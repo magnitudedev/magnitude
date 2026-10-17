@@ -310,6 +310,16 @@ export function ChatPage() {
           </select>
         </label>
         <Button type="button" variant="outline" onClick={createConversation} className="sm:hidden">New chat</Button>
+        <select
+          aria-label="Conversation history"
+          value={activeId ?? ""}
+          disabled={conversations.length === 0}
+          onChange={event => { setActiveId(event.target.value || null); setError(null) }}
+          className="max-w-[min(42vw,12rem)] rounded-lg border border-slate-200 bg-white px-2 py-2 text-xs text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 sm:hidden dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+        >
+          {conversations.length === 0 && <option value="">No history</option>}
+          {conversations.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}
+        </select>
         <Button type="button" variant="outline" onClick={() => { setOpenWebUIError(null); setShowOpenWebUI(true) }}>Open WebUI</Button>
       </header>
       {modelsError && <div role="alert" className="m-4 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">{modelsError} <button type="button" className="ml-2 underline" onClick={() => window.location.reload()}>Retry</button></div>}
