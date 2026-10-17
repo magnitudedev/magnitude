@@ -130,10 +130,14 @@ export function ChatPage() {
   }
 
   const updateConversation = (conversation: Conversation) => {
-    setConversations(current => {
-      if (deletedConversationIdsRef.current.has(conversation.id)) {
-        return current.filter(item => item.id !== conversation.id)
+    if (deletedConversationIdsRef.current.has(conversation.id)) {
+      setConversations(current => current.filter(item => item.id !== conversation.id))
+      if (streamingConversationIdRef.current !== conversation.id) {
+        deletedConversationIdsRef.current.delete(conversation.id)
       }
+      return
+    }
+    setConversations(current => {
       const next = [conversation, ...current.filter(item => item.id !== conversation.id)]
       next.sort((a, b) => b.updatedAt - a.updatedAt)
       return next
