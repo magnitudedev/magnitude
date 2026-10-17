@@ -36,7 +36,9 @@ on this computer: the catalog's separate drafter as soon as that drafter is pres
 projector it lacks, which never blocks the drafter. What it lacks is reported as missing components
 (`Projector`, `Drafter`, each with the bytes it would download), not as an update: update means a
 newer catalog revision, and is reported only when an older revision of the model's packages is also
-present. Each missing component can be fetched alone (`install_catalog_component`), and installing
+present. The same holds once the catalog's own target package is installed: a drafter that is absent
+with no earlier revision here is a missing component, so fetching a found copy's projector leaves only
+the drafter missing, never an update. Each missing component can be fetched alone (`install_catalog_component`), and installing
 the catalog model fetches everything missing. Either way a file whose exact content is already on
 this computer is copied (cloned where the file system can) and verified, never downloaded again, so
 fetching the projector downloads only the projector. External attributions are derived on every

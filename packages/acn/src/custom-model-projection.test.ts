@@ -385,6 +385,46 @@ describe("local models state", () => {
       assessment: { complete: true, settledModels: 1, totalModels: 1 },
     })
   })
+  it("follows a found exact target through its projector and then its drafter without ever reporting an update", () => {
+    const modelId = "gemma-4-e2b-it-qat:gguf:q4"
+    const desired = { metadata: { storageBytes: 1 }, profile: { contextLength: 32_768 }, speculativeMethod: Option.none() }
+    const step = (ownership: string, missingComponents: readonly unknown[], speculative: boolean) => projectLocalModels({
+      source: { ...sources([]), catalogModels: [{
+        id: modelId,
+        source: {
+          aliases: Option.none(), description: "", desired, displayName: "Gemma 4 E2B", fidelityRank: 1, intelligence: 1,
+          license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, quantizationAware: true,
+          releaseDate: "2026-04-02", sourceUrls: [], support: { level: "supported" }, variantLabel: "Q4 QAT",
+          localState: {
+            _tag: "Installed",
+            effective: { _tag: "Ready", model: { ...desired, speculativeMethod: speculative ? Option.some({ _tag: "Mtp" }) : Option.none() } },
+            installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/files/model.gguf", ownership },
+            updateState: { _tag: "Current" },
+            missingComponents,
+          },
+        },
+      } as unknown as LocalModelSourcesState["catalogModels"][number]] },
+      assessment: assessments([]),
+      operations: [],
+      runtime: [],
+      removals: new Map(),
+      config: customModelsConfig(),
+      downloads: [],
+    }).models[0]
+    const projector = { component: "Projector", downloadBytes: 987_000_000 }
+    const drafter = { component: "Drafter", downloadBytes: 59_200_000 }
+    const observed = [
+      step("External", [projector, drafter], false),
+      step("Mixed", [drafter], false),
+      step("Mixed", [], true),
+    ].map((model) => model?._tag === "Catalog" ? [model.acquisitionState._tag, model.missingComponents] : undefined)
+    expect(observed).toEqual([
+      ["Installed", [projector, drafter]],
+      ["Installed", [drafter]],
+      ["Installed", []],
+    ])
+  })
+
   it("lists catalog models with their aliases and leaves hiding an external copy to ICN", () => {
     const desired = {
       metadata: { storageBytes: 1 },

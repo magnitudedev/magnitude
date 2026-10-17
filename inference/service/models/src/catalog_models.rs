@@ -672,10 +672,10 @@ enum CatalogMaterialState<'a> {
 /// `local_files` are files on this computer in any location, a hidden found copy's included, which
 /// an installation copies rather than downloads.
 ///
-/// A found exact target (the catalog's target weights in another app's location) is the catalog
-/// model and serves with every catalog component on this computer: the catalog drafter when it is
-/// here, without a projector it lacks. What it lacks is reported as missing components, never as an
-/// update, unless an older catalog revision of this model is also here.
+/// The current target, the catalog's target package or a found exact copy of its weights (in
+/// another app's location), serves with every catalog component on this computer: the catalog
+/// drafter when it is here, without a projector it lacks. What it lacks is reported as missing
+/// components, never as an update; update means an older catalog revision of this model is here.
 fn catalog_resolution<'a>(
     definition: &RecommendableModel,
     present: &BTreeMap<ModelPackageId, &'a InstalledModelPackage>,
@@ -768,7 +768,8 @@ fn catalog_resolution<'a>(
         .iter()
         .find(|entry| entry.package.id == catalog_target.id)
         .copied();
-    let exact_target = desired_target.is_none().then(|| {
+    // The current target: the catalog's own target package, else a found copy of its exact weights.
+    let current_target = desired_target.or_else(|| {
         targets
             .iter()
             .find(|entry| {
@@ -776,8 +777,7 @@ fn catalog_resolution<'a>(
             })
             .copied()
     });
-    let exact_target = exact_target.flatten();
-    let selected_target = desired_target.or(exact_target).or(match targets.as_slice() {
+    let selected_target = current_target.or(match targets.as_slice() {
         [target] => Some(*target),
         _ => None,
     });
@@ -792,10 +792,10 @@ fn catalog_resolution<'a>(
             effective: effective_configuration_model(&configuration, present),
             configuration: Some(configuration),
         }
-    } else if let Some(target) = exact_target {
+    } else if let Some(target) = current_target {
         if superseded_package_ids.is_empty() {
             required_download_bytes = 0;
-            missing_components = found_target_missing_components(
+            missing_components = current_target_missing_components(
                 definition,
                 &target.package,
                 present,
@@ -879,9 +879,10 @@ fn present_components_bundle(
     }
 }
 
-/// What a found exact target lacks of its catalog bundle: the catalog target's projector, and the
-/// catalog's separate drafter. Each downloads only the bytes not already on this computer.
-fn found_target_missing_components(
+/// What the current target serves without: the catalog target's projector when the serving target
+/// (a found copy of its weights) lacks it, and the catalog's separate drafter when it is not on this
+/// computer. Each downloads only the bytes not already here.
+fn current_target_missing_components(
     definition: &RecommendableModel,
     found: &ModelPackage,
     present: &BTreeMap<ModelPackageId, &InstalledModelPackage>,
@@ -1388,6 +1389,81 @@ mod tests {
         );
     }
 
+    /// The Fedora round 3b sequence: the exact target in a Hugging Face cache with no drafter
+    /// anywhere, then the projector alone (which installs the catalog's target package, its weights
+    /// copied from the cache), then the drafter alone. No step is an update, and each step reports
+    /// exactly what is still missing.
+    #[test]
+    fn a_found_exact_target_fetching_its_projector_then_its_drafter_is_never_an_update() {
+        let (found, target) = found_exact_target_without_projector();
+        let draft = package("draft", 900);
+        let definition = definition(ServableModelBundle::SpeculativeDecoding {
+            target: target.clone(),
+            draft_source: SpeculativeDraftSource::Separate {
+                draft: draft.clone(),
+            },
+            method: SpeculativeMethod::Mtp,
+        });
+        let external = attributed_external(found.clone(), &definition);
+        let stored_target = installed(target.clone(), ModelPackageInstallationOrigin::Magnitude);
+        let stored_draft = installed(draft.clone(), ModelPackageInstallationOrigin::Magnitude);
+        let step = |entries: &[&InstalledModelPackage]| {
+            let present = entries
+                .iter()
+                .map(|entry| (entry.package.id.clone(), *entry))
+                .collect::<BTreeMap<_, _>>();
+            let local_files = entries
+                .iter()
+                .flat_map(|entry| &entry.package.files)
+                .map(|file| file.id.clone())
+                .collect::<BTreeSet<_>>();
+            let resolution = catalog_resolution(&definition, &present, &[], &local_files);
+            let CatalogMaterialState::Installed {
+                configuration: Some(configuration),
+                effective: EffectiveModel::Ready { model },
+                ..
+            } = resolution.state
+            else {
+                panic!("the catalog model is installed and ready at every step");
+            };
+            (
+                configuration.bundle,
+                model.speculative_method,
+                resolution.required_download_bytes,
+                resolution.missing_components,
+            )
+        };
+        let projector = CatalogMissingComponent {
+            component: CatalogComponent::Projector,
+            download_bytes: 600,
+        };
+        let drafter = CatalogMissingComponent {
+            component: CatalogComponent::Drafter,
+            download_bytes: 900,
+        };
+
+        let (bundle, method, update, missing) = step(&[&external]);
+        assert_eq!(bundle, ServableModelBundle::Standalone { package: found });
+        assert_eq!((method, update), (None, 0));
+        assert_eq!(missing, vec![projector, drafter.clone()]);
+
+        let (bundle, method, update, missing) = step(&[&external, &stored_target]);
+        assert_eq!(
+            bundle,
+            ServableModelBundle::Standalone {
+                package: target.clone()
+            },
+            "the catalog's own target, with its projector, serves once it is here"
+        );
+        assert_eq!((method, update), (None, 0), "a missing drafter is not an update");
+        assert_eq!(missing, vec![drafter], "only the drafter is left to fetch");
+
+        let (bundle, method, update, missing) = step(&[&external, &stored_target, &stored_draft]);
+        assert_eq!(bundle, definition.configuration.bundle);
+        assert_eq!((method, update), (Some(SpeculativeMethod::Mtp), 0));
+        assert!(missing.is_empty());
+    }
+
     #[test]
     fn a_found_exact_target_beside_an_older_catalog_revision_is_an_update() {
         let (found, target) = found_exact_target_without_projector();
@@ -1507,14 +1583,27 @@ mod tests {
             configuration.bundle,
             ServableModelBundle::Standalone { .. }
         ));
-        assert_eq!(resolution.required_download_bytes, 5);
+        assert_eq!(
+            resolution.required_download_bytes, 0,
+            "a missing drafter with no earlier revision here is not an update"
+        );
+        assert_eq!(
+            resolution.missing_components,
+            vec![CatalogMissingComponent {
+                component: CatalogComponent::Drafter,
+                download_bytes: 5,
+            }]
+        );
 
         // A missing package whose files are on this computer, as a hidden found copy's are, is
         // copied, not downloaded.
         let held = BTreeSet::from([ModelFileId("file-draft".to_owned())]);
         assert_eq!(
-            catalog_resolution(&definition, &present, &[], &held).required_download_bytes,
-            0
+            catalog_resolution(&definition, &present, &[], &held).missing_components,
+            vec![CatalogMissingComponent {
+                component: CatalogComponent::Drafter,
+                download_bytes: 0,
+            }]
         );
     }
 
