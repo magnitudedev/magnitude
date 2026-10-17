@@ -1,0 +1,37 @@
+name: Native Chat validation (fork)
+
+on:
+  push:
+    branches:
+      - feat/native-chat-section
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-chat-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web-chat:
+    name: Web Chat typecheck, tests and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out fork branch
+        uses: actions/checkout@v4
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Typecheck shared client
+        run: bun run --cwd packages/client-common typecheck
+      - name: Typecheck web
+        run: bun run --cwd web typecheck
+      - name: Run web tests
+        run: bun run --cwd web test
+      - name: Build web
+        run: bun run --cwd web build
