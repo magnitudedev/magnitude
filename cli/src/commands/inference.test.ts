@@ -30,6 +30,7 @@ import {
   TEST_COMMIT,
   TEST_REPOSITORY,
   unsupportedAssessment,
+  unreadableAssessment,
 } from "./fixtures/inference"
 import { registerInferenceCommands } from "./inference"
 import type { CliModelsClient } from "./inference-client"
@@ -835,6 +836,19 @@ describe("--json output", () => {
     })
     expect(versions[0]).not.toHaveProperty("onThisComputer")
     expect((document.drafters as Record<string, unknown>[])[0]!.verdict).toMatchObject({ _tag: "Rejected" })
+  })
+
+  it("renders and encodes an unreadable version, which has no serving profile", () => {
+    const [, , recommended] = makeInspection().versions
+    const inspection = makeInspection({
+      versions: [recommended!, { ...recommended!, label: "Q3_K_M", recommended: false, assessment: Option.some(unreadableAssessment()) }],
+    })
+    const output = renderInspection({ inspection, drafters: [], models: [] })
+    expect(output).toMatch(/Q3_K_M.*Unsupported: The file is incomplete or damaged/)
+    const document = encode(inspectionJson, { inspection, drafters: [], models: [] })
+    const unreadable = (document.inspection as { versions: Record<string, unknown>[] }).versions[1]!.assessment
+    expect(unreadable).toMatchObject({ _tag: "Unsupported", reasons: [{ _tag: "Unreadable" }] })
+    expect(unreadable).not.toHaveProperty("profile")
   })
 
   it("encodes status, detail, pull, catalog, and hardware documents", () => {

@@ -42,7 +42,7 @@ import { CopyCommand } from "./components/copy-command"
 import { useId, useMemo, useRef, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
-import { localModelDeprecation, type ProviderModelId, type CatalogLocalModel, type CustomLocalModel, type CustomModelAcquisitionState, type DrafterCandidate, type LocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
+import { localModelAssessmentProfile, localModelDeprecation, type ProviderModelId, type CatalogLocalModel, type CustomLocalModel, type CustomModelAcquisitionState, type DrafterCandidate, type LocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
 import type { ApplicationSnapshot, AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessChange, type NetworkBind, type OwnerCapability } from "@magnitudedev/sdk"
 import { FolderPicker } from "./components/folder-picker"
@@ -96,7 +96,7 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false, 
         {custom}
         <dl className="flex flex-wrap gap-x-8 gap-y-3">
           <div><dt className="text-xs text-slate-500">License</dt><dd className="mt-1">{Option.getOrElse(model.presentation.license, () => "Not specified")}</dd></div>
-          {serving._tag === "Assessed" && <div><dt className="text-xs text-slate-500">Context window</dt><dd className="mt-1">{serving.assessment.profile.contextLength.toLocaleString()} tokens</dd></div>}
+          {serving._tag === "Assessed" && Option.match(localModelAssessmentProfile(serving.assessment), { onNone: () => null, onSome: (profile) => <div><dt className="text-xs text-slate-500">Context window</dt><dd className="mt-1">{profile.contextLength.toLocaleString()} tokens</dd></div> })}
           {serving._tag === "Assessed" && serving.capabilities.vision && <div className="self-end"><TooltipProvider><ActionTooltip label="Supports vision" trigger={<button type="button" aria-label="Supports vision" className="rounded p-1 text-slate-500 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-200"><EyeIcon aria-hidden="true" className="size-4" /></button>} /></TooltipProvider></div>}
         </dl>
         {model._tag === "Catalog" && model.presentation.sourceUrls.length > 0 && <div><p className="mb-2 text-xs text-slate-500">Sources</p><div className="flex flex-wrap gap-x-4 gap-y-2">{model.presentation.sourceUrls.map(url => {

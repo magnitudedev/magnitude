@@ -761,10 +761,13 @@ export const UnsupportedReasonSchema = Schema.Union(
 )
 export type UnsupportedReason = typeof UnsupportedReasonSchema.Type
 
-/** The engine cannot execute a custom model or candidate; catalog models are never unsupported. */
+/**
+ * The engine cannot execute a custom model or candidate; catalog models are never unsupported. An
+ * unreadable file has no serving profile.
+ */
 export const LocalModelUnsupportedAssessmentSchema = Schema.TaggedStruct("Unsupported", {
   environmentId: AssessmentEnvironmentIdSchema,
-  profile: ServingProfileSchema,
+  profile: Schema.optionalWith(ServingProfileSchema, { as: "Option", exact: true }),
   reasons: Schema.NonEmptyArray(UnsupportedReasonSchema),
   detail: Schema.String,
 })

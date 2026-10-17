@@ -160,7 +160,8 @@ export const projectAssessment = (environmentId: string, assessment: ModelAssess
     })
   }
   return Schema.decodeUnknownSync(LocalModelAssessmentSchema)({
-    _tag: "Unsupported", environmentId, profile: assessment.profile,
+    _tag: "Unsupported", environmentId,
+    ...Option.match(assessment.profile, { onNone: () => ({}), onSome: (profile) => ({ profile }) }),
     reasons: productUnsupportedReasons(assessment.reasons, assessment.detail), detail: assessment.detail,
   })
 }

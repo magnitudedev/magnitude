@@ -8,6 +8,7 @@ import {
   type DrafterCandidate,
   type LocalModel,
   type LocalModelAcquisitionState,
+  type LocalModelAssessment,
   type LocalModelsState,
   type ModelCapabilities,
   type ModelInstallation,
@@ -25,12 +26,19 @@ export const localModelServingState = (
   model: LocalModel,
 ): Option.Option<LocalModelServingState> => Option.some(model.servingState)
 
+/** The profile an assessment was made for; an unreadable model's has none. */
+export const localModelAssessmentProfile = (
+  assessment: LocalModelAssessment,
+): Option.Option<ServingProfile> => assessment._tag === "Unsupported"
+  ? assessment.profile
+  : Option.some(assessment.profile)
+
 export const localModelServingProfile = (
   model: LocalModel,
 ): Option.Option<ServingProfile> => {
   const serving = model.servingState
   switch (serving._tag) {
-    case "Assessed": return Option.some(serving.assessment.profile)
+    case "Assessed": return localModelAssessmentProfile(serving.assessment)
     case "Assessing": return Option.some(serving.profile)
     case "Failed": return Option.isOption(serving.profile) ? serving.profile : Option.some(serving.profile)
   }

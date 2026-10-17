@@ -117,10 +117,18 @@ export const doesNotFitAssessment = (): LocalModelAssessment => ({
 
 export const unsupportedAssessment = (ggmlType: string): LocalModelAssessment => ({
   _tag: "Unsupported",
-  profile: { contextLength: CONTEXT_LENGTH },
+  profile: Option.some({ contextLength: CONTEXT_LENGTH }),
   environmentId: ENVIRONMENT_ID,
   reasons: [{ _tag: "WeightTypes", types: [{ ggmlType, tensorCount: 2 }] }],
   detail: `source_element has no ${ggmlType} case`,
+})
+
+export const unreadableAssessment = (): LocalModelAssessment => ({
+  _tag: "Unsupported",
+  profile: Option.none(),
+  environmentId: ENVIRONMENT_ID,
+  reasons: [{ _tag: "Unreadable" }],
+  detail: "file is shorter than its header declares",
 })
 
 const catalogPresentation = {

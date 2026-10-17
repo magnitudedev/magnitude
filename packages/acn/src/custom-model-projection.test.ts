@@ -43,7 +43,7 @@ const fits = assessed({
 const unsupported = assessed({
   _tag: "Unsupported",
   environmentId: "environment",
-  profile: { contextLength: 32_768 },
+  profile: Option.some({ contextLength: 32_768 }),
   reasons: [{ _tag: "Architecture", architecture: "deepseek4" }],
   detail: "",
 })
@@ -398,6 +398,38 @@ describe("local models state", () => {
       downloads: [],
     })
     expect(hiddenCopy.models[0]?._tag === "Catalog" && hiddenCopy.models[0].catalogData.aliases).toEqual([])
+
+    // ICN no longer attributes a hidden external copy: the catalog model isn't installed and the copy
+    // is a hidden found model under its alias, until it is unhidden.
+    const alias = `hf:owner/${external}/model.gguf`
+    const notInstalled = { ...catalogEntry(external, "External"), source: {
+      ...catalogEntry(external, "External").source, localState: { _tag: "NotInstalled" },
+    } } as unknown as LocalModelSourcesState["catalogModels"][number]
+    const hidden = projectLocalModels({
+      source: {
+        ...sources([], [customSource(nativeCustomModel({ modelId: alias, files: [{ path: "/files/model.gguf", sizeBytes: 1 }] }))]),
+        catalogModels: [notInstalled],
+      },
+      assessment: assessments([]),
+      operations: [],
+      runtime: [],
+      removals: new Map(),
+      config: customModelsConfig({ hidden: [alias] as never }),
+      downloads: [],
+    })
+    expect(hidden.models.map((model) => [model.modelId, model.acquisitionState._tag])).toEqual([[external, "NotInstalled"]])
+    expect(hidden.hidden.map(({ modelId }) => modelId)).toEqual([alias])
+    const unhidden = projectLocalModels({
+      source: { ...sources([]), catalogModels: [catalogEntry(external, "External")] },
+      assessment: assessments([]),
+      operations: [],
+      runtime: [],
+      removals: new Map(),
+      config: customModelsConfig(),
+      downloads: [],
+    })
+    expect(unhidden.models.map((model) => [model.modelId, model.acquisitionState._tag])).toEqual([[external, "Installed"]])
+    expect(unhidden.hidden).toEqual([])
   })
 
   it("moves a found model the engine cannot run into the unsupported list with its reasons", () => {
@@ -407,7 +439,7 @@ describe("local models state", () => {
     }
     snapshot.custom.entries[1]!.state.profiles = [{
       _tag: "Unsupported",
-      profile: { contextLength: 32_768 },
+      profile: Option.some({ contextLength: 32_768 }),
       reasons: [{ _tag: "Architecture", architecture: "deepseek4" }],
       detail: "unknown architecture deepseek4",
     }]
@@ -440,7 +472,7 @@ describe("local models state", () => {
     }
     snapshot.custom.entries[0]!.state.profiles = [{
       _tag: "Unsupported",
-      profile: { contextLength: 40_960 },
+      profile: Option.some({ contextLength: 40_960 }),
       reasons: [
         { _tag: "Architecture", architecture: "qwen3" },
         { _tag: "Tokenizer", model: "gpt2", pre: Option.some("qwen2") },

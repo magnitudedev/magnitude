@@ -1100,13 +1100,22 @@ async fn a_file_with_an_unknown_tensor_type_is_an_unreadable_version_not_a_faile
     assert_eq!(inspection.unsupported_architecture, None);
     let legacy = version(&inspection, "llama-Q4_0_4_4.gguf");
     let Some(ModelAssessment::Unsupported {
-        reasons, detail, ..
+        profile,
+        reasons,
+        detail,
     }) = &legacy.assessment
     else {
         panic!("the legacy file is unsupported: {:?}", legacy.assessment);
     };
+    assert_eq!(profile, &None, "an unreadable file has no serving profile");
     assert_eq!(reasons, &[UnsupportedReason::Unreadable]);
     assert!(detail.contains("unknown GGUF tensor type 31"), "{detail}");
+    let encoded = serde_json::to_value(&legacy.assessment).expect("serialize");
+    assert_eq!(encoded["_tag"], "Unsupported");
+    assert!(
+        encoded.get("profile").is_none(),
+        "an unreadable version serializes without a profile: {encoded}"
+    );
     assert_eq!(
         legacy.model_id.as_str(),
         format!("hf:{LEGACY}/llama-Q4_0_4_4.gguf")

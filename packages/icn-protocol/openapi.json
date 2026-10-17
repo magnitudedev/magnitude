@@ -6962,9 +6962,8 @@
           },
           {
             "type": "object",
-            "description": "The engine cannot execute a custom model, with every reason it found. A catalog model is\nnever unsupported: the pool drops a catalog target the engine cannot execute as a release\ndefect.",
+            "description": "The engine cannot execute a custom model, with every reason it found. A catalog model is\nnever unsupported: the pool drops a catalog target the engine cannot execute as a release\ndefect. An unreadable file has no serving profile.",
             "required": [
-              "profile",
               "reasons",
               "detail",
               "_tag"

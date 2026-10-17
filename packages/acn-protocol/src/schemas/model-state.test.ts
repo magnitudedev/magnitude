@@ -270,6 +270,11 @@ describe("LocalModelSchema invariants", () => {
     expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(withoutPerformance)).toThrow()
     expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(unsupported)).toThrow()
     expect(() => Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)(unsupported)).not.toThrow()
+    const { profile: _profile, ...unreadable } = unsupported.assessment
+    expect(Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)({
+      ...unsupported,
+      assessment: { ...unreadable, reasons: [{ _tag: "Unreadable" }] },
+    })).toMatchObject({ assessment: { _tag: "Unsupported", profile: Option.none() } })
     expect(() => Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)({
       ...unsupported,
       assessment: { ...unsupported.assessment, reasons: [] },
@@ -376,6 +381,27 @@ describe("CandidateInspectionSchema", () => {
     displayName: "Model",
     versions: [version("Q4_K_M", true), version("Q8_0", false)],
   }
+
+  it("accepts an unreadable version whose assessment has no serving profile", () => {
+    const unreadable = {
+      _tag: "Unsupported",
+      environmentId: "environment",
+      reasons: [{ _tag: "Unreadable" }],
+      detail: "file is shorter than its header declares",
+    }
+    const decoded = Schema.decodeUnknownSync(CandidateInspectionSchema)({
+      ...inspection,
+      versions: [version("Q4_K_M", true), { ...version("Q8_0", false), assessment: unreadable }],
+    })
+    const assessment = Option.getOrThrow(decoded.versions[1]!.assessment)
+    expect(assessment._tag === "Unsupported" && assessment.profile).toEqual(Option.none())
+    const encoded = Schema.encodeSync(CandidateInspectionSchema)(decoded)
+    expect(encoded.versions[1]!.assessment).toEqual(unreadable)
+    expect(() => Schema.decodeUnknownSync(CandidateInspectionSchema)({
+      ...inspection,
+      versions: [version("Q4_K_M", true), { ...version("Q8_0", false), assessment: { ...unreadable, profile: { contextLength: 0 } } }],
+    })).toThrow()
+  })
 
   it("accepts a repository step with one recommendation and a listed selection", () => {
     expect(() => Schema.decodeUnknownSync(CandidateInspectionSchema)({

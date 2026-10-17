@@ -3383,9 +3383,9 @@ mod tests {
 
     fn unsupported_assessment() -> ModelAssessment {
         ModelAssessment::Unsupported {
-            profile: ServingProfile {
+            profile: Some(ServingProfile {
                 context_length: 8192,
-            },
+            }),
             reasons: Vec::new(),
             detail: "unknown GGUF tensor type 31".to_owned(),
         }

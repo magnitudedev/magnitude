@@ -606,21 +606,17 @@ fn unsupported_model(
     fingerprint: Option<ModelFingerprint>,
 ) -> CachedModelAssessment {
     let (reasons, detail) = unsupported_reasons(unsupported);
-    unsupported_assessment(requested.profile, reasons, detail, fingerprint)
+    unsupported_assessment(Some(requested.profile), reasons, detail, fingerprint)
 }
 
-/// A file on disk shorter than its header declares: refused before the engine sees it.
-pub(crate) fn unreadable_assessment(context_length: u32, detail: String) -> CachedModelAssessment {
-    unsupported_assessment(
-        magnitude_service_contracts::models::ServingProfile { context_length },
-        vec![UnsupportedReason::Unreadable],
-        detail,
-        None,
-    )
+/// A file whose header or bytes cannot be read: refused before the engine sees it, without a
+/// serving profile.
+pub(crate) fn unreadable_assessment(detail: String) -> CachedModelAssessment {
+    unsupported_assessment(None, vec![UnsupportedReason::Unreadable], detail, None)
 }
 
 fn unsupported_assessment(
-    profile: magnitude_service_contracts::models::ServingProfile,
+    profile: Option<magnitude_service_contracts::models::ServingProfile>,
     reasons: Vec<UnsupportedReason>,
     detail: String,
     fingerprint: Option<ModelFingerprint>,

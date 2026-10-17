@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { Dialog } from "./ui/dialog"
 import { FindStepView, LocalFileSummary, LocalFileView, RepositoryFooter, RepositoryView, SearchResultsView, addVersionRequest, confirmAction, formatDownloads, initialVersion, parseModelReference, unsupportedVersionLabel, versionVerdict, type FindTab } from "./add-model-dialog"
-import { catalogId, catalogModel, drafterCandidate, inspection, repository, version, doesNotFit, unsupported } from "../../test/models/fixtures"
+import { catalogId, catalogModel, drafterCandidate, inspection, repository, version, doesNotFit, unsupported, unreadable } from "../../test/models/fixtures"
 
 const inDialog = (node: ReactNode) => renderToStaticMarkup(<Dialog open>{node}</Dialog>)
 const models = [catalogModel()]
@@ -107,6 +107,13 @@ describe("repository step", () => {
     expect(html).toContain('aria-label="Back to search"')
     expect(html.match(/type="radio"[^>]*disabled=""/g)).toHaveLength(2)
     expect(html).toMatch(/type="radio"[^>]*checked=""/)
+  })
+  it("shows an unreadable version, which has no serving profile, as damaged and unselectable", () => {
+    const damaged = version("Q3_K_M", { assessment: Option.some(unreadable) })
+    expect(versionVerdict(damaged)).toMatchObject({ label: "File is damaged", detail: "The file is incomplete or damaged", selectable: false })
+    const html = inDialog(<RepositoryView inspection={inspection({ versions: [version("Q4_K_P", { recommended: true }), damaged] })} models={models} selectedVersion={Option.some("Q4_K_P")} onSelectVersion={() => {}} />)
+    expect(html).toContain('title="The file is incomplete or damaged">File is damaged<')
+    expect(html.match(/type="radio"[^>]*disabled=""/g)).toHaveLength(1)
   })
   it("explains why when no version runs on this computer", () => {
     const nothingRuns = inspection({ versions: [

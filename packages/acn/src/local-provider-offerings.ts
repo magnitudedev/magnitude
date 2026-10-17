@@ -1,5 +1,6 @@
 import { Context, Effect, Layer, Option, Stream } from "effect"
 import {
+  localModelAssessmentProfile,
   localModelDeprecation,
   localModelIsAvailable,
   localModelProviderModelId,
@@ -64,18 +65,21 @@ export const projectLocalProviderOfferings = (models: readonly LocalModel[]) => 
   const assessedModels = models.flatMap((model) => Option.match(localModelServingState(model), {
     onNone: () => [],
     onSome: (serving) => serving._tag === "Assessed"
-      ? [{ model, serving }]
+      ? Option.match(localModelAssessmentProfile(serving.assessment), {
+        onNone: () => [],
+        onSome: (profile) => [{ model, serving, profile }],
+      })
       : [],
   }))
   const selected = assessedModels.filter(({ model, serving }) =>
     serving.assessment._tag === "Fits" && Option.isSome(localModelProviderModelId(model)))
   return {
-    offerings: selected.map(({ model, serving }): LocalProviderOffering => ({
+    offerings: selected.map(({ model, serving, profile }): LocalProviderOffering => ({
       providerModelId: model.modelId,
-      profile: serving.assessment.profile,
+      profile,
       capabilities: serving.capabilities,
     })),
-    entries: assessedModels.map(({ model, serving }): ProviderModelCatalogEntry => {
+    entries: assessedModels.map(({ model, serving, profile }): ProviderModelCatalogEntry => {
       return {
         providerId: LOCAL_PROVIDER_ID,
         providerModelId: model.modelId,
@@ -83,8 +87,8 @@ export const projectLocalProviderOfferings = (models: readonly LocalModel[]) => 
         displayName: model.presentation.displayName,
         variantLabel: Option.some(model.presentation.variantLabel),
         supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
-        contextWindow: serving.assessment.profile.contextLength,
-        maxOutputTokens: serving.assessment.profile.contextLength,
+        contextWindow: profile.contextLength,
+        maxOutputTokens: profile.contextLength,
         memory: serving.assessment._tag === "Fits" ? Option.some(serving.assessment.memory.domains)
           : serving.assessment._tag === "DoesNotFit" ? Option.some(serving.assessment.memoryDomains)
             : Option.none(),

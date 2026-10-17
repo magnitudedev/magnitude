@@ -24,8 +24,12 @@ export const doesNotFit: LocalModelAssessment = {
   _tag: "DoesNotFit", assessmentId, environmentId, profile: { contextLength: 32_768 }, memoryDomains: [], totalRequiredBytes: 0, deficitBytes: 4 * GB, limitingResource: "system",
 }
 export const unsupported = (...reasons: [UnsupportedReason, ...UnsupportedReason[]]): LocalModelAssessment => ({
-  _tag: "Unsupported", environmentId, profile: { contextLength: 32_768 }, reasons, detail: "engine detail",
+  _tag: "Unsupported", environmentId, profile: Option.some({ contextLength: 32_768 }), reasons, detail: "engine detail",
 })
+
+export const unreadable: LocalModelAssessment = {
+  _tag: "Unsupported", environmentId, profile: Option.none(), reasons: [{ _tag: "Unreadable" }], detail: "file is shorter than its header declares",
+}
 
 export const catalogModel = (): CatalogLocalModel => ({
   _tag: "Catalog",

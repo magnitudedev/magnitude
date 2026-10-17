@@ -92,7 +92,8 @@ terminals, and errors stay on stderr with a nonzero exit. Under `--json` every i
 writes its error to stderr as one document, `{"error": {"message": <product message>, "code":
 <stable snake_case code>}}`, so stdout holds only a successful result. The code is the service's
 failure code when it has one, else the failure's kind. One shared command runner produces this
-document for every command.
+document for every command, and it reports an unexpected defect, such as a response that fails to
+decode, the same way instead of crashing.
 
 Memory uses hardware-conventional units; storage and transfer use decimal units; context uses
 compact token counts; generation speed uses `tok/s`. Rounded values are presentation only.

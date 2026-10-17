@@ -485,7 +485,10 @@ package removes every Magnitude-owned inventory occurrence of that package and p
 external occurrence; when an external copy of the target remains, as after upgrading with the same
 file in a Hugging Face cache, it keeps serving the catalog model from where it is. A hidden found
 copy is identified by the `hf:` ID it has as a found model, so hiding it ends its attribution to
-the catalog model and it is listed as a hidden found model.
+the catalog model, even when it is exactly a catalog package the catalog remembers: no catalog model
+counts it as installed, and it is listed as a hidden found model. Hiding changes only what is
+shown: installing the catalog model copies the hidden copy's verified bytes into Magnitude's store
+rather than downloading them, and leaves the copy's files where they are.
 
 Removing an added custom model deletes its Magnitude-owned files under the same rules; any of its
 files that are also present in an external location stay there, and the model remains as found.

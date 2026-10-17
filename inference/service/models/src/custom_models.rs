@@ -225,7 +225,7 @@ impl ModelDomainResolver {
     /// catalog model, and not the drafter any custom model serves with.
     fn unused_drafter_packages(&self) -> Result<Vec<ModelPackageId>, InventoryError> {
         let projection = self.local_projection()?;
-        let installed = self.inventory.installed_packages_response()?;
+        let installed = self.inventory.catalog_packages_response()?;
         let present = installed
             .packages
             .iter()
@@ -1382,7 +1382,7 @@ mod tests {
 
     use magnitude_service_contracts::models::{
         CustomModelDeclaration, DrafterAttachment, DrafterCategory, DrafterLineage, DrafterVerdict,
-        ModelRoot, ModelRootKind,
+        ModelAssessmentSubject, ModelRoot, ModelRootKind, RecommendableModel,
     };
     use magnitude_service_contracts::{ContentIdentity, ModelInventory as _};
     use sha2::{Digest, Sha256};
@@ -1409,17 +1409,25 @@ mod tests {
         }
 
         async fn with_hub(endpoint: String) -> Self {
-            let temporary = tempfile::tempdir().unwrap();
+            Self::open(tempfile::tempdir().unwrap(), endpoint, Vec::new()).await
+        }
+
+        async fn open(
+            temporary: tempfile::TempDir,
+            endpoint: String,
+            catalog: Vec<RecommendableModel>,
+        ) -> Self {
             let root = temporary.path().canonicalize().unwrap();
             let store = root.join("store");
             let mut config = InventoryConfig::with_roots(store.clone(), root.join("cache")).unwrap();
             config.hub_endpoint = Some(endpoint);
+            config.catalog_models = catalog.clone();
             let inventory = Arc::new(ManagedModelStore::open(config).await.unwrap());
             inventory.ensure_installed_model_inventory().await.unwrap();
             let resolver = ModelDomainResolver::new(
                 inventory,
                 RecommendableModelCatalog {
-                    models: Vec::new(),
+                    models: catalog,
                     diagnostics: Vec::new(),
                 },
             );
@@ -1440,6 +1448,28 @@ mod tests {
 
         fn inventory(&self) -> &ManagedModelStore {
             &self.resolver.inventory
+        }
+
+        /// The same store opened again, as after a restart, with `catalog` as its catalog.
+        async fn restart(self, catalog: Vec<RecommendableModel>) -> Self {
+            self.restart_with_hub("http://127.0.0.1:9".to_owned(), catalog)
+                .await
+        }
+
+        async fn restart_with_hub(
+            self,
+            endpoint: String,
+            catalog: Vec<RecommendableModel>,
+        ) -> Self {
+            let Self {
+                _temporary: temporary,
+                resolver,
+                local,
+                ..
+            } = self;
+            drop(local);
+            drop(resolver);
+            Self::open(temporary, endpoint, catalog).await
         }
     }
 
@@ -2318,6 +2348,296 @@ mod tests {
         assert_eq!(
             ids(&listed.models),
             [local_id(&folder.join("Qwen3.6-35B-A3B-MTP-Q4_K_M.gguf")).to_string()]
+        );
+    }
+
+    fn catalog_definition(target: ModelPackage) -> RecommendableModel {
+        RecommendableModel {
+            model_id: magnitude_service_contracts::models::CatalogBaseId::new("model").unwrap(),
+            variant_id: magnitude_service_contracts::models::CatalogVariantId::new("gguf:q4")
+                .unwrap(),
+            configuration: ModelServingConfiguration {
+                bundle: ServableModelBundle::Standalone { package: target },
+                profile: ServingProfile {
+                    context_length: 4_096,
+                },
+            },
+            display_name: "Model".to_owned(),
+            variant_label: "Q4".to_owned(),
+            description: String::new(),
+            release_date: magnitude_service_contracts::models::ModelReleaseDate::new("2026-01-01")
+                .unwrap(),
+            license: "test".to_owned(),
+            parameterization: magnitude_service_contracts::models::ModelParameterization::Dense {
+                total_parameters: 1_000_000_000,
+            },
+            intelligence: 0,
+            support: magnitude_service_contracts::models::CatalogSupport::Supported,
+            fidelity_rank: 0,
+            quantization_aware: false,
+        }
+    }
+
+    /// A catalog model whose only copy is exactly its target in a Hugging Face cache (as after
+    /// removing Magnitude's copy) is a found copy. Hiding it by the `hf:` ID it has as a found model
+    /// ends its attribution, even though the catalog remembers the package: the catalog model is
+    /// no longer installed, the copy is a hidden found model under its own ID, and the catalog ID
+    /// no longer resolves to it, across a restart, until it is unhidden.
+    #[tokio::test]
+    async fn hiding_a_catalog_models_external_copy_makes_it_a_hidden_found_model() {
+        use magnitude_service_contracts::models::{CatalogModelState, InstalledModelPackages as _};
+
+        let fixture = Fixture::new().await;
+        let cache = fixture.root.join("hf");
+        publish_hf_cache(
+            &cache,
+            "owner/Model-GGUF",
+            &"a".repeat(40),
+            &[("Model-Q4_K_M.gguf", model_bytes("model"))],
+        );
+        let shown = roots(vec![root(ModelRootKind::HuggingFaceCache, &cache)]);
+        fixture.apply(shown.clone()).await;
+        let found = fixture.inventory().list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        let found_id = ModelId::hugging_face(
+            &HuggingFaceRepositoryId::new("owner/Model-GGUF").unwrap(),
+            &HuggingFaceArtifactSelector::new("Model-Q4_K_M.gguf").unwrap(),
+        );
+        let catalog = vec![catalog_definition(found)];
+        let catalog_model_id = catalog_id(&catalog[0]);
+        let hidden = LocalModelsConfiguration {
+            hidden: vec![found_id.clone()],
+            ..shown.clone()
+        };
+
+        let attributed = |fixture: &Fixture| {
+            let catalog = fixture.resolver.catalog_snapshot().unwrap();
+            assert_eq!(catalog.models[0].aliases, [found_id.clone()]);
+            matches!(catalog.models[0].local_state, CatalogModelState::Installed { .. })
+        };
+
+        // Shown, the copy is the catalog model's (and the catalog remembers its package).
+        let mut fixture = fixture.restart(catalog.clone()).await;
+        let listed = fixture.apply(shown.clone()).await;
+        assert!(listed.models.is_empty() && listed.hidden.is_empty());
+        assert!(attributed(&fixture));
+        assert_eq!(
+            fixture.resolver.canonical_model_id(found_id.clone()).unwrap(),
+            catalog_model_id
+        );
+
+        for restarted in [false, true] {
+            if restarted {
+                fixture = fixture.restart(catalog.clone()).await;
+            }
+            let listed = fixture.apply(hidden.clone()).await;
+            assert!(listed.models.is_empty(), "restarted: {restarted}");
+            assert_eq!(ids(&listed.hidden), [found_id.to_string()], "restarted: {restarted}");
+            assert!(
+                !attributed(&fixture),
+                "the catalog model is not installed (restarted: {restarted})"
+            );
+            assert_eq!(
+                fixture.resolver.canonical_model_id(found_id.clone()).unwrap(),
+                found_id
+            );
+            assert!(
+                fixture
+                    .resolver
+                    .assessment_configuration(&ModelAssessmentSubject::Catalog {
+                        model_id: catalog_model_id.clone(),
+                        selection: magnitude_service_contracts::models::CatalogModelSelection::Effective,
+                    })
+                    .is_err(),
+                "the catalog ID no longer resolves to the hidden copy (restarted: {restarted})"
+            );
+        }
+
+        let listed = fixture.apply(shown).await;
+        assert!(listed.models.is_empty() && listed.hidden.is_empty());
+        assert!(attributed(&fixture), "unhidden, the copy is the catalog model's again");
+        assert_eq!(
+            fixture.resolver.canonical_model_id(found_id).unwrap(),
+            catalog_model_id
+        );
+    }
+
+    /// A Hub serving one repository's metadata and file metadata at `commit`, recording every
+    /// request; it never serves file contents.
+    fn serve_metadata_only(
+        repository: &'static str,
+        commit: String,
+        files: Vec<(&'static str, Vec<u8>)>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "id": repository,
+            "sha": commit,
+            "siblings": files.iter().map(|(path, bytes)| serde_json::json!({
+                "rfilename": path,
+                "size": bytes.len(),
+                "lfs": { "sha256": sha256(bytes), "size": bytes.len() },
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap();
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(mut connection) = connection else {
+                    return;
+                };
+                let mut reader = BufReader::new(connection.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                recorded.lock().unwrap().push(request_line.trim().to_owned());
+                let file = files.iter().find(|(path, _)| {
+                    request_line.contains(&format!("/{repository}/resolve/{commit}/{path}"))
+                });
+                let response = if request_line
+                    .contains(&format!("/api/models/{repository}/revision/{commit}"))
+                {
+                    let mut response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(&body);
+                    response
+                } else if let (true, Some((_, bytes))) = (request_line.starts_with("HEAD "), file) {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nETag: \"{}\"\r\nX-Repo-Commit: {commit}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        sha256(bytes),
+                        bytes.len()
+                    )
+                    .into_bytes()
+                } else {
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec()
+                };
+                let _ = connection.write_all(&response);
+            }
+        });
+        (endpoint, requests)
+    }
+
+    /// Hiding changes only what is shown: installing a catalog model whose target is exactly a
+    /// hidden found copy copies that copy's bytes into Magnitude's store instead of downloading
+    /// them, needs no further download, and leaves the copy's files where they are.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn installing_a_catalog_model_copies_the_bytes_of_its_hidden_found_copy() {
+        use magnitude_service_contracts::models::{
+            CatalogModelState, InstalledModelPackages as _, ModelDownloads as _,
+            ModelInstallationOwnership, StartModelDownloadRequest,
+        };
+
+        let fixture = Fixture::new().await;
+        let cache = fixture.root.join("hf");
+        let commit = "a".repeat(40);
+        let bytes = model_bytes("model");
+        let snapshot = publish_hf_cache(
+            &cache,
+            "owner/Model-GGUF",
+            &commit,
+            &[("Model-Q4_K_M.gguf", bytes.clone())],
+        );
+        let shown = roots(vec![root(ModelRootKind::HuggingFaceCache, &cache)]);
+        fixture.apply(shown.clone()).await;
+        let found = fixture.inventory().list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        let found_id = ModelId::hugging_face(
+            &HuggingFaceRepositoryId::new("owner/Model-GGUF").unwrap(),
+            &HuggingFaceArtifactSelector::new("Model-Q4_K_M.gguf").unwrap(),
+        );
+        let catalog = vec![catalog_definition(found)];
+        let catalog_model_id = catalog_id(&catalog[0]);
+        let (endpoint, requests) = serve_metadata_only(
+            "owner/Model-GGUF",
+            commit,
+            vec![("Model-Q4_K_M.gguf", bytes.clone())],
+        );
+        let fixture = fixture.restart_with_hub(endpoint, catalog.clone()).await;
+        let hidden = LocalModelsConfiguration {
+            hidden: vec![found_id.clone()],
+            ..shown
+        };
+        fixture.apply(hidden.clone()).await;
+        assert!(matches!(
+            fixture.resolver.catalog_snapshot().unwrap().models[0].local_state,
+            CatalogModelState::NotInstalled
+        ));
+
+        let downloads = crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
+            .await
+            .unwrap();
+        let started = downloads
+            .start(StartModelDownloadRequest {
+                bundle: catalog[0].configuration.bundle.clone(),
+                for_model: Some(catalog_model_id),
+            })
+            .await
+            .unwrap();
+        assert!(
+            started.download.is_some(),
+            "a hidden copy is not an installation of the catalog model"
+        );
+        let mut state = fixture.resolver.catalog_snapshot().unwrap().models[0]
+            .local_state
+            .clone();
+        for _ in 0..200 {
+            if matches!(state, CatalogModelState::Installed { .. }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            state = fixture.resolver.catalog_snapshot().unwrap().models[0]
+                .local_state
+                .clone();
+        }
+        let CatalogModelState::Installed {
+            installation,
+            update_state,
+            ..
+        } = state
+        else {
+            panic!("the catalog model is installed from the hidden copy's bytes: {state:?}");
+        };
+        assert!(matches!(
+            installation,
+            magnitude_service_contracts::models::ModelInstallation::Resolved {
+                ownership: ModelInstallationOwnership::Magnitude,
+                ..
+            }
+        ));
+        assert_eq!(
+            update_state,
+            magnitude_service_contracts::models::CatalogModelUpdate::Current
+        );
+        let fetched = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("GET ") && request.contains("/resolve/"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(fetched.is_empty(), "no file bytes are downloaded: {fetched:?}");
+        assert_eq!(fs::read(snapshot.join("Model-Q4_K_M.gguf")).unwrap(), bytes);
+        // The copy holds the installed catalog model's content, so it is that model's and isn't
+        // listed apart; its ID stays hidden, so removing Magnitude's copy hides it again.
+        let listed = fixture.local.refresh_local().await.unwrap();
+        assert!(listed.models.is_empty() && listed.hidden.is_empty());
+        assert_eq!(
+            fixture.inventory().local_models_configuration().unwrap().hidden,
+            [found_id]
         );
     }
 

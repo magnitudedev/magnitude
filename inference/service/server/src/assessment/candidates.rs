@@ -771,7 +771,7 @@ impl ManagedModelCandidates {
         material: impl std::future::Future<Output = Result<TargetMaterial, InventoryError>>,
     ) -> Option<CachedModelAssessment> {
         if let Some(detail) = &group.unreadable {
-            return Some(super::assessor::unreadable_assessment(0, detail.clone()));
+            return Some(super::assessor::unreadable_assessment(detail.clone()));
         }
         if !self.recognized(group) {
             return None;
@@ -2352,8 +2352,6 @@ fn same_bytes(model: &CustomModel, group: &GgufGroup, header_digest: &str) -> bo
             .is_some_and(|primary| local_header_digest(&primary.path).is_ok_and(|digest| digest == header_digest))
 }
 
-/// Versions with their verdicts. The recommended version is the largest fitting Q4_K-class
-/// version, else the largest fitting version.
 /// The verdict of a local file shorter than its header declares, which the engine never reads.
 fn unreadable_local_group(root: &Path, group: &GgufGroup) -> Option<CachedModelAssessment> {
     let detail = group.files.iter().find_map(|file| {
@@ -2361,12 +2359,11 @@ fn unreadable_local_group(root: &Path, group: &GgufGroup) -> Option<CachedModelA
             .err()
             .map(|error| error.to_string())
     })?;
-    let context = magnitude_service_models::gguf::inspect(&root.join(&group.primary().path))
-        .ok()?
-        .training_context_length?;
-    Some(super::assessor::unreadable_assessment(context, detail))
+    Some(super::assessor::unreadable_assessment(detail))
 }
 
+/// Versions with their verdicts. The recommended version is the largest fitting Q4_K-class
+/// version, else the largest fitting version.
 /// `projector_bytes` is the projector a download adds, or `None` for local files used in place.
 fn candidate_versions(
     versions: Vec<AssessedVersion<'_>>,
@@ -2532,7 +2529,7 @@ mod tests {
         else {
             panic!("a truncated file is unsupported");
         };
-        assert_eq!(profile.context_length, 4096);
+        assert_eq!(profile, None);
         assert_eq!(
             reasons,
             [magnitude_service_contracts::models::UnsupportedReason::Unreadable]

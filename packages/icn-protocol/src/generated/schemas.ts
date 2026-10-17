@@ -1916,7 +1916,10 @@ export const ModelAssessment = S.Union(
   S.extend(
     S.TaggedStruct("Unsupported", {
       detail: S.String,
-      profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+      profile: S.optionalWith(
+        S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+        { exact: true, as: "Option" },
+      ),
       reasons: S.Array(S.suspend((): S.Schema<UnsupportedReason, UnsupportedReasonEncoded> => UnsupportedReason)),
     }),
     S.Record({ key: S.String, value: JsonValue }),

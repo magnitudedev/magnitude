@@ -81,7 +81,18 @@ impl InstalledPackageSnapshot {
         revision: u64,
         reconciliation_complete: bool,
     ) -> InstalledModelPackagesResponse {
-        let packages = self.records.values().fold(
+        self.response_of(revision, reconciliation_complete, |_| true)
+    }
+
+    /// One package per content among the occurrences `include` keeps, each represented by its
+    /// highest-precedence occurrence.
+    pub(crate) fn response_of(
+        &self,
+        revision: u64,
+        reconciliation_complete: bool,
+        include: impl Fn(&InstalledModelPackage) -> bool,
+    ) -> InstalledModelPackagesResponse {
+        let packages = self.records.values().filter(|record| include(&record.installed)).fold(
             BTreeMap::<ModelPackageId, InstalledModelPackage>::new(),
             |mut packages, record| {
                 packages
@@ -312,6 +323,25 @@ impl ManagedModelStore {
                 snapshot.response(
                     self.packages_revision.load(Ordering::Acquire),
                     self.reconciliation_complete.load(Ordering::Acquire),
+                )
+            })
+    }
+
+    /// The installed packages catalog models are made of: every occurrence except hidden found
+    /// copies (see `hidden_occurrence`).
+    pub(crate) fn catalog_packages_response(
+        &self,
+    ) -> Result<InstalledModelPackagesResponse, InventoryError> {
+        self.installed_packages
+            .read()
+            .map_err(|_| {
+                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+            })
+            .map(|snapshot| {
+                snapshot.response_of(
+                    self.packages_revision.load(Ordering::Acquire),
+                    self.reconciliation_complete.load(Ordering::Acquire),
+                    |installed| !self.hidden_occurrence(installed.origin, &installed.package),
                 )
             })
     }

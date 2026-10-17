@@ -987,7 +987,7 @@ mod tests {
                 template_fingerprint: String::new(),
                 fingerprint: None,
                 profile: ModelAssessment::Unsupported {
-                    profile: test_configuration(catalog.model_id().as_str()).profile,
+                    profile: Some(test_configuration(catalog.model_id().as_str()).profile),
                     reasons: Vec::new(),
                     detail: failure.message.clone(),
                 },

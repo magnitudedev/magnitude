@@ -1,4 +1,4 @@
-import { Data, Effect, Schema, type ParseResult } from "effect"
+import { Cause, Data, Effect, Schema, type ParseResult } from "effect"
 import stringWidth from "string-width"
 
 const messageOf = (error: unknown): string => {
@@ -62,8 +62,8 @@ export const runCommand = <A>(options: {
     try: () => process.stdout.write(output),
     catch: (error) => new CommandOutputFailed({ message: messageOf(error) }),
   })),
-  Effect.catchAll((error) => Effect.sync(() => {
-    process.stderr.write(renderCommandError(error, options.json !== undefined))
+  Effect.catchAllCause((cause) => Effect.sync(() => {
+    process.stderr.write(renderCommandError(Cause.squash(cause), options.json !== undefined))
     process.exitCode = 1
   })),
   Effect.asVoid,

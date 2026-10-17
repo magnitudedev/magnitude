@@ -641,6 +641,9 @@ impl ManagedModelStore {
                 retryable: false,
             },
         };
+        if self.hidden_occurrence(installation_origin(&model.location), package) {
+            return InstalledCatalogAttribution::NotCatalogTarget;
+        }
         let exact = self
             .config
             .catalog_models
@@ -706,15 +709,6 @@ impl ManagedModelStore {
         // installations. External material is a catalog target only when its
         // weights are exactly a current target's.
         if !matches!(model.location, ModelLocation::MagnitudeCache { .. }) {
-            // A found copy of a catalog target that was hidden stays a hidden found model.
-            let hidden = hub_model_id(package).is_some_and(|model_id| {
-                self.local_models
-                    .read()
-                    .is_ok_and(|configuration| configuration.hidden.contains(&model_id))
-            });
-            if hidden {
-                return InstalledCatalogAttribution::NotCatalogTarget;
-            }
             let exact = self
                 .config
                 .catalog_models
@@ -789,6 +783,23 @@ impl ManagedModelStore {
                 ),
             )
         }
+    }
+
+    /// Whether an occurrence outside Magnitude's store is a found model the configuration hides, by
+    /// the `hf:` ID it has as a found model. Such a copy is never a catalog model's: it is not
+    /// attributed to one and no catalog model counts it as installed, even when it is exactly a
+    /// catalog package; it stays in inventory as a hidden found model.
+    pub(crate) fn hidden_occurrence(
+        &self,
+        origin: ModelPackageInstallationOrigin,
+        package: &ModelPackage,
+    ) -> bool {
+        origin != ModelPackageInstallationOrigin::Magnitude
+            && hub_model_id(package).is_some_and(|model_id| {
+                self.local_models
+                    .read()
+                    .is_ok_and(|configuration| configuration.hidden.contains(&model_id))
+            })
     }
 
     fn remember_catalog_package(
@@ -929,9 +940,10 @@ impl ManagedModelStore {
                 validation,
                 primary,
             } = self.inspect_package_from_resolved(&resolved)?;
+            let hidden = self.hidden_occurrence(installation_origin(&model.location), &package);
             for catalog_model in &self.config.catalog_models {
                 for (catalog_package, role) in catalog_packages(catalog_model) {
-                    if catalog_package.id == package.id {
+                    if !hidden && catalog_package.id == package.id {
                         self.remember_catalog_package(catalog_model, &package, role);
                     }
                 }
@@ -998,6 +1010,26 @@ impl ManagedModelStore {
         &self,
         package_id: &ModelPackageId,
     ) -> Result<(ModelPackage, ResolvedModel), InventoryError> {
+        self.installed_package_where(package_id, |_| true)
+    }
+
+    /// The installation an acquisition of `package_id` already has. A hidden found copy is not
+    /// one: acquiring the package makes Magnitude's own copy, from that copy's bytes when they
+    /// verify (see `local_sources`), and leaves it where it is.
+    pub(crate) fn acquired_package_from_snapshot(
+        &self,
+        package_id: &ModelPackageId,
+    ) -> Result<(ModelPackage, ResolvedModel), InventoryError> {
+        self.installed_package_where(package_id, |installed| {
+            !self.hidden_occurrence(installed.origin, &installed.package)
+        })
+    }
+
+    fn installed_package_where(
+        &self,
+        package_id: &ModelPackageId,
+        include: impl Fn(&InstalledModelPackage) -> bool,
+    ) -> Result<(ModelPackage, ResolvedModel), InventoryError> {
         let record = self
             .installed_packages
             .read()
@@ -1007,6 +1039,7 @@ impl ManagedModelStore {
             .records
             .values()
             .filter(|record| record.installed.package.id == *package_id)
+            .filter(|record| include(&record.installed))
             .min_by_key(|record| (origin_precedence(record.installed.origin), &record.model.id))
             .cloned()
             .ok_or_else(|| InventoryError::NotFound(package_id.0.clone()))?;

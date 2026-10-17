@@ -231,6 +231,26 @@ describe("finding models", () => {
     expect(result.versions[1]?.assessment.pipe(Option.map(({ _tag }) => _tag))).toEqual(Option.some("Unsupported"))
   })
 
+  it("projects an unreadable version without a serving profile", async () => {
+    const wire = Schema.encodeSync(CandidateInspection)(inspection())
+    const unreadable = Schema.decodeUnknownSync(CandidateInspection)({
+      ...wire,
+      versions: [wire.versions[0], {
+        ...wire.versions[1],
+        assessment: { _tag: "Unsupported", reasons: [{ _tag: "Unreadable" }], detail: "file is shorter than its header declares" },
+      }],
+    })
+    const { run } = harness({ inspect: unreadable })
+    const result = await run((commands) => commands.inspectCandidate("owner/model-GGUF"))
+    expect(result.versions[1]?.assessment).toEqual(Option.some({
+      _tag: "Unsupported",
+      environmentId: expect.any(String),
+      profile: Option.none(),
+      reasons: [{ _tag: "Unreadable" }],
+      detail: "file is shorter than its header declares",
+    }))
+  })
+
   it("reports the inference service's own message, and never a contract failure as unreachable", async () => {
     const integrity = harness({
       inspectFailure: {
@@ -667,6 +687,23 @@ describe("catalog models found elsewhere", () => {
     expect(result.hidden).toEqual([alias])
     expect(result.afterAliasUnhide).toEqual([])
     expect(result.refused.message).toBe(`${owned} is a catalog model. Remove it with \`magnitude catalog remove ${owned}\` instead.`)
+    expect(result.afterUnhide).toEqual([])
+  })
+
+  it("hides a catalog model whose external copy is already hidden again without change, and unhides it by its catalog ID", async () => {
+    const alias = CustomFormModelIdSchema.make("hf:unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf")
+    const { run } = harness({
+      config: customModelsConfig({ hidden: [alias] }),
+      catalogRows: [{ _tag: "Catalog", modelId: external, acquisitionState: { _tag: "NotInstalled" } } as unknown as LocalModelsState["models"][number]],
+      catalog: [{ id: external, source: { aliases: Option.some([alias]) } }] as unknown as readonly CatalogModelSource[],
+    })
+    const result = await run((commands, models) => Effect.gen(function* () {
+      yield* commands.hide(external)
+      const hidden = (yield* models.get).hidden
+      yield* commands.unhide(external)
+      return { hidden, afterUnhide: (yield* models.get).hidden }
+    }))
+    expect(result.hidden).toEqual([alias])
     expect(result.afterUnhide).toEqual([])
   })
 

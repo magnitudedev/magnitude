@@ -372,7 +372,7 @@ impl ManagedModelStore {
             .collect::<Result<Vec<_>, _>>()?;
         let mut resolved_packages = Vec::with_capacity(packages.len());
         for (package_id, key, package) in packages {
-            let installed = match self.installed_package_from_snapshot(&package_id) {
+            let installed = match self.acquired_package_from_snapshot(&package_id) {
                 Ok((_package, resolved)) => Some(resolved.model),
                 Err(InventoryError::NotFound(_)) | Err(InventoryError::NotReady(_)) => None,
                 Err(error) => return Err(error),

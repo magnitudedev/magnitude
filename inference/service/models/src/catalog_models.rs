@@ -12,7 +12,8 @@ use magnitude_service_contracts::models::{
     EffectiveModel,
     InstalledCatalogAttribution, InstalledModelPackage, ModelAssessmentSubject,
     ModelDomainInvalidation, ModelFailure, ModelId, ModelInstallation, ModelInstallationOwnership,
-    ModelPackageId, ModelPackageInstallationOrigin, ModelServingConfiguration, ParsedModelId,
+    ModelFileId, ModelPackageId, ModelPackageInstallationOrigin, ModelServingConfiguration,
+    ParsedModelId,
     RecommendableModel, ServableModelBundle,
 };
 
@@ -140,7 +141,7 @@ impl ModelDomainResolver {
         model_id: &ModelId,
     ) -> Result<ModelServingConfiguration, InventoryError> {
         let definition = self.catalog_definition(model_id)?;
-        let installed = self.inventory.installed_packages_response()?;
+        let installed = self.inventory.catalog_packages_response()?;
         let present = installed
             .packages
             .iter()
@@ -154,7 +155,7 @@ impl ModelDomainResolver {
             .entries()
             .cloned()
             .collect::<Vec<_>>();
-        match catalog_resolution(definition, &present, &affiliations).state {
+        match catalog_resolution(definition, &present, &affiliations, &BTreeSet::new()).state {
             CatalogMaterialState::NotInstalled => Err(InventoryError::NotReady(format!(
                 "catalog model {model_id} is not installed"
             ))),
@@ -186,7 +187,7 @@ impl ModelDomainResolver {
     }
 
     pub fn catalog_snapshot(&self) -> Result<CatalogModelsResponse, InventoryError> {
-        let installed = self.inventory.installed_packages_response()?;
+        let installed = self.inventory.catalog_packages_response()?;
         let present = installed
             .packages
             .iter()
@@ -209,9 +210,20 @@ impl ModelDomainResolver {
             records.records.values().map(|record| &record.installed),
             Some(&self.catalog.models),
         );
+        let local_files = records
+            .records
+            .values()
+            .flat_map(|record| &record.installed.package.files)
+            .map(|file| file.id.clone())
+            .collect::<BTreeSet<_>>();
         let occurrence_origins = records
             .records
             .values()
+            .filter(|record| {
+                !self
+                    .inventory
+                    .hidden_occurrence(record.installed.origin, &record.installed.package)
+            })
             .fold(
                 BTreeMap::<ModelPackageId, InstallationOrigins>::new(),
                 |mut origins, record| {
@@ -230,8 +242,13 @@ impl ModelDomainResolver {
                 .models
                 .iter()
                 .map(|definition| {
-                    let mut model =
-                        catalog_model(definition, &present, &affiliations, &occurrence_origins);
+                    let mut model = catalog_model(
+                        definition,
+                        &present,
+                        &affiliations,
+                        &occurrence_origins,
+                        &local_files,
+                    );
                     model.aliases = aliases
                         .get(&(definition.model_id.clone(), definition.variant_id.clone()))
                         .map(|aliases| aliases.iter().cloned().collect())
@@ -255,7 +272,7 @@ impl ModelDomainResolver {
 
     pub fn catalog_removal_plan(&self, id: &ModelId) -> Result<CatalogRemovalPlan, InventoryError> {
         let definition = self.catalog_definition(id)?;
-        let installed = self.inventory.installed_packages_response()?;
+        let installed = self.inventory.catalog_packages_response()?;
         let affiliations = self
             .inventory
             .catalog_affiliations
@@ -341,7 +358,7 @@ impl ModelDomainResolver {
         id: &ModelId,
     ) -> Result<Vec<ModelPackageId>, InventoryError> {
         let definition = self.catalog_definition(id)?;
-        let installed = self.inventory.installed_packages_response()?;
+        let installed = self.inventory.catalog_packages_response()?;
         let present = installed
             .packages
             .iter()
@@ -355,7 +372,7 @@ impl ModelDomainResolver {
             .entries()
             .cloned()
             .collect::<Vec<_>>();
-        let resolution = catalog_resolution(definition, &present, &affiliations);
+        let resolution = catalog_resolution(definition, &present, &affiliations, &BTreeSet::new());
         if !resolution.missing_desired_package_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -496,8 +513,9 @@ fn catalog_model(
     present: &BTreeMap<ModelPackageId, &InstalledModelPackage>,
     affiliations: &[magnitude_service_contracts::models::CatalogPackageAffiliation],
     occurrence_origins: &BTreeMap<ModelPackageId, InstallationOrigins>,
+    local_files: &BTreeSet<ModelFileId>,
 ) -> CatalogModel {
-    let resolution = catalog_resolution(definition, present, affiliations);
+    let resolution = catalog_resolution(definition, present, affiliations, local_files);
     CatalogModel {
         id: catalog_id(definition),
         desired: ready_model(
@@ -587,10 +605,13 @@ enum CatalogMaterialState<'a> {
     },
 }
 
+/// `local_files` are files on this computer in any location, a hidden found copy's included, which
+/// an installation copies rather than downloads.
 fn catalog_resolution<'a>(
     definition: &RecommendableModel,
     present: &BTreeMap<ModelPackageId, &'a InstalledModelPackage>,
     affiliations: &[magnitude_service_contracts::models::CatalogPackageAffiliation],
+    local_files: &BTreeSet<ModelFileId>,
 ) -> CatalogResolution<'a> {
     let desired_packages = catalog_packages(definition).collect::<Vec<_>>();
     let desired_ids = desired_packages
@@ -603,11 +624,12 @@ fn catalog_resolution<'a>(
         .cloned()
         .collect::<Vec<_>>();
     // A missing package's files already present elsewhere (its exact target weights found in a
-    // Hugging Face cache) are copied locally, not downloaded.
+    // Hugging Face cache, hidden or not) are copied locally, not downloaded.
     let present_files = present
         .values()
         .flat_map(|entry| &entry.package.files)
         .map(|file| &file.id)
+        .chain(local_files)
         .collect::<BTreeSet<_>>();
     let required_download_bytes = desired_packages
         .iter()
@@ -1027,7 +1049,7 @@ mod tests {
         let definition = definition(ServableModelBundle::Standalone {
             package: package("target", 20),
         });
-        let resolution = catalog_resolution(&definition, &BTreeMap::new(), &[]);
+        let resolution = catalog_resolution(&definition, &BTreeMap::new(), &[], &BTreeSet::new());
         assert!(matches!(
             resolution.state,
             CatalogMaterialState::NotInstalled
@@ -1059,7 +1081,7 @@ mod tests {
             variant_id: definition.variant_id.clone(),
         };
         let present = BTreeMap::from([(external.package.id.clone(), &external)]);
-        let model = catalog_model(&definition, &present, &[], &BTreeMap::new());
+        let model = catalog_model(&definition, &present, &[], &BTreeMap::new(), &BTreeSet::new());
         let CatalogModelState::Installed {
             effective: EffectiveModel::Ready { .. },
             installation: ModelInstallation::Resolved { ownership, .. },
@@ -1122,6 +1144,7 @@ mod tests {
             &present,
             &[affiliation(&prior.package.id, CatalogPackageRole::Target)],
             &BTreeMap::new(),
+            &BTreeSet::new(),
         );
         let CatalogModelState::Installed {
             effective: EffectiveModel::Ready { .. },
@@ -1157,7 +1180,7 @@ mod tests {
             method: SpeculativeMethod::DSpark,
         });
         let present = BTreeMap::from([(target.package.id.clone(), &target)]);
-        let resolution = catalog_resolution(&definition, &present, &[]);
+        let resolution = catalog_resolution(&definition, &present, &[], &BTreeSet::new());
         let CatalogMaterialState::Installed {
             configuration: Some(configuration),
             effective: EffectiveModel::Ready { .. },
@@ -1171,6 +1194,14 @@ mod tests {
             ServableModelBundle::Standalone { .. }
         ));
         assert_eq!(resolution.required_download_bytes, 5);
+
+        // A missing package whose files are on this computer, as a hidden found copy's are, is
+        // copied, not downloaded.
+        let held = BTreeSet::from([ModelFileId("file-draft".to_owned())]);
+        assert_eq!(
+            catalog_resolution(&definition, &present, &[], &held).required_download_bytes,
+            0
+        );
     }
 
     #[test]
@@ -1203,7 +1234,7 @@ mod tests {
             (target.package.id.clone(), &target),
             (draft.package.id.clone(), &draft),
         ]);
-        let model = catalog_model(&definition, &present, &[], &BTreeMap::new());
+        let model = catalog_model(&definition, &present, &[], &BTreeMap::new(), &BTreeSet::new());
         let CatalogModelState::Installed {
             effective: EffectiveModel::Unavailable { failure },
             installation:
@@ -1245,6 +1276,7 @@ mod tests {
                 affiliation(&second.package.id, CatalogPackageRole::Target),
             ],
             &BTreeMap::new(),
+            &BTreeSet::new(),
         );
         let CatalogModelState::Installed {
             effective: EffectiveModel::Unavailable { failure },
@@ -1283,6 +1315,7 @@ mod tests {
             &present,
             &[affiliation(&prior.package.id, CatalogPackageRole::Target)],
             &BTreeMap::new(),
+            &BTreeSet::new(),
         );
         let CatalogModelState::Installed {
             update_state: CatalogModelUpdate::Current,
@@ -1320,6 +1353,7 @@ mod tests {
             &present,
             &[],
             &origins,
+            &BTreeSet::new(),
         );
         assert!(matches!(
             model.local_state,

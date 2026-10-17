@@ -760,11 +760,16 @@ export const CustomModelCommandsLive: Layer.Layer<
 
     hide: (modelId) => Effect.gen(function* () {
       // A catalog model found only in an external location is hidden by its files' found-model IDs, which ICN
-      // then stops attributing to the catalog model.
+      // then stops attributing to the catalog model; hiding it again changes nothing.
       const hiddenIds = Schema.is(CatalogFormModelIdSchema)(modelId)
-        ? Option.isNone(yield* externalCatalogFiles(modelId))
-          ? yield* catalogHideRefusal(modelId)
-          : yield* catalogAliases(modelId)
+        ? yield* Effect.gen(function* () {
+            const aliases = yield* catalogAliases(modelId)
+            const { hidden } = yield* customModels.get
+            const alreadyHidden = aliases.length > 0 && aliases.every((alias) => hidden.includes(alias))
+            return alreadyHidden || Option.isSome(yield* externalCatalogFiles(modelId))
+              ? aliases
+              : yield* catalogHideRefusal(modelId)
+          })
         : [modelId]
       const declaration = Schema.is(CustomFormModelIdSchema)(modelId) ? (yield* customModels.get).declarations[modelId] : undefined
       if (declaration !== undefined) return yield* managedHideRefusal(modelId, declaration.origin._tag)

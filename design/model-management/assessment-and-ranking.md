@@ -82,7 +82,7 @@ presents. Adding a weight type or relaxing a family check changes verdicts, neve
 |---|---|
 | `Fits` | Profile, memory, performance, and the drafter verdict |
 | `DoesNotFit` | Profile, memory, the limiting resource and deficit, and the drafter verdict |
-| `Unsupported` | Profile, the complete list of `UnsupportedReason`s, and developer detail |
+| `Unsupported` | Profile when one exists, the complete list of `UnsupportedReason`s, and developer detail; an unreadable file has no profile |
 
 `UnsupportedReason` is a closed, structured set: architecture, weight types (each type with its
 tensor count), rope scaling, unrecognized tensor, unrecognized metadata, tokenizer, chat template,

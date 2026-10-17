@@ -143,4 +143,35 @@ describe("custom model reconciliation", () => {
       drafter: { _tag: "Reference", method: { _tag: "DFlash" }, reference: drafterReference },
     }])
   })
+
+  it("delivers a hidden external copy of a catalog model to ICN at start, as after a restart", async () => {
+    const alias = "hf:openbmb/MiniCPM5-1B-GGUF/MiniCPM5-1B-Q4_K_M.gguf"
+    const configured: LocalModelsConfiguration[] = []
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const custom = yield* makeTestCustomModels(customModelsConfig({ drafters: {}, hidden: [alias] as never }))
+      const layer = CustomModelReconcilerLive.pipe(Layer.provide(Layer.mergeAll(
+        Layer.succeed(CustomModels, custom),
+        Layer.succeed(ModelLocations, {
+          environment: { platform: "linux", env: {}, home: "/h" },
+          resolve: Effect.succeed([]),
+          list: () => Effect.succeed([]),
+        }),
+        DrafterMethodsLive,
+        Layer.succeed(IcnLocalModels, {
+          configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
+        } as never),
+        Layer.succeed(IcnCandidates, { drafters: () => Effect.succeed([]) } as never),
+        Layer.succeed(ModelSlotController, {
+          state: Effect.succeed({ slots: {
+            primary: { _tag: "Unassigned", slotId: "primary" },
+            secondary: { _tag: "Unassigned", slotId: "secondary" },
+          } }),
+          updateModelSlot: () => Effect.void,
+        } as never),
+        Layer.succeed(AcnChanges, { publish: () => Effect.void, stream: Stream.empty } as never),
+      )))
+      yield* Effect.flatMap(CustomModelReconciler, () => Effect.sleep("50 millis")).pipe(Effect.provide(layer))
+    })))
+    expect(configured[0]!.hidden).toEqual([alias])
+  })
 })

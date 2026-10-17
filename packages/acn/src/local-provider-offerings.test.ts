@@ -10,6 +10,7 @@ import {
   ModelVariantLabelSchema,
   type LocalModel,
   type LocalModelsState,
+  type ServingProfile,
 } from "@magnitudedev/acn-protocol"
 import { localProviderOfferingsReady, projectLocalProviderOfferings } from "./local-provider-offerings"
 
@@ -125,6 +126,29 @@ describe("local provider offerings", () => {
       servingState: { _tag: "Assessing", profile: { contextLength: 32_768 } },
     }])
     expect(projection).toEqual({ offerings: [], entries: [] })
+  })
+
+  it("lists an unsupported model with a profile but not an unreadable one, which has none", () => {
+    const model = assessed("hf:owner/repository/model-q5.gguf", "Discovered")
+    if (model._tag !== "Custom" || model.servingState._tag !== "Assessed") throw new Error("expected an assessed custom model")
+    const serving = model.servingState
+    const unsupported = (profile: Option.Option<ServingProfile>): LocalModel => ({
+      ...model,
+      servingState: {
+        ...serving,
+        assessment: {
+          _tag: "Unsupported",
+          environmentId: AssessmentEnvironmentIdSchema.make("environment"),
+          profile,
+          reasons: [{ _tag: "Unreadable" }],
+          detail: "file is shorter than its header declares",
+        },
+      },
+    })
+    expect(projectLocalProviderOfferings([unsupported(Option.none())])).toEqual({ offerings: [], entries: [] })
+    const listed = projectLocalProviderOfferings([unsupported(Option.some({ contextLength: 8_192 }))])
+    expect(listed.offerings).toEqual([])
+    expect(listed.entries.map(({ contextWindow }) => contextWindow)).toEqual([8_192])
   })
 
   it("preserves resource and compatibility reasons in provider catalog entries", () => {

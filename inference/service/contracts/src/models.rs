@@ -2026,9 +2026,11 @@ pub enum ModelAssessment {
     },
     /// The engine cannot execute a custom model, with every reason it found. A catalog model is
     /// never unsupported: the pool drops a catalog target the engine cannot execute as a release
-    /// defect.
+    /// defect. An unreadable file has no serving profile.
     Unsupported {
-        profile: ServingProfile,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        profile: Option<ServingProfile>,
         reasons: Vec<UnsupportedReason>,
         detail: String,
     },
@@ -2438,9 +2440,9 @@ mod custom_model_wire_tests {
     #[test]
     fn unsupported_assessment_carries_reasons_and_detail() {
         let assessment = ModelAssessment::Unsupported {
-            profile: ServingProfile {
+            profile: Some(ServingProfile {
                 context_length: 4096,
-            },
+            }),
             reasons: vec![UnsupportedReason::UnrecognizedTensor {
                 name: "rope_freqs.weight".to_owned(),
             }],
@@ -2454,6 +2456,28 @@ mod custom_model_wire_tests {
                 "reasons": [{ "_tag": "UnrecognizedTensor", "name": "rope_freqs.weight" }],
                 "detail": "unrecognized tensor"
             })
+        );
+    }
+
+    #[test]
+    fn unreadable_assessment_serializes_without_a_profile() {
+        let assessment = ModelAssessment::Unsupported {
+            profile: None,
+            reasons: vec![UnsupportedReason::Unreadable],
+            detail: "truncated".to_owned(),
+        };
+        let encoded = json!({
+            "_tag": "Unsupported",
+            "reasons": [{ "_tag": "Unreadable" }],
+            "detail": "truncated"
+        });
+        assert_eq!(
+            serde_json::to_value(&assessment).expect("serialize"),
+            encoded
+        );
+        assert_eq!(
+            serde_json::from_value::<ModelAssessment>(encoded).expect("deserialize"),
+            assessment
         );
     }
 
