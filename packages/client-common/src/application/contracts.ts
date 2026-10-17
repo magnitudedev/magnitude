@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 
-export const ApplicationPage = Schema.Literal("discover", "catalog", "models", "connections", "usage", "status", "settings")
+export const ApplicationPage = Schema.Literal("chat", "discover", "catalog", "models", "connections", "usage", "status", "settings")
 export type ApplicationPage = typeof ApplicationPage.Type
 /** A message raised outside the renderer, shown in the app while its window exists. */
 export const HostNotice = Schema.Struct({ title: Schema.String, description: Schema.String })

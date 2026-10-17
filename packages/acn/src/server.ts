@@ -133,9 +133,12 @@ export interface AcnServerOptions {
   readonly debug?: boolean
   readonly dataDir?: string
   readonly port?: number
+  /** Override the default loopback-only browser entry point for the native Chat page. */
+  readonly chatPort?: number
 }
 
 export const ACN_PUBLIC_PORT = 10_100
+export const ACN_CHAT_PORT = 10_101
 
 class InferenceProxyFailed extends Data.TaggedError("InferenceProxyFailed")<{
   readonly cause: unknown
@@ -799,6 +802,24 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     const remote = yield* makeRemoteAccess(network, sessions)
     yield* installAcnHealthRoutes(router, lifecycle, remote).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
+    // The Chat entry point is a second loopback-only listener. If another local
+    // application owns the port, keep the main inference service healthy and
+    // report the conflict rather than taking down ACN.
+    const chatPort = options.chatPort ?? ACN_CHAT_PORT
+    if (chatPort !== (options.port ?? ACN_PUBLIC_PORT)) {
+      const chatListener = yield* Layer.buildWithScope(BunHttpServer.layer({
+        port: chatPort,
+        hostname: "127.0.0.1",
+        idleTimeout: 0,
+      }), applicationScope).pipe(
+        Effect.map(Option.some),
+        Effect.catchAll(error => Effect.logWarning(`Chat listener could not bind to 127.0.0.1:${chatPort}; the main Magnitude service remains available.`, error).pipe(Effect.as(Option.none()))),
+      )
+      if (Option.isSome(chatListener)) {
+        const chatServer = Context.get(chatListener.value, HttpServer.HttpServer)
+        yield* chatServer.serve(router.asHttpEffect()).pipe(Effect.provide(Context.merge(infrastructure, chatListener.value)))
+      }
+    }
     if (network.enabled && network.bind !== primaryBind) {
       const additional = yield* Layer.buildWithScope(BunHttpServer.layer({
         port: options.port ?? ACN_PUBLIC_PORT,
