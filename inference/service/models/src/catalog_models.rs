@@ -433,13 +433,29 @@ impl ModelDomainResolver {
         if !resolution.missing_desired_package_ids.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(resolution
+        // A package holding a current catalog package's weights or drafter is that package's
+        // material (its weights found on their own, say), never a superseded revision.
+        let current_files = self
+            .catalog
+            .models
+            .iter()
+            .flat_map(catalog_packages)
+            .flat_map(|(package, _)| &package.files)
+            .filter(|file| file.role != ModelFileRole::Projector)
+            .map(|file| &file.id)
+            .collect::<BTreeSet<_>>();
+        let superseded = resolution
             .superseded_package_ids
             .into_iter()
             .filter(|package_id| {
-                present
-                    .get(package_id)
-                    .is_some_and(|entry| entry.origin == ModelPackageInstallationOrigin::Magnitude)
+                present.get(package_id).is_some_and(|entry| {
+                    entry.origin == ModelPackageInstallationOrigin::Magnitude
+                        && !entry
+                            .package
+                            .files
+                            .iter()
+                            .any(|file| current_files.contains(&file.id))
+                })
             })
             .filter(|package_id| {
                 !self.catalog.models.iter().any(|candidate| {
@@ -454,6 +470,15 @@ impl ModelDomainResolver {
                             || affiliation.variant_id != definition.variant_id)
                 })
             })
+            .collect::<BTreeSet<_>>();
+        let records =
+            self.inventory.installed_packages.read().map_err(|_| {
+                InventoryError::Internal("installed package lock poisoned".to_owned())
+            })?;
+        Ok(superseded
+            .iter()
+            .filter(|package_id| !records.shares_managed_files(package_id, &superseded))
+            .cloned()
             .collect())
     }
 }

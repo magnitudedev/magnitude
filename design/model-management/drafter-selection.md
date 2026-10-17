@@ -111,8 +111,8 @@ projector it lacks never blocks it), and otherwise offers the drafter-only downl
   a catalog model's own included), is saved as automatic, never as a fixed reference, so a later
   catalog drafter still applies. A model whose drafter is turned off is offered no recommended
   drafter.
-- Magnitude's downloaded drafters are pruned only when no model still on this computer references
-  them: attached through its choice, or one it would use (the drafter of every catalog model it
+- Magnitude's downloaded drafters are pruned only after a model is removed, never on a drafter
+  change, and only when no model still on this computer references them: attached through its choice, or one it would use (the drafter of every catalog model it
   matches, even while a drafter beside it is recommended instead, a drafter from its own repository,
   or its recommended drafter even while its drafter is turned off), whatever its origin.
   Turned off, the model is a standalone bundle, which the engine serves plain: built-in MTP heads
@@ -123,7 +123,10 @@ projector it lacks never blocks it), and otherwise offers the drafter-only downl
   included. ICN's candidate enumeration is the single source of that order and of the recommended
   drafter; it is recomputed whenever its inputs change (a file appearing, moving or disappearing in
   any location, a model's folder or repository included; a drafter or catalog package installed
-  or removed; a configuration change), never kept until a restart. A found or imported model with
+  or removed; a configuration change), never kept until a restart. While a model's recompute is
+  pending (its target package changed, say, when a projector appeared beside it), its previous answer
+  stands, so an attached drafter is never shown as none in the meantime; a model with no answer yet
+  is computed before the others are recomputed. A found or imported model with
   none of its automatic candidates on this computer has no attached drafter: ACN projects it
   without one, and clients offer the recommended drafter ("Faster with a drafter · Add (size)").
 - "In this folder" means the folder of each place this model's own bytes are found, never another

@@ -174,7 +174,7 @@ it("stops a running model before removing it, and removes an idle model without 
   expect(calls).toEqual(["stop loaded-instance", "remove model-a:gguf:test", "remove model-b:gguf:test"])
   expect(external.message).toBe("model-c:gguf:test uses files in your Hugging Face cache "
     + "(/home/ada/.cache/huggingface/hub/models--o--r/snapshots/c/m.gguf), which Magnitude never deletes. "
-    + "Hide it with `magnitude models hide model-c:gguf:test`, or delete it with the Hugging Face CLI (`hf cache delete`).")
+    + "Hide it with `magnitude models hide model-c:gguf:test`, or delete it with the Hugging Face CLI (`hf cache rm`).")
   expect(customCalls).toContain("custom remove hf:owner/repo/model-Q4_K_M.gguf")
 })
 

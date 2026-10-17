@@ -106,7 +106,7 @@ const deleteElsewhere = (location: Option.Option<ModelLocationKind>): string => 
   onNone: () => "or delete the files yourself",
   onSome: (kind) => {
     switch (kind) {
-      case "HuggingFaceCache": return "or delete it with the Hugging Face CLI (`hf cache delete`)"
+      case "HuggingFaceCache": return "or delete it with the Hugging Face CLI (`hf cache rm`)"
       case "LmStudio": return "or delete it in LM Studio"
       case "Ollama": return "or delete it with `ollama rm`"
       case "LlamaCpp":

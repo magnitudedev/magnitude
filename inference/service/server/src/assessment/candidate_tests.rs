@@ -2253,7 +2253,7 @@ async fn the_recommended_drafter_of_a_catalog_model_is_its_catalog_drafter() {
 }
 
 #[test]
-fn enrichment_answers_only_for_the_exact_target_it_was_computed_for() {
+fn enrichment_for_a_changed_target_keeps_the_models_last_answer_until_it_is_recomputed() {
     use magnitude_service_models::{
         CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts,
     };
@@ -2309,15 +2309,27 @@ fn enrichment_answers_only_for_the_exact_target_it_was_computed_for() {
     };
     let (package_a, package_b) = (package("package_a"), package("package_b"));
     assert_eq!(enrichment.enrich(&facts(&package_a)), result);
+    assert!(enrichment.knows(&facts(&package_a)));
+    // QA (Debian, round 3b): a projector appearing beside a model changed its target package, and
+    // the model showed "Drafter None" while its heads drafted, until the recompute finished.
     assert_eq!(
         enrichment.enrich(&facts(&package_b)),
-        CustomModelEnrichmentResult::default()
+        result,
+        "the model's last answer stands while its new target is computed"
+    );
+    assert!(
+        !enrichment.knows(&facts(&package_b)),
+        "the new target is still pending"
     );
     assert!(enrichment.record(
         (model_id.clone(), "package_b".to_owned()),
         2,
         CustomModelEnrichmentResult::default()
     ));
+    assert_eq!(
+        enrichment.enrich(&facts(&package_b)),
+        CustomModelEnrichmentResult::default()
+    );
 }
 
 /// QA saw a cold inspection of multi-version repositories pull 450 MB to 1.4 GB, far beyond
@@ -3719,4 +3731,73 @@ async fn a_load_after_a_file_moves_reads_it_where_it_is_now_without_a_restart() 
     let (target, draft) = fixture.load_files(&id).await;
     assert_eq!(target, relocated, "the target loads from its new path");
     assert!(draft.is_some_and(|draft| draft.exists()));
+}
+
+/// QA (Debian, round 3b): once a projector appeared beside a model, its target package changed
+/// and the model showed "Drafter None" for half a minute while its drafter served. However the
+/// target package changes, an attached drafter stays shown while the enrichment catches up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_projector_appearing_beside_a_model_never_shows_its_drafter_as_none() {
+    let locations = tempfile::tempdir().expect("locations");
+    let folder = locations.path().join("A");
+    let model = folder.join("model-Q4_K_M.gguf");
+    write_sparse(&model, &llama(7, Encoding::Q8_0));
+    let beside = folder.join("dflash2.gguf");
+    write_sparse(&beside, &dflash2());
+    let fixture = live_fixture(LocalModelsConfiguration {
+        roots: vec![magnitude_service_contracts::models::ModelRoot {
+            kind: magnitude_service_contracts::models::ModelRootKind::Folder,
+            path: folder.clone(),
+            enabled: true,
+        }],
+        ..LocalModelsConfiguration::default()
+    })
+    .await;
+    let in_folder = DrafterReference::Local {
+        path: beside.clone(),
+    };
+    let before = fixture
+        .rescan_until(&model, Some((&in_folder, true)), "the folder drafter")
+        .await;
+
+    write_sparse(&folder.join("mmproj-F16.gguf"), &projector());
+    fixture.local.refresh_local().await.expect("rescan");
+    // Until the enrichment has answered for the model's new target (the stub projector leaves the
+    // engine nothing to bind, so its eventual answer offers no drafter), the drafter it had stays.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut pending_seen = 0;
+    loop {
+        let listed = fixture.local.list_local().await.expect("local models");
+        let now = listed
+            .models
+            .iter()
+            .find(|listed| listed.model_id == before.model_id)
+            .expect("the model");
+        assert!(now.projector.is_some(), "the projector is part of the model");
+        let target = match fixture
+            .resolver
+            .serving_configuration(&now.model_id)
+            .expect("serving configuration")
+            .bundle
+        {
+            ServableModelBundle::SpeculativeDecoding { target, .. }
+            | ServableModelBundle::Standalone { package: target } => target.id.0,
+        };
+        if fixture
+            ._candidates
+            .enrichment
+            .knows_key(&(now.model_id.clone(), target))
+        {
+            break;
+        }
+        pending_seen += 1;
+        assert_eq!(
+            now.drafter.as_ref().map(|drafter| &drafter.reference),
+            Some(&in_folder),
+            "while the new target is pending, the attached drafter is never shown as none"
+        );
+        assert!(std::time::Instant::now() < deadline, "the enrichment answers");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    eprintln!("pending samples: {pending_seen}");
 }

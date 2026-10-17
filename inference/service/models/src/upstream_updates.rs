@@ -332,6 +332,18 @@ mod tests {
         ModelId, RecommendableModelCatalog,
     };
 
+    struct NoRemoval;
+
+    impl magnitude_service_contracts::models::CatalogPackageRemover for NoRemoval {
+        fn remove_catalog_packages(
+            &self,
+            _package_ids: Vec<ModelPackageId>,
+        ) -> futures_util::future::BoxFuture<'_, Result<u64, magnitude_service_contracts::InventoryError>>
+        {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
     const REPOSITORY: &str = "owner/Model-GGUF";
     const TARGET: &str = "Model-Q4_K_M.gguf";
 
@@ -498,7 +510,8 @@ mod tests {
                 diagnostics: Vec::new(),
             },
         );
-        let local = crate::custom_models::ManagedLocalModels::new(resolver.clone());
+        let local =
+            crate::custom_models::ManagedLocalModels::new(resolver.clone(), Arc::new(NoRemoval));
         let configuration = LocalModelsConfiguration {
             declarations: vec![declaration(&pinned)],
             ..LocalModelsConfiguration::default()

@@ -119,6 +119,57 @@ impl InstalledPackageSnapshot {
             packages: packages.into_values().collect(),
         }
     }
+
+    /// Whether deleting Magnitude's copies of `package_id` would unlink a snapshot file that a
+    /// Magnitude package outside `removing` is served from too. Two packages can name the same
+    /// file in one snapshot (a target with its projector, and the same weights found on their own
+    /// when the snapshot has several projectors); deleting one deletes the other's file.
+    pub(crate) fn shares_managed_files(
+        &self,
+        package_id: &ModelPackageId,
+        removing: &BTreeSet<ModelPackageId>,
+    ) -> bool {
+        let entries = |record: &InstalledPackageRecord| -> Vec<(String, String, PathBuf)> {
+            let (
+                ModelPackageInstallationOrigin::Magnitude,
+                ModelLocation::MagnitudeCache { components, .. },
+                ModelSource::HuggingFace {
+                    repository, commit, ..
+                },
+            ) = (
+                record.installed.origin,
+                &record.model.location,
+                &record.model.source,
+            )
+            else {
+                return Vec::new();
+            };
+            components
+                .iter()
+                .map(|component| {
+                    (
+                        repository.to_lowercase(),
+                        commit.clone(),
+                        component.path.clone(),
+                    )
+                })
+                .collect()
+        };
+        let removed = self
+            .records
+            .values()
+            .filter(|record| &record.installed.package.id == package_id)
+            .flat_map(entries)
+            .collect::<BTreeSet<_>>();
+        self.records
+            .values()
+            .filter(|record| {
+                &record.installed.package.id != package_id
+                    && !removing.contains(&record.installed.package.id)
+            })
+            .flat_map(entries)
+            .any(|entry| removed.contains(&entry))
+    }
 }
 
 /// Which occurrence of the same content represents it: the managed store, then the Hugging Face

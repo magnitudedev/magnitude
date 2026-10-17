@@ -74,6 +74,42 @@
       }
     },
     {
+      "name": "qwen35-ud-q6kxl-mtp",
+      "description": "Catalog Qwen3.5 4B UD-Q6_K_XL (the gguf:q6 target): 33 blocks with nextn_predict_layers 1, its MTP block the last. A full model with built-in heads, never a drafter; binds its built-in MTP head.",
+      "target": [
+        {
+          "header": "headers/Qwen3.5-4B-UD-Q6_K_XL.gguf.gz",
+          "repository": "unsloth/Qwen3.5-4B-MTP-GGUF",
+          "revision": "86835bf9949e4d14d6860f7910b1340ad4f271a9",
+          "path": "Qwen3.5-4B-UD-Q6_K_XL.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "bound": "mtp"
+        }
+      }
+    },
+    {
+      "name": "qwen35-q6k-mtp",
+      "description": "Qwen3.5 4B Q6_K from the catalog repository, a non-target version: the same metadata and tensor directory names as UD-Q6_K_XL. Binds its built-in MTP head.",
+      "target": [
+        {
+          "header": "headers/Qwen3.5-4B-Q6_K.gguf.gz",
+          "repository": "unsloth/Qwen3.5-4B-MTP-GGUF",
+          "revision": "86835bf9949e4d14d6860f7910b1340ad4f271a9",
+          "path": "Qwen3.5-4B-Q6_K.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "bound": "mtp"
+        }
+      }
+    },
+    {
       "name": "qwen35-0.8b-mtp",
       "description": "unsloth Qwen3.5 0.8B MTP Q3_K_M: binds its built-in MTP heads. They stay bound beside its mmproj-F16.gguf projector (also in headers/), which the engine boundary test covers.",
       "target": [

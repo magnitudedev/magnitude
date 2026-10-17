@@ -795,6 +795,24 @@ describe("drafter changes", () => {
     expect(recorded.prunes).toBe(0)
   })
 
+  it("never prunes on any drafter change: built-in heads, another drafter, none or auto", async () => {
+    const builtIn = { _tag: "Embedded" } as const
+    const { run, recorded } = harness({
+      drafters: [
+        nativeCandidate({ onThisComputer: true }),
+        nativeCandidate({ category: "BuiltIn", reference: builtIn, label: "Built in", lineage: "Exact", sizeBytes: 0, method: { _tag: "Mtp" }, verdict: { _tag: "Bound", method: { _tag: "Mtp" }, memoryBytes: 1 } }),
+      ],
+    })
+    await run((commands) => Effect.gen(function* () {
+      yield* commands.setModelDrafter(foundId, { _tag: "Reference", reference: builtIn })
+      yield* commands.setModelDrafter(foundId, { _tag: "Reference", reference: drafterReference })
+      yield* commands.setModelDrafter(foundId, { _tag: "None" })
+      yield* commands.setModelDrafter(foundId, { _tag: "Auto" })
+    }))
+    expect(recorded.prunes).toBe(0)
+    expect(recorded.removedFiles).toEqual([])
+  })
+
   it("keeps the drafter's files when it is turned off, so turning it back on downloads nothing", async () => {
     const { run, recorded } = harness({ drafters: [nativeCandidate({ onThisComputer: true })] })
     const chosen = await run((commands) => commands.setModelDrafter(foundId, { _tag: "None" }).pipe(

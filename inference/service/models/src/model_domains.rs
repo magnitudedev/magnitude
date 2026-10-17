@@ -62,8 +62,8 @@ pub fn managed_model_services(
     optimizer: Arc<dyn CatalogModelOptimizer>,
 ) -> Result<ManagedModelServices, InventoryError> {
     let installations =
-        ManagedCatalogInstallations::new(resolver.clone(), downloads, remover, optimizer);
-    let local = ManagedLocalModels::new(resolver.clone());
+        ManagedCatalogInstallations::new(resolver.clone(), downloads, remover.clone(), optimizer);
+    let local = ManagedLocalModels::new(resolver.clone(), remover);
     crate::upstream_updates::start(&resolver);
     let catalog = ManagedCatalogModels::new(resolver, installations.clone(), {
         let local = Arc::downgrade(&local);

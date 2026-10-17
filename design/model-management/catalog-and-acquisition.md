@@ -524,7 +524,11 @@ model-level progress/state.
 Superseded cleanup is an invariant of the authoritative installed set, not a task owned by the
 request that admitted a download. After an installed-set change is committed, one coalesced catalog
 maintenance pass removes exact affiliated superseded package IDs only for catalog models whose
-entire desired package set is present. Cleanup failure is logged and may be retried after a later
+entire desired package set is present. A package holding any current catalog package's weights or
+drafter file is never superseded: it is that material seen another way (the target's weights found
+on their own when the snapshot holds several projectors, say), not an older revision. Nor is a
+package removed while another Magnitude package is served from one of its snapshot files, since
+deleting it would delete that file. Cleanup failure is logged and may be retried after a later
 authoritative change. There is no request poller and no package-attempt completion trigger.
 
 Download state determines neither configuration, offering, slot identity, nor physical presence.
@@ -579,9 +583,14 @@ Removing an added custom model deletes its Magnitude-owned files under the same 
 files that are also present in an external location stay there, and the model remains as found.
 Removing an imported model forgets its declaration and never touches the file. A found model is
 hidden, never deleted; so is a catalog model whose files are all in external locations, which is a
-found copy. After a model is removed or stops using its drafter, and after catalog removal, the
-Magnitude-owned drafter packages that no installed catalog model and no custom model uses are
-removed; while any custom model's automatic drafter is not yet worked out, catalog drafters are kept.
+found copy. After a model is removed, and after catalog removal, the Magnitude-owned drafter
+packages that no installed catalog model and no custom model uses are removed; changing or turning
+off a drafter never prunes. While any custom model's automatic drafter is not yet worked out, catalog
+drafters are kept. ICN checks each package again at the deletion itself, whatever the reference
+accounting decided: it deletes only a package of Magnitude's holding drafter files alone (never a
+target's weights, a model with built-in heads included), that no installed catalog model's bundle
+and no custom model uses, that shares no snapshot file with another package, and that the residency
+admits for removal (a package a resident model has loaded is kept).
 Catalog removal itself keeps the catalog model's drafter while a custom model uses it (or may, while
 an automatic drafter is being worked out) and removes the target; pruning removes the drafter once no
 model uses it. An added model whose target is still downloading uses the drafter it downloads with

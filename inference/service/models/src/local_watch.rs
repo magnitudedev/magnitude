@@ -133,12 +133,11 @@ fn affected(event: &notify::Event, interests: &[PathBuf]) -> BTreeSet<PathBuf> {
 }
 
 /// A set of watches that calls `on_change` with the configured paths a burst of events concerned,
-/// once the burst has settled. Dropping it stops watching.
+/// once the burst has settled. Dropping it stops watching and reports a burst still settling.
 pub(crate) struct RootWatcher {
     targets: Vec<WatchTarget>,
     unwatched: BTreeSet<PathBuf>,
     _watcher: notify::RecommendedWatcher,
-    debounce: tokio::task::JoinHandle<()>,
 }
 
 impl RootWatcher {
@@ -147,7 +146,7 @@ impl RootWatcher {
         on_change: impl Fn(BTreeSet<PathBuf>) + Send + 'static,
     ) -> Option<Self> {
         let runtime = tokio::runtime::Handle::try_current().ok()?;
-        let (events, mut received) = tokio::sync::mpsc::unbounded_channel::<BTreeSet<PathBuf>>();
+        let (events, received) = tokio::sync::mpsc::unbounded_channel::<BTreeSet<PathBuf>>();
         let interests = targets
             .iter()
             .map(|target| target.interest.clone())
@@ -179,23 +178,11 @@ impl RootWatcher {
                 unwatched.insert(target.interest.clone());
             }
         }
-        let debounce = runtime.spawn(async move {
-            while let Some(mut affected) = received.recv().await {
-                loop {
-                    match tokio::time::timeout(WATCH_DEBOUNCE, received.recv()).await {
-                        Ok(Some(more)) => affected.extend(more),
-                        Ok(None) => return,
-                        Err(_) => break,
-                    }
-                }
-                on_change(affected);
-            }
-        });
+        runtime.spawn(debounced(received, on_change));
         Some(Self {
             targets,
             unwatched,
             _watcher: watcher,
-            debounce,
         })
     }
 
@@ -209,8 +196,24 @@ impl RootWatcher {
     }
 }
 
-impl Drop for RootWatcher {
-    fn drop(&mut self) {
-        self.debounce.abort();
+/// Reports each burst of changes once `WATCH_DEBOUNCE` passes without more. A burst still
+/// settling when the watch stops (replaced because a location was added, say, or dropped) is
+/// reported then, never lost: the watcher owns the only sender, so stopping it ends the channel.
+pub(crate) async fn debounced(
+    mut received: tokio::sync::mpsc::UnboundedReceiver<BTreeSet<PathBuf>>,
+    on_change: impl Fn(BTreeSet<PathBuf>),
+) {
+    while let Some(mut affected) = received.recv().await {
+        loop {
+            match tokio::time::timeout(WATCH_DEBOUNCE, received.recv()).await {
+                Ok(Some(more)) => affected.extend(more),
+                Ok(None) => {
+                    on_change(affected);
+                    return;
+                }
+                Err(_) => break,
+            }
+        }
+        on_change(affected);
     }
 }

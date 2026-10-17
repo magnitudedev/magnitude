@@ -190,6 +190,13 @@ impl CandidateEnrichment {
             .is_ok_and(|results| results.contains_key(key))
     }
 
+    /// Whether any result is known for the model, for whichever target.
+    fn knows_model(&self, model_id: &ModelId) -> bool {
+        self.results
+            .read()
+            .is_ok_and(|results| results.keys().any(|(known, _)| known == model_id))
+    }
+
     /// Whether the result for `key` was computed from the inputs at `revision`. An older result
     /// keeps answering until it is recomputed.
     fn is_current(&self, key: &(ModelId, String), revision: u64) -> bool {
@@ -234,6 +241,10 @@ impl CandidateEnrichment {
 }
 
 impl CustomModelEnrichment for CandidateEnrichment {
+    /// The result for the model's exact target, or, while that is being computed (its target
+    /// package changed: a projector appeared beside it, say), the model's previous result. The
+    /// projection checks every automatic candidate against the files present, so a drafter that
+    /// is attached and serving is never shown as none while a recompute is pending.
     fn enrich(&self, model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult {
         self.results
             .read()
@@ -241,6 +252,12 @@ impl CustomModelEnrichment for CandidateEnrichment {
             .and_then(|results| {
                 results
                     .get(&(model.model_id.clone(), model.target.id.0.clone()))
+                    .or_else(|| {
+                        results
+                            .iter()
+                            .find(|((model_id, _), _)| model_id == model.model_id)
+                            .map(|(_, result)| result)
+                    })
                     .map(|(_, result)| result.clone())
             })
             .unwrap_or_default()
@@ -396,21 +413,30 @@ impl ManagedModelCandidates {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                let mut changed = false;
-                for model_id in models {
-                    let Ok(configuration) =
-                        candidates
+                // Models with no result yet come first, so a model just added or installed is
+                // never kept waiting behind recomputing the others; each result is published as
+                // soon as it is known, and a pass restarts as soon as the inputs move again.
+                let mut pending = models
+                    .into_iter()
+                    .filter_map(|model_id| {
+                        let configuration = candidates
                             .assessor
                             .configuration_for(&ModelAssessmentSubject::Custom {
                                 model_id: model_id.clone(),
                             })
-                    else {
-                        continue;
-                    };
-                    let key = (
-                        model_id.clone(),
-                        bundle_target(&configuration.bundle).id.0.clone(),
-                    );
+                            .ok()?;
+                        let key = (
+                            model_id.clone(),
+                            bundle_target(&configuration.bundle).id.0.clone(),
+                        );
+                        Some((enrichment.knows_model(&model_id), key))
+                    })
+                    .collect::<Vec<_>>();
+                pending.sort_by_key(|(known, _)| *known);
+                for (_, key) in pending {
+                    if resolver.custom_model_inputs_revision().ok() != Some(revision) {
+                        break;
+                    }
                     if enrichment.is_current(&key, revision)
                         || failed.get(&key).is_some_and(|(failed_at, at)| {
                             *failed_at == revision && at.elapsed() < ENRICHMENT_RETRY_DELAY
@@ -418,19 +444,18 @@ impl ManagedModelCandidates {
                     {
                         continue;
                     }
-                    match candidates.enrich_model(&model_id).await {
+                    match candidates.enrich_model(&key.0).await {
                         Ok(result) => {
                             failed.remove(&key);
-                            changed |= enrichment.record(key, revision, result);
+                            if enrichment.record(key, revision, result) {
+                                resolver.custom_model_enrichment_changed();
+                            }
                         }
                         Err(error) => {
-                            tracing::warn!(model.id = %model_id.as_str(), %error, "custom model enrichment failed");
+                            tracing::warn!(model.id = %key.0.as_str(), %error, "custom model enrichment failed");
                             failed.insert(key, (revision, std::time::Instant::now()));
                         }
                     }
-                }
-                if changed {
-                    resolver.custom_model_enrichment_changed();
                 }
                 tokio::select! {
                     change = changes.next() => if change.is_none() { return },

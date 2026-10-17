@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use magnitude_service_contracts::models::{
-    AttachedDrafter, AttachedDrafterState, CatalogPackageRole, CustomModel,
+    AttachedDrafter, AttachedDrafterState, CatalogPackageRemover, CatalogPackageRole, CustomModel,
     CustomModelCatalogAttribution, CustomModelDeclaration, CustomModelDeclarationOrigin,
     CustomModelFile, CustomModelOrigin, CustomModelState, DrafterCandidate, DrafterChoice,
     DrafterPruning, DrafterReference, EffectiveModel, FoundSource, HuggingFaceArtifactSelector,
@@ -365,6 +365,97 @@ impl ModelDomainResolver {
             .filter(|package_id| !used.contains(package_id))
             .collect::<BTreeSet<_>>();
         Ok(unused.into_iter().collect())
+    }
+
+    /// Why drafter pruning may not delete `package_id`, checked against the inventory right
+    /// before the deletion and whatever the reference accounting decided. Pruning deletes only a
+    /// package of Magnitude's that holds drafter files alone (never a target's weights, which a
+    /// model with built-in heads also is), that no installed catalog model's bundle and no custom
+    /// model uses, and that shares no file with another package. Whether a resident model has it
+    /// loaded is the residency's admission, at the removal itself.
+    pub(crate) fn drafter_prune_refusal(
+        &self,
+        package_id: &ModelPackageId,
+    ) -> Result<Option<&'static str>, InventoryError> {
+        let projection = self.local_projection()?;
+        let installed = self.inventory.catalog_packages_response()?;
+        let records =
+            self.inventory.installed_packages.read().map_err(|_| {
+                InventoryError::Internal("installed package lock poisoned".to_owned())
+            })?;
+        let managed = records
+            .records
+            .values()
+            .filter(|record| {
+                &record.installed.package.id == package_id
+                    && record.installed.origin == ModelPackageInstallationOrigin::Magnitude
+            })
+            .collect::<Vec<_>>();
+        let Some(package) = managed.first().map(|record| &record.installed.package) else {
+            return Ok(Some("Magnitude holds no copy of it"));
+        };
+        let drafter_only = package
+            .files
+            .iter()
+            .all(|file| matches!(file.role, ModelFileRole::Weights | ModelFileRole::Draft))
+            && managed.iter().all(|record| {
+                record.primary.as_ref().is_some_and(|evidence| {
+                    evidence.role(&self.inventory.config.architectures) == GgufRole::Drafter
+                })
+            });
+        if !drafter_only {
+            return Ok(Some("it is not a drafter-only package"));
+        }
+        let files = package
+            .files
+            .iter()
+            .map(|file| &file.id)
+            .collect::<BTreeSet<_>>();
+        let holds = |other: &ModelPackage| {
+            &other.id == package_id || other.files.iter().any(|file| files.contains(&file.id))
+        };
+        if self
+            .catalog
+            .models
+            .iter()
+            .any(|definition| holds(crate::lineage::catalog_target(definition)))
+        {
+            return Ok(Some("it holds a catalog model's target"));
+        }
+        let present = installed
+            .packages
+            .iter()
+            .map(|entry| &entry.package.id)
+            .collect::<BTreeSet<_>>();
+        if self
+            .catalog
+            .models
+            .iter()
+            .filter(|definition| present.contains(&crate::lineage::catalog_target(definition).id))
+            .flat_map(crate::inventory::catalog_packages)
+            .any(|(package, _)| holds(package))
+        {
+            return Ok(Some("an installed catalog model uses it"));
+        }
+        let custom_uses = projection
+            .models
+            .iter()
+            .chain(&projection.hidden)
+            .any(|projected| {
+                projected.managed_packages.contains(package_id)
+                    || projected.awaited_drafter.as_ref() == Some(package_id)
+                    || projected.configuration.as_ref().is_ok_and(|configuration| {
+                        crate::model_projection::bundle_packages(&configuration.bundle)
+                            .any(|package| holds(package))
+                    })
+            });
+        if custom_uses {
+            return Ok(Some("a custom model uses it"));
+        }
+        if records.shares_managed_files(package_id, &BTreeSet::new()) {
+            return Ok(Some("another package is served from its files"));
+        }
+        Ok(None)
     }
 
     /// The Hub repository a custom model's lineage and drafters come from, when its files name
@@ -1505,6 +1596,7 @@ fn resolve_drafter(
 
 pub struct ManagedLocalModels {
     resolver: Arc<ModelDomainResolver>,
+    remover: Arc<dyn CatalogPackageRemover>,
     watcher: Mutex<Option<RootWatcher>>,
     unwatched: Mutex<BTreeSet<PathBuf>>,
     readable: Mutex<BTreeMap<PathBuf, bool>>,
@@ -1512,9 +1604,15 @@ pub struct ManagedLocalModels {
 }
 
 impl ManagedLocalModels {
-    pub(crate) fn new(resolver: Arc<ModelDomainResolver>) -> Arc<Self> {
+    /// `remover` deletes pruned drafters with the residency's admission, which refuses a package
+    /// a resident model has loaded.
+    pub(crate) fn new(
+        resolver: Arc<ModelDomainResolver>,
+        remover: Arc<dyn CatalogPackageRemover>,
+    ) -> Arc<Self> {
         let models = Arc::new_cyclic(|this| Self {
             resolver,
+            remover,
             watcher: Mutex::new(None),
             unwatched: Mutex::new(BTreeSet::new()),
             readable: Mutex::new(BTreeMap::new()),
@@ -1748,16 +1846,22 @@ impl LocalModels for ManagedLocalModels {
 
     fn prune_drafters(&self) -> BoxFuture<'_, Result<DrafterPruning, InventoryError>> {
         Box::pin(async move {
-            use magnitude_service_contracts::models::InstalledModelPackages as _;
             self.inventory().ensure_installed_model_inventory().await?;
             let unused = self.resolver.unused_drafter_packages()?;
             let mut removed = Vec::new();
             let mut freed_bytes = 0_u64;
             for package_id in unused {
-                let removal = self.inventory().remove_installed(&package_id).await?;
-                if removal.removed {
-                    freed_bytes = freed_bytes.saturating_add(removal.freed_bytes);
-                    removed.push(package_id);
+                if let Some(reason) = self.resolver.drafter_prune_refusal(&package_id)? {
+                    tracing::warn!(package_id = %package_id.0, reason, "drafter pruning kept a package it may not delete");
+                    continue;
+                }
+                match self.remover.remove_catalog_packages(vec![package_id.clone()]).await {
+                    Ok(freed) => {
+                        freed_bytes = freed_bytes.saturating_add(freed);
+                        removed.push(package_id);
+                    }
+                    Err(InventoryError::Loaded(_)) => {}
+                    Err(error) => return Err(error),
                 }
             }
             Ok(DrafterPruning {
@@ -1833,7 +1937,10 @@ mod tests {
                     diagnostics: Vec::new(),
                 },
             );
-            let local = ManagedLocalModels::new(resolver.clone());
+            let local = ManagedLocalModels::new(
+                resolver.clone(),
+                Arc::new(StoreRemover(resolver.inventory.clone())),
+            );
             Self {
                 _temporary: temporary,
                 root,
@@ -5134,6 +5241,9 @@ mod tests {
             .expect("the catalog drafter package");
         let mut target = draft.clone();
         target.id = ModelPackageId("owner-model-target-not-here".to_owned());
+        for file in &mut target.files {
+            file.id = magnitude_service_contracts::models::ModelFileId("file-target-not-here".to_owned());
+        }
         let mut definition = catalog_definition(target.clone());
         definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
             target,
@@ -5234,6 +5344,341 @@ mod tests {
             pruned.removed.len(),
             1,
             "once the model is removed its drafter goes too"
+        );
+    }
+
+    /// A Qwen3.5 4B quant with its MTP block, as unsloth's Qwen3.5-4B-MTP-GGUF ships them: every
+    /// quant has the same name and file type, so only `description` tells them apart.
+    fn qwen35_mtp_quant(description: &str) -> Vec<u8> {
+        gguf_bytes(
+            &[
+                ("general.architecture", Meta::Str("qwen35")),
+                ("general.name", Meta::Str("Qwen3.5-4B")),
+                ("general.description", Meta::Str(description)),
+                ("general.file_type", Meta::U32(18)),
+                ("qwen35.block_count", Meta::U32(2)),
+                ("qwen35.nextn_predict_layers", Meta::U32(1)),
+            ],
+            &[
+                "token_embd.weight",
+                "blk.0.attn_q.weight",
+                "blk.1.attn_q.weight",
+                "blk.1.nextn.eh_proj.weight",
+            ],
+        )
+    }
+
+    struct CatalogSibling {
+        fixture: Fixture,
+        installations: Arc<crate::catalog_installations::ManagedCatalogInstallations>,
+        catalog_model: ModelId,
+        target: ModelPackage,
+        draft: ModelPackage,
+        catalog_weights: PathBuf,
+        sibling: CustomModelDeclaration,
+    }
+
+    const SIBLING_REPOSITORY: &str = "unsloth/Qwen3.5-4B-MTP-GGUF";
+
+    /// The Arch round 3b setup: the catalog model installed (UD-Q6_K_XL with built-in heads and
+    /// mmproj-BF16, plus the catalog DFlash), then the non-target Q6_K added from the same snapshot
+    /// with mmproj-F16. With two projectors in the snapshot, the catalog weights are also found
+    /// on their own, as a second package of the same file.
+    async fn catalog_with_an_added_sibling() -> CatalogSibling {
+        use magnitude_service_contracts::models::{InstalledModelPackages as _, ModelFileRole};
+        let commit = "8".repeat(40);
+        let draft_commit = "0".repeat(40);
+        let weights = qwen35_mtp_quant("UD-Q6_K_XL");
+        let projector = |name: &str| {
+            gguf_bytes(
+                &[
+                    ("general.architecture", Meta::Str("clip")),
+                    ("general.name", Meta::Str(name)),
+                ],
+                &["v.patch_embd.weight"],
+            )
+        };
+        let drafter = drafter_bytes("Qwen3.5-4B-DFlash");
+        let catalog_files = [
+            ("Qwen3.5-4B-UD-Q6_K_XL.gguf", weights),
+            ("mmproj-BF16.gguf", projector("bf16")),
+        ];
+        let drafter_files = [("Qwen3.5-4B-DFlash-Q8_0.gguf", drafter)];
+
+        let release = Fixture::new().await;
+        publish_managed(&release.store, SIBLING_REPOSITORY, &commit, &catalog_files);
+        publish_managed(
+            &release.store,
+            "magnitudedev/Qwen3.5-4B-DFlash-GGUF",
+            &draft_commit,
+            &drafter_files,
+        );
+        release.apply(LocalModelsConfiguration::default()).await;
+        let packages = release.inventory().list_installed().await.unwrap().packages;
+        let target = packages
+            .iter()
+            .map(|installed| installed.package.clone())
+            .find(|package| package.files.iter().any(|file| file.role == ModelFileRole::Projector))
+            .expect("the catalog target pairs its projector");
+        let draft = packages
+            .iter()
+            .map(|installed| installed.package.clone())
+            .find(|package| package.id != target.id)
+            .expect("the catalog drafter");
+        let mut definition = catalog_definition(target.clone());
+        definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+            target: target.clone(),
+            draft_source: SpeculativeDraftSource::Separate {
+                draft: draft.clone(),
+            },
+            method: SpeculativeMethod::DFlash,
+        };
+        let catalog_model = catalog_id(&definition);
+
+        let fixture = Fixture::new().await.restart(vec![definition]).await;
+        let snapshot =
+            publish_managed(&fixture.store, SIBLING_REPOSITORY, &commit, &catalog_files);
+        publish_managed(
+            &fixture.store,
+            "magnitudedev/Qwen3.5-4B-DFlash-GGUF",
+            &draft_commit,
+            &drafter_files,
+        );
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        publish_managed(
+            &fixture.store,
+            SIBLING_REPOSITORY,
+            &commit,
+            &[
+                ("Qwen3.5-4B-Q6_K.gguf", qwen35_mtp_quant("Q6_K")),
+                ("mmproj-F16.gguf", projector("f16")),
+            ],
+        );
+        let sibling = CustomModelDeclaration {
+            model_id: format!("hf:{SIBLING_REPOSITORY}/Qwen3.5-4B-Q6_K.gguf")
+                .parse()
+                .unwrap(),
+            origin: CustomModelDeclarationOrigin::Added {
+                repository: HuggingFaceRepositoryId::new(SIBLING_REPOSITORY).unwrap(),
+                commit,
+            },
+            target: vec!["Qwen3.5-4B-Q6_K.gguf".to_owned()],
+            projector: Some("mmproj-F16.gguf".to_owned()),
+        };
+        let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
+            fixture.resolver.clone(),
+            Arc::new(
+                crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
+                    .await
+                    .unwrap(),
+            ),
+            Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
+            Arc::new(NoOptimizer),
+        );
+        CatalogSibling {
+            fixture,
+            installations,
+            catalog_model,
+            target,
+            draft,
+            catalog_weights: snapshot.join("Qwen3.5-4B-UD-Q6_K_XL.gguf"),
+            sibling,
+        }
+    }
+
+    impl CatalogSibling {
+        fn catalog_installed(&self) -> bool {
+            use magnitude_service_contracts::models::CatalogModelState;
+            matches!(
+                self.fixture.resolver.catalog_snapshot().unwrap().models[0].local_state,
+                CatalogModelState::Installed { .. }
+            )
+        }
+
+        /// The sibling declared with `drafter`, then everything that removes packages afterwards:
+        /// catalog maintenance and drafter pruning.
+        async fn choose_sibling_drafter(&self, drafter: DrafterChoice) {
+            self.fixture
+                .apply(LocalModelsConfiguration {
+                    declarations: vec![self.sibling.clone()],
+                    drafters: vec![DrafterAttachment {
+                        model_id: self.sibling.model_id.clone(),
+                        drafter,
+                    }],
+                    ..LocalModelsConfiguration::default()
+                })
+                .await;
+            self.installations
+                .cleanup_model(&self.catalog_model)
+                .await
+                .unwrap();
+            self.fixture.local.prune_drafters().await.unwrap();
+        }
+    }
+
+    /// The Arch round 3b BLOCKER: turning the added Q6_K's drafter off (or to its built-in heads)
+    /// deleted the catalog model's UD-Q6_K_XL. Catalog maintenance took the weights found on their
+    /// own (with two projectors in the snapshot they pair with neither) for a superseded revision
+    /// of the catalog model and deleted the file the catalog target serves from. The catalog
+    /// target's files are never deleted, whatever the sibling's drafter.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_added_siblings_drafter_change_never_deletes_the_catalog_target() {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+        for drafter in [
+            DrafterChoice::Reference {
+                reference: DrafterReference::Embedded,
+                method: SpeculativeMethod::Mtp,
+            },
+            DrafterChoice::None,
+        ] {
+            let setup = catalog_with_an_added_sibling().await;
+            assert!(setup.catalog_installed());
+            setup.choose_sibling_drafter(drafter.clone()).await;
+            let packages = setup.fixture.inventory().list_installed().await.unwrap().packages;
+            assert!(
+                packages.iter().any(|installed| installed.package.id != setup.target.id
+                    && installed
+                        .package
+                        .files
+                        .iter()
+                        .any(|file| setup.target.files.iter().any(|held| held.id == file.id
+                            && file.role == ModelFileRole::Weights))),
+                "the catalog weights are also found on their own"
+            );
+            assert!(
+                setup.catalog_weights.exists(),
+                "the catalog target's weights are kept with the sibling's drafter {drafter:?}"
+            );
+            setup.fixture.local.refresh_local().await.unwrap();
+            assert!(setup.catalog_installed(), "{drafter:?}");
+            assert!(
+                packages.iter().any(|installed| installed.package.id == setup.draft.id),
+                "the installed catalog model's drafter is kept"
+            );
+        }
+    }
+
+    /// Drafter pruning's own check at the deletion, whatever the reference accounting says: it
+    /// refuses the catalog target, the catalog weights found on their own (a full model with
+    /// built-in heads, not a drafter), and the drafter of an installed catalog model.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drafter_pruning_refuses_target_weights_and_an_installed_catalog_bundle() {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+        let setup = catalog_with_an_added_sibling().await;
+        setup
+            .fixture
+            .apply(LocalModelsConfiguration {
+                declarations: vec![setup.sibling.clone()],
+                ..LocalModelsConfiguration::default()
+            })
+            .await;
+        let weights_alone = setup
+            .fixture
+            .inventory()
+            .list_installed()
+            .await
+            .unwrap()
+            .packages
+            .into_iter()
+            .map(|installed| installed.package)
+            .find(|package| {
+                package.id != setup.target.id
+                    && package.files.iter().any(|file| {
+                        file.role == ModelFileRole::Weights
+                            && setup.target.files.iter().any(|held| held.id == file.id)
+                    })
+            })
+            .expect("the catalog weights found on their own");
+        let refusal =
+            |package: &ModelPackage| setup.fixture.resolver.drafter_prune_refusal(&package.id).unwrap();
+        assert_eq!(refusal(&setup.target), Some("it is not a drafter-only package"));
+        assert_eq!(refusal(&weights_alone), Some("it is not a drafter-only package"));
+        assert_eq!(refusal(&setup.draft), Some("an installed catalog model uses it"));
+        let pruned = setup.fixture.local.prune_drafters().await.unwrap();
+        assert!(pruned.removed.is_empty(), "{pruned:?}");
+        assert!(setup.catalog_weights.exists());
+    }
+
+    /// The residency refuses removing a package a resident model has loaded.
+    struct LoadedRemover;
+
+    impl CatalogPackageRemover for LoadedRemover {
+        fn remove_catalog_packages(
+            &self,
+            package_ids: Vec<ModelPackageId>,
+        ) -> futures_util::future::BoxFuture<'_, Result<u64, InventoryError>> {
+            Box::pin(async move { Err(InventoryError::Loaded(package_ids[0].0.clone())) })
+        }
+    }
+
+    /// Removing an added model deletes its own files and the separate drafter it downloaded,
+    /// once nothing uses it, unless a resident model has that drafter loaded. The catalog model
+    /// beside it in the same snapshot keeps its target and its drafter.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_an_added_model_deletes_its_unused_drafter_and_nothing_of_the_catalog_models() {
+        let setup = catalog_with_an_added_sibling().await;
+        let drafter_commit = "d".repeat(40);
+        let drafter = publish_managed(
+            &setup.fixture.store,
+            "magnitudedev/Other-DFlash-GGUF",
+            &drafter_commit,
+            &[("Other-DFlash-Q8_0.gguf", drafter_bytes("other drafter"))],
+        )
+        .join("Other-DFlash-Q8_0.gguf");
+        let with_sibling = LocalModelsConfiguration {
+            declarations: vec![setup.sibling.clone()],
+            drafters: vec![DrafterAttachment {
+                model_id: setup.sibling.model_id.clone(),
+                drafter: DrafterChoice::Reference {
+                    reference: DrafterReference::HuggingFace {
+                        repository: HuggingFaceRepositoryId::new("magnitudedev/Other-DFlash-GGUF")
+                            .unwrap(),
+                        commit: drafter_commit,
+                        path: "Other-DFlash-Q8_0.gguf".to_owned(),
+                    },
+                    method: SpeculativeMethod::DFlash,
+                },
+            }],
+            ..LocalModelsConfiguration::default()
+        };
+        setup.fixture.apply(with_sibling).await;
+        let kept = setup.fixture.local.prune_drafters().await.unwrap();
+        assert!(kept.removed.is_empty(), "the sibling serves with it: {kept:?}");
+
+        setup
+            .fixture
+            .local
+            .remove_local(&setup.sibling.model_id)
+            .await
+            .unwrap();
+        setup.fixture.apply(LocalModelsConfiguration::default()).await;
+        setup
+            .installations
+            .cleanup_model(&setup.catalog_model)
+            .await
+            .unwrap();
+        let loaded = ManagedLocalModels::new(setup.fixture.resolver.clone(), Arc::new(LoadedRemover));
+        let refused = loaded.prune_drafters().await.unwrap();
+        assert!(refused.removed.is_empty(), "a loaded drafter is kept: {refused:?}");
+        assert!(drafter.exists());
+
+        let pruned = setup.fixture.local.prune_drafters().await.unwrap();
+        assert_eq!(pruned.removed.len(), 1, "{pruned:?}");
+        assert!(!drafter.exists(), "the removed model's drafter goes");
+        assert!(setup.catalog_weights.exists());
+        assert!(setup.catalog_installed());
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+        assert!(
+            setup
+                .fixture
+                .inventory()
+                .list_installed()
+                .await
+                .unwrap()
+                .packages
+                .iter()
+                .any(|installed| installed.package.id == setup.draft.id),
+            "the catalog model's drafter stays"
         );
     }
 
@@ -5689,6 +6134,29 @@ mod tests {
         )
         .expect("the watcher starts");
         assert_eq!(watcher.unwatched(), &BTreeSet::from([missing]));
+    }
+
+    /// QA (Debian, round 3b): a model kept "Drafter None" with its drafter back in its folder,
+    /// after the drafter was moved out and back and another folder was added at once. Adding the
+    /// folder replaced the watcher while the move back was still settling, and the burst was
+    /// dropped. A watch that stops reports what it had received at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_stopped_while_a_change_settles_still_reports_it() {
+        let (events, received) = tokio::sync::mpsc::unbounded_channel();
+        let (reported, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        let debounce = tokio::spawn(crate::local_watch::debounced(received, move |affected| {
+            let _ = reported.send(affected);
+        }));
+        let folder = PathBuf::from("/models/A");
+        events.send(BTreeSet::from([folder.clone()])).unwrap();
+        tokio::time::sleep(crate::local_watch::WATCH_DEBOUNCE / 3).await;
+        assert!(reports.try_recv().is_err(), "still settling");
+
+        let stopped = tokio::time::Instant::now();
+        drop(events);
+        assert_eq!(reports.recv().await, Some(BTreeSet::from([folder])));
+        assert_eq!(stopped.elapsed(), Duration::ZERO, "reported as the watch stops");
+        debounce.await.unwrap();
     }
 
     fn imported(file: &Path) -> CustomModelDeclaration {

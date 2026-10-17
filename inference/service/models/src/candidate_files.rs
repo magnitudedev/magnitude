@@ -864,6 +864,37 @@ mod tests {
         );
     }
 
+    /// The Arch round 3b files (the real headers): the catalog's UD-Q6_K_XL and the Q6_K beside
+    /// it declare `nextn_predict_layers` 1 of 33 blocks, and their MTP block is the last of the
+    /// 33 they hold. Each is a full model with built-in heads, never a head file.
+    #[test]
+    fn a_full_model_declaring_prediction_layers_is_a_target_with_built_in_heads() {
+        let architectures = RecognizedArchitectures::new(
+            ["qwen35", "qwen4exp"],
+            ["dflash", "gemma4-assistant", "qwen4exp"],
+        );
+        for name in ["Qwen3.5-4B-UD-Q6_K_XL.gguf", "Qwen3.5-4B-Q6_K.gguf"] {
+            let header = fixture_header(name);
+            assert_eq!(
+                classify_header(&header, &architectures).unwrap().role,
+                CandidateFileRole::Target {
+                    architecture: Some("qwen35".to_owned())
+                },
+                "{name}"
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let file = directory.path().join(name);
+            std::fs::write(&file, &header).unwrap();
+            let inspection = crate::gguf::inspect(&file).unwrap();
+            assert_eq!(inspection.nextn_predict_layers, Some(1), "{name}");
+            assert_eq!(
+                inspection.role(&architectures),
+                crate::gguf::GgufRole::Model { embedded_mtp: true },
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn base_repositories_come_from_repo_urls_or_else_organization_and_name() {
         use magnitude_artifacts::gguf::{ByteOrder, Metadata, Scalar};
