@@ -17,6 +17,7 @@ import { App, AppShell } from "./app"
 import { ModelsSkeleton } from "./components/page-skeletons"
 import { ErrorNotice } from "./components/error-notice"
 import { RemoteAccessProvider, SignIn } from "./remote-access"
+import { readLanguage, translate, useI18n } from "./i18n"
 
 export interface ApplicationEntry<E> {
   readonly host: ApplicationHost
@@ -29,11 +30,16 @@ export interface ApplicationEntry<E> {
   readonly reconnect: "Automatic" | "OnConnect"
 }
 
+function StartupFailure({ descriptionKey }: { descriptionKey: "reloadWindowRestart" | "quitAndReopen" }) {
+  const { t } = useI18n()
+  return <div className="p-6"><ErrorNotice title={t("magnitudeCouldNotOpen")} description={t(descriptionKey)} /></div>
+}
+
 function SessionGate() {
   const client = useAgentClient()
   const session = useAtomValue(useMemo(() => client.runtime.atom(ApplicationSession), [client]))
   if (Result.isSuccess(session)) return <SessionProvider session={session.value}><App /></SessionProvider>
-  if (Result.isFailure(session)) return <div className="p-6"><ErrorNotice title="Magnitude couldn’t open" description="Reload this window. If it still won’t open, restart Magnitude." /></div>
+  if (Result.isFailure(session)) return <StartupFailure descriptionKey="reloadWindowRestart" />
   return null
 }
 
@@ -62,11 +68,11 @@ export const renderApplication = <E,>(entry: ApplicationEntry<E>) => {
     window.addEventListener("beforeunload", () => { Runtime.runFork(runtime)(Scope.close(scope, Exit.void)) }, { once: true })
     const connection = yield* makeFirstPartyConnection(MagnitudeClient.layer({ origin, autoStart: false, reconnect: entry.reconnect }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
     const client = createAgentClient(connection.client, { host: entry.host, navigation: entry.navigation })
-    const readError = Either.isLeft(appearance) ? "The saved appearance could not be read. Using System appearance." : null
+    const readError = Either.isLeft(appearance) ? translate(readLanguage(), "savedAppearanceReadError") : null
     root.render(<RegistryProvider initialValues={[[appearanceReadError, readError]]}><AgentClientProvider tag={client}><ServiceConnectionProvider connection={connection.client.connection}><RemoteAccessProvider access={{ origin, canSignIn: entry.canSignIn, remote }}><SessionGate /></RemoteAccessProvider></ServiceConnectionProvider></AgentClientProvider></RegistryProvider>)
   })
   Effect.runPromise(boot).catch(error => {
     console.error(error)
-    root.render(<div className="p-6"><ErrorNotice title="Magnitude couldn’t open" description="Quit Magnitude and open it again." /></div>)
+    root.render(<StartupFailure descriptionKey="quitAndReopen" />)
   })
 }

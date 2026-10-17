@@ -9,6 +9,10 @@ import { ConfirmDialog } from "./components/confirm-dialog"
 import { Button } from "./components/ui/button"
 import { Input } from "./components/ui/input"
 
+import { readLanguage, translate } from "./i18n"
+
+const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
+
 /**
  * How this window reaches its service. `canSignIn` is true for a browser, which may be on another
  * device; `remote` is true once that browser is signed in from another device.
@@ -44,13 +48,13 @@ type SignInError = SignInFailure | ServiceUnavailable | InvalidServiceResponse
 
 const failureMessage = (failure: Option.Option<SignInError>) => {
   const value = Option.getOrUndefined(failure)
-  if (value?._tag === "SignInThrottled") return { title: "Too many attempts", description: `Wait ${value.retryAfterSeconds === 1 ? "a second" : `${value.retryAfterSeconds} seconds`}, then try again.` }
-  if (value?._tag !== "SignInRefused") return { title: "Can’t reach Magnitude", description: "Check that Magnitude is running on that computer and that this device can reach it." }
+  if (value?._tag === "SignInThrottled") return { title: tr("tooManyAttempts"), description: tr("waitThenRetry").replace("{duration}", value.retryAfterSeconds === 1 ? tr("aSecond") : `${value.retryAfterSeconds} ${tr("secondsWord")}`) }
+  if (value?._tag !== "SignInRefused") return { title: tr("cantReachMagnitude"), description: tr("canNotReachCheck") }
   switch (value.reason) {
-    case "WrongKey": return { title: "That key didn’t work", description: "Copy the key again from Settings → Network access on the computer running Magnitude. On a server, run `magnitude server setup` to print it." }
-    case "NoKey": return { title: "No key is set", description: "On the computer running Magnitude, open Settings → Network access and choose Regenerate to create one." }
-    case "NetworkAccessOff": return { title: "Network access is off", description: "Turn on Network access in Settings on the computer running Magnitude." }
-    case "CrossOrigin": return { title: "Couldn’t sign in", description: "Open Magnitude using its own address, then try again." }
+    case "WrongKey": return { title: tr("wrongKey"), description: tr("copyKeyAgain") }
+    case "NoKey": return { title: tr("noKeySet"), description: tr("noKeySetDescription") }
+    case "NetworkAccessOff": return { title: tr("networkAccessOff"), description: tr("turnOnNetworkAccess") }
+    case "CrossOrigin": return { title: tr("couldNotSignIn"), description: tr("openOwnAddress") }
   }
 }
 
@@ -65,14 +69,14 @@ export function SignIn({ origin, keyConfigured, onSignedIn }: { origin: string; 
     <div className="w-full max-w-sm">
       <div className="mb-6 flex items-center gap-2.5"><MagnitudeMark className="size-8" /><span className="font-heading text-lg font-semibold">Magnitude</span></div>
       <form className="rounded-lg border border-slate-300 bg-white p-6 dark:border-slate-750 dark:bg-slate-850" onSubmit={event => { event.preventDefault(); if (key.trim()) submit(key.trim()) }}>
-        <h1 className="font-heading text-xl font-semibold tracking-tight">Sign in</h1>
+        <h1 className="font-heading text-xl font-semibold tracking-tight">{tr("signIn")}</h1>
         {keyConfigured ? <>
-          <p className="mt-2 text-sm text-slate-500">Enter the Network access key from Settings on the computer running Magnitude.</p>
-          <label className="mt-5 block text-sm font-medium" htmlFor="network-access-key">Network access key</label>
+          <p className="mt-2 text-sm text-slate-500">{tr("enterNetworkKey")}</p>
+          <label className="mt-5 block text-sm font-medium" htmlFor="network-access-key">{tr("networkAccessKey")}</label>
           <Input id="network-access-key" type="password" autoComplete="current-password" autoFocus spellCheck={false} value={key} onChange={event => setKey(event.target.value)} className="mt-1.5 font-mono" />
           {error && <ErrorNotice className="mt-4" title={error.title} description={error.description} />}
-          <Button type="submit" className="mt-5 w-full" disabled={!key.trim() || result.waiting}>Sign in</Button>
-        </> : <ErrorNotice className="mt-4" title="No key is set" description="On the computer running Magnitude, open Settings → Network access and choose Regenerate to create one, then reload this page." />}
+          <Button type="submit" className="mt-5 w-full" disabled={!key.trim() || result.waiting}>{tr("signIn")}</Button>
+        </> : <ErrorNotice className="mt-4" title={tr("noKeySet")} description={`${tr("noKeySetDescription")} ${tr("reloadPage")}`} />}
       </form>
     </div>
   </main>
@@ -88,33 +92,13 @@ export function useSignInRecheck(): Effect.Effect<boolean> {
 
 export type DisconnectWarning = "TurnOffNetworkAccess" | "RegenerateKey" | "StopRequiringKey" | "ChangeAddress" | "Restart"
 
-const warnings: Record<DisconnectWarning, { title: string; description: string; confirmLabel: string }> = {
-  TurnOffNetworkAccess: {
-    title: "Turn off network access?",
-    description: "This browser is connected over the network. The next time Magnitude restarts, including for an automatic update, remote access stops: this browser and every other device, app and agent lose access, and only someone on the computer running Magnitude can turn it back on.",
-    confirmLabel: "Turn off",
-  },
-  RegenerateKey: {
-    title: "Regenerate the key?",
-    description: "When Magnitude restarts, the current key stops working. This browser will be signed out, and you’ll need the new key to sign in again.",
-    confirmLabel: "Regenerate",
-  },
-  StopRequiringKey: {
-    title: "Stop requiring the key?",
-    description: "When Magnitude restarts, any device that can reach this computer can use it for inference without a key. Only do this on a network you trust. This browser still needs the key to sign in.",
-    confirmLabel: "Stop requiring",
-  },
-  ChangeAddress: {
-    title: "Change the address?",
-    description: "When Magnitude restarts, it accepts connections only on the address you choose. This browser may not be able to reconnect.",
-    confirmLabel: "Change address",
-  },
-  Restart: {
-    title: "Restart Magnitude?",
-    description: "This browser will be disconnected while Magnitude restarts, then reconnects on its own.",
-    confirmLabel: "Restart",
-  },
-}
+const getWarnings = (): Record<DisconnectWarning, { title: string; description: string; confirmLabel: string }> => ({
+  TurnOffNetworkAccess: { title: tr("turnOffNetworkQuestion"), description: tr("turnOffNetworkDescription"), confirmLabel: tr("turnOff") },
+  RegenerateKey: { title: tr("regenerateKeyQuestion"), description: tr("regenerateKeyDescription"), confirmLabel: tr("regenerate") },
+  StopRequiringKey: { title: tr("stopRequiringKeyQuestion"), description: tr("stopRequiringKeyDescription"), confirmLabel: tr("stopRequiring") },
+  ChangeAddress: { title: tr("changeAddressQuestion"), description: tr("changeAddressDescription"), confirmLabel: tr("changeAddress") },
+  Restart: { title: tr("restartMagnitudeQuestion"), description: tr("restartDisconnectDescription"), confirmLabel: tr("restart") },
+})
 
 /**
  * Runs an action that can cut this browser off. From another device it first asks in an
@@ -123,7 +107,7 @@ const warnings: Record<DisconnectWarning, { title: string; description: string; 
 export function useDisconnectWarning(): { readonly warn: (warning: DisconnectWarning, action: () => void) => void; readonly dialog: ReactNode } {
   const { remote } = useRemoteAccess()
   const [pending, setPending] = useState<{ warning: DisconnectWarning; action: () => void } | null>(null)
-  const copy = pending === null ? null : warnings[pending.warning]
+  const copy = pending === null ? null : getWarnings()[pending.warning]
   return {
     warn: (warning, action) => remote ? setPending({ warning, action }) : action(),
     dialog: copy && <ConfirmDialog open onOpenChange={open => { if (!open) setPending(null) }} title={copy.title} description={copy.description}

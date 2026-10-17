@@ -1,8 +1,7 @@
 import { ErrorNotice } from "./error-notice"
 import { pageLayout } from "./page-layout"
 import type { HarnessConnectionStatus, HarnessId } from "@magnitudedev/sdk"
-import { Brand } from "effect"
-import { useMemo, useState } from "react"
+import { useState } from "react"
 import type { ProviderModelId } from "@magnitudedev/sdk"
 import { harnessCommand, harnessInstallationUrl } from "@magnitudedev/sdk"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select"
@@ -12,6 +11,10 @@ import { Button } from "./ui/button"
 import { ActionTooltip, TooltipProvider } from "./ui/tooltip"
 import { HarnessLogo } from "./harness-logo"
 
+
+import { readLanguage, translate } from "../i18n"
+
+const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
 
 type Props = {
   connections: readonly HarnessConnectionStatus[]
@@ -29,7 +32,7 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
     const rows = connections.filter(row => row.installed === installed)
       .sort((a, b) => Number(b.inspection._tag === "Connected") - Number(a.inspection._tag === "Connected"))
     if (rows.length === 0) return null
-    const title = installed ? "Installed on your machine" : "Not installed"
+    const title = installed ? tr("installedOnMachine") : tr("notInstalled")
     return <section key={title} aria-label={title}>
       <h2 className="mb-4 text-sm font-medium text-slate-500">{title}</h2>
       <div className={pageLayout.harnessGrid}>{rows.map(row => {
@@ -41,20 +44,20 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
             <div><h3 className="text-lg font-semibold">{row.name}</h3>
               <p className={`mt-1 flex items-center gap-2 text-sm ${installed && row.inspection._tag === "Connected" ? "text-green-600 dark:text-green-400" : needsAttention ? "text-orange-600 dark:text-orange-400" : "text-slate-500"}`}>
                 {installed && <span aria-hidden="true" className={`size-2 shrink-0 rounded-full ${row.inspection._tag === "Connected" ? "bg-green-600 dark:bg-green-400" : needsAttention ? "bg-orange-500" : "bg-slate-400"}`} />}
-                {!installed ? "Not installed" : row.inspection._tag === "Connected" ? "Connected" : row.inspection._tag === "Unavailable" ? "Status unavailable" : needsAttention ? "Connection needs repair" : "Not connected"}
+                {!installed ? tr("notInstalled") : row.inspection._tag === "Connected" ? tr("connected") : row.inspection._tag === "Unavailable" ? tr("statusUnavailable") : needsAttention ? tr("connectionNeedsRepair") : tr("notConnected")}
               </p>
             </div>
           </div>
           <div className="ml-auto flex shrink-0 flex-wrap items-center justify-end gap-3">
-            {installed && row.id === "pi" && row.plugin._tag === "Some" && <span className="text-sm text-slate-500">Includes <a href="https://pi.dev/packages/@magnitudedev/pi-extension" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:underline">Pi extension<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a></span>}
+            {installed && row.id === "pi" && row.plugin._tag === "Some" && <span className="text-sm text-slate-500">{tr("includes")} <a href="https://pi.dev/packages/@magnitudedev/pi-extension" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:underline">{tr("piExtension")}<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a></span>}
             {installed ? <>{row.inspection._tag === "Connected"
-              ? <ActionTooltip label="Refresh connection" trigger={<Button variant="ghost" size="icon-sm" aria-label="Refresh connection" disabled={busy || !canConnect} onClick={() => onConnect(row.id)}><ArrowClockwiseIcon aria-hidden="true" className="size-4" /></Button>} />
-              : <Button disabled={busy || !canConnect} onClick={() => onConnect(row.id)}>{needsAttention ? "Repair connection" : "Connect"}</Button>}{!needsAttention && (row.managed || row.inspection._tag === "Connected") && <Button variant="outline" disabled={busy} onClick={() => onDisconnect(row.id)}>Disconnect</Button>}</>
-              : <a href={harnessInstallationUrl(row.id)} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm text-slate-500 hover:underline">Install {row.name}<ArrowUpRightIcon aria-hidden="true" className="size-4" /></a>}
+              ? <ActionTooltip label={tr("refreshConnection")} trigger={<Button variant="ghost" size="icon-sm" aria-label={tr("refreshConnection")} disabled={busy || !canConnect} onClick={() => onConnect(row.id)}><ArrowClockwiseIcon aria-hidden="true" className="size-4" /></Button>} />
+              : <Button disabled={busy || !canConnect} onClick={() => onConnect(row.id)}>{needsAttention ? tr("repairConnection") : tr("connect")}</Button>}{!needsAttention && (row.managed || row.inspection._tag === "Connected") && <Button variant="outline" disabled={busy} onClick={() => onDisconnect(row.id)}>{tr("disconnect")}</Button>}</>
+              : <a href={harnessInstallationUrl(row.id)} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-sm text-slate-500 hover:underline">{tr("install")} {row.name}<ArrowUpRightIcon aria-hidden="true" className="size-4" /></a>}
           </div>
         </div>
-              {installed && row.inspection._tag === "Unavailable" && <ErrorNotice title="Couldn’t verify this connection" description="The agent’s configuration could not be read or validated. Check it before reconnecting." className="mt-2" />}
-        {installed && row.inspection._tag === "Connected" && <div className="mt-4 border-t border-slate-200 pt-4 text-sm text-slate-500 dark:border-slate-750"><HarnessCommand harness={row.id} name={row.name} models={models} defaultModel={defaultModel} platform={platform} /><div className="relative mt-3 text-xs"><details className="group"><summary className="w-fit cursor-pointer list-none hover:text-slate-700 dark:hover:text-slate-300 [&::-webkit-details-marker]:hidden"><span aria-hidden="true" className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>Configuration files</summary><ul className="mt-2 space-y-1">{row.configurationFiles.map(file => <li key={file} className="break-all font-mono text-xs">{file}</li>)}</ul></details>{models.length > 0 && <span className="mt-2 block text-slate-500 md:absolute md:right-0 md:top-0 md:mt-0 md:max-w-[calc(100%-9rem)] md:truncate md:text-right">Run this in {platform === "win32" ? "PowerShell" : "your terminal"} from your project folder.</span>}</div></div>}
+              {installed && row.inspection._tag === "Unavailable" && <ErrorNotice title={tr("couldNotVerifyConnection")} description={tr("agentConfigInvalid")} className="mt-2" />}
+        {installed && row.inspection._tag === "Connected" && <div className="mt-4 border-t border-slate-200 pt-4 text-sm text-slate-500 dark:border-slate-750"><HarnessCommand harness={row.id} name={row.name} models={models} defaultModel={defaultModel} platform={platform} /><div className="relative mt-3 text-xs"><details className="group"><summary className="w-fit cursor-pointer list-none hover:text-slate-700 dark:hover:text-slate-300 [&::-webkit-details-marker]:hidden"><span aria-hidden="true" className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>{tr("configurationFiles")}</summary><ul className="mt-2 space-y-1">{row.configurationFiles.map(file => <li key={file} className="break-all font-mono text-xs">{file}</li>)}</ul></details>{models.length > 0 && <span className="mt-2 block text-slate-500 md:absolute md:right-0 md:top-0 md:mt-0 md:max-w-[calc(100%-9rem)] md:truncate md:text-right">{tr("runInProjectFolder").replace("{shell}", platform === "win32" ? "PowerShell" : tr("terminal"))}</span>}</div></div>}
 
       </article>})}</div>
     </section>
@@ -67,12 +70,12 @@ export interface CommandModel { readonly id: ProviderModelId; readonly label: st
 export function HarnessCommand({ harness, name, models, defaultModel, platform }: { harness: HarnessId; name: string; models: readonly CommandModel[]; defaultModel: ProviderModelId | undefined; platform: string }) {
   const [selection, setSelection] = useState<string | null>(null)
   const selected = models.find(model => model.id === selection) ?? models.find(model => model.id === defaultModel) ?? models[0]
-  if (!selected) return <p>Download a compatible model to get a command for this agent.</p>
+  if (!selected) return <p>{tr("downloadCompatibleModel")}</p>
   const command = harnessCommand(harness, selected.id, platform)
   return <div className="space-y-2">
-    <div className="flex min-w-0 flex-col items-stretch gap-2 md:flex-row md:items-center md:gap-3"><div className="flex min-w-0 max-w-full shrink-0 items-center gap-2 md:max-w-[45%]"><Select items={models.map(model => ({ value: model.id, label: model.label }))} value={selected.id} onValueChange={setSelection}><SelectTrigger variant="inline" aria-label={`${name} model`} className="min-w-0 max-w-full py-1 text-slate-800 dark:text-slate-200"><SelectValue className="min-w-0 truncate" /></SelectTrigger><SelectContent className="w-max min-w-64 max-w-[calc(100vw-2rem)]">{models.map(model => <SelectItem key={model.id} value={model.id}>{model.label}</SelectItem>)}</SelectContent></Select></div>
-    <CopyCommand key={command} command={command} label={`Copy ${name} command`} />
+    <div className="flex min-w-0 flex-col items-stretch gap-2 md:flex-row md:items-center md:gap-3"><div className="flex min-w-0 max-w-full shrink-0 items-center gap-2 md:max-w-[45%]"><Select items={models.map(model => ({ value: model.id, label: model.label }))} value={selected.id} onValueChange={setSelection}><SelectTrigger variant="inline" aria-label={tr("harnessModel").replace("{name}", name)} className="min-w-0 max-w-full py-1 text-slate-800 dark:text-slate-200"><SelectValue className="min-w-0 truncate" /></SelectTrigger><SelectContent className="w-max min-w-64 max-w-[calc(100vw-2rem)]">{models.map(model => <SelectItem key={model.id} value={model.id}>{model.label}</SelectItem>)}</SelectContent></Select></div>
+    <CopyCommand key={command} command={command} label={tr("copyHarnessCommand").replace("{name}", name)} />
     </div>
-    {harness === "openclaw" && <><p className="text-xs">With your gateway running, open the TUI, then enter this inside it to select the model for the current session:</p><CopyCommand key={selected.id} command={`/model magnitude/${selected.id}`} label="Copy OpenClaw model command" /></>}
+    {harness === "openclaw" && <><p className="text-xs">{tr("openClawTuiInstruction")}</p><CopyCommand key={selected.id} command={`/model magnitude/${selected.id}`} label={tr("copyOpenClawCommand")} /></>}
   </div>
 }

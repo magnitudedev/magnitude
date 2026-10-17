@@ -8,12 +8,16 @@ import { MemoryIcon } from "@phosphor-icons/react"
 import type { ModelInstanceAllocation } from "@magnitudedev/sdk"
 import { activeLocalModel, formatMemorySize, useLocalModels } from "@magnitudedev/client-common"
 
+import { readLanguage, translate } from "../i18n"
+
+const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
+
 export function MemoryFigures({ allocation }: { readonly allocation: Option.Option<ModelInstanceAllocation> | null }) {
   const domains = allocation === null ? [] : Option.match(allocation, { onNone: () => [], onSome: value => value.memoryDomains })
   const segments = [
-    { label: "Model weights", bytes: domains.reduce((sum, domain) => sum + domain.modelBytes + domain.auxiliaryBytes, 0), color: "bg-blue-600 dark:bg-blue-400" },
-    { label: "KV cache", bytes: domains.reduce((sum, domain) => sum + domain.contextBytes, 0), color: "bg-blue-300 dark:bg-blue-700" },
-    { label: "Overhead", bytes: domains.reduce((sum, domain) => sum + domain.computeBytes, 0), color: "bg-slate-600 dark:bg-slate-300" },
+    { label: tr("modelWeights"), bytes: domains.reduce((sum, domain) => sum + domain.modelBytes + domain.auxiliaryBytes, 0), color: "bg-blue-600 dark:bg-blue-400" },
+    { label: tr("kvCache"), bytes: domains.reduce((sum, domain) => sum + domain.contextBytes, 0), color: "bg-blue-300 dark:bg-blue-700" },
+    { label: tr("overhead"), bytes: domains.reduce((sum, domain) => sum + domain.computeBytes, 0), color: "bg-slate-600 dark:bg-slate-300" },
   ]
   const total = segments.reduce((sum, segment) => sum + segment.bytes, 0)
   return <>
@@ -33,11 +37,11 @@ export function MemoryFigures({ allocation }: { readonly allocation: Option.Opti
 
 function ModelMemory() {
   const models = useLocalModels()
-  if (Result.isInitial(models)) return <LoadingRegion label="Loading memory"><MemoryFigures allocation={null} /></LoadingRegion>
-  if (Result.isFailure(models)) return <ErrorNotice title="Memory usage is unavailable" description="Magnitude can’t read the model’s memory usage right now." className="mt-4" />
-  if (!Result.isSuccess(models)) return <p className="mt-4 text-sm text-slate-500">Reading memory…</p>
+  if (Result.isInitial(models)) return <LoadingRegion label={tr("loadingMemory")}><MemoryFigures allocation={null} /></LoadingRegion>
+  if (Result.isFailure(models)) return <ErrorNotice title={tr("memoryUsageUnavailable")} description={tr("cannotReadMemoryUsage")} className="mt-4" />
+  if (!Result.isSuccess(models)) return <p className="mt-4 text-sm text-slate-500">{tr("loadingMemory")}</p>
   const active = Option.getOrNull(activeLocalModel(models.value))
-  if (active && active.residency._tag !== "Ready" && !(active.residency._tag === "Stopping" && active.residency.allocation._tag === "Resident")) return <p className="mt-4 text-sm text-slate-500">Loading model…</p>
+  if (active && active.residency._tag !== "Ready" && !(active.residency._tag === "Stopping" && active.residency.allocation._tag === "Resident")) return <p className="mt-4 text-sm text-slate-500">{tr("modelLoading")}</p>
   const allocation = active?.residency._tag === "Ready" ? Option.some(active.residency.allocation)
     : active?.residency._tag === "Stopping" && active.residency.allocation._tag === "Resident" ? Option.some(active.residency.allocation.allocation)
     : Option.none()
@@ -45,8 +49,8 @@ function ModelMemory() {
 }
 
 export function MemoryBreakdown() {
-  return <section aria-label="Memory usage" className={pageLayout.card}>
-    <div className="flex items-center gap-3"><MemoryIcon className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Memory</h2></div>
+  return <section aria-label={tr("memoryUsage")} className={pageLayout.card}>
+    <div className="flex items-center gap-3"><MemoryIcon className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">{tr("memory")}</h2></div>
     <ModelMemory />
   </section>
 }

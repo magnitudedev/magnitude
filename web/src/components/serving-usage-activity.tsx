@@ -4,6 +4,11 @@ import type { ServingUsageSnapshot } from "@magnitudedev/sdk"
 import { ActionTooltip, TooltipProvider } from "./ui/tooltip"
 import { Skeleton } from "./ui/skeleton"
 
+import { readLanguage, translate } from "../i18n"
+
+const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
+const locale = () => ({ en: "en-US", es: "es-ES", "zh-CN": "zh-CN", hi: "hi-IN", ur: "ur-PK", bn: "bn-BD", fr: "fr-FR", de: "de-DE", ja: "ja-JP", pt: "pt-PT", it: "it-IT", uk: "uk-UA" })[readLanguage()]
+
 type Activity = Extract<ServingUsageSnapshot, { _tag: "Available" }>["dailyActivity"]
 const colors = [
   "bg-slate-100 dark:bg-slate-800",
@@ -12,7 +17,7 @@ const colors = [
   "bg-blue-500 dark:bg-blue-500",
   "bg-blue-700 dark:bg-blue-300",
 ] as const
-const dateLabel = (date: string) => new Date(`${date}T12:00:00Z`).toLocaleDateString(undefined, { timeZone: "UTC", month: "long", day: "numeric", year: "numeric" })
+const dateLabel = (date: string) => new Date(`${date}T12:00:00Z`).toLocaleDateString(locale(), { timeZone: "UTC", month: "long", day: "numeric", year: "numeric" })
 
 export function activitySummary(days: Activity) {
   const totalTokens = days.reduce((total, day) => total + day.totalTokens, 0)
@@ -44,29 +49,29 @@ export function UsageActivity({ days }: { days: Activity | null }) {
     setFocusedDate(days[next]!.date)
     table.current?.querySelector<HTMLButtonElement>(`[data-day-index="${next}"]`)?.focus()
   }
-  return <section aria-label="Token activity" aria-busy={!days}>
+  return <section aria-label={tr("tokenActivity")} aria-busy={!days}>
     <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-      <h2 className="text-sm font-medium">Token activity</h2>
+      <h2 className="text-sm font-medium">{tr("tokenActivity")}</h2>
       <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
-        {summary ? <span aria-label={`Current streak: ${summary.currentStreak} ${summary.currentStreak === 1 ? "day" : "days"}`} className="flex items-center gap-1.5 text-slate-500"><FireIcon aria-hidden="true" weight="fill" className="size-4 text-orange-500" /><span className="font-medium tabular-nums text-slate-900 dark:text-slate-100">{summary.currentStreak}</span> {summary.currentStreak === 1 ? "day" : "days"} streak</span> : <Skeleton className="h-5 w-28" />}
-        {summary ? <p className="text-slate-500"><strong className="font-medium tabular-nums text-slate-900 dark:text-slate-100">{summary.totalTokens.toLocaleString()}</strong> tokens · Past year</p> : <Skeleton className="h-5 w-40" />}
+        {summary ? <span aria-label={tr("currentStreak").replace("{count}", String(summary.currentStreak)).replace("{days}", summary.currentStreak === 1 ? tr("day") : tr("days"))} className="flex items-center gap-1.5 text-slate-500"><FireIcon aria-hidden="true" weight="fill" className="size-4 text-orange-500" /><span className="font-medium tabular-nums text-slate-900 dark:text-slate-100">{summary.currentStreak}</span> {tr("streakLabel").replace("{count}", String(summary.currentStreak)).replace("{days}", summary.currentStreak === 1 ? tr("day") : tr("days"))}</span> : <Skeleton className="h-5 w-28" />}
+        {summary ? <p className="text-slate-500"><strong className="font-medium tabular-nums text-slate-900 dark:text-slate-100">{summary.totalTokens.toLocaleString()}</strong> {tr("tokensPastYear")}</p> : <Skeleton className="h-5 w-40" />}
       </div>
     </div>
     <div className="overflow-x-auto pb-2 [direction:rtl] md:[direction:ltr]">
       <TooltipProvider>
-        <table ref={table} aria-label="Daily token activity, Sunday through Saturday; use arrow keys to navigate" className="w-full min-w-[640px] table-fixed border-separate border-spacing-[3px] [direction:ltr]">
+        <table ref={table} aria-label={tr("dailyTokenActivity")} className="w-full min-w-[640px] table-fixed border-separate border-spacing-[3px] [direction:ltr]">
           <thead><tr><td className="w-8" />{weeks.map((week, column) => {
             const month = week.find(day => day.date.endsWith("-01"))
-            return <th key={column} scope="col" className="h-6 overflow-visible whitespace-nowrap text-left text-xs font-normal text-slate-500">{month && new Date(`${month.date}T12:00:00Z`).toLocaleDateString(undefined, { timeZone: "UTC", month: "short" })}</th>
+            return <th key={column} scope="col" className="h-6 overflow-visible whitespace-nowrap text-left text-xs font-normal text-slate-500">{month && new Date(`${month.date}T12:00:00Z`).toLocaleDateString(locale(), { timeZone: "UTC", month: "short" })}</th>
           })}</tr></thead>
-          <tbody>{["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((weekday, row) => <tr key={weekday}>
+          <tbody>{Array.from({ length: 7 }, (_, row) => new Date(Date.UTC(2023, 0, row + 1)).toLocaleDateString(locale(), { timeZone: "UTC", weekday: "short" })).map((weekday, row) => <tr key={weekday}>
             <th scope="row" className="text-left text-[10px] font-normal text-slate-500"><span className={row % 2 === 0 ? "sr-only" : ""}>{weekday}</span></th>
             {weeks.map((week, column) => {
               const day = week[row]
               const cell = "block aspect-square w-full rounded-[3px]"
               if (!days) return <td key={column}><Skeleton className={cell} /></td>
               if (!day) return <td key={column}><span aria-hidden="true" className={`${cell} invisible`} /></td>
-              const label = `${day.totalTokens.toLocaleString()} tokens on ${dateLabel(day.date)}`
+              const label = `${day.totalTokens.toLocaleString()} ${tr("tokensLabel")} · ${dateLabel(day.date)}`
               return <td key={column}><ActionTooltip label={label} trigger={<button type="button" aria-label={label} data-day-index={column * 7 + row} data-activity-level={activityLevel(day.totalTokens, maximum)} tabIndex={day.date === focusDate ? 0 : -1}
                 onFocus={() => setFocusedDate(day.date)} onKeyDown={event => navigate(event, column * 7 + row)}
                 className={`${cell} ${colors[activityLevel(day.totalTokens, maximum)]} outline-offset-2 focus-visible:outline-2 focus-visible:outline-blue-500`} />} /></td>
@@ -76,7 +81,7 @@ export function UsageActivity({ days }: { days: Activity | null }) {
       </TooltipProvider>
     </div>
     <div className="mt-2 flex justify-end text-xs text-slate-500">
-      <div className="flex shrink-0 items-center gap-1.5" aria-label="Activity scale: no tokens, then four increasing levels relative to the busiest day"><span className="mr-1">Less</span>{colors.map(color => <span key={color} aria-hidden="true" className={`size-3 rounded-[3px] ${color}`} />)}<span className="ml-1">More</span></div>
+      <div className="flex shrink-0 items-center gap-1.5" aria-label={tr("activityScale")}><span className="mr-1">{tr("less")}</span>{colors.map(color => <span key={color} aria-hidden="true" className={`size-3 rounded-[3px] ${color}`} />)}<span className="ml-1">{tr("more")}</span></div>
     </div>
   </section>
 }
