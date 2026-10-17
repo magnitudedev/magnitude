@@ -1,0 +1,23 @@
+---
+title: "Local Chat"
+description: "Use Magnitude's built-in local-first chat interface."
+---
+
+Magnitude serves its management and inference interface at `http://127.0.0.1:10100`. The Chat page is available at `/chat`; a dedicated loopback listener opens directly into Chat at `http://127.0.0.1:10101`.
+
+The Chat page lists exact model IDs from `/inference/v1/models` and sends OpenAI-compatible streaming requests to `/inference/v1/chat/completions`. Conversation history is stored in the current browser's local storage. It is not synchronized to other devices and is not sent to a cloud service by the Chat UI.
+
+If port 10101 is already in use, Magnitude logs a warning and keeps the canonical service on port 10100 available. Stop the process using 10101 and restart Magnitude to enable the dedicated Chat entry point. The second listener binds only to `127.0.0.1`; it does not expose the Chat page to the LAN.
+
+## Data and privacy
+
+- Prompts and responses are stored in browser local storage for this origin.
+- Deleting a conversation removes it from this browser's stored history.
+- Clearing this site's browser storage removes all locally saved conversations.
+- No remote model or cloud fallback is attempted if local inference fails.
+
+## Troubleshooting
+
+- **No models available:** install/load a model from My Models, then retry.
+- **Request failed:** check that Magnitude is healthy at `http://127.0.0.1:10100/health`.
+- **Chat URL does not open:** check whether another process owns port 10101. Magnitude does not terminate or replace that process.
