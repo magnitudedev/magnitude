@@ -72,6 +72,7 @@ export function ChatPage() {
   const [conversations, setConversations] = useState<Conversation[]>(readConversations)
   const [activeId, setActiveId] = useState<string | null>(() => readConversations()[0]?.id ?? null)
   const [models, setModels] = useState<string[]>([])
+  const [preferredModel, setPreferredModel] = useState("")
   const [modelsLoading, setModelsLoading] = useState(true)
   const [modelsError, setModelsError] = useState<string | null>(null)
   const [draft, setDraft] = useState("")
@@ -81,7 +82,7 @@ export function ChatPage() {
   const abortRef = useRef<AbortController | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
   const active = conversations.find(item => item.id === activeId) ?? null
-  const selectedModel = active?.model || models[0] || ""
+  const selectedModel = (active?.model && models.includes(active.model) ? active.model : "") || preferredModel || models[0] || ""
 
   useEffect(() => {
     let cancelled = false
@@ -240,7 +241,7 @@ export function ChatPage() {
         <label className="flex items-center gap-2 text-xs text-slate-500">Model
           <select aria-label="Model" value={selectedModel} disabled={modelsLoading || models.length === 0 || working} onChange={event => {
             const model = event.target.value
-            if (!active) return
+            if (!active) { setPreferredModel(model); return }
             updateConversation({ ...active, model, updatedAt: Date.now() })
           }} className="max-w-[min(52vw,22rem)] rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100">
             {models.length === 0 && <option value="">No models available</option>}
