@@ -14,6 +14,16 @@ type Conversation = {
 
 const STORAGE_KEY = "magnitude.web.chat.v1"
 const apiBase = "/inference/v1"
+const OPEN_WEBUI_URL_KEY = "magnitude.web.openWebUIUrl.v1"
+
+function readStoredOpenWebUIUrl(): string {
+  try {
+    const stored = localStorage.getItem(OPEN_WEBUI_URL_KEY)
+    return stored ? normalizeLocalEmbedUrl(stored) ?? "" : ""
+  } catch {
+    return ""
+  }
+}
 
 function readConversations(): Conversation[] {
   try {
@@ -81,12 +91,8 @@ export function ChatPage() {
   const [error, setError] = useState<string | null>(null)
   const [storageWarning, setStorageWarning] = useState(false)
   const [showOpenWebUI, setShowOpenWebUI] = useState(false)
-  const [openWebUIUrl, setOpenWebUIUrl] = useState(() => {
-    try { return localStorage.getItem("magnitude.web.openWebUIUrl.v1") ?? "" } catch { return "" }
-  })
-  const [openWebUIInput, setOpenWebUIInput] = useState(() => {
-    try { return localStorage.getItem("magnitude.web.openWebUIUrl.v1") ?? "http://127.0.0.1:3000/" } catch { return "http://127.0.0.1:3000/" }
-  })
+  const [openWebUIUrl, setOpenWebUIUrl] = useState(readStoredOpenWebUIUrl)
+  const [openWebUIInput, setOpenWebUIInput] = useState(() => readStoredOpenWebUIUrl() || "http://127.0.0.1:3000/")
   const [openWebUIError, setOpenWebUIError] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
@@ -235,7 +241,7 @@ export function ChatPage() {
       return
     }
     try {
-      localStorage.setItem("magnitude.web.openWebUIUrl.v1", normalized)
+      localStorage.setItem(OPEN_WEBUI_URL_KEY, normalized)
     } catch {
       // The current page can still use this URL for this session.
     }
