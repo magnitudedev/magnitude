@@ -270,7 +270,7 @@ export function ChatPage() {
         <Button type="submit">Connect</Button>
       </form>
       <p id="open-webui-help" className="border-b border-slate-100 px-4 py-2 text-xs leading-5 text-slate-500 dark:border-slate-800 sm:px-6">Only loopback URLs are accepted. The default port 3000 is an example; use your actual Open WebUI address. A blank frame may mean the server blocks embedding with CSP or X-Frame-Options.</p>
-      {openWebUIError && <p role="alert" className="m-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">{openWebUIError}</p>}
+      {openWebUIError && <p role="alert" className="m-3 rounded-lg border border-red-200 bg-rose-200/30 p-3 text-sm text-red-800 dark:border-red-800 dark:bg-slate-900 dark:text-red-200">{openWebUIError}</p>}
       {openWebUIUrl
         ? <iframe key={openWebUIUrl} src={openWebUIUrl} title="Open WebUI local chat" loading="eager" referrerPolicy="no-referrer" allow="clipboard-read; clipboard-write" className="min-h-0 w-full flex-1 border-0 bg-white dark:bg-slate-925" />
         : <div className="flex flex-1 items-center justify-center p-8 text-center"><div className="max-w-lg"><h3 className="text-lg font-semibold">Connect your local Open WebUI</h3><p className="mt-2 text-sm leading-6 text-slate-500">Enter its loopback URL above. Magnitude will not install or start Open WebUI for you, and this iframe does not bypass the server's embedding policy.</p></div></div>}
@@ -313,13 +313,13 @@ export function ChatPage() {
           <p className="mt-2 text-sm leading-6 text-slate-500">Choose a model and ask a question. Text appears as it is generated. Your conversation history stays in this browser.</p>
           {!modelsLoading && models.length === 0 && <p className="mt-3 text-sm text-slate-500">Load a model in My Models before starting a conversation.</p>}
         </div>}
-        {active?.messages.map((message, index) => <article key={`${active.id}-${index}`} className={`mx-auto w-full max-w-3xl ${message.role === "user" ? "rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 dark:border-blue-950 dark:bg-blue-950/40" : "px-1 py-2"}`}>
+        {active?.messages.map((message, index) => <article key={`${active.id}-${index}`} className={`mx-auto w-full max-w-3xl ${message.role === "user" ? "rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 dark:border-blue-900 dark:bg-blue-900/40" : "px-1 py-2"}`}>
           <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">{message.role === "user" ? "You" : "Magnitude"}</p>
           <p className="whitespace-pre-wrap break-words text-sm leading-7 text-slate-800 dark:text-slate-100">{message.content || (working && index === active.messages.length - 1 ? "Generating…" : "")}</p>
         </article>)}
         <div ref={endRef} />
       </div>
-      {error && <div role="alert" className="mx-4 mb-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">{error}</div>}
+      {error && <div role="alert" className="mx-4 mb-2 rounded-lg border border-red-200 bg-rose-200/30 p-3 text-sm text-red-800 dark:border-red-800 dark:bg-slate-900 dark:text-red-200">{error}</div>}
       <form onSubmit={send} className="border-t border-slate-200 p-3 dark:border-slate-750 sm:p-5">
         <div className="mx-auto max-w-3xl rounded-xl border border-slate-300 bg-white p-2 focus-within:border-blue-400 dark:border-slate-700 dark:bg-slate-900">
           <textarea value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => {
