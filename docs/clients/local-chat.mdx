@@ -5,19 +5,34 @@ description: "Use Magnitude's built-in local-first chat interface."
 
 Magnitude serves its management and inference interface at `http://127.0.0.1:10100`. The Chat page is available at `/chat`; a dedicated loopback listener opens directly into Chat at `http://127.0.0.1:10101`.
 
-The Chat page lists exact model IDs from `/inference/v1/models` and sends OpenAI-compatible streaming requests to `/inference/v1/chat/completions`. Conversation history is stored in the current browser's local storage. It is not synchronized to other devices and is not sent to a cloud service by the Chat UI.
+The native Chat page lists exact model IDs from `/inference/v1/models` and sends OpenAI-compatible streaming requests to `/inference/v1/chat/completions`. Conversation history is stored in the current browser's local storage. It is not synchronized to other devices and is not sent to a cloud service by the Chat UI.
 
-If port 10101 is already in use, Magnitude logs a warning and keeps the canonical service on port 10100 available. Stop the process using 10101 and restart Magnitude to enable the dedicated Chat entry point. The second listener binds only to `127.0.0.1`; it does not expose the Chat page to the LAN.
+## Optional Open WebUI embedding
+
+Chat also has an **Open WebUI** view for an existing local Open WebUI instance. Enter its loopback URL (for example, `http://127.0.0.1:3000/`; the port depends on your installation). Only `localhost`, `127.0.0.1`, and `[::1]` HTTP(S) URLs are accepted; remote hosts and embedded credentials are rejected. The URL is saved in this browser's local storage.
+
+This feature does not install or start Open WebUI, proxy its traffic, or bypass its frame policy. If the iframe is blank or blocked, inspect the Open WebUI server's `Content-Security-Policy` (especially `frame-ancestors`) and `X-Frame-Options`, browser console, authentication, and cookie behavior. Do not disable security headers globally as a workaround. Configure Open WebUI separately to use Magnitude's OpenAI-compatible inference endpoint if that is the desired model backend. If Open WebUI runs in Docker, remember that `127.0.0.1` inside the container refers to the container itself.
+
+The native Chat remains available through **Back to native Chat**. The embedded view is optional and should be treated as experimental until a real local installation has been tested end-to-end in supported browsers.
 
 ## Data and privacy
 
-- Prompts and responses are stored in browser local storage for this origin.
-- Deleting a conversation removes it from this browser's stored history.
-- Clearing this site's browser storage removes all locally saved conversations.
-- No remote model or cloud fallback is attempted if local inference fails.
+- Native Chat prompts and responses are stored in browser local storage for this origin.
+- The Open WebUI URL is stored in browser local storage; Open WebUI controls its own chat history, authentication, and data handling.
+- Deleting a native conversation removes it from this browser's stored history.
+- Clearing this site's browser storage removes locally saved native conversations and the configured Open WebUI URL.
+- No remote model or cloud fallback is attempted by the native Chat UI if local inference fails.
+
+If the Open WebUI URL changes or is no longer available, reopen the Open WebUI view and update the URL. A failed embed must not be interpreted as a successful integration.
 
 ## Troubleshooting
 
 - **No models available:** install/load a model from My Models, then retry.
-- **Request failed:** check that Magnitude is healthy at `http://127.0.0.1:10100/health`.
-- **Chat URL does not open:** check whether another process owns port 10101. Magnitude does not terminate or replace that process.
+- **Native request failed:** check that Magnitude is healthy at `http://127.0.0.1:10100/health`.
+- **Chat URL does not open:** check whether another process owns port 10101. Magnitude must not terminate or replace that process.
+- **Open WebUI is blank/blocked:** confirm the URL is loopback, inspect CSP/X-Frame-Options and browser console, and verify Open WebUI works directly in a tab.
+- **Open WebUI cannot reach Magnitude:** configure the API URL for the actual host/container network; do not assume container-local `127.0.0.1` points to the host.
+
+## Validation status
+
+The optional embedding code and URL-validation unit tests are authored in the working branch. They still require CI/typecheck/build execution and end-to-end testing with a real Open WebUI instance. Do not treat the iframe path as validated until those checks pass.
