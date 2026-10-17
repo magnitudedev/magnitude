@@ -360,6 +360,7 @@ const catalogModel = (
     acquisitionState,
     servingState: catalogModelServingState(ready, assessment, rankingScores, unavailableFailure),
     missingComponents: source.localState._tag === "Installed" ? source.localState.missingComponents : [],
+    drafterWithheld: source.localState._tag === "Installed" && source.localState.drafterWithheld,
   })
 }
 
@@ -576,6 +577,8 @@ export const unsupportedLocalModel = (model: NativeUnsupportedLocalModel): Optio
 export interface LocalModelsApi {
   readonly state: Effect.Effect<LocalModelsState>
   readonly changes: Stream.Stream<void>
+  /** The current state, then every change, with no change lost between the two. */
+  readonly states: Stream.Stream<LocalModelsState>
   readonly refresh: Effect.Effect<void>
 }
 export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalModelsApi>() {}
@@ -621,6 +624,7 @@ export const LocalModelsLive: Layer.Layer<
   return LocalModels.of({
     state: projection.get,
     changes: projection.changes.pipe(Stream.map(() => undefined)),
+    states: projection.values,
     refresh: sources.refreshLocalModels.pipe(Effect.orDie),
   })
 }))

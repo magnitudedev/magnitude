@@ -1,85 +1,91 @@
-import { Effect, Fiber, Stream, SubscriptionRef } from "effect"
+import { Effect, Fiber, SubscriptionRef } from "effect"
 import { describe, expect, it } from "vitest"
 import { HarnessIdSchema, type LocalModelsState } from "@magnitudedev/acn-protocol"
 import { isolatedHarnessHome, moveHarnessSelectionsOnAliasChanges } from "./harness-connections"
 
 const alias = "hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf"
-const state = (aliases: readonly string[], installed: readonly string[] = []) => ({
+const installation = { _tag: "Resolved", installedBytes: 1, primaryPath: "/m.gguf", ownership: "External" }
+/** `offered` models are installed and assessed to fit; `assessing` ones are installed and not assessed yet. */
+const state = (aliases: readonly string[], offered: readonly string[] = [], assessing: readonly string[] = []) => ({
   models: [
-    { _tag: "Catalog", modelId: "qwen3.5-4b:gguf:q4", catalogData: { aliases }, acquisitionState: { _tag: "NotInstalled" } },
-    ...installed.map((modelId) => ({
+    { _tag: "Catalog", modelId: "qwen3.5-4b:gguf:q4", catalogData: { aliases, support: { _tag: "Supported" } }, acquisitionState: { _tag: "NotInstalled" }, servingState: { _tag: "Assessing" } },
+    ...offered.map((modelId) => ({
       _tag: "Custom",
       modelId,
-      acquisitionState: { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/m.gguf", ownership: "External" }, residencyState: { _tag: "Unloaded" } },
+      acquisitionState: { _tag: "External", installation, residencyState: { _tag: "Unloaded" } },
+      servingState: { _tag: "Assessed", assessment: { _tag: "Fits" } },
+    })),
+    ...assessing.map((modelId) => ({
+      _tag: "Custom",
+      modelId,
+      acquisitionState: { _tag: "External", installation, residencyState: { _tag: "Unloaded" } },
+      servingState: { _tag: "Assessing" },
     })),
   ],
   hidden: [],
 }) as unknown as LocalModelsState
 
+/** Runs the move over a state that `steps` change in turn, and counts the syncs after the start and after each step. */
+const syncsAfter = (initial: LocalModelsState, steps: readonly LocalModelsState[]) => Effect.runPromise(Effect.gen(function* () {
+  const models = yield* SubscriptionRef.make(initial)
+  let calls = 0
+  const fiber = yield* moveHarnessSelectionsOnAliasChanges(
+    models.changes,
+    Effect.sync(() => { calls += 1; return [HarnessIdSchema.make("opencode")] }),
+  ).pipe(Effect.fork)
+  yield* Effect.sleep("10 millis")
+  const counts = [calls]
+  for (const step of steps) {
+    yield* SubscriptionRef.set(models, step)
+    yield* Effect.sleep("10 millis")
+    counts.push(calls)
+  }
+  yield* Fiber.interrupt(fiber)
+  return counts
+}))
+
 describe("harness selections after an upgrade", () => {
-  it("reconciles connected harnesses at start and whenever the catalog's aliases change, and not otherwise", async () => {
-    const runs = await Effect.runPromise(Effect.gen(function* () {
-      const models = yield* SubscriptionRef.make(state([alias]))
-      const calls: string[] = []
-      const fiber = yield* moveHarnessSelectionsOnAliasChanges(
-        { state: SubscriptionRef.get(models), changes: models.changes.pipe(Stream.drop(1), Stream.as(undefined)) },
-        Effect.sync(() => { calls.push("sync"); return [HarnessIdSchema.make("opencode")] }),
-      ).pipe(Effect.fork)
-      yield* Effect.sleep("10 millis")
-      const atStart = calls.length
-      yield* SubscriptionRef.set(models, state([alias]))
-      yield* Effect.sleep("10 millis")
-      const unchanged = calls.length
-      yield* SubscriptionRef.set(models, state([alias, "hf:other/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf"]))
-      yield* Effect.sleep("10 millis")
-      const afterNewAlias = calls.length
-      yield* Fiber.interrupt(fiber)
-      return { atStart, unchanged, afterNewAlias }
-    }))
-    expect(runs).toEqual({ atStart: 1, unchanged: 1, afterNewAlias: 2 })
+  it("reconciles at start when aliases and offered models are known, and again only when the aliases change", async () => {
+    expect(await syncsAfter(state([alias], ["local:abc"]), [
+      state([alias], ["local:abc"]),
+      state([alias, "hf:other/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf"], ["local:abc"]),
+    ])).toEqual([1, 1, 2])
   })
 
-  it("does nothing while the catalog lists no aliases, then reconciles once one appears", async () => {
-    const runs = await Effect.runPromise(Effect.gen(function* () {
-      const models = yield* SubscriptionRef.make(state([]))
-      const calls: string[] = []
-      const fiber = yield* moveHarnessSelectionsOnAliasChanges(
-        { state: SubscriptionRef.get(models), changes: models.changes.pipe(Stream.drop(1), Stream.as(undefined)) },
-        Effect.sync(() => { calls.push("sync"); return [] }),
-      ).pipe(Effect.fork)
-      yield* Effect.sleep("10 millis")
-      const before = calls.length
-      yield* SubscriptionRef.set(models, state([alias]))
-      yield* Effect.sleep("10 millis")
-      const after = calls.length
-      yield* Fiber.interrupt(fiber)
-      return { before, after }
-    }))
-    expect(runs).toEqual({ before: 0, after: 1 })
+  it("waits for the aliases when the models are offered first", async () => {
+    expect(await syncsAfter(state([], ["local:abc"]), [state([alias], ["local:abc"])])).toEqual([0, 1])
   })
-})
 
-describe("harness selections once models are installed", () => {
-  it("reconciles again when the engine first has installed models after the aliases were known, and not when nothing changes", async () => {
-    const runs = await Effect.runPromise(Effect.gen(function* () {
+  it("waits for the new engine to assess an installed model before reconciling, so the service offers it", async () => {
+    expect(await syncsAfter(state([alias], [], ["local:abc"]), [
+      state([alias], [], ["local:abc"]),
+      state([alias], ["local:abc"]),
+      state([alias], ["local:abc"]),
+    ])).toEqual([0, 0, 1, 1])
+  })
+
+  it("waits for models to arrive after the service starts with none", async () => {
+    expect(await syncsAfter(state([alias]), [state([alias], [], ["local:abc"]), state([alias], ["local:abc"])])).toEqual([0, 0, 1])
+  })
+
+  it("reconciles again when another model becomes offered, so a selection whose model wasn't offered yet moves too", async () => {
+    expect(await syncsAfter(state([alias], ["local:abc"]), [state([alias], ["local:abc", "qwen3.5-4b:gguf:q4"])])).toEqual([1, 2])
+  })
+
+  it("misses no change made while it starts", async () => {
+    const calls = await Effect.runPromise(Effect.gen(function* () {
       const models = yield* SubscriptionRef.make(state([alias]))
-      const calls: string[] = []
+      let calls = 0
       const fiber = yield* moveHarnessSelectionsOnAliasChanges(
-        { state: SubscriptionRef.get(models), changes: models.changes.pipe(Stream.drop(1), Stream.as(undefined)) },
-        Effect.sync(() => { calls.push("sync"); return [] }),
+        models.changes,
+        Effect.sync(() => { calls += 1; return [] }),
       ).pipe(Effect.fork)
-      yield* Effect.sleep("10 millis")
-      const beforeModels = calls.length
       yield* SubscriptionRef.set(models, state([alias], ["local:abc"]))
       yield* Effect.sleep("10 millis")
-      const afterModels = calls.length
-      yield* SubscriptionRef.set(models, state([alias], ["local:abc"]))
-      yield* Effect.sleep("10 millis")
-      const unchanged = calls.length
       yield* Fiber.interrupt(fiber)
-      return { beforeModels, afterModels, unchanged }
+      return calls
     }))
-    expect(runs).toEqual({ beforeModels: 1, afterModels: 2, unchanged: 2 })
+    expect(calls).toBe(1)
   })
 })
 

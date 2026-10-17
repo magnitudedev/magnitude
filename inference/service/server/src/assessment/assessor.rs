@@ -536,6 +536,9 @@ fn unsupported_reason(reason: EngineUnsupportedReason) -> UnsupportedReason {
         EngineUnsupportedReason::Tokenizer { model, pre } => {
             KnownUnsupportedReason::Tokenizer { model, pre }
         }
+        EngineUnsupportedReason::MissingMetadata { key } => {
+            KnownUnsupportedReason::MissingMetadata { key }
+        }
         EngineUnsupportedReason::ChatTemplate => KnownUnsupportedReason::ChatTemplate,
         EngineUnsupportedReason::KernelDomain {
             backend,

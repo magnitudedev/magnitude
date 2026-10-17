@@ -3346,6 +3346,7 @@
               "installation",
               "updateState",
               "missingComponents",
+              "drafterWithheld",
               "_tag"
             ],
             "properties": {
@@ -3364,6 +3365,9 @@
                   "$ref": "#/components/schemas/CatalogMissingComponent"
                 }
               },
+              "drafterWithheld": {
+                "type": "boolean"
+              },
               "_tag": {
                 "type": "string",
                 "enum": [
@@ -3372,7 +3376,8 @@
               }
             }
           }
-        ]
+        ],
+        "description": "A catalog model's state here. `drafter_withheld`: it serves without its catalog drafter, which\nit fits only without, so it loads rather than being refused."
       },
       "CatalogModelUpdate": {
         "oneOf": [
@@ -5082,7 +5087,7 @@
       },
       "DrafterCandidatesResponse": {
         "type": "object",
-        "description": "Drafter candidates for one target, in the product's category order.",
+        "description": "Drafter candidates for one target, in the product's category order. `entered` is the listed\nreference the request's different drafter resolves to: a listed candidate that is the same file\n(a catalog drafter by its package, otherwise the same repository, commit and path), else the\ndifferent drafter's own Other row; absent without a different drafter.",
         "required": [
           "candidates"
         ],
@@ -5092,6 +5097,9 @@
             "items": {
               "$ref": "#/components/schemas/DrafterCandidate"
             }
+          },
+          "entered": {
+            "$ref": "#/components/schemas/DrafterReference"
           }
         },
         "additionalProperties": false
@@ -6736,6 +6744,24 @@
           {
             "type": "object",
             "required": [
+              "key",
+              "_tag"
+            ],
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "MissingMetadata"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "model",
               "_tag"
             ],
@@ -6860,9 +6886,23 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "UnsupportedFormat"
+                ]
+              }
+            }
           }
         ],
-        "description": "A reason the engine raises, typed where it raises it."
+        "description": "A reason the engine raises, typed where it raises it. `UnsupportedFormat` is the service's own:\na found model whose files are not GGUF, such as an Ollama model stored for its MLX runner."
       },
       "LocalModelRemoval": {
         "type": "object",

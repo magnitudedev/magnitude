@@ -734,6 +734,28 @@ describe("model status", () => {
     expect(output).toContain(`Change: magnitude models drafter ${model.modelId} <auto | none | drafter>`)
   })
 
+  it("marks a drafter entered by hand, listed as Other with its verdict, as the one in use", () => {
+    const hand = { _tag: "Local", path: "/drafters/hand-dspark.gguf" } as const
+    const verdict = { _tag: "Bound", method: { _tag: "DSpark" }, memoryBytes: 1_073_741_824 } as const
+    const model = makeAddedModel({
+      drafterChoice: { _tag: "Reference", reference: hand },
+      drafter: Option.some({
+        reference: hand, name: "hand-dspark.gguf", label: "Untested", sizeBytes: 5_000_000, verdict,
+        availability: { _tag: "Present" }, updateAvailable: false,
+      }),
+    })
+    const candidates = [
+      ...makeDrafterCandidates(),
+      makeDrafterCandidate({
+        category: "Other", reference: hand, name: "hand-dspark.gguf", label: "Untested", sizeBytes: 5_000_000,
+        lineage: "None", verdict, onThisComputer: true, method: Option.some({ _tag: "DSpark" }),
+      }),
+    ]
+    const output = renderModelDetail({ model, models: [model], drafters: { _tag: "Listed", candidates }, hidden: false })
+    expect(output).toMatch(/^\* hand-dspark\.gguf\s+5 MB, no download\s+Works · DSpark\s+.*\/drafters\/hand-dspark\.gguf$/m)
+    expect(output).toMatch(/^ {2}Magnitude DFlash for Qwen Test\s/m)
+  })
+
   it("offers a recommended drafter and survives unavailable drafter choices", () => {
     const output = renderModelDetail({
       model: makeFoundModel(),

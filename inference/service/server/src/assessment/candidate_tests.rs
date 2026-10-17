@@ -192,6 +192,18 @@ fn tokens() -> Vec<String> {
 }
 
 /// A two-layer `llama` target with `general.file_type` `file_type`.
+/// A local GGUF holding every byte of tensor data its header declares (zeros after `contents`),
+/// as a model on disk does; a shorter file holds no weights and is never a version.
+fn write_complete_bytes(path: &std::path::Path, contents: &[u8], length: u64) {
+    std::fs::write(path, contents).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(length.max(contents.len() as u64))
+        .unwrap();
+}
+
 fn llama(file_type: u32, weights: Encoding) -> Gguf {
     let mut gguf = Gguf::default();
     gguf.set("general.architecture", Meta::Str("llama".into()));
@@ -1121,8 +1133,32 @@ async fn fixture_with(
     other_catalog_model: bool,
     extra_repositories: BTreeMap<String, StubRepository>,
 ) -> Fixture {
+    fixture_from(
+        custom,
+        local_models,
+        other_catalog_model,
+        extra_repositories,
+        false,
+        cpu_environment(),
+    )
+    .await
+}
+
+/// A fixture over every option: with `qwen`, the hub also serves the Qwen3.5 4B repositories and
+/// the catalog also lists Qwen3.5 4B with its DFlash drafter.
+async fn fixture_from(
+    custom: Vec<CustomModel>,
+    local_models: LocalModelsConfiguration,
+    other_catalog_model: bool,
+    extra_repositories: BTreeMap<String, StubRepository>,
+    qwen: bool,
+    environment: Arc<AssessmentEnvironment>,
+) -> Fixture {
     let mut stub = hub();
     stub.repositories.extend(extra_repositories);
+    if qwen {
+        stub.repositories.extend(qwen_repositories());
+    }
     let (endpoint, hub) = stub.serve();
     let directory = tempfile::tempdir().expect("temporary directory");
     let mut config = InventoryConfig::with_roots(
@@ -1154,13 +1190,16 @@ async fn fixture_with(
         };
         catalog.models.insert(0, other);
     }
+    if qwen {
+        catalog.models.push(qwen_catalog_model(&models).await);
+    }
     let lineage = CatalogLineage::new(Arc::clone(&models), catalog.clone());
     let resolver = ModelDomainResolver::new(Arc::clone(&models), catalog.clone());
     let assessor = Arc::new(ModelAssessor::new(
         Arc::clone(&models),
         resolver,
         Arc::new(ReleaseCatalog::without_material(catalog).expect("release catalog")),
-        cpu_environment(),
+        environment,
     ));
     let candidates = ManagedModelCandidates::new(
         assessor,
@@ -1295,9 +1334,9 @@ async fn inspection_groups_versions_and_reports_each_engine_verdict() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_local_file_is_identified_by_its_header_digest_unless_a_listed_model_has_it() {
     let folder = tempfile::tempdir().expect("model folder");
-    let (header, _) = llama(7, Encoding::Q8_0).bytes();
+    let (header, length) = llama(7, Encoding::Q8_0).bytes();
     let path = folder.path().join("model.gguf");
-    std::fs::write(&path, header).unwrap();
+    write_complete_bytes(&path, &header, length);
     let digest =
         magnitude_service_models::candidate_files::local_model_digest(&[path.clone()]).unwrap();
     let request = || CandidateInspectionRequest::Local { path: path.clone() };
@@ -1338,14 +1377,14 @@ async fn a_local_file_is_identified_by_its_header_digest_unless_a_listed_model_h
 #[tokio::test(flavor = "multi_thread")]
 async fn a_copy_of_a_listed_model_elsewhere_is_already_on_this_computer_as_that_model() {
     let folder = tempfile::tempdir().expect("model folders");
-    let (bytes, _) = llama(7, Encoding::Q8_0).bytes();
+    let (bytes, length) = llama(7, Encoding::Q8_0).bytes();
     let found_path = folder
         .path()
         .join("lmstudio/community/Llama-GGUF/llama-Q8_0.gguf");
     let copy = folder.path().join("Downloads/llama-copy.gguf");
     for path in [&found_path, &copy] {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, &bytes).unwrap();
+        write_complete_bytes(path, &bytes, length);
     }
     let found = ModelId::hugging_face(
         &HuggingFaceRepositoryId::new("community/Llama-GGUF".to_owned()).unwrap(),
@@ -1354,7 +1393,7 @@ async fn a_copy_of_a_listed_model_elsewhere_is_already_on_this_computer_as_that_
         )
         .unwrap(),
     );
-    let mut listed = custom_model(found.clone(), bytes.len() as u64);
+    let mut listed = custom_model(found.clone(), length);
     listed.files[0].path = found_path;
     let fixture = fixture(vec![listed]).await;
 
@@ -1384,7 +1423,7 @@ async fn a_copy_of_a_listed_model_elsewhere_is_already_on_this_computer_as_that_
 #[tokio::test(flavor = "multi_thread")]
 async fn a_same_header_twin_with_other_weights_is_not_already_on_this_computer() {
     let folder = tempfile::tempdir().expect("model folders");
-    let (mut bytes, _) = llama(7, Encoding::Q8_0).bytes();
+    let (mut bytes, length) = llama(7, Encoding::Q8_0).bytes();
     bytes.resize(bytes.len() + 8192, 0);
     let mut altered_bytes = bytes.clone();
     *altered_bytes.last_mut().unwrap() ^= 0xff;
@@ -1392,7 +1431,7 @@ async fn a_same_header_twin_with_other_weights_is_not_already_on_this_computer()
     let altered = folder.path().join("B/renamed-altered.gguf");
     for (path, contents) in [(&twin, &bytes), (&altered, &altered_bytes)] {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, contents).unwrap();
+        write_complete_bytes(path, contents, length);
     }
     let digests = |path: &PathBuf| {
         (
@@ -1549,10 +1588,10 @@ async fn a_file_with_an_unknown_tensor_type_is_an_unreadable_version_not_a_faile
 #[tokio::test(flavor = "multi_thread")]
 async fn a_symlinked_local_file_is_inspected_through_its_link_under_its_own_name() {
     let folder = tempfile::tempdir().expect("model folder");
-    let (header, _) = llama(7, Encoding::Q8_0).bytes();
+    let (header, length) = llama(7, Encoding::Q8_0).bytes();
     let blob = folder.path().join("blobs/0123abcd");
     std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
-    std::fs::write(&blob, header).unwrap();
+    write_complete_bytes(&blob, &header, length);
     let snapshot = folder.path().join("snapshots/commit");
     std::fs::create_dir_all(&snapshot).unwrap();
     let link = snapshot.join("model-Q8_0.gguf");
@@ -1967,8 +2006,10 @@ async fn without_a_repository_drafter_the_catalog_drafter_is_preselected() {
 async fn drafters_in_a_local_model_folder_precede_the_fingerprint_matched_catalog_drafter() {
     let fixture = fixture(Vec::new()).await;
     let folder = tempfile::tempdir().expect("model folder");
-    let write =
-        |name: &str, gguf: &Gguf| std::fs::write(folder.path().join(name), gguf.bytes().0).unwrap();
+    let write = |name: &str, gguf: &Gguf| {
+        let (header, length) = gguf.bytes();
+        write_complete_bytes(&folder.path().join(name), &header, length);
+    };
     write("model.gguf", &llama(7, Encoding::Q8_0));
     write("dflash.gguf", &dflash(HIDDEN));
     write("dflash-narrow.gguf", &dflash(HIDDEN / 2));
@@ -3343,7 +3384,20 @@ struct LiveFixture {
 }
 
 async fn live_fixture(local_models: LocalModelsConfiguration) -> LiveFixture {
-    let (endpoint, hub) = hub().serve();
+    live_fixture_from(local_models, false, cpu_environment()).await
+}
+
+/// A live fixture whose catalog, with `qwen`, also lists Qwen3.5 4B with its DFlash drafter.
+async fn live_fixture_from(
+    local_models: LocalModelsConfiguration,
+    qwen: bool,
+    environment: Arc<AssessmentEnvironment>,
+) -> LiveFixture {
+    let mut stub = hub();
+    if qwen {
+        stub.repositories.extend(qwen_repositories());
+    }
+    let (endpoint, hub) = stub.serve();
     let directory = tempfile::tempdir().expect("temporary directory");
     let mut config = InventoryConfig::with_roots(
         directory.path().join("models"),
@@ -3358,7 +3412,10 @@ async fn live_fixture(local_models: LocalModelsConfiguration) -> LiveFixture {
         .ensure_model_inventory()
         .await
         .expect("location scan");
-    let (catalog, _) = llama_test_catalog(&models).await;
+    let (mut catalog, _) = llama_test_catalog(&models).await;
+    if qwen {
+        catalog.models.push(qwen_catalog_model(&models).await);
+    }
     let lineage = CatalogLineage::new(Arc::clone(&models), catalog.clone());
     let resolver = ModelDomainResolver::new(Arc::clone(&models), catalog.clone());
     let downloads = Arc::new(
@@ -3377,7 +3434,7 @@ async fn live_fixture(local_models: LocalModelsConfiguration) -> LiveFixture {
         Arc::clone(&models),
         resolver.clone(),
         Arc::new(ReleaseCatalog::without_material(catalog).expect("release catalog")),
-        cpu_environment(),
+        environment,
     ));
     let candidates = ManagedModelCandidates::new(
         assessor,
@@ -3437,7 +3494,7 @@ impl LiveFixture {
         what: &str,
     ) -> CustomModel {
         self.local.refresh_local().await.expect("rescan");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
         loop {
             let listed = self.local.list_local().await.expect("local models");
             let model = listed
@@ -3800,4 +3857,502 @@ async fn a_projector_appearing_beside_a_model_never_shows_its_drafter_as_none() 
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     eprintln!("pending samples: {pending_seen}");
+}
+
+/// Arki05's shard-set repositories ship `skeleton.gguf`: a whole Qwen3.5 4B header (the real one)
+/// whose directory declares 8.41 GB of tensor data, in a 10,968,000-byte file. It holds no weights,
+/// so it is never a version, in the repository or in a folder; the model beside it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shard_set_skeleton_holding_no_weights_is_never_a_version() {
+    const REPOSITORY: &str = "Arki05/Qwen3.5-4B-GGUF-shards";
+    const REVISION: &str = "a3b39a557f0d8cf364f196911e0ba220ae0e48f2";
+    const SKELETON: &str = "skeleton.gguf";
+    const SKELETON_BYTES: u64 = 10_968_000;
+    const TARGET: &str = "Qwen3.5-4B-Q3_K_M.gguf";
+    let served = |path: &str| fixture_file(&format!("headers/{path}.gz"), path);
+    let skeleton = StubFile {
+        size_bytes: SKELETON_BYTES,
+        ..served(SKELETON)
+    };
+    let target = served(TARGET);
+    let fixture = fixture_with(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::from([(
+            REPOSITORY.to_owned(),
+            StubRepository {
+                commit: REVISION.to_owned(),
+                files: vec![skeleton.clone(), target.clone()],
+                card_base_models: Vec::new(),
+            },
+        )]),
+    )
+    .await;
+    let labels = |inspection: &magnitude_service_contracts::models::CandidateInspection| {
+        inspection
+            .versions
+            .iter()
+            .map(|version| version.label.clone())
+            .collect::<Vec<_>>()
+    };
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::HuggingFace {
+            repository: HuggingFaceRepositoryId::new(REPOSITORY.to_owned()).unwrap(),
+            revision: REVISION.to_owned(),
+        })
+        .await
+        .expect("inspection");
+    assert_eq!(labels(&inspection), ["Q3_K_M"], "{inspection:#?}");
+
+    let folder = tempfile::tempdir().expect("model folder");
+    for file in [&skeleton, &target] {
+        let path = folder.path().join(&file.path);
+        std::fs::write(&path, &file.header).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(file.size_bytes)
+            .unwrap();
+    }
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::Local {
+            path: folder.path().to_path_buf(),
+        })
+        .await
+        .expect("folder inspection");
+    assert_eq!(labels(&inspection), ["Q3_K_M"], "{inspection:#?}");
+}
+
+// Fit with built-in heads ------------------------------------------------------------------------
+
+const QWEN_TARGET: &str = "unsloth/Qwen3.5-4B-MTP-GGUF";
+const QWEN_DRAFT: &str = "magnitudedev/Qwen3.5-4B-DFlash-GGUF";
+const QWEN_COMMUNITY: &str = "community/Qwen3.5-4B-GGUF";
+const QWEN_FILE: &str = "Qwen3.5-4B-UD-Q4_K_XL.gguf";
+const QWEN_Q3_FILE: &str = "Qwen3.5-4B-Q3_K_M.gguf";
+const QWEN_DRAFT_FILE: &str = "Qwen3.5-4B-DFlash-Q8_0.gguf";
+
+/// The real Qwen3.5 4B headers, whose targets carry built-in MTP heads: the catalog target and
+/// its DFlash drafter, and a community repository with the same UD-Q4_K_XL file and a Q3_K_M.
+fn qwen_repositories() -> BTreeMap<String, StubRepository> {
+    let served = |path: &str| fixture_file(&format!("headers/{path}.gz"), path);
+    BTreeMap::from([
+        (
+            QWEN_TARGET.to_owned(),
+            repository('1', vec![served(QWEN_FILE)], &["Qwen/Qwen3.5-4B"]),
+        ),
+        (
+            QWEN_DRAFT.to_owned(),
+            repository('2', vec![served(QWEN_DRAFT_FILE)], &["Qwen/Qwen3.5-4B"]),
+        ),
+        (
+            QWEN_COMMUNITY.to_owned(),
+            repository(
+                '3',
+                vec![served(QWEN_FILE), served(QWEN_Q3_FILE)],
+                &["Qwen/Qwen3.5-4B"],
+            ),
+        ),
+    ])
+}
+
+/// The catalog's Qwen3.5 4B, served with its DFlash drafter.
+async fn qwen_catalog_model(models: &Arc<ManagedModelStore>) -> RecommendableModel {
+    let (mut catalog, _) = llama_test_catalog(models).await;
+    let mut model = catalog.models.remove(0);
+    model.model_id = magnitude_service_contracts::models::CatalogBaseId::new("qwen3.5-4b").unwrap();
+    model.variant_id = magnitude_service_contracts::models::CatalogVariantId::new("gguf:q4").unwrap();
+    model.display_name = "Qwen3.5 4B".to_owned();
+    model.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+        target: hugging_face_package(models, QWEN_TARGET, QWEN_FILE).await,
+        draft_source: SpeculativeDraftSource::Separate {
+            draft: hugging_face_package(models, QWEN_DRAFT, QWEN_DRAFT_FILE).await,
+        },
+        method: SpeculativeMethod::DFlash,
+    };
+    model
+}
+
+fn qwen_catalog_id() -> ModelId {
+    "qwen3.5-4b:gguf:q4".parse().unwrap()
+}
+
+/// What a file needs on the standard CPU environment served plain, with its built-in heads, and
+/// with the catalog DFlash: the host's capacity and each composition's required bytes.
+struct Requirements {
+    capacity: u64,
+    plain: u64,
+    heads: u64,
+    dflash: u64,
+}
+
+impl Requirements {
+    async fn of(file: &str) -> Self {
+        let standard = fixture_from(
+            Vec::new(),
+            LocalModelsConfiguration::default(),
+            false,
+            BTreeMap::new(),
+            true,
+            cpu_environment(),
+        )
+        .await;
+        let assess = |drafter: Option<CandidateDrafter>| {
+            let candidate = ModelCandidate {
+                drafter,
+                ..hugging_face_candidate(QWEN_COMMUNITY, '3', file)
+            };
+            let candidates = Arc::clone(&standard.candidates);
+            async move {
+                let assessment = candidates
+                    .assess_candidate(candidate)
+                    .await
+                    .expect("assessment");
+                let ModelAssessment::Fits { memory, .. } = &assessment else {
+                    panic!("everything fits the standard host: {assessment:?}");
+                };
+                let host = memory.first().expect("a memory domain");
+                (host.capacity_bytes, host.required_bytes)
+            }
+        };
+        let (capacity, plain) = assess(None).await;
+        let (_, heads) = assess(Some(CandidateDrafter {
+            reference: DrafterReference::Embedded,
+            method: SpeculativeMethod::Mtp,
+        }))
+        .await;
+        let (_, dflash) = assess(Some(CandidateDrafter {
+            reference: DrafterReference::Catalog {
+                model_id: qwen_catalog_id(),
+            },
+            method: SpeculativeMethod::DFlash,
+        }))
+        .await;
+        assert!(
+            plain < heads.min(dflash),
+            "the heads and the drafter each need more than the model served plain"
+        );
+        Self {
+            capacity,
+            plain,
+            heads,
+            dflash,
+        }
+    }
+
+    /// A CPU environment whose host may use halfway between serving plain and serving with the
+    /// cheaper drafter: the model fits plain and with neither its heads nor the DFlash.
+    fn between(&self) -> Arc<AssessmentEnvironment> {
+        let budget = (self.plain + self.heads.min(self.dflash)) / 2;
+        let reserve = |floor: u64| serde_json::json!({ "fraction_divisor": u64::MAX, "floor_bytes": floor });
+        let reserves: magnitude_executor::platform::MemoryReserves =
+            serde_json::from_value(serde_json::json!({
+                "host": { "planning": reserve(self.capacity - budget), "emergency": reserve(0) },
+                "device": { "planning": reserve(0), "emergency": reserve(0) },
+            }))
+            .expect("memory reserves");
+        let catalog = seismic::DeviceCatalog::discover().expect("device catalog");
+        let setup = magnitude_engine::assessment::AssessmentSetup::discover(
+            &catalog,
+            magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+            reserves,
+            crate::assessment::environment::serving_policy(),
+            magnitude_engine::options::standard_service_limits(),
+        )
+        .expect("the CPU backend is selectable");
+        Arc::new(AssessmentEnvironment {
+            id: magnitude_service_contracts::models::AssessmentEnvironmentId(format!(
+                "cpu-test-{budget}"
+            )),
+            setup,
+        })
+    }
+}
+
+/// QA (Windows CUDA 8 GB, round 3b): a found Qwen3.5 4B with built-in MTP heads fit served plain,
+/// yet its catalog DFlash was preselected and attached and the load was refused: whether it fits
+/// "without a drafter" was judged with its heads. A drafter that would push a model that fits
+/// plain out of fitting is never automatic, for a file from any repository, the exact catalog
+/// target and the catalog model alike; a version's verdict is then the model served plain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_that_fits_only_served_plain_gets_no_automatic_drafter_even_with_built_in_heads() {
+    let requirements = Requirements::of(QWEN_FILE).await;
+    let fixture = fixture_from(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::new(),
+        true,
+        requirements.between(),
+    )
+    .await;
+    let drafters = |repository: &'static str, seed: char| {
+        let candidates = Arc::clone(&fixture.candidates);
+        async move {
+            candidates
+                .drafters(DrafterCandidatesRequest::Candidate {
+                    candidate: hugging_face_candidate(repository, seed, QWEN_FILE),
+                    other: None,
+                })
+                .await
+                .expect("drafter candidates")
+                .candidates
+        }
+    };
+
+    let community = drafters(QWEN_COMMUNITY, '3').await;
+    for category in [DrafterCategory::CatalogDrafter, DrafterCategory::BuiltIn] {
+        let listed = community
+            .iter()
+            .find(|candidate| candidate.category == category)
+            .unwrap_or_else(|| panic!("{category:?} is listed: {community:#?}"));
+        assert!(is_bound(&listed.verdict), "{category:?} binds: {listed:?}");
+        assert!(!listed.automatic, "{category:?} would stop the model fitting");
+    }
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::HuggingFace {
+            repository: HuggingFaceRepositoryId::new(QWEN_COMMUNITY.to_owned()).unwrap(),
+            revision: commit('3'),
+        })
+        .await
+        .expect("inspection");
+    let verdict = version(&inspection, QWEN_FILE).assessment.clone();
+    assert!(
+        matches!(verdict, Some(ModelAssessment::Fits { .. })),
+        "adding it installs the model served plain, which fits: {verdict:?}"
+    );
+
+    let exact = drafters(QWEN_TARGET, '1').await;
+    assert_eq!(exact.len(), 1, "{exact:#?}");
+    assert_eq!(exact[0].category, DrafterCategory::CatalogDrafter);
+    assert!(is_bound(&exact[0].verdict));
+    assert!(!exact[0].automatic, "the exact catalog target serves plain");
+    assert_eq!(
+        fixture
+            .candidates
+            .recommended_drafter(&qwen_catalog_id())
+            .await
+            .expect("recommendation"),
+        None,
+        "the catalog model serves plain"
+    );
+}
+
+fn folder_root(path: &std::path::Path) -> magnitude_service_contracts::models::ModelRoot {
+    magnitude_service_contracts::models::ModelRoot {
+        kind: magnitude_service_contracts::models::ModelRootKind::Folder,
+        path: path.to_path_buf(),
+        enabled: true,
+    }
+}
+
+/// Writes a shared fixture header at `path`, sized as its tensor directory declares.
+fn write_fixture_sparse(path: &std::path::Path, name: &str) {
+    let StubFile {
+        header, size_bytes, ..
+    } = fixture_file(&format!("headers/{name}.gz"), name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, &header).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(size_bytes)
+        .unwrap();
+}
+
+/// The QA case end to end: a found Qwen3.5 4B with heads that fits only served plain, with the
+/// catalog DFlash on this computer, attaches no drafter and is recommended none, so it loads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_found_model_that_fits_only_served_plain_never_attaches_its_catalog_drafter_on_disk() {
+    let requirements = Requirements::of(QWEN_Q3_FILE).await;
+    let locations = tempfile::tempdir().expect("locations");
+    let model = locations.path().join("found").join(QWEN_Q3_FILE);
+    write_fixture_sparse(&model, QWEN_Q3_FILE);
+    write_fixture_sparse(
+        &locations.path().join("drafters").join(QWEN_DRAFT_FILE),
+        QWEN_DRAFT_FILE,
+    );
+    let fixture = live_fixture_from(
+        LocalModelsConfiguration {
+            roots: vec![
+                folder_root(&locations.path().join("found")),
+                folder_root(&locations.path().join("drafters")),
+            ],
+            ..LocalModelsConfiguration::default()
+        },
+        true,
+        requirements.between(),
+    )
+    .await;
+    // Let the enrichment answer before checking that nothing is attached.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    loop {
+        fixture.local.refresh_local().await.expect("rescan");
+        let listed = fixture.local.list_local().await.expect("local models");
+        let found = listed
+            .models
+            .iter()
+            .find(|candidate| candidate.files.first().is_some_and(|first| first.path == model))
+            .expect("the found model");
+        if found.variant_of.is_some() {
+            assert_eq!(found.recommended_drafter, None, "{found:#?}");
+            assert_eq!(found.drafter, None, "{found:#?}");
+            assert!(matches!(
+                fixture
+                    .resolver
+                    .serving_configuration(&found.model_id)
+                    .expect("serving configuration")
+                    .bundle,
+                ServableModelBundle::Standalone { .. }
+            ));
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the enrichment answers");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// QA (Linux CUDA, round 3b): with the catalog drafter's bytes gone, a found model with working
+/// built-in heads showed "Drafter None · Add" and served plain, because only the first automatic
+/// drafter was known. Attachment follows the whole automatic order over what is on this
+/// computer: the heads serve while the better catalog drafter stays recommended, to be added.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_found_model_falls_back_to_its_built_in_heads_while_the_catalog_drafter_is_missing() {
+    let locations = tempfile::tempdir().expect("locations");
+    let model = locations.path().join("found").join(QWEN_Q3_FILE);
+    write_fixture_sparse(&model, QWEN_Q3_FILE);
+    let catalog_copy = locations.path().join("drafters").join(QWEN_DRAFT_FILE);
+    write_fixture_sparse(&catalog_copy, QWEN_DRAFT_FILE);
+    let fixture = live_fixture_from(
+        LocalModelsConfiguration {
+            roots: vec![
+                folder_root(&locations.path().join("found")),
+                folder_root(&locations.path().join("drafters")),
+            ],
+            ..LocalModelsConfiguration::default()
+        },
+        true,
+        cpu_environment(),
+    )
+    .await;
+    let catalog = DrafterReference::Catalog {
+        model_id: qwen_catalog_id(),
+    };
+    fixture
+        .rescan_until(&model, Some((&catalog, true)), "the catalog drafter on disk")
+        .await;
+
+    std::fs::remove_file(&catalog_copy).unwrap();
+    let listed = fixture
+        .rescan_until(
+            &model,
+            Some((&DrafterReference::Embedded, true)),
+            "without the catalog drafter the built-in heads serve",
+        )
+        .await;
+    assert_eq!(
+        listed
+            .recommended_drafter
+            .as_ref()
+            .map(|candidate| &candidate.reference),
+        Some(&catalog),
+        "the catalog drafter stays recommended, offered to add"
+    );
+
+    write_fixture_sparse(&catalog_copy, QWEN_DRAFT_FILE);
+    fixture
+        .rescan_until(
+            &model,
+            Some((&catalog, true)),
+            "back on disk, the catalog drafter takes over again",
+        )
+        .await;
+}
+
+/// A catalog model that fits only without its catalog drafter is assessed, and would be served,
+/// without it, so it loads rather than being refused; with room for the drafter it keeps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalog_model_that_fits_only_without_its_drafter_is_served_plain() {
+    use magnitude_service_contracts::models::{CatalogModelSelection, ModelAssessmentSubject};
+    let requirements = Requirements::of(QWEN_FILE).await;
+    let desired = |fixture: &LiveFixture| {
+        fixture
+            .resolver
+            .assessment_configuration(&ModelAssessmentSubject::Catalog {
+                model_id: qwen_catalog_id(),
+                selection: CatalogModelSelection::Desired,
+            })
+            .expect("configuration")
+            .bundle
+    };
+    let constrained = live_fixture_from(
+        LocalModelsConfiguration::default(),
+        true,
+        requirements.between(),
+    )
+    .await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    while !matches!(desired(&constrained), ServableModelBundle::Standalone { .. }) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the catalog model is served plain"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let standard =
+        live_fixture_from(LocalModelsConfiguration::default(), true, cpu_environment()).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(
+        matches!(
+            desired(&standard),
+            ServableModelBundle::SpeculativeDecoding { .. }
+        ),
+        "with room for it, the catalog drafter stays"
+    );
+}
+
+/// A different drafter that is the catalog drafter's own file (its package's repository, commit
+/// and path) is that listed catalog candidate: no Other row is added, and it is what the entered
+/// drafter resolves to. Any other file is its own Other row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_different_drafter_that_is_the_catalog_drafters_file_resolves_to_the_catalog_candidate() {
+    let fixture = fixture(Vec::new()).await;
+    let drafters = |other: String| {
+        fixture
+            .candidates
+            .drafters(DrafterCandidatesRequest::Candidate {
+                candidate: hugging_face_candidate(COMMUNITY, 'c', "llama-Q8_0.gguf"),
+                other: Some(other),
+            })
+    };
+    let listed = candidate_drafters(&fixture, COMMUNITY, 'c').await;
+    let catalog = listed
+        .iter()
+        .find(|candidate| candidate.category == DrafterCategory::CatalogDrafter)
+        .expect("the catalog drafter is listed")
+        .reference
+        .clone();
+
+    let same = drafters(format!("{CATALOG_DRAFT}:dflash.gguf"))
+        .await
+        .expect("drafter candidates");
+    assert_eq!(same.candidates, listed, "no second row for the same file");
+    assert_eq!(same.entered, Some(catalog));
+
+    let third_party = drafters(format!("{THIRD_PARTY}:draft.gguf"))
+        .await
+        .expect("drafter candidates");
+    let other = third_party
+        .candidates
+        .last()
+        .expect("the different drafter is listed");
+    assert_eq!(other.category, DrafterCategory::Other);
+    assert_eq!(third_party.entered, Some(other.reference.clone()));
 }

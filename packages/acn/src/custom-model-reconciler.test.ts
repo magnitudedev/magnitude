@@ -16,6 +16,9 @@ import {
   makeTestCustomModels,
 } from "./custom-models.test-support"
 
+const listedDrafters = <A, E>(candidates: Effect.Effect<A, E>) =>
+  Effect.map(candidates, (listed) => ({ candidates: listed, entered: Option.none() }))
+
 describe("custom model disappearance", () => {
   it("names forgotten declarations and newly hidden models only", () => {
     const previous = customModelsConfig()
@@ -47,7 +50,7 @@ describe("custom model reconciliation", () => {
           configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
         } as never),
         Layer.succeed(IcnCandidates, {
-          drafters: () => Effect.succeed([{
+          drafters: () => listedDrafters(Effect.succeed([{
             category: "CatalogDrafter",
             reference: drafterReference,
             name: "Magnitude DFlash for Qwen3.6 35B-A3B",
@@ -58,7 +61,7 @@ describe("custom model reconciliation", () => {
             onThisComputer: false,
             sizeBytes: 1,
             verdict: { _tag: "Bound", method: { _tag: "DSpark" }, memoryBytes: 1 },
-          }]),
+          }])),
         } as never),
         Layer.succeed(ModelSlotController, {
           state: Effect.succeed({ slots: {
@@ -117,7 +120,7 @@ describe("custom model reconciliation", () => {
           configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
         } as never),
         Layer.succeed(IcnCandidates, {
-          drafters: (request: { readonly _tag: string }) => Effect.sync(() => {
+          drafters: (request: { readonly _tag: string }) => listedDrafters(Effect.sync(() => {
             requests.push(request._tag)
             return request._tag === "Model" ? [] : [{
               category: "CatalogDrafter",
@@ -131,7 +134,7 @@ describe("custom model reconciliation", () => {
               sizeBytes: 1,
               verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: 1 },
             }]
-          }),
+          })),
         } as never),
         Layer.succeed(ModelSlotController, {
           state: Effect.succeed({ slots: {
@@ -166,7 +169,7 @@ describe("custom model reconciliation", () => {
         Layer.succeed(IcnLocalModels, {
           configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
         } as never),
-        Layer.succeed(IcnCandidates, { drafters: () => Effect.fail(new Error("offline")) } as never),
+        Layer.succeed(IcnCandidates, { drafters: () => listedDrafters(Effect.fail(new Error("offline"))) } as never),
         Layer.succeed(ModelSlotController, {
           state: Effect.succeed({ slots: {
             primary: { _tag: "Unassigned", slotId: "primary" },
@@ -199,7 +202,7 @@ describe("custom model reconciliation", () => {
         Layer.succeed(IcnLocalModels, {
           configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
         } as never),
-        Layer.succeed(IcnCandidates, { drafters: () => Effect.succeed([]) } as never),
+        Layer.succeed(IcnCandidates, { drafters: () => listedDrafters(Effect.succeed([])) } as never),
         Layer.succeed(ModelSlotController, {
           state: Effect.succeed({ slots: {
             primary: { _tag: "Unassigned", slotId: "primary" },

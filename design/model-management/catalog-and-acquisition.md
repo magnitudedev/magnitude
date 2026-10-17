@@ -302,7 +302,7 @@ ICN scans a list of model roots that ACN resolves and supplies (see
 | Hugging Face cache | Hub cache layout; repository and selector give the `hf:` ID. A snapshot entry links to `<repository>/blobs/<hash>`, whose name is the file's Hub content hash; classic caches keep the bytes there, while current `huggingface_hub` makes that entry a link into a store every repository of the hub shares (`<hub>/blobs/<xx>/<hash>`, named by another hash). Both layouts are read, following link chains only within the hub (a link's `..` steps are applied to its canonical directory, since Windows doesn't resolve them in canonical verbatim paths); the repository blob's name is the content identity, and the cache stays read-only. Without symlink support (Windows without Developer Mode, or `HF_HUB_DISABLE_SYMLINKS`) `huggingface_hub` keeps plain copies in the snapshots and no blobs; those files are found like any other, and one at a catalog file's repository, commit and path with that file's size and header digest takes the catalog file's Hub SHA-256 |
 | LM Studio | Publisher/repository layout gives the `hf:` ID |
 | llama.cpp cache | Current llama.cpp writes the Hugging Face hub layout (in the location itself or its `hub` folder): repository and commit, like the Hugging Face cache, but owned by llama.cpp (without `LLAMA_CACHE`, llama.cpp downloads into the shared Hugging Face cache, and those files stay the Hugging Face cache's). The older flat layout: `manifest=<owner>=<repository>=<tag>.json` names each flat `<owner>_<repository>_<file>` and its projector; a name without a manifest parses only when its repository segment ends in `GGUF`; others are `local:` |
-| Ollama | Manifests name each model and its GGUF blob; both `manifests/` and newer releases' `manifests-v2/` (whose entries may be symlinks to the manifest stored as a blob, followed only within the root, and which name Ollama's registry `ollama.com` rather than `registry.ollama.ai`; since Ollama 0.40 an entry is a manifest list whose `gguf` entry names the model's manifest blob by digest) are read, and a model in both is one model, named as Ollama names it (`qwen3.5:0.8b`). A GGUF blob's `sha256-<hex>` name is its content identity; `hf.co/…` pulls take the `hf:` ID of the repository file with the same SHA-256 (resolved once from the repository's file list and cached, matches and misses alike), so the same bytes have one ID whichever locations are enabled; until resolved, and for library models, the ID is `local:` |
+| Ollama | Manifests name each model and its GGUF blob; both `manifests/` and newer releases' `manifests-v2/` (whose entries may be symlinks to the manifest stored as a blob, followed only within the root, and which name Ollama's registry `ollama.com` rather than `registry.ollama.ai`; since Ollama 0.40 an entry is a manifest list naming one manifest blob per runner format, of which only the pulled one is on disk; its `gguf` manifest is read when present, otherwise the one that is) are read, and a model in both is one model, named as Ollama names it (`qwen3.5:0.8b`). A GGUF blob's `sha256-<hex>` name is its content identity; `hf.co/…` pulls take the `hf:` ID of the repository file with the same SHA-256 (resolved once from the repository's file list and cached, matches and misses alike), so the same bytes have one ID whichever locations are enabled; until resolved, and for library models, the ID is `local:`. A model Ollama stores for its MLX runner (`format: safetensors`, as 0.40 pulls library models on Apple silicon) has no GGUF: each tensor is its own safetensors blob (`application/vnd.ollama.image.tensor` layers, MLX-quantized), which can't be presented to the engine as a GGUF without copying, so once all its tensor blobs are present it is listed under "can't run" by its Ollama name with the `UnsupportedFormat` reason ("Stored in a format Magnitude can't read yet"), and its blobs are never opened |
 | User folders | Any GGUFs beneath the folder; `local:` |
 
 Each automatic location resolves to every directory its tool may use on this host, most
@@ -341,7 +341,10 @@ Each complete independently callable GGUF group is a custom-model candidate. A s
 own selector; a complete shard set uses its lexical first shard. Projectors and drafters are
 classified from their tensors, never from file names, and belong to the selected package rather
 than receiving independent model identities. An importance matrix (`general.type = imatrix`) is
-quantization data, never a candidate version. Metadata-only directories, Safetensors-only
+quantization data, never a candidate version. So is a GGUF that holds no weights, by its header
+and size alone: one with no tensors that is not a split's first shard, or one shorter than the
+tensor data its directory declares (a shard-set skeleton, whose directory describes weights stored
+in other files). Metadata-only directories, Safetensors-only
 repositories, and incomplete shard sets produce no model. The `hf:` and `local:` forms follow
 [terminology](./terminology.md); quantization presentation comes from bounded GGUF parsing rather
 than filename parsing.
@@ -362,6 +365,8 @@ header declares, is published as an unsupported local model with the `Unreadable
 location; a local candidate inspected before adding gets the same verdict; a symlinked file is
 read through its link and named by the path the user sees, and an imported file is served through
 its declared path wherever its link points; it receives no callable identity and is never offered.
+A found model with no GGUF at all, such as an Ollama model stored as MLX tensors, is published the
+same way with the `UnsupportedFormat` reason.
 Every readable group is published as a custom model and assessed, so the engine decides support:
 ACN lists a found or imported custom model whose assessment is `Unsupported` among the unsupported
 local models with the assessment's reasons, never as an offering; an added one keeps its row so it

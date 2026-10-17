@@ -35,8 +35,8 @@ use crate::candidate_files::RecognizedArchitectures;
 use crate::catalog_models::catalog_id;
 use crate::gguf::{GgufBaseModel, GgufRole};
 use crate::inventory::{
-    InstalledPackageRecord, InstalledPackageSnapshot, ManagedModelStore, hf_repo_dir,
-    origin_precedence,
+    InstalledPackageRecord, InstalledPackageSnapshot, ManagedModelStore, UNSUPPORTED_FORMAT_CODE,
+    hf_repo_dir, origin_precedence,
 };
 use crate::local_watch::{RootWatcher, watch_targets};
 use crate::model_domains::{ModelDomainResolver, domain_changes};
@@ -92,6 +92,12 @@ pub trait CustomModelEnrichment: Send + Sync + 'static {
     /// computer is used as that drafter.
     fn drafter_content(&self, _reference: &DrafterReference) -> Option<DrafterContent> {
         None
+    }
+    /// Whether a catalog model serves without its catalog drafter, because it fits served plain
+    /// and not with that drafter. When this changes it calls
+    /// [`ModelDomainResolver::catalog_drafter_fit_changed`].
+    fn withholds_catalog_drafter(&self, _model_id: &ModelId) -> bool {
+        false
     }
 }
 
@@ -189,6 +195,15 @@ impl ModelDomainResolver {
             *current = enrichment;
         }
         self.custom_model_enrichment_changed();
+    }
+
+    /// Whether a catalog model serves without its catalog drafter, because it fits served plain
+    /// and not with that drafter.
+    pub(crate) fn withholds_catalog_drafter(&self, model_id: &ModelId) -> bool {
+        self.local
+            .enrichment
+            .read()
+            .is_ok_and(|enrichment| enrichment.withholds_catalog_drafter(model_id))
     }
 
     /// Republishes the local-models list after the enrichment's knowledge changed.
@@ -1049,9 +1064,18 @@ fn unsupported_model(
             .unwrap_or_else(|| file_stem(&occurrence.primary)),
         origin,
         path: occurrence.primary.clone(),
-        reasons: vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)],
+        reasons: vec![UnsupportedReason::Known(unreadable_reason(occurrence))],
         detail,
     })
+}
+
+fn unreadable_reason(occurrence: &Occurrence<'_>) -> KnownUnsupportedReason {
+    match &occurrence.record.installed.validation {
+        PackageValidation::Unsupported { failure } if failure.code == UNSUPPORTED_FORMAT_CODE => {
+            KnownUnsupportedReason::UnsupportedFormat
+        }
+        _ => KnownUnsupportedReason::Unreadable,
+    }
 }
 
 /// What every model's projection consults: the configuration, the catalog, the enrichment, every
@@ -2510,6 +2534,55 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["qwen3.5:0.8b"]
         );
+    }
+
+    /// A model Ollama 0.40 stores for its MLX runner, one safetensors blob per tensor, can't be
+    /// read in place, so it is listed under "can't run" by its Ollama name with the format as its
+    /// reason, beside the store's GGUF pulls.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ollama_model_stored_as_mlx_tensors_is_unsupported_by_its_format() {
+        let fixture = Fixture::new().await;
+        let ollama = fixture.root.join("ollama");
+        crate::local_roots::write_ollama_mlx_pull(&ollama, "qwen3.5", "4b", "qwen");
+        let llama = model_bytes("llama gguf");
+        write_ollama(
+            &ollama,
+            "registry.ollama.ai",
+            "library",
+            "llama3.2",
+            "1b",
+            &[("application/vnd.ollama.image.model", &llama)],
+        );
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Ollama, &ollama)]))
+            .await;
+
+        assert_eq!(
+            listed
+                .models
+                .iter()
+                .map(|model| model.display_name.as_str())
+                .collect::<Vec<_>>(),
+            ["llama3.2:1b"]
+        );
+        assert_eq!(listed.unsupported.len(), 1);
+        let unsupported = &listed.unsupported[0];
+        assert_eq!(unsupported.display_name, "qwen3.5:4b");
+        assert_eq!(
+            unsupported.origin,
+            CustomModelOrigin::Found {
+                source: FoundSource::Ollama
+            }
+        );
+        assert_eq!(
+            unsupported.reasons,
+            [UnsupportedReason::Known(
+                KnownUnsupportedReason::UnsupportedFormat
+            )]
+        );
+        assert!(unsupported.detail.contains("safetensors"));
     }
 
     /// A version added from a catalog model's repository that isn't the catalog's exact target is

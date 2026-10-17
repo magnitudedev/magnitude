@@ -160,6 +160,22 @@
       }
     },
     {
+      "name": "qwen35-arki05-skeleton",
+      "description": "Arki05's skeleton.gguf from a Qwen3.5 4B shard-set repository: a complete qwen35 header (426 tensors, BF16 and F32, with qcore.skeleton) whose directory declares 8.41 GB of tensor data, in a 10,968,000-byte file. The engine judges headers only, so it is supported here, where the file is served at its declared length; the service never lists the real file as a version, since it is shorter than the data its header declares.",
+      "target": [
+        {
+          "header": "headers/skeleton.gguf.gz",
+          "repository": "Arki05/Qwen3.5-4B-GGUF-shards",
+          "revision": "a3b39a557f0d8cf364f196911e0ba220ae0e48f2",
+          "path": "skeleton.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported",
+        "drafter": "none"
+      }
+    },
+    {
       "name": "qwen4exp-supported",
       "description": "Catalog Qwen3.8 Flash Next UD-Q4_K_XL (qwen4exp family), four shards.",
       "target": [
@@ -313,6 +329,37 @@
       "expected": {
         "target": "supported",
         "drafter": "none"
+      }
+    },
+    {
+      "name": "lfm25-1.2b-liquid-dspark",
+      "description": "LiquidAI LFM2.5 1.2B Instruct Q4_K_M with LiquidAI's own DSpark drafter for it. Width (2048), vocabulary (65536) and taps (layers 3-15 of 16) match the target, but the file omits dflash.attention.causal, which the engine requires and never infers; it is otherwise identical in form to Magnitude's republished DSpark drafters, which declare it. The drafter is refused for that missing key, never as built for another model.",
+      "target": [
+        {
+          "header": "headers/LFM2.5-1.2B-Instruct-Q4_K_M.gguf.gz",
+          "repository": "LiquidAI/LFM2.5-1.2B-Instruct-GGUF",
+          "revision": "8ed288026e23958ad9dfa92d53ed773a8eee7125",
+          "path": "LFM2.5-1.2B-Instruct-Q4_K_M.gguf"
+        }
+      ],
+      "draft": {
+        "header": "headers/LFM2.5-1.2B-Instruct-DSpark-Q4_K_M.gguf.gz",
+        "repository": "LiquidAI/LFM2.5-1.2B-Instruct-DSpark-GGUF",
+        "revision": "9235d674d3bbda8a775ca42a4275d11a8c0ab008",
+        "path": "LFM2.5-1.2B-Instruct-DSpark-Q4_K_M.gguf"
+      },
+      "method": "dspark",
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "rejected": [
+            {
+              "MissingMetadata": {
+                "key": "dflash.attention.causal"
+              }
+            }
+          ]
+        }
       }
     },
     {

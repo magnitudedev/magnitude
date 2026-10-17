@@ -53,6 +53,10 @@ describe("unsupported reasons in the UI", () => {
       reference: "z-lab/drafter:dflash.gguf",
       reasons: [reason({ _tag: "TargetMismatch", detail: "hidden size 2048 != 4096" })],
     }))).toBe("This drafter can't be used with this model: Its drafter wasn't built for this model.")
+    expect(drafterNotUsableMessage(new DrafterNotUsable({
+      reference: "LiquidAI/LFM2.5-1.2B-Instruct-DSpark-GGUF/LFM2.5-1.2B-Instruct-DSpark-Q4_K_M.gguf",
+      reasons: [reason({ _tag: "MissingMetadata", key: "dflash.attention.causal" })],
+    }))).toBe("This drafter can't be used with this model: Is missing a setting Magnitude needs (dflash.attention.causal).")
     expect(drafterNotUsableMessage(new DrafterNotUsable({ reference: "x", reasons: [] })))
       .toBe("This drafter can't be used with this model.")
   })
@@ -64,6 +68,7 @@ describe("unsupported reasons in the UI", () => {
       { _tag: "RopeScaling", kind: "yarn" },
       { _tag: "UnrecognizedTensor", name: "rope_freqs.weight" },
       { _tag: "UnrecognizedMetadata", key: "llama.rope.scaling.type" },
+      { _tag: "MissingMetadata", key: "dflash.attention.causal" },
       { _tag: "Tokenizer", model: "t5" },
       { _tag: "ChatTemplate" },
       { _tag: "TiedOutputHead" },
@@ -71,12 +76,14 @@ describe("unsupported reasons in the UI", () => {
       { _tag: "KernelDomain", backend: "metal", entry: "attention", statics: [["head_dim", 80]] },
       { _tag: "Backend", backend: "vulkan" },
       { _tag: "Unreadable" },
+      { _tag: "UnsupportedFormat" },
     ].map((value) => unsupportedReasonMessage(reason(value)))).toEqual([
       "No kernels for the deepseek4 architecture",
       "Uses IQ1_M weights, which Magnitude doesn't support yet",
       "Uses rope frequency scaling, which Magnitude doesn't support yet",
       "Has parts Magnitude doesn't recognize (rope_freqs.weight)",
       "Has parts Magnitude doesn't recognize (llama.rope.scaling.type)",
+      "Is missing a setting Magnitude needs (dflash.attention.causal)",
       "Uses a tokenizer Magnitude doesn't support",
       "Its chat template can't be read",
       "Uses a tied output layer, which Magnitude doesn't support yet",
@@ -84,6 +91,7 @@ describe("unsupported reasons in the UI", () => {
       "Its layer sizes aren't supported on this GPU",
       "Its layer sizes aren't supported on this GPU",
       "The file is incomplete or damaged",
+      "Stored in a format Magnitude can't read yet",
     ])
   })
 
@@ -210,6 +218,31 @@ describe("drafter presentation", () => {
       recommendedDrafter: Option.some(candidate({ onThisComputer: true })),
     })).pipe(Option.map(({ label }) => label))).toEqual(Option.some("Faster with a drafter · Add"))
     expect(customModelDrafterOffer(makeFoundModel())).toEqual(Option.none())
+  })
+
+  it("offers the better recommended drafter while built-in heads serve in its place, and not once it is attached", () => {
+    const attached = (reference: DrafterCandidate["reference"]) => Option.some({
+      reference,
+      name: "MTP heads",
+      label: "Built into this model",
+      sizeBytes: 0,
+      verdict: bound,
+      availability: { _tag: "Present" as const },
+      updateAvailable: false,
+    })
+    const recommended = candidate({})
+    const heads = makeFoundModel({ recommendedDrafter: Option.some(recommended), drafter: attached({ _tag: "Embedded" }) })
+    expect(customModelDrafterOffer(heads).pipe(Option.map(({ label }) => label)))
+      .toEqual(Option.some("Faster with a drafter · Add (900 MB)"))
+    expect(customModelDrafterOffer(makeFoundModel({
+      recommendedDrafter: Option.some(recommended),
+      drafter: attached(recommended.reference),
+    }))).toEqual(Option.none())
+    expect(customModelDrafterOffer(makeFoundModel({
+      recommendedDrafter: Option.some(recommended),
+      drafter: attached({ _tag: "Embedded" }),
+      drafterChoice: { _tag: "Reference", reference: { _tag: "Embedded" } },
+    }))).toEqual(Option.none())
   })
 
   it("offers no drafter to a model whose drafter was turned off", () => {

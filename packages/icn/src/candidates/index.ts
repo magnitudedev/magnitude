@@ -2,8 +2,8 @@ import { Context, Effect, Layer } from "effect"
 import type {
   CandidateInspection,
   CandidateInspectionRequest,
-  DrafterCandidate,
   DrafterCandidatesRequest,
+  DrafterCandidatesResponse,
   HuggingFaceModelSearchRequest,
   HuggingFaceModelSearchResults,
   HuggingFaceRepositorySnapshot,
@@ -25,7 +25,7 @@ export type CandidateBundleError = Failure<"candidates", "buildCandidateBundle">
 
 /**
  * Files not yet added: Hugging Face search, repository resolution (a revision pinned to its commit),
- * inspection, drafters in ICN's category order, assessment, and the exact bundle a download fetches (a
+ * inspection, drafters in ICN's category order (with the listed one a different drafter resolves to), assessment, and the exact bundle a download fetches (a
  * local target yields its drafter alone).
  */
 export interface IcnCandidatesService {
@@ -35,7 +35,7 @@ export interface IcnCandidatesService {
     revision: string,
   ) => Effect.Effect<HuggingFaceRepositorySnapshot, HuggingFaceResolveError>
   readonly inspect: (request: CandidateInspectionRequest) => Effect.Effect<CandidateInspection, CandidateInspectionError>
-  readonly drafters: (request: DrafterCandidatesRequest) => Effect.Effect<readonly DrafterCandidate[], DrafterCandidatesError>
+  readonly drafters: (request: DrafterCandidatesRequest) => Effect.Effect<DrafterCandidatesResponse, DrafterCandidatesError>
   readonly assess: (candidate: ModelCandidate) => Effect.Effect<ModelAssessment, CandidateAssessmentError>
   readonly bundle: (candidate: ModelCandidate) => Effect.Effect<ServableModelBundle, CandidateBundleError>
 }
@@ -48,9 +48,7 @@ export const IcnCandidatesLive: Layer.Layer<IcnCandidates, never, IcnClient> = L
     resolveRepository: (repository, revision) =>
       client.huggingFace.resolveHuggingFaceRepository({ payload: { repository, revision } }),
     inspect: (request) => client.candidates.inspectModelCandidate({ payload: request }),
-    drafters: (request) => client.candidates.listDrafterCandidates({ payload: request }).pipe(
-      Effect.map(({ candidates }) => candidates),
-    ),
+    drafters: (request) => client.candidates.listDrafterCandidates({ payload: request }),
     assess: (candidate) => client.models.assessModelCandidate({ payload: candidate }),
     bundle: (candidate) => client.candidates.buildCandidateBundle({ payload: candidate }),
   })),

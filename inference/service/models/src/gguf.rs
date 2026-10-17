@@ -259,12 +259,7 @@ fn read_counted(file: &mut Counted) -> Result<LocalGgufRead, GgufError> {
     let directory = magnitude_artifacts::gguf::read_header(&bytes[..header_end])
         .and_then(|directory| directory.require_execution_byte_order().map(|()| directory))
         .map_err(GgufError::Header)?;
-    let declared = directory
-        .tensors
-        .iter()
-        .map(|tensor| tensor.offset.saturating_add(tensor.nbytes))
-        .max()
-        .map_or(0, |end| end.saturating_add(directory.data_offset));
+    let declared = declared_length(&directory);
     let truncated = (length < declared).then(|| {
         format!(
             "GGUF file is truncated: it has {length} bytes of the {declared} its header declares"
@@ -289,6 +284,18 @@ fn read_counted(file: &mut Counted) -> Result<LocalGgufRead, GgufError> {
         },
         header: bytes,
     })
+}
+
+/// The length a file with this header has when it holds every byte of tensor data its directory
+/// declares (for a split file's shard, that shard's own tensors).
+#[must_use]
+pub fn declared_length(directory: &Directory) -> u64 {
+    directory
+        .tensors
+        .iter()
+        .map(|tensor| tensor.offset.saturating_add(tensor.nbytes))
+        .max()
+        .map_or(0, |end| end.saturating_add(directory.data_offset))
 }
 
 /// The least a header read asks for at once.

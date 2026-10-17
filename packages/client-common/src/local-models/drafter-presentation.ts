@@ -1,4 +1,4 @@
-import { Option } from "effect"
+import { Data, Equal, Option } from "effect"
 import type {
   CandidateFile,
   CandidateVersion,
@@ -57,12 +57,21 @@ export const candidateDownloadBytes = (
   }
 }
 
-/** "Faster with a drafter · Add (0.9 GB)" for a custom model with no drafter and a recommended one, unless its drafter was turned off. */
+/**
+ * "Faster with a drafter · Add (0.9 GB)" for a custom model whose recommended drafter isn't attached: none is, or,
+ * under automatic choice, a lesser one on this computer serves meanwhile (its built-in heads, say). Never once its
+ * drafter was turned off or chosen.
+ */
 export const customModelDrafterOffer = (
   model: CustomLocalModel,
 ): Option.Option<{ readonly label: string; readonly candidate: DrafterCandidate }> => {
-  if (Option.isSome(model.drafter) || model.drafterChoice._tag === "None") return Option.none()
-  return Option.map(model.recommendedDrafter, (candidate) => {
+  if (model.drafterChoice._tag === "None") return Option.none()
+  if (Option.isSome(model.drafter) && model.drafterChoice._tag === "Reference") return Option.none()
+  const offered = Option.filter(model.recommendedDrafter, (candidate) => Option.match(model.drafter, {
+    onNone: () => true,
+    onSome: (attached) => !candidate.onThisComputer && !Equal.equals(Data.struct(attached.reference), Data.struct(candidate.reference)),
+  }))
+  return Option.map(offered, (candidate) => {
     const bytes = drafterCandidateDownloadBytes(candidate)
     return {
       label: bytes > 0 ? `Faster with a drafter · Add (${formatStorageSize(bytes)})` : "Faster with a drafter · Add",

@@ -91,10 +91,12 @@ candidate inspection call assesses its versions from range-fetched headers and r
 verdicts.
 
 `UnsupportedReason` is a closed, structured set: architecture, weight types (each type with its
-tensor count), rope scaling, unrecognized tensor, unrecognized metadata, tokenizer, chat template,
-kernel domain, backend, unreadable, target mismatch, and tied output head. Target mismatch is a
-drafter (or projector) that does not fit the target it is bound to; tied output head is a target
-whose output projection is its embedding where the family needs a separate one. Every refusal names
+tensor count), rope scaling, unrecognized tensor, unrecognized metadata, missing metadata,
+tokenizer, chat template, kernel domain, backend, unreadable, target mismatch, and tied output
+head. Target mismatch is a drafter (or projector) that does not fit the target it is bound to;
+missing metadata is a well-formed file that omits a declaration the engine requires and never
+infers (a block drafter's attention causality, which some published drafters predate); tied output
+head is a target whose output projection is its embedding where the family needs a separate one. Every refusal names
 at least one reason: a header missing what its family needs, or contradicting itself, is
 unreadable, and a planner refusal of a validated definition names the backend. The assessment
 collects every reason, not the first: a representation failure does not stop the weight-type

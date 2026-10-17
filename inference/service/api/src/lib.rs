@@ -2905,6 +2905,7 @@ mod tests {
                         on_this_computer: false,
                         method: Some(SpeculativeMethod::DFlash),
                     }],
+                    entered: None,
                 })
             })
         }

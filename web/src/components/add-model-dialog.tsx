@@ -264,8 +264,11 @@ export const confirmAction = (inspection: CandidateInspection, version: Candidat
 /** The inspected repository: a version that can run gets its drafters and Download; one that can't gets the reason in their place. */
 export function InspectedRepository({ inspection, file, models, onBack, onAdded }: { inspection: CandidateInspection; file: Option.Option<string>; models: readonly LocalModel[]; onBack?: () => void; onAdded: () => void }) {
   const [picked, setPicked] = useState(() => initialVersion(inspection, file))
+  // The version the dialog opened on is scrolled into view until the user picks one.
+  const [revealed, setRevealed] = useState(picked)
   const version = Option.flatMap(picked, label => Option.fromNullable(inspection.versions.find(entry => entry.label === label)))
-  const header = { inspection, models, selectedVersion: picked, onSelectVersion: (label: string) => setPicked(Option.some(label)), ...(onBack ? { onBack } : {}) }
+  const onSelectVersion = (label: string) => { setPicked(Option.some(label)); setRevealed(Option.none()) }
+  const header = { inspection, models, selectedVersion: picked, revealedVersion: revealed, onSelectVersion, ...(onBack ? { onBack } : {}) }
   const source = inspection.source
   if (Option.isNone(version) || !versionVerdict(version.value).selectable || Option.isSome(inspection.unsupportedArchitecture) || source._tag !== "HuggingFace") return <RepositoryView {...header} />
   return <VersionWithDrafters key={version.value.label} version={version.value} header={header} onAdded={onAdded}
@@ -436,10 +439,20 @@ export function RepositoryFooter({ local, action, pending, failure, onConfirm }:
 }
 
 /** The repository step: header, versions with verdicts, drafter choices, and the footer. */
-export function RepositoryView({ inspection, models, selectedVersion, onSelectVersion, onBack, drafters, footer }: {
+/** Scrolls the version the dialog opened on into the middle of the dialog, as a linked version far down the list needs. */
+export const revealVersionRow = (row: Pick<HTMLElement, "scrollIntoView"> | null) => {
+  row?.scrollIntoView({ block: "center" })
+}
+
+/** Whether a version's row is scrolled into view: the selected one, while it is still the version the dialog opened on. */
+export const revealsVersion = (label: string, selectedVersion: Option.Option<string>, revealedVersion: Option.Option<string>) =>
+  Option.contains(selectedVersion, label) && Option.contains(revealedVersion, label)
+
+export function RepositoryView({ inspection, models, selectedVersion, revealedVersion = Option.none(), onSelectVersion, onBack, drafters, footer }: {
   inspection: CandidateInspection
   models: readonly LocalModel[]
   selectedVersion: Option.Option<string>
+  revealedVersion?: Option.Option<string>
   onSelectVersion: (label: string) => void
   onBack?: () => void
   drafters?: ReactNode
@@ -481,7 +494,8 @@ export function RepositoryView({ inspection, models, selectedVersion, onSelectVe
               {inspection.versions.map(version => {
                 const verdict = versionVerdict(version)
                 const selected = Option.contains(selectedVersion, version.label)
-                return <label key={version.label} data-selected={selected || undefined} className={`flex items-center gap-3 px-3 py-2 text-sm ${verdict.selectable ? "cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800" : selected ? "" : "opacity-60"} ${selected ? "bg-blue-50 dark:bg-slate-800" : ""}`}>
+                const revealed = revealsVersion(version.label, selectedVersion, revealedVersion)
+                return <label key={version.label} ref={revealed ? revealVersionRow : undefined} data-selected={selected || undefined} className={`flex items-center gap-3 px-3 py-2 text-sm ${verdict.selectable ? "cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800" : selected ? "" : "opacity-60"} ${selected ? "bg-blue-50 dark:bg-slate-800" : ""}`}>
                   <input type="radio" name={name} className="accent-blue-600" checked={selected} disabled={!verdict.selectable} onChange={() => onSelectVersion(version.label)} />
                   <span className="w-24 shrink-0 truncate font-medium sm:w-28" title={version.files.join("\n")}>{version.label}</span>
                   <span className="w-16 shrink-0 tabular-nums text-slate-500 sm:w-20">{formatStorageSize(version.sizeBytes)}</span>

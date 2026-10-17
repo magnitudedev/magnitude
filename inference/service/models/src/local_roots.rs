@@ -26,6 +26,7 @@ use crate::inventory::{
 
 const OLLAMA_MODEL_MEDIA_TYPE: &str = "application/vnd.ollama.image.model";
 const OLLAMA_PROJECTOR_MEDIA_TYPE: &str = "application/vnd.ollama.image.projector";
+const OLLAMA_TENSOR_MEDIA_TYPE: &str = "application/vnd.ollama.image.tensor";
 const OLLAMA_MANIFEST_LIST_MEDIA_TYPE: &str = "application/vnd.ollama.manifest.list.v2+json";
 const OLLAMA_GGUF_FORMAT: &str = "gguf";
 const OLLAMA_REGISTRY: &str = "registry.ollama.ai";
@@ -88,6 +89,7 @@ fn push_external(
     origin: ExternalOrigin,
     declared_by: LocalDeclaration,
     components: Vec<ModelComponent>,
+    unsupported_format: Option<String>,
     output: &mut Vec<DiscoveryCandidate>,
 ) {
     let Some(primary) = primary_path(root, &components) else {
@@ -113,6 +115,7 @@ fn push_external(
         },
         primary,
         deletable: false,
+        unsupported_format,
     })));
 }
 
@@ -130,6 +133,7 @@ fn push_group(
         origin,
         LocalDeclaration::Discovery,
         components,
+        None,
         output,
     );
     Ok(())
@@ -404,8 +408,8 @@ fn ollama_pulls(root: &Path) -> Result<Vec<OllamaPull>, InventoryError> {
                             manifest,
                         };
                         let keep_existing = pulls.get(&name).is_some_and(|existing| {
-                            ollama_components(root, &existing.manifest).is_some()
-                                || ollama_components(root, &pull.manifest).is_none()
+                            ollama_model(root, &existing.manifest).is_some()
+                                || ollama_model(root, &pull.manifest).is_none()
                         });
                         if !keep_existing {
                             pulls.insert(name, pull);
@@ -418,8 +422,9 @@ fn ollama_pulls(root: &Path) -> Result<Vec<OllamaPull>, InventoryError> {
     Ok(pulls.into_values().collect())
 }
 
-/// The manifest a tag names, read only when it resolves inside the root. A manifest list
-/// resolves to its GGUF manifest, which Ollama stores as a blob.
+/// The manifest a tag names, read only when it resolves inside the root. A manifest list names one
+/// manifest per runner format, stored as a blob only for the format Ollama pulled; it resolves to
+/// its GGUF manifest when that is on disk, and otherwise to the one that is.
 fn read_ollama_manifest(root: &Path, contained: &Path, tag: &Path) -> Option<OllamaManifest> {
     let read = |path: &Path| {
         fs::canonicalize(path)
@@ -433,14 +438,14 @@ fn read_ollama_manifest(root: &Path, contained: &Path, tag: &Path) -> Option<Oll
     {
         return serde_json::from_value(document).ok();
     }
-    let list = serde_json::from_value::<OllamaManifestList>(document).ok()?;
-    let entry = list
-        .manifests
-        .iter()
-        .find(|entry| entry.format.as_deref() == Some(OLLAMA_GGUF_FORMAT))?;
-    let hex = sha256_hex(&entry.digest)?;
-    let gguf = read(&root.join("blobs").join(format!("sha256-{hex}")))?;
-    serde_json::from_value(gguf).ok()
+    let mut list = serde_json::from_value::<OllamaManifestList>(document).ok()?;
+    list.manifests
+        .sort_by_key(|entry| entry.format.as_deref() != Some(OLLAMA_GGUF_FORMAT));
+    list.manifests.iter().find_map(|entry| {
+        let hex = sha256_hex(&entry.digest)?;
+        let manifest = read(&root.join("blobs").join(format!("sha256-{hex}")))?;
+        serde_json::from_value(manifest).ok()
+    })
 }
 
 /// The hex of a `sha256:<hex>` digest, when well formed.
@@ -553,19 +558,31 @@ fn scan_ollama(
             let file = read_ollama_hub_file(cache, &repository, pull.model_sha256()?)?.file?;
             hub_file(repository, file)
         });
-        if let Some(components) = ollama_components(root, &pull.manifest) {
-            push_external(
-                root,
-                "ollama",
-                ExternalOrigin::Ollama {
-                    name: pull.name,
-                    hub,
-                },
-                LocalDeclaration::Discovery,
-                components,
-                output,
-            );
-        }
+        let (components, unsupported_format) = match ollama_model(root, &pull.manifest) {
+            Some(OllamaModel::Gguf(components)) => (components, None),
+            Some(OllamaModel::Tensors(components)) => {
+                let detail = format!(
+                    "Ollama stores {} as {} safetensors tensor files for its MLX runner, not as a \
+                     GGUF",
+                    pull.name,
+                    components.len()
+                );
+                (components, Some(detail))
+            }
+            None => continue,
+        };
+        push_external(
+            root,
+            "ollama",
+            ExternalOrigin::Ollama {
+                name: pull.name,
+                hub,
+            },
+            LocalDeclaration::Discovery,
+            components,
+            unsupported_format,
+            output,
+        );
     }
     Ok(())
 }
@@ -587,6 +604,38 @@ fn ollama_blob(root: &Path, layer: &OllamaLayer) -> Option<(PathBuf, String)> {
         .ok()
         .filter(|metadata| metadata.is_file() && metadata.len() == layer.size)?;
     Some((relative, hex.to_owned()))
+}
+
+/// What a manifest holds once every blob it names for the model is on disk.
+enum OllamaModel {
+    /// One GGUF blob, with its projector when that is on disk too.
+    Gguf(Vec<ModelComponent>),
+    /// One safetensors file per tensor, as Ollama stores a model for its MLX runner. Nothing in
+    /// them is GGUF, so the engine can't read them in place.
+    Tensors(Vec<ModelComponent>),
+}
+
+fn ollama_model(root: &Path, manifest: &OllamaManifest) -> Option<OllamaModel> {
+    if let Some(components) = ollama_components(root, manifest) {
+        return Some(OllamaModel::Gguf(components));
+    }
+    let tensors = manifest
+        .layers
+        .iter()
+        .filter(|layer| layer.media_type == OLLAMA_TENSOR_MEDIA_TYPE)
+        .map(|layer| {
+            let (path, hex) = ollama_blob(root, layer)?;
+            Some(ModelComponent {
+                path,
+                role: ComponentRole::Weights,
+                size_bytes: layer.size,
+                content: ContentIdentity::Sha256 { value: hex },
+                shard_index: None,
+                relationship: None,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!tensors.is_empty()).then_some(OllamaModel::Tensors(tensors))
 }
 
 fn ollama_components(root: &Path, manifest: &OllamaManifest) -> Option<Vec<ModelComponent>> {
@@ -756,6 +805,7 @@ fn push_declared(
         ExternalOrigin::Imported,
         LocalDeclaration::Configuration,
         components,
+        None,
         output,
     );
     Ok(())
@@ -777,6 +827,140 @@ fn read_bounded_json(path: &Path, limit: u64) -> Option<serde_json::Value> {
         return None;
     }
     serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+/// Writes an Ollama 0.40 pull of a model stored for its MLX runner, as `ollama pull qwen3.5:4b`
+/// leaves it on Apple silicon: every tensor its own safetensors blob named in the manifest, the
+/// tag in `manifests-v2/ollama.com/library/<model>/<tag>` a symlink to a manifest list whose GGUF
+/// entry was never downloaded, and the MLX manifest both as a blob and as the `manifests/` copy.
+/// Returns the tensor blobs' total size.
+#[cfg(all(test, unix))]
+pub(crate) fn write_ollama_mlx_pull(root: &Path, model: &str, tag: &str, seed: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let blobs = root.join("blobs");
+    fs::create_dir_all(&blobs).unwrap();
+    let blob = |bytes: &[u8]| {
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        fs::write(blobs.join(format!("sha256-{digest}")), bytes).unwrap();
+        serde_json::json!({ "digest": format!("sha256:{digest}"), "size": bytes.len() })
+    };
+    let safetensors = |name: &str, dtype: &str, shape: &[u64], data: &[u8]| {
+        let header = serde_json::to_vec(&serde_json::json!({
+            "__metadata__": { "quant_type": "nvfp4", "group_size": "16" },
+            name: { "dtype": dtype, "shape": shape, "data_offsets": [0, data.len()] },
+        }))
+        .unwrap();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(data);
+        bytes
+    };
+    let tensors = [
+        (
+            "language_model.model.embed_tokens.weight",
+            "U32",
+            &[4u64, 2][..],
+        ),
+        (
+            "language_model.model.layers.0.linear_attn.dt_bias",
+            "BF16",
+            &[4][..],
+        ),
+        (
+            "language_model.model.layers.0.mlp.down_proj.weight",
+            "U32",
+            &[2, 2][..],
+        ),
+        ("vision_tower.blocks.0.attn.qkv.weight", "BF16", &[2, 2][..]),
+    ];
+    let mut total = 0;
+    let mut layers = Vec::new();
+    for (name, dtype, shape) in tensors {
+        let data = format!("{seed}:{name}").into_bytes();
+        let bytes = safetensors(name, dtype, shape, &data);
+        total += bytes.len() as u64;
+        let mut layer = blob(&bytes);
+        layer["mediaType"] = OLLAMA_TENSOR_MEDIA_TYPE.into();
+        layer["name"] = name.into();
+        layers.push(layer);
+    }
+    for (name, bytes) in [
+        ("config.json", br#"{"model_type":"qwen3_5"}"#.as_slice()),
+        ("tokenizer.json", br#"{"version":"1.0"}"#.as_slice()),
+    ] {
+        let mut layer = blob(bytes);
+        layer["mediaType"] = "application/vnd.ollama.image.json".into();
+        layer["name"] = name.into();
+        layers.push(layer);
+    }
+    let mut license = blob(b"Apache License 2.0");
+    license["mediaType"] = "application/vnd.ollama.image.license".into();
+    layers.push(license);
+    let mut params = blob(br#"{"temperature":1,"top_k":20}"#);
+    params["mediaType"] = "application/vnd.ollama.image.params".into();
+    layers.push(params);
+    let mut config = blob(
+        br#"{"model_format":"safetensors","file_type":"nvfp4","renderer":"qwen3.5","capabilities":["completion","vision","thinking"]}"#,
+    );
+    config["mediaType"] = "application/vnd.docker.container.image.v1+json".into();
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": config,
+        "layers": layers,
+        "runner": "mlx",
+        "format": "safetensors",
+    }))
+    .unwrap();
+    let mlx = blob(&manifest);
+    let gguf = format!(
+        "sha256:{:x}",
+        Sha256::digest(format!("{seed} gguf manifest"))
+    );
+    let list = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OLLAMA_MANIFEST_LIST_MEDIA_TYPE,
+        "manifests": [
+            {
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "digest": gguf,
+                "runner": "llamacpp",
+                "format": "gguf",
+            },
+            {
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "digest": mlx["digest"],
+                "runner": "mlx",
+                "format": "safetensors",
+            },
+        ],
+    }))
+    .unwrap();
+    let list = blob(&list);
+    let v1 = root
+        .join("manifests")
+        .join(OLLAMA_REGISTRY)
+        .join("library")
+        .join(model)
+        .join(tag);
+    fs::create_dir_all(v1.parent().unwrap()).unwrap();
+    fs::write(v1, &manifest).unwrap();
+    let v2 = root
+        .join("manifests-v2")
+        .join(OLLAMA_REGISTRY_HOST)
+        .join("library")
+        .join(model)
+        .join(tag);
+    fs::create_dir_all(v2.parent().unwrap()).unwrap();
+    let list_blob = format!(
+        "sha256-{}",
+        list["digest"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("sha256:")
+    );
+    std::os::unix::fs::symlink(Path::new("../../../../blobs").join(list_blob), v2).unwrap();
+    total
 }
 
 #[cfg(all(test, unix))]
@@ -1059,5 +1243,98 @@ mod tests {
             names,
             ["hf.co/unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M", "llama3.2:1b"]
         );
+    }
+
+    /// Ollama 0.40 on Apple silicon pulls a library model's MLX manifest: one safetensors blob
+    /// per tensor and no GGUF. Both trees resolve to that one pull, a store with only
+    /// `manifests-v2` too, and it is found with a format the engine can't read, never dropped.
+    #[test]
+    fn ollama_finds_a_model_stored_as_mlx_tensors_as_an_unsupported_format() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let total = write_ollama_mlx_pull(root, "qwen3.5", "4b", "qwen");
+        let llama = manifest(root, b"llama weights", 13);
+        write_v2(root, "ollama.com", "library/llama3.2/1b", &llama);
+
+        let scan = |root: &Path| {
+            let mut output = Vec::new();
+            scan_ollama(
+                root,
+                &ModelCache::new(&temporary.path().join("cache")),
+                &mut output,
+            )
+            .unwrap();
+            output
+                .into_iter()
+                .map(|DiscoveryCandidate::Artifact(artifact)| *artifact)
+                .collect::<Vec<_>>()
+        };
+        for pass in ["both trees", "manifests-v2 only"] {
+            let found = scan(root);
+            let names = found
+                .iter()
+                .map(|artifact| match &artifact.location {
+                    ModelLocation::External {
+                        origin: ExternalOrigin::Ollama { name, .. },
+                        ..
+                    } => name.as_str(),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["llama3.2:1b", "qwen3.5:4b"], "{pass}");
+            assert_eq!(found[0].unsupported_format, None);
+            let qwen = &found[1];
+            assert_eq!(
+                qwen.unsupported_format.as_deref(),
+                Some(
+                    "Ollama stores qwen3.5:4b as 4 safetensors tensor files for its MLX runner, \
+                     not as a GGUF"
+                ),
+                "{pass}"
+            );
+            let ModelLocation::External {
+                components,
+                total_bytes,
+                ..
+            } = &qwen.location
+            else {
+                unreachable!()
+            };
+            assert_eq!(*total_bytes, total);
+            assert!(components.iter().all(|component| {
+                component.role == ComponentRole::Weights && component.path.starts_with("blobs")
+            }));
+            fs::remove_dir_all(root.join("manifests")).ok();
+        }
+        assert!(!root.join("manifests").exists());
+    }
+
+    /// A tensor blob still being pulled leaves the model unlisted until it completes, as a GGUF
+    /// blob does.
+    #[test]
+    fn ollama_skips_an_mlx_pull_with_a_missing_tensor_blob() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        write_ollama_mlx_pull(root, "qwen3.5", "4b", "qwen");
+        let pulls = ollama_pulls(root).unwrap();
+        let layer = pulls[0]
+            .manifest
+            .layers
+            .iter()
+            .find(|layer| layer.media_type == OLLAMA_TENSOR_MEDIA_TYPE)
+            .unwrap();
+        let blob = root
+            .join("blobs")
+            .join(format!("sha256-{}", sha256_hex(&layer.digest).unwrap()));
+        fs::rename(&blob, blob.with_extension("partial")).unwrap();
+
+        let mut output = Vec::new();
+        scan_ollama(
+            root,
+            &ModelCache::new(&temporary.path().join("cache")),
+            &mut output,
+        )
+        .unwrap();
+        assert!(output.is_empty());
     }
 }

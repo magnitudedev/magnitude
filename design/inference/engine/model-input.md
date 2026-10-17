@@ -90,7 +90,8 @@ identity, so both sides name one package. Live device resources remain worker-co
 A separate block drafter declares block causality independently of history
 windows. Its GGUF `dflash.attention.causal` is either BOOL (broadcast to all draft
 layers) or ARRAY<BOOL> with exactly one element per layer. No sliding-window or
-model-name heuristic supplies omitted semantics. Interpretation normalizes this
+model-name heuristic supplies omitted semantics. A drafter that omits it is refused
+with `MissingMetadata` naming the key, never as built for another target. Interpretation normalizes this
 once to per-layer block attention; execution consumes only that normalized model.
 History reach is likewise a declared draft fact: a sliding layer reads its
 `attention.sliding_window`, and a full layer reads at most `dflash.context_length`

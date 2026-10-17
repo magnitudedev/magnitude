@@ -69,6 +69,7 @@ import {
   nativeDrafterReference,
   presentField,
   productDrafterCandidate,
+  productDrafterReference,
 } from "./drafter-references"
 import { LocalModelSources } from "./local-model-sources"
 import { LocalModels, projectAssessment } from "./local-models"
@@ -301,8 +302,9 @@ const pinnedChoice = (requested: DrafterChoice, chosen: Option.Option<DrafterCan
       })
 
 /**
- * The drafter choice persisted for a model: Auto stays Auto, as does picking the recommended drafter, so a
- * later catalog drafter still applies; any other reference is pinned with its method.
+ * The drafter choice persisted for a model: Auto stays Auto, as does picking the recommended drafter (by the
+ * candidate the choice resolved to, so the catalog drafter's file named by its Hugging Face path counts), so a
+ * later catalog drafter still applies; any other reference is pinned, as the candidate it resolved to, with its method.
  */
 const persistedChoice = (
   requested: DrafterChoice,
@@ -310,7 +312,7 @@ const persistedChoice = (
   recommended: Option.Option<DrafterReference>,
 ): PersistedDrafterChoice => {
   const recommendedPicked = requested._tag === "Reference" && Option.exists(recommended,
-    (reference) => drafterReferenceKey(reference) === drafterReferenceKey(requested.reference))
+    (reference) => Option.exists(chosen, (candidate) => drafterReferenceKey(candidate.reference) === drafterReferenceKey(reference)))
   return requested._tag === "Auto" || recommendedPicked ? { _tag: "Auto" } : pinnedChoice(requested, chosen)
 }
 
@@ -472,17 +474,22 @@ export const CustomModelCommandsLive: Layer.Layer<
     }
   })
 
-  const listDrafterCandidates = (target: DrafterTarget, other: Option.Option<string>) => Effect.gen(function* () {
+  const listNativeDrafterCandidates = (target: DrafterTarget, other: Option.Option<string>) => Effect.gen(function* () {
     const { request } = yield* nativeTarget(target)
     const label = Option.getOrElse(other, () => target._tag === "Model" ? target.modelId : target.files[0])
     const entered = Option.map(other, (input) => drafterInput(input, locations.environment))
     const native = yield* icn.drafters(request(entered)).pipe(Effect.mapError(candidateFailure(label)))
     const { catalogModels } = yield* sources.state
-    const candidates = native.flatMap((candidate) => Option.toArray(productDrafterCandidate(candidate, catalogModels)))
+    const candidates = native.candidates.flatMap((candidate) => Option.toArray(productDrafterCandidate(candidate, catalogModels)))
     yield* Effect.forEach(candidates, (candidate) => candidate.verdict._tag === "Bound"
       ? methods.remember(candidate.reference, candidate.verdict.method)
       : Effect.void, { discard: true })
-    return candidates
+    const resolved = Option.flatMap(native.entered, productDrafterReference)
+    return {
+      candidates,
+      entered: Option.flatMap(resolved, (reference) => Option.fromNullable(
+        candidates.find((candidate) => drafterReferenceKey(candidate.reference) === drafterReferenceKey(reference)))),
+    }
   })
 
   /** How ICN's "different drafter" input names a reference it did not list. */
@@ -493,6 +500,31 @@ export const CustomModelCommandsLive: Layer.Layer<
       default: return Option.none()
     }
   }
+
+  /**
+   * A model's drafter choices: ICN's list, then the drafter the user pinned when ICN doesn't list it (one entered by
+   * hand), checked again as a different drafter so it shows as Other with its verdict. A pinned file that resolves to a
+   * listed candidate adds no row, and one that can't be checked now is left out rather than failing the list.
+   */
+  const listDrafterCandidates = (target: DrafterTarget, other: Option.Option<string>) => Effect.gen(function* () {
+    const { candidates } = yield* listNativeDrafterCandidates(target, other)
+    if (target._tag !== "Model" || Option.isSome(other)) return candidates
+    const pinned = (yield* customModels.get).drafters[target.modelId as CustomFormModelId]
+    if (pinned?._tag !== "Reference") return candidates
+    const listed = new Set(candidates.map(({ reference }) => drafterReferenceKey(reference)))
+    if (listed.has(drafterReferenceKey(pinned.reference))) return candidates
+    const entered = yield* Option.match(otherReference(pinned.reference), {
+      onNone: () => Effect.succeed(Option.none<DrafterCandidate>()),
+      onSome: (input) => listNativeDrafterCandidates(target, Option.some(input)).pipe(
+        Effect.map(({ entered }) => entered),
+        Effect.orElseSucceed(() => Option.none<DrafterCandidate>()),
+      ),
+    })
+    return Option.match(Option.filter(entered, ({ reference }) => !listed.has(drafterReferenceKey(reference))), {
+      onNone: () => candidates,
+      onSome: (candidate) => [...candidates, candidate],
+    })
+  })
 
   /** The drafter a choice resolves to; a rejected or unknown reference is refused, never attached. */
   const chooseDrafter = (target: DrafterTarget, choice: DrafterChoice) => Effect.gen(function* () {
@@ -506,9 +538,8 @@ export const CustomModelCommandsLive: Layer.Layer<
       onSome: Effect.succeed,
       onNone: () => Option.match(otherReference(choice.reference), {
         onNone: () => Effect.fail(new InvalidModelReference({ reference: key, message: "This drafter isn't available for this model." })),
-        onSome: (other) => listDrafterCandidates(target, Option.some(other)).pipe(
-          Effect.flatMap((listed) => Option.match(Option.orElse(matching(listed), () => Option.fromNullable(
-            listed.find(({ category }) => category === "Other"))), {
+        onSome: (other) => listNativeDrafterCandidates(target, Option.some(other)).pipe(
+          Effect.flatMap(({ entered }) => Option.match(entered, {
             onNone: () => Effect.fail(new InvalidModelReference({ reference: other, message: "Magnitude couldn't check this drafter." })),
             onSome: Effect.succeed,
           })),

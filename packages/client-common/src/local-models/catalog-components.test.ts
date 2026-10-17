@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { makeSetupModel } from "../application/fixtures/model"
-import { catalogComponentDownloadLabel, catalogComponentName, catalogComponentOffers } from "./catalog-components"
+import { Option } from "effect"
+import { catalogComponentDownloadLabel, catalogComponentName, catalogComponentOffers, catalogDrafterWithheldNote } from "./catalog-components"
 
 const projector = { component: "Projector", downloadBytes: 1_034_945_421 } as const
 
@@ -32,5 +33,11 @@ describe("catalog component offers", () => {
   it("names a drafter whose bytes are already here without a size", () => {
     expect(catalogComponentName("Drafter")).toBe("Drafter")
     expect(catalogComponentDownloadLabel({ component: "Drafter", downloadBytes: 0 })).toBe("Download")
+  })
+
+  it("says when a catalog model runs without its drafter because it fits only without it", () => {
+    expect(catalogDrafterWithheldNote({ ...makeSetupModel(true), drafterWithheld: true }))
+      .toEqual(Option.some("Off - this model fits this computer only without it"))
+    expect(catalogDrafterWithheldNote(makeSetupModel(true))).toEqual(Option.none())
   })
 })

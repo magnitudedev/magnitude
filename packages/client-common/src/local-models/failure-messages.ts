@@ -27,6 +27,7 @@ export const unsupportedReasonMessage = (reason: UnsupportedReason): string => {
     case "RopeScaling": return "Uses rope frequency scaling, which Magnitude doesn't support yet"
     case "UnrecognizedTensor": return `Has parts Magnitude doesn't recognize (${reason.name})`
     case "UnrecognizedMetadata": return `Has parts Magnitude doesn't recognize (${reason.key})`
+    case "MissingMetadata": return `Is missing a setting Magnitude needs (${reason.key})`
     case "Tokenizer": return "Uses a tokenizer Magnitude doesn't support"
     case "ChatTemplate": return "Its chat template can't be read"
     case "TiedOutputHead": return "Uses a tied output layer, which Magnitude doesn't support yet"
@@ -34,6 +35,7 @@ export const unsupportedReasonMessage = (reason: UnsupportedReason): string => {
     case "KernelDomain":
     case "Backend": return `Its layer sizes aren't supported on this ${backendDevice(reason.backend)}`
     case "Unreadable": return "The file is incomplete or damaged"
+    case "UnsupportedFormat": return "Stored in a format Magnitude can't read yet"
     case "Unknown": return reason.detail.trim() === "" ? "Magnitude can't run this model" : `Magnitude can't run this model (${reason.detail.trim()})`
   }
 }

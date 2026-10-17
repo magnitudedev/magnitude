@@ -5,7 +5,7 @@ import { dirname, join, posix, win32 } from "node:path"
 import {
   canonicalLocalModelId,
   HarnessConnectionFailed,
-  localModelIsInstalled,
+  localModelProviderModelId,
   type HarnessConnectOutcome,
   type HarnessConnectRequest,
   type HarnessConnectionsSnapshot,
@@ -26,7 +26,7 @@ import {
 import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { AcnHost } from "./server-settings"
-import { LocalModels, type LocalModelsApi } from "./local-models"
+import { LocalModels } from "./local-models"
 
 export interface AcnHarnessConnectionsApi {
   /** Inspects on subscribe, after any connect or disconnect from any client, and every two seconds while observed. */
@@ -54,14 +54,16 @@ const aliasKey = ({ models }: LocalModelsState): string => models
   .join("\n")
 
 /**
- * What moving selections depends on: the catalog's aliases, and the installed models a harness can be
- * synced to. Empty while there are no aliases, so nothing runs.
+ * What moving selections depends on: the catalog's aliases, and the models a harness can be synced to,
+ * which are the models the service offers for inference (installed and assessed to fit). Empty while
+ * either is empty, so nothing runs: just after an upgrade the aliases and the installed models are known
+ * before the new engine has assessed any model, and the service offers none until it has.
  */
 const renameKey = (state: LocalModelsState): string => {
   const aliases = aliasKey(state)
-  if (aliases.length === 0) return ""
-  const installed = state.models.filter(localModelIsInstalled).map(({ modelId }) => modelId).sort()
-  return `${aliases}\n\n${installed.join("\n")}`
+  const offered = state.models.flatMap((model) => Option.toArray(localModelProviderModelId(model))).sort()
+  if (aliases.length === 0 || offered.length === 0) return ""
+  return `${aliases}\n\n${offered.join("\n")}`
 }
 
 /**
@@ -75,17 +77,16 @@ export const isolatedHarnessHome = (dataDir: string, home: string, platform: Nod
 }
 
 /**
- * Once at start, whenever the catalog's aliases change, and whenever the installed models change, moves
- * every connected harness whose selection names an alias to the catalog ID, through the same
- * reconciliation `connections sync` uses. Just after an upgrade the aliases are known before the engine
- * has any installed model to sync a harness to, so the move runs again once models are installed; it
- * changes nothing for harnesses already moved.
+ * Moves every connected harness whose selection names an alias to the catalog ID, through the same
+ * reconciliation `connections sync` uses, once the aliases and the offered models are both known, and
+ * again whenever either changes, in whichever order they arrive. It changes nothing for harnesses
+ * already moved. `states` is the current state followed by every change, so none is missed at start.
  */
 export const moveHarnessSelectionsOnAliasChanges = <E>(
-  localModels: Pick<LocalModelsApi, "state" | "changes">,
+  states: Stream.Stream<LocalModelsState>,
   syncRenamedSelections: Effect.Effect<ReadonlyArray<HarnessId>, E>,
 ): Effect.Effect<void, E> =>
-  Stream.concat(Stream.fromEffect(localModels.state), localModels.changes.pipe(Stream.mapEffect(() => localModels.state))).pipe(
+  states.pipe(
     Stream.map(renameKey),
     Stream.changes,
     Stream.filter((key) => key.length > 0),
@@ -129,7 +130,7 @@ export const AcnHarnessConnectionsLive = Layer.scoped(AcnHarnessConnections, Eff
     : Effect.void
 
   if (!serverService) {
-    yield* moveHarnessSelectionsOnAliasChanges(localModels, service.pipe(
+    yield* moveHarnessSelectionsOnAliasChanges(localModels.states, service.pipe(
       Effect.flatMap((connections) => connections.syncRenamedSelections),
       Effect.tap((renamed) => renamed.length > 0 ? changed : Effect.void),
       Effect.catchAll((error) => Effect.logWarning(`Moving harness selections to renamed models failed: ${error.message}`).pipe(Effect.as([]))),

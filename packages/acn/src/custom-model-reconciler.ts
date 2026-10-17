@@ -68,7 +68,8 @@ export const CustomModelReconcilerLive: Layer.Layer<
       const modelId = id as CustomFormModelId
       const key = drafterReferenceKey(choice.reference)
       const bound = (request: unknown) => candidates.drafters(request as Native.DrafterCandidatesRequest).pipe(
-        Effect.orElseSucceed(() => []),
+        Effect.map(({ candidates: listed }) => listed),
+        Effect.orElseSucceed((): readonly Native.DrafterCandidate[] => []),
         Effect.map((listed) => Option.fromNullable(listed.find((candidate) => {
           const reference = productDrafterReference(candidate.reference)
           return candidate.verdict._tag === "Bound" && Option.isSome(reference) && drafterReferenceKey(reference.value) === key

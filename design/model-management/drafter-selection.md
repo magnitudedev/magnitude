@@ -3,10 +3,12 @@ applies_to:
   - inference/service/models/src/catalog.rs
   - inference/service/models/src/preview.rs
   - inference/service/models/src/custom_models.rs
+  - inference/service/models/src/catalog_models.rs
   - inference/service/server/src/assessment/**
   - packages/acn/src/local-model*
   - packages/acn/src/drafter-references*
   - packages/client-common/src/local-models/drafter-presentation*
+  - packages/client-common/src/local-models/catalog-components*
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/storage/src/types/custom-models*
 ---
@@ -71,6 +73,11 @@ user may enter **a different drafter** (a Hugging Face file or a local path); it
 cannot be chosen when rejected, is labelled "Untested" when its lineage does not match, and is never chosen
 automatically. ACN passes a drafter the user entered to ICN as `owner/repo[@revision]:path`, whether it was typed as
 a link, `owner/repo/path.gguf`, or `hf:owner/repo/path.gguf`, and a local path as an absolute path.
+A different drafter that is the same file as a listed candidate (the catalog drafter's package, or
+the same repository, commit and path) is that candidate: ICN reports the listed reference the entry
+resolves to, no second row is added, and choosing it attaches (and saves) that candidate. Once
+chosen, any other different drafter stays in the model's list (after the candidates above, as a
+different drafter with its verdict) and is marked as the one in use, in every client.
 **No drafter** is always available. The preselected candidate's label reads "Recommended · ",
 followed by its source label.
 
@@ -91,18 +98,25 @@ rejected candidate is listed but never preselected.
 
 A drafter never makes a model that fits stop fitting. A candidate that binds is automatic unless the model fits
 without a drafter and not with it; such a candidate is listed with its verdict, and the next automatic one, or no
-drafter, is preselected. When the model doesn't fit even without a drafter, fit doesn't decide. A user-entered
+drafter, is preselected. "Without a drafter" is the model served plain (`ModelMethod::Plain`), never the engine's
+automatic method, which takes built-in heads; the heads are a candidate like any other, judged with them. When the
+model doesn't fit even without a drafter, fit doesn't decide. The rule holds for every origin and every path: the
+candidate list, the recommended drafter, and the attachment, which takes only automatic candidates. A user-entered
 drafter is never automatic. A candidate version's verdict (the repository step, `catalog inspect`) is the
-assessment of exactly what adding it installs: its target and projector with its preselected drafter, so the
-installed model gets the same verdict.
-Catalog models always use their catalog drafter, including one whose exact target is found in another
-app's location: it serves with the catalog drafter as soon as that drafter is on this computer (a
-projector it lacks never blocks it), and otherwise offers the drafter-only download.
+assessment of exactly what adding it installs: its target and projector with its preselected drafter, or served
+plain when none is preselected, so the installed model gets the same verdict.
+Catalog models always use their catalog drafter unless it doesn't fit, including one whose exact target is found in
+another app's location: it serves with the catalog drafter as soon as that drafter is on this computer (a
+projector it lacks never blocks it), and otherwise offers the drafter-only download. A catalog model that fits
+served plain and not with its catalog drafter is served plain instead of being refused: ICN works this out once
+per catalog model (it depends on the release material and this computer, not on the files here), the catalog
+projection then serves and assesses the model's target alone, reports `drafterWithheld`, and offers no drafter
+download; clients say the drafter is off because the model fits only without it.
 
 ## Controls
 
-- Catalog models keep the catalog's drafter; it changes only through Update. They never offer a
-  drafter change.
+- Catalog models keep the catalog's drafter; it changes only through Update, and is off only while
+  the model fits only without it. They never offer a drafter change.
 - Every custom model can add, change, or turn off its drafter. The choice is a persisted
   declaration keyed by `ModelId` and is delivered to ICN with the local-models configuration. A
   chosen reference is persisted with the method the engine binds it with, so ICN receives it right
@@ -120,7 +134,8 @@ projector it lacks never blocks it), and otherwise offers the drafter-only downl
 - A model whose choice is automatic attaches the first of its automatic candidates, in the order
   above, that is on this computer, checked against the files present at every projection: a
   recommended drafter that goes missing gives way at once to the next one here, built-in heads
-  included. ICN's candidate enumeration is the single source of that order and of the recommended
+  included. ICN therefore hands the projection every automatic candidate, never only the first, and
+  while a lesser one serves, clients still offer the recommended one ("Faster with a drafter · Add"). ICN's candidate enumeration is the single source of that order and of the recommended
   drafter; it is recomputed whenever its inputs change (a file appearing, moving or disappearing in
   any location, a model's folder or repository included; a drafter or catalog package installed
   or removed; a configuration change), never kept until a restart. While a model's recompute is
@@ -159,7 +174,8 @@ projector it lacks never blocks it), and otherwise offers the drafter-only downl
 ## Conformance
 
 - No drafter is preselected unless the engine binds it.
-- No drafter is preselected that makes a model fitting without one not fit.
+- No drafter is preselected or attached automatically that makes a model fitting served plain not
+  fit, whatever the model's origin; a catalog model in that case is served plain.
 - A candidate version's verdict equals the installed model's verdict for the same composition.
 - Found, imported, and added models receive the same recommendation as an equivalent catalog
   quantization, including models without a Hugging Face identity.

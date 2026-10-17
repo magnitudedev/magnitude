@@ -86,7 +86,8 @@ pub enum CandidateFileRole {
     Drafter {
         architecture: String,
     },
-    /// Quantization data that is not a model, such as an importance matrix.
+    /// A file that is not a model: quantization data such as an importance matrix, or a GGUF that
+    /// holds no weights.
     Auxiliary,
 }
 
@@ -94,6 +95,15 @@ impl CandidateFileRole {
     #[must_use]
     pub fn of(directory: &Directory, architectures: &RecognizedArchitectures) -> Self {
         if directory.value("general.type").and_then(Value::string) == Some("imatrix") {
+            return Self::Auxiliary;
+        }
+        // A split's first shard may hold only metadata; any other file without tensors holds no
+        // weights.
+        let split = directory
+            .value("split.count")
+            .and_then(Value::unsigned)
+            .is_some_and(|count| count > 1);
+        if directory.tensors.is_empty() && !split {
             return Self::Auxiliary;
         }
         let architecture = directory
@@ -142,6 +152,21 @@ pub struct HeaderClassification {
     pub role: CandidateFileRole,
     pub base_repositories: BTreeSet<String>,
     pub quantization: Option<String>,
+    pub declared_bytes: u64,
+}
+
+impl HeaderClassification {
+    /// This header's classification for a file of `size_bytes`. A file shorter than the tensor
+    /// data its header declares, such as a shard set's skeleton whose directory describes weights
+    /// stored in other files, holds no weights: it is auxiliary, never a version, drafter or
+    /// projector.
+    #[must_use]
+    pub fn for_file(mut self, size_bytes: u64) -> Self {
+        if size_bytes < self.declared_bytes {
+            self.role = CandidateFileRole::Auxiliary;
+        }
+        self
+    }
 }
 
 /// Classify one GGUF header held in memory.
@@ -154,6 +179,7 @@ pub fn classify_header(
         role: CandidateFileRole::of(&directory, architectures),
         base_repositories: header_base_repositories(&directory),
         quantization: inspection.quantization,
+        declared_bytes: crate::gguf::declared_length(&directory),
     })
 }
 
@@ -711,14 +737,18 @@ mod tests {
             CandidateFileRole::of(&directory(&[("general.type", "imatrix")]), &architectures),
             CandidateFileRole::Auxiliary
         );
+        let model = crate::test_gguf::gguf_bytes(
+            &[
+                ("general.type", crate::test_gguf::Meta::Str("model")),
+                (
+                    "general.architecture",
+                    crate::test_gguf::Meta::Str("qwen35"),
+                ),
+            ],
+            &["token_embd.weight"],
+        );
         assert_eq!(
-            CandidateFileRole::of(
-                &directory(&[
-                    ("general.type", "model"),
-                    ("general.architecture", "qwen35")
-                ]),
-                &architectures
-            ),
+            classify_header(&model, &architectures).unwrap().role,
             CandidateFileRole::Target {
                 architecture: Some("qwen35".to_owned())
             }
@@ -800,6 +830,54 @@ mod tests {
             .read_to_end(&mut header)
             .expect("gzipped header");
         header
+    }
+
+    /// Arki05's `skeleton.gguf` (the real header) is a whole Qwen3.5 4B header: 426 tensors whose
+    /// directory declares 8.41 GB of data after its 3 MB header, in a file of 10,968,000 bytes. It
+    /// holds none of the weights it describes, so at its real size it is auxiliary, never a
+    /// version; the same header on a file holding its data is a target.
+    #[test]
+    fn a_file_shorter_than_its_declared_tensor_data_holds_no_weights() {
+        let architectures = RecognizedArchitectures::new(["qwen35"], ["dflash"]);
+        let classification =
+            classify_header(&fixture_header("skeleton.gguf"), &architectures).unwrap();
+        assert_eq!(classification.declared_bytes, 3_017_952 + 8_413_425_664);
+        let target = CandidateFileRole::Target {
+            architecture: Some("qwen35".to_owned()),
+        };
+        assert_eq!(classification.role, target);
+        assert_eq!(
+            classification.clone().for_file(10_968_000).role,
+            CandidateFileRole::Auxiliary
+        );
+        assert_eq!(
+            classification.for_file(3_017_952 + 8_413_425_664).role,
+            target
+        );
+    }
+
+    #[test]
+    fn a_file_without_tensors_holds_no_weights_unless_it_is_a_splits_first_shard() {
+        use crate::test_gguf::{Meta, gguf_bytes};
+        let architectures = RecognizedArchitectures::new(["qwen35"], ["dflash"]);
+        let classify = |metadata: &[(&str, Meta<'_>)]| {
+            classify_header(&gguf_bytes(metadata, &[]), &architectures)
+                .unwrap()
+                .role
+        };
+        assert_eq!(
+            classify(&[("general.architecture", Meta::Str("qwen35"))]),
+            CandidateFileRole::Auxiliary
+        );
+        assert_eq!(
+            classify(&[
+                ("general.architecture", Meta::Str("qwen35")),
+                ("split.count", Meta::U32(3)),
+            ]),
+            CandidateFileRole::Target {
+                architecture: Some("qwen35".to_owned())
+            }
+        );
     }
 
     /// HauhauCS's FastMTP file (the real header) declares the target's `qwen35` architecture,

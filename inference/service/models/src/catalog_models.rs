@@ -126,7 +126,12 @@ impl ModelDomainResolver {
                 selection,
             } => match selection {
                 magnitude_service_contracts::models::CatalogModelSelection::Desired => {
-                    Ok(self.catalog_definition(model_id)?.configuration.clone())
+                    let configuration = self.catalog_definition(model_id)?.configuration.clone();
+                    Ok(if self.withholds_catalog_drafter(model_id) {
+                        plain_configuration(configuration)
+                    } else {
+                        configuration
+                    })
                 }
                 magnitude_service_contracts::models::CatalogModelSelection::Effective => {
                     self.effective_catalog_configuration(model_id)
@@ -155,7 +160,11 @@ impl ModelDomainResolver {
             .entries()
             .cloned()
             .collect::<Vec<_>>();
-        match catalog_resolution(definition, &present, &affiliations, &BTreeSet::new()).state {
+        let mut resolution = catalog_resolution(definition, &present, &affiliations, &BTreeSet::new());
+        if self.withholds_catalog_drafter(model_id) {
+            resolution = resolution.without_drafter(&present);
+        }
+        match resolution.state {
             CatalogMaterialState::NotInstalled => Err(InventoryError::NotReady(format!(
                 "catalog model {model_id} is not installed"
             ))),
@@ -182,8 +191,25 @@ impl ModelDomainResolver {
         }
     }
 
+    /// Monotonic over the inventory and the catalog's own generation.
     pub fn revision(&self) -> Result<u64, InventoryError> {
-        Ok(self.inventory.installed_packages_response()?.revision)
+        Ok(self.inventory.installed_packages_response()?.revision
+            + self.catalog_changes.generation.load(Ordering::Acquire))
+    }
+
+    /// Republishes the catalog list after which catalog models serve without their drafter changed.
+    pub fn catalog_drafter_fit_changed(&self) {
+        self.catalog_changes.generation.fetch_add(1, Ordering::AcqRel);
+        self.publish_catalog_change();
+    }
+
+    pub(crate) fn publish_catalog_change(&self) {
+        if let Ok(revision) = self.revision() {
+            let _ = self
+                .catalog_changes
+                .changes
+                .send(ModelDomainInvalidation { revision });
+        }
     }
 
     pub fn catalog_snapshot(&self) -> Result<CatalogModelsResponse, InventoryError> {
@@ -241,7 +267,7 @@ impl ModelDomainResolver {
             origins.include(projector.installed.origin);
         }
         Ok(CatalogModelsResponse {
-            revision: installed.revision,
+            revision: self.revision()?,
             reconciliation_complete: installed.reconciliation_complete,
             models: self
                 .catalog
@@ -254,6 +280,7 @@ impl ModelDomainResolver {
                         &affiliations,
                         &occurrence_origins,
                         &local_files,
+                        self.withholds_catalog_drafter(&catalog_id(definition)),
                     );
                     model.aliases = aliases
                         .get(&(definition.model_id.clone(), definition.variant_id.clone()))
@@ -489,7 +516,6 @@ pub struct ManagedCatalogModels {
     installations: Arc<ManagedCatalogInstallations>,
     maintenance_generation: Arc<AtomicU64>,
     maintenance_running: Arc<AtomicBool>,
-    changes: tokio::sync::broadcast::Sender<ModelDomainInvalidation>,
     inventory_observer: Arc<dyn InstalledPackagesObserver>,
 }
 
@@ -499,19 +525,17 @@ impl ManagedCatalogModels {
         installations: Arc<ManagedCatalogInstallations>,
         make_inventory_observer: impl FnOnce(Weak<Self>) -> Arc<dyn InstalledPackagesObserver>,
     ) -> Arc<Self> {
-        let (changes, _) = tokio::sync::broadcast::channel(32);
         Arc::new_cyclic(|catalog| Self {
             resolver,
             installations,
             maintenance_generation: Arc::new(AtomicU64::new(0)),
             maintenance_running: Arc::new(AtomicBool::new(false)),
-            changes,
             inventory_observer: make_inventory_observer(catalog.clone()),
         })
     }
 
-    pub(crate) fn installed_packages_changed(&self, revision: u64) {
-        let _ = self.changes.send(ModelDomainInvalidation { revision });
+    pub(crate) fn installed_packages_changed(&self, _revision: u64) {
+        self.resolver.publish_catalog_change();
         self.request_maintenance();
     }
 
@@ -594,7 +618,7 @@ impl CatalogModels for ManagedCatalogModels {
     fn watch_catalog(&self) -> BoxStream<'static, ModelDomainInvalidation> {
         domain_changes(
             self.resolver.revision().unwrap_or_default(),
-            self.changes.subscribe(),
+            self.resolver.catalog_changes.changes.subscribe(),
         )
     }
 }
@@ -605,8 +629,12 @@ fn catalog_model(
     affiliations: &[magnitude_service_contracts::models::CatalogPackageAffiliation],
     occurrence_origins: &BTreeMap<ModelPackageId, InstallationOrigins>,
     local_files: &BTreeSet<ModelFileId>,
+    withhold_drafter: bool,
 ) -> CatalogModel {
-    let resolution = catalog_resolution(definition, present, affiliations, local_files);
+    let mut resolution = catalog_resolution(definition, present, affiliations, local_files);
+    if withhold_drafter {
+        resolution = resolution.without_drafter(present);
+    }
     CatalogModel {
         id: catalog_id(definition),
         desired: ready_model(
@@ -655,6 +683,7 @@ fn catalog_model(
                     }
                 },
                 missing_components: resolution.missing_components,
+                drafter_withheld: resolution.drafter_withheld,
             },
         },
     }
@@ -668,7 +697,46 @@ struct CatalogResolution<'a> {
     superseded_package_ids: Vec<ModelPackageId>,
     required_download_bytes: u64,
     missing_components: Vec<CatalogMissingComponent>,
+    drafter_withheld: bool,
     state: CatalogMaterialState<'a>,
+}
+
+impl<'a> CatalogResolution<'a> {
+    /// The model served without its catalog drafter, which it fits only without, whether or not
+    /// that drafter is here; the drafter is then no missing component either.
+    fn without_drafter(mut self, present: &BTreeMap<ModelPackageId, &InstalledModelPackage>) -> Self {
+        if let CatalogMaterialState::Installed {
+            configuration,
+            effective,
+            ..
+        } = &mut self.state
+        {
+            if let Some(configuration) = configuration
+                && matches!(configuration.bundle, ServableModelBundle::SpeculativeDecoding { .. })
+            {
+                *configuration = plain_configuration(configuration.clone());
+                *effective = effective_configuration_model(configuration, present);
+            }
+            self.drafter_withheld = true;
+        }
+        self.missing_components
+            .retain(|missing| missing.component != CatalogComponent::Drafter);
+        self
+    }
+}
+
+/// A configuration served plain: its target alone.
+fn plain_configuration(configuration: ModelServingConfiguration) -> ModelServingConfiguration {
+    let package = match configuration.bundle {
+        ServableModelBundle::Standalone { package }
+        | ServableModelBundle::SpeculativeDecoding {
+            target: package, ..
+        } => package,
+    };
+    ModelServingConfiguration {
+        bundle: ServableModelBundle::Standalone { package },
+        profile: configuration.profile,
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -898,6 +966,7 @@ fn catalog_resolution<'a>(
         superseded_package_ids,
         required_download_bytes,
         missing_components,
+        drafter_withheld: false,
         state,
     }
 }
@@ -1370,12 +1439,13 @@ mod tests {
             "the catalog drafter on this computer serves with the found weights at once"
         );
 
-        let model = catalog_model(&definition, &present, &[], &BTreeMap::new(), &local_files);
+        let model = catalog_model(&definition, &present, &[], &BTreeMap::new(), &local_files, false);
         let CatalogModelState::Installed {
             effective: EffectiveModel::Ready { model: ready },
             installation: ModelInstallation::Resolved { ownership, .. },
             update_state,
             missing_components,
+            ..
         } = model.local_state
         else {
             panic!("the found exact target is the installed catalog model: {:?}", model.local_state);
@@ -1399,6 +1469,68 @@ mod tests {
             }],
             "only the projector is fetched; the found weights are copied, never downloaded"
         );
+    }
+
+    /// A catalog model that fits only without its drafter serves plain and says so, rather than
+    /// being refused; the drafter is then no missing component to add.
+    #[test]
+    fn a_catalog_model_that_fits_only_without_its_drafter_serves_plain_and_says_so() {
+        let (found, target) = found_exact_target_without_projector();
+        let draft = package("draft", 900);
+        let definition = definition(ServableModelBundle::SpeculativeDecoding {
+            target,
+            draft_source: SpeculativeDraftSource::Separate {
+                draft: draft.clone(),
+            },
+            method: SpeculativeMethod::DFlash,
+        });
+        let external = attributed_external(found.clone(), &definition);
+        let drafter = installed(draft, ModelPackageInstallationOrigin::Magnitude);
+        let with_drafter = BTreeMap::from([
+            (external.package.id.clone(), &external),
+            (drafter.package.id.clone(), &drafter),
+        ]);
+        let without_drafter = BTreeMap::from([(external.package.id.clone(), &external)]);
+        for present in [&with_drafter, &without_drafter] {
+            let model = catalog_model(&definition, present, &[], &BTreeMap::new(), &BTreeSet::new(), true);
+            let CatalogModelState::Installed {
+                effective: EffectiveModel::Ready { model: ready },
+                missing_components,
+                drafter_withheld,
+                ..
+            } = model.local_state
+            else {
+                panic!("the model is installed and ready: {:?}", model.local_state);
+            };
+            assert_eq!(ready.speculative_method, None, "it serves plain");
+            assert!(drafter_withheld, "and says why");
+            assert!(
+                missing_components
+                    .iter()
+                    .all(|missing| missing.component != CatalogComponent::Drafter),
+                "a drafter it won't use is never offered: {missing_components:?}"
+            );
+            let resolution = catalog_resolution(&definition, present, &[], &BTreeSet::new())
+                .without_drafter(present);
+            let CatalogMaterialState::Installed {
+                configuration: Some(configuration),
+                ..
+            } = resolution.state
+            else {
+                panic!("installed");
+            };
+            assert_eq!(
+                configuration.bundle,
+                ServableModelBundle::Standalone {
+                    package: found.clone()
+                }
+            );
+        }
+        let model = catalog_model(&definition, &with_drafter, &[], &BTreeMap::new(), &BTreeSet::new(), false);
+        assert!(matches!(
+            model.local_state,
+            CatalogModelState::Installed { drafter_withheld: false, .. }
+        ));
     }
 
     #[test]
@@ -1606,6 +1738,7 @@ mod tests {
             &[affiliation(&prior.package.id, CatalogPackageRole::Target)],
             &BTreeMap::new(),
             &BTreeSet::new(),
+            false,
         );
         let CatalogModelState::Installed {
             effective: EffectiveModel::Ready { .. },
@@ -1709,7 +1842,7 @@ mod tests {
             (target.package.id.clone(), &target),
             (draft.package.id.clone(), &draft),
         ]);
-        let model = catalog_model(&definition, &present, &[], &BTreeMap::new(), &BTreeSet::new());
+        let model = catalog_model(&definition, &present, &[], &BTreeMap::new(), &BTreeSet::new(), false);
         let CatalogModelState::Installed {
             effective: EffectiveModel::Unavailable { failure },
             installation:
@@ -1757,6 +1890,7 @@ mod tests {
             ],
             &BTreeMap::new(),
             &BTreeSet::new(),
+            false,
         );
         let CatalogModelState::Installed {
             effective: EffectiveModel::Unavailable { failure },
@@ -1796,6 +1930,7 @@ mod tests {
             &[affiliation(&prior.package.id, CatalogPackageRole::Target)],
             &BTreeMap::new(),
             &BTreeSet::new(),
+            false,
         );
         let CatalogModelState::Installed {
             update_state: CatalogModelUpdate::Current,
@@ -1834,6 +1969,7 @@ mod tests {
             &[],
             &origins,
             &BTreeSet::new(),
+            false,
         );
         assert!(matches!(
             model.local_state,

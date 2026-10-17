@@ -181,6 +181,7 @@ struct CatalogFacts {
 struct CandidateEnrichment {
     results: std::sync::RwLock<BTreeMap<(ModelId, String), (u64, CustomModelEnrichmentResult)>>,
     drafter_contents: std::sync::RwLock<BTreeMap<String, DrafterContent>>,
+    withheld_catalog_drafters: std::sync::RwLock<BTreeMap<ModelId, bool>>,
 }
 
 impl CandidateEnrichment {
@@ -225,6 +226,21 @@ impl CandidateEnrichment {
         results.retain(|(model_id, _), _| model_id != &key.0);
         results.insert(key, (revision, result.clone()));
         previous != result
+    }
+
+    fn knows_catalog_drafter_fit(&self, model_id: &ModelId) -> bool {
+        self.withheld_catalog_drafters
+            .read()
+            .is_ok_and(|withheld| withheld.contains_key(model_id))
+    }
+
+    /// Record whether a catalog model serves without its drafter; whether that changed what it
+    /// serves.
+    fn record_catalog_drafter_fit(&self, model_id: ModelId, withheld: bool) -> bool {
+        let Ok(mut known) = self.withheld_catalog_drafters.write() else {
+            return false;
+        };
+        known.insert(model_id, withheld).unwrap_or(false) != withheld
     }
 
     /// Record a drafter reference's bytes; whether they are new.
@@ -272,6 +288,12 @@ impl CustomModelEnrichment for CandidateEnrichment {
             .read()
             .ok()
             .and_then(|contents| contents.get(&reference_key(reference)).cloned())
+    }
+
+    fn withholds_catalog_drafter(&self, model_id: &ModelId) -> bool {
+        self.withheld_catalog_drafters
+            .read()
+            .is_ok_and(|withheld| withheld.get(model_id).copied().unwrap_or(false))
     }
 }
 
@@ -330,6 +352,22 @@ impl ManagedModelCandidates {
         ))
     }
 
+    /// Whether a catalog model serves without its catalog drafter: the engine binds the drafter,
+    /// and the model fits served plain and not with it. Catalog models use their catalog drafter
+    /// unless it doesn't fit; one that fits only without it still loads, served plain.
+    async fn withholds_catalog_drafter(&self, model_id: &ModelId) -> Result<bool, InventoryError> {
+        let target = self.model_target(model_id).await?;
+        Ok(self
+            .enumerate_drafters(&target, None, true)
+            .await?
+            .iter()
+            .any(|candidate| {
+                candidate.category == DrafterCategory::CatalogDrafter
+                    && is_bound(&candidate.verdict)
+                    && !candidate.automatic
+            }))
+    }
+
     /// A custom model's lineage hint and recommended drafter.
     async fn enrich_model(
         &self,
@@ -364,7 +402,9 @@ impl ManagedModelCandidates {
             .snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.license.clone());
-        let drafters = automatic(self.enumerate_drafters(&target, None, true).await?);
+        // Every automatic candidate, not only the first: the projection attaches the first one on
+        // this computer, so built-in heads serve while a better drafter is still to be added.
+        let drafters = automatic(self.enumerate_drafters(&target, None, false).await?);
         if let Some(chosen) = self.chosen_drafter(model_id).await {
             self.learn_drafter_content(&chosen).await;
         }
@@ -457,9 +497,39 @@ impl ManagedModelCandidates {
                         }
                     }
                 }
+                // Whether each catalog model with a drafter fits only without it, once: it depends
+                // on the release material and this computer, never on the files here.
+                let catalog = candidates
+                    .catalog
+                    .list_catalog()
+                    .await
+                    .map(|response| response.models)
+                    .unwrap_or_default();
+                let mut catalog_failed = false;
+                for model in catalog {
+                    if resolver.custom_model_inputs_revision().ok() != Some(revision) {
+                        break;
+                    }
+                    if model.desired.speculative_method.is_none()
+                        || enrichment.knows_catalog_drafter_fit(&model.id)
+                    {
+                        continue;
+                    }
+                    match candidates.withholds_catalog_drafter(&model.id).await {
+                        Ok(withheld) => {
+                            if enrichment.record_catalog_drafter_fit(model.id, withheld) {
+                                resolver.catalog_drafter_fit_changed();
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(model.id = %model.id.as_str(), %error, "catalog drafter fit failed");
+                            catalog_failed = true;
+                        }
+                    }
+                }
                 tokio::select! {
                     change = changes.next() => if change.is_none() { return },
-                    () = tokio::time::sleep(ENRICHMENT_RETRY_DELAY), if !failed.is_empty() => {}
+                    () = tokio::time::sleep(ENRICHMENT_RETRY_DELAY), if !failed.is_empty() || catalog_failed => {}
                 }
             }
         });
@@ -1027,14 +1097,18 @@ impl ManagedModelCandidates {
     }
 
     /// The assessment of a candidate with its preselected drafter, assessed exactly as its drafter
-    /// candidate was (so it is a cache hit), or `None` when it has no separate drafter.
+    /// candidate was (so it is a cache hit): served plain when none is preselected, as the
+    /// installed model is, or `None` when it uses its built-in heads.
     async fn preselected_assessment(
         &self,
         candidate: &ModelCandidate,
     ) -> Result<Option<CachedModelAssessment>, InventoryError> {
         let target = self.candidate_target(candidate).await?;
         let Some(chosen) = recommended(self.enumerate_drafters(&target, None, true).await?) else {
-            return Ok(None);
+            return Ok(Some(
+                self.assess(&target.material, None, ModelMethod::Plain)
+                    .await?,
+            ));
         };
         let Some(method) = chosen.method else {
             return Ok(None);
@@ -1696,21 +1770,40 @@ impl ManagedModelCandidates {
     ///
     /// A drafter the engine binds is automatic unless the model fits without a drafter and not
     /// with it: a drafter never makes a model that fits not fit, so the next candidate, or none, is
-    /// chosen instead. When the model doesn't fit even without one, fit doesn't decide. A catalog
-    /// model, and a catalog model's exact target, always take the catalog drafter.
+    /// chosen instead. "Without a drafter" is the model served plain, never with its built-in heads.
+    /// When the model doesn't fit even without one, fit doesn't decide. A catalog model, and a
+    /// catalog model's exact target, are offered only the catalog drafter, under the same rule.
     async fn enumerate_drafters(
         &self,
         target: &DrafterTarget,
         other: Option<&str>,
         stop_at_first_automatic: bool,
     ) -> Result<Vec<DrafterCandidate>, InventoryError> {
-        let plain = self
+        self.drafter_list(target, other, stop_at_first_automatic)
+            .await
+            .map(|list| list.candidates)
+    }
+
+    /// The drafter list of `enumerate_drafters`, with the listed reference a different drafter
+    /// resolves to: a candidate already listed that is the same file (the catalog drafter's
+    /// package, or the same repository, commit and path), else its own Other row.
+    async fn drafter_list(
+        &self,
+        target: &DrafterTarget,
+        other: Option<&str>,
+        stop_at_first_automatic: bool,
+    ) -> Result<DrafterList, InventoryError> {
+        let bare = self
+            .assess(&target.material, None, ModelMethod::Plain)
+            .await?;
+        if matches!(bare.profile, ModelAssessment::Unsupported { .. }) {
+            return Ok(DrafterList::default());
+        }
+        let fit_decides = fits(&bare.profile);
+        // The target as the engine takes it on its own: with its built-in heads when it has any.
+        let own = self
             .assess(&target.material, None, ModelMethod::Auto)
             .await?;
-        if matches!(plain.profile, ModelAssessment::Unsupported { .. }) {
-            return Ok(Vec::new());
-        }
-        let fit_decides = fits(&plain.profile);
         let regardless_of_fit = |mut candidate: DrafterCandidate| {
             candidate.automatic = candidate.category != DrafterCategory::Other
                 && is_bound(&candidate.verdict);
@@ -1730,25 +1823,11 @@ impl ManagedModelCandidates {
                 .into_iter()
                 .collect(),
             None => {
-                self.catalog_matches(exact, &target.lineage, plain.fingerprint.as_ref())
+                self.catalog_matches(exact, &target.lineage, own.fingerprint.as_ref())
                     .await
             }
         };
         let matched = matches.first().cloned();
-        // A catalog model, and a file that is exactly a catalog model's target, use only that
-        // catalog model's drafter.
-        let exact_catalog = matches!(&matched, Some((_, DrafterLineage::Exact)));
-        if target.catalog.is_some() || exact_catalog {
-            let Some((matched, lineage)) = &matched else {
-                return Ok(Vec::new());
-            };
-            return Ok(self
-                .catalog_drafter(&target, matched, *lineage)
-                .await
-                .map(regardless_of_fit)
-                .into_iter()
-                .collect());
-        }
         let decide = |candidate: DrafterCandidate| {
             if fit_decides {
                 candidate
@@ -1756,6 +1835,23 @@ impl ManagedModelCandidates {
                 regardless_of_fit(candidate)
             }
         };
+        // A catalog model, and a file that is exactly a catalog model's target, use only that
+        // catalog model's drafter, unless it would keep a model that fits without it from fitting.
+        let exact_catalog = matches!(&matched, Some((_, DrafterLineage::Exact)));
+        if target.catalog.is_some() || exact_catalog {
+            let Some((matched, lineage)) = &matched else {
+                return Ok(DrafterList::default());
+            };
+            return Ok(DrafterList {
+                candidates: self
+                    .catalog_drafter(&target, matched, *lineage)
+                    .await
+                    .map(decide)
+                    .into_iter()
+                    .collect(),
+                entered: None,
+            });
+        }
         let done = |candidates: &[DrafterCandidate]| {
             stop_at_first_automatic && candidates.iter().any(|candidate| candidate.automatic)
         };
@@ -1793,11 +1889,11 @@ impl ManagedModelCandidates {
             )
         });
         if !embedded_catalog && !done(&candidates) {
-            let verdict = verdict_of(&plain.profile);
+            let verdict = verdict_of(&own.profile);
             if !matches!(verdict, DrafterVerdict::None) {
                 candidates.push(decide(DrafterCandidate {
                     category: DrafterCategory::BuiltIn,
-                    automatic: is_bound(&verdict) && fits(&plain.profile),
+                    automatic: is_bound(&verdict) && fits(&own.profile),
                     reference: DrafterReference::Embedded,
                     name: embedded_drafter_name(bound_method(&verdict).as_ref()),
                     label: "Built into this model".to_owned(),
@@ -1810,6 +1906,7 @@ impl ManagedModelCandidates {
             }
         }
         let mut candidates = in_choice_order(candidates);
+        let mut entered = None;
         if let Some(other) = other {
             let mut related = target.lineage.clone();
             if let Some((matched, _)) = &matched {
@@ -1817,14 +1914,34 @@ impl ManagedModelCandidates {
             }
             let candidate = self.other_drafter(&target, &related, other).await?;
             let key = reference_key(&candidate.reference);
-            if !candidates
+            match candidates
                 .iter()
-                .any(|listed| reference_key(&listed.reference) == key)
+                .find(|listed| self.drafter_file_key(&listed.reference) == key)
             {
-                candidates.push(candidate);
+                Some(listed) => entered = Some(listed.reference.clone()),
+                None => {
+                    entered = Some(candidate.reference.clone());
+                    candidates.push(candidate);
+                }
             }
         }
-        Ok(candidates)
+        Ok(DrafterList {
+            candidates,
+            entered,
+        })
+    }
+
+    /// The file a listed drafter is, as a Hugging Face reference key: a catalog drafter's package
+    /// file, else its own reference.
+    fn drafter_file_key(&self, reference: &DrafterReference) -> String {
+        match reference {
+            DrafterReference::Catalog { model_id } => self
+                .lineage
+                .variant(model_id)
+                .and_then(|matched| catalog_draft_key(&matched.model)),
+            _ => None,
+        }
+        .unwrap_or_else(|| reference_key(reference))
     }
 
     async fn catalog_drafter(
@@ -2226,10 +2343,10 @@ impl ModelCandidates for ManagedModelCandidates {
                     (self.model_target(&model_id).await?, other)
                 }
             };
+            let list = self.drafter_list(&target, other.as_deref(), false).await?;
             Ok(DrafterCandidatesResponse {
-                candidates: self
-                    .enumerate_drafters(&target, other.as_deref(), false)
-                    .await?,
+                candidates: list.candidates,
+                entered: list.entered,
             })
         })
     }
@@ -2450,6 +2567,13 @@ fn other_drafter_label(lineage: DrafterLineage) -> String {
             "Entered by you".to_owned()
         }
     }
+}
+
+/// A target's drafter candidates, and the listed reference its different drafter resolves to.
+#[derive(Default)]
+struct DrafterList {
+    candidates: Vec<DrafterCandidate>,
+    entered: Option<DrafterReference>,
 }
 
 fn reference_key(reference: &DrafterReference) -> String {

@@ -1,5 +1,6 @@
 import { LightningIcon } from "@phosphor-icons/react"
-import { catalogComponentDownloadLabel, catalogComponentName, catalogComponentOffers, formatStorageSize } from "@magnitudedev/client-common"
+import { Option } from "effect"
+import { catalogComponentDownloadLabel, catalogComponentName, catalogComponentOffers, catalogDrafterWithheldNote, formatStorageSize } from "@magnitudedev/client-common"
 import type { CatalogComponent, CatalogLocalModel } from "@magnitudedev/sdk"
 import { Button } from "./ui/button"
 
@@ -15,11 +16,15 @@ export function CatalogDrafterOffer({ model, disabled, onDownload }: { model: Ca
 /** In Details, each catalog component a found exact target lacks ("Image input · Download (1.0 GB)"), fetched alone. */
 export function CatalogComponentDetails({ model, disabled, onDownload }: { model: CatalogLocalModel; disabled: boolean; onDownload: (component: CatalogComponent) => void }) {
   const offers = catalogComponentOffers(model)
-  if (offers.length === 0) return null
+  const withheld = catalogDrafterWithheldNote(model)
+  if (offers.length === 0 && Option.isNone(withheld)) return null
   return <dl className="flex flex-wrap gap-x-8 gap-y-3">
-    {offers.map(offer => <div key={offer.component}><dt className="text-xs text-slate-500">{catalogComponentName(offer.component)}</dt><dd className="mt-1 flex items-center gap-2">
-      <span className="text-slate-500">Not downloaded</span>
-      <Button variant="outline" size="unstyled" className="h-auto px-1.5 py-0.5 text-xs" disabled={disabled} onClick={() => onDownload(offer.component)}>{catalogComponentDownloadLabel(offer)}</Button>
-    </dd></div>)}
+    {[
+      ...offers.map(offer => <div key={offer.component}><dt className="text-xs text-slate-500">{catalogComponentName(offer.component)}</dt><dd className="mt-1 flex items-center gap-2">
+        <span className="text-slate-500">Not downloaded</span>
+        <Button variant="outline" size="unstyled" className="h-auto px-1.5 py-0.5 text-xs" disabled={disabled} onClick={() => onDownload(offer.component)}>{catalogComponentDownloadLabel(offer)}</Button>
+      </dd></div>),
+      ...Option.toArray(Option.map(withheld, note => <div key="withheld"><dt className="text-xs text-slate-500">Drafter</dt><dd className="mt-1 text-slate-500">{note}</dd></div>)),
+    ]}
   </dl>
 }

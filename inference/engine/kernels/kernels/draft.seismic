@@ -176,6 +176,10 @@ native readout_project_rows for cuda from "cuda/readout_project_rows.cu":
         threadgroups (S, O, 1)
         threads_per_threadgroup (256, 1, 1)
 
+# Vulkan: each threadgroup projects one feature row through the GEMV
+# library, whose shared region is the row-norm squares, then one row's staged
+# packets (64 bytes each) and their 16-column sums (8 bytes each), at most
+# 288 packets a chunk (`lib/projection/projection.glsl`).
 native readout_project_rows for vulkan from "vulkan/readout_project_rows.comp":
     static (V, D, S, I, WS)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32])
@@ -183,7 +187,7 @@ native readout_project_rows for vulkan from "vulkan/readout_project_rows.comp":
     launch readout_project_rows_gemv:
         threadgroups (S * I + (1 - I) * ceil_div(S, SIMDGROUPS * ROWS * 32 / LANES), O, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (min(ceil_div(D, 32), 448) * 64)
+        shared_bytes (256 + min(ceil_div(D, 32), 288) * 72)
 
 native readout_project_rows for cpu from "cpu/readout_project_rows.rs":
     static (WS, I)

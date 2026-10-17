@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// One cause a model or drafter cannot run. `TargetMismatch` is a drafter
-/// or projector that does not fit its target; `Unreadable` is a truncated
-/// or invalid GGUF, or a header missing what its family needs.
+/// or projector that does not fit its target; `MissingMetadata` is a
+/// well-formed file that omits a declaration the engine requires and never
+/// infers (a block drafter's attention causality); `Unreadable` is a
+/// truncated or invalid GGUF, or a header missing what its family needs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnsupportedReason {
     Architecture {
@@ -25,6 +27,9 @@ pub enum UnsupportedReason {
         name: String,
     },
     UnrecognizedMetadata {
+        key: String,
+    },
+    MissingMetadata {
         key: String,
     },
     Tokenizer {
@@ -76,6 +81,7 @@ impl fmt::Display for UnsupportedReason {
             Self::RopeScaling { kind } => write!(formatter, "rope scaling {kind:?}"),
             Self::UnrecognizedTensor { name } => write!(formatter, "tensor {name:?}"),
             Self::UnrecognizedMetadata { key } => write!(formatter, "metadata {key:?}"),
+            Self::MissingMetadata { key } => write!(formatter, "missing metadata {key:?}"),
             Self::Tokenizer { model, pre } => {
                 write!(
                     formatter,

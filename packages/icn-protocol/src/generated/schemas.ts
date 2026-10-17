@@ -430,6 +430,7 @@ export const CatalogModelState = S.Union(
   S.extend(S.TaggedStruct("NotInstalled", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
     S.TaggedStruct("Installed", {
+      drafterWithheld: S.Boolean,
       effective: S.suspend((): S.Schema<EffectiveModel, EffectiveModelEncoded> => EffectiveModel),
       installation: S.suspend((): S.Schema<ModelInstallation, ModelInstallationEncoded> => ModelInstallation),
       missingComponents: S.Array(
@@ -1159,6 +1160,10 @@ export type DrafterCandidatesRequestEncoded = S.Schema.Encoded<typeof DrafterCan
 
 export const DrafterCandidatesResponse = S.Struct({
   candidates: S.Array(S.suspend((): S.Schema<DrafterCandidate, DrafterCandidateEncoded> => DrafterCandidate)),
+  entered: S.optionalWith(
+    S.suspend((): S.Schema<DrafterReference, DrafterReferenceEncoded> => DrafterReference),
+    { exact: true, as: "Option" },
+  ),
 })
 export type DrafterCandidatesResponse = S.Schema.Type<typeof DrafterCandidatesResponse>
 export type DrafterCandidatesResponseEncoded = S.Schema.Encoded<typeof DrafterCandidatesResponse>
@@ -1810,6 +1815,12 @@ export const KnownUnsupportedReason = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
+    S.TaggedStruct("MissingMetadata", {
+      key: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
     S.TaggedStruct("Tokenizer", {
       model: S.String,
       pre: S.optionalWith(S.String, { exact: true, as: "Option" }),
@@ -1839,6 +1850,7 @@ export const KnownUnsupportedReason = S.Union(
   ),
   S.extend(S.TaggedStruct("TiedOutputHead", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(S.TaggedStruct("Unreadable", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("UnsupportedFormat", {}), S.Record({ key: S.String, value: JsonValue })),
 )
 export type KnownUnsupportedReason = S.Schema.Type<typeof KnownUnsupportedReason>
 export type KnownUnsupportedReasonEncoded = S.Schema.Encoded<typeof KnownUnsupportedReason>

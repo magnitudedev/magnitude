@@ -80,6 +80,9 @@ const ARRAY_KEYS: [&str; 3] = [
 
 const MASK_TOKEN: &str = "tokenizer.ggml.mask_token_id";
 
+/// The declaration of the draft's block attention, which is never inferred.
+const CAUSALITY: &str = "dflash.attention.causal";
+
 /// Draft-wide roles. Reduced vocabulary (`d2t`) is not admitted.
 const GLOBAL_ROLES: [&str; 14] = [
     "output.weight",
@@ -188,9 +191,11 @@ impl error::Error for Error {}
 
 impl Error {
     /// The unsupported features this error names. A draft that disagrees
-    /// with its target, or whose geometry, attention semantics or assembled
-    /// definition are outside what drafting admits, does not fit the target
-    /// it was bound to; one missing a key or weight it needs is `Unreadable`.
+    /// with its target, or whose geometry or assembled definition are
+    /// outside what drafting admits, does not fit the target it was bound
+    /// to; one that omits its attention causality names that key, since a
+    /// published file that predates the declaration is otherwise sound; one
+    /// missing another key or a weight it needs is `Unreadable`.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
             Self::Architecture(architecture) => vec![UnsupportedReason::Architecture {
@@ -206,7 +211,10 @@ impl Error {
                 )
                 .collect(),
             Self::RopeScaling(kind) => vec![UnsupportedReason::RopeScaling { kind: kind.clone() }],
-            Self::MissingCausality | Self::Geometry(_) | Self::Target(_) | Self::Definition(_) => {
+            Self::MissingCausality => vec![UnsupportedReason::MissingMetadata {
+                key: CAUSALITY.into(),
+            }],
+            Self::Geometry(_) | Self::Target(_) | Self::Definition(_) => {
                 vec![UnsupportedReason::TargetMismatch {
                     detail: self.to_string(),
                 }]

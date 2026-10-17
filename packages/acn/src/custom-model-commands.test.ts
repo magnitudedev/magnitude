@@ -22,6 +22,7 @@ import {
 import {
   CatalogFormModelIdSchema,
   CustomFormModelIdSchema,
+  DrafterReferenceSchema,
   HuggingFaceRepositoryIdSchema,
   type LocalModelsState,
 } from "@magnitudedev/acn-protocol"
@@ -94,6 +95,15 @@ const inspection = (onThisComputer?: string, catalogModel?: string) => Schema.de
   ],
 })
 
+interface DrafterList {
+  readonly candidates: readonly NativeDrafterCandidate[]
+  readonly entered: Option.Option<NativeDrafterCandidate["reference"]>
+}
+
+/** ICN's drafter list; `entered` is the listed candidate a different drafter resolved to. */
+const listed = (candidates: readonly NativeDrafterCandidate[], entered?: NativeDrafterCandidate): DrafterList =>
+  ({ candidates, entered: Option.map(Option.fromNullable(entered), ({ reference }) => reference) })
+
 interface Recorded {
   readonly bundles: ModelCandidate[]
   readonly started: unknown[]
@@ -111,6 +121,7 @@ const harness = (options: {
   readonly inspect?: ReturnType<typeof inspection>
   readonly inspectFailure?: unknown
   readonly drafters?: readonly NativeDrafterCandidate[]
+  readonly draftersFor?: (request: { readonly other: Option.Option<string> }) => Effect.Effect<DrafterList, unknown>
   readonly downloads?: readonly ModelDownload[]
   readonly customModels?: ReturnType<typeof nativeCustomModel>[]
   readonly catalog?: readonly CatalogModelSource[]
@@ -145,10 +156,11 @@ const harness = (options: {
     inspect: () => options.inspectFailure === undefined
       ? Effect.succeed(options.inspect ?? inspection())
       : Effect.fail(options.inspectFailure as never),
-    drafters: (request) => Effect.sync(() => {
+    drafters: (request) => Effect.suspend(() => {
       recorded.drafterRequests.push(request)
-      return options.drafters ?? [nativeCandidate()]
-    }),
+      return options.draftersFor?.(request as { readonly other: Option.Option<string> })
+        ?? Effect.succeed(listed(options.drafters ?? [nativeCandidate()]))
+    }) as never,
     assess: () => Effect.die("unused"),
     bundle: (candidate) => Effect.sync(() => {
       recorded.bundles.push(candidate)
@@ -370,6 +382,84 @@ describe("finding models", () => {
     const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.some("z-lab/d:dflash.gguf")))
     expect(result.map(({ label }) => label)).toEqual(["Large", "Small", "Magnitude DFlash", "Built in"])
     expect(recorded.drafterRequests[0]).toMatchObject({ _tag: "Model", modelId: foundId, other: Option.some("z-lab/d:dflash.gguf") })
+  })
+})
+
+describe("a drafter entered by hand", () => {
+  const hand = { _tag: "Local", path: "/drafters/hand-dspark.gguf" } as const
+  const handBound = { _tag: "Bound", method: { _tag: "DSpark" }, memoryBytes: 1 }
+  const pinnedByHand = customModelsConfig({ drafters: { [foundId]: { _tag: "Reference", reference: hand, method: { _tag: "DSpark" } } } })
+  const entered = nativeCandidate({
+    category: "Other", reference: hand, name: "hand-dspark.gguf", label: "Untested", lineage: "None",
+    method: { _tag: "DSpark" }, onThisComputer: true, sizeBytes: 5, verdict: handBound,
+  })
+
+  it("is listed as Other with its verdict after ICN's list when ICN doesn't list it", async () => {
+    const { run, recorded } = harness({
+      config: pinnedByHand,
+      draftersFor: ({ other }) => Effect.succeed(Option.isSome(other) ? listed([nativeCandidate(), entered], entered) : listed([nativeCandidate()])),
+    })
+    const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.none()))
+    expect(result.map(({ category, reference }) => [category, reference])).toEqual([
+      ["CatalogDrafter", drafterReference],
+      ["Other", hand],
+    ])
+    expect(result[1]?.verdict).toEqual(handBound)
+    expect(recorded.drafterRequests).toHaveLength(2)
+    expect(recorded.drafterRequests[1]).toMatchObject({ _tag: "Model", modelId: foundId, other: Option.some(hand.path) })
+  })
+
+  it("is not checked again when ICN lists it, and is left out when it can't be checked", async () => {
+    const nextToModel = harness({ config: pinnedByHand, drafters: [nativeCandidate(), nativeCandidate({ category: "NextToModel", reference: hand })] })
+    await nextToModel.run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.none()))
+    expect(nextToModel.recorded.drafterRequests).toHaveLength(1)
+    const failing = harness({
+      config: pinnedByHand,
+      draftersFor: ({ other }) => Option.isSome(other) ? Effect.fail({ _tag: "NotFound", message: "gone" }) : Effect.succeed(listed([nativeCandidate()])),
+    })
+    const result = await failing.run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.none()))
+    expect(result.map(({ category }) => category)).toEqual(["CatalogDrafter"])
+  })
+})
+
+describe("a drafter entered by hand that is a listed candidate's file", () => {
+  const catalogFile = Schema.decodeUnknownSync(DrafterReferenceSchema)({
+    _tag: "HuggingFace", repository: "magnitudedev/Model-DFlash-GGUF", commit: "d1", path: "Model-DFlash-Q8_0.gguf",
+  })
+  const catalog = nativeCandidate({ onThisComputer: true })
+  const resolvesToCatalog = ({ other }: { readonly other: Option.Option<string> }) =>
+    Effect.succeed(Option.isSome(other) ? listed([catalog], catalog) : listed([catalog]))
+
+  it("adds no Other row when the pinned file resolves to the listed catalog drafter", async () => {
+    const { run } = harness({
+      config: customModelsConfig({ drafters: { [foundId]: { _tag: "Reference", reference: catalogFile, method: { _tag: "DFlash" } } } }),
+      draftersFor: resolvesToCatalog,
+    })
+    const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.none()))
+    expect(result.map(({ category, reference }) => [category, reference])).toEqual([["CatalogDrafter", drafterReference]])
+  })
+
+  it("attaches the listed catalog drafter when its file is chosen by its Hugging Face path", async () => {
+    const recommendedDrafter = {
+      category: "CatalogDrafter", reference: drafterReference, name: "Magnitude DFlash for Model", label: "Magnitude DFlash",
+      lineage: "Lineage", method: { _tag: "DFlash" }, onThisComputer: true, sizeBytes: 900, verdict: bound, automatic: true,
+    }
+    const recommended = harness({
+      config: customModelsConfig({ drafters: {} }),
+      customModels: [nativeCustomModel({ recommendedDrafter })],
+      draftersFor: resolvesToCatalog,
+    })
+    const chosen = await recommended.run((commands, models) => commands.setModelDrafter(foundId, { _tag: "Reference", reference: catalogFile }).pipe(
+      Effect.zipWith(models.get, (result, config) => ({ result, saved: config.drafters[foundId] })),
+    ))
+    expect(Option.map(chosen.result.drafter, ({ reference }) => reference)).toEqual(Option.some(drafterReference))
+    expect(chosen.saved).toEqual({ _tag: "Auto" })
+
+    const notRecommended = harness({ config: customModelsConfig({ drafters: {} }), draftersFor: resolvesToCatalog })
+    const saved = await notRecommended.run((commands, models) => commands.setModelDrafter(foundId, { _tag: "Reference", reference: catalogFile }).pipe(
+      Effect.zipRight(models.get),
+    ))
+    expect(saved.drafters[foundId]).toEqual({ _tag: "Reference", reference: drafterReference, method: { _tag: "DFlash" } })
   })
 })
 

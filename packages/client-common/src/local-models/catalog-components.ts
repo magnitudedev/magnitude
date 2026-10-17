@@ -1,3 +1,4 @@
+import { Option } from "effect"
 import type { CatalogComponent, CatalogMissingComponent, LocalModel } from "@magnitudedev/sdk"
 import { formatStorageSize } from "../utils/format-bytes"
 
@@ -15,3 +16,9 @@ export const catalogComponentOffers = (model: LocalModel): readonly CatalogMissi
 /** "Download (1.0 GB)", or "Download" when its bytes are already on this computer. */
 export const catalogComponentDownloadLabel = ({ downloadBytes }: CatalogMissingComponent): string =>
   downloadBytes > 0 ? `Download (${formatStorageSize(downloadBytes)})` : "Download"
+
+/** Why an installed catalog model runs without its catalog drafter: it fits this computer only without it. */
+export const catalogDrafterWithheldNote = (model: LocalModel): Option.Option<string> =>
+  model._tag === "Catalog" && model.drafterWithheld
+    ? Option.some("Off - this model fits this computer only without it")
+    : Option.none()

@@ -1,6 +1,7 @@
 import {
   catalogComponentName,
   catalogComponentOffers,
+  catalogDrafterWithheldNote,
   catalogVariantOfName,
   customModelDrafterOffer,
   formatLocalModelDisplayName,
@@ -179,9 +180,13 @@ const variantOfLabel = (model: LocalModel, models: readonly LocalModel[]): Optio
       onSome: (name) => `${name} (${variantOf})`,
     }))
 
-/** The attached drafter, "Turned off", or the recommended drafter's offer when none is attached. */
+/** The attached drafter, "Turned off", or the recommended drafter's offer when it isn't the one attached. */
 const drafterSummary = (model: CustomLocalModel): Option.Option<string> => Option.match(model.drafter, {
-  onSome: (drafter) => Option.some([drafter.name, ...Option.toArray(drafterTransferStatus(model))].join(" · ")),
+  onSome: (drafter) => Option.some([
+    drafter.name,
+    ...Option.toArray(drafterTransferStatus(model)),
+    ...Option.toArray(Option.map(customModelDrafterOffer(model), ({ label }) => label)),
+  ].join(" · ")),
   onNone: () => model.drafterChoice._tag === "None"
     ? Option.some(DRAFTER_TURNED_OFF)
     : Option.map(customModelDrafterOffer(model), ({ label }) => label),
@@ -295,12 +300,17 @@ const componentCommand = (model: LocalModel, { component }: CatalogMissingCompon
 const componentSize = ({ downloadBytes }: CatalogMissingComponent): string =>
   downloadBytes > 0 ? ` (${formatStorageSize(downloadBytes)})` : ""
 
-/** One line per catalog component the model lacks, each with the command that downloads only it. */
-const catalogComponentFields = (model: LocalModel): readonly (readonly [string, string])[] =>
-  catalogComponentOffers(model).map((offer) => [
+/**
+ * One line per catalog component the model lacks, each with the command that downloads only it, and the
+ * drafter it runs without because it fits only without it.
+ */
+const catalogComponentFields = (model: LocalModel): readonly (readonly [string, string])[] => [
+  ...catalogComponentOffers(model).map((offer) => [
     catalogComponentName(offer.component),
     `Not downloaded${componentSize(offer)} - ${componentCommand(model, offer)}`,
-  ] as const)
+  ] as const),
+  ...Option.toArray(Option.map(catalogDrafterWithheldNote(model), (note) => ["Drafter", note] as const)),
+]
 
 /** The list's footer line for each catalog component a model lacks. */
 const catalogComponentHints = (models: readonly LocalModel[]): string[] => models.flatMap((model) =>

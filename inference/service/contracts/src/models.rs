@@ -1223,6 +1223,8 @@ pub struct CatalogMissingComponent {
     pub download_bytes: u64,
 }
 
+/// A catalog model's state here. `drafter_withheld`: it serves without its catalog drafter, which
+/// it fits only without, so it loads rather than being refused.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
@@ -1234,6 +1236,7 @@ pub enum CatalogModelState {
         installation: ModelInstallation,
         update_state: CatalogModelUpdate,
         missing_components: Vec<CatalogMissingComponent>,
+        drafter_withheld: bool,
     },
 }
 
@@ -1396,7 +1399,8 @@ impl From<KnownUnsupportedReason> for UnsupportedReason {
     }
 }
 
-/// A reason the engine raises, typed where it raises it.
+/// A reason the engine raises, typed where it raises it. `UnsupportedFormat` is the service's own:
+/// a found model whose files are not GGUF, such as an Ollama model stored for its MLX runner.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
@@ -1414,6 +1418,9 @@ pub enum KnownUnsupportedReason {
         name: String,
     },
     UnrecognizedMetadata {
+        key: String,
+    },
+    MissingMetadata {
         key: String,
     },
     Tokenizer {
@@ -1436,6 +1443,7 @@ pub enum KnownUnsupportedReason {
     },
     TiedOutputHead,
     Unreadable,
+    UnsupportedFormat,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1881,12 +1889,18 @@ pub enum DrafterCandidatesRequest {
     },
 }
 
-/// Drafter candidates for one target, in the product's category order.
+/// Drafter candidates for one target, in the product's category order. `entered` is the listed
+/// reference the request's different drafter resolves to: a listed candidate that is the same file
+/// (a catalog drafter by its package, otherwise the same repository, commit and path), else the
+/// different drafter's own Other row; absent without a different drafter.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DrafterCandidatesResponse {
     pub candidates: Vec<DrafterCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub entered: Option<DrafterReference>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -2513,11 +2527,15 @@ mod custom_model_wire_tests {
                     value: 80,
                 }],
             }),
+            UnsupportedReason::Known(KnownUnsupportedReason::MissingMetadata {
+                key: "dflash.attention.causal".to_owned(),
+            }),
             UnsupportedReason::Known(KnownUnsupportedReason::TargetMismatch {
                 detail: "hidden size".to_owned(),
             }),
             UnsupportedReason::Known(KnownUnsupportedReason::TiedOutputHead),
             UnsupportedReason::Known(KnownUnsupportedReason::Unreadable),
+            UnsupportedReason::Known(KnownUnsupportedReason::UnsupportedFormat),
         ];
         let encoded = serde_json::to_value(&reasons).expect("serialize");
         assert_eq!(
@@ -2532,9 +2550,11 @@ mod custom_model_wire_tests {
                     "entry": "matmul",
                     "statics": [{ "name": "head_dim", "value": 80 }]
                 },
+                { "_tag": "MissingMetadata", "key": "dflash.attention.causal" },
                 { "_tag": "TargetMismatch", "detail": "hidden size" },
                 { "_tag": "TiedOutputHead" },
-                { "_tag": "Unreadable" }
+                { "_tag": "Unreadable" },
+                { "_tag": "UnsupportedFormat" }
             ])
         );
         assert_eq!(

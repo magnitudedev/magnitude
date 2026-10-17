@@ -3,6 +3,8 @@ import { Effect, Exit, Queue, Stream, SubscriptionRef, type Equivalence, type Sc
 export interface MaterializedProjection<A> {
   readonly get: Effect.Effect<A>
   readonly changes: Stream.Stream<A>
+  /** The current value, then every change, with no change lost between the two. */
+  readonly values: Stream.Stream<A>
 }
 
 export const coalesceInvalidations = <R>(
@@ -40,5 +42,6 @@ export const materializeProjection = <A, R, R2>(options: {
   return {
     get: SubscriptionRef.get(current).pipe(Effect.flatMap(restore)),
     changes: current.changes.pipe(Stream.drop(1), Stream.mapEffect(restore)),
+    values: current.changes.pipe(Stream.mapEffect(restore)),
   }
 })

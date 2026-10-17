@@ -3,7 +3,7 @@ import type { ReactNode } from "react"
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { Dialog } from "./ui/dialog"
-import { FindStepView, InspectedRepository, LocalFileSummary, LocalFileView, NativeFileChoice, ggufOpenRequest, RepositoryFooter, RepositoryView, SearchResultsView, VerdictLabel, addVersionRequest, confirmAction, formatDownloads, initialVersion, parseModelReference, unselectableVersionNotice, unsupportedVersionLabel, versionVerdict, type FindTab } from "./add-model-dialog"
+import { FindStepView, InspectedRepository, LocalFileSummary, LocalFileView, NativeFileChoice, ggufOpenRequest, RepositoryFooter, RepositoryView, SearchResultsView, VerdictLabel, addVersionRequest, confirmAction, formatDownloads, initialVersion, parseModelReference, revealVersionRow, revealsVersion, unselectableVersionNotice, unsupportedVersionLabel, versionVerdict, type FindTab } from "./add-model-dialog"
 import { catalogId, catalogModel, drafterCandidate, inspection, repository, version, doesNotFit, unsupported, unreadable } from "../../test/models/fixtures"
 
 const inDialog = (node: ReactNode) => renderToStaticMarkup(<Dialog open>{node}</Dialog>)
@@ -239,5 +239,20 @@ describe("add GGUF file", () => {
     expect(unsupportedFile).toContain("Magnitude can’t run this model")
     expect(unsupportedFile).toContain("No kernels for the deepseek4 architecture")
     expect(unsupportedFile).not.toContain("Fits your machine")
+  })
+})
+
+describe("a version the dialog opens on", () => {
+  it("scrolls its row into the middle of the dialog", () => {
+    const calls: unknown[] = []
+    revealVersionRow({ scrollIntoView: (options?: boolean | ScrollIntoViewOptions) => { calls.push(options) } })
+    revealVersionRow(null)
+    expect(calls).toEqual([{ block: "center" }])
+  })
+
+  it("is revealed while selected, and no longer once the user picks a version", () => {
+    expect(revealsVersion("Q4_K_M", Option.some("Q4_K_M"), Option.some("Q4_K_M"))).toBe(true)
+    expect(revealsVersion("Q8_0", Option.some("Q4_K_M"), Option.some("Q4_K_M"))).toBe(false)
+    expect(revealsVersion("Q4_K_M", Option.some("Q4_K_M"), Option.none())).toBe(false)
   })
 })

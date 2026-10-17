@@ -138,6 +138,7 @@ describe("model catalog changes", () => {
         Layer.succeed(LocalModels, LocalModels.of({
           state: Effect.succeed(local()),
           changes: Stream.fromPubSub(localChanges),
+          states: Stream.make(local()),
           refresh: Effect.void,
         })),
         Layer.succeed(AcnChanges, AcnChanges.of({

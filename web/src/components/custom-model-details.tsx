@@ -59,6 +59,7 @@ export function CustomModelDetails({ model, variantOfName, disabled, onChangeDra
       {Option.match(model.drafter, {
         onSome: drafter => <>
           <span className="min-w-0 truncate" title={drafter.name}>{drafter.name}{drafter.updateAvailable ? " · Update available" : ""}</span>
+          <DrafterOffer model={model} disabled={disabled} onAdd={onAddDrafter} />
           <Button variant="outline" size="unstyled" className={textButton} disabled={disabled} onClick={onChangeDrafter}>Change</Button>
           <Button variant="ghost" size="unstyled" className={textButton} disabled={disabled} onClick={onTurnOffDrafter}>Turn off</Button>
         </>,

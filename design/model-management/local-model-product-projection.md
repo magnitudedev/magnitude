@@ -80,7 +80,9 @@ A catalog model whose exact target is found externally serves with the catalog c
 this computer. Each component it lacks is listed in `missingComponents` (`Projector` or `Drafter`, with
 its download bytes), never as `UpdateAvailable`; clients offer each one while the model is `Installed`
 ("Image input · Download", "Faster with a drafter · Add"), and `DownloadCatalogComponent` fetches only
-that component.
+that component. A catalog model that fits this computer only without its catalog drafter is served
+without it and carries `drafterWithheld`; it lists no `Drafter` component, and clients say the drafter
+is off because the model fits only without it (see [drafter selection](./drafter-selection.md)).
 
 Adding a drafter to a model whose target is present downloads only the drafter. When a catalog
 drafter gets a new revision, every model using it shows Update. Hide applies only to found models

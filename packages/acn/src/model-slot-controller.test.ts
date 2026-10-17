@@ -96,6 +96,7 @@ describe("model slot reconciliation", () => {
       Layer.succeed(LocalModels, LocalModels.of({
         state: Effect.succeed(localModels),
         changes: Stream.never,
+        states: Stream.make(localModels),
         refresh: Effect.void,
       })),
       Layer.succeed(LocalProviderOfferings, LocalProviderOfferings.of({
@@ -164,7 +165,7 @@ describe("model slot reconciliation", () => {
     } as never
     const dependencies = Layer.mergeAll(
       Layer.succeed(ModelSelection, ModelSelection.of(makeModelSelection(handle))),
-      Layer.succeed(LocalModels, LocalModels.of({ state: Effect.succeed(localModels), changes: Stream.never, refresh: Effect.void })),
+      Layer.succeed(LocalModels, LocalModels.of({ state: Effect.succeed(localModels), changes: Stream.never, states: Stream.make(localModels), refresh: Effect.void })),
       Layer.succeed(LocalProviderOfferings, LocalProviderOfferings.of({
         ready: Effect.succeed(true),
         list: Effect.succeed([]),

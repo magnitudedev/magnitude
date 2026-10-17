@@ -32,6 +32,8 @@ use crate::package_service::PrimaryEvidence;
 use crate::snapshot_blobs::{RepositoryBlob, RepositoryBlobs};
 use crate::store_fs::ensure_store_layout;
 
+/// The failure code of a model whose files are in a format the engine can't read.
+pub(crate) const UNSUPPORTED_FORMAT_CODE: &str = "unsupported_format";
 const MAX_SCAN_ENTRIES: usize = 100_000;
 const MAX_SCAN_DEPTH: usize = 8;
 const BACKGROUND_RECONCILIATION_RETRY_DELAY: std::time::Duration =
@@ -1579,6 +1581,7 @@ fn scan_managed(
                     },
                     primary,
                     deletable: true,
+                    unsupported_format: None,
                 })));
             }
         }
@@ -1737,6 +1740,7 @@ fn append_discovered_groups(
             },
             primary,
             deletable: true,
+            unsupported_format: None,
         })));
     }
     Ok(())
@@ -1825,6 +1829,7 @@ pub(crate) fn scan_hf_cache(
                     },
                     primary,
                     deletable: false,
+                    unsupported_format: None,
                 })));
             }
         }
@@ -1842,6 +1847,7 @@ pub(crate) struct ArtifactCandidate {
     pub(crate) location: ModelLocation,
     pub(crate) primary: PathBuf,
     pub(crate) deletable: bool,
+    pub(crate) unsupported_format: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1910,10 +1916,27 @@ fn reuse_metadata(
     })
 }
 
+/// A candidate whose files are in a format the engine can't read is incompatible as found; its
+/// files are never opened.
 fn enrich_candidate(
     candidate: &ArtifactCandidate,
     cache: &ModelCache,
 ) -> Result<InventoryModel, InventoryError> {
+    if let Some(detail) = &candidate.unsupported_format {
+        return Ok(unavailable_model(
+            candidate.id.clone(),
+            candidate.content_id.clone(),
+            candidate.created,
+            candidate.ready_at,
+            candidate.source.clone(),
+            candidate.location.clone(),
+            &candidate.primary,
+            candidate.deletable,
+            UNSUPPORTED_FORMAT_CODE,
+            detail.clone(),
+            true,
+        ));
+    }
     let model = build_model(
         candidate.id.clone(),
         candidate.content_id.clone(),

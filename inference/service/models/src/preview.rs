@@ -1774,7 +1774,7 @@ fn classification_evidence(
     architectures: &crate::candidate_files::RecognizedArchitectures,
 ) -> String {
     format!(
-        "candidate-classification-v4:{digest}:{}",
+        "candidate-classification-v5:{digest}:{}",
         architectures.key()
     )
 }
@@ -1984,12 +1984,18 @@ impl ManagedModelStore {
             self.write_header(header);
             read = Some(header.to_vec());
         })?;
+        let size_bytes = std::fs::metadata(path)
+            .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))?
+            .len();
         let evidence = classification_evidence(&gguf.inspection.header_digest, architectures);
         if let Some(classification) = self
             .cache
-            .read_index(ModelIndexKind::CandidateClassification, &evidence)
+            .read_index::<crate::candidate_files::HeaderClassification>(
+                ModelIndexKind::CandidateClassification,
+                &evidence,
+            )
         {
-            return Ok((gguf, classification));
+            return Ok((gguf, classification.for_file(size_bytes)));
         }
         let header = match read.or_else(|| self.cache.read_header(&gguf.inspection.header_digest)) {
             Some(header) => header,
@@ -1998,7 +2004,7 @@ impl ManagedModelStore {
         let classification = crate::candidate_files::classify_header(&header, architectures)?;
         self.cache
             .write_index(ModelIndexKind::CandidateClassification, &evidence, &classification);
-        Ok((gguf, classification))
+        Ok((gguf, classification.for_file(size_bytes)))
     }
 
     /// The header digest and classification of one file of an immutable repository snapshot.
@@ -2031,7 +2037,7 @@ impl ManagedModelStore {
             &classification_evidence(&header.digest, architectures),
             &classification,
         );
-        Ok((header.digest, classification))
+        Ok((header.digest, classification.for_file(file.size_bytes)))
     }
 
     /// A file's header digest and classification when it was classified before.
@@ -2044,11 +2050,13 @@ impl ManagedModelStore {
         architectures: &crate::candidate_files::RecognizedArchitectures,
     ) -> Option<(String, crate::candidate_files::HeaderClassification)> {
         let digest = self.cached_hugging_face_header_digest(repository, commit, file)?;
-        let classification = self.cache.read_index(
-            ModelIndexKind::CandidateClassification,
-            &classification_evidence(&digest, architectures),
-        )?;
-        Some((digest, classification))
+        let classification = self
+            .cache
+            .read_index::<crate::candidate_files::HeaderClassification>(
+                ModelIndexKind::CandidateClassification,
+                &classification_evidence(&digest, architectures),
+            )?;
+        Some((digest, classification.for_file(file.size_bytes)))
     }
 
     /// The header digest of one readable file of an immutable repository snapshot when its

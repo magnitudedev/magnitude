@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
 
 use futures_util::stream::{BoxStream, StreamExt};
@@ -18,7 +19,15 @@ pub struct ModelDomainResolver {
     pub(crate) inventory: Arc<ManagedModelStore>,
     pub(crate) catalog: RecommendableModelCatalog,
     pub(crate) local: LocalModelsContext,
+    pub(crate) catalog_changes: CatalogChanges,
     pub(crate) upstream: UpstreamUpdates,
+}
+
+/// What republishes the catalog list: the inventory, and what it shows that the inventory doesn't
+/// hold (which catalog models serve without their drafter), counted by `generation`.
+pub(crate) struct CatalogChanges {
+    pub(crate) generation: AtomicU64,
+    pub(crate) changes: tokio::sync::broadcast::Sender<ModelDomainInvalidation>,
 }
 
 impl ModelDomainResolver {
@@ -28,6 +37,10 @@ impl ModelDomainResolver {
             inventory,
             catalog,
             local: LocalModelsContext::new(),
+            catalog_changes: CatalogChanges {
+                generation: AtomicU64::new(0),
+                changes: tokio::sync::broadcast::channel(32).0,
+            },
             upstream: UpstreamUpdates::new(),
         })
     }

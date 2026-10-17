@@ -45,4 +45,10 @@ describe("catalog model components", () => {
     const updating = { ...lacking(projector), acquisitionState: { ...installed, _tag: "Optimizing", progress: { stage: "preparing", completed: 0, total: 0 } } } as unknown as CatalogLocalModel
     expect(CatalogComponentDetails({ model: updating, disabled: false, onDownload: () => {} })).toBeNull()
   })
+
+  it("says in Details when a catalog model runs without its drafter because it fits only without it", () => {
+    const html = renderToStaticMarkup(CatalogComponentDetails({ model: { ...catalogModel(), drafterWithheld: true }, disabled: false, onDownload: () => {} })!)
+    expect(html).toContain(">Drafter<")
+    expect(html).toContain("Off - this model fits this computer only without it")
+  })
 })

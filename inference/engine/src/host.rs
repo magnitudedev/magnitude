@@ -585,7 +585,6 @@ mod tests {
         for error in [
             Error::Target("draft width 1024 differs from the target's 2048".into()),
             Error::Geometry("draft taps no target layer".into()),
-            Error::MissingCausality,
         ] {
             let expected = error.to_string();
             let reasons = reasons(DraftUnavailable::Block(error));
@@ -597,6 +596,12 @@ mod tests {
                 "{reasons:?}"
             );
         }
+        assert_eq!(
+            reasons(DraftUnavailable::Block(Error::MissingCausality)),
+            [UnsupportedReason::MissingMetadata {
+                key: "dflash.attention.causal".into()
+            }]
+        );
         assert_eq!(
             reasons(DraftUnavailable::Block(Error::MissingWeight("fc.weight".into()))),
             [UnsupportedReason::Unreadable]

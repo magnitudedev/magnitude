@@ -716,6 +716,7 @@ const KnownUnsupportedReasonSchema = Schema.Union(
   Schema.TaggedStruct("RopeScaling", { kind: NonEmptyString }),
   Schema.TaggedStruct("UnrecognizedTensor", { name: NonEmptyString }),
   Schema.TaggedStruct("UnrecognizedMetadata", { key: NonEmptyString }),
+  Schema.TaggedStruct("MissingMetadata", { key: NonEmptyString }),
   Schema.TaggedStruct("Tokenizer", {
     model: NonEmptyString,
     pre: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
@@ -730,12 +731,14 @@ const KnownUnsupportedReasonSchema = Schema.Union(
   }),
   Schema.TaggedStruct("Backend", { backend: NonEmptyString }),
   Schema.TaggedStruct("Unreadable", {}),
+  Schema.TaggedStruct("UnsupportedFormat", {}),
   UnknownUnsupportedReasonSchema,
 )
 
 const knownUnsupportedReasonTags: ReadonlySet<string> = new Set<UnsupportedReason["_tag"]>([
-  "Architecture", "WeightTypes", "RopeScaling", "UnrecognizedTensor", "UnrecognizedMetadata", "Tokenizer",
-  "ChatTemplate", "TiedOutputHead", "TargetMismatch", "KernelDomain", "Backend", "Unreadable", "Unknown",
+  "Architecture", "WeightTypes", "RopeScaling", "UnrecognizedTensor", "UnrecognizedMetadata", "MissingMetadata", "Tokenizer",
+  "ChatTemplate", "TiedOutputHead", "TargetMismatch", "KernelDomain", "Backend", "Unreadable", "UnsupportedFormat",
+  "Unknown",
 ])
 
 const UnrecognizedUnsupportedReasonSchema = Schema.transform(
@@ -1061,6 +1064,10 @@ export const CatalogMissingComponentSchema = Schema.Struct({
 })
 export type CatalogMissingComponent = typeof CatalogMissingComponentSchema.Type
 
+/**
+ * A catalog model on this computer. `drafterWithheld`: it runs without its catalog drafter, because it fits this
+ * computer only without it, so it loads rather than being refused.
+ */
 export const CatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
   ...LocalModelFields,
   modelId: CatalogFormModelIdSchema,
@@ -1069,6 +1076,7 @@ export const CatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
   storageBytes: NonNegativeSafeInteger,
   acquisitionState: LocalModelAcquisitionStateSchema,
   missingComponents: Schema.Array(CatalogMissingComponentSchema),
+  drafterWithheld: Schema.Boolean,
 })
 export type CatalogLocalModel = typeof CatalogLocalModelSchema.Type
 

@@ -40,6 +40,7 @@ export const catalogModel = (): CatalogLocalModel => ({
   acquisitionState: { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 24 * GB, primaryPath: "/models/qwen.gguf", ownership: "Magnitude" }, residencyState: { _tag: "Unloaded" } },
   servingState: { _tag: "Assessed", capabilities, speculativeMethod: Option.none(), metadata, assessment: { _tag: "Fits", assessmentId, environmentId, profile: { contextLength: 32_768 }, memory: { domains: [], totalRequiredBytes: 24 * GB, requiredSystemMemoryBytes: 0 }, performance: [{ contextTokens: 32_768, estimatedTokensPerSecond: 80 }] }, rankingScores: Option.none() },
   missingComponents: [],
+  drafterWithheld: false,
 })
 
 export const drafterCandidate = (overrides: Partial<DrafterCandidate> = {}): DrafterCandidate => ({

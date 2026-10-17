@@ -4885,14 +4885,42 @@ fn metal_head_logits_scoped_launches_match_the_host() {
     else {
         return;
     };
-    head_logits_scoped_launches_match_the_host(&device);
+    head_logits_match_the_host(
+        &device,
+        Repr::Q6k,
+        (256, 256),
+        &[1, 8, 32, 128],
+        &[MAPPINGS[0], MAPPINGS[2]],
+    );
 }
 
-fn head_logits_scoped_launches_match_the_host(device: &Device) {
+/// The draft head readout (`readout_project_rows`) at the widths of real
+/// draft heads (Qwen3.5 0.8B: 1024, Gemma 4 E2B: 1536, and a width whose
+/// staging spans two GEMV chunks) over every weight form a tied embedding
+/// table takes. The decode rows of a head's slots stage one activation row
+/// per workgroup, with the per-16 sums of the biased kinds (q4g32s, q4k,
+/// q6k) after the staged values.
+#[test]
+fn draft_head_logits_match_the_host_at_head_widths() {
+    for device in devices() {
+        for repr in [Repr::Q4g32s, Repr::Q4k, Repr::Q6k, Repr::Q8, Repr::Bf16] {
+            for d in [1024, 1536, 9472] {
+                head_logits_match_the_host(&device, repr, (40, d), &[1, 3], &MAPPINGS[..2]);
+            }
+        }
+    }
+}
+
+fn head_logits_match_the_host(
+    device: &Device,
+    repr: Repr,
+    (v, d): (usize, usize),
+    row_classes: &[usize],
+    mappings: &[Mapping],
+) {
     let act = Act::Bf16;
-    let (v, d) = (256usize, 256usize);
-    let head = weight(Repr::Q6k, v, d, 81, 1.0);
-    for rows in [1usize, 8, 32, 128] {
+    let head = weight(repr, v, d, 81, 1.0);
+    for &rows in row_classes {
         let mut rng = Rng::new(rows as u64 + 31);
         let features = (0..rows * d)
             .map(|_| act.round(rng.symmetric()))
@@ -4908,14 +4936,36 @@ fn head_logits_scoped_launches_match_the_host(device: &Device) {
             .iter()
             .map(|(_, magnitude)| reassociation(rows) * magnitude + 1e-7)
             .collect::<Vec<_>>();
-        for mapping in [MAPPINGS[0], MAPPINGS[2]] {
+        let mappings = if is_cpu(device) {
+            &mappings[..1]
+        } else {
+            mappings
+        };
+        for &mapping in mappings {
+            let specialization = if is_cpu(device) {
+                let implementation = readout_project_rows::native_implementation(device)
+                    .unwrap()
+                    .unwrap();
+                let statics = implementation
+                    .statics
+                    .iter()
+                    .fold(NativeSpecialization::new(), |statics, name| {
+                        statics.with_static(name.clone(), 0)
+                    });
+                implementation
+                    .default_specialization(&statics)
+                    .unwrap()
+                    .with_param("INT8", 0)
+            } else {
+                prepared_projection_specialization_on(device, &[("V", v), ("D", d)], mapping)
+            };
             let kernel = readout_project_rows::native_for_device_with(
                 device,
                 readout_project_rows::Elements {
                     A: act.element(),
-                    OW: Repr::Q6k.resident(&device),
+                    OW: repr.resident(&device),
                 },
-                &prepared_projection_specialization_on(device, &[("V", v), ("D", d)], mapping),
+                &specialization,
             )
             .unwrap();
             let logits = kernel
@@ -4930,7 +4980,10 @@ fn head_logits_scoped_launches_match_the_host(device: &Device) {
                 .unwrap()
                 .value;
             assert_within(
-                &format!("head_logits O {rows} {mapping:?}"),
+                &format!(
+                    "{:?} head_logits {repr:?} V {v} D {d} O {rows} {mapping:?}",
+                    device.backend()
+                ),
                 &read_f32(&logits),
                 &values,
                 &bounds,

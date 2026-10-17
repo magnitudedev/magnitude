@@ -40,6 +40,7 @@ const catalogModel = {
   },
   acquisitionState: { _tag: "NotInstalled" },
   missingComponents: [],
+  drafterWithheld: false,
   servingState: {
     _tag: "Failed",
     profile: { contextLength: 4096 },
@@ -316,9 +317,11 @@ describe("UnsupportedReasonSchema", () => {
       { _tag: "WeightTypes", types: [{ ggmlType: "Q2_K", tensorCount: 2 }, { ggmlType: "IQ1_M", tensorCount: 40 }] },
       { _tag: "Tokenizer", model: "gpt2", pre: "qwen2" },
       { _tag: "KernelDomain", backend: "metal", entry: "matmul", statics: [["head_dim", 72]] },
+      { _tag: "MissingMetadata", key: "dflash.attention.causal" },
       { _tag: "TargetMismatch", detail: "drafter hidden size 2048 does not match 4096" },
       { _tag: "TiedOutputHead" },
       { _tag: "Unreadable" },
+      { _tag: "UnsupportedFormat" },
     ]) {
       const decoded = Schema.decodeUnknownSync(UnsupportedReasonSchema)(reason)
       expect(decoded._tag).toBe(reason._tag)
