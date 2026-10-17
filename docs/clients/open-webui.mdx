@@ -1,0 +1,50 @@
+---
+title: "Open WebUI with Magnitude"
+description: "Configure an existing local Open WebUI instance to use Magnitude inference."
+---
+
+Magnitude exposes an OpenAI-compatible inference API at `http://127.0.0.1:10100/inference/v1` while its service is running. Open WebUI can use that API as a model connection, then its UI can optionally be shown inside Magnitude's Chat page.
+
+## Configure the OpenAI connection
+
+1. Start Magnitude and confirm `http://127.0.0.1:10100/health` is healthy.
+2. In Open WebUI, open the administrator settings for Connections and add an OpenAI-compatible connection.
+3. Set the base URL to the address of Magnitude's API that is reachable **from the Open WebUI server process**:
+   - Open WebUI running directly on the same host: `http://127.0.0.1:10100/inference/v1`.
+   - Open WebUI running in a container: do **not** assume container-local `127.0.0.1` points to the host. Use a host address reachable from that container (often `host.docker.internal` when configured) or an appropriate container/network arrangement.
+4. Use an exact model ID returned by `GET /inference/v1/models`.
+5. Test listing models and generating a short response before embedding the UI.
+
+### API key and network access
+
+Magnitude does not require an API key for a request that it identifies as coming from the same computer. A container-to-host request may not appear to originate from loopback. In that case, configure Magnitude's **Network access** deliberately, use its configured API key, and restrict access to the intended local network. Do not expose an unauthenticated inference API to the LAN or internet merely to make the integration work.
+
+For details, see [Magnitude API overview](/api/overview), [API endpoints](/api/endpoints), and [Network access](/api/network-access).
+
+## Embed Open WebUI in Magnitude
+
+1. Open Magnitude's **Chat** page.
+2. Select **Open WebUI**.
+3. Enter the actual loopback URL for the Open WebUI web interface, such as `http://127.0.0.1:3000/` if that is the configured host port.
+4. Select **Connect**.
+
+The embed field accepts only HTTP(S) URLs with hostnames `localhost`, `127.0.0.1`, or `[::1]`. It does not install or start Open WebUI. The configured URL is stored in this browser's local storage.
+
+## Embedding policy and authentication
+
+The iframe does not bypass browser security. If Open WebUI refuses to load in Magnitude, open Open WebUI directly first and inspect its response headers and browser console. A `Content-Security-Policy` containing a restrictive `frame-ancestors` directive or an `X-Frame-Options` header can block framing. Authentication redirects, cookies, and browser privacy settings can also change behavior.
+
+Do not remove security headers globally as a workaround. If embedding is required, choose a narrowly scoped policy that trusts only the intended parent origin and review the security implications before deploying it.
+
+## End-to-end acceptance checklist
+
+- [ ] Magnitude health endpoint returns HTTP 200.
+- [ ] Open WebUI can list the models from Magnitude.
+- [ ] Open WebUI can complete a real inference request using an exact Magnitude model ID.
+- [ ] Streaming responses arrive incrementally.
+- [ ] Open WebUI loads inside Magnitude in Chromium without CSP or authentication errors.
+- [ ] The configured session survives navigation/reload as expected.
+- [ ] The same behavior is checked in Firefox; differences are documented.
+- [ ] Magnitude's canonical port 10100 remains healthy and the optional Chat listener on 10101 does not collide with another service.
+
+The embedding path is experimental until this checklist is completed on the target installation. A successful iframe render alone does not prove that the model connection or streaming works.
