@@ -1164,6 +1164,18 @@ async fn fixture_with(
     }
 }
 
+/// A model store with nothing in it, for what reads local files through its caches.
+pub(super) async fn bare_store() -> (tempfile::TempDir, Arc<ManagedModelStore>) {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let config = InventoryConfig::with_roots(
+        directory.path().join("models"),
+        directory.path().join("cache"),
+    )
+    .expect("inventory config");
+    let store = Arc::new(ManagedModelStore::open(config).await.expect("model store"));
+    (directory, store)
+}
+
 fn hugging_face_candidate(repository: &str, seed: char, target: &str) -> ModelCandidate {
     ModelCandidate {
         source: CandidateSource::HuggingFace {
@@ -1864,6 +1876,45 @@ async fn repository_drafters_follow_the_method_order_at_any_path() {
     assert_eq!(fixture.hub.drafter_searches.load(Ordering::SeqCst), 0);
 }
 
+/// Same-named drafters in a repository's subfolders are listed under their whole paths, so their
+/// rows are told apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn same_named_drafters_in_repository_subfolders_are_named_by_their_paths() {
+    const SUBFOLDERS: &str = "community/Llama-Subfolders-GGUF";
+    let fixture = fixture_with(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::from([(
+            SUBFOLDERS.to_owned(),
+            repository(
+                '8',
+                vec![
+                    StubFile::new("llama-Q8_0.gguf", &llama(7, Encoding::Q8_0)),
+                    StubFile::new("Q4/dflash.gguf", &dflash(HIDDEN)),
+                    StubFile::new("Q8/dflash.gguf", &dflash(HIDDEN)),
+                ],
+                &["community/Llama-Finetune"],
+            ),
+        )]),
+    )
+    .await;
+    let candidates = candidate_drafters(&fixture, SUBFOLDERS, '8').await;
+    let names = candidates
+        .iter()
+        .filter(|candidate| candidate.category == DrafterCategory::NextToModel)
+        .map(|candidate| candidate.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "community/Llama-Subfolders-GGUF/Q4/dflash.gguf",
+            "community/Llama-Subfolders-GGUF/Q8/dflash.gguf",
+        ]),
+        "{candidates:#?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn without_a_repository_drafter_the_catalog_drafter_is_preselected() {
     let fixture = fixture(Vec::new()).await;
@@ -2198,6 +2249,7 @@ fn enrichment_answers_only_for_the_exact_target_it_was_computed_for() {
     let result = CustomModelEnrichmentResult {
         variant_of: Some("llama-test:gguf:q8".parse().unwrap()),
         drafters: Vec::new(),
+        catalog_drafters: Vec::new(),
         license: Some("apache-2.0".to_owned()),
     };
     let key = (model_id.clone(), "package_a".to_owned());
@@ -2356,6 +2408,63 @@ async fn a_cold_inspection_reads_about_the_distinct_header_bytes_of_every_layout
     }
 }
 
+/// A local inspection reads each file once (its header and the two ends of its tensor data) and
+/// never again for the engine, its drafters, its lineage or its identity; an unchanged file is not
+/// read at all by a later inspection or drafter listing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_inspection_reads_each_file_at_most_once() {
+    use magnitude_service_models::gguf::{CONTENT_SAMPLE_BYTES, LocalReads};
+    let fixture = fixture(Vec::new()).await;
+    let folder = tempfile::tempdir().expect("model folder");
+    let model = folder.path().join("model.gguf");
+    let drafter = folder.path().join("dflash.gguf");
+    let target = llama(7, Encoding::Q8_0);
+    write_complete(&model, &target);
+    write_complete(&drafter, &dflash(HIDDEN));
+    let model_reads = LocalReads::watch(&model);
+    let drafter_reads = LocalReads::watch(&drafter);
+
+    let request = || CandidateInspectionRequest::Local {
+        path: model.clone(),
+    };
+    let first = fixture.candidates.inspect(request()).await.expect("inspection");
+    assert!(
+        matches!(
+            first.versions[0].assessment,
+            Some(ModelAssessment::Fits { .. } | ModelAssessment::DoesNotFit { .. })
+        ),
+        "{first:#?}"
+    );
+    let (header, length) = target.bytes();
+    let (reads, bytes) = model_reads.reads();
+    assert_eq!(reads, 1, "the model is read once");
+    assert!(
+        bytes <= length && bytes <= header.len() as u64 + 3 * CONTENT_SAMPLE_BYTES,
+        "only the header and the two ends of the tensor data are read: {bytes} of {length}"
+    );
+    assert_eq!(drafter_reads.reads().0, 1, "the drafter beside it is read once");
+
+    let second = fixture.candidates.inspect(request()).await.expect("inspection");
+    assert_eq!(first, second);
+    fixture
+        .candidates
+        .drafters(DrafterCandidatesRequest::Candidate {
+            candidate: ModelCandidate {
+                source: CandidateSource::Local {
+                    path: folder.path().to_path_buf(),
+                },
+                target: vec!["model.gguf".to_owned()],
+                projector: None,
+                drafter: None,
+            },
+            other: None,
+        })
+        .await
+        .expect("drafter candidates");
+    assert_eq!(model_reads.reads().0, 1, "an unchanged model is not read again");
+    assert_eq!(drafter_reads.reads().0, 1, "an unchanged drafter is not read again");
+}
+
 fn write_complete(path: &std::path::Path, gguf: &Gguf) {
     let (header, length) = gguf.bytes();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2487,6 +2596,42 @@ fn local_llama_with_base(base: &str) -> (tempfile::TempDir, ModelCandidate) {
     (folder, candidate)
 }
 
+/// "Variant of" never comes from a fingerprint alone when the file declares a lineage: models of
+/// one architecture and size can share every dimension and the tokenizer (Qwen3.5 27B and Qwen3.8
+/// 27B do), so a file naming a base model the catalog doesn't know is a variant of none, though its
+/// fingerprint still offers that catalog model's drafter. A file declaring no lineage at all is
+/// matched by its fingerprint.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fingerprint_names_the_variant_only_of_a_file_without_lineage() {
+    let fixture = fixture(Vec::new()).await;
+    let (unrelated, candidate) = local_llama_with_base("someone/Unrelated-Base");
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::Local {
+            path: unrelated.path().join("model.gguf"),
+        })
+        .await
+        .expect("inspection");
+    assert_eq!(inspection.variant_of, None);
+    let drafters = drafters_of(&fixture, candidate).await;
+    assert!(
+        drafters.iter().any(|candidate| candidate.category == DrafterCategory::CatalogDrafter
+            && candidate.lineage == DrafterLineage::Fingerprint),
+        "{drafters:#?}"
+    );
+
+    let plain = tempfile::tempdir().expect("model folder");
+    write_complete(&plain.path().join("model.gguf"), &llama(7, Encoding::Q8_0));
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::Local {
+            path: plain.path().join("model.gguf"),
+        })
+        .await
+        .expect("inspection");
+    assert_eq!(inspection.variant_of.as_ref(), Some(&fixture.catalog_id));
+}
+
 async fn drafters_of(
     fixture: &Fixture,
     candidate: ModelCandidate,
@@ -2561,8 +2706,8 @@ fn is_bound(verdict: &DrafterVerdict) -> bool {
 
 /// A listed model added at one commit is not the same version at another commit of its
 /// repository, even with the same Hub ID and file sizes; with no commit known, it still is.
-#[test]
-fn a_version_at_another_commit_is_not_the_added_model_at_its_own() {
+#[tokio::test]
+async fn a_version_at_another_commit_is_not_the_added_model_at_its_own() {
     use magnitude_service_models::candidate_files::{CandidateGguf, GgufGroup};
     let model_id = ModelId::hugging_face(
         &HuggingFaceRepositoryId::new(COMMUNITY.to_owned()).unwrap(),
@@ -2582,8 +2727,10 @@ fn a_version_at_another_commit_is_not_the_added_model_at_its_own() {
         repository: HuggingFaceRepositoryId::new(COMMUNITY.to_owned()).unwrap(),
         commit: commit('a'),
     };
+    let (_directory, store) = bare_store().await;
     let at = |commit: &str, model: &CustomModel| {
         super::on_this_computer(
+            &store,
             std::slice::from_ref(model),
             Some((&model_id, commit)),
             &group,

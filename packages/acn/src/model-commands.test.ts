@@ -9,6 +9,7 @@ const UPGRADED_ALIAS = "hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.ggu
 const localModels = {
   state: Effect.succeed({
     models: [{ _tag: "Catalog", modelId: "model-a:gguf:test", catalogData: { aliases: [UPGRADED_ALIAS] } }],
+    unsupported: [],
     hidden: [],
   }),
 } as never
@@ -96,6 +97,47 @@ it("retries active and slot Stop against the exact stopping instance", async () 
     Effect.provideService(LocalModelRemovals, {} as never),
   ))
   expect(stopped).toEqual(["retained-instance", "retained-instance"])
+})
+
+it("stops a model named by any ID form, and refuses one that isn't on this computer", async () => {
+  const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
+  const { ModelInstancesSnapshot } = await import("@magnitudedev/icn-protocol/schemas")
+  const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+  const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+  const { ModelSlotController } = await import("./model-slot-controller")
+  const { LocalModelRemovals } = await import("./local-model-removals")
+  const added = "hf:owner/repo/model-Q4_K_M.gguf"
+  const imported = `local:${"a".repeat(64)}`
+  const stopped: string[] = []
+  const running = (id: string, modelId: string) => ({ id, modelId, lifecycle: { _tag: "Loading", fraction: 0.5, stage: "loading_weights" } })
+  const snapshot = Schema.decodeUnknownSync(ModelInstancesSnapshot)({ revision: 1, instances: [
+    running("catalog-instance", "model-a:gguf:test"), running("added-instance", added), running("imported-instance", imported),
+  ] })
+  const stop = (model: string) => Effect.gen(function* () {
+    const commands = yield* ModelCommands
+    return yield* commands.stopModel(Schema.decodeUnknownSync(ModelIdSchema)(model))
+  }).pipe(
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
+    Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, { state: Effect.succeed({
+      models: [
+        { _tag: "Catalog", modelId: "model-a:gguf:test", catalogData: { aliases: [UPGRADED_ALIAS] } },
+        { _tag: "Custom", modelId: added },
+      ],
+      hidden: [{ _tag: "Custom", modelId: imported }],
+    }) } as never),
+    Effect.provideService(IcnInstances, { get: Effect.succeed(snapshot) } as never),
+    Effect.provideService(IcnClient, { models: { stopModelInstance: ({ path }: { path: { instance_id: string } }) => Effect.sync(() => { stopped.push(path.instance_id); return {} }) } } as never),
+    Effect.provideService(ModelSlotController, {} as never),
+    Effect.provideService(IcnCatalog, {} as never),
+    Effect.provideService(IcnCatalogInstallations, {} as never),
+    Effect.provideService(LocalModelRemovals, {} as never),
+  )
+  for (const model of ["model-a:gguf:test", UPGRADED_ALIAS, added, imported]) await Effect.runPromise(stop(model))
+  expect(stopped).toEqual(["catalog-instance", "catalog-instance", "added-instance", "imported-instance"])
+  const unknown = await Effect.runPromise(stop("hf:owner/repo/missing.gguf").pipe(Effect.flip))
+  expect(unknown).toMatchObject({ _tag: "LocalModelMutationFailed", code: "model_not_found", message: "hf:owner/repo/missing.gguf is not a model on this computer." })
+  expect(stopped).toHaveLength(4)
 })
 
 it("stops a running model before removing it, and removes an idle model without stopping", async () => {

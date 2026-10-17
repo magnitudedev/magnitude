@@ -373,6 +373,7 @@ describe("local models state", () => {
     expect(state.models.map(({ modelId }) => modelId)).toEqual([foundId])
     expect(state.hidden.map(({ modelId }) => modelId)).toEqual(["hf:other/hidden-GGUF/hidden.gguf"])
     expect(state.unsupported).toEqual([{
+      modelId: Option.none(),
       displayName: "sha256-1",
       origin: { _tag: "Found", source: { _tag: "Ollama" } },
       path: "/ollama/blobs/sha256-1",
@@ -520,6 +521,7 @@ describe("local models state", () => {
     })
     expect(state.models.map(({ modelId }) => modelId)).toEqual([foundId])
     expect(state.unsupported).toEqual([{
+      modelId: Option.some(unsupportedId),
       displayName: "Unsupported Model",
       origin: { _tag: "Found", source: { _tag: "LmStudio" } },
       path: "/models/unsupported.gguf",

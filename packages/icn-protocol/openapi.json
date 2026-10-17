@@ -1287,7 +1287,7 @@
             }
           },
           "422": {
-            "description": "Installed model failed integrity validation",
+            "description": "Installed model failed integrity validation, does not fit, or the engine cannot run it (`model_unsupported`)",
             "content": {
               "application/json": {
                 "schema": {

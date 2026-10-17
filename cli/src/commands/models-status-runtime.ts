@@ -477,8 +477,16 @@ export const loadInstance = (modelInput: string, options: JsonOption = {}) => mo
   options,
 )
 
-export const stopInstance = (options: JsonOption = {}) => commandEffect({
-  effect: withClient((client) => client.models.stop({})),
-  render: () => "Stopped the active local model.\n",
-  json: asJson(options, jsonDocument(Schema.Struct({}), () => ({}))),
-})
+/** Stops the named model, by any ID the other commands accept, or else the active one. */
+export const stopInstance = (modelInput?: string, options: JsonOption = {}) => modelInput === undefined
+  ? commandEffect({
+      effect: withClient((client) => client.models.stop({})),
+      render: () => "Stopped the active local model.\n",
+      json: asJson(options, jsonDocument(Schema.Struct({}), () => ({}))),
+    })
+  : modelMutation(
+      modelInput.trim(),
+      (client, modelId) => client.models.stopModel({ modelId }),
+      (modelId) => `Stopped ${modelId}.\n`,
+      options,
+    )

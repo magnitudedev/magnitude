@@ -168,6 +168,10 @@ const shortUnsupportedReason = (group: UnsupportedReasonGroup): string => {
   }
 }
 
+const isRunnable = (version: CandidateVersion) =>
+  Option.exists(version.assessment, (assessment) => assessment._tag === "Fits")
+
+/** A version's verdict and marks; a named version is marked selected only when it can run here, as pull would refuse it. */
 export const versionVerdict = (version: CandidateVersion, selected: boolean): string => {
   const verdict = Option.match(version.assessment, {
     onNone: () => "Not assessed",
@@ -181,7 +185,7 @@ export const versionVerdict = (version: CandidateVersion, selected: boolean): st
   })
   const marks = [
     ...(version.recommended ? ["recommended"] : []),
-    ...(selected && !version.recommended ? ["selected"] : []),
+    ...(selected && !version.recommended && isRunnable(version) ? ["selected"] : []),
   ]
   return [
     marks.length > 0 ? `${verdict} (${marks.join(", ")})` : verdict,
@@ -206,9 +210,6 @@ const inspectionHeader = (inspection: CandidateInspection, models: readonly Loca
   ]
   return [inspection.displayName, ...(details.length > 0 ? [details.join(" · ")] : [])]
 }
-
-const isRunnable = (version: CandidateVersion) =>
-  Option.exists(version.assessment, (assessment) => assessment._tag === "Fits")
 
 const acquireCommand = (inspection: CandidateInspection, version: CandidateVersion, force = false): string =>
   inspection.source._tag === "HuggingFace"

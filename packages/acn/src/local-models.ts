@@ -557,6 +557,7 @@ export const unsupportedCustomModel = (inputs: CustomModelInputs): Option.Option
   return Option.flatMap(externalUnsupportedAssessment(inputs, origin), (unsupported) => {
     const path = entry.source.files[0]?.path ?? (origin._tag === "Imported" ? origin.path : entry.id)
     return Schema.validateOption(UnsupportedLocalModelSchema)({
+      modelId: Option.some(entry.id),
       displayName: entry.source.displayName.trim().length > 0 ? entry.source.displayName : fileStem(path),
       origin,
       path,

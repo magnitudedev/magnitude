@@ -32,9 +32,20 @@ export const unsupportedReasonMessage = (reason: UnsupportedReason): string => {
     case "TiedOutputHead": return "Uses a tied output layer, which Magnitude doesn't support yet"
     case "TargetMismatch": return "Its drafter wasn't built for this model"
     case "KernelDomain":
-    case "Backend": return "Its layer sizes aren't supported on this GPU"
+    case "Backend": return `Its layer sizes aren't supported on this ${backendDevice(reason.backend)}`
     case "Unreadable": return "The file is incomplete or damaged"
     case "Unknown": return reason.detail.trim() === "" ? "Magnitude can't run this model" : `Magnitude can't run this model (${reason.detail.trim()})`
+  }
+}
+
+/** The device a backend reason names: the CPU, a GPU, or the computer when the engine names no backend. */
+const backendDevice = (backend: string): string => {
+  switch (backend.toLowerCase()) {
+    case "cpu": return "CPU"
+    case "metal":
+    case "cuda":
+    case "vulkan": return "GPU"
+    default: return "computer"
   }
 }
 

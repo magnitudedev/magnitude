@@ -59,12 +59,14 @@ pub struct CustomModelFacts<'a> {
     pub base_models: &'a [GgufBaseModel],
 }
 
-/// A custom model's lineage hint, license, and its automatic drafter candidates: every candidate
-/// the engine binds, in the order automatic choice takes them, the first being the recommended one.
+/// A custom model's lineage hint, license, its automatic drafter candidates (every candidate the
+/// engine binds, in the order automatic choice takes them, the first being the recommended one),
+/// and the catalog models it matches, whose drafters it may use.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CustomModelEnrichmentResult {
     pub variant_of: Option<ModelId>,
     pub drafters: Vec<DrafterCandidate>,
+    pub catalog_drafters: Vec<ModelId>,
     pub license: Option<String>,
 }
 
@@ -322,14 +324,15 @@ impl ModelDomainResolver {
             .filter_map(|definition| separate_draft(&definition.configuration.bundle))
             .collect::<BTreeSet<_>>();
         used.extend(custom.into_iter().flatten());
-        // A drafter stays while any model here would use it: as its recommended drafter (even with
-        // its drafter turned off), or as a drafter from its own repository.
+        // A drafter stays while any model here would use it: as its recommended drafter or its
+        // catalog model's drafter (even with its drafter turned off), or as a drafter from its own
+        // repository.
         let projection = self.local_projection()?;
         let projected = projection.models.iter().chain(&projection.hidden);
         used.extend(
             projected
                 .clone()
-                .filter_map(|model| model.candidate_drafter.clone()),
+                .flat_map(|model| model.candidate_drafters.iter().cloned()),
         );
         let repositories = projected
             .filter_map(|model| model.lineage_repository.as_deref())
@@ -443,7 +446,7 @@ struct ProjectedModel {
     model: CustomModel,
     locations: Vec<PathBuf>,
     lineage_repository: Option<String>,
-    candidate_drafter: Option<ModelPackageId>,
+    candidate_drafters: Vec<ModelPackageId>,
     configuration: Result<ModelServingConfiguration, ModelFailure>,
     managed_packages: Vec<ModelPackageId>,
     drafter_pending: bool,
@@ -1061,15 +1064,36 @@ impl ModelContext<'_> {
                 candidate.method.clone()?,
             ))
         });
-        // The drafter package this model would use as its recommended drafter, whatever its choice:
-        // a turned-off drafter stays referenced while the model is here.
-        let candidate_drafter =
-            enriched.recommended_drafter().and_then(|candidate| {
-                match resolve(candidate.reference.clone(), candidate.method.clone()?).source? {
-                    SpeculativeDraftSource::Separate { draft } => Some(draft.id),
-                    SpeculativeDraftSource::Embedded => None,
-                }
-            });
+        // The drafter packages this model would use whatever its choice, so a turned-off drafter
+        // stays referenced while the model is here: its recommended drafter, and the drafter of
+        // every catalog model it matches, even when a drafter beside it is recommended instead.
+        let separate = |resolved: ResolvedDrafter| match resolved.source? {
+            SpeculativeDraftSource::Separate { draft } => Some(draft.id),
+            SpeculativeDraftSource::Embedded => None,
+        };
+        let mut candidate_drafters = enriched
+            .recommended_drafter()
+            .and_then(|candidate| {
+                separate(resolve(candidate.reference.clone(), candidate.method.clone()?))
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        candidate_drafters.extend(enriched.catalog_drafters.iter().filter_map(|model_id| {
+            let method = catalog
+                .models
+                .iter()
+                .find(|definition| catalog_id(definition) == *model_id)
+                .and_then(|definition| match &definition.configuration.bundle {
+                    ServableModelBundle::SpeculativeDecoding { method, .. } => Some(method.clone()),
+                    ServableModelBundle::Standalone { .. } => None,
+                })?;
+            separate(resolve(
+                DrafterReference::Catalog {
+                    model_id: model_id.clone(),
+                },
+                method,
+            ))
+        }));
         let drafter = match &choice {
             DrafterChoice::None => None,
             // The first automatic candidate on this computer now, so a recommended drafter that
@@ -1174,7 +1198,7 @@ impl ModelContext<'_> {
                 .map(|occurrence| occurrence.primary.clone())
                 .collect(),
             lineage_repository: group.lineage_repository(),
-            candidate_drafter,
+            candidate_drafters,
             drafter_pending: matches!(choice, DrafterChoice::Auto) && !enrichment_known,
             awaited_drafter: None,
             managed_packages: group
@@ -1251,7 +1275,7 @@ impl ModelContext<'_> {
         Some(ProjectedModel {
             locations: Vec::new(),
             lineage_repository: Some(repository.as_str().to_owned()),
-            candidate_drafter: None,
+            candidate_drafters: Vec::new(),
             model: CustomModel {
                 model_id: declaration.model_id.clone(),
                 origin: CustomModelOrigin::Added {
@@ -4212,6 +4236,7 @@ mod tests {
                     })
                     .into_iter()
                     .collect(),
+                catalog_drafters: Vec::new(),
                 license: None,
             }
         }
@@ -4631,6 +4656,107 @@ mod tests {
         ));
     }
 
+    /// Recommends each model the drafter beside it and reports it matching one catalog model, as
+    /// enrichment does for a found or imported model with a drafter in its folder.
+    struct BesideAndCatalog {
+        beside: DrafterReference,
+        catalog: Option<ModelId>,
+    }
+
+    impl CustomModelEnrichment for BesideAndCatalog {
+        fn enrich(&self, _model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult {
+            CustomModelEnrichmentResult {
+                variant_of: self.catalog.clone(),
+                drafters: vec![DrafterCandidate {
+                    category: DrafterCategory::NextToModel,
+                    reference: self.beside.clone(),
+                    name: "mtp.gguf".to_owned(),
+                    label: "In this folder".to_owned(),
+                    size_bytes: 1,
+                    lineage: DrafterLineage::Lineage,
+                    verdict: DrafterVerdict::Bound {
+                        method: SpeculativeMethod::Mtp,
+                        memory_bytes: 1,
+                    },
+                    automatic: true,
+                    on_this_computer: true,
+                    method: Some(SpeculativeMethod::Mtp),
+                }],
+                catalog_drafters: self.catalog.iter().cloned().collect(),
+                license: None,
+            }
+        }
+    }
+
+    /// The arm64 QA case: removing an added model pruned the catalog drafter of a model still on
+    /// this computer, because that model's recommended drafter was the one beside it. A model's
+    /// catalog drafter is kept while the model is here, whatever it recommends; with no model
+    /// matching that catalog model, the drafter goes.
+    #[tokio::test]
+    async fn pruning_keeps_the_catalog_drafter_of_a_model_here_that_recommends_another() {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+        let fixture = Fixture::new().await;
+        let drafter = publish_managed(
+            &fixture.store,
+            "owner/Model-MTP-GGUF",
+            &"b".repeat(40),
+            &[("Model-MTP.gguf", drafter_bytes("catalog drafter"))],
+        )
+        .join("Model-MTP.gguf");
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        let draft = fixture
+            .inventory()
+            .list_installed()
+            .await
+            .unwrap()
+            .packages
+            .into_iter()
+            .map(|entry| entry.package)
+            .next()
+            .expect("the catalog drafter package");
+        let mut target = draft.clone();
+        target.id = ModelPackageId("owner-model-target-not-here".to_owned());
+        let mut definition = catalog_definition(target.clone());
+        definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+            target,
+            draft_source: SpeculativeDraftSource::Separate { draft },
+            method: SpeculativeMethod::Mtp,
+        };
+        let catalog_model = catalog_id(&definition);
+        let fixture = fixture.restart(vec![definition]).await;
+
+        let folder = fixture.root.join("imported");
+        write_model(&folder.join("model.gguf"), "imported");
+        write_dflash_drafter(&folder.join("mtp.gguf"), "beside");
+        let beside = DrafterReference::Local {
+            path: folder.join("mtp.gguf"),
+        };
+        let enrichment = |catalog: Option<ModelId>| {
+            Arc::new(BesideAndCatalog {
+                beside: beside.clone(),
+                catalog,
+            })
+        };
+        fixture
+            .resolver
+            .set_custom_model_enrichment(enrichment(Some(catalog_model)));
+        let configuration = LocalModelsConfiguration {
+            roots: vec![root(ModelRootKind::Folder, &folder)],
+            ..LocalModelsConfiguration::default()
+        };
+        fixture.apply(configuration.clone()).await;
+        let kept = fixture.local.prune_drafters().await.unwrap();
+        assert!(kept.removed.is_empty(), "{kept:?}");
+        assert!(drafter.exists(), "the catalog drafter of a model here is kept");
+
+        fixture.resolver.set_custom_model_enrichment(enrichment(None));
+        fixture.apply(configuration).await;
+        let pruned = fixture.local.prune_drafters().await.unwrap();
+        assert_eq!(pruned.removed.len(), 1, "no model here uses it any more");
+        assert!(!drafter.exists());
+        assert!(folder.join("mtp.gguf").exists(), "files outside the store are never touched");
+    }
+
     /// After a restart mid-download, the drafter that finished before the target is kept for the
     /// target still arriving, so the resumed download completes the whole model.
     #[tokio::test]
@@ -4808,6 +4934,7 @@ mod tests {
                     on_this_computer: true,
                     method: Some(self.method.clone()),
                 }],
+                catalog_drafters: Vec::new(),
                 license: None,
             }
         }
@@ -5404,6 +5531,7 @@ mod tests {
                     ),
                     candidate(DrafterReference::Embedded, SpeculativeMethod::Mtp),
                 ],
+                catalog_drafters: Vec::new(),
                 license: None,
             }
         }

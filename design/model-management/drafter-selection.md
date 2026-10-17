@@ -50,8 +50,12 @@ commit, read once and cached with that commit's snapshot; catalog fingerprints c
 header bundle.
 
 The product side matches only on engine-supplied fingerprints and declared lineage; it never parses
-headers or file names. "Variant of" shown to users is a display hint from lineage; the engine
-verdict alone decides compatibility.
+headers or file names. "Variant of" shown to users is a display hint: the exact catalog target or
+lineage match, and the fingerprint match only for a file whose lineage names no base model (an
+Ollama library model, a file without metadata). A fingerprint never overrides declared lineage,
+because models of one architecture and size can share every fingerprinted dimension and the
+tokenizer (Qwen3.5 27B and Qwen3.8 27B do); it still offers that catalog model's drafter. The
+engine verdict alone decides compatibility.
 
 ## Candidates
 
@@ -108,8 +112,9 @@ projector it lacks never blocks it), and otherwise offers the drafter-only downl
   catalog drafter still applies. A model whose drafter is turned off is offered no recommended
   drafter.
 - Magnitude's downloaded drafters are pruned only when no model still on this computer references
-  them: attached through its choice, or one it would use (its catalog drafter, a drafter from its
-  own repository, or its recommended drafter even while its drafter is turned off).
+  them: attached through its choice, or one it would use (the drafter of every catalog model it
+  matches, even while a drafter beside it is recommended instead, a drafter from its own repository,
+  or its recommended drafter even while its drafter is turned off), whatever its origin.
   Turned off, the model is a standalone bundle, which the engine serves plain: built-in MTP heads
   draft only through a bundle that declares them, never implicitly.
 - A model whose choice is automatic attaches the first of its automatic candidates, in the order

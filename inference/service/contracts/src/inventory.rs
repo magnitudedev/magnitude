@@ -927,6 +927,12 @@ pub enum InventoryError {
     /// The model's assessment says it cannot fit this machine's memory.
     #[error("{0}")]
     DoesNotFit(String),
+    /// The engine cannot run the model, for these reasons.
+    #[error("{message}")]
+    ModelUnsupported {
+        message: String,
+        reasons: Vec<crate::models::UnsupportedReason>,
+    },
     #[error("inventory I/O failed: {0}")]
     Io(String),
     #[error("upstream model service failed: {0}")]

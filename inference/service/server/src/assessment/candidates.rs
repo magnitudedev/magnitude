@@ -11,8 +11,11 @@ use std::sync::{Arc, Weak};
 
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
+use magnitude_artifacts::Error as ArtifactError;
+use magnitude_artifacts::gguf::{FileHeader, HeaderSource};
 use magnitude_engine::assessment::{
-    ModelPackagePaths, PreparedModelAssessment, finish_model_assessment, prepare_model_assessment,
+    ModelPackagePaths, PreparedModelAssessment, finish_model_assessment,
+    prepare_model_assessment_from,
 };
 use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
 use magnitude_engine::options::ModelMethod;
@@ -33,11 +36,11 @@ use magnitude_service_contracts::{
 };
 use magnitude_service_models::candidate_files::{
     CandidateFileRole, CandidateGguf, GgufGroup, RecognizedArchitectures, display_name,
-    group_ggufs, header_base_repositories, hugging_face_repository_from_url, is_q4_k_class,
-    local_directory, local_header_digest, local_model_digest, version_label,
+    base_model_repositories, group_ggufs, header_inspection,
+    hugging_face_repository_from_url, is_q4_k_class, local_directory, version_label,
 };
 use magnitude_service_models::lineage::{
-    CatalogLineage, CatalogLineageMatch, CatalogShape, CatalogShapes,
+    CatalogLineage, CatalogLineageMatch,
 };
 use magnitude_service_models::{
     CachedModelAssessment, CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts,
@@ -62,12 +65,14 @@ const ENRICHMENT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_se
 
 type Guard = Arc<dyn Send + Sync>;
 
-/// A target's header material: its first GGUF (shards beside it), its projector, and the identity
-/// of exactly those bytes.
+/// A target's header material: its first GGUF (shards beside it), its projector, the identity
+/// of exactly those bytes, and the header digest of each file whose digest is known, so the engine
+/// reads that header from the header cache rather than the file.
 struct TargetMaterial {
     target: PathBuf,
     projector: Option<PathBuf>,
     identity: String,
+    headers: BTreeMap<PathBuf, String>,
     _guards: Vec<Guard>,
 }
 
@@ -75,7 +80,45 @@ struct TargetMaterial {
 struct DrafterMaterial {
     path: PathBuf,
     identity: String,
+    headers: BTreeMap<PathBuf, String>,
     _guards: Vec<Guard>,
+}
+
+/// GGUF headers for the engine from this service's caches: a header whose digest the material
+/// names comes from the content-addressed header cache, and any other file's through its identity
+/// cache, so assessing a file again never rereads it.
+struct StoredHeaders {
+    store: Arc<ManagedModelStore>,
+    known: BTreeMap<PathBuf, String>,
+}
+
+impl StoredHeaders {
+    fn bytes(&self, path: &Path) -> Result<Vec<u8>, ArtifactError> {
+        if let Some(bytes) = self
+            .known
+            .get(path)
+            .and_then(|digest| self.store.cached_header(digest))
+        {
+            return Ok(bytes);
+        }
+        self.store
+            .local_gguf_header(path)
+            .map(|(_, header)| header)
+            .map_err(|error| match error {
+                InventoryError::Integrity(detail) => ArtifactError::Invalid(detail),
+                other => ArtifactError::Io(std::io::Error::other(other.to_string())),
+            })
+    }
+}
+
+impl HeaderSource for StoredHeaders {
+    fn header(&self, path: &Path) -> Result<FileHeader, ArtifactError> {
+        let size = std::fs::metadata(path)?.len();
+        Ok(FileHeader {
+            directory: magnitude_artifacts::gguf::read_header(&self.bytes(path)?)?,
+            size,
+        })
+    }
 }
 
 /// Everything drafter enumeration knows about one target.
@@ -129,7 +172,6 @@ struct ClassifiedGroup {
 #[derive(Default)]
 struct CatalogFacts {
     fingerprints: Vec<(ModelId, ModelFingerprint)>,
-    shapes: Vec<CatalogShape>,
 }
 
 /// Computed lineage hints and automatic drafters, keyed by model and exact target package, each
@@ -286,10 +328,21 @@ impl ManagedModelCandidates {
             }
             _ => None,
         };
-        let variant_of = self
-            .catalog_match(exact, &target.lineage, plain.fingerprint.as_ref())
-            .await
-            .map(|(matched, _)| matched.model_id);
+        let matches = self
+            .catalog_matches(exact, &target.lineage, plain.fingerprint.as_ref())
+            .await;
+        let variant_of = variant_of(
+            &matches,
+            &target.lineage,
+            target
+                .repository
+                .as_ref()
+                .map(|(repository, _)| repository.as_str()),
+        );
+        let catalog_drafters = matches
+            .into_iter()
+            .map(|(matched, _)| matched.model_id)
+            .collect();
         let license = target
             .snapshot
             .as_ref()
@@ -301,6 +354,7 @@ impl ManagedModelCandidates {
         Ok(CustomModelEnrichmentResult {
             variant_of,
             drafters,
+            catalog_drafters,
             license,
         })
     }
@@ -468,18 +522,31 @@ impl ManagedModelCandidates {
             draft: drafter.map(|drafter| drafter.path.clone()),
             method,
         };
+        let headers = StoredHeaders {
+            store: Arc::clone(self.models()),
+            known: target
+                .headers
+                .iter()
+                .chain(drafter.iter().flat_map(|drafter| &drafter.headers))
+                .map(|(path, digest)| (path.clone(), digest.clone()))
+                .collect(),
+        };
         let setup_environment = Arc::clone(&environment);
         let (prepared, fallback_context) = crate::spawn_blocking_traced(move || {
+            let prepared = prepare_model_assessment_from(&paths, &headers, &setup_environment.setup);
             // An unsupported file is profiled at its training context when its header names one;
             // without one it has no profile.
-            let fallback_context = magnitude_service_models::gguf::inspect(&paths.target)
-                .ok()
-                .and_then(|inspection| inspection.training_context_length)
-                .unwrap_or_default();
-            (
-                prepare_model_assessment(&paths, &setup_environment.setup),
-                fallback_context,
-            )
+            let fallback_context = match &prepared {
+                Ok(PreparedModelAssessment::Unsupported { .. }) => headers
+                    .header(&paths.target)
+                    .ok()
+                    .and_then(|header| {
+                        magnitude_service_models::gguf::training_context_length(&header.directory)
+                    })
+                    .unwrap_or_default(),
+                _ => 0,
+            };
+            (prepared, fallback_context)
         })
         .await
         .map_err(|error| {
@@ -611,6 +678,7 @@ impl ManagedModelCandidates {
             target,
             projector,
             identity,
+            headers: preview_headers(&prepared),
             _guards: vec![Arc::new(prepared)],
         })
     }
@@ -640,33 +708,60 @@ impl ManagedModelCandidates {
         Ok(DrafterMaterial {
             path,
             identity,
+            headers: preview_headers(&prepared),
             _guards: vec![Arc::new(prepared)],
         })
     }
 
+    /// Local material, identified by header digests from the identity cache: an unchanged file is
+    /// never read again, and the engine reads its header from the header cache.
     fn local_target(
         &self,
         target: PathBuf,
         projector: Option<PathBuf>,
     ) -> Result<TargetMaterial, InventoryError> {
         let mut identity = Vec::new();
+        let mut headers = BTreeMap::new();
         for path in std::iter::once(&target).chain(projector.iter()) {
-            identity.push(local_header_digest(path)?);
+            let digest = self.models().local_gguf(path)?.inspection.header_digest;
+            identity.push(digest.clone());
+            headers.insert(path.clone(), digest);
         }
         Ok(TargetMaterial {
             target,
             projector,
             identity: identity.join(","),
+            headers,
             _guards: Vec::new(),
         })
     }
 
     fn local_drafter(&self, path: PathBuf) -> Result<DrafterMaterial, InventoryError> {
+        let identity = self.models().local_gguf(&path)?.inspection.header_digest;
         Ok(DrafterMaterial {
-            identity: local_header_digest(&path)?,
+            headers: BTreeMap::from([(path.clone(), identity.clone())]),
+            identity,
             path,
             _guards: Vec::new(),
         })
+    }
+
+    /// The repositories a GGUF names as its base models, from its cached facts.
+    fn header_lineage(&self, path: &Path, known: &BTreeMap<PathBuf, String>) -> BTreeSet<String> {
+        let base_models = match known
+            .get(path)
+            .and_then(|digest| self.models().cached_header(digest))
+        {
+            Some(header) => header_inspection(&header)
+                .map(|(_, inspection)| inspection.base_models)
+                .unwrap_or_default(),
+            None => self
+                .models()
+                .local_gguf(path)
+                .map(|gguf| gguf.inspection.base_models)
+                .unwrap_or_default(),
+        };
+        base_model_repositories(&base_models)
     }
 
     /// A resolved bundle's target (and projector) as material, identified by its exact package.
@@ -679,6 +774,7 @@ impl ManagedModelCandidates {
             target,
             projector,
             identity,
+            headers: BTreeMap::new(),
             _guards: vec![Arc::new(resolved)],
         })
     }
@@ -717,6 +813,7 @@ impl ManagedModelCandidates {
         Ok(Some(DrafterMaterial {
             path,
             identity,
+            headers: BTreeMap::new(),
             _guards: vec![Arc::new(resolved)],
         }))
     }
@@ -945,9 +1042,10 @@ impl ManagedModelCandidates {
     ) -> (Vec<CandidateGguf>, Vec<ClassifiedGroup>) {
         let root = root.to_path_buf();
         let architectures = self.architectures.clone();
+        let store = Arc::clone(self.models());
         crate::spawn_blocking_traced(move || {
             let files = scan_ggufs(&root, depth);
-            let classified = classify_local(&root, &files, &architectures);
+            let classified = classify_local(&store, &root, &files, &architectures);
             (files, classified)
         })
         .await
@@ -1027,6 +1125,7 @@ impl ManagedModelCandidates {
                     .filter(|model_id| catalog_installed.contains(model_id))
                     .or_else(|| {
                         on_this_computer(
+                            self.models(),
                             &custom,
                             Some((&model_id, snapshot.commit.as_str())),
                             &group.group,
@@ -1057,10 +1156,13 @@ impl ManagedModelCandidates {
         let fingerprint = versions
             .iter()
             .find_map(|version| version.assessment.as_ref()?.fingerprint.clone());
-        let variant_of = self
-            .catalog_match(None, &lineage, fingerprint.as_ref())
-            .await
-            .map(|(matched, _)| matched.model_id);
+        let variant_of = variant_of(
+            &self
+                .catalog_matches(None, &lineage, fingerprint.as_ref())
+                .await,
+            &lineage,
+            Some(snapshot.repository.as_str()),
+        );
         let projector_bytes = projector.map_or(0, |projector| projector.group.size_bytes());
         Ok(CandidateInspection {
             source: CandidateSource::HuggingFace {
@@ -1129,7 +1231,7 @@ impl ManagedModelCandidates {
                 root.join(&group.group.primary().path),
                 projector_path.clone(),
             );
-            let unreadable = unreadable_local_group(&root, &group.group);
+            let unreadable = unreadable_local_group(self.models(), &root, &group.group);
             pending.push(async move {
                 match unreadable {
                     Some(assessment) => Some(assessment),
@@ -1163,6 +1265,7 @@ impl ManagedModelCandidates {
             .zip(assessments)
             .filter_map(|(group, assessment)| {
                 let on_this_computer = on_this_computer(
+                    self.models(),
                     &custom,
                     None,
                     &group.group,
@@ -1191,10 +1294,13 @@ impl ManagedModelCandidates {
         let fingerprint = versions
             .iter()
             .find_map(|version| version.assessment.as_ref()?.fingerprint.clone());
-        let variant_of = self
-            .catalog_match(None, &lineage, fingerprint.as_ref())
-            .await
-            .map(|(matched, _)| matched.model_id);
+        let variant_of = variant_of(
+            &self
+                .catalog_matches(None, &lineage, fingerprint.as_ref())
+                .await,
+            &lineage,
+            None,
+        );
         let name = selected
             .as_ref()
             .and_then(|selected| selected.file_stem())
@@ -1282,9 +1388,8 @@ impl ManagedModelCandidates {
 
     // Catalog matching ----------------------------------------------------------------------
 
-    /// Each catalog model's shape fingerprint, from its release header material, computed once.
-    /// Each catalog model's shape fingerprint, architecture and parameter count, computed once and
-    /// concurrently from the release header bundle.
+    /// Each catalog model's shape fingerprint, computed once and concurrently from the release
+    /// header bundle.
     async fn catalog_facts(&self) -> &CatalogFacts {
         self.catalog_facts
             .get_or_init(|| async {
@@ -1302,21 +1407,7 @@ impl ManagedModelCandidates {
                         let fingerprint = EngineModelFingerprint::from_path(&target)
                             .ok()
                             .map(super::assessor::model_fingerprint);
-                        let shape = local_directory(&target).ok().and_then(|directory| {
-                            Some(CatalogShape {
-                                model_id: model_id.clone(),
-                                architecture: directory
-                                    .value("general.architecture")
-                                    .and_then(|value| value.string())?
-                                    .to_owned(),
-                                parameters: directory
-                                    .tensors
-                                    .iter()
-                                    .map(|tensor| tensor.shape.iter().product::<u64>())
-                                    .sum(),
-                            })
-                        });
-                        Some((model_id, fingerprint, shape))
+                        Some((model_id, fingerprint))
                     })
                     .await
                     .ok()
@@ -1327,28 +1418,14 @@ impl ManagedModelCandidates {
                 .collect::<Vec<_>>()
                 .await;
                 let mut catalog = CatalogFacts::default();
-                for (model_id, fingerprint, shape) in facts {
+                for (model_id, fingerprint) in facts {
                     if let Some(fingerprint) = fingerprint {
                         catalog.fingerprints.push((model_id, fingerprint));
                     }
-                    catalog.shapes.extend(shape);
                 }
                 catalog
             })
             .await
-    }
-
-    /// The catalog model a target derives from: the first of [`Self::catalog_matches`].
-    async fn catalog_match(
-        &self,
-        exact: Option<(&str, &str, &Path)>,
-        lineage: &BTreeSet<String>,
-        fingerprint: Option<&ModelFingerprint>,
-    ) -> Option<(CatalogLineageMatch, DrafterLineage)> {
-        self.catalog_matches(exact, lineage, fingerprint)
-            .await
-            .into_iter()
-            .next()
     }
 
     /// The catalog models a target derives from, best first: an exact catalog target alone; else
@@ -1420,7 +1497,7 @@ impl ManagedModelCandidates {
                     .hub()
                     .lineage(&snapshot.repository, Some(snapshot.base_models.clone()))
                     .await;
-                lineage.extend(header_lineage(&material.target));
+                lineage.extend(self.header_lineage(&material.target, &material.headers));
                 Ok(DrafterTarget {
                     material,
                     repository: Some((snapshot.repository.clone(), snapshot.commit.clone())),
@@ -1437,14 +1514,16 @@ impl ManagedModelCandidates {
                     .projector
                     .as_ref()
                     .map(|file| path.join(&file.path));
-                let lineage = header_lineage(&target);
-                let folders = target
+                let material = self.local_target(target, projector)?;
+                let lineage = self.header_lineage(&material.target, &material.headers);
+                let folders = material
+                    .target
                     .parent()
                     .map(|parent| DrafterFolder::whole(parent.to_path_buf()))
                     .into_iter()
                     .collect();
                 Ok(DrafterTarget {
-                    material: self.local_target(target, projector)?,
+                    material,
                     repository: None,
                     primary: None,
                     folders,
@@ -1528,7 +1607,7 @@ impl ManagedModelCandidates {
             .filter(|file| file.role == ModelFileRole::Weights)
             .map(|file| file.path.clone())
             .min();
-        let mut lineage = header_lineage(&material.target);
+        let mut lineage = self.header_lineage(&material.target, &material.headers);
         // A model from a known Hub repository lists that repository's drafters, at its commit or
         // else at `main`; never whatever else shares its folder.
         let snapshot = match &repository {
@@ -1853,7 +1932,8 @@ impl ManagedModelCandidates {
             category: DrafterCategory::NextToModel,
             automatic: is_bound(&verdict) && fits,
             reference,
-            name: format!("{}/{}", snapshot.repository, file_name(&path)),
+            // The whole path: a repository may ship same-named drafters in several subfolders.
+            name: format!("{}/{}", snapshot.repository, path_string(&path)),
             label: "In this repository".to_owned(),
             size_bytes: file.size_bytes,
             lineage: DrafterLineage::Lineage,
@@ -1899,7 +1979,10 @@ impl ManagedModelCandidates {
         let local = Path::new(reference);
         if local.is_absolute() {
             let material = self.local_drafter(local.to_path_buf())?;
-            let lineage = lineage_kind(&header_lineage(&material.path), related);
+            let lineage = lineage_kind(
+                &self.header_lineage(&material.path, &material.headers),
+                related,
+            );
             let (verdict, _) = self
                 .drafter_verdict(target, &material)
                 .await
@@ -1945,7 +2028,7 @@ impl ManagedModelCandidates {
             .hub()
             .lineage(&snapshot.repository, Some(snapshot.base_models.clone()))
             .await;
-        lineage.extend(header_lineage(&material.path));
+        lineage.extend(self.header_lineage(&material.path, &material.headers));
         let lineage = lineage_kind(&lineage, related);
         let (verdict, _) = self
             .drafter_verdict(target, &material)
@@ -1962,7 +2045,7 @@ impl ManagedModelCandidates {
             category: DrafterCategory::Other,
             automatic: false,
             reference,
-            name: format!("{}/{}", snapshot.repository, file_name(&path)),
+            name: format!("{}/{}", snapshot.repository, path_string(&path)),
             label: other_drafter_label(lineage),
             size_bytes: file.size_bytes,
             lineage,
@@ -2086,12 +2169,6 @@ impl ManagedModelCandidates {
             }
             DrafterReference::Local { .. } => Ok(None),
         }
-    }
-}
-
-impl CatalogShapes for ManagedModelCandidates {
-    fn catalog_shapes(&self) -> BoxFuture<'_, Vec<CatalogShape>> {
-        Box::pin(async move { self.catalog_facts().await.shapes.clone() })
     }
 }
 
@@ -2311,6 +2388,25 @@ fn download_bytes(candidate: &DrafterCandidate) -> u64 {
 }
 
 /// The candidates automatic choice may take, in its order (see `DrafterCandidate::automatic`).
+/// The catalog model a target is a variant of, for display: its exact catalog target or lineage
+/// match, else its fingerprint match only when its lineage names no base model at all (an Ollama
+/// library model, a file without metadata). A fingerprint never overrides a declared lineage:
+/// models of one architecture and size often share every dimension and the tokenizer (Qwen3.5 27B
+/// and Qwen3.8 27B do), so it says which drafters bind, not which model this is.
+fn variant_of(
+    matches: &[(CatalogLineageMatch, DrafterLineage)],
+    lineage: &BTreeSet<String>,
+    repository: Option<&str>,
+) -> Option<ModelId> {
+    let declared = lineage
+        .iter()
+        .any(|named| repository.is_none_or(|repository| !named.eq_ignore_ascii_case(repository)));
+    matches
+        .iter()
+        .find(|(_, kind)| *kind != DrafterLineage::Fingerprint || !declared)
+        .map(|(matched, _)| matched.model_id.clone())
+}
+
 fn automatic(candidates: Vec<DrafterCandidate>) -> Vec<DrafterCandidate> {
     candidates
         .into_iter()
@@ -2503,13 +2599,6 @@ fn sha256_of(file: &HuggingFaceRepositoryFile) -> Option<&str> {
     }
 }
 
-/// The repositories a local GGUF names as its base models.
-fn header_lineage(path: &Path) -> BTreeSet<String> {
-    local_directory(path)
-        .map(|directory| header_base_repositories(&directory))
-        .unwrap_or_default()
-}
-
 /// GGUFs beneath `root`, relative to it, at most `depth` directories deep. Partial downloads and
 /// hidden files are skipped.
 fn classified_group(
@@ -2542,7 +2631,10 @@ fn unreadable_group(group: GgufGroup, detail: String) -> ClassifiedGroup {
     }
 }
 
+/// A local folder's GGUF groups classified through the identity cache: each file is read at most
+/// once, and an unchanged one not at all.
 fn classify_local(
+    store: &ManagedModelStore,
     root: &Path,
     files: &[CandidateGguf],
     architectures: &RecognizedArchitectures,
@@ -2550,27 +2642,45 @@ fn classify_local(
     group_ggufs(files)
         .into_iter()
         .filter_map(|group| {
-            let path = root.join(&group.primary().path);
-            let directory = local_directory(&path).ok()?;
-            let inspection = magnitude_service_models::gguf::inspect(&path).ok()?;
+            let (gguf, classification) = store
+                .classify_local_gguf(&root.join(&group.primary().path), architectures)
+                .ok()?;
             Some(ClassifiedGroup {
-                role: CandidateFileRole::of(&directory, architectures),
-                base_repositories: header_base_repositories(&directory),
-                quantization: inspection.quantization,
-                header_digest: local_header_digest(&path).ok()?,
-                local_digest: local_model_digest(
-                    &group
-                        .files
-                        .iter()
-                        .map(|file| root.join(&file.path))
-                        .collect::<Vec<_>>(),
-                )
-                .ok(),
+                role: classification.role,
+                base_repositories: classification.base_repositories,
+                quantization: classification.quantization,
+                header_digest: gguf.inspection.header_digest,
+                local_digest: local_digest(
+                    store,
+                    group.files.iter().map(|file| root.join(&file.path)),
+                ),
                 group,
                 unreadable: None,
             })
         })
         .collect()
+}
+
+/// The `local:` digest of a model's shards, first shard first, from the identity cache.
+fn local_digest(
+    store: &ManagedModelStore,
+    shards: impl IntoIterator<Item = PathBuf>,
+) -> Option<String> {
+    let samples = shards
+        .into_iter()
+        .map(|shard| store.local_gguf(&shard).ok()?.inspection.content_sample)
+        .collect::<Option<Vec<_>>>()?;
+    Some(magnitude_service_models::gguf::local_model_digest(
+        samples.iter().map(String::as_str),
+    ))
+}
+
+/// The header digest of a file, from the identity cache.
+fn header_digest(store: &ManagedModelStore, path: &Path) -> Option<String> {
+    store
+        .local_gguf(path)
+        .ok()
+        .map(|gguf| gguf.inspection.header_digest)
 }
 
 /// GGUF files under `root`, named by the paths the user sees: a symlinked file (a Hugging Face
@@ -2725,6 +2835,7 @@ fn local_model_id(header_digest: &str) -> Option<ModelId> {
 /// pull's, is not part of the version), the same files, or files with the same header and sizes
 /// wherever they are.
 fn on_this_computer(
+    store: &ManagedModelStore,
     custom: &[CustomModel],
     hugging_face: Option<(&ModelId, &str)>,
     group: &GgufGroup,
@@ -2760,7 +2871,9 @@ fn on_this_computer(
                 })
                 || (!paths.is_empty() && model.files.iter().any(|file| paths.contains(&file.path)))
         })
-        .or_else(|| listed().find(|model| same_bytes(model, group, header_digest, local_digest)))
+        .or_else(|| {
+            listed().find(|model| same_bytes(store, model, group, header_digest, local_digest))
+        })
         .map(|model| model.model_id.clone())
 }
 
@@ -2790,6 +2903,7 @@ fn listed_at(custom: &[CustomModel], group: &GgufGroup, root: &Path) -> Option<M
 /// digest, which samples the weights, for a local version, or the same header for a remote one
 /// whose weights can't be sampled. Files are read only for a model whose sizes already match.
 fn same_bytes(
+    store: &ManagedModelStore,
     model: &CustomModel,
     group: &GgufGroup,
     header_digest: &str,
@@ -2802,28 +2916,46 @@ fn same_bytes(
             .zip(&group.files)
             .all(|(file, version)| file.size_bytes == version.size_bytes)
         && match local_digest {
-            Some(local_digest) => local_model_digest(
-                &model
-                    .files
-                    .iter()
-                    .map(|file| file.path.clone())
-                    .collect::<Vec<_>>(),
-            )
-            .is_ok_and(|digest| digest == local_digest),
+            Some(local_digest) => {
+                self::local_digest(store, model.files.iter().map(|file| file.path.clone()))
+                    .is_some_and(|digest| digest == local_digest)
+            }
             None => model.files.first().is_some_and(|primary| {
-                local_header_digest(&primary.path).is_ok_and(|digest| digest == header_digest)
+                self::header_digest(store, &primary.path).is_some_and(|digest| digest == header_digest)
             }),
         }
 }
 
 /// The verdict of a local file shorter than its header declares, which the engine never reads.
-fn unreadable_local_group(root: &Path, group: &GgufGroup) -> Option<CachedModelAssessment> {
-    let detail = group.files.iter().find_map(|file| {
-        magnitude_service_models::gguf::inspect_complete(&root.join(&file.path))
-            .err()
-            .map(|error| error.to_string())
-    })?;
+fn unreadable_local_group(
+    store: &ManagedModelStore,
+    root: &Path,
+    group: &GgufGroup,
+) -> Option<CachedModelAssessment> {
+    let detail = group
+        .files
+        .iter()
+        .find_map(|file| match store.local_gguf(&root.join(&file.path)) {
+            Ok(gguf) => gguf.truncated,
+            Err(error) => Some(error.to_string()),
+        })?;
     Some(super::assessor::unreadable_assessment(detail))
+}
+
+/// Each preview header's digest, keyed by the path its file was materialized at.
+fn preview_headers(prepared: &magnitude_service_models::PreparedPreview) -> BTreeMap<PathBuf, String> {
+    prepared
+        .model
+        .components
+        .iter()
+        .filter_map(|component| {
+            let header = prepared
+                .headers
+                .iter()
+                .find(|header| component.path.ends_with(&header.path))?;
+            Some((component.path.clone(), header.digest.clone()))
+        })
+        .collect()
 }
 
 /// Versions with their verdicts. The recommended version is the largest fitting Q4_K-class
@@ -2981,7 +3113,9 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, minimal_gguf()).unwrap();
         }
-        let identity = |path: &Path| local_header_digest(path).unwrap();
+        let identity = |path: &Path| {
+            magnitude_service_models::candidate_files::local_header_digest(path).unwrap()
+        };
         let here = AssessmentEnvironmentId("environment_metal_m3".to_owned());
         let elsewhere = AssessmentEnvironmentId("environment_cuda_4090".to_owned());
         let key = |environment: &AssessmentEnvironmentId, path: &Path| {
@@ -3004,8 +3138,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_truncated_local_candidate_is_unreadable_and_a_whole_one_is_assessed() {
+    #[tokio::test]
+    async fn a_truncated_local_candidate_is_unreadable_and_a_whole_one_is_assessed() {
+        let (_directory, store) = super::hub_tests::bare_store().await;
         let root = tempfile::tempdir().unwrap();
         let whole = minimal_gguf();
         std::fs::write(root.path().join("whole.gguf"), &whole).unwrap();
@@ -3021,8 +3156,9 @@ mod tests {
             }],
         };
 
-        assert!(unreadable_local_group(root.path(), &group("whole.gguf")).is_none());
-        let truncated = unreadable_local_group(root.path(), &group("truncated.gguf")).unwrap();
+        assert!(unreadable_local_group(&store, root.path(), &group("whole.gguf")).is_none());
+        let truncated =
+            unreadable_local_group(&store, root.path(), &group("truncated.gguf")).unwrap();
         let ModelAssessment::Unsupported {
             profile, reasons, ..
         } = truncated.profile

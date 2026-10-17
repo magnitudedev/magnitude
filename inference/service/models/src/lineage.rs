@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use futures_util::future::BoxFuture;
 use magnitude_service_contracts::models::{
     ModelFileRole, ModelId, ModelPackage, ModelPackageSource, RecommendableModel,
     RecommendableModelCatalog, ServableModelBundle,
@@ -283,72 +282,6 @@ async fn pinned_repository_base_models(
         .collect())
 }
 
-/// A catalog model's architecture and parameter count, read from its release header.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CatalogShape {
-    pub model_id: ModelId,
-    pub architecture: String,
-    pub parameters: u64,
-}
-
-/// The catalog's shapes, computed by whoever holds the release headers.
-pub trait CatalogShapes: Send + Sync {
-    fn catalog_shapes(&self) -> BoxFuture<'_, Vec<CatalogShape>>;
-}
-
-/// Parameter counts within this fraction of a catalog model's are the same size: a GGUF with or
-/// without its MTP layers differs by about 3%, while neighbouring sizes of one family differ by
-/// far more.
-const SHAPE_TOLERANCE: f64 = 0.05;
-
-/// The catalog model of the same architecture whose parameter count is closest to `parameters`,
-/// within `SHAPE_TOLERANCE`, and whose size does not contradict the size `name` spells (a
-/// repository named E2B is never a variant of the E4B, whatever its file sizes add up to). The
-/// weakest lineage signal: a display hint for repositories that declare no lineage at all.
-#[must_use]
-pub fn shape_match<'a>(
-    shapes: &'a [CatalogShape],
-    architecture: &str,
-    parameters: u64,
-    name: &str,
-) -> Option<&'a CatalogShape> {
-    let named = name_sizes(name);
-    shapes
-        .iter()
-        .filter(|shape| shape.architecture == architecture && shape.parameters > 0)
-        .filter(|shape| {
-            let sizes = name_sizes(shape.model_id.as_str());
-            named.is_empty() || sizes.is_empty() || !named.is_disjoint(&sizes)
-        })
-        .map(|shape| {
-            let difference = shape.parameters.abs_diff(parameters) as f64 / shape.parameters as f64;
-            (shape, difference)
-        })
-        .filter(|(_, difference)| *difference <= SHAPE_TOLERANCE)
-        .min_by(|left, right| left.1.total_cmp(&right.1))
-        .map(|(shape, _)| shape)
-}
-
-/// The sizes a model name spells, such as `4b`, `e2b`, `35b`, `a3b` or `270m`, lowercased.
-fn name_sizes(name: &str) -> BTreeSet<String> {
-    name.to_lowercase()
-        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '.'))
-        .filter(|token| {
-            let count = token
-                .strip_prefix(['a', 'e'])
-                .unwrap_or(token)
-                .strip_suffix(['b', 'm']);
-            count.is_some_and(|count| {
-                count.starts_with(|character: char| character.is_ascii_digit())
-                    && count
-                        .chars()
-                        .all(|character| character.is_ascii_digit() || character == '.')
-            })
-        })
-        .map(str::to_owned)
-        .collect()
-}
-
 /// Hub lineage of arbitrary repositories, cached in memory and fetched with bounded concurrency.
 pub struct HubLineage {
     models: Arc<ManagedModelStore>,
@@ -495,81 +428,6 @@ pub(crate) fn hub_base_model_ids(value: &serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_shape_matches_the_closest_catalog_model_of_its_architecture_within_tolerance() {
-        let shape = |model_id: &str, architecture: &str, parameters| CatalogShape {
-            model_id: model_id.parse().unwrap(),
-            architecture: architecture.to_owned(),
-            parameters,
-        };
-        let shapes = [
-            shape("qwen3.5-4b:gguf:q4", "qwen35", 4_326_350_848),
-            shape("qwen3.5-9b:gguf:q4", "qwen35", 8_953_803_264),
-            shape("other-4b:gguf:q4", "llama", 4_205_751_296),
-        ];
-        assert_eq!(
-            shape_match(
-                &shapes,
-                "qwen35",
-                4_205_751_296,
-                "someone/Qwen3.5-4B-Abliterated-GGUF"
-            )
-            .map(|shape| shape.model_id.as_str()),
-            Some("qwen3.5-4b:gguf:q4"),
-            "the same model without its MTP layers"
-        );
-        assert_eq!(
-            shape_match(&shapes, "qwen35", 4_205_751_296, "someone/Unnamed-GGUF")
-                .map(|shape| shape.model_id.as_str()),
-            Some("qwen3.5-4b:gguf:q4"),
-            "a name without a size leaves the shape to decide"
-        );
-        assert_eq!(shape_match(&shapes, "qwen35", 2_000_000_000, "a/b"), None);
-        assert_eq!(shape_match(&shapes, "gemma4", 4_205_751_296, "a/b"), None);
-    }
-
-    #[test]
-    fn a_shape_never_contradicts_the_size_the_name_spells() {
-        let shapes = [
-            CatalogShape {
-                model_id: "gemma-4-e2b-it-qat:gguf:q4".parse().unwrap(),
-                architecture: "gemma4".to_owned(),
-                parameters: 4_628_569_635,
-            },
-            CatalogShape {
-                model_id: "gemma-4-e4b-it-qat:gguf:q4".parse().unwrap(),
-                architecture: "gemma4".to_owned(),
-                parameters: 7_518_069_290,
-            },
-        ];
-        // weareapexcreators/Gemma-4-E2B-it-LocalAI declares no lineage, and its GGUF metadata
-        // totals the E4B's parameter count.
-        assert_eq!(
-            shape_match(
-                &shapes,
-                "gemma4",
-                7_518_069_290,
-                "weareapexcreators/Gemma-4-E2B-it-LocalAI"
-            ),
-            None
-        );
-        assert_eq!(
-            shape_match(
-                &shapes,
-                "gemma4",
-                7_518_069_290,
-                "someone/Gemma-4-E4B-it-LocalAI"
-            )
-            .map(|shape| shape.model_id.as_str()),
-            Some("gemma-4-e4b-it-qat:gguf:q4")
-        );
-        assert_eq!(
-            name_sizes("Qwen/Qwen3.6-35B-A3B"),
-            BTreeSet::from(["35b".to_owned(), "a3b".to_owned()])
-        );
-        assert!(name_sizes("Qwen3.5-Coder").is_empty());
-    }
 
     #[test]
     fn hub_base_models_parse_both_shapes() {

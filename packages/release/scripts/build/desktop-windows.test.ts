@@ -66,6 +66,19 @@ describe("Windows installer link handler", () => {
   })
 })
 
+describe("Windows installer stage", () => {
+  const script = Effect.runSync(renderWindowsInstaller(readFileSync(join(import.meta.dirname, "../../resources/windows/desktop.nsi"), "utf8"), input))
+  const install = script.slice(script.indexOf('Section "Magnitude"'), script.indexOf("SectionEnd"))
+  it("removes the stage after a fresh install moves the payload out", () => {
+    const fresh = install.slice(install.indexOf('Rename "$Stage" "$INSTDIR"'))
+    expect(fresh.slice(0, fresh.indexOf("ClearErrors"))).toContain("Call CleanupStage")
+  })
+  it("removes the stage after a committed update, and keeps it while previous files remain for a retry", () => {
+    const finish = install.slice(install.indexOf("FinishReplacement"), install.indexOf("Goto installed"))
+    expect(finish).toMatch(/\$\{If\} \$0 != 0[^]*StrCpy \$Stage ""\s*\$\{Else\}\s*Call CleanupStage\s*\$\{EndIf\}/)
+  })
+})
+
 describe("Windows installer source boundary", () => {
   it.each(["redirected payload", "x64 helper"] as const)("rejects %s before compiler execution", async scenario => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {

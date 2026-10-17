@@ -87,6 +87,20 @@ describe("unsupported reasons in the UI", () => {
     ])
   })
 
+  it("names the device a backend reason is about, never a GPU on a CPU-only computer", () => {
+    expect([
+      { _tag: "Backend", backend: "cpu" },
+      { _tag: "KernelDomain", backend: "cpu", entry: "attention", statics: [] },
+      { _tag: "Backend", backend: "cuda" },
+      { _tag: "Backend", backend: "native" },
+    ].map((value) => unsupportedReasonMessage(reason(value)))).toEqual([
+      "Its layer sizes aren't supported on this CPU",
+      "Its layer sizes aren't supported on this CPU",
+      "Its layer sizes aren't supported on this GPU",
+      "Its layer sizes aren't supported on this computer",
+    ])
+  })
+
   it("names every unsupported weight type and renders an unknown case with its detail", () => {
     expect(unsupportedReasonMessage(reason({
       _tag: "WeightTypes",
@@ -208,6 +222,7 @@ describe("drafter presentation", () => {
 
 describe("custom models in client projections", () => {
   const unsupported = {
+    modelId: Option.none(),
     displayName: "DeepSeek V4 Flash",
     origin: { _tag: "Found", source: { _tag: "Folder", path: "/Volumes/External/models/" } },
     path: "/Volumes/External/models/deepseek.gguf",

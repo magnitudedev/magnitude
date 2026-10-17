@@ -376,6 +376,9 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       StopActiveLocalModel: () =>
         observeRpcDefects("StopActiveLocalModel", modelCommands.stopActiveModel),
 
+      StopLocalModel: ({ modelId }) =>
+        observeRpcDefects("StopLocalModel", modelCommands.stopModel(modelId)),
+
       LoadModelSlot: ({ slotId }) =>
         observeRpcDefects("LoadModelSlot", modelCommands.loadSlot(slotId)),
 

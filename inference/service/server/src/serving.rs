@@ -101,6 +101,11 @@ fn unavailable(error: InventoryError) -> ServingError {
         InventoryError::Unsupported(message) => ModelUnavailable::Unsupported(message),
         InventoryError::Integrity(message) => ModelUnavailable::Integrity(message),
         InventoryError::DoesNotFit(message) => ModelUnavailable::DoesNotFit(message),
+        InventoryError::ModelUnsupported { message, .. } => ModelUnavailable::Operation {
+            code: "model_unsupported".to_owned(),
+            message,
+            retryable: false,
+        },
         InventoryError::ModelOperation { code, .. } if code == "model_instance_stopped" => {
             ModelUnavailable::InstanceStopped
         }

@@ -19,7 +19,7 @@ magnitude catalog inspect <huggingface-url | owner/repo | owner/repo:QUANT | pat
 magnitude catalog pull <model-id | owner/repo[:QUANT] | huggingface-url> [--drafter auto|none|<drafter>] [--force]
 magnitude models status [model-id] [--all]
 magnitude models load <model-id>
-magnitude models stop
+magnitude models stop [model-id]
 magnitude models import <path.gguf> [--drafter auto|none|<drafter>]
 magnitude models drafter <model-id> <auto | none | drafter>
 magnitude models hide|unhide <model-id>

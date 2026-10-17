@@ -509,3 +509,43 @@ fn a_chained_head_widens_again_when_the_text_turns_predictable() {
         "{narrow} rounds of perfect text before three proposals are verified: {rounds}"
     );
 }
+
+/// A CPU: the drafter's launch costs little next to the target's, whose
+/// rows each cost a share of a plain decode, so drafting pays only on
+/// predictable text.
+const CPU: Costs = Costs {
+    draft: |generated| if generated == 0 { 0.0 } else { 20.0 },
+    verify: |rows| 50.0 + 10.0 * (rows - 1) as f64,
+};
+
+/// Drafting that measured slower stops, but never for good: the time set
+/// aside for looks carries from request to request, so a load of short
+/// requests, none long enough to earn a look by itself, still looks, and
+/// drafts again once the text turns predictable.
+#[test]
+fn looks_carry_across_short_requests_so_drafting_that_stopped_can_resume() {
+    let load = warmed(&Stream::of(&[(400, UNPREDICTABLE)]), CPU);
+    let off = adaptive(&Stream::of(&[(30, UNPREDICTABLE)]), CPU, &load);
+    assert!(
+        off.rounds
+            .iter()
+            .filter(|(choice, _)| choice.generated > 0)
+            .count()
+            * 4
+            <= off.rounds.len(),
+        "drafting that doesn't pay is mostly off: {}",
+        off.rounds()
+    );
+    let predictable = Stream::of(&[(30, PREDICTABLE)]);
+    let resumed = (0..20)
+        .map(|_| adaptive(&predictable, CPU, &load))
+        .position(|run| {
+            run.rounds
+                .iter()
+                .any(|(choice, _)| !choice.look && choice.verified > 0)
+        });
+    assert!(
+        resumed.is_some(),
+        "short requests over predictable text draft again"
+    );
+}

@@ -470,24 +470,59 @@ pub fn inspect_header(path: impl AsRef<Path>) -> Result<Directory, Error> {
     read_file_directory(&source, false)
 }
 
+/// One GGUF file's validated header directory and logical size.
+#[derive(Clone, Debug)]
+pub struct FileHeader {
+    pub directory: Directory,
+    pub size: u64,
+}
+
+/// Where header-only inspection reads GGUF headers: the files themselves
+/// ([`FileHeaders`]), or a host that already holds them, so assessing one
+/// file several ways never rereads it. A header is the file's bytes through
+/// its aligned tensor-data offset, parsed by [`read_header`].
+pub trait HeaderSource {
+    fn header(&self, path: &Path) -> Result<FileHeader, Error>;
+}
+
+/// Headers read from the files they describe.
+pub struct FileHeaders;
+
+impl HeaderSource for FileHeaders {
+    fn header(&self, path: &Path) -> Result<FileHeader, Error> {
+        let source = FileSource::open(path)?;
+        Ok(FileHeader {
+            directory: read_file_directory(&source, false)?,
+            size: source.size(),
+        })
+    }
+}
+
 /// Inspect the headers of the GGUF component `path` names: the file itself,
 /// or every shard when it is the first shard of a split GGUF (see
 /// [`split_paths`]). Tensor payloads need not exist. Returns the component
-/// directory and its files in shard order.
-pub(crate) fn inspect_component_header(path: &Path) -> Result<(Directory, Vec<FileSource>), Error> {
-    let first = FileSource::open(path)?;
-    let directory = read_file_directory(&first, false)?;
-    match split_paths(path, &directory)? {
-        None => Ok((directory, vec![first])),
+/// directory and its files (absolute, in shard order) with their sizes.
+pub(crate) fn inspect_component_header(
+    path: &Path,
+    headers: &dyn HeaderSource,
+) -> Result<(Directory, Vec<(PathBuf, u64)>), Error> {
+    let read = |path: &Path| -> Result<(FileHeader, PathBuf), Error> {
+        let header = headers.header(path)?;
+        header.directory.require_execution_byte_order()?;
+        Ok((header, std::path::absolute(path)?))
+    };
+    let (first, first_path) = read(path)?;
+    match split_paths(path, &first.directory)? {
+        None => Ok((first.directory, vec![(first_path, first.size)])),
         Some(paths) => {
-            let mut sources = vec![first];
-            let mut shards = vec![directory];
+            let mut files = vec![(first_path, first.size)];
+            let mut shards = vec![first.directory];
             for shard in &paths[1..] {
-                let source = FileSource::open(shard)?;
-                shards.push(read_file_directory(&source, false)?);
-                sources.push(source);
+                let (header, path) = read(shard)?;
+                files.push((path, header.size));
+                shards.push(header.directory);
             }
-            Ok((merge_shards(shards)?.0, sources))
+            Ok((merge_shards(shards)?.0, files))
         }
     }
 }

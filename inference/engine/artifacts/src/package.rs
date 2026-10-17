@@ -1,5 +1,5 @@
 use crate::{
-    gguf::{self, Directory, GgufArtifact, TensorDescriptor},
+    gguf::{self, Directory, FileHeaders, GgufArtifact, HeaderSource, TensorDescriptor},
     ArtifactIdentity, Error, PackageIdentity, TemplatePayload, TokenizerPayload,
 };
 use serde::{Deserialize, Serialize};
@@ -84,16 +84,13 @@ struct HeaderComponent {
 }
 
 impl HeaderComponent {
-    fn inspect(path: &Path) -> Result<Self, Error> {
-        let (directory, sources) = gguf::inspect_component_header(path)?;
+    fn inspect(path: &Path, headers: &dyn HeaderSource) -> Result<Self, Error> {
+        let (directory, files) = gguf::inspect_component_header(path, headers)?;
         Ok(Self {
             directory,
-            files: sources
-                .iter()
-                .map(|source| ComponentFile {
-                    path: source.path().to_path_buf(),
-                    size: source.size(),
-                })
+            files: files
+                .into_iter()
+                .map(|(path, size)| ComponentFile { path, size })
                 .collect(),
         })
     }
@@ -112,6 +109,15 @@ impl PackageHeaders {
     /// shard of a split GGUF) and an optional explicit projector header.
     /// No tensor payload is read or required to exist.
     pub fn open(target: impl AsRef<Path>, projector: Option<&Path>) -> Result<Self, Error> {
+        Self::open_from(target, projector, &FileHeaders)
+    }
+
+    /// [`Self::open`] with headers from `headers`.
+    pub fn open_from(
+        target: impl AsRef<Path>,
+        projector: Option<&Path>,
+        headers: &dyn HeaderSource,
+    ) -> Result<Self, Error> {
         let target_path = target.as_ref();
         if let Some(projector_path) = projector {
             if target_path.canonicalize()? == projector_path.canonicalize()? {
@@ -120,8 +126,10 @@ impl PackageHeaders {
                 ));
             }
         }
-        let target = HeaderComponent::inspect(target_path)?;
-        let projector = projector.map(HeaderComponent::inspect).transpose()?;
+        let target = HeaderComponent::inspect(target_path, headers)?;
+        let projector = projector
+            .map(|projector| HeaderComponent::inspect(projector, headers))
+            .transpose()?;
         let identity = PackageIdentity {
             target: ArtifactIdentity::for_open(),
             projector: projector.as_ref().map(|_| ArtifactIdentity::for_open()),
@@ -137,7 +145,12 @@ impl PackageHeaders {
     /// Add a separate draft model's header as a component of the package.
     /// On failure the package keeps its target and projector.
     pub fn add_draft(&mut self, draft: &Path) -> Result<(), Error> {
-        let component = HeaderComponent::inspect(draft)?;
+        self.add_draft_from(draft, &FileHeaders)
+    }
+
+    /// [`Self::add_draft`] with the draft's header from `headers`.
+    pub fn add_draft_from(&mut self, draft: &Path, headers: &dyn HeaderSource) -> Result<(), Error> {
+        let component = HeaderComponent::inspect(draft, headers)?;
         let others = self
             .target
             .files

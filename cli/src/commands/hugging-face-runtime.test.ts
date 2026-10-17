@@ -40,6 +40,16 @@ describe("catalog inspect with a named version that doesn't run here", () => {
     ])
   })
 
+  it("never marks a named version that can't run as selected", () => {
+    for (const label of ["Q8_K_P", "Q2_K_P"]) {
+      const output = renderInspection({ inspection: makeInspection({ selectedVersion: Option.some(label) }), drafters: [], models: [] })
+      expect(output).not.toContain("(selected)")
+      expect(output).toMatch(/^Q4_K_P .*Fits \(recommended\)$/m)
+    }
+    expect(renderInspection({ inspection: makeInspection({ selectedVersion: Option.some("Q6_K_P") }), drafters: [], models: [] }))
+      .toMatch(/^Q6_K_P .*Fits \(selected\) · already on this computer$/m)
+  })
+
   it("keeps the download hint for a named version that fits", () => {
     expect(acquisitionHint(makeInspection({ selectedVersion: Option.some("Q6_K_P") })))
       .toBe(`Download: magnitude catalog pull ${TEST_REPOSITORY}:Q6_K_P`)

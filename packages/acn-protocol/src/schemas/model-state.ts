@@ -1098,8 +1098,13 @@ export type CustomLocalModel = typeof CustomLocalModelSchema.Type
 export const LocalModelSchema = Schema.Union(CatalogLocalModelSchema, CustomLocalModelSchema)
 export type LocalModel = typeof LocalModelSchema.Type
 
-/** A complete GGUF in a model location the engine cannot run; never callable, never a row. */
+/**
+ * A complete GGUF in a model location the engine cannot run; never callable, never a row. `modelId` is
+ * its ID when it has one (a readable file the engine refuses), so a command naming it is refused with
+ * these reasons.
+ */
 export const UnsupportedLocalModelSchema = Schema.Struct({
+  modelId: Schema.optionalWith(ModelIdSchema, { as: "Option", exact: true }),
   displayName: NonEmptyString,
   origin: CustomModelOriginSchema,
   path: NonEmptyString,

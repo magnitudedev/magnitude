@@ -142,14 +142,15 @@ impl ModelInstances {
         let _ = self.assessments.set(assessments);
     }
 
-    /// Refuse a load the assessment says cannot fit, before the residency replaces anything.
-    /// A model not yet assessed is admitted: the engine's own resource plan still guards it.
+    /// Refuse a load the assessment says cannot fit or the engine cannot run, before the residency
+    /// replaces anything. A model not yet assessed is admitted: the engine's own resource plan
+    /// still guards it.
     async fn admit(&self, target: &ResolvedResidencyTarget) -> Result<(), InventoryError> {
         let Some(assessments) = self.assessments.get() else {
             return Ok(());
         };
         let snapshot = assessments.snapshot().await?;
-        match assessed_fit(&snapshot, &target.model_id, &target.configuration.profile) {
+        match assessed_refusal(&snapshot, &target.model_id, &target.configuration.profile) {
             Some(refusal) => Err(refusal),
             None => Ok(()),
         }
@@ -337,8 +338,9 @@ impl CatalogPackageRemover for ModelInstances {
     }
 }
 
-/// The refusal for `model_id` served at `profile` when its assessment does not fit.
-fn assessed_fit(
+/// The refusal for `model_id` served at `profile` when its assessment does not fit there, or when
+/// the engine cannot run it at all, with the engine's reasons.
+fn assessed_refusal(
     snapshot: &ModelAssessmentsSnapshot,
     model_id: &ModelId,
     profile: &ServingProfile,
@@ -364,6 +366,12 @@ fn assessed_fit(
                 "{model_id} needs {} more memory than this computer can provide",
                 memory_size(*deficit_bytes)
             ))),
+            ModelAssessment::Unsupported {
+                reasons, detail, ..
+            } => Some(InventoryError::ModelUnsupported {
+                message: format!("Magnitude can't run {model_id}: {detail}"),
+                reasons: reasons.clone(),
+            }),
             _ => None,
         })
 }
@@ -918,7 +926,7 @@ mod tests {
     #[test]
     fn a_load_assessed_as_not_fitting_is_refused_with_the_shortfall() {
         let snapshot = snapshot(MODEL, does_not_fit(262_144, 1_825_361_000));
-        let refusal = assessed_fit(
+        let refusal = assessed_refusal(
             &snapshot,
             &model_id(MODEL),
             &ServingProfile { context_length: 262_144 },
@@ -943,11 +951,40 @@ mod tests {
             "drafter": { "_tag": "None" },
         });
         let profile = ServingProfile { context_length: 262_144 };
-        assert!(assessed_fit(&snapshot(MODEL, fits), &model_id(MODEL), &profile).is_none());
+        assert!(assessed_refusal(&snapshot(MODEL, fits), &model_id(MODEL), &profile).is_none());
         let other_profile = snapshot(MODEL, does_not_fit(131_072, 1));
-        assert!(assessed_fit(&other_profile, &model_id(MODEL), &profile).is_none());
+        assert!(assessed_refusal(&other_profile, &model_id(MODEL), &profile).is_none());
         let other_model = snapshot("other:gguf:q4", does_not_fit(262_144, 1));
-        assert!(assessed_fit(&other_model, &model_id(MODEL), &profile).is_none());
+        assert!(assessed_refusal(&other_model, &model_id(MODEL), &profile).is_none());
+    }
+
+    #[test]
+    fn a_load_the_engine_cannot_run_is_refused_with_its_reasons() {
+        let snapshot = snapshot(
+            MODEL,
+            serde_json::json!({
+                "_tag": "Unsupported",
+                "profile": { "contextLength": 131_072 },
+                "reasons": [{ "_tag": "Architecture", "architecture": "deepseek4" }],
+                "detail": "no family recognizes deepseek4",
+            }),
+        );
+        let refusal = assessed_refusal(
+            &snapshot,
+            &model_id(MODEL),
+            &ServingProfile { context_length: 262_144 },
+        );
+        let Some(InventoryError::ModelUnsupported { message, reasons }) = refusal else {
+            panic!("expected an unsupported refusal, got {refusal:?}");
+        };
+        assert_eq!(
+            message,
+            format!("Magnitude can't run {MODEL}: no family recognizes deepseek4")
+        );
+        assert_eq!(
+            serde_json::to_value(&reasons).unwrap(),
+            serde_json::json!([{ "_tag": "Architecture", "architecture": "deepseek4" }])
+        );
     }
 
     #[test]

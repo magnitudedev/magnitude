@@ -147,7 +147,8 @@ before using its embedded publisher key to verify the installer release and byte
 authenticates the installer, waits for silent setup, and refreshes command PATH in the invoking shell.
 Both executable signatures require the configured publisher and a timestamp. Fresh installation publishes a complete staged payload by same-volume rename.
 A private installer-owned scratch container permits recovery after interrupted extraction; cleanup
-is relative to retained handles and cannot follow directory redirections. Existing unsafe scratch
+is relative to retained handles and cannot follow directory redirections. A completed install or update
+removes the emptied container; only a retained previous tree keeps it. Existing unsafe scratch
 permissions are rejected without repair. The installed uninstaller is the sole removal record and
 must match its executing self-copy before mutation. Payload removal rejects redirected paths,
 preserves unrelated installed files, and retains the exact removal record until required cleanup

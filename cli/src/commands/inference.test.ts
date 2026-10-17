@@ -180,7 +180,7 @@ describe("inference command surface", () => {
       "status", "load", "stop", "import", "drafter", "hide", "unhide", "folders",
     ])
     expect(root.commands[2]!.commands[7]!.commands.map((command) => command.name())).toEqual(["list", "add", "remove", "enable", "disable"])
-    expect(root.commands[2]!.commands[2]!.registeredArguments).toHaveLength(0)
+    expect(root.commands[2]!.commands[2]!.registeredArguments.map((argument) => argument.required)).toEqual([false])
   })
 
   it("accepts --json on every inference command", () => {
@@ -212,7 +212,7 @@ describe("inference command surface", () => {
       "catalog remove": { arguments: ["<model-id>"], options: [] },
       "models status": { arguments: ["[model-id]"], options: ["--all"] },
       "models load": { arguments: ["<model-id>"], options: [] },
-      "models stop": { arguments: [], options: [] },
+      "models stop": { arguments: ["[model-id]"], options: [] },
       "models import": { arguments: ["<path>"], options: ["--drafter"] },
       "models drafter": { arguments: ["<model-id>", "<drafter>"], options: [] },
       "models hide": { arguments: ["<model-id>"], options: [] },

@@ -78,9 +78,10 @@ export const registerInferenceCommands = (program: Command): void => {
     .action((modelId, options) => loadRuntime().then(({ execute, loadInstance }) =>
       execute(loadInstance(modelId, options))))
   models.command("stop")
-    .description("Stop the active local model")
+    .description("Stop a local model, or the active one when no model is named")
+    .argument("[model-id]", "Model ID from `magnitude models status`")
     .option("--json", JSON_HELP)
-    .action((options) => loadRuntime().then(({ execute, stopInstance }) => execute(stopInstance(options))))
+    .action((modelId, options) => loadRuntime().then(({ execute, stopInstance }) => execute(stopInstance(modelId, options))))
   models.command("import")
     .description("Add one GGUF file where it is; Magnitude never moves or deletes it")
     .argument("<path>", "Path to a .gguf file")

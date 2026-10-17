@@ -2,7 +2,7 @@ import { BunFileSystem } from "@effect/platform-bun"
 import { Effect, Layer, Option, Schema, Stream, SubscriptionRef } from "effect"
 import { describe, expect, it } from "vitest"
 import type { CustomModelsConfig } from "@magnitudedev/storage"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -196,7 +196,7 @@ const harness = (options: {
         }),
       } as never),
       Layer.succeed(LocalModelSources, {
-        state: Effect.succeed({ customModels: sourceModels, catalogModels: options.catalog ?? [] }),
+        state: Effect.succeed({ customModels: sourceModels, hiddenModels: [], catalogModels: options.catalog ?? [] }),
       } as never),
       Layer.succeed(LocalModels, { state: Effect.succeed(localState) } as never),
       Layer.succeed(CustomModels, custom),
@@ -571,6 +571,118 @@ describe("adding models", () => {
     expect(result.config.drafters[foundId]).toEqual({ _tag: "None" })
     expect(result.config.drafters[importedId]).toBeUndefined()
     expect(recorded.started).toEqual([])
+  })
+})
+
+describe("importing through a link", () => {
+  const otherImportedId = CustomFormModelIdSchema.make(`local:${"b".repeat(64)}`)
+  const linkedFiles = () => {
+    const root = mkdtempSync(join(tmpdir(), "magnitude-links-"))
+    const file = join(root, "store", "model-Q4_K_M.gguf")
+    const link = join(root, "link.gguf")
+    const second = join(root, "second-link.gguf")
+    mkdirSync(join(root, "store"))
+    writeFileSync(file, "gguf")
+    symlinkSync(file, link)
+    symlinkSync(link, second)
+    return { root, file, link, second }
+  }
+  const linkInspection = (path: string, onThisComputer?: string) => Schema.decodeUnknownSync(CandidateInspection)({
+    source: { _tag: "Local", path },
+    displayName: "Linked",
+    versions: [{
+      label: "Q4_K_M", modelId: importedId, ...(onThisComputer === undefined ? {} : { onThisComputer }),
+      files: [{ path, sizeBytes: 4 }], sizeBytes: 4, downloadBytes: 0, recommended: true,
+    }],
+  })
+  const importedDeclaration = (path: string) => ({ origin: { _tag: "Imported", path, headerDigest: "b".repeat(64) }, target: [path] })
+
+  it("declares nothing for a link to a file a found model already lists", async () => {
+    const { root, file, link } = linkedFiles()
+    try {
+      const { run } = harness({
+        config: customModelsConfig({ declarations: {}, drafters: {} }),
+        customModels: [nativeCustomModel({ files: [{ path: file, sizeBytes: 4 }] })],
+        inspect: linkInspection(link, foundId),
+      })
+      const result = await run((commands, models) => Effect.gen(function* () {
+        const imported = yield* commands.importModelFile(link, { _tag: "None" })
+        return { imported, config: yield* models.get }
+      }))
+      expect(result.imported).toMatchObject({ modelId: foundId, outcome: "AlreadyOnThisComputer" })
+      expect(result.config.declarations).toEqual({})
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("declares a file reached through a second link only once", async () => {
+    const { root, link, second } = linkedFiles()
+    try {
+      const { run } = harness({
+        config: customModelsConfig({ declarations: { [otherImportedId]: importedDeclaration(link) }, drafters: {} }),
+        customModels: [],
+        inspect: linkInspection(second),
+      })
+      const config = await run((commands, models) => commands.importModelFile(second, { _tag: "None" }).pipe(Effect.zipRight(models.get)))
+      expect(Object.keys(config.declarations)).toEqual([otherImportedId])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("forgets a declaration left by a link when the model it names is removed", async () => {
+    const { root, file, link } = linkedFiles()
+    try {
+      const { run } = harness({
+        config: customModelsConfig({
+          declarations: { [otherImportedId]: importedDeclaration(link) },
+          drafters: { [otherImportedId]: { _tag: "None" } },
+        }),
+        customModels: [nativeCustomModel({ files: [{ path: file, sizeBytes: 4 }] })],
+      })
+      const config = await run((commands, models) => commands.remove(foundId).pipe(Effect.zipRight(models.get)))
+      expect(config.hidden).toEqual([foundId])
+      expect(config.declarations).toEqual({})
+      expect(config.drafters).toEqual({})
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("hiding a model that isn't on this computer", () => {
+  it("fails for an unknown custom or catalog ID and changes nothing", async () => {
+    const { run } = harness({ config: customModelsConfig({ declarations: {} }) })
+    const unknownCustom = CustomFormModelIdSchema.make(`local:${"c".repeat(64)}`)
+    const unknownCatalog = CatalogFormModelIdSchema.make("no-such-model:gguf:q4")
+    const result = await run((commands, models) => Effect.gen(function* () {
+      const custom = yield* commands.hide(unknownCustom).pipe(Effect.flip)
+      const catalog = yield* commands.hide(unknownCatalog).pipe(Effect.flip)
+      return { custom, catalog, hidden: (yield* models.get).hidden }
+    }))
+    expect(result.custom).toMatchObject({ code: "custom_model_not_found", message: `${unknownCustom} is not a model on this computer.` })
+    expect(result.catalog).toMatchObject({ code: "custom_model_not_found", message: `${unknownCatalog} is not a model on this computer.` })
+    expect(result.hidden).toEqual([])
+  })
+
+  it("hides a catalog model named by its alias", async () => {
+    const external = CatalogFormModelIdSchema.make("qwen3.6-35b-a3b:gguf:q4")
+    const alias = CustomFormModelIdSchema.make("hf:unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf")
+    const { run } = harness({
+      catalogRows: [{
+        _tag: "Catalog",
+        modelId: external,
+        acquisitionState: {
+          _tag: "Installed",
+          installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/nonexistent-home/m.gguf", ownership: "External" },
+          residencyState: { _tag: "Unloaded" },
+        },
+      } as unknown as LocalModelsState["models"][number]],
+      catalog: [{ id: external, source: { aliases: Option.some([alias]) } }] as unknown as readonly CatalogModelSource[],
+    })
+    const hidden = await run((commands, models) => commands.hide(alias).pipe(Effect.zipRight(models.get), Effect.map(({ hidden }) => hidden)))
+    expect(hidden).toEqual([alias])
   })
 })
 

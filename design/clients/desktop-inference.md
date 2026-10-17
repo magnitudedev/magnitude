@@ -142,7 +142,8 @@ Custom models follow [the local-model product projection](../model-management/lo
   source tag and a plain reason per structured reason; there are no actions. An unknown reason
   renders as "Magnitude can't run this model" with its detail.
 - **Hugging Face "Use this model".** Desktop main registers the `magnitude://` URL scheme on macOS,
-  Windows and Linux. `magnitude://open_from_hf?model=<owner/repo>&file=<path>` focuses the window and
+  Windows and Linux. `magnitude://open_from_hf?model=<owner/repo>&file=<path>` brings the window to the front (on
+  Windows, which denies focus to a background process, by making it topmost while it takes focus) and
   opens the Add dialog at the repository step with that version preselected and the drafter
   recommended as usual. Main forwards the request as a typed host action; the renderer owns the
   dialog. A link never starts a download by itself.

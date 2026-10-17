@@ -13,6 +13,7 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   ADDED_MODEL_ID,
+  CATALOG_DRAFTER_ID,
   catalogState,
   FOUND_MODEL_ID,
   IMPORTED_MODEL_ID,
@@ -148,11 +149,35 @@ describe("model mutations accept hf: and local: IDs", () => {
     expect(json).toEqual({ modelId })
   })
 
-  it("models stop", async () => {
-    const { text, json, models } = await runBoth({ stop: succeed() }, (options) => stopInstance(options))
+  it("models stop with no ID stops the active model", async () => {
+    const { text, json, models } = await runBoth({ stop: succeed() }, (options) => stopInstance(undefined, options))
     expect(models.stop).toHaveBeenCalledWith({})
     expect(text).toBe("Stopped the active local model.\n")
     expect(json).toEqual({})
+  })
+
+  it.each([
+    ["catalog", CATALOG_DRAFTER_ID],
+    ["hf:", ADDED_MODEL_ID],
+    ["local:", IMPORTED_MODEL_ID],
+    ["alias", FOUND_MODEL_ID],
+  ] as const)("models stop with a %s ID", async (_, modelId) => {
+    const { text, json, models } = await runBoth({ stopModel: succeed(), stop: succeed() }, (options) => stopInstance(` ${modelId} `, options))
+    expect(models.stopModel).toHaveBeenCalledWith({ modelId })
+    expect(models.stop).not.toHaveBeenCalled()
+    expect(text).toBe(`Stopped ${modelId}.\n`)
+    expect(json).toEqual({ modelId })
+  })
+
+  it("models hide fails with the service's error for an ID that isn't on this computer", async () => {
+    const message = `${IMPORTED_MODEL_ID} is not a model on this computer.`
+    const { client } = fakeService({
+      hideModel: () => Effect.fail({ _tag: "LocalModelMutationFailed", code: "custom_model_not_found", message, retryable: false }),
+    })
+    const result = await capture(hideModel(IMPORTED_MODEL_ID), client)
+    expect(result.stdout).toBe("")
+    expect(result.stderr).toContain(message)
+    expect(result.exitCode).toBe(1)
   })
 
   it.each(MODEL_IDS)("models hide with a %s ID", async (_, modelId) => {

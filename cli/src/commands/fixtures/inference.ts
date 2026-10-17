@@ -313,6 +313,7 @@ export const makeImportedModel = (overrides: Partial<CustomLocalModel> = {}): Cu
 })
 
 export const makeUnsupportedLocalModel = (overrides: Partial<UnsupportedLocalModel> = {}): UnsupportedLocalModel => ({
+  modelId: Option.none(),
   displayName: "DeepSeek V4 Flash",
   origin: { _tag: "Found", source: { _tag: "Ollama" } },
   path: "/Users/test/.ollama/models/blobs/sha256-abc",

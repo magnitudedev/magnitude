@@ -4,6 +4,7 @@ import {
   CustomFormModelIdSchema,
   ModelIdSchema,
   ModelSlotMutationRejected,
+  ModelVersionNotRunnable,
   PRIMARY_SLOT_ID,
   LocalModelMutationFailed,
   type CatalogComponent,
@@ -34,7 +35,8 @@ export interface ModelCommandsApi {
   readonly loadSlot: (slotId: SlotId) => Effect.Effect<{}, LocalInferenceError>
   readonly previewSlotLoad: (slotId: SlotId) => Effect.Effect<ModelLoadPlan, LocalInferenceError>
   readonly stopSlot: (slotId: SlotId) => Effect.Effect<{}, LocalInferenceError>
-  readonly loadModel: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
+  readonly loadModel: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError | ModelVersionNotRunnable>
+  readonly stopModel: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
   readonly stopActiveModel: Effect.Effect<{}, LocalInferenceError>
 }
 export class ModelCommands extends Context.Tag("ModelCommands")<ModelCommands, ModelCommandsApi>() {}
@@ -55,6 +57,28 @@ export const ModelCommandsLive: Layer.Layer<
   const canonical = (modelId: ModelId) => localModels.state.pipe(
     Effect.map(({ models, hidden }) => canonicalLocalModelId([...models, ...hidden], modelId)),
   )
+  const onThisComputer = (modelId: ModelId) => localModels.state.pipe(Effect.flatMap(({ models, hidden }) =>
+    [...models, ...hidden].some((model) => model.modelId === modelId)
+      ? Effect.succeed(modelId)
+      : Effect.fail(new LocalModelMutationFailed({
+          code: "model_not_found",
+          message: `${modelId} is not a model on this computer.`,
+          retryable: false,
+        }))))
+  /** A model the engine can't run is refused with its reasons before ICN is asked to load it. */
+  const runnable = (modelId: ModelId) => localModels.state.pipe(Effect.flatMap(({ models, unsupported }) => {
+    const served = models.find((model) => model.modelId === modelId)?.servingState
+    const reasons = served?._tag === "Assessed" && served.assessment._tag === "Unsupported"
+      ? served.assessment.reasons
+      : unsupported.find((model) => Option.getOrUndefined(model.modelId) === modelId)?.reasons
+    return reasons === undefined
+      ? Effect.succeed(modelId)
+      : Effect.fail(new ModelVersionNotRunnable({
+          reference: modelId,
+          version: modelId,
+          verdict: { _tag: "Unsupported", reasons },
+        }))
+  }))
   const scope = yield* Effect.scope
   const client = yield* IcnClient
   const installations = yield* IcnCatalogInstallations
@@ -156,9 +180,10 @@ export const ModelCommandsLive: Layer.Layer<
       Effect.mapError((cause) => cause instanceof ModelSlotMutationRejected ? cause : modelCommandFailure("preview", cause))),
     stopSlot: (slotId) => selectedLocalModel(slotId).pipe(Effect.flatMap(stopModel)),
     loadModel: (modelId) => canonical(modelId).pipe(
-      Effect.flatMap(requestLoad),
-      Effect.mapError((cause) => modelCommandFailure("load", cause)),
+      Effect.flatMap(runnable),
+      Effect.flatMap((id) => requestLoad(id).pipe(Effect.mapError((cause) => modelCommandFailure("load", cause)))),
     ),
+    stopModel: (modelId) => canonical(modelId).pipe(Effect.flatMap(onThisComputer), Effect.flatMap(stopModel)),
     stopActiveModel: instances.get.pipe(Effect.flatMap(({ instances: current }) => {
       const active = current.findLast((instance) =>
         instance.lifecycle._tag === "Loading" || instance.lifecycle._tag === "Ready" || instance.lifecycle._tag === "Stopping")

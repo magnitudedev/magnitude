@@ -46,7 +46,6 @@ pub struct HuggingFaceDiscovery {
     models: Arc<ManagedModelStore>,
     architectures: RecognizedArchitectures,
     lineage: Arc<CatalogLineage>,
-    shapes: Arc<dyn crate::lineage::CatalogShapes>,
     searches: tokio::sync::Mutex<BTreeMap<String, (Instant, HuggingFaceModelSearchResults)>>,
 }
 
@@ -56,13 +55,11 @@ impl HuggingFaceDiscovery {
         models: Arc<ManagedModelStore>,
         architectures: RecognizedArchitectures,
         lineage: Arc<CatalogLineage>,
-        shapes: Arc<dyn crate::lineage::CatalogShapes>,
     ) -> Self {
         Self {
             models,
             architectures,
             lineage,
-            shapes,
             searches: tokio::sync::Mutex::new(BTreeMap::new()),
         }
     }
@@ -113,11 +110,6 @@ impl HuggingFaceDiscovery {
         let mut hidden_count = 0_u32;
         let mut kept = Vec::new();
         for model in metadata {
-            let parameters = model
-                .gguf
-                .as_ref()
-                .and_then(|gguf| gguf.get("total"))
-                .and_then(serde_json::Value::as_u64);
             let Some(mut result) = model.into_contract() else {
                 continue;
             };
@@ -142,12 +134,12 @@ impl HuggingFaceDiscovery {
                     },
                 )];
             }
-            kept.push((result, parameters));
+            kept.push(result);
         }
         let mut results = futures_util::stream::iter(kept)
-            .map(|(mut result, parameters)| async move {
+            .map(|mut result| async move {
                 if result.unsupported.is_empty() {
-                    result.variant_of = self.variant_of(&result, parameters).await;
+                    result.variant_of = self.variant_of(&result).await;
                 }
                 result
             })
@@ -168,13 +160,9 @@ impl HuggingFaceDiscovery {
     }
 
     /// The catalog model a result derives from: its repository and direct base models first,
-    /// then one more hop through finetunes, then, for a repository that declares no lineage the
-    /// catalog knows, the catalog model of its architecture and size.
-    async fn variant_of(
-        &self,
-        result: &HuggingFaceModelSearchResult,
-        parameters: Option<u64>,
-    ) -> Option<ModelId> {
+    /// then one more hop through finetunes. A repository whose lineage reaches no catalog model is
+    /// a variant of none: an architecture and a size don't say which model a file is.
+    async fn variant_of(&self, result: &HuggingFaceModelSearchResult) -> Option<ModelId> {
         let mut direct = BTreeSet::from([result.repository.to_lowercase()]);
         direct.extend(result.base_models.iter().map(|base| base.to_lowercase()));
         if let Some(matched) = self.lineage.match_lineage(&direct).await {
@@ -185,17 +173,10 @@ impl HuggingFaceDiscovery {
             .hub()
             .lineage(&result.repository, Some(result.base_models.clone()))
             .await;
-        if let Some(matched) = self.lineage.match_lineage(&lineage).await {
-            return Some(matched.model_id);
-        }
-        let shapes = self.shapes.catalog_shapes().await;
-        crate::lineage::shape_match(
-            &shapes,
-            result.architecture.as_deref()?,
-            parameters?,
-            &result.repository,
-        )
-        .map(|shape| shape.model_id.clone())
+        self.lineage
+            .match_lineage(&lineage)
+            .await
+            .map(|matched| matched.model_id)
     }
 }
 
@@ -1990,6 +1971,36 @@ impl ManagedModelStore {
         pinned
     }
 
+    /// A local GGUF's facts and classification. Its header is read only when the file changed or
+    /// was never classified, and then from the header cache when it holds it.
+    pub fn classify_local_gguf(
+        &self,
+        path: &Path,
+        architectures: &crate::candidate_files::RecognizedArchitectures,
+    ) -> Result<(crate::gguf::LocalGguf, crate::candidate_files::HeaderClassification), InventoryError>
+    {
+        let mut read = None;
+        let gguf = crate::inventory::local_gguf_cached(&self.cache, path, |header| {
+            self.write_header(header);
+            read = Some(header.to_vec());
+        })?;
+        let evidence = classification_evidence(&gguf.inspection.header_digest, architectures);
+        if let Some(classification) = self
+            .cache
+            .read_index(ModelIndexKind::CandidateClassification, &evidence)
+        {
+            return Ok((gguf, classification));
+        }
+        let header = match read.or_else(|| self.cache.read_header(&gguf.inspection.header_digest)) {
+            Some(header) => header,
+            None => self.local_gguf_header(path)?.1,
+        };
+        let classification = crate::candidate_files::classify_header(&header, architectures)?;
+        self.cache
+            .write_index(ModelIndexKind::CandidateClassification, &evidence, &classification);
+        Ok((gguf, classification))
+    }
+
     /// The header digest and classification of one file of an immutable repository snapshot.
     /// Once classified, a file costs one index read: neither its header nor the network is
     /// touched again.
@@ -3185,7 +3196,6 @@ mod tests {
                 Arc::clone(&store),
                 catalog_with_target("catalog/Llama-GGUF", &commit),
             ),
-            Arc::new(StubShapes),
         );
         discovery
             .search(HuggingFaceModelSearchRequest {
@@ -3324,20 +3334,6 @@ mod tests {
         })
     }
 
-    struct StubShapes;
-
-    impl crate::lineage::CatalogShapes for StubShapes {
-        fn catalog_shapes(&self) -> BoxFuture<'_, Vec<crate::lineage::CatalogShape>> {
-            Box::pin(async {
-                vec![crate::lineage::CatalogShape {
-                    model_id: "llama-test:gguf:q8".parse().unwrap(),
-                    architecture: "llama".to_owned(),
-                    parameters: 8_000_000_000,
-                }]
-            })
-        }
-    }
-
     fn search_hub() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         serve_hub(|path, query| {
             let result = |id: &str, seed: char, architecture: &str, base: &[&str]| {
@@ -3403,7 +3399,6 @@ mod tests {
             Arc::clone(&store),
             RecognizedArchitectures::new(["llama"], ["dflash"]),
             CatalogLineage::new(Arc::clone(&store), catalog),
-            Arc::new(StubShapes),
         );
         let results = discovery
             .search(HuggingFaceModelSearchRequest {
@@ -3429,9 +3424,9 @@ mod tests {
             "a repository whose name says MTP is a model result: names never decide"
         );
         assert_eq!(
-            results.results[3].variant_of.as_ref().map(ModelId::as_str),
-            Some("llama-test:gguf:q8"),
-            "a repository without lineage matches the catalog model of its architecture and size"
+            results.results[3].variant_of, None,
+            "a repository whose lineage reaches no catalog model is a variant of none, whatever \
+             its architecture and size"
         );
         let community = &results.results[2];
         assert_eq!(community.architecture.as_deref(), Some("llama"));
@@ -3507,7 +3502,6 @@ mod tests {
                 Arc::clone(&store),
                 catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40)),
             ),
-            Arc::new(StubShapes),
         );
         let results = discovery
             .search(HuggingFaceModelSearchRequest {

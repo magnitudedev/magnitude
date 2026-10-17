@@ -20,7 +20,8 @@ use crate::host::{bind_draft, vocabulary_mismatch};
 use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy, ResolvedMethod};
 use crate::planning::{plan_backend, plan_execution, ExecutionPlanningError};
 use magnitude_artifacts::{
-    gguf::TensorDescriptor, PackageHeaders, PackageManifest, TemplatePayload, TokenizerPayload,
+    gguf::{FileHeaders, HeaderSource, TensorDescriptor},
+    PackageHeaders, PackageManifest, TemplatePayload, TokenizerPayload,
 };
 use magnitude_chat::{
     artifacts::{gguf_templates, gguf_tokenizer_vocabulary},
@@ -297,8 +298,18 @@ pub fn prepare_model_assessment(
     package: &ModelPackagePaths,
     setup: &AssessmentSetup,
 ) -> Result<PreparedModelAssessment, ModelAssessmentError> {
+    prepare_model_assessment_from(package, &FileHeaders, setup)
+}
+
+/// [`prepare_model_assessment`] with the package's headers from `headers`,
+/// so a host that already read them never has them read again.
+pub fn prepare_model_assessment_from(
+    package: &ModelPackagePaths,
+    headers: &dyn HeaderSource,
+    setup: &AssessmentSetup,
+) -> Result<PreparedModelAssessment, ModelAssessmentError> {
     let layout = resident_layout(ExecutionPath::Native, setup.selected.info.backend);
-    let admitted = match admit(package, layout)? {
+    let admitted = match admit(package, headers, layout)? {
         Admission::Unsupported {
             unsupported,
             fingerprint,
@@ -394,7 +405,7 @@ pub fn kernel_inventory(
     backend: seismic::BackendName,
 ) -> Result<KernelInventory, ModelAssessmentError> {
     let layout = resident_layout(ExecutionPath::Native, backend);
-    let admitted = match admit(package, layout)? {
+    let admitted = match admit(package, &FileHeaders, layout)? {
         Admission::Unsupported { unsupported, .. } => {
             return Ok(KernelInventory::Unsupported(unsupported));
         }
@@ -646,8 +657,16 @@ fn unreadable(error: &magnitude_artifacts::Error) -> UnsupportedModel {
 /// interpretation, tokenizer and chat templates are independent checks,
 /// and every refusal among them is reported together. An admitted target's
 /// drafter is admitted the same way, against the target's definition.
-fn admit(package: &ModelPackagePaths, layout: Layout) -> Result<Admission, ModelAssessmentError> {
-    let mut headers = match PackageHeaders::open(&package.target, package.projector.as_deref()) {
+fn admit(
+    package: &ModelPackagePaths,
+    source: &dyn HeaderSource,
+    layout: Layout,
+) -> Result<Admission, ModelAssessmentError> {
+    let mut headers = match PackageHeaders::open_from(
+        &package.target,
+        package.projector.as_deref(),
+        source,
+    ) {
         Ok(headers) => headers,
         Err(error) if error.unreadable() => {
             return Ok(Admission::Unsupported {
@@ -707,7 +726,7 @@ fn admit(package: &ModelPackagePaths, layout: Layout) -> Result<Admission, Model
     let (family, definition) = interpreted;
     let context_limit = u32::try_from(definition.decoder.context_limit)
         .map_err(|_| ModelAssessmentError::ContextLimit(definition.decoder.context_limit))?;
-    let drafter = admit_drafter(package, &mut headers, family, &definition, layout)?;
+    let drafter = admit_drafter(package, source, &mut headers, family, &definition, layout)?;
     Ok(Admission::Admitted(Box::new(AdmittedPackage {
         headers,
         definition,
@@ -724,6 +743,7 @@ fn admit(package: &ModelPackagePaths, layout: Layout) -> Result<Admission, Model
 /// that needs a drafter the package does not have is rejected.
 fn admit_drafter(
     package: &ModelPackagePaths,
+    source: &dyn HeaderSource,
     headers: &mut PackageHeaders,
     family: &dyn ModelFamily,
     definition: &ModelDefinition,
@@ -750,7 +770,7 @@ fn admit_drafter(
     if package.method == ModelMethod::Plain {
         return Ok(DrafterAdmission::None);
     }
-    match headers.add_draft(path) {
+    match headers.add_draft_from(path, source) {
         Ok(()) => {}
         Err(error) if error.unreadable() => {
             return Ok(DrafterAdmission::Rejected(unreadable(&error)));

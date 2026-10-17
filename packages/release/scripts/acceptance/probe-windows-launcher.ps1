@@ -36,6 +36,7 @@ function Install-Version([string]$Version) {
     }
     if ($process.ExitCode -ne 0) { throw "Installer $Version failed with $($process.ExitCode)" }
   } finally { $process.Dispose() }
+  if (Test-Path $stage) { throw "Installer $Version left its installation stage behind" }
 }
 function Read-Ready($Process) {
   $line = $Process.StandardOutput.ReadLineAsync()

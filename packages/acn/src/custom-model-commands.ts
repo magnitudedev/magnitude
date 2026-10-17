@@ -752,6 +752,34 @@ export const CustomModelCommandsLive: Layer.Layer<
     [...state.models, ...state.hidden].find((model): model is CustomLocalModel => model._tag === "Custom" && model.modelId === modelId),
   )))
 
+  /** The file a path names once links are followed; a path that can't be resolved names itself. */
+  const realPath = (path: string) => fs.realPath(path).pipe(Effect.orElseSucceed(() => path))
+
+  const modelFiles = (modelId: CustomFormModelId) => sources.state.pipe(Effect.map(({ customModels: models, hiddenModels }) =>
+    [...models, ...hiddenModels].find(({ id }) => id === modelId)?.source.files.map(({ path }) => path) ?? []))
+
+  /** Imported declarations, other than `except`, whose file is one of `paths`, however each was reached. */
+  const importedDeclarationsOf = (config: CustomModelsConfig, paths: readonly string[], except: Option.Option<CustomFormModelId>) =>
+    Effect.gen(function* () {
+      const files = new Set(yield* Effect.forEach(paths, realPath))
+      const imported = Object.entries(config.declarations).flatMap(([id, declaration]) =>
+        declaration.origin._tag === "Imported" && !Option.contains(except, id as CustomFormModelId)
+          ? [{ id: id as CustomFormModelId, path: declaration.origin.path }]
+          : [])
+      const matching = yield* Effect.filter(imported, ({ path }) => realPath(path).pipe(Effect.map((file) => files.has(file))))
+      return matching.map(({ id }) => id)
+    })
+
+  /** A catalog model's ID for one of its aliases: the ID its files have as a found model. */
+  const catalogModelForAlias = (modelId: ModelId) => sources.state.pipe(Effect.map(({ catalogModels }) => Option.fromNullable(
+    catalogModels.find(({ source }) => Option.exists(source.aliases, (aliases) => aliases.includes(modelId as string)))?.id)))
+
+  const isKnownCatalogModel = (modelId: CatalogFormModelId) => Effect.gen(function* () {
+    const { catalogModels } = yield* sources.state
+    const state = yield* localModels.state
+    return catalogModels.some(({ id }) => id === modelId) || [...state.models, ...state.hidden].some((model) => model.modelId === modelId)
+  })
+
   const modelAcquisition = (modelId: CustomFormModelId) => Effect.gen(function* () {
     const config = yield* customModels.get
     const related = customModelDownloads(modelId, config, (yield* downloads.get).state.downloads)
@@ -935,8 +963,12 @@ export const CustomModelCommandsLive: Layer.Layer<
       )
       // A file without a Hugging Face identity is recorded where it is: a new model, or one more location of the
       // model that already has its bytes, which keeps that model's identity and origin. A file with a Hugging Face
-      // identity is found where it is; only its drafter is recorded.
-      const declaration: CustomModelDeclaration | undefined = identity._tag === "Local"
+      // identity is found where it is; only its drafter is recorded. Links are followed first: a file already
+      // listed or declared, through a link or its own path, is recorded once.
+      const file = yield* realPath(parsed.path)
+      const listed = (yield* Effect.forEach(Option.isSome(existing) ? yield* modelFiles(modelId) : [], realPath)).includes(file)
+      const declared = (yield* importedDeclarationsOf(yield* customModels.get, [file], Option.none())).length > 0
+      const declaration: CustomModelDeclaration | undefined = identity._tag === "Local" && !listed && !declared
         ? {
             origin: { _tag: "Imported", path: parsed.path, headerDigest: identity.headerDigest },
             target: [parsed.path],
@@ -983,9 +1015,14 @@ export const CustomModelCommandsLive: Layer.Layer<
       return { drafter: chosen, drafterDownloadStarted }
     }).pipe(Effect.mapError(toMutation)),
 
-    hide: (modelId) => Effect.gen(function* () {
-      // A catalog model found only in an external location is hidden by its files' found-model IDs, which ICN
-      // then stops attributing to the catalog model; hiding it again changes nothing.
+    hide: (requested) => Effect.gen(function* () {
+      // An alias names its catalog model. A catalog model found only in an external location is hidden by its
+      // files' found-model IDs, which ICN then stops attributing to the catalog model; hiding it again changes nothing.
+      const modelId: ModelId = Option.getOrElse(yield* catalogModelForAlias(requested), () => requested)
+      const known = Schema.is(CatalogFormModelIdSchema)(modelId)
+        ? yield* isKnownCatalogModel(modelId)
+        : Option.isSome(yield* rowFor(modelId)) || (yield* customModels.get).declarations[modelId as CustomFormModelId] !== undefined
+      if (!known) return yield* notFound(modelId)
       const hiddenIds = Schema.is(CatalogFormModelIdSchema)(modelId)
         ? yield* Effect.gen(function* () {
             const aliases = yield* catalogAliases(modelId)
@@ -1046,11 +1083,18 @@ export const CustomModelCommandsLive: Layer.Layer<
     remove: (modelId) => Effect.gen(function* () {
       const { config, related } = yield* modelAcquisition(modelId)
       const declaration = config.declarations[modelId]
+      // A declaration an earlier import left for a file this model lists, reached through a link, goes with it.
+      const duplicates = yield* importedDeclarationsOf(config, yield* modelFiles(modelId), Option.some(modelId))
+      const forgetDuplicates = (current: CustomModelsConfig): CustomModelsConfig => duplicates.reduce((next, id) => ({
+        ...next,
+        declarations: withoutKey(next.declarations, id),
+        drafters: withoutKey(next.drafters, id),
+      }), current)
       if (declaration === undefined) {
         if (Option.isNone(yield* rowFor(modelId))) return yield* notFound(modelId)
-        yield* customModels.modify((current) => Effect.succeed([undefined, current.hidden.includes(modelId)
+        yield* customModels.modify((current) => Effect.succeed([undefined, forgetDuplicates(current.hidden.includes(modelId)
           ? current
-          : { ...current, hidden: [...current.hidden, modelId] }] as const))
+          : { ...current, hidden: [...current.hidden, modelId] })] as const))
         yield* settle
         return {}
       }
@@ -1063,11 +1107,11 @@ export const CustomModelCommandsLive: Layer.Layer<
           Effect.mapError(commandFailed("remove")),
         )
       }
-      yield* customModels.modify((current) => Effect.succeed([undefined, {
+      yield* customModels.modify((current) => Effect.succeed([undefined, forgetDuplicates({
         ...current,
         declarations: withoutKey(current.declarations, modelId),
         drafters: withoutKey(current.drafters, modelId),
-      }] as const))
+      })] as const))
       yield* settle
       yield* pruneDrafters
       return {}

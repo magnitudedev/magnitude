@@ -346,7 +346,11 @@ a round's time is its two launches. Three rules:
    round that loses a known time to the fastest budget. It goes to the wider
    width with the most to gain for that time, where the gain is that width's rate
    if every proposal were right. Looks take a fixed share of decode time, scaled
-   down where little can be gained. A look is also taken on a run of rounds that
+   down where little can be gained. The time set aside for looks belongs to the
+   load and carries from request to request, and a round with nothing wider to
+   look at keeps it, so drafting that stopped paying (as on a CPU, where it
+   usually costs more than it saves) is still tried again however short the
+   load's requests are. A look is also taken on a run of rounds that
    accepted everything they verified, which is what text that became predictable
    looks like from a narrow width. The run that earns one halves when such a look
    finds its block right and doubles when it finds it wrong, and the load carries

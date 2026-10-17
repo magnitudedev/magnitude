@@ -102,13 +102,18 @@ static void remove_installation_fixture(LPCWSTR root) {
   swprintf(path, 32768, L"%ls\\resources", root); require(RemoveDirectoryW(path), "remove empty fixture resources");
   require(RemoveDirectoryW(root), "remove empty installation fixture");
 }
+static void require_stage_removed(LPCWSTR payload, const char *message) {
+  WCHAR container[32768]; wcscpy(container, payload);
+  WCHAR *leaf = wcsrchr(container, L'\\'); require(leaf != NULL, "stage payload has a container"); *leaf = 0;
+  require(GetFileAttributesW(container) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND, message);
+}
 #define RESOLVE_FUNCTION(library, variable, name) do { \
   FARPROC pointer = GetProcAddress(library, name); \
   require(pointer != NULL && sizeof(pointer) == sizeof(variable), "resolve " name); \
   memcpy(&variable, &pointer, sizeof(variable)); \
 } while (0)
 static void check_replacement(HMODULE library) {
-  DWORD (WINAPI *hold)(void), (WINAPI *rollback)(void), (WINAPI *retire_previous)(void);
+  DWORD (WINAPI *hold)(void), (WINAPI *rollback)(void), (WINAPI *retire_previous)(void), (WINAPI *cleanup)(void);
   DWORD (WINAPI *create_stage)(LPWSTR, DWORD);
   DWORD (WINAPI *begin)(LPCWSTR, LPCWSTR, LPCWSTR);
   DWORD (WINAPI *finish)(LPCWSTR);
@@ -117,6 +122,7 @@ static void check_replacement(HMODULE library) {
   RESOLVE_FUNCTION(library, create_stage, "CreateStage");
   RESOLVE_FUNCTION(library, begin, "BeginReplacement");
   RESOLVE_FUNCTION(library, rollback, "RollbackReplacement");
+  RESOLVE_FUNCTION(library, cleanup, "CleanupStage");
   RESOLVE_FUNCTION(library, retire_previous, "RetirePreviousForRemoval");
   require(retire_previous() == ERROR_INVALID_HANDLE, "previous removal requires the exact installed uninstaller");
   RESOLVE_FUNCTION(library, finish, "FinishReplacement");
@@ -146,6 +152,8 @@ static void check_replacement(HMODULE library) {
   require_success(begin(root, L"1.2.3", L"1.2.4"), "retry replacement after rollback");
   require_success(finish(L"1.2.3"), "retire exact old inventory after commit");
   require(validate(root, L"1.2.4") == ERROR_SUCCESS, "committed replacement has complete new inventory");
+  require_success(cleanup(), "remove the stage after a committed replacement");
+  require_stage_removed(payload, "a committed replacement leaves no stage container");
   swprintf(file, 32768, L"%ls\\Magnitude.exe", root); require(DeleteFileW(file), "remove new fixture executable");
   swprintf(file, 32768, L"%ls\\Uninstall Magnitude.exe", root); require(DeleteFileW(file), "remove new fixture uninstaller");
   swprintf(file, 32768, L"%ls\\resources\\installation-files.txt", root); require(DeleteFileW(file), "remove new fixture inventory");
@@ -196,6 +204,7 @@ static void check_interrupted_replacement(HMODULE library, LPCWSTR mode) {
   remove_installation_fixture(root);
   require_success(create_stage(payload, 32768), "previous installation is no longer treated as scratch");
   require_success(cleanup(), "clean remaining extraction scratch");
+  require_stage_removed(payload, "cleanup leaves no empty stage container");
   puts("PASS interrupted installation recovery");
 }
 

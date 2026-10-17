@@ -539,11 +539,18 @@ static DWORD clear_scratch(HANDLE directory, unsigned depth) {
   HeapFree(GetProcessHeap(), 0, buffer);
   return error;
 }
+/* Clears extraction scratch and removes the then-empty container, after a finished or a
+   failed install alike. A retained previous tree keeps the container for recovery. */
 __declspec(dllexport) DWORD WINAPI CleanupStage(void) {
   if (!leaseHeld || stageDirectory == INVALID_HANDLE_VALUE) return ERROR_INVALID_HANDLE;
   DWORD error = require_absent_child(stageDirectory, L"previous");
-  if (error) return error;
-  return clear_scratch(stageDirectory, 0);
+  if (!error) error = clear_scratch(stageDirectory, 0);
+  if (!error) {
+    FILE_DISPOSITION_INFO remove = {TRUE};
+    if (!SetFileInformationByHandle(stageDirectory, FileDispositionInfo, &remove, sizeof(remove))) error = GetLastError();
+  }
+  if (!error) { CloseHandle(stageDirectory); stageDirectory = INVALID_HANDLE_VALUE; }
+  return error;
 }
 static DWORD stage_paths(WCHAR parent[32768], WCHAR container[32768], WCHAR payload[32768]) {
   PWSTR local = NULL;
@@ -574,7 +581,7 @@ __declspec(dllexport) DWORD WINAPI CreateStage(LPWSTR output, DWORD capacity) {
   SECURITY_ATTRIBUTES attributes = {sizeof(attributes), descriptor, FALSE};
   if (!CreateDirectoryW(container, &attributes) && GetLastError() != ERROR_ALREADY_EXISTS) error = GetLastError();
   if (!error) {
-    stageDirectory = CreateFileW(container, READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY,
+    stageDirectory = CreateFileW(container, READ_CONTROL | DELETE | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY,
       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (stageDirectory == INVALID_HANDLE_VALUE) error = GetLastError();

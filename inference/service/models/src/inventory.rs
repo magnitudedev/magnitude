@@ -1941,17 +1941,70 @@ impl DeclaredProjectors {
     }
 }
 
-/// Header inspection of a file found while scanning, cached by its path, size and modification
-/// time so an unchanged location is rescanned without rereading headers.
+/// Header inspection of a complete file found while scanning (see [`local_gguf_cached`]).
 pub(crate) fn inspect_cached(cache: &ModelCache, path: &Path) -> Option<gguf::GgufInspection> {
-    let metadata = path.metadata().ok()?;
-    let evidence = format!("gguf-file-v6\0{}", file_identity(path, &metadata));
-    if let Some(inspection) = cache.read_index(ModelIndexKind::GgufInspection, &evidence) {
-        return Some(inspection);
+    local_gguf_cached(cache, path, |_| {})
+        .ok()
+        .filter(|gguf| gguf.truncated.is_none())
+        .map(|gguf| gguf.inspection)
+}
+
+/// What one read of a local GGUF establishes, cached by its path, size and modification time, so
+/// an unchanged file is never read again. `read` receives the header bytes of a file that had to
+/// be read.
+pub(crate) fn local_gguf_cached(
+    cache: &ModelCache,
+    path: &Path,
+    read: impl FnOnce(&[u8]),
+) -> Result<gguf::LocalGguf, InventoryError> {
+    let metadata = path.metadata().map_err(io_error)?;
+    let evidence = format!("gguf-file-v7\0{}", file_identity(path, &metadata));
+    if let Some(gguf) = cache.read_index(ModelIndexKind::GgufInspection, &evidence) {
+        return Ok(gguf);
     }
-    let inspection = gguf::inspect_complete(path).ok()?;
-    cache.write_index(ModelIndexKind::GgufInspection, &evidence, &inspection);
-    Some(inspection)
+    let local = gguf::read_local(path)
+        .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))?;
+    read(&local.header);
+    cache.write_index(ModelIndexKind::GgufInspection, &evidence, &local.gguf);
+    Ok(local.gguf)
+}
+
+impl ManagedModelStore {
+    /// A local GGUF's identity and header facts, read at most once while the file is unchanged.
+    /// A file that is read has its header kept in the content-addressed header cache, so its
+    /// header is read from there afterwards.
+    pub fn local_gguf(&self, path: &Path) -> Result<gguf::LocalGguf, InventoryError> {
+        local_gguf_cached(&self.cache, path, |header| {
+            self.write_header(header);
+        })
+    }
+
+    /// A local GGUF's facts with its header bytes: from the header cache when it holds them, else
+    /// from one read of the file.
+    pub fn local_gguf_header(
+        &self,
+        path: &Path,
+    ) -> Result<(gguf::LocalGguf, Vec<u8>), InventoryError> {
+        let mut read = None;
+        let gguf = local_gguf_cached(&self.cache, path, |header| {
+            self.write_header(header);
+            read = Some(header.to_vec());
+        })?;
+        if let Some(header) = read.or_else(|| self.cache.read_header(&gguf.inspection.header_digest))
+        {
+            return Ok((gguf, header));
+        }
+        let local = gguf::read_local(path)
+            .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))?;
+        self.write_header(&local.header);
+        Ok((local.gguf, local.header))
+    }
+
+    /// The GGUF header with this digest, when the header cache holds it.
+    #[must_use]
+    pub fn cached_header(&self, digest: &str) -> Option<Vec<u8>> {
+        self.cache.read_header(digest)
+    }
 }
 
 /// Every complete GGUF group under `root`. Projectors are recognized from their headers and pair

@@ -167,55 +167,251 @@ pub enum GgufError {
 /// data its header declares is truncated, so it is refused as unreadable. Header-only previews use
 /// [`inspect`].
 pub fn inspect_complete(path: &Path) -> Result<GgufInspection, GgufError> {
-    let directory = read_directory(path)?;
+    let read = read_local(path)?;
+    match read.gguf.truncated {
+        Some(detail) => Err(GgufError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            detail,
+        ))),
+        None => Ok(read.gguf.inspection),
+    }
+}
+
+pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
+    Ok(read_local(path)?.gguf.inspection)
+}
+
+/// What one read of a GGUF on disk establishes: its inspection, content sample included, and why
+/// it is truncated when it holds less tensor data than its header declares.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalGguf {
+    pub inspection: GgufInspection,
+    pub truncated: Option<String>,
+}
+
+/// A GGUF read from disk with its header bytes (through the aligned tensor-data offset).
+pub struct LocalGgufRead {
+    pub gguf: LocalGguf,
+    pub header: Vec<u8>,
+}
+
+/// Read a GGUF on disk once: its header, then the first and last [`CONTENT_SAMPLE_BYTES`] of its
+/// tensor data for its content sample. No byte of the file is read twice.
+pub fn read_local(path: &Path) -> Result<LocalGgufRead, GgufError> {
+    let mut file = Counted {
+        file: File::open(path)?,
+        read: 0,
+    };
+    let read = read_counted(&mut file);
+    LocalReads::record(path, file.read);
+    read
+}
+
+fn read_counted(file: &mut Counted) -> Result<LocalGgufRead, GgufError> {
+    let length = file.file.metadata()?.len();
+    let mut bytes = Vec::new();
+    let data_offset = loop {
+        let wanted = match crate::header_layout::walk(&bytes) {
+            Ok(crate::header_layout::Layout::Complete { data_offset, .. }) => break data_offset,
+            Ok(crate::header_layout::Layout::Incomplete { estimate, .. }) => estimate,
+            Err(_) if bytes.len() >= 8 && bytes[..4] != MAGIC => {
+                return Err(GgufError::InvalidMagic);
+            }
+            Err(_) if bytes.len() >= 8 => {
+                let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+                if !SUPPORTED_VERSIONS.contains(&version) {
+                    return Err(GgufError::UnsupportedVersion(version));
+                }
+                return Err(GgufError::Header(magnitude_artifacts::Error::Invalid(
+                    "invalid GGUF header".to_owned(),
+                )));
+            }
+            Err(error) => {
+                return Err(GgufError::Header(magnitude_artifacts::Error::Invalid(error)));
+            }
+        };
+        if bytes.len() >= crate::header_layout::MAX_HEADER_BYTES {
+            return Err(GgufError::Header(magnitude_artifacts::Error::Invalid(
+                "GGUF header exceeds the largest header read".to_owned(),
+            )));
+        }
+        let wanted = wanted
+            .max(READ_STEP)
+            .min(crate::header_layout::MAX_HEADER_BYTES - bytes.len());
+        if append(file, &mut bytes, wanted)? == 0 {
+            return Err(GgufError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "GGUF header is shorter than its tensor-data offset",
+            )));
+        }
+    };
+    let header_bytes = (data_offset as u64).min(length);
+    let header_end = usize::try_from(header_bytes).expect("a read header fits in memory");
+    if bytes.len() < header_end {
+        let missing = header_end - bytes.len();
+        if append(file, &mut bytes, missing)? != missing {
+            return Err(GgufError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "GGUF header is shorter than its tensor-data offset",
+            )));
+        }
+    }
+    let directory = magnitude_artifacts::gguf::read_header(&bytes[..header_end])
+        .and_then(|directory| directory.require_execution_byte_order().map(|()| directory))
+        .map_err(GgufError::Header)?;
     let declared = directory
         .tensors
         .iter()
         .map(|tensor| tensor.offset.saturating_add(tensor.nbytes))
         .max()
         .map_or(0, |end| end.saturating_add(directory.data_offset));
-    let actual = std::fs::metadata(path)?.len();
-    if actual < declared {
-        return Err(GgufError::Io(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            format!(
-                "GGUF file is truncated: it has {actual} bytes of the {declared} its header declares"
-            ),
-        )));
-    }
-    let header_digest = header_digest(path, header_extent(&directory, actual))?;
-    with_content_sample(
-        path,
-        interpret(&directory, header_digest, header_extent(&directory, actual))?,
-    )
-}
-
-pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
-    let directory = read_directory(path)?;
-    let file_length = std::fs::metadata(path)?.len();
-    let header_digest = header_digest(path, header_extent(&directory, file_length))?;
-    with_content_sample(
-        path,
-        interpret(
-            &directory,
-            header_digest,
-            header_extent(&directory, file_length),
-        )?,
-    )
-}
-
-fn with_content_sample(
-    path: &Path,
-    mut inspection: GgufInspection,
-) -> Result<GgufInspection, GgufError> {
-    let mut file = File::open(path)?;
-    let length = file.metadata()?.len();
+    let truncated = (length < declared).then(|| {
+        format!(
+            "GGUF file is truncated: it has {length} bytes of the {declared} its header declares"
+        )
+    });
+    let header_digest = format!("{:x}", Sha256::digest(&bytes[..header_end]));
+    let mut inspection = interpret(&directory, header_digest, header_bytes)?;
     inspection.content_sample = Some(content_sample_digest(
-        &mut file,
-        inspection.header_bytes,
+        &mut Prefixed {
+            prefix: &bytes,
+            file,
+            position: 0,
+        },
+        header_bytes,
         length,
     )?);
-    Ok(inspection)
+    bytes.truncate(header_end);
+    Ok(LocalGgufRead {
+        gguf: LocalGguf {
+            inspection,
+            truncated,
+        },
+        header: bytes,
+    })
+}
+
+/// The least a header read asks for at once.
+const READ_STEP: usize = 1024 * 1024;
+
+/// Append up to `wanted` bytes from `file` to `bytes`; how many it appended.
+fn append(file: &mut Counted, bytes: &mut Vec<u8>, wanted: usize) -> io::Result<usize> {
+    file.take(wanted as u64).read_to_end(bytes)
+}
+
+/// A file and how many bytes were read from it.
+struct Counted {
+    file: File,
+    read: u64,
+}
+
+impl Read for Counted {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.file.read(buffer)?;
+        self.read += read as u64;
+        Ok(read)
+    }
+}
+
+impl io::Seek for Counted {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        self.file.seek(position)
+    }
+}
+
+/// The reads of the local GGUFs being watched: how many times each was read and how many of its
+/// bytes, from when a watch starts until it is dropped. How often a file is read is part of what
+/// inspection guarantees, so it can be observed.
+pub struct LocalReads {
+    path: std::path::PathBuf,
+}
+
+static WATCHED: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, (u64, u64)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+impl LocalReads {
+    #[must_use]
+    pub fn watch(path: &Path) -> Self {
+        if let Ok(mut watched) = WATCHED.lock() {
+            watched.insert(path.to_path_buf(), (0, 0));
+        }
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// How many times the file was read, and how many bytes in all.
+    #[must_use]
+    pub fn reads(&self) -> (u64, u64) {
+        WATCHED
+            .lock()
+            .ok()
+            .and_then(|watched| watched.get(&self.path).copied())
+            .unwrap_or_default()
+    }
+
+    fn record(path: &Path, bytes: u64) {
+        if let Ok(mut watched) = WATCHED.lock()
+            && let Some((reads, total)) = watched.get_mut(path)
+        {
+            *reads += 1;
+            *total += bytes;
+        }
+    }
+}
+
+impl Drop for LocalReads {
+    fn drop(&mut self) {
+        if let Ok(mut watched) = WATCHED.lock() {
+            watched.remove(&self.path);
+        }
+    }
+}
+
+/// A file whose first bytes were already read: reads inside `prefix` are served from it, so
+/// sampling the file after its header never reads those bytes again.
+struct Prefixed<'a> {
+    prefix: &'a [u8],
+    file: &'a mut Counted,
+    position: u64,
+}
+
+impl Read for Prefixed<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = match usize::try_from(self.position)
+            .ok()
+            .and_then(|position| self.prefix.get(position..))
+            .filter(|rest| !rest.is_empty())
+        {
+            Some(rest) => {
+                let count = rest.len().min(buffer.len());
+                buffer[..count].copy_from_slice(&rest[..count]);
+                count
+            }
+            None => {
+                use io::Seek as _;
+                self.file.seek(io::SeekFrom::Start(self.position))?;
+                self.file.read(buffer)?
+            }
+        };
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl io::Seek for Prefixed<'_> {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        self.position = match position {
+            io::SeekFrom::Start(offset) => offset,
+            io::SeekFrom::End(_) | io::SeekFrom::Current(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "a content sample seeks from the start",
+                ));
+            }
+        };
+        Ok(self.position)
+    }
 }
 
 /// How much of each end of a file's tensor-data region its content sample reads.
@@ -276,15 +472,11 @@ pub fn local_model_digest_of(shards: &[impl AsRef<Path>]) -> Result<String, Gguf
     let samples = shards
         .iter()
         .map(|shard| {
-            let path = shard.as_ref();
-            let directory = read_directory(path)?;
-            let mut file = File::open(path)?;
-            let length = file.metadata()?.len();
-            Ok(content_sample_digest(
-                &mut file,
-                header_extent(&directory, length),
-                length,
-            )?)
+            read_local(shard.as_ref())?
+                .gguf
+                .inspection
+                .content_sample
+                .ok_or_else(|| GgufError::Io(io::Error::other("a read file has a content sample")))
         })
         .collect::<Result<Vec<_>, GgufError>>()?;
     Ok(local_model_digest(samples.iter().map(String::as_str)))
@@ -293,9 +485,17 @@ pub fn local_model_digest_of(shards: &[impl AsRef<Path>]) -> Result<String, Gguf
 /// The lowercase hex SHA-256 of a GGUF's header bytes on disk, through the aligned tensor-data
 /// offset.
 pub fn file_header_digest(path: &Path) -> Result<String, GgufError> {
-    let directory = read_directory(path)?;
-    let length = std::fs::metadata(path)?.len();
-    header_digest(path, header_extent(&directory, length))
+    Ok(read_local(path)?.gguf.inspection.header_digest)
+}
+
+/// The context a model was trained for, as its header declares it.
+#[must_use]
+pub fn training_context_length(directory: &Directory) -> Option<u32> {
+    let architecture = string_value(directory, "general.architecture");
+    architecture
+        .as_ref()
+        .and_then(|architecture| u32_value(directory, &format!("{architecture}.context_length")))
+        .or_else(|| u32_value(directory, "llama.context_length"))
 }
 
 /// The bytes of a GGUF that are its header: through the aligned tensor-data offset, or the whole
@@ -304,33 +504,6 @@ pub fn file_header_digest(path: &Path) -> Result<String, GgufError> {
 #[must_use]
 pub fn header_extent(directory: &Directory, file_length: u64) -> u64 {
     directory.data_offset.min(file_length)
-}
-
-fn read_directory(path: &Path) -> Result<Directory, GgufError> {
-    let mut preamble = [0_u8; 8];
-    File::open(path)?.read_exact(&mut preamble)?;
-    if preamble[..4] != MAGIC {
-        return Err(GgufError::InvalidMagic);
-    }
-    let version = u32::from_le_bytes([preamble[4], preamble[5], preamble[6], preamble[7]]);
-    if !SUPPORTED_VERSIONS.contains(&version) && !SUPPORTED_VERSIONS.contains(&version.swap_bytes())
-    {
-        return Err(GgufError::UnsupportedVersion(version));
-    }
-    magnitude_artifacts::gguf::inspect_header(path).map_err(GgufError::Header)
-}
-
-fn header_digest(path: &Path, header_bytes: u64) -> Result<String, GgufError> {
-    let mut header = File::open(path)?.take(header_bytes);
-    let mut digest = Sha256::new();
-    let copied = io::copy(&mut header, &mut digest)?;
-    if copied != header_bytes {
-        return Err(GgufError::Io(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "GGUF header is shorter than its tensor-data offset",
-        )));
-    }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 /// The block a `blk.<index>.*` tensor belongs to.
@@ -357,10 +530,7 @@ pub(crate) fn interpret(
 ) -> Result<GgufInspection, GgufError> {
     let architecture = string_value(directory, "general.architecture");
     let tensors = GgufTensors::of(directory, architecture.as_deref());
-    let training_context_length = architecture
-        .as_ref()
-        .and_then(|architecture| u32_value(directory, &format!("{architecture}.context_length")))
-        .or_else(|| u32_value(directory, "llama.context_length"));
+    let training_context_length = training_context_length(directory);
     let nextn_predict_layers = architecture.as_ref().and_then(|architecture| {
         u32_value(directory, &format!("{architecture}.nextn_predict_layers"))
     });

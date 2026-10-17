@@ -11,6 +11,7 @@ import {
   ModelLocationError,
   ModelPreferenceMutationFailed,
   ModelSlotUpdateError,
+  ModelVersionNotRunnable,
 } from "../errors"
 import {
   AutomaticModelLocationKindSchema,
@@ -115,11 +116,17 @@ const RemoveLocalModel = Rpc.make("RemoveLocalModel", {
 const LoadLocalModel = Rpc.make("LoadLocalModel", {
   payload: Schema.Struct({ modelId: ModelIdSchema }),
   success: Schema.Struct({}),
-  error: LocalInferenceError,
+  error: Schema.Union(LocalInferenceError, ModelVersionNotRunnable),
 }).pipe(atMostOnce)
 
 const StopActiveLocalModel = Rpc.make("StopActiveLocalModel", {
   payload: Schema.Struct({}),
+  success: Schema.Struct({}),
+  error: LocalInferenceError,
+}).pipe(atMostOnce)
+
+const StopLocalModel = Rpc.make("StopLocalModel", {
+  payload: Schema.Struct({ modelId: ModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 }).pipe(atMostOnce)
@@ -265,6 +272,7 @@ export const Models = {
   removeLocalModel: RemoveLocalModel,
   load: LoadLocalModel,
   stop: StopActiveLocalModel,
+  stopModel: StopLocalModel,
   loadSlot: LoadSlot,
   stopSlot: StopSlot,
   previewSlotLoad: PreviewSlotLoad,

@@ -43,10 +43,8 @@ a prefilter against the engine's recognized-architecture list. Repositories the 
 never returned as new models, and drafter repositories (a drafter architecture, such as DFlash,
 EAGLE, a Gemma assistant or MTP-only heads, or the Hub's speculative-decoding tags) are neither
 results nor counted as hidden: they are offered only in drafter lists. "Variant of" follows the
-Hub `baseModels` (two hops), and for a repository declaring no lineage the catalog knows, the catalog
-model of the same architecture whose parameter count is within 5% and whose size does not
-contradict the size the repository name spells (`E2B` is never a variant of the E4B; a display hint
-only). Results are ordered with those of unsupported architectures last, then repositories whose
+Hub `baseModels` (two hops); a repository whose lineage reaches no catalog model is a variant of
+none, since an architecture and a size don't say which model a file is. Results are ordered with those of unsupported architectures last, then repositories whose
 name is exactly the query (ignoring case, separators, a trailing `GGUF` and an uploader's `Org_`
 prefix), then by downloads. Resolution returns the requested repository's immutable snapshot and
 GGUF file evidence. Candidate inspection groups a repository's or path's GGUFs into versions (shards
@@ -73,15 +71,24 @@ distinct header bytes its files need (a split version's further shards only as f
 directories); at the 2026-10 QA's repositories that is 26 MB for `unsloth/gemma-4-E2B-it-GGUF`,
 21 MB for `huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF` and 15 MB for
 `Arki05/Qwen3.5-4B-GGUF-shards`, where each read 0.45 to 1.4 GB before. That a file's header is unreadable is cached like a header, by repository, commit, path and
-content identity, so a repeated inspection fetches nothing for it. A header is every byte through the aligned tensor-data offset, or the whole file when it holds no
+content identity, so a repeated inspection fetches nothing for it. A local file is read at most
+once, in one pass: its header (walked the same way) and the first and last MiB of its tensor data
+for its `local:` identity, never a byte twice. What that read establishes (header digest, content
+sample, header facts, whether the file is truncated) is cached by the file's path, size and
+modification time, and its header goes into the content-addressed header cache, so an unchanged
+file is never read again: its identity, classification, lineage and every engine assessment of it
+(with any drafter) come from those caches, and the engine reads a header the service already holds
+through the header source it is given rather than from the file. A header is every byte through the aligned tensor-data offset, or the whole file when it holds no
 tensor data and ends before that offset's padding, as a split's metadata-only first shard may. A file whose header is invalid is a version assessed `Unsupported` with the `Unreadable`
 reason and the parser's detail; it never fails the repository's inspection, and an inspection
 failure is never reported as a network failure unless the inference service was unreachable. Each version also reports the bytes adding it downloads before any drafter: its
 files and the repository's projector, or nothing when it is already on this computer or is a local
 file used in place. Each version carries its canonical model ID,
-so clients never form identities, and a label: the quantization its file or folder name spells as a
-quantization label (`Q4_K_M`, `UD-Q4_K_XL`; a name such as `q40` is not one), else the header's
-`general.file_type` label. The ID is a repository file's `hf:` ID, and for a path the ID of the custom
+so clients never form identities, and a label: the header's `general.file_type` label, spelled as
+the file or folder name spells it when that names the same weight type more precisely (`UD-Q4_K_XL`
+or `Q4_K_P` for a `Q4_K_M` header); a name naming another type is ignored, since files are renamed
+freely (`renamed-q8.gguf` with a `Q4_K_M` header is `Q4_K_M`). With nothing in the header, the
+quantization the name spells (a name such as `q40` is not one), else the file name. The ID is a repository file's `hf:` ID, and for a path the ID of the custom
 model listed at that path (a Hugging Face identity when its location gives one), else `local:` with
 the file's local digest (see terminology), a copy of a listed model's bytes elsewhere included. A
 version whose bytes are already listed also names that model as on this computer, whichever location

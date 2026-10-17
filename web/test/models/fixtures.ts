@@ -120,7 +120,7 @@ export const inspection = (overrides: Partial<CandidateInspection> = {}): Candid
 })
 
 export const unsupportedLocal = (displayName: string, origin: CustomModelOrigin, reason: UnsupportedReason): UnsupportedLocalModel => ({
-  displayName, origin, path: `/models/${displayName}.gguf`, reasons: [reason], detail: "engine detail",
+  modelId: Option.none(), displayName, origin, path: `/models/${displayName}.gguf`, reasons: [reason], detail: "engine detail",
 })
 
 export const selector = HuggingFaceArtifactSelectorSchema.make("Q4_K_P.gguf")

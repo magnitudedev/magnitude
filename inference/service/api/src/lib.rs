@@ -536,6 +536,12 @@ impl ApiError {
                 "model_does_not_fit",
                 false,
             ),
+            InventoryError::ModelUnsupported { .. } => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_request_error",
+                "model_unsupported",
+                false,
+            ),
             InventoryError::ModelOperation {
                 code, retryable, ..
             } => (
@@ -604,7 +610,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         (status = 400, description = "Invalid model identity or request", body = ErrorResponse),
         (status = 404, description = "Model is not installed", body = ErrorResponse),
         (status = 409, description = "Model cannot currently be admitted", body = ErrorResponse),
-        (status = 422, description = "Installed model failed integrity validation", body = ErrorResponse),
+        (status = 422, description = "Installed model failed integrity validation, does not fit, or the engine cannot run it (`model_unsupported`)", body = ErrorResponse),
         (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
     )
 )]

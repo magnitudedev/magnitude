@@ -126,13 +126,16 @@ Section "Magnitude"
     System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::FinishReplacement(w "$PreviousVersion") i .r0'
     ${If} $0 != 0
       DetailPrint "The update is installed. Previous files were retained because cleanup could not complete (code $0). Setup will retry cleanup next time."
+      StrCpy $Stage ""
+    ${Else}
+      Call CleanupStage
     ${EndIf}
-    StrCpy $Stage ""
     Goto installed
   ${EndIf}
   Rename "$Stage" "$INSTDIR"
   IfErrors stageFailed
-  StrCpy $Stage ""
+  ; Only the empty stage container remains; remove it so a fresh install leaves nothing behind.
+  Call CleanupStage
   ClearErrors
   SetOutPath "$INSTDIR"
   IfErrors registrationFailed

@@ -42,8 +42,11 @@ There is no mutable residency-policy API.
 Every load, whether a warm demand from a client, CLI, or API or an on-demand load for an inference
 request, first consults the model's current assessment. A load whose assessment for the served
 profile is Does not fit is refused with the typed `model_does_not_fit` failure (HTTP 422, not
-retryable) before the residency replaces anything, so the resident model keeps serving. A model
-whose assessment is still pending is admitted, and the engine's own resource plan still guards it.
+retryable) before the residency replaces anything, so the resident model keeps serving. A load
+whose assessment is Unsupported is refused the same way with `model_unsupported`, carrying the
+engine's reasons; ACN refuses it before asking ICN, as `ModelVersionNotRunnable` with those reasons.
+A model whose assessment is still pending is admitted, and the engine's own resource plan still
+guards it.
 
 Explicit Stop, replacement, memory-pressure eviction, worker failure, and ICN teardown remain
 distinct release causes. Session runtimes keep their own two-minute zero-use plus Quiescent
@@ -53,7 +56,8 @@ operations such as downloads outlive initiating callers according to their domai
 ## Guarantees
 
 - First-party and external inference requests protect residency through the same exact lease.
-- A load assessed as Does not fit never displaces a resident instance.
+- A load assessed as Does not fit or Unsupported never displaces a resident instance, and never
+  reports success.
 - A Ready instance with an active lease cannot idle-release.
 - Final lease release and equivalent warm demand each start a full one-hour interval.
 - Closing ordinary clients or the desktop window cannot change a model deadline; full owner Quit stops the tree.

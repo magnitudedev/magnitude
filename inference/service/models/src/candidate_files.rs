@@ -114,10 +114,8 @@ impl CandidateFileRole {
 
 /// Inspect one GGUF header held in memory (every byte through the aligned tensor-data offset).
 pub fn header_directory(header: &[u8]) -> Result<Directory, InventoryError> {
-    let file =
-        tempfile::NamedTempFile::new().map_err(|error| InventoryError::Io(error.to_string()))?;
-    std::fs::write(file.path(), header).map_err(|error| InventoryError::Io(error.to_string()))?;
-    magnitude_artifacts::gguf::inspect_header(file.path())
+    magnitude_artifacts::gguf::read_header(header)
+        .and_then(|directory| directory.require_execution_byte_order().map(|()| directory))
         .map_err(|error| InventoryError::Integrity(error.to_string()))
 }
 
@@ -193,16 +191,39 @@ pub fn header_base_repositories(directory: &Directory) -> BTreeSet<String> {
         directory
             .value(&format!("general.base_model.{index}.{name}"))
             .and_then(Value::string)
+            .map(ToOwned::to_owned)
+    };
+    base_model_repositories(
+        &(0..count)
+            .map(|index| crate::gguf::GgufBaseModel {
+                name: field(index, "name"),
+                organization: field(index, "organization"),
+                repo_url: field(index, "repo_url"),
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The repositories `general.base_model.N.*` entries name, lowercased: each one's repository URL,
+/// else its organization and name.
+#[must_use]
+pub fn base_model_repositories(base_models: &[crate::gguf::GgufBaseModel]) -> BTreeSet<String> {
+    let field = |value: &Option<String>| {
+        value
+            .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
     };
-    (0..count)
-        .filter_map(|index| {
-            field(index, "repo_url")
+    base_models
+        .iter()
+        .filter_map(|base| {
+            field(&base.repo_url)
+                .as_deref()
                 .and_then(hugging_face_repository_from_url)
                 .or_else(|| {
-                    let organization = field(index, "organization")?;
-                    let name = field(index, "name")?;
+                    let organization = field(&base.organization)?;
+                    let name = field(&base.name)?;
                     let repository = format!("{organization}/{}", name.replace(' ', "-"));
                     (!organization.contains(['/', ' ']) && !name.contains('/'))
                         .then(|| repository.to_lowercase())
@@ -303,12 +324,11 @@ pub fn split_shard(path: &Path) -> Option<(String, u32, u32)> {
     (index >= 1 && index <= total && total <= 256).then(|| (prefix.to_owned(), index, total))
 }
 
-/// A short presentation label for a version: the quantization written in its name the way GGUF
-/// writers spell it (`Q4_K_M`, `IQ2_M`, `UD-Q4_K_XL`, `BF16`), else its file stem. Labels never
-/// decide compatibility.
+/// A version's presentation label: its header's quantization, spelled by the file or folder name
+/// when that names the same weight type more precisely the way GGUF writers do (`UD-Q4_K_XL`,
+/// `Q4_K_P`); with nothing in the header, the quantization the name spells, else its file stem.
+/// Labels never decide compatibility.
 #[must_use]
-/// A version's label: the quantization its file or folder name spells (keeping a qualifier such as
-/// `UD-`), else its header's quantization, else its file name.
 pub fn version_label(path: &Path, header_quantization: Option<&str>) -> String {
     let stem = path
         .file_name()
@@ -332,10 +352,29 @@ pub fn version_label(path: &Path, header_quantization: Option<&str>) -> String {
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    quantization_label(&stem)
-        .or_else(|| quantization_label(directory))
-        .or_else(|| header_label(header_quantization))
-        .unwrap_or(stem)
+    let named = quantization_label(&stem).or_else(|| quantization_label(directory));
+    match (header_label(header_quantization), named) {
+        // A name that spells the header's weight type more precisely (`UD-Q4_K_XL`, `Q4_K_P` for a
+        // Q4_K_M header) keeps its writer's label; any other name is ignored, since files are
+        // renamed freely.
+        (Some(header), Some(named)) if weight_type(&named) == weight_type(&header) => named,
+        (Some(header), _) => header,
+        (None, Some(named)) => named,
+        (None, None) => stem,
+    }
+}
+
+/// The weight type a quantization label names, without its size or mix suffix: `Q4_K` for
+/// `UD-Q4_K_XL`, `Q8_0` for `Q8_0`, `IQ2` for `IQ2_M`, `MXFP4` for `MXFP4_MOE`.
+fn weight_type(label: &str) -> &str {
+    let label = label.strip_prefix("UD-").unwrap_or(label);
+    if label.starts_with('Q') {
+        if let Some(index) = label.find("_K") {
+            return &label[..index + 2];
+        }
+        return label;
+    }
+    label.split('_').next().unwrap_or(label)
 }
 
 fn header_label(header_quantization: Option<&str>) -> Option<String> {
@@ -517,6 +556,25 @@ mod tests {
         assert_eq!(
             version_label(Path::new("model-UD-Q4_K_XL.gguf"), Some("Q4_K - Medium")),
             "UD-Q4_K_XL"
+        );
+        assert_eq!(
+            version_label(Path::new("Model-Q4_K_P.gguf"), Some("Q4_K - Medium")),
+            "Q4_K_P"
+        );
+        assert_eq!(
+            version_label(Path::new("renamed-q8.gguf"), Some("Q4_K - Medium")),
+            "Q4_K_M",
+            "a renamed file is labelled by its header, not its name"
+        );
+        assert_eq!(
+            version_label(Path::new("Q8_0/renamed.gguf"), Some("IQ4_XS - 4.25 bpw")),
+            "IQ4_XS",
+            "a folder name that contradicts the header gives way to it"
+        );
+        assert_eq!(
+            version_label(Path::new("my-model-final.gguf"), Some("Q6_K")),
+            "Q6_K",
+            "a name with no quantization takes the header's, never the whole name"
         );
     }
 

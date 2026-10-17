@@ -1,5 +1,6 @@
 import { isServerRunning, resolveServerConflict } from "./server-conflict"
 import { windowChrome, windowControlColors } from "./window-chrome"
+import { raiseWindow } from "./window-raise"
 import { makeMacCliRegistration } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
 import { makeRendererRecovery } from "./renderer-recovery"
@@ -311,11 +312,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     wantsWindow = true
     if (!window) return
     const reload = yield* rendererRecovery.open
-    yield* Effect.sync(() => {
-      if (window.isMinimized()) window.restore()
-      window.show()
-      window.focus()
-    })
+    yield* Effect.sync(() => raiseWindow(window, app, process.platform))
     if (reload) yield* loadRenderer()
     // Raising the retained window must preserve the renderer's current page.
     if (page !== undefined) yield* PubSub.publish(actions, { _tag: "Navigate", page })

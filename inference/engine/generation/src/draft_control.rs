@@ -201,13 +201,18 @@ pub fn share_rows(outlooks: &[DraftOutlook], rows: usize) -> Option<Vec<usize>> 
 }
 
 /// What a load's requests share: launch costs by context class and sequence
-/// count, and the acceptance its latest request reached.
+/// count, the acceptance its latest request reached, and the decode time set
+/// aside for the next look. That time carries from request to request, so a
+/// load of requests each too short to earn a look by itself still takes them
+/// at their share of the decode time, and drafting that stopped paying is
+/// tried again.
 #[derive(Debug, Default)]
 pub struct DraftLoad {
     costs: Mutex<BTreeMap<(usize, usize), LaunchCosts>>,
     right: Mutex<Option<Vec<f64>>>,
     /// The run of accepted rounds that earned its latest request a look.
     look_run: Mutex<Option<u32>>,
+    look_seconds: Mutex<f64>,
 }
 
 /// A drafted block being scored against the tokens committed after it.
@@ -240,7 +245,8 @@ pub struct DraftController {
     /// Blocks behind each depth's estimate, counted up to its share.
     blocks_scored: Vec<u32>,
     blocks: Vec<Block>,
-    /// Seconds of decode time set aside for the next look.
+    /// Seconds of decode time set aside for the next look (see
+    /// [`DraftLoad`]).
     look_seconds: f64,
     /// Rounds in a row whose verified proposals were all accepted, and the
     /// run of them that earns a look. A look that finds its block right
@@ -269,6 +275,7 @@ impl DraftController {
     pub fn new(widest: usize, load: Arc<DraftLoad>) -> Self {
         let seed = load.right.lock().expect("draft load acceptance").clone();
         let look_run = load.look_run.lock().expect("draft load looks").unwrap_or(1);
+        let look_seconds = *load.look_seconds.lock().expect("draft load look time");
         let (right, scored) = match seed {
             Some(right) if right.len() == widest => (right, u32::MAX),
             _ => (vec![1.0; widest], 0),
@@ -279,7 +286,7 @@ impl DraftController {
             right,
             blocks_scored: vec![scored; widest],
             blocks: Vec::new(),
-            look_seconds: 0.0,
+            look_seconds,
             accepted_run: 0,
             look_run,
             run_look: false,
@@ -459,12 +466,15 @@ impl DraftController {
                     kept
                 }
             }
+            // Nothing wider to look at this round (the fastest pair is the
+            // widest, or the request's last tokens leave no room): the time
+            // set aside so far is kept for the next round that has one.
             None => {
-                self.look_seconds = 0.0;
                 self.run_look = false;
                 kept
             }
         };
+        *self.load.look_seconds.lock().expect("draft load look time") = self.look_seconds;
         self.choice = RoundChoice {
             generated,
             verified: 0,

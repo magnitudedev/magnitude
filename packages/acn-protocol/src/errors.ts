@@ -310,8 +310,9 @@ export const ModelCandidateError = Schema.Union(
 export type ModelCandidateError = Schema.Schema.Type<typeof ModelCandidateError>
 
 /**
- * A version refused before anything downloads: the engine can't run it, or it needs more memory than this
- * computer can provide and the request didn't force it. Clients word it from these facts.
+ * A version refused before anything downloads, or a model refused a load: the engine can't run it, or it
+ * needs more memory than this computer can provide and the request didn't force it. Clients word it from
+ * these facts.
  */
 export class ModelVersionNotRunnable extends Schema.TaggedError<ModelVersionNotRunnable>()(
   "ModelVersionNotRunnable",

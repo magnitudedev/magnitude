@@ -17,6 +17,7 @@ axum.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 libc.workspace = true
+magnitude-artifacts = { path = "../../engine/artifacts" }
 magnitude-engine = { path = "../../engine" }
 magnitude-executor = { path = "../../engine/executor" }
 magnitude-service-api = { path = "../api" }
@@ -42,7 +43,6 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 flate2.workspace = true
 http-body-util.workspace = true
-magnitude-artifacts = { path = "../../engine/artifacts" }
 tempfile = "3.24.0"
 tower = { workspace = true, features = ["util"] }
 tokio = { workspace = true, features = ["test-util"] }
