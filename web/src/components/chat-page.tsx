@@ -281,6 +281,7 @@ export function ChatPage() {
             {models.map(model => <option key={model} value={model}>{model}</option>)}
           </select>
         </label>
+        <Button type="button" variant="outline" onClick={createConversation} className="sm:hidden">New chat</Button>
         <Button type="button" variant="outline" onClick={() => { setOpenWebUIError(null); setShowOpenWebUI(true) }}>Open WebUI</Button>
       </header>
       {modelsError && <div role="alert" className="m-4 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">{modelsError} <button type="button" className="ml-2 underline" onClick={() => window.location.reload()}>Retry</button></div>}
