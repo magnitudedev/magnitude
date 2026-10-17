@@ -111,7 +111,7 @@ The architectural goal remains to separate conversation UI from administration, 
 
 The working branch now includes an opt-in Open WebUI view within the Chat page. It accepts only loopback HTTP(S) URLs (`localhost`, `127.0.0.1`, or `[::1]`), rejects URL credentials and non-web protocols, strips URL fragments, and persists the selected URL in browser local storage. A native Chat route remains available as a fallback. The URL validation helper has unit tests for accepted loopback URLs, remote-host rejection, credentials, malformed URLs, non-web schemes, and fragment removal.
 
-The fork's CI typechecks, tests, and production build now pass, including unit tests for Open WebUI URL validation. That does not establish that an actual Open WebUI instance can be embedded or authenticate successfully. The iframe cannot reliably inspect a cross-origin child's HTTP headers or authentication state, so server policy and real browser behavior remain manual integration checks. Do not claim Open WebUI embedding or inference has passed until the real-instance end-to-end checks are green.
+The fork's CI typechecks, tests, and production build passed on commit `bdcd27756ff80edd0f1163303cfa1fad016bc031`, including unit tests for Open WebUI URL validation. A later mobile-history UX change has been committed separately and needs a fresh CI run. Passing unit tests do not establish that an actual Open WebUI instance can be embedded or authenticate successfully. The iframe cannot reliably inspect a cross-origin child's HTTP headers or authentication state, so server policy and real browser behavior remain manual integration checks. Do not claim Open WebUI embedding or inference has passed until the real-instance end-to-end checks are green.
 
 
 The implementation guide for connecting an existing Open WebUI instance to Magnitude is available at [`docs/clients/open-webui.mdx`](https://github.com/robertosantosx2/magnitude/blob/feat/native-chat-section/docs/clients/open-webui.mdx). It explains the host-versus-container address distinction, API key/network-access requirements, embedding policy, and end-to-end acceptance checklist.
@@ -132,3 +132,8 @@ The implementation guide for connecting an existing Open WebUI instance to Magni
 | Upstream maintainer review and upstream CI | Pending | Fork CI does not substitute for upstream checks |
 
 The PR should remain a draft until the pending runtime acceptance checks are completed. The standalone page previously available on port 10101 is not evidence that this PR's Native Chat component works in-browser.
+
+
+## Mobile usability follow-up (2026-10-17)
+
+The mobile header now exposes both **New chat** and a **Conversation history** selector, because the desktop history sidebar is hidden on narrow screens. This closes the navigation gap where mobile users could create a conversation but could not switch back to another saved conversation. The change is in commit [c655dfe](https://github.com/robertosantosx2/magnitude/commit/c655dfe5175138dfa425ab006def8f4b5c325e9e). It still requires a fresh CI run and a real-browser check at narrow viewport sizes.
