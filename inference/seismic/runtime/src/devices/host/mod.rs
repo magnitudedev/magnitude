@@ -266,11 +266,16 @@ pub struct ProcessMemoryLimit {
     pub kind: ProcessLimitKind,
     pub limit_bytes: u64,
     pub used_bytes: u64,
+    /// Clean inactive file cache the OS can reclaim within this limit. Zero
+    /// for address-space, data-segment and committed-memory limits, where
+    /// reclaiming physical pages does not release the accounted resource.
+    pub reclaimable_bytes: u64,
 }
 
 impl ProcessMemoryLimit {
     pub fn remaining_bytes(&self) -> u64 {
-        self.limit_bytes.saturating_sub(self.used_bytes)
+        self.limit_bytes
+            .saturating_sub(self.used_bytes.saturating_sub(self.reclaimable_bytes))
     }
 }
 

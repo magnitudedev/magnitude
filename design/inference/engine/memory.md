@@ -260,6 +260,12 @@ distress, and a dedicated device's own memory has none.
 Process limits are the visible ones. Inside a container the container's own cgroup limit is
 visible while cgroups above it may be hidden; hidden ancestors bound nothing beyond host headroom,
 so a contained process plans and claims against its own limit and host headroom.
+Linux cgroup usage includes file cache: live headroom credits clean inactive file
+pages that the kernel can reclaim within that cgroup. Raw usage remains observable;
+anonymous memory, active cache, dirty/writeback pages and unknown reclaimability
+receive no credit. Ancestor observations use hierarchical counters. Process address
+space, data-segment and Windows commit limits receive no physical-cache credit.
+Host availability and every applicable limit still bound claims, with the same reserves.
 
 An unavailable required observation is Blind: residency and growth wait on memory
 immediately, and a continuous second of Blind is treated as Reclaim. If Reclaim persists for one

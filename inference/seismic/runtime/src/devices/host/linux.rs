@@ -101,6 +101,7 @@ fn resource_limits() -> Result<Vec<ProcessMemoryLimit>, ObservationError> {
             kind,
             limit_bytes: limit.rlim_cur,
             used_bytes,
+            reclaimable_bytes: 0,
         });
     }
     Ok(limits)
@@ -183,6 +184,10 @@ fn cgroup_v2_limits(
             kind: ProcessLimitKind::CgroupV2 { cgroup },
             limit_bytes: parse_bytes(&max, value)?,
             used_bytes: read_bytes(&directory.join("memory.current"))?,
+            reclaimable_bytes: inactive_file_headroom(
+                directory,
+                ["inactive_file", "file_dirty", "file_writeback"],
+            )?,
         });
         Ok(())
     })?;
@@ -220,6 +225,10 @@ fn cgroup_v1_limits(
             kind: ProcessLimitKind::CgroupV1 { cgroup },
             limit_bytes,
             used_bytes: read_bytes(&directory.join("memory.usage_in_bytes"))?,
+            reclaimable_bytes: inactive_file_headroom(
+                directory,
+                ["total_inactive_file", "total_dirty", "total_writeback"],
+            )?,
         });
         Ok(())
     })?;
@@ -231,6 +240,32 @@ fn cgroup_v1_limits(
         LimitVisibility::CgroupAncestorsHidden
     };
     Ok(visibility)
+}
+
+/// Cgroup usage includes reclaimable page cache, unlike Linux MemAvailable.
+/// Credit only inactive filesystem pages, conservatively excluding all dirty
+/// and writeback pages. Anonymous memory, tmpfs/shmem (on the anon lists),
+/// active cache and kernel allocations receive no credit. V1 counters must be
+/// hierarchical, like memory.usage_in_bytes, so ancestor limits include their
+/// children's cache. Missing counters cannot establish reclaimability.
+fn inactive_file_headroom(directory: &Path, keys: [&str; 3]) -> Result<u64, ObservationError> {
+    let path = directory.join("memory.stat");
+    let stat = read(&path)?;
+    let mut values = [None; 3];
+    for line in stat.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(key) = fields.next() else { continue };
+        if let Some(index) = keys.iter().position(|candidate| *candidate == key) {
+            let value = fields.next().unwrap_or("");
+            values[index] = Some(parse_bytes(&path, value)?);
+        }
+    }
+    Ok(match values {
+        [Some(inactive), Some(dirty), Some(writeback)] => {
+            inactive.saturating_sub(dirty.saturating_add(writeback))
+        }
+        _ => 0,
+    })
 }
 
 /// The v1 memory controller reports "no limit" as its page counter maximum,
@@ -393,11 +428,11 @@ mod tests {
             kind,
             limit_bytes,
             used_bytes,
+            reclaimable_bytes: 0,
         }
     }
 
-    const V2_HOST_MOUNT: &str =
-        "30 25 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,nsdelegate\n";
+    const V2_HOST_MOUNT: &str = "30 25 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw,nsdelegate\n";
     const V1_HOST_MOUNTS: &str = "\
 24 21 0:22 / /sys/fs/cgroup ro,nosuid,nodev,noexec shared:9 - tmpfs tmpfs ro,mode=755
 33 24 0:29 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:15 - cgroup cgroup rw,memory
@@ -409,8 +444,10 @@ mod tests {
         let fixture = Fixture::new("v2-host", "0::/user.slice/app.scope\n", V2_HOST_MOUNT);
         fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.max", "1000\n");
         fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.current", "400\n");
+        fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.stat", "");
         fixture.write("sys/fs/cgroup/user.slice/memory.max", "max\n");
         fixture.write("sys/fs/cgroup/user.slice/memory.current", "900\n");
+        fixture.write("sys/fs/cgroup/user.slice/memory.stat", "");
         let (limits, visibility) = fixture.limits().unwrap();
         assert_eq!(
             limits,
@@ -431,6 +468,7 @@ mod tests {
         fixture.write("sys/fs/cgroup/cgroup.type", "domain\n");
         fixture.write("sys/fs/cgroup/memory.max", "2000\n");
         fixture.write("sys/fs/cgroup/memory.current", "500\n");
+        fixture.write("sys/fs/cgroup/memory.stat", "");
         let (limits, visibility) = fixture.limits().unwrap();
         assert_eq!(
             limits,
@@ -452,6 +490,10 @@ mod tests {
             V1_HOST_MOUNTS,
         );
         let memory = "sys/fs/cgroup/memory";
+        fixture.write(
+            &format!("{memory}/system.slice/svc.service/memory.stat"),
+            "",
+        );
         fixture.write(
             &format!("{memory}/system.slice/svc.service/memory.limit_in_bytes"),
             "3000\n",
@@ -499,6 +541,7 @@ mod tests {
             "sys/fs/cgroup/unified/user.slice/app.scope/cgroup.procs",
             "1\n",
         );
+        fixture.write("sys/fs/cgroup/memory/user.slice/memory.stat", "");
         fixture.write(
             "sys/fs/cgroup/memory/user.slice/memory.limit_in_bytes",
             "6000\n",
@@ -509,6 +552,7 @@ mod tests {
         );
         fixture.write("sys/fs/cgroup/memory/memory.limit_in_bytes", &unlimited);
         fixture.write("sys/fs/cgroup/memory/memory.usage_in_bytes", "9000\n");
+        fixture.write("sys/fs/cgroup/memory/memory.stat", "");
         let (limits, visibility) = fixture.limits().unwrap();
         assert_eq!(
             limits,
@@ -531,9 +575,11 @@ mod tests {
         fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.max", "1000\n");
         fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.high", "800\n");
         fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.current", "810\n");
+        fixture.write("sys/fs/cgroup/user.slice/app.scope/memory.stat", "");
         fixture.write("sys/fs/cgroup/user.slice/memory.max", "max\n");
         fixture.write("sys/fs/cgroup/user.slice/memory.high", "700\n");
         fixture.write("sys/fs/cgroup/user.slice/memory.current", "750\n");
+        fixture.write("sys/fs/cgroup/user.slice/memory.stat", "");
         let (limits, visibility) = fixture.limits().unwrap();
         assert_eq!(
             limits,
@@ -561,6 +607,7 @@ mod tests {
         );
         fixture.write("sys/fs/cgroup/memory/memory.limit_in_bytes", "4000\n");
         fixture.write("sys/fs/cgroup/memory/memory.usage_in_bytes", "1500\n");
+        fixture.write("sys/fs/cgroup/memory/memory.stat", "");
         let (limits, visibility) = fixture.limits().unwrap();
         assert_eq!(
             limits,
@@ -571,6 +618,67 @@ mod tests {
             )]
         );
         assert_eq!(visibility, LimitVisibility::CgroupAncestorsHidden);
+    }
+
+    #[test]
+    fn v2_headroom_credits_only_clean_inactive_file_cache() {
+        let fixture = Fixture::new("v2-cache", "0::/worker\n", V2_HOST_MOUNT);
+        fixture.write("sys/fs/cgroup/worker/memory.max", "1000\n");
+        fixture.write("sys/fs/cgroup/worker/memory.current", "900\n");
+        for (stat, reclaimable, remaining) in [
+            (
+                "inactive_file 600\nfile_dirty 100\nfile_writeback 50\nanon 300\n",
+                450,
+                550,
+            ),
+            (
+                "inactive_file 0\nfile_dirty 0\nfile_writeback 0\nanon 900\n",
+                0,
+                100,
+            ),
+            (
+                "inactive_file 600\nfile_dirty 700\nfile_writeback 0\n",
+                0,
+                100,
+            ),
+            ("inactive_file 600\nfile_writeback 0\n", 0, 100),
+            // Non-atomic counters can briefly disagree; never grant more
+            // than the limit even when the cache counter exceeds usage.
+            (
+                "inactive_file 1200\nfile_dirty 0\nfile_writeback 0\n",
+                1200,
+                1000,
+            ),
+        ] {
+            fixture.write("sys/fs/cgroup/worker/memory.stat", stat);
+            let (limits, _) = fixture.limits().unwrap();
+            assert_eq!(limits[0].used_bytes, 900);
+            assert_eq!(limits[0].reclaimable_bytes, reclaimable);
+            assert_eq!(limits[0].remaining_bytes(), remaining);
+        }
+    }
+
+    #[test]
+    fn v1_ancestor_cache_uses_hierarchical_counters() {
+        let fixture = Fixture::new("v1-cache", "4:memory:/parent/worker\n", V1_HOST_MOUNTS);
+        fixture.write(
+            "sys/fs/cgroup/memory/parent/worker/memory.limit_in_bytes",
+            &v1_unlimited_bytes().unwrap().to_string(),
+        );
+        fixture.write(
+            "sys/fs/cgroup/memory/parent/memory.limit_in_bytes",
+            "1000\n",
+        );
+        fixture.write("sys/fs/cgroup/memory/parent/memory.usage_in_bytes", "900\n");
+        fixture.write("sys/fs/cgroup/memory/parent/memory.stat",
+            "inactive_file 0\ndirty 0\nwriteback 0\ntotal_inactive_file 600\ntotal_dirty 100\ntotal_writeback 50\n");
+        fixture.write(
+            "sys/fs/cgroup/memory/memory.limit_in_bytes",
+            &v1_unlimited_bytes().unwrap().to_string(),
+        );
+        let (limits, _) = fixture.limits().unwrap();
+        assert_eq!(limits[0].reclaimable_bytes, 450);
+        assert_eq!(limits[0].remaining_bytes(), 550);
     }
 
     #[test]

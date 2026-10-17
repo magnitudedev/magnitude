@@ -115,5 +115,6 @@ fn job_limits() -> Result<Vec<ProcessMemoryLimit>, ObservationError> {
         kind: ProcessLimitKind::WindowsJobProcess,
         limit_bytes: information.ProcessMemoryLimit as u64,
         used_bytes: counters.PagefileUsage as u64,
+        reclaimable_bytes: 0,
     }])
 }

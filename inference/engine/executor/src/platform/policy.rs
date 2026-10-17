@@ -1109,6 +1109,28 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_file_cache_is_available_but_anonymous_usage_and_reserves_still_bound_claims() {
+        let mut sampled = host(
+            5 * GIB,
+            vec![ProcessMemoryLimit {
+                kind: ProcessLimitKind::CgroupV2 {
+                    cgroup: "/worker".into(),
+                },
+                limit_bytes: 4 * GIB,
+                used_bytes: 3 * GIB,
+                reclaimable_bytes: 2 * GIB,
+            }],
+        );
+        let reading = readings(&sampled, 8 * GIB, None, DeviceMeasurements::Host).unwrap()[0];
+        assert_eq!(reading.band, MemoryBand::Normal);
+        assert_eq!(reading.ceiling_bytes, GIB);
+        sampled.limits[0].reclaimable_bytes = 0;
+        let reading = readings(&sampled, 8 * GIB, None, DeviceMeasurements::Host).unwrap()[0];
+        assert_eq!(reading.band, MemoryBand::Reclaim);
+        assert_eq!(reading.ceiling_bytes, 0);
+    }
+
+    #[test]
     fn process_limits_bound_host_headroom() {
         let limited = host(
             12 * GIB,
@@ -1118,6 +1140,7 @@ mod tests {
                 },
                 limit_bytes: 8 * GIB,
                 used_bytes: 4 * GIB,
+                reclaimable_bytes: 0,
             }],
         );
         let reading = readings(&limited, 16 * GIB, None, DeviceMeasurements::Host).unwrap();
@@ -1244,13 +1267,8 @@ mod tests {
         assert_eq!(staging.band, MemoryBand::Normal);
         assert_eq!(band_of(&normal), MemoryBand::Normal);
 
-        let card_reclaim = readings(
-            &host(8 * GIB, vec![]),
-            64 * GIB,
-            Some(24 * GIB),
-            cuda(GIB),
-        )
-        .unwrap();
+        let card_reclaim =
+            readings(&host(8 * GIB, vec![]), 64 * GIB, Some(24 * GIB), cuda(GIB)).unwrap();
         assert_eq!(card_reclaim[0].band, MemoryBand::Reclaim);
         assert_eq!(card_reclaim[0].ceiling_bytes, 0);
         assert_eq!(band_of(&card_reclaim), MemoryBand::Reclaim);
