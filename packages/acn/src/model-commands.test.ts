@@ -158,7 +158,7 @@ it("reports whether a catalog sync installs, updates, or finds the model current
     } as never),
     Effect.provideService(IcnCatalogInstallations, { refresh: Effect.void } as never),
     Effect.provideService(ModelSlotController, {} as never),
-    Effect.provideService(LocalModelRemovals, {} as never),
+    Effect.provideService(LocalModelRemovals, { forget: () => Effect.void } as never),
   )
   expect(await Effect.runPromise(sync("NotInstalled", "Admitted"))).toBe("Installing")
   expect(await Effect.runPromise(sync("Installed", "Admitted"))).toBe("Updating")

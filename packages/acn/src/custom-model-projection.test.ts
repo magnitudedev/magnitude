@@ -159,8 +159,8 @@ describe("custom model rows", () => {
     const present = Option.getOrThrow(customModel(inputs(customSource(nativeCustomModel({ drafter: attachedDrafter })))))
     expect(Option.map(present.drafter, ({ availability }) => availability._tag)).toEqual(Option.some("Present"))
 
-    const catalogDrafter = customSource(nativeCustomModel({
-      drafter: { method: { _tag: "DFlash" }, reference: { _tag: "Catalog", modelId: "qwen3.6-35b-a3b:gguf:q4" }, state: { _tag: "Ready" } },
+    const catalogDrafter = (state: string) => customSource(nativeCustomModel({
+      drafter: { method: { _tag: "DFlash" }, reference: { _tag: "Catalog", modelId: "qwen3.6-35b-a3b:gguf:q4" }, state: { _tag: state } },
     }))
     const catalog = [{
       id: "qwen3.6-35b-a3b:gguf:q4",
@@ -170,13 +170,20 @@ describe("custom model rows", () => {
         localState: { _tag: "Installed", updateState: { _tag: "Available" } },
       },
     }] as never
-    expect(Option.map(Option.getOrThrow(customModel(inputs(catalogDrafter, { catalog }))).drafter,
+    expect(Option.map(Option.getOrThrow(customModel(inputs(catalogDrafter("NotInstalled"), {
+      catalog,
+      drafterChoice: { _tag: "Reference", reference: { _tag: "Catalog", modelId: "qwen3.6-35b-a3b:gguf:q4" } } as never,
+    }))).drafter,
       ({ updateAvailable, name, label }) => ({ updateAvailable, name, label })))
       .toEqual(Option.some({
         updateAvailable: true,
         name: "Magnitude DFlash for Qwen3.6 35B-A3B",
         label: "Trained for Qwen3.6 35B-A3B",
       }))
+    // The catalog model's own update (a found exact target missing its projector, say) is not the
+    // drafter's: its current drafter is here.
+    expect(Option.map(Option.getOrThrow(customModel(inputs(catalogDrafter("Ready"), { catalog }))).drafter,
+      ({ updateAvailable }) => updateAvailable)).toEqual(Option.some(false))
   })
 })
 

@@ -313,10 +313,10 @@ impl CatalogPackageRemover for ModelInstances {
         package_ids: Vec<ModelPackageId>,
     ) -> BoxFuture<'_, Result<u64, InventoryError>> {
         Box::pin(async move {
-            let mut permits = Vec::with_capacity(package_ids.len());
-            for package_id in &package_ids {
-                permits.push(self.residency.acquire_package_removal(package_id.clone()).await?);
-            }
+            let permit = self
+                .residency
+                .acquire_package_removal(package_ids.clone())
+                .await?;
             self.environment.configurations.evict_packages(&package_ids);
             let mut reclaimed_bytes = 0_u64;
             for package_id in package_ids {
@@ -328,7 +328,7 @@ impl CatalogPackageRemover for ModelInstances {
                         .freed_bytes,
                 );
             }
-            drop(permits);
+            drop(permit);
             Ok(reclaimed_bytes)
         })
     }

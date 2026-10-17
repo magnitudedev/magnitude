@@ -141,7 +141,7 @@ fn header_digest(path: &Path, header_bytes: u64) -> Result<String, GgufError> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn role(directory: &Directory, architecture: Option<&str>) -> GgufRole {
+pub(crate) fn role(directory: &Directory, architecture: Option<&str>) -> GgufRole {
     let nextn_tensors = directory
         .tensors
         .iter()

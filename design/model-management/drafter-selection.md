@@ -97,7 +97,10 @@ Catalog models always use their catalog drafter.
 - A found or imported model whose choice is automatic has no attached drafter until the
   recommended one is on this computer: ACN projects it without a drafter, and clients offer the
   recommended drafter ("Faster with a drafter · Add (size)"). A drafter the user chose that is
-  missing with no download running is an interrupted download that Sync resumes. An attached
+  missing with no download running is an interrupted download that Sync resumes, and that ACN
+  resumes by itself when the service starts. A catalog drafter has an update only when its catalog
+  model has one and its current drafter package is not on this computer; a catalog model's update
+  of other parts (its target or projector) is not its drafter's. An attached
   drafter's verdict is its own: the assessment's when it names the attached method, else ICN's
   verdict for the matching recommended candidate, never another drafter's.
 - Adding a drafter to a model whose target is present downloads only the drafter; one already on

@@ -350,7 +350,18 @@ impl ModelDomainResolver {
             })
             .cloned()
             .collect::<BTreeSet<_>>();
-        Ok(removal_plan(&ids, &target_ids, &managed_ids, &shared_ids))
+        drop(occurrences);
+        let mut plan = removal_plan(&ids, &target_ids, &managed_ids, &shared_ids);
+        // A drafter another model uses stays; pruning removes it once no model does. While a
+        // model's automatic drafter is still being worked out, this model's drafter stays too.
+        let in_use = match self.custom_drafter_packages()? {
+            Some(used) => used,
+            None => crate::custom_models::separate_draft(&definition.configuration.bundle)
+                .into_iter()
+                .collect(),
+        };
+        plan.package_ids.retain(|package_id| !in_use.contains(package_id));
+        Ok(plan)
     }
 
     pub(crate) fn catalog_cleanup_package_ids(

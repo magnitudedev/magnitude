@@ -34,8 +34,9 @@ observed or declared. Observed material has exactly one truthful state, `Ready` 
 both containing the selected resolved installation. An added model whose target has not landed in
 the store is a `NotInstalled` row from its declaration, so ACN projects its download as installation
 progress; it cannot be served until the target lands. Downloads do not outlive the service, so ACN
-restarts the download of every such row when it starts, and the download resumes from its durable
-checkpoint.
+restarts every part a restart interrupted when it starts: the download of every such row (its target
+with its drafter), and the drafter of any model whose chosen drafter has not arrived. Each resumes
+from its durable checkpoint.
 
 ## ACN projection
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Cause, Effect, Option } from "effect"
 import { CatalogFormModelIdSchema } from "@magnitudedev/acn-protocol"
-import { catalogRemovalOutcome } from "./local-model-removals"
+import { catalogRemovalOutcome, type LocalModelRemovalsApi } from "./local-model-removals"
 
 const modelId = CatalogFormModelIdSchema.make("qwen3.5-4b:gguf:q4")
 
@@ -24,5 +24,51 @@ describe("catalog removal outcomes", () => {
       expect(failure.code).toBe(code)
       if (reason === "ExternalOwnership") expect(failure.message).toContain(`magnitude models hide ${modelId}`)
     }
+  })
+})
+
+describe("catalog removal state", () => {
+  const removalsWith = async (removeResult: Effect.Effect<unknown, unknown>) => {
+    const { IcnClient, IcnCatalog, IcnLocalModels } = await import("@magnitudedev/icn")
+    const { LocalModelRemovals, LocalModelRemovalsLive } = await import("./local-model-removals")
+    return <A, E>(use: (removals: LocalModelRemovalsApi) => Effect.Effect<A, E>) => Effect.runPromise(
+      LocalModelRemovals.pipe(
+        Effect.flatMap(use),
+        Effect.provide(LocalModelRemovalsLive),
+        Effect.provideService(IcnClient, { catalog: { removeCatalogModelInstallation: () => removeResult } } as never),
+        Effect.provideService(IcnCatalog, { refresh: Effect.void } as never),
+        Effect.provideService(IcnLocalModels, { pruneDrafters: Effect.void } as never),
+      ),
+    )
+  }
+  const remoteError = (code: string, message: string) => Effect.fail({
+    _tag: "GeneratedClientRemoteError",
+    operationId: "removeCatalogModelInstallation",
+    status: 409,
+    headers: {},
+    body: { error: { code, message, type: "model_error", param: Option.none() } },
+  })
+
+  it("answers a removal of a model that isn't installed clearly and leaves no failed state", async () => {
+    const run = await removalsWith(remoteError("catalog_model_not_installed", `catalog model ${modelId} is not installed`))
+    const { failure, state } = await run((removals) => Effect.gen(function* () {
+      const failure = yield* Effect.flip(removals.remove(modelId))
+      return { failure, state: yield* removals.state }
+    }))
+    expect(failure).toMatchObject({ _tag: "LocalModelMutationFailed", code: "model_not_installed" })
+    expect(failure.message).toBe(`${modelId} is not installed on this computer, so there is nothing to remove.`)
+    expect(state.size).toBe(0)
+  })
+
+  it("keeps a real failure until a new installation supersedes it", async () => {
+    const run = await removalsWith(remoteError("remove_failed", "Removal failed"))
+    const { failed, forgotten } = await run((removals) => Effect.gen(function* () {
+      yield* Effect.flip(removals.remove(modelId))
+      const failed = (yield* removals.state).get(modelId)
+      yield* removals.forget(modelId)
+      return { failed, forgotten: yield* removals.state }
+    }))
+    expect(failed?._tag).toBe("RemoveFailed")
+    expect(forgotten.size).toBe(0)
   })
 })

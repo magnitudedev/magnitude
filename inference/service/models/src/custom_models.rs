@@ -221,48 +221,48 @@ impl ModelDomainResolver {
         Ok(projection)
     }
 
+    /// The separate drafter packages custom models use: the drafter each serves with, or downloads
+    /// with its target. `None` while a model's automatic drafter isn't worked out yet, when it may
+    /// be about to use any catalog drafter.
+    pub(crate) fn custom_drafter_packages(
+        &self,
+    ) -> Result<Option<BTreeSet<ModelPackageId>>, InventoryError> {
+        let projection = self.local_projection()?;
+        let projected = || projection.models.iter().chain(&projection.hidden);
+        if projected().any(|projected| projected.drafter_pending) {
+            return Ok(None);
+        }
+        Ok(Some(
+            projected()
+                .filter_map(|projected| match &projected.configuration {
+                    Ok(configuration) => separate_draft(&configuration.bundle),
+                    Err(_) => projected.awaited_drafter.clone(),
+                })
+                .collect(),
+        ))
+    }
+
     /// The Magnitude-owned drafter packages no model uses: not the drafter of an installed
     /// catalog model, and not the drafter any custom model serves with.
     fn unused_drafter_packages(&self) -> Result<Vec<ModelPackageId>, InventoryError> {
-        let projection = self.local_projection()?;
+        let custom = self.custom_drafter_packages()?;
         let installed = self.inventory.catalog_packages_response()?;
         let present = installed
             .packages
             .iter()
             .map(|entry| &entry.package.id)
             .collect::<BTreeSet<_>>();
-        let separate_draft = |bundle: &ServableModelBundle| match bundle {
-            ServableModelBundle::SpeculativeDecoding {
-                draft_source: SpeculativeDraftSource::Separate { draft },
-                ..
-            } => Some(draft.id.clone()),
-            _ => None,
-        };
-        // A model whose automatic drafter isn't worked out yet may be about to use any catalog
-        // drafter, so none is pruned until it is.
-        let drafter_pending = projection
-            .models
-            .iter()
-            .chain(&projection.hidden)
-            .any(|projected| projected.drafter_pending);
         let mut used = self
             .catalog
             .models
             .iter()
             .filter(|definition| {
-                drafter_pending
+                custom.is_none()
                     || present.contains(&crate::lineage::catalog_target(definition).id)
             })
             .filter_map(|definition| separate_draft(&definition.configuration.bundle))
             .collect::<BTreeSet<_>>();
-        used.extend(
-            projection
-                .models
-                .iter()
-                .chain(&projection.hidden)
-                .filter_map(|projected| projected.configuration.as_ref().ok())
-                .filter_map(|configuration| separate_draft(&configuration.bundle)),
-        );
+        used.extend(custom.into_iter().flatten());
         let records = self.inventory.installed_packages.read().map_err(|_| {
             InventoryError::Internal("installed package lock poisoned".to_owned())
         })?;
@@ -329,6 +329,7 @@ struct ProjectedModel {
     configuration: Result<ModelServingConfiguration, ModelFailure>,
     managed_packages: Vec<ModelPackageId>,
     drafter_pending: bool,
+    awaited_drafter: Option<ModelPackageId>,
 }
 
 #[derive(Clone)]
@@ -945,6 +946,7 @@ impl ModelContext<'_> {
             .sum();
         Some(ProjectedModel {
             drafter_pending: matches!(choice, DrafterChoice::Auto) && !enrichment_known,
+            awaited_drafter: None,
             managed_packages: group
                 .occurrences
                 .iter()
@@ -981,25 +983,28 @@ impl ModelContext<'_> {
             return None;
         };
         let primary = declaration.target.first()?;
-        let drafter = self
+        let resolved = self
             .configuration
             .drafters
             .iter()
             .find(|attachment| attachment.model_id == declaration.model_id)
             .and_then(|attachment| match &attachment.drafter {
-                DrafterChoice::Reference { reference, method } => Some(
-                    resolve_drafter(
-                        reference.clone(),
-                        method.clone(),
-                        false,
-                        self.enrichment.drafter_content(reference),
-                        self.catalog,
-                        self.occurrences,
-                    )
-                    .attached,
-                ),
+                DrafterChoice::Reference { reference, method } => Some(resolve_drafter(
+                    reference.clone(),
+                    method.clone(),
+                    false,
+                    self.enrichment.drafter_content(reference),
+                    self.catalog,
+                    self.occurrences,
+                )),
                 DrafterChoice::Auto | DrafterChoice::None => None,
             });
+        // The drafter it downloads with its target is in use while the target is still arriving.
+        let awaited_drafter = resolved.as_ref().and_then(|resolved| match &resolved.source {
+            Some(SpeculativeDraftSource::Separate { draft }) => Some(draft.id.clone()),
+            _ => None,
+        });
+        let drafter = resolved.map(|resolved| resolved.attached);
         let (display_name, variant_label) = crate::candidate_files::model_presentation(
             Path::new(primary),
             Some(repository.as_str()),
@@ -1041,7 +1046,19 @@ impl ModelContext<'_> {
             }),
             managed_packages: Vec::new(),
             drafter_pending: false,
+            awaited_drafter,
         })
+    }
+}
+
+/// The separate drafter package a bundle serves with.
+pub(crate) fn separate_draft(bundle: &ServableModelBundle) -> Option<ModelPackageId> {
+    match bundle {
+        ServableModelBundle::SpeculativeDecoding {
+            draft_source: SpeculativeDraftSource::Separate { draft },
+            ..
+        } => Some(draft.id.clone()),
+        _ => None,
     }
 }
 
@@ -2534,7 +2551,7 @@ mod tests {
     /// hidden found copy copies that copy's bytes into Magnitude's store instead of downloading
     /// them, needs no further download, and leaves the copy's files where they are.
     #[tokio::test(flavor = "multi_thread")]
-    async fn installing_a_catalog_model_copies_the_bytes_of_its_hidden_found_copy() {
+    async fn installing_a_catalog_model_reuses_the_bytes_of_its_hidden_found_copy() {
         use magnitude_service_contracts::models::{
             CatalogModelState, InstalledModelPackages as _, ModelDownloads as _,
             ModelInstallationOwnership, StartModelDownloadRequest,
@@ -2631,6 +2648,26 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(fetched.is_empty(), "no file bytes are downloaded: {fetched:?}");
         assert_eq!(fs::read(snapshot.join("Model-Q4_K_M.gguf")).unwrap(), bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let identity = |path: PathBuf| {
+                let metadata = fs::metadata(path).unwrap();
+                (metadata.dev(), metadata.ino())
+            };
+            let installed = fixture
+                .store
+                .join("hub")
+                .join("models--owner--Model-GGUF")
+                .join("snapshots")
+                .join("a".repeat(40))
+                .join("Model-Q4_K_M.gguf");
+            assert_eq!(
+                identity(installed),
+                identity(snapshot.join("Model-Q4_K_M.gguf")),
+                "Magnitude's blob is the found file itself; its bytes are not written again"
+            );
+        }
         // The copy holds the installed catalog model's content, so it is that model's and isn't
         // listed apart; its ID stays hidden, so removing Magnitude's copy hides it again.
         let listed = fixture.local.refresh_local().await.unwrap();
@@ -3330,6 +3367,136 @@ mod tests {
         assert!(pruned.freed_bytes > 0);
         assert!(!snapshot.join("Model-DFlash-Q8_0.gguf").exists());
         assert!(folder.join("target.gguf").exists(), "the model's own files are never touched");
+    }
+
+    /// Removing a catalog model deletes its target and keeps its drafter while a found model uses
+    /// it; once nothing does, the removal takes the drafter too.
+    #[tokio::test]
+    async fn removing_a_catalog_model_keeps_a_drafter_another_model_uses() {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+        let fixture = Fixture::new().await;
+        publish_managed(
+            &fixture.store,
+            "owner/Model-GGUF",
+            &"a".repeat(40),
+            &[("Model-Q4_K_M.gguf", model_bytes("catalog target"))],
+        );
+        publish_managed(
+            &fixture.store,
+            "owner/Model-MTP-GGUF",
+            &"b".repeat(40),
+            &[("Model-MTP.gguf", drafter_bytes("catalog drafter"))],
+        );
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        let packages = fixture.inventory().list_installed().await.unwrap().packages;
+        let package = |repository: &str| {
+            packages
+                .iter()
+                .map(|entry| entry.package.clone())
+                .find(|package| matches!(
+                    &package.source,
+                    magnitude_service_contracts::models::ModelPackageSource::HuggingFace { repository: source, .. }
+                        if source == repository
+                ))
+                .unwrap()
+        };
+        let (target, draft) = (package("owner/Model-GGUF"), package("owner/Model-MTP-GGUF"));
+        let mut definition = catalog_definition(target.clone());
+        definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+            target: target.clone(),
+            draft_source: SpeculativeDraftSource::Separate {
+                draft: draft.clone(),
+            },
+            method: SpeculativeMethod::Mtp,
+        };
+        let catalog_model_id = catalog_id(&definition);
+        let fixture = fixture.restart(vec![definition]).await;
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("found.gguf"), "found");
+        let using = LocalModelsConfiguration {
+            roots: vec![root(ModelRootKind::Folder, &folder)],
+            drafters: vec![DrafterAttachment {
+                model_id: local_id(&folder.join("found.gguf")),
+                drafter: DrafterChoice::Reference {
+                    reference: DrafterReference::Catalog {
+                        model_id: catalog_model_id.clone(),
+                    },
+                    method: SpeculativeMethod::Mtp,
+                },
+            }],
+            ..LocalModelsConfiguration::default()
+        };
+        fixture.apply(using.clone()).await;
+
+        let plan = fixture.resolver.catalog_removal_plan(&catalog_model_id).unwrap();
+        assert_eq!(plan.package_ids, [target.id.clone()]);
+
+        fixture
+            .apply(LocalModelsConfiguration {
+                drafters: Vec::new(),
+                ..using
+            })
+            .await;
+        let plan = fixture.resolver.catalog_removal_plan(&catalog_model_id).unwrap();
+        assert_eq!(
+            plan.package_ids.iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([&target.id, &draft.id])
+        );
+    }
+
+    /// After a restart mid-download, the drafter that finished before the target is kept for the
+    /// target still arriving, so the resumed download completes the whole model.
+    #[tokio::test]
+    async fn the_drafter_of_an_added_model_still_downloading_is_not_pruned() {
+        let fixture = Fixture::new().await;
+        let drafter_commit = "e".repeat(40);
+        let snapshot = publish_managed(
+            &fixture.store,
+            "magnitudedev/Model-DFlash-GGUF",
+            &drafter_commit,
+            &[("Model-DFlash-Q8_0.gguf", drafter_bytes("drafter"))],
+        );
+        let id: ModelId = "hf:owner/Pending-GGUF/Pending-Q4_K_M.gguf".parse().unwrap();
+        let configuration = LocalModelsConfiguration {
+            declarations: vec![CustomModelDeclaration {
+                model_id: id.clone(),
+                origin: CustomModelDeclarationOrigin::Added {
+                    repository: HuggingFaceRepositoryId::new("owner/Pending-GGUF").unwrap(),
+                    commit: "c".repeat(40),
+                },
+                target: vec!["Pending-Q4_K_M.gguf".to_owned()],
+                projector: None,
+            }],
+            drafters: vec![DrafterAttachment {
+                model_id: id.clone(),
+                drafter: DrafterChoice::Reference {
+                    reference: DrafterReference::HuggingFace {
+                        repository: HuggingFaceRepositoryId::new("magnitudedev/Model-DFlash-GGUF")
+                            .unwrap(),
+                        commit: drafter_commit,
+                        path: "Model-DFlash-Q8_0.gguf".to_owned(),
+                    },
+                    method: SpeculativeMethod::DFlash,
+                },
+            }],
+            ..LocalModelsConfiguration::default()
+        };
+        let pending = fixture.apply(configuration.clone()).await;
+        assert_eq!(pending.models[0].state, CustomModelState::NotInstalled);
+
+        let kept = fixture.local.prune_drafters().await.unwrap();
+        assert!(kept.removed.is_empty(), "the pending model's drafter is in use");
+        assert!(snapshot.join("Model-DFlash-Q8_0.gguf").exists());
+
+        fixture
+            .apply(LocalModelsConfiguration {
+                declarations: Vec::new(),
+                drafters: Vec::new(),
+                ..configuration
+            })
+            .await;
+        let pruned = fixture.local.prune_drafters().await.unwrap();
+        assert_eq!(pruned.removed.len(), 1, "once the model is removed its drafter goes too");
     }
 
     #[tokio::test]

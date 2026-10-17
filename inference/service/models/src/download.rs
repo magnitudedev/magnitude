@@ -1152,9 +1152,10 @@ async fn download_component_once(
     Ok(())
 }
 
-/// A component copied from a file already on this computer with the same content (the exact
-/// file in a Hugging Face cache) instead of fetched: cloned where the file system can, then
-/// verified like a download before it becomes the blob.
+/// A component taken from a file already on this computer with the same content (the exact file
+/// in a Hugging Face cache) instead of fetched, verified like a download before it becomes the
+/// blob. The blob is a hard link to that file where the file system allows one, so the bytes are
+/// on disk once and nothing is written; otherwise it is a copy, cloned where the file system can.
 async fn copy_local_component(
     source: &Path,
     component: &ModelComponent,
@@ -1162,7 +1163,6 @@ async fn copy_local_component(
     progress: &mut impl FnMut(u64, DownloadStage),
     control: &TransferControl,
 ) -> Result<(), DownloadError> {
-    use tokio::io::AsyncReadExt as _;
     if !matches!(component.content, ContentIdentity::Sha256 { .. }) {
         return Err(DownloadError {
             kind: DownloadErrorKind::Integrity,
@@ -1173,6 +1173,25 @@ async fn copy_local_component(
     }
     discard_component_files(paths).await?;
     progress(0, DownloadStage::Verifying);
+    // The link is made at the blob path, never at the partial path a later download resumes
+    // into, so nothing Magnitude writes can reach the other file through it. It names the file
+    // itself: a Hugging Face snapshot entry is a symbolic link, which `link` would not follow.
+    let linked = match tokio::fs::canonicalize(source).await {
+        Ok(file) => tokio::fs::hard_link(&file, &paths.blob).await.is_ok(),
+        Err(_) => false,
+    };
+    if linked {
+        let result = async {
+            let integrity = verified_integrity(&paths.blob, component, progress, control).await?;
+            atomic_json(&paths.checkpoint, &integrity.record(component)).await?;
+            sync_parent(&paths.blob).await
+        }
+        .await;
+        if result.is_err() {
+            discard_component_files(paths).await?;
+        }
+        return result;
+    }
     let copied = tokio::fs::copy(source, &paths.partial).await;
     let result = async {
         if copied.map_err(download_io)? != component.size_bytes {
@@ -1183,21 +1202,7 @@ async fn copy_local_component(
                 resumable: false,
             });
         }
-        let mut file = tokio::fs::File::open(&paths.partial).await.map_err(download_io)?;
-        let mut integrity = DownloadIntegrity::empty(component);
-        let mut buffer = vec![0_u8; 8 * 1024 * 1024];
-        loop {
-            if control.is_cancelled() {
-                return Err(cancelled_error());
-            }
-            let read = file.read(&mut buffer).await.map_err(download_io)?;
-            if read == 0 {
-                break;
-            }
-            integrity.update(&buffer[..read])?;
-            progress(integrity.bytes, DownloadStage::Verifying);
-        }
-        integrity.verify(component)?;
+        let integrity = verified_integrity(&paths.partial, component, progress, control).await?;
         atomic_json(&paths.checkpoint, &integrity.record(component)).await?;
         publish_verified_blob(paths).await
     }
@@ -1206,6 +1211,32 @@ async fn copy_local_component(
         discard_component_files(paths).await?;
     }
     result
+}
+
+/// Reads `path` in full and checks it is exactly `component`'s content.
+async fn verified_integrity(
+    path: &Path,
+    component: &ModelComponent,
+    progress: &mut impl FnMut(u64, DownloadStage),
+    control: &TransferControl,
+) -> Result<DownloadIntegrity, DownloadError> {
+    use tokio::io::AsyncReadExt as _;
+    let mut file = tokio::fs::File::open(path).await.map_err(download_io)?;
+    let mut integrity = DownloadIntegrity::empty(component);
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    loop {
+        if control.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        let read = file.read(&mut buffer).await.map_err(download_io)?;
+        if read == 0 {
+            break;
+        }
+        integrity.update(&buffer[..read])?;
+        progress(integrity.bytes, DownloadStage::Verifying);
+    }
+    integrity.verify(component)?;
+    Ok(integrity)
 }
 
 async fn recover_partial(
@@ -2854,8 +2885,10 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let repo = source_repository(&endpoint, directory.path());
         let control = TransferControl::new(Duration::from_secs(60));
-        let found = directory.path().join("found.gguf");
+        let found = directory.path().join("found-blob");
         tokio::fs::write(&found, &contents).await.expect("found file");
+        let snapshot_entry = directory.path().join("found.gguf");
+        std::os::unix::fs::symlink(&found, &snapshot_entry).expect("snapshot entry");
         let blobs = directory
             .path()
             .join("hub")
@@ -2946,6 +2979,57 @@ mod tests {
         let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
         assert_eq!(tokio::fs::read(&paths.blob).await.expect("blob"), contents);
         assert_eq!(ranges.lock().expect("ranges").len(), 1);
+        assert_eq!(
+            tokio::fs::read(&changed).await.expect("changed file"),
+            vec![8_u8; 64 * 1024],
+            "the other file is never written"
+        );
+    }
+
+    /// An exact copy elsewhere on the same file system becomes the blob without writing its bytes
+    /// again: the blob is the same file, and nothing is fetched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_exact_local_copy_on_the_same_file_system_is_linked_not_copied() {
+        use std::os::unix::fs::MetadataExt as _;
+        let contents = vec![5_u8; 64 * 1024];
+        let component = model_component(&contents);
+        let (endpoint, ranges) = serve_source(contents.clone(), usize::MAX, 0);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let control = TransferControl::new(Duration::from_secs(60));
+        let found = directory.path().join("found-blob");
+        tokio::fs::write(&found, &contents).await.expect("found file");
+        let snapshot_entry = directory.path().join("found.gguf");
+        std::os::unix::fs::symlink(&found, &snapshot_entry).expect("snapshot entry");
+        let blobs = directory
+            .path()
+            .join("hub")
+            .join(hf_repo_dir(&repo.repo_path()))
+            .join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.expect("blobs");
+
+        download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            Some(&snapshot_entry),
+            |_, _| {},
+            &control,
+        )
+        .await
+        .expect("component from the local copy");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        assert!(std::fs::symlink_metadata(&paths.blob).expect("blob").is_file());
+        let blob = std::fs::metadata(&paths.blob).expect("blob");
+        let source = std::fs::metadata(&found).expect("found file");
+        assert_eq!((blob.dev(), blob.ino()), (source.dev(), source.ino()));
+        assert!(ranges.lock().expect("ranges").is_empty(), "nothing is fetched");
+        assert!(
+            recover_completed_blob(&paths, &component).await.expect("recovery"),
+            "the linked blob is a complete, verified blob"
+        );
     }
 
     #[tokio::test]

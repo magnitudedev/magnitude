@@ -118,6 +118,17 @@ impl CandidateFileRole {
         {
             return Self::Drafter { architecture };
         }
+        // A file its tensors show to be a drafter, whatever architecture it declares: an MTP head
+        // extracted from its model under the model's own architecture (a Nemotron-H `mtp-*.gguf`
+        // keeps only its prediction block, the embedding and the head), or a drafter kind the
+        // engine doesn't bind. It is offered as a drafter with the engine's verdict, never as a
+        // version of the model.
+        if matches!(
+            crate::gguf::role(directory, Some(&architecture)),
+            crate::gguf::GgufRole::Drafter { .. }
+        ) {
+            return Self::Drafter { architecture };
+        }
         Self::Target {
             architecture: Some(architecture),
         }
@@ -589,6 +600,67 @@ mod tests {
             ),
             CandidateFileRole::Target {
                 architecture: Some("qwen35".to_owned())
+            }
+        );
+    }
+
+    /// bartowski's Nemotron-H `mtp-*.gguf` keeps the model's architecture and metadata (its
+    /// `nextn_predict_layers` too) but only the trailing prediction block (`blk.52`, a full layer
+    /// beside its `nextn.*` combine and head norm), the embedding and the head. The full model
+    /// declares the same metadata and holds every block.
+    #[test]
+    fn a_nemotron_h_mtp_file_is_a_drafter_and_its_model_a_target() {
+        use crate::test_gguf::{Meta, gguf_bytes};
+        let architectures = RecognizedArchitectures::new(["nemotron_h_moe"], ["dflash"]);
+        let metadata = [
+            ("general.architecture", Meta::Str("nemotron_h_moe")),
+            ("general.type", Meta::Str("model")),
+            ("nemotron_h_moe.block_count", Meta::U32(53)),
+            ("nemotron_h_moe.nextn_predict_layers", Meta::U32(1)),
+        ];
+        let head_block = [
+            "blk.52.attn_k.weight",
+            "blk.52.attn_norm.weight",
+            "blk.52.attn_output.weight",
+            "blk.52.attn_q.weight",
+            "blk.52.attn_v.weight",
+            "blk.52.exp_probs_b.bias",
+            "blk.52.ffn_down_exps.weight",
+            "blk.52.ffn_down_shexp.weight",
+            "blk.52.ffn_gate_inp.weight",
+            "blk.52.ffn_up_exps.weight",
+            "blk.52.ffn_up_shexp.weight",
+            "blk.52.nextn.eh_proj.weight",
+            "blk.52.nextn.enorm.weight",
+            "blk.52.nextn.hnorm.weight",
+            "blk.52.nextn.shared_head_norm.weight",
+            "blk.52.post_attention_norm.weight",
+        ];
+        let mtp = ["output.weight", "output_norm.weight", "token_embd.weight"]
+            .into_iter()
+            .chain(head_block)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            classify_header(&gguf_bytes(&metadata, &mtp), &architectures).unwrap().role,
+            CandidateFileRole::Drafter {
+                architecture: "nemotron_h_moe".to_owned()
+            }
+        );
+        let model = [
+            "output.weight",
+            "output_norm.weight",
+            "token_embd.weight",
+            "blk.0.ssm_in.weight",
+            "blk.1.ffn_up_exps.weight",
+            "blk.5.attn_q.weight",
+        ]
+        .into_iter()
+        .chain(head_block)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            classify_header(&gguf_bytes(&metadata, &model), &architectures).unwrap().role,
+            CandidateFileRole::Target {
+                architecture: Some("nemotron_h_moe".to_owned())
             }
         );
     }

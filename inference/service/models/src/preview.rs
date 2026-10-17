@@ -1749,7 +1749,7 @@ fn classification_evidence(
     digest: &str,
     architectures: &crate::candidate_files::RecognizedArchitectures,
 ) -> String {
-    format!("candidate-classification-v2:{digest}:{}", architectures.key())
+    format!("candidate-classification-v3:{digest}:{}", architectures.key())
 }
 
 fn remote_header_evidence(endpoint: &str, repository: &str, commit: &str, path: &Path) -> String {

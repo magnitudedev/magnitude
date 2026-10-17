@@ -393,8 +393,17 @@ const sourceUrls = (modelId: ModelId): readonly string[] => {
 
 const fileStem = (path: string) => (path.split(/[\\/]/).at(-1) ?? path).replace(/\.gguf$/i, "")
 
-const catalogUpdateAvailable = (catalog: readonly CatalogModelSource[], reference: DrafterReference): boolean =>
-  reference._tag === "Catalog" && catalog.some(({ id, source }) => id === reference.modelId
+/**
+ * ICN resolves a catalog drafter to that catalog model's current drafter package, so one that is
+ * present is current: the catalog model's own update (its target or projector, say) is not the
+ * drafter's. A catalog drafter that isn't here while its catalog model has an update is one.
+ */
+const catalogDrafterUpdateAvailable = (
+  catalog: readonly CatalogModelSource[],
+  reference: DrafterReference,
+  present: boolean,
+): boolean =>
+  reference._tag === "Catalog" && !present && catalog.some(({ id, source }) => id === reference.modelId
     && source.localState._tag === "Installed" && source.localState.updateState._tag === "Available")
 
 export interface CustomModelInputs {
@@ -458,7 +467,7 @@ export const attachedDrafter = (inputs: CustomModelInputs): Option.Option<Attach
       sizeBytes: Option.match(recommended, { onNone: () => 0, onSome: ({ sizeBytes }) => sizeBytes }),
       verdict,
       availability,
-      updateAvailable: catalogUpdateAvailable(catalog, reference),
+      updateAvailable: catalogDrafterUpdateAvailable(catalog, reference, native.state._tag === "Ready"),
     })
   }))
 }

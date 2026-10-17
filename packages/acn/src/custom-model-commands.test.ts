@@ -604,6 +604,14 @@ describe("drafter and download recovery", () => {
     expect(recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: addedId }])
   })
 
+  it("resumes a drafter download a restart interrupted when the service starts", async () => {
+    const { run, recorded } = harness({
+      customModels: [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: drafterReference, state: { _tag: "NotInstalled" } } })],
+    })
+    await run(() => Effect.sleep("50 millis"))
+    expect(recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: foundId }])
+  })
+
   it("lists an added model's drafters from its declared repository file while it downloads", async () => {
     const { run, recorded } = harness({
       customModels: [nativeCustomModel({
@@ -643,12 +651,16 @@ describe("drafter updates", () => {
   }] as unknown as readonly CatalogModelSource[]
 
   it("updates a catalog drafter with a newer revision, and is current otherwise", async () => {
-    const customModels = [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: catalogDrafter, state: { _tag: "Ready" } } })]
-    const updating = harness({ customModels, catalog: catalog("Available") })
+    const withDrafter = (state: string) =>
+      [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: catalogDrafter, state: { _tag: state } } })]
+    const updating = harness({ customModels: withDrafter("NotInstalled"), catalog: catalog("Available") })
     expect((await updating.run((commands) => commands.sync(foundId))).outcome).toBe("Updating")
-    const current = harness({ customModels, catalog: catalog("Current") })
+    const current = harness({ customModels: withDrafter("Ready"), catalog: catalog("Current") })
     expect((await current.run((commands) => commands.sync(foundId))).outcome).toBe("AlreadyCurrent")
     expect(current.recorded.started).toEqual([])
+    // Its catalog model's update is of other parts; the current drafter is already here.
+    const catalogOnly = harness({ customModels: withDrafter("Ready"), catalog: catalog("Available") })
+    expect((await catalogOnly.run((commands) => commands.sync(foundId))).outcome).toBe("AlreadyCurrent")
   })
 })
 

@@ -519,8 +519,15 @@ file in a Hugging Face cache, it keeps serving the catalog model from where it i
 copy is identified by the `hf:` ID it has as a found model, so hiding it ends its attribution to
 the catalog model, even when it is exactly a catalog package the catalog remembers: no catalog model
 counts it as installed, and it is listed as a hidden found model. Hiding changes only what is
-shown: installing the catalog model copies the hidden copy's verified bytes into Magnitude's store
-rather than downloading them, and leaves the copy's files where they are.
+shown: installing the catalog model takes the hidden copy's verified bytes rather than downloading
+them, and leaves the copy's files where they are.
+
+A package file whose exact bytes are already in an external location (a found or hidden exact copy,
+as when updating a catalog model whose target is in a Hugging Face cache) is never downloaded and
+never written again: Magnitude's blob is a hard link to that file, verified in full like a download,
+so the bytes are on disk once and only files present nowhere else are fetched. Magnitude only ever
+deletes its own link. Where the file system cannot link (another volume, or a file the user may not
+link), the blob is a copy, cloned where the file system can.
 
 Removing an added custom model deletes its Magnitude-owned files under the same rules; any of its
 files that are also present in an external location stay there, and the model remains as found.
@@ -529,6 +536,16 @@ hidden, never deleted; so is a catalog model whose files are all in external loc
 found copy. After a model is removed or stops using its drafter, and after catalog removal, the
 Magnitude-owned drafter packages that no installed catalog model and no custom model uses are
 removed; while any custom model's automatic drafter is not yet worked out, catalog drafters are kept.
+Catalog removal itself keeps the catalog model's drafter while a custom model uses it (or may, while
+an automatic drafter is being worked out) and removes the target; pruning removes the drafter once no
+model uses it. An added model whose target is still downloading uses the drafter it downloads with
+it, so a drafter that finished first is never pruned before its target lands.
+
+Removing a catalog model that is not installed changes nothing: it is reported as not installed,
+never as a failed removal, and a new installation supersedes any earlier removal failure. A removal
+takes one exclusive residency admission covering every package it deletes (target and drafter
+together); it waits behind a load, a release or another removal for at most a minute, then is refused
+with a retryable error, so a removal request never hangs.
 
 Deleting artifacts does not delete slot selection, favorites, or recency. Those are user intent and
 may remain unresolved until the exact catalog configuration and required files are available again.

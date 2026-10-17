@@ -279,6 +279,11 @@ const withoutKey = <K extends string, V>(record: Readonly<Record<K, V>>, key: K)
   return next
 }
 
+/** Just after a restart no download exists, so a missing part of a model was interrupted by it. */
+export const interruptedByRestart = (model: CustomLocalModel): boolean =>
+  (model.origin._tag === "Added" && model.acquisitionState._tag === "NotInstalled")
+  || Option.exists(model.drafter, ({ availability }) => availability._tag === "DownloadFailed")
+
 /** The drafter choice persisted for a resolved candidate; nothing binding keeps Auto for ICN to resolve. */
 const persistedChoice = (requested: DrafterChoice, chosen: Option.Option<DrafterCandidate>): DrafterChoice =>
   requested._tag === "None"
@@ -905,7 +910,8 @@ export const CustomModelCommandsLive: Layer.Layer<
     ),
   })
 
-  // Downloads do not outlive the service; an added model interrupted by a restart resumes, keeping its bytes.
+  // Downloads do not outlive the service; every part a restart interrupted resumes, keeping its bytes:
+  // an added model's target (with its drafter), and any model's chosen drafter that hasn't arrived.
   // A push first relearns the drafter methods its bundle needs.
   yield* Effect.gen(function* () {
     yield* reconciler.push.pipe(Effect.ignore)
@@ -913,8 +919,8 @@ export const CustomModelCommandsLive: Layer.Layer<
       Effect.filterOrFail((current) => current.preparation.discovery.complete, () => "discovering" as const),
       Effect.retry(Schedule.spaced("1 second")),
     )
-    const interrupted = state.models.filter((model) => model._tag === "Custom" && model.origin._tag === "Added"
-      && model.acquisitionState._tag === "NotInstalled")
+    const interrupted = state.models.filter((model): model is CustomLocalModel => model._tag === "Custom")
+      .filter(interruptedByRestart)
     yield* Effect.forEach(interrupted, (model) => commands.sync(model.modelId as CustomFormModelId).pipe(
       Effect.catchAll((error) => Effect.logWarning(`Unable to resume the download of ${model.modelId}: ${error.message}`)),
     ), { discard: true })

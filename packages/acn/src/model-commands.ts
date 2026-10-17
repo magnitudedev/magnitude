@@ -101,6 +101,7 @@ export const ModelCommandsLive: Layer.Layer<
     ? catalogCommand(modelId)
     : customCommand(Schema.decodeSync(CustomFormModelIdSchema)(modelId))))
   const catalogSync = (modelId: CatalogFormModelId) => Effect.gen(function* () {
+    yield* removals.forget(modelId)
     const installed = (yield* catalog.get).state.models
       .some((model) => model.id === modelId && model.localState._tag === "Installed")
     const admission = yield* client.catalog.installCatalogModel({ path: { model_id: modelId } }).pipe(

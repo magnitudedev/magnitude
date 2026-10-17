@@ -17,6 +17,8 @@ export interface LocalModelRemovalsApi {
   readonly state: Effect.Effect<ReadonlyMap<CatalogFormModelId, LocalModelRemovalState>>
   readonly changes: Stream.Stream<void>
   readonly remove: (modelId: CatalogFormModelId) => Effect.Effect<{}, LocalInferenceError>
+  /** A new installation supersedes an earlier removal's failure. */
+  readonly forget: (modelId: CatalogFormModelId) => Effect.Effect<void>
 }
 
 export class LocalModelRemovals extends Context.Tag("LocalModelRemovals")<
@@ -39,6 +41,15 @@ export const catalogRemovalOutcome = (modelId: CatalogFormModelId) => (
       retryable: false,
     }))
 
+const CATALOG_MODEL_NOT_INSTALLED = "catalog_model_not_installed"
+
+/** Removing a model that isn't installed changes nothing, so it is never a failed removal. */
+export const notInstalledRemoval = (modelId: CatalogFormModelId) => new LocalModelMutationFailed({
+  code: "model_not_installed",
+  message: `${modelId} is not installed on this computer, so there is nothing to remove.`,
+  retryable: false,
+})
+
 const updated = (
   current: ReadonlyMap<CatalogFormModelId, LocalModelRemovalState>,
   update: (next: Map<CatalogFormModelId, LocalModelRemovalState>) => void,
@@ -58,6 +69,10 @@ export const LocalModelRemovalsLive: Layer.Layer<
     const catalog = yield* IcnCatalog
     const localModels = yield* IcnLocalModels
     const removals = yield* SubscriptionRef.make<ReadonlyMap<CatalogFormModelId, LocalModelRemovalState>>(new Map())
+    const clear = (modelId: CatalogFormModelId) =>
+      SubscriptionRef.update(removals, (current) => current.has(modelId)
+        ? updated(current, (next) => next.delete(modelId))
+        : current)
     const remove = (modelId: CatalogFormModelId) => Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
       const admitted = yield* SubscriptionRef.modify(removals, (current) => current.get(modelId)?._tag === "Removing"
         ? [false, current]
@@ -69,25 +84,28 @@ export const LocalModelRemovalsLive: Layer.Layer<
           retryable: true,
         })
       }
-      const clear = SubscriptionRef.update(removals, (current) => updated(current, (next) => next.delete(modelId)))
       yield* restore(client.catalog.removeCatalogModelInstallation({ path: { model_id: modelId } }).pipe(
         Effect.mapError((cause) => icnCommandFailure("remove", cause)),
+        Effect.mapError((failure) => failure.code === CATALOG_MODEL_NOT_INSTALLED ? notInstalledRemoval(modelId) : failure),
         Effect.flatMap(catalogRemovalOutcome(modelId)),
         Effect.tap(() => catalog.refresh.pipe(Effect.ignore)),
         // The catalog model's drafter stays while another model uses it; otherwise it goes too.
         Effect.tap(() => localModels.pruneDrafters.pipe(Effect.ignore)),
-        Effect.tapError((failure) => SubscriptionRef.update(removals, (current) => updated(current, (next) => next.set(modelId, {
-          _tag: "RemoveFailed",
-          failure,
-        })))),
-        Effect.onInterrupt(() => clear),
+        Effect.tapError((failure) => failure.code === "model_not_installed"
+          ? clear(modelId)
+          : SubscriptionRef.update(removals, (current) => updated(current, (next) => next.set(modelId, {
+              _tag: "RemoveFailed",
+              failure,
+            })))),
+        Effect.onInterrupt(() => clear(modelId)),
       ))
-      yield* clear
+      yield* clear(modelId)
       return {}
     }))
     return LocalModelRemovals.of({
       state: SubscriptionRef.get(removals),
       changes: removals.changes.pipe(Stream.drop(1), Stream.map(() => undefined)),
       remove,
+      forget: clear,
     })
   }))
