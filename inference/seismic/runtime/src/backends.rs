@@ -298,6 +298,22 @@ impl AdmittedWorkflowKind {
     }
 }
 
+/// Discovery must enforce the same minimum instruction set as native
+/// specialization. Otherwise assessment promises a CPU that cannot form even
+/// the first import kernel (for example QEMU's default virtual CPU).
+fn cpu_availability(tier: Option<seismic_native_cpu::Tier>) -> Availability {
+    match tier {
+        Some(_) => Availability::Available,
+        None => Availability::Unavailable {
+            reason: format!(
+                "CPU execution requires {} ({}) or higher; expose these CPU features to the virtual machine",
+                seismic_native_cpu::Tier::all()[0].name(),
+                seismic_native_cpu::Tier::all()[0].features(),
+            ),
+        },
+    }
+}
+
 /// Enumerates every enabled backend. Only cheap native queries run here:
 /// no context, queue, stream, worker pool or profile is created, with one
 /// exception that keeps discovery the authority on availability: a Vulkan
@@ -314,7 +330,7 @@ pub(crate) fn discover() -> BackendDiscovery {
         name: format!("Host CPU ({})", std::env::consts::ARCH),
         kind: DeviceKind::Cpu,
         backend: BackendName::Cpu,
-        availability: Availability::Available,
+        availability: cpu_availability(seismic_native_cpu::Tier::detected()),
         memory: DiscoveredMemory::Host {
             max_allocation_bytes: seismic_cpu::MAX_ALLOCATION_BYTES,
         },
@@ -1251,8 +1267,20 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::granted_bytes;
+    use super::{cpu_availability, granted_bytes};
+    use crate::devices::Availability;
     use seismic_lang::registry::BackendName;
+
+    #[test]
+    fn cpu_discovery_enforces_the_native_instruction_set_floor() {
+        let Availability::Unavailable { reason } = cpu_availability(None) else {
+            panic!("a CPU with no native instruction-set tier was admitted");
+        };
+        assert!(reason.contains(seismic_native_cpu::Tier::all()[0].features()));
+        for tier in seismic_native_cpu::Tier::all() {
+            assert_eq!(cpu_availability(Some(*tier)), Availability::Available);
+        }
+    }
 
     /// The first successful measurement stands for the process; a failure
     /// is measured again.

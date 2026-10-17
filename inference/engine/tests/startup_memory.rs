@@ -144,6 +144,34 @@ fn qualification_deficit_is_retryable_and_recovers() {
 }
 
 #[test]
+#[ignore = "run under an explicitly selected QEMU CPU with MAGNITUDE_TEST_CPU_AVAILABLE"]
+fn virtual_cpu_availability_is_enforced_before_open() {
+    let expected = std::env::var("MAGNITUDE_TEST_CPU_AVAILABLE").unwrap() == "true";
+    let catalog = DeviceCatalog::discover().unwrap();
+    let topology = catalog.topology();
+    let cpu = topology
+        .devices()
+        .iter()
+        .find(|device| device.backend == BackendName::Cpu)
+        .unwrap();
+    eprintln!("virtual CPU: {:?}", cpu.availability);
+    assert_eq!(
+        matches!(cpu.availability, seismic::Availability::Available),
+        expected
+    );
+    let opened = catalog.open_backend(BackendName::Cpu);
+    if expected {
+        assert!(opened.is_ok());
+    } else {
+        let error = opened.err().expect("unsupported CPU opened");
+        assert!(
+            error.to_string().contains("CPU execution requires"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires a real model; reports a load under the enclosing VM or cgroup"]
 fn probe_model_load() {
     let resolved = model();
