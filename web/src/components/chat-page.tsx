@@ -177,13 +177,14 @@ export function ChatPage() {
       const decoder = new TextDecoder()
       let buffer = ""
       let done = false
+      let streamFinished = false
       const append = (delta: string) => {
         const last = conversation!.messages[conversation!.messages.length - 1]
         last.content += delta
         conversation!.updatedAt = Date.now()
         updateConversation(conversation!)
       }
-      while (!done) {
+      while (!done && !streamFinished && !controller.signal.aborted) {
         const part = await reader.read()
         done = part.done
         buffer += decoder.decode(part.value, { stream: !done })
@@ -191,14 +192,19 @@ export function ChatPage() {
         const blocks = buffer.split("\n\n")
         buffer = blocks.pop() ?? ""
         for (const block of blocks) {
-          consumeChatEvent(block, append)
+          if (consumeChatEvent(block, append)) {
+            streamFinished = true
+            break
+          }
           if (controller.signal.aborted) break
         }
       }
-      if (buffer.trim()) consumeChatEvent(buffer, append)
+      if (!streamFinished && buffer.trim()) streamFinished = consumeChatEvent(buffer, append)
+      // Stop reading immediately on [DONE] or cancellation instead of relying on
+      // the upstream server to close the streaming response promptly.
       await reader.cancel().catch(() => undefined)
     } catch (cause) {
-      if (!(cause instanceof DOMException && cause.name === "AbortError")) {
+      if (!(cause instanceof Error && cause.name === "AbortError")) {
         const message = cause instanceof Error ? cause.message : String(cause)
         setError(`Could not complete the request: ${message}`)
       }
