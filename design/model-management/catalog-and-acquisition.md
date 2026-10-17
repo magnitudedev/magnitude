@@ -563,8 +563,10 @@ counts it as installed, and it is listed as a hidden found model. Hiding changes
 shown: installing the catalog model takes the hidden copy's verified bytes rather than downloading
 them, and leaves the copy's files where they are.
 
-A package file whose exact bytes are already in an external location (a found or hidden exact copy,
-as when updating a catalog model whose target is in a Hugging Face cache) is never downloaded:
+A catalog target whose exact weights are found and not hidden is never copied: it is acquired as its
+projector package and served composed of the found weights and that package (see [intrinsic target
+mapping](./intrinsic-target-mapping.md)). Any other package file whose exact bytes are already in an
+external location (a hidden exact copy, say) is never downloaded:
 Magnitude's blob is its own file made from that one and verified in full like a download, so only
 files present nowhere else are fetched. The blob is never a hard link or any other link to the
 external file, which is only ever read. Where the file system supports copy-on-write clones (APFS,

@@ -7,15 +7,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hf_hub::HFClient;
 use magnitude_service_contracts::models::{
-    CatalogPackageRole, CustomModelDeclarationOrigin, InstalledModelPackage,
-    InstalledModelPackagesResponse, LocalModelsConfiguration, ModelFileRelationship, ModelFileRole,
+    CatalogPackageRole, CustomModelDeclarationOrigin, InstalledCatalogAttribution,
+    InstalledModelPackage, InstalledModelPackagesResponse, PackageValidation, LocalModelsConfiguration, ModelFileRelationship, ModelFileRole,
     ModelPackage, ModelPackageId, ModelPackageInstallationOrigin, ModelPackageSource, ModelRoot,
     ModelRootKind, RecommendableModel, ServableModelBundle, SpeculativeDraftSource,
 };
 use magnitude_service_contracts::{
-    ComponentRole, ContentIdentity, HubCacheOwner, Integrity, InventoryEntryId, InventoryError,
-    InventoryModel, InventoryProperties, LocalDeclaration, ModelAvailability, ModelComponent,
-    ModelLocation, ModelOperation, ModelSource,
+    ComponentRelationship, ComponentRole, ContentIdentity, HubCacheOwner, Integrity,
+    InventoryEntryId, InventoryError, InventoryModel, InventoryProperties, LocalDeclaration,
+    ModelAvailability, ModelComponent, ModelLocation, ModelOperation, ModelSource,
+    ResolvedComponent, ResolvedModel,
 };
 use magnitude_service_utils::file_cache::recover_map;
 use sha2::{Digest, Sha256};
@@ -173,6 +174,49 @@ pub(crate) fn catalog_packages(
         } => None,
     };
     target.chain(dependency)
+}
+
+/// A catalog target's projector as a package of its own: what Magnitude stores when the target's
+/// weights are found in another app's location, so those weights are never copied. Its one file
+/// is the target's projector file, so the target composed of the found weights and this package
+/// is exactly the catalog's target package.
+pub(crate) fn catalog_projector_package(target: &ModelPackage) -> Option<ModelPackage> {
+    let projector = target
+        .files
+        .iter()
+        .find(|file| file.role == ModelFileRole::Projector)?;
+    let files = vec![projector.clone()];
+    Some(ModelPackage {
+        id: crate::package_service::canonical_package_id(&files, &[]),
+        source: target.source.clone(),
+        files,
+        relationships: Vec::new(),
+        properties: target.properties.clone(),
+    })
+}
+
+/// Every package Magnitude's store may hold for a catalog model: its bundle's packages and its
+/// target's projector package.
+pub(crate) fn catalog_store_packages(
+    model: &RecommendableModel,
+) -> impl Iterator<Item = (ModelPackage, CatalogPackageRole)> + '_ {
+    catalog_packages(model)
+        .map(|(package, role)| (package.clone(), role))
+        .chain(
+            catalog_projector_package(catalog_target(model))
+                .map(|package| (package, CatalogPackageRole::Dependency)),
+        )
+}
+
+/// The file a store package is known by: its first weights file, or the projector of a projector
+/// package.
+pub(crate) fn package_primary_path(root: &Path, components: &[ModelComponent]) -> Option<PathBuf> {
+    primary_path(root, components).or_else(|| match components {
+        [component] if component.role == ComponentRole::Projector => {
+            Some(root.join(&component.path))
+        }
+        _ => None,
+    })
 }
 
 impl InventoryConfig {
@@ -346,12 +390,128 @@ impl ManagedModelStore {
                 InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
             })
             .map(|snapshot| {
-                snapshot.response_of(
+                let mut response = snapshot.response_of(
                     self.packages_revision.load(Ordering::Acquire),
                     self.reconciliation_complete.load(Ordering::Acquire),
                     |installed| !self.hidden_occurrence(installed.origin, &installed.package),
-                )
+                );
+                for (composed, _, _) in self.composed_catalog_targets(&snapshot) {
+                    if !response.packages.iter().any(|installed| installed.package.id == composed.package.id) {
+                        response.packages.push(composed);
+                    }
+                }
+                response
             })
+    }
+
+    /// Catalog targets composed of a found exact copy of their weights and Magnitude's projector
+    /// package (see `catalog_projector_package`): each the target's own package, installed where its
+    /// weights are, plus the records of its weights and projector. Hidden copies compose nothing.
+    pub(crate) fn composed_catalog_targets(
+        &self,
+        records: &InstalledPackageSnapshot,
+    ) -> Vec<(InstalledModelPackage, InstalledPackageRecord, InstalledPackageRecord)> {
+        self.config
+            .catalog_models
+            .iter()
+            .filter_map(|model| {
+                let target = catalog_target(model);
+                let projector = catalog_projector_package(target)?;
+                let visible = |record: &&InstalledPackageRecord| {
+                    !self.hidden_occurrence(record.installed.origin, &record.installed.package)
+                };
+                let weights = records
+                    .records
+                    .values()
+                    .filter(visible)
+                    .filter(|record| {
+                        record.installed.package.id != target.id
+                            && crate::package_service::exact_target_weights(target, &record.installed.package)
+                    })
+                    .min_by_key(|record| origin_precedence(record.installed.origin))?;
+                let stored = records.records.values().find(|record| {
+                    record.installed.package.id == projector.id
+                        && record.installed.origin == ModelPackageInstallationOrigin::Magnitude
+                })?;
+                let validation = [&weights.installed.validation, &stored.installed.validation]
+                    .into_iter()
+                    .find(|validation| !matches!(validation, PackageValidation::Valid))
+                    .cloned()
+                    .unwrap_or(PackageValidation::Valid);
+                Some((
+                    InstalledModelPackage {
+                        path: weights.installed.path.clone(),
+                        package: target.clone(),
+                        origin: weights.installed.origin,
+                        validation,
+                        catalog_attribution: InstalledCatalogAttribution::Attributed {
+                            model_id: model.model_id.clone(),
+                            variant_id: model.variant_id.clone(),
+                        },
+                    },
+                    weights.clone(),
+                    stored.clone(),
+                ))
+            })
+            .collect()
+    }
+
+    /// The composed catalog target `package_id` resolved for serving: its found weights' components
+    /// and Magnitude's projector.
+    pub(crate) fn composed_catalog_target(
+        &self,
+        package_id: &ModelPackageId,
+    ) -> Result<(ModelPackage, ResolvedModel), InventoryError> {
+        let snapshot = self
+            .installed_packages
+            .read()
+            .map_err(|_| InventoryError::Internal("installed package snapshot lock poisoned".to_owned()))?
+            .clone();
+        let (composed, weights, stored) = self
+            .composed_catalog_targets(&snapshot)
+            .into_iter()
+            .find(|(composed, _, _)| composed.package.id == *package_id)
+            .ok_or_else(|| InventoryError::NotFound(package_id.0.clone()))?;
+        let resolve = |record: &InstalledPackageRecord| {
+            crate::service::resolve_components(&self.config.root, &record.model).map_err(|error| {
+                match error {
+                    InventoryError::Io(_) => InventoryError::NotFound(package_id.0.clone()),
+                    other => other,
+                }
+            })
+        };
+        let mut components = resolve(&weights)?;
+        let weights_path = composed
+            .package
+            .files
+            .iter()
+            .filter(|file| file.role == ModelFileRole::Weights)
+            .map(|file| file.path.clone())
+            .min()
+            .ok_or_else(|| InventoryError::NotFound(package_id.0.clone()))?;
+        for projector in resolve(&stored)? {
+            let declared = stored
+                .installed
+                .package
+                .files
+                .first()
+                .map(|file| file.path.clone())
+                .unwrap_or_else(|| projector.path.clone());
+            components.push(ResolvedComponent {
+                relationship: Some(ComponentRelationship::ProjectorFor {
+                    projector: declared,
+                    model: weights_path.clone(),
+                }),
+                ..projector
+            });
+        }
+        Ok((
+            composed.package,
+            ResolvedModel {
+                model: weights.model,
+                components,
+            },
+        ))
     }
 
     #[must_use]
@@ -1324,7 +1484,7 @@ fn scan_managed(
             for package in config
                 .catalog_models
                 .iter()
-                .flat_map(catalog_packages)
+                .flat_map(catalog_store_packages)
                 .map(|(package, _)| package)
             {
                 let ModelPackageSource::HuggingFace {
@@ -1337,11 +1497,11 @@ fn scan_managed(
                 if package_repository != &repository {
                     continue;
                 }
-                let components = components_for_catalog_package(package)?;
+                let components = components_for_catalog_package(&package)?;
                 if !catalog_components_present(&snapshot, &repository_root, &components) {
                     continue;
                 }
-                let primary = match primary_path(&snapshot, &components) {
+                let primary = match package_primary_path(&snapshot, &components) {
                     Some(path) => path,
                     None => continue,
                 };

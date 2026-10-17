@@ -325,7 +325,7 @@ impl ManagedCatalogInstallations {
                 retryable: false,
             });
         }
-        if plan.externally_owned {
+        if plan.externally_owned && plan.package_ids.is_empty() {
             return Ok(CatalogInstallationRemoval::Retained {
                 reason: CatalogInstallationRetentionReason::ExternalOwnership,
             });

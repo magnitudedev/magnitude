@@ -18,7 +18,9 @@ use magnitude_service_contracts::models::{
 };
 
 use crate::catalog_installations::ManagedCatalogInstallations;
-use crate::inventory::{InstalledPackagesObserver, catalog_packages, catalog_target};
+use crate::inventory::{
+    InstalledPackagesObserver, catalog_packages, catalog_projector_package, catalog_target,
+};
 use crate::model_domains::{ModelDomainResolver, domain_changes};
 use crate::model_projection::{
     bundle_packages, effective_configuration_model, primary_model_path,
@@ -33,9 +35,10 @@ pub struct CatalogRemovalPlan {
 }
 
 /// Removal deletes Magnitude's own copies of the model's packages and never another app's files.
-/// A target with no copy of Magnitude's own is retained as externally owned; one that another
-/// catalog model shares is retained as shared. When an external copy of the target remains after
-/// Magnitude's is removed, it serves the catalog model from where it is.
+/// A target with no copy of Magnitude's own is externally owned: only Magnitude's own components
+/// of it (its projector package and drafter) are removed, and the found target stays. A target
+/// that another catalog model shares is retained as shared. When an external copy of the target
+/// remains after Magnitude's is removed, it serves the catalog model from where it is.
 fn removal_plan(
     ids: &BTreeSet<ModelPackageId>,
     target_ids: &BTreeSet<ModelPackageId>,
@@ -47,14 +50,11 @@ fn removal_plan(
         .cloned()
         .collect::<BTreeSet<_>>();
     CatalogRemovalPlan {
-        package_ids: if managed_targets.is_empty() {
-            Vec::new()
-        } else {
-            ids.intersection(managed_ids)
-                .filter(|package_id| !shared_ids.contains(*package_id))
-                .cloned()
-                .collect()
-        },
+        package_ids: ids
+            .intersection(managed_ids)
+            .filter(|package_id| !shared_ids.contains(*package_id))
+            .cloned()
+            .collect(),
         installed: !target_ids.is_empty(),
         externally_owned: managed_targets.is_empty(),
         shared: !managed_targets.is_disjoint(shared_ids),
@@ -234,6 +234,12 @@ impl ModelDomainResolver {
                     origins
                 },
             );
+        let mut occurrence_origins = occurrence_origins;
+        for (composed, weights, projector) in self.inventory.composed_catalog_targets(&records) {
+            let origins = occurrence_origins.entry(composed.package.id).or_default();
+            origins.include(weights.installed.origin);
+            origins.include(projector.installed.origin);
+        }
         Ok(CatalogModelsResponse {
             revision: installed.revision,
             reconciliation_complete: installed.reconciliation_complete,
@@ -713,12 +719,16 @@ fn catalog_resolution<'a>(
         .filter(|(package, _)| !present.contains_key(&package.id))
         .map(|(package, _)| download_bytes(package))
         .sum::<u64>();
+    let projector_package = catalog_projector_package(catalog_target(definition));
     let superseded_package_ids = affiliations
         .iter()
         .filter(|affiliation| {
             affiliation.model_id == definition.model_id
                 && affiliation.variant_id == definition.variant_id
                 && !desired_ids.contains(&affiliation.package_id)
+                && projector_package
+                    .as_ref()
+                    .is_none_or(|projector| projector.id != affiliation.package_id)
                 && present.contains_key(&affiliation.package_id)
         })
         .map(|affiliation| affiliation.package_id.clone())
@@ -742,6 +752,22 @@ fn catalog_resolution<'a>(
                         && affiliation.variant_id == definition.variant_id
                         && affiliation.package_id == entry.package.id
                 })
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    // A found copy and a projector package that a composed target holds count once, as it.
+    let installed_packages = installed_packages
+        .iter()
+        .filter(|entry| {
+            !installed_packages.iter().any(|other| {
+                other.package.id != entry.package.id
+                    && other.package.files.len() > entry.package.files.len()
+                    && entry
+                        .package
+                        .files
+                        .iter()
+                        .all(|file| other.package.files.iter().any(|held| held.id == file.id))
+            })
         })
         .copied()
         .collect::<Vec<_>>();
@@ -893,10 +919,12 @@ fn current_target_missing_components(
         file.role == ModelFileRole::Projector
             && !found.files.iter().any(|found| found.id == file.id)
     });
-    let projector = lacks_projector.then(|| CatalogMissingComponent {
-        component: CatalogComponent::Projector,
-        download_bytes: download_bytes(catalog_target),
-    });
+    let projector = catalog_projector_package(catalog_target)
+        .filter(|_| lacks_projector)
+        .map(|projector| CatalogMissingComponent {
+            component: CatalogComponent::Projector,
+            download_bytes: download_bytes(&projector),
+        });
     let drafter = catalog_draft(definition)
         .filter(|draft| !present.contains_key(&draft.id))
         .map(|draft| CatalogMissingComponent {
@@ -1390,8 +1418,8 @@ mod tests {
     }
 
     /// The Fedora round 3b sequence: the exact target in a Hugging Face cache with no drafter
-    /// anywhere, then the projector alone (which installs the catalog's target package, its weights
-    /// copied from the cache), then the drafter alone. No step is an update, and each step reports
+    /// anywhere, then the projector alone (stored as its own package, the target composed of it and
+    /// the found weights), then the drafter alone. No step is an update, and each step reports
     /// exactly what is still missing.
     #[test]
     fn a_found_exact_target_fetching_its_projector_then_its_drafter_is_never_an_update() {
@@ -1405,8 +1433,15 @@ mod tests {
             method: SpeculativeMethod::Mtp,
         });
         let external = attributed_external(found.clone(), &definition);
-        let stored_target = installed(target.clone(), ModelPackageInstallationOrigin::Magnitude);
+        // Fetching the projector stores only the projector package; the inventory then lists the
+        // catalog's target composed of the found weights and that package, where the weights are.
+        let stored_projector = installed(
+            crate::inventory::catalog_projector_package(&target).unwrap(),
+            ModelPackageInstallationOrigin::Magnitude,
+        );
+        let composed_target = attributed_external(target.clone(), &definition);
         let stored_draft = installed(draft.clone(), ModelPackageInstallationOrigin::Magnitude);
+        let affiliations = [affiliation(&stored_projector.package.id, CatalogPackageRole::Dependency)];
         let step = |entries: &[&InstalledModelPackage]| {
             let present = entries
                 .iter()
@@ -1417,7 +1452,13 @@ mod tests {
                 .flat_map(|entry| &entry.package.files)
                 .map(|file| file.id.clone())
                 .collect::<BTreeSet<_>>();
-            let resolution = catalog_resolution(&definition, &present, &[], &local_files);
+            let resolution = catalog_resolution(&definition, &present, &affiliations, &local_files);
+            let installed_bytes = resolution
+                .installed_packages
+                .iter()
+                .flat_map(|entry| &entry.package.files)
+                .map(|file| file.size_bytes)
+                .sum::<u64>();
             let CatalogMaterialState::Installed {
                 configuration: Some(configuration),
                 effective: EffectiveModel::Ready { model },
@@ -1427,6 +1468,7 @@ mod tests {
                 panic!("the catalog model is installed and ready at every step");
             };
             (
+                installed_bytes,
                 configuration.bundle,
                 model.speculative_method,
                 resolution.required_download_bytes,
@@ -1442,23 +1484,28 @@ mod tests {
             download_bytes: 900,
         };
 
-        let (bundle, method, update, missing) = step(&[&external]);
+        let (bytes, bundle, method, update, missing) = step(&[&external]);
+        assert_eq!(bytes, 3_000);
         assert_eq!(bundle, ServableModelBundle::Standalone { package: found });
         assert_eq!((method, update), (None, 0));
         assert_eq!(missing, vec![projector, drafter.clone()]);
 
-        let (bundle, method, update, missing) = step(&[&external, &stored_target]);
+        let (bytes, bundle, method, update, missing) =
+            step(&[&external, &stored_projector, &composed_target]);
+        assert_eq!(bytes, 3_000 + 600, "the found weights and the projector count once");
         assert_eq!(
             bundle,
             ServableModelBundle::Standalone {
                 package: target.clone()
             },
-            "the catalog's own target, with its projector, serves once it is here"
+            "the catalog's target, composed of the found weights and the stored projector, serves"
         );
         assert_eq!((method, update), (None, 0), "a missing drafter is not an update");
         assert_eq!(missing, vec![drafter], "only the drafter is left to fetch");
 
-        let (bundle, method, update, missing) = step(&[&external, &stored_target, &stored_draft]);
+        let (bytes, bundle, method, update, missing) =
+            step(&[&external, &stored_projector, &composed_target, &stored_draft]);
+        assert_eq!(bytes, 3_000 + 600 + 900);
         assert_eq!(bundle, definition.configuration.bundle);
         assert_eq!((method, update), (Some(SpeculativeMethod::Mtp), 0));
         assert!(missing.is_empty());

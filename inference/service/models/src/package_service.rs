@@ -25,6 +25,7 @@ use crate::PreparedPreview;
 use crate::cache::{CachedModelAssessment, ModelIndexKind};
 use crate::inventory::{
     InstalledPackageRecord, InstalledPackageSnapshot, ManagedModelStore, catalog_packages,
+    catalog_projector_package, catalog_store_packages,
     catalog_target, origin_precedence,
 };
 
@@ -476,6 +477,8 @@ fn package_validation_for(model: &InventoryModel, package: &ModelPackage) -> Pac
                 .collect::<Vec<_>>();
             match projectors.as_slice() {
                 [] => {}
+                // A projector package holds only the projector of a target found elsewhere.
+                [_] if package.files.len() == 1 => {}
                 [projector] => {
                     let related_to_weights = package.relationships.iter().any(|relationship| {
                         matches!(
@@ -1064,7 +1067,7 @@ impl ManagedModelStore {
             } = self.inspect_package_from_resolved(&resolved)?;
             let hidden = self.hidden_occurrence(installation_origin(&model.location), &package);
             for catalog_model in &self.config.catalog_models {
-                for (catalog_package, role) in catalog_packages(catalog_model) {
+                for (catalog_package, role) in catalog_store_packages(catalog_model) {
                     if !hidden && catalog_package.id == package.id {
                         self.remember_catalog_package(catalog_model, &package, role);
                     }
@@ -1135,6 +1138,37 @@ impl ManagedModelStore {
         self.installed_package_where(package_id, |_| true)
     }
 
+    /// What acquiring `package` fetches. A catalog target whose exact weights are found in another
+    /// app's location (and not hidden) is acquired as its projector package: the found weights are
+    /// never copied into Magnitude's store, and the target is served composed of the two.
+    pub(crate) fn acquisition_package(&self, package: ModelPackage) -> Result<ModelPackage, InventoryError> {
+        let Some(projector) = catalog_projector_package(&package) else {
+            return Ok(package);
+        };
+        if !self
+            .config
+            .catalog_models
+            .iter()
+            .any(|model| catalog_target(model).id == package.id)
+        {
+            return Ok(package);
+        }
+        let records = self
+            .installed_packages
+            .read()
+            .map_err(|_| InventoryError::Internal("installed package snapshot lock poisoned".to_owned()))?;
+        let installed = records
+            .records
+            .values()
+            .any(|record| record.installed.package.id == package.id);
+        let found = records.records.values().any(|record| {
+            record.installed.origin != ModelPackageInstallationOrigin::Magnitude
+                && !self.hidden_occurrence(record.installed.origin, &record.installed.package)
+                && exact_target_weights(&package, &record.installed.package)
+        });
+        Ok(if found && !installed { projector } else { package })
+    }
+
     /// The installation an acquisition of `package_id` already has. A hidden found copy is not
     /// one: acquiring the package makes Magnitude's own copy, from that copy's bytes when they
     /// verify (see `local_sources`), and leaves it where it is.
@@ -1184,11 +1218,15 @@ impl ManagedModelStore {
         &self,
         package_id: &ModelPackageId,
     ) -> Result<(ModelPackage, ResolvedModel), InventoryError> {
-        match self.installed_package_from_snapshot(package_id) {
+        let observed = |store: &Self| match store.installed_package_from_snapshot(package_id) {
+            Err(InventoryError::NotFound(_)) => store.composed_catalog_target(package_id),
+            observed => observed,
+        };
+        match observed(self) {
             Ok(installed) => Ok(installed),
             Err(InventoryError::NotFound(_)) => {
                 self.ensure_installed_model_inventory().await?;
-                self.installed_package_from_snapshot(package_id)
+                observed(self)
             }
             Err(error) => Err(error),
         }

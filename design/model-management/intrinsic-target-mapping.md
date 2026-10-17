@@ -36,13 +36,22 @@ on this computer: the catalog's separate drafter as soon as that drafter is pres
 projector it lacks, which never blocks the drafter. What it lacks is reported as missing components
 (`Projector`, `Drafter`, each with the bytes it would download), not as an update: update means a
 newer catalog revision, and is reported only when an older revision of the model's packages is also
-present. The same holds once the catalog's own target package is installed: a drafter that is absent
-with no earlier revision here is a missing component, so fetching a found copy's projector leaves only
-the drafter missing, never an update. Each missing component can be fetched alone (`install_catalog_component`), and installing
-the catalog model fetches everything missing. Either way a file whose exact content is already on
-this computer is copied (cloned where the file system can) and verified, never downloaded again, so
-fetching the projector downloads only the projector. External attributions are derived on every
-reconciliation and are not persisted as affiliations.
+present. A drafter that is absent with no earlier revision here is a missing component whatever the
+target's ownership.
+
+The found weights are never copied into Magnitude's store. Acquiring a catalog target whose exact
+weights are found (and not hidden) acquires only its projector package: a package of the target's
+one projector file, which is the one package without weights. The inventory then lists the catalog's
+target package composed of the found weights and that projector package, installed where the weights
+are, and resolves it for serving to the found weights plus the stored projector. So fetching the
+projector (`install_catalog_component`) downloads and stores only the projector, and installing the
+catalog model fetches only the missing projector and drafter. Removal deletes only Magnitude's
+projector package and drafter and leaves the found file; a model with nothing of Magnitude's is
+retained as externally owned and is hidden instead. When the found weights disappear, the composed
+target goes with them and the model is not installed; its full download then fetches the target and
+reuses the stored projector. A hidden copy composes nothing: installing the catalog model then makes
+Magnitude's own copy of its bytes. External attributions are derived on every reconciliation and are
+not persisted as affiliations; the projector package is affiliated as a dependency.
 
 Zero or multiple candidates produce a truthful failure. There is no scoring, normalization,
 filename parsing, fuzzy comparison, closest match, or package-derived public identity. Drafters and

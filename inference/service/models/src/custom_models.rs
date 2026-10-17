@@ -3266,6 +3266,424 @@ mod tests {
         (endpoint, requests)
     }
 
+    /// A Hub serving each repository's metadata and file metadata at its commit and, for ranged
+    /// GETs, its files' bytes, recording every request.
+    fn serve_files(
+        repositories: Vec<(&'static str, String, Vec<(&'static str, Vec<u8>)>)>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(mut connection) = connection else {
+                    return;
+                };
+                let mut reader = BufReader::new(connection.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let mut range = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("range")
+                    {
+                        range = Some(value.trim().to_owned());
+                    }
+                }
+                recorded.lock().unwrap().push(request_line.trim().to_owned());
+                let mut response =
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+                for (repository, commit, files) in &repositories {
+                    if request_line.contains(&format!("/api/models/{repository}/revision/{commit}")) {
+                        let body = serde_json::to_vec(&serde_json::json!({
+                            "id": repository,
+                            "sha": commit,
+                            "siblings": files.iter().map(|(path, bytes)| serde_json::json!({
+                                "rfilename": path,
+                                "size": bytes.len(),
+                                "lfs": { "sha256": sha256(bytes), "size": bytes.len() },
+                            })).collect::<Vec<_>>(),
+                        }))
+                        .unwrap();
+                        response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        response.extend_from_slice(&body);
+                    }
+                    let Some((_, bytes)) = files.iter().find(|(path, _)| {
+                        request_line.contains(&format!("/{repository}/resolve/{commit}/{path}"))
+                    }) else {
+                        continue;
+                    };
+                    if request_line.starts_with("HEAD ") {
+                        response = format!(
+                            "HTTP/1.1 200 OK\r\nETag: \"{}\"\r\nX-Repo-Commit: {commit}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            sha256(bytes),
+                            bytes.len()
+                        )
+                        .into_bytes();
+                        continue;
+                    }
+                    let (start, end) = range
+                        .as_deref()
+                        .and_then(|range| range.trim_start_matches("bytes=").split_once('-'))
+                        .map(|(start, end)| {
+                            (
+                                start.parse::<usize>().unwrap_or(0),
+                                end.parse::<usize>().unwrap_or(bytes.len() - 1),
+                            )
+                        })
+                        .unwrap_or((0, bytes.len() - 1));
+                    let end = end.min(bytes.len() - 1);
+                    let body = &bytes[start..=end];
+                    response = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
+                        body.len(),
+                        bytes.len()
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(body);
+                }
+                let _ = connection.write_all(&response);
+            }
+        });
+        (endpoint, requests)
+    }
+
+    /// A bundle over its installed packages, as the server resolves one for serving.
+    fn installed_bundle_input(
+        bundle: &ServableModelBundle,
+    ) -> magnitude_service_contracts::models::ModelBundleInput {
+        use magnitude_service_contracts::models::{
+            ModelBundleInput, ModelPackageOperand, SpeculativeDraftSourceInput,
+        };
+        let installed = |package: &ModelPackage| ModelPackageOperand::Installed {
+            package_id: package.id.clone(),
+        };
+        match bundle {
+            ServableModelBundle::Standalone { package } => ModelBundleInput::Standalone {
+                package: installed(package),
+            },
+            ServableModelBundle::SpeculativeDecoding {
+                target,
+                draft_source,
+                method,
+            } => ModelBundleInput::SpeculativeDecoding {
+                target: installed(target),
+                draft_source: match draft_source {
+                    SpeculativeDraftSource::Embedded => SpeculativeDraftSourceInput::Embedded,
+                    SpeculativeDraftSource::Separate { draft } => {
+                        SpeculativeDraftSourceInput::Separate {
+                            draft: installed(draft),
+                        }
+                    }
+                },
+                method: method.clone(),
+            },
+        }
+    }
+
+    struct NoOptimizer;
+
+    impl magnitude_service_contracts::models::CatalogModelOptimizer for NoOptimizer {
+        fn optimize_catalog_model(
+            &self,
+            _model_id: ModelId,
+            _progress: Box<dyn Fn(magnitude_service_contracts::models::CatalogOptimizationProgress) + Send + Sync>,
+        ) -> futures_util::future::BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    struct StoreRemover(Arc<ManagedModelStore>);
+
+    impl magnitude_service_contracts::models::CatalogPackageRemover for StoreRemover {
+        fn remove_catalog_packages(
+            &self,
+            package_ids: Vec<ModelPackageId>,
+        ) -> futures_util::future::BoxFuture<'_, Result<u64, InventoryError>> {
+            use magnitude_service_contracts::models::InstalledModelPackages as _;
+            Box::pin(async move {
+                let mut freed = 0_u64;
+                for package_id in package_ids {
+                    freed += self.0.remove_installed(&package_id).await?.freed_bytes;
+                }
+                Ok(freed)
+            })
+        }
+    }
+
+    /// Every model file under Magnitude's store (not its integrity records), by size.
+    fn stored_files(store: &Path) -> Vec<(PathBuf, u64)> {
+        fn walk(directory: &Path, files: &mut Vec<(PathBuf, u64)>) {
+            let Ok(entries) = fs::read_dir(directory) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    walk(&entry.path(), files);
+                } else if kind.is_file()
+                    && entry.path().extension().is_none_or(|extension| extension != "integrity")
+                {
+                    files.push((entry.path(), entry.metadata().unwrap().len()));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&store.join("hub"), &mut files);
+        files
+    }
+
+    /// The Debian round 3b sequence on a file system without clones: the catalog's exact target
+    /// weights in a Hugging Face cache, its projector and drafter nowhere. Fetching the projector
+    /// stores only the projector (the found weights are never copied), and the catalog model serves
+    /// the found weights, the stored projector and, once fetched, the stored drafter as one bundle.
+    /// Removing it removes only Magnitude's projector and drafter. When the found weights
+    /// disappear, the model is not installed and its full download reuses the stored projector.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_found_catalog_target_stores_only_its_missing_components() {
+        use magnitude_service_contracts::models::{
+            CatalogComponent, CatalogInstallationRemoval, CatalogMissingComponent,
+            CatalogModelState, CatalogModelUpdate, InstalledModelPackages as _, ModelFileRole,
+            ModelPackageInstallationOrigin, SpeculativeDraftSource, SpeculativeMethod,
+        };
+
+        let fixture = Fixture::new().await;
+        let cache = fixture.root.join("hf");
+        let commit = "a".repeat(40);
+        let draft_commit = "b".repeat(40);
+        let weights = model_bytes("model");
+        let projector = gguf_bytes(
+            &[
+                ("general.architecture", Meta::Str("clip")),
+                ("general.name", Meta::Str("projector")),
+            ],
+            &["v.patch_embd.weight"],
+        );
+        let drafter = drafter_bytes("drafter");
+        let snapshot = publish_hf_cache(
+            &cache,
+            "owner/Model-GGUF",
+            &commit,
+            &[
+                ("Model-Q4_K_M.gguf", weights.clone()),
+                ("mmproj-F16.gguf", projector.clone()),
+            ],
+        );
+        publish_hf_cache(
+            &cache,
+            "owner/Model-DFlash-GGUF",
+            &draft_commit,
+            &[("Model-DFlash.gguf", drafter.clone())],
+        );
+        let shown = roots(vec![root(ModelRootKind::HuggingFaceCache, &cache)]);
+        fixture.apply(shown.clone()).await;
+        let packages = fixture.inventory().list_installed().await.unwrap().packages;
+        let target = packages
+            .iter()
+            .map(|installed| installed.package.clone())
+            .find(|package| package.files.iter().any(|file| file.role == ModelFileRole::Projector))
+            .expect("the catalog target pairs its projector");
+        let draft = packages
+            .iter()
+            .map(|installed| installed.package.clone())
+            .find(|package| package.files.iter().any(|file| file.path.ends_with("Model-DFlash.gguf")))
+            .expect("the drafter package");
+        // The cache then holds only the target's weights, as `hf download` of the one GGUF leaves it.
+        fs::remove_file(snapshot.join("mmproj-F16.gguf")).unwrap();
+        fs::remove_dir_all(cache.join(hf_repo_dir("owner/Model-DFlash-GGUF"))).unwrap();
+        let mut definition = catalog_definition(target.clone());
+        definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+            target: target.clone(),
+            draft_source: SpeculativeDraftSource::Separate {
+                draft: draft.clone(),
+            },
+            method: SpeculativeMethod::DFlash,
+        };
+        let catalog = vec![definition];
+        let model_id = catalog_id(&catalog[0]);
+        let (endpoint, requests) = serve_files(vec![
+            (
+                "owner/Model-GGUF",
+                commit.clone(),
+                vec![
+                    ("Model-Q4_K_M.gguf", weights.clone()),
+                    ("mmproj-F16.gguf", projector.clone()),
+                ],
+            ),
+            (
+                "owner/Model-DFlash-GGUF",
+                draft_commit,
+                vec![("Model-DFlash.gguf", drafter.clone())],
+            ),
+        ]);
+        let fixture = fixture.restart_with_hub(endpoint, catalog.clone()).await;
+        fixture.apply(shown.clone()).await;
+        let downloads = crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
+            .await
+            .unwrap();
+        let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
+            fixture.resolver.clone(),
+            Arc::new(downloads),
+            Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
+            Arc::new(NoOptimizer),
+        );
+        let state = || fixture.resolver.catalog_snapshot().unwrap().models[0].local_state.clone();
+        let missing = |state: &CatalogModelState| match state {
+            CatalogModelState::Installed {
+                update_state,
+                missing_components,
+                ..
+            } => {
+                assert_eq!(*update_state, CatalogModelUpdate::Current, "{state:?}");
+                missing_components.clone()
+            }
+            CatalogModelState::NotInstalled => panic!("the found target installs the catalog model"),
+        };
+        let settle = |expected: usize| async move {
+            for _ in 0..200 {
+                if missing(&state()).len() == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            missing(&state())
+        };
+        let projector_component = CatalogMissingComponent {
+            component: CatalogComponent::Projector,
+            download_bytes: projector.len() as u64,
+        };
+        let drafter_component = CatalogMissingComponent {
+            component: CatalogComponent::Drafter,
+            download_bytes: drafter.len() as u64,
+        };
+        assert_eq!(missing(&state()), vec![projector_component, drafter_component.clone()]);
+
+        installations
+            .install_component(&model_id, CatalogComponent::Projector)
+            .await
+            .unwrap();
+        assert_eq!(settle(1).await, vec![drafter_component]);
+        let stored = stored_files(&fixture.store);
+        assert_eq!(
+            stored.iter().map(|(_, size)| size).sum::<u64>(),
+            projector.len() as u64,
+            "only the projector is stored, never a second copy of the target: {stored:?}"
+        );
+        assert!(stored.iter().all(|(path, _)| !path.ends_with("Model-Q4_K_M.gguf")));
+        let fetched = |requests: &Arc<Mutex<Vec<String>>>| {
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.starts_with("GET ") && request.contains("/resolve/"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            fetched(&requests).iter().all(|request| request.contains("mmproj-F16.gguf")),
+            "{:?}",
+            fetched(&requests)
+        );
+
+        // The catalog's target is served composed of the found weights and the stored projector.
+        async fn serving(
+            fixture: &Fixture,
+            model_id: &ModelId,
+        ) -> (ServableModelBundle, magnitude_service_contracts::models::ResolvedServableModelBundle) {
+            let configuration = fixture.resolver.serving_configuration(model_id).unwrap();
+            let resolved = fixture
+                .inventory()
+                .resolve_bundle(installed_bundle_input(&configuration.bundle))
+                .await
+                .unwrap();
+            (configuration.bundle, resolved)
+        }
+        let (bundle, resolved) = serving(&fixture, &model_id).await;
+        assert_eq!(bundle, ServableModelBundle::Standalone { package: target.clone() });
+        let paths = resolved
+            .target_model
+            .components
+            .iter()
+            .map(|component| (component.role.clone(), component.path.clone()))
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&(
+            magnitude_service_contracts::ComponentRole::Weights,
+            snapshot.join("Model-Q4_K_M.gguf")
+        )), "{paths:?}");
+        assert!(paths.iter().any(|(role, path)| {
+            *role == magnitude_service_contracts::ComponentRole::Projector && path.starts_with(&fixture.store)
+        }), "{paths:?}");
+
+        installations
+            .install_component(&model_id, CatalogComponent::Drafter)
+            .await
+            .unwrap();
+        assert!(settle(0).await.is_empty());
+        let (bundle, resolved) = serving(&fixture, &model_id).await;
+        assert_eq!(bundle, catalog[0].configuration.bundle, "found weights, stored projector and drafter");
+        assert!(resolved.draft_model.is_some());
+        assert_eq!(
+            stored_files(&fixture.store).iter().map(|(_, size)| size).sum::<u64>(),
+            (projector.len() + drafter.len()) as u64
+        );
+
+        // Removal removes Magnitude's projector and drafter; the found weights stay and still serve.
+        let removed = installations.remove(&model_id).await.unwrap();
+        assert!(matches!(removed, CatalogInstallationRemoval::Removed { .. }), "{removed:?}");
+        fixture.inventory().ensure_installed_model_inventory().await.unwrap();
+        assert!(stored_files(&fixture.store).is_empty());
+        assert_eq!(fs::read(snapshot.join("Model-Q4_K_M.gguf")).unwrap(), weights);
+        assert_eq!(missing(&state()).len(), 2);
+
+        // With the projector stored again, the found weights disappearing leave the model not
+        // installed, and its full download takes the stored projector instead of fetching it.
+        installations
+            .install_component(&model_id, CatalogComponent::Projector)
+            .await
+            .unwrap();
+        assert_eq!(settle(1).await.len(), 1);
+        fs::remove_dir_all(cache.join(hf_repo_dir("owner/Model-GGUF"))).unwrap();
+        fixture.local.refresh_local().await.unwrap();
+        assert_eq!(state(), CatalogModelState::NotInstalled);
+        requests.lock().unwrap().clear();
+        installations.install(&model_id).await.unwrap();
+        for _ in 0..200 {
+            if matches!(state(), CatalogModelState::Installed { missing_components, .. } if missing_components.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(matches!(
+            state(),
+            CatalogModelState::Installed { missing_components, .. } if missing_components.is_empty()
+        ));
+        assert!(
+            fetched(&requests).iter().all(|request| !request.contains("mmproj-F16.gguf")),
+            "the stored projector is reused: {:?}",
+            fetched(&requests)
+        );
+        let target_owner = fixture
+            .inventory()
+            .list_installed()
+            .await
+            .unwrap()
+            .packages
+            .into_iter()
+            .find(|installed| installed.package.id == target.id)
+            .map(|installed| installed.origin);
+        assert_eq!(target_owner, Some(ModelPackageInstallationOrigin::Magnitude));
+    }
+
     /// Hiding changes only what is shown: installing a catalog model whose target is exactly a
     /// hidden found copy copies that copy's bytes into Magnitude's store instead of downloading
     /// them, needs no further download, and leaves the copy's files where they are.

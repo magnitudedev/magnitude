@@ -894,6 +894,7 @@ impl ManagedModelStore {
             })
             .min_by_key(|component| component.shard_index.unwrap_or(0))
             .map(|component| snapshot.join(&component.path))
+            .or_else(|| crate::inventory::package_primary_path(&snapshot, &components))
             .ok_or_else(|| DownloadError {
                 kind: DownloadErrorKind::Internal,
                 message: "published model has no runnable weight component".to_owned(),

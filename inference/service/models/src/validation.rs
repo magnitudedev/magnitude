@@ -126,13 +126,17 @@ fn validate_download_package(package: &ModelPackage) -> Result<(), InventoryErro
             )));
         }
     }
-    if !package
-        .files
-        .iter()
-        .any(|file| file.role == ModelFileRole::Weights)
+    // A projector package (see `catalog_projector_package`) is the one package without weights.
+    let projector_package = matches!(package.files.as_slice(), [file] if file.role == ModelFileRole::Projector)
+        && package.relationships.is_empty();
+    if !projector_package
+        && !package
+            .files
+            .iter()
+            .any(|file| file.role == ModelFileRole::Weights)
     {
         return Err(InventoryError::InvalidRequest(
-            "package must contain at least one weights file".to_owned(),
+            "package must contain at least one weights file, or be one projector".to_owned(),
         ));
     }
 
@@ -364,6 +368,16 @@ mod tests {
 
         let mut projector = package("projector.gguf");
         projector.files[0].role = ModelFileRole::Projector;
+        assert!(
+            ValidatedDownloadPackage::new(projector.clone()).is_ok(),
+            "a projector package holds only a projector"
+        );
+        let mut auxiliary = projector.files[0].clone();
+        auxiliary.id = ModelFileId(format!("file_{}", "c".repeat(64)));
+        auxiliary.sha256 = "c".repeat(64);
+        auxiliary.path = "imatrix.gguf".into();
+        auxiliary.role = ModelFileRole::Auxiliary;
+        projector.files.push(auxiliary);
         assert!(ValidatedDownloadPackage::new(projector).is_err());
     }
 }

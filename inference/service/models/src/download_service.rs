@@ -519,8 +519,8 @@ impl ModelDownloads for ManagedModelDownloads {
             let _start_guard = self.starts.lock().await;
             let packages = bundle_packages(&request.bundle)
                 .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
+                .map(|package| self.manager.acquisition_package(package.clone()))
+                .collect::<Result<Vec<_>, _>>()?;
             if packages
                 .iter()
                 .map(|package| &package.id)
