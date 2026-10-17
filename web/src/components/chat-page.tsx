@@ -3,6 +3,7 @@ import { ArrowUpIcon, PlusIcon, StopIcon, TrashIcon } from "@phosphor-icons/reac
 import { Button } from "./ui/button"
 import { normalizeLocalEmbedUrl } from "./open-webui-url"
 import { consumeChatEvent } from "./chat-stream"
+import { CHAT_LANGUAGES, CHAT_LANGUAGE_NAMES, isChatLanguage, localizeChatTree, readChatLanguage, writeChatLanguage, type ChatLanguage } from "./chat-i18n"
 
 type ChatMessage = { role: "user" | "assistant"; content: string }
 type Conversation = {
@@ -68,6 +69,7 @@ export function ChatPage() {
   const [error, setError] = useState<string | null>(null)
   const [storageWarning, setStorageWarning] = useState(false)
   const [showOpenWebUI, setShowOpenWebUI] = useState(false)
+  const [chatLanguage, setChatLanguageState] = useState<ChatLanguage>(readChatLanguage)
   const [openWebUIUrl, setOpenWebUIUrl] = useState(readStoredOpenWebUIUrl)
   const [openWebUIInput, setOpenWebUIInput] = useState(() => readStoredOpenWebUIUrl() || "http://127.0.0.1:3000/")
   const [openWebUIError, setOpenWebUIError] = useState<string | null>(null)
@@ -77,6 +79,22 @@ export function ChatPage() {
   const messagesRef = useRef<HTMLDivElement>(null)
   const active = conversations.find(item => item.id === activeId) ?? null
   const selectedModel = (active?.model && models.includes(active.model) ? active.model : "") || preferredModel || models[0] || ""
+
+  useEffect(() => {
+    const syncLanguage = () => setChatLanguageState(readChatLanguage())
+    window.addEventListener("storage", syncLanguage)
+    window.addEventListener("magnitude-language-change", syncLanguage)
+    return () => {
+      window.removeEventListener("storage", syncLanguage)
+      window.removeEventListener("magnitude-language-change", syncLanguage)
+    }
+  }, [])
+
+  const changeChatLanguage = (value: string) => {
+    if (!isChatLanguage(value)) return
+    setChatLanguageState(value)
+    writeChatLanguage(value)
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -267,7 +285,7 @@ export function ChatPage() {
   }
 
   if (showOpenWebUI) {
-    return <div className="flex h-[calc(100vh-8rem)] min-h-[32rem] min-w-0 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-925">
+    return localizeChatTree(<div className="flex h-[calc(100vh-8rem)] min-h-[32rem] min-w-0 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-925">
       <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-750 sm:px-6">
         <div className="min-w-0"><h2 className="truncate text-sm font-semibold">Open WebUI</h2><p className="mt-0.5 text-xs text-slate-500">Embedded local interface · external server policy still applies</p></div>
         <div className="flex flex-wrap items-center gap-2">
@@ -286,10 +304,10 @@ export function ChatPage() {
       {openWebUIUrl
         ? <iframe key={openWebUIUrl} src={openWebUIUrl} title="Open WebUI local chat" loading="eager" referrerPolicy="no-referrer" allow="clipboard-read; clipboard-write" className="min-h-0 w-full flex-1 border-0 bg-white dark:bg-slate-925" />
         : <div className="flex flex-1 items-center justify-center p-8 text-center"><div className="max-w-lg"><h3 className="text-lg font-semibold">Connect your local Open WebUI</h3><p className="mt-2 text-sm leading-6 text-slate-500">Enter its loopback URL above. Magnitude will not install or start Open WebUI for you, and this iframe does not bypass the server's embedding policy.</p></div></div>}
-    </div>
+    </div>, chatLanguage)
   }
 
-  return <div className="flex h-[calc(100dvh-8rem)] min-h-[24rem] min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-925">
+  return localizeChatTree(<div className="flex h-[calc(100dvh-8rem)] min-h-[24rem] min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-925">
     <aside className="hidden w-64 shrink-0 flex-col border-r border-slate-200 bg-slate-50 p-3 dark:border-slate-750 dark:bg-slate-900 sm:flex">
       <Button onClick={createConversation} className="mb-3 justify-start gap-2"><PlusIcon className="size-4" />New chat</Button>
       <div className="min-h-0 flex-1 space-y-1 overflow-y-auto" aria-label="Conversation history">
@@ -304,6 +322,11 @@ export function ChatPage() {
     <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-750 sm:px-6">
         <div className="min-w-0"><h2 className="truncate text-sm font-semibold">{active?.title ?? "New chat"}</h2><p className="mt-0.5 text-xs text-slate-500">Local inference · streaming responses</p></div>
+        <label className="flex items-center gap-2 text-xs text-slate-500">Language
+          <select aria-label="Chat language" value={chatLanguage} onChange={event => changeChatLanguage(event.target.value)} className="max-w-[min(36vw,11rem)] rounded-lg border border-slate-200 bg-white px-2 py-2 text-sm text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100">
+            {CHAT_LANGUAGES.map(language => <option key={language} value={language}>{CHAT_LANGUAGE_NAMES[language]}</option>)}
+          </select>
+        </label>
         <label className="flex items-center gap-2 text-xs text-slate-500">Model
           <select aria-label="Model" value={selectedModel} disabled={modelsLoading || models.length === 0 || working} onChange={event => {
             const model = event.target.value
@@ -355,5 +378,5 @@ export function ChatPage() {
         </div>
       </form>
     </section>
-  </div>
+  </div>, chatLanguage)
 }
