@@ -50,8 +50,9 @@ import type { JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channe
 import {
   MagnitudeHealthResponseSchema,
   AcnRpcGroup, } from "@magnitudedev/acn-protocol"
-import { IcnHardware, IcnProcess, makeIcnProvider, ReleaseIcnInstallationError } from "@magnitudedev/icn"
+import { IcnHardware, IcnInstances, IcnProcess, makeIcnProvider, ReleaseIcnInstallationError } from "@magnitudedev/icn"
 import { AcnBoundaryLive } from "./boundary/acn"
+import type { ActiveModelDevice } from "@magnitudedev/acn-protocol"
 import { defaultDataDir } from "./data-dir"
 import { AgentFactoryLive } from "./agent-factory"
 import { AgentRuntimeLive } from "./agent-runtime"
@@ -693,6 +694,7 @@ export const installAcnHealthRoutes = (
   router: HttpLayerRouter.HttpRouter,
   lifecycle: AcnServiceLifecycleApi,
   remote: RemoteAccessApi,
+  readActiveModelDevices: () => Effect.Effect<readonly ActiveModelDevice[] | undefined> = () => Effect.succeed(undefined),
 ) => Effect.gen(function* () {
   const network = remote.network
   yield* router.addGlobalMiddleware((responseEffect) => Effect.gen(function* () {
@@ -718,7 +720,8 @@ export const installAcnHealthRoutes = (
     if ((yield* remote.access(request)) === "Anonymous") {
       return HttpServerResponse.unsafeJson({ service: "magnitude-acn", version: ACN_VERSION, state: { _tag: state._tag } }, { status })
     }
-    const body = yield* encodeHealthResponse(makeHealthResponse(ACN_VERSION, state))
+    const activeModelDevices = yield* readActiveModelDevices()
+    const body = yield* encodeHealthResponse(makeHealthResponse(ACN_VERSION, state, undefined, undefined, undefined, activeModelDevices))
     return yield* HttpServerResponse.json(body, { status })
   }).pipe(Effect.orDie))
 })
@@ -797,7 +800,8 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     const server = Context.get(infrastructure, HttpServer.HttpServer)
     const sessions = yield* fileSessionStore(join(dataDir, REMOTE_SESSIONS_FILE), network).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
     const remote = yield* makeRemoteAccess(network, sessions)
-    yield* installAcnHealthRoutes(router, lifecycle, remote).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
+    let readActiveModelDevices: (() => Effect.Effect<readonly ActiveModelDevice[] | undefined>) | undefined
+    yield* installAcnHealthRoutes(router, lifecycle, remote, () => readActiveModelDevices?.() ?? Effect.succeed(undefined)).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
     if (network.enabled && network.bind !== primaryBind) {
       const additional = yield* Layer.buildWithScope(BunHttpServer.layer({
@@ -840,6 +844,39 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
         Effect.provide(serviceContext),
       )
       const applicationContext = Context.merge(serviceContext, handlers)
+      const observedInstances = Context.get(applicationContext, IcnInstances)
+      const observedHardware = Context.get(applicationContext, IcnHardware)
+      readActiveModelDevices = () => Effect.gen(function* () {
+        const snapshot = yield* observedInstances.get
+        const hardwareSnapshot = yield* observedHardware.get
+        const active: ActiveModelDevice[] = []
+        for (const instance of snapshot.instances) {
+          if (instance.lifecycle._tag !== "Ready") continue
+          // ICN's generated client schema is intentionally tolerant of additive
+          // lifecycle fields; the worker-confirmed device is supplied by the newer
+          // residency contract and may be absent on older workers.
+          const lifecycle = instance.lifecycle as typeof instance.lifecycle & {
+            readonly device?: { readonly id?: unknown; readonly backend?: unknown }
+          }
+          const device = lifecycle.device
+          if (typeof device?.id !== "string"
+            || !["cpu", "metal", "cuda", "vulkan"].includes(String(device.backend))) continue
+          const hardwareDevice = hardwareSnapshot.state.memory_domains
+            .flatMap(domain => domain.devices)
+            .find(candidate => candidate.id === device.id)
+          const deviceName = hardwareDevice === undefined
+            ? undefined
+            : [hardwareDevice.name, hardwareDevice.description].find(value => value.trim().length > 0)
+          active.push({
+            instanceId: instance.id,
+            modelId: instance.modelId,
+            deviceId: device.id,
+            backend: device.backend as ActiveModelDevice["backend"],
+            ...(deviceName === undefined ? {} : { deviceName }),
+          })
+        }
+        return active
+      })
       const rpcRouter = yield* HttpLayerRouter.make
       const rawProtocol = yield* RpcServer.makeProtocolHttpRouter({ path: "/rpc" }).pipe(
         Effect.provideService(HttpLayerRouter.HttpRouter, rpcRouter),
