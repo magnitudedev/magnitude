@@ -1,6 +1,6 @@
 import {
   DirectoryAccessDenied, DirectoryNotFound, DrafterNotUsable, InvalidDirectoryPath, InvalidModelReference, LocalModelMutationFailed,
-  ModelSourceUnavailable, ModelVersionNotRunnable, PathNotDirectory,
+  ModelRepositoryNotFound, ModelSourceUnavailable, ModelVersionNotRunnable, PathNotDirectory,
 } from "@magnitudedev/sdk"
 import { drafterNotUsableMessage, modelVersionNotRunnableMessage } from "@magnitudedev/client-common"
 import type { NoticeContent } from "./error-notice"
@@ -19,11 +19,12 @@ const sourceUnavailableNotice = (error: ModelSourceUnavailable): NoticeContent &
 
 /**
  * A Hugging Face or file reference that couldn't be read or added, in the user's terms. Service text
- * stays out; Magnitude's own product messages for a repository that needs access and a file it
- * couldn't read are shown as written.
+ * stays out; Magnitude's own product messages for a repository that needs access, one Hugging Face
+ * won't show, and a file it couldn't read are shown as written.
  */
 export const candidateErrorNotice = (error: unknown): NoticeContent & { readonly retryable: boolean } => {
   if (error instanceof InvalidModelReference) return { title: "Magnitude can’t open this model", description: "Paste a Hugging Face link, owner/repo, or owner/repo:QUANT.", retryable: false }
+  if (error instanceof ModelRepositoryNotFound) return { title: "Magnitude can’t find this repository", description: error.message, retryable: false }
   if (error instanceof ModelSourceUnavailable) return sourceUnavailableNotice(error)
   if (error instanceof ModelVersionNotRunnable) return { title: "This version doesn’t run here", description: modelVersionNotRunnableMessage(error), retryable: false }
   if (error instanceof DrafterNotUsable) return { title: "This drafter can’t be used", description: drafterNotUsableMessage(error), retryable: false }

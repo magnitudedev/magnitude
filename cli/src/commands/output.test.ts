@@ -1,6 +1,6 @@
 import { Data, Effect, Schema } from "effect"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { DrafterNotUsable, ModelVersionNotRunnable } from "@magnitudedev/sdk"
+import { DrafterNotUsable, ModelRepositoryNotFound, ModelVersionNotRunnable } from "@magnitudedev/sdk"
 import { jsonDocument, renderCommandError, renderFields, renderTable, runCommand } from "./output"
 
 class ExpectedFailure extends Data.TaggedError("ExpectedFailure")<{
@@ -20,6 +20,13 @@ describe("service refusals", () => {
       message: "This drafter can't be used with this model: Its drafter wasn't built for this model.",
       code: "drafter_not_usable",
     } })
+  })
+
+  it("says a repository Hugging Face won't show may be missing, private or gated, with a typed code", () => {
+    const message = "Repository not found, or it's private or gated. Check the name, or set HF_TOKEN if you have access."
+    const error = new ModelRepositoryNotFound({ reference: "nobody-xyz/does-not-exist-GGUF", message })
+    expect(renderCommandError(error, false)).toBe(`${message}\n`)
+    expect(JSON.parse(renderCommandError(error, true))).toEqual({ error: { message, code: "model_repository_not_found" } })
   })
 
   it("words an imported file the engine can't run with its reasons", () => {

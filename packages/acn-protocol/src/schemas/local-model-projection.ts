@@ -33,16 +33,16 @@ export const localModelAssessmentProfile = (
   ? assessment.profile
   : Option.some(assessment.profile)
 
+/**
+ * The profile a model's assessment was made for, the context clients show. Until the model is
+ * assessed (still downloading, or assessing) its serving state names only the profile it will be
+ * assessed for, a placeholder for a model whose files aren't read yet, so there is none to show.
+ */
 export const localModelServingProfile = (
   model: LocalModel,
-): Option.Option<ServingProfile> => {
-  const serving = model.servingState
-  switch (serving._tag) {
-    case "Assessed": return localModelAssessmentProfile(serving.assessment)
-    case "Assessing": return Option.some(serving.profile)
-    case "Failed": return Option.isOption(serving.profile) ? serving.profile : Option.some(serving.profile)
-  }
-}
+): Option.Option<ServingProfile> => model.servingState._tag === "Assessed"
+  ? localModelAssessmentProfile(model.servingState.assessment)
+  : Option.none()
 
 export const localModelCapabilities = (
   model: LocalModel,

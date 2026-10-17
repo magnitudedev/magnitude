@@ -209,6 +209,11 @@ with its anonymous classification. Header reads for inspection that the Hub refu
 gated or private repository) fail with the model operation code `hugging_face_access_required`,
 whose message asks for accepting the repository's terms and setting `HF_TOKEN` (or, with a token,
 for granting that account access); clients present it as such, never as a connection failure.
+Repository metadata the Hub refuses (401 or 404) fails with the model operation code
+`hugging_face_repository_not_found`: the Hub answers an anonymous request for a repository that
+doesn't exist with 401, so the repository may be missing, private or gated. Clients present it as
+a typed not-found error whose message asks to check the name or set `HF_TOKEN`. A gated repository
+shows its metadata, so only its refused files get `hugging_face_access_required`.
 
 ## Artifact stores and inventory
 

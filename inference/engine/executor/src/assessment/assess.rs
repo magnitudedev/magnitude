@@ -13,8 +13,8 @@ use super::estimate::{PerformanceEstimate, estimate_performance, performance_dep
 use crate::platform::{DomainRole, MemoryReserves, fit_capacities};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
-    AssessmentMemoryCharge, AssessmentMemoryTerms, ExecutionPlanDraft, HostProcessBytes,
-    ResourceCapacity, ResourcePlanner,
+    AssessmentMemoryCharge, AssessmentMemoryTerms, DeviceProcessBytes, ExecutionPlanDraft,
+    HostProcessBytes, ResourceCapacity, ResourcePlanner,
 };
 use magnitude_family_contracts::ModelDefinition;
 use seismic::{DeviceTopology, HostMemoryStatus, MemoryPoolId};
@@ -143,8 +143,11 @@ pub fn prepare_execution_assessment(
         draft.device().backend(),
     )
     .map_err(AssessmentError::Memory)?;
+    let device_process =
+        DeviceProcessBytes::derive(draft.device().backend(), host_process.kernels)
+            .map_err(AssessmentError::Memory)?;
     let charge = header
-        .with_graph_resource_bound(&graph, host_process)
+        .with_graph_resource_bound(&graph, host_process, device_process)
         .and_then(|bounds| {
             state
                 .fit_state_bytes(terms.fit_depth, terms.recurrent_banks)

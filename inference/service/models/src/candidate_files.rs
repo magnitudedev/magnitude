@@ -732,6 +732,42 @@ mod tests {
         );
     }
 
+    fn fixture_header(name: &str) -> Vec<u8> {
+        use std::io::Read;
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../engine/fixtures/assessment/headers")
+            .join(format!("{name}.gz"));
+        let mut header = Vec::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(path).expect("fixture header"))
+            .read_to_end(&mut header)
+            .expect("gzipped header");
+        header
+    }
+
+    /// HauhauCS's FastMTP file (the real header) declares the target's `qwen35` architecture,
+    /// metadata and `general.file_type`, but holds only the trailing prediction block, a
+    /// reduced-vocabulary output and an I32 `d2t` map. Its sibling holds every block.
+    #[test]
+    fn a_fastmtp_head_file_is_a_drafter_and_its_sibling_a_target() {
+        let architectures = RecognizedArchitectures::new(
+            ["qwen35", "qwen4exp"],
+            ["dflash", "gemma4-assistant", "qwen4exp"],
+        );
+        let classify = |name: &str| classify_header(&fixture_header(name), &architectures).unwrap();
+        assert_eq!(
+            classify("Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-FastMTP-32K.gguf").role,
+            CandidateFileRole::Drafter {
+                architecture: "qwen35".to_owned()
+            }
+        );
+        assert_eq!(
+            classify("Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ3_XS.gguf").role,
+            CandidateFileRole::Target {
+                architecture: Some("qwen35".to_owned())
+            }
+        );
+    }
+
     #[test]
     fn base_repositories_come_from_repo_urls_or_else_organization_and_name() {
         use magnitude_artifacts::gguf::{ByteOrder, Metadata, Scalar};

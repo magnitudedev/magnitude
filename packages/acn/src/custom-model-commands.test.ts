@@ -328,6 +328,27 @@ describe("finding models", () => {
     })
   })
 
+  it("says a repository Hugging Face won't show may be missing, private or gated, for inspect and add", async () => {
+    const missing = harness({
+      inspectFailure: {
+        _tag: "GeneratedClientRemoteError",
+        status: 409,
+        body: { error: { code: "hugging_face_repository_not_found", message: "Repository not found" } },
+      },
+    })
+    const message = "Repository not found, or it's private or gated. Check the name, or set HF_TOKEN if you have access."
+    const inspected = await missing.run((commands) => commands.inspectCandidate("nobody-xyz/does-not-exist-GGUF").pipe(Effect.either))
+    expect(inspected._tag === "Left" && inspected.left).toMatchObject({
+      _tag: "ModelRepositoryNotFound",
+      reference: "nobody-xyz/does-not-exist-GGUF",
+      message,
+    })
+    const added = await missing.run((commands) => commands.addHuggingFaceModel({
+      repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false
+    }).pipe(Effect.either))
+    expect(added._tag === "Left" && added.left).toMatchObject({ _tag: "ModelRepositoryNotFound", message })
+  })
+
   it("refuses a version the repository does not have", async () => {
     const { run } = harness()
     const result = await run((commands) => commands.inspectCandidate("owner/model-GGUF:IQ1_M").pipe(Effect.either))

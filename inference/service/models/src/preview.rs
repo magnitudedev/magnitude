@@ -605,6 +605,12 @@ async fn fetch_hub_model(
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         return Ok(HubModelFetch::NotModified);
     }
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::NOT_FOUND
+    ) {
+        return Err(hub_repository_not_found());
+    }
     if !response.status().is_success() {
         return Err(InventoryError::Upstream(format!(
             "Hugging Face metadata returned HTTP {}",
@@ -1650,6 +1656,18 @@ pub(crate) fn hub_access_required(with_token: bool) -> InventoryError {
             "This repository requires accepting its terms on Hugging Face and an access token. Set HF_TOKEN to a token from an account that has accepted them, then try again."
         }
         .to_owned(),
+        retryable: false,
+    }
+}
+
+/// A repository whose metadata the Hub refuses: it doesn't exist, or it's private or gated and this
+/// request has no access. The Hub answers an anonymous request for a missing repository with 401,
+/// so neither status tells them apart. A gated repository shows its metadata, and its refused files
+/// get [`hub_access_required`].
+pub(crate) fn hub_repository_not_found() -> InventoryError {
+    InventoryError::ModelOperation {
+        code: "hugging_face_repository_not_found".to_owned(),
+        message: "Repository not found, or it's private or gated. Check the name, or set HF_TOKEN if you have access.".to_owned(),
         retryable: false,
     }
 }
@@ -2936,6 +2954,63 @@ mod tests {
         assert_eq!(code, "hugging_face_access_required");
         assert!(message.contains("HF_TOKEN"), "{message}");
         assert!(!retryable);
+    }
+
+    /// The Hub answers an anonymous metadata request for a repository that doesn't exist with 401,
+    /// and one with a token with 404; neither confirms the repository exists, so both say it may
+    /// be missing, private or gated.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_repository_says_it_may_be_missing_private_or_gated() {
+        use std::io::{BufRead, BufReader, Write};
+        for status in ["401 Unauthorized", "404 Not Found"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("hub listener");
+            let endpoint = format!("http://{}", listener.local_addr().expect("hub address"));
+            std::thread::spawn(move || {
+                for connection in listener.incoming() {
+                    let Ok(mut connection) = connection else {
+                        return;
+                    };
+                    let mut reader = BufReader::new(connection.try_clone().expect("stream"));
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let _ = write!(
+                        connection,
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                }
+            });
+            let error = match fetch_hub_model(
+                &reqwest::Client::new(),
+                None,
+                &endpoint,
+                "nobody-xyz/does-not-exist-GGUF",
+                "main",
+                None,
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("{status}: a refused repository fails"),
+            };
+            let InventoryError::ModelOperation {
+                code,
+                message,
+                retryable,
+            } = error
+            else {
+                panic!("{status}: a refused repository is a model operation failure: {error:?}");
+            };
+            assert_eq!(code, "hugging_face_repository_not_found", "{status}");
+            assert_eq!(
+                message,
+                "Repository not found, or it's private or gated. Check the name, or set HF_TOKEN if you have access."
+            );
+            assert!(!retryable);
+        }
     }
 
     /// The Linux QA lanes saw one inspect pull 446 MB to 1.1 GB for files with unknown tensor

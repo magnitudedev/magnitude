@@ -292,8 +292,19 @@ export class ModelSourceUnavailable extends Schema.TaggedError<ModelSourceUnavai
   { reason: ModelSourceUnavailableReasonSchema, message: Schema.String, retryable: Schema.Boolean },
 ) {}
 
+/**
+ * A Hugging Face repository that Hugging Face won't show: it doesn't exist, or it's private or gated
+ * and the request has no access. Hugging Face answers an anonymous request for a missing repository
+ * as if it were private, so the two can't be told apart.
+ */
+export class ModelRepositoryNotFound extends Schema.TaggedError<ModelRepositoryNotFound>()(
+  "ModelRepositoryNotFound",
+  { reference: Schema.String, message: Schema.String },
+) {}
+
 export const ModelCandidateError = Schema.Union(
   InvalidModelReference,
+  ModelRepositoryNotFound,
   ModelSourceUnavailable,
 )
 export type ModelCandidateError = Schema.Schema.Type<typeof ModelCandidateError>
@@ -325,6 +336,7 @@ export class DrafterNotUsable extends Schema.TaggedError<DrafterNotUsable>()(
 
 export const CustomModelMutationError = Schema.Union(
   InvalidModelReference,
+  ModelRepositoryNotFound,
   ModelSourceUnavailable,
   LocalModelMutationFailed,
   ModelVersionNotRunnable,

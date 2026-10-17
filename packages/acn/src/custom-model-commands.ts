@@ -14,6 +14,7 @@ import {
   InvalidModelReference,
   LocalModelAssessmentSchema,
   LocalModelMutationFailed,
+  ModelRepositoryNotFound,
   ModelSourceUnavailable,
   ModelVersionNotRunnable,
   PathNotDirectory,
@@ -204,6 +205,10 @@ const remoteMessage = (cause: GeneratedClientError<unknown>): string => {
 export const accessRequiredMessage = "This repository requires accepting its terms on Hugging Face and an access token. "
   + "Set HF_TOKEN to a token from an account that has accepted them, then try again."
 
+/** The product message for a repository Hugging Face won't show: missing, private or gated. */
+export const repositoryNotFoundMessage = "Repository not found, or it's private or gated. "
+  + "Check the name, or set HF_TOKEN if you have access."
+
 /** The product message for a file whose contents Magnitude couldn't read. */
 export const unreadableFileMessage = "Magnitude couldn't read this file. It may be incomplete, damaged, "
   + "or use a format Magnitude doesn't support yet."
@@ -227,6 +232,8 @@ const candidateFailure = (reference: string) => (cause: GeneratedClientError<unk
       switch (remoteCode(cause)) {
         case "hugging_face_access_required":
           return new ModelSourceUnavailable({ reason: "AccessRequired", message: accessRequiredMessage, retryable: false })
+        case "hugging_face_repository_not_found":
+          return new ModelRepositoryNotFound({ reference, message: repositoryNotFoundMessage })
         case "integrity_failed":
           return new ModelSourceUnavailable({ reason: "Unreadable", message: unreadableFileMessage, retryable: false })
         default: {
@@ -263,7 +270,7 @@ const notFound = (modelId: ModelId) => new LocalModelMutationFailed({
 })
 
 const commandFailed = (operation: string) => (cause: GeneratedClientError<unknown> | ModelCandidateError) =>
-  cause._tag === "InvalidModelReference" || cause._tag === "ModelSourceUnavailable"
+  cause._tag === "InvalidModelReference" || cause._tag === "ModelRepositoryNotFound" || cause._tag === "ModelSourceUnavailable"
     ? new LocalModelMutationFailed({ code: `custom_model_${operation}_failed`, message: cause.message, retryable: true })
     : new LocalModelMutationFailed({
         code: `custom_model_${operation}_failed`,
@@ -736,8 +743,8 @@ export const CustomModelCommandsLive: Layer.Layer<
   )
 
   const toMutation = (cause: GeneratedClientError<unknown> | CustomModelMutationError): CustomModelMutationError =>
-    cause._tag === "InvalidModelReference" || cause._tag === "ModelSourceUnavailable" || cause._tag === "LocalModelMutationFailed"
-      || cause._tag === "ModelVersionNotRunnable" || cause._tag === "DrafterNotUsable"
+    cause._tag === "InvalidModelReference" || cause._tag === "ModelRepositoryNotFound" || cause._tag === "ModelSourceUnavailable"
+      || cause._tag === "LocalModelMutationFailed" || cause._tag === "ModelVersionNotRunnable" || cause._tag === "DrafterNotUsable"
       ? cause
       : candidateFailure("model")(cause)
 

@@ -2441,6 +2441,35 @@ struct AssessmentFixture {
     expected: serde_json::Value,
 }
 
+fn fixtures_root() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/fixtures/assessment")
+}
+
+/// A shared fixture's header (`headers/<name>.gz`) served as the repository file `path`, sized as
+/// its tensor directory declares.
+fn fixture_file(header: &str, path: &str) -> StubFile {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(
+        std::fs::File::open(fixtures_root().join(header)).expect("fixture header"),
+    )
+    .read_to_end(&mut bytes)
+    .expect("gzipped header");
+    let directory = magnitude_artifacts::gguf::read_header(&bytes).expect("GGUF header");
+    let size_bytes = directory.data_offset
+        + directory
+            .tensors
+            .iter()
+            .map(|tensor| tensor.offset + tensor.nbytes)
+            .max()
+            .unwrap_or(0);
+    StubFile {
+        path: path.to_owned(),
+        header: bytes,
+        size_bytes,
+    }
+}
+
 /// The contract form of a reason in the engine's serde form: `"Unreadable"`, or
 /// `{ "WeightTypes": { "types": [{ "ggml_type": .. }] } }` with snake-case fields.
 fn contract_reason(engine: &serde_json::Value) -> serde_json::Value {
@@ -2517,9 +2546,7 @@ fn method_name(method: &SpeculativeMethod) -> String {
 /// the fixtures' token strings are blanked.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_shared_real_header_fixtures_get_their_manifest_verdicts_through_the_service() {
-    use std::io::Read;
-    let root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/fixtures/assessment");
+    let root = fixtures_root();
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("manifest.json")).expect("manifest"))
             .expect("manifest JSON");
@@ -2531,20 +2558,9 @@ async fn the_shared_real_header_fixtures_get_their_manifest_verdicts_through_the
         .iter()
         .flat_map(|fixture| fixture.target.iter().chain(fixture.draft.iter()))
     {
-        let mut header = Vec::new();
-        flate2::read::GzDecoder::new(
-            std::fs::File::open(root.join(&component.header)).expect("fixture header"),
-        )
-        .read_to_end(&mut header)
-        .expect("gzipped header");
-        let directory = magnitude_artifacts::gguf::read_header(&header).expect("GGUF header");
-        let size_bytes = directory.data_offset
-            + directory
-                .tensors
-                .iter()
-                .map(|tensor| tensor.offset + tensor.nbytes)
-                .max()
-                .unwrap_or(0);
+        let StubFile {
+            header, size_bytes, ..
+        } = fixture_file(&component.header, &component.path);
         let repository = repositories
             .entry(component.repository.clone())
             .or_insert_with(|| StubRepository {
@@ -2683,6 +2699,89 @@ async fn the_shared_real_header_fixtures_get_their_manifest_verdicts_through_the
             (expected, listed) => panic!("{}: expected {expected}, listed {listed:?}", case.name),
         }
     }
+}
+
+/// HauhauCS's Qwen3.8 27B MTP repository ships a FastMTP file: a `qwen35` prediction head alone,
+/// declaring the target's metadata and `general.file_type` (Q3_K_M). Its header makes it a drafter,
+/// so it is never a version; the engine doesn't bind a separate `qwen35` head, so the drafter list
+/// shows it Rejected with the engine's reasons. Version labels come from each header's file type.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fastmtp_file_is_a_rejected_drafter_never_a_version() {
+    const REPOSITORY: &str = "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF";
+    const REVISION: &str = "993a5971fda8f30dd1b7eb2654792ba4415c7460";
+    const TARGET: &str = "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ3_XS.gguf";
+    const FASTMTP: &str = "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-FastMTP-32K.gguf";
+    let served = |path: &str| fixture_file(&format!("headers/{path}.gz"), path);
+    let fixture = fixture_with(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::from([(
+            REPOSITORY.to_owned(),
+            StubRepository {
+                commit: REVISION.to_owned(),
+                files: vec![served(TARGET), served(FASTMTP)],
+                card_base_models: Vec::new(),
+            },
+        )]),
+    )
+    .await;
+    let repository = HuggingFaceRepositoryId::new(REPOSITORY.to_owned()).unwrap();
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::HuggingFace {
+            repository: repository.clone(),
+            revision: REVISION.to_owned(),
+        })
+        .await
+        .expect("inspection");
+    assert_eq!(
+        inspection
+            .versions
+            .iter()
+            .map(|version| version.label.as_str())
+            .collect::<Vec<_>>(),
+        ["IQ3_XS"],
+        "{inspection:#?}"
+    );
+
+    let candidates = fixture
+        .candidates
+        .drafters(DrafterCandidatesRequest::Candidate {
+            candidate: ModelCandidate {
+                source: CandidateSource::HuggingFace {
+                    repository,
+                    commit: REVISION.to_owned(),
+                },
+                target: vec![TARGET.to_owned()],
+                projector: None,
+                drafter: None,
+            },
+            other: None,
+        })
+        .await
+        .expect("drafter candidates")
+        .candidates;
+    let fastmtp = candidates
+        .iter()
+        .find(|candidate| {
+            matches!(&candidate.reference, DrafterReference::HuggingFace { path, .. } if path == FASTMTP)
+        })
+        .unwrap_or_else(|| panic!("the FastMTP drafter is listed: {candidates:#?}"));
+    assert_eq!(fastmtp.category, DrafterCategory::NextToModel);
+    let DrafterVerdict::Rejected { reasons, .. } = &fastmtp.verdict else {
+        panic!("expected rejected, got {:?}", fastmtp.verdict);
+    };
+    assert!(
+        reasons_match(
+            reasons,
+            &[
+                serde_json::json!({ "WeightTypes": { "types": [{ "ggml_type": "I32", "tensor_count": 1 }] } }),
+                serde_json::json!({ "Architecture": { "architecture": "qwen35" } }),
+            ]
+        ),
+        "{reasons:?}"
+    );
 }
 
 /// A repository whose base model is a finetune of the catalog model's base reaches the catalog

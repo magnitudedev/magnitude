@@ -397,6 +397,20 @@ describe("models status variant and drafter columns", () => {
     expect(output).toMatch(/^ {2}None\s+—/m)
   })
 
+  it("shows no context while a model downloads, before it has an assessment", () => {
+    const downloading = makeAddedModel({
+      acquisitionState: { _tag: "Installing", progress: { stage: "downloading", completedBytes: 1, totalBytes: 4, bytesPerSecond: Option.none() } },
+      servingState: { _tag: "Assessing", profile: { contextLength: 100_000 } },
+    })
+    const detail = renderModelDetail({ model: downloading, models: [], drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false })
+    expect(detail).not.toMatch(/^ {2}Context/m)
+    expect(detail).not.toContain("100K")
+    expect(rowOf(renderModelsStatus(statusView({ models: [downloading] })), ADDED_MODEL_ID)).not.toContain("100K")
+
+    expect(renderModelDetail({ model: makeAddedModel(), models: [], drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false }))
+      .toMatch(/^ {2}Context\s+32K$/m)
+  })
+
   it("hides Update for an attached drafter while it downloads", () => {
     const base = Option.getOrThrow(makeAddedModel().drafter)
     const downloading = makeAddedModel({

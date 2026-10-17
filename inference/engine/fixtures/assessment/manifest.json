@@ -362,6 +362,46 @@
           ]
         }
       }
+    },
+    {
+      "name": "qwen35-fastmtp-drafter",
+      "description": "HauhauCS Qwen3.8 27B IQ3_XS with the repository's FastMTP file: a qwen35 prediction head alone (one trailing block, a reduced-vocabulary output and an I32 d2t map), which the engine does not bind as a separate drafter.",
+      "target": [
+        {
+          "header": "headers/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ3_XS.gguf.gz",
+          "repository": "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
+          "revision": "993a5971fda8f30dd1b7eb2654792ba4415c7460",
+          "path": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ3_XS.gguf"
+        }
+      ],
+      "draft": {
+        "header": "headers/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-FastMTP-32K.gguf.gz",
+        "repository": "HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF",
+        "revision": "993a5971fda8f30dd1b7eb2654792ba4415c7460",
+        "path": "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-FastMTP-32K.gguf"
+      },
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "rejected": [
+            {
+              "WeightTypes": {
+                "types": [
+                  {
+                    "ggml_type": "I32",
+                    "tensor_count": 1
+                  }
+                ]
+              }
+            },
+            {
+              "Architecture": {
+                "architecture": "qwen35"
+              }
+            }
+          ]
+        }
+      }
     }
   ]
 }

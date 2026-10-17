@@ -10,7 +10,7 @@ use crate::planning::{plan_execution, ExecutionPlanningError};
 use magnitude_executor::{
     platform,
     AssessmentGraphResourceBounds, AssessmentHeaderBounds, AssessmentMemoryTerms,
-    HostProcessBytes, ResourceCapacity, ResourcePlanner,
+    DeviceProcessBytes, HostProcessBytes, ResourceCapacity, ResourcePlanner,
 };
 use seismic::{BackendName, DeviceCatalog, DeviceSelector};
 use serde::{Deserialize, Serialize};
@@ -95,9 +95,13 @@ impl ExecutionManifest {
             backend,
         )
         .map_err(internal)?;
+        let device_process =
+            DeviceProcessBytes::derive(backend, host_process.kernels).map_err(internal)?;
         let bounds =
             AssessmentHeaderBounds::derive(definition, draft.load(), policy.codec(), backend)
-                .and_then(|header| header.with_graph_resource_bound(&graph, host_process))
+                .and_then(|header| {
+                    header.with_graph_resource_bound(&graph, host_process, device_process)
+                })
                 .map_err(internal)?;
         let initial_state = state
             .target_state()

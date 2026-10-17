@@ -45,7 +45,8 @@ pub struct AssessmentMemoryTerms {
 
 /// Upper bounds for every nonresident charge of a clean load. The prepared
 /// resource bound covers all steady native holdings (invocation storage,
-/// graph workspace, output, upload regions and bound constants); the startup
+/// graph workspace, output, upload regions, bound constants, recorded graphs
+/// and the worker's device bytes); the startup
 /// bound covers the additional qualification/import peak; the component
 /// bound is the import peak of an optional component a served request
 /// loads; the staging bound is the host upload peak of a dedicated device's
@@ -65,6 +66,80 @@ pub struct AssessmentMemoryBounds {
     /// the resident weights on, after the import.
     pub bound_graph_host_bytes: u64,
     pub host_process: HostProcessBytes,
+    pub device_process: DeviceProcessBytes,
+}
+
+/// What a load's worker holds of its device's memory outside every charged
+/// allocation: the driver's per-process context and the loaded images of
+/// the native kernels it prepares (CUDA modules, Vulkan pipelines). Each is
+/// a cost measured on the backend times a count the plan fixes
+/// (`DeviceProcessCosts::of`), held from the preparation of the programs to
+/// the end of serving. A unified device's are part of its worker's host
+/// bytes, which are measured with them, so they are zero there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceProcessBytes {
+    pub context: u64,
+    pub programs: u64,
+}
+
+/// The measured device cost of a load's worker on one backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeviceProcessCosts {
+    context: u64,
+    per_kernel: u64,
+}
+
+impl DeviceProcessCosts {
+    /// CUDA's context is measured on the device itself, once per process
+    /// at discovery, and its usable capacity already excludes it (the usable
+    /// capacity table in `design/inference/engine/memory.md`), so it is not
+    /// charged again. Vulkan's capacity is
+    /// the device-local heap or its budget, which the device's creation
+    /// takes from. Metal and the CPU are unified: their kernels and runtime
+    /// are measured in the worker's host bytes. The CUDA and Vulkan costs
+    /// are placeholders until the round 3 lanes measure them
+    /// (`inference/scripts/device-memory-costs.py`).
+    fn of(backend: BackendName) -> Self {
+        match backend {
+            BackendName::Metal | BackendName::Cpu => Self {
+                context: 0,
+                per_kernel: 0,
+            },
+            BackendName::Cuda => Self {
+                context: 0,
+                per_kernel: CUDA_PER_KERNEL,
+            },
+            BackendName::Vulkan => Self {
+                context: VULKAN_CONTEXT,
+                per_kernel: VULKAN_PER_KERNEL,
+            },
+        }
+    }
+}
+
+const CUDA_PER_KERNEL: u64 = 0;
+const VULKAN_CONTEXT: u64 = 0;
+const VULKAN_PER_KERNEL: u64 = 0;
+
+impl DeviceProcessBytes {
+    /// The device bytes of a load on `backend` that prepares `kernels`
+    /// native kernels (`HostProcessBytes::kernels`).
+    pub fn derive(backend: BackendName, kernels: u64) -> Result<Self, String> {
+        let costs = DeviceProcessCosts::of(backend);
+        Ok(Self {
+            context: costs.context,
+            programs: costs
+                .per_kernel
+                .checked_mul(kernels)
+                .ok_or("prepared program device bytes overflow")?,
+        })
+    }
+
+    pub fn bytes(&self) -> Result<u64, String> {
+        self.context
+            .checked_add(self.programs)
+            .ok_or_else(|| "worker device bytes overflow".to_owned())
+    }
 }
 
 /// What a load's worker holds in host RAM that no planned holding names:
@@ -533,17 +608,21 @@ impl AssessmentHeaderBounds {
     }
 
     /// Complete the memory bounds with the graph-pool upper bound and the
-    /// worker's host bytes for the same backend and workload limits.
+    /// worker's host and device bytes for the same backend and workload
+    /// limits. The device bytes are steady holdings of the allocation domain,
+    /// part of the prepared resource bound.
     pub fn with_graph_resource_bound(
         self,
         graph: &AssessmentGraphResourceBounds,
         host_process: HostProcessBytes,
+        device_process: DeviceProcessBytes,
     ) -> Result<AssessmentMemoryBounds, String> {
         Ok(AssessmentMemoryBounds {
             prepared_resource_bytes: self
                 .prepared_program_bytes
                 .checked_add(graph.total_bytes)
                 .and_then(|bytes| bytes.checked_add(graph.recorded_graph_bytes))
+                .and_then(|bytes| bytes.checked_add(device_process.bytes().ok()?))
                 .ok_or("assessment prepared resource bound overflow")?,
             startup_additional_bytes: self.startup_additional_bytes,
             component_upload_bytes: self.component_upload_bytes,
@@ -565,6 +644,7 @@ impl AssessmentHeaderBounds {
             },
             bound_graph_host_bytes: graph.sealed_target_graphs.bound.bytes,
             host_process,
+            device_process,
         })
     }
 }
@@ -2377,13 +2457,18 @@ mod tests {
             BackendName::Cpu,
         )
         .unwrap();
+        let device_process =
+            DeviceProcessBytes::derive(BackendName::Cpu, host_process.kernels).unwrap();
         let bounds = header
-            .with_graph_resource_bound(&graph, host_process)
+            .with_graph_resource_bound(&graph, host_process, device_process)
             .unwrap();
         assert_eq!(bounds.host_process, host_process);
+        assert_eq!(bounds.device_process, device_process);
         assert_eq!(
             bounds.prepared_resource_bytes,
-            header.prepared_program_bytes + graph.total_bytes
+            header.prepared_program_bytes
+                + graph.total_bytes
+                + device_process.bytes().unwrap()
         );
         assert_eq!(
             bounds.startup_additional_bytes,
@@ -2437,6 +2522,11 @@ mod tests {
         kernels: 0,
     };
 
+    const NO_DEVICE_PROCESS: DeviceProcessBytes = DeviceProcessBytes {
+        context: 0,
+        programs: 0,
+    };
+
     fn fixture_charge(allocation_bytes: u64, staging_bytes: u64) -> AssessmentMemoryCharge {
         AssessmentMemoryCharge {
             exact_resident_bytes: allocation_bytes,
@@ -2453,6 +2543,7 @@ mod tests {
                 },
                 bound_graph_host_bytes: 0,
                 host_process: NO_HOST_PROCESS,
+                device_process: NO_DEVICE_PROCESS,
             },
             serving_bytes: allocation_bytes,
             allocation_bytes,
@@ -2487,6 +2578,7 @@ mod tests {
             },
             bound_graph_host_bytes: 0,
             host_process: NO_HOST_PROCESS,
+            device_process: NO_DEVICE_PROCESS,
         };
         // The workload's state outgrows the load's startup state and peak:
         // the peak is not charged on top of it.
@@ -2678,6 +2770,35 @@ mod tests {
                 deficit_bytes: 95,
             }
         );
+    }
+
+    /// The worker's device bytes are the backend's context and a cost per
+    /// kernel the load prepares; a unified device's are in its host bytes,
+    /// and a CUDA context is already outside the device's usable capacity.
+    #[test]
+    fn worker_device_bytes_price_the_context_and_kernels() {
+        for backend in [
+            BackendName::Cpu,
+            BackendName::Metal,
+            BackendName::Vulkan,
+            BackendName::Cuda,
+        ] {
+            let costs = DeviceProcessCosts::of(backend);
+            let device = DeviceProcessBytes::derive(backend, 40).unwrap();
+            assert_eq!(
+                device,
+                DeviceProcessBytes {
+                    context: costs.context,
+                    programs: 40 * costs.per_kernel,
+                }
+            );
+            assert_eq!(device.bytes().unwrap(), device.context + device.programs);
+        }
+        for unified in [BackendName::Cpu, BackendName::Metal] {
+            let device = DeviceProcessBytes::derive(unified, 40).unwrap();
+            assert_eq!(device.bytes().unwrap(), 0);
+        }
+        assert_eq!(DeviceProcessCosts::of(BackendName::Cuda).context, 0);
     }
 
     /// The worker's host bytes are counts the plan fixes times the costs

@@ -831,6 +831,7 @@ fn report_load_phase(name: &str, started: &mut Instant) {
 /// opening and its own end (`searched`), whose peak is its process's.
 fn report_load_memory(moment: &str, device: &seismic::Device) {
     let memory = seismic::ProcessMemory::read();
+    let usage = device.memory_usage();
     eprintln!(
         "magnitude-engine: memory {}",
         serde_json::json!({
@@ -840,7 +841,9 @@ fn report_load_memory(moment: &str, device: &seismic::Device) {
             "graphics_bytes": memory.graphics_bytes,
             "mapped_bytes": memory.mapped_bytes,
             "rest_bytes": memory.rest_bytes(),
-            "device_charged_bytes": device.memory_usage().charged,
+            "device_charged_bytes": usage.charged,
+            "device_held_bytes": usage.held,
+            "device_unallocated_bytes": usage.unallocated,
             "peak_footprint_bytes": seismic::ProcessMemory::peak_footprint(),
         })
     );

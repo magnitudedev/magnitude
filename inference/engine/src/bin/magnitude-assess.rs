@@ -201,6 +201,8 @@ fn print_breakdown(
             "host_vocabulary_bytes": host.vocabulary,
             "host_program_bytes": host.programs,
             "host_vision_bytes": host.vision,
+            "device_context_bytes": bounds.device_process.context,
+            "device_program_bytes": bounds.device_process.programs,
             "kernels": host.kernels,
             "host_bytes": charge.host_bytes().ok(),
         })

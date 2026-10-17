@@ -229,9 +229,23 @@ raises them here, never a margin elsewhere.
 | Metal | 175 MB | 1,800 B | 5.7 MB | 210 MB | M4 Max, macOS 15.5: MiniCPM5 1B, Qwen3.5 0.8B, 2B and 4B, LFM2.5 1.2B, Gemma 4 E2B QAT (with its drafter and projector) and Q4_K_M (`bugs/26-10-17/unplanned-host-heap-in-memory-verdict.md`) |
 | CPU, Vulkan, CUDA | Metal's | Metal's | Metal's | Metal's | Not yet measured: the vocabulary and program structures are the engine's own and the same on every backend, the runtimes are not |
 
-A dedicated device's prepared programs also hold device memory outside the charge (CUDA modules,
-Vulkan pipelines); it is not yet measured, and its device term is part of what the device reserve
-measurement records.
+A dedicated device also loses memory to the worker outside every charged allocation, and assessment
+charges it in the allocation domain with the prepared resources: the loaded images of the native
+kernels the load prepares (CUDA modules, Vulkan pipelines), a cost per kernel of the kernel inventory,
+and the driver's per-process context where the usable capacity does not already exclude it. A CUDA
+context is measured on the device itself when its capacity is measured and is outside that capacity,
+so it is not charged; a Vulkan device's creation takes from the heap or budget its capacity is, so it
+is. A unified device's kernels and runtime are in its worker's host bytes.
+
+| Backend | Context | Per kernel | Measured on |
+|---|---|---|---|
+| CUDA | In the usable capacity | Not yet measured | A10G, L40S (Linux), A10 (Windows): round 3 |
+| Vulkan | Not yet measured | Not yet measured | Radeon PRO V710 (Linux, Windows): round 3 |
+| Metal, CPU | In the host bytes | In the host bytes | |
+
+The device costs are measured as the host costs are: the device memory the GPU lost at each load
+moment, less what the engine holds then (`held`), by
+`inference/scripts/device-memory-costs.py` on an otherwise idle GPU.
 
 ## Bands
 
