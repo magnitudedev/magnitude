@@ -171,7 +171,14 @@ export function ChatPage() {
       const response = await fetch(`${apiBase}/chat/completions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: selectedModel, messages: conversation.messages.slice(0, -1), stream: true }),
+        // Disable hidden reasoning by default: some local reasoning models otherwise emit
+        // reasoning_content without user-facing content, leaving the chat bubble empty.
+        body: JSON.stringify({
+          model: selectedModel,
+          messages: conversation.messages.slice(0, -1),
+          reasoning_effort: "none",
+          stream: true,
+        }),
         signal: controller.signal,
       })
       if (!response.ok) {
