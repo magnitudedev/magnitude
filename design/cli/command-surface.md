@@ -32,7 +32,7 @@ hardware
 catalog status | list | show <model-id> | recommendations [--preference <value>] [--limit <count>]
 catalog search <query> [--all] [--limit <count>]
 catalog inspect <huggingface-url | owner/repo | owner/repo:QUANT>
-catalog pull <model-id | owner/repo[:QUANT]> [--drafter auto|none|<ref>] [--force]
+catalog pull <model-id | owner/repo[:QUANT]> [--drafter auto|none|<ref>] [--force] [--only projector|drafter]
 catalog cancel <model-id> | remove <model-id>
 models status [model-id] [--all] | load <model-id> | stop
 models import <path.gguf> [--drafter auto|none|<ref>]
@@ -162,8 +162,10 @@ can provide") unless `--force` is given; ACN enforces both (`ModelVersionNotRunn
 desktop, which disables those versions, and the CLI agree. `--force` applies only to Hugging Face
 versions and never admits an unsupported one. Pull acknowledges admitted work by what it is, from the sync outcome: a first
 or resumed download, an update to a newer revision, or a missing drafter, and directs the caller to
-focused model status. Pull, cancel, and removal validate only argument syntax before delegating
-directly to their authoritative mutations.
+focused model status. `--only projector|drafter` downloads just that component of a catalog model
+whose exact target was found on this computer without it (`DownloadCatalogComponent`); it applies only
+to catalog models and not with `--drafter` or `--force`. Pull, cancel, and removal validate only
+argument syntax before delegating directly to their authoritative mutations.
 
 `models import` adds one GGUF file in place, with the same drafter choice. `models drafter` adds,
 changes, or turns off the drafter of a custom model and is refused for catalog models. `models hide`
@@ -178,9 +180,12 @@ or off, which applies to all its directories.
 `models status` lists catalog models on the computer or with relevant acquisition/removal work and
 every visible custom model, with its source, the catalog model it is a variant of, and its drafter
 (the attached drafter, "Turned off", or the recommended drafter's "Faster with a drafter · Add"),
-followed by a footer counting models that can't run and
+followed by a footer with one line per catalog component an installed catalog model lacks ("Image
+input for … isn't downloaded" with its `--only` pull command) and counts of models that can't run and
 hidden models; `--all` lists those with their reasons and lists hidden models marked hidden. The addressed form adds Source, Variant of, Drafter,
-and the drafter candidates with their labels and verdicts. Addressed model commands
+and the drafter candidates with their labels and verdicts; for a catalog model, a line per missing
+component ("Image input  Not downloaded (1.03 GB) - magnitude catalog pull <id> --only projector"), which
+is never reported as an update. Addressed model commands
 accept every canonical model ID, hidden models' included; the addressed form of a hidden model says
 it is hidden and how to unhide it. One status field applies product priority:
 removal, transfer, failures, load/stop, ready, update availability, then unloaded. An optimizing

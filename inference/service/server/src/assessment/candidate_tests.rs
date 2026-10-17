@@ -764,6 +764,15 @@ impl CatalogModels for StubCatalog {
         Box::pin(async move { Err(InventoryError::NotFound(model_id.as_str().to_owned())) })
     }
 
+    fn install_catalog_component(
+        &self,
+        model_id: &ModelId,
+        _component: magnitude_service_contracts::models::CatalogComponent,
+    ) -> BoxFuture<'_, Result<CatalogInstallationAdmission, InventoryError>> {
+        let model_id = model_id.clone();
+        Box::pin(async move { Err(InventoryError::NotFound(model_id.as_str().to_owned())) })
+    }
+
     fn remove_catalog_model_installation(
         &self,
         model_id: &ModelId,
@@ -1045,31 +1054,13 @@ async fn fixture_with_other_catalog_model() -> Fixture {
     .await
 }
 
-async fn fixture_with(
-    custom: Vec<CustomModel>,
-    local_models: LocalModelsConfiguration,
-    other_catalog_model: bool,
-    extra_repositories: BTreeMap<String, StubRepository>,
-) -> Fixture {
-    let mut stub = hub();
-    stub.repositories.extend(extra_repositories);
-    let (endpoint, hub) = stub.serve();
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let mut config = InventoryConfig::with_roots(
-        directory.path().join("models"),
-        directory.path().join("cache"),
-    )
-    .expect("inventory config");
-    config.hub_endpoint = Some(endpoint);
-    config.local_models = local_models;
-    config.architectures = super::engine_architectures();
-    let models = Arc::new(ManagedModelStore::open(config).await.expect("model store"));
-    models
-        .ensure_model_inventory()
-        .await
-        .expect("location scan");
-    let target = hugging_face_package(&models, CATALOG_TARGET, "llama-Q8_0.gguf").await;
-    let draft = hugging_face_package(&models, CATALOG_DRAFT, "dflash.gguf").await;
+/// The catalog the fixtures serve: Llama Test, whose drafter is the DFlash file in its own
+/// repository.
+async fn llama_test_catalog(
+    models: &Arc<ManagedModelStore>,
+) -> (RecommendableModelCatalog, ModelId) {
+    let target = hugging_face_package(models, CATALOG_TARGET, "llama-Q8_0.gguf").await;
+    let draft = hugging_face_package(models, CATALOG_DRAFT, "dflash.gguf").await;
     let base = magnitude_service_contracts::models::CatalogBaseId::new("llama-test").unwrap();
     let variant = magnitude_service_contracts::models::CatalogVariantId::new("gguf:q8").unwrap();
     let catalog = RecommendableModelCatalog {
@@ -1101,6 +1092,33 @@ async fn fixture_with(
         }],
         diagnostics: Vec::new(),
     };
+    (catalog, ModelId::catalog(&base, &variant))
+}
+
+async fn fixture_with(
+    custom: Vec<CustomModel>,
+    local_models: LocalModelsConfiguration,
+    other_catalog_model: bool,
+    extra_repositories: BTreeMap<String, StubRepository>,
+) -> Fixture {
+    let mut stub = hub();
+    stub.repositories.extend(extra_repositories);
+    let (endpoint, hub) = stub.serve();
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut config = InventoryConfig::with_roots(
+        directory.path().join("models"),
+        directory.path().join("cache"),
+    )
+    .expect("inventory config");
+    config.hub_endpoint = Some(endpoint);
+    config.local_models = local_models;
+    config.architectures = super::engine_architectures();
+    let models = Arc::new(ManagedModelStore::open(config).await.expect("model store"));
+    models
+        .ensure_model_inventory()
+        .await
+        .expect("location scan");
+    let (catalog, catalog_id) = llama_test_catalog(&models).await;
     let mut catalog = catalog;
     if other_catalog_model {
         let mut other = catalog.models[0].clone();
@@ -1137,7 +1155,7 @@ async fn fixture_with(
         models,
         lineage,
         candidates,
-        catalog_id: ModelId::catalog(&base, &variant),
+        catalog_id,
     }
 }
 
@@ -2031,11 +2049,18 @@ fn enrichment_answers_only_for_the_exact_target_it_was_computed_for() {
     );
     let result = CustomModelEnrichmentResult {
         variant_of: Some("llama-test:gguf:q8".parse().unwrap()),
-        recommended_drafter: None,
+        drafters: Vec::new(),
         license: Some("apache-2.0".to_owned()),
     };
-    assert!(enrichment.record((model_id.clone(), "package_a".to_owned()), result.clone()));
-    assert!(!enrichment.record((model_id.clone(), "package_a".to_owned()), result.clone()));
+    let key = (model_id.clone(), "package_a".to_owned());
+    assert!(enrichment.record(key.clone(), 1, result.clone()));
+    assert!(enrichment.is_current(&key, 1));
+    assert!(
+        !enrichment.is_current(&key, 2),
+        "a result is stale once the inputs it was computed from change"
+    );
+    assert!(!enrichment.record(key.clone(), 2, result.clone()));
+    assert!(enrichment.is_current(&key, 2));
     let origin = CustomModelOrigin::Imported {
         path: PathBuf::from("/models/model.gguf"),
     };
@@ -2075,6 +2100,7 @@ fn enrichment_answers_only_for_the_exact_target_it_was_computed_for() {
     );
     assert!(enrichment.record(
         (model_id.clone(), "package_b".to_owned()),
+        2,
         CustomModelEnrichmentResult::default()
     ));
 }
@@ -2236,7 +2262,9 @@ async fn a_flat_llama_cpp_root_offers_only_the_models_own_repository_drafters() 
             .expect("target material"),
         repository: Some(("owner/Llama-GGUF".to_owned(), String::new())),
         primary: None,
-        folder: super::drafter_folder(&found, Some("owner/Llama-GGUF"), false, Some(root.path())),
+        folders: super::drafter_folder(&found, Some("owner/Llama-GGUF"), false, Some(root.path()))
+            .into_iter()
+            .collect(),
         snapshot: None,
         lineage: Default::default(),
         catalog: None,
@@ -2821,4 +2849,322 @@ async fn a_user_entered_drafter_without_lineage_is_untested() {
     assert_eq!(entered.lineage, DrafterLineage::None);
     assert_eq!(entered.label, "Untested");
     assert!(is_bound(&entered.verdict), "{:?}", entered.verdict);
+}
+
+struct NoCatalogEffects;
+
+impl magnitude_service_contracts::models::CatalogModelOptimizer for NoCatalogEffects {
+    fn optimize_catalog_model(
+        &self,
+        _model_id: ModelId,
+        _progress: Box<
+            dyn Fn(magnitude_service_contracts::models::CatalogOptimizationProgress) + Send + Sync,
+        >,
+    ) -> BoxFuture<'static, ()> {
+        Box::pin(async {})
+    }
+}
+
+impl magnitude_service_contracts::models::CatalogPackageRemover for NoCatalogEffects {
+    fn remove_catalog_packages(
+        &self,
+        _package_ids: Vec<magnitude_service_contracts::models::ModelPackageId>,
+    ) -> BoxFuture<'_, Result<u64, InventoryError>> {
+        Box::pin(async { Err(InventoryError::Unsupported("no removal in tests".into())) })
+    }
+}
+
+/// The service as it runs: the store scanning `local_models`, the local-models and catalog domains
+/// over it, and the candidates enriching custom models in the background.
+struct LiveFixture {
+    _directory: tempfile::TempDir,
+    _hub: Arc<StubHub>,
+    resolver: Arc<ModelDomainResolver>,
+    local: Arc<magnitude_service_models::ManagedLocalModels>,
+    _candidates: Arc<ManagedModelCandidates>,
+}
+
+async fn live_fixture(local_models: LocalModelsConfiguration) -> LiveFixture {
+    let (endpoint, hub) = hub().serve();
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut config = InventoryConfig::with_roots(
+        directory.path().join("models"),
+        directory.path().join("cache"),
+    )
+    .expect("inventory config");
+    config.hub_endpoint = Some(endpoint);
+    config.local_models = local_models;
+    config.architectures = super::engine_architectures();
+    let models = Arc::new(ManagedModelStore::open(config).await.expect("model store"));
+    models
+        .ensure_model_inventory()
+        .await
+        .expect("location scan");
+    let (catalog, _) = llama_test_catalog(&models).await;
+    let lineage = CatalogLineage::new(Arc::clone(&models), catalog.clone());
+    let resolver = ModelDomainResolver::new(Arc::clone(&models), catalog.clone());
+    let downloads = Arc::new(
+        magnitude_service_models::ManagedModelDownloads::open(Arc::clone(&models))
+            .await
+            .expect("downloads"),
+    );
+    let services = magnitude_service_models::managed_model_services(
+        resolver.clone(),
+        downloads,
+        Arc::new(NoCatalogEffects),
+        Arc::new(NoCatalogEffects),
+    )
+    .expect("model services");
+    let assessor = Arc::new(ModelAssessor::new(
+        Arc::clone(&models),
+        resolver.clone(),
+        Arc::new(ReleaseCatalog::without_material(catalog).expect("release catalog")),
+        cpu_environment(),
+    ));
+    let candidates = ManagedModelCandidates::new(
+        assessor,
+        lineage,
+        super::engine_architectures(),
+        services.catalog.clone(),
+        services.local.clone(),
+    );
+    candidates.start_enrichment(resolver.clone());
+    LiveFixture {
+        _directory: directory,
+        _hub: hub,
+        resolver,
+        local: services.local,
+        _candidates: candidates,
+    }
+}
+
+impl LiveFixture {
+    /// Rescans every location, as a watch event does, then waits until the attached drafter of the
+    /// custom model whose file is `file` is `expected` (its reference, and whether it serves).
+    async fn rescan_until(
+        &self,
+        file: &std::path::Path,
+        expected: Option<(&DrafterReference, bool)>,
+        what: &str,
+    ) -> CustomModel {
+        self.local.refresh_local().await.expect("rescan");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let listed = self.local.list_local().await.expect("local models");
+            let model = listed
+                .models
+                .iter()
+                .find(|model| model.files.first().is_some_and(|first| first.path == file))
+                .unwrap_or_else(|| panic!("{what}: no model at {}", file.display()));
+            let serves = matches!(
+                self.resolver
+                    .serving_configuration(&model.model_id)
+                    .map(|configuration| configuration.bundle),
+                Ok(ServableModelBundle::SpeculativeDecoding { .. })
+            );
+            let attached = model.drafter.as_ref().map(|drafter| {
+                (
+                    &drafter.reference,
+                    drafter.state
+                        == magnitude_service_contracts::models::AttachedDrafterState::Ready
+                        && serves,
+                )
+            });
+            if attached == expected {
+                return model.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: attached {attached:?}, recommended {:?}",
+                model
+                    .recommended_drafter
+                    .as_ref()
+                    .map(|candidate| &candidate.reference)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+fn write_sparse(path: &std::path::Path, gguf: &Gguf) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let (header, length) = gguf.bytes();
+    std::fs::write(path, header).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(length)
+        .unwrap();
+}
+
+/// QA (Debian, round 3): a drafter added to a found model's folder was listed as recommended but
+/// never attached until a restart, and once moved into a subfolder the model kept naming the
+/// missing file and served without the catalog drafter that was on disk. The automatic drafter
+/// follows every change to the files, live.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_found_models_automatic_drafter_follows_its_folder_and_the_catalog_drafter_live() {
+    let locations = tempfile::tempdir().expect("locations");
+    let folder = locations.path().join("A");
+    let drafters = locations.path().join("drafters");
+    let model = folder.join("model-IQ3_XXS.gguf");
+    write_sparse(&model, &llama(7, Encoding::Q8_0));
+    let catalog_copy = drafters.join("catalog-dflash.gguf");
+    write_sparse(&catalog_copy, &dflash(HIDDEN));
+    let root = |path: &std::path::Path| magnitude_service_contracts::models::ModelRoot {
+        kind: magnitude_service_contracts::models::ModelRootKind::Folder,
+        path: path.to_path_buf(),
+        enabled: true,
+    };
+    let fixture = live_fixture(LocalModelsConfiguration {
+        roots: vec![root(&folder), root(&drafters)],
+        ..LocalModelsConfiguration::default()
+    })
+    .await;
+    let catalog = DrafterReference::Catalog {
+        model_id: "llama-test:gguf:q8".parse().unwrap(),
+    };
+    fixture
+        .rescan_until(
+            &model,
+            Some((&catalog, true)),
+            "the catalog drafter on disk",
+        )
+        .await;
+
+    let beside = folder.join("dflash2.gguf");
+    write_sparse(&beside, &dflash2());
+    let in_folder = DrafterReference::Local {
+        path: beside.clone(),
+    };
+    fixture
+        .rescan_until(
+            &model,
+            Some((&in_folder, true)),
+            "a drafter added to the folder takes over without a restart",
+        )
+        .await;
+
+    let moved = folder.join("sub/dflash2.gguf");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&beside, &moved).unwrap();
+    fixture
+        .rescan_until(
+            &model,
+            Some((&catalog, true)),
+            "moved into a subfolder, the drafter gives way to the catalog drafter on disk",
+        )
+        .await;
+
+    std::fs::remove_file(&catalog_copy).unwrap();
+    fixture
+        .rescan_until(
+            &model,
+            Some((&catalog, false)),
+            "without the catalog drafter on disk the model serves plain and offers it",
+        )
+        .await;
+
+    std::fs::rename(&moved, &beside).unwrap();
+    fixture
+        .rescan_until(
+            &model,
+            Some((&in_folder, true)),
+            "moved back, it attaches again",
+        )
+        .await;
+}
+
+/// QA (Arch, round 3): a copy of a model with its last 4 KiB changed (the same header, other
+/// weights) is a second model, and it was offered and attached the "In this folder" drafter beside
+/// the first model, in another folder. Each model's folder drafters come from its own folder.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_sharing_a_header_with_another_never_takes_the_drafter_in_its_folder() {
+    let locations = tempfile::tempdir().expect("locations");
+    let pair = locations.path().join("gemma-pair");
+    let picked = locations.path().join("picked");
+    let drafters = locations.path().join("drafters");
+    let original = pair.join("model-Q8_0.gguf");
+    write_sparse(&original, &llama(7, Encoding::Q8_0));
+    let beside = pair.join("mtp-model-Q8_0.gguf");
+    write_sparse(&beside, &dflash2());
+    write_sparse(&drafters.join("catalog-dflash.gguf"), &dflash(HIDDEN));
+    let copy = picked.join("model-Q8_0.gguf");
+    std::fs::create_dir_all(&picked).unwrap();
+    std::fs::copy(&original, &copy).unwrap();
+    {
+        use std::io::{Seek, SeekFrom};
+        let mut file = std::fs::OpenOptions::new().write(true).open(&copy).unwrap();
+        let length = file.metadata().unwrap().len();
+        file.seek(SeekFrom::Start(length - 4096)).unwrap();
+        file.write_all(&[0xff; 4096]).unwrap();
+    }
+    let root = |path: &std::path::Path| magnitude_service_contracts::models::ModelRoot {
+        kind: magnitude_service_contracts::models::ModelRootKind::Folder,
+        path: path.to_path_buf(),
+        enabled: true,
+    };
+    let fixture = live_fixture(LocalModelsConfiguration {
+        roots: vec![root(&pair), root(&picked), root(&drafters)],
+        ..LocalModelsConfiguration::default()
+    })
+    .await;
+    let in_pair = DrafterReference::Local {
+        path: beside.clone(),
+    };
+    let catalog = DrafterReference::Catalog {
+        model_id: "llama-test:gguf:q8".parse().unwrap(),
+    };
+
+    let first = fixture
+        .rescan_until(
+            &original,
+            Some((&in_pair, true)),
+            "the pair keeps its drafter",
+        )
+        .await;
+    let second = fixture
+        .rescan_until(
+            &copy,
+            Some((&catalog, true)),
+            "the copy with other weights takes the catalog drafter, never the pair's",
+        )
+        .await;
+    assert_ne!(first.model_id, second.model_id, "two models");
+    assert_eq!(
+        second
+            .recommended_drafter
+            .as_ref()
+            .map(|candidate| &candidate.reference),
+        Some(&catalog)
+    );
+    let offered = fixture
+        ._candidates
+        .drafters(DrafterCandidatesRequest::Model {
+            model_id: second.model_id.clone(),
+            other: None,
+        })
+        .await
+        .expect("drafter candidates")
+        .candidates;
+    assert!(
+        offered
+            .iter()
+            .all(|candidate| candidate.category != DrafterCategory::NextToModel),
+        "no drafter from another folder is offered: {offered:#?}"
+    );
+    let served = |model_id: &ModelId| match fixture
+        .resolver
+        .serving_configuration(model_id)
+        .unwrap()
+        .bundle
+    {
+        ServableModelBundle::SpeculativeDecoding { target, .. }
+        | ServableModelBundle::Standalone { package: target } => target.id,
+    };
+    assert_ne!(
+        served(&first.model_id),
+        served(&second.model_id),
+        "each model serves its own weights"
+    );
 }

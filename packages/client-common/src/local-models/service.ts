@@ -6,6 +6,7 @@ import { Models } from "../operations"
 import {
   LocalModelMutationFailed,
   localModelManagedAcquisition,
+  type CatalogComponent,
   localModelResidency,
   type CustomFormModelId,
   type CustomLocalModel,
@@ -70,6 +71,7 @@ const makeLocalModels = Effect.gen(function* () {
   const registry = yield* Registry.AtomRegistry
   const query = effectQuery.Models.GetCatalog({})
   const install = effectQuery.Models.SyncLocalModel
+  const downloadComponent = effectQuery.Models.DownloadCatalogComponent
   const cancelDownload = effectQuery.Models.CancelLocalModelSync
   const dismissDownloadFailure = effectQuery.Models.AcknowledgeLocalModelSyncFailure
   const remove = effectQuery.Models.RemoveLocalModel
@@ -98,7 +100,7 @@ const makeLocalModels = Effect.gen(function* () {
   ))
   const unsupported = Atom.make((get) => Result.map(get(state), (models) => models.unsupported))
   const hidden = Atom.make((get) => Result.map(get(state), (models) => models.hidden))
-  const observeCommand = (mutation: typeof Models.LoadLocalModel | typeof Models.RemoveLocalModel | typeof Models.SyncLocalModel | typeof Models.CancelLocalModelSync | typeof Models.AcknowledgeLocalModelSyncFailure | typeof Models.SetModelDrafter | typeof Models.HideModel | typeof Models.UnhideModel, operation: LocalModelCommand) =>
+  const observeCommand = (mutation: typeof Models.LoadLocalModel | typeof Models.RemoveLocalModel | typeof Models.SyncLocalModel | typeof Models.DownloadCatalogComponent | typeof Models.CancelLocalModelSync | typeof Models.AcknowledgeLocalModelSyncFailure | typeof Models.SetModelDrafter | typeof Models.HideModel | typeof Models.UnhideModel, operation: LocalModelCommand) =>
     Mutation.state({ filters: { mutation }, select: ({ input, result }: {
       readonly input: { readonly modelId: ModelId }
       readonly result: Result.Result<unknown, unknown>
@@ -107,7 +109,8 @@ const makeLocalModels = Effect.gen(function* () {
       failure: Result.isFailure(result) && !result.waiting ? Option.some(localModelCommandFailure(operation, result.cause)) : Option.none(),
     }) })
   const commandObservations = yield* Effect.all([
-    observeCommand(Models.SyncLocalModel, "install"), observeCommand(Models.CancelLocalModelSync, "cancel"),
+    observeCommand(Models.SyncLocalModel, "install"), observeCommand(Models.DownloadCatalogComponent, "install"),
+    observeCommand(Models.CancelLocalModelSync, "cancel"),
     observeCommand(Models.AcknowledgeLocalModelSyncFailure, "dismiss"), observeCommand(Models.RemoveLocalModel, "remove"),
     observeCommand(Models.LoadLocalModel, "load"), observeCommand(Models.SetModelDrafter, "drafter"),
     observeCommand(Models.HideModel, "hide"), observeCommand(Models.UnhideModel, "unhide"),
@@ -131,6 +134,8 @@ const makeLocalModels = Effect.gen(function* () {
     stop: Mutation.execute(stop, {}).pipe(provideRegistry),
     retry: queryClient.invalidate(Models.GetCatalog.match()),
     install: (modelId: ModelId) => Mutation.execute(install, { modelId }).pipe(provideRegistry),
+    downloadComponent: (modelId: ModelId, component: CatalogComponent) =>
+      Mutation.execute(downloadComponent, { modelId, component }).pipe(provideRegistry),
     cancelDownload: (modelId: ModelId) => Mutation.execute(cancelDownload, { modelId }).pipe(provideRegistry),
     dismissDownloadFailure: (modelId: ModelId) => Mutation.execute(dismissDownloadFailure, { modelId }).pipe(provideRegistry),
     remove: (modelId: ModelId) => Mutation.execute(remove, { modelId }).pipe(provideRegistry),
@@ -162,6 +167,7 @@ export const LocalModelsLive = Layer.scoped(LocalModels, makeLocalModels)
 export function useLocalModelMutations() {
   const client = useAgentClient()
   const install = useAtomSet(useMemo(() => client.runtime.fn((modelId: ModelId) => Effect.flatMap(LocalModels, models => models.install(modelId)), { concurrent: true }), [client]))
+  const downloadComponent = useAtomSet(useMemo(() => client.runtime.fn(({ modelId, component }: { readonly modelId: ModelId; readonly component: CatalogComponent }) => Effect.flatMap(LocalModels, models => models.downloadComponent(modelId, component)), { concurrent: true }), [client]))
   const cancel = useAtomSet(useMemo(() => client.runtime.fn((modelId: ModelId) => Effect.flatMap(LocalModels, models => models.cancelDownload(modelId)), { concurrent: true }), [client]))
   const dismissFailure = useAtomSet(useMemo(() => client.runtime.fn((modelId: ModelId) => Effect.flatMap(LocalModels, models => models.dismissDownloadFailure(modelId)), { concurrent: true }), [client]))
   const remove = useAtomSet(useMemo(() => client.runtime.fn((modelId: ModelId) => Effect.flatMap(LocalModels, models => models.remove(modelId)), { concurrent: true }), [client]))
@@ -172,6 +178,7 @@ export function useLocalModelMutations() {
   const unhide = useAtomSet(useMemo(() => client.runtime.fn((modelId: ModelId) => Effect.flatMap(LocalModels, models => models.unhide(modelId)), { concurrent: true }), [client]))
   return {
     install: useCallback((modelId: ModelId) => install(modelId), [install]),
+    downloadComponent: useCallback((modelId: ModelId, component: CatalogComponent) => downloadComponent({ modelId, component }), [downloadComponent]),
     cancel: useCallback((modelId: ModelId) => cancel(modelId), [cancel]),
     dismissFailure: useCallback((modelId: ModelId) => dismissFailure(modelId), [dismissFailure]),
     remove: useCallback((modelId: ModelId) => remove(modelId), [remove]),

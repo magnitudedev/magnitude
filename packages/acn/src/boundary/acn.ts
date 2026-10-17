@@ -358,6 +358,9 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       SyncLocalModel: ({ modelId }) =>
         observeRpcDefects("SyncLocalModel", modelCommands.sync(modelId)),
 
+      DownloadCatalogComponent: ({ modelId, component }) =>
+        observeRpcDefects("DownloadCatalogComponent", modelCommands.downloadCatalogComponent(modelId, component)),
+
       CancelLocalModelSync: ({ modelId }) =>
         observeRpcDefects("CancelLocalModelSync", modelCommands.cancelSync(modelId)),
 

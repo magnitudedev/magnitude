@@ -207,7 +207,7 @@ describe("inference command surface", () => {
       "catalog recommendations": { arguments: [], options: ["--preference", "--limit"] },
       "catalog search": { arguments: ["<query>"], options: ["--all", "--limit"] },
       "catalog inspect": { arguments: ["<reference>"], options: [] },
-      "catalog pull": { arguments: ["<model>"], options: ["--drafter", "--force"] },
+      "catalog pull": { arguments: ["<model>"], options: ["--drafter", "--force", "--only"] },
       "catalog cancel": { arguments: ["<model-id>"], options: [] },
       "catalog remove": { arguments: ["<model-id>"], options: [] },
       "models status": { arguments: ["[model-id]"], options: ["--all"] },
@@ -672,6 +672,23 @@ describe("model status", () => {
       "1 hidden model.",
       "List them: magnitude models status --all",
     ])
+  })
+
+  it("reports a projector a found catalog target lacks as image input, never as an update, with the command that downloads only it", () => {
+    const lacking = makeInstalledCatalogModel({ missingComponents: [{ component: "Projector", downloadBytes: 1_034_945_421 }] })
+    const command = `magnitude catalog pull ${lacking.modelId} --only projector`
+    const list = renderModelsStatus(statusView({ models: [lacking] }))
+    expect(list).not.toContain("Update available")
+    expect(list).toContain(`Image input for Qwen Test (Q4) isn't downloaded (1.03 GB): ${command}`)
+    const detail = renderModelDetail({ model: lacking, models: [lacking], drafters: { _tag: "NotApplicable" }, hidden: false })
+    expect(detail).toMatch(new RegExp(`Image input\\s+Not downloaded \\(1\\.03 GB\\) - ${command}`))
+    expect(detail).toMatch(/Installation\s+Installed/)
+    expect(detail).not.toMatch(/Update\s+Available/)
+    const downloading = makeInstalledCatalogModel({
+      missingComponents: lacking.missingComponents,
+      acquisitionState: { ...lacking.acquisitionState, _tag: "Optimizing", progress: { stage: "preparing", completed: 0, total: 0, device: Option.none() } } as never,
+    })
+    expect(renderModelDetail({ model: downloading, models: [], drafters: { _tag: "NotApplicable" }, hidden: false })).not.toContain("Image input")
   })
 
   it("lists unsupported models with reasons and hidden models under --all", () => {

@@ -1,7 +1,7 @@
 import { Effect, Option } from "effect"
 import { describe, expect, it, vi } from "vitest"
 import { CatalogFormModelIdSchema } from "@magnitudedev/sdk"
-import { acquisitionHint, pull, pullJson, renderInspection, renderPull, type PullResult } from "./hugging-face-runtime"
+import { acquisitionHint, parseCatalogComponent, pull, pullComponent, pullJson, renderInspection, renderPull, type PullResult } from "./hugging-face-runtime"
 import type { CliModelsClient } from "./inference-client"
 import { parseDrafterArgument, parsePullReference } from "./model-references"
 import { fitsAssessment, makeInspection, TEST_REPOSITORY } from "./fixtures/inference"
@@ -91,5 +91,30 @@ describe("a version that is exactly a catalog model", () => {
       versionRequested: false,
       added: { _tag: "Catalog", modelId: catalogModel, version: "Q4_K_P", outcome: "Started" },
     })
+  })
+})
+
+describe("downloading one catalog component", () => {
+  it("downloads only the projector of a catalog model and says so", async () => {
+    const downloadCatalogComponent = vi.fn(() => Effect.succeed({ started: true }))
+    const syncLocalModel = vi.fn(() => Effect.die("only the component is downloaded"))
+    const client = { models: { downloadCatalogComponent, syncLocalModel } } as unknown as CliModelsClient
+    const component = Effect.runSync(parseCatalogComponent("projector"))
+    const result = await Effect.runPromise(pullComponent(client, catalogModel, component))
+    expect(downloadCatalogComponent).toHaveBeenCalledWith({ modelId: catalogModel, component: "Projector" })
+    expect(syncLocalModel).not.toHaveBeenCalled()
+    expect(renderPull(result)).toBe([
+      `Downloading only the image input for ${catalogModel}.`,
+      `Check progress: magnitude models status ${catalogModel}`,
+      "",
+    ].join("\n"))
+    expect(await Effect.runPromise(pullJson.encode(result)))
+      .toEqual({ _tag: "Component", modelId: catalogModel, component: "Projector", started: true })
+    expect(renderPull({ ...result, started: false } as PullResult)).toBe(`${catalogModel} already has its image input. Nothing to download.\n`)
+  })
+
+  it("accepts only projector or drafter", () => {
+    expect(Effect.runSync(parseCatalogComponent("Drafter"))).toBe("Drafter")
+    expect(Effect.runSync(Effect.flip(parseCatalogComponent("weights"))).message).toBe("--only takes projector or drafter, not weights.")
   })
 })

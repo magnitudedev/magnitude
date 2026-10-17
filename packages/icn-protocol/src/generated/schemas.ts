@@ -251,6 +251,10 @@ export const CandidateVersion = S.Struct({
 export type CandidateVersion = S.Schema.Type<typeof CandidateVersion>
 export type CandidateVersionEncoded = S.Schema.Encoded<typeof CandidateVersion>
 
+export const CatalogComponent = S.Union(S.Literal("Projector"), S.Literal("Drafter"))
+export type CatalogComponent = S.Schema.Type<typeof CatalogComponent>
+export type CatalogComponentEncoded = S.Schema.Encoded<typeof CatalogComponent>
+
 export const CatalogInstallationAdmission = S.Union(
   S.extend(S.TaggedStruct("Current", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
@@ -378,6 +382,13 @@ export const CatalogInstallationsResponse = S.extend(
 export type CatalogInstallationsResponse = S.Schema.Type<typeof CatalogInstallationsResponse>
 export type CatalogInstallationsResponseEncoded = S.Schema.Encoded<typeof CatalogInstallationsResponse>
 
+export const CatalogMissingComponent = S.Struct({
+  component: S.suspend((): S.Schema<CatalogComponent, CatalogComponentEncoded> => CatalogComponent),
+  downloadBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type CatalogMissingComponent = S.Schema.Type<typeof CatalogMissingComponent>
+export type CatalogMissingComponentEncoded = S.Schema.Encoded<typeof CatalogMissingComponent>
+
 export const CatalogModel = S.Struct({
   aliases: S.optionalWith(S.Array(S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId)), {
     exact: true,
@@ -421,6 +432,9 @@ export const CatalogModelState = S.Union(
     S.TaggedStruct("Installed", {
       effective: S.suspend((): S.Schema<EffectiveModel, EffectiveModelEncoded> => EffectiveModel),
       installation: S.suspend((): S.Schema<ModelInstallation, ModelInstallationEncoded> => ModelInstallation),
+      missingComponents: S.Array(
+        S.suspend((): S.Schema<CatalogMissingComponent, CatalogMissingComponentEncoded> => CatalogMissingComponent),
+      ),
       updateState: S.suspend((): S.Schema<CatalogModelUpdate, CatalogModelUpdateEncoded> => CatalogModelUpdate),
     }),
     S.Record({ key: S.String, value: JsonValue }),

@@ -17,13 +17,13 @@ use magnitude_service_contracts::bootstrap_protocol::{
     IcnStartupRecordType,
 };
 use magnitude_service_contracts::models::{
-    CandidateInspection, CandidateInspectionRequest, CatalogInstallationAdmission,
-    CatalogInstallationOperation, CatalogInstallationOperationId, CatalogInstallationRemoval,
-    CatalogInstallations, CatalogInstallationsResponse, CatalogModel, CatalogModelState,
-    CatalogModels, CatalogModelsResponse, CustomModel, CustomModelOrigin, CustomModelState,
-    DrafterCandidatesRequest, DrafterCandidatesResponse, DrafterPruning, EffectiveModel,
-    FoundSource, LocalModelRemoval, LocalModels, LocalModelsConfiguration, LocalModelsResponse,
-    ModelAssessment, ModelAssessmentDomainSnapshot, ModelAssessmentEntryState,
+    CandidateInspection, CandidateInspectionRequest, CatalogComponent,
+    CatalogInstallationAdmission, CatalogInstallationOperation, CatalogInstallationOperationId,
+    CatalogInstallationRemoval, CatalogInstallations, CatalogInstallationsResponse, CatalogModel,
+    CatalogModelState, CatalogModels, CatalogModelsResponse, CustomModel, CustomModelOrigin,
+    CustomModelState, DrafterCandidatesRequest, DrafterCandidatesResponse, DrafterPruning,
+    EffectiveModel, FoundSource, LocalModelRemoval, LocalModels, LocalModelsConfiguration,
+    LocalModelsResponse, ModelAssessment, ModelAssessmentDomainSnapshot, ModelAssessmentEntryState,
     ModelAssessmentSubject, ModelAssessments, ModelAssessmentsSnapshot, ModelCandidate,
     ModelCandidates, ModelCapabilities, ModelDownload, ModelDownloadId, ModelDownloads,
     ModelDownloadsResponse, ModelId, ModelInstance, ModelInstanceId, ModelInstancesInvalidation,
@@ -293,6 +293,10 @@ pub fn app(state: AppState, serving: magnitude_serving::Serving) -> Router {
         .route(
             "/api/v1/catalog/models/{model_id}/install",
             post(install_catalog_model),
+        )
+        .route(
+            "/api/v1/catalog/models/{model_id}/components/{component}/install",
+            post(install_catalog_component),
         )
         .route(
             "/api/v1/catalog/models/{model_id}/installation",
@@ -1013,6 +1017,44 @@ async fn install_catalog_model(
     Ok(Json(result))
 }
 
+#[utoipa::path(post, path = "/api/v1/catalog/models/{model_id}/components/{component}/install", operation_id = "installCatalogComponent", tag = "catalog",
+    params(
+        ("model_id" = String, Path, description = "Canonical catalog model ID"),
+        ("component" = CatalogComponent, Path, description = "The one component to fetch")
+    ),
+    responses(
+        (status = 200, description = "Catalog installation admission", body = CatalogInstallationAdmission),
+        (status = 404, description = "Catalog model not found", body = ErrorResponse),
+        (status = 409, description = "Installation cannot be admitted", body = ErrorResponse),
+        (status = 500, description = "Installation failed", body = ErrorResponse)
+    )
+)]
+async fn install_catalog_component(
+    State(state): State<AppState>,
+    Path((model_id, component)): Path<(String, CatalogComponent)>,
+) -> Result<Json<CatalogInstallationAdmission>, ApiError> {
+    let parsed_id = model_id
+        .parse::<ModelId>()
+        .map_err(|error| ApiError::invalid(error.to_string()))?;
+    if !matches!(parsed_id.parsed(), ParsedModelId::Catalog { .. }) {
+        return Err(ApiError::invalid(
+            "catalog installation requires a catalog model ID",
+        ));
+    }
+    let result = state
+        .catalog_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?
+        .install_catalog_component(&parsed_id, component)
+        .await
+        .map_err(ApiError::from_inventory)?;
+    state.invalidate_resources([
+        InferenceResourceTopic::Catalog,
+        InferenceResourceTopic::CatalogInstallations,
+    ]);
+    Ok(Json(result))
+}
+
 #[utoipa::path(delete, path = "/api/v1/catalog/models/{model_id}/installation", operation_id = "removeCatalogModelInstallation", tag = "catalog",
     params(("model_id" = String, Path, description = "Canonical catalog model ID")),
     responses(
@@ -1645,6 +1687,7 @@ fn open_ai_model(
         catalog_models,
         catalog_model,
         install_catalog_model,
+        install_catalog_component,
         remove_catalog_model_installation,
         catalog_installations,
         catalog_installation,
@@ -1703,6 +1746,7 @@ fn open_ai_model(
         CatalogInstallationsResponse,
         CatalogInstallationAdmission,
         CatalogInstallationRemoval,
+        CatalogComponent,
         EnsureModelInstanceRequest,
         OpenAiModel,
         OpenAiModelArchitecture,
@@ -2998,6 +3042,15 @@ mod tests {
         fn install_catalog_model(
             &self,
             model_id: &ModelId,
+        ) -> BoxFuture<'_, Result<CatalogInstallationAdmission, InventoryError>> {
+            let model_id = model_id.to_string();
+            Box::pin(async move { Err(InventoryError::NotFound(model_id)) })
+        }
+
+        fn install_catalog_component(
+            &self,
+            model_id: &ModelId,
+            _component: CatalogComponent,
         ) -> BoxFuture<'_, Result<CatalogInstallationAdmission, InventoryError>> {
             let model_id = model_id.to_string();
             Box::pin(async move { Err(InventoryError::NotFound(model_id)) })

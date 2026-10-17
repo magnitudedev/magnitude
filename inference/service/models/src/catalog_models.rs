@@ -6,15 +6,15 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
-    CatalogBaseId, CatalogInstallationAdmission, CatalogInstallationRemoval, CatalogModel,
-    CatalogModelState, CatalogVariantId,
+    CatalogBaseId, CatalogComponent, CatalogInstallationAdmission, CatalogInstallationRemoval,
+    CatalogMissingComponent, CatalogModel, CatalogModelState, CatalogVariantId,
     CatalogModelUpdate, CatalogModels, CatalogModelsResponse, CatalogPackageRole, CatalogSupport,
     EffectiveModel,
     InstalledCatalogAttribution, InstalledModelPackage, ModelAssessmentSubject,
     ModelDomainInvalidation, ModelFailure, ModelId, ModelInstallation, ModelInstallationOwnership,
-    ModelFileId, ModelPackageId, ModelPackageInstallationOrigin, ModelServingConfiguration,
-    ParsedModelId,
-    RecommendableModel, ServableModelBundle,
+    ModelFileId, ModelFileRole, ModelPackage, ModelPackageId, ModelPackageInstallationOrigin,
+    ModelServingConfiguration, ParsedModelId, RecommendableModel, ServableModelBundle,
+    SpeculativeDraftSource,
 };
 
 use crate::catalog_installations::ManagedCatalogInstallations;
@@ -257,6 +257,46 @@ impl ModelDomainResolver {
                 })
                 .collect(),
         })
+    }
+
+    /// The download that fetches only `component` of catalog model `id`, or `None` when the
+    /// component is not missing. Only a component a found exact target lacks can be fetched alone.
+    pub(crate) fn catalog_component_download(
+        &self,
+        id: &ModelId,
+        component: CatalogComponent,
+    ) -> Result<Option<ServableModelBundle>, InventoryError> {
+        let definition = self.catalog_definition(id)?;
+        let model = self
+            .catalog_snapshot()?
+            .models
+            .into_iter()
+            .find(|model| model.id == *id)
+            .ok_or_else(|| InventoryError::NotFound(id.to_string()))?;
+        let CatalogModelState::Installed {
+            missing_components, ..
+        } = model.local_state
+        else {
+            return Err(InventoryError::ModelOperation {
+                code: "catalog_model_not_installed".to_owned(),
+                message: format!("catalog model {id} is not installed"),
+                retryable: false,
+            });
+        };
+        if !missing_components
+            .iter()
+            .any(|missing| missing.component == component)
+        {
+            return Ok(None);
+        }
+        let package = match component {
+            CatalogComponent::Projector => catalog_target(definition),
+            CatalogComponent::Drafter => catalog_draft(definition)
+                .ok_or_else(|| InventoryError::Internal(format!("catalog model {id} has no separate drafter")))?,
+        };
+        Ok(Some(ServableModelBundle::Standalone {
+            package: package.clone(),
+        }))
     }
 
     pub(crate) fn catalog_definition(
@@ -503,6 +543,15 @@ impl CatalogModels for ManagedCatalogModels {
         Box::pin(async move { self.installations.install(&id).await })
     }
 
+    fn install_catalog_component(
+        &self,
+        id: &ModelId,
+        component: CatalogComponent,
+    ) -> BoxFuture<'_, Result<CatalogInstallationAdmission, InventoryError>> {
+        let id = id.clone();
+        Box::pin(async move { self.installations.install_component(&id, component).await })
+    }
+
     fn remove_catalog_model_installation(
         &self,
         id: &ModelId,
@@ -574,16 +623,20 @@ fn catalog_model(
                         required_download_bytes: resolution.required_download_bytes,
                     }
                 },
+                missing_components: resolution.missing_components,
             },
         },
     }
 }
 
+/// `required_download_bytes` is the update: what a newer catalog revision needs fetched.
+/// `missing_components` are what a found exact target lacks, which is not an update.
 struct CatalogResolution<'a> {
     installed_packages: Vec<&'a InstalledModelPackage>,
     missing_desired_package_ids: Vec<ModelPackageId>,
     superseded_package_ids: Vec<ModelPackageId>,
     required_download_bytes: u64,
+    missing_components: Vec<CatalogMissingComponent>,
     state: CatalogMaterialState<'a>,
 }
 
@@ -618,6 +671,11 @@ enum CatalogMaterialState<'a> {
 
 /// `local_files` are files on this computer in any location, a hidden found copy's included, which
 /// an installation copies rather than downloads.
+///
+/// A found exact target (the catalog's target weights in another app's location) is the catalog
+/// model and serves with every catalog component on this computer: the catalog drafter when it is
+/// here, without a projector it lacks. What it lacks is reported as missing components, never as an
+/// update, unless an older catalog revision of this model is also here.
 fn catalog_resolution<'a>(
     definition: &RecommendableModel,
     present: &BTreeMap<ModelPackageId, &'a InstalledModelPackage>,
@@ -642,13 +700,19 @@ fn catalog_resolution<'a>(
         .map(|file| &file.id)
         .chain(local_files)
         .collect::<BTreeSet<_>>();
-    let required_download_bytes = desired_packages
+    let download_bytes = |package: &ModelPackage| -> u64 {
+        package
+            .files
+            .iter()
+            .filter(|file| !present_files.contains(&file.id))
+            .map(|file| file.size_bytes)
+            .sum()
+    };
+    let missing_bytes = desired_packages
         .iter()
         .filter(|(package, _)| !present.contains_key(&package.id))
-        .flat_map(|(package, _)| &package.files)
-        .filter(|file| !present_files.contains(&file.id))
-        .map(|file| file.size_bytes)
-        .sum();
+        .map(|(package, _)| download_bytes(package))
+        .sum::<u64>();
     let superseded_package_ids = affiliations
         .iter()
         .filter(|affiliation| {
@@ -681,10 +745,11 @@ fn catalog_resolution<'a>(
         })
         .copied()
         .collect::<Vec<_>>();
+    let catalog_target = catalog_target(definition);
     let targets = present
         .values()
         .filter(|entry| {
-            entry.package.id == catalog_target(definition).id
+            entry.package.id == catalog_target.id
                 || matches!(
                     &entry.catalog_attribution,
                     InstalledCatalogAttribution::Attributed { model_id, variant_id }
@@ -701,18 +766,52 @@ fn catalog_resolution<'a>(
         .collect::<Vec<_>>();
     let desired_target = targets
         .iter()
-        .find(|entry| entry.package.id == catalog_target(definition).id)
+        .find(|entry| entry.package.id == catalog_target.id)
         .copied();
-    let selected_target = desired_target.or(match targets.as_slice() {
+    let exact_target = desired_target.is_none().then(|| {
+        targets
+            .iter()
+            .find(|entry| {
+                crate::package_service::exact_target_weights(catalog_target, &entry.package)
+            })
+            .copied()
+    });
+    let exact_target = exact_target.flatten();
+    let selected_target = desired_target.or(exact_target).or(match targets.as_slice() {
         [target] => Some(*target),
         _ => None,
     });
+    let mut required_download_bytes = missing_bytes;
+    let mut missing_components = Vec::new();
     let state = if targets.is_empty() {
         CatalogMaterialState::NotInstalled
     } else if missing_desired_package_ids.is_empty() {
         let configuration = definition.configuration.clone();
         CatalogMaterialState::Installed {
             selected_target: desired_target,
+            effective: effective_configuration_model(&configuration, present),
+            configuration: Some(configuration),
+        }
+    } else if let Some(target) = exact_target {
+        if superseded_package_ids.is_empty() {
+            required_download_bytes = 0;
+            missing_components = found_target_missing_components(
+                definition,
+                &target.package,
+                present,
+                download_bytes,
+            );
+        }
+        let configuration = ModelServingConfiguration {
+            bundle: present_components_bundle(
+                &definition.configuration.bundle,
+                &target.package,
+                present,
+            ),
+            profile: definition.configuration.profile.clone(),
+        };
+        CatalogMaterialState::Installed {
+            selected_target: Some(target),
             effective: effective_configuration_model(&configuration, present),
             configuration: Some(configuration),
         }
@@ -747,7 +846,76 @@ fn catalog_resolution<'a>(
         missing_desired_package_ids,
         superseded_package_ids,
         required_download_bytes,
+        missing_components,
         state,
+    }
+}
+
+/// The catalog bundle served from `target` with the catalog's drafter when it is on this computer.
+fn present_components_bundle(
+    bundle: &ServableModelBundle,
+    target: &ModelPackage,
+    present: &BTreeMap<ModelPackageId, &InstalledModelPackage>,
+) -> ServableModelBundle {
+    match bundle {
+        ServableModelBundle::SpeculativeDecoding {
+            draft_source: SpeculativeDraftSource::Separate { draft },
+            ..
+        } if !present.contains_key(&draft.id) => ServableModelBundle::Standalone {
+            package: target.clone(),
+        },
+        ServableModelBundle::SpeculativeDecoding {
+            draft_source,
+            method,
+            ..
+        } => ServableModelBundle::SpeculativeDecoding {
+            target: target.clone(),
+            draft_source: draft_source.clone(),
+            method: method.clone(),
+        },
+        ServableModelBundle::Standalone { .. } => ServableModelBundle::Standalone {
+            package: target.clone(),
+        },
+    }
+}
+
+/// What a found exact target lacks of its catalog bundle: the catalog target's projector, and the
+/// catalog's separate drafter. Each downloads only the bytes not already on this computer.
+fn found_target_missing_components(
+    definition: &RecommendableModel,
+    found: &ModelPackage,
+    present: &BTreeMap<ModelPackageId, &InstalledModelPackage>,
+    download_bytes: impl Fn(&ModelPackage) -> u64,
+) -> Vec<CatalogMissingComponent> {
+    let catalog_target = catalog_target(definition);
+    let lacks_projector = catalog_target.files.iter().any(|file| {
+        file.role == ModelFileRole::Projector
+            && !found.files.iter().any(|found| found.id == file.id)
+    });
+    let projector = lacks_projector.then(|| CatalogMissingComponent {
+        component: CatalogComponent::Projector,
+        download_bytes: download_bytes(catalog_target),
+    });
+    let drafter = catalog_draft(definition)
+        .filter(|draft| !present.contains_key(&draft.id))
+        .map(|draft| CatalogMissingComponent {
+            component: CatalogComponent::Drafter,
+            download_bytes: download_bytes(draft),
+        });
+    projector.into_iter().chain(drafter).collect()
+}
+
+fn catalog_draft(definition: &RecommendableModel) -> Option<&ModelPackage> {
+    match &definition.configuration.bundle {
+        ServableModelBundle::SpeculativeDecoding {
+            draft_source: SpeculativeDraftSource::Separate { draft },
+            ..
+        } => Some(draft),
+        ServableModelBundle::Standalone { .. }
+        | ServableModelBundle::SpeculativeDecoding {
+            draft_source: SpeculativeDraftSource::Embedded,
+            ..
+        } => None,
     }
 }
 
@@ -1067,9 +1235,14 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn exact_target_weights_found_externally_install_the_catalog_model_and_only_the_rest_is_downloaded() {
-        let found = package("found", 3_000);
+    /// The catalog target found in a Hugging Face cache without its projector, as `hf download`
+    /// of the one GGUF leaves it.
+    fn found_exact_target_without_projector() -> (ModelPackage, ModelPackage) {
+        let mut found = package("found", 3_000);
+        found.source = ModelPackageSource::HuggingFace {
+            repository: "unsloth/gemma-4-E2B-it-qat-GGUF".to_owned(),
+            revision: "a".repeat(40),
+        };
         let mut target = found.clone();
         target.id = ModelPackageId("target".to_owned());
         target.files.push(ModelFile {
@@ -1080,36 +1253,155 @@ mod tests {
             tensor_storage_bytes: Some(600),
             sha256: "b".repeat(64),
         });
-        let draft = package("draft", 900);
-        let definition = definition(ServableModelBundle::SpeculativeDecoding {
-            target,
-            draft_source: SpeculativeDraftSource::Separate { draft },
-            method: SpeculativeMethod::DFlash,
-        });
+        (found, target)
+    }
+
+    fn attributed_external(
+        found: ModelPackage,
+        definition: &RecommendableModel,
+    ) -> InstalledModelPackage {
         let mut external = installed(found, ModelPackageInstallationOrigin::HuggingFaceCache);
         external.catalog_attribution = InstalledCatalogAttribution::Attributed {
             model_id: definition.model_id.clone(),
             variant_id: definition.variant_id.clone(),
         };
-        let present = BTreeMap::from([(external.package.id.clone(), &external)]);
-        let model = catalog_model(&definition, &present, &[], &BTreeMap::new(), &BTreeSet::new());
-        let CatalogModelState::Installed {
+        external
+    }
+
+    #[test]
+    fn a_found_exact_target_serves_with_the_catalog_drafter_and_reports_its_missing_projector() {
+        let (found, target) = found_exact_target_without_projector();
+        let draft = package("draft", 900);
+        let definition = definition(ServableModelBundle::SpeculativeDecoding {
+            target,
+            draft_source: SpeculativeDraftSource::Separate {
+                draft: draft.clone(),
+            },
+            method: SpeculativeMethod::Mtp,
+        });
+        let external = attributed_external(found.clone(), &definition);
+        let drafter = installed(draft.clone(), ModelPackageInstallationOrigin::Magnitude);
+        let present = BTreeMap::from([
+            (external.package.id.clone(), &external),
+            (drafter.package.id.clone(), &drafter),
+        ]);
+        let local_files = present
+            .values()
+            .flat_map(|entry| &entry.package.files)
+            .map(|file| file.id.clone())
+            .collect::<BTreeSet<_>>();
+
+        let resolution = catalog_resolution(&definition, &present, &[], &local_files);
+        let CatalogMaterialState::Installed {
+            configuration: Some(configuration),
             effective: EffectiveModel::Ready { .. },
+            ..
+        } = resolution.state
+        else {
+            panic!("the found exact target serves the catalog model");
+        };
+        assert_eq!(
+            configuration.bundle,
+            ServableModelBundle::SpeculativeDecoding {
+                target: found,
+                draft_source: SpeculativeDraftSource::Separate { draft },
+                method: SpeculativeMethod::Mtp,
+            },
+            "the catalog drafter on this computer serves with the found weights at once"
+        );
+
+        let model = catalog_model(&definition, &present, &[], &BTreeMap::new(), &local_files);
+        let CatalogModelState::Installed {
+            effective: EffectiveModel::Ready { model: ready },
             installation: ModelInstallation::Resolved { ownership, .. },
-            update_state:
-                CatalogModelUpdate::Available {
-                    required_download_bytes,
-                },
+            update_state,
+            missing_components,
         } = model.local_state
         else {
             panic!("the found exact target is the installed catalog model: {:?}", model.local_state);
         };
-        assert_eq!(ownership, ModelInstallationOwnership::External);
+        assert_eq!(ownership, ModelInstallationOwnership::Mixed);
+        assert_eq!(ready.speculative_method, Some(SpeculativeMethod::Mtp));
         assert_eq!(
-            required_download_bytes,
-            600 + 900,
-            "the target weights are already here; only the projector and drafter are fetched"
+            update_state,
+            CatalogModelUpdate::Current,
+            "a missing projector is not a newer catalog revision"
         );
+        assert_eq!(
+            missing_components,
+            vec![CatalogMissingComponent {
+                component: CatalogComponent::Projector,
+                download_bytes: 600,
+            }],
+            "only the projector is fetched; the found weights are copied, never downloaded"
+        );
+    }
+
+    #[test]
+    fn a_found_exact_target_without_the_catalog_drafter_offers_it_alone() {
+        let (found, target) = found_exact_target_without_projector();
+        let definition = definition(ServableModelBundle::SpeculativeDecoding {
+            target,
+            draft_source: SpeculativeDraftSource::Separate {
+                draft: package("draft", 900),
+            },
+            method: SpeculativeMethod::DFlash,
+        });
+        let external = attributed_external(found.clone(), &definition);
+        let present = BTreeMap::from([(external.package.id.clone(), &external)]);
+        let resolution = catalog_resolution(&definition, &present, &[], &BTreeSet::new());
+        let CatalogMaterialState::Installed {
+            configuration: Some(configuration),
+            effective: EffectiveModel::Ready { .. },
+            ..
+        } = &resolution.state
+        else {
+            panic!("the found exact target serves the catalog model");
+        };
+        assert_eq!(
+            configuration.bundle,
+            ServableModelBundle::Standalone { package: found }
+        );
+        assert_eq!(resolution.required_download_bytes, 0);
+        assert_eq!(
+            resolution.missing_components,
+            vec![
+                CatalogMissingComponent {
+                    component: CatalogComponent::Projector,
+                    download_bytes: 600,
+                },
+                CatalogMissingComponent {
+                    component: CatalogComponent::Drafter,
+                    download_bytes: 900,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_found_exact_target_beside_an_older_catalog_revision_is_an_update() {
+        let (found, target) = found_exact_target_without_projector();
+        let definition = definition(ServableModelBundle::SpeculativeDecoding {
+            target,
+            draft_source: SpeculativeDraftSource::Separate {
+                draft: package("draft", 900),
+            },
+            method: SpeculativeMethod::DFlash,
+        });
+        let external = attributed_external(found, &definition);
+        let prior_draft = installed(package("prior-draft", 800), ModelPackageInstallationOrigin::Magnitude);
+        let present = BTreeMap::from([
+            (external.package.id.clone(), &external),
+            (prior_draft.package.id.clone(), &prior_draft),
+        ]);
+        let resolution = catalog_resolution(
+            &definition,
+            &present,
+            &[affiliation(&prior_draft.package.id, CatalogPackageRole::Dependency)],
+            &BTreeSet::new(),
+        );
+        assert_eq!(resolution.required_download_bytes, 600 + 900);
+        assert!(resolution.missing_components.is_empty());
     }
 
     #[test]
@@ -1167,6 +1459,7 @@ mod tests {
                 CatalogModelUpdate::Available {
                     required_download_bytes,
                 },
+            ..
         } = model.local_state
         else {
             panic!("the unique prior target must remain a ready installed fallback")
@@ -1255,6 +1548,7 @@ mod tests {
                     ..
                 },
             update_state: CatalogModelUpdate::Current,
+            ..
         } = model.local_state
         else {
             panic!("an invalid installed dependency must make the effective bundle unavailable")

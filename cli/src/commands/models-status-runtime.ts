@@ -1,4 +1,6 @@
 import {
+  catalogComponentName,
+  catalogComponentOffers,
   catalogVariantOfName,
   customModelDrafterOffer,
   formatLocalModelDisplayName,
@@ -19,6 +21,7 @@ import {
   ModelIdSchema,
   UnsupportedLocalModelSchema,
   localModelDeprecation,
+  type CatalogMissingComponent,
   type CustomLocalModel,
   type DrafterCandidate,
   type DrafterReference,
@@ -205,6 +208,7 @@ export const renderModelsStatus = ({ models, unsupported, hidden, all }: ModelsS
   const listed = all ? [...visible, ...hidden] : visible
   const isHidden = (model: LocalModel) => hidden.some(({ modelId }) => modelId === model.modelId)
   const footer = all ? [] : [
+    ...catalogComponentHints(visible),
     ...(unsupported.length > 0
       ? [`${plural(unsupported.length, "other model")} on this computer can't run in Magnitude.`]
       : []),
@@ -285,6 +289,24 @@ const installationFields = (model: LocalModel): readonly (readonly [string, stri
   ]
 }
 
+const componentCommand = (model: LocalModel, { component }: CatalogMissingComponent): string =>
+  `magnitude catalog pull ${model.modelId} --only ${component.toLowerCase()}`
+
+const componentSize = ({ downloadBytes }: CatalogMissingComponent): string =>
+  downloadBytes > 0 ? ` (${formatStorageSize(downloadBytes)})` : ""
+
+/** One line per catalog component the model lacks, each with the command that downloads only it. */
+const catalogComponentFields = (model: LocalModel): readonly (readonly [string, string])[] =>
+  catalogComponentOffers(model).map((offer) => [
+    catalogComponentName(offer.component),
+    `Not downloaded${componentSize(offer)} - ${componentCommand(model, offer)}`,
+  ] as const)
+
+/** The list's footer line for each catalog component a model lacks. */
+const catalogComponentHints = (models: readonly LocalModel[]): string[] => models.flatMap((model) =>
+  catalogComponentOffers(model).map((offer) =>
+    `${catalogComponentName(offer.component)} for ${formatLocalModelDisplayName(model)} isn't downloaded${componentSize(offer)}: ${componentCommand(model, offer)}`))
+
 const customSourceDetail = (model: CustomLocalModel): string => {
   switch (model.origin._tag) {
     case "Added": return `Hugging Face · ${model.origin.repository}`
@@ -360,6 +382,7 @@ export const renderModelDetail = (view: ModelDetailView): string => {
       ...Option.match(model.presentation.license, { onNone: () => [], onSome: (license) => [["License", license] as const] }),
       ...supportFields(model, models),
       ...installationFields(model),
+      ...catalogComponentFields(model),
       ...(localModelIsInstalled(model) ? [["Runtime", residencyLabel(model)]] as const : []),
       ...(modelMemoryBytes(model) === undefined ? [] : [["Memory", modelMemory(model)]] as const),
       ...(modelContext(model) === "—" ? [] : [["Context", modelContext(model)]] as const),

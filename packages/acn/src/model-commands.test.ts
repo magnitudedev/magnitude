@@ -166,6 +166,46 @@ it("reports whether a catalog sync installs, updates, or finds the model current
   expect(await Effect.runPromise(sync("Installed", "Current"))).toBe("AlreadyCurrent")
 })
 
+it("downloads only the named component of a catalog model and refuses custom models", async () => {
+  const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
+  const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+  const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+  const { ModelSlotController } = await import("./model-slot-controller")
+  const { LocalModelRemovals } = await import("./local-model-removals")
+  const requested: unknown[] = []
+  const download = (model: string, admission: string) => Effect.gen(function* () {
+    const commands = yield* ModelCommands
+    return yield* commands.downloadCatalogComponent(Schema.decodeUnknownSync(ModelIdSchema)(model), "Projector")
+  }).pipe(
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
+    Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, localModels),
+    Effect.provideService(IcnInstances, { get: Effect.succeed({ revision: 1, instances: [] }) } as never),
+    Effect.provideService(IcnClient, {
+      catalog: {
+        installCatalogModel: () => Effect.die("a component download never installs the whole bundle"),
+        installCatalogComponent: (request: unknown) => Effect.sync(() => {
+          requested.push(request)
+          return { _tag: admission, operationId: "op" }
+        }),
+      },
+    } as never),
+    Effect.provideService(IcnCatalog, { refresh: Effect.void } as never),
+    Effect.provideService(IcnCatalogInstallations, { refresh: Effect.void } as never),
+    Effect.provideService(ModelSlotController, {} as never),
+    Effect.provideService(LocalModelRemovals, {} as never),
+  )
+  expect(await Effect.runPromise(download("model-a:gguf:test", "Admitted"))).toEqual({ started: true })
+  expect(await Effect.runPromise(download("model-a:gguf:test", "Current"))).toEqual({ started: false })
+  expect(requested).toEqual([
+    { path: { model_id: "model-a:gguf:test", component: "Projector" } },
+    { path: { model_id: "model-a:gguf:test", component: "Projector" } },
+  ])
+  const refused = await Effect.runPromise(download("hf:owner/repo/model-Q4_K_M.gguf", "Admitted").pipe(Effect.flip))
+  expect(refused._tag === "LocalModelMutationFailed" && refused.code).toBe("catalog_component_requires_catalog_model")
+  expect(requested).toHaveLength(2)
+})
+
 describe("load acknowledgement", () => {
   const loadFixture = async (initial: unknown, ensure: (modelId: string) => unknown) => {
     const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")

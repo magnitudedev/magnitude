@@ -943,6 +943,42 @@ export const inspectModelCandidateOperation = {
   payloadRequired: true,
 } as const
 
+export const installCatalogComponentOperation = {
+  operationId: "installCatalogComponent",
+  transport: "http",
+  method: "POST",
+  path: "/api/v1/catalog/models/{model_id}/components/{component}/install",
+  group: "catalog",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.CatalogInstallationAdmission, Schemas.CatalogInstallationAdmissionEncoded> =>
+          Schemas.CatalogInstallationAdmission,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  pathParameters: S.Struct({ model_id: S.String, component: S.Literal("Projector", "Drafter") }),
+} as const
+
 export const installCatalogModelOperation = {
   operationId: "installCatalogModel",
   transport: "http",

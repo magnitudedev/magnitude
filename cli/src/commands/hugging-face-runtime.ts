@@ -1,5 +1,6 @@
 import {
   candidateDownloadBytes,
+  catalogComponentName,
   catalogVariantOfName,
   formatStorageSize,
   modelVersionNotRunnableMessage,
@@ -11,6 +12,7 @@ import {
   unsupportedReasonMessages,
 } from "@magnitudedev/client-common"
 import {
+  CatalogComponentSchema,
   CatalogFormModelIdSchema,
   CustomFormModelIdSchema,
   DrafterCandidateSchema,
@@ -21,6 +23,7 @@ import {
   ModelVersionNotRunnable,
   type CandidateInspection,
   type CandidateVersion,
+  type CatalogComponent,
   type CatalogFormModelId,
   type DrafterCandidate,
   type DrafterChoice,
@@ -436,6 +439,11 @@ export const PullResultSchema = Schema.Union(
     modelId: CustomFormModelIdSchema,
     outcome: LocalModelSyncOutcomeSchema,
   }),
+  Schema.TaggedStruct("Component", {
+    modelId: CatalogFormModelIdSchema,
+    component: CatalogComponentSchema,
+    started: Schema.Boolean,
+  }),
   Schema.TaggedStruct("HuggingFace", {
     repository: HuggingFaceRepositoryIdSchema,
     versionRequested: Schema.Boolean,
@@ -460,6 +468,12 @@ export const renderPull = (result: PullResult): string => {
   if (result._tag === "Custom") return result.outcome === "AlreadyCurrent"
     ? `${result.modelId} is up to date.\n`
     : syncStarted(result.modelId, result.outcome)
+  if (result._tag === "Component") {
+    const name = catalogComponentName(result.component).toLowerCase()
+    return result.started
+      ? `Downloading only the ${name} for ${result.modelId}.\nCheck progress: magnitude models status ${result.modelId}\n`
+      : `${result.modelId} already has its ${name}. Nothing to download.\n`
+  }
   const { added } = result
   const name = `${result.repository}:${added.version}`
   const choice = result.versionRequested ? "" : " (the recommended version)"
@@ -556,12 +570,36 @@ export const pull = (
   }
 }
 
+/** `--only projector|drafter`: the one catalog component to download. */
+export const parseCatalogComponent = (value: string): Effect.Effect<CatalogComponent, ModelCommandError> => {
+  switch (value.trim().toLowerCase()) {
+    case "projector": return Effect.succeed("Projector")
+    case "drafter": return Effect.succeed("Drafter")
+    default: return Effect.fail(new ModelCommandError({ message: `--only takes projector or drafter, not ${value}.` }))
+  }
+}
+
+/** Downloads only one component a catalog model lacks, such as the projector its found target came without. */
+export const pullComponent = (
+  client: CliModelsClient,
+  modelId: CatalogFormModelId,
+  component: CatalogComponent,
+): Effect.Effect<PullResult, unknown> => client.models.downloadCatalogComponent({ modelId, component }).pipe(
+  Effect.map(({ started }) => ({ _tag: "Component" as const, modelId, component, started })))
+
 export const pullModel = (
   modelInput: string,
-  options: JsonOption & { readonly drafter?: string; readonly force?: boolean } = {},
+  options: JsonOption & { readonly drafter?: string; readonly force?: boolean; readonly only?: string } = {},
 ) => commandEffect({
   effect: Effect.gen(function* () {
     const reference = yield* parsePullReference(modelInput.trim())
+    if (options.only !== undefined) {
+      const component = yield* parseCatalogComponent(options.only)
+      if (reference._tag !== "Catalog" || options.drafter !== undefined || options.force === true) {
+        return yield* new ModelCommandError({ message: "--only applies only to a catalog model, without --drafter or --force." })
+      }
+      return yield* withClient((client) => pullComponent(client, reference.modelId, component))
+    }
     if (reference._tag === "Catalog" && options.drafter !== undefined) {
       return yield* new ModelCommandError({
         message: "Catalog models come with their drafter; --drafter applies only to models from Hugging Face.",

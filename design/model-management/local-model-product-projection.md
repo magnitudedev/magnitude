@@ -76,6 +76,12 @@ Actions follow who owns the files:
 | Found | Hide from Magnitude; never touches the files | None | Add, Change, Turn off |
 | Catalog, files only in an external location | Hide from Magnitude; Remove explains where the files are | New catalog revision | The catalog's |
 
+A catalog model whose exact target is found externally serves with the catalog components that are on
+this computer. Each component it lacks is listed in `missingComponents` (`Projector` or `Drafter`, with
+its download bytes), never as `UpdateAvailable`; clients offer each one while the model is `Installed`
+("Image input · Download", "Faster with a drafter · Add"), and `DownloadCatalogComponent` fetches only
+that component.
+
 Adding a drafter to a model whose target is present downloads only the drafter. When a catalog
 drafter gets a new revision, every model using it shows Update. Hide applies only to found models
 (including a catalog model whose files are only in an external location); ACN refuses to hide an

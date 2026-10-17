@@ -15,6 +15,7 @@ import {
 import {
   AutomaticModelLocationKindSchema,
   AddedModelSchema,
+  CatalogComponentSchema,
   CandidateInspectionSchema,
   CustomFormModelIdSchema,
   DrafterCandidateSchema,
@@ -80,6 +81,13 @@ const SetFavorite = Rpc.make("SetModelFavorite", {
 const SyncLocalModel = Rpc.make("SyncLocalModel", {
   payload: Schema.Struct({ modelId: ModelIdSchema }),
   success: Schema.Struct({ outcome: LocalModelSyncOutcomeSchema }),
+  error: LocalInferenceError,
+}).pipe(atMostOnce)
+
+/** Fetches only one component a catalog model lacks (see CatalogMissingComponent); false when it is already here. */
+const DownloadCatalogComponent = Rpc.make("DownloadCatalogComponent", {
+  payload: Schema.Struct({ modelId: ModelIdSchema, component: CatalogComponentSchema }),
+  success: Schema.Struct({ started: Schema.Boolean }),
   error: LocalInferenceError,
 }).pipe(atMostOnce)
 
@@ -251,6 +259,7 @@ export const Models = {
   clearSlot: ClearSlot,
   setFavorite: SetFavorite,
   syncLocalModel: SyncLocalModel,
+  downloadCatalogComponent: DownloadCatalogComponent,
   cancelLocalModelSync: CancelLocalModelSync,
   acknowledgeLocalModelSyncFailure: AcknowledgeLocalModelSyncFailure,
   removeLocalModel: RemoveLocalModel,

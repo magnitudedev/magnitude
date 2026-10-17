@@ -42,7 +42,7 @@ import { CopyCommand } from "./components/copy-command"
 import { useId, useMemo, useRef, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
-import { localModelDeprecation, localModelServingProfile, type ProviderModelId, type CatalogLocalModel, type CustomLocalModel, type CustomModelAcquisitionState, type DrafterCandidate, type LocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
+import { localModelDeprecation, localModelServingProfile, type ProviderModelId, type CatalogComponent, type CatalogLocalModel, type CustomLocalModel, type CustomModelAcquisitionState, type DrafterCandidate, type LocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
 import type { ApplicationSnapshot, AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessChange, type NetworkBind, type OwnerCapability } from "@magnitudedev/sdk"
 import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
@@ -53,7 +53,7 @@ import {
   describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
   formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory,
   catalogModelReplacement, performanceRangeSpeedLabel, localModelSpeedNote, catalogVariantOfName, customModelDrafterOffer, useCustomModels, useHiddenLocalModels, useUnsupportedLocalModels,
-  LOCAL_MODEL_RANKING_SCALE_VALUES,
+  LOCAL_MODEL_RANKING_SCALE_VALUES, catalogComponentOffers,
 } from "@magnitudedev/client-common"
 import { appearanceReadError } from "./appearance"
 import { useNavigate, useServerPlatform, useSession } from "./session"
@@ -72,6 +72,7 @@ import { ModelsHeader } from "./components/models-header"
 import { AddModelDialog, ggufOpenRequest, type AddDialogRequest } from "./components/add-model-dialog"
 import { DrafterPickerDialog } from "./components/drafter-list"
 import { CustomModelDetails, DrafterNotices, DrafterOffer, drafterUpdateAvailable } from "./components/custom-model-details"
+import { CatalogComponentDetails, CatalogDrafterOffer } from "./components/catalog-model-components"
 import { ModelRemoveAction } from "./components/model-remove-action"
 import { SourceTag, UnsupportedModels } from "./components/local-model-lists"
 import { DiscoverSections, ModelsListing, acquiring, afterModelAdded, otherVersionsRequest, selectModels, type DiscoverRecommendationState } from "./components/models-page"
@@ -87,7 +88,7 @@ const moveModelsCommand = (platform: string, from: string, to: string) => platfo
 const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
 const pageIcons = { discover: StackIcon, catalog: SquaresFourIcon, models: CubeIcon, connections: PlugIcon, usage: ChartBarIcon, status: PulseIcon, settings: SlidersIcon }
 
-/** `custom` leads the details of a non-catalog model; `onFindOtherVersions` adds Other versions to a catalog model's. */
+/** `custom` leads the details: a custom model's source and drafter, or a catalog model's missing components. `onFindOtherVersions` adds Other versions to a catalog model's. */
 function ModelDetails({ model, radar = false, open, contentId, compact = false, custom, onFindOtherVersions }: { model: LocalModel; radar?: boolean; open?: boolean; contentId?: string; compact?: boolean; custom?: ReactNode; onFindOtherVersions?: () => void }) {
   const serving = model.servingState
   const content = (
@@ -297,6 +298,9 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
 function ModelCard({ model, models, showMemory = false, replacing, hardware, onFindOtherVersions }: { model: LocalModel; models: readonly LocalModel[]; showMemory?: boolean; replacing?: string; hardware: Option.Option<LocalInferenceHardware>; onFindOtherVersions?: () => void }) {
   const [detailsOpen, setDetailsOpen] = useState(false)
   const detailsId = useId()
+  const { downloadComponent } = useLocalModelMutations()
+  const componentsDisabled = useLocalModelCommandStatus(model.modelId).pending
+  const downloadModelComponent = (component: CatalogComponent) => downloadComponent(model.modelId, component)
   const deprecation = localModelDeprecation(model)
   const detailsToggle = <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}>Details<CaretDownIcon aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
   const acquisition = model.acquisitionState
@@ -312,8 +316,9 @@ function ModelCard({ model, models, showMemory = false, replacing, hardware, onF
         onSome: value => model._tag === "Catalog" && <DeprecatedModelControls model={model} replacement={catalogModelReplacement(models, value)}>{detailsToggle}</DeprecatedModelControls>,
       })}
       {model._tag === "Custom" && <CustomModelDrafter model={model} models={models} detailsOpen={detailsOpen} detailsId={detailsId} />}
+      {model._tag === "Catalog" && !detailsOpen && catalogComponentOffers(model).some(({ component }) => component === "Drafter") && <div className="col-span-full -mt-2 pl-14"><CatalogDrafterOffer model={model} disabled={componentsDisabled} onDownload={downloadModelComponent} /></div>}
     </div>
-    {model._tag === "Catalog" && <ModelDetails model={model} radar open={detailsOpen} contentId={detailsId} {...(onFindOtherVersions ? { onFindOtherVersions } : {})} />}
+    {model._tag === "Catalog" && <ModelDetails model={model} radar open={detailsOpen} contentId={detailsId} custom={<CatalogComponentDetails model={model} disabled={componentsDisabled} onDownload={downloadModelComponent} />} {...(onFindOtherVersions ? { onFindOtherVersions } : {})} />}
   </article>
 }
 /** A custom model's drafter offer on its card, its details with drafter controls, and drafter notices. */

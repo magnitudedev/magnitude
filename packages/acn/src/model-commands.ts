@@ -5,6 +5,8 @@ import {
   ModelIdSchema,
   ModelSlotMutationRejected,
   PRIMARY_SLOT_ID,
+  LocalModelMutationFailed,
+  type CatalogComponent,
   type LocalInferenceError,
   type LocalModelSyncOutcome,
   type ModelId,
@@ -24,6 +26,8 @@ import { CatalogModelSync } from "./catalog-model-sync"
 /** Commands by canonical model ID: a catalog ID addresses its installation, a custom ID its downloads. */
 export interface ModelCommandsApi {
   readonly sync: (modelId: ModelId) => Effect.Effect<{ readonly outcome: LocalModelSyncOutcome }, LocalInferenceError>
+  readonly downloadCatalogComponent: (modelId: ModelId, component: CatalogComponent) =>
+    Effect.Effect<{ readonly started: boolean }, LocalInferenceError>
   readonly cancelSync: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
   readonly acknowledgeSyncFailure: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
   readonly remove: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
@@ -130,6 +134,15 @@ export const ModelCommandsLive: Layer.Layer<
   )
   return ModelCommands.of({
     sync: (modelId) => byForm(modelId, catalogSync.sync, custom.sync),
+    downloadCatalogComponent: (modelId, component) => byForm(
+      modelId,
+      (id) => catalogSync.downloadComponent(id, component),
+      (id) => Effect.fail(new LocalModelMutationFailed({
+        code: "catalog_component_requires_catalog_model",
+        message: `${id} is not a catalog model; only catalog models have components to download`,
+        retryable: false,
+      })),
+    ),
     cancelSync: (modelId) => byForm(modelId, catalogCancel, custom.cancelSync),
     acknowledgeSyncFailure: (modelId) => byForm(modelId, catalogAcknowledge, custom.acknowledgeSyncFailure),
     remove: (modelId) => byForm(modelId, catalogRemove, (id) => stopModel(id).pipe(Effect.zipRight(custom.remove(id)))),

@@ -157,6 +157,7 @@ const makeCatalogOnlyModel = (
     aliases: [],
   },
   acquisitionState: { _tag: "NotInstalled" },
+  missingComponents: [],
   servingState: {
     _tag: "Assessed",
     metadata,

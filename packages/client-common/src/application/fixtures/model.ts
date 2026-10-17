@@ -34,6 +34,7 @@ export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readon
           residencyState: { _tag: "Unloaded" },
         }
       : { _tag: "NotInstalled" },
+    missingComponents: [],
     servingState: {
       _tag: "Assessed",
       capabilities: {

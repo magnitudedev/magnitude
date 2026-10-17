@@ -144,7 +144,9 @@ relationship to the package weights. Native assessment establishes whether MTMD 
 input. Primary-weight metadata and projector presence alone never establish runnable image
 capability. A missing, ambiguous, or incompatible projector fails generation. Embedded MTP
 combined with a projector is rejected: its head embeds every prompt token and cannot enter
-media rows. A separately packaged Gemma QAT assistant reads the target's history, media rows
+media rows. The engine is the only authority for this: binding drops such a head (built-in
+heads, or a separate head file of that kind) whenever a projector is present, so assessment reports
+the drafter `Rejected` with a target-mismatch reason and a load serves the target without it. A separately packaged Gemma QAT assistant reads the target's history, media rows
 included, and is admitted only with its matching target and validated composed capability.
 Generation independently refuses a token-embedding drafter for a request with media spans.
 Speculative decoding is explicit as either capability embedded in the target GGUF or an exact draft

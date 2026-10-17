@@ -89,12 +89,26 @@ impl PrimaryEvidence {
     }
 }
 
-/// The file identity of external content whose SHA-256 is unknown. It is derived from the header
-/// digest and size, so building a package never reads tensor data.
-fn header_file_digest(header_digest: &str, size_bytes: u64) -> String {
+/// The file identity of external content whose SHA-256 is unknown: its content sample (header,
+/// length, and both ends of its tensor data), so files sharing a header but not their weights are
+/// different files, never one package served from either. Without a sample it is the header
+/// digest and size. Building a package never reads all of a file's tensor data.
+fn inspected_file_digest(
+    header_digest: &str,
+    content_sample: Option<&str>,
+    size_bytes: u64,
+) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"magnitude-header-file-v1\0");
-    digest.update(header_digest.as_bytes());
+    match content_sample {
+        Some(sample) => {
+            digest.update(b"magnitude-sampled-file-v1\0");
+            digest.update(sample.as_bytes());
+        }
+        None => {
+            digest.update(b"magnitude-header-file-v1\0");
+            digest.update(header_digest.as_bytes());
+        }
+    }
     digest.update(b"\0");
     digest.update(size_bytes.to_le_bytes());
     format!("{:x}", digest.finalize())
@@ -323,7 +337,11 @@ fn package_from_resolved_with(
             content => match inspection.as_ref() {
                 Some(inspection) => catalog_sha256(&source, declared, &inspection.header_digest)
                     .unwrap_or_else(|| {
-                        header_file_digest(&inspection.header_digest, declared.size_bytes)
+                        inspected_file_digest(
+                            &inspection.header_digest,
+                            inspection.content_sample.as_deref(),
+                            declared.size_bytes,
+                        )
                     }),
                 None => unreadable_file_digest(content, declared.size_bytes),
             },

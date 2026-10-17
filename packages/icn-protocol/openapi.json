@@ -631,6 +631,76 @@
         }
       }
     },
+    "/api/v1/catalog/models/{model_id}/components/{component}/install": {
+      "post": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "installCatalogComponent",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "description": "Canonical catalog model ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "component",
+            "in": "path",
+            "description": "The one component to fetch",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/CatalogComponent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Catalog installation admission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogInstallationAdmission"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Catalog model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Installation cannot be admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Installation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/catalog/models/{model_id}/install": {
       "post": {
         "tags": [
@@ -2874,6 +2944,14 @@
         },
         "additionalProperties": false
       },
+      "CatalogComponent": {
+        "type": "string",
+        "description": "A part of a catalog model's bundle that can be fetched on its own: the projector that gives\nits target image input, or its separate drafter.",
+        "enum": [
+          "Projector",
+          "Drafter"
+        ]
+      },
       "CatalogInstallationAdmission": {
         "oneOf": [
           {
@@ -3141,6 +3219,25 @@
           }
         }
       },
+      "CatalogMissingComponent": {
+        "type": "object",
+        "description": "A catalog component absent from this computer while the model's exact target weights are\nfound elsewhere. It is not an update: the model serves without it until it is fetched.",
+        "required": [
+          "component",
+          "downloadBytes"
+        ],
+        "properties": {
+          "component": {
+            "$ref": "#/components/schemas/CatalogComponent"
+          },
+          "downloadBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "CatalogModel": {
         "type": "object",
         "description": "A catalog variant and its state on this computer. `aliases` are the `hf:` IDs its target's\nfiles found in an external location (a Hugging Face cache) would have as custom models, which\nclients resolve to this model, so references made before the file was attributed keep working.",
@@ -3248,6 +3345,7 @@
               "effective",
               "installation",
               "updateState",
+              "missingComponents",
               "_tag"
             ],
             "properties": {
@@ -3259,6 +3357,12 @@
               },
               "updateState": {
                 "$ref": "#/components/schemas/CatalogModelUpdate"
+              },
+              "missingComponents": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CatalogMissingComponent"
+                }
               },
               "_tag": {
                 "type": "string",

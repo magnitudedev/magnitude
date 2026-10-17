@@ -81,6 +81,15 @@ const SyncLocalModel = mutation(
   }
 );
 
+const DownloadCatalogComponent = mutation(
+  Rpcs.downloadCatalogComponent,
+  (client) => client.models.downloadCatalogComponent,
+  {
+    scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
+    synchronize: () => synchronizeCatalog,
+  }
+);
+
 const CancelLocalModelSync = mutation(
   Rpcs.cancelLocalModelSync,
   (client) => client.models.cancelLocalModelSync,
@@ -248,6 +257,7 @@ export const Models = Group.make({
   ClearSlot,
   SetFavorite,
   SyncLocalModel,
+  DownloadCatalogComponent,
   CancelLocalModelSync,
   AcknowledgeLocalModelSyncFailure,
   RemoveLocalModel,

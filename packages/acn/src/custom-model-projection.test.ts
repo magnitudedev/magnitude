@@ -388,7 +388,7 @@ describe("local models state", () => {
       profile: { contextLength: 32_768 },
       speculativeMethod: Option.none(),
     }
-    const catalogEntry = (id: string, ownership: string) => ({
+    const catalogEntry = (id: string, ownership: string, missingComponents: readonly unknown[] = []) => ({
       id,
       source: {
         aliases: Option.some([`hf:owner/${id}/model.gguf`]),
@@ -403,6 +403,7 @@ describe("local models state", () => {
           effective: { _tag: "Ready", model: desired },
           installation: { _tag: "Resolved", installedBytes: 1, primaryPath: `/files/${id}.gguf`, ownership },
           updateState: { _tag: "Current" },
+          missingComponents,
         },
         parameterization: { architecture: "dense", totalParameters: 1 },
         quantizationAware: false,
@@ -469,6 +470,26 @@ describe("local models state", () => {
     })
     expect(unhidden.models.map((model) => [model.modelId, model.acquisitionState._tag])).toEqual([[external, "Installed"]])
     expect(unhidden.hidden).toEqual([])
+
+    // An exact target found without its projector is installed and current; the projector is
+    // reported on its own so clients can offer it, never as an update.
+    const lacking = projectLocalModels({
+      source: {
+        ...sources([]),
+        catalogModels: [catalogEntry(external, "External", [{ component: "Projector", downloadBytes: 1_034_945_421 }])],
+      },
+      assessment: assessments([]),
+      operations: [],
+      runtime: [],
+      removals: new Map(),
+      config: customModelsConfig(),
+      downloads: [],
+    })
+    const [lackingModel] = lacking.models
+    expect(lackingModel?.acquisitionState._tag).toBe("Installed")
+    expect(lackingModel?._tag === "Catalog" && lackingModel.missingComponents)
+      .toEqual([{ component: "Projector", downloadBytes: 1_034_945_421 }])
+    expect(state.models.every((model) => model._tag === "Catalog" && model.missingComponents.length === 0)).toBe(true)
   })
 
   it("moves a found model the engine cannot run into the unsupported list with its reasons", () => {

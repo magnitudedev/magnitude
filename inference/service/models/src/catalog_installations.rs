@@ -7,12 +7,13 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
-    CatalogInstallationAdmission, CatalogInstallationOperation, CatalogInstallationOperationId,
+    CatalogComponent, CatalogInstallationAdmission, CatalogInstallationOperation,
+    CatalogInstallationOperationId,
     CatalogInstallationOperationState, CatalogInstallationProgress, CatalogInstallationRemoval,
     CatalogInstallationRetentionReason, CatalogInstallations, CatalogInstallationsInvalidation,
     CatalogInstallationsResponse, CatalogModelOptimizer, CatalogOptimizationProgress,
     CatalogPackageRemover, ModelDownload, ModelDownloadId, ModelDownloadState, ModelDownloads,
-    ModelId, StartModelDownloadRequest,
+    ModelId, ServableModelBundle, StartModelDownloadRequest,
 };
 
 use crate::ManagedModelDownloads;
@@ -200,6 +201,28 @@ impl ManagedCatalogInstallations {
         let _mutation = self.mutations.lock().await;
         let definition = self.resolver.catalog_definition(id)?;
         reject_unavailable(id, definition)?;
+        self.reject_active(id).await?;
+        let bundle = definition.configuration.bundle.clone();
+        self.admit(id, bundle).await
+    }
+
+    /// Fetches only one component a found exact target lacks; the found weights stay where they
+    /// are and the rest of the bundle is untouched.
+    pub(crate) async fn install_component(
+        &self,
+        id: &ModelId,
+        component: CatalogComponent,
+    ) -> Result<CatalogInstallationAdmission, InventoryError> {
+        let _mutation = self.mutations.lock().await;
+        reject_unavailable(id, self.resolver.catalog_definition(id)?)?;
+        self.reject_active(id).await?;
+        match self.resolver.catalog_component_download(id, component)? {
+            Some(bundle) => self.admit(id, bundle).await,
+            None => Ok(CatalogInstallationAdmission::Current),
+        }
+    }
+
+    async fn reject_active(&self, id: &ModelId) -> Result<(), InventoryError> {
         let existing_operation_ids = self
             .operations
             .read()
@@ -223,10 +246,18 @@ impl ManagedCatalogInstallations {
                 });
             }
         }
+        Ok(())
+    }
+
+    async fn admit(
+        &self,
+        id: &ModelId,
+        bundle: ServableModelBundle,
+    ) -> Result<CatalogInstallationAdmission, InventoryError> {
         let started = self
             .downloads
             .start(StartModelDownloadRequest {
-                bundle: definition.configuration.bundle.clone(),
+                bundle,
                 for_model: Some(id.clone()),
             })
             .await?;

@@ -43,7 +43,8 @@ The digest is the lowercase hex SHA-256 over every shard's content sample, first
 shard's sample covers its header bytes (through the aligned tensor-data offset), its length, and the
 first and last 1 MiB of its tensor data. Two files with the same header but different weights are
 two models, and no external file is ever hashed in full. It is neither a package ID nor a full-file
-hash. The same bytes in two places are one model (the grouping key and the ID are the same digest),
+hash, but an external file whose SHA-256 is unknown takes its package file identity from the same
+content sample, so two such models are also two packages, each served from its own file. The same bytes in two places are one model (the grouping key and the ID are the same digest),
 and a moved file keeps its ID. A model with a Hugging Face identity (added, in the Hugging Face
 cache, in LM Studio's publisher/repository layout, or a llama.cpp file name that parses to a
 repository) uses its `hf:` ID wherever it is found. An Ollama model keeps its `local:` ID; its

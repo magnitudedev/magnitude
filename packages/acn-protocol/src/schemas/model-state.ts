@@ -1046,6 +1046,20 @@ const LocalModelFields = {
   presentation: LocalModelPresentationSchema,
 } as const
 
+/** A part of a catalog model fetched on its own: the projector that adds image input, or the catalog drafter. */
+export const CatalogComponentSchema = Schema.Literal("Projector", "Drafter")
+export type CatalogComponent = typeof CatalogComponentSchema.Type
+
+/**
+ * A component a catalog model lacks because its exact target was found on this computer without it. The model
+ * serves without it, with every catalog component that is here, until it is fetched; it is never an update.
+ */
+export const CatalogMissingComponentSchema = Schema.Struct({
+  component: CatalogComponentSchema,
+  downloadBytes: NonNegativeSafeInteger,
+})
+export type CatalogMissingComponent = typeof CatalogMissingComponentSchema.Type
+
 export const CatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
   ...LocalModelFields,
   modelId: CatalogFormModelIdSchema,
@@ -1053,6 +1067,7 @@ export const CatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
   catalogData: LocalModelCatalogDataSchema,
   storageBytes: NonNegativeSafeInteger,
   acquisitionState: LocalModelAcquisitionStateSchema,
+  missingComponents: Schema.Array(CatalogMissingComponentSchema),
 })
 export type CatalogLocalModel = typeof CatalogLocalModelSchema.Type
 

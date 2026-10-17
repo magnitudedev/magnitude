@@ -59,17 +59,27 @@ pub struct CustomModelFacts<'a> {
     pub base_models: &'a [GgufBaseModel],
 }
 
+/// A custom model's lineage hint, license, and its automatic drafter candidates: every candidate
+/// the engine binds, in the order automatic choice takes them, the first being the recommended one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CustomModelEnrichmentResult {
     pub variant_of: Option<ModelId>,
-    pub recommended_drafter: Option<DrafterCandidate>,
+    pub drafters: Vec<DrafterCandidate>,
     pub license: Option<String>,
+}
+
+impl CustomModelEnrichmentResult {
+    #[must_use]
+    pub fn recommended_drafter(&self) -> Option<&DrafterCandidate> {
+        self.drafters.first()
+    }
 }
 
 /// Lineage and drafter recommendation for custom models. It is called while the local-models
 /// list is projected, so it answers from what it already knows and does no I/O; when its
 /// knowledge changes it calls [`ModelDomainResolver::custom_model_enrichment_changed`]. A model
-/// whose drafter choice is `Auto` uses `recommended_drafter`.
+/// whose drafter choice is `Auto` uses the first of its automatic drafters that is on this
+/// computer, checked against the files present at each projection.
 pub trait CustomModelEnrichment: Send + Sync + 'static {
     fn enrich(&self, model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult;
     /// Whether `enrich` answers from knowledge rather than from not having computed it yet.
@@ -154,6 +164,7 @@ impl CustomModelEnrichment for NoEnrichment {
 pub(crate) struct LocalModelsContext {
     enrichment: RwLock<Arc<dyn CustomModelEnrichment>>,
     generation: AtomicU64,
+    configuration_generation: AtomicU64,
     changes: tokio::sync::broadcast::Sender<ModelDomainInvalidation>,
 }
 
@@ -163,6 +174,7 @@ impl LocalModelsContext {
         Self {
             enrichment: RwLock::new(Arc::new(NoEnrichment)),
             generation: AtomicU64::new(0),
+            configuration_generation: AtomicU64::new(0),
             changes,
         }
     }
@@ -195,6 +207,15 @@ impl ModelDomainResolver {
                 .changes
                 .send(ModelDomainInvalidation { revision });
         }
+    }
+
+    /// What a custom model's enrichment is computed from on this side: the installed packages
+    /// (every file in a location or the store, drafters included) and the local-models
+    /// configuration. It advances whenever either changes, and never for the enrichment's own
+    /// results, so an enrichment recomputed at a newer revision follows every change to them.
+    pub fn custom_model_inputs_revision(&self) -> Result<u64, InventoryError> {
+        Ok(self.inventory.installed_packages_response()?.revision
+            + self.local.configuration_generation.load(Ordering::Acquire))
     }
 
     /// Monotonic over both the inventory and the local generation.
@@ -359,6 +380,23 @@ impl ModelDomainResolver {
             .and_then(|projected| projected.lineage_repository.clone()))
     }
 
+    /// The primary file of every place a custom model's bytes are found, each with the folder
+    /// its "in this folder" drafters come from. Only this model's own files: another model whose
+    /// file shares their header is not one of its places.
+    pub fn custom_model_locations(
+        &self,
+        model_id: &ModelId,
+    ) -> Result<Vec<PathBuf>, InventoryError> {
+        let projection = self.local_projection()?;
+        Ok(projection
+            .models
+            .into_iter()
+            .chain(projection.hidden)
+            .find(|projected| &projected.model.model_id == model_id)
+            .map(|projected| projected.locations)
+            .unwrap_or_default())
+    }
+
     pub(crate) fn custom_serving_configuration(
         &self,
         model_id: &ModelId,
@@ -403,6 +441,7 @@ impl LocalProjection {
 
 struct ProjectedModel {
     model: CustomModel,
+    locations: Vec<PathBuf>,
     lineage_repository: Option<String>,
     candidate_drafter: Option<ModelPackageId>,
     configuration: Result<ModelServingConfiguration, ModelFailure>,
@@ -1005,32 +1044,7 @@ impl ModelContext<'_> {
             .iter()
             .find(|attachment| attachment.model_id == model_id)
             .map_or(DrafterChoice::Auto, |attachment| attachment.drafter.clone());
-        // The drafter package this model would use as its recommended drafter, whatever its choice:
-        // a turned-off drafter stays referenced while the model is here.
-        let candidate_drafter = enriched.recommended_drafter.as_ref().and_then(|candidate| {
-            let resolved = resolve_drafter(
-                candidate.reference.clone(),
-                candidate.method.clone()?,
-                enrichment.drafter_content(&candidate.reference),
-                catalog,
-                catalog_drafters,
-                occurrences,
-            );
-            match resolved.source? {
-                SpeculativeDraftSource::Separate { draft } => Some(draft.id),
-                SpeculativeDraftSource::Embedded => None,
-            }
-        });
-        let drafter = match &choice {
-            DrafterChoice::None => None,
-            DrafterChoice::Auto => enriched.recommended_drafter.as_ref().and_then(|candidate| {
-                Some((candidate.reference.clone(), candidate.method.clone()?))
-            }),
-            DrafterChoice::Reference { reference, method } => {
-                Some((reference.clone(), method.clone()))
-            }
-        }
-        .map(|(reference, method)| {
+        let resolve = |reference: DrafterReference, method: SpeculativeMethod| {
             let content = enrichment.drafter_content(&reference);
             resolve_drafter(
                 reference,
@@ -1040,7 +1054,39 @@ impl ModelContext<'_> {
                 catalog_drafters,
                 occurrences,
             )
+        };
+        let mut automatic = enriched.drafters.iter().filter_map(|candidate| {
+            Some(resolve(
+                candidate.reference.clone(),
+                candidate.method.clone()?,
+            ))
         });
+        // The drafter package this model would use as its recommended drafter, whatever its choice:
+        // a turned-off drafter stays referenced while the model is here.
+        let candidate_drafter =
+            enriched.recommended_drafter().and_then(|candidate| {
+                match resolve(candidate.reference.clone(), candidate.method.clone()?).source? {
+                    SpeculativeDraftSource::Separate { draft } => Some(draft.id),
+                    SpeculativeDraftSource::Embedded => None,
+                }
+            });
+        let drafter = match &choice {
+            DrafterChoice::None => None,
+            // The first automatic candidate on this computer now, so a recommended drafter that
+            // went missing gives way to the next one that binds; with none here, the recommended
+            // one, missing, which clients offer to add.
+            DrafterChoice::Auto => automatic.next().map(|recommended| {
+                if recommended.source.is_some() {
+                    return recommended;
+                }
+                automatic
+                    .find(|next| next.source.is_some())
+                    .unwrap_or(recommended)
+            }),
+            DrafterChoice::Reference { reference, method } => {
+                Some(resolve(reference.clone(), method.clone()))
+            }
+        };
 
         let profile = custom_profile(installed);
         let speculative = drafter
@@ -1122,6 +1168,11 @@ impl ModelContext<'_> {
             .map(|file| file.size_bytes)
             .sum();
         Some(ProjectedModel {
+            locations: group
+                .occurrences
+                .iter()
+                .map(|occurrence| occurrence.primary.clone())
+                .collect(),
             lineage_repository: group.lineage_repository(),
             candidate_drafter,
             drafter_pending: matches!(choice, DrafterChoice::Auto) && !enrichment_known,
@@ -1139,15 +1190,16 @@ impl ModelContext<'_> {
                 origin,
                 display_name,
                 variant_label,
-                variant_of: enriched.variant_of,
+                variant_of: enriched.variant_of.clone(),
                 files,
                 size_bytes,
                 projector,
                 drafter: drafter.map(|drafter| drafter.attached),
                 // A model whose drafter is turned off is offered none.
                 recommended_drafter: enriched
-                    .recommended_drafter
-                    .filter(|_| choice != DrafterChoice::None),
+                    .recommended_drafter()
+                    .filter(|_| choice != DrafterChoice::None)
+                    .cloned(),
                 license: enriched.license.or_else(|| evidence.license.clone()),
                 profile,
                 state,
@@ -1197,6 +1249,7 @@ impl ModelContext<'_> {
             None,
         );
         Some(ProjectedModel {
+            locations: Vec::new(),
             lineage_repository: Some(repository.as_str().to_owned()),
             candidate_drafter: None,
             model: CustomModel {
@@ -1605,6 +1658,10 @@ impl LocalModels for ManagedLocalModels {
                 .configure_local_models(configuration.clone())
                 .await?
             {
+                self.resolver
+                    .local
+                    .configuration_generation
+                    .fetch_add(1, Ordering::AcqRel);
                 self.resolver
                     .local
                     .generation
@@ -3978,7 +4035,7 @@ mod tests {
         fn enrich(&self, model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult {
             CustomModelEnrichmentResult {
                 variant_of: None,
-                recommended_drafter: self
+                drafters: self
                     .0
                     .get(model.model_id)
                     .map(|reference| DrafterCandidate {
@@ -3994,7 +4051,9 @@ mod tests {
                         },
                         on_this_computer: true,
                         method: Some(SpeculativeMethod::DFlash),
-                    }),
+                    })
+                    .into_iter()
+                    .collect(),
                 license: None,
             }
         }
@@ -4476,7 +4535,7 @@ mod tests {
         fn enrich(&self, _model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult {
             CustomModelEnrichmentResult {
                 variant_of: Some(self.variant_of.clone()),
-                recommended_drafter: Some(DrafterCandidate {
+                drafters: vec![DrafterCandidate {
                     category: DrafterCategory::NextToModel,
                     reference: DrafterReference::Local {
                         path: self.drafter.clone(),
@@ -4488,7 +4547,7 @@ mod tests {
                     verdict: DrafterVerdict::None,
                     on_this_computer: true,
                     method: Some(self.method.clone()),
-                }),
+                }],
                 license: None,
             }
         }
@@ -5052,6 +5111,96 @@ mod tests {
             gone.models[0].state,
             CustomModelState::Ready { .. }
         ));
+    }
+
+    /// Lists the automatic drafters in order: a DFlash file, then built-in heads.
+    struct InOrder(PathBuf);
+
+    impl CustomModelEnrichment for InOrder {
+        fn enrich(&self, _model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult {
+            let candidate = |reference, method: SpeculativeMethod| DrafterCandidate {
+                category: DrafterCategory::NextToModel,
+                reference,
+                name: "drafter".to_owned(),
+                label: "In this folder".to_owned(),
+                size_bytes: 1,
+                lineage: DrafterLineage::Lineage,
+                verdict: DrafterVerdict::Bound {
+                    method: method.clone(),
+                    memory_bytes: 1,
+                },
+                on_this_computer: true,
+                method: Some(method),
+            };
+            CustomModelEnrichmentResult {
+                variant_of: None,
+                drafters: vec![
+                    candidate(
+                        DrafterReference::Local {
+                            path: self.0.clone(),
+                        },
+                        SpeculativeMethod::DFlash,
+                    ),
+                    candidate(DrafterReference::Embedded, SpeculativeMethod::Mtp),
+                ],
+                license: None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_automatic_drafter_that_goes_missing_gives_way_to_the_next_one_on_this_computer() {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        let drafter = folder.join("drafter.gguf");
+        write_mtp_model(&folder.join("with-heads.gguf"), "heads");
+        write_dflash_drafter(&drafter, "drafter");
+        let id = local_id(&folder.join("with-heads.gguf"));
+        fixture
+            .resolver
+            .set_custom_model_enrichment(Arc::new(InOrder(drafter.clone())));
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &folder)]))
+            .await;
+        assert_eq!(
+            drafter_state(&listed, &id),
+            Some(AttachedDrafterState::Ready)
+        );
+        assert_eq!(
+            served_drafter(&fixture, &id).as_deref(),
+            Some(Path::new("drafter.gguf"))
+        );
+
+        fs::remove_file(&drafter).unwrap();
+        let listed = fixture.local.refresh_local().await.unwrap();
+        let model = listed
+            .models
+            .iter()
+            .find(|model| model.model_id == id)
+            .unwrap();
+        assert_eq!(
+            model.drafter.as_ref().map(|drafter| &drafter.reference),
+            Some(&DrafterReference::Embedded),
+            "the next automatic drafter, already here, is attached at once"
+        );
+        assert!(matches!(
+            fixture.resolver.serving_configuration(&id).unwrap().bundle,
+            ServableModelBundle::SpeculativeDecoding {
+                draft_source: SpeculativeDraftSource::Embedded,
+                method: SpeculativeMethod::Mtp,
+                ..
+            }
+        ));
+        assert_eq!(
+            model
+                .recommended_drafter
+                .as_ref()
+                .map(|candidate| &candidate.reference),
+            Some(&DrafterReference::Local {
+                path: drafter.clone()
+            }),
+            "the recommendation is the enumeration's until it is recomputed"
+        );
     }
 
     #[test]

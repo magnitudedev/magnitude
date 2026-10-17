@@ -30,6 +30,7 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         cancelCatalogInstallation: makeHttpOperation(http, options, Operations.cancelCatalogInstallationOperation),
         getCatalogInstallation: makeHttpOperation(http, options, Operations.getCatalogInstallationOperation),
         getCatalogModel: makeHttpOperation(http, options, Operations.getCatalogModelOperation),
+        installCatalogComponent: makeHttpOperation(http, options, Operations.installCatalogComponentOperation),
         installCatalogModel: makeHttpOperation(http, options, Operations.installCatalogModelOperation),
         listCatalogInstallations: makeHttpOperation(http, options, Operations.listCatalogInstallationsOperation),
         listCatalogModels: makeHttpOperation(http, options, Operations.listCatalogModelsOperation),

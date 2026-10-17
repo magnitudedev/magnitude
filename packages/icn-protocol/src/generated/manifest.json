@@ -1,7 +1,7 @@
 {
   "generator": "@magnitudedev/openapi-effect",
   "generatorVersion": "0.0.1",
-  "protocolHash": "0a805568741c80f97ad5d2b1127324897a2f64813a19f8107f05d81e84b00f5d",
+  "protocolHash": "2f62854d2376c23dda5acdd5576f6a7e7cc77e8e42e72e18ae2ead90f1b73bf5",
   "configHash": "35eaa09ad05c284228c67845b4e6f4db4aa545ca4a74ee0d812d04c6af53ee75",
   "files": [
     "api.ts",
@@ -35,6 +35,7 @@
     "getModelProperties",
     "health",
     "inspectModelCandidate",
+    "installCatalogComponent",
     "installCatalogModel",
     "listCatalogInstallations",
     "listCatalogModels",

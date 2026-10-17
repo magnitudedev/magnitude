@@ -205,6 +205,7 @@ const harness = (options: {
           recorded.catalogSyncs.push(modelId)
           return { outcome: "Installing" as const }
         }),
+        downloadComponent: () => Effect.succeed({ started: false }),
       }),
       DrafterMethodsLive,
       makeModelLocations({ platform: "linux", env: { OLLAMA_MODELS: "/nonexistent/ollama" }, home: "/nonexistent-home" })

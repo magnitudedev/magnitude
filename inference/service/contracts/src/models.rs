@@ -1204,6 +1204,25 @@ pub enum CatalogModelUpdate {
     },
 }
 
+/// A part of a catalog model's bundle that can be fetched on its own: the projector that gives
+/// its target image input, or its separate drafter.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CatalogComponent {
+    Projector,
+    Drafter,
+}
+
+/// A catalog component absent from this computer while the model's exact target weights are
+/// found elsewhere. It is not an update: the model serves without it until it is fetched.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogMissingComponent {
+    pub component: CatalogComponent,
+    pub download_bytes: u64,
+}
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
@@ -1214,6 +1233,7 @@ pub enum CatalogModelState {
         effective: EffectiveModel,
         installation: ModelInstallation,
         update_state: CatalogModelUpdate,
+        missing_components: Vec<CatalogMissingComponent>,
     },
 }
 
@@ -2339,6 +2359,12 @@ pub trait CatalogModels: Send + Sync + 'static {
     fn install_catalog_model(
         &self,
         model_id: &ModelId,
+    ) -> BoxFuture<'_, Result<CatalogInstallationAdmission, InventoryError>>;
+    /// Fetches only `component` of an installed catalog model whose target is found elsewhere.
+    fn install_catalog_component(
+        &self,
+        model_id: &ModelId,
+        component: CatalogComponent,
     ) -> BoxFuture<'_, Result<CatalogInstallationAdmission, InventoryError>>;
     fn remove_catalog_model_installation(
         &self,

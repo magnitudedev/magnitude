@@ -39,6 +39,7 @@ const catalogModel = {
     aliases: [],
   },
   acquisitionState: { _tag: "NotInstalled" },
+  missingComponents: [],
   servingState: {
     _tag: "Failed",
     profile: { contextLength: 4096 },
@@ -126,6 +127,18 @@ describe("ModelIdSchema", () => {
 })
 
 describe("LocalModelSchema invariants", () => {
+  it("carries the components a catalog model lacks apart from its acquisition state", () => {
+    const decoded = Schema.decodeUnknownSync(LocalModelSchema)({
+      ...catalogModel,
+      missingComponents: [{ component: "Projector", downloadBytes: 1_034_945_421 }],
+    })
+    expect(decoded._tag === "Catalog" && decoded.missingComponents)
+      .toEqual([{ component: "Projector", downloadBytes: 1_034_945_421 }])
+    expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
+      ...catalogModel,
+      missingComponents: [{ component: "Weights", downloadBytes: 1 }],
+    })).toThrow()
+  })
   it("preserves structured acquisition failure facts", () => {
     const decoded = Schema.decodeUnknownSync(LocalModelSchema)({
       ...catalogModel,

@@ -84,7 +84,9 @@ built-in MTP heads. The first candidate that binds, in this order, is preselecte
 Ties within one method go to the smaller download (nothing, when its files are already here), then ICN's
 enumeration order. Candidates are listed in this same order: by source, then method, then download. A
 rejected candidate is listed but never preselected.
-Catalog models always use their catalog drafter.
+Catalog models always use their catalog drafter, including one whose exact target is found in another
+app's location: it serves with the catalog drafter as soon as that drafter is on this computer (a
+projector it lacks never blocks it), and otherwise offers the drafter-only download.
 
 ## Controls
 
@@ -102,9 +104,18 @@ Catalog models always use their catalog drafter.
   own repository, or its recommended drafter even while its drafter is turned off).
   Turned off, the model is a standalone bundle, which the engine serves plain: built-in MTP heads
   draft only through a bundle that declares them, never implicitly.
-- A found or imported model whose choice is automatic has no attached drafter until the
-  recommended one is on this computer: ACN projects it without a drafter, and clients offer the
-  recommended drafter ("Faster with a drafter · Add (size)"). An imported model's "In this folder" drafters are on this
+- A model whose choice is automatic attaches the first of its automatic candidates, in the order
+  above, that is on this computer, checked against the files present at every projection: a
+  recommended drafter that goes missing gives way at once to the next one here, built-in heads
+  included. ICN's candidate enumeration is the single source of that order and of the recommended
+  drafter; it is recomputed whenever its inputs change (a file appearing, moving or disappearing in
+  any location, a model's folder or repository included; a drafter or catalog package installed
+  or removed; a configuration change), never kept until a restart. A found or imported model with
+  none of its automatic candidates on this computer has no attached drafter: ACN projects it
+  without one, and clients offer the recommended drafter ("Faster with a drafter · Add (size)").
+- "In this folder" means the folder of each place this model's own bytes are found, never another
+  model's: files sharing a header but not their weights (their content samples differ) are
+  different files and different packages. An imported model's "In this folder" drafters are on this
   computer wherever that folder is: ICN observes and watches them with the imported file, so the
   automatic choice attaches them in place even outside every model location, as it does a drafter
   chosen by local path. A drafter the user chose that is

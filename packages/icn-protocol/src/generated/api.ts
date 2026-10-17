@@ -447,6 +447,31 @@ export const inspectModelCandidate = HttpApiEndpoint.post("inspectModelCandidate
     { status: 500 },
   )
 
+export const installCatalogComponent = HttpApiEndpoint.post(
+  "installCatalogComponent",
+  "/api/v1/catalog/models/:model_id/components/:component/install",
+)
+  .setPath(S.Struct({ model_id: S.String, component: S.Literal("Projector", "Drafter") }))
+  .addSuccess(
+    S.suspend(
+      (): S.Schema<Schemas.CatalogInstallationAdmission, Schemas.CatalogInstallationAdmissionEncoded> =>
+        Schemas.CatalogInstallationAdmission,
+    ),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
 export const installCatalogModel = HttpApiEndpoint.post(
   "installCatalogModel",
   "/api/v1/catalog/models/:model_id/install",
@@ -805,6 +830,7 @@ export const CatalogGroup = HttpApiGroup.make("catalog")
   .add(cancelCatalogInstallation)
   .add(getCatalogInstallation)
   .add(getCatalogModel)
+  .add(installCatalogComponent)
   .add(installCatalogModel)
   .add(listCatalogInstallations)
   .add(listCatalogModels)

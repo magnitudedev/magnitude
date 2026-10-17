@@ -83,7 +83,7 @@ struct DrafterTarget {
     material: TargetMaterial,
     repository: Option<(String, String)>,
     primary: Option<PathBuf>,
-    folder: Option<DrafterFolder>,
+    folders: Vec<DrafterFolder>,
     snapshot: Option<HuggingFaceRepositorySnapshot>,
     lineage: BTreeSet<String>,
     catalog: Option<ModelId>,
@@ -92,6 +92,7 @@ struct DrafterTarget {
 /// The folder whose own files are offered as drafters "in this folder". A model from a known Hub
 /// repository whose snapshot can't be read (offline) is offered only that repository's files a
 /// flat cache root names with its prefix (llama.cpp's `<owner>_<repository>_<file>`).
+#[derive(PartialEq, Eq)]
 struct DrafterFolder {
     path: PathBuf,
     prefix: Option<String>,
@@ -131,11 +132,12 @@ struct CatalogFacts {
     shapes: Vec<CatalogShape>,
 }
 
-/// Computed lineage hints and recommended drafters, keyed by model and exact target package, and
-/// the bytes of every drafter reference whose header has been read, keyed by reference.
+/// Computed lineage hints and automatic drafters, keyed by model and exact target package, each
+/// with the custom-model inputs revision it was computed at, and the bytes of every drafter
+/// reference whose header has been read, keyed by reference.
 #[derive(Default)]
 struct CandidateEnrichment {
-    results: std::sync::RwLock<BTreeMap<(ModelId, String), CustomModelEnrichmentResult>>,
+    results: std::sync::RwLock<BTreeMap<(ModelId, String), (u64, CustomModelEnrichmentResult)>>,
     drafter_contents: std::sync::RwLock<BTreeMap<String, DrafterContent>>,
 }
 
@@ -146,18 +148,33 @@ impl CandidateEnrichment {
             .is_ok_and(|results| results.contains_key(key))
     }
 
-    /// Record a result; whether it changed what the projection sees.
-    fn record(&self, key: (ModelId, String), result: CustomModelEnrichmentResult) -> bool {
+    /// Whether the result for `key` was computed from the inputs at `revision`. An older result
+    /// keeps answering until it is recomputed.
+    fn is_current(&self, key: &(ModelId, String), revision: u64) -> bool {
+        self.results.read().is_ok_and(|results| {
+            results
+                .get(key)
+                .is_some_and(|(computed_at, _)| *computed_at == revision)
+        })
+    }
+
+    /// Record a result computed at `revision`; whether it changed what the projection sees.
+    fn record(
+        &self,
+        key: (ModelId, String),
+        revision: u64,
+        result: CustomModelEnrichmentResult,
+    ) -> bool {
         let Ok(mut results) = self.results.write() else {
             return false;
         };
         let previous = results
             .iter()
             .find(|((model_id, _), _)| model_id == &key.0)
-            .map(|(_, previous)| previous.clone())
+            .map(|(_, (_, previous))| previous.clone())
             .unwrap_or_default();
         results.retain(|(model_id, _), _| model_id != &key.0);
-        results.insert(key, result.clone());
+        results.insert(key, (revision, result.clone()));
         previous != result
     }
 
@@ -182,7 +199,7 @@ impl CustomModelEnrichment for CandidateEnrichment {
             .and_then(|results| {
                 results
                     .get(&(model.model_id.clone(), model.target.id.0.clone()))
-                    .cloned()
+                    .map(|(_, result)| result.clone())
             })
             .unwrap_or_default()
     }
@@ -277,21 +294,25 @@ impl ManagedModelCandidates {
             .snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.license.clone());
-        let recommended_drafter = recommended(self.enumerate_drafters(target, None, true).await?);
+        let drafters = automatic(self.enumerate_drafters(target, None, true).await?);
         if let Some(chosen) = self.chosen_drafter(model_id).await {
             self.learn_drafter_content(&chosen).await;
         }
         Ok(CustomModelEnrichmentResult {
             variant_of,
-            recommended_drafter,
+            drafters,
             license,
         })
     }
 
-    /// Fill every custom model's lineage hint and recommended drafter. The projection asks the
+    /// Fill every custom model's lineage hint and automatic drafters. The projection asks the
     /// enrichment synchronously, so results are computed here in the background, one model at a
     /// time, keyed by the model and its exact target package, and the list is republished when
-    /// they change.
+    /// they change. A result is recomputed whenever the custom-model inputs revision moves past
+    /// the one it was computed at: a file appearing, moving or disappearing in any location (a
+    /// model's folder or repository included), a drafter package installed or removed, a catalog
+    /// installation, or a configuration change. Candidate enumeration is the only source of the
+    /// automatic order, so the list and the attachment never disagree for long.
     pub fn start_enrichment(self: &Arc<Self>, resolver: Arc<ModelDomainResolver>) {
         let warmed = Arc::clone(self);
         tokio::spawn(async move {
@@ -303,8 +324,11 @@ impl ManagedModelCandidates {
         let candidates = Arc::clone(self);
         tokio::spawn(async move {
             let mut changes = candidates.local.watch_local();
-            let mut failed = BTreeMap::<(ModelId, String), std::time::Instant>::new();
+            let mut failed = BTreeMap::<(ModelId, String), (u64, std::time::Instant)>::new();
             loop {
+                let Ok(revision) = resolver.custom_model_inputs_revision() else {
+                    return;
+                };
                 let models = candidates
                     .local
                     .list_local()
@@ -333,21 +357,21 @@ impl ManagedModelCandidates {
                         model_id.clone(),
                         bundle_target(&configuration.bundle).id.0.clone(),
                     );
-                    if enrichment.knows_key(&key)
-                        || failed
-                            .get(&key)
-                            .is_some_and(|at| at.elapsed() < ENRICHMENT_RETRY_DELAY)
+                    if enrichment.is_current(&key, revision)
+                        || failed.get(&key).is_some_and(|(failed_at, at)| {
+                            *failed_at == revision && at.elapsed() < ENRICHMENT_RETRY_DELAY
+                        })
                     {
                         continue;
                     }
                     match candidates.enrich_model(&model_id).await {
                         Ok(result) => {
                             failed.remove(&key);
-                            changed |= enrichment.record(key, result);
+                            changed |= enrichment.record(key, revision, result);
                         }
                         Err(error) => {
                             tracing::warn!(model.id = %model_id.as_str(), %error, "custom model enrichment failed");
-                            failed.insert(key, std::time::Instant::now());
+                            failed.insert(key, (revision, std::time::Instant::now()));
                         }
                     }
                 }
@@ -1318,7 +1342,7 @@ impl ManagedModelCandidates {
                     material,
                     repository: Some((snapshot.repository.clone(), snapshot.commit.clone())),
                     primary: Some(primary),
-                    folder: None,
+                    folders: Vec::new(),
                     snapshot: Some(snapshot),
                     lineage,
                     catalog: None,
@@ -1331,14 +1355,16 @@ impl ManagedModelCandidates {
                     .as_ref()
                     .map(|file| path.join(&file.path));
                 let lineage = header_lineage(&target);
-                let folder = target
+                let folders = target
                     .parent()
-                    .map(|parent| DrafterFolder::whole(parent.to_path_buf()));
+                    .map(|parent| DrafterFolder::whole(parent.to_path_buf()))
+                    .into_iter()
+                    .collect();
                 Ok(DrafterTarget {
                     material: self.local_target(target, projector)?,
                     repository: None,
                     primary: None,
-                    folder,
+                    folders,
                     snapshot: None,
                     lineage,
                     catalog: None,
@@ -1363,7 +1389,7 @@ impl ManagedModelCandidates {
                 material: Self::resolved_target(resolved)?,
                 repository: None,
                 primary: None,
-                folder: None,
+                folders: Vec::new(),
                 snapshot: None,
                 lineage: BTreeSet::new(),
                 catalog: Some(model_id.clone()),
@@ -1434,19 +1460,40 @@ impl ManagedModelCandidates {
             }
             None => None,
         };
-        let folder = drafter_folder(
-            &model.origin,
-            repository
-                .as_ref()
-                .map(|(repository, _)| repository.as_str()),
-            snapshot.is_some(),
-            material.target.parent(),
-        );
+        // Each place this model's own bytes are found gives its folder; never the folder of the
+        // file its target package resolves to, nor of another model sharing its header.
+        let locations = self
+            .resolver
+            .get()
+            .and_then(|resolver| resolver.custom_model_locations(model_id).ok())
+            .filter(|locations| !locations.is_empty())
+            .unwrap_or_else(|| {
+                model
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .take(1)
+                    .collect()
+            });
+        let mut folders = Vec::<DrafterFolder>::new();
+        for location in &locations {
+            if let Some(folder) = drafter_folder(
+                &model.origin,
+                repository
+                    .as_ref()
+                    .map(|(repository, _)| repository.as_str()),
+                snapshot.is_some(),
+                location.parent(),
+            ) && !folders.contains(&folder)
+            {
+                folders.push(folder);
+            }
+        }
         Ok(DrafterTarget {
             material,
             repository,
             primary,
-            folder,
+            folders,
             snapshot,
             lineage,
             catalog: None,
@@ -1657,23 +1704,24 @@ impl ManagedModelCandidates {
                 .collect::<Vec<_>>();
             return collect_candidates(pending).await;
         }
-        let Some(folder) = &target.folder else {
-            return Vec::new();
-        };
-        let (_, classified) = self.scan_local(&folder.path, DRAFTER_SCAN_DEPTH).await;
-        let pending = classified
-            .into_iter()
-            .filter(|group| matches!(group.role, CandidateFileRole::Drafter { .. }))
-            .filter(|group| group.group.files.len() == 1)
-            .filter(|group| folder.admits(&group.group.primary().path))
-            .map(|group| {
-                self.local_drafter_candidate(
-                    target,
-                    folder.path.join(&group.group.primary().path),
-                    group.group.size_bytes(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let mut pending = Vec::new();
+        for folder in &target.folders {
+            let (_, classified) = self.scan_local(&folder.path, DRAFTER_SCAN_DEPTH).await;
+            pending.extend(
+                classified
+                    .into_iter()
+                    .filter(|group| matches!(group.role, CandidateFileRole::Drafter { .. }))
+                    .filter(|group| group.group.files.len() == 1)
+                    .filter(|group| folder.admits(&group.group.primary().path))
+                    .map(|group| {
+                        self.local_drafter_candidate(
+                            target,
+                            folder.path.join(&group.group.primary().path),
+                            group.group.size_bytes(),
+                        )
+                    }),
+            );
+        }
         collect_candidates(pending).await
     }
 
@@ -2148,10 +2196,19 @@ fn download_bytes(candidate: &DrafterCandidate) -> u64 {
 
 /// The first candidate, in choice order, that the engine binds; a user-entered drafter is never
 /// chosen automatically.
+/// The candidates automatic choice may take, in its order: every one the engine binds that the
+/// user did not enter.
+fn automatic(candidates: Vec<DrafterCandidate>) -> Vec<DrafterCandidate> {
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.category != DrafterCategory::Other && is_bound(&candidate.verdict)
+        })
+        .collect()
+}
+
 fn recommended(candidates: Vec<DrafterCandidate>) -> Option<DrafterCandidate> {
-    candidates.into_iter().find(|candidate| {
-        candidate.category != DrafterCategory::Other && is_bound(&candidate.verdict)
-    })
+    automatic(candidates).into_iter().next()
 }
 
 fn other_drafter_label(lineage: DrafterLineage) -> String {
