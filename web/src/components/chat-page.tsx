@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react"
 import { ArrowUpIcon, PlusIcon, StopIcon, TrashIcon } from "@phosphor-icons/react"
 import { Button } from "./ui/button"
 import { normalizeLocalEmbedUrl } from "./open-webui-url"
+import { consumeChatEvent } from "./chat-stream"
 
 type ChatMessage = { role: "user" | "assistant"; content: string }
 type Conversation = {
@@ -53,31 +54,7 @@ function saveConversations(conversations: Conversation[]) {
   }
 }
 
-function consumeEvent(block: string, onText: (text: string) => void): boolean {
-  let finished = false
-  for (const line of block.split(/\r?\n/)) {
-    if (!line.startsWith("data:")) continue
-    const data = line.slice(5).trimStart()
-    if (data === "[DONE]") {
-      finished = true
-      continue
-    }
-    if (!data) continue
-    try {
-      const event = JSON.parse(data) as {
-        choices?: Array<{ delta?: { content?: unknown } }>
-        error?: { message?: string }
-      }
-      if (event.error?.message) throw new Error(event.error.message)
-      const content = event.choices?.[0]?.delta?.content
-      if (typeof content === "string" && content.length > 0) onText(content)
-    } catch (error) {
-      if (error instanceof Error && error.message !== "Unexpected end of JSON input") throw error
-      // Keepalive/comment frames have no data field; malformed JSON data frames should surface as errors.
-    }
-  }
-  return finished
-}
+
 
 export function ChatPage() {
   const [conversations, setConversations] = useState<Conversation[]>(readConversations)
