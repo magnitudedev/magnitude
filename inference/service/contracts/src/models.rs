@@ -1739,3 +1739,26 @@ pub trait ModelDownloads: Send + Sync + 'static {
 pub struct ModelDownloadsInvalidation {
     pub revision: u64,
 }
+
+
+#[cfg(test)]
+mod model_instance_lifecycle_compatibility_tests {
+    use super::ModelInstanceLifecycle;
+
+    #[test]
+    fn accepts_ready_instances_from_workers_that_do_not_report_device_identity() {
+        let lifecycle: ModelInstanceLifecycle = serde_json::from_value(serde_json::json!({
+            "_tag": "Ready",
+            "allocation": {
+                "contextWindowTokens": 1,
+                "memoryDomains": []
+            }
+        }))
+        .expect("legacy Ready lifecycle without device identity remains readable");
+
+        assert!(matches!(
+            lifecycle,
+            ModelInstanceLifecycle::Ready { device: None, .. }
+        ));
+    }
+}
