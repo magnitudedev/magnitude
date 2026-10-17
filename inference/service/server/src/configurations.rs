@@ -70,16 +70,26 @@ impl ResolvedConfigurations {
         }
     }
 
-    /// The configuration's resolution, resolving it once for concurrent callers.
+    /// The configuration's resolution, resolving it once for concurrent callers. A resolution is
+    /// kept by its bundle and the files its packages are at now: a package is named by its
+    /// content, which may be in several places or move, so a file moved, or the copy that served
+    /// it gone, resolves afresh from where the package is, never from where it was.
     pub async fn resolve(
         &self,
         configuration: &ModelServingConfiguration,
     ) -> Result<Arc<ResolvedConfiguration>, InventoryError> {
+        let (input, package_ids) = installed_bundle(&configuration.bundle);
+        let material = self.models.resolve_bundle(input).await?;
+        let paths = engine_material(&material)?;
+        let key = ResolutionKey {
+            bundle: servable_model_bundle_key_for_bundle(&configuration.bundle),
+            files: std::iter::once(paths.target.clone())
+                .chain(paths.projector.clone())
+                .chain(paths.draft.clone())
+                .collect(),
+        };
         self.cache
-            .resolve(
-                servable_model_bundle_key_for_bundle(&configuration.bundle),
-                || self.resolve_uncached(&configuration.bundle),
-            )
+            .resolve(key, || self.resolve_material(material, paths, package_ids))
             .await
     }
 
@@ -94,17 +104,14 @@ impl ResolvedConfigurations {
         });
     }
 
-    async fn resolve_uncached(
+    async fn resolve_material(
         &self,
-        bundle: &ServableModelBundle,
+        material: ResolvedServableModelBundle,
+        paths: ModelPackagePaths,
+        package_ids: Vec<ModelPackageId>,
     ) -> Result<Arc<ResolvedConfiguration>, InventoryError> {
-        let (input, package_ids) = installed_bundle(bundle);
-        let material = self.models.resolve_bundle(input).await?;
-        let configuration = engine_configuration(
-            engine_material(&material)?,
-            self.kernel_directory.clone(),
-            self.reserves,
-        );
+        let configuration =
+            engine_configuration(paths, self.kernel_directory.clone(), self.reserves);
         let resolved = crate::spawn_blocking_traced(move || configuration.resolve())
             .await
             .map_err(|error| {
@@ -203,18 +210,25 @@ pub fn resolve_failure(error: ResolveError) -> InventoryError {
     }
 }
 
+/// A resolution's identity: the bundle, and the files its material is read from.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ResolutionKey {
+    bundle: ServableModelBundleKey,
+    files: Vec<PathBuf>,
+}
+
 type Entry<T> = Arc<tokio::sync::OnceCell<Arc<T>>>;
 
 /// Resolutions by key: the `retained` most recently used, and every one something else still
 /// holds, which is found again rather than resolved twice. Concurrent callers for one key share
 /// one resolution; a failed resolution is not kept.
-struct ResolutionCache<T> {
+struct ResolutionCache<T, K = ResolutionKey> {
     retained: usize,
-    recent: Mutex<VecDeque<(ServableModelBundleKey, Entry<T>)>>,
-    held: Mutex<BTreeMap<ServableModelBundleKey, Weak<T>>>,
+    recent: Mutex<VecDeque<(K, Entry<T>)>>,
+    held: Mutex<BTreeMap<K, Weak<T>>>,
 }
 
-impl<T> ResolutionCache<T> {
+impl<T, K: Clone + Ord> ResolutionCache<T, K> {
     fn new(retained: usize) -> Self {
         Self {
             retained,
@@ -223,7 +237,7 @@ impl<T> ResolutionCache<T> {
         }
     }
 
-    async fn resolve<E, F, Fut>(&self, key: ServableModelBundleKey, resolve: F) -> Result<Arc<T>, E>
+    async fn resolve<E, F, Fut>(&self, key: K, resolve: F) -> Result<Arc<T>, E>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Arc<T>, E>>,
@@ -260,7 +274,7 @@ impl<T> ResolutionCache<T> {
             });
     }
 
-    fn entry(&self, key: &ServableModelBundleKey) -> Entry<T> {
+    fn entry(&self, key: &K) -> Entry<T> {
         let mut recent = self.recent.lock().expect("resolution cache lock");
         if let Some(position) = recent.iter().position(|(existing, _)| existing == key) {
             let used = recent.remove(position).expect("position is in range");
@@ -276,7 +290,7 @@ impl<T> ResolutionCache<T> {
         entry
     }
 
-    fn still_held(&self, key: &ServableModelBundleKey) -> Option<Arc<T>> {
+    fn still_held(&self, key: &K) -> Option<Arc<T>> {
         self.held
             .lock()
             .expect("resolution cache lock")
@@ -284,13 +298,13 @@ impl<T> ResolutionCache<T> {
             .and_then(Weak::upgrade)
     }
 
-    fn hold(&self, key: ServableModelBundleKey, resolved: &Arc<T>) {
+    fn hold(&self, key: K, resolved: &Arc<T>) {
         let mut held = self.held.lock().expect("resolution cache lock");
         held.retain(|_, resolved| resolved.strong_count() > 0);
         held.insert(key, Arc::downgrade(resolved));
     }
 
-    fn forget(&self, key: &ServableModelBundleKey, entry: &Entry<T>) {
+    fn forget(&self, key: &K, entry: &Entry<T>) {
         self.recent
             .lock()
             .expect("resolution cache lock")
@@ -368,7 +382,7 @@ mod tests {
     }
 
     async fn resolve_counting(
-        cache: &ResolutionCache<String>,
+        cache: &ResolutionCache<String, ServableModelBundleKey>,
         index: usize,
         resolutions: &std::sync::atomic::AtomicUsize,
     ) -> Arc<String> {
@@ -385,7 +399,8 @@ mod tests {
     /// resolution and those still held stay in memory.
     #[tokio::test]
     async fn a_long_run_of_resolutions_keeps_only_the_recent_and_the_held() {
-        let cache = ResolutionCache::<String>::new(RETAINED_CONFIGURATIONS);
+        let cache =
+            ResolutionCache::<String, ServableModelBundleKey>::new(RETAINED_CONFIGURATIONS);
         let resolutions = std::sync::atomic::AtomicUsize::new(0);
         let resident = resolve_counting(&cache, 0, &resolutions).await;
         for round in 0..2_000 {
@@ -422,7 +437,8 @@ mod tests {
 
     #[tokio::test]
     async fn forgetting_drops_recent_and_held_resolutions_and_a_failure_is_not_kept() {
-        let cache = ResolutionCache::<String>::new(RETAINED_CONFIGURATIONS);
+        let cache =
+            ResolutionCache::<String, ServableModelBundleKey>::new(RETAINED_CONFIGURATIONS);
         let resolutions = std::sync::atomic::AtomicUsize::new(0);
         let held = resolve_counting(&cache, 1, &resolutions).await;
         resolve_counting(&cache, 2, &resolutions).await;

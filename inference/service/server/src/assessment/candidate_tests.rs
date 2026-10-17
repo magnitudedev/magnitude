@@ -173,6 +173,21 @@ fn tokens() -> Vec<String> {
     tokens[2] = "</s>".into();
     tokens[3] = "<|im_start|>".into();
     tokens[4] = "<|im_end|>".into();
+    // Byte-level BPE spells every byte (GPT-2's byte-to-character map), so the engine resolves a
+    // stub target for loading as well as for assessment.
+    let mut shifted = 0;
+    for byte in 0..=255_u32 {
+        let printable = (u32::from(b'!')..=u32::from(b'~')).contains(&byte)
+            || (0xA1..=0xAC).contains(&byte)
+            || (0xAE..=0xFF).contains(&byte);
+        let character = if printable {
+            byte
+        } else {
+            shifted += 1;
+            255 + shifted
+        };
+        tokens[5 + byte as usize] = char::from_u32(character).unwrap().to_string();
+    }
     tokens
 }
 
@@ -3310,6 +3325,7 @@ struct LiveFixture {
     _directory: tempfile::TempDir,
     _hub: Arc<StubHub>,
     resolver: Arc<ModelDomainResolver>,
+    configurations: crate::configurations::ResolvedConfigurations,
     local: Arc<magnitude_service_models::ManagedLocalModels>,
     _candidates: Arc<ManagedModelCandidates>,
 }
@@ -3359,16 +3375,47 @@ async fn live_fixture(local_models: LocalModelsConfiguration) -> LiveFixture {
         services.local.clone(),
     );
     candidates.start_enrichment(resolver.clone());
+    let configurations = crate::configurations::ResolvedConfigurations::new(
+        Arc::clone(&models),
+        directory.path().join("kernels"),
+        magnitude_executor::platform::MemoryReserves::standard(),
+    );
     LiveFixture {
         _directory: directory,
         _hub: hub,
         resolver,
+        configurations,
         local: services.local,
         _candidates: candidates,
     }
 }
 
 impl LiveFixture {
+    /// Resolves the model for loading and opens its material as a worker does, returning the
+    /// target and draft files it reads.
+    async fn load_files(&self, model_id: &ModelId) -> (PathBuf, Option<PathBuf>) {
+        let configuration = self
+            .resolver
+            .serving_configuration(model_id)
+            .expect("serving configuration");
+        let resolved = self
+            .configurations
+            .resolve(&configuration)
+            .await
+            .expect("the model resolves for loading");
+        magnitude_artifacts::Package::open_manifest(&resolved.manifest.package)
+            .expect("the worker opens the files it is given");
+        (
+            resolved.manifest.package.target.path().to_path_buf(),
+            resolved
+                .manifest
+                .package
+                .draft
+                .as_ref()
+                .map(|draft| draft.path().to_path_buf()),
+        )
+    }
+
     /// Rescans every location, as a watch event does, then waits until the attached drafter of the
     /// custom model whose file is `file` is `expected` (its reference, and whether it serves).
     async fn rescan_until(
@@ -3597,4 +3644,79 @@ async fn a_model_sharing_a_header_with_another_never_takes_the_drafter_in_its_fo
         served(&second.model_id),
         "each model serves its own weights"
     );
+}
+
+/// QA (Fedora and arm64, round 3): with the drafter's bytes in two places, moving the attached copy
+/// into a subfolder switched the model to the catalog drafter (the same package, the other copy),
+/// but every load kept the resolution of the moved file and failed until a restart. Moving the
+/// target itself did the same. A resolution follows where its packages are now.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_after_a_file_moves_reads_it_where_it_is_now_without_a_restart() {
+    let locations = tempfile::tempdir().expect("locations");
+    let folder = locations.path().join("lfm-own");
+    let elsewhere = locations.path().join("lfm-imp");
+    let other = locations.path().join("other");
+    let model = folder.join("model-Q4_K_M.gguf");
+    write_sparse(&model, &llama(7, Encoding::Q8_0));
+    let beside = folder.join("folder-dflash.gguf");
+    write_sparse(&beside, &dflash(HIDDEN));
+    let copy = elsewhere.join("dflash-copy.gguf");
+    write_sparse(&copy, &dflash(HIDDEN));
+    std::fs::create_dir_all(&other).unwrap();
+    let root = |path: &std::path::Path| magnitude_service_contracts::models::ModelRoot {
+        kind: magnitude_service_contracts::models::ModelRootKind::Folder,
+        path: path.to_path_buf(),
+        enabled: true,
+    };
+    let fixture = live_fixture(LocalModelsConfiguration {
+        roots: vec![root(&folder), root(&elsewhere), root(&other)],
+        ..LocalModelsConfiguration::default()
+    })
+    .await;
+    let in_folder = DrafterReference::Local {
+        path: beside.clone(),
+    };
+    let catalog = DrafterReference::Catalog {
+        model_id: "llama-test:gguf:q8".parse().unwrap(),
+    };
+
+    let listed = fixture
+        .rescan_until(&model, Some((&in_folder, true)), "the folder drafter")
+        .await;
+    let id = listed.model_id.clone();
+    // The drafter package is one content in two places; the load reads one of them.
+    let (target, read) = fixture.load_files(&id).await;
+    assert_eq!(target, model);
+    let read = read.expect("a draft");
+    assert!(read == beside || read == copy, "{}", read.display());
+
+    let moved = read
+        .parent()
+        .unwrap()
+        .join("sub")
+        .join(read.file_name().unwrap());
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&read, &moved).unwrap();
+    let attached = if read == beside { &catalog } else { &in_folder };
+    fixture
+        .rescan_until(&model, Some((attached, true)), "after the move")
+        .await;
+    let (target, draft) = fixture.load_files(&id).await;
+    assert_eq!(target, model);
+    let draft = draft.expect("a draft");
+    assert_ne!(
+        draft, read,
+        "the load never reads the moved file's old path"
+    );
+    assert!(draft.exists(), "{}", draft.display());
+
+    let relocated = other.join("model-Q4_K_M.gguf");
+    std::fs::rename(&model, &relocated).unwrap();
+    let listed = fixture
+        .rescan_until(&relocated, Some((attached, true)), "the moved target")
+        .await;
+    assert_eq!(listed.model_id, id, "a moved file keeps its ID");
+    let (target, draft) = fixture.load_files(&id).await;
+    assert_eq!(target, relocated, "the target loads from its new path");
+    assert!(draft.is_some_and(|draft| draft.exists()));
 }

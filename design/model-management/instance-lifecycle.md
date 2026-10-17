@@ -115,7 +115,10 @@ tokenizer, template or properties path exists and those operations never lease o
 resolution holds the model's package metadata, tokenizers and templates (100 to 250 MB for a
 250K-token vocabulary), so the cache keeps only the most recently used one beyond those still held:
 the resident model holds its own, which host-only operations on it find however many other models
-were previewed since. The service process on glibc caps its malloc arenas, keeps large blocks on
+were previewed since. A resolution is keyed by its bundle and the files its packages are read
+from now: a package names content, which may sit in several places or move, so a move or a removed
+copy resolves afresh from the inventory's current locations, never from a path that is gone. The
+service process on glibc caps its malloc arenas, keeps large blocks on
 their own mappings and periodically returns free arena pages, so the brief peaks of assessment,
 inspection and previews do not stay resident. The load
 then waits while memory admission is closed (stage `queued`), previews itself on the service's
