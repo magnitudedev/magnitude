@@ -191,11 +191,11 @@ export function ChatPage() {
         const blocks = buffer.split("\n\n")
         buffer = blocks.pop() ?? ""
         for (const block of blocks) {
-          consumeEvent(block, append)
+          consumeChatEvent(block, append)
           if (controller.signal.aborted) break
         }
       }
-      if (buffer.trim()) consumeEvent(buffer, append)
+      if (buffer.trim()) consumeChatEvent(buffer, append)
       await reader.cancel().catch(() => undefined)
     } catch (cause) {
       if (!(cause instanceof DOMException && cause.name === "AbortError")) {
