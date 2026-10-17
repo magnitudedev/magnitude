@@ -133,7 +133,7 @@ export interface AcnServerOptions {
   readonly debug?: boolean
   readonly dataDir?: string
   readonly port?: number
-  /** Optional loopback-only browser entry point for the native Chat page. */
+  /** Override the default loopback-only browser entry point for the native Chat page. */
   readonly chatPort?: number
 }
 
