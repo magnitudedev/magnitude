@@ -25,9 +25,15 @@ fn main() {
     files.sort();
     let mut digest = Sha256::new();
     for file in &files {
-        let relative = file.strip_prefix(&manifest).unwrap_or(file);
+        let relative = file
+            .strip_prefix(&manifest)
+            .unwrap_or(file)
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         let contents = std::fs::read(file).expect("a source file reads");
-        for part in [relative.to_string_lossy().as_bytes(), &contents] {
+        for part in [relative.as_bytes(), &contents] {
             digest.update((part.len() as u64).to_le_bytes());
             digest.update(part);
         }

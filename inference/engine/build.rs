@@ -64,10 +64,15 @@ fn main() {
     }
     let mut digest = Sha256::new();
     for file in files {
+        // Hash the path with '/' separators on every host so Windows derives the same identity.
         let relative = file
             .strip_prefix(root)
-            .expect("source under the inference root");
-        digest.update(relative.to_string_lossy().as_bytes());
+            .expect("source under the inference root")
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        digest.update(relative.as_bytes());
         digest.update([0]);
         digest.update(std::fs::read(&file).expect("engine source file"));
         digest.update([0]);
