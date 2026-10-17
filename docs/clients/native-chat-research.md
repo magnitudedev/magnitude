@@ -112,3 +112,6 @@ The architectural goal remains to separate conversation UI from administration, 
 The working branch now includes an opt-in Open WebUI view within the Chat page. It accepts only loopback HTTP(S) URLs (`localhost`, `127.0.0.1`, or `[::1]`), rejects URL credentials and non-web protocols, strips URL fragments, and persists the selected URL in browser local storage. A native Chat route remains available as a fallback. The URL validation helper has unit tests for accepted loopback URLs, remote-host rejection, credentials, malformed URLs, non-web schemes, and fragment removal.
 
 These changes are authored but not yet executed through the web typecheck, test suite, or build in this environment. The iframe cannot reliably inspect a cross-origin child page's HTTP headers or authentication state, so server policy and real browser behavior remain manual integration checks. Do not claim that Open WebUI embedding or inference has passed until CI and end-to-end checks are green.
+
+
+The implementation guide for connecting an existing Open WebUI instance to Magnitude is available at [`docs/clients/open-webui.mdx`](https://github.com/robertosantosx2/magnitude/blob/feat/native-chat-section/docs/clients/open-webui.mdx). It explains the host-versus-container address distinction, API key/network-access requirements, embedding policy, and end-to-end acceptance checklist.
