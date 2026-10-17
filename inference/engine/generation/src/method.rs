@@ -47,6 +47,18 @@ pub enum MethodCheckpoint {
 }
 
 impl MethodCheckpoint {
+    /// Whether a generation under `choice` can resume from this checkpoint:
+    /// it was taken under the same method, so the drafter history the
+    /// retained state holds (or lacks) is the one the generation needs.
+    pub fn resumes(&self, choice: MethodChoice) -> bool {
+        matches!(
+            (choice, self),
+            (MethodChoice::Plain, Self::Plain)
+                | (MethodChoice::Mtp { .. }, Self::Mtp(_))
+                | (MethodChoice::DFlash { .. }, Self::DFlash(_))
+        )
+    }
+
     /// Host bytes the checkpoint keeps.
     pub fn retained_bytes(&self) -> u64 {
         match self {

@@ -74,6 +74,24 @@
       }
     },
     {
+      "name": "qwen35-0.8b-mtp",
+      "description": "unsloth Qwen3.5 0.8B MTP Q3_K_M: binds its built-in MTP heads. They stay bound beside its mmproj-F16.gguf projector (also in headers/), which the engine boundary test covers.",
+      "target": [
+        {
+          "header": "headers/Qwen3.5-0.8B-Q3_K_M.gguf.gz",
+          "repository": "unsloth/Qwen3.5-0.8B-MTP-GGUF",
+          "revision": "cf8a611f6ed2c2060046219a19f12cd3d5ecd67c",
+          "path": "Qwen3.5-0.8B-Q3_K_M.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "bound": "mtp"
+        }
+      }
+    },
+    {
       "name": "qwen35-iq2m",
       "description": "Qwen3.5 4B UD-IQ2_M: IQ2_S and Q2_K tensors have no import.",
       "target": [

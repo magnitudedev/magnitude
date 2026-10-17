@@ -1560,7 +1560,7 @@ fn mtp_reading_target_keeps_the_shared_draft_budget() {
 /// Media rows enter the target from the projector under placeholder
 /// tokens. A reading head never sees them as tokens: every prompt chunk but
 /// the closing one demands nothing of it. A head embedding prompt tokens
-/// cannot admit them.
+/// cannot enter them: that request generates without drafting.
 #[test]
 fn mtp_reading_target_admits_media_rows_an_embedding_head_cannot() {
     let layout = || {
@@ -1593,8 +1593,32 @@ fn mtp_reading_target_admits_media_rows_an_embedding_head_cannot() {
         configured.clone(),
         None,
         Arc::new(Mtp::new("fixture", 2).unwrap()),
+    )
+    .expect("a media request beside an embedding head generates");
+    assert_eq!(embedding.method_choice(), MethodChoice::Plain);
+    assert_eq!(embedding.method_identity(), "plain");
+    assert!(!embedding.method_requirements().head);
+    // Every prompt row is entered by target rounds alone, and decoding
+    // drafts nothing.
+    let prompt = start(resident(embedding), 4);
+    assert_eq!(prompt.round_forward().tokens.len(), 4);
+    let (embedding, effects) = resolve(prompt, &[20], None);
+    assert!(effects.is_empty());
+    assert_eq!(embedding.generated(), [TokenId(20)]);
+    assert_eq!(start(embedding, 4).round_forward().tokens, [TokenId(20)]);
+    // A text request on the same load still drafts with the head.
+    assert_eq!(
+        Generation::new_with_method(
+            vec![TokenId(1), TokenId(1), TokenId(3), TokenId(4)],
+            InputLayout::new(4, vec![]).unwrap(),
+            configured.clone(),
+            None,
+            Arc::new(Mtp::new("fixture", 2).unwrap()),
+        )
+        .unwrap()
+        .method_choice(),
+        MethodChoice::Mtp { proposals: 2 }
     );
-    assert!(embedding.is_err());
     // The separate draft's history is the target's fused features.
     configured.method = MethodChoice::DFlash { proposals: 2 };
     assert!(
@@ -1620,6 +1644,10 @@ fn mtp_reading_target_checkpoints_retain_no_feature_rows() {
     };
     assert_eq!((state.position(), state.target_rows()), (4, 4));
     assert_eq!(checkpoint.retained_bytes(), 0);
+    // Only a drafting request of the same method resumes it.
+    assert!(checkpoint.resumes(MethodChoice::Mtp { proposals: 2 }));
+    assert!(!checkpoint.resumes(MethodChoice::Plain));
+    assert!(!checkpoint.resumes(MethodChoice::DFlash { proposals: 2 }));
     let mut resumed = reading_fresh(&[1, 2, 3, 4, 7], InputLayout::new(5, vec![]).unwrap(), 2);
     resumed.resume_at(Some((4, &checkpoint))).unwrap();
     let closing = start(resumed, 1);

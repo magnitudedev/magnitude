@@ -39,6 +39,10 @@ opentelemetry-otlp = { version = "0.33.0", features = ["http-json", "reqwest"] }
 name = "worker_parity"
 harness = false
 
+[[test]]
+name = "media_drafting"
+harness = false
+
 [dev-dependencies]
 magnitude-family-common = { path = "families/common", features = ["catalog-headers"] }
 flate2.workspace = true

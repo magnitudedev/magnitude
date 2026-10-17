@@ -142,13 +142,15 @@ declaration names the exact projector path in that repository. Package construct
 validation are one operation: an image target requires an exact projector component and a typed
 relationship to the package weights. Native assessment establishes whether MTMD recognizes image
 input. Primary-weight metadata and projector presence alone never establish runnable image
-capability. A missing, ambiguous, or incompatible projector fails generation. Embedded MTP
-combined with a projector is rejected: its head embeds every prompt token and cannot enter
-media rows. The engine is the only authority for this: binding drops such a head (built-in
-heads, or a separate head file of that kind) whenever a projector is present, so assessment reports
-the drafter `Rejected` with a target-mismatch reason and a load serves the target without it. A separately packaged Gemma QAT assistant reads the target's history, media rows
-included, and is admitted only with its matching target and validated composed capability.
-Generation independently refuses a token-embedding drafter for a request with media spans.
+capability. A missing, ambiguous, or incompatible projector fails generation. A projector
+never decides a drafter's verdict. An MTP head that embeds every prompt token (built-in heads, or a
+separate head file of that kind) cannot enter media rows, so the engine generates each request with
+media spans without drafting and drafts every text request; the drafter stays bound and the model
+keeps its text speedup. A drafter reading the target's history or features (a Gemma QAT assistant,
+DFlash, DSpark) sees media rows through the target and drafts image requests too. A separately
+packaged Gemma QAT assistant is admitted only with its matching target and validated composed
+capability. A request without drafting never retains or resumes a prefix with a drafting request,
+whose drafter history it lacks.
 Speculative decoding is explicit as either capability embedded in the target GGUF or an exact draft
 file in the target or another repository. Every package source is locked.
 

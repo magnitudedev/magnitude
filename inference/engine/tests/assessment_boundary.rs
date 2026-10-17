@@ -903,3 +903,53 @@ fn widened_weights_are_charged_as_resident() {
     assert_eq!(q3k_required, q6k_required);
     assert!(q3k_required.iter().all(|required| *required > q6k_stored));
 }
+
+/// A shared real-header fixture (`fixtures/assessment/headers`),
+/// decompressed into `scratch` under its repository file name.
+fn real_header(scratch: &Scratch, name: &str) -> PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/assessment/headers")
+        .join(format!("{name}.gz"));
+    let mut decoder = flate2::read::GzDecoder::new(
+        std::fs::File::open(&source).unwrap_or_else(|error| panic!("{}: {error}", source.display())),
+    );
+    let path = scratch.file(name);
+    std::io::copy(&mut decoder, &mut std::fs::File::create(&path).unwrap()).unwrap();
+    path
+}
+
+/// A projector never decides the drafter: unsloth's Qwen3.5 0.8B MTP target
+/// binds its built-in heads alone and beside its projector, where it also
+/// gains vision. Generation drafts its text requests and generates requests
+/// with media rows (which the heads cannot enter) without drafting.
+#[test]
+fn embedded_mtp_heads_stay_bound_beside_a_projector() {
+    let scratch = Scratch::new("mtp-projector");
+    let target = real_header(&scratch, "Qwen3.5-0.8B-Q3_K_M.gguf");
+    let projector = real_header(&scratch, "mmproj-F16.gguf");
+    let assessed = |projector: Option<PathBuf>| {
+        let package = ModelPackagePaths {
+            projector,
+            ..package(target.clone())
+        };
+        let PreparedModelAssessment::Planned { facts, .. } = prepared(&package) else {
+            panic!("the target plans");
+        };
+        facts
+    };
+    for (projector, vision) in [(None, false), (Some(projector), true)] {
+        let facts = assessed(projector);
+        assert_eq!(facts.capabilities.vision, vision);
+        assert!(
+            matches!(
+                facts.drafter,
+                DrafterVerdict::Bound {
+                    method: SpeculativeMethod::Mtp,
+                    ..
+                }
+            ),
+            "vision {vision}: {:?}",
+            facts.drafter
+        );
+    }
+}

@@ -324,7 +324,7 @@ impl Generation {
         let GenerationSeed {
             prompt,
             layout,
-            options,
+            mut options,
             constraint,
         } = seed;
         if method_factory.identity().is_empty()
@@ -334,16 +334,16 @@ impl Generation {
         }
         // Media rows enter the target from the projector under placeholder
         // tokens. A drafter reading the target's history sees them through
-        // the target; one embedding every prompt token cannot enter them.
-        if method_factory.embeds_prompt_tokens()
+        // the target; one embedding every prompt token cannot enter them, so
+        // such a request generates without drafting.
+        let method_factory: Arc<dyn Method> = if method_factory.embeds_prompt_tokens()
             && layout.spans().iter().any(|span| !span.language_history)
         {
-            return Err(
-                "this drafter embeds prompt tokens and cannot enter media rows; \
-                 generate without drafting"
-                    .into(),
-            );
-        }
+            options.method = MethodChoice::Plain;
+            Arc::new(Plain)
+        } else {
+            method_factory
+        };
         let finish = (options.max_tokens == 0).then_some(FinishReason::Length);
         let constraint = controls::Controlled::compose(
             constraint,
@@ -409,6 +409,11 @@ impl Generation {
             draft_n: self.draft_stats.proposed,
             draft_n_accepted: self.draft_stats.accepted,
         }
+    }
+    /// The method this request generates under: the load's, or plain for a
+    /// request whose media rows its drafter cannot enter.
+    pub fn method_choice(&self) -> MethodChoice {
+        self.options.method
     }
     pub fn method_identity(&self) -> &str {
         self.method_factory.identity()

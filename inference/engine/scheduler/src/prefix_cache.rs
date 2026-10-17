@@ -16,7 +16,7 @@
 //! by the memory heap after the entry's state drops.
 use magnitude_executor::ResourcePlan;
 use magnitude_family_contracts::{InputLayout, TokenId};
-use magnitude_generation::{Generation, MethodCheckpoint};
+use magnitude_generation::{Generation, MethodCheckpoint, MethodChoice};
 use serde::{Deserialize, Serialize};
 
 pub const MIN_PREFIX_HIT: usize = 64;
@@ -58,26 +58,38 @@ impl PrefixCacheCapacity {
 }
 
 /// A request's input path: its prompt, then its accepted output, with the
-/// media identities its layout conditions on. Derived from the generation
-/// that owns them, never stored.
+/// media identities its layout conditions on, and the method it generates
+/// under. Derived from the generation that owns them, never stored.
 #[derive(Clone, Copy)]
 pub struct PrefixPath<'a> {
     prompt: &'a [TokenId],
     generated: &'a [TokenId],
     layout: &'a InputLayout,
+    method: MethodChoice,
 }
 
 impl<'a> PrefixPath<'a> {
-    pub fn new(prompt: &'a [TokenId], generated: &'a [TokenId], layout: &'a InputLayout) -> Self {
+    pub fn new(
+        prompt: &'a [TokenId],
+        generated: &'a [TokenId],
+        layout: &'a InputLayout,
+        method: MethodChoice,
+    ) -> Self {
         Self {
             prompt,
             generated,
             layout,
+            method,
         }
     }
 
     pub fn of(generation: &'a Generation) -> Self {
-        Self::new(generation.prompt(), generation.generated(), generation.layout())
+        Self::new(
+            generation.prompt(),
+            generation.generated(),
+            generation.layout(),
+            generation.method_choice(),
+        )
     }
 
     pub fn len(&self) -> usize {
@@ -225,7 +237,10 @@ impl<S> PrefixCache<S> {
             .ok_or_else(|| "prefix hit is no longer cached".to_owned())
     }
 
-    /// The deepest entry whose path is a prefix of `path`. Entries in
+    /// The deepest entry whose path is a prefix of `path`, retained under
+    /// the method `path` generates under (a request drafting without media
+    /// and one generating plainly beside it never share a drafter history).
+    /// Entries in
     /// submitted use are hits too: every hit forks shared claims. Only
     /// entries below position `bound` qualify: a resumed request must still
     /// compute the row it samples from.
@@ -255,6 +270,7 @@ impl<S> PrefixCache<S> {
             let position = entry.position();
             if position < MIN_PREFIX_HIT
                 || position >= bound
+                || !entry.method.resumes(path.method)
                 || path.shared_boundary(&entry.tokens, &entry.conditioning) != position
             {
                 continue;
@@ -310,7 +326,11 @@ impl<S> PrefixCache<S> {
         if let Some(existing) = self
             .entries
             .iter()
-            .position(|entry| entry.tokens == tokens && entry.conditioning == conditioning)
+            .position(|entry| {
+                entry.tokens == tokens
+                    && entry.conditioning == conditioning
+                    && std::mem::discriminant(&entry.method) == std::mem::discriminant(&method)
+            })
         {
             let last_use = self.tick()?;
             self.entries[existing].last_use = last_use;
@@ -477,7 +497,11 @@ mod tests {
 
     impl Owned {
         fn path(&self) -> PrefixPath<'_> {
-            PrefixPath::new(&self.prompt, &self.generated, &self.layout)
+            self.under(MethodChoice::Plain)
+        }
+
+        fn under(&self, method: MethodChoice) -> PrefixPath<'_> {
+            PrefixPath::new(&self.prompt, &self.generated, &self.layout, method)
         }
     }
 
@@ -549,6 +573,25 @@ mod tests {
         assert!(!path.exact_boundary(8));
         assert!(path.exact_boundary(11));
         assert!(!path.exact_boundary(12));
+    }
+
+    /// A request generating plainly beside a drafting load (one with media
+    /// its drafter cannot enter) retains a state without drafter history; a
+    /// drafting request never resumes it, nor refreshes it away.
+    #[test]
+    fn hits_follow_the_method_the_entry_was_retained_under() {
+        let mut cache = PrefixCache::new(capacity(8));
+        let target = text(96, "artifact");
+        assert!(retain(&mut cache, &target, 80, rows(0..80)));
+        let drafting = MethodChoice::Mtp { proposals: 2 };
+        assert!(cache.lookup(target.under(drafting), usize::MAX).unwrap().is_none());
+        assert_eq!(cache.deepest(target.under(drafting), usize::MAX), 0);
+        assert!(!cache.holds(target.under(drafting), 80));
+        assert_eq!(lookup_any(&mut cache, &target).unwrap().position(), 80);
+        assert!(cache
+            .lookup(target.under(MethodChoice::DFlash { proposals: 2 }), usize::MAX)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
