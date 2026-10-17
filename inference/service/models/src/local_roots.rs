@@ -26,6 +26,8 @@ use crate::inventory::{
 
 const OLLAMA_MODEL_MEDIA_TYPE: &str = "application/vnd.ollama.image.model";
 const OLLAMA_PROJECTOR_MEDIA_TYPE: &str = "application/vnd.ollama.image.projector";
+const OLLAMA_MANIFEST_LIST_MEDIA_TYPE: &str = "application/vnd.ollama.manifest.list.v2+json";
+const OLLAMA_GGUF_FORMAT: &str = "gguf";
 const OLLAMA_REGISTRY: &str = "registry.ollama.ai";
 const OLLAMA_REGISTRY_HOST: &str = "ollama.com";
 const OLLAMA_MANIFEST_TREES: [&str; 2] = ["manifests", "manifests-v2"];
@@ -340,6 +342,19 @@ struct OllamaManifest {
     layers: Vec<OllamaLayer>,
 }
 
+/// A `manifests-v2` entry Ollama 0.40 and later write for a tag: one manifest per runner format,
+/// each stored as a blob named by its digest.
+#[derive(serde::Deserialize)]
+struct OllamaManifestList {
+    manifests: Vec<OllamaManifestListEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct OllamaManifestListEntry {
+    digest: String,
+    format: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 struct OllamaLayer {
     #[serde(rename = "mediaType")]
@@ -374,13 +389,7 @@ fn ollama_pulls(root: &Path) -> Result<Vec<OllamaPull>, InventoryError> {
                 for model in read_dir_sorted(&namespace.path())? {
                     let model_name = model.file_name().to_string_lossy().into_owned();
                     for tag in read_dir_sorted(&model.path())? {
-                        let Some(manifest) = fs::canonicalize(tag.path())
-                            .ok()
-                            .filter(|path| path.starts_with(&contained))
-                            .and_then(|path| read_bounded_json(&path, MAX_OLLAMA_MANIFEST_BYTES))
-                            .and_then(|document| {
-                                serde_json::from_value::<OllamaManifest>(document).ok()
-                            })
+                        let Some(manifest) = read_ollama_manifest(root, &contained, &tag.path())
                         else {
                             continue;
                         };
@@ -407,6 +416,41 @@ fn ollama_pulls(root: &Path) -> Result<Vec<OllamaPull>, InventoryError> {
         }
     }
     Ok(pulls.into_values().collect())
+}
+
+/// The manifest a tag names, read only when it resolves inside the root. A manifest list
+/// resolves to its GGUF manifest, which Ollama stores as a blob.
+fn read_ollama_manifest(root: &Path, contained: &Path, tag: &Path) -> Option<OllamaManifest> {
+    let read = |path: &Path| {
+        fs::canonicalize(path)
+            .ok()
+            .filter(|path| path.starts_with(contained))
+            .and_then(|path| read_bounded_json(&path, MAX_OLLAMA_MANIFEST_BYTES))
+    };
+    let document = read(tag)?;
+    if document.get("mediaType").and_then(|value| value.as_str())
+        != Some(OLLAMA_MANIFEST_LIST_MEDIA_TYPE)
+    {
+        return serde_json::from_value(document).ok();
+    }
+    let list = serde_json::from_value::<OllamaManifestList>(document).ok()?;
+    let entry = list
+        .manifests
+        .iter()
+        .find(|entry| entry.format.as_deref() == Some(OLLAMA_GGUF_FORMAT))?;
+    let hex = sha256_hex(&entry.digest)?;
+    let gguf = read(&root.join("blobs").join(format!("sha256-{hex}")))?;
+    serde_json::from_value(gguf).ok()
+}
+
+/// The hex of a `sha256:<hex>` digest, when well formed.
+fn sha256_hex(digest: &str) -> Option<&str> {
+    digest.strip_prefix("sha256:").filter(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 /// Ollama's own registry under the name its older manifests use.
@@ -536,14 +580,7 @@ fn ollama_name(registry: &str, namespace: &str, model: &str, tag: &str) -> Strin
 }
 
 fn ollama_blob(root: &Path, layer: &OllamaLayer) -> Option<(PathBuf, String)> {
-    let hex = layer.digest.strip_prefix("sha256:")?;
-    if hex.len() != 64
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return None;
-    }
+    let hex = sha256_hex(&layer.digest)?;
     let relative = PathBuf::from("blobs").join(format!("sha256-{hex}"));
     // A blob still being pulled has a different size, or exists only as `-partial` files.
     fs::metadata(root.join(&relative))
@@ -835,6 +872,65 @@ mod tests {
             pulls[0].hub_repository().as_deref(),
             Some("unsloth/Qwen3.5-0.8B-GGUF")
         );
+    }
+
+    /// Ollama 0.40 writes only `manifests-v2/ollama.com/...` for a library pull, and the tag
+    /// links to a manifest list whose GGUF entry names the real manifest by digest. The
+    /// safetensors entry's manifest is not on disk.
+    #[test]
+    fn ollama_reads_a_v2_only_store_whose_tag_links_to_a_manifest_list() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let blobs = root.join("blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        let blob = |bytes: &[u8]| {
+            let digest = sha256(bytes);
+            fs::write(blobs.join(format!("sha256-{digest}")), bytes).unwrap();
+            digest
+        };
+        let model = blob(b"qwen weights");
+        let draft = blob(b"qwen draft weights");
+        let template = blob(b"{{ .Prompt }}");
+        let config = blob(br#"{"model_format":"gguf","model_family":"qwen35"}"#);
+        let gguf_manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "digest": format!("sha256:{config}"),
+                "size": 47,
+            },
+            "layers": [
+                {"mediaType": OLLAMA_MODEL_MEDIA_TYPE, "digest": format!("sha256:{model}"), "size": 12},
+                {"mediaType": "application/vnd.ollama.image.draft", "digest": format!("sha256:{draft}"), "size": 18},
+                {"mediaType": "application/vnd.ollama.image.template", "digest": format!("sha256:{template}"), "size": 13},
+            ],
+        }))
+        .unwrap();
+        let gguf = blob(&gguf_manifest);
+        let list = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.ollama.manifest.list.v2+json","manifests":[{{"mediaType":"application/vnd.docker.distribution.manifest.v2+json","digest":"sha256:{gguf}","runner":"llamacpp","format":"gguf"}},{{"mediaType":"application/vnd.docker.distribution.manifest.v2+json","digest":"sha256:{}","runner":"mlx","format":"safetensors"}}]}}"#,
+            sha256(b"mlx manifest not pulled"),
+        );
+        let list = blob(list.as_bytes());
+        symlink(
+            Path::new("../../../../blobs").join(format!("sha256-{list}")),
+            manifest_path(root, "manifests-v2", "ollama.com", "library/qwen3.5/0.8b"),
+        )
+        .unwrap();
+        assert!(!root.join("manifests").exists());
+
+        let pulls = ollama_pulls(root).unwrap();
+        assert_eq!(
+            pulls
+                .iter()
+                .map(|pull| pull.name.as_str())
+                .collect::<Vec<_>>(),
+            ["qwen3.5:0.8b"]
+        );
+        assert_eq!(pulls[0].model_sha256(), Some(model.as_str()));
+        let components = ollama_components(root, &pulls[0].manifest).unwrap();
+        assert_eq!(components.len(), 1);
     }
 
     #[test]

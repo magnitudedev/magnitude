@@ -111,7 +111,13 @@ process keeps the model's chat semantics.
 
 A load resolves the model's installed material through the service's single resolved-configuration
 cache, which host-only operations (counting, template application, properties) share, so no second
-tokenizer, template or properties path exists and those operations never lease or load. The load
+tokenizer, template or properties path exists and those operations never lease or load. A
+resolution holds the model's package metadata, tokenizers and templates (100 to 250 MB for a
+250K-token vocabulary), so the cache keeps only the most recently used one beyond those still held:
+the resident model holds its own, which host-only operations on it find however many other models
+were previewed since. The service process on glibc caps its malloc arenas, keeps large blocks on
+their own mappings and periodically returns free arena pages, so the brief peaks of assessment,
+inspection and previews do not stay resident. The load
 then waits while memory admission is closed (stage `queued`), previews itself on the service's
 device catalog (the same engine preview the load-plan endpoint returns), and has the worker load
 exactly the previewed device with the service's kernel cache and reserve policy.

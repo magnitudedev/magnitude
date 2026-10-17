@@ -30,6 +30,7 @@ use magnitude_service_server::serving::ServiceModels;
 use magnitude_service_server::worker_process::{self, WorkerLauncher};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
+mod allocator;
 mod installation;
 mod parent_control;
 mod startup;
@@ -98,11 +99,16 @@ fn main() -> anyhow::Result<()> {
             telemetry::init_worker();
             std::process::exit(run_inference_worker());
         }
-        command => tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("failed to start the service runtime")?
-            .block_on(run(command)),
+        command => {
+            if matches!(command, Command::Serve { .. }) {
+                allocator::configure();
+            }
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to start the service runtime")?
+                .block_on(run(command))
+        }
     }
 }
 
@@ -130,6 +136,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             local_models_config,
             installation,
         } => {
+            tokio::spawn(allocator::release_free_memory());
             let installation = installation::Installation::load(&installation)
                 .context("invalid ICN installation")?;
             let release_catalog = Arc::new(open_installation_catalog(&installation)?);

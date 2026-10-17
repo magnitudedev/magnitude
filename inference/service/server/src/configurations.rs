@@ -3,9 +3,9 @@
 //! Loads, host-only operations (counting, template application, properties) and protocol
 //! request preparation share it; there is no second tokenizer, template or properties path.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use magnitude_engine::assessment::ModelPackagePaths;
 use magnitude_engine::composition::EngineConfiguration;
@@ -29,9 +29,11 @@ use magnitude_service_models::{
 use crate::assessment::assessor::engine_material;
 use crate::assessment::environment::serving_policy;
 
-/// Resolved configurations kept for reuse. A resolution holds the model's tokenizer and
-/// templates, so only the few most recently used models are kept.
-const CACHED_CONFIGURATIONS: usize = 4;
+/// Resolved configurations kept for reuse beyond those still held elsewhere. A resolution holds
+/// the model's package metadata, tokenizers and templates, 100 to 250 MB for a 250K-token
+/// vocabulary, so only the most recently used one is kept; one still held, such as the resident
+/// model's, is found again without being kept here.
+const RETAINED_CONFIGURATIONS: usize = 1;
 
 /// One model's device-free engine configuration.
 pub struct ResolvedConfiguration {
@@ -46,14 +48,12 @@ pub struct ResolvedConfiguration {
     _material: ResolvedServableModelBundle,
 }
 
-type Entry = Arc<tokio::sync::OnceCell<Arc<ResolvedConfiguration>>>;
-
 /// The shared resolved-configuration cache.
 pub struct ResolvedConfigurations {
     models: Arc<ManagedModelStore>,
     kernel_directory: PathBuf,
     reserves: MemoryReserves,
-    entries: Mutex<VecDeque<(ServableModelBundleKey, Entry)>>,
+    cache: ResolutionCache<ResolvedConfiguration>,
 }
 
 impl ResolvedConfigurations {
@@ -66,7 +66,7 @@ impl ResolvedConfigurations {
             models,
             kernel_directory,
             reserves,
-            entries: Mutex::new(VecDeque::new()),
+            cache: ResolutionCache::new(RETAINED_CONFIGURATIONS),
         }
     }
 
@@ -75,57 +75,23 @@ impl ResolvedConfigurations {
         &self,
         configuration: &ModelServingConfiguration,
     ) -> Result<Arc<ResolvedConfiguration>, InventoryError> {
-        let key = servable_model_bundle_key_for_bundle(&configuration.bundle);
-        let entry = self.entry(&key);
-        let resolved = entry
-            .get_or_try_init(|| self.resolve_uncached(&configuration.bundle))
+        self.cache
+            .resolve(
+                servable_model_bundle_key_for_bundle(&configuration.bundle),
+                || self.resolve_uncached(&configuration.bundle),
+            )
             .await
-            .cloned();
-        if resolved.is_err() {
-            self.forget(&key, &entry);
-        }
-        resolved
     }
 
     /// Forget every configuration reading one of `package_ids`, before those packages are
     /// removed.
     pub fn evict_packages(&self, package_ids: &[ModelPackageId]) {
-        self.entries
-            .lock()
-            .expect("resolved configuration lock")
-            .retain(|(_, entry)| {
-                entry.get().is_none_or(|resolved| {
-                    !resolved
-                        .package_ids
-                        .iter()
-                        .any(|package_id| package_ids.contains(package_id))
-                })
-            });
-    }
-
-    fn entry(&self, key: &ServableModelBundleKey) -> Entry {
-        let mut entries = self.entries.lock().expect("resolved configuration lock");
-        if let Some(position) = entries.iter().position(|(existing, _)| existing == key) {
-            let used = entries.remove(position).expect("position is in range");
-            let entry = Arc::clone(&used.1);
-            entries.push_back(used);
-            return entry;
-        }
-        let entry = Entry::default();
-        entries.push_back((key.clone(), Arc::clone(&entry)));
-        if entries.len() > CACHED_CONFIGURATIONS {
-            entries.pop_front();
-        }
-        entry
-    }
-
-    fn forget(&self, key: &ServableModelBundleKey, entry: &Entry) {
-        self.entries
-            .lock()
-            .expect("resolved configuration lock")
-            .retain(|(existing, existing_entry)| {
-                existing != key || !Arc::ptr_eq(existing_entry, entry)
-            });
+        self.cache.forget_where(|resolved| {
+            resolved
+                .package_ids
+                .iter()
+                .any(|package_id| package_ids.contains(package_id))
+        });
     }
 
     async fn resolve_uncached(
@@ -237,6 +203,111 @@ pub fn resolve_failure(error: ResolveError) -> InventoryError {
     }
 }
 
+type Entry<T> = Arc<tokio::sync::OnceCell<Arc<T>>>;
+
+/// Resolutions by key: the `retained` most recently used, and every one something else still
+/// holds, which is found again rather than resolved twice. Concurrent callers for one key share
+/// one resolution; a failed resolution is not kept.
+struct ResolutionCache<T> {
+    retained: usize,
+    recent: Mutex<VecDeque<(ServableModelBundleKey, Entry<T>)>>,
+    held: Mutex<BTreeMap<ServableModelBundleKey, Weak<T>>>,
+}
+
+impl<T> ResolutionCache<T> {
+    fn new(retained: usize) -> Self {
+        Self {
+            retained,
+            recent: Mutex::new(VecDeque::new()),
+            held: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    async fn resolve<E, F, Fut>(&self, key: ServableModelBundleKey, resolve: F) -> Result<Arc<T>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Arc<T>, E>>,
+    {
+        let entry = self.entry(&key);
+        let resolved = entry
+            .get_or_try_init(|| async {
+                match self.still_held(&key) {
+                    Some(resolved) => Ok(resolved),
+                    None => resolve().await,
+                }
+            })
+            .await
+            .cloned();
+        match &resolved {
+            Ok(resolved) => self.hold(key, resolved),
+            Err(_) => self.forget(&key, &entry),
+        }
+        resolved
+    }
+
+    fn forget_where(&self, matches: impl Fn(&T) -> bool) {
+        self.recent
+            .lock()
+            .expect("resolution cache lock")
+            .retain(|(_, entry)| entry.get().is_none_or(|resolved| !matches(resolved)));
+        self.held
+            .lock()
+            .expect("resolution cache lock")
+            .retain(|_, resolved| {
+                resolved
+                    .upgrade()
+                    .is_some_and(|resolved| !matches(&resolved))
+            });
+    }
+
+    fn entry(&self, key: &ServableModelBundleKey) -> Entry<T> {
+        let mut recent = self.recent.lock().expect("resolution cache lock");
+        if let Some(position) = recent.iter().position(|(existing, _)| existing == key) {
+            let used = recent.remove(position).expect("position is in range");
+            let entry = Arc::clone(&used.1);
+            recent.push_back(used);
+            return entry;
+        }
+        let entry = Entry::default();
+        recent.push_back((key.clone(), Arc::clone(&entry)));
+        while recent.len() > self.retained {
+            recent.pop_front();
+        }
+        entry
+    }
+
+    fn still_held(&self, key: &ServableModelBundleKey) -> Option<Arc<T>> {
+        self.held
+            .lock()
+            .expect("resolution cache lock")
+            .get(key)
+            .and_then(Weak::upgrade)
+    }
+
+    fn hold(&self, key: ServableModelBundleKey, resolved: &Arc<T>) {
+        let mut held = self.held.lock().expect("resolution cache lock");
+        held.retain(|_, resolved| resolved.strong_count() > 0);
+        held.insert(key, Arc::downgrade(resolved));
+    }
+
+    fn forget(&self, key: &ServableModelBundleKey, entry: &Entry<T>) {
+        self.recent
+            .lock()
+            .expect("resolution cache lock")
+            .retain(|(existing, existing_entry)| {
+                existing != key || !Arc::ptr_eq(existing_entry, entry)
+            });
+    }
+
+    #[cfg(test)]
+    fn sizes(&self) -> (usize, usize) {
+        (
+            self.recent.lock().expect("resolution cache lock").len(),
+            self.held.lock().expect("resolution cache lock").len(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +361,81 @@ mod tests {
             assert_eq!(code, "invalid_model_configuration");
             assert!(message.contains("the package's draft is DSpark"), "{message}");
         }
+    }
+
+    fn key(index: usize) -> ServableModelBundleKey {
+        ServableModelBundleKey(format!("bundle-{index}"))
+    }
+
+    async fn resolve_counting(
+        cache: &ResolutionCache<String>,
+        index: usize,
+        resolutions: &std::sync::atomic::AtomicUsize,
+    ) -> Arc<String> {
+        cache
+            .resolve(key(index), || async {
+                resolutions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok::<_, ()>(Arc::new(format!("model {index}")))
+            })
+            .await
+            .unwrap()
+    }
+
+    /// However many models are previewed, loaded or counted against, only the most recent
+    /// resolution and those still held stay in memory.
+    #[tokio::test]
+    async fn a_long_run_of_resolutions_keeps_only_the_recent_and_the_held() {
+        let cache = ResolutionCache::<String>::new(RETAINED_CONFIGURATIONS);
+        let resolutions = std::sync::atomic::AtomicUsize::new(0);
+        let resident = resolve_counting(&cache, 0, &resolutions).await;
+        for round in 0..2_000 {
+            resolve_counting(&cache, 1 + round % 200, &resolutions).await;
+            let (recent, held) = cache.sizes();
+            assert!(
+                recent <= RETAINED_CONFIGURATIONS,
+                "round {round}: {recent} recent"
+            );
+            assert!(held <= 2, "round {round}: {held} held");
+        }
+        let before = resolutions.load(std::sync::atomic::Ordering::Relaxed);
+        let again = resolve_counting(&cache, 0, &resolutions).await;
+        assert!(
+            Arc::ptr_eq(&resident, &again),
+            "a held resolution is found again"
+        );
+        assert_eq!(
+            resolutions.load(std::sync::atomic::Ordering::Relaxed),
+            before
+        );
+
+        drop((resident, again));
+        resolve_counting(&cache, 7, &resolutions).await;
+        resolve_counting(&cache, 8, &resolutions).await;
+        assert_eq!(cache.sizes(), (1, 1));
+        resolve_counting(&cache, 0, &resolutions).await;
+        assert_eq!(
+            resolutions.load(std::sync::atomic::Ordering::Relaxed),
+            before + 3,
+            "a released resolution is resolved again"
+        );
+    }
+
+    #[tokio::test]
+    async fn forgetting_drops_recent_and_held_resolutions_and_a_failure_is_not_kept() {
+        let cache = ResolutionCache::<String>::new(RETAINED_CONFIGURATIONS);
+        let resolutions = std::sync::atomic::AtomicUsize::new(0);
+        let held = resolve_counting(&cache, 1, &resolutions).await;
+        resolve_counting(&cache, 2, &resolutions).await;
+        cache.forget_where(|resolved| resolved.as_str() == "model 1");
+        resolve_counting(&cache, 1, &resolutions).await;
+        assert_eq!(resolutions.load(std::sync::atomic::Ordering::Relaxed), 3);
+        drop(held);
+
+        let failed = cache
+            .resolve(key(9), || async { Err::<Arc<String>, _>("unreadable") })
+            .await;
+        assert_eq!(failed, Err("unreadable"));
+        resolve_counting(&cache, 9, &resolutions).await;
+        assert_eq!(resolutions.load(std::sync::atomic::Ordering::Relaxed), 4);
     }
 }

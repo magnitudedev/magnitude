@@ -57,12 +57,15 @@ pub(super) const GRACEFUL_EXIT: std::time::Duration = std::time::Duration::from_
 const INTERRUPTED_EXIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// A ready instance's engine: its host chat semantics and its worker client. A lease hands it
-/// out; the protocol layer binds requests to it.
+/// out; the protocol layer binds requests to it. It holds its resolved configuration, so
+/// host-only operations on the resident model find it in the shared cache however many other
+/// models were resolved since.
 #[derive(Clone)]
 pub struct ResidentEngine {
     pub host: Arc<HostArtifacts>,
     pub client: EngineClient,
     pub context_window_tokens: u32,
+    _configuration: Arc<ResolvedConfiguration>,
 }
 
 /// Everything a model load needs besides the model.
@@ -735,6 +738,7 @@ impl EngineResidency {
                 host,
                 client,
                 context_window_tokens,
+                _configuration: Arc::clone(&resolved),
             },
         })
     }
