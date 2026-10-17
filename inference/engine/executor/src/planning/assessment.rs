@@ -73,16 +73,19 @@ pub struct AssessmentMemoryBounds {
 }
 
 /// What a load's worker holds of its device's memory outside every charged
-/// allocation: the driver's per-process context and the loaded images of
-/// the native kernels it prepares (CUDA modules, Vulkan pipelines). Each is
-/// a cost measured on the backend times a count the plan fixes
-/// (`DeviceProcessCosts::of`), held from the preparation of the programs to
-/// the end of serving. A unified device's are part of its worker's host
-/// bytes, which are measured with them, so they are zero there.
+/// allocation: the driver objects its device's creation makes where the
+/// usable capacity does not already exclude them, the driver objects of the
+/// native kernels it prepares (Vulkan pipelines; CUDA modules measure
+/// none), and the free space of the blocks its allocations are carved from.
+/// Each is a cost measured on the backend, the kernels' times a count the
+/// plan fixes (`DeviceProcessCosts::of`). A unified device's are part of
+/// its worker's host bytes, which are measured with them, so they are zero
+/// there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceProcessBytes {
     pub context: u64,
     pub programs: u64,
+    pub slack: u64,
 }
 
 /// The measured device cost of a load's worker on one backend.
@@ -90,39 +93,52 @@ pub struct DeviceProcessBytes {
 struct DeviceProcessCosts {
     context: u64,
     per_kernel: u64,
+    slack: u64,
 }
 
 impl DeviceProcessCosts {
-    /// CUDA's context is measured on the device itself, once per process
-    /// at discovery, and its usable capacity already excludes it (the usable
-    /// capacity table in `design/inference/engine/memory.md`), so it is not
-    /// charged again. Vulkan's capacity is
-    /// the device-local heap or its budget, which the device's creation
-    /// takes from. Metal and the CPU are unified: their kernels and runtime
-    /// are measured in the worker's host bytes. The CUDA and Vulkan costs
-    /// are placeholders until the round 3 lanes measure them
-    /// (`inference/scripts/device-memory-costs.py`).
+    /// Measured by `inference/scripts/device-memory-costs.py` on an A10G and
+    /// an L40S (CUDA, Linux) and a Radeon PRO V710 (Vulkan, Linux), loading
+    /// Qwen3.5 2B and 4B (with and without DFlash), Gemma 4 E2B (with and
+    /// without its projector) and a 26B or 27B model each.
+    ///
+    /// CUDA: what the device lost beyond what the engine holds (`held`) is
+    /// the process's context, within 20 MB on both cards, and the usable
+    /// capacity already excludes the context (measured on the device at
+    /// discovery), so it is not charged again; kernel modules showed no
+    /// device cost. Vulkan: the device's creation (67 MB) takes from the
+    /// heap or budget that is the capacity, and the driver objects beyond
+    /// the charge grow with the kernels (3.5 MB each at most). On both, the
+    /// block allocator held free space at load end (0.47–0.89 GB on CUDA,
+    /// 0.55–1.15 GB on Vulkan), whatever the model; a load holds that space
+    /// at any moment, the fit depth included, and the cost is the most
+    /// measured. Metal and the CPU are unified: their kernels and runtime
+    /// are measured in the worker's host bytes.
     fn of(backend: BackendName) -> Self {
         match backend {
             BackendName::Metal | BackendName::Cpu => Self {
                 context: 0,
                 per_kernel: 0,
+                slack: 0,
             },
             BackendName::Cuda => Self {
                 context: 0,
-                per_kernel: CUDA_PER_KERNEL,
+                per_kernel: 0,
+                slack: CUDA_BLOCK_SLACK,
             },
             BackendName::Vulkan => Self {
                 context: VULKAN_CONTEXT,
                 per_kernel: VULKAN_PER_KERNEL,
+                slack: VULKAN_BLOCK_SLACK,
             },
         }
     }
 }
 
-const CUDA_PER_KERNEL: u64 = 0;
-const VULKAN_CONTEXT: u64 = 0;
-const VULKAN_PER_KERNEL: u64 = 0;
+const CUDA_BLOCK_SLACK: u64 = 890_000_000;
+const VULKAN_CONTEXT: u64 = 67_000_000;
+const VULKAN_PER_KERNEL: u64 = 3_500_000;
+const VULKAN_BLOCK_SLACK: u64 = 1_151_000_000;
 
 impl DeviceProcessBytes {
     /// The device bytes of a load on `backend` that prepares `kernels`
@@ -135,12 +151,14 @@ impl DeviceProcessBytes {
                 .per_kernel
                 .checked_mul(kernels)
                 .ok_or("prepared program device bytes overflow")?,
+            slack: costs.slack,
         })
     }
 
     pub fn bytes(&self) -> Result<u64, String> {
         self.context
             .checked_add(self.programs)
+            .and_then(|bytes| bytes.checked_add(self.slack))
             .ok_or_else(|| "worker device bytes overflow".to_owned())
     }
 }
@@ -2589,6 +2607,7 @@ mod tests {
     const NO_DEVICE_PROCESS: DeviceProcessBytes = DeviceProcessBytes {
         context: 0,
         programs: 0,
+        slack: 0,
     };
 
     fn fixture_charge(allocation_bytes: u64, staging_bytes: u64) -> AssessmentMemoryCharge {
@@ -2856,15 +2875,26 @@ mod tests {
                 DeviceProcessBytes {
                     context: costs.context,
                     programs: 40 * costs.per_kernel,
+                    slack: costs.slack,
                 }
             );
-            assert_eq!(device.bytes().unwrap(), device.context + device.programs);
+            assert_eq!(
+                device.bytes().unwrap(),
+                device.context + device.programs + device.slack
+            );
         }
         for unified in [BackendName::Cpu, BackendName::Metal] {
             let device = DeviceProcessBytes::derive(unified, 40).unwrap();
             assert_eq!(device.bytes().unwrap(), 0);
         }
-        assert_eq!(DeviceProcessCosts::of(BackendName::Cuda).context, 0);
+        // A CUDA context is outside the usable capacity; a dedicated
+        // device's block allocator holds free space whatever the model.
+        let cuda = DeviceProcessBytes::derive(BackendName::Cuda, 40).unwrap();
+        assert_eq!(cuda.context, 0);
+        assert!(cuda.slack > 0);
+        let vulkan = DeviceProcessBytes::derive(BackendName::Vulkan, 40).unwrap();
+        assert!(vulkan.context > 0 && vulkan.programs > 0 && vulkan.slack > 0);
+        assert!(DeviceProcessBytes::derive(BackendName::Vulkan, u64::MAX).is_err());
     }
 
     /// The worker's host bytes are counts the plan fixes times the costs

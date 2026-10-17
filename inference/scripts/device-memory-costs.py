@@ -169,9 +169,17 @@ def main():
         breakdown = breakdown[-1]
         # The first run prepares the kernel cache (its search runs in a child
         # process); the measured run then only loads.
-        run_engine(options.bin, options.backend, paths, cache, scratch / f"{index}-{name}-prepare.log", options.port)
         sampler = Sampler()
+        idle = sampler.read()
+        run_engine(options.bin, options.backend, paths, cache, scratch / f"{index}-{name}-prepare.log", options.port)
+        # A driver returns an exited process's memory lazily: measure from
+        # the idle device, not from what the preparing run left behind.
+        settled = time.time() + 180
+        while sampler.read() > idle + (64 << 20) and time.time() < settled:
+            time.sleep(1)
         baseline = sampler.read()
+        if baseline > idle + (64 << 20):
+            print(f"{name}: the device did not return to idle ({baseline - idle} bytes above it)", file=sys.stderr)
         sampler.start()
         lines = run_engine(options.bin, options.backend, paths, cache, scratch / f"{index}-{name}.log", options.port)
         sampler.stop()
@@ -190,7 +198,7 @@ def main():
         planned = breakdown["serving_bytes"] - breakdown["state_bytes"] + breakdown["startup_state_bytes"]
         result = {
             "model": paths, "backend": options.backend, "host": platform.node(), "os": platform.system(),
-            "kernels": kernels, "baseline_used_bytes": baseline,
+            "kernels": kernels, "idle_used_bytes": idle, "baseline_used_bytes": baseline,
             "context_bytes": context, "program_bytes": programs,
             "program_bytes_per_kernel": programs // max(kernels, 1),
             "loaded_lost_bytes": loaded, "peak_lost_bytes": peak,

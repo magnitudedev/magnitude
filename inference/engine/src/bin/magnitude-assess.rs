@@ -204,6 +204,7 @@ fn print_breakdown(
             "host_vision_bytes": host.vision,
             "device_context_bytes": bounds.device_process.context,
             "device_program_bytes": bounds.device_process.programs,
+            "device_slack_bytes": bounds.device_process.slack,
             "kernels": host.kernels,
             "host_bytes": charge.host_bytes().ok(),
         })
