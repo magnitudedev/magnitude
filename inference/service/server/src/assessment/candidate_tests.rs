@@ -229,13 +229,18 @@ fn llama(file_type: u32, weights: Encoding) -> Gguf {
 
 /// A one-layer DFlash drafter of width `hidden` tapping the target's first layer.
 fn dflash(hidden: u64) -> Gguf {
+    dflash_with_feed_forward(hidden, FEED_FORWARD)
+}
+
+/// A DFlash drafter whose layer has `feed_forward` units.
+fn dflash_with_feed_forward(hidden: u64, feed_forward: u64) -> Gguf {
     let mut gguf = Gguf::default();
     gguf.set("general.architecture", Meta::Str("dflash".into()));
     for (key, value) in [
         ("block_count", 1),
         ("context_length", 4096),
         ("embedding_length", hidden),
-        ("feed_forward_length", FEED_FORWARD),
+        ("feed_forward_length", feed_forward),
         ("attention.head_count", HEADS),
         ("attention.head_count_kv", KV_HEADS),
         ("attention.key_length", WIDTH),
@@ -263,9 +268,9 @@ fn dflash(hidden: u64) -> Gguf {
     gguf.tensor(&name("attn_v"), &[key, hidden], Encoding::Q8_0);
     gguf.tensor(&name("attn_output"), &[hidden, query], Encoding::Q8_0);
     gguf.tensor(&name("ffn_norm"), &[hidden], Encoding::F32);
-    gguf.tensor(&name("ffn_gate"), &[FEED_FORWARD, hidden], Encoding::Q8_0);
-    gguf.tensor(&name("ffn_up"), &[FEED_FORWARD, hidden], Encoding::Q8_0);
-    gguf.tensor(&name("ffn_down"), &[hidden, FEED_FORWARD], Encoding::Q8_0);
+    gguf.tensor(&name("ffn_gate"), &[feed_forward, hidden], Encoding::Q8_0);
+    gguf.tensor(&name("ffn_up"), &[feed_forward, hidden], Encoding::Q8_0);
+    gguf.tensor(&name("ffn_down"), &[hidden, feed_forward], Encoding::Q8_0);
     gguf
 }
 
@@ -1346,6 +1351,68 @@ async fn a_copy_of_a_listed_model_elsewhere_is_already_on_this_computer_as_that_
     );
 }
 
+/// Two files with the same header but different weights are two models: a file listed as one is
+/// already on this computer as that model, never as its same-header twin listed before it, and
+/// an unlisted file with a listed twin's header is not on this computer at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_same_header_twin_with_other_weights_is_not_already_on_this_computer() {
+    let folder = tempfile::tempdir().expect("model folders");
+    let (mut bytes, _) = llama(7, Encoding::Q8_0).bytes();
+    bytes.resize(bytes.len() + 8192, 0);
+    let mut altered_bytes = bytes.clone();
+    *altered_bytes.last_mut().unwrap() ^= 0xff;
+    let twin = folder.path().join("B2/moved.gguf");
+    let altered = folder.path().join("B/renamed-altered.gguf");
+    for (path, contents) in [(&twin, &bytes), (&altered, &altered_bytes)] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    let digests = |path: &PathBuf| {
+        (
+            magnitude_service_models::candidate_files::local_header_digest(path).unwrap(),
+            magnitude_service_models::candidate_files::local_model_digest(&[path.clone()])
+                .unwrap(),
+        )
+    };
+    let (twin_header, twin_digest) = digests(&twin);
+    let (altered_header, altered_digest) = digests(&altered);
+    assert_eq!(twin_header, altered_header);
+    assert_ne!(twin_digest, altered_digest);
+    let listed = |digest: &str, path: &PathBuf| {
+        let mut model = custom_model(
+            ModelId::local(
+                &magnitude_service_contracts::models::LocalModelDigest::new(digest.to_owned())
+                    .unwrap(),
+            ),
+            bytes.len() as u64,
+        );
+        model.files[0].path = path.clone();
+        model
+    };
+    let request = || CandidateInspectionRequest::Local {
+        path: altered.clone(),
+    };
+
+    let both = fixture(vec![
+        listed(&twin_digest, &twin),
+        listed(&altered_digest, &altered),
+    ])
+    .await;
+    let inspection = both.candidates.inspect(request()).await.expect("inspection");
+    assert_eq!(
+        inspection.versions[0].on_this_computer.as_ref().map(ModelId::as_str),
+        Some(format!("local:{altered_digest}").as_str())
+    );
+
+    let twin_only = fixture(vec![listed(&twin_digest, &twin)]).await;
+    let inspection = twin_only
+        .candidates
+        .inspect(request())
+        .await
+        .expect("inspection");
+    assert_eq!(inspection.versions[0].on_this_computer, None);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drafter_already_in_another_apps_folder_is_on_this_computer() {
     let fixture = fixture(Vec::new()).await;
@@ -1593,8 +1660,8 @@ fn preselected(
 ) -> &magnitude_service_contracts::models::DrafterCandidate {
     candidates
         .iter()
-        .find(|candidate| matches!(candidate.verdict, DrafterVerdict::Bound { .. }))
-        .expect("a bound drafter")
+        .find(|candidate| candidate.automatic)
+        .expect("an automatic drafter")
 }
 
 fn hugging_face_path(candidate: &magnitude_service_contracts::models::DrafterCandidate) -> &str {
@@ -1680,6 +1747,87 @@ async fn a_drafter_in_the_model_repository_precedes_the_catalog_drafter() {
         "Hugging Face is never searched for drafters"
     );
 }
+
+/// A drafter the engine binds but with which a model that fits without one no longer fits is
+/// listed, never chosen automatically: the next candidate (here the catalog drafter) is. A version's
+/// verdict before adding it is the verdict of exactly what adding it installs: its target with
+/// the preselected drafter, assessed the same way as that composition is afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drafter_that_stops_the_model_fitting_is_never_preselected_and_versions_carry_the_preselected_verdict()
+ {
+    const HEAVY: &str = "community/Llama-Heavy-Drafter-GGUF";
+    let fixture = fixture_with(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::from([(
+            HEAVY.to_owned(),
+            repository(
+                '7',
+                vec![
+                    StubFile::new("llama-Q8_0.gguf", &llama(7, Encoding::Q8_0)),
+                    StubFile::new(
+                        "dflash-heavy.gguf",
+                        &dflash_with_feed_forward(HIDDEN, 1 << 27),
+                    ),
+                ],
+                &["base/Llama"],
+            ),
+        )]),
+    )
+    .await;
+    let candidates = candidate_drafters(&fixture, HEAVY, '7').await;
+    let heavy = candidates
+        .iter()
+        .find(|candidate| matches!(&candidate.reference, DrafterReference::HuggingFace { path, .. } if path == "dflash-heavy.gguf"))
+        .unwrap_or_else(|| panic!("the heavy drafter is listed: {candidates:#?}"));
+    assert!(
+        matches!(heavy.verdict, DrafterVerdict::Bound { .. }),
+        "the engine binds it: {:?}",
+        heavy.verdict
+    );
+    assert!(!heavy.automatic, "it would stop the model fitting");
+    let chosen = preselected(&candidates);
+    assert_eq!(
+        chosen.reference,
+        DrafterReference::Catalog {
+            model_id: fixture.catalog_id.clone()
+        }
+    );
+
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::HuggingFace {
+            repository: HuggingFaceRepositoryId::new(HEAVY.to_owned()).unwrap(),
+            revision: commit('7'),
+        })
+        .await
+        .expect("inspection");
+    let before = version(&inspection, "llama-Q8_0.gguf")
+        .assessment
+        .clone()
+        .expect("an assessment");
+    let after = fixture
+        .candidates
+        .assess_candidate(ModelCandidate {
+            drafter: Some(CandidateDrafter {
+                reference: chosen.reference.clone(),
+                method: chosen.method.clone().expect("a bound method"),
+            }),
+            ..hugging_face_candidate(HEAVY, '7', "llama-Q8_0.gguf")
+        })
+        .await
+        .expect("the installed composition's assessment");
+    assert!(
+        matches!(
+            &before,
+            ModelAssessment::Fits { drafter: DrafterVerdict::Bound { .. }, .. }
+        ),
+        "{before:?}"
+    );
+    assert_eq!(before, after, "the verdict before adding is the verdict after");
+}
+
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repository_drafters_follow_the_method_order_at_any_path() {
@@ -2810,6 +2958,141 @@ async fn a_fastmtp_file_is_a_rejected_drafter_never_a_version() {
         ),
         "{reasons:?}"
     );
+}
+
+/// FadedRedStar's Qwen3.5 9B heretic repository ships MTP draft files that declare `qwen35` with a
+/// prediction layer but hold no block, only the embedding and head. Their headers make them
+/// drafters, so they are never versions (nor damaged versions), in the repository or in a folder;
+/// the drafter list shows them Rejected with the engine's reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_head_file_without_blocks_is_a_rejected_drafter_never_a_version() {
+    const REPOSITORY: &str = "FadedRedStar/Qwen3.5-9B-heretic-GGUF";
+    const REVISION: &str = "df0a5cba190b86ef81cc804bb24f7d6ccee4e83e";
+    const TARGET: &str = "Qwen3.5-9B-heretic-Q4_K_M.gguf";
+    const HEADS: [&str; 2] = [
+        "mtp-Qwen3.5-9B-heretic-Q8_0.gguf",
+        "mtp-Qwen3.5-9B-heretic-BF16.gguf",
+    ];
+    let served = |path: &str| fixture_file(&format!("headers/{path}.gz"), path);
+    let fixture = fixture_with(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::from([(
+            REPOSITORY.to_owned(),
+            StubRepository {
+                commit: REVISION.to_owned(),
+                files: vec![served(TARGET), served(HEADS[0]), served(HEADS[1])],
+                card_base_models: Vec::new(),
+            },
+        )]),
+    )
+    .await;
+    let rejected_qwen35 = [serde_json::json!({ "Architecture": { "architecture": "qwen35" } })];
+    let assert_heads_rejected =
+        |candidates: &[magnitude_service_contracts::models::DrafterCandidate],
+         is_head: &dyn Fn(&DrafterReference, &str) -> bool| {
+            for head in HEADS {
+                let listed = candidates
+                    .iter()
+                    .find(|candidate| is_head(&candidate.reference, head))
+                    .unwrap_or_else(|| panic!("{head} is listed: {candidates:#?}"));
+                assert_eq!(listed.category, DrafterCategory::NextToModel, "{head}");
+                let DrafterVerdict::Rejected { reasons, .. } = &listed.verdict else {
+                    panic!("{head}: expected rejected, got {:?}", listed.verdict);
+                };
+                assert!(reasons_match(reasons, &rejected_qwen35), "{head}: {reasons:?}");
+            }
+        };
+
+    let repository = HuggingFaceRepositoryId::new(REPOSITORY.to_owned()).unwrap();
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::HuggingFace {
+            repository: repository.clone(),
+            revision: REVISION.to_owned(),
+        })
+        .await
+        .expect("inspection");
+    assert_eq!(
+        inspection
+            .versions
+            .iter()
+            .map(|version| version.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Q4_K_M"],
+        "{inspection:#?}"
+    );
+    let candidates = fixture
+        .candidates
+        .drafters(DrafterCandidatesRequest::Candidate {
+            candidate: ModelCandidate {
+                source: CandidateSource::HuggingFace {
+                    repository,
+                    commit: REVISION.to_owned(),
+                },
+                target: vec![TARGET.to_owned()],
+                projector: None,
+                drafter: None,
+            },
+            other: None,
+        })
+        .await
+        .expect("drafter candidates")
+        .candidates;
+    assert_heads_rejected(&candidates, &|reference, head| {
+        matches!(reference, DrafterReference::HuggingFace { path, .. } if path == head)
+    });
+
+    let folder = tempfile::tempdir().expect("model folder");
+    for name in [TARGET, HEADS[0], HEADS[1]] {
+        let StubFile {
+            header, size_bytes, ..
+        } = served(name);
+        let path = folder.path().join(name);
+        std::fs::write(&path, &header).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(size_bytes)
+            .unwrap();
+    }
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::Local {
+            path: folder.path().to_path_buf(),
+        })
+        .await
+        .expect("folder inspection");
+    assert_eq!(
+        inspection
+            .versions
+            .iter()
+            .flat_map(|version| version.files.iter().map(|file| file.path.as_str()))
+            .collect::<Vec<_>>(),
+        [TARGET],
+        "{inspection:#?}"
+    );
+    let candidates = fixture
+        .candidates
+        .drafters(DrafterCandidatesRequest::Candidate {
+            candidate: ModelCandidate {
+                source: CandidateSource::Local {
+                    path: folder.path().to_path_buf(),
+                },
+                target: vec![TARGET.to_owned()],
+                projector: None,
+                drafter: None,
+            },
+            other: None,
+        })
+        .await
+        .expect("folder drafter candidates")
+        .candidates;
+    assert_heads_rejected(&candidates, &|reference, head| {
+        matches!(reference, DrafterReference::Local { path } if path.file_name().is_some_and(|name| name == head))
+    });
 }
 
 /// A repository whose base model is a finetune of the catalog model's base reaches the catalog

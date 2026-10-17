@@ -31,7 +31,7 @@ import { CustomModelReconciler } from "./custom-model-reconciler"
 import { CustomModels, localModelsConfiguration } from "./custom-models"
 import { DrafterMethodsLive } from "./drafter-references"
 import { LocalModelSources, type CatalogModelSource } from "./local-model-sources"
-import { LocalModels, customModel } from "./local-models"
+import { LocalModels, catalogAcquisition, customModel } from "./local-models"
 import { customModelDownloads, type RelatedDownload } from "./custom-model-downloads"
 import { makeModelLocations } from "./model-locations"
 import {
@@ -63,6 +63,8 @@ const nativeCandidate = (overrides: Record<string, unknown> = {}) => Schema.deco
   onThisComputer: false,
   sizeBytes: 900,
   verdict: bound,
+  automatic: (overrides.category ?? "CatalogDrafter") !== "Other"
+    && ((overrides.verdict as { _tag?: string } | undefined)?._tag ?? "Bound") === "Bound",
   ...overrides,
 })
 
@@ -380,7 +382,7 @@ describe("adding models", () => {
     }))
     expect(result.added).toMatchObject({ modelId: addedId, version: "Q4_K_M", outcome: "Started" })
     expect(result.config.declarations[addedId]?.origin).toEqual({ _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee", pendingCommit: Option.none() })
-    expect(result.config.drafters[addedId]).toEqual({ _tag: "Reference", reference: drafterReference, method: { _tag: "DFlash" } })
+    expect(result.config.drafters[addedId]).toEqual({ _tag: "Auto" })
     expect(recorded.bundles[0]).toMatchObject({
       source: { _tag: "HuggingFace", repository: "owner/model-GGUF", commit: "c0ffee" },
       target: ["model-Q4_K_M.gguf"],
@@ -388,6 +390,31 @@ describe("adding models", () => {
     })
     expect(recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: addedId }])
     expect(recorded.pushes).toBeGreaterThan(0)
+  })
+
+  it("adds a version of a catalog model's repository that isn't its exact target as a custom model whose catalog drafter is Auto", async () => {
+    const catalogDrafter = { _tag: "Catalog", modelId: CatalogFormModelIdSchema.make("qwen3.5-4b:gguf:q4") } as const
+    const { run, recorded } = harness({ drafters: [nativeCandidate({ reference: catalogDrafter, lineage: "Exact" })] })
+    const result = await run((commands, models) => Effect.gen(function* () {
+      const added = yield* commands.addHuggingFaceModel({ repository, revision: Option.none(), version: Option.some("Q4_K_M"), drafter: { _tag: "Auto" }, force: false })
+      return { added, config: yield* models.get }
+    }))
+    expect(result.added).toMatchObject({ _tag: "Custom", modelId: addedId, outcome: "Started" })
+    expect(result.config.declarations[addedId]?.origin._tag).toBe("Added")
+    expect(result.config.drafters[addedId]).toEqual({ _tag: "Auto" })
+    expect(recorded.catalogSyncs).toEqual([])
+    expect(recorded.bundles[0]?.drafter).toEqual(Option.some({ method: { _tag: "DFlash" }, reference: catalogDrafter }))
+  })
+
+  it("pins a drafter the user names when adding", async () => {
+    const other = { _tag: "Local", path: "/drafters/dspark.gguf" } as const
+    const { run } = harness({ drafters: [nativeCandidate({
+      category: "Other", reference: other, method: { _tag: "DSpark" }, verdict: { _tag: "Bound", method: { _tag: "DSpark" }, memoryBytes: 1 },
+    })] })
+    const config = await run((commands, models) => commands.addHuggingFaceModel({
+      repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Reference", reference: other }, force: false,
+    }).pipe(Effect.zipRight(models.get)))
+    expect(config.drafters[addedId]).toEqual({ _tag: "Reference", reference: other, method: { _tag: "DSpark" } })
   })
 
   it("installs the catalog model a version exactly is instead of declaring a Hugging Face model", async () => {
@@ -434,7 +461,7 @@ describe("adding models", () => {
       return { added, config: yield* models.get }
     }))
     expect(result.added._tag === "Custom" && result.added.drafter.pipe(Option.map(({ onThisComputer }) => onThisComputer))).toEqual(Option.some(true))
-    expect(result.config.drafters[addedId]).toEqual({ _tag: "Reference", reference: drafterReference, method: { _tag: "DFlash" } })
+    expect(result.config.drafters[addedId]).toEqual({ _tag: "Auto" })
     expect(recorded.bundles[0]?.drafter).toEqual(Option.none())
   })
 
@@ -681,7 +708,7 @@ describe("drafter changes", () => {
     const other = { _tag: "Local", path: "/drafters/dspark.gguf" } as const
     const recommendedDrafter = {
       category: "CatalogDrafter", reference: drafterReference, name: "Magnitude DFlash for Model", label: "Magnitude DFlash",
-      lineage: "Lineage", method: { _tag: "DFlash" }, onThisComputer: true, sizeBytes: 900, verdict: bound,
+      lineage: "Lineage", method: { _tag: "DFlash" }, onThisComputer: true, sizeBytes: 900, verdict: bound, automatic: true,
     }
     const { run } = harness({
       customModels: [nativeCustomModel({ recommendedDrafter })],
@@ -1056,6 +1083,40 @@ describe("catalog models found elsewhere", () => {
     expect(result.afterAliasUnhide).toEqual([])
     expect(result.refused.message).toBe(`${owned} is a catalog model. Remove it with \`magnitude catalog remove ${owned}\` instead.`)
     expect(result.afterUnhide).toEqual([])
+  })
+
+  it("hides a found catalog copy that serves with the catalog drafter from Magnitude's store, and Remove points to Hide", async () => {
+    // ICN's catalog state for weights found only in a Hugging Face cache, beside the catalog drafter Magnitude
+    // downloaded: ownership follows the weights, so the projected row is External.
+    const native = {
+      localState: {
+        _tag: "Installed",
+        effective: { _tag: "Ready", model: readyModel },
+        installation: { _tag: "Resolved", installedBytes: 2, primaryPath: cachePath, ownership: "External" },
+        updateState: { _tag: "Current" },
+        missingComponents: [{ component: "Projector", downloadBytes: 1 }],
+      },
+      desired: { metadata: { storageBytes: 2 } },
+    } as unknown as Parameters<typeof catalogAcquisition>[0]
+    const row = {
+      _tag: "Catalog",
+      modelId: external,
+      acquisitionState: catalogAcquisition(native, undefined, { _tag: "Unloaded" }),
+    } as unknown as LocalModelsState["models"][number]
+    const alias = CustomFormModelIdSchema.make("hf:unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf")
+    const { run } = harness({
+      catalogRows: [row],
+      catalog: [{ id: external, source: { aliases: Option.some([alias]) } }] as unknown as readonly CatalogModelSource[],
+    })
+    const result = await run((commands, models) => Effect.gen(function* () {
+      const files = yield* commands.externalCatalogFiles(external)
+      yield* commands.hide(external)
+      return { files, hidden: (yield* models.get).hidden }
+    }))
+    expect(result.hidden).toEqual([alias])
+    const refusal = externalCatalogRemovalRefusal(external, Option.getOrThrow(result.files))
+    expect(refusal.message).toContain(`magnitude models hide ${external}`)
+    expect(refusal.message).not.toContain("catalog remove")
   })
 
   it("hides a catalog model whose external copy is already hidden again without change, and unhides it by its catalog ID", async () => {

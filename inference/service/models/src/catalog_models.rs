@@ -958,6 +958,11 @@ pub(crate) fn catalog_id(definition: &RecommendableModel) -> ModelId {
     ModelId::catalog(&definition.model_id, &definition.variant_id)
 }
 
+/// Ownership is of the model's own weights: where the selected target's copies are. A catalog
+/// drafter or projector in Magnitude's store beside a found copy of the weights doesn't make
+/// Magnitude own the model, so Remove (Magnitude's copy of the weights) and Hide (weights found
+/// only elsewhere) follow the target alone. Without a selected target, every installed package
+/// counts.
 fn installation(
     installed: &[&InstalledModelPackage],
     selected_target: Option<&InstalledModelPackage>,
@@ -974,7 +979,8 @@ fn installation(
                 .sum::<u64>()
         })
         .sum();
-    let origins = installed
+    let owned = selected_target.map_or_else(|| installed.to_vec(), |target| vec![target]);
+    let origins = owned
         .iter()
         .fold(InstallationOrigins::default(), |mut origins, entry| {
             if let Some(occurrences) = occurrence_origins.get(&entry.package.id) {
@@ -1320,7 +1326,11 @@ mod tests {
         else {
             panic!("the found exact target is the installed catalog model: {:?}", model.local_state);
         };
-        assert_eq!(ownership, ModelInstallationOwnership::Mixed);
+        assert_eq!(
+            ownership,
+            ModelInstallationOwnership::External,
+            "the catalog drafter in Magnitude's store doesn't make Magnitude own the found weights"
+        );
         assert_eq!(ready.speculative_method, Some(SpeculativeMethod::Mtp));
         assert_eq!(
             update_state,
@@ -1555,7 +1565,11 @@ mod tests {
         };
         assert_eq!(failure.code, "invalid_draft");
         assert_eq!(installed_bytes, 25);
-        assert_eq!(ownership, ModelInstallationOwnership::Mixed);
+        assert_eq!(
+            ownership,
+            ModelInstallationOwnership::Magnitude,
+            "ownership follows the target, not a drafter found elsewhere"
+        );
     }
 
     #[test]

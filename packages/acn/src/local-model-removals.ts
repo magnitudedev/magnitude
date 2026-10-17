@@ -91,7 +91,8 @@ export const LocalModelRemovalsLive: Layer.Layer<
         Effect.tap(() => catalog.refresh.pipe(Effect.ignore)),
         // The catalog model's drafter stays while another model uses it; otherwise it goes too.
         Effect.tap(() => localModels.pruneDrafters.pipe(Effect.ignore)),
-        Effect.tapError((failure) => failure.code === "model_not_installed"
+        // Nothing to remove, or nothing of Magnitude's to remove (Hide applies), is a refusal, not a failed removal.
+        Effect.tapError((failure) => failure.code === "model_not_installed" || failure.code === "model_removal_retained_external"
           ? clear(modelId)
           : SubscriptionRef.update(removals, (current) => updated(current, (next) => next.set(modelId, {
               _tag: "RemoveFailed",

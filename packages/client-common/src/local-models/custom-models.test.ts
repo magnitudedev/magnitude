@@ -133,6 +133,7 @@ const candidate = (overrides: Partial<DrafterCandidate>): DrafterCandidate => ({
   verdict: bound,
   onThisComputer: false,
   method: Option.some({ _tag: "DFlash" }),
+  automatic: (overrides.category ?? "CatalogDrafter") !== "Other" && (overrides.verdict?._tag ?? "Bound") === "Bound",
   ...overrides,
 })
 

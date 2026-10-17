@@ -25,6 +25,11 @@ model/quality evidence to the complete catalog `ModelId`. Attribution resolves i
    content. A projector or drafter the external material lacks does not change what its weights
    are.
 
+A package an added custom model declares (the same repository, commit and target files) that is not
+an exact current target is never attributed after step 1: a version added from a catalog model's
+repository is a custom model even when its intrinsic identity is the catalog target's, and an
+affiliation recorded for it earlier is forgotten.
+
 An external exact target is the catalog model: it is never also a custom model, and the catalog
 reports the model installed with external ownership. It serves with every catalog component that is
 on this computer: the catalog's separate drafter as soon as that drafter is present, and without a

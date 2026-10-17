@@ -52,6 +52,7 @@ export const drafterCandidate = (overrides: Partial<DrafterCandidate> = {}): Dra
   verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: GB },
   onThisComputer: false,
   method: Option.some({ _tag: "DFlash" }),
+  automatic: (overrides.category ?? "CatalogDrafter") !== "Other" && (overrides.verdict?._tag ?? "Bound") === "Bound",
   ...overrides,
 })
 

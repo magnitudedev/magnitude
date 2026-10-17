@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 
 use futures_util::future::BoxFuture;
 use magnitude_service_contracts::models::{
+    CustomModelDeclarationOrigin,
     CatalogPackageAffiliation, CatalogPackageRole, InstalledCatalogAttribution,
     InstalledModelPackage, InstalledModelPackages, InstalledModelPackagesResponse,
     ModelBundleInput, ModelFailure, ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole,
@@ -724,6 +725,13 @@ impl ManagedModelStore {
                 ),
             );
         }
+        // A version the user added from a catalog model's repository that isn't that model's exact
+        // target is a custom model, whatever its intrinsic identity: it is never an upgrade of the
+        // catalog model, and an affiliation an earlier attribution recorded for it is forgotten.
+        if self.declared_added_package(package) {
+            self.forget_catalog_package(package);
+            return InstalledCatalogAttribution::NotCatalogTarget;
+        }
 
         let affiliated_keys = self
             .catalog_affiliations
@@ -865,6 +873,57 @@ impl ManagedModelStore {
             })
     }
 
+    /// Whether an added custom model's declaration names exactly this package: its repository,
+    /// pinned commit and target files.
+    fn declared_added_package(&self, package: &ModelPackage) -> bool {
+        let ModelPackageSource::HuggingFace {
+            repository,
+            revision,
+        } = &package.source
+        else {
+            return false;
+        };
+        let weights = package
+            .files
+            .iter()
+            .filter(|file| file.role == ModelFileRole::Weights)
+            .map(|file| file.path.to_string_lossy().replace('\\', "/"))
+            .collect::<BTreeSet<_>>();
+        self.local_models.read().is_ok_and(|configuration| {
+            configuration.declarations.iter().any(|declaration| {
+                matches!(
+                    &declaration.origin,
+                    CustomModelDeclarationOrigin::Added { repository: declared, commit }
+                        if declared.as_str().eq_ignore_ascii_case(repository) && commit == revision
+                ) && !declaration.target.is_empty()
+                    && declaration
+                        .target
+                        .iter()
+                        .all(|path| weights.contains(path.as_str()))
+            })
+        })
+    }
+
+    fn forget_catalog_package(&self, package: &ModelPackage) {
+        let Ok(mut affiliations) = self.catalog_affiliations.write() else {
+            tracing::warn!("catalog affiliation lock poisoned while forgetting a package");
+            return;
+        };
+        if affiliations.forget_package(&package.id) {
+            self.catalog_affiliations_dirty
+                .store(true, Ordering::Release);
+            match affiliations.persist(&self.config.root) {
+                Ok(()) => self
+                    .catalog_affiliations_dirty
+                    .store(false, Ordering::Release),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "failed to persist catalog package affiliations; retrying on the next inventory reconciliation"
+                ),
+            }
+        }
+    }
+
     fn remember_catalog_package(
         &self,
         catalog_model: &magnitude_service_contracts::models::RecommendableModel,
@@ -959,7 +1018,7 @@ impl ManagedModelStore {
 
     fn gguf_inspection_cache_key(path: &Path, content: &ContentIdentity) -> Option<String> {
         let evidence =
-            serde_json::to_vec(&("gguf-inspection-v6", content, path.metadata().ok()?.len()))
+            serde_json::to_vec(&("gguf-inspection-v7", content, path.metadata().ok()?.len()))
                 .ok()?;
         Some(format!("gguf_inspection_{:x}", Sha256::digest(evidence)))
     }

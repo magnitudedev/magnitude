@@ -1544,6 +1544,9 @@ pub enum DrafterLineage {
     None,
 }
 
+/// One drafter a model may use. `automatic` says whether automatic choice may take it: the engine
+/// binds it, the user didn't enter it, and with it the model still fits when it fits without one.
+/// The first automatic candidate, in order, is the preselected drafter.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1555,6 +1558,7 @@ pub struct DrafterCandidate {
     pub size_bytes: u64,
     pub lineage: DrafterLineage,
     pub verdict: DrafterVerdict,
+    pub automatic: bool,
     pub on_this_computer: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]

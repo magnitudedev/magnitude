@@ -452,6 +452,66 @@
           ]
         }
       }
+    },
+    {
+      "name": "qwen35-headless-mtp-drafter-q80",
+      "description": "FadedRedStar Qwen3.5 9B heretic Q4_K_M with the repository's Q8_0 MTP draft file: it declares qwen35 with 33 blocks and one prediction layer but holds only the token embedding, output norm and output head, no block. The service classifies it as a drafter from its tensors; the engine does not bind a qwen35 file as a separate drafter.",
+      "target": [
+        {
+          "header": "headers/Qwen3.5-9B-heretic-Q4_K_M.gguf.gz",
+          "repository": "FadedRedStar/Qwen3.5-9B-heretic-GGUF",
+          "revision": "df0a5cba190b86ef81cc804bb24f7d6ccee4e83e",
+          "path": "Qwen3.5-9B-heretic-Q4_K_M.gguf"
+        }
+      ],
+      "draft": {
+        "header": "headers/mtp-Qwen3.5-9B-heretic-Q8_0.gguf.gz",
+        "repository": "FadedRedStar/Qwen3.5-9B-heretic-GGUF",
+        "revision": "df0a5cba190b86ef81cc804bb24f7d6ccee4e83e",
+        "path": "mtp-Qwen3.5-9B-heretic-Q8_0.gguf"
+      },
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "rejected": [
+            {
+              "Architecture": {
+                "architecture": "qwen35"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "qwen35-headless-mtp-drafter-bf16",
+      "description": "FadedRedStar Qwen3.5 9B heretic Q4_K_M with the repository's BF16 MTP draft file: it declares qwen35 with 33 blocks and one prediction layer but holds only the token embedding, output norm and output head, no block. The service classifies it as a drafter from its tensors; the engine does not bind a qwen35 file as a separate drafter.",
+      "target": [
+        {
+          "header": "headers/Qwen3.5-9B-heretic-Q4_K_M.gguf.gz",
+          "repository": "FadedRedStar/Qwen3.5-9B-heretic-GGUF",
+          "revision": "df0a5cba190b86ef81cc804bb24f7d6ccee4e83e",
+          "path": "Qwen3.5-9B-heretic-Q4_K_M.gguf"
+        }
+      ],
+      "draft": {
+        "header": "headers/mtp-Qwen3.5-9B-heretic-BF16.gguf.gz",
+        "repository": "FadedRedStar/Qwen3.5-9B-heretic-GGUF",
+        "revision": "df0a5cba190b86ef81cc804bb24f7d6ccee4e83e",
+        "path": "mtp-Qwen3.5-9B-heretic-BF16.gguf"
+      },
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "rejected": [
+            {
+              "Architecture": {
+                "architecture": "qwen35"
+              }
+            }
+          ]
+        }
+      }
     }
   ]
 }

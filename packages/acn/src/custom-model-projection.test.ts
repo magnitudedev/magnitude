@@ -201,6 +201,7 @@ describe("attached drafters", () => {
     sizeBytes: 1_530_000_000,
     lineage: "Fingerprint",
     verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: 1_530_000_000 },
+    automatic: true,
     onThisComputer: false,
     method: { _tag: "DFlash" },
   }
@@ -247,6 +248,7 @@ describe("attached drafters", () => {
         sizeBytes: 200_000_000,
         lineage: "Lineage",
         verdict: mtp,
+        automatic: true,
         onThisComputer: true,
         method: { _tag: "Mtp" },
       },

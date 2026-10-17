@@ -54,6 +54,14 @@ impl CatalogAffiliations {
         self.entries.insert(affiliation)
     }
 
+    /// Forgets every affiliation of `package_id`; whether there was one.
+    pub(crate) fn forget_package(&mut self, package_id: &ModelPackageId) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|affiliation| &affiliation.package_id != package_id);
+        self.entries.len() != before
+    }
+
     pub(crate) fn persist(&self, root: &Path) -> std::io::Result<()> {
         let bytes = serde_json::to_vec_pretty(&StoredCatalogAffiliations {
             affiliations: self.entries.iter().collect(),

@@ -768,6 +768,44 @@ mod tests {
         );
     }
 
+    /// FadedRedStar's Qwen3.5 9B MTP draft files (the real headers) declare `qwen35` with 33
+    /// blocks and one prediction layer, but hold only the token embedding, output norm and output
+    /// head: no block at all. They are head files whose blocks are missing, so they are drafters
+    /// the engine judges, never models. Their sibling holds the 32 model blocks.
+    #[test]
+    fn a_head_file_without_its_prediction_blocks_is_a_drafter() {
+        let architectures = RecognizedArchitectures::new(
+            ["qwen35", "qwen4exp"],
+            ["dflash", "gemma4-assistant", "qwen4exp"],
+        );
+        let classify = |name: &str| classify_header(&fixture_header(name), &architectures).unwrap();
+        for head in [
+            "mtp-Qwen3.5-9B-heretic-Q8_0.gguf",
+            "mtp-Qwen3.5-9B-heretic-BF16.gguf",
+        ] {
+            assert_eq!(
+                classify(head).role,
+                CandidateFileRole::Drafter {
+                    architecture: "qwen35".to_owned()
+                },
+                "{head}"
+            );
+        }
+        assert_eq!(
+            classify("Qwen3.5-9B-heretic-Q4_K_M.gguf").role,
+            CandidateFileRole::Target {
+                architecture: Some("qwen35".to_owned())
+            }
+        );
+        assert_eq!(
+            classify("Qwen3.5-4B-Q3_K_M.gguf").role,
+            CandidateFileRole::Target {
+                architecture: Some("qwen35".to_owned())
+            },
+            "a model with built-in prediction blocks holds every block"
+        );
+    }
+
     #[test]
     fn base_repositories_come_from_repo_urls_or_else_organization_and_name() {
         use magnitude_artifacts::gguf::{ByteOrder, Metadata, Scalar};

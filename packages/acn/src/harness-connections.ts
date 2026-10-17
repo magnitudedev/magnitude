@@ -5,6 +5,7 @@ import { dirname, join, posix, win32 } from "node:path"
 import {
   canonicalLocalModelId,
   HarnessConnectionFailed,
+  localModelIsInstalled,
   type HarnessConnectOutcome,
   type HarnessConnectRequest,
   type HarnessConnectionsSnapshot,
@@ -53,6 +54,17 @@ const aliasKey = ({ models }: LocalModelsState): string => models
   .join("\n")
 
 /**
+ * What moving selections depends on: the catalog's aliases, and the installed models a harness can be
+ * synced to. Empty while there are no aliases, so nothing runs.
+ */
+const renameKey = (state: LocalModelsState): string => {
+  const aliases = aliasKey(state)
+  if (aliases.length === 0) return ""
+  const installed = state.models.filter(localModelIsInstalled).map(({ modelId }) => modelId).sort()
+  return `${aliases}\n\n${installed.join("\n")}`
+}
+
+/**
  * Whether this service's profile is not the person's own `~/.magnitude` (a development or test profile),
  * so harness configuration goes to a separate home. Windows paths compare without regard to case.
  */
@@ -63,15 +75,18 @@ export const isolatedHarnessHome = (dataDir: string, home: string, platform: Nod
 }
 
 /**
- * Once at start and whenever the catalog's aliases change, moves every connected harness whose selection
- * names an alias to the catalog ID, through the same reconciliation `connections sync` uses.
+ * Once at start, whenever the catalog's aliases change, and whenever the installed models change, moves
+ * every connected harness whose selection names an alias to the catalog ID, through the same
+ * reconciliation `connections sync` uses. Just after an upgrade the aliases are known before the engine
+ * has any installed model to sync a harness to, so the move runs again once models are installed; it
+ * changes nothing for harnesses already moved.
  */
 export const moveHarnessSelectionsOnAliasChanges = <E>(
   localModels: Pick<LocalModelsApi, "state" | "changes">,
   syncRenamedSelections: Effect.Effect<ReadonlyArray<HarnessId>, E>,
 ): Effect.Effect<void, E> =>
   Stream.concat(Stream.fromEffect(localModels.state), localModels.changes.pipe(Stream.mapEffect(() => localModels.state))).pipe(
-    Stream.map(aliasKey),
+    Stream.map(renameKey),
     Stream.changes,
     Stream.filter((key) => key.length > 0),
     Stream.runForEach(() => syncRenamedSelections),

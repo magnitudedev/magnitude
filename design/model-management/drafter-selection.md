@@ -27,10 +27,10 @@ is configuration of a model, never part of its `ModelId`.
 
 ICN computes catalog targets' shape fingerprints from the release header bundle, enumerates drafter
 candidates for a target (a candidate or a model ID), assesses each candidate's binding, and orders
-them for automatic choice; the recommended drafter of a custom model is the first candidate ICN's
-order binds. ACN keeps ICN's order, persists attached drafters as declarations, and exposes the
-choice. Clients present the list, preselect the first bound candidate that the user did not enter,
-and never judge compatibility.
+them for automatic choice, marking each candidate automatic choice may take (`automatic`); the
+recommended drafter of a custom model is the first automatic candidate in ICN's order. ACN keeps ICN's
+order, persists attached drafters as declarations, and exposes the choice. Clients present the list,
+preselect the first automatic candidate, and never judge compatibility or fit.
 
 ## Matching a model to its catalog parent
 
@@ -84,6 +84,13 @@ built-in MTP heads. The first candidate that binds, in this order, is preselecte
 Ties within one method go to the smaller download (nothing, when its files are already here), then ICN's
 enumeration order. Candidates are listed in this same order: by source, then method, then download. A
 rejected candidate is listed but never preselected.
+
+A drafter never makes a model that fits stop fitting. A candidate that binds is automatic unless the model fits
+without a drafter and not with it; such a candidate is listed with its verdict, and the next automatic one, or no
+drafter, is preselected. When the model doesn't fit even without a drafter, fit doesn't decide. A user-entered
+drafter is never automatic. A candidate version's verdict (the repository step, `catalog inspect`) is the
+assessment of exactly what adding it installs: its target and projector with its preselected drafter, so the
+installed model gets the same verdict.
 Catalog models always use their catalog drafter, including one whose exact target is found in another
 app's location: it serves with the catalog drafter as soon as that drafter is on this computer (a
 projector it lacks never blocks it), and otherwise offers the drafter-only download.
@@ -96,7 +103,8 @@ projector it lacks never blocks it), and otherwise offers the drafter-only downl
   declaration keyed by `ModelId` and is delivered to ICN with the local-models configuration. A
   chosen reference is persisted with the method the engine binds it with, so ICN receives it right
   after a restart, offline included; ACN only validates that method against ICN's candidates later.
-  Choosing the recommended drafter is saved as automatic, never as a fixed reference, so a later
+  Choosing the recommended drafter, or adding a model with the automatic drafter (from any repository,
+  a catalog model's own included), is saved as automatic, never as a fixed reference, so a later
   catalog drafter still applies. A model whose drafter is turned off is offered no recommended
   drafter.
 - Magnitude's downloaded drafters are pruned only when no model still on this computer references
@@ -143,6 +151,8 @@ projector it lacks never blocks it), and otherwise offers the drafter-only downl
 ## Conformance
 
 - No drafter is preselected unless the engine binds it.
+- No drafter is preselected that makes a model fitting without one not fit.
+- A candidate version's verdict equals the installed model's verdict for the same composition.
 - Found, imported, and added models receive the same recommendation as an equivalent catalog
   quantization, including models without a Hugging Face identity.
 - Candidate order and tie-breaks are deterministic for equal inputs.

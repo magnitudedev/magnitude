@@ -1121,6 +1121,7 @@ export type DrafterAttachment = S.Schema.Type<typeof DrafterAttachment>
 export type DrafterAttachmentEncoded = S.Schema.Encoded<typeof DrafterAttachment>
 
 export const DrafterCandidate = S.Struct({
+  automatic: S.Boolean,
   category: S.suspend((): S.Schema<DrafterCategory, DrafterCategoryEncoded> => DrafterCategory),
   label: S.String,
   lineage: S.suspend((): S.Schema<DrafterLineage, DrafterLineageEncoded> => DrafterLineage),

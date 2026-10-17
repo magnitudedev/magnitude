@@ -1945,7 +1945,7 @@ impl DeclaredProjectors {
 /// time so an unchanged location is rescanned without rereading headers.
 pub(crate) fn inspect_cached(cache: &ModelCache, path: &Path) -> Option<gguf::GgufInspection> {
     let metadata = path.metadata().ok()?;
-    let evidence = format!("gguf-file-v5\0{}", file_identity(path, &metadata));
+    let evidence = format!("gguf-file-v6\0{}", file_identity(path, &metadata));
     if let Some(inspection) = cache.read_index(ModelIndexKind::GgufInspection, &evidence) {
         return Some(inspection);
     }

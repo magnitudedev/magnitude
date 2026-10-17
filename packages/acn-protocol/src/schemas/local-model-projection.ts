@@ -147,10 +147,9 @@ export const customModelSourceLabel = (origin: CustomModelOrigin): string => {
 }
 
 /**
- * The preselected drafter: the first candidate, in ICN's order, that the engine binds. A drafter the
- * user entered is never preselected.
+ * The preselected drafter: the first candidate, in ICN's order, that automatic choice may take. It
+ * binds, the user didn't enter it, and it never makes a model that fits without a drafter not fit.
  */
 export const preselectedDrafterCandidate = (
   candidates: readonly DrafterCandidate[],
-): Option.Option<DrafterCandidate> => Option.fromNullable(candidates.find(({ category, verdict }) =>
-  category !== "Other" && verdict._tag === "Bound"))
+): Option.Option<DrafterCandidate> => Option.fromNullable(candidates.find(({ automatic }) => automatic))

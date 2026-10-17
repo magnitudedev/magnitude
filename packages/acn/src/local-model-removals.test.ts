@@ -60,6 +60,17 @@ describe("catalog removal state", () => {
     expect(state.size).toBe(0)
   })
 
+  it("answers a model whose weights only another app holds with Hide and leaves no failed state", async () => {
+    const run = await removalsWith(Effect.succeed({ _tag: "Retained", reason: "ExternalOwnership" }))
+    const { failure, state } = await run((removals) => Effect.gen(function* () {
+      const failure = yield* Effect.flip(removals.remove(modelId))
+      return { failure, state: yield* removals.state }
+    }))
+    expect(failure).toMatchObject({ _tag: "LocalModelMutationFailed", code: "model_removal_retained_external" })
+    expect(failure.message).toContain(`magnitude models hide ${modelId}`)
+    expect(state.size).toBe(0)
+  })
+
   it("keeps a real failure until a new installation supersedes it", async () => {
     const run = await removalsWith(remoteError("remove_failed", "Removal failed"))
     const { failed, forgotten } = await run((removals) => Effect.gen(function* () {

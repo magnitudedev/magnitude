@@ -62,9 +62,11 @@ pub enum GgufTensors {
 
 impl GgufTensors {
     /// A head file holds only its prediction blocks (each a full layer beside its `nextn.*`
-    /// tensors) and at most the shared embedding and head, or declares that it shares its target's
-    /// tables. A full model declaring the same architecture and prediction layers holds every
-    /// block.
+    /// tensors, or the trailing blocks its `nextn_predict_layers` declares) and at most the shared
+    /// embedding and head, or declares that it shares its target's tables. A file declaring
+    /// prediction layers with no block at all is a head file whose blocks are missing, which the
+    /// engine judges as a drafter. A full model declaring the same architecture and prediction
+    /// layers holds every block.
     #[must_use]
     pub fn of(directory: &Directory, architecture: Option<&str>) -> Self {
         let nextn_tensors = directory
@@ -72,18 +74,30 @@ impl GgufTensors {
             .iter()
             .filter(|tensor| is_nextn_tensor(&tensor.name))
             .count();
-        let nextn_blocks = directory
+        let mut prediction_blocks = directory
             .tensors
             .iter()
             .filter(|tensor| is_nextn_tensor(&tensor.name))
             .filter_map(|tensor| block_index(&tensor.name))
+            .filter_map(|index| index.parse::<u64>().ok())
             .collect::<std::collections::BTreeSet<_>>();
-        let only_prediction_blocks = !nextn_blocks.is_empty()
+        let unsigned = |key: &str| {
+            architecture
+                .and_then(|architecture| directory.value(&format!("{architecture}.{key}")))
+                .and_then(Value::unsigned)
+        };
+        if let (Some(blocks), Some(layers @ 1..)) =
+            (unsigned("block_count"), unsigned("nextn_predict_layers"))
+        {
+            prediction_blocks.extend(blocks.saturating_sub(layers)..blocks);
+        }
+        let only_prediction_blocks = !prediction_blocks.is_empty()
             && directory
                 .tensors
                 .iter()
                 .filter_map(|tensor| block_index(&tensor.name))
-                .all(|block| nextn_blocks.contains(block));
+                .filter_map(|index| index.parse::<u64>().ok())
+                .all(|block| prediction_blocks.contains(&block));
         let shares_target_tables = architecture.is_some_and(|architecture| {
             matches!(
                 directory.value(&format!("{architecture}.nextn_shared_target_tensors")),

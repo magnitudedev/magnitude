@@ -267,7 +267,7 @@ impl ManagedModelCandidates {
     ) -> Result<Option<DrafterCandidate>, InventoryError> {
         let target = self.model_target(model_id).await?;
         Ok(recommended(
-            self.enumerate_drafters(target, None, true).await?,
+            self.enumerate_drafters(&target, None, true).await?,
         ))
     }
 
@@ -294,7 +294,7 @@ impl ManagedModelCandidates {
             .snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.license.clone());
-        let drafters = automatic(self.enumerate_drafters(target, None, true).await?);
+        let drafters = automatic(self.enumerate_drafters(&target, None, true).await?);
         if let Some(chosen) = self.chosen_drafter(model_id).await {
             self.learn_drafter_content(&chosen).await;
         }
@@ -882,6 +882,60 @@ impl ManagedModelCandidates {
             .ok()
     }
 
+    /// A version's verdict is the one adding it gives the installed model: its target and
+    /// projector with the drafter preselected for it (see `enumerate_drafters`). An unsupported
+    /// version keeps its own verdict, and so does one whose drafters can't be worked out.
+    async fn with_preselected_drafter(
+        &self,
+        candidate: ModelCandidate,
+        plain: Option<CachedModelAssessment>,
+    ) -> Option<CachedModelAssessment> {
+        let plain = plain?;
+        if matches!(plain.profile, ModelAssessment::Unsupported { .. }) {
+            return Some(plain);
+        }
+        match self.preselected_assessment(&candidate).await {
+            Ok(Some(assessed)) => Some(assessed),
+            Ok(None) => Some(plain),
+            Err(error) => {
+                tracing::warn!(%error, "the preselected drafter of a candidate version is unavailable");
+                Some(plain)
+            }
+        }
+    }
+
+    /// The assessment of a candidate with its preselected drafter, assessed exactly as its drafter
+    /// candidate was (so it is a cache hit), or `None` when it has no separate drafter.
+    async fn preselected_assessment(
+        &self,
+        candidate: &ModelCandidate,
+    ) -> Result<Option<CachedModelAssessment>, InventoryError> {
+        let target = self.candidate_target(candidate).await?;
+        let Some(chosen) = recommended(self.enumerate_drafters(&target, None, true).await?) else {
+            return Ok(None);
+        };
+        let Some(method) = chosen.method else {
+            return Ok(None);
+        };
+        let engine = match &chosen.reference {
+            DrafterReference::Embedded => return Ok(None),
+            DrafterReference::Catalog { .. } => engine_method(&method),
+            DrafterReference::HuggingFace { .. } | DrafterReference::Local { .. } => {
+                ModelMethod::Auto
+            }
+        };
+        let drafter = self
+            .candidate_drafter_material(&CandidateDrafter {
+                reference: chosen.reference,
+                method,
+            })
+            .await?;
+        Ok(Some(
+            self.assess(&target.material, drafter.as_ref(), engine)
+                .await?,
+        ))
+    }
+
     /// A local folder's GGUFs, found and classified off the async runtime: reading headers is
     /// file I/O and hashing.
     async fn scan_local(
@@ -932,6 +986,22 @@ impl ManagedModelCandidates {
                     &group.group.primary().path,
                     projector_path.as_deref(),
                 ),
+            ));
+        }
+        let assessments = futures_util::stream::iter(pending)
+            .buffered(assessment_concurrency())
+            .collect::<Vec<_>>()
+            .await;
+        let source = CandidateSource::HuggingFace {
+            repository: repository.clone(),
+            commit: snapshot.commit.clone(),
+        };
+        let projector_file = projector.map(|projector| candidate_file(projector.group.primary()));
+        let mut pending = Vec::new();
+        for (group, assessment) in targets.iter().zip(assessments) {
+            pending.push(self.with_preselected_drafter(
+                version_candidate(&source, group, projector_file.clone()),
+                assessment,
             ));
         }
         let assessments = futures_util::stream::iter(pending)
@@ -1069,6 +1139,19 @@ impl ManagedModelCandidates {
                     }
                 }
             });
+        }
+        let assessments = futures_util::stream::iter(pending)
+            .buffered(assessment_concurrency())
+            .collect::<Vec<_>>()
+            .await;
+        let source = CandidateSource::Local { path: root.clone() };
+        let projector_file = projector.map(|projector| candidate_file(projector.group.primary()));
+        let mut pending = Vec::new();
+        for (group, assessment) in targets.iter().zip(assessments) {
+            pending.push(self.with_preselected_drafter(
+                version_candidate(&source, group, projector_file.clone()),
+                assessment,
+            ));
         }
         let assessments = futures_util::stream::iter(pending)
             .buffered(assessment_concurrency())
@@ -1504,12 +1587,18 @@ impl ManagedModelCandidates {
 
     /// The drafters offered for a target, in automatic-choice order (see `in_choice_order`), each
     /// with the engine's verdict, then the explicit `other` reference when one is given. With
-    /// `stop_at_first_bound`, sources after the first one that binds are not assessed.
+    /// `stop_at_first_automatic`, sources after the first one automatic choice may take are not
+    /// assessed.
+    ///
+    /// A drafter the engine binds is automatic unless the model fits without a drafter and not
+    /// with it: a drafter never makes a model that fits not fit, so the next candidate, or none, is
+    /// chosen instead. When the model doesn't fit even without one, fit doesn't decide. A catalog
+    /// model, and a catalog model's exact target, always take the catalog drafter.
     async fn enumerate_drafters(
         &self,
-        target: DrafterTarget,
+        target: &DrafterTarget,
         other: Option<&str>,
-        stop_at_first_bound: bool,
+        stop_at_first_automatic: bool,
     ) -> Result<Vec<DrafterCandidate>, InventoryError> {
         let plain = self
             .assess(&target.material, None, ModelMethod::Auto)
@@ -1517,6 +1606,12 @@ impl ManagedModelCandidates {
         if matches!(plain.profile, ModelAssessment::Unsupported { .. }) {
             return Ok(Vec::new());
         }
+        let fit_decides = fits(&plain.profile);
+        let regardless_of_fit = |mut candidate: DrafterCandidate| {
+            candidate.automatic = candidate.category != DrafterCategory::Other
+                && is_bound(&candidate.verdict);
+            candidate
+        };
         let exact = match (&target.repository, &target.primary) {
             (Some((repository, commit)), Some(primary)) => {
                 Some((repository.as_str(), commit.as_str(), primary.as_path()))
@@ -1546,19 +1641,29 @@ impl ManagedModelCandidates {
             return Ok(self
                 .catalog_drafter(&target, matched, *lineage)
                 .await
+                .map(regardless_of_fit)
                 .into_iter()
                 .collect());
         }
+        let decide = |candidate: DrafterCandidate| {
+            if fit_decides {
+                candidate
+            } else {
+                regardless_of_fit(candidate)
+            }
+        };
         let done = |candidates: &[DrafterCandidate]| {
-            stop_at_first_bound
-                && candidates
-                    .iter()
-                    .any(|candidate| is_bound(&candidate.verdict))
+            stop_at_first_automatic && candidates.iter().any(|candidate| candidate.automatic)
         };
         let catalog_file = matched
             .as_ref()
             .and_then(|(matched, _)| catalog_draft_key(&matched.model));
-        let mut candidates = self.next_to_model(&target, catalog_file.as_deref()).await;
+        let mut candidates = self
+            .next_to_model(&target, catalog_file.as_deref())
+            .await
+            .into_iter()
+            .map(decide)
+            .collect::<Vec<_>>();
         // The best catalog match's drafter; when the engine rejects it, the fingerprint-matched
         // catalog model's drafter is offered too.
         for (matched, lineage) in &matches {
@@ -1569,7 +1674,7 @@ impl ManagedModelCandidates {
                 continue;
             };
             let bound = is_bound(&candidate.verdict);
-            candidates.push(candidate);
+            candidates.push(decide(candidate));
             if bound {
                 break;
             }
@@ -1586,8 +1691,9 @@ impl ManagedModelCandidates {
         if !embedded_catalog && !done(&candidates) {
             let verdict = verdict_of(&plain.profile);
             if !matches!(verdict, DrafterVerdict::None) {
-                candidates.push(DrafterCandidate {
+                candidates.push(decide(DrafterCandidate {
                     category: DrafterCategory::BuiltIn,
+                    automatic: is_bound(&verdict) && fits(&plain.profile),
                     reference: DrafterReference::Embedded,
                     name: embedded_drafter_name(bound_method(&verdict).as_ref()),
                     label: "Built into this model".to_owned(),
@@ -1596,7 +1702,7 @@ impl ManagedModelCandidates {
                     method: bound_method(&verdict),
                     verdict,
                     on_this_computer: true,
-                });
+                }));
             }
         }
         let mut candidates = in_choice_order(candidates);
@@ -1654,14 +1760,15 @@ impl ManagedModelCandidates {
                 (Some(material), package_bytes(draft), on_this_computer)
             }
         };
-        let verdict = self
+        let assessed = self
             .assess(&target.material, drafter.as_ref(), engine_method(method))
             .await
-            .map(|assessed| verdict_of(&assessed.profile))
             .map_err(|error| tracing::warn!(%error, "catalog drafter assessment failed"))
             .ok()?;
+        let verdict = verdict_of(&assessed.profile);
         Some(DrafterCandidate {
             category: DrafterCategory::CatalogDrafter,
+            automatic: is_bound(&verdict) && fits(&assessed.profile),
             reference: DrafterReference::Catalog {
                 model_id: matched.model_id.clone(),
             },
@@ -1734,7 +1841,7 @@ impl ManagedModelCandidates {
     ) -> Option<DrafterCandidate> {
         let file = snapshot_file(snapshot, &path).ok()?;
         let material = self.hugging_face_drafter(snapshot, &path).await.ok()?;
-        let verdict = self.drafter_verdict(target, &material).await?;
+        let (verdict, fits) = self.drafter_verdict(target, &material).await?;
         let reference = DrafterReference::HuggingFace {
             repository: hugging_face_id(&snapshot.repository),
             commit: snapshot.commit.clone(),
@@ -1744,6 +1851,7 @@ impl ManagedModelCandidates {
         self.remember_drafter_content(&reference, &content);
         Some(DrafterCandidate {
             category: DrafterCategory::NextToModel,
+            automatic: is_bound(&verdict) && fits,
             reference,
             name: format!("{}/{}", snapshot.repository, file_name(&path)),
             label: "In this repository".to_owned(),
@@ -1763,9 +1871,10 @@ impl ManagedModelCandidates {
         size_bytes: u64,
     ) -> Option<DrafterCandidate> {
         let material = self.local_drafter(path.clone()).ok()?;
-        let verdict = self.drafter_verdict(target, &material).await?;
+        let (verdict, fits) = self.drafter_verdict(target, &material).await?;
         Some(DrafterCandidate {
             category: DrafterCategory::NextToModel,
+            automatic: is_bound(&verdict) && fits,
             name: file_name(&path),
             reference: DrafterReference::Local { path },
             label: "In this folder".to_owned(),
@@ -1791,12 +1900,13 @@ impl ManagedModelCandidates {
         if local.is_absolute() {
             let material = self.local_drafter(local.to_path_buf())?;
             let lineage = lineage_kind(&header_lineage(&material.path), related);
-            let verdict = self
+            let (verdict, _) = self
                 .drafter_verdict(target, &material)
                 .await
                 .ok_or_else(|| InventoryError::Internal("drafter assessment failed".to_owned()))?;
             return Ok(DrafterCandidate {
                 category: DrafterCategory::Other,
+                automatic: false,
                 reference: DrafterReference::Local {
                     path: local.to_path_buf(),
                 },
@@ -1837,7 +1947,7 @@ impl ManagedModelCandidates {
             .await;
         lineage.extend(header_lineage(&material.path));
         let lineage = lineage_kind(&lineage, related);
-        let verdict = self
+        let (verdict, _) = self
             .drafter_verdict(target, &material)
             .await
             .ok_or_else(|| InventoryError::Internal("drafter assessment failed".to_owned()))?;
@@ -1850,6 +1960,7 @@ impl ManagedModelCandidates {
         self.remember_drafter_content(&reference, &content);
         Ok(DrafterCandidate {
             category: DrafterCategory::Other,
+            automatic: false,
             reference,
             name: format!("{}/{}", snapshot.repository, file_name(&path)),
             label: other_drafter_label(lineage),
@@ -1861,14 +1972,15 @@ impl ManagedModelCandidates {
         })
     }
 
+    /// The engine's verdict on a drafter for the target, and whether the model fits with it.
     async fn drafter_verdict(
         &self,
         target: &DrafterTarget,
         drafter: &DrafterMaterial,
-    ) -> Option<DrafterVerdict> {
+    ) -> Option<(DrafterVerdict, bool)> {
         self.assess(&target.material, Some(drafter), ModelMethod::Auto)
             .await
-            .map(|assessed| verdict_of(&assessed.profile))
+            .map(|assessed| (verdict_of(&assessed.profile), fits(&assessed.profile)))
             .map_err(|error| tracing::warn!(%error, "drafter assessment failed"))
             .ok()
     }
@@ -2014,7 +2126,7 @@ impl ModelCandidates for ManagedModelCandidates {
             };
             Ok(DrafterCandidatesResponse {
                 candidates: self
-                    .enumerate_drafters(target, other.as_deref(), false)
+                    .enumerate_drafters(&target, other.as_deref(), false)
                     .await?,
             })
         })
@@ -2162,6 +2274,10 @@ fn is_bound(verdict: &DrafterVerdict) -> bool {
     matches!(verdict, DrafterVerdict::Bound { .. })
 }
 
+fn fits(assessment: &ModelAssessment) -> bool {
+    matches!(assessment, ModelAssessment::Fits { .. })
+}
+
 /// Candidates in automatic-choice order: by category (`DrafterCategory`'s order), then by method
 /// (DFlash2, DSpark, DFlash, MTP; one with no known method last), then the smaller download, and
 /// otherwise in enumeration order. The first bound candidate in this order is the recommendation.
@@ -2194,16 +2310,11 @@ fn download_bytes(candidate: &DrafterCandidate) -> u64 {
     }
 }
 
-/// The first candidate, in choice order, that the engine binds; a user-entered drafter is never
-/// chosen automatically.
-/// The candidates automatic choice may take, in its order: every one the engine binds that the
-/// user did not enter.
+/// The candidates automatic choice may take, in its order (see `DrafterCandidate::automatic`).
 fn automatic(candidates: Vec<DrafterCandidate>) -> Vec<DrafterCandidate> {
     candidates
         .into_iter()
-        .filter(|candidate| {
-            candidate.category != DrafterCategory::Other && is_bound(&candidate.verdict)
-        })
+        .filter(|candidate| candidate.automatic)
         .collect()
 }
 
@@ -2513,6 +2624,26 @@ fn choose_projector(classified: &[ClassifiedGroup]) -> Option<&ClassifiedGroup> 
         .min_by_key(|group| (group.group.size_bytes(), group.group.primary().path.clone()))
 }
 
+/// The candidate one version of an inspection is: its shards in order and the inspection's
+/// projector, with the drafter left to automatic choice.
+fn version_candidate(
+    source: &CandidateSource,
+    group: &ClassifiedGroup,
+    projector: Option<CandidateFile>,
+) -> ModelCandidate {
+    ModelCandidate {
+        source: source.clone(),
+        target: group
+            .group
+            .files
+            .iter()
+            .map(|file| path_string(&file.path))
+            .collect(),
+        projector,
+        drafter: None,
+    }
+}
+
 fn candidate_file(file: &CandidateGguf) -> CandidateFile {
     CandidateFile {
         path: path_string(&file.path),
@@ -2611,9 +2742,14 @@ fn on_this_computer(
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
-    custom
-        .iter()
-        .filter(|model| !matches!(model.state, CustomModelState::NotInstalled))
+    let listed = || {
+        custom
+            .iter()
+            .filter(|model| !matches!(model.state, CustomModelState::NotInstalled))
+    };
+    // A model this version is by identity or location wins over one that merely has its bytes,
+    // so a file is never answered with a same-header twin.
+    listed()
         .find(|model| {
             Some(&model.model_id) == local.as_ref()
                 || hugging_face.is_some_and(|(model_id, commit)| {
@@ -2623,8 +2759,8 @@ fn on_this_computer(
                             == group.size_bytes()
                 })
                 || (!paths.is_empty() && model.files.iter().any(|file| paths.contains(&file.path)))
-                || same_bytes(model, group, header_digest)
         })
+        .or_else(|| listed().find(|model| same_bytes(model, group, header_digest, local_digest)))
         .map(|model| model.model_id.clone())
 }
 
@@ -2650,18 +2786,34 @@ fn listed_at(custom: &[CustomModel], group: &GgufGroup, root: &Path) -> Option<M
         .map(|model| model.model_id.clone())
 }
 
-/// Whether a model's weights are the version's bytes: the same file sizes, and the same header,
-/// which is read only for a model whose sizes already match.
-fn same_bytes(model: &CustomModel, group: &GgufGroup, header_digest: &str) -> bool {
+/// Whether a model's weights are the version's bytes: the same file sizes, then the same `local:`
+/// digest, which samples the weights, for a local version, or the same header for a remote one
+/// whose weights can't be sampled. Files are read only for a model whose sizes already match.
+fn same_bytes(
+    model: &CustomModel,
+    group: &GgufGroup,
+    header_digest: &str,
+    local_digest: Option<&str>,
+) -> bool {
     model.files.len() == group.files.len()
         && model
             .files
             .iter()
             .zip(&group.files)
             .all(|(file, version)| file.size_bytes == version.size_bytes)
-        && model.files.first().is_some_and(|primary| {
-            local_header_digest(&primary.path).is_ok_and(|digest| digest == header_digest)
-        })
+        && match local_digest {
+            Some(local_digest) => local_model_digest(
+                &model
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .is_ok_and(|digest| digest == local_digest),
+            None => model.files.first().is_some_and(|primary| {
+                local_header_digest(&primary.path).is_ok_and(|digest| digest == header_digest)
+            }),
+        }
 }
 
 /// The verdict of a local file shorter than its header declares, which the engine never reads.
@@ -2974,6 +3126,7 @@ mod tests {
                     detail: "rejected".to_owned(),
                 },
             },
+            automatic: category != DrafterCategory::Other && method.is_some(),
             on_this_computer: false,
             method,
         }

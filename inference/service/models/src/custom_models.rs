@@ -2381,6 +2381,88 @@ mod tests {
         );
     }
 
+    /// A version added from a catalog model's repository that isn't the catalog's exact target is
+    /// a custom model, even when its intrinsic identity (`general.name` and file type) is the
+    /// catalog target's, as a Q4_K_M beside a catalog UD-Q4_K_XL is: once its files are in
+    /// Magnitude's store it is installed under its own ID, across a restart, and the catalog
+    /// model stays not installed.
+    #[tokio::test]
+    async fn an_added_non_target_version_from_a_catalog_repository_is_an_installed_custom_model() {
+        use magnitude_service_contracts::models::{CatalogModelState, InstalledModelPackages as _};
+        let quant = |description: &str| {
+            gguf_bytes(
+                &[
+                    ("general.architecture", Meta::Str("llama")),
+                    ("general.name", Meta::Str("Model")),
+                    ("general.description", Meta::Str(description)),
+                    ("general.file_type", Meta::U32(15)),
+                ],
+                &["token_embd.weight", "blk.0.attn_q.weight"],
+            )
+        };
+        let repository = "owner/Model-GGUF";
+        let commit = "a".repeat(40);
+
+        let release = Fixture::new().await;
+        publish_managed(
+            &release.store,
+            repository,
+            &commit,
+            &[("Model-UD-Q4_K_XL.gguf", quant("catalog target"))],
+        );
+        release.apply(LocalModelsConfiguration::default()).await;
+        let target = release.inventory().list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        assert!(target.properties.intrinsic_quality_id.is_some());
+        let catalog = vec![catalog_definition(target)];
+
+        let fixture = Fixture::new().await;
+        publish_managed(
+            &fixture.store,
+            repository,
+            &commit,
+            &[("Model-Q4_K_M.gguf", quant("another version"))],
+        );
+        let id: ModelId = "hf:owner/Model-GGUF/Model-Q4_K_M.gguf".parse().unwrap();
+        let configuration = LocalModelsConfiguration {
+            declarations: vec![CustomModelDeclaration {
+                model_id: id.clone(),
+                origin: CustomModelDeclarationOrigin::Added {
+                    repository: HuggingFaceRepositoryId::new(repository).unwrap(),
+                    commit: commit.clone(),
+                },
+                target: vec!["Model-Q4_K_M.gguf".to_owned()],
+                projector: None,
+            }],
+            ..LocalModelsConfiguration::default()
+        };
+        let mut fixture = fixture.restart(catalog.clone()).await;
+        for restarted in [false, true] {
+            if restarted {
+                fixture = fixture.restart(catalog.clone()).await;
+            }
+            let listed = fixture.apply(configuration.clone()).await;
+            let model = listed
+                .models
+                .iter()
+                .find(|model| model.model_id == id)
+                .unwrap_or_else(|| panic!("the added model is listed (restarted: {restarted}): {listed:#?}"));
+            assert!(
+                matches!(model.state, CustomModelState::Ready { .. }),
+                "the added model is installed (restarted: {restarted}): {:?}",
+                model.state
+            );
+            assert!(
+                matches!(
+                    fixture.resolver.catalog_snapshot().unwrap().models[0].local_state,
+                    CatalogModelState::NotInstalled
+                ),
+                "the catalog model is not installed (restarted: {restarted})"
+            );
+        }
+    }
+
     /// An added model whose same bytes are also in another tool's location is partly Magnitude's:
     /// its ownership is Mixed, and Magnitude alone otherwise.
     #[tokio::test]
@@ -4049,6 +4131,7 @@ mod tests {
                             method: SpeculativeMethod::DFlash,
                             memory_bytes: 1,
                         },
+                        automatic: true,
                         on_this_computer: true,
                         method: Some(SpeculativeMethod::DFlash),
                     })
@@ -4183,6 +4266,107 @@ mod tests {
             pruning.drafters[0].1.exists(),
             "A still uses the shared drafter"
         );
+    }
+
+    /// A catalog model whose weights are only in a Hugging Face cache, served with its catalog
+    /// drafter from Magnitude's store, is still a found copy: its installation is externally
+    /// owned, so Remove (which deletes only Magnitude's copy of the weights) has nothing to delete
+    /// and Hide is what applies. Hiding it by its found-model ID ends the attribution. Once
+    /// Magnitude holds its own copy of the weights too, the installation is mixed and Remove
+    /// deletes that copy.
+    #[tokio::test]
+    async fn an_external_catalog_copy_with_the_catalog_drafter_in_the_store_is_external() {
+        use magnitude_service_contracts::models::{
+            CatalogModelState, InstalledModelPackages as _, ModelInstallation,
+            ModelInstallationOwnership,
+        };
+        let fixture = Fixture::new().await;
+        let cache = fixture.root.join("hf");
+        let target_bytes = model_bytes("catalog target");
+        publish_hf_cache(
+            &cache,
+            "owner/Model-GGUF",
+            &"a".repeat(40),
+            &[("Model-Q4_K_M.gguf", target_bytes.clone())],
+        );
+        publish_managed(
+            &fixture.store,
+            "owner/Model-MTP-GGUF",
+            &"b".repeat(40),
+            &[("Model-MTP.gguf", drafter_bytes("catalog drafter"))],
+        );
+        let shown = roots(vec![root(ModelRootKind::HuggingFaceCache, &cache)]);
+        fixture.apply(shown.clone()).await;
+        let packages = fixture.inventory().list_installed().await.unwrap().packages;
+        let package = |repository: &str| {
+            packages
+                .iter()
+                .map(|entry| entry.package.clone())
+                .find(|package| matches!(
+                    &package.source,
+                    magnitude_service_contracts::models::ModelPackageSource::HuggingFace { repository: source, .. }
+                        if source == repository
+                ))
+                .unwrap()
+        };
+        let (target, draft) = (package("owner/Model-GGUF"), package("owner/Model-MTP-GGUF"));
+        let mut definition = catalog_definition(target.clone());
+        definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+            target: target.clone(),
+            draft_source: SpeculativeDraftSource::Separate { draft },
+            method: SpeculativeMethod::Mtp,
+        };
+        let catalog_model_id = catalog_id(&definition);
+        let catalog = vec![definition];
+        let fixture = fixture.restart(catalog.clone()).await;
+        fixture.apply(shown.clone()).await;
+        let ownership = |fixture: &Fixture| match &fixture.resolver.catalog_snapshot().unwrap().models[0]
+            .local_state
+        {
+            CatalogModelState::Installed {
+                installation: ModelInstallation::Resolved { ownership, .. },
+                ..
+            } => Some(*ownership),
+            CatalogModelState::Installed { .. } => panic!("the found target resolves"),
+            CatalogModelState::NotInstalled => None,
+        };
+
+        assert_eq!(ownership(&fixture), Some(ModelInstallationOwnership::External));
+        let plan = fixture
+            .resolver
+            .catalog_removal_plan(&catalog_model_id)
+            .unwrap();
+        assert!(plan.installed && plan.externally_owned, "Remove has no copy of the weights to delete");
+
+        let found_id = ModelId::hugging_face(
+            &HuggingFaceRepositoryId::new("owner/Model-GGUF").unwrap(),
+            &HuggingFaceArtifactSelector::new("Model-Q4_K_M.gguf").unwrap(),
+        );
+        let listed = fixture
+            .apply(LocalModelsConfiguration {
+                hidden: vec![found_id.clone()],
+                ..shown.clone()
+            })
+            .await;
+        assert_eq!(ids(&listed.hidden), [found_id.to_string()]);
+        assert_eq!(ownership(&fixture), None, "hidden, the copy is no longer the catalog model");
+
+        fixture.apply(shown.clone()).await;
+        publish_managed(
+            &fixture.store,
+            "owner/Model-GGUF",
+            &"a".repeat(40),
+            &[("Model-Q4_K_M.gguf", target_bytes)],
+        );
+        let fixture = fixture.restart(catalog).await;
+        fixture.apply(shown).await;
+        assert_eq!(ownership(&fixture), Some(ModelInstallationOwnership::Mixed));
+        let plan = fixture
+            .resolver
+            .catalog_removal_plan(&catalog_model_id)
+            .unwrap();
+        assert!(!plan.externally_owned);
+        assert!(plan.package_ids.contains(&target.id), "Remove deletes Magnitude's copy");
     }
 
     /// Removing a catalog model deletes its target and keeps its drafter while a found model uses
@@ -4545,6 +4729,7 @@ mod tests {
                     size_bytes: 1,
                     lineage: DrafterLineage::Lineage,
                     verdict: DrafterVerdict::None,
+                    automatic: false,
                     on_this_computer: true,
                     method: Some(self.method.clone()),
                 }],
@@ -5129,6 +5314,7 @@ mod tests {
                     method: method.clone(),
                     memory_bytes: 1,
                 },
+                automatic: true,
                 on_this_computer: true,
                 method: Some(method),
             };

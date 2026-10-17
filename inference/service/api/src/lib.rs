@@ -2895,6 +2895,7 @@ mod tests {
                             method: SpeculativeMethod::DFlash,
                             memory_bytes: 900,
                         },
+                        automatic: true,
                         on_this_computer: false,
                         method: Some(SpeculativeMethod::DFlash),
                     }],

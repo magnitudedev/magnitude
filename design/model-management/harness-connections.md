@@ -142,8 +142,9 @@ model before an upgrade), sync moves the selection to the catalog ID. Each conne
 current Magnitude selection for this; connect and setup descriptions accept an alias the same way,
 including the CLI's `connections connect --set-model`, which resolves the alias through the running
 service's catalog before writing the harness configuration in the person's own home.
-ACN applies this without a manual sync: once at start and whenever the catalog's aliases change, it
-subscribes to the local-model projection and reconciles only the connections in the manifest whose
+ACN applies this without a manual sync: once at start, whenever the catalog's aliases change, and
+whenever the set of installed models changes (after an upgrade the aliases are known before the engine
+has any model to sync a harness to), it subscribes to the local-model projection and reconciles only the connections in the manifest whose
 selection names an alias, through the same per-connection reconciliation sync uses. Harnesses
 Magnitude hasn't connected, and connections whose selection is not an alias, are never touched, so
 the reconciliation is idempotent. A server service account, which refuses sync, skips it. With an explicit model, the connector records the previous

@@ -227,7 +227,7 @@ function SwitchToReplacement({ target }: { target: CatalogLocalModel }) {
 }
 /** An installed deprecated model is removable and offers one step to its replacement; it never loads. */
 function DeprecatedModelControls({ model, replacement, children }: { model: CatalogLocalModel; replacement: Option.Option<CatalogLocalModel>; children?: ReactNode }) {
-  const { remove } = useLocalModelMutations()
+  const { remove, hide } = useLocalModelMutations()
   const command = useLocalModelCommandStatus(model.modelId)
   const replacementCommand = useLocalModelCommandStatus(Option.match(replacement, { onNone: () => model.modelId, onSome: target => target.modelId }))
   const acquisition = model.acquisitionState
@@ -235,7 +235,7 @@ function DeprecatedModelControls({ model, replacement, children }: { model: Cata
   return <TooltipProvider><div className="contents">
     <div className="flex flex-wrap items-center justify-end gap-2">{children}
       {Option.match(replacement, { onNone: () => null, onSome: target => <SwitchToReplacement target={target} /> })}
-      {localModelIsInstalled(model) && <ModelRemoveAction model={model} running={false} disabled={pending} onRemove={() => remove(model.modelId)} />}
+      {localModelIsInstalled(model) && <ModelRemoveAction model={model} running={false} disabled={pending} onRemove={() => remove(model.modelId)} onHide={() => hide(model.modelId)} />}
     </div>
     {Option.isSome(replacement) && replacementCommand.failures.map(failure => <ErrorNotice key={`replacement-${failure.operation}`} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
     <ErrorNotice severity="info" title={Option.isSome(replacement) ? "A replacement model is available" : "This model is no longer supported"} description={Option.isSome(replacement) ? `Switch to ${formatLocalModelDisplayName(replacement.value)} to continue receiving support.` : "Choose another model from Catalog."} className="col-span-full mt-3" />

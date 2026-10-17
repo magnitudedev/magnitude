@@ -619,13 +619,13 @@ export const CustomModelCommandsLive: Layer.Layer<
     return Option.orElse(
       Option.map(attached, (drafter): DrafterCandidate => ({
         category: "Other", reference: drafter.reference, name: drafter.name, label: drafter.label,
-        sizeBytes: drafter.sizeBytes, lineage: "None", verdict: drafter.verdict, onThisComputer: false,
+        sizeBytes: drafter.sizeBytes, lineage: "None", verdict: drafter.verdict, automatic: false, onThisComputer: false,
         method: Option.none(),
       })),
       () => configured?._tag === "Reference" ? Option.some<DrafterCandidate>({
         category: "Other", reference: configured.reference,
         ...drafterReferenceNaming(configured.reference, catalogModels), sizeBytes: 0,
-        lineage: "None", verdict: { _tag: "None" }, onThisComputer: false, method: Option.some(configured.method),
+        lineage: "None", verdict: { _tag: "None" }, automatic: false, onThisComputer: false, method: Option.some(configured.method),
       }) : Option.none(),
     )
   })
@@ -877,7 +877,9 @@ export const CustomModelCommandsLive: Layer.Layer<
             target: selected.files,
             projector: Option.map(inspection.projector, ({ path }) => path),
           })
-      yield* persistDrafter(modelId, pinnedChoice(drafter, chosen), declaration)
+      // Auto stays Auto, so the model follows automatic choice (a catalog drafter by lineage included); only a
+      // drafter the user names is pinned.
+      yield* persistDrafter(modelId, persistedChoice(drafter, chosen, Option.none()), declaration)
       yield* settle
       const drafterDownloadStarted = Option.isSome(declaration)
         ? yield* startAddedDownload(modelId, declaration.value, chosen).pipe(Effect.as(false))
@@ -1083,13 +1085,13 @@ export const CustomModelCommandsLive: Layer.Layer<
       const chosen = Option.orElse(
         Option.map(attached, (drafter): DrafterCandidate => ({
           category: "Other", reference: drafter.reference, name: drafter.name, label: drafter.label,
-          sizeBytes: drafter.sizeBytes, lineage: "None", verdict: drafter.verdict, onThisComputer: false,
+          sizeBytes: drafter.sizeBytes, lineage: "None", verdict: drafter.verdict, automatic: false, onThisComputer: false,
           method: Option.none(),
         })),
         () => configured?._tag === "Reference" ? Option.some<DrafterCandidate>({
           category: "Other", reference: configured.reference,
           ...drafterReferenceNaming(configured.reference, sourceState.catalogModels), sizeBytes: 0,
-          lineage: "None", verdict: { _tag: "None" }, onThisComputer: false, method: Option.some(configured.method),
+          lineage: "None", verdict: { _tag: "None" }, automatic: false, onThisComputer: false, method: Option.some(configured.method),
         }) : Option.none(),
       )
       const acquisition = Option.map(row, ({ acquisitionState }) => acquisitionState._tag)

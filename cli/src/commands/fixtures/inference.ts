@@ -205,6 +205,7 @@ export const makeDrafterCandidate = (overrides: Partial<DrafterCandidate> = {}):
   verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: GIB },
   onThisComputer: false,
   method: Option.some({ _tag: "DFlash" }),
+  automatic: (overrides.category ?? "CatalogDrafter") !== "Other" && (overrides.verdict?._tag ?? "Bound") === "Bound",
   ...overrides,
 })
 

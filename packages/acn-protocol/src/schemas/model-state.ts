@@ -967,6 +967,7 @@ export const DrafterCandidateSchema = Schema.Struct({
   sizeBytes: NonNegativeSafeInteger,
   lineage: DrafterLineageSchema,
   verdict: DrafterVerdictSchema,
+  automatic: Schema.Boolean,
   onThisComputer: Schema.Boolean,
   method: Schema.optionalWith(SpeculativeMethodSchema, { as: "Option", exact: true }),
 })

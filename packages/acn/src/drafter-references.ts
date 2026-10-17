@@ -94,6 +94,7 @@ export const productDrafterCandidate = (
   ),
   sizeBytes: candidate.sizeBytes,
   lineage: candidate.lineage,
+  automatic: candidate.automatic,
   onThisComputer: candidate.onThisComputer,
   ...presentField("method", candidate.method),
   verdict: candidate.verdict._tag === "Rejected"

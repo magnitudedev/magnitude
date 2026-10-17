@@ -121,6 +121,12 @@ Catalog acquisition state is model-level: installation bytes, ownership, progres
 update availability, and residency appear only in variants where they are meaningful. A primary
 path exists only on a resolved installation; genuinely ambiguous installed target material is an
 unresolved installation and does not fabricate one.
+Ownership is of the model's own weights: where the selected target's copies are. `Magnitude` is a
+copy only in Magnitude's store, `External` weights found only in another location, and `Mixed` both.
+A catalog drafter or projector in Magnitude's store beside external weights leaves the installation
+`External`. Remove deletes only Magnitude's copy of the weights, so an `External` catalog model is
+hidden instead (Hide, `magnitude models hide`), and a `Mixed` one is removed and stays listed from its
+external copy.
 An installation's optimization projects as `Optimizing`, an installed-family state that carries
 residency and optimization progress (stage, completed and total units, and the device once known).
 Installing or Updating moves to `Optimizing` and then to `Installed`; cancellation, a load, or a
