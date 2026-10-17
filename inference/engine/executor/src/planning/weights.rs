@@ -1384,9 +1384,7 @@ impl ModelLoadPlan {
             scope,
             kind: WeightKind::Output,
         };
-        self.weights()
-            .chain(self.unplaced_output.iter())
-            .find(|weight| weight.role == role)
+        self.planned_weights().find(|weight| weight.role == role)
     }
 
     pub fn readout_choices(&self) -> &[ReadoutClassChoice] {
@@ -1397,10 +1395,16 @@ impl ModelLoadPlan {
         &self.readout_candidates
     }
 
-    /// Preparation may import optional views under its transient budget; final
-    /// residency, assessment and ordinary graphs use only `weights()`.
-    pub(crate) fn qualification_weights(&self) -> impl Iterator<Item = &WeightPlan> {
-        self.weights().chain(self.readout_candidates.iter())
+    /// Every weight the plan names, for the kernels prepared over it: the
+    /// placed weights, the output projections stored as planes (planned and
+    /// not placed, which a finalized plan's packed readers still bind) and
+    /// the optional views preparation may import under its transient
+    /// budget. Final residency, assessment and ordinary graphs use only
+    /// `weights()`.
+    pub(crate) fn planned_weights(&self) -> impl Iterator<Item = &WeightPlan> {
+        self.weights()
+            .chain(self.unplaced_output.iter())
+            .chain(self.readout_candidates.iter())
     }
 
     pub fn weights(&self) -> impl Iterator<Item = &WeightPlan> {

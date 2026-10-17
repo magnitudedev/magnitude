@@ -123,7 +123,7 @@ pub(crate) fn weight_plan(
     kind: WeightKind,
 ) -> Result<&WeightPlan, String> {
     let role = WeightRole { scope, kind };
-    load.qualification_weights()
+    load.planned_weights()
         .find(|weight| weight.role == role)
         .ok_or_else(|| format!("weight {role:?} is absent from the load plan"))
 }

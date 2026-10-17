@@ -439,3 +439,164 @@ fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
         }
     }
 }
+
+/// Every catalog package with a projector and a drafter lists its kernels
+/// over its finalized readout, with every view the load offers selected:
+/// a scope stored as views keeps its packed projection planned and not
+/// placed, and the readers still bound to it (an embedded head's prepared
+/// readout, the target's packed readout) resolve it. Each target variant is
+/// planned with its projector and with its separate draft, and with its
+/// embedded MTP heads where it has them.
+#[test]
+fn catalog_media_drafting_packages_list_kernels_over_every_finalized_readout() {
+    let models: BTreeMap<String, Vec<(String, String)>> =
+        headers::index()
+            .into_iter()
+            .fold(BTreeMap::new(), |mut models, (model, role, file)| {
+                models.entry(model).or_default().push((role, file));
+                models
+            });
+    let mut planned = Vec::new();
+    let mut failures = Vec::new();
+    for (model, components) in &models {
+        let file = |role: &str| {
+            components
+                .iter()
+                .find(|(component, _)| component == role)
+                .map(|(_, file)| file.clone())
+        };
+        let (Some(projector_file), Some(draft_file)) = (file("projector"), file("draft")) else {
+            continue;
+        };
+        let projector = headers::directory(&projector_file);
+        let draft = headers::directory(&draft_file);
+        if !magnitude_family_dflash::recognizes(&draft) {
+            continue;
+        }
+        let identity = PackageIdentity {
+            target: ArtifactIdentity([7; 32]),
+            projector: Some(ArtifactIdentity([8; 32])),
+        };
+        for (role, target_file) in components {
+            if !role.starts_with("target") || target_file.ends_with("-allshards.json") {
+                continue;
+            }
+            let target = headers::directory(target_file);
+            let context = format!("{model} {role}");
+            let Some(family) = FAMILIES.iter().find(|family| family.recognizes(&target)) else {
+                failures.push(format!("{context}: no family recognizes the target"));
+                continue;
+            };
+            let declared = match family.inspect(&target, Some(&projector), identity) {
+                Ok(definition) => definition,
+                Err(error) => {
+                    failures.push(format!("{context}: {error}"));
+                    continue;
+                }
+            };
+            let separate = match magnitude_family_dflash::inspect(&draft, &declared, &|layer| {
+                family.layer_entry(&declared, layer)
+            }) {
+                Ok(separate) => separate,
+                Err(error) => {
+                    failures.push(format!("{context}: the draft does not bind: {error}"));
+                    continue;
+                }
+            };
+            let component =
+                |file: &str, directory: &magnitude_artifacts::gguf::Directory, identity| {
+                    ComponentManifest {
+                        files: vec![ComponentFile {
+                            path: file.into(),
+                            size: directory.tensors.iter().map(|tensor| tensor.nbytes).sum(),
+                        }],
+                        identity,
+                        tensors: directory.tensors.clone(),
+                    }
+                };
+            let mut loads = vec![(
+                "draft",
+                magnitude_family_contracts::ModelDefinition {
+                    head: None,
+                    draft: Some(separate),
+                    ..declared.clone()
+                },
+                Some(component(&draft_file, &draft, ArtifactIdentity([9; 32]))),
+            )];
+            if declared.head.is_some() {
+                loads.push(("mtp", declared.clone(), None));
+            }
+            for (method, definition, draft_component) in loads {
+                let context = format!("{context} {method}");
+                if let Err(error) = crate::operators::admit(&definition, true) {
+                    failures.push(format!("{context}: {error}"));
+                    continue;
+                }
+                let manifest = PackageManifest {
+                    identity,
+                    target: component(target_file, &target, identity.target),
+                    projector: Some(component(
+                        &projector_file,
+                        &projector,
+                        identity.projector.unwrap(),
+                    )),
+                    draft: draft_component,
+                };
+                let backend = BackendName::Metal;
+                let load = match ModelLoadPlan::derive(
+                    &manifest,
+                    &definition,
+                    ComponentSelection {
+                        head: true,
+                        vision: true,
+                    },
+                    resident_layout(ExecutionPath::Native, backend),
+                )
+                .and_then(|load| load.with_readout_candidates(&definition))
+                {
+                    Ok(load) => load,
+                    Err(error) => {
+                        failures.push(format!("{context}: {error}"));
+                        continue;
+                    }
+                };
+                let scopes: std::collections::BTreeSet<_> = load
+                    .readout_candidates()
+                    .iter()
+                    .map(|candidate| format!("{:?}", candidate.role.scope))
+                    .collect();
+                let mut selected = Vec::new();
+                for candidate in load.readout_candidates() {
+                    if !selected.contains(&candidate.role.scope) {
+                        selected.push(candidate.role.scope);
+                    }
+                }
+                let choices: Vec<_> = selected
+                    .into_iter()
+                    .map(|scope| crate::ReadoutClassChoice {
+                        scope,
+                        norm_scope: scope,
+                        prepared: false,
+                        rows: vec![1],
+                    })
+                    .collect();
+                let listed = load.finalize_readout(&choices).and_then(|load| {
+                    let plan = load
+                        .program_plan(&definition, KvCodec::AffineK8V4)
+                        .map_err(|error| error.to_string())?;
+                    crate::HostProcessBytes::derive(&definition, &load, &plan, LIMITS, backend)
+                });
+                match listed {
+                    Ok(_) => planned.push(format!("{context}: views {scopes:?}")),
+                    Err(error) => failures.push(format!("{context}: {error}")),
+                }
+            }
+        }
+    }
+    println!("{}", planned.join("\n"));
+    assert!(
+        !planned.is_empty(),
+        "no catalog package has a projector and a drafter"
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
