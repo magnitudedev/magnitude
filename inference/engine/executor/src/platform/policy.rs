@@ -629,7 +629,7 @@ pub fn observe_domains(
             unallocated_bytes: usage.unallocated,
         }
     });
-    domain_readings(
+    let readings = domain_readings(
         info.selector,
         &host,
         host_pool.id,
@@ -637,7 +637,19 @@ pub fn observe_domains(
         dedicated,
         &status.measurements,
         reserves,
-    )
+    );
+    // Opt-in investigation trace: use the exact samples that decide the
+    // ceiling, rather than sampling again after a failed worker has exited.
+    if std::env::var_os("MAGNITUDE_TRACE_MEMORY_BUDGET").is_some() {
+        eprintln!(
+            "magnitude-engine: memory budget pid={} device={} capacity={} charged={} host={host:?} readings={readings:?}",
+            std::process::id(),
+            info.selector,
+            host_pool.capacity_bytes,
+            usage.charged,
+        );
+    }
+    readings
 }
 
 /// Refresh Seismic's enforced ceiling on `device` from fresh readings: the

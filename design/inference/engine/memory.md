@@ -99,7 +99,12 @@ approaches the floor raises it here, never a per-backend constant elsewhere.
 The heap's standing reports its holdings by class, each used domain's newly observed headroom,
 and its band. Every allocation, including startup imports, optional
 components, workspace growth and numerical state slab growth, has a claim before it occurs.
-The heap exists from the opened device's first startup allocation: startup claims are heap
+The heap exists from the opened device's first startup allocation. Program preparation
+claims its planned invocation buffers plus peak qualification fixtures before forming
+any kernel, including during a Prepare request; the loaded domain inherits this same
+heap. A preparation refusal reports the normal memory-pressure or insufficient-memory
+outcome rather than an internal kernel error. The load diagnostics include the enforced
+device limit and refused peak demand alongside its charges. Startup claims are heap
 claims, each held through its allocation, and the loaded domain inherits the same heap, so no
 separate preclaim check or capacity table decides beside it. A refused startup claim fails the
 load, naming the domain that refused it (the allocation domain, or host RAM for a dedicated
