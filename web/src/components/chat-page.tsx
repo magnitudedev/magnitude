@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react"
 import { ArrowUpIcon, PlusIcon, StopIcon, TrashIcon } from "@phosphor-icons/react"
 import { Button } from "./ui/button"
+import { normalizeLocalEmbedUrl } from "./open-webui-url"
 
 type ChatMessage = { role: "user" | "assistant"; content: string }
 type Conversation = {
@@ -79,6 +80,14 @@ export function ChatPage() {
   const [working, setWorking] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [storageWarning, setStorageWarning] = useState(false)
+  const [showOpenWebUI, setShowOpenWebUI] = useState(false)
+  const [openWebUIUrl, setOpenWebUIUrl] = useState(() => {
+    try { return localStorage.getItem("magnitude.web.openWebUIUrl.v1") ?? "" } catch { return "" }
+  })
+  const [openWebUIInput, setOpenWebUIInput] = useState(() => {
+    try { return localStorage.getItem("magnitude.web.openWebUIUrl.v1") ?? "http://127.0.0.1:3000/" } catch { return "http://127.0.0.1:3000/" }
+  })
+  const [openWebUIError, setOpenWebUIError] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
   const active = conversations.find(item => item.id === activeId) ?? null
@@ -218,10 +227,47 @@ export function ChatPage() {
     }
   }
 
+  const connectOpenWebUI = (event: FormEvent) => {
+    event.preventDefault()
+    const normalized = normalizeLocalEmbedUrl(openWebUIInput)
+    if (!normalized) {
+      setOpenWebUIError("Enter a valid local URL using localhost, 127.0.0.1, or [::1]. Remote hosts and embedded credentials are not allowed.")
+      return
+    }
+    try {
+      localStorage.setItem("magnitude.web.openWebUIUrl.v1", normalized)
+    } catch {
+      // The current page can still use this URL for this session.
+    }
+    setOpenWebUIUrl(normalized)
+    setOpenWebUIInput(normalized)
+    setOpenWebUIError(null)
+  }
+
   const removeConversation = (id: string) => {
     const next = conversations.filter(item => item.id !== id)
     setConversations(next)
     if (activeId === id) setActiveId(next[0]?.id ?? null)
+  }
+
+  if (showOpenWebUI) {
+    return <div className="flex h-[calc(100vh-8rem)] min-h-[32rem] min-w-0 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-925">
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-750 sm:px-6">
+        <div className="min-w-0"><h2 className="truncate text-sm font-semibold">Open WebUI</h2><p className="mt-0.5 text-xs text-slate-500">Embedded local interface · external server policy still applies</p></div>
+        <Button type="button" variant="outline" onClick={() => setShowOpenWebUI(false)}>Back to native Chat</Button>
+      </header>
+      <form onSubmit={connectOpenWebUI} className="flex flex-wrap items-end gap-2 border-b border-slate-200 p-3 dark:border-slate-750 sm:px-6">
+        <label className="min-w-0 flex-1 text-xs font-medium text-slate-600 dark:text-slate-300">Local Open WebUI URL
+          <input value={openWebUIInput} onChange={event => setOpenWebUIInput(event.target.value)} type="url" inputMode="url" autoComplete="url" placeholder="http://127.0.0.1:3000/" aria-describedby="open-webui-help" className="mt-1 block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" />
+        </label>
+        <Button type="submit">Connect</Button>
+      </form>
+      <p id="open-webui-help" className="border-b border-slate-100 px-4 py-2 text-xs leading-5 text-slate-500 dark:border-slate-800 sm:px-6">Only loopback URLs are accepted. The default port 3000 is an example; use your actual Open WebUI address. A blank frame may mean the server blocks embedding with CSP or X-Frame-Options.</p>
+      {openWebUIError && <p role="alert" className="m-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200">{openWebUIError}</p>}
+      {openWebUIUrl
+        ? <iframe key={openWebUIUrl} src={openWebUIUrl} title="Open WebUI local chat" loading="eager" referrerPolicy="no-referrer" allow="clipboard-read; clipboard-write" className="min-h-0 w-full flex-1 border-0 bg-white dark:bg-slate-925" />
+        : <div className="flex flex-1 items-center justify-center p-8 text-center"><div className="max-w-lg"><h3 className="text-lg font-semibold">Connect your local Open WebUI</h3><p className="mt-2 text-sm leading-6 text-slate-500">Enter its loopback URL above. Magnitude will not install or start Open WebUI for you, and this iframe does not bypass the server's embedding policy.</p></div></div>}
+    </div>
   }
 
   return <div className="flex min-h-[calc(100vh-8rem)] min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-925">
@@ -249,6 +295,7 @@ export function ChatPage() {
             {models.map(model => <option key={model} value={model}>{model}</option>)}
           </select>
         </label>
+        <Button type="button" variant="outline" onClick={() => { setOpenWebUIError(null); setShowOpenWebUI(true) }}>Open WebUI</Button>
       </header>
       {modelsError && <div role="alert" className="m-4 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">{modelsError} <button type="button" className="ml-2 underline" onClick={() => window.location.reload()}>Retry</button></div>}
       {storageWarning && <p role="status" className="px-5 pt-3 text-xs text-amber-700 dark:text-amber-300">Browser storage is unavailable; history may be lost when you leave this page.</p>}
