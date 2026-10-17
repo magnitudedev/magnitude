@@ -11,7 +11,7 @@ export const CHAT_LANGUAGE_NAMES: Record<ChatLanguage, string> = {
   it: "Italiano", uk: "Українська",
 }
 
-const keys = [
+export const CHAT_TRANSLATION_KEYS = [
   "New chat",
   "Local inference · streaming responses",
   "Model",
@@ -53,7 +53,7 @@ const keys = [
 ] as const
 
 const translations: Record<ChatLanguage, readonly string[]> = {
-  en: keys,
+  en: CHAT_TRANSLATION_KEYS,
   es: [
     "Nuevo chat", "Inferencia local · respuestas en streaming", "Modelo", "No hay modelos disponibles",
     "Magnitude todavía no tiene modelos disponibles para inferencia. Instala o carga un modelo y vuelve a intentarlo.",
@@ -197,8 +197,12 @@ const translations: Record<ChatLanguage, readonly string[]> = {
   ],
 }
 
+export const CHAT_TRANSLATION_COUNTS = Object.fromEntries(
+  CHAT_LANGUAGES.map(language => [language, translations[language].length]),
+) as Record<ChatLanguage, number>
+
 const dictionaries = Object.fromEntries(
-  CHAT_LANGUAGES.map(language => [language, Object.fromEntries(keys.map((key, index) => [key, translations[language][index] ?? key]))]),
+  CHAT_LANGUAGES.map(language => [language, Object.fromEntries(CHAT_TRANSLATION_KEYS.map((key, index) => [key, translations[language][index] ?? key]))]),
 ) as Record<ChatLanguage, Record<string, string>>
 
 export function isChatLanguage(value: unknown): value is ChatLanguage {
