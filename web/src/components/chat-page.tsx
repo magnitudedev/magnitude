@@ -302,7 +302,7 @@ export function ChatPage() {
       <p className="px-2 pt-3 text-xs text-slate-500">Stored in this browser only.</p>
     </aside>
     <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-750 sm:px-6">
+      <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-750 sm:px-6">
         <div className="min-w-0"><h2 className="truncate text-sm font-semibold">{active?.title ?? "New chat"}</h2><p className="mt-0.5 text-xs text-slate-500">Local inference · streaming responses</p></div>
         <label className="flex items-center gap-2 text-xs text-slate-500">Model
           <select aria-label="Model" value={selectedModel} disabled={modelsLoading || models.length === 0 || working} onChange={event => {
