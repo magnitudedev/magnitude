@@ -62,7 +62,7 @@ function consumeEvent(block: string, onText: (text: string) => void): boolean {
       if (typeof content === "string" && content.length > 0) onText(content)
     } catch (error) {
       if (error instanceof Error && error.message !== "Unexpected end of JSON input") throw error
-      // Ignore non-JSON keepalive/comment events; malformed JSON data frames are reported by the server.
+      // Keepalive/comment frames have no data field; malformed JSON data frames should surface as errors.
     }
   }
   return finished
@@ -130,16 +130,17 @@ export function ChatPage() {
       messages: [],
       updatedAt: Date.now(),
     }
-    const next = [conversation, ...conversations]
-    setConversations(next)
+    setConversations(current => [conversation, ...current])
     setActiveId(conversation.id)
     setError(null)
   }
 
   const updateConversation = (conversation: Conversation) => {
-    const next = [conversation, ...conversations.filter(item => item.id !== conversation.id)]
-    next.sort((a, b) => b.updatedAt - a.updatedAt)
-    setConversations(next)
+    setConversations(current => {
+      const next = [conversation, ...current.filter(item => item.id !== conversation.id)]
+      next.sort((a, b) => b.updatedAt - a.updatedAt)
+      return next
+    })
   }
 
   const send = async (event: FormEvent) => {
