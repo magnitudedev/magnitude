@@ -105,3 +105,10 @@ The architectural goal remains to separate conversation UI from administration, 
 - [LEONES design and tracking branch](https://github.com/robertosantosx2/LEONES/tree/feat/magnitude-native-chat).
 - [Current status](https://github.com/robertosantosx2/LEONES/blob/feat/magnitude-native-chat/docs/magnitude-native-chat/STATUS.md).
 - [Open WebUI + iframe ADR](https://github.com/robertosantosx2/LEONES/blob/feat/magnitude-native-chat/docs/magnitude-native-chat/ADR-openwebui-iframe.md).
+
+
+## Implementation update (2026-10-17)
+
+The working branch now includes an opt-in Open WebUI view within the Chat page. It accepts only loopback HTTP(S) URLs (`localhost`, `127.0.0.1`, or `[::1]`), rejects URL credentials and non-web protocols, strips URL fragments, and persists the selected URL in browser local storage. A native Chat route remains available as a fallback. The URL validation helper has unit tests for accepted loopback URLs, remote-host rejection, credentials, malformed URLs, non-web schemes, and fragment removal.
+
+These changes are authored but not yet executed through the web typecheck, test suite, or build in this environment. The iframe cannot reliably inspect a cross-origin child page's HTTP headers or authentication state, so server policy and real browser behavior remain manual integration checks. Do not claim that Open WebUI embedding or inference has passed until CI and end-to-end checks are green.
