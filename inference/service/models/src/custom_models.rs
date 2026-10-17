@@ -4469,6 +4469,7 @@ mod tests {
     struct Recommends {
         drafter: PathBuf,
         variant_of: ModelId,
+        method: SpeculativeMethod,
     }
 
     impl CustomModelEnrichment for Recommends {
@@ -4486,7 +4487,7 @@ mod tests {
                     lineage: DrafterLineage::Lineage,
                     verdict: DrafterVerdict::None,
                     on_this_computer: true,
-                    method: Some(SpeculativeMethod::DFlash),
+                    method: Some(self.method.clone()),
                 }),
                 license: None,
             }
@@ -4510,6 +4511,7 @@ mod tests {
             .set_custom_model_enrichment(Arc::new(Recommends {
                 drafter: drafters.join("drafter.gguf"),
                 variant_of: variant_of.clone(),
+                method: SpeculativeMethod::DFlash,
             }));
         assert!(futures_util::StreamExt::next(&mut changes).await.is_some());
         fixture
@@ -4577,6 +4579,7 @@ mod tests {
             .set_custom_model_enrichment(Arc::new(Recommends {
                 drafter: drafters.join("drafter.gguf"),
                 variant_of: "qwen3.6-35b-a3b:gguf:q4".parse().unwrap(),
+                method: SpeculativeMethod::DFlash,
             }));
         let attach = |drafter: DrafterChoice| LocalModelsConfiguration {
             roots: vec![
@@ -4824,11 +4827,240 @@ mod tests {
         assert_eq!(watcher.unwatched(), &BTreeSet::from([missing]));
     }
 
+    fn imported(file: &Path) -> CustomModelDeclaration {
+        CustomModelDeclaration {
+            model_id: local_id(file),
+            origin: CustomModelDeclarationOrigin::Imported {
+                path: file.to_path_buf(),
+            },
+            target: vec![file.to_string_lossy().into_owned()],
+            projector: None,
+        }
+    }
+
+    /// The separate drafter file a model serves with, if any.
+    fn served_drafter(fixture: &Fixture, model_id: &ModelId) -> Option<PathBuf> {
+        match fixture
+            .resolver
+            .serving_configuration(model_id)
+            .unwrap()
+            .bundle
+        {
+            ServableModelBundle::SpeculativeDecoding {
+                draft_source: SpeculativeDraftSource::Separate { draft },
+                ..
+            } => Some(draft.files[0].path.clone()),
+            _ => None,
+        }
+    }
+
+    fn drafter_state(
+        listed: &LocalModelsResponse,
+        model_id: &ModelId,
+    ) -> Option<AttachedDrafterState> {
+        listed
+            .models
+            .iter()
+            .find(|model| &model.model_id == model_id)
+            .and_then(|model| model.drafter.as_ref())
+            .map(|drafter| drafter.state.clone())
+    }
+
+    /// A target and the drafter file beside it, as the real pairs are shaped: a DSpark/DFlash
+    /// drafter (LFM2.5 with magnitudedev's DSpark), Gemma 4's `mtp-*` assistant file, and an MTP
+    /// file of prediction-head tensors only.
+    fn write_pair(target: &Path, drafter: &Path, shape: &str) -> SpeculativeMethod {
+        let arch = |name| ("general.architecture", Meta::Str(name));
+        match shape {
+            "dspark" => {
+                write_model(target, "LFM2.5 2.6B");
+                write_dflash_drafter(drafter, "LFM2.5 2.6B DSpark");
+                SpeculativeMethod::DSpark
+            }
+            "gemma-mtp" => {
+                crate::test_gguf::write_gguf(
+                    target,
+                    &[
+                        arch("gemma4"),
+                        ("general.name", Meta::Str("gemma-4-E2B-it")),
+                    ],
+                    &["token_embd.weight", "blk.0.attn_q.weight"],
+                );
+                crate::test_gguf::write_gguf(
+                    drafter,
+                    &[
+                        arch("gemma4-assistant"),
+                        ("general.name", Meta::Str("mtp-gemma-4-E2B-it")),
+                    ],
+                    &["blk.0.attn_q.weight"],
+                );
+                SpeculativeMethod::Mtp
+            }
+            "nextn-mtp" => {
+                crate::test_gguf::write_gguf(
+                    target,
+                    &[arch("qwen35"), ("general.name", Meta::Str("Qwen3.5"))],
+                    &["token_embd.weight", "blk.0.attn_q.weight"],
+                );
+                crate::test_gguf::write_gguf(
+                    drafter,
+                    &[arch("qwen35"), ("general.name", Meta::Str("Qwen3.5 MTP"))],
+                    &["blk.3.nextn.eh_proj.weight"],
+                );
+                SpeculativeMethod::Mtp
+            }
+            _ => unreachable!("{shape}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_imported_models_automatic_drafter_beside_it_is_attached_in_place_outside_every_location()
+     {
+        for shape in ["dspark", "gemma-mtp", "nextn-mtp"] {
+            let fixture = Fixture::new().await;
+            let folder = fixture.root.join("Downloads/imported");
+            let target = folder.join("target-Q4_K_M.gguf");
+            let drafter = folder.join("drafter-beside.gguf");
+            let method = write_pair(&target, &drafter, shape);
+            write_model(&folder.join("unrelated-model.gguf"), "unrelated");
+            let declaration = imported(&target);
+            let id = declaration.model_id.clone();
+            fixture
+                .resolver
+                .set_custom_model_enrichment(Arc::new(Recommends {
+                    drafter: drafter.clone(),
+                    variant_of: "lfm2.5-2.6b:gguf:q4".parse().unwrap(),
+                    method: method.clone(),
+                }));
+
+            // Auto: no drafter choice is stored, as a pick of the recommended drafter saves.
+            let listed = fixture
+                .apply(LocalModelsConfiguration {
+                    declarations: vec![declaration],
+                    ..LocalModelsConfiguration::default()
+                })
+                .await;
+
+            assert_eq!(
+                ids(&listed.models),
+                [id.to_string()],
+                "{shape}: only the imported file is a model; its folder's other models are not picked up"
+            );
+            assert_eq!(
+                drafter_state(&listed, &id),
+                Some(AttachedDrafterState::Ready),
+                "{shape}"
+            );
+            assert_eq!(
+                served_drafter(&fixture, &id).as_deref(),
+                Some(Path::new("drafter-beside.gguf")),
+                "{shape}: the automatic drafter is served from where it is"
+            );
+            assert!(matches!(
+                fixture.resolver.serving_configuration(&id).unwrap().bundle,
+                ServableModelBundle::SpeculativeDecoding { method: served, .. } if served == method
+            ));
+            assert!(
+                fixture
+                    .local
+                    .watched()
+                    .iter()
+                    .any(|watched| watched.path == folder),
+                "{shape}: the folder holding the model and its drafter is watched"
+            );
+
+            fs::remove_file(&drafter).unwrap();
+            let gone = fixture.local.refresh_local().await.unwrap();
+            assert_eq!(
+                drafter_state(&gone, &id),
+                Some(AttachedDrafterState::NotInstalled),
+                "{shape}"
+            );
+            assert_eq!(
+                served_drafter(&fixture, &id),
+                None,
+                "{shape}: a model whose drafter disappeared serves plain"
+            );
+            assert!(matches!(
+                gone.models[0].state,
+                CustomModelState::Ready { .. }
+            ));
+
+            write_pair(&target, &drafter, shape);
+            let back = fixture.local.refresh_local().await.unwrap();
+            assert_eq!(
+                drafter_state(&back, &id),
+                Some(AttachedDrafterState::Ready),
+                "{shape}: the drafter is found again when it comes back"
+            );
+            assert!(served_drafter(&fixture, &id).is_some(), "{shape}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_imported_models_explicit_local_drafter_elsewhere_is_attached_and_watched() {
+        let fixture = Fixture::new().await;
+        let target = fixture.root.join("Downloads/lfm-Q4_K_M.gguf");
+        let elsewhere = fixture.root.join("Elsewhere");
+        let drafter = elsewhere.join("other-drafter.gguf");
+        write_model(&target, "target");
+        write_dflash_drafter(&drafter, "drafter");
+        write_dflash_drafter(&elsewhere.join("loose-drafter.gguf"), "loose");
+        let declaration = imported(&target);
+        let id = declaration.model_id.clone();
+        let configuration = LocalModelsConfiguration {
+            declarations: vec![declaration],
+            drafters: vec![DrafterAttachment {
+                model_id: id.clone(),
+                drafter: DrafterChoice::Reference {
+                    reference: DrafterReference::Local {
+                        path: drafter.clone(),
+                    },
+                    method: SpeculativeMethod::DFlash,
+                },
+            }],
+            ..LocalModelsConfiguration::default()
+        };
+
+        let listed = fixture.apply(configuration).await;
+
+        assert_eq!(
+            drafter_state(&listed, &id),
+            Some(AttachedDrafterState::Ready)
+        );
+        assert_eq!(
+            served_drafter(&fixture, &id).as_deref(),
+            Some(Path::new("other-drafter.gguf"))
+        );
+        assert!(
+            fixture
+                .local
+                .watched()
+                .iter()
+                .any(|watched| watched.path == elsewhere),
+            "the chosen drafter's folder is watched"
+        );
+
+        fs::remove_file(&drafter).unwrap();
+        let gone = fixture.local.refresh_local().await.unwrap();
+        assert_eq!(
+            drafter_state(&gone, &id),
+            Some(AttachedDrafterState::NotInstalled)
+        );
+        assert_eq!(served_drafter(&fixture, &id), None);
+        assert!(matches!(
+            gone.models[0].state,
+            CustomModelState::Ready { .. }
+        ));
+    }
+
     #[test]
     fn watch_targets_cover_enabled_roots_and_declared_files() {
         let temporary = tempfile::tempdir().unwrap();
         let present = temporary.path().join("present");
         fs::create_dir_all(&present).unwrap();
+        let drafters = temporary.path().join("drafters");
+        fs::create_dir_all(&drafters).unwrap();
         let configuration = LocalModelsConfiguration {
             roots: vec![
                 root(ModelRootKind::Folder, &present),
@@ -4849,6 +5081,15 @@ mod tests {
                 target: vec![present.join("file.gguf").to_string_lossy().into_owned()],
                 projector: None,
             }],
+            drafters: vec![DrafterAttachment {
+                model_id: format!("local:{}", "a".repeat(64)).parse().unwrap(),
+                drafter: DrafterChoice::Reference {
+                    reference: DrafterReference::Local {
+                        path: drafters.join("drafter.gguf"),
+                    },
+                    method: SpeculativeMethod::DFlash,
+                },
+            }],
             ..LocalModelsConfiguration::default()
         };
         let targets = crate::local_watch::watch_targets(&configuration);
@@ -4861,6 +5102,7 @@ mod tests {
             BTreeSet::from([
                 (present.clone(), true),
                 (present.clone(), false),
+                (drafters.clone(), false),
                 (temporary.path().to_path_buf(), false),
             ])
         );

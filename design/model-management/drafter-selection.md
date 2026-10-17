@@ -104,7 +104,10 @@ Catalog models always use their catalog drafter.
   draft only through a bundle that declares them, never implicitly.
 - A found or imported model whose choice is automatic has no attached drafter until the
   recommended one is on this computer: ACN projects it without a drafter, and clients offer the
-  recommended drafter ("Faster with a drafter · Add (size)"). A drafter the user chose that is
+  recommended drafter ("Faster with a drafter · Add (size)"). An imported model's "In this folder" drafters are on this
+  computer wherever that folder is: ICN observes and watches them with the imported file, so the
+  automatic choice attaches them in place even outside every model location, as it does a drafter
+  chosen by local path. A drafter the user chose that is
   missing with no download running is an interrupted download that Sync resumes, and that ACN
   resumes by itself when the service starts. A catalog drafter whose current revision is not on
   this computer keeps serving with the earlier revision of that catalog model's drafter (matched by

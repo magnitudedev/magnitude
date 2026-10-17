@@ -1182,7 +1182,7 @@ fn scan(
             discovered.extend(candidates.iter().cloned());
         }
     }
-    crate::local_roots::scan_declared_files(local, &mut discovered);
+    crate::local_roots::scan_declared_files(local, cache, &config.architectures, &mut discovered);
     let (mut cached_models, cached_evidence, _) =
         load_inventory_index(&ModelCache::new(&config.cache_root));
     // The durable entry controls cache validity. Overlay only transient runtime state for an entry
@@ -2116,7 +2116,7 @@ pub(crate) fn collect_gguf(
     Ok(())
 }
 
-fn split_shard_name(path: &Path) -> Option<(PathBuf, u32, u32)> {
+pub(crate) fn split_shard_name(path: &Path) -> Option<(PathBuf, u32, u32)> {
     if !path.extension()?.to_str()?.eq_ignore_ascii_case("gguf") {
         return None;
     }

@@ -307,7 +307,9 @@ Ollama service's folder owned by the `ollama` user). The location is found when 
 found, else can't read when any is unreadable, else not found. The user may turn off an automatic
 location, which turns off all of its directories, and add or remove folders, each one directory;
 the change reaches ICN as a new configuration and reconciles only the affected roots. Imported files
-are scanned at their declared paths. An imported file is one more location of its bytes: it names
+are scanned at their declared paths, together with the drafter files in the imported file's own folder
+(never a subfolder's) and any drafter attached by local path, all referenced in place and watched with
+the directories that hold them. An imported file is one more location of its bytes: it names
 the model (its `local:` ID and the Imported origin) only while no scanned location holds the same
 bytes; otherwise the model keeps the identity and origin its found locations give it, and the import
 keeps it available when those files disappear. ACN reports such an import as already on this

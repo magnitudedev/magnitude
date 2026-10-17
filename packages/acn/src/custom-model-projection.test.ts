@@ -232,6 +232,33 @@ describe("attached drafters", () => {
     }))
   })
 
+  it("attaches an imported model's automatic drafter in its folder once ICN finds it there", () => {
+    const beside = { _tag: "Local", path: "/home/me/fx/g4imp/mtp-gemma-4-E2B-it-Q4_0.gguf" }
+    const mtp = { _tag: "Bound", method: { _tag: "Mtp" }, memoryBytes: 200_000_000 }
+    const imported = customSource(nativeCustomModel({
+      modelId: importedId,
+      origin: { _tag: "Imported", path: "/home/me/fx/g4imp/gemma-4-E2B-it-Q4_0.gguf" },
+      drafter: { method: { _tag: "Mtp" }, reference: beside, state: { _tag: "Ready" }, updateAvailable: false },
+      recommendedDrafter: {
+        category: "NextToModel",
+        reference: beside,
+        name: "mtp-gemma-4-E2B-it-Q4_0.gguf",
+        label: "In this folder",
+        sizeBytes: 200_000_000,
+        lineage: "Lineage",
+        verdict: mtp,
+        onThisComputer: true,
+        method: { _tag: "Mtp" },
+      },
+    }))
+    const row = Option.getOrThrow(customModel(inputs(imported)))
+    expect(row.drafter).toMatchObject(Option.some({
+      name: "mtp-gemma-4-E2B-it-Q4_0.gguf",
+      availability: { _tag: "Present" },
+      verdict: mtp,
+    }))
+  })
+
   it("never gives a present drafter the verdict of a different method", () => {
     const present = customSource(nativeCustomModel({ drafter: attachedDrafter, recommendedDrafter }))
     expect(Option.map(Option.getOrThrow(customModel(inputs(present, { assessment: withHeads }))).drafter, ({ verdict }) => verdict))

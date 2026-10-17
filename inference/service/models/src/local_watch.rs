@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use magnitude_service_contracts::models::{CustomModelDeclarationOrigin, LocalModelsConfiguration};
+use magnitude_service_contracts::models::{
+    CustomModelDeclarationOrigin, DrafterChoice, DrafterReference, LocalModelsConfiguration,
+};
 use notify::{EventKind, RecursiveMode, Watcher};
 
 use crate::local_roots::is_partial_download;
@@ -28,7 +30,8 @@ pub(crate) struct WatchTarget {
     pub(crate) interest: PathBuf,
 }
 
-/// Every enabled root, recursively, and the directories of declared files. A root that does not
+/// Every enabled root, recursively, and the directories of declared files: imported models (whose
+/// folder also holds their drafters) and drafters attached by local path. A root that does not
 /// exist yet is watched through its nearest existing ancestor, so creating it is noticed.
 pub(crate) fn watch_targets(configuration: &LocalModelsConfiguration) -> Vec<WatchTarget> {
     let roots = configuration
@@ -46,9 +49,23 @@ pub(crate) fn watch_targets(configuration: &LocalModelsConfiguration) -> Vec<Wat
             )
         })
         .flat_map(|declaration| declaration.target.iter().chain(&declaration.projector))
-        .filter_map(|file| Path::new(file).parent())
+        .map(Path::new);
+    let drafters =
+        configuration
+            .drafters
+            .iter()
+            .filter_map(|attachment| match &attachment.drafter {
+                DrafterChoice::Reference {
+                    reference: DrafterReference::Local { path },
+                    ..
+                } => Some(path.as_path()),
+                _ => None,
+            });
+    let files = declared
+        .chain(drafters)
+        .filter_map(Path::parent)
         .map(|directory| existing_target(directory, false));
-    let mut targets = roots.chain(declared).flatten().collect::<Vec<_>>();
+    let mut targets = roots.chain(files).flatten().collect::<Vec<_>>();
     targets.sort();
     targets.dedup();
     targets

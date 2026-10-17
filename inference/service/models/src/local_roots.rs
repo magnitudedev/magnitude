@@ -2,7 +2,7 @@
 //! place. Each scanner reads directory layouts, manifests and GGUF headers only; it never writes,
 //! moves or hashes a file in full, and partial downloads never form a group.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -20,8 +20,8 @@ use crate::candidate_files::RecognizedArchitectures;
 use crate::identity::{content_id, inventory_entry_id};
 use crate::inventory::{
     ArtifactCandidate, DeclaredProjectors, DiscoveryCandidate, ModelGroup, canonical_or_self,
-    components_for_group, discover_groups, modified_seconds, now, primary_path, read_dir_sorted,
-    scan_hf_cache,
+    components_for_group, discover_groups, inspect_cached, modified_seconds, now, primary_path,
+    read_dir_sorted, scan_hf_cache, split_shard_name,
 };
 
 const OLLAMA_MODEL_MEDIA_TYPE: &str = "application/vnd.ollama.image.model";
@@ -607,10 +607,13 @@ fn scan_folder(
     Ok(())
 }
 
-/// Files declarations reference in place: imported models, and drafters attached by local path.
-/// A declared file that is missing simply contributes nothing.
+/// Files declarations reference in place: imported models, the drafters in each imported model's
+/// own folder, and drafters attached by local path. A declared file that is missing simply
+/// contributes nothing.
 pub(crate) fn scan_declared_files(
     configuration: &LocalModelsConfiguration,
+    cache: &ModelCache,
+    architectures: &RecognizedArchitectures,
     output: &mut Vec<DiscoveryCandidate>,
 ) {
     let imported = configuration
@@ -622,11 +625,20 @@ pub(crate) fn scan_declared_files(
                 CustomModelDeclarationOrigin::Imported { .. }
             )
         })
-        .map(|declaration| ModelGroup {
-            paths: declaration.target.iter().map(PathBuf::from).collect(),
-            projector: declaration.projector.as_ref().map(PathBuf::from),
+        .collect::<Vec<_>>();
+    let folders = imported
+        .iter()
+        .filter_map(|declaration| Path::new(declaration.target.first()?).parent())
+        .map(Path::to_path_buf)
+        .collect::<BTreeSet<_>>();
+    let beside = folders
+        .iter()
+        .flat_map(|folder| folder_drafters(folder, cache, architectures))
+        .map(|path| ModelGroup {
+            paths: vec![path],
+            projector: None,
         });
-    let drafters =
+    let attached =
         configuration
             .drafters
             .iter()
@@ -640,7 +652,11 @@ pub(crate) fn scan_declared_files(
                 }),
                 _ => None,
             });
-    for group in imported.chain(drafters) {
+    let models = imported.iter().map(|declaration| ModelGroup {
+        paths: declaration.target.iter().map(PathBuf::from).collect(),
+        projector: declaration.projector.as_ref().map(PathBuf::from),
+    });
+    for group in models.chain(beside).chain(attached) {
         if let Err(error) = push_declared(&group, output) {
             tracing::warn!(
                 path = %group.paths[0].display(),
@@ -649,6 +665,37 @@ pub(crate) fn scan_declared_files(
             );
         }
     }
+}
+
+/// The drafters "in this folder" for a model imported from `folder`: its own single-file GGUFs,
+/// never a subfolder's, whose header declares a drafter role. They are referenced in place like
+/// the model, so its automatic drafter resolves wherever the folder is.
+fn folder_drafters(
+    folder: &Path,
+    cache: &ModelCache,
+    architectures: &RecognizedArchitectures,
+) -> Vec<PathBuf> {
+    let Ok(entries) = read_dir_sorted(folder) else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+                && !is_partial_download(path)
+                && split_shard_name(path).is_none()
+                && path.is_file()
+        })
+        .filter(|path| {
+            inspect_cached(cache, path).is_some_and(|inspection| {
+                inspection.role(architectures) == crate::gguf::GgufRole::Drafter
+            })
+        })
+        .collect()
 }
 
 fn push_declared(
