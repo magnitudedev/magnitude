@@ -5,7 +5,7 @@
 
 use crate::{invalid, product, Error};
 use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value};
-use magnitude_family_common::{rotary, Tensors};
+use magnitude_family_common::{architecture_keys, rotary, Tensors};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
@@ -90,9 +90,9 @@ pub fn describe_projector(
     {
         return Err(invalid("unsupported Muse Glimmer projector identity"));
     }
-    if let Some(entry) = directory.metadata.iter().find(|entry| {
-        !entry.name.starts_with("general.") && !KEYS.contains(&entry.name.as_str())
-    }) {
+    if let Some((_, entry)) = architecture_keys(directory, PROJECTOR_ARCHITECTURE)
+        .find(|(_, entry)| !KEYS.contains(&entry.name.as_str()))
+    {
         return Err(invalid(format!("unknown metadata {:?}", entry.name)));
     }
     if unsigned(directory, "clip.vision.projection_dim")? != output_hidden {

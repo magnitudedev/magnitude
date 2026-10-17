@@ -3,7 +3,7 @@ pub mod inputs;
 
 use crate::{Error, invalid};
 use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value};
-use magnitude_family_common::Tensors;
+use magnitude_family_common::{Tensors, architecture_keys};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, MergerStage, PositionSampling, VisionActivation,
     VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock, VisionDescription,
@@ -90,10 +90,8 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
     {
         return Err(invalid("unsupported MiniCPM-V projector identity"));
     }
-    if let Some(entry) = directory
-        .metadata
-        .iter()
-        .find(|e| !e.name.starts_with("general.") && !KEYS.contains(&e.name.as_str()))
+    if let Some((_, entry)) = architecture_keys(directory, PROJECTOR_ARCHITECTURE)
+        .find(|(_, entry)| !KEYS.contains(&entry.name.as_str()))
     {
         return Err(invalid(format!(
             "unknown projector metadata {:?}",

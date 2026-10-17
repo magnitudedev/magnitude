@@ -5,7 +5,7 @@ use magnitude_artifacts::{
     gguf::{ByteOrder, Directory, Encoding, Metadata as Entry, Scalar, TensorDescriptor, Value},
     UnsupportedReason,
 };
-use magnitude_family_common::{HeaderError, Metadata, Tensors};
+use magnitude_family_common::{architecture_keys, HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::FamilyError;
 
 fn directory(keys: &[&str], tensors: &[&str]) -> Directory {
@@ -65,6 +65,32 @@ fn every_unknown_architecture_key_is_named() {
                 key: "arch.rope.scaling.type".into()
             },
         ]
+    );
+}
+
+#[test]
+fn only_the_architecture_namespace_is_read_strictly() {
+    let header = directory(
+        &[
+            "arch.block_count",
+            "general.quantized_by",
+            "mradermacher.quantize_version",
+            "unsloth.version",
+            "imatrix.chunks_count",
+            "quantize.imatrix.file",
+            "split.count",
+            "other_arch.block_count",
+            "archive.block_count",
+            "tokenizer.ggml.model",
+        ],
+        &[],
+    );
+    assert!(Metadata::new(&header, "arch", &["block_count"]).is_ok());
+    assert_eq!(
+        architecture_keys(&header, "arch")
+            .map(|(key, entry)| (key, entry.name.as_str()))
+            .collect::<Vec<_>>(),
+        [("block_count", "arch.block_count")]
     );
 }
 

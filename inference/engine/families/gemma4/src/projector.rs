@@ -5,7 +5,7 @@
 
 use crate::{invalid, product, Error};
 use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value};
-use magnitude_family_common::{HeaderError, Tensors};
+use magnitude_family_common::{architecture_keys, HeaderError, Tensors};
 use magnitude_family_contracts::{
     CellReduction, ImportTransform, LinearClamp, MergerStage, PositionSampling, RmsNorm,
     Standardize, UnweightedRms, VisionActivation, VisionAttention, VisionAttentionScale,
@@ -143,11 +143,10 @@ pub fn describe_projector(
     {
         return Err(invalid("unsupported Gemma projector identity"));
     }
-    for entry in &directory.metadata {
-        let known = entry.name.starts_with("general.")
-            || IGNORED_PREFIXES
-                .iter()
-                .any(|prefix| entry.name.starts_with(prefix))
+    for (_, entry) in architecture_keys(directory, PROJECTOR_ARCHITECTURE) {
+        let known = IGNORED_PREFIXES
+            .iter()
+            .any(|prefix| entry.name.starts_with(prefix))
             || [
                 "clip.has_vision_encoder",
                 "clip.vision.projector_type",

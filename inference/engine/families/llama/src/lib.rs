@@ -19,7 +19,7 @@ use magnitude_artifacts::{
     gguf::{Directory, Value},
     PackageIdentity, UnsupportedReason,
 };
-use magnitude_family_common::{rotary, HeaderError, Metadata, Tensors};
+use magnitude_family_common::{architecture_keys, rotary, HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
     DefinitionError, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId,
@@ -31,8 +31,6 @@ use std::{error, fmt};
 
 /// The family identity every definition this crate builds carries.
 pub const FAMILY_ID: &str = "llama";
-
-const PREFIX: &str = "llama.";
 
 /// Every `llama.*` key of the admitted feature set. Each is required and
 /// scalar; any other key names a feature this family does not admit.
@@ -50,10 +48,6 @@ const ADMITTED_KEYS: [&str; 12] = [
     "rope.freq_base",
     "vocab_size",
 ];
-
-/// Container and provenance namespaces that carry no numerical meaning for
-/// the decoder (the tokenizer is interpreted by the chat layer).
-const CONTAINER_NAMESPACES: [&str; 4] = ["general.", "tokenizer.", "quantize.", "split."];
 
 const GLOBAL_ROLES: [&str; 3] = ["token_embd.weight", "output_norm.weight", "output.weight"];
 
@@ -275,20 +269,13 @@ pub fn admit(directory: &Directory) -> Result<(), Error> {
     }
     let mut features = Vec::new();
     let mut scaled = false;
-    for metadata in &directory.metadata {
-        match metadata.name.strip_prefix(PREFIX) {
-            Some(key) if key.starts_with("rope.scaling.") => scaled = true,
-            Some(key) if !ADMITTED_KEYS.contains(&key) => {
-                features.push(Feature::UnknownMetadata(metadata.name.clone()));
-            }
-            Some(_) if matches!(metadata.value, Value::Array(_)) => {
-                features.push(Feature::PerLayerMetadata(metadata.name.clone()));
-            }
-            Some(_) => {}
-            None if CONTAINER_NAMESPACES
-                .iter()
-                .any(|namespace| metadata.name.starts_with(namespace)) => {}
-            None => features.push(Feature::UnknownMetadata(metadata.name.clone())),
+    for (key, metadata) in architecture_keys(directory, FAMILY_ID) {
+        if key.starts_with("rope.scaling.") {
+            scaled = true;
+        } else if !ADMITTED_KEYS.contains(&key) {
+            features.push(Feature::UnknownMetadata(metadata.name.clone()));
+        } else if matches!(metadata.value, Value::Array(_)) {
+            features.push(Feature::PerLayerMetadata(metadata.name.clone()));
         }
     }
     if scaled {

@@ -21,7 +21,7 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::{
     rotary::{self, Yarn},
-    HeaderError, Metadata, Tensors,
+    architecture_keys, HeaderError, Metadata, Tensors,
 };
 use magnitude_family_contracts::{
     checked_product, ActivationFunction, Attention, AttentionGate, Block, BlockAttention,
@@ -35,7 +35,6 @@ use std::{error, fmt};
 
 /// The GGUF architecture of a DFlash-family block drafter.
 pub const ARCHITECTURE: &str = "dflash";
-const PREFIX: &str = "dflash.";
 
 /// Every admitted `dflash.*` key; any other key names a feature this family
 /// does not admit.
@@ -78,10 +77,6 @@ const ARRAY_KEYS: [&str; 3] = [
     "attention.sliding_window_pattern",
     "rope.dimension_sections",
 ];
-
-/// Container and provenance namespaces without numerical meaning for the
-/// draft (its tokenizer is the target's; only the mask token is read).
-const CONTAINER_NAMESPACES: [&str; 4] = ["general.", "tokenizer.", "quantize.", "split."];
 
 const MASK_TOKEN: &str = "tokenizer.ggml.mask_token_id";
 
@@ -297,23 +292,16 @@ pub fn recognize(directory: &Directory) -> Result<(), Error> {
         architecture => return Err(Error::Architecture(architecture.map(str::to_owned))),
     }
     let mut metadata = Vec::new();
-    for entry in &directory.metadata {
-        match entry.name.strip_prefix(PREFIX) {
-            Some(key) if !ADMITTED_KEYS.contains(&key) => metadata.push(entry.name.clone()),
-            Some(key)
-                if key != "attention.causal"
-                    && matches!(entry.value, Value::Array(_)) != ARRAY_KEYS.contains(&key) =>
-            {
-                return Err(Error::Metadata {
-                    key: entry.name.clone(),
-                    expected: "of its admitted arity",
-                });
-            }
-            Some(_) => {}
-            None if CONTAINER_NAMESPACES
-                .iter()
-                .any(|namespace| entry.name.starts_with(namespace)) => {}
-            None => metadata.push(entry.name.clone()),
+    for (key, entry) in architecture_keys(directory, ARCHITECTURE) {
+        if !ADMITTED_KEYS.contains(&key) {
+            metadata.push(entry.name.clone());
+        } else if key != "attention.causal"
+            && matches!(entry.value, Value::Array(_)) != ARRAY_KEYS.contains(&key)
+        {
+            return Err(Error::Metadata {
+                key: entry.name.clone(),
+                expected: "of its admitted arity",
+            });
         }
     }
     let tensors = directory

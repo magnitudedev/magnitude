@@ -198,6 +198,38 @@
       }
     },
     {
+      "name": "llama-mradermacher-provenance",
+      "description": "Community MiniCPM5 2B Q4_K_M from mradermacher (llama family): its mradermacher.* provenance keys configure nothing and are ignored.",
+      "target": [
+        {
+          "header": "headers/MiniCPM5-2B.Q4_K_M.gguf.gz",
+          "repository": "mradermacher/MiniCPM5-2B-GGUF",
+          "revision": "1defcfa1437eb604050ce5be06f18b240155545f",
+          "path": "MiniCPM5-2B.Q4_K_M.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported",
+        "drafter": "none"
+      }
+    },
+    {
+      "name": "llama-bartowski-provenance",
+      "description": "Community MiniCPM5 2B Q4_K_M from bartowski (llama family): its quantize.imatrix.* provenance keys configure nothing and are ignored.",
+      "target": [
+        {
+          "header": "headers/MiniCPM5-2B-Q4_K_M.gguf.gz",
+          "repository": "bartowski/MiniCPM5-2B-GGUF",
+          "revision": "31fee0334c4ed9f1e079afe586ba30cb83e0f883",
+          "path": "MiniCPM5-2B-Q4_K_M.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported",
+        "drafter": "none"
+      }
+    },
+    {
       "name": "nemotron-h-supported",
       "description": "Catalog Nemotron 3.5 Lightning 30B A3B NVFP4 (nemotron_h family).",
       "target": [

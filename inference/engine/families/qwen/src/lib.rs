@@ -14,6 +14,7 @@ use magnitude_artifacts::{
     gguf::{Directory, Scalar, Value},
     UnsupportedReason,
 };
+use magnitude_family_common::architecture_keys;
 use magnitude_family_contracts::{
     ActivationFunction, Attention, AttentionGate, DenseFfn, ExpertSelection, FeedForwardUp,
     GateFunction, GatedDelta, HeadNorm, HistoryDomain, HistoryReads, KeyValue, MediaRowAttention,
@@ -43,17 +44,9 @@ impl<'a> Metadata<'a> {
     /// Reads `family.*` keys, refusing every one outside `keys` as
     /// unrecognized metadata.
     pub fn new(directory: &'a Directory, family: &str, keys: &[&str]) -> Result<Self, Error> {
-        let prefix = format!("{family}.");
-        let unknown = directory
-            .metadata
-            .iter()
-            .filter(|entry| {
-                entry
-                    .name
-                    .strip_prefix(&prefix)
-                    .is_some_and(|key| !keys.contains(&key))
-            })
-            .map(|entry| entry.name.clone())
+        let unknown = architecture_keys(directory, family)
+            .filter(|(key, _)| !keys.contains(key))
+            .map(|(_, entry)| entry.name.clone())
             .collect::<Vec<_>>();
         if !unknown.is_empty() {
             let detail = format!("unknown Qwen metadata {unknown:?}");
@@ -65,7 +58,10 @@ impl<'a> Metadata<'a> {
                 detail,
             ));
         }
-        Ok(Metadata { directory, prefix })
+        Ok(Metadata {
+            directory,
+            prefix: format!("{family}."),
+        })
     }
     /// The full metadata name of `key`.
     pub fn key(&self, key: &str) -> String {

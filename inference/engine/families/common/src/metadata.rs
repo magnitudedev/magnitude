@@ -3,7 +3,27 @@
 //! its reader admits.
 
 use crate::HeaderError;
-use magnitude_artifacts::gguf::{Directory, Scalar, Value};
+use magnitude_artifacts::gguf::{self, Directory, Scalar, Value};
+
+/// Every metadata entry in `architecture`'s own namespace, with its name
+/// within that namespace.
+///
+/// Only that namespace configures a model, so it is the only one a family
+/// reads strictly (the chat layer reads `tokenizer.*` strictly). Every other
+/// namespace configures nothing: `general.*` describes the model, and
+/// container and uploader namespaces (`split.*`, `quantize.*`, `imatrix.*`,
+/// `mradermacher.*`, `unsloth.*`, ...) record how the file was made. A family
+/// may read a named key there, but never refuses one it does not know.
+pub fn architecture_keys<'a>(
+    directory: &'a Directory,
+    architecture: &str,
+) -> impl Iterator<Item = (&'a str, &'a gguf::Metadata)> + 'a {
+    let prefix = format!("{architecture}.");
+    directory
+        .metadata
+        .iter()
+        .filter_map(move |entry| entry.name.strip_prefix(&prefix).map(|key| (key, entry)))
+}
 
 pub struct Metadata<'a> {
     directory: &'a Directory,
@@ -17,22 +37,17 @@ impl<'a> Metadata<'a> {
         architecture: &str,
         keys: &[&str],
     ) -> Result<Self, HeaderError> {
-        let prefix = format!("{architecture}.");
-        let unknown = directory
-            .metadata
-            .iter()
-            .filter(|entry| {
-                entry
-                    .name
-                    .strip_prefix(&prefix)
-                    .is_some_and(|key| !keys.contains(&key))
-            })
-            .map(|entry| entry.name.clone())
+        let unknown = architecture_keys(directory, architecture)
+            .filter(|(key, _)| !keys.contains(key))
+            .map(|(_, entry)| entry.name.clone())
             .collect::<Vec<_>>();
         if !unknown.is_empty() {
             return Err(HeaderError::UnknownMetadata(unknown));
         }
-        Ok(Self { directory, prefix })
+        Ok(Self {
+            directory,
+            prefix: format!("{architecture}."),
+        })
     }
 
     /// The full metadata name of `key`.

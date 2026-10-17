@@ -53,6 +53,15 @@ without their own history and never reads them), so such a file interprets to th
 one without them. The header weight-encoding check stays independent of interpretation and still
 counts such a tensor's stored type.
 
+Metadata is read strictly only where it can change what the model computes. Every key in the
+component's own architecture namespace (`<general.architecture>.*`) must be one its family reads,
+and the chat layer reads `tokenizer.*` the same way; any other such key is unrecognized metadata.
+Every other namespace configures nothing and is ignored whatever it holds: `general.*` describes
+the model, and container and uploader namespaces (`split.*`, `quantize.*`, `imatrix.*`,
+`mradermacher.*`, `unsloth.*` and the like) record how the file was made. A family may read a named
+key outside its namespace, such as a projector's base-model name, but never refuses one it does not
+know. The rule is shared by every family, so a quantizer's provenance stamp never decides a verdict.
+
 An input row's token also names the rows it reads of a gathered table, by the table's row rule. A
 token table's row is the token. An n-gram table's rows hash the token with its predecessors: order
 `n` mixes the last `n` tokens (exact 64-bit products, XOR-combined) into each of its heads' row

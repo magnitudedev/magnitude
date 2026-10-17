@@ -159,16 +159,16 @@ fn features_outside_the_admitted_set_are_each_refused_by_name() {
         )]))
     );
 
-    let mut foreign = minicpm5();
+    let mut unknown = minicpm5();
     set_metadata(
-        &mut foreign,
-        "minicpm.scale_emb",
+        &mut unknown,
+        "llama.embedding_scale",
         Value::Scalar(Scalar::Float(12.0)),
     );
     assert_eq!(
-        admit(&foreign),
+        admit(&unknown),
         Err(Error::Unadmitted(vec![Feature::UnknownMetadata(
-            "minicpm.scale_emb".into()
+            "llama.embedding_scale".into()
         )]))
     );
 
@@ -227,6 +227,25 @@ fn features_outside_the_admitted_set_are_each_refused_by_name() {
         admit(&other),
         Err(Error::Architecture(Some("mistral3".into())))
     );
+}
+
+#[test]
+fn namespaces_that_configure_nothing_are_ignored() {
+    let mut stamped = minicpm5();
+    for key in [
+        "mradermacher.quantize_version",
+        "mradermacher.quantized_by",
+        "unsloth.version",
+        "imatrix.dataset",
+        "quantize.imatrix.file",
+        "split.count",
+        "general.quantized_by",
+        "minicpm.scale_emb",
+    ] {
+        set_metadata(&mut stamped, key, Value::Scalar(Scalar::String("x".into())));
+    }
+    assert_eq!(admit(&stamped), Ok(()));
+    assert_eq!(inspect(&stamped), inspect(&minicpm5()));
 }
 
 #[test]
