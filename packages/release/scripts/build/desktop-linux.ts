@@ -93,6 +93,9 @@ const symbolicMode = (mode: string) => mode.length !== 10 ? -1 : [...mode.slice(
 
 /** Every package ships the same root-owned system files, and never a sudoers rule. */
 export const validateLinuxSystemFiles = (paths: readonly string[], entry: (path: string) => Option.Option<{ readonly mode: number; readonly owner: string }>) => Effect.gen(function* () {
+  if (paths.some(path => path === "usr/lib/.build-id" || path.startsWith("usr/lib/.build-id/"))) {
+    return yield* new DesktopBuildFailed({ message: "Linux installer must not contain global build-ID links that can conflict with other applications" })
+  }
   if (paths.some(path => path === "etc/sudoers.d" || path.startsWith("etc/sudoers.d/") || path === "etc/sudoers")) {
     return yield* new DesktopBuildFailed({ message: "Linux installer must not contain a sudoers rule; `magnitude server setup` writes it" })
   }

@@ -66,6 +66,12 @@ describe("Linux system files", () => {
   it("accepts the root-owned unit, Polkit actions and their wrappers", async () => {
     await expect(validate(listing)).resolves.toBeUndefined()
   })
+  it.each(["usr/lib/.build-id", "usr/lib/.build-id/5c", "usr/lib/.build-id/5c/b76311ea91b4bc51b112829d8b06cd2398a6ba"])("rejects global build-ID entry %s", async path => {
+    await expect(validate(listing, [...listing.keys(), path])).rejects.toThrow("must not contain global build-ID links")
+  })
+  it("accepts bundled binaries in the application directory", async () => {
+    await expect(validate(listing, [...listing.keys(), "usr/lib/magnitude-desktop/chrome-sandbox", "usr/lib/magnitude-desktop/libEGL.so"])).resolves.toBeUndefined()
+  })
   it("rejects a group-writable unit", async () => {
     await expect(validate(new Map([...listing, ["usr/lib/systemd/system/magnitude.service", { mode: 0o664, owner: "root/root" }]]))).rejects.toThrow("root-owned")
   })
