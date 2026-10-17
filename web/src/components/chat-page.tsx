@@ -296,7 +296,7 @@ export function ChatPage() {
       </div>
       <p className="px-2 pt-3 text-xs text-slate-500">Stored in this browser only.</p>
     </aside>
-    <section className="flex min-w-0 flex-1 flex-col">
+    <section className="flex min-h-0 min-w-0 flex-1 flex-col">
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-750 sm:px-6">
         <div className="min-w-0"><h2 className="truncate text-sm font-semibold">{active?.title ?? "New chat"}</h2><p className="mt-0.5 text-xs text-slate-500">Local inference · streaming responses</p></div>
         <label className="flex items-center gap-2 text-xs text-slate-500">Model
@@ -337,7 +337,7 @@ export function ChatPage() {
         <div ref={endRef} />
       </div>
       {error && <div role="alert" className="mx-4 mb-2 rounded-lg border border-red-200 bg-rose-200/30 p-3 text-sm text-red-800 dark:border-red-800 dark:bg-slate-900 dark:text-red-200">{error}</div>}
-      <form onSubmit={send} className="border-t border-slate-200 p-3 dark:border-slate-750 sm:p-5">
+      <form onSubmit={send} className="shrink-0 border-t border-slate-200 bg-white p-3 dark:border-slate-750 dark:bg-slate-925 sm:p-5">
         <div className="mx-auto max-w-3xl rounded-xl border border-slate-300 bg-white p-2 focus-within:border-blue-400 dark:border-slate-700 dark:bg-slate-900">
           <textarea value={draft} onChange={event => setDraft(event.target.value)} onKeyDown={event => {
             if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() }
