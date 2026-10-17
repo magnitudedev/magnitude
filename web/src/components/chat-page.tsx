@@ -241,8 +241,10 @@ export function ChatPage() {
   }
 
   const removeConversation = (id: string) => {
-    deletedConversationIdsRef.current.add(id)
-    if (streamingConversationIdRef.current === id) abortRef.current?.abort()
+    if (streamingConversationIdRef.current === id) {
+      deletedConversationIdsRef.current.add(id)
+      abortRef.current?.abort()
+    }
     const next = conversations.filter(item => item.id !== id)
     setConversations(next)
     if (activeId === id) setActiveId(next[0]?.id ?? null)
