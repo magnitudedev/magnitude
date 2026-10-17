@@ -72,6 +72,8 @@ export function ChatPage() {
   const [openWebUIInput, setOpenWebUIInput] = useState(() => readStoredOpenWebUIUrl() || "http://127.0.0.1:3000/")
   const [openWebUIError, setOpenWebUIError] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const streamingConversationIdRef = useRef<string | null>(null)
+  const deletedConversationIdsRef = useRef(new Set<string>())
   const endRef = useRef<HTMLDivElement>(null)
   const active = conversations.find(item => item.id === activeId) ?? null
   const selectedModel = (active?.model && models.includes(active.model) ? active.model : "") || preferredModel || models[0] || ""
@@ -129,6 +131,9 @@ export function ChatPage() {
 
   const updateConversation = (conversation: Conversation) => {
     setConversations(current => {
+      if (deletedConversationIdsRef.current.has(conversation.id)) {
+        return current.filter(item => item.id !== conversation.id)
+      }
       const next = [conversation, ...current.filter(item => item.id !== conversation.id)]
       next.sort((a, b) => b.updatedAt - a.updatedAt)
       return next
@@ -157,6 +162,7 @@ export function ChatPage() {
     setWorking(true)
     const controller = new AbortController()
     abortRef.current = controller
+    streamingConversationIdRef.current = conversation.id
     try {
       const response = await fetch(`${apiBase}/chat/completions`, {
         method: "POST",
@@ -210,6 +216,7 @@ export function ChatPage() {
       }
     } finally {
       abortRef.current = null
+      streamingConversationIdRef.current = null
       setWorking(false)
       conversation.updatedAt = Date.now()
       updateConversation(conversation)
@@ -234,6 +241,8 @@ export function ChatPage() {
   }
 
   const removeConversation = (id: string) => {
+    deletedConversationIdsRef.current.add(id)
+    if (streamingConversationIdRef.current === id) abortRef.current?.abort()
     const next = conversations.filter(item => item.id !== id)
     setConversations(next)
     if (activeId === id) setActiveId(next[0]?.id ?? null)
