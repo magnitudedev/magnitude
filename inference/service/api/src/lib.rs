@@ -1992,6 +1992,10 @@ mod tests {
                                 context_window_tokens: 1,
                                 memory_domains: Vec::new(),
                             },
+                            device: ModelLoadDevice {
+                                id: "test-device".parse().unwrap(),
+                                backend: ExecutionBackend::Cpu,
+                            },
                         },
                     }],
                 })
