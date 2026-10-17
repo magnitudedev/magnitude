@@ -136,5 +136,7 @@ export type AcnHealthResponse = typeof AcnHealthResponseSchema.Type;
 export const MagnitudeHealthResponseSchema = Schema.Struct({
   ...AcnHealthResponseSchema.fields,
   rpcVersion: PositiveSafeInteger,
+  /** Live model placement; absent while the service is starting or on older workers. */
+  activeModelDevices: Schema.optional(Schema.Array(ActiveModelDeviceSchema)),
 });
 export type MagnitudeHealthResponse = typeof MagnitudeHealthResponseSchema.Type;

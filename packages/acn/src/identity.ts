@@ -6,6 +6,7 @@ import {
   type MagnitudeHealthResponse,
   MAGNITUDE_RPC_VERSION,
   type AcnHealthState,
+  type ActiveModelDevice,
 } from "@magnitudedev/acn-protocol";
 import { ACN_REVISION } from "./version";
 
@@ -18,6 +19,7 @@ export const makeHealthResponse = (
   id: string = ACN_INSTANCE_ID,
   pid: number = process.pid,
   revision: number = ACN_REVISION,
+  activeModelDevices?: readonly ActiveModelDevice[],
 ): MagnitudeHealthResponse => ({
   service: "magnitude-acn",
   version: AcnIdentitySchema.make(version),
@@ -26,4 +28,5 @@ export const makeHealthResponse = (
   id: AcnInstanceIdSchema.make(id),
   pid,
   state,
+  ...(activeModelDevices === undefined ? {} : { activeModelDevices: [...activeModelDevices] }),
 });
