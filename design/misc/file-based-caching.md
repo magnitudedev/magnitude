@@ -156,6 +156,9 @@ tolerant readers and atomic publication, not from the lock.
 Cache deletion and garbage collection are always safe. Size and age policies may remove any entry;
 the next access regenerates it. Negative or operational results are cached only when they are stable
 domain facts with complete validity evidence; transient failures are never persisted as facts.
+The remote GGUF header cache is bounded by size with least-recently-used eviction and stores the
+large metadata entries headers share once; its policy is in
+[Model catalog and acquisition](../model-management/catalog-and-acquisition.md#header-cache).
 
 Model-assessment entries are keyed by the complete assessment identity: the assessment environment
 (engine build, device and its resolved memory bandwidth, normalized stable topology and process

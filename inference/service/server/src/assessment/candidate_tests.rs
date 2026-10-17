@@ -38,6 +38,7 @@ use crate::assessment::environment::AssessmentEnvironment;
 
 // Synthetic GGUF headers ---------------------------------------------------------------------
 
+#[derive(Clone)]
 enum Meta {
     U32(u32),
     F32(f32),
@@ -46,12 +47,18 @@ enum Meta {
     Strings(Vec<String>),
     I32s(Vec<i32>),
     U32s(Vec<u32>),
+    F32s(Vec<f32>),
 }
 
 #[derive(Default)]
 struct Gguf {
     metadata: Vec<(String, Meta)>,
     tensors: Vec<(String, Vec<u64>, Encoding)>,
+}
+
+fn string(out: &mut Vec<u8>, value: &str) {
+    out.extend((value.len() as u64).to_le_bytes());
+    out.extend(value.as_bytes());
 }
 
 impl Gguf {
@@ -73,60 +80,51 @@ impl Gguf {
         }
     }
 
+    /// The encoded bytes of one metadata entry: its key, value type and value.
+    fn entry(key: &str, value: &Meta) -> Vec<u8> {
+        fn array<T>(out: &mut Vec<u8>, element: u32, values: &[T], encode: impl Fn(&mut Vec<u8>, &T)) {
+            out.extend(9u32.to_le_bytes());
+            out.extend(element.to_le_bytes());
+            out.extend((values.len() as u64).to_le_bytes());
+            for value in values {
+                encode(out, value);
+            }
+        }
+        let mut out = Vec::new();
+        string(&mut out, key);
+        match value {
+            Meta::U32(value) => {
+                out.extend(4u32.to_le_bytes());
+                out.extend(value.to_le_bytes());
+            }
+            Meta::F32(value) => {
+                out.extend(6u32.to_le_bytes());
+                out.extend(value.to_le_bytes());
+            }
+            Meta::Bool(value) => {
+                out.extend(7u32.to_le_bytes());
+                out.push(u8::from(*value));
+            }
+            Meta::Str(value) => {
+                out.extend(8u32.to_le_bytes());
+                string(&mut out, value);
+            }
+            Meta::Strings(values) => array(&mut out, 8, values, |out, value| string(out, value)),
+            Meta::I32s(values) => array(&mut out, 5, values, |out, value| out.extend(value.to_le_bytes())),
+            Meta::U32s(values) => array(&mut out, 4, values, |out, value| out.extend(value.to_le_bytes())),
+            Meta::F32s(values) => array(&mut out, 6, values, |out, value| out.extend(value.to_le_bytes())),
+        }
+        out
+    }
+
     /// The header and the logical size of the file it heads.
     fn bytes(&self) -> (Vec<u8>, u64) {
-        fn string(out: &mut Vec<u8>, value: &str) {
-            out.extend((value.len() as u64).to_le_bytes());
-            out.extend(value.as_bytes());
-        }
         let mut out = b"GGUF".to_vec();
         out.extend(3u32.to_le_bytes());
         out.extend((self.tensors.len() as u64).to_le_bytes());
         out.extend((self.metadata.len() as u64).to_le_bytes());
         for (key, value) in &self.metadata {
-            string(&mut out, key);
-            match value {
-                Meta::U32(value) => {
-                    out.extend(4u32.to_le_bytes());
-                    out.extend(value.to_le_bytes());
-                }
-                Meta::F32(value) => {
-                    out.extend(6u32.to_le_bytes());
-                    out.extend(value.to_le_bytes());
-                }
-                Meta::Bool(value) => {
-                    out.extend(7u32.to_le_bytes());
-                    out.push(u8::from(*value));
-                }
-                Meta::Str(value) => {
-                    out.extend(8u32.to_le_bytes());
-                    string(&mut out, value);
-                }
-                Meta::Strings(values) => {
-                    out.extend(9u32.to_le_bytes());
-                    out.extend(8u32.to_le_bytes());
-                    out.extend((values.len() as u64).to_le_bytes());
-                    for value in values {
-                        string(&mut out, value);
-                    }
-                }
-                Meta::I32s(values) => {
-                    out.extend(9u32.to_le_bytes());
-                    out.extend(5u32.to_le_bytes());
-                    out.extend((values.len() as u64).to_le_bytes());
-                    for value in values {
-                        out.extend(value.to_le_bytes());
-                    }
-                }
-                Meta::U32s(values) => {
-                    out.extend(9u32.to_le_bytes());
-                    out.extend(4u32.to_le_bytes());
-                    out.extend((values.len() as u64).to_le_bytes());
-                    for value in values {
-                        out.extend(value.to_le_bytes());
-                    }
-                }
-            }
+            out.extend(Self::entry(key, value));
         }
         let mut offset = 0u64;
         for (name, shape, encoding) in &self.tensors {
@@ -305,6 +303,136 @@ fn projector() -> Gguf {
     gguf
 }
 
+// A repository laid out as published ones are ------------------------------------------------
+
+/// The tokenizer arrays every file of `LAYOUTS` shares, sized like a real vocabulary's relative to
+/// the rest of a header: tokens, scores, token types and merges.
+fn layout_tokenizer() -> Vec<(String, Meta)> {
+    let tokens = (0..VOCABULARY)
+        .map(|id| match id {
+            0 => "<unk>".to_owned(),
+            1 => "<s>".to_owned(),
+            2 => "</s>".to_owned(),
+            3 => "<|im_start|>".to_owned(),
+            4 => "<|im_end|>".to_owned(),
+            id => format!("t{id}-{:08x}", id.wrapping_mul(2_654_435_761) as u32),
+        })
+        .collect::<Vec<_>>();
+    let mut kinds = vec![1; VOCABULARY as usize];
+    kinds[..5].fill(3);
+    let merges = (0..120_000_u64)
+        .map(|index| format!("t{} t{}", 5 + index % 31_000, 5 + (index * 7919) % 31_000))
+        .collect::<Vec<_>>();
+    vec![
+        ("tokenizer.ggml.tokens".to_owned(), Meta::Strings(tokens)),
+        ("tokenizer.ggml.scores".to_owned(), Meta::F32s((0..VOCABULARY).map(|id| -(id as f32)).collect())),
+        ("tokenizer.ggml.token_type".to_owned(), Meta::I32s(kinds)),
+        ("tokenizer.ggml.merges".to_owned(), Meta::Strings(merges)),
+    ]
+}
+
+/// The encoded length of the shared tokenizer arrays.
+fn layout_shared_bytes() -> usize {
+    layout_tokenizer()
+        .iter()
+        .map(|(key, value)| Gguf::entry(key, value).len())
+        .sum()
+}
+
+/// `gguf` with the shared tokenizer in place of its token list, its metadata ordered as `order`
+/// moves keys to the end.
+fn with_layout_tokenizer(mut gguf: Gguf, padding: u32, to_end: &[&str]) -> Gguf {
+    let at = gguf
+        .metadata
+        .iter()
+        .position(|(key, _)| key == "tokenizer.ggml.tokens")
+        .unwrap_or(gguf.metadata.len());
+    gguf.metadata.retain(|(key, _)| {
+        !matches!(
+            key.as_str(),
+            "tokenizer.ggml.tokens" | "tokenizer.ggml.token_type" | "tokenizer.ggml.merges"
+        )
+    });
+    let at = at.min(gguf.metadata.len());
+    gguf.metadata.splice(at..at, layout_tokenizer());
+    gguf.set("tokenizer.ggml.padding_token_id", Meta::U32(padding));
+    for key in to_end {
+        if let Some(index) = gguf.metadata.iter().position(|(name, _)| name == key) {
+            let entry = gguf.metadata.remove(index);
+            gguf.metadata.push(entry);
+        }
+    }
+    gguf
+}
+
+/// The files of `LAYOUTS`: quantizations whose metadata order, names, padding token and
+/// imatrix keys differ around one shared tokenizer, one preceded by a large metadata array of its
+/// own, a three-way split version, a projector, an MTP drafter whose end-of-sequence token and
+/// first and last token types differ, an imatrix, and a file whose header the engine can't read.
+fn layout_files() -> Vec<StubFile> {
+    let mut bf16 = llama(32, Encoding::BF16);
+    bf16.metadata.rotate_right(1);
+    let bf16 = with_layout_tokenizer(bf16, 0, &[]);
+    let mut q8 = with_layout_tokenizer(llama(7, Encoding::Q8_0), 0, &["general.file_type", "tokenizer.chat_template"]);
+    q8.set("quantize.imatrix.file", Meta::Str("imatrix/imatrix.gguf".into()));
+    q8.set("quantize.imatrix.entries_count", Meta::U32(14));
+    let mut q4 = with_layout_tokenizer(llama(15, Encoding::Q4K), 2, &["general.file_type"]);
+    q4.set("general.name", Meta::Str("Llama Layouts Abliterated Q4_K_M".into()));
+    let mut q2 = llama(10, Encoding::Q8_0);
+    q2.encode_all(Encoding::Q8_0, Encoding::Q2K);
+    q2.metadata.insert(
+        2,
+        ("prism.hadamard.sign_values".to_owned(), Meta::I32s((0..40_000).collect())),
+    );
+    let q2 = with_layout_tokenizer(q2, 0, &[]);
+    let iq1 = with_layout_tokenizer(llama(29, Encoding::Q8_0), 0, &[]);
+    let mut mtp = dflash(HIDDEN);
+    mtp.metadata.extend(layout_tokenizer());
+    if let Some((_, Meta::I32s(kinds))) =
+        mtp.metadata.iter_mut().find(|(key, _)| key == "tokenizer.ggml.token_type")
+    {
+        kinds[3] = 1;
+        kinds[VOCABULARY as usize - 10] = 4;
+    }
+    mtp.set("tokenizer.ggml.eos_token_id", Meta::U32(2));
+    let mut imatrix = Gguf::default();
+    imatrix.set("general.type", Meta::Str("imatrix".into()));
+    for block in 0..BLOCKS {
+        imatrix.tensor(&format!("blk.{block}.ffn_up.weight.in_sum2"), &[HIDDEN], Encoding::F32);
+    }
+    let mut files = vec![
+        StubFile::new("Llama-Layouts-BF16.gguf", &bf16),
+        StubFile::new("Llama-Layouts-Q8_0.gguf", &q8),
+        StubFile::new("Llama-Layouts-Q4_K_M.gguf", &q4),
+        StubFile::new("Llama-Layouts-Q2_K.gguf", &q2),
+        StubFile::new("Llama-Layouts-IQ1_M.gguf", &iq1).with_tensor_type("blk.0.ffn_up.weight", 142),
+        StubFile::new("MTP/mtp-Llama-Layouts.gguf", &mtp),
+        StubFile::new("mmproj-F16.gguf", &projector()),
+        StubFile::new("imatrix/imatrix.gguf", &imatrix),
+    ];
+    let q6 = with_layout_tokenizer(llama(18, Encoding::Q8_0), 0, &[]);
+    let shard_tensors = q6.tensors.len().div_ceil(3);
+    for (index, tensors) in q6.tensors.chunks(shard_tensors).enumerate() {
+        let mut shard = Gguf::default();
+        if index == 0 {
+            shard.metadata = q6
+                .metadata
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+        }
+        shard.set("split.no", Meta::U32(index as u32));
+        shard.set("split.count", Meta::U32(3));
+        shard.set("split.tensors.count", Meta::U32(q6.tensors.len() as u32));
+        shard.tensors = tensors.to_vec();
+        files.push(StubFile::new(
+            &format!("Q6_K/Llama-Layouts-Q6_K-{:05}-of-00003.gguf", index + 1),
+            &shard,
+        ));
+    }
+    files
+}
+
 // The stub Hub -------------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -362,6 +490,7 @@ struct StubHub {
     search: Vec<serde_json::Value>,
     drafter_searches: AtomicUsize,
     header_requests: AtomicUsize,
+    header_bytes: AtomicUsize,
 }
 
 fn commit(seed: char) -> String {
@@ -494,6 +623,7 @@ impl StubHub {
                 let body = (start..=end)
                     .map(|offset| file.header.get(offset as usize).copied().unwrap_or(0))
                     .collect::<Vec<_>>();
+                self.header_bytes.fetch_add(body.len(), Ordering::SeqCst);
                 (
                     "206 Partial Content".to_owned(),
                     format!("Content-Range: bytes {start}-{end}/{}\r\n", file.size_bytes),
@@ -597,6 +727,7 @@ const CATALOG_DRAFT: &str = "catalog/Llama-DFlash-GGUF";
 const COMMUNITY: &str = "community/Llama-Finetune-GGUF";
 const THIRD_PARTY: &str = "thirdparty/Llama-DFlash-GGUF";
 const SPECULATIVE: &str = "community/Llama-Speculative-GGUF";
+const LAYOUTS: &str = "layouts/Llama-Layouts-GGUF";
 const REJECTED: &str = "community/Llama-Rejected-GGUF";
 const PLAIN: &str = "community/Llama-Plain-GGUF";
 const LEGACY: &str = "community/Llama-Legacy-GGUF";
@@ -703,6 +834,7 @@ fn hub() -> StubHub {
             &[],
         ),
     );
+    repositories.insert(LAYOUTS.to_owned(), repository('5', layout_files(), &[]));
     repositories.insert(
         THIRD_PARTY.to_owned(),
         repository('9', vec![StubFile::new("draft.gguf", &dflash(HIDDEN))], &["base/Llama"]),
@@ -730,6 +862,7 @@ fn hub() -> StubHub {
         ],
         drafter_searches: AtomicUsize::new(0),
         header_requests: AtomicUsize::new(0),
+        header_bytes: AtomicUsize::new(0),
     }
 }
 
@@ -1692,4 +1825,107 @@ fn enrichment_answers_only_for_the_exact_target_it_was_computed_for() {
         (model_id.clone(), "package_b".to_owned()),
         CustomModelEnrichmentResult::default()
     ));
+}
+
+/// QA saw a cold inspection of multi-version repositories pull 450 MB to 1.4 GB, far beyond
+/// their headers. A cold inspection, with the drafter list a CLI inspection asks for, reads each
+/// file's own header bytes and the shared tokenizer once, whatever order the metadata is in, and a
+/// split version's other shards only as far as their tensor directories.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cold_inspection_reads_about_the_distinct_header_bytes_of_every_layout() {
+    let fixture = fixture(Vec::new()).await;
+    let files = layout_files();
+    let carrying = files
+        .iter()
+        .filter(|file| {
+            file.header
+                .windows(b"tokenizer.ggml.merges".len())
+                .any(|window| window == b"tokenizer.ggml.merges")
+        })
+        .count();
+    // The MTP drafter's token types are its own.
+    let own_token_types = layout_tokenizer()
+        .iter()
+        .find(|(key, _)| key == "tokenizer.ggml.token_type")
+        .map(|(key, value)| Gguf::entry(key, value).len())
+        .unwrap();
+    let needed = files.iter().map(|file| file.header.len()).sum::<usize>()
+        - (carrying - 1) * layout_shared_bytes()
+        + own_token_types;
+    let before = fixture.hub.header_bytes.load(Ordering::SeqCst);
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::HuggingFace {
+            repository: HuggingFaceRepositoryId::new(LAYOUTS.to_owned()).unwrap(),
+            revision: "main".to_owned(),
+        })
+        .await
+        .expect("inspection");
+    fixture
+        .candidates
+        .drafters(DrafterCandidatesRequest::Candidate {
+            candidate: hugging_face_candidate(LAYOUTS, '5', "Llama-Layouts-Q8_0.gguf"),
+            other: None,
+        })
+        .await
+        .expect("drafter candidates");
+    let served = fixture.hub.header_bytes.load(Ordering::SeqCst) - before;
+    eprintln!(
+        "cold inspection of {} files: {served} bytes served for {needed} distinct header bytes ({:.2}x); every header whole is {} bytes",
+        files.len(),
+        served as f64 / needed as f64,
+        files.iter().map(|file| file.header.len()).sum::<usize>(),
+    );
+    assert!(carrying >= 7, "{carrying} files carry the shared tokenizer");
+    for file in [
+        "Llama-Layouts-BF16.gguf",
+        "Llama-Layouts-Q8_0.gguf",
+        "Llama-Layouts-Q4_K_M.gguf",
+        "Llama-Layouts-Q2_K.gguf",
+        "Q6_K/Llama-Layouts-Q6_K-00001-of-00003.gguf",
+    ] {
+        let assessment = &version(&inspection, file).assessment;
+        assert!(
+            assessment.as_ref().is_some_and(|assessment| !matches!(
+                assessment,
+                ModelAssessment::Unsupported { reasons, .. } if reasons.contains(&UnsupportedReason::Unreadable)
+            )),
+            "{file} is assessed from its exact header: {assessment:?}"
+        );
+    }
+    assert!(matches!(
+        &version(&inspection, "Llama-Layouts-IQ1_M.gguf").assessment,
+        Some(ModelAssessment::Unsupported { reasons, .. }) if reasons == &[UnsupportedReason::Unreadable]
+    ));
+    assert!(
+        served <= 2 * needed,
+        "{served} bytes served for {needed} distinct header bytes"
+    );
+    let snapshot = refresh_hugging_face_repository(
+        &fixture.models,
+        HuggingFaceRepositoryRequest {
+            repository: LAYOUTS.to_owned(),
+            revision: commit('5'),
+        },
+    )
+    .await
+    .expect("snapshot");
+    for file in &files {
+        let listed = snapshot
+            .gguf_files
+            .iter()
+            .find(|listed| listed.path == PathBuf::from(&file.path))
+            .expect("listed");
+        let expected = format!("{:x}", Sha256::digest(&file.header));
+        let digest = fixture
+            .models
+            .cached_hugging_face_header_digest(LAYOUTS, &snapshot.commit, listed)
+            .or_else(|| {
+                fixture
+                    .models
+                    .hugging_face_reference_header(LAYOUTS, &snapshot.commit, listed)
+                    .map(|bytes| format!("{:x}", Sha256::digest(&bytes)))
+            });
+        assert_eq!(digest, Some(expected), "{} is read exactly", file.path);
+    }
 }

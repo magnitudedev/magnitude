@@ -22,7 +22,6 @@ use magnitude_service_contracts::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::cache::ModelBlobKind;
 use crate::inventory::ManagedModelStore;
 use crate::package_service::{
     ServableModelBundleKey, servable_model_bundle_key_for_bundle, validated_package_from_resolved,
@@ -1664,7 +1663,7 @@ impl ResolvingRecommendableCatalog {
             .map(|header| {
                 self.models
                     .cache
-                    .read_blob(ModelBlobKind::GgufHeader, &header.digest)
+                    .read_header(&header.digest)
                     .map(|bytes| (header.digest.clone(), bytes))
                     .ok_or_else(|| {
                         InventoryError::Integrity(format!(

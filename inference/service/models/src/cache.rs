@@ -1,15 +1,18 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use getrandom::fill;
 use magnitude_service_contracts::models::{ModelAssessment, ModelCapabilities};
 use magnitude_service_utils::file_cache::{
-    read_bytes, read_json, read_object, write_bytes_atomic, write_json_atomic,
+    read_json, read_object, write_json_atomic,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+
+use crate::header_cache::{HEADER_CAPACITY_BYTES, HEADER_EVICTION_GRACE, HeaderCache};
 
 /// One completed profile assessment. Its evidence key carries the complete assessment identity
 /// (environment, bundle, profile and depths), so a read never revalidates it.
@@ -24,7 +27,6 @@ pub struct CachedModelAssessment {
 }
 
 const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
-const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ModelIndexKind {
@@ -55,23 +57,11 @@ impl ModelIndexKind {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum ModelBlobKind {
-    GgufHeader,
-}
-
-impl ModelBlobKind {
-    fn relative(self) -> &'static str {
-        match self {
-            Self::GgufHeader => "gguf-headers",
-        }
-    }
-}
-
 /// The sole filesystem namespace owner for recomputable model data.
 #[derive(Clone, Debug)]
 pub struct ModelCache {
     root: PathBuf,
+    headers: HeaderCache,
 }
 
 pub struct ModelCacheWorkspace {
@@ -99,6 +89,7 @@ impl ModelCache {
     pub fn new(cache_root: &Path) -> Self {
         Self {
             root: cache_root.to_path_buf(),
+            headers: HeaderCache::new(cache_root, HEADER_CAPACITY_BYTES, HEADER_EVICTION_GRACE),
         }
     }
 
@@ -160,29 +151,24 @@ impl ModelCache {
         self.root.join("kernels")
     }
 
-    pub fn read_blob(&self, kind: ModelBlobKind, digest: &str) -> Option<Vec<u8>> {
-        valid_digest(digest)
-            .then(|| read_bytes(&self.blob_path(kind, digest), MAX_BLOB_BYTES))
-            .flatten()
-            .filter(|bytes| hex_sha256(bytes) == digest)
-    }
-
-    /// Whether a blob is stored, without reading or verifying it; `read_blob` still verifies.
+    /// The GGUF header with this sha256, or `None` when the header cache doesn't hold it (see
+    /// `header_cache`): its caller fetches it again.
     #[must_use]
-    pub fn has_blob(&self, kind: ModelBlobKind, digest: &str) -> bool {
-        valid_digest(digest) && self.blob_path(kind, digest).is_file()
+    pub fn read_header(&self, digest: &str) -> Option<Vec<u8>> {
+        self.headers.read(digest)
     }
 
-    pub fn write_blob(&self, kind: ModelBlobKind, digest: &str, bytes: &[u8]) {
-        if !valid_digest(digest) || hex_sha256(bytes) != digest {
-            return;
-        }
-        write_bytes_atomic(
-            &self.blob_path(kind, digest),
-            &self.lock_path(&format!("blob-{digest}")),
-            bytes,
-            MAX_BLOB_BYTES,
-        );
+    /// Whether the header cache holds this header, marking it used for the read that follows;
+    /// `read_header` still verifies it.
+    #[must_use]
+    pub fn has_header(&self, digest: &str) -> bool {
+        self.headers.contains(digest)
+    }
+
+    /// Stores a GGUF header and returns its sha256. When the header cache has outgrown its
+    /// capacity, `pinned` names the headers it must keep.
+    pub fn write_header(&self, header: &[u8], pinned: impl FnOnce() -> BTreeSet<String>) -> String {
+        self.headers.write(header, pinned)
     }
 
     pub fn workspace(&self) -> io::Result<ModelCacheWorkspace> {
@@ -240,10 +226,6 @@ impl ModelCache {
             .join(format!("{digest}.json"))
     }
 
-    fn blob_path(&self, kind: ModelBlobKind, digest: &str) -> PathBuf {
-        self.root.join("blobs").join(kind.relative()).join(digest)
-    }
-
     fn lock_path(&self, name: &str) -> PathBuf {
         self.root.join(".locks").join(format!("{name}.lock"))
     }
@@ -257,12 +239,6 @@ fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
 
 #[cfg(test)]
 mod tests {
@@ -288,20 +264,10 @@ mod tests {
             Some(42)
         );
         let bytes = b"header";
-        let digest = hex_sha256(bytes);
-        cache.write_blob(ModelBlobKind::GgufHeader, &digest, bytes);
-        assert_eq!(
-            cache
-                .read_blob(ModelBlobKind::GgufHeader, &digest)
-                .as_deref(),
-            Some(bytes.as_slice())
-        );
-        cache.write_blob(ModelBlobKind::GgufHeader, &"0".repeat(64), bytes);
-        assert!(
-            cache
-                .read_blob(ModelBlobKind::GgufHeader, &"0".repeat(64))
-                .is_none()
-        );
+        let digest = cache.write_header(bytes, BTreeSet::new);
+        assert_eq!(digest, hex_sha256(bytes));
+        assert_eq!(cache.read_header(&digest).as_deref(), Some(bytes.as_slice()));
+        assert!(cache.read_header(&"0".repeat(64)).is_none());
 
         let index_path = cache.index_path(ModelIndexKind::InventoryMetadata, "model evidence");
         fs::write(&index_path, b"corrupt").unwrap();
@@ -315,13 +281,8 @@ mod tests {
             Some(7)
         );
 
-        let blob_path = cache.blob_path(ModelBlobKind::GgufHeader, &digest);
-        fs::write(&blob_path, b"corrupt").unwrap();
-        assert!(
-            cache
-                .read_blob(ModelBlobKind::GgufHeader, &digest)
-                .is_none()
-        );
+        fs::write(directory.path().join("blobs/gguf-headers").join(&digest), b"corrupt").unwrap();
+        assert!(cache.read_header(&digest).is_none());
     }
 
     #[test]

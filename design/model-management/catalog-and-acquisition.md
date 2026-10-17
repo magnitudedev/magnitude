@@ -52,13 +52,27 @@ prefix), then by downloads. Resolution returns the requested repository's immuta
 GGUF file evidence. Candidate inspection groups a repository's or path's GGUFs into versions (shards
 together) and assesses each through the engine from headers fetched by range request; it never
 reads file names for compatibility or quantization. Headers and their classification are cached by
-the file's content identity, so a repository is read once. Quantizations of one model share a
-tokenizer that is nearly all of a header, so after one header is read whole, each sibling is read
-as its own prefix, three verification windows inside the tokenizer compared byte for byte with the
-first header's, and its own remainder; any mismatch, or a result that does not parse, reads that
-header whole. A header read stops growing as soon as the bytes in hand prove the header invalid
-(such as a tensor type the engine doesn't know); only a prefix that ends before its header reads
-on. That a file's header is unreadable is cached like a header, by repository, commit, path and
+the file's content identity, so a repository is read once. A header is read by walking its layout
+from the bytes in hand and requesting about as many more as the layout still declares (exactly for
+fixed-width values, extrapolated within string lists, at most 4 MiB at a time), so a header costs
+its own length plus little; a header read stops as soon as the bytes in hand can't be a GGUF
+header, and whether the engine accepts one (its tensor types) is decided on the complete bytes.
+Quantizations of one model share a tokenizer that is nearly all of a header, as a few large
+metadata entries (token list, scores, token types, merges). One header is read whole first: an
+already cached one, else the largest file's (a projector, an imatrix or a drafter may carry no
+tokenizer; one that carries nothing to share leaves the next largest to be read). Every other file
+is read with it as a reference: when the walk reaches an entry whose key, type and element count
+match a reference's large entry, the run of large entries starting there is checked in one round of
+concurrent requests, windows at the start, middle and end of each entry compared byte for byte; the
+leading entries that match are taken from the reference and the file's own bytes continue the read.
+Small entries may differ in order, length and value (names, special token ids, quantization keys),
+an entry that differs (an MTP drafter's token types) is read from the file, and entries after it are
+checked again. Equality outside the windows is assumed, so the windows sit where tokenizers of one
+model differ: special tokens first, added tokens last. A cold inspection reads within twice the
+distinct header bytes its files need (a split version's further shards only as far as their tensor
+directories); at the 2026-10 QA's repositories that is 26 MB for `unsloth/gemma-4-E2B-it-GGUF`,
+21 MB for `huihui-ai/Huihui-Qwen3.8-27B-abliterated-GGUF` and 15 MB for
+`Arki05/Qwen3.5-4B-GGUF-shards`, where each read 0.45 to 1.4 GB before. That a file's header is unreadable is cached like a header, by repository, commit, path and
 content identity, so a repeated inspection fetches nothing for it. A header is every byte through the aligned tensor-data offset, or the whole file when it holds no
 tensor data and ends before that offset's padding, as a split's metadata-only first shard may. A file whose header is invalid is a version assessed `Unsupported` with the `Unreadable`
 reason and the parser's detail; it never fails the repository's inspection, and an inspection
@@ -239,6 +253,24 @@ All inventory indexes, content hashes, GGUF parses, validations, and derived pac
 caches. Missing, stale, malformed, unreadable, or unwritable cache state causes scoped recomputation
 and cannot remove a valid artifact from inventory. Catalog failure cannot hide independently
 servable artifacts.
+
+### Header cache
+
+The GGUF headers fetched by range request for inspection and previews are kept in a header cache
+(`blobs/gguf-headers` under the model cache), by the sha256 of the header bytes. A header is stored
+as a recipe of segments: every metadata entry of 64 KiB or more (a tokenizer's lists) is a chunk
+file named by its own sha256 (`blobs/gguf-header-chunks`), stored once however many headers hold
+it, and the rest of the header is inline in the recipe; the headers of one model's quantizations
+share their tokenizer chunks, across repositories too. The cache is bounded to 512 MiB of recipes
+and the chunks they reference. Reading a header marks it used, and once the cache has grown by an
+eighth of its capacity since it last checked (and on its first write in a process) it evicts the
+least recently used headers until it fits, then removes chunks no remaining header references.
+Eviction never removes a header the release catalog lists, a header of a file of an installed
+Hugging Face package, or a header used in the last ten minutes (an inspection or install in
+flight). Eviction is always safe: every read assembles the header and verifies its sha256, so an
+evicted, partially removed or damaged header, and any entry not in the recipe format, is a miss
+that its reader fetches again by range request; the classification and assessment indexes keyed by
+header digest stay valid, so an evicted header costs a fetch only when its bytes are needed again.
 
 ### Model locations
 

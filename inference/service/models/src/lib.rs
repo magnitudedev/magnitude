@@ -11,7 +11,8 @@ mod custom_models;
 mod download;
 mod download_service;
 pub mod gguf;
-mod header_delta;
+mod header_cache;
+mod header_layout;
 mod hugging_face;
 mod identity;
 mod inventory;
@@ -22,6 +23,7 @@ mod model_domains;
 mod model_projection;
 mod package_service;
 mod preview;
+mod remote_header;
 mod service;
 mod snapshot_blobs;
 mod store_fs;
@@ -30,7 +32,7 @@ mod test_gguf;
 mod validation;
 
 pub use cache::{
-    CachedModelAssessment, ModelBlobKind, ModelCache, ModelCacheWorkspace, ModelIndexKind,
+    CachedModelAssessment, ModelCache, ModelCacheWorkspace, ModelIndexKind,
 };
 pub use catalog::{
     CatalogLockAdvance, GeneratedReleaseCatalog, ReleaseCatalog, ReleaseComponentHeader,

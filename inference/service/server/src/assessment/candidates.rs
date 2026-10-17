@@ -660,9 +660,9 @@ impl ManagedModelCandidates {
     // Classification -------------------------------------------------------------------------
 
     /// Every complete GGUF of a snapshot, classified from its header. Classifications are cached
-    /// by header, so only files never seen before are read: one whole header first, whose
-    /// tokenizer the others then share (see the store's `hugging_face_gguf_header`), read
-    /// concurrently.
+    /// by header, so only files never seen before are read: one whole header first, whose large
+    /// metadata entries (the tokenizer) the others then share (see the store's
+    /// `hugging_face_gguf_header`), read concurrently.
     async fn classify_hugging_face(
         &self,
         snapshot: &HuggingFaceRepositorySnapshot,
@@ -695,30 +695,44 @@ impl ManagedModelCandidates {
         if uncached.is_empty() {
             return Ok(classified);
         }
-        // Read a likely model file whole: a projector shares no tokenizer. Names only order the
-        // requests; headers decide every role. A probe whose header is invalid can't share its
-        // tokenizer, so the next file is read whole instead.
-        let mut sibling = None;
-        while sibling.is_none() && !uncached.is_empty() {
+        // Read one header whole to lend its tokenizer to the others: an already cached one, or
+        // the largest file's, the likeliest to be a complete model carrying the tokenizer (a
+        // projector, an imatrix or a drafter may carry none). Names only order the requests;
+        // headers decide every role. A probe whose header holds nothing to share (an imatrix)
+        // or can't be read at all leaves the next largest file to be read whole.
+        let probe_order = |group: &GgufGroup| {
+            (
+                !path_string(&group.primary().path).to_lowercase().contains("mmproj"),
+                group.size_bytes(),
+            )
+        };
+        let mut reference = classified
+            .iter()
+            .map(|classified| &classified.group)
+            .max_by_key(|group| probe_order(group))
+            .and_then(|group| {
+                let file = snapshot_file(snapshot, &group.primary().path).ok()?;
+                self.models()
+                    .hugging_face_reference_header(&snapshot.repository, &snapshot.commit, file)
+            });
+        while reference.is_none() && !uncached.is_empty() {
             let probe = uncached
                 .iter()
-                .position(|group| !path_string(&group.primary().path).to_lowercase().contains("mmproj"))
-                .unwrap_or(0);
+                .enumerate()
+                .max_by_key(|(_, group)| probe_order(group))
+                .map_or(0, |(index, _)| index);
             let probe = uncached.remove(probe);
             let probe_file = snapshot_file(snapshot, &probe.primary().path)?;
-            let group = self.classify_hugging_face_group(snapshot, probe, None).await?;
-            if group.unreadable.is_none() {
-                sibling = Some(
-                    self.models()
-                        .hugging_face_gguf_header(&snapshot.repository, &snapshot.commit, probe_file, None)
-                        .await?,
-                );
-            }
-            classified.push(group);
+            classified.push(self.classify_hugging_face_group(snapshot, probe, &[]).await?);
+            reference = self.models().hugging_face_reference_header(
+                &snapshot.repository,
+                &snapshot.commit,
+                probe_file,
+            );
         }
-        let sibling = sibling.as_ref().map(|header| header.bytes.as_slice());
+        let references = reference.as_deref().into_iter().collect::<Vec<_>>();
         let rest = futures_util::stream::iter(uncached.into_iter().map(|group| {
-            self.classify_hugging_face_group(snapshot, group, sibling)
+            self.classify_hugging_face_group(snapshot, group, &references)
         }))
         .buffered(HEADER_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -739,7 +753,7 @@ impl ManagedModelCandidates {
         &self,
         snapshot: &HuggingFaceRepositorySnapshot,
         group: GgufGroup,
-        sibling: Option<&[u8]>,
+        references: &[&[u8]],
     ) -> Result<ClassifiedGroup, InventoryError> {
         let file = snapshot_file(snapshot, &group.primary().path)?;
         match self
@@ -749,7 +763,7 @@ impl ManagedModelCandidates {
                 &snapshot.commit,
                 file,
                 &self.architectures,
-                sibling,
+                references,
             )
             .await
         {

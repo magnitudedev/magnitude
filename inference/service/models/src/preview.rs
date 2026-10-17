@@ -19,15 +19,13 @@ use reqwest::header::{CONTENT_RANGE, ETAG, IF_NONE_MATCH, RANGE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::cache::{ModelBlobKind, ModelCacheWorkspace, ModelIndexKind};
+use crate::cache::{ModelCacheWorkspace, ModelIndexKind};
 use crate::candidate_files::RecognizedArchitectures;
 use crate::lineage::CatalogLineage;
 use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::content_id;
 use crate::inventory::{ManagedModelStore, build_model, now};
 
-const INITIAL_HEADER_BYTES: usize = 1024 * 1024;
-const MAX_HEADER_BYTES: usize = 128 * 1024 * 1024;
 const MAX_HUB_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HUB_SIBLINGS: usize = 100_000;
 const MAX_HUB_SEARCH_RESULTS: u32 = 50;
@@ -714,8 +712,7 @@ impl ManagedModelStore {
             .map_err(|error| InventoryError::Internal(error.to_string()))?;
         let cached = self.cached_preview_artifact(source).filter(|artifact| {
             artifact.components.iter().all(|component| {
-                self.cache
-                    .has_blob(ModelBlobKind::GgufHeader, &component.header_digest)
+                self.cache.has_header(&component.header_digest)
             })
         });
         let artifact = match cached {
@@ -745,8 +742,7 @@ impl ManagedModelStore {
             .map_err(|error| InventoryError::Internal(error.to_string()))?;
         let cached = self.cached_preview_artifact(source).filter(|artifact| {
             artifact.components.iter().all(|component| {
-                self.cache
-                    .has_blob(ModelBlobKind::GgufHeader, &component.header_digest)
+                self.cache.has_header(&component.header_digest)
             })
         });
         let artifact = match cached {
@@ -819,12 +815,9 @@ impl ManagedModelStore {
                 &commit,
                 &component.path,
                 size,
-                None,
             )
             .await?;
-            let header_digest = format!("{:x}", Sha256::digest(&header));
-            self.cache
-                .write_blob(ModelBlobKind::GgufHeader, &header_digest, &header);
+            let header_digest = self.write_header(&header);
             components.push(CachedComponent {
                 component,
                 header_digest,
@@ -856,7 +849,7 @@ impl ManagedModelStore {
                             size_bytes: component.size_bytes,
                             content: component.content.clone(),
                         },
-                        None,
+                        &[],
                     )
                     .await?;
                 Ok::<_, InventoryError>((
@@ -875,12 +868,6 @@ impl ManagedModelStore {
             .into_iter()
             .collect::<Result<Vec<_>, InventoryError>>()?;
         components.sort_by_key(|(index, _)| *index);
-        for (_, component) in &components {
-            if let Some(header) = &component.acquired_header {
-                self.cache
-                    .write_blob(ModelBlobKind::GgufHeader, &component.header_digest, header);
-            }
-        }
         Ok(CachedArtifact {
             repository: source.repository.clone(),
             commit: snapshot.commit.clone(),
@@ -903,7 +890,7 @@ impl ManagedModelStore {
         for cached in &artifact.components {
             let bytes = self
                 .cache
-                .read_blob(ModelBlobKind::GgufHeader, &cached.header_digest)
+                .read_header(&cached.header_digest)
                 .or_else(|| cached.acquired_header.clone())
                 .ok_or_else(|| InventoryError::Internal("preview header cache miss".to_owned()))?;
             let path = workspace.path().join(&cached.component.path);
@@ -1529,10 +1516,8 @@ impl<'a> RemoteRanges<'a> {
     }
 }
 
-/// Every byte of a remote GGUF through its aligned tensor-data offset, by exact range requests.
-/// The first request asks for `size_hint` (a sibling's header length) or `INITIAL_HEADER_BYTES`,
-/// and each further request grows the range fourfold, so a header costs one request when the
-/// hint holds and few when it doesn't.
+/// Every byte of a remote GGUF through its aligned tensor-data offset (see `remote_header`),
+/// when the engine's parser accepts it.
 async fn fetch_header(
     http: &reqwest::Client,
     endpoint: &str,
@@ -1540,70 +1525,30 @@ async fn fetch_header(
     commit: &str,
     path: &Path,
     logical_size: u64,
-    size_hint: Option<usize>,
 ) -> Result<Vec<u8>, InventoryError> {
     let mut remote = RemoteRanges::new(http, endpoint, repository, commit, path, logical_size)?;
-    read_header(&mut remote, Vec::new(), size_hint.unwrap_or(INITIAL_HEADER_BYTES)).await
+    let header = crate::remote_header::read_header(&mut remote, &[]).await?;
+    match header_verdict(header).await? {
+        (header, Ok(())) => Ok(header),
+        (_, Err(detail)) => Err(InventoryError::Integrity(detail)),
+    }
 }
 
-/// A remote header read on from `prefix` (its first bytes, possibly none), first to
-/// `target_length`.
-pub(crate) async fn read_header(
-    remote: &mut RemoteRanges<'_>,
-    mut bytes: Vec<u8>,
-    target_length: usize,
-) -> Result<Vec<u8>, InventoryError> {
-    let logical_length = remote.logical_length();
-    let mut target_length = target_length
-        .max(INITIAL_HEADER_BYTES)
-        .min(MAX_HEADER_BYTES)
-        .min(logical_length);
-    loop {
-        if target_length > bytes.len() {
-            let range = remote.read(bytes.len(), target_length).await?;
-            bytes.extend_from_slice(&range);
-        }
-        let (returned, inspected) = tokio::task::spawn_blocking(move || {
-            let inspected = header_prefix(&bytes);
-            (bytes, inspected)
-        })
-        .await
-        .map_err(|error| InventoryError::Internal(error.to_string()))?;
-        bytes = returned;
-        match inspected? {
-            HeaderPrefix::Complete(header_length) if header_length <= bytes.len() => {
-                bytes.truncate(header_length);
-                return Ok(bytes);
-            }
-            // A file with no tensor data (a split's metadata-only first shard) may end before the
-            // padding to its aligned data offset: the whole file is its header.
-            HeaderPrefix::Complete(_) if bytes.len() == logical_length => return Ok(bytes),
-            HeaderPrefix::Complete(header_length)
-                if header_length <= MAX_HEADER_BYTES.min(logical_length) =>
-            {
-                target_length = header_length;
-            }
-            HeaderPrefix::Truncated
-                if bytes.len() < MAX_HEADER_BYTES && bytes.len() < logical_length =>
-            {
-                target_length = bytes
-                    .len()
-                    .saturating_mul(4)
-                    .min(MAX_HEADER_BYTES)
-                    .min(logical_length);
-            }
-            HeaderPrefix::Truncated if bytes.len() == logical_length => {
-                return Err(InventoryError::Integrity(
-                    "the file ends before its GGUF header does".to_owned(),
-                ));
-            }
-            HeaderPrefix::Complete(_) | HeaderPrefix::Truncated => {
-                return Err(InventoryError::Integrity(format!(
-                    "GGUF header extends beyond {MAX_HEADER_BYTES} bytes"
-                )));
-            }
-        }
-    }
+/// A complete header and whether the engine's parser accepts it, or why not.
+async fn header_verdict(
+    header: Vec<u8>,
+) -> Result<(Vec<u8>, Result<(), String>), InventoryError> {
+    tokio::task::spawn_blocking(move || {
+        let verdict = match header_prefix(&header) {
+            Ok(HeaderPrefix::Complete(length)) if length >= header.len() => Ok(()),
+            Ok(_) => Err("the GGUF header's layout is inconsistent".to_owned()),
+            Err(InventoryError::Integrity(detail)) => Err(detail),
+            Err(error) => return Err(error),
+        };
+        Ok((header, verdict))
+    })
+    .await
+    .map_err(|error| InventoryError::Internal(error.to_string()))?
 }
 
 /// What a GGUF prefix says about its header.
@@ -1636,7 +1581,8 @@ pub(crate) fn header_prefix(prefix: &[u8]) -> Result<HeaderPrefix, InventoryErro
 
 /// The aligned tensor-data offset of a GGUF prefix, or an error when the prefix is too short to
 /// hold the whole header.
-pub(crate) fn header_length(prefix: &[u8]) -> Result<usize, InventoryError> {
+#[cfg(test)]
+fn header_length(prefix: &[u8]) -> Result<usize, InventoryError> {
     match header_prefix(prefix)? {
         HeaderPrefix::Complete(length) => Ok(length),
         HeaderPrefix::Truncated => Err(InventoryError::Integrity(
@@ -1806,13 +1752,8 @@ fn classification_evidence(
     format!("candidate-classification-v2:{digest}:{}", architectures.key())
 }
 
-fn remote_header_evidence(
-    endpoint: &str,
-    repository: &str,
-    commit: &str,
-    file: &HuggingFaceRepositoryFile,
-) -> String {
-    format!("{endpoint}:{repository}@{commit}/{}", file.path.display())
+fn remote_header_evidence(endpoint: &str, repository: &str, commit: &str, path: &Path) -> String {
+    format!("{endpoint}:{repository}@{commit}/{}", path.display())
 }
 
 /// One remote GGUF header: every byte through the aligned tensor-data offset, and its sha256.
@@ -1822,8 +1763,10 @@ pub struct RemoteGgufHeader {
     pub bytes: Vec<u8>,
 }
 
-/// What reading one remote file's header found: its bytes (stored as a blob by digest), or why it
-/// isn't a readable GGUF header. Both are facts of the immutable file, so neither is fetched again.
+/// What reading one remote file's header found: its bytes (stored in the header cache by
+/// digest), or why the engine can't read it, with the bytes when the header is complete but
+/// invalid (a tensor type the engine doesn't know). Both are facts of the immutable file, so
+/// neither is fetched again.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CachedRemoteGgufHeader {
@@ -1834,40 +1777,57 @@ struct CachedRemoteGgufHeader {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
 enum CachedRemoteHeader {
-    Read { digest: String },
-    Unreadable { detail: String },
+    Read {
+        digest: String,
+    },
+    Unreadable {
+        detail: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<String>,
+    },
+}
+
+impl CachedRemoteHeader {
+    fn digest(&self) -> Option<&str> {
+        match self {
+            Self::Read { digest } => Some(digest),
+            Self::Unreadable { digest, .. } => digest.as_deref(),
+        }
+    }
 }
 
 impl ManagedModelStore {
     /// The header of one file of an immutable repository snapshot, fetched by range requests once
-    /// and then served from the header cache. `sibling` is the header of another quantization of
-    /// the same model, whose tokenizer this file most likely shares (see `header_delta`).
+    /// and then served from the header cache. `references` are headers of other files of the same
+    /// repository, whose large metadata entries (a shared tokenizer) this file's header most
+    /// likely holds too (see `remote_header`).
     pub async fn hugging_face_gguf_header(
         &self,
         repository: &str,
         commit: &str,
         file: &HuggingFaceRepositoryFile,
-        sibling: Option<&[u8]>,
+        references: &[&[u8]],
     ) -> Result<RemoteGgufHeader, InventoryError> {
-        let evidence = remote_header_evidence(self.client.endpoint(), repository, commit, file);
+        let evidence =
+            remote_header_evidence(self.client.endpoint(), repository, commit, &file.path);
         match self.cached_hugging_face_header(repository, commit, file) {
-            Some(CachedRemoteHeader::Unreadable { detail }) => {
+            Some(CachedRemoteHeader::Unreadable { detail, .. }) => {
                 return Err(InventoryError::Integrity(detail));
             }
-            Some(CachedRemoteHeader::Read { .. }) | None => {}
-        }
-        if let Some(digest) = self.cached_hugging_face_header_digest(repository, commit, file) {
-            let cache = self.cache.clone();
-            let cached = tokio::task::spawn_blocking(move || {
-                cache
-                    .read_blob(ModelBlobKind::GgufHeader, &digest)
-                    .map(|bytes| RemoteGgufHeader { digest, bytes })
-            })
-            .await
-            .map_err(|error| InventoryError::Internal(error.to_string()))?;
-            if let Some(cached) = cached {
-                return Ok(cached);
+            Some(CachedRemoteHeader::Read { digest }) => {
+                let cache = self.cache.clone();
+                let cached = tokio::task::spawn_blocking(move || {
+                    cache
+                        .read_header(&digest)
+                        .map(|bytes| RemoteGgufHeader { digest, bytes })
+                })
+                .await
+                .map_err(|error| InventoryError::Internal(error.to_string()))?;
+                if let Some(cached) = cached {
+                    return Ok(cached);
+                }
             }
+            None => {}
         }
         let mut remote = RemoteRanges::new(
             &self.http,
@@ -1877,57 +1837,110 @@ impl ManagedModelStore {
             &file.path,
             file.size_bytes,
         )?;
-        let read = async {
-            let shared = match sibling {
-                Some(sibling) => {
-                    crate::header_delta::read_header_sharing_tokenizer(&mut remote, sibling).await?
-                }
-                None => None,
+        let (bytes, verdict) =
+            match crate::remote_header::read_header(&mut remote, references).await {
+                Ok(bytes) => header_verdict(bytes).await?,
+                Err(InventoryError::Integrity(detail)) => (Vec::new(), Err(detail)),
+                Err(error) => return Err(error),
             };
-            match shared {
-                Some(bytes) => Ok(bytes),
-                None => {
-                    let target = sibling.map_or(INITIAL_HEADER_BYTES, <[u8]>::len);
-                    read_header(&mut remote, Vec::new(), target).await
-                }
-            }
-        };
-        let bytes = match read.await {
-            Ok(bytes) => bytes,
-            Err(InventoryError::Integrity(detail)) => {
-                self.cache.write_index(
-                    ModelIndexKind::HuggingFaceGgufHeader,
-                    &evidence,
-                    &CachedRemoteGgufHeader {
-                        content: file.content.clone(),
-                        header: CachedRemoteHeader::Unreadable {
-                            detail: detail.clone(),
-                        },
-                    },
-                );
-                return Err(InventoryError::Integrity(detail));
-            }
-            Err(error) => return Err(error),
-        };
-        let cache = self.cache.clone();
+        let store = self.clone();
         let content = file.content.clone();
         tokio::task::spawn_blocking(move || {
-            let digest = format!("{:x}", Sha256::digest(&bytes));
-            cache.write_blob(ModelBlobKind::GgufHeader, &digest, &bytes);
-            cache.write_index(
+            let digest = (!bytes.is_empty()).then(|| store.write_header(&bytes));
+            let header = match (&verdict, digest.clone()) {
+                (Ok(()), Some(digest)) => CachedRemoteHeader::Read { digest },
+                (Ok(()), None) => CachedRemoteHeader::Unreadable {
+                    detail: "the GGUF header is empty".to_owned(),
+                    digest: None,
+                },
+                (Err(detail), digest) => CachedRemoteHeader::Unreadable {
+                    detail: detail.clone(),
+                    digest,
+                },
+            };
+            store.cache.write_index(
                 ModelIndexKind::HuggingFaceGgufHeader,
                 &evidence,
-                &CachedRemoteGgufHeader {
-                    content,
-                    header: CachedRemoteHeader::Read {
-                        digest: digest.clone(),
-                    },
-                },
+                &CachedRemoteGgufHeader { content, header },
             );
-            RemoteGgufHeader { digest, bytes }
+            match (verdict, digest) {
+                (Ok(()), Some(digest)) => Ok(RemoteGgufHeader { digest, bytes }),
+                (Ok(()), None) => Err(InventoryError::Integrity(
+                    "the GGUF header is empty".to_owned(),
+                )),
+                (Err(detail), _) => Err(InventoryError::Integrity(detail)),
+            }
         })
         .await
-        .map_err(|error| InventoryError::Internal(error.to_string()))
+        .map_err(|error| InventoryError::Internal(error.to_string()))?
+    }
+
+    /// The cached header of one file of a repository snapshot, readable or not, when it holds
+    /// large metadata entries other files of the repository may share: a reference for reading
+    /// their headers (see `remote_header`). Nothing is fetched.
+    #[must_use]
+    pub fn hugging_face_reference_header(
+        &self,
+        repository: &str,
+        commit: &str,
+        file: &HuggingFaceRepositoryFile,
+    ) -> Option<Vec<u8>> {
+        let cached = self.cached_hugging_face_header(repository, commit, file)?;
+        let bytes = self.cache.read_header(cached.digest()?)?;
+        matches!(
+            crate::header_layout::walk(&bytes),
+            Ok(crate::header_layout::Layout::Complete { entries, .. })
+                if entries.iter().any(crate::header_layout::Entry::shared)
+        )
+        .then_some(bytes)
+    }
+
+    /// Stores a header in the header cache, keeping the headers installed packages and the
+    /// release catalog need when the cache evicts.
+    pub(crate) fn write_header(&self, header: &[u8]) -> String {
+        self.cache
+            .write_header(header, || self.pinned_header_digests())
+    }
+
+    /// The headers the header cache never evicts: the release catalog's, and those of every file
+    /// of an installed Hugging Face package.
+    fn pinned_header_digests(&self) -> BTreeSet<String> {
+        let mut pinned = self
+            .config
+            .catalog_header_digests
+            .values()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if let Ok(snapshot) = self.installed_packages.read() {
+            for record in snapshot.records.values() {
+                let package = &record.installed.package;
+                let magnitude_service_contracts::models::ModelPackageSource::HuggingFace {
+                    repository,
+                    revision,
+                } = &package.source
+                else {
+                    continue;
+                };
+                for file in &package.files {
+                    if let Some(digest) = self
+                        .cache
+                        .read_index::<CachedRemoteGgufHeader>(
+                            ModelIndexKind::HuggingFaceGgufHeader,
+                            &remote_header_evidence(
+                                self.client.endpoint(),
+                                repository,
+                                revision,
+                                &file.path,
+                            ),
+                        )
+                        .and_then(|cached| cached.header.digest().map(ToOwned::to_owned))
+                    {
+                        pinned.insert(digest);
+                    }
+                }
+            }
+        }
+        pinned
     }
 
     /// The header digest and classification of one file of an immutable repository snapshot.
@@ -1939,13 +1952,13 @@ impl ManagedModelStore {
         commit: &str,
         file: &HuggingFaceRepositoryFile,
         architectures: &crate::candidate_files::RecognizedArchitectures,
-        sibling: Option<&[u8]>,
+        references: &[&[u8]],
     ) -> Result<(String, crate::candidate_files::HeaderClassification), InventoryError> {
         if let Some(classified) = self.cached_hugging_face_classification(repository, commit, file, architectures) {
             return Ok(classified);
         }
         let header = self
-            .hugging_face_gguf_header(repository, commit, file, sibling)
+            .hugging_face_gguf_header(repository, commit, file, references)
             .await?;
         let classifier = architectures.clone();
         let classification = tokio::task::spawn_blocking(move || {
@@ -1978,8 +1991,8 @@ impl ManagedModelStore {
         Some((digest, classification))
     }
 
-    /// The header digest of one file of an immutable repository snapshot when its header was
-    /// fetched before, without reading the header itself.
+    /// The header digest of one readable file of an immutable repository snapshot when its
+    /// header was fetched before, without reading the header itself.
     #[must_use]
     pub fn cached_hugging_face_header_digest(
         &self,
@@ -2002,7 +2015,7 @@ impl ManagedModelStore {
         self.cache
             .read_index::<CachedRemoteGgufHeader>(
                 ModelIndexKind::HuggingFaceGgufHeader,
-                &remote_header_evidence(self.client.endpoint(), repository, commit, file),
+                &remote_header_evidence(self.client.endpoint(), repository, commit, &file.path),
             )
             .filter(|cached| cached.content == file.content)
             .map(|cached| cached.header)
@@ -2389,10 +2402,7 @@ mod tests {
                 .unwrap()
                 .read_exact(&mut header)
                 .unwrap();
-            let header_digest = format!("{:x}", Sha256::digest(&header));
-            manager
-                .cache
-                .write_blob(ModelBlobKind::GgufHeader, &header_digest, &header);
+            let header_digest = manager.write_header(&header);
             let relative =
                 PathBuf::from(fixture.file_name().and_then(|name| name.to_str()).unwrap());
             let preview_component = ModelComponent {
@@ -2619,14 +2629,14 @@ mod tests {
         };
         let commit = "a".repeat(40);
         let sibling = store
-            .hugging_face_gguf_header("owner/repo", &commit, &file("sibling.gguf", &sibling_file), None)
+            .hugging_face_gguf_header("owner/repo", &commit, &file("sibling.gguf", &sibling_file), &[])
             .await
             .unwrap();
         let same_length = header_length(&same).unwrap();
         assert!(same_length > 2 * 1024 * 1024);
         let before = sent.load(std::sync::atomic::Ordering::SeqCst);
         let shared = store
-            .hugging_face_gguf_header("owner/repo", &commit, &file("same.gguf", &same), Some(&sibling.bytes))
+            .hugging_face_gguf_header("owner/repo", &commit, &file("same.gguf", &same), &[&sibling.bytes])
             .await
             .unwrap();
         assert_eq!(shared.bytes, same[..same_length], "the shared header is exactly the file's");
@@ -2635,18 +2645,18 @@ mod tests {
             "only the prefix, the verification windows and the remainder are read"
         );
         let different = store
-            .hugging_face_gguf_header("owner/repo", &commit, &file("renamed.gguf", &renamed), Some(&sibling.bytes))
+            .hugging_face_gguf_header("owner/repo", &commit, &file("renamed.gguf", &renamed), &[&sibling.bytes])
             .await
             .unwrap();
         assert_eq!(
             different.bytes,
             renamed[..header_length(&renamed).unwrap()],
-            "a tokenizer that differs inside a verification window is read whole"
+            "a tokenizer that differs inside a verification window is read from the file"
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_header_is_read_in_few_requests_and_in_one_with_a_sibling_hint() {
+    async fn a_header_is_read_in_about_its_own_length_in_two_requests() {
         let description = "x".repeat(3 * 1024 * 1024);
         let mut file = crate::test_gguf::gguf_bytes(
             &[
@@ -2657,31 +2667,24 @@ mod tests {
         );
         file.resize(file.len() + 8 * 1024 * 1024, 0);
         let size = u64::try_from(file.len()).unwrap();
-        let (endpoint, requests, _) = serve_ranges(vec![("model-Q4_K_M.gguf", file.clone())]);
-        let http = reqwest::Client::new();
-        let path = Path::new("model-Q4_K_M.gguf");
-        let header = fetch_header(&http, &endpoint, "owner/repo", &"a".repeat(40), path, size, None)
-            .await
-            .unwrap();
+        let (endpoint, requests, sent) = serve_ranges(vec![("model-Q4_K_M.gguf", file.clone())]);
+        let header = fetch_header(
+            &reqwest::Client::new(),
+            &endpoint,
+            "owner/repo",
+            &"a".repeat(40),
+            Path::new("model-Q4_K_M.gguf"),
+            size,
+        )
+        .await
+        .unwrap();
         assert!(header.len() > 3 * 1024 * 1024 && file.starts_with(&header));
         assert_eq!(
             requests.load(std::sync::atomic::Ordering::SeqCst),
             2,
-            "a 1 MiB probe, then a fourfold range"
+            "a probe, then the rest its layout declares"
         );
-        let hinted = fetch_header(
-            &http,
-            &endpoint,
-            "owner/repo",
-            &"a".repeat(40),
-            path,
-            size,
-            Some(header.len()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(hinted, header);
-        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3, "the hint covers the header");
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst) <= header.len() + 64 * 1024);
     }
 
     /// A split's metadata-only first shard: no tensors, its header unpadded at the end of the file,
@@ -2722,7 +2725,6 @@ mod tests {
                 &"a".repeat(40),
                 Path::new("model-00001-of-00006.gguf"),
                 size,
-                None,
             )
             .await
             .unwrap();
@@ -2751,7 +2753,6 @@ mod tests {
             &"a".repeat(40),
             Path::new("model.gguf"),
             size,
-            None,
         )
         .await
         .unwrap();
@@ -2778,7 +2779,6 @@ mod tests {
             &"a".repeat(40),
             Path::new("model.gguf"),
             size,
-            None,
         )
         .await
         .unwrap_err();
@@ -2818,7 +2818,6 @@ mod tests {
             &"a".repeat(40),
             Path::new("model.gguf"),
             1024 * 1024 * 1024,
-            None,
         )
         .await
         .unwrap_err();
@@ -2862,7 +2861,7 @@ mod tests {
         let commit = "a".repeat(40);
         for attempt in 0..2 {
             let error = store
-                .hugging_face_gguf_header("owner/repo", &commit, &repository_file, None)
+                .hugging_face_gguf_header("owner/repo", &commit, &repository_file, &[])
                 .await
                 .unwrap_err();
             assert!(
@@ -2872,7 +2871,7 @@ mod tests {
         }
         assert_eq!(
             sent.load(std::sync::atomic::Ordering::SeqCst),
-            INITIAL_HEADER_BYTES,
+            crate::remote_header::INITIAL_READ_BYTES,
             "one probe, and nothing on the retry"
         );
     }
@@ -2907,7 +2906,6 @@ mod tests {
             &"a".repeat(40),
             Path::new("model-Q4_0_4_4.gguf"),
             size,
-            None,
         )
         .await
         .unwrap_err();
