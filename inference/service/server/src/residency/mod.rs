@@ -15,7 +15,7 @@ use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
     MemoryShortage, ModelId, ModelInstance, ModelInstanceAllocation, ModelInstanceFailure,
     ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot,
-    ModelLoadPlan,
+    ModelLoadDevice, ModelLoadPlan,
     ModelLoadStage, ModelPackageId, ModelReleaseReason, ModelServingConfiguration,
     ModelStoppingAllocation,
 };
