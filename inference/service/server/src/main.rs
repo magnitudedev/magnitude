@@ -166,6 +166,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 inventory_config.local_models = read_local_models_configuration(&path)?;
             }
             inventory_config.catalog_models = release_catalog.catalog().models.clone();
+            inventory_config.catalog_header_digests = release_catalog.file_header_digests();
             let inventory = Arc::new(
                 ManagedModelStore::open(inventory_config)
                     .await

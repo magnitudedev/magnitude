@@ -32,7 +32,7 @@ hardware
 catalog status | list | show <model-id> | recommendations [--preference <value>] [--limit <count>]
 catalog search <query> [--all] [--limit <count>]
 catalog inspect <huggingface-url | owner/repo | owner/repo:QUANT>
-catalog pull <model-id | owner/repo[:QUANT]> [--drafter auto|none|<ref>]
+catalog pull <model-id | owner/repo[:QUANT]> [--drafter auto|none|<ref>] [--force]
 catalog cancel <model-id> | remove <model-id>
 models status [model-id] [--all] | load <model-id> | stop
 models import <path.gguf> [--drafter auto|none|<ref>]
@@ -148,7 +148,11 @@ is likewise independent of background assessment.
 it adds that model pinned to the repository's current commit: with no quant it picks the
 recommended version, with no `--drafter` it uses `auto` (the preselected drafter), and it prints
 what it chose and the model ID to load. A version already on this computer downloads only the
-drafter, and says so. Pull acknowledges admitted work by what it is, from the sync outcome: a first
+drafter, and says so. A version the engine can't run is refused with its reasons, and one that does
+not fit is refused with how much more memory it needs ("needs X GB more memory than this computer
+can provide") unless `--force` is given; ACN enforces both (`ModelVersionNotRunnable`), so the
+desktop, which disables those versions, and the CLI agree. `--force` applies only to Hugging Face
+versions and never admits an unsupported one. Pull acknowledges admitted work by what it is, from the sync outcome: a first
 or resumed download, an update to a newer revision, or a missing drafter, and directs the caller to
 focused model status. Pull, cancel, and removal validate only argument syntax before delegating
 directly to their authoritative mutations.

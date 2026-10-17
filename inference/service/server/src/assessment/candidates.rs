@@ -19,7 +19,7 @@ use magnitude_engine::options::ModelMethod;
 use magnitude_service_contracts::models::{
     CandidateDrafter, CandidateFile, CandidateInspection, CandidateInspectionRequest,
     CandidateSource, CandidateVersion, CatalogModelState, CatalogModels, CustomModel,
-    CustomModelOrigin, CustomModelState, DrafterCandidate, DrafterCandidatesRequest,
+    CustomModelOrigin, CustomModelState, DrafterCandidate, DrafterCandidatesRequest, DrafterChoice,
     DrafterCandidatesResponse, DrafterCategory, DrafterLineage, DrafterReference, DrafterVerdict,
     HuggingFaceRepositoryId, LocalModels, ModelAssessment, ModelAssessmentProfile,
     ModelAssessmentSubject, ModelCandidate, ModelCandidates, ModelFileRole, ModelFingerprint,
@@ -39,7 +39,7 @@ use magnitude_service_models::candidate_files::{
 use magnitude_service_models::lineage::{CatalogLineage, CatalogLineageMatch, CatalogShape, CatalogShapes};
 use magnitude_service_models::{
     CachedModelAssessment, CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts,
-    ManagedModelStore, ModelDomainResolver, ServableModelBundleKey,
+    DrafterContent, ManagedModelStore, ModelDomainResolver, ServableModelBundleKey,
     refresh_hugging_face_repository,
 };
 use sha2::{Digest, Sha256};
@@ -103,10 +103,12 @@ struct CatalogFacts {
     shapes: Vec<CatalogShape>,
 }
 
-/// Computed lineage hints and recommended drafters, keyed by model and exact target package.
+/// Computed lineage hints and recommended drafters, keyed by model and exact target package, and
+/// the bytes of every drafter reference whose header has been read, keyed by reference.
 #[derive(Default)]
 struct CandidateEnrichment {
     results: std::sync::RwLock<BTreeMap<(ModelId, String), CustomModelEnrichmentResult>>,
+    drafter_contents: std::sync::RwLock<BTreeMap<String, DrafterContent>>,
 }
 
 impl CandidateEnrichment {
@@ -130,6 +132,14 @@ impl CandidateEnrichment {
         results.insert(key, result.clone());
         previous != result
     }
+
+    /// Record a drafter reference's bytes; whether they are new.
+    fn record_drafter_content(&self, reference: &DrafterReference, content: DrafterContent) -> bool {
+        let Ok(mut contents) = self.drafter_contents.write() else {
+            return false;
+        };
+        contents.insert(reference_key(reference), content.clone()) != Some(content)
+    }
 }
 
 impl CustomModelEnrichment for CandidateEnrichment {
@@ -148,6 +158,13 @@ impl CustomModelEnrichment for CandidateEnrichment {
     fn knows(&self, model: &CustomModelFacts<'_>) -> bool {
         self.knows_key(&(model.model_id.clone(), model.target.id.0.clone()))
     }
+
+    fn drafter_content(&self, reference: &DrafterReference) -> Option<DrafterContent> {
+        self.drafter_contents
+            .read()
+            .ok()
+            .and_then(|contents| contents.get(&reference_key(reference)).cloned())
+    }
 }
 
 pub struct ManagedModelCandidates {
@@ -158,6 +175,8 @@ pub struct ManagedModelCandidates {
     local: Arc<dyn LocalModels>,
     catalog_facts: tokio::sync::OnceCell<CatalogFacts>,
     gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    enrichment: Arc<CandidateEnrichment>,
+    resolver: std::sync::OnceLock<Arc<ModelDomainResolver>>,
 }
 
 /// The engine's recognized architectures, which search and file classification use.
@@ -183,6 +202,8 @@ impl ManagedModelCandidates {
             local,
             catalog_facts: tokio::sync::OnceCell::new(),
             gates: tokio::sync::Mutex::new(BTreeMap::new()),
+            enrichment: Arc::new(CandidateEnrichment::default()),
+            resolver: std::sync::OnceLock::new(),
         })
     }
 
@@ -221,6 +242,9 @@ impl ManagedModelCandidates {
             .as_ref()
             .and_then(|snapshot| snapshot.license.clone());
         let recommended_drafter = recommended(self.enumerate_drafters(target, None, true).await?);
+        if let Some(chosen) = self.chosen_drafter(model_id).await {
+            self.learn_drafter_content(&chosen).await;
+        }
         Ok(CustomModelEnrichmentResult {
             variant_of,
             recommended_drafter,
@@ -237,8 +261,9 @@ impl ManagedModelCandidates {
         tokio::spawn(async move {
             warmed.catalog_facts().await;
         });
-        let enrichment = Arc::new(CandidateEnrichment::default());
+        let enrichment = Arc::clone(&self.enrichment);
         resolver.set_custom_model_enrichment(enrichment.clone());
+        let _ = self.resolver.set(Arc::clone(&resolver));
         let candidates = Arc::clone(self);
         tokio::spawn(async move {
             let mut changes = candidates.local.watch_local();
@@ -296,6 +321,58 @@ impl ManagedModelCandidates {
                 }
             }
         });
+    }
+
+    /// The drafter reference a model's configuration chooses explicitly.
+    async fn chosen_drafter(&self, model_id: &ModelId) -> Option<DrafterReference> {
+        let configuration = self.local.configuration().await.ok()?;
+        configuration
+            .drafters
+            .into_iter()
+            .find(|attachment| &attachment.model_id == model_id)
+            .and_then(|attachment| match attachment.drafter {
+                DrafterChoice::Reference { reference, .. } => Some(reference),
+                DrafterChoice::Auto | DrafterChoice::None => None,
+            })
+    }
+
+    /// Remembers a drafter reference's bytes for the local-models projection, which then uses a
+    /// copy of them found anywhere on this computer, and republishes the list when they are new.
+    fn remember_drafter_content(&self, reference: &DrafterReference, content: &DrafterContent) {
+        if self
+            .enrichment
+            .record_drafter_content(reference, content.clone())
+            && let Some(resolver) = self.resolver.get()
+        {
+            resolver.custom_model_enrichment_changed();
+        }
+    }
+
+    /// Reads a drafter reference's header to learn its bytes, and remembers them.
+    async fn learn_drafter_content(&self, reference: &DrafterReference) -> Option<DrafterContent> {
+        let content = match reference {
+            DrafterReference::Catalog { model_id } => {
+                let matched = self.lineage.variant(model_id)?;
+                let file = catalog_draft_reference(&matched.model)?;
+                Box::pin(self.learn_drafter_content(&file)).await?
+            }
+            DrafterReference::HuggingFace {
+                repository,
+                commit,
+                path,
+            } => {
+                let snapshot = self.snapshot(repository.as_str(), commit).await.ok()?;
+                let file = snapshot_file(&snapshot, Path::new(path)).ok()?;
+                let material = self
+                    .hugging_face_drafter(&snapshot, Path::new(path))
+                    .await
+                    .ok()?;
+                hugging_face_drafter_content(file, &material)
+            }
+            DrafterReference::Local { .. } | DrafterReference::Embedded => return None,
+        };
+        self.remember_drafter_content(reference, &content);
+        Some(content)
     }
 
     // Assessment ---------------------------------------------------------------------------
@@ -892,10 +969,10 @@ impl ManagedModelCandidates {
             .filter_map(|(group, assessment)| {
                 let on_this_computer =
                     on_this_computer(&custom, None, &group.group, &group.header_digest, Some(&root));
-                // A file already listed keeps that model's identity (a Hugging Face one when its
-                // location gives it); any other file is identified by its header digest.
-                let model_id = on_this_computer
-                    .clone()
+                // A file a listed model is found at keeps that model's identity (a Hugging Face one
+                // when its location gives it); any other file, a copy of a listed model's bytes
+                // included, is identified by its header digest.
+                let model_id = listed_at(&custom, &group.group, &root)
                     .or_else(|| local_model_id(&group.header_digest))?;
                 Some(AssessedVersion {
                     group,
@@ -1343,11 +1420,15 @@ impl ManagedModelCandidates {
                     .map_err(|error| tracing::warn!(%error, "catalog drafter material is unavailable"))
                     .ok()?;
                 let material = Self::resolved_drafter(resolved).ok().flatten()?;
-                (
-                    Some(material),
-                    package_bytes(draft),
-                    self.models().has_installed_package(&draft.id),
-                )
+                let reference = DrafterReference::Catalog {
+                    model_id: matched.model_id.clone(),
+                };
+                let content = self.learn_drafter_content(&reference).await;
+                let on_this_computer = self.models().has_installed_package(&draft.id)
+                    || content
+                        .or_else(|| DrafterContent::of_package(draft))
+                        .is_some_and(|content| self.models().has_installed_content(&content));
+                (Some(material), package_bytes(draft), on_this_computer)
             }
         };
         let verdict = self
@@ -1429,21 +1510,23 @@ impl ManagedModelCandidates {
         let file = snapshot_file(snapshot, &path).ok()?;
         let material = self.hugging_face_drafter(snapshot, &path).await.ok()?;
         let verdict = self.drafter_verdict(target, &material).await?;
+        let reference = DrafterReference::HuggingFace {
+            repository: hugging_face_id(&snapshot.repository),
+            commit: snapshot.commit.clone(),
+            path: path_string(&path),
+        };
+        let content = hugging_face_drafter_content(file, &material);
+        self.remember_drafter_content(&reference, &content);
         Some(DrafterCandidate {
             category: DrafterCategory::NextToModel,
-            reference: DrafterReference::HuggingFace {
-                repository: hugging_face_id(&snapshot.repository),
-                commit: snapshot.commit.clone(),
-                path: path_string(&path),
-            },
+            reference,
             name: format!("{}/{}", snapshot.repository, file_name(&path)),
             label: "In this repository".to_owned(),
             size_bytes: file.size_bytes,
             lineage: DrafterLineage::Lineage,
             method: bound_method(&verdict),
             verdict,
-            on_this_computer: sha256_of(file)
-                .is_some_and(|sha256| self.models().has_installed_file(sha256)),
+            on_this_computer: self.models().has_installed_content(&content),
         })
     }
 
@@ -1533,21 +1616,23 @@ impl ManagedModelCandidates {
             .drafter_verdict(target, &material)
             .await
             .ok_or_else(|| InventoryError::Internal("drafter assessment failed".to_owned()))?;
+        let reference = DrafterReference::HuggingFace {
+            repository: hugging_face_id(&snapshot.repository),
+            commit: snapshot.commit.clone(),
+            path: path_string(&path),
+        };
+        let content = hugging_face_drafter_content(file, &material);
+        self.remember_drafter_content(&reference, &content);
         Ok(DrafterCandidate {
             category: DrafterCategory::Other,
-            reference: DrafterReference::HuggingFace {
-                repository: hugging_face_id(&snapshot.repository),
-                commit: snapshot.commit.clone(),
-                path: path_string(&path),
-            },
+            reference,
             name: format!("{}/{}", snapshot.repository, file_name(&path)),
             label: other_drafter_label(lineage),
             size_bytes: file.size_bytes,
             lineage,
             method: bound_method(&verdict),
             verdict,
-            on_this_computer: sha256_of(file)
-                .is_some_and(|sha256| self.models().has_installed_file(sha256)),
+            on_this_computer: self.models().has_installed_content(&content),
         })
     }
 
@@ -1906,9 +1991,10 @@ fn reference_key(reference: &DrafterReference) -> String {
     }
 }
 
-/// The catalog drafter's file as a Hugging Face reference key, so the same file found elsewhere
-/// is not listed twice.
-fn catalog_draft_key(model: &magnitude_service_contracts::models::RecommendableModel) -> Option<String> {
+/// The catalog drafter's file as a Hugging Face reference.
+fn catalog_draft_reference(
+    model: &magnitude_service_contracts::models::RecommendableModel,
+) -> Option<DrafterReference> {
     let ServableModelBundle::SpeculativeDecoding {
         draft_source: SpeculativeDraftSource::Separate { draft },
         ..
@@ -1929,11 +2015,30 @@ fn catalog_draft_key(model: &magnitude_service_contracts::models::RecommendableM
         .filter(|file| matches!(file.role, ModelFileRole::Weights | ModelFileRole::Draft))
         .map(|file| file.path.clone())
         .min()?;
-    Some(reference_key(&DrafterReference::HuggingFace {
+    Some(DrafterReference::HuggingFace {
         repository: hugging_face_id(repository),
         commit: revision.clone(),
         path: path_string(&path),
-    }))
+    })
+}
+
+/// The catalog drafter's file as a Hugging Face reference key, so the same file found elsewhere
+/// is not listed twice.
+fn catalog_draft_key(model: &magnitude_service_contracts::models::RecommendableModel) -> Option<String> {
+    catalog_draft_reference(model).map(|reference| reference_key(&reference))
+}
+
+/// A single-file Hugging Face drafter's bytes: the header digest its material was read with, its
+/// size, and its Hub SHA-256 when the Hub gives one.
+fn hugging_face_drafter_content(
+    file: &HuggingFaceRepositoryFile,
+    material: &DrafterMaterial,
+) -> DrafterContent {
+    DrafterContent {
+        header_digest: Some(material.identity.clone()),
+        sha256: sha256_of(file).map(str::to_owned),
+        size_bytes: file.size_bytes,
+    }
 }
 
 /// The name Magnitude gives the drafter it ships for a catalog model, such as "Magnitude DFlash
@@ -2185,7 +2290,8 @@ fn local_model_id(header_digest: &str) -> Option<ModelId> {
 
 /// The custom model already on this computer with the same bytes: the same header digest, the
 /// same Hugging Face identity and weights size (a projector it was found with, such as an Ollama
-/// pull's, is not part of the version), or the same files.
+/// pull's, is not part of the version), the same files, or files with the same header and sizes
+/// wherever they are.
 fn on_this_computer(
     custom: &[CustomModel],
     hugging_face: Option<&ModelId>,
@@ -2212,8 +2318,38 @@ fn on_this_computer(
                     && model.files.iter().map(|file| file.size_bytes).sum::<u64>()
                         == group.size_bytes())
                 || (!paths.is_empty() && model.files.iter().any(|file| paths.contains(&file.path)))
+                || same_bytes(model, group, header_digest)
         })
         .map(|model| model.model_id.clone())
+}
+
+/// The listed model found at exactly these files.
+fn listed_at(custom: &[CustomModel], group: &GgufGroup, root: &Path) -> Option<ModelId> {
+    let paths = group
+        .files
+        .iter()
+        .map(|file| root.join(&file.path))
+        .collect::<BTreeSet<_>>();
+    custom
+        .iter()
+        .filter(|model| !matches!(model.state, CustomModelState::NotInstalled))
+        .find(|model| model.files.iter().any(|file| paths.contains(&file.path)))
+        .map(|model| model.model_id.clone())
+}
+
+/// Whether a model's weights are the version's bytes: the same file sizes, and the same header,
+/// which is read only for a model whose sizes already match.
+fn same_bytes(model: &CustomModel, group: &GgufGroup, header_digest: &str) -> bool {
+    model.files.len() == group.files.len()
+        && model
+            .files
+            .iter()
+            .zip(&group.files)
+            .all(|(file, version)| file.size_bytes == version.size_bytes)
+        && model
+            .files
+            .first()
+            .is_some_and(|primary| local_header_digest(&primary.path).is_ok_and(|digest| digest == header_digest))
 }
 
 /// Versions with their verdicts. The recommended version is the largest fitting Q4_K-class

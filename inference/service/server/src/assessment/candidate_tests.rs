@@ -788,6 +788,11 @@ fn cpu_environment() -> Arc<AssessmentEnvironment> {
 }
 
 async fn fixture(custom: Vec<CustomModel>) -> Fixture {
+    fixture_scanning(custom, LocalModelsConfiguration::default()).await
+}
+
+/// A fixture whose store has scanned the locations `local_models` names.
+async fn fixture_scanning(custom: Vec<CustomModel>, local_models: LocalModelsConfiguration) -> Fixture {
     let (endpoint, hub) = hub().serve();
     let directory = tempfile::tempdir().expect("temporary directory");
     let mut config = InventoryConfig::with_roots(
@@ -796,7 +801,9 @@ async fn fixture(custom: Vec<CustomModel>) -> Fixture {
     )
     .expect("inventory config");
     config.hub_endpoint = Some(endpoint);
+    config.local_models = local_models;
     let models = Arc::new(ManagedModelStore::open(config).await.expect("model store"));
+    models.ensure_model_inventory().await.expect("location scan");
     let target = hugging_face_package(&models, CATALOG_TARGET, "llama-Q8_0.gguf").await;
     let draft = hugging_face_package(&models, CATALOG_DRAFT, "dflash.gguf").await;
     let base = magnitude_service_contracts::models::CatalogBaseId::new("llama-test").unwrap();
@@ -985,6 +992,96 @@ async fn a_local_file_is_identified_by_its_header_digest_unless_a_listed_model_h
     let version = &inspection.versions[0];
     assert_eq!(version.model_id, found);
     assert_eq!(version.on_this_computer, Some(found));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_copy_of_a_listed_model_elsewhere_is_already_on_this_computer_as_that_model() {
+    let folder = tempfile::tempdir().expect("model folders");
+    let (bytes, _) = llama(7, Encoding::Q8_0).bytes();
+    let found_path = folder.path().join("lmstudio/community/Llama-GGUF/llama-Q8_0.gguf");
+    let copy = folder.path().join("Downloads/llama-copy.gguf");
+    for path in [&found_path, &copy] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, &bytes).unwrap();
+    }
+    let found = ModelId::hugging_face(
+        &HuggingFaceRepositoryId::new("community/Llama-GGUF".to_owned()).unwrap(),
+        &magnitude_service_contracts::models::HuggingFaceArtifactSelector::new(
+            "llama-Q8_0.gguf".to_owned(),
+        )
+        .unwrap(),
+    );
+    let mut listed = custom_model(found.clone(), bytes.len() as u64);
+    listed.files[0].path = found_path;
+    let fixture = fixture(vec![listed]).await;
+
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::Local { path: copy.clone() })
+        .await
+        .expect("inspection");
+
+    assert_eq!(
+        inspection.versions[0].on_this_computer,
+        Some(found),
+        "the same bytes at another path are the model already listed"
+    );
+    let digest = magnitude_service_models::candidate_files::local_header_digest(&copy).unwrap();
+    assert_eq!(
+        inspection.versions[0].model_id.as_str(),
+        format!("local:{digest}"),
+        "the copy itself is identified by its header, so it can be recorded as one more location"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drafter_already_in_another_apps_folder_is_on_this_computer() {
+    let fixture = fixture(Vec::new()).await;
+    let candidates = candidate_drafters(&fixture, PLAIN, '3').await;
+    assert!(!candidates[0].on_this_computer, "{candidates:#?}");
+
+    let lm_studio = tempfile::tempdir().expect("LM Studio folder");
+    let copy = lm_studio.path().join("someone/Mirror-GGUF/renamed-dflash.gguf");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    let (header, length) = dflash(HIDDEN).bytes();
+    std::fs::write(&copy, header).unwrap();
+    std::fs::OpenOptions::new().write(true).open(&copy).unwrap().set_len(length).unwrap();
+    let fixture = fixture_scanning(
+        Vec::new(),
+        LocalModelsConfiguration {
+            roots: vec![magnitude_service_contracts::models::ModelRoot {
+                kind: magnitude_service_contracts::models::ModelRootKind::LmStudio,
+                path: lm_studio.path().to_path_buf(),
+                enabled: true,
+            }],
+            ..LocalModelsConfiguration::default()
+        },
+    )
+    .await;
+
+    let catalog = candidate_drafters(&fixture, PLAIN, '3').await;
+    assert_eq!(catalog[0].category, DrafterCategory::CatalogDrafter);
+    assert!(
+        catalog[0].on_this_computer,
+        "the catalog drafter's bytes in LM Studio are used where they are"
+    );
+    let own = candidate_drafters(&fixture, COMMUNITY, 'c').await;
+    assert_eq!(hugging_face_path(&own[0]), "dflash-draft.gguf");
+    assert!(own[0].on_this_computer, "a repository drafter's bytes elsewhere count too");
+    assert!(!own[1].on_this_computer, "a different drafter is not");
+
+    use magnitude_service_models::CustomModelEnrichment as _;
+    let header_digest =
+        magnitude_service_models::candidate_files::local_header_digest(&copy).unwrap();
+    let known = fixture
+        .candidates
+        .enrichment
+        .drafter_content(&DrafterReference::Catalog {
+            model_id: fixture.catalog_id.clone(),
+        })
+        .expect("the catalog drafter's bytes are known to the projection");
+    assert_eq!(known.header_digest, Some(header_digest));
+    assert_eq!(known.size_bytes, std::fs::metadata(&copy).unwrap().len());
 }
 
 #[tokio::test(flavor = "multi_thread")]

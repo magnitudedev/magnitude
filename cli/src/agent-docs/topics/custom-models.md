@@ -7,7 +7,8 @@ three places:
 - **Hugging Face, through Magnitude.** `catalog pull owner/repo[:QUANT]` downloads into Magnitude's
   own store. `catalog remove` deletes that copy.
 - **A GGUF file.** `models import <path.gguf>` uses the file where it is. Magnitude never moves or
-  deletes it; `catalog remove` only forgets it.
+  deletes it; `catalog remove` only forgets it. A file with the same bytes as a model already on this
+  computer is that model: the import says so and keeps the model's ID and source.
 - **Found on this computer.** The Hugging Face cache, LM Studio, the llama.cpp cache, Ollama, and
   folders you add are scanned for GGUFs. These files belong to their apps; `models hide` hides a
   found model without touching its files. Models added from Hugging Face or imported can't be
@@ -38,7 +39,8 @@ any version already on this computer, then lists drafter choices and the exact c
 
 `catalog pull` with no quant picks the recommended version and says so. It pins the repository's
 current commit and prints the model ID. If that version is already on this computer, only the
-drafter downloads. A catalog model ID keeps working exactly as before. A custom model ID updates
+drafter downloads. A version Magnitude can't run is refused with the reason; one that needs more
+memory than this computer can provide is refused unless you pass `--force`. A catalog model ID keeps working exactly as before. A custom model ID updates
 that model: an added model to its repository's newer commit, and any model to a newer revision of
 its catalog drafter.
 
@@ -71,7 +73,8 @@ match is allowed and marked untested. Catalog models keep the drafter Magnitude 
 `models drafter` refuses them. `models status <model-id>` shows the drafter in use and every choice
 with its label, its verdict, and the argument that selects it. A found or imported model whose
 recommended drafter isn't on this computer shows "Faster with a drafter · Add"; `models drafter
-<model-id> auto` downloads only the drafter. When a catalog drafter gets a new revision,
+<model-id> auto` downloads only the drafter. A drafter whose bytes are already in any location, another
+app's included, is used where it is and never downloaded. When a catalog drafter gets a new revision,
 `models status` shows Update for every model using it; `catalog pull <model-id>` downloads it.
 
 ## What's on this computer

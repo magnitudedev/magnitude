@@ -101,7 +101,13 @@ Catalog models always use their catalog drafter.
   drafter's verdict is its own: the assessment's when it names the attached method, else ICN's
   verdict for the matching recommended candidate, never another drafter's.
 - Adding a drafter to a model whose target is present downloads only the drafter; one already on
-  this computer downloads nothing. The download names the model it is for, so the attached drafter
+  this computer downloads nothing. A drafter is on this computer when any location, another app's
+  included, holds its bytes: a file with its header digest and size, or its Hub SHA-256 when known.
+  ICN learns a drafter reference's bytes when it reads the drafter's header (listing candidates, or
+  enriching a model whose choice names it), reports such a candidate as on this computer, and the
+  projection attaches that file as-is, never copying it; when it disappears, the drafter is missing
+  again and can be downloaded. Automatic sources are unchanged: this reuses bytes of the drafters
+  listed above and never discovers new drafters. The download names the model it is for, so the attached drafter
   shows its progress and failure whichever repository, the catalog's included, it comes from. A
   drafter in an external location remains externally owned.
 - When a catalog drafter gets a new revision, every model using it, catalog or custom, shows

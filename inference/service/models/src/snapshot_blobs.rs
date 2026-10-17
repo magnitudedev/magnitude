@@ -11,7 +11,7 @@ use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use same_file::Handle;
 
@@ -126,7 +126,7 @@ impl Roots {
             if !fs::symlink_metadata(&located)?.file_type().is_symlink() {
                 return Ok(None);
             }
-            current = parent.join(fs::read_link(&located)?);
+            current = link_destination(&parent, &fs::read_link(&located)?);
         }
         Ok(None)
     }
@@ -145,6 +145,28 @@ impl Roots {
         };
         Ok(Some(RepositoryBlob { entry, storage }))
     }
+}
+
+/// Where a link in the canonical directory `parent` points. A relative target's `..` steps are
+/// applied to `parent` lexically, which is exact because a canonical path holds no links: Windows
+/// canonical paths are verbatim (`\\?\C:\…`), and the OS does not resolve `..` inside those, so
+/// joining `..\..\blobs\<hash>` onto one would name nothing.
+fn link_destination(parent: &Path, target: &Path) -> PathBuf {
+    if target.has_root() {
+        return target.to_path_buf();
+    }
+    let mut destination = parent.to_path_buf();
+    for component in target.components() {
+        match component {
+            Component::ParentDir => {
+                destination.pop();
+            }
+            Component::CurDir => {}
+            Component::Normal(name) => destination.push(name),
+            Component::RootDir | Component::Prefix(_) => return target.to_path_buf(),
+        }
+    }
+    destination
 }
 
 #[cfg(test)]
@@ -272,6 +294,33 @@ mod tests {
                 .resolve(&snapshot.join("direct.gguf"))
                 .expect("direct entry"),
             None
+        );
+    }
+
+    #[test]
+    fn link_targets_step_out_of_their_canonical_directory_lexically() {
+        let parent = Path::new("/hub/models--owner--model/snapshots/commit");
+        assert_eq!(
+            link_destination(parent, Path::new("../../blobs/hash")),
+            Path::new("/hub/models--owner--model/blobs/hash")
+        );
+        assert_eq!(
+            link_destination(parent, Path::new("./../../../blobs/de/hash")),
+            Path::new("/hub/blobs/de/hash")
+        );
+        assert_eq!(
+            link_destination(parent, Path::new("/elsewhere/hash")),
+            Path::new("/elsewhere/hash")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn link_targets_resolve_against_verbatim_windows_paths() {
+        let parent = Path::new(r"\\?\C:\hub\models--owner--model\blobs");
+        assert_eq!(
+            link_destination(parent, Path::new(r"..\..\blobs\de\hash")),
+            Path::new(r"\\?\C:\hub\blobs\de\hash")
         );
     }
 

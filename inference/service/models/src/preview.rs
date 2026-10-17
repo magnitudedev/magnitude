@@ -142,7 +142,7 @@ impl HuggingFaceDiscovery {
             }
             kept.push((result, parameters));
         }
-        let results = futures_util::stream::iter(kept)
+        let mut results = futures_util::stream::iter(kept)
             .map(|(mut result, parameters)| async move {
                 if result.unsupported.is_empty() {
                     result.variant_of = self.variant_of(&result, parameters).await;
@@ -152,6 +152,13 @@ impl HuggingFaceDiscovery {
             .buffered(SEARCH_LINEAGE_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
+        results.sort_by_key(|result| {
+            (
+                !result.unsupported.is_empty(),
+                !names_exactly(&result.repository, query),
+                std::cmp::Reverse(result.downloads.unwrap_or(0)),
+            )
+        });
         Ok(HuggingFaceModelSearchResults {
             results,
             hidden_count,
@@ -180,9 +187,38 @@ impl HuggingFaceDiscovery {
             return Some(matched.model_id);
         }
         let shapes = self.shapes.catalog_shapes().await;
-        crate::lineage::shape_match(&shapes, result.architecture.as_deref()?, parameters?)
-            .map(|shape| shape.model_id.clone())
+        crate::lineage::shape_match(
+            &shapes,
+            result.architecture.as_deref()?,
+            parameters?,
+            &result.repository,
+        )
+        .map(|shape| shape.model_id.clone())
     }
+}
+
+/// Whether a repository's name is exactly the query: the same words, ignoring case, separators
+/// and a trailing `GGUF`, with or without an uploader's `Org_` prefix (`bartowski/Qwen_Qwen3.5-4B-GGUF`
+/// is exactly "Qwen3.5 4B").
+fn names_exactly(repository: &str, query: &str) -> bool {
+    let words = |text: &str| {
+        text.to_lowercase()
+            .split(|character: char| !(character.is_alphanumeric() || character == '.'))
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let query = words(query);
+    let name = repository.rsplit('/').next().unwrap_or(repository);
+    std::iter::once(name)
+        .chain(name.split_once('_').map(|(_, rest)| rest))
+        .any(|name| {
+            let mut name = words(name);
+            if name.last().is_some_and(|word| word == "gguf") {
+                name.pop();
+            }
+            name == query
+        })
 }
 
 impl HuggingFaceModelCatalog for HuggingFaceDiscovery {
@@ -1986,18 +2022,12 @@ impl ManagedModelStore {
         Ok((package, prepared))
     }
 
-    /// Whether an installed package, in any location, holds a file with this content digest.
+    /// Whether an installed package, in any location, another app's included, holds these
+    /// drafter bytes.
     #[must_use]
-    pub fn has_installed_file(&self, sha256: &str) -> bool {
+    pub fn has_installed_content(&self, content: &crate::DrafterContent) -> bool {
         self.installed_packages.read().is_ok_and(|snapshot| {
-            snapshot.records.values().any(|record| {
-                record
-                    .installed
-                    .package
-                    .files
-                    .iter()
-                    .any(|file| file.sha256 == sha256)
-            })
+            snapshot.records.values().any(|record| content.held_by(record))
         })
     }
 
@@ -3096,6 +3126,59 @@ mod tests {
             [UnsupportedReason::Architecture {
                 architecture: "deepseek4".to_owned()
             }]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_lists_exact_names_first_then_by_downloads_and_unsupported_last() {
+        let (endpoint, _) = serve_hub(|path, query| {
+            let result = |id: &str, seed: char, architecture: &str, downloads: u64| {
+                serde_json::json!({
+                    "id": id,
+                    "sha": seed.to_string().repeat(40),
+                    "downloads": downloads,
+                    "tags": ["gguf"],
+                    "gguf": { "architecture": architecture },
+                })
+            };
+            (path == "/api/models" && query.contains("search=")).then(|| {
+                serde_json::json!([
+                    result("unsupported/Llama-8B-GGUF", 'a', "deepseek4", 5_000),
+                    result("someone/Llama-8B-Uncensored-GGUF", 'b', "llama", 900),
+                    result("community/Llama-8B-GGUF", 'c', "llama", 100),
+                    result("bartowski/Meta_Llama-8B-GGUF", 'd', "llama", 50),
+                    result("other/Llama-8B-Instruct-GGUF", 'e', "llama", 70),
+                ])
+            })
+        });
+        let (_temporary, store) = stub_store(endpoint).await;
+        let discovery = HuggingFaceDiscovery::new(
+            Arc::clone(&store),
+            RecognizedArchitectures::new(["llama"], ["dflash"]),
+            CatalogLineage::new(Arc::clone(&store), catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40))),
+            Arc::new(StubShapes),
+        );
+        let results = discovery
+            .search(HuggingFaceModelSearchRequest {
+                query: "llama 8b".to_owned(),
+                limit: 10,
+                include_unsupported: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            results
+                .results
+                .iter()
+                .map(|result| result.repository.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "community/Llama-8B-GGUF",
+                "bartowski/Meta_Llama-8B-GGUF",
+                "someone/Llama-8B-Uncensored-GGUF",
+                "other/Llama-8B-Instruct-GGUF",
+                "unsupported/Llama-8B-GGUF",
+            ]
         );
     }
 

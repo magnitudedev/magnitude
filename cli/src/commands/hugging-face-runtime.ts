@@ -2,6 +2,7 @@ import {
   candidateDownloadBytes,
   catalogVariantOfName,
   formatStorageSize,
+  modelVersionNotRunnableMessage,
   noRunnableVersionReason,
   preselectedDrafterCandidate,
   unsupportedReasonGroupMessage,
@@ -17,6 +18,7 @@ import {
   HuggingFaceSearchResponseSchema,
   LocalModelSyncOutcomeSchema,
   Models,
+  ModelVersionNotRunnable,
   type CandidateInspection,
   type CandidateVersion,
   type CatalogFormModelId,
@@ -434,11 +436,19 @@ export const renderPull = (result: PullResult): string => {
 
 export const pullJson = jsonDocument(PullResultSchema, (result: PullResult) => result)
 
+/** A refused version in the CLI's words; one that only lacks memory can be forced. */
+const versionRefusal = (error: ModelVersionNotRunnable): ModelCommandError => new ModelCommandError({
+  message: error.verdict._tag === "DoesNotFit"
+    ? `${modelVersionNotRunnableMessage(error)} Download it anyway with: magnitude catalog pull ${error.reference} --force`
+    : modelVersionNotRunnableMessage(error),
+})
+
 const addHuggingFaceModel = (
   client: CliModelsClient,
   input: string,
   reference: HuggingFaceReference,
   drafter: DrafterArgument,
+  force: boolean,
 ): Effect.Effect<PullResult, unknown> => Effect.gen(function* () {
   const versionRequested = Option.isSome(reference.version) || Option.isSome(reference.file)
   if (Option.isNone(reference.file) && drafter._tag !== "Lookup") {
@@ -447,6 +457,7 @@ const addHuggingFaceModel = (
       revision: reference.revision,
       version: reference.version,
       drafter: drafterChoice(drafter),
+      force,
     })
     return { _tag: "HuggingFace" as const, repository: reference.repository, versionRequested, added }
   }
@@ -465,26 +476,34 @@ const addHuggingFaceModel = (
     revision: Option.some(inspection.source.commit),
     version: Option.some(version.label),
     drafter: yield* resolveDrafterChoice(client, candidateDrafterTarget(inspection, version), drafter),
+    force,
   })
   return { _tag: "HuggingFace" as const, repository: inspection.source.repository, versionRequested, added }
-})
+}).pipe(Effect.catchIf(
+  (error): error is ModelVersionNotRunnable => error instanceof ModelVersionNotRunnable,
+  (error) => Effect.fail(versionRefusal(error)),
+))
 
 export const pull = (
   client: CliModelsClient,
   input: string,
   reference: PullReference,
   drafter: DrafterArgument,
+  force = false,
 ): Effect.Effect<PullResult, unknown> => {
   switch (reference._tag) {
     case "Catalog": return client.models.syncLocalModel({ modelId: reference.modelId }).pipe(
       Effect.map(({ outcome }) => ({ _tag: "Catalog" as const, modelId: reference.modelId, outcome })))
     case "Custom": return client.models.syncLocalModel({ modelId: reference.modelId }).pipe(
       Effect.map(({ outcome }) => ({ _tag: "Custom" as const, modelId: reference.modelId, outcome })))
-    case "HuggingFace": return addHuggingFaceModel(client, input, reference.reference, drafter)
+    case "HuggingFace": return addHuggingFaceModel(client, input, reference.reference, drafter, force)
   }
 }
 
-export const pullModel = (modelInput: string, options: JsonOption & { readonly drafter?: string } = {}) => runCommand({
+export const pullModel = (
+  modelInput: string,
+  options: JsonOption & { readonly drafter?: string; readonly force?: boolean } = {},
+) => runCommand({
   effect: Effect.gen(function* () {
     const reference = yield* parsePullReference(modelInput.trim())
     if (reference._tag === "Catalog" && options.drafter !== undefined) {
@@ -498,7 +517,10 @@ export const pullModel = (modelInput: string, options: JsonOption & { readonly d
       })
     }
     const drafter = yield* parseDrafterArgument(options.drafter ?? "auto")
-    return yield* withClient((client) => pull(client, modelInput.trim(), reference, drafter))
+    if (reference._tag !== "HuggingFace" && options.force === true) {
+      return yield* new ModelCommandError({ message: "--force applies only to models from Hugging Face." })
+    }
+    return yield* withClient((client) => pull(client, modelInput.trim(), reference, drafter, options.force === true))
   }),
   render: renderPull,
   json: asJson(options, pullJson),

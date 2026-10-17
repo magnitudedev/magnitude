@@ -14,6 +14,7 @@ import {
   LocalModelAssessmentSchema,
   LocalModelMutationFailed,
   ModelSourceUnavailable,
+  ModelVersionNotRunnable,
   PathNotDirectory,
   parseModelId,
   preselectedDrafterCandidate,
@@ -162,9 +163,10 @@ export interface CustomModelCommandsApi {
     readonly revision: Option.Option<string>
     readonly version: Option.Option<string>
     readonly drafter: DrafterChoice
+    readonly force: boolean
   }) => Effect.Effect<AddedCustomModel, CustomModelMutationError>
   readonly importModelFile: (path: string, drafter: DrafterChoice) => Effect.Effect<
-    ChosenDrafter & { readonly modelId: CustomFormModelId },
+    ChosenDrafter & { readonly modelId: CustomFormModelId; readonly outcome: "Started" | "AlreadyOnThisComputer" },
     CustomModelMutationError
   >
   readonly setModelDrafter: (
@@ -522,11 +524,13 @@ export const CustomModelCommandsLive: Layer.Layer<
     chosen: Option.Option<DrafterCandidate>,
   ) => Effect.gen(function* () {
     if (declaration.origin._tag !== "Added") return false
+    // A separate drafter already on this computer, in any location, is used where it is, never downloaded.
+    const downloaded = Option.filter(chosen, ({ reference, onThisComputer }) => reference._tag === "Embedded" || !onThisComputer)
     const bundle = yield* icn.bundle({
       source: { _tag: "HuggingFace", repository: declaration.origin.repository, commit: declaration.origin.commit } as Native.CandidateSource,
       target: [...declaration.target],
       projector: Option.map(declaration.projector, (path) => ({ path, sizeBytes: 0 })),
-      drafter: yield* candidateDrafter(chosen),
+      drafter: yield* candidateDrafter(downloaded),
     })
     yield* downloads.start(bundle, modelId)
     return true
@@ -553,6 +557,7 @@ export const CustomModelCommandsLive: Layer.Layer<
 
   const toMutation = (cause: GeneratedClientError<unknown> | CustomModelMutationError): CustomModelMutationError =>
     cause._tag === "InvalidModelReference" || cause._tag === "ModelSourceUnavailable" || cause._tag === "LocalModelMutationFailed"
+      || cause._tag === "ModelVersionNotRunnable"
       ? cause
       : candidateFailure("model")(cause)
 
@@ -628,7 +633,7 @@ export const CustomModelCommandsLive: Layer.Layer<
 
     listDrafterCandidates,
 
-    addHuggingFaceModel: ({ repository, revision, version, drafter }) => Effect.gen(function* () {
+    addHuggingFaceModel: ({ repository, revision, version, drafter, force }) => Effect.gen(function* () {
       const reference = Option.match(version, { onNone: () => repository, onSome: (quant) => `${repository}:${quant}` })
       const native = yield* icn.inspect({ _tag: "HuggingFace", repository, revision: Option.getOrElse(revision, () => "main") })
         .pipe(Effect.mapError(candidateFailure(reference)))
@@ -640,8 +645,16 @@ export const CustomModelCommandsLive: Layer.Layer<
       if (selected === undefined) {
         return yield* new InvalidModelReference({ reference, message: "Name a version: owner/repository:QUANT." })
       }
-      if (Option.exists(selected.assessment, ({ _tag }) => _tag === "Unsupported")) {
-        return yield* new InvalidModelReference({ reference, message: `Magnitude can't run ${selected.label}.` })
+      const assessment = Option.getOrUndefined(selected.assessment)
+      if (assessment?._tag === "Unsupported") {
+        return yield* new ModelVersionNotRunnable({
+          reference, version: selected.label, verdict: { _tag: "Unsupported", reasons: assessment.reasons },
+        })
+      }
+      if (assessment?._tag === "DoesNotFit" && !force) {
+        return yield* new ModelVersionNotRunnable({
+          reference, version: selected.label, verdict: { _tag: "DoesNotFit", deficitBytes: assessment.deficitBytes },
+        })
       }
       const source = inspection.source
       if (source._tag !== "HuggingFace") return yield* new InvalidModelReference({ reference, message: "Not a Hugging Face repository." })
@@ -687,25 +700,46 @@ export const CustomModelCommandsLive: Layer.Layer<
         || Option.exists(version.assessment, ({ _tag }) => _tag === "Unsupported")) {
         return yield* new InvalidModelReference({ reference, message: "Magnitude can't run this file." })
       }
-      const modelId = version.modelId
-      const identity = parseModelId(modelId)
-      const target: DrafterTarget = { _tag: "Candidate", source: inspection.source, files: version.files }
-      const chosen = yield* chooseDrafter(target, drafter)
-      // A file that already has a Hugging Face identity is found where it is; only its drafter is recorded.
-      const declaration: Option.Option<CustomModelDeclaration> = identity._tag === "Local"
-        ? Option.some({
+      // The same bytes are one model: a file whose bytes are already a model on this computer is that model.
+      const existing = Option.flatMap(version.onThisComputer, Schema.decodeUnknownOption(CustomFormModelIdSchema))
+      const modelId = Option.getOrElse(existing, () => version.modelId)
+      const identity = parseModelId(version.modelId)
+      const target: DrafterTarget = Option.isSome(existing)
+        ? { _tag: "Model", modelId }
+        : { _tag: "Candidate", source: inspection.source, files: version.files }
+      // A model already here keeps its drafter unless the import names one or turns it off.
+      const current = (yield* customModels.get).drafters[modelId]
+      const requested = Option.isSome(existing) && drafter._tag === "Auto" && current !== undefined ? current : drafter
+      const chosen = yield* chooseDrafter(target, requested)
+      // A file without a Hugging Face identity is recorded where it is: a new model, or one more location of the
+      // model that already has its bytes, which keeps that model's identity and origin. A file with a Hugging Face
+      // identity is found where it is; only its drafter is recorded.
+      const declaration: CustomModelDeclaration | undefined = identity._tag === "Local"
+        ? {
             origin: { _tag: "Imported", path: parsed.path, headerDigest: identity.headerDigest },
             target: [parsed.path],
             projector: Option.map(inspection.projector, ({ path: projector }) => projector),
-          })
-        : Option.none()
-      yield* persistDrafter(modelId, persistedChoice(drafter, chosen), declaration)
+          }
+        : undefined
+      yield* customModels.modify((config) => Effect.succeed([undefined, {
+        ...config,
+        declarations: declaration === undefined || config.declarations[version.modelId] !== undefined
+          ? config.declarations
+          : { ...config.declarations, [version.modelId]: declaration },
+        drafters: { ...config.drafters, [modelId]: persistedChoice(requested, chosen) },
+        hidden: config.hidden.filter((hidden) => hidden !== modelId),
+      } satisfies CustomModelsConfig] as const))
       yield* settle
       const drafterDownloadStarted = yield* Option.match(chosen, {
         onNone: () => Effect.succeed(false),
         onSome: (value) => startDrafterOnly(modelId, target, value),
       })
-      return { modelId, drafter: chosen, drafterDownloadStarted }
+      return {
+        modelId,
+        drafter: chosen,
+        outcome: Option.isSome(existing) ? "AlreadyOnThisComputer" as const : "Started" as const,
+        drafterDownloadStarted,
+      }
     }).pipe(Effect.mapError(toMutation)),
 
     setModelDrafter: (modelId, drafter) => Effect.gen(function* () {

@@ -13,6 +13,7 @@ import { fixturePackageFiles, piPackageFiles } from "./pi-package-fixture"
 import { inspectPluginContent } from "@magnitudedev/release/plugin-content"
 import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
 import { HarnessModelSchema, type HarnessCompanionPackage } from "./contract"
+import { skillText } from "./inspection"
 import { PiPackageSourceSchema } from "./connectors/pi-package-state"
 import { PiPackageEntrySchema } from "./connectors/pi-settings"
 import {
@@ -2194,6 +2195,27 @@ describe("read-only connection inspection", () => {
       expect((yield* Effect.either(service.disconnect(id)))._tag).toBe("Left")
       expect((yield* fs.stat(primary)).type).toBe("Directory")
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+  it("keeps a connection whose skill an earlier build wrote with CRLF line endings, and writes LF", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-inspection-crlf-skill-" })
+      const paths = fixturePaths(root)
+      const service = yield* installedService(paths)
+      yield* service.connect(HarnessIdSchema.make("opencode"), { model: Option.none(), installSkill: true })
+      const skillFile = paths.skillInstallations["shared-agents"].skillFile
+      const written = yield* fs.readFileString(skillFile)
+      expect(written).not.toContain("\r\n")
+      yield* fs.writeFileString(skillFile, written.replace(/\n/g, "\r\n"))
+      const reopened = yield* installedService(paths)
+      expect((yield* reopened.inspect).find((row) => row.id === "opencode")?.inspection._tag).toBe("Connected")
+      yield* fs.writeFileString(skillFile, `${written}\nchanged\n`)
+      expect((yield* reopened.inspect).find((row) => row.id === "opencode")?.inspection).toEqual({ _tag: "Disconnected", reason: "Magnitude skill is missing or has changed" })
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+  it("compares skill files by text, not line endings", () => {
+    expect(skillText("---\r\nname: magnitude\r\n---\r\n")).toBe("---\nname: magnitude\n---\n")
+    expect(skillText("a\nb\n")).toBe("a\nb\n")
   })
   it("remembers a chosen optional skill and detects its later removal", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {

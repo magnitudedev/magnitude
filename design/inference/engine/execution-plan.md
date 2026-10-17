@@ -459,7 +459,10 @@ cost improvement select the progressive recipe. A class choice identifies the pr
 normalization scope and whether its canonical input was already prepared. Consumers sharing a
 physical table do not share qualification when those semantics differ. Plane residency is merged
 by projection scope; graph class selection uses the exact consumer recipe. Missing or unfinished
-evidence selects packed; full-logit and indexed policies use packed. Later loads consume the saved class choices without
+evidence selects packed; full-logit and indexed policies use packed. A recipe is offered only when
+each of its kernels admits a specialization at the recipe's dimensions on the device, each kernel
+bound to exactly the static dimensions it declares (the refinement levels read no normalization);
+an inadmissible recipe keeps the head packed, the form assessment planned, and never fails a load. Later loads consume the saved class choices without
 additional profiling. Their evidence binds the exact finalized packed specialization; a changed
 canonical choice falls back to packed without reopening qualification. The progressive levels preserve every row whose exact score could win:
 top codes establish a lower-bound threshold, refinement tightens it, and the exact pass scores

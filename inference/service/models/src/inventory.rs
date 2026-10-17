@@ -129,6 +129,7 @@ pub struct InventoryConfig {
     pub max_concurrent_downloads: usize,
     pub disk_reserve_bytes: u64,
     pub catalog_models: Vec<RecommendableModel>,
+    pub catalog_header_digests: BTreeMap<String, String>,
     pub hub_endpoint: Option<String>,
 }
 
@@ -200,6 +201,7 @@ impl InventoryConfig {
             max_concurrent_downloads: 2,
             disk_reserve_bytes: 2 * 1024 * 1024 * 1024,
             catalog_models: Vec::new(),
+            catalog_header_digests: BTreeMap::new(),
             hub_endpoint: None,
         })
     }
@@ -2021,7 +2023,9 @@ pub(crate) fn collect_gguf(
     }
     for entry in read_dir_sorted(directory)? {
         let path = entry.path();
-        if entry.file_name().to_string_lossy().starts_with('.') {
+        if entry.file_name().to_string_lossy().starts_with('.')
+            || crate::local_roots::is_partial_download(&path)
+        {
             continue;
         }
         let file_type = entry.file_type().map_err(io_error)?;
@@ -2861,6 +2865,87 @@ mod tests {
         );
     }
 
+    /// `huggingface_hub` without symlink support (Windows without Developer Mode, or
+    /// `HF_HUB_DISABLE_SYMLINKS`) keeps a plain copy in the snapshot and no blob, so no blob name
+    /// gives the file's Hub SHA-256. A copy at a catalog file's repository, commit and path, with its
+    /// size and header digest, is that file: the catalog's exact target, not a second custom model.
+    #[tokio::test]
+    async fn plain_copy_layout_catalog_target_is_identified_by_its_hub_hash() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let cache = temporary.path().join("cache");
+        let hf_cache = temporary.path().join("hub");
+        let commit = "3d55fac80935ae6456986ad2384b5cbcc4d6c948";
+        let repository_root = hf_cache.join("models--Owner--Model-GGUF");
+        let snapshot = repository_root.join("snapshots").join(commit);
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(repository_root.join("refs")).unwrap();
+        fs::write(repository_root.join("refs/main"), commit).unwrap();
+        let file = snapshot.join("Model-Q4_K_M.gguf");
+        write_minimal_gguf_with_string_metadata(&file, &[("general.name", "Model")]);
+        let bytes = fs::read(&file).unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let header_digest = crate::gguf::inspect_complete(&file).unwrap().header_digest;
+
+        let weights = ModelFile {
+            id: ModelFileId(format!("file_{sha256}")),
+            path: PathBuf::from("Model-Q4_K_M.gguf"),
+            role: ModelFileRole::Weights,
+            size_bytes: bytes.len() as u64,
+            tensor_storage_bytes: None,
+            sha256: sha256.clone(),
+        };
+        let target = ModelPackage {
+            id: crate::package_service::canonical_package_id(std::slice::from_ref(&weights), &[]),
+            source: ModelPackageSource::HuggingFace {
+                repository: "owner/Model-GGUF".to_owned(),
+                revision: commit.to_owned(),
+            },
+            files: vec![weights],
+            relationships: Vec::new(),
+            properties: ModelPackageProperties {
+                format: "gguf".to_owned(),
+                quantization: "unknown".to_owned(),
+                quantization_name: "unknown".to_owned(),
+                architecture: "unknown".to_owned(),
+                maximum_context_length: None,
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
+            },
+        };
+        let installed = |header_digests: BTreeMap<String, String>| {
+            let (store, cache, hf_cache, target) =
+                (store.clone(), cache.clone(), hf_cache.clone(), target.clone());
+            async move {
+                let mut configured = InventoryConfig::with_roots(store, cache).unwrap();
+                configured.add_hugging_face_caches([hf_cache]);
+                configured.catalog_models = vec![catalog_model(target)];
+                configured.catalog_header_digests = header_digests;
+                let manager = ManagedModelStore::open(configured).await.unwrap();
+                manager.ensure_installed_model_inventory().await.unwrap();
+                manager.list_installed().await.unwrap().packages
+            }
+        };
+
+        let packages = installed(BTreeMap::from([(sha256.clone(), header_digest)])).await;
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].package.files[0].sha256, sha256);
+        assert_eq!(packages[0].package.id, target.id);
+        assert!(matches!(
+            packages[0].catalog_attribution,
+            InstalledCatalogAttribution::Attributed { .. }
+        ));
+
+        // A copy whose header differs from the catalog file's is not that file.
+        let packages = installed(BTreeMap::from([(sha256.clone(), "0".repeat(64))])).await;
+        assert_eq!(packages.len(), 1);
+        assert_ne!(packages[0].package.files[0].sha256, sha256);
+        assert_eq!(
+            packages[0].catalog_attribution,
+            InstalledCatalogAttribution::NotCatalogTarget
+        );
+    }
+
     #[tokio::test]
     async fn completed_publication_updates_installed_snapshot_before_returning() {
         let temporary = tempfile::tempdir().unwrap();
@@ -3091,6 +3176,34 @@ mod tests {
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].paths[0], snapshot.join("MODEL.GGUF"));
+    }
+
+    /// A file a download tool is still writing (llama.cpp and browsers name it `*-partial.gguf`)
+    /// is never a model: the watcher ignores its removal, so discovering it would leave it stale.
+    #[test]
+    fn partial_downloads_named_gguf_are_not_discovered() {
+        let temporary = tempfile::tempdir().unwrap();
+        let folder = temporary.path().join("models");
+        fs::create_dir(&folder).unwrap();
+        write_minimal_gguf(&folder.join("model.gguf"));
+        write_minimal_gguf(&folder.join("other.gguf-partial.gguf"));
+        write_minimal_gguf(&folder.join("third-partial.gguf"));
+
+        let groups = discover_groups(
+            &folder,
+            &folder,
+            &ModelCache::new(&temporary.path().join("cache")),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.paths.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![folder.join("model.gguf")]]
+        );
     }
 
     #[test]

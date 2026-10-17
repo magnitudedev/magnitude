@@ -250,8 +250,9 @@ not own this wire-compatibility behavior.
 
 Pi, OpenCode, OpenClaw, Codex, and Oh My Pi share the `~/.agents/skills` target. Hermes,
 Claude Code, and Cline use harness-specific user targets. Installation atomically replaces the
-selected target's Magnitude skill with the bundled version; shared targets receive one physical
-copy.
+selected target's Magnitude skill with the bundled version, written with LF line endings; shared
+targets receive one physical copy. An installed skill matches when its text does, whatever its
+line endings, so a skill an earlier build wrote with CRLF stays connected across an upgrade.
 
 Startup is an explicit preference to register the desktop owner at login. Connecting a harness does
 not implicitly enable login startup or launch the harness. The desktop service supplies the proxy

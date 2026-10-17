@@ -4,6 +4,7 @@ import {
   CatalogFormModelIdSchema,
   CustomFormModelIdSchema,
   DirectoryNotFound,
+  ModelVersionNotRunnable,
   type CustomLocalModel,
   type ModelCatalogState,
 } from "@magnitudedev/sdk"
@@ -203,7 +204,7 @@ describe("inference command surface", () => {
       "catalog recommendations": { arguments: [], options: ["--preference", "--limit"] },
       "catalog search": { arguments: ["<query>"], options: ["--all", "--limit"] },
       "catalog inspect": { arguments: ["<reference>"], options: [] },
-      "catalog pull": { arguments: ["<model>"], options: ["--drafter"] },
+      "catalog pull": { arguments: ["<model>"], options: ["--drafter", "--force"] },
       "catalog cancel": { arguments: ["<model-id>"], options: [] },
       "catalog remove": { arguments: ["<model-id>"], options: [] },
       "models status": { arguments: ["[model-id]"], options: ["--all"] },
@@ -477,13 +478,15 @@ describe("pull and model mutations", () => {
 
   it("renders import and drafter acknowledgements", () => {
     const modelId = CustomFormModelIdSchema.make(`local:${"b".repeat(64)}`)
-    expect(renderImport({ path: "/models/q.gguf", modelId, drafter: Option.none(), drafterDownloadStarted: false })).toBe([
+    expect(renderImport({ path: "/models/q.gguf", modelId, drafter: Option.none(), outcome: "Started", drafterDownloadStarted: false })).toBe([
       "Added /models/q.gguf. Magnitude uses the file where it is and never moves or deletes it.",
       "Drafter: none",
       `Model ID: ${modelId}`,
       `Load it: magnitude models load ${modelId}`,
       "",
     ].join("\n"))
+    expect(renderImport({ path: "/copies/q.gguf", modelId: FOUND_MODEL_ID, drafter: Option.none(), outcome: "AlreadyOnThisComputer", drafterDownloadStarted: false }))
+      .toContain(`Already on this computer: /copies/q.gguf has the same bytes as ${FOUND_MODEL_ID}, so it is that model.`)
     expect(renderSetDrafter({ modelId, drafter: Option.none(), drafterDownloadStarted: false })).toBe(`Turned off the drafter for ${modelId}.\n`)
     expect(renderSetDrafter({ modelId, drafter: Option.none(), drafterDownloadStarted: false }, "Auto"))
       .toBe(`No drafter is known to work with ${modelId}, so it runs without one.\n`)
@@ -511,8 +514,35 @@ describe("pull and model mutations", () => {
       revision: Option.none(),
       version: Option.none(),
       drafter: { _tag: "Auto" },
+      force: false,
     })
     expect(result).toMatchObject({ _tag: "Right", right: { _tag: "HuggingFace", versionRequested: false } })
+  })
+
+  it("passes --force and words a version the service refuses", async () => {
+    const { client, models } = fakeClient({ addHuggingFaceModel: () => Effect.succeed(added("Started")) })
+    await run(pull(client, TEST_REPOSITORY, pullReference(TEST_REPOSITORY), drafterArgument("auto"), true))
+    expect(models.addHuggingFaceModel).toHaveBeenCalledWith(expect.objectContaining({ force: true }))
+
+    const reference = `${TEST_REPOSITORY}:Q8_0`
+    const tooLarge = fakeClient({
+      addHuggingFaceModel: () => Effect.fail(new ModelVersionNotRunnable({
+        reference, version: "Q8_0", verdict: { _tag: "DoesNotFit", deficitBytes: 6 * 1024 ** 3 },
+      })),
+    })
+    const refused = await run(pull(tooLarge.client, reference, pullReference(reference), drafterArgument("auto")))
+    expect(refused._tag === "Left" && (refused.left as { message: string }).message).toBe(
+      `Q8_0 needs 6 GB more memory than this computer can provide. Download it anyway with: magnitude catalog pull ${reference} --force`,
+    )
+    const unsupported = fakeClient({
+      addHuggingFaceModel: () => Effect.fail(new ModelVersionNotRunnable({
+        reference, version: "Q2_K",
+        verdict: { _tag: "Unsupported", reasons: [{ _tag: "WeightTypes", types: [{ ggmlType: "Q2_K", tensorCount: 2 }] }] },
+      })),
+    })
+    const cannot = await run(pull(unsupported.client, reference, pullReference(reference), drafterArgument("auto"), true))
+    expect(cannot._tag === "Left" && (cannot.left as { message: string }).message)
+      .toBe("Magnitude can't run Q2_K: Uses Q2_K weights, which Magnitude doesn't support yet.")
   })
 
   it("keeps catalog pull on the catalog sync", async () => {
@@ -549,6 +579,7 @@ describe("pull and model mutations", () => {
       revision: Option.some(TEST_COMMIT),
       version: Option.some("Q6_K_P"),
       drafter: { _tag: "Reference", reference: { _tag: "Local", path: "/drafters/mtp.gguf" } },
+      force: false,
     })
   })
 
@@ -564,6 +595,7 @@ describe("pull and model mutations", () => {
       revision: Option.some(TEST_COMMIT),
       version: Option.some("Q4_K_P"),
       drafter: { _tag: "None" },
+      force: false,
     })
     expect(result).toMatchObject({ _tag: "Right", right: { versionRequested: true } })
   })
@@ -596,7 +628,7 @@ describe("pull and model mutations", () => {
 
   it("imports a file with the chosen drafter", async () => {
     const modelId = CustomFormModelIdSchema.make(`local:${"c".repeat(64)}`)
-    const { client, models } = fakeClient({ importModelFile: () => Effect.succeed({ modelId, drafter: Option.none() }) })
+    const { client, models } = fakeClient({ importModelFile: () => Effect.succeed({ modelId, drafter: Option.none(), outcome: "Started" }) })
     const result = await run(importFile(client, "/models/q.gguf", drafterArgument("built-in")))
     expect(models.importModelFile).toHaveBeenCalledWith({
       path: "/models/q.gguf",
@@ -863,8 +895,9 @@ describe("--json output", () => {
       path: "/m/q.gguf",
       modelId: CustomFormModelIdSchema.make(`local:${"d".repeat(64)}`),
       drafter: Option.none(),
+      outcome: "Started",
       drafterDownloadStarted: false,
-    })).toEqual({ path: "/m/q.gguf", modelId: `local:${"d".repeat(64)}`, drafterDownloadStarted: false })
+    })).toEqual({ path: "/m/q.gguf", modelId: `local:${"d".repeat(64)}`, outcome: "Started", drafterDownloadStarted: false })
   })
 
   it.each([

@@ -43,7 +43,9 @@ export const ImportResultSchema = Schema.extend(
 export type ImportResult = typeof ImportResultSchema.Type
 
 export const renderImport = (result: ImportResult): string => ensureTrailingNewline([
-  `Added ${result.path}. Magnitude uses the file where it is and never moves or deletes it.`,
+  result.outcome === "AlreadyOnThisComputer"
+    ? `Already on this computer: ${result.path} has the same bytes as ${result.modelId}, so it is that model. Magnitude never moves or deletes it.`
+    : `Added ${result.path}. Magnitude uses the file where it is and never moves or deletes it.`,
   drafterLine(result.drafter),
   `Model ID: ${result.modelId}`,
   result.drafterDownloadStarted

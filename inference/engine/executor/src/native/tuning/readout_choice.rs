@@ -142,11 +142,41 @@ fn declared_defaults<E: seismic::Entry>(
     device: &seismic::Device,
     statics: &NativeSpecialization,
 ) -> Result<NativeSpecialization, CatalogFailure> {
+    let implementation = native_implementation::<E>(device)?;
+    implementation
+        .default_specialization(&only_declared(&implementation, statics))
+        .map_err(fail)
+}
+
+fn native_implementation<E: seismic::Entry>(
+    device: &seismic::Device,
+) -> Result<seismic::NativeImplementation, CatalogFailure> {
     seismic::generated::native_implementation::<E>(device)
         .map_err(fail)?
-        .ok_or_else(|| fail("readout recipe has no native implementation"))?
-        .default_specialization(statics)
-        .map_err(fail)
+        .ok_or_else(|| fail("readout recipe has no native implementation"))
+}
+
+fn only_declared(
+    implementation: &seismic::NativeImplementation,
+    statics: &NativeSpecialization,
+) -> NativeSpecialization {
+    statics
+        .statics()
+        .iter()
+        .filter(|(name, _)| implementation.statics.contains(name))
+        .fold(NativeSpecialization::new(), |spec, (name, value)| {
+            spec.with_static(name.clone(), *value)
+        })
+}
+
+/// The recipe's statics that `E`'s native implementation on `device` declares. The recipe's
+/// kernels share one set of dimensions, but each declares only those it reads (the refinement
+/// levels read no norm), and a specialization naming an undeclared static is refused.
+pub(crate) fn declared_statics<E: seismic::Entry>(
+    device: &seismic::Device,
+    statics: &NativeSpecialization,
+) -> Result<NativeSpecialization, CatalogFailure> {
+    Ok(only_declared(&native_implementation::<E>(device)?, statics))
 }
 
 impl ReadoutRecipe {
@@ -165,6 +195,17 @@ impl ReadoutRecipe {
             .with_static("D", self.hidden)
             .with_static("PT", self.parts)
             .with_static("NM", self.norm_extent)
+    }
+
+    /// Whether every kernel of the progressive recipe admits a specialization at this recipe's
+    /// statics on `device`. A recipe that doesn't is never offered: the head stays packed, the
+    /// form assessment planned, rather than failing the load.
+    pub(crate) fn admissible(self, device: &seismic::Device) -> bool {
+        let spec = self.statics();
+        declared_defaults::<readout_top_rows::Entry>(device, &spec).is_ok()
+            && declared_defaults::<readout_refine_rows::Entry>(device, &spec).is_ok()
+            && declared_defaults::<readout_exact_rows::Entry>(device, &spec).is_ok()
+            && declared_defaults::<readout_planes_rows::Entry>(device, &spec).is_ok()
     }
 
     /// Row-independent fixed programs are formed once per exact physical
@@ -936,5 +977,61 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             cache.store_readout_choice(&self.key, &self.receipt);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Q8_0 head served as progressive planes on CUDA (MiniCPM5 1B Q8, MXFP4 Qwen3.5 9B) failed
+    /// to load with "`NM` is not a static dimension": the refinement levels declare no norm, and
+    /// were handed the whole recipe's statics. Every recipe kernel takes only those it declares.
+    #[test]
+    fn every_progressive_readout_kernel_takes_only_the_statics_it_declares() {
+        let backend = if cfg!(target_os = "macos") {
+            seismic::BackendName::Metal
+        } else {
+            seismic::BackendName::Cuda
+        };
+        let Some(device) = seismic::DeviceCatalog::discover()
+            .ok()
+            .and_then(|catalog| catalog.open_backend(backend).ok())
+        else {
+            return;
+        };
+        let statics = NativeSpecialization::new()
+            .with_static("V", 130_560)
+            .with_static("D", 1_536)
+            .with_static("PT", 1)
+            .with_static("NM", 1_536)
+            .with_static("P", 3);
+        assert!(
+            native_implementation::<readout_refine_rows::Entry>(&device)
+                .unwrap()
+                .default_specialization(&statics)
+                .is_err(),
+            "the refinement levels refuse the recipe's norm statics"
+        );
+        declared_defaults::<readout_top_rows::Entry>(&device, &statics).unwrap();
+        declared_defaults::<readout_refine_rows::Entry>(&device, &statics).unwrap();
+        declared_defaults::<readout_exact_rows::Entry>(&device, &statics).unwrap();
+        declared_defaults::<readout_planes_rows::Entry>(&device, &statics).unwrap();
+        readout_refine_rows::native_digest_with(
+            &device,
+            readout_refine_rows::Elements {
+                A: seismic::Element::f32(),
+            },
+            &declared_statics::<readout_refine_rows::Entry>(&device, &statics).unwrap(),
+        )
+        .unwrap();
+        readout_exact_rows::native_digest_with(
+            &device,
+            readout_exact_rows::Elements {
+                A: seismic::Element::f32(),
+            },
+            &declared_statics::<readout_exact_rows::Entry>(&device, &statics).unwrap(),
+        )
+        .unwrap();
     }
 }

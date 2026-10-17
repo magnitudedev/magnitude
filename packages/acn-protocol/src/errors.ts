@@ -2,7 +2,7 @@ import { Schema } from "effect"
 import { ProjectIdSchema } from "./schemas/project"
 import { RelativePathSchema } from "./schemas/paths"
 import { ProjectFileTextSnapshotSchema } from "./schemas/project-files"
-import { SlotIdSchema } from "./schemas/model-state"
+import { SlotIdSchema, UnsupportedReasonSchema } from "./schemas/model-state"
 
 export class SessionNotFound extends Schema.TaggedError<SessionNotFound>()(
   "SessionNotFound",
@@ -298,10 +298,27 @@ export const ModelCandidateError = Schema.Union(
 )
 export type ModelCandidateError = Schema.Schema.Type<typeof ModelCandidateError>
 
+/**
+ * A version refused before anything downloads: the engine can't run it, or it needs more memory than this
+ * computer can provide and the request didn't force it. Clients word it from these facts.
+ */
+export class ModelVersionNotRunnable extends Schema.TaggedError<ModelVersionNotRunnable>()(
+  "ModelVersionNotRunnable",
+  {
+    reference: Schema.String,
+    version: Schema.String,
+    verdict: Schema.Union(
+      Schema.TaggedStruct("Unsupported", { reasons: Schema.NonEmptyArray(UnsupportedReasonSchema) }),
+      Schema.TaggedStruct("DoesNotFit", { deficitBytes: Schema.NonNegativeInt }),
+    ),
+  },
+) {}
+
 export const CustomModelMutationError = Schema.Union(
   InvalidModelReference,
   ModelSourceUnavailable,
   LocalModelMutationFailed,
+  ModelVersionNotRunnable,
 )
 export type CustomModelMutationError = Schema.Schema.Type<typeof CustomModelMutationError>
 

@@ -1047,6 +1047,25 @@ impl ReleaseCatalog {
         })
     }
 
+    /// The header digest of every bundled package file, by the file's Hub SHA-256.
+    #[must_use]
+    pub fn file_header_digests(&self) -> BTreeMap<String, String> {
+        self.planner_inputs
+            .values()
+            .flat_map(|input| input.packages())
+            .flat_map(|package| {
+                package.components.iter().filter_map(|component| {
+                    package
+                        .package
+                        .files
+                        .iter()
+                        .find(|file| file.path == component.component.path)
+                        .map(|file| (file.sha256.clone(), component.header_digest.clone()))
+                })
+            })
+            .collect()
+    }
+
     pub fn resolve_bundle(
         &self,
         bundle_key: &ServableModelBundleKey,

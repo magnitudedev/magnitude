@@ -1,6 +1,7 @@
 use super::specialization::{Specializer, Tuning};
 use super::tuning::readout_choice::{
     QualifiedRecipe, ReadoutContender, ReadoutRecipe, RecipePreparation, RecipeState,
+    declared_statics,
 };
 use super::tuning::streams::{StreamMixDownTuning, StreamMixUpTuning};
 use super::tuning::{
@@ -732,6 +733,9 @@ impl<'a> Preparation<'a> {
             low_planes,
             scale_extent,
         };
+        if !recipe.admissible(device) {
+            return Ok(None);
+        }
         let bound = seismic::NativeSpecialization::new()
             .with_static("V", vocabulary)
             .with_static("D", hidden)
@@ -751,16 +755,20 @@ impl<'a> Preparation<'a> {
             bindings: format!("{scope:?}"),
             outcome: error.to_string(),
         })?;
+        let refine_bound =
+            declared_statics::<magnitude_kernels::readout_refine_rows::Entry>(device, &bound)?;
+        let exact_bound =
+            declared_statics::<magnitude_kernels::readout_exact_rows::Entry>(device, &bound)?;
         let additional_digests = [
             magnitude_kernels::readout_refine_rows::native_digest_with(
                 device,
                 magnitude_kernels::readout_refine_rows::Elements { A: activation },
-                &bound,
+                &refine_bound,
             ),
             magnitude_kernels::readout_exact_rows::native_digest_with(
                 device,
                 magnitude_kernels::readout_exact_rows::Elements { A: activation },
-                &bound,
+                &exact_bound,
             ),
             magnitude_kernels::readout_planes_rows::native_digest_with(
                 device,

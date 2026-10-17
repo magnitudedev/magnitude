@@ -1,5 +1,5 @@
-import type { ModelAcquisitionFailure, ModelLocationKind, UnsupportedReason } from "@magnitudedev/sdk"
-import { formatStorageSize } from "../utils/format-bytes"
+import type { ModelAcquisitionFailure, ModelLocationKind, ModelVersionNotRunnable, UnsupportedReason } from "@magnitudedev/sdk"
+import { formatMemorySize, formatStorageSize } from "../utils/format-bytes"
 
 export const modelDownloadFailureMessage = (failure: ModelAcquisitionFailure): string => {
   switch (failure._tag) {
@@ -70,6 +70,12 @@ export const unsupportedReasonGroupMessage = ({ reason, count }: UnsupportedReas
 /** Every distinct user-facing reason, in the engine's order, with identical reasons said once. */
 export const unsupportedReasonMessages = (reasons: ReadonlyArray<UnsupportedReason>): ReadonlyArray<string> =>
   unsupportedReasonGroups(reasons).map(unsupportedReasonGroupMessage)
+
+/** Why a version was refused before anything downloaded. */
+export const modelVersionNotRunnableMessage = ({ version, verdict }: ModelVersionNotRunnable): string =>
+  verdict._tag === "Unsupported"
+    ? `Magnitude can't run ${version}: ${unsupportedReasonMessages(verdict.reasons).join("; ")}.`
+    : `${version} needs ${formatMemorySize(verdict.deficitBytes, { rounding: "up" })} more memory than this computer can provide.`
 
 const joinWithAnd = (values: ReadonlyArray<string>): string =>
   values.length <= 2 ? values.join(" and ") : `${values.slice(0, -1).join(", ")}, and ${values.at(-1)}`

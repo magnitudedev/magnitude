@@ -1,5 +1,5 @@
 /// <reference path="./assets.d.ts" />
-import { inspectHarnessConnection } from "./inspection"
+import { inspectHarnessConnection, skillText } from "./inspection"
 import { SqliteDriver } from "@magnitudedev/storage/sqlite"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as FileSystem from "@effect/platform/FileSystem"
@@ -42,7 +42,9 @@ import { resolveHarnessConnectionPaths, type HarnessConnectionPaths } from "./pa
 import { describeHarnessSetup } from "./setup"
 import { makeHarnessConnectorRegistry, type HarnessConnectorRegistry } from "./registry"
 import { OPENAI_BASE_URL, readOr } from "./shared"
-import skillContents from "./magnitude-skill.md" with { type: "text" }
+import bundledSkill from "./magnitude-skill.md" with { type: "text" }
+
+const skillContents = skillText(bundledSkill)
 
 export {
   ANTHROPIC_BASE_URL,

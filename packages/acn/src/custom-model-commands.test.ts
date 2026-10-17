@@ -278,7 +278,7 @@ describe("finding models", () => {
       },
     })
     const result = await gated.run((commands) => commands.addHuggingFaceModel({
-      repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" },
+      repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false
     }).pipe(Effect.either))
     expect(result._tag === "Left" && result.left).toMatchObject({
       _tag: "ModelSourceUnavailable",
@@ -313,7 +313,7 @@ describe("adding models", () => {
   it("declares an added model with its drafter and downloads the bundle ICN builds", async () => {
     const { run, recorded } = harness()
     const result = await run((commands, models) => Effect.gen(function* () {
-      const added = yield* commands.addHuggingFaceModel({ repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" } })
+      const added = yield* commands.addHuggingFaceModel({ repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false })
       return { added, config: yield* models.get }
     }))
     expect(result.added).toMatchObject({ modelId: addedId, version: "Q4_K_M", outcome: "Started" })
@@ -328,19 +328,75 @@ describe("adding models", () => {
     expect(recorded.pushes).toBeGreaterThan(0)
   })
 
+  it("downloads only the target when the chosen drafter is already on this computer", async () => {
+    const { run, recorded } = harness({ drafters: [nativeCandidate({ onThisComputer: true })] })
+    const result = await run((commands, models) => Effect.gen(function* () {
+      const added = yield* commands.addHuggingFaceModel({ repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false })
+      return { added, config: yield* models.get }
+    }))
+    expect(result.added.drafter.pipe(Option.map(({ onThisComputer }) => onThisComputer))).toEqual(Option.some(true))
+    expect(result.config.drafters[addedId]).toEqual({ _tag: "Reference", reference: drafterReference })
+    expect(recorded.bundles[0]?.drafter).toEqual(Option.none())
+  })
+
   it("refuses an unsupported version before anything downloads", async () => {
     const { run, recorded } = harness()
     const result = await run((commands) => commands.addHuggingFaceModel({
-      repository, revision: Option.none(), version: Option.some("Q2_K"), drafter: { _tag: "None" },
+      repository, revision: Option.none(), version: Option.some("Q2_K"), drafter: { _tag: "None" }, force: false
     }).pipe(Effect.either))
-    expect(result._tag).toBe("Left")
+    expect(result._tag === "Left" && result.left).toMatchObject({
+      _tag: "ModelVersionNotRunnable",
+      version: "Q2_K",
+      verdict: { _tag: "Unsupported", reasons: [{ _tag: "WeightTypes" }] },
+    })
     expect(recorded.started).toEqual([])
+  })
+
+  it("refuses a version that needs more memory than this computer can provide unless forced", async () => {
+    const tooLarge = Schema.decodeUnknownSync(CandidateInspection)({
+      source: { _tag: "HuggingFace", repository: "owner/model-GGUF", commit: "c0ffee" },
+      displayName: "",
+      versions: [{
+        label: "Q8_0",
+        modelId: "hf:owner/model-GGUF/model-Q8_0.gguf",
+        files: [{ path: "model-Q8_0.gguf", sizeBytes: 100 }],
+        sizeBytes: 100,
+        downloadBytes: 100,
+        recommended: false,
+        assessment: {
+          _tag: "DoesNotFit",
+          assessmentId: "assessment",
+          profile: { contextLength: 4096 },
+          memory: [{ memoryDomainId: "system", capacityBytes: 8, compatibilityReserveBytes: 0, remainingBytes: -4, requiredBytes: 12 }],
+          limitingResource: "system",
+          deficitBytes: 4,
+          drafter: { _tag: "None" },
+        },
+      }],
+    })
+    const refused = harness({ inspect: tooLarge })
+    const result = await refused.run((commands) => commands.addHuggingFaceModel({
+      repository, revision: Option.none(), version: Option.some("Q8_0"), drafter: { _tag: "None" }, force: false,
+    }).pipe(Effect.either))
+    expect(result._tag === "Left" && result.left).toMatchObject({
+      _tag: "ModelVersionNotRunnable",
+      version: "Q8_0",
+      verdict: { _tag: "DoesNotFit", deficitBytes: 4 },
+    })
+    expect(refused.recorded.started).toEqual([])
+
+    const forced = harness({ inspect: tooLarge })
+    const added = await forced.run((commands) => commands.addHuggingFaceModel({
+      repository, revision: Option.none(), version: Option.some("Q8_0"), drafter: { _tag: "None" }, force: true,
+    }))
+    expect(added).toMatchObject({ version: "Q8_0", outcome: "Started" })
+    expect(forced.recorded.started).toHaveLength(1)
   })
 
   it("adds a version already on this computer by fetching only its drafter", async () => {
     const { run, recorded } = harness({ inspect: inspection(foundId) })
     const result = await run((commands, models) => Effect.gen(function* () {
-      const added = yield* commands.addHuggingFaceModel({ repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" } })
+      const added = yield* commands.addHuggingFaceModel({ repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false })
       return { added, config: yield* models.get }
     }))
     expect(result.added).toMatchObject({ modelId: foundId, outcome: "AlreadyOnThisComputer" })
@@ -361,9 +417,34 @@ describe("adding models", () => {
       const imported = yield* commands.importModelFile("/models/imported.gguf", { _tag: "None" })
       return { imported, config: yield* models.get }
     }))
-    expect(result.imported.modelId).toBe(importedId)
+    expect(result.imported).toMatchObject({ modelId: importedId, outcome: "Started" })
     expect(result.config.declarations[importedId]?.origin).toMatchObject({ _tag: "Imported", path: "/models/imported.gguf" })
     expect(result.config.drafters[importedId]).toEqual({ _tag: "None" })
+  })
+
+  it("imports a copy of a found model as that model: one more location, never a replacement", async () => {
+    const config = customModelsConfig({ declarations: {}, drafters: { [foundId]: { _tag: "None" } } })
+    const { run, recorded } = harness({
+      inspect: Schema.decodeUnknownSync(CandidateInspection)({
+        source: { _tag: "Local", path: "/copies/copy.gguf" },
+        displayName: "Copy",
+        versions: [{
+          label: "Q8_0", modelId: importedId, onThisComputer: foundId,
+          files: [{ path: "/copies/copy.gguf", sizeBytes: 1 }], sizeBytes: 1, downloadBytes: 0, recommended: true,
+        }],
+      }),
+      config,
+    })
+    const result = await run((commands, models) => Effect.gen(function* () {
+      const imported = yield* commands.importModelFile("/copies/copy.gguf", { _tag: "Auto" })
+      return { imported, config: yield* models.get }
+    }))
+    expect(result.imported).toMatchObject({ modelId: foundId, outcome: "AlreadyOnThisComputer" })
+    expect(result.config.declarations[importedId]?.origin).toMatchObject({ _tag: "Imported", path: "/copies/copy.gguf" })
+    expect(result.config.declarations[foundId]).toBeUndefined()
+    expect(result.config.drafters[foundId]).toEqual({ _tag: "None" })
+    expect(result.config.drafters[importedId]).toBeUndefined()
+    expect(recorded.started).toEqual([])
   })
 })
 

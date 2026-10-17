@@ -143,6 +143,7 @@ const makeLocalModels = Effect.gen(function* () {
       readonly revision: Option.Option<string>
       readonly version: Option.Option<string>
       readonly drafter: DrafterChoice
+      readonly force: boolean
     }) => Mutation.execute(addFromHuggingFace, input).pipe(provideRegistry),
     importFile: (path: string, drafter: DrafterChoice) =>
       Mutation.execute(importFile, { path, drafter }).pipe(provideRegistry),

@@ -180,24 +180,31 @@ const AddedCustomModelSchema = Schema.Struct({
   drafterDownloadStarted: Schema.Boolean,
 })
 
-/** Pins the repository's commit, picks the recommended version when none is named, and starts the download. */
+/**
+ * Pins the repository's commit, picks the recommended version when none is named, and starts the download. A
+ * version the engine can't run is refused, and one that needs more memory than this computer can provide is
+ * refused unless `force` is set (ModelVersionNotRunnable).
+ */
 const AddHuggingFaceModel = Rpc.make("AddHuggingFaceModel", {
   payload: Schema.Struct({
     repository: HuggingFaceRepositoryIdSchema,
     revision: optional(NonEmptyString),
     version: optional(NonEmptyString),
     drafter: DrafterChoiceSchema,
+    force: Schema.Boolean,
   }),
   success: AddedCustomModelSchema,
   error: CustomModelMutationError,
 }).pipe(atMostOnce)
 
-/** Declares one GGUF by path, referenced in place; never copies or deletes it. */
+/** Declares one GGUF by path, referenced in place; never copies or deletes it. A file whose bytes are already a
+ * model on this computer is that model: one more location, with the outcome AlreadyOnThisComputer. */
 const ImportModelFile = Rpc.make("ImportModelFile", {
   payload: Schema.Struct({ path: NonEmptyString, drafter: DrafterChoiceSchema }),
   success: Schema.Struct({
     modelId: CustomFormModelIdSchema,
     drafter: optional(DrafterCandidateSchema),
+    outcome: Schema.Literal("Started", "AlreadyOnThisComputer"),
     drafterDownloadStarted: Schema.Boolean,
   }),
   error: CustomModelMutationError,

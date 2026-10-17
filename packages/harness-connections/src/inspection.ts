@@ -31,6 +31,9 @@ const includesFields = (actual: unknown, expected: unknown): boolean => {
   return Object.entries(expected).every(([key, value]) => includesFields(valueAt(actual, [key]), value))
 }
 
+/** A skill file's text with LF line endings: a build checked out on Windows bundles the skill with CRLF, and a skill compares by its text, not its line endings. */
+export const skillText = (contents: string) => contents.replace(/\r\n/g, "\n")
+
 /** Read owned configuration fields; never repair files or start a harness while inspecting. */
 export const inspectHarnessConnection = (
   paths: HarnessConnectionPaths,
@@ -93,7 +96,7 @@ export const inspectHarnessConnection = (
   if (!valid) return disconnected(present ? "Magnitude configuration has changed" : "Not connected")
   if (Option.isSome(requiredSkill)) {
     const path = paths.skillInstallations[connector.skillInstallationTarget].skillFile
-    if ((yield* readOr(path, "")) !== requiredSkill.value) return disconnected("Magnitude skill is missing or has changed")
+    if (skillText(yield* readOr(path, "")) !== skillText(requiredSkill.value)) return disconnected("Magnitude skill is missing or has changed")
   }
   if (connector.companion !== undefined && !(yield* connector.companion.inspect)) {
     return disconnected("Magnitude plugin is missing, disabled, or incompatible")

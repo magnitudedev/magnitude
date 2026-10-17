@@ -275,7 +275,7 @@ export type AddTarget =
 export const addVersionRequest = (target: AddTarget, version: CandidateVersion, drafter: DrafterChoice) =>
   target._tag === "File"
     ? { _tag: "Import" as const, request: { path: target.path, drafter } }
-    : { _tag: "Add" as const, request: { repository: target.repository, revision: Option.some(target.commit), version: Option.some(version.label), drafter } }
+    : { _tag: "Add" as const, request: { repository: target.repository, revision: Option.some(target.commit), version: Option.some(version.label), drafter, force: false } }
 
 /** The drafter choices for one version and the footer that adds it with the chosen drafter. */
 function useVersionConfirmation(inspection: CandidateInspection, version: CandidateVersion, target: AddTarget, onAdded: () => void) {

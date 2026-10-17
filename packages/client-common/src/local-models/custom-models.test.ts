@@ -2,6 +2,7 @@ import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   CatalogFormModelIdSchema,
+  ModelVersionNotRunnable,
   UnsupportedReasonSchema,
   type CandidateVersion,
   type DrafterCandidate,
@@ -19,7 +20,7 @@ import {
   drafterCandidateSelectable,
   drafterCandidateWarning,
 } from "./drafter-presentation"
-import { unsupportedReasonMessage, unsupportedReasonMessages } from "./failure-messages"
+import { modelVersionNotRunnableMessage, unsupportedReasonMessage, unsupportedReasonMessages } from "./failure-messages"
 import { noRunnableVersionReason } from "./candidate-versions"
 import {
   installedLocalModels,
@@ -33,6 +34,19 @@ import { localModelCommandStatus } from "./service"
 const reason = (value: unknown): UnsupportedReason => Schema.decodeUnknownSync(UnsupportedReasonSchema)(value)
 
 describe("unsupported reasons in the UI", () => {
+  it("explains a refused version with its reasons or the memory it lacks", () => {
+    expect(modelVersionNotRunnableMessage(new ModelVersionNotRunnable({
+      reference: "owner/model-GGUF:Q2_K",
+      version: "Q2_K",
+      verdict: { _tag: "Unsupported", reasons: [reason({ _tag: "WeightTypes", types: [{ ggmlType: "Q2_K", tensorCount: 2 }] })] },
+    }))).toBe("Magnitude can't run Q2_K: Uses Q2_K weights, which Magnitude doesn't support yet.")
+    expect(modelVersionNotRunnableMessage(new ModelVersionNotRunnable({
+      reference: "owner/model-GGUF:Q8_0",
+      version: "Q8_0",
+      verdict: { _tag: "DoesNotFit", deficitBytes: 6 * 1024 ** 3 + 1 },
+    }))).toBe("Q8_0 needs 6.1 GB more memory than this computer can provide.")
+  })
+
   it("words every known case as the product specifies", () => {
     expect([
       { _tag: "Architecture", architecture: "deepseek4" },

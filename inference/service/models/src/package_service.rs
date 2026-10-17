@@ -15,7 +15,8 @@ use magnitude_service_contracts::models::{
 use magnitude_service_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, ExternalOrigin, HubCacheOwner,
     InventoryError,
-    InventoryModel, InventoryProperties, ModelAvailability, ModelInventory, ModelLocation,
+    InventoryModel, InventoryProperties, ModelAvailability, ModelComponent, ModelInventory,
+    ModelLocation,
     ModelPreviewComponentSource, ModelPreviewSource, ModelSource, ResolvedModel,
 };
 use sha2::{Digest, Sha256};
@@ -250,9 +251,13 @@ fn package_relationship(
     }
 }
 
+/// Builds a resolved model's package. `catalog_sha256` names the Hub SHA-256 of a file whose blob
+/// name gives none (a Hugging Face cache written without symlinks keeps plain copies in its
+/// snapshots) when a catalog file is that exact file.
 fn package_from_resolved_with(
     resolved: &ResolvedModel,
     inspect: impl Fn(&Path, &ContentIdentity) -> Option<crate::gguf::GgufInspection>,
+    catalog_sha256: impl Fn(&ModelPackageSource, &ModelComponent, &str) -> Option<String>,
 ) -> Result<(ModelPackage, Option<crate::gguf::GgufInspection>), InventoryError> {
     let model = &resolved.model;
     let source = package_source(model, resolved);
@@ -287,9 +292,10 @@ fn package_from_resolved_with(
                 value.clone()
             }
             content => match inspection.as_ref() {
-                Some(inspection) => {
-                    header_file_digest(&inspection.header_digest, declared.size_bytes)
-                }
+                Some(inspection) => catalog_sha256(&source, declared, &inspection.header_digest)
+                    .unwrap_or_else(|| {
+                        header_file_digest(&inspection.header_digest, declared.size_bytes)
+                    }),
                 None => unreadable_file_digest(content, declared.size_bytes),
             },
         };
@@ -449,8 +455,9 @@ fn package_validation_for(model: &InventoryModel, package: &ModelPackage) -> Pac
 fn validated_package_from_resolved_with(
     resolved: &ResolvedModel,
     inspect_gguf: impl Fn(&Path, &ContentIdentity) -> Option<crate::gguf::GgufInspection>,
+    catalog_sha256: impl Fn(&ModelPackageSource, &ModelComponent, &str) -> Option<String>,
 ) -> Result<ValidatedModelPackage, InventoryError> {
-    let (package, primary) = package_from_resolved_with(resolved, inspect_gguf)?;
+    let (package, primary) = package_from_resolved_with(resolved, inspect_gguf, catalog_sha256)?;
     let validation = package_validation_for(&resolved.model, &package);
     Ok(ValidatedModelPackage {
         package,
@@ -462,9 +469,11 @@ fn validated_package_from_resolved_with(
 pub(crate) fn validated_package_from_resolved(
     resolved: &ResolvedModel,
 ) -> Result<ValidatedModelPackage, InventoryError> {
-    validated_package_from_resolved_with(resolved, |path, _| {
-        crate::gguf::inspect_complete(path).ok()
-    })
+    validated_package_from_resolved_with(
+        resolved,
+        |path, _| crate::gguf::inspect_complete(path).ok(),
+        |_, _, _| None,
+    )
 }
 
 fn installed_path(model: &InventoryModel, resolved: &ResolvedModel) -> PathBuf {
@@ -823,9 +832,55 @@ impl ManagedModelStore {
         &self,
         resolved: &ResolvedModel,
     ) -> Result<ValidatedModelPackage, InventoryError> {
-        validated_package_from_resolved_with(resolved, |path, content| {
-            self.inspect_gguf(path, content)
-        })
+        validated_package_from_resolved_with(
+            resolved,
+            |path, content| self.inspect_gguf(path, content),
+            |source, component, header_digest| {
+                self.catalog_file_sha256(source, component, header_digest)
+            },
+        )
+    }
+
+    /// The Hub SHA-256 of a file found at the same repository, commit and path as a catalog file,
+    /// with that file's size and header digest.
+    fn catalog_file_sha256(
+        &self,
+        source: &ModelPackageSource,
+        component: &ModelComponent,
+        header_digest: &str,
+    ) -> Option<String> {
+        let ModelPackageSource::HuggingFace {
+            repository,
+            revision,
+        } = source
+        else {
+            return None;
+        };
+        self.config
+            .catalog_models
+            .iter()
+            .flat_map(catalog_packages)
+            .filter(|(package, _)| {
+                matches!(
+                    &package.source,
+                    ModelPackageSource::HuggingFace {
+                        repository: catalog_repository,
+                        revision: catalog_revision,
+                    } if catalog_repository.eq_ignore_ascii_case(repository)
+                        && catalog_revision == revision
+                )
+            })
+            .flat_map(|(package, _)| &package.files)
+            .find(|file| {
+                file.path == component.path
+                    && file.size_bytes == component.size_bytes
+                    && self
+                        .config
+                        .catalog_header_digests
+                        .get(&file.sha256)
+                        .is_some_and(|digest| digest == header_digest)
+            })
+            .map(|file| file.sha256.clone())
     }
 
     fn gguf_inspection_cache_key(path: &Path, content: &ContentIdentity) -> Option<String> {

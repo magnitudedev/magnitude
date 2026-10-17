@@ -146,7 +146,7 @@ describe("add GGUF file", () => {
     expect(addVersionRequest({ _tag: "File", path: "/Users/me/gguf-import/MiniCPM5-2B-Q4_K_M.gguf" }, version("Q4_K_M"), { _tag: "Auto" }))
       .toEqual({ _tag: "Import", request: { path: "/Users/me/gguf-import/MiniCPM5-2B-Q4_K_M.gguf", drafter: { _tag: "Auto" } } })
     expect(addVersionRequest({ _tag: "Repository", repository, commit: "c0ffee" }, version("Q4_K_P"), { _tag: "None" }))
-      .toEqual({ _tag: "Add", request: { repository, revision: Option.some("c0ffee"), version: Option.some("Q4_K_P"), drafter: { _tag: "None" } } })
+      .toEqual({ _tag: "Add", request: { repository, revision: Option.some("c0ffee"), version: Option.some("Q4_K_P"), drafter: { _tag: "None" }, force: false } })
   })
   it("opens on the file picker, in place of the version list, until a file is chosen", () => {
     const html = inDialog(<LocalFileView browser={<p>file browser</p>} file={Option.none()} />)

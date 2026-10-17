@@ -48,6 +48,7 @@ export const registerInferenceCommands = (program: Command): void => {
     .description("Download or update a model, or add a model from Hugging Face")
     .argument("<model>", "Model ID, Hugging Face link, or owner/repo[:QUANT]")
     .option("--drafter <drafter>", DRAFTER_HELP)
+    .option("--force", "Download a Hugging Face version that needs more memory than this computer can provide")
     .option("--json", JSON_HELP)
     .action((model, options) => loadRuntime().then(({ pullModel }) => pullModel(model, options)))
   catalog.command("cancel")

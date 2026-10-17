@@ -1,7 +1,8 @@
 import {
   DirectoryAccessDenied, DirectoryNotFound, InvalidDirectoryPath, InvalidModelReference, LocalModelMutationFailed,
-  ModelSourceUnavailable, PathNotDirectory,
+  ModelSourceUnavailable, ModelVersionNotRunnable, PathNotDirectory,
 } from "@magnitudedev/sdk"
+import { modelVersionNotRunnableMessage } from "@magnitudedev/client-common"
 import type { NoticeContent } from "./error-notice"
 
 const unreachable = { title: "Couldn’t reach the Magnitude service", description: "Check the service on Status, then try again.", retryable: true }
@@ -24,6 +25,7 @@ const sourceUnavailableNotice = (error: ModelSourceUnavailable): NoticeContent &
 export const candidateErrorNotice = (error: unknown): NoticeContent & { readonly retryable: boolean } => {
   if (error instanceof InvalidModelReference) return { title: "Magnitude can’t open this model", description: "Paste a Hugging Face link, owner/repo, or owner/repo:QUANT.", retryable: false }
   if (error instanceof ModelSourceUnavailable) return sourceUnavailableNotice(error)
+  if (error instanceof ModelVersionNotRunnable) return { title: "This version doesn’t run here", description: modelVersionNotRunnableMessage(error), retryable: false }
   if (error instanceof LocalModelMutationFailed) return { title: "Couldn’t add this model", description: "Nothing was changed. Try again.", retryable: error.retryable }
   return unreachable
 }

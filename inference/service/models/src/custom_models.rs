@@ -75,6 +75,67 @@ pub trait CustomModelEnrichment: Send + Sync + 'static {
     fn knows(&self, _model: &CustomModelFacts<'_>) -> bool {
         true
     }
+    /// The bytes a drafter reference names, when known, so a copy of them anywhere on this
+    /// computer is used as that drafter.
+    fn drafter_content(&self, _reference: &DrafterReference) -> Option<DrafterContent> {
+        None
+    }
+}
+
+/// The bytes of a drafter's GGUF: the digest of its header and its size, and its Hub SHA-256 when
+/// known. A file with these bytes in any location, another app's included, is that drafter, used
+/// where it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrafterContent {
+    pub header_digest: Option<String>,
+    pub sha256: Option<String>,
+    pub size_bytes: u64,
+}
+
+impl DrafterContent {
+    /// The content of a package's single weights file, by the digest its file identity records.
+    #[must_use]
+    pub fn of_package(package: &ModelPackage) -> Option<Self> {
+        let mut weights = package.files.iter().filter(|file| {
+            matches!(file.role, ModelFileRole::Weights | ModelFileRole::Draft)
+        });
+        let file = weights.next()?;
+        if weights.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            header_digest: None,
+            sha256: Some(file.sha256.clone()),
+            size_bytes: file.size_bytes,
+        })
+    }
+
+    /// These bytes with whatever `other`, describing the same file, knows besides.
+    #[must_use]
+    pub fn merge(self, other: Option<Self>) -> Self {
+        match other {
+            Some(other) if other.size_bytes == self.size_bytes => Self {
+                header_digest: self.header_digest.or(other.header_digest),
+                sha256: self.sha256.or(other.sha256),
+                size_bytes: self.size_bytes,
+            },
+            _ => self,
+        }
+    }
+
+    /// Whether an installed package's single weights file holds these bytes.
+    pub(crate) fn held_by(&self, record: &InstalledPackageRecord) -> bool {
+        let Some(file) = Self::of_package(&record.installed.package) else {
+            return false;
+        };
+        file.size_bytes == self.size_bytes
+            && (self.header_digest.as_deref().is_some_and(|digest| {
+                record
+                    .primary
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.header_digest == digest)
+            }) || self.sha256.is_some() && self.sha256 == file.sha256)
+    }
 }
 
 struct NoEnrichment;
@@ -497,6 +558,27 @@ impl<'a> ContentGroup<'a> {
                 .any(|occurrence| same_file(&occurrence.primary, Path::new(target))),
         }
     }
+
+    /// The declaration that names this content: an added model's, else an imported file's while
+    /// no location Magnitude scans holds the same bytes. Importing bytes already found elsewhere
+    /// adds one more location of that model and changes neither its identity nor its origin.
+    fn declaration<'d>(
+        &self,
+        declarations: &'d [CustomModelDeclaration],
+    ) -> Option<&'d CustomModelDeclaration> {
+        let matching = || declarations.iter().filter(|declaration| self.matches(declaration));
+        matching()
+            .find(|declaration| {
+                matches!(declaration.origin, CustomModelDeclarationOrigin::Added { .. })
+            })
+            .or_else(|| {
+                let found = self
+                    .occurrences
+                    .iter()
+                    .any(|occurrence| occurrence.found_source().is_some());
+                matching().find(|_| !found)
+            })
+    }
 }
 
 fn custom_profile(installed: &InstalledModelPackage) -> ServingProfile {
@@ -597,10 +679,7 @@ fn project(
             digest,
             occurrences: members,
         };
-        let declaration = configuration
-            .declarations
-            .iter()
-            .find(|declaration| group.matches(declaration));
+        let declaration = group.declaration(&configuration.declarations);
         let Some(id) = declaration
             .map(|declaration| declaration.model_id.clone())
             .or_else(|| group.computed_id())
@@ -795,7 +874,8 @@ impl ModelContext<'_> {
             }
         }
         .map(|(reference, method)| {
-            resolve_drafter(reference, method, embedded_mtp, catalog, occurrences)
+            let content = enrichment.drafter_content(&reference);
+            resolve_drafter(reference, method, embedded_mtp, content, catalog, occurrences)
         });
 
         let profile = custom_profile(installed);
@@ -912,6 +992,7 @@ impl ModelContext<'_> {
                         reference.clone(),
                         method.clone(),
                         false,
+                        self.enrichment.drafter_content(reference),
                         self.catalog,
                         self.occurrences,
                     )
@@ -989,15 +1070,26 @@ fn rejected(
     }
 }
 
-/// Resolves a drafter reference against the files on this computer. A drafter that is not here
-/// yet leaves the model serving without one until it is.
+/// Resolves a drafter reference against the files on this computer: the file it names, or any
+/// file holding its bytes (`content`), wherever it is. A drafter that is not here yet leaves the
+/// model serving without one until it is.
 fn resolve_drafter(
     reference: DrafterReference,
     method: SpeculativeMethod,
     embedded_mtp: bool,
+    content: Option<DrafterContent>,
     catalog: &RecommendableModelCatalog,
     occurrences: &[Occurrence<'_>],
 ) -> ResolvedDrafter {
+    let holding = |content: Option<&DrafterContent>, named: &dyn Fn(&Occurrence<'_>) -> bool| {
+        occurrences
+            .iter()
+            .filter(|occurrence| {
+                named(occurrence)
+                    || content.is_some_and(|content| content.held_by(occurrence.record))
+            })
+            .min_by_key(|occurrence| occurrence.precedence)
+    };
     let separate = |reference: DrafterReference,
                     method: SpeculativeMethod,
                     found: Option<&Occurrence<'_>>| match found {
@@ -1070,10 +1162,11 @@ fn resolve_drafter(
                     draft_source: SpeculativeDraftSource::Separate { draft },
                     ..
                 } => {
-                    let found = occurrences
-                        .iter()
-                        .filter(|occurrence| occurrence.record.installed.package.id == draft.id)
-                        .min_by_key(|occurrence| occurrence.precedence);
+                    let content = DrafterContent::of_package(draft)
+                        .map(|catalog_content| catalog_content.merge(content));
+                    let found = holding(content.as_ref(), &|occurrence| {
+                        occurrence.record.installed.package.id == draft.id
+                    });
                     separate(reference, method, found)
                 }
                 ServableModelBundle::SpeculativeDecoding {
@@ -1092,23 +1185,17 @@ fn resolve_drafter(
             commit,
             path,
         } => {
-            let found = occurrences
-                .iter()
-                .filter(|occurrence| {
-                    occurrence.hub.as_ref().is_some_and(|identity| {
-                        identity.file.repository == repository.as_str()
-                            && identity.file.selector == *path
-                            && identity.commit.as_deref() == Some(commit.as_str())
-                    })
+            let found = holding(content.as_ref(), &|occurrence| {
+                occurrence.hub.as_ref().is_some_and(|identity| {
+                    identity.file.repository == repository.as_str()
+                        && identity.file.selector == *path
+                        && identity.commit.as_deref() == Some(commit.as_str())
                 })
-                .min_by_key(|occurrence| occurrence.precedence);
+            });
             separate(reference, method, found)
         }
         DrafterReference::Local { path } => {
-            let found = occurrences
-                .iter()
-                .filter(|occurrence| same_file(&occurrence.primary, path))
-                .min_by_key(|occurrence| occurrence.precedence);
+            let found = holding(None, &|occurrence| same_file(&occurrence.primary, path));
             separate(reference, method, found)
         }
     }
@@ -2400,6 +2487,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn importing_a_copy_of_a_found_model_adds_a_location_and_never_replaces_it() {
+        let fixture = Fixture::new().await;
+        let lm_studio = fixture.root.join("lmstudio");
+        let found = lm_studio.join("lmstudio-community/Shared-GGUF/Shared-Q4_K_M.gguf");
+        write_model(&found, "shared");
+        let copy = fixture.root.join("Downloads/Shared-copy.gguf");
+        fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        fs::copy(&found, &copy).unwrap();
+        let copy_id = local_id(&copy);
+        let configuration = LocalModelsConfiguration {
+            roots: vec![root(ModelRootKind::LmStudio, &lm_studio)],
+            declarations: vec![CustomModelDeclaration {
+                model_id: copy_id.clone(),
+                origin: CustomModelDeclarationOrigin::Imported { path: copy.clone() },
+                target: vec![copy.to_string_lossy().into_owned()],
+                projector: None,
+            }],
+            ..LocalModelsConfiguration::default()
+        };
+
+        let listed = fixture.apply(configuration).await;
+        assert_eq!(
+            ids(&listed.models),
+            ["hf:lmstudio-community/Shared-GGUF/Shared-Q4_K_M.gguf"],
+            "the same bytes are one model, keeping the identity its found location gives it"
+        );
+        assert_eq!(
+            listed.models[0].origin,
+            CustomModelOrigin::Found {
+                source: FoundSource::LmStudio
+            }
+        );
+        assert_eq!(listed.models[0].files[0].path, found);
+
+        fs::remove_file(&found).unwrap();
+        let after = fixture.local.refresh_local().await.unwrap();
+        assert_eq!(
+            ids(&after.models),
+            [copy_id.to_string()],
+            "the imported copy keeps the model when the found file disappears"
+        );
+        assert_eq!(
+            after.models[0].origin,
+            CustomModelOrigin::Imported { path: copy.clone() }
+        );
+        assert_eq!(after.models[0].files[0].path, copy);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn an_imported_symlink_is_served_through_its_link_wherever_it_points() {
@@ -2704,6 +2840,129 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Knows the bytes of one drafter reference, as the server learns them from its header.
+    struct KnowsDrafter {
+        reference: DrafterReference,
+        content: DrafterContent,
+    }
+
+    impl CustomModelEnrichment for KnowsDrafter {
+        fn enrich(&self, _model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult {
+            CustomModelEnrichmentResult::default()
+        }
+
+        fn drafter_content(&self, reference: &DrafterReference) -> Option<DrafterContent> {
+            (reference == &self.reference).then(|| self.content.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_drafter_already_in_another_location_is_used_where_it_is() {
+        let fixture = Fixture::new().await;
+        let commit = "e".repeat(40);
+        let bytes = drafter_bytes("drafter");
+        let lm_studio = fixture.root.join("lmstudio");
+        let in_lm_studio = lm_studio.join("someone/Mirror-GGUF/drafter-copy.gguf");
+        fs::create_dir_all(in_lm_studio.parent().unwrap()).unwrap();
+        fs::write(&in_lm_studio, &bytes).unwrap();
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("target.gguf"), "target");
+        let target = local_id(&folder.join("target.gguf"));
+        let reference = DrafterReference::HuggingFace {
+            repository: HuggingFaceRepositoryId::new("magnitudedev/Model-DFlash-GGUF").unwrap(),
+            commit,
+            path: "Model-DFlash-Q8_0.gguf".to_owned(),
+        };
+        fixture
+            .resolver
+            .set_custom_model_enrichment(Arc::new(KnowsDrafter {
+                reference: reference.clone(),
+                content: DrafterContent {
+                    header_digest: Some(header_digest(&in_lm_studio)),
+                    sha256: Some(sha256(&bytes)),
+                    size_bytes: bytes.len() as u64,
+                },
+            }));
+        let configuration = LocalModelsConfiguration {
+            roots: vec![
+                root(ModelRootKind::Folder, &folder),
+                root(ModelRootKind::LmStudio, &lm_studio),
+            ],
+            drafters: vec![DrafterAttachment {
+                model_id: target.clone(),
+                drafter: DrafterChoice::Reference {
+                    reference: reference.clone(),
+                    method: SpeculativeMethod::DFlash,
+                },
+            }],
+            ..LocalModelsConfiguration::default()
+        };
+
+        let listed = fixture.apply(configuration).await;
+        assert_eq!(ids(&listed.models), [target.to_string()]);
+        assert_eq!(
+            listed.models[0].drafter.as_ref().map(|drafter| drafter.state.clone()),
+            Some(AttachedDrafterState::Ready),
+            "a file with the drafter's header and size is that drafter, wherever it is"
+        );
+        let ServableModelBundle::SpeculativeDecoding {
+            draft_source: SpeculativeDraftSource::Separate { draft },
+            ..
+        } = fixture.resolver.serving_configuration(&target).unwrap().bundle
+        else {
+            panic!("the model serves with the drafter found in LM Studio");
+        };
+        assert_eq!(
+            draft.files[0].path,
+            PathBuf::from("someone/Mirror-GGUF/drafter-copy.gguf")
+        );
+        assert!(
+            !fixture.store.join("hub").exists()
+                || fs::read_dir(fixture.store.join("hub")).unwrap().next().is_none(),
+            "nothing is copied into Magnitude's store"
+        );
+
+        fs::remove_file(&in_lm_studio).unwrap();
+        let after = fixture.local.refresh_local().await.unwrap();
+        assert_eq!(
+            after.models[0].drafter.as_ref().map(|drafter| drafter.state.clone()),
+            Some(AttachedDrafterState::NotInstalled),
+            "when the copy disappears the drafter can be downloaded again"
+        );
+        assert!(matches!(
+            fixture.resolver.serving_configuration(&target).unwrap().bundle,
+            ServableModelBundle::Standalone { .. }
+        ));
+
+        // A Hugging Face cache blob of another repository holds it by its Hub SHA-256 alone.
+        let cache = fixture.root.join("hf");
+        publish_hf_cache(
+            &cache,
+            "someone/Other-GGUF",
+            &"f".repeat(40),
+            &[("other-name.gguf", bytes.clone())],
+        );
+        fixture
+            .resolver
+            .set_custom_model_enrichment(Arc::new(KnowsDrafter {
+                reference: reference.clone(),
+                content: DrafterContent {
+                    header_digest: None,
+                    sha256: Some(sha256(&bytes)),
+                    size_bytes: bytes.len() as u64,
+                },
+            }));
+        let mut configuration = fixture.local.configuration().await.unwrap();
+        configuration
+            .roots
+            .push(root(ModelRootKind::HuggingFaceCache, &cache));
+        let cached = fixture.apply(configuration).await;
+        assert_eq!(
+            cached.models[0].drafter.as_ref().map(|drafter| drafter.state.clone()),
+            Some(AttachedDrafterState::Ready)
+        );
     }
 
     #[tokio::test]

@@ -44,7 +44,11 @@ never returned as new models, and drafter repositories (a drafter architecture, 
 EAGLE, a Gemma assistant or MTP-only heads, or the Hub's speculative-decoding tags) are neither
 results nor counted as hidden: they are offered only in drafter lists. "Variant of" follows the
 Hub `baseModels` (two hops), and for a repository declaring no lineage the catalog knows, the catalog
-model of the same architecture whose parameter count is within 5% (a display hint only). Resolution returns the requested repository's immutable snapshot and
+model of the same architecture whose parameter count is within 5% and whose size does not
+contradict the size the repository name spells (`E2B` is never a variant of the E4B; a display hint
+only). Results are ordered with those of unsupported architectures last, then repositories whose
+name is exactly the query (ignoring case, separators, a trailing `GGUF` and an uploader's `Org_`
+prefix), then by downloads. Resolution returns the requested repository's immutable snapshot and
 GGUF file evidence. Candidate inspection groups a repository's or path's GGUFs into versions (shards
 together) and assesses each through the engine from headers fetched by range request; it never
 reads file names for compatibility or quantization. Headers and their classification are cached by
@@ -64,11 +68,12 @@ file used in place. Each version carries its canonical model ID,
 so clients never form identities, and a label: the quantization its file or folder name spells as a
 quantization label (`Q4_K_M`, `UD-Q4_K_XL`; a name such as `q40` is not one), else the header's
 `general.file_type` label. The ID is a repository file's `hf:` ID, and for a path the ID of the custom
-model already listed with those bytes (a Hugging Face identity when its location gives one), else
-`local:` with the file's header digest. A version whose bytes are already listed also names that
-model as on this computer, whichever location lists it: the same header digest, the same `hf:` ID
-and weights size (a projector found beside it, as with an Ollama pull, is not part of the version),
-or the same files. For a chosen version and drafter the service
+model listed at that path (a Hugging Face identity when its location gives one), else `local:` with
+the file's header digest, a copy of a listed model's bytes elsewhere included. A version whose bytes
+are already listed also names that model as on this computer, whichever location lists it: the same
+header digest, the same `hf:` ID and weights size (a projector found beside it, as with an Ollama
+pull, is not part of the version), the same files, or files of the same sizes whose header is the
+version's. For a chosen version and drafter the service
 also returns the exact servable bundle to download, with the same package identities a post-download
 scan computes; clients never construct bundles. These queries do not change the release catalog,
 managed inventory, or configuration, and catalog use does not depend on them.
@@ -242,7 +247,7 @@ ICN scans a list of model roots that ACN resolves and supplies (see
 
 | Location | Layout and identity |
 |---|---|
-| Hugging Face cache | Hub cache layout; repository and selector give the `hf:` ID. A snapshot entry links to `<repository>/blobs/<hash>`, whose name is the file's Hub content hash; classic caches keep the bytes there, while current `huggingface_hub` makes that entry a link into a store every repository of the hub shares (`<hub>/blobs/<xx>/<hash>`, named by another hash). Both layouts are read, following link chains only within the hub; the repository blob's name is the content identity, and the cache stays read-only |
+| Hugging Face cache | Hub cache layout; repository and selector give the `hf:` ID. A snapshot entry links to `<repository>/blobs/<hash>`, whose name is the file's Hub content hash; classic caches keep the bytes there, while current `huggingface_hub` makes that entry a link into a store every repository of the hub shares (`<hub>/blobs/<xx>/<hash>`, named by another hash). Both layouts are read, following link chains only within the hub (a link's `..` steps are applied to its canonical directory, since Windows doesn't resolve them in canonical verbatim paths); the repository blob's name is the content identity, and the cache stays read-only. Without symlink support (Windows without Developer Mode, or `HF_HUB_DISABLE_SYMLINKS`) `huggingface_hub` keeps plain copies in the snapshots and no blobs; those files are found like any other, and one at a catalog file's repository, commit and path with that file's size and header digest takes the catalog file's Hub SHA-256 |
 | LM Studio | Publisher/repository layout gives the `hf:` ID |
 | llama.cpp cache | Current llama.cpp writes the Hugging Face hub layout (in the location itself or its `hub` folder): repository and commit, like the Hugging Face cache, but owned by llama.cpp (without `LLAMA_CACHE`, llama.cpp downloads into the shared Hugging Face cache, and those files stay the Hugging Face cache's). The older flat layout: `manifest=<owner>=<repository>=<tag>.json` names each flat `<owner>_<repository>_<file>` and its projector; a name without a manifest parses only when its repository segment ends in `GGUF`; others are `local:` |
 | Ollama | Manifests name each model and its GGUF blob; both `manifests/` and newer releases' `manifests-v2/` (whose entries may be symlinks to the manifest stored as a blob, followed only within the root, and which name Ollama's registry `ollama.com` rather than `registry.ollama.ai`) are read, and a model in both is one model, named as Ollama names it (`qwen3.5:0.8b`). A GGUF blob's `sha256-<hex>` name is its content identity; `hf.co/…` pulls take the `hf:` ID of the repository file with the same SHA-256 (resolved once from the repository's file list and cached, matches and misses alike), so the same bytes have one ID whichever locations are enabled; until resolved, and for library models, the ID is `local:` |
@@ -261,13 +266,20 @@ Ollama service's folder owned by the `ollama` user). The location is found when 
 found, else can't read when any is unreadable, else not found. The user may turn off an automatic
 location, which turns off all of its directories, and add or remove folders, each one directory;
 the change reaches ICN as a new configuration and reconciles only the affected roots. Imported files
-are scanned at their declared paths. ICN watches every enabled root, so models appear and disappear
+are scanned at their declared paths. An imported file is one more location of its bytes: it names
+the model (its `local:` ID and the Imported origin) only while no scanned location holds the same
+bytes; otherwise the model keeps the identity and origin its found locations give it, and the import
+keeps it available when those files disappear. ACN reports such an import as already on this
+computer, records the path under the file's own `local:` ID, and leaves the model's drafter choice
+unchanged unless the import names a drafter or turns it off. ICN watches every enabled root, so models appear and disappear
 without a restart; a watch event triggers scoped reconciliation of that root, never a global scan.
 
 Magnitude never writes to, moves, adopts, or deletes from an external location. Scans read GGUF
 headers only, follow no link out of a root, and skip partial downloads and temporary files. External
 files are identified by their header digest and never hashed in full; a package file whose SHA-256
-is not known from a blob name takes its identity from that digest and its size. A location that
+is not known from a blob name takes its identity from that digest and its size, unless it is a
+catalog file's exact copy in a Hugging Face cache (same repository, commit, path, size and header
+digest), which takes the catalog file's SHA-256 and so is that catalog file. A location that
 cannot be read is skipped for that reconciliation and never hides another location's models.
 
 Each complete independently callable GGUF group is a custom-model candidate. A standalone file is its
