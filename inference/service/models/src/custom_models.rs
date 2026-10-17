@@ -3732,6 +3732,81 @@ mod tests {
         assert!(after.models[0].files[0].path.starts_with(&cache));
     }
 
+    /// Removing an added model whose same bytes are also in Ollama or the llama.cpp cache deletes
+    /// only Magnitude's copy; once ACN drops the declaration, the model is listed as found from
+    /// that location (by the identity that location gives it) and is not hidden.
+    #[tokio::test]
+    async fn removing_an_added_model_found_in_ollama_or_llama_cpp_keeps_it_as_a_found_model() {
+        let commit = "c".repeat(40);
+        let repository = "owner/Added-GGUF";
+        let added_id: ModelId = "hf:owner/Added-GGUF/Added-Q4_K_M.gguf".parse().unwrap();
+        for source in [FoundSource::LlamaCpp, FoundSource::Ollama] {
+            let fixture = Fixture::new().await;
+            let bytes = model_bytes("added and found");
+            let snapshot = publish_managed(
+                &fixture.store,
+                repository,
+                &commit,
+                &[("Added-Q4_K_M.gguf", bytes.clone())],
+            );
+            let location = fixture.root.join("location");
+            let (kind, found_id, external) = match &source {
+                FoundSource::LlamaCpp => {
+                    fs::create_dir_all(&location).unwrap();
+                    let file = location.join("owner_Added-GGUF_Added-Q4_K_M.gguf");
+                    fs::write(&file, &bytes).unwrap();
+                    (ModelRootKind::LlamaCpp, added_id.clone(), file)
+                }
+                FoundSource::Ollama => {
+                    write_ollama(
+                        &location,
+                        "registry.ollama.ai",
+                        "library",
+                        "added",
+                        "latest",
+                        &[("application/vnd.ollama.image.model", &bytes)],
+                    );
+                    let file = location
+                        .join("blobs")
+                        .join(format!("sha256-{}", sha256(&bytes)));
+                    (ModelRootKind::Ollama, local_id(&file), file)
+                }
+                _ => unreachable!(),
+            };
+            let shown = roots(vec![root(kind, &location)]);
+            let declared = LocalModelsConfiguration {
+                declarations: vec![CustomModelDeclaration {
+                    model_id: added_id.clone(),
+                    origin: CustomModelDeclarationOrigin::Added {
+                        repository: HuggingFaceRepositoryId::new(repository).unwrap(),
+                        commit: commit.clone(),
+                    },
+                    target: vec!["Added-Q4_K_M.gguf".to_owned()],
+                    projector: None,
+                }],
+                ..shown.clone()
+            };
+            let listed = fixture.apply(declared).await;
+            assert_eq!(ids(&listed.models), [added_id.to_string()], "{source:?}");
+            assert!(matches!(listed.models[0].origin, CustomModelOrigin::Added { .. }));
+
+            let removal = fixture.local.remove_local(&added_id).await.unwrap();
+            assert!(removal.removed, "{source:?}");
+            let listed = fixture.apply(shown).await;
+            assert!(
+                !snapshot.join("Added-Q4_K_M.gguf").exists(),
+                "Magnitude's copy is gone ({source:?})"
+            );
+            assert!(external.exists(), "the other location's file stays ({source:?})");
+            assert_eq!(ids(&listed.models), [found_id.to_string()], "{source:?}");
+            assert_eq!(
+                listed.models[0].origin,
+                CustomModelOrigin::Found { source: source.clone() }
+            );
+            assert!(listed.hidden.is_empty(), "{source:?}");
+        }
+    }
+
     #[tokio::test]
     async fn an_added_model_is_listed_not_installed_until_its_download_lands() {
         let fixture = Fixture::new().await;

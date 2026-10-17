@@ -759,6 +759,27 @@ describe("removal by origin", () => {
     expect(config.hidden).toEqual([foundId])
   })
 
+  it("removes only Magnitude's copy of an added model also found in llama.cpp, and never hides it", async () => {
+    const { run, recorded } = harness({
+      customModels: [nativeCustomModel({
+        modelId: addedId,
+        origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
+        files: [{ path: "/store/model-Q4_K_M.gguf", sizeBytes: 1_000 }],
+        state: {
+          _tag: "Ready",
+          catalogAttribution: { _tag: "NotInCatalog" },
+          installation: { _tag: "Resolved", installedBytes: 1_000, ownership: "Mixed", primaryPath: "/store/model-Q4_K_M.gguf" },
+          model: readyModel,
+        },
+      })],
+    })
+    const config = await run((commands, models) => commands.remove(addedId).pipe(Effect.zipRight(models.get)))
+    expect(recorded.removedFiles).toEqual([addedId])
+    expect(config.declarations[addedId]).toBeUndefined()
+    expect(config.drafters[addedId]).toBeUndefined()
+    expect(config.hidden).toEqual([])
+  })
+
   it("refuses to hide a model added from Hugging Face or imported, and hides a found one", async () => {
     const { run } = harness()
     const result = await run((commands, models) => Effect.gen(function* () {
