@@ -89,6 +89,15 @@ export const AcnHardwareSummarySchema = Schema.Struct({
 })
 export type AcnHardwareSummary = typeof AcnHardwareSummarySchema.Type
 
+/** Worker-confirmed execution device for a currently resident local model. */
+export const ActiveModelDeviceSchema = Schema.Struct({
+  instanceId: NonEmptyString,
+  modelId: NonEmptyString,
+  deviceId: NonEmptyString,
+  backend: Schema.Literal("cpu", "metal", "cuda", "vulkan"),
+})
+export type ActiveModelDevice = typeof ActiveModelDeviceSchema.Type
+
 export class AcnReady extends Schema.TaggedClass<AcnReady>()("Ready", {
   hardware: Schema.optionalWith(AcnHardwareSummarySchema, { as: "Option", exact: true }),
 }) {}
