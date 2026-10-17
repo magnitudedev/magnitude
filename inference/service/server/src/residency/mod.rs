@@ -117,6 +117,8 @@ fn verify_worker_retirement(worker: &dyn ResidencyWorker) -> Result<(), ModelOpe
 pub struct PreparedResidency<R> {
     pub package_ids: Vec<ModelPackageId>,
     pub allocation: ModelInstanceAllocation,
+    /// Identity reported by the worker that actually opened the model.
+    pub device: ModelLoadDevice,
     pub worker: Arc<dyn ResidencyWorker>,
     pub resident: R,
 }
@@ -708,7 +710,13 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         if ready.instance.id != instance_id {
             return;
         }
-        let lifecycle = ModelInstanceLifecycle::Ready { allocation };
+        let ModelInstanceLifecycle::Ready { device, .. } = &ready.instance.lifecycle else {
+            return;
+        };
+        let lifecycle = ModelInstanceLifecycle::Ready {
+            allocation,
+            device: device.clone(),
+        };
         if ready.instance.lifecycle == lifecycle {
             return;
         }
@@ -1077,6 +1085,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                     model_id: loading.instance.model_id,
                     lifecycle: ModelInstanceLifecycle::Ready {
                         allocation: prepared.allocation.clone(),
+                        device: prepared.device.clone(),
                     },
                 };
                 let mut ready = ReadyResidency {
@@ -1791,6 +1800,10 @@ mod tests {
                             allocation: ModelInstanceAllocation {
                                 context_window_tokens: 1,
                                 memory_domains: Vec::new(),
+                            },
+                            device: magnitude_service_contracts::models::ModelLoadDevice {
+                                id: magnitude_service_contracts::HardwareDeviceId::new("host-cpu"),
+                                backend: magnitude_service_contracts::ExecutionBackend::Cpu,
                             },
                             worker,
                             resident: model_id.to_string(),

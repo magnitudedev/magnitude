@@ -655,6 +655,8 @@ pub enum ModelInstanceLifecycle {
     },
     Ready {
         allocation: ModelInstanceAllocation,
+        /// Device and backend confirmed by the inference worker after opening the model.
+        device: ModelLoadDevice,
     },
     #[serde(rename_all = "camelCase")]
     Stopping {

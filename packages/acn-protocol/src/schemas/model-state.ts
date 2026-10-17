@@ -436,6 +436,8 @@ export const ModelResidencySchema = Schema.Union(
   }),
   Schema.TaggedStruct("Ready", {
     allocation: ModelInstanceAllocationSchema,
+    /** Device/backend confirmed by the worker that loaded the model. */
+    device: Schema.optional(ModelLoadDeviceSchema),
   }),
   Schema.TaggedStruct("Stopping", {
     reason: ModelReleaseReasonSchema,
