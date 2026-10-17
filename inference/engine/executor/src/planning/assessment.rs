@@ -46,12 +46,15 @@ pub struct AssessmentMemoryTerms {
 /// Upper bounds for every nonresident charge of a clean load. The prepared
 /// resource bound covers all steady native holdings (invocation storage,
 /// graph workspace, output, upload regions and bound constants); the startup
-/// bound covers the additional qualification/import peak; the staging bound
-/// is the host upload peak of a dedicated device's import.
+/// bound covers the additional qualification/import peak; the component
+/// bound is the import peak of an optional component a served request
+/// loads; the staging bound is the host upload peak of a dedicated device's
+/// imports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssessmentMemoryBounds {
     pub prepared_resource_bytes: u64,
     pub startup_additional_bytes: u64,
+    pub component_upload_bytes: u64,
     pub staging_upload_bytes: u64,
     /// Host heap of the sealed target graphs
     /// (`AssessmentGraphResourceBounds::sealed_target_graphs`): system RAM
@@ -61,6 +64,116 @@ pub struct AssessmentMemoryBounds {
     /// (`PlannedSealedGraphs::bound`): system RAM, held from the binding of
     /// the resident weights on, after the import.
     pub bound_graph_host_bytes: u64,
+    pub host_process: HostProcessBytes,
+}
+
+/// What a load's worker holds in host RAM that no planned holding names:
+/// the runtime it opens its device in, the model's vocabulary, the programs
+/// it prepares and, for a model that reads images, the vision encoder's
+/// graphs and programs prepared when a request first sends one. Each term
+/// is a count the model's plan fixes times a cost measured on the backend
+/// (`HostProcessCosts::of`), held from its preparation to the end of
+/// serving, so their sum bounds what the worker holds of them at any moment
+/// of the load and while serving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostProcessBytes {
+    pub runtime: u64,
+    pub vocabulary: u64,
+    pub programs: u64,
+    pub vision: u64,
+    /// The native kernels the load prepares (`kernel_inventory`), the count
+    /// `programs` is priced on.
+    pub kernels: u64,
+}
+
+/// The measured host cost of a load's worker on one backend. Every cost is
+/// a measurement of real loads on that backend (`design/inference/engine/memory.md`,
+/// "Host memory of a load"), not a margin: what a worker holds beyond its
+/// planned holdings, apportioned to the counts that drive it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostProcessCosts {
+    runtime: u64,
+    per_token: u64,
+    per_kernel: u64,
+    vision: u64,
+}
+
+impl HostProcessCosts {
+    /// Metal is measured on an M4 Max (macOS 15.5) from loads of MiniCPM5
+    /// 1B, Qwen3.5 0.8B, 2B and 4B, LFM2.5 1.2B and Gemma 4 E2B: the
+    /// process footprint at load end less everything the plan holds then is
+    /// the worker's own memory, and these are the least-overestimating costs
+    /// under which no measured load exceeds its plan. The vision cost is
+    /// what Qwen3.5 2B's and Gemma 4 E2B's workers held after their first
+    /// image beyond everything else their plans hold, the two within 2 %. The other backends are not yet measured and
+    /// take Metal's costs: the vocabulary's and the prepared programs'
+    /// structures are the engine's own and the same on every backend, the
+    /// runtimes are not.
+    fn of(backend: BackendName) -> Self {
+        match backend {
+            BackendName::Metal | BackendName::Cpu | BackendName::Vulkan | BackendName::Cuda => {
+                Self {
+                    runtime: METAL_RUNTIME,
+                    per_token: METAL_PER_TOKEN,
+                    per_kernel: METAL_PER_KERNEL,
+                    vision: METAL_VISION,
+                }
+            }
+        }
+    }
+}
+
+const METAL_RUNTIME: u64 = 175_000_000;
+const METAL_PER_TOKEN: u64 = 1_800;
+const METAL_PER_KERNEL: u64 = 5_700_000;
+const METAL_VISION: u64 = 210_000_000;
+
+impl HostProcessBytes {
+    /// The worker's unplanned host bytes for a load of `programs` (the
+    /// load's program plan under `limits`) on `backend`.
+    pub fn derive(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        programs: &super::ProgramPlan,
+        limits: ResourceLimits,
+        backend: BackendName,
+    ) -> Result<Self, String> {
+        let costs = HostProcessCosts::of(backend);
+        let kernels = crate::native::kernel_requests(
+            backend,
+            programs,
+            definition,
+            load,
+            crate::TuningLimits::of(limits, definition),
+        )
+        .map_err(|failure| crate::CatalogError::native(backend, failure).to_string())?
+        .len() as u64;
+        Ok(Self {
+            runtime: costs.runtime,
+            vocabulary: costs
+                .per_token
+                .checked_mul(definition.decoder.vocabulary)
+                .ok_or("vocabulary host bytes overflow")?,
+            programs: costs
+                .per_kernel
+                .checked_mul(kernels)
+                .ok_or("prepared program host bytes overflow")?,
+            vision: if programs.vision().is_some() {
+                costs.vision
+            } else {
+                0
+            },
+            kernels,
+        })
+    }
+
+    pub fn bytes(&self) -> Result<u64, String> {
+        self.runtime
+            .checked_add(self.vocabulary)
+            .and_then(|bytes| bytes.checked_add(self.programs))
+            .and_then(|bytes| bytes.checked_add(self.vision))
+            .ok_or_else(|| "worker host bytes overflow".to_owned())
+    }
 }
 
 /// The host heap a load's sealed target graphs hold (their plans, the
@@ -82,11 +195,15 @@ pub struct SealedGraphHostBytes {
 /// Header-derived charges that are known before graph formation. Prepared
 /// native invocation storage is exact; the startup charge is the same
 /// qualification/import upper bound used by the production resource planner;
-/// the staging charge is the largest selected source tensor's import window.
+/// the component charge is the import window an optional head or vision
+/// component claims beside its weights when a request first needs it
+/// (`DomainState::component_growth`); the staging charge is the largest
+/// selected source tensor's import window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AssessmentHeaderBounds {
     pub prepared_program_bytes: u64,
     pub startup_additional_bytes: u64,
+    pub component_upload_bytes: u64,
     pub staging_upload_bytes: u64,
 }
 
@@ -95,6 +212,11 @@ pub struct AssessmentHeaderBounds {
 pub struct AssessmentMemoryCharge {
     /// Weights and slab-rounded state at the fit depth, all exact.
     pub exact_resident_bytes: u64,
+    /// The workload's state at the fit depth, part of `exact_resident_bytes`.
+    pub state_bytes: u64,
+    /// The state a load allocates at startup, which the loaded model holds
+    /// before its first request.
+    pub startup_state_bytes: u64,
     pub bounds: AssessmentMemoryBounds,
     /// What the device's allocation domain holds while the loaded model
     /// serves at the fit depth: the weights, every prepared resource and the
@@ -399,18 +521,23 @@ impl AssessmentHeaderBounds {
         let import_peak = source_import_peak_bytes(largest_source)?;
         let startup_additional_bytes =
             AttestedPrograms::qualification_peak_bytes(load)?.max(import_peak);
+        let component_upload_bytes = load
+            .head_upload_peak_bytes()?
+            .max(load.vision_upload_peak_bytes()?);
         Ok(Self {
             prepared_program_bytes,
             startup_additional_bytes,
+            component_upload_bytes,
             staging_upload_bytes: import_peak,
         })
     }
 
-    /// Complete the memory bounds with the graph-pool upper bound for the
-    /// same backend and workload limits.
+    /// Complete the memory bounds with the graph-pool upper bound and the
+    /// worker's host bytes for the same backend and workload limits.
     pub fn with_graph_resource_bound(
         self,
         graph: &AssessmentGraphResourceBounds,
+        host_process: HostProcessBytes,
     ) -> Result<AssessmentMemoryBounds, String> {
         Ok(AssessmentMemoryBounds {
             prepared_resource_bytes: self
@@ -419,6 +546,7 @@ impl AssessmentHeaderBounds {
                 .and_then(|bytes| bytes.checked_add(graph.recorded_graph_bytes))
                 .ok_or("assessment prepared resource bound overflow")?,
             startup_additional_bytes: self.startup_additional_bytes,
+            component_upload_bytes: self.component_upload_bytes,
             staging_upload_bytes: self.staging_upload_bytes,
             // The target's sealed plans, the prepared graphs that hold
             // them and the family's constant values, and the state copy
@@ -436,6 +564,7 @@ impl AssessmentHeaderBounds {
                     .ok_or("assessment sealed graph bytes overflow")?,
             },
             bound_graph_host_bytes: graph.sealed_target_graphs.bound.bytes,
+            host_process,
         })
     }
 }
@@ -526,10 +655,11 @@ impl AssessmentMemoryTerms {
 
     /// The charge of each memory role. The allocation domain holds the
     /// weights and every prepared resource, plus the larger of two phases
-    /// that never coexist: the workload's state at the fit depth, which grows
-    /// only after the load is ready, and the load itself, its startup state
-    /// with the qualification/import peak. A dedicated device's staging
-    /// domain holds its host upload window.
+    /// that never coexist: serving, the workload's state at the fit depth,
+    /// which grows only after the load is ready, with the import window of
+    /// an optional component a request loads there; and the load itself,
+    /// its startup state with the qualification/import peak. A dedicated
+    /// device's staging domain holds the larger upload window.
     pub fn charge(
         self,
         bounds: AssessmentMemoryBounds,
@@ -547,15 +677,22 @@ impl AssessmentMemoryTerms {
         let serving_bytes = prepared_bytes
             .checked_add(state_slab_bytes)
             .ok_or("assessment serving charge overflow")?;
+        let serving_peak_bytes = state_slab_bytes
+            .checked_add(bounds.component_upload_bytes)
+            .ok_or("assessment serving peak overflow")?;
         let allocation_bytes = prepared_bytes
-            .checked_add(state_slab_bytes.max(loading_bytes))
+            .checked_add(serving_peak_bytes.max(loading_bytes))
             .ok_or("assessment allocation charge overflow")?;
         Ok(AssessmentMemoryCharge {
             exact_resident_bytes,
+            state_bytes: state_slab_bytes,
+            startup_state_bytes,
             bounds,
             serving_bytes,
             allocation_bytes,
-            staging_bytes: bounds.staging_upload_bytes,
+            staging_bytes: bounds
+                .staging_upload_bytes
+                .max(bounds.component_upload_bytes),
             host_table_bytes: self.host_table_bytes,
             shared_table_bytes: self.shared_table_bytes,
         })
@@ -563,6 +700,18 @@ impl AssessmentMemoryTerms {
 }
 
 impl AssessmentMemoryCharge {
+    /// Everything the load holds in system RAM outside its device
+    /// allocations: the host tables, the target graphs' sealed plans (the
+    /// most a load seals) and static bindings, and the worker's own host
+    /// bytes. All are held together from the binding of the weights on.
+    pub fn host_bytes(&self) -> Result<u64, String> {
+        self.host_table_bytes
+            .checked_add(self.bounds.sealed_graph_host_bytes.at_most)
+            .and_then(|bytes| bytes.checked_add(self.bounds.bound_graph_host_bytes))
+            .and_then(|bytes| bytes.checked_add(self.bounds.host_process.bytes().ok()?))
+            .ok_or_else(|| "host charge overflows".to_owned())
+    }
+
     /// Compare the charge with every domain's stable fit capacity
     /// (`platform::fit_capacities`). A domain's remaining bytes are
     /// `capacity − reserve − required`; the workload fits when none is
@@ -582,9 +731,9 @@ impl AssessmentMemoryCharge {
         {
             return Err("fit capacities have no allocation domain".into());
         }
-        // Host tables and the sealed graph plans are system RAM: the staging
-        // domain of a dedicated device, the allocation domain of a unified
-        // one.
+        // Host tables, the graphs' sealed plans and static bindings and the
+        // worker's own host bytes are system RAM: the staging domain of a
+        // dedicated device, the allocation domain of a unified one.
         let dedicated = capacities
             .iter()
             .any(|(role, _)| *role == DomainRole::Staging);
@@ -593,10 +742,10 @@ impl AssessmentMemoryCharge {
                 "host-shared storage outside the allocation domain of a unified device".into(),
             );
         }
+        let host_bytes = self.host_bytes()?;
         let with_tables = |bytes: u64| {
             bytes
-                .checked_add(self.host_table_bytes)
-                .and_then(|bytes| bytes.checked_add(self.bounds.sealed_graph_host_bytes.at_most))
+                .checked_add(host_bytes)
                 .ok_or_else(|| "domain charge with host tables overflows".to_owned())
         };
         // The stored tables' bytes, charged with the weights, move to host
@@ -2192,6 +2341,12 @@ mod tests {
             header.staging_upload_bytes,
             load.target_upload_peak_bytes().unwrap()
         );
+        assert_eq!(
+            header.component_upload_bytes,
+            load.head_upload_peak_bytes()
+                .unwrap()
+                .max(load.vision_upload_peak_bytes().unwrap())
+        );
         let state = crate::ResourcePlanner::state_plan(
             &definition,
             &load,
@@ -2214,7 +2369,18 @@ mod tests {
             BackendName::Cpu,
         )
         .unwrap();
-        let bounds = header.with_graph_resource_bound(&graph).unwrap();
+        let host_process = HostProcessBytes::derive(
+            &definition,
+            &load,
+            &load.program_plan(&definition, KvCodec::Dense).unwrap(),
+            limits,
+            BackendName::Cpu,
+        )
+        .unwrap();
+        let bounds = header
+            .with_graph_resource_bound(&graph, host_process)
+            .unwrap();
+        assert_eq!(bounds.host_process, host_process);
         assert_eq!(
             bounds.prepared_resource_bytes,
             header.prepared_program_bytes + graph.total_bytes
@@ -2240,7 +2406,8 @@ mod tests {
             charge.allocation_bytes,
             terms.exact_resident_bytes(0).unwrap()
                 + bounds.prepared_resource_bytes
-                + state_bytes.max(startup_state + bounds.startup_additional_bytes)
+                + (state_bytes + bounds.component_upload_bytes)
+                    .max(startup_state + bounds.startup_additional_bytes)
         );
         assert_eq!(charge.staging_bytes, header.staging_upload_bytes);
 
@@ -2262,18 +2429,30 @@ mod tests {
         );
     }
 
+    const NO_HOST_PROCESS: HostProcessBytes = HostProcessBytes {
+        runtime: 0,
+        vocabulary: 0,
+        programs: 0,
+        vision: 0,
+        kernels: 0,
+    };
+
     fn fixture_charge(allocation_bytes: u64, staging_bytes: u64) -> AssessmentMemoryCharge {
         AssessmentMemoryCharge {
             exact_resident_bytes: allocation_bytes,
+            state_bytes: 0,
+            startup_state_bytes: 0,
             bounds: AssessmentMemoryBounds {
                 prepared_resource_bytes: 0,
                 startup_additional_bytes: 0,
+                component_upload_bytes: 0,
                 staging_upload_bytes: staging_bytes,
                 sealed_graph_host_bytes: SealedGraphHostBytes {
                     at_most: 0,
                     at_least: 0,
                 },
                 bound_graph_host_bytes: 0,
+                host_process: NO_HOST_PROCESS,
             },
             serving_bytes: allocation_bytes,
             allocation_bytes,
@@ -2300,12 +2479,14 @@ mod tests {
         let bounds = AssessmentMemoryBounds {
             prepared_resource_bytes: 40,
             startup_additional_bytes: 60,
+            component_upload_bytes: 0,
             staging_upload_bytes: 7,
             sealed_graph_host_bytes: SealedGraphHostBytes {
                 at_most: 0,
                 at_least: 0,
             },
             bound_graph_host_bytes: 0,
+            host_process: NO_HOST_PROCESS,
         };
         // The workload's state outgrows the load's startup state and peak:
         // the peak is not charged on top of it.
@@ -2321,6 +2502,20 @@ mod tests {
         assert_eq!(loading.serving_bytes, 125 + 40 + 50);
         assert!(terms.charge(bounds, u64::MAX, 10).is_err());
         assert!(terms.charge(bounds, 50, u64::MAX).is_err());
+        // An optional component a request loads at the fit depth claims its
+        // import window beside the workload's state: serving's peak, and a
+        // dedicated device stages the larger of the two windows.
+        let component = AssessmentMemoryBounds {
+            component_upload_bytes: 30,
+            ..bounds
+        };
+        let loaded = terms.charge(component, 90, 10).unwrap();
+        assert_eq!(loaded.allocation_bytes, 125 + 40 + 90 + 30);
+        assert_eq!(loaded.serving_bytes, 125 + 40 + 90);
+        assert_eq!(loaded.staging_bytes, 30);
+        // The load's own peak still bounds it where it is the larger.
+        let early = terms.charge(component, 20, 10).unwrap();
+        assert_eq!(early.allocation_bytes, 125 + 40 + (10 + 60));
         assert!(
             AssessmentMemoryTerms {
                 history_per_token: u64::MAX,
@@ -2456,6 +2651,89 @@ mod tests {
             .unwrap();
         assert_eq!(dedicated_sealed.domains[0].required_bytes, 800);
         assert_eq!(dedicated_sealed.domains[1].required_bytes, 370);
+
+        // The graphs' static bindings and the worker's own host bytes are
+        // system RAM too, held with the tables and the sealed plans.
+        let mut worker = sealed;
+        worker.bounds.bound_graph_host_bytes = 3;
+        worker.bounds.host_process = HostProcessBytes {
+            runtime: 4,
+            vocabulary: 5,
+            programs: 6,
+            vision: 7,
+            kernels: 2,
+        };
+        assert_eq!(worker.host_bytes().unwrap(), 50 + 20 + 3 + 4 + 5 + 6 + 7);
+        let unified_worker = worker.assess_fit(&unified, DomainRole::Allocation).unwrap();
+        assert_eq!(unified_worker.domains[0].required_bytes, 870 + 25);
+        let dedicated_worker = worker
+            .assess_fit(&dedicated, DomainRole::Allocation)
+            .unwrap();
+        assert_eq!(dedicated_worker.domains[0].required_bytes, 800);
+        assert_eq!(dedicated_worker.domains[1].required_bytes, 370 + 25);
+        assert_eq!(
+            dedicated_worker.verdict,
+            AssessmentFitVerdict::DoesNotFit {
+                limiting: host,
+                deficit_bytes: 95,
+            }
+        );
+    }
+
+    /// The worker's host bytes are counts the plan fixes times the costs
+    /// measured on the backend: its runtime, a cost per vocabulary entry and
+    /// one per native kernel the load prepares, the kernels being the
+    /// load's own inventory (`kernel_requests`, which a load's preparation
+    /// is tested to prepare exactly).
+    #[test]
+    fn worker_host_bytes_price_the_plans_vocabulary_and_kernels() {
+        let definition = crate::planning::tests::fixture_definition();
+        let manifest = crate::planning::tests::fixture_manifest(&definition);
+        let selection = ComponentSelection {
+            head: false,
+            vision: false,
+        };
+        let load =
+            ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows16).unwrap();
+        let programs = load.program_plan(&definition, KvCodec::Dense).unwrap();
+        let limits = fixture_limits(false);
+        for backend in [
+            BackendName::Cpu,
+            BackendName::Metal,
+            BackendName::Vulkan,
+            BackendName::Cuda,
+        ] {
+            let costs = HostProcessCosts::of(backend);
+            let kernels = crate::native::kernel_requests(
+                backend,
+                &programs,
+                &definition,
+                &load,
+                crate::TuningLimits::of(limits, &definition),
+            )
+            .unwrap()
+            .len() as u64;
+            assert!(kernels > 0);
+            let host =
+                HostProcessBytes::derive(&definition, &load, &programs, limits, backend).unwrap();
+            // The fixture reads no images: no vision term.
+            assert!(programs.vision().is_none());
+            assert_eq!(
+                host,
+                HostProcessBytes {
+                    runtime: costs.runtime,
+                    vocabulary: costs.per_token * definition.decoder.vocabulary,
+                    programs: costs.per_kernel * kernels,
+                    vision: 0,
+                    kernels,
+                }
+            );
+            assert_eq!(
+                host.bytes().unwrap(),
+                host.runtime + host.vocabulary + host.programs
+            );
+            assert!(host.runtime > 0 && host.vocabulary > 0 && host.programs > 0);
+        }
     }
 
     /// A stored table's slots and directory are charged where the device's

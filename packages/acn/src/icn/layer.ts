@@ -130,8 +130,8 @@ const resolveModelStore = (dataDir: string) =>
   });
 
 /**
- * The local-models snapshot ICN scans first, from the saved choices as they stand at spawn. Drafters
- * whose binding method is relearned after readiness are completed by the first configuration push.
+ * The local-models snapshot ICN scans first, from the saved choices as they stand at spawn, chosen
+ * drafters included with their persisted methods.
  */
 const resolveLocalModelsSnapshot = Effect.gen(function* () {
   const storage = yield* MagnitudeStorage;
@@ -145,7 +145,7 @@ const resolveLocalModelsSnapshot = Effect.gen(function* () {
     Effect.orElseSucceed(() => EMPTY_CUSTOM_MODELS_CONFIG)
   );
   const locations = yield* resolveAutomaticLocations(hostDiscoveryEnvironment());
-  return localModelsConfiguration(config, locations, () => Option.none());
+  return localModelsConfiguration(config, locations);
 });
 
 const makeProcess = (dataDir: string, modelStore: string, localModels: LocalModelsConfiguration) =>

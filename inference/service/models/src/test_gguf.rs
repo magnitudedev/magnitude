@@ -109,3 +109,12 @@ pub(crate) fn write_projector(path: &Path, name: &str) {
         &["v.patch_embd.weight"],
     );
 }
+
+/// Architecture sets shaped like the engine's: the service never holds its own, so tests supply
+/// these the way the server supplies the engine's.
+pub(crate) fn engine_architectures() -> crate::candidate_files::RecognizedArchitectures {
+    crate::candidate_files::RecognizedArchitectures::new(
+        ["llama", "qwen35", "qwen35moe", "qwen4exp", "nemotron_h_moe", "gemma4"],
+        ["dflash", "gemma4-assistant", "qwen4exp"],
+    )
+}

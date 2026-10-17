@@ -196,6 +196,43 @@ including an open drafter boundary, is counted once across all physical owners a
 consumers. Weak census observations and generation obligations do not extend its lifetime;
 reclaim estimates exclude allocations still owned by a fork, retained prefix or submitted work.
 
+## Host memory of a load
+
+A load's worker holds system RAM beside its device holdings, and assessment charges all of it there
+(the allocation domain of a unified device, the staging domain of a dedicated one), held from the
+preparation of the programs to the end of serving, so it is charged once beside the larger of the
+load and serving phases. Two kinds of term make it up:
+
+- Exact from the plan: the host tables' row caches, the most host heap the target and state copy
+  graphs' sealed plans hold, and the target graphs' static bindings.
+- The worker's own memory, which no structure of the plan describes: its runtime (process, Seismic's
+  catalog, the opened device), the model's vocabulary (the artifact's token tables, the scheduler's
+  tokenizer and the grammar vocabulary), its prepared programs (checked entries, prepared
+  implementations and compiled pipelines, the call storage qualification leaves with them, and the
+  graph preparation they drive beyond the sealed plans), and for a model that reads images the vision
+  encoder's graphs and programs, prepared when a request first sends one. Each is a count the plan
+  fixes times a cost measured on the backend: a runtime constant, a cost per vocabulary entry, a cost
+  per native kernel of the load's kernel inventory (the device-free listing of the kernels its
+  preparation forms) and a vision constant.
+
+An optional component a request loads (vision or a drafter head) claims its import window beside its
+weights; assessment charges that window at the fit depth, as the serving phase's peak.
+
+The costs are measured, not margins: from loads on the backend, the process footprint at load end
+less everything the plan holds at that moment (weights, prepared resources, startup state and the
+exact host terms) is the worker's own memory, and the costs are the least-overestimating bound
+under which no measured load exceeds its plan. A load whose footprint exceeds what its plan holds
+raises them here, never a margin elsewhere.
+
+| Backend | Runtime | Per vocabulary entry | Per kernel | Vision | Measured on |
+|---|---|---|---|---|---|
+| Metal | 175 MB | 1,800 B | 5.7 MB | 210 MB | M4 Max, macOS 15.5: MiniCPM5 1B, Qwen3.5 0.8B, 2B and 4B, LFM2.5 1.2B, Gemma 4 E2B QAT (with its drafter and projector) and Q4_K_M (`bugs/26-10-17/unplanned-host-heap-in-memory-verdict.md`) |
+| CPU, Vulkan, CUDA | Metal's | Metal's | Metal's | Metal's | Not yet measured: the vocabulary and program structures are the engine's own and the same on every backend, the runtimes are not |
+
+A dedicated device's prepared programs also hold device memory outside the charge (CUDA modules,
+Vulkan pipelines); it is not yet measured, and its device term is part of what the device reserve
+measurement records.
+
 ## Bands
 
 The heap observes every domain it uses on every claim and every 100 ms while loaded. Headroom is
@@ -333,6 +370,10 @@ kill is independent fault containment; it chooses nothing to release.
   growth, interleaving, forks, window release, rollback and Reclaim; graphs are sealed to that limit
   and a launch beyond it is rejected before submission, never discovered by a graph lookup.
 - Startup, lazy component and state-growth allocations all claim from the one device heap.
+- On a unified device, a load's process footprint never exceeds what assessment charges for the
+  same state: at load end, its weights, prepared resources, startup state and every host term.
+  Each host term is exact from the plan or a count the plan fixes times a cost measured on the
+  backend; none is a margin.
 
 ## Physical state placement
 

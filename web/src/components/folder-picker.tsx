@@ -1,8 +1,9 @@
-import { useState } from "react"
-import { Result, useAtomValue } from "@effect-atom/atom-react"
-import { Option } from "effect"
+import { useMemo, useState } from "react"
+import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { Effect, Option } from "effect"
 import { ArrowUpIcon, FileIcon, FolderIcon } from "@phosphor-icons/react"
-import { formatStorageSize, useAgentClient } from "@magnitudedev/client-common"
+import { formatStorageSize, useAgentClient, type HostOpenPathRequest } from "@magnitudedev/client-common"
+import { useSession } from "../session"
 import type { DirectoryListing } from "@magnitudedev/sdk"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "./ui/dialog"
 import { Button } from "./ui/button"
@@ -12,6 +13,27 @@ import { SkeletonLine } from "./page-skeletons"
 
 /** What a directory browser lists: folders only, or folders and their GGUF files. */
 export type PickerKind = "folder" | "gguf"
+
+/** Shows the native open dialog and calls back with the path chosen; nothing happens when the user cancels. */
+export type NativeOpenPath = (request: HostOpenPathRequest, onChosen: (path: string) => void) => void
+
+/**
+ * The desktop's native open dialog, present whenever the window has a native host on any OS; a
+ * browser has none and browses the service's folders in-app instead.
+ */
+export function useNativeOpenPath(): Option.Option<NativeOpenPath> {
+  const session = useSession()
+  const run = useAtomSet(useMemo(() => Atom.fn(({ request, onChosen }: { request: HostOpenPathRequest; onChosen: (path: string) => void }) =>
+    Option.match(session.openPathDialog, {
+      onNone: () => Effect.void,
+      onSome: open => open(request).pipe(Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: path => Effect.sync(() => onChosen(path)) }))),
+    })), [session]))
+  return Option.map(session.openPathDialog, () => (request, onChosen) => run({ request, onChosen }))
+}
+
+/** The action that chooses a path: the native dialog when the window has one, else `onBrowse` opens the in-app browser. */
+export const choosePath = (native: Option.Option<NativeOpenPath>, request: HostOpenPathRequest, onChosen: (path: string) => void, onBrowse: () => void) => () =>
+  Option.match(native, { onNone: onBrowse, onSome: open => open(request, onChosen) })
 
 /**
  * Chooses a folder on the machine running Magnitude, which may not be the machine showing this

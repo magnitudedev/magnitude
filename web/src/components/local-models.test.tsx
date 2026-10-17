@@ -1,8 +1,8 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
-import { HiddenModels, SourceTag, UnsupportedModels, unsupportedSummary } from "./local-model-lists"
-import { ModelRemoveAction, removalKind } from "./model-remove-action"
+import { HiddenModels, SourceTag, UnhideButton, UnsupportedModels, unsupportedSummary } from "./local-model-lists"
+import { ModelRemoveAction, keepsExternalCopy, removalConfirmation, removalKind } from "./model-remove-action"
 import { FoundModelsBanner, HuggingFaceLink, NoRecommendations, foundModelsSummary } from "./discover-custom"
 import { ModelsHeader, matchStatus, searchPlaceholder } from "./models-header"
 import { labForName, modelLab, variantLab } from "./model-logo"
@@ -56,6 +56,32 @@ describe("removing by origin", () => {
     expect(renderToStaticMarkup(<ModelRemoveAction model={found} running={false} disabled={false} onRemove={() => {}} />)).toBe("")
     expect(removalKind({ ...found, acquisitionState: { ...found.acquisitionState, installation: { ...found.acquisitionState.installation, ownership: "Mixed" as const } } })).toBe("delete")
   })
+  it("says removing an added model with the same bytes elsewhere deletes only Magnitude's copy and keeps it listed", () => {
+    const addedModel = customModel(added)
+    const alsoFound = customModel(added, { acquisitionState: { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 23_000_000_000, primaryPath: "/models/qwen.gguf", ownership: "Mixed" }, residencyState: { _tag: "Unloaded" } } })
+    expect(keepsExternalCopy(alsoFound)).toBe(true)
+    expect(keepsExternalCopy(addedModel)).toBe(false)
+    expect(keepsExternalCopy(customModel(foundIn({ _tag: "LmStudio" })))).toBe(false)
+    expect(removalConfirmation(alsoFound, false)).toEqual({
+      title: "Remove Magnitude’s copy of Qwen3.6 35B A3B Uncensored (Q4_K_P)?",
+      description: "Only the files Magnitude downloaded are deleted. The same model is also in another location on this computer, so it stays in My Models from there.",
+      confirmLabel: "Remove",
+    })
+    expect(removalConfirmation(alsoFound, true).title).toBe("Stop Qwen3.6 35B A3B Uncensored (Q4_K_P) and remove Magnitude’s copy?")
+    expect(removalConfirmation(addedModel, false)).toEqual({
+      title: "Remove the downloaded files for Qwen3.6 35B A3B Uncensored (Q4_K_P)?",
+      description: "You can download it again later.",
+      confirmLabel: "Remove",
+    })
+    expect(removalConfirmation(addedModel, false).description).not.toContain("another location")
+  })
+  it("tells an imported file how to add it again, without doubled punctuation", () => {
+    const confirmation = removalConfirmation(customModel(imported), false)
+    expect(confirmation.description).toBe("The file stays where it is. You can add it again with Add GGUF file…")
+    expect(confirmation.description).not.toMatch(/…\.$/)
+    expect(confirmation.confirmLabel).toBe("Remove from Magnitude")
+    expect(removalConfirmation(customModel(imported), true).confirmLabel).toBe("Stop and remove")
+  })
   it("offers no hide action without a hide handler", () => {
     expect(renderToStaticMarkup(<ModelRemoveAction model={customModel(foundIn({ _tag: "Ollama" }))} running={false} disabled={false} onRemove={() => {}} />)).toBe("")
   })
@@ -75,12 +101,14 @@ describe("models that can't run", () => {
     expect(html).toContain("3 other models on this computer can’t run in Magnitude")
     expect(html).toContain("No kernels for the deepseek4 architecture")
     expect(html).toContain("Uses IQ1_M weights")
-    expect(html).toContain("Magnitude can&#x27;t run this model")
     expect(html).toContain(">LM Studio<")
     expect(html).toContain(">Hugging Face cache<")
     expect(html).toContain("text-slate-500")
     expect(html).not.toMatch(/<button/)
-    expect(html).not.toContain("PRIVATE<")
+  })
+  it("shows an unknown reason's detail in the row itself", () => {
+    const html = renderToStaticMarkup(<UnsupportedModels models={models} />)
+    expect(html).toMatch(/>gpt-oss 20B<.*>Ollama<.*<span class="min-w-0 flex-1">Magnitude can&#x27;t run this model \(PRIVATE\)<\/span>/)
   })
   it("says many unrecognized tensors once", () => {
     const gemma = unsupportedLocal("Gemma 4 E2B (Q4_K_M)", foundIn({ _tag: "LmStudio" }), { _tag: "UnrecognizedTensor", name: "blk.15.attn_k" })
@@ -96,11 +124,15 @@ describe("models that can't run", () => {
 
 describe("hidden filter", () => {
   it("lists hidden models with Unhide, and says when there are none", () => {
-    const html = renderToStaticMarkup(<HiddenModels models={[customModel(foundIn({ _tag: "Ollama" }))]} disabled={false} onUnhide={() => {}} />)
+    const html = renderToStaticMarkup(<HiddenModels models={[customModel(foundIn({ _tag: "Ollama" }))]} unhide={model => <UnhideButton pending={false} onUnhide={() => model} />} />)
     expect(html).toContain("Hidden from Magnitude")
-    expect(html).toContain("Unhide")
+    expect(html).toMatch(/<button[^>]*>.*Unhide<\/button>/)
+    expect(html).not.toMatch(/<button[^>]*disabled=""[^>]*>.*Unhide/)
     expect(html).toContain(">Ollama<")
-    expect(renderToStaticMarkup(<HiddenModels models={[]} disabled={false} onUnhide={() => {}} />)).toContain("No hidden models")
+    expect(renderToStaticMarkup(<HiddenModels models={[]} unhide={() => null} />)).toContain("No hidden models")
+  })
+  it("disables Unhide while its command is pending", () => {
+    expect(renderToStaticMarkup(<UnhideButton pending onUnhide={() => {}} />)).toMatch(/<button[^>]*disabled=""[^>]*>.*Unhide<\/button>/)
   })
   it("tags where files came from", () => {
     expect(renderToStaticMarkup(<SourceTag label="Hugging Face" />)).toContain(">Hugging Face<")

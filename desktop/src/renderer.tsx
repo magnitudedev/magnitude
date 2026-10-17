@@ -2,7 +2,7 @@ import { Effect, Option, Schema, Stream } from "effect"
 import { ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
 import { ApplicationHostFailed, HostAction, ModelTrayPresentation, type ApplicationHost } from "@magnitudedev/client-common"
 import { renderApplication } from "@magnitudedev/web/run"
-import type { DesktopApi } from "./desktop-rpc"
+import { OpenPathResult, type DesktopApi } from "./desktop-rpc"
 
 /** The preload bridge is the renderer's only Promise boundary; everything past this file is Effect. */
 const bridge: DesktopApi = window.__magnitudeDesktop
@@ -33,6 +33,11 @@ const host: ApplicationHost = {
     presentModel: value => call(() => bridge.presentModel(Schema.encodeSync(ModelTrayPresentation)(value))),
     resolveQuitFailure: decision => call(() => bridge.resolveQuitFailure(decision)),
     retryService: call(() => bridge.retry()),
+    chooseOpenPath: request => call(() => bridge.chooseOpenPath({ kind: request.kind, title: request.title, ...Option.match(request.defaultPath, { onNone: () => ({}), onSome: defaultPath => ({ defaultPath }) }) })).pipe(
+      Effect.flatMap(Schema.decodeUnknown(OpenPathResult)),
+      Effect.mapError(error => error instanceof ApplicationHostFailed ? error : new ApplicationHostFailed({ message: "The file dialog returned an unexpected result." })),
+      Effect.map(result => result.path),
+    ),
     application: observe(ApplicationSnapshot, bridge.observe),
   }),
 }

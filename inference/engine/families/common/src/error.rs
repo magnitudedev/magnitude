@@ -90,8 +90,10 @@ impl error::Error for HeaderError {}
 impl HeaderError {
     /// The unsupported features this error names: unknown keys, keys or
     /// tensors stored in a form the family doesn't read (such as a weight
-    /// with an extra unit dimension), unbound tensors and rope scaling outside
-    /// the admitted ranges. A header missing what the family needs names none.
+    /// with an extra unit dimension), unbound tensors, rope scaling outside
+    /// the admitted ranges, and an output head absent because it is tied to
+    /// the embedding. A header missing anything else the family needs, or
+    /// whose values contradict each other, is `Unreadable`.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
             Self::UnknownMetadata(keys) => keys
@@ -113,13 +115,20 @@ impl HeaderError {
             Self::Yarn => vec![UnsupportedReason::RopeScaling {
                 kind: "yarn".into(),
             }],
+            Self::MissingWeight(name) if name == OUTPUT_HEAD => {
+                vec![UnsupportedReason::TiedOutputHead]
+            }
             Self::MissingMetadata(_)
             | Self::MissingWeight(_)
             | Self::Rotary { .. }
-            | Self::Definition(_) => Vec::new(),
+            | Self::Definition(_) => vec![UnsupportedReason::Unreadable],
         }
     }
 }
+
+/// The output projection a GGUF stores apart from the embedding unless the
+/// two are tied.
+const OUTPUT_HEAD: &str = "output.weight";
 
 impl From<HeaderError> for FamilyError {
     fn from(error: HeaderError) -> Self {
@@ -150,6 +159,24 @@ mod tests {
                 name: "blk.0.ffn_gate_inp_shexp.weight".into()
             }]
         );
-        assert!(HeaderError::MissingWeight("output.weight".into()).reasons().is_empty());
+    }
+
+    #[test]
+    fn a_header_missing_what_the_family_needs_is_unreadable_unless_its_head_is_tied() {
+        assert_eq!(
+            HeaderError::MissingWeight("output.weight".into()).reasons(),
+            [UnsupportedReason::TiedOutputHead]
+        );
+        for error in [
+            HeaderError::MissingWeight("blk.0.attn_q.weight".into()),
+            HeaderError::MissingMetadata("lfm2.block_count".into()),
+            HeaderError::Rotary {
+                rotated: 3,
+                width: 64,
+                base: 10_000.0,
+            },
+        ] {
+            assert_eq!(error.reasons(), [UnsupportedReason::Unreadable], "{error}");
+        }
     }
 }

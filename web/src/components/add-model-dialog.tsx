@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from "react"
+import { useEffect, useId, useState, type ReactNode } from "react"
 import { Cause, Exit, Option } from "effect"
 import { Result, useAtomRefresh, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { ArrowLeftIcon, ArrowUpRightIcon, DownloadSimpleIcon, LinkIcon, MagnifyingGlassIcon, PlusIcon } from "@phosphor-icons/react"
@@ -15,15 +15,16 @@ import { SkeletonLine } from "./page-skeletons"
 import { HuggingFaceLogo, NamedLogo, variantLab } from "./model-logo"
 import { DrafterList, drafterChoice, selectedDrafterCandidate, useDrafterCandidates, type DrafterSelection } from "./drafter-list"
 import { candidateErrorNotice } from "./candidate-errors"
-import { DirectoryBrowser, useDirectoryBrowser } from "./folder-picker"
+import { DirectoryBrowser, useDirectoryBrowser, useNativeOpenPath, type NativeOpenPath } from "./folder-picker"
+import { ActionTooltip, TooltipProvider } from "./ui/tooltip"
 
-/** What the dialog opens on: the app's own requests, plus Add GGUF file…, whose step starts with a file picker. */
-export type AddDialogRequest = AddModelRequest | { readonly _tag: "LocalFile" }
+/** What the dialog opens on: the app's own requests, plus Add GGUF file…, with the file the native dialog chose or none to pick in-app. */
+export type AddDialogRequest = AddModelRequest | { readonly _tag: "LocalFile"; readonly file: Option.Option<string> }
 
 type Step =
   | { readonly _tag: "Find"; readonly tab: FindTab; readonly query: string }
   | { readonly _tag: "Repository"; readonly reference: string; readonly file: Option.Option<string> }
-  | { readonly _tag: "LocalFile" }
+  | { readonly _tag: "LocalFile"; readonly file: Option.Option<string> }
 
 export type FindTab = "search" | "paste"
 
@@ -31,7 +32,7 @@ const initialStep = (request: AddDialogRequest): Step => {
   switch (request._tag) {
     case "Search": return { _tag: "Find", tab: "search", query: request.query }
     case "HuggingFace": return { _tag: "Repository", reference: request.repository, file: request.file }
-    case "LocalFile": return { _tag: "LocalFile" }
+    case "LocalFile": return { _tag: "LocalFile", file: request.file }
   }
 }
 
@@ -64,7 +65,7 @@ export function AddModelDialog({ request, models, onClose, onAdded }: {
 function AddModelFlow({ request, models, onAdded }: { request: AddDialogRequest; models: readonly LocalModel[]; onAdded: () => void }) {
   const [step, setStep] = useState(() => initialStep(request))
   const [find, setFind] = useState<{ tab: FindTab; query: string }>(() => step._tag === "Find" ? { tab: step.tab, query: step.query } : { tab: "search", query: "" })
-  if (step._tag === "LocalFile") return <LocalFileStep models={models} onAdded={onAdded} />
+  if (step._tag === "LocalFile") return <LocalFileStep initialFile={step.file} models={models} onAdded={onAdded} />
   if (step._tag === "Find") return <FindStep tab={find.tab} query={find.query} models={models}
     onChange={next => setFind(next)} onOpen={reference => setStep({ _tag: "Repository", reference, file: Option.none() })} />
   return <RepositoryStep reference={step.reference} file={step.file} models={models} onAdded={onAdded}
@@ -179,16 +180,34 @@ function SearchResultRow({ result, models, onOpen }: { result: HuggingFaceSearch
   </button>
 }
 
-function RepositoryStep({ reference, file, models, onBack, onAdded }: { reference: string; file: Option.Option<string>; models: readonly LocalModel[]; onBack?: () => void; onAdded: () => void }) {
+/** What an inspection shows: still reading (including while Retry runs), the failure with Retry, or the result. */
+export type InspectionView =
+  | { readonly _tag: "Reading" }
+  | { readonly _tag: "Failed"; readonly error: Option.Option<unknown> }
+  | { readonly _tag: "Inspected"; readonly inspection: CandidateInspection }
+
+export const inspectionView = (result: Result.Result<CandidateInspection, unknown>): InspectionView =>
+  Result.isSuccess(result) ? { _tag: "Inspected", inspection: result.value }
+    : Result.isFailure(result) && !result.waiting ? { _tag: "Failed", error: Cause.failureOption(result.cause) }
+    : { _tag: "Reading" }
+
+/** Inspects a reference; a failure remembered from an earlier opening is read again rather than shown stale. */
+function useInspection(reference: string) {
   const client = useAgentClient()
   const inspect = client.Models.InspectModelCandidate({ reference })
-  const inspection = useAtomValue(inspect).result
+  const result = useAtomValue(inspect).result
   const retry = useAtomRefresh(inspect)
-  if (Result.isSuccess(inspection)) return <InspectedRepository inspection={inspection.value} file={file} models={models} onAdded={onAdded} {...(onBack ? { onBack } : {})} />
+  useEffect(() => { if (Result.isFailure(result) && !result.waiting) retry() }, [inspect])
+  return { view: inspectionView(result), retry }
+}
+
+function RepositoryStep({ reference, file, models, onBack, onAdded }: { reference: string; file: Option.Option<string>; models: readonly LocalModel[]; onBack?: () => void; onAdded: () => void }) {
+  const { view, retry } = useInspection(reference)
+  if (view._tag === "Inspected") return <InspectedRepository inspection={view.inspection} file={file} models={models} onAdded={onAdded} {...(onBack ? { onBack } : {})} />
   return <>
     <DialogHeader><DialogTitle className="flex items-center gap-2">{onBack && <BackButton onBack={onBack} />}{reference}</DialogTitle></DialogHeader>
-    {Result.isFailure(inspection)
-      ? <InspectionFailure error={Cause.failureOption(inspection.cause)} onRetry={retry} />
+    {view._tag === "Failed"
+      ? <InspectionFailure error={view.error} onRetry={retry} />
       : <div aria-busy="true" aria-label="Reading the repository" className="space-y-2">
         <p className="text-xs text-slate-500">Reading the repository and checking each version against this machine…</p>
         {[0, 1, 2, 3].map(index => <SkeletonLine key={index} className="h-9" width="100%" />)}
@@ -205,15 +224,11 @@ function BackButton({ onBack }: { onBack: () => void }) {
   return <Button variant="ghost" size="icon-sm" aria-label="Back to search" onClick={onBack}><ArrowLeftIcon /></Button>
 }
 
-const plannedSupport = new Set<UnsupportedReason["_tag"]>([
-  "WeightTypes", "RopeScaling", "UnrecognizedTensor", "UnrecognizedMetadata", "TiedOutputHead", "Tokenizer", "KernelDomain", "Backend",
-])
-
-/** The short verdict for versions the engine can't run: damaged, planned support, or not supported. */
+/** The short verdict for versions the engine can't run: damaged, an architecture without kernels, or anything else not supported yet. */
 export const unsupportedVersionLabel = (reasons: readonly UnsupportedReason[]): string =>
   reasons.some(reason => reason._tag === "Unreadable") ? "File is damaged"
-    : reasons.length > 0 && reasons.every(reason => plannedSupport.has(reason._tag)) ? "Not supported yet"
-    : "Not supported"
+    : reasons.some(reason => reason._tag === "Architecture") ? "Not supported"
+    : "Not supported yet"
 
 /** A version's engine verdict, never read from its file name; `detail` is the full reason behind a short label. */
 export const versionVerdict = (version: CandidateVersion): { readonly label: string; readonly detail?: string; readonly selectable: boolean; readonly recommended: boolean } => {
@@ -246,12 +261,13 @@ export const confirmAction = (inspection: CandidateInspection, version: Candidat
   return { label: `Download (${formatStorageSize(totalBytes)})`, download: true }
 }
 
-function InspectedRepository({ inspection, file, models, onBack, onAdded }: { inspection: CandidateInspection; file: Option.Option<string>; models: readonly LocalModel[]; onBack?: () => void; onAdded: () => void }) {
+/** The inspected repository: a version that can run gets its drafters and Download; one that can't gets the reason in their place. */
+export function InspectedRepository({ inspection, file, models, onBack, onAdded }: { inspection: CandidateInspection; file: Option.Option<string>; models: readonly LocalModel[]; onBack?: () => void; onAdded: () => void }) {
   const [picked, setPicked] = useState(() => initialVersion(inspection, file))
   const version = Option.flatMap(picked, label => Option.fromNullable(inspection.versions.find(entry => entry.label === label)))
   const header = { inspection, models, selectedVersion: picked, onSelectVersion: (label: string) => setPicked(Option.some(label)), ...(onBack ? { onBack } : {}) }
   const source = inspection.source
-  if (Option.isNone(version) || Option.isSome(inspection.unsupportedArchitecture) || source._tag !== "HuggingFace") return <RepositoryView {...header} />
+  if (Option.isNone(version) || !versionVerdict(version.value).selectable || Option.isSome(inspection.unsupportedArchitecture) || source._tag !== "HuggingFace") return <RepositoryView {...header} />
   return <VersionWithDrafters key={version.value.label} version={version.value} header={header} onAdded={onAdded}
     target={{ _tag: "Repository", repository: source.repository, commit: source.commit }} />
 }
@@ -277,6 +293,17 @@ export const addVersionRequest = (target: AddTarget, version: CandidateVersion, 
     ? { _tag: "Import" as const, request: { path: target.path, drafter } }
     : { _tag: "Add" as const, request: { repository: target.repository, revision: Option.some(target.commit), version: Option.some(version.label), drafter, force: false } }
 
+/**
+ * This confirmation's own Add or Import: the mutation's state is shared by every opening of the
+ * dialog, so a pending or failed add from an earlier one shows nothing here until this one submits.
+ */
+export const submissionState = (submitted: boolean, state: Result.Result<unknown, unknown>): { readonly pending: boolean; readonly failure: NoticeContent | undefined } => ({
+  pending: submitted && state.waiting,
+  failure: submitted && Result.isFailure(state) && !state.waiting
+    ? Option.match(Cause.failureOption(state.cause), { onNone: () => ({ title: "Couldn’t add this model", description: "Try again." }), onSome: candidateErrorNotice })
+    : undefined,
+})
+
 /** The drafter choices for one version and the footer that adds it with the chosen drafter. */
 function useVersionConfirmation(inspection: CandidateInspection, version: CandidateVersion, target: AddTarget, onAdded: () => void) {
   const client = useAgentClient()
@@ -288,11 +315,10 @@ function useVersionConfirmation(inspection: CandidateInspection, version: Candid
   const adding = useAtomValue(client.Models.AddHuggingFaceModel)
   const importFile = useAtomSet(client.Models.ImportModelFile, { mode: "promiseExit" })
   const importing = useAtomValue(client.Models.ImportModelFile)
-  const state = target._tag === "File" ? importing : adding
-  const failure = Result.isFailure(state) && !state.waiting
-    ? Option.match(Cause.failureOption(state.cause), { onNone: () => ({ title: "Couldn’t add this model", description: "Try again." }), onSome: candidateErrorNotice })
-    : undefined
+  const [submitted, setSubmitted] = useState(false)
+  const { pending, failure } = submissionState(submitted, target._tag === "File" ? importing : adding)
   const confirm = () => {
+    setSubmitted(true)
     const done = (exit: Exit.Exit<unknown, unknown>) => { if (Exit.isSuccess(exit)) onAdded() }
     const command = addVersionRequest(target, version, drafterChoice(selection, list))
     if (command._tag === "Import") void importFile(command.request).then(done)
@@ -302,18 +328,36 @@ function useVersionConfirmation(inspection: CandidateInspection, version: Candid
     drafters: Result.isFailure(candidates) ? <ErrorNotice severity="warning" title="Couldn’t list drafters" description="The recommended drafter is still used when you add this model." />
       : findingDrafters ? <div aria-busy="true" aria-label="Finding drafters" className="space-y-2"><p className="text-xs text-slate-500">Finding drafters for this version…</p><SkeletonLine className="h-10" width="100%" /><SkeletonLine className="h-10" width="100%" /></div>
       : <DrafterList candidates={list} selection={selection} onSelect={setSelection} otherPending={otherPending} otherFailure={otherFailure} onCheckOther={checkOther} />,
-    footer: <RepositoryFooter local={target._tag === "File"} action={confirmAction(inspection, version, selectedDrafterCandidate(selection, list))} pending={state.waiting || findingDrafters} failure={failure} onConfirm={confirm} />,
+    footer: <RepositoryFooter local={target._tag === "File"} action={confirmAction(inspection, version, selectedDrafterCandidate(selection, list))} pending={pending || findingDrafters} failure={failure} onConfirm={confirm} />,
   }
 }
 
 const localFileNote = "Magnitude uses this file where it is and never moves or deletes it."
 
-/** Add GGUF file…: the repository step with a file picker in place of the version list. */
-function LocalFileStep({ models, onAdded }: { models: readonly LocalModel[]; onAdded: () => void }) {
+export const ggufOpenRequest = { kind: "gguf", title: "Add a GGUF file", defaultPath: Option.none() } as const
+
+/** Add GGUF file…: the repository step with the chosen file in place of the version list; the native dialog chooses it when the window has one. */
+function LocalFileStep({ initialFile, models, onAdded }: { initialFile: Option.Option<string>; models: readonly LocalModel[]; onAdded: () => void }) {
+  const native = useNativeOpenPath()
+  const [file, setFile] = useState(initialFile)
+  const inspection = Option.map(file, path => <LocalFileInspection key={path} path={path} models={models} onAdded={onAdded} />)
+  return Option.match(native, {
+    onSome: open => <LocalFileView browser={<NativeFileChoice file={file} open={open} onChosen={path => setFile(Option.some(path))} />} file={inspection} />,
+    onNone: () => <BrowsedLocalFile file={file} onChosen={path => setFile(Option.some(path))} inspection={inspection} />,
+  })
+}
+
+function BrowsedLocalFile({ file, onChosen, inspection }: { file: Option.Option<string>; onChosen: (path: string) => void; inspection: Option.Option<ReactNode> }) {
   const browser = useDirectoryBrowser("gguf", Option.none())
-  const [file, setFile] = useState(Option.none<string>())
-  return <LocalFileView browser={<DirectoryBrowser browser={browser} selectedFile={file} onSelectFile={path => setFile(Option.some(path))} />}
-    file={Option.map(file, path => <LocalFileInspection key={path} path={path} models={models} onAdded={onAdded} />)} />
+  return <LocalFileView browser={<DirectoryBrowser browser={browser} selectedFile={file} onSelectFile={onChosen} />} file={inspection} />
+}
+
+/** The file the native dialog chose, with a button that opens it again. */
+export function NativeFileChoice({ file, open, onChosen }: { file: Option.Option<string>; open: NativeOpenPath; onChosen: (path: string) => void }) {
+  return <div className="flex items-center gap-2">
+    <span className="min-w-0 flex-1 truncate font-mono text-xs text-slate-600 dark:text-slate-300" title={Option.getOrUndefined(file)}>{Option.getOrElse(file, () => "No file chosen")}</span>
+    <Button size="sm" variant="outline" className="shrink-0" onClick={() => open(ggufOpenRequest, onChosen)}>{Option.isSome(file) ? "Choose another file…" : "Choose a file…"}</Button>
+  </div>
 }
 
 /** The Add GGUF file step: the file picker on top, then the chosen file's verdict, drafters, and Add. */
@@ -332,17 +376,15 @@ export function LocalFileView({ browser, file }: { browser: ReactNode; file: Opt
 }
 
 function LocalFileInspection({ path, models, onAdded }: { path: string; models: readonly LocalModel[]; onAdded: () => void }) {
-  const client = useAgentClient()
-  const inspect = client.Models.InspectModelCandidate({ reference: path })
-  const inspection = useAtomValue(inspect).result
-  const retry = useAtomRefresh(inspect)
-  if (Result.isFailure(inspection)) return <InspectionFailure error={Cause.failureOption(inspection.cause)} onRetry={retry} />
-  if (!Result.isSuccess(inspection)) return <div aria-busy="true" aria-label="Reading the file" className="space-y-2"><SkeletonLine className="h-9" width="100%" /><SkeletonLine className="h-10" width="100%" /></div>
-  const version = inspection.value.versions[0]
-  if (version === undefined || Option.isSome(inspection.value.unsupportedArchitecture) || !versionVerdict(version).selectable) {
-    return <LocalFileSummary inspection={inspection.value} models={models} />
+  const { view, retry } = useInspection(path)
+  if (view._tag === "Failed") return <InspectionFailure error={view.error} onRetry={retry} />
+  if (view._tag === "Reading") return <div aria-busy="true" aria-label="Reading the file" className="space-y-2"><SkeletonLine className="h-9" width="100%" /><SkeletonLine className="h-10" width="100%" /></div>
+  const { inspection } = view
+  const version = inspection.versions[0]
+  if (version === undefined || Option.isSome(inspection.unsupportedArchitecture) || !versionVerdict(version).selectable) {
+    return <LocalFileSummary inspection={inspection} models={models} />
   }
-  return <LocalFileVersion path={path} inspection={inspection.value} version={version} models={models} onAdded={onAdded} />
+  return <LocalFileVersion path={path} inspection={inspection} version={version} models={models} onAdded={onAdded} />
 }
 
 function LocalFileVersion({ path, inspection, version, models, onAdded }: { path: string; inspection: CandidateInspection; version: CandidateVersion; models: readonly LocalModel[]; onAdded: () => void }) {
@@ -364,9 +406,7 @@ export function LocalFileSummary({ inspection, models, drafters, footer }: { ins
         {facts.length > 0 && <span className="block truncate text-xs text-slate-500">{facts.join(" · ")}</span>}
       </span>
       {version !== undefined && <span className="shrink-0 text-xs tabular-nums text-slate-500">{formatStorageSize(version.sizeBytes)}</span>}
-      {verdict !== undefined && Option.isNone(inspection.unsupportedArchitecture) && (verdict.recommended
-        ? <span className="shrink-0 rounded-full border border-blue-300 px-2 py-0.5 text-xs text-blue-700 dark:border-blue-700 dark:text-blue-400">Recommended</span>
-        : <span className="shrink-0 text-xs text-slate-500" title={verdict.detail}>{verdict.label}</span>)}
+      {verdict !== undefined && Option.isNone(inspection.unsupportedArchitecture) && <span className="shrink-0 text-xs"><VerdictLabel verdict={verdict} /></span>}
     </section>
     {Option.isSome(inspection.unsupportedArchitecture)
       ? <ErrorNotice severity="info" title="Magnitude can’t run this model" description={`${unsupportedReasonMessages(inspection.unsupportedArchitecture.value).join(". ")}.`} />
@@ -407,6 +447,11 @@ export function RepositoryView({ inspection, models, selectedVersion, onSelectVe
 }) {
   const name = useId()
   const variantOf = catalogVariantOfName(models, inspection.variantOf)
+  const noRunnableVersion = noRunnableVersionReason(inspection.versions)
+  const unselectable = Option.filter(
+    Option.flatMap(selectedVersion, label => Option.fromNullable(inspection.versions.find(version => version.label === label))),
+    version => !versionVerdict(version).selectable,
+  )
   const source = inspection.source
   const facts = [...(Option.isSome(variantOf) ? [`Variant of ${variantOf.value}`] : []), ...Option.toArray(inspection.license)]
   return <>
@@ -435,15 +480,14 @@ export function RepositoryView({ inspection, models, selectedVersion, onSelectVe
             <div role="radiogroup" aria-label="Version" className="divide-y divide-slate-200 overflow-hidden rounded-lg border border-slate-200 dark:divide-slate-750 dark:border-slate-750">
               {inspection.versions.map(version => {
                 const verdict = versionVerdict(version)
-                return <label key={version.label} className={`flex items-center gap-3 px-3 py-2 text-sm ${verdict.selectable ? "cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800" : "opacity-60"}`}>
-                  <input type="radio" name={name} className="accent-blue-600" checked={Option.contains(selectedVersion, version.label)} disabled={!verdict.selectable} onChange={() => onSelectVersion(version.label)} />
+                const selected = Option.contains(selectedVersion, version.label)
+                return <label key={version.label} data-selected={selected || undefined} className={`flex items-center gap-3 px-3 py-2 text-sm ${verdict.selectable ? "cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800" : selected ? "" : "opacity-60"} ${selected ? "bg-blue-50 dark:bg-slate-800" : ""}`}>
+                  <input type="radio" name={name} className="accent-blue-600" checked={selected} disabled={!verdict.selectable} onChange={() => onSelectVersion(version.label)} />
                   <span className="w-24 shrink-0 truncate font-medium sm:w-28" title={version.files.join("\n")}>{version.label}</span>
                   <span className="w-16 shrink-0 tabular-nums text-slate-500 sm:w-20">{formatStorageSize(version.sizeBytes)}</span>
                   <span className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-x-2 gap-y-0.5 text-right text-xs">
                     {Option.isSome(version.onThisComputer) && <span className="text-green-700 dark:text-green-400">Already on this computer</span>}
-                    {verdict.recommended
-                      ? <span className="rounded-full border border-blue-300 px-2 py-0.5 text-blue-700 dark:border-blue-700 dark:text-blue-400">Recommended</span>
-                      : <span className="text-slate-500" title={verdict.detail}>{verdict.label}</span>}
+                    <VerdictLabel verdict={verdict} />
                   </span>
                 </label>
               })}
@@ -451,12 +495,37 @@ export function RepositoryView({ inspection, models, selectedVersion, onSelectVe
           </section>
           {drafters && <DrafterSection>{drafters}</DrafterSection>}
         </>}
-    {Option.isNone(inspection.unsupportedArchitecture) && Option.match(noRunnableVersionReason(inspection.versions), {
-      onNone: () => null,
+    {Option.isNone(inspection.unsupportedArchitecture) && Option.match(noRunnableVersion, {
+      onNone: () => Option.match(unselectable, { onNone: () => null, onSome: version => <UnselectableVersionFooter version={version} /> }),
       onSome: reason => <NoRunnableVersionFooter reason={reason} />,
     })}
     {footer}
   </>
+}
+
+/** A verdict; the reason behind a short label opens from a focusable trigger, so it reaches keyboard and screen reader users too. */
+export function VerdictLabel({ verdict }: { verdict: ReturnType<typeof versionVerdict> }) {
+  if (verdict.recommended) return <span className="rounded-full border border-blue-300 px-2 py-0.5 text-blue-700 dark:border-blue-700 dark:text-blue-400">Recommended</span>
+  if (verdict.detail === undefined) return <span className="text-slate-500">{verdict.label}</span>
+  return <TooltipProvider><ActionTooltip label={verdict.detail} trigger={
+    <button type="button" className="cursor-help rounded text-slate-500 underline decoration-dotted underline-offset-2 focus-visible:outline-2 focus-visible:outline-blue-500">
+      {verdict.label}<span className="sr-only">: {verdict.detail}</span>
+    </button>} /></TooltipProvider>
+}
+
+/** What a linked or pasted version that can't run here says in place of Download, while another version can. */
+export const unselectableVersionNotice = (version: CandidateVersion): NoticeContent => {
+  const assessment = Option.getOrUndefined(version.assessment)
+  return assessment?._tag === "Unsupported"
+    ? { title: `Magnitude can’t run ${version.label}`, description: `${unsupportedReasonMessages(assessment.reasons).join(". ")}. Pick another version to download.` }
+    : { title: `${version.label} is too large for this machine`, description: "Pick another version to download." }
+}
+
+/** In place of Download when the chosen version can't run here but another one can. */
+export function UnselectableVersionFooter({ version }: { version: CandidateVersion }) {
+  return <div className="border-t border-slate-200 pt-4 dark:border-slate-750">
+    <ErrorNotice severity="info" {...unselectableVersionNotice(version)} />
+  </div>
 }
 
 /** In place of Download when nothing can run: what is wrong, from the versions' verdicts. */

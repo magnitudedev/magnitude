@@ -43,10 +43,10 @@ export const drafterChoice = (selection: DrafterSelection, candidates: readonly 
   })
 }
 
-/** The selection that shows a model's attached drafter, or the recommendation when it has none. */
+/** The selection that shows a model's attached drafter, No drafter once it was turned off, or the recommendation when it has none. */
 export const attachedDrafterSelection = (model: CustomLocalModel, candidates: readonly DrafterCandidate[]): DrafterSelection =>
   Option.match(model.drafter, {
-    onNone: () => ({ _tag: "Auto" }),
+    onNone: () => model.drafterChoice._tag === "None" ? { _tag: "None" } : { _tag: "Auto" },
     onSome: drafter => {
       const match = candidates.find(candidate => drafterReferenceKey(candidate.reference) === drafterReferenceKey(drafter.reference))
       return match ? { _tag: "Candidate", key: drafterKey(match) } : { _tag: "Auto" }

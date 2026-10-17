@@ -83,11 +83,15 @@ so clients never form identities, and a label: the quantization its file or fold
 quantization label (`Q4_K_M`, `UD-Q4_K_XL`; a name such as `q40` is not one), else the header's
 `general.file_type` label. The ID is a repository file's `hf:` ID, and for a path the ID of the custom
 model listed at that path (a Hugging Face identity when its location gives one), else `local:` with
-the file's header digest, a copy of a listed model's bytes elsewhere included. A version whose bytes
-are already listed also names that model as on this computer, whichever location lists it: the same
-header digest, the same `hf:` ID and weights size (a projector found beside it, as with an Ollama
-pull, is not part of the version), the same files, or files of the same sizes whose header is the
-version's. For a chosen version and drafter the service
+the file's local digest (see terminology), a copy of a listed model's bytes elsewhere included. A
+version whose bytes are already listed also names that model as on this computer, whichever location
+lists it: the same local digest, the same `hf:` ID and weights size at the same commit when the
+listed model's commit is known (a projector found beside it, as with an Ollama pull, is not part of
+the version), the same files, or files of the same sizes whose header is the version's. A Hugging Face version that is exactly a current catalog target (the same repository, commit and
+file) names that catalog model whether or not it is installed; adding it installs the catalog model
+with the catalog's drafter and never declares a custom model, and an installed one is reported as
+already on this computer. A version or file the engine can't run is refused before anything is
+declared or downloaded, with the engine's reasons, an architecture without kernels included. For a chosen version and drafter the service
 also returns the exact servable bundle to download, with the same package identities a post-download
 scan computes; clients never construct bundles. These queries do not change the release catalog,
 managed inventory, or configuration, and catalog use does not depend on them.
@@ -307,8 +311,9 @@ unchanged unless the import names a drafter or turns it off. ICN watches every e
 without a restart; a watch event triggers scoped reconciliation of that root, never a global scan.
 
 Magnitude never writes to, moves, adopts, or deletes from an external location. Scans read GGUF
-headers only, follow no link out of a root, and skip partial downloads and temporary files. External
-files are identified by their header digest and never hashed in full; a package file whose SHA-256
+headers only (and, for identity, the first and last 1 MiB of each file's tensor data), follow no
+link out of a root, and skip partial downloads and temporary files. External models are identified
+by their local digest and never hashed in full; a package file whose SHA-256
 is not known from a blob name takes its identity from that digest and its size, unless it is a
 catalog file's exact copy in a Hugging Face cache (same repository, commit, path, size and header
 digest), which takes the catalog file's SHA-256 and so is that catalog file. A location that
@@ -372,8 +377,26 @@ carries an added model's declared target acquires that target, any other fetches
 whatever repository (the catalog's included) the drafter comes from. A catalog installation names its
 catalog model the same way. These
 downloads share the catalog path's locking, resume, LFS SHA-256 verification, disk-space checks,
-failure classification, publication, acknowledgement and post-download optimization. Update for an
-added model means its repository has a newer commit; it never follows a mutable revision implicitly.
+failure classification, publication, acknowledgement and post-download optimization.
+
+Update for an added model means its repository has a newer commit where its target is still present
+with other content; it never follows a mutable revision implicitly. ICN checks each added declaration
+in the background: it resolves the repository's `main` with the `HF_TOKEN` credential when one is set,
+compares the target files' LFS content at `main` and at the pinned commit, and reports the newer commit
+on the custom model (`updateCommit`) only when a target file differs and none is missing. A result is
+kept for about six hours; a check that cannot reach the Hub keeps the last result and reports nothing.
+A newer commit that changes only other files, or no longer has the target, is no update. ACN presents
+the model as having an update. Like a catalog update, the model keeps serving its pinned copy while the
+update downloads, and reads as updating with progress. Sync re-resolves the same version (its model
+ID names the target) at that commit, with its shards and projector and a drafter from the same
+repository moved to that commit when the commit still has it, downloads that bundle and records the
+commit as the declaration's `pendingCommit`; the commit ICN receives stays the pinned one. When the
+download completes, ACN pins the newer commit, target, projector and moved drafter and clears
+`pendingCommit`; a cancelled or failed update only clears it, so the model stays on its pinned commit.
+After a restart, a pending update whose download is gone is fetched again, keeping its bytes, and one
+that completed meanwhile is pinned. Once the copy at the pinned commit is installed and valid and the
+Hub has been reached since the service started, ICN removes Magnitude's copies of the target at other
+commits, except one at the newer commit the Hub reports, which is an update waiting to be pinned.
 
 Admission validates each package in the requested bundle against the current materialized package
 record and that package's current exact file evidence. It does not await inventory-wide filesystem
@@ -523,11 +546,14 @@ shown: installing the catalog model takes the hidden copy's verified bytes rathe
 them, and leaves the copy's files where they are.
 
 A package file whose exact bytes are already in an external location (a found or hidden exact copy,
-as when updating a catalog model whose target is in a Hugging Face cache) is never downloaded and
-never written again: Magnitude's blob is a hard link to that file, verified in full like a download,
-so the bytes are on disk once and only files present nowhere else are fetched. Magnitude only ever
-deletes its own link. Where the file system cannot link (another volume, or a file the user may not
-link), the blob is a copy, cloned where the file system can.
+as when updating a catalog model whose target is in a Hugging Face cache) is never downloaded:
+Magnitude's blob is its own file made from that one and verified in full like a download, so only
+files present nowhere else are fetched. The blob is never a hard link or any other link to the
+external file, which is only ever read. Where the file system supports copy-on-write clones (APFS,
+btrfs, XFS), the blob is a clone sharing the external file's extents until either changes, so the
+bytes stay on disk once; elsewhere, or across volumes, it is a streamed copy hashed as it is
+written. Either way the blob is exclusively Magnitude's: removing it reports its size as freed and
+never changes the external file.
 
 Removing an added custom model deletes its Magnitude-owned files under the same rules; any of its
 files that are also present in an external location stay there, and the model remains as found.

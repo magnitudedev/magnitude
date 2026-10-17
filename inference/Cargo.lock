@@ -2272,6 +2272,7 @@ dependencies = [
 name = "magnitude-engine"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "libc",
  "magnitude-artifacts",
  "magnitude-batching",
@@ -2619,6 +2620,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "flate2",
  "futures-util",
  "http-body-util",
  "libc",

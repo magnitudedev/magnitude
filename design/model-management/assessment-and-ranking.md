@@ -4,6 +4,7 @@ applies_to:
   - inference/service/server/src/assessment/**
   - inference/service/contracts/src/models.rs
   - inference/engine/src/assessment.rs
+  - inference/engine/fixtures/assessment/**
   - inference/catalog/**
   - packages/icn/src/hardware/**
   - packages/icn/src/models/**
@@ -82,15 +83,33 @@ presents. Adding a weight type or relaxing a family check changes verdicts, neve
 |---|---|
 | `Fits` | Profile, memory, performance, and the drafter verdict |
 | `DoesNotFit` | Profile, memory, the limiting resource and deficit, and the drafter verdict |
-| `Unsupported` | Profile when one exists, the complete list of `UnsupportedReason`s, and developer detail; an unreadable file has no profile |
+| `Unsupported` | Profile when one exists, the complete, never empty list of `UnsupportedReason`s, and developer detail; an unreadable file has no profile |
+
+The subject of an assessment is a catalog model (with its selection) or a custom model. A
+candidate (a Hugging Face repository or a local file not yet added) is not a subject: a separate
+candidate inspection call assesses its versions from range-fetched headers and returns the same
+verdicts.
 
 `UnsupportedReason` is a closed, structured set: architecture, weight types (each type with its
 tensor count), rope scaling, unrecognized tensor, unrecognized metadata, tokenizer, chat template,
-kernel domain, backend, and unreadable. The assessment collects every reason, not the first: a
-representation failure does not stop the weight-type check, and a file with two unsupported types
-reports both. Clients own user-facing wording per case; `detail` stays developer text for Details
-and `--json`. Clients render an unknown case generically with its detail, so the engine can add
-cases without a client release.
+kernel domain, backend, unreadable, target mismatch, and tied output head. Target mismatch is a
+drafter (or projector) that does not fit the target it is bound to; tied output head is a target
+whose output projection is its embedding where the family needs a separate one. Every refusal names
+at least one reason: a header missing what its family needs, or contradicting itself, is
+unreadable, and a planner refusal of a validated definition names the backend. The assessment
+collects every reason, not the first: a representation failure does not stop the weight-type
+check, and a file with two unsupported types reports both. Clients own user-facing wording per
+case; `detail` stays developer text for Details and `--json`. Clients render an unknown case
+generically with its detail, so the engine can add cases without a client release. The engine
+(ICN) updates independently of ACN, so the wire form is open: a reason ICN's contract doesn't name
+decodes as an unrecognized reason keeping its tag and detail, and ACN projects it as `Unknown`. The
+service never emits one itself.
+
+Every readable candidate version gets the engine's verdict, an architecture the engine doesn't
+recognize included; the product only labels, groups and orders by the engine's recognized
+architecture sets and verdicts, and never judges a file by its name, its metadata key names or an
+architecture list of its own. Built-in prediction heads are attached as chosen and bind or not by
+the engine's drafter verdict.
 
 `DrafterVerdict` is `None`, `Bound` (method and resident memory), or `Rejected` (reasons and
 detail). A drafter that fails to bind is reported, never silently dropped. The engine reports only
@@ -109,9 +128,11 @@ Engine guarantees:
 - **Header-only and deterministic.** A verdict reads GGUF headers only, never weights, and is a
   function of the header bytes, backend, and hardware, so it is cached by header digest.
 - **Resident memory.** Memory is reported as stored after import, including widened types, not as
-  file size.
+  file size, together with what the load's worker holds in system RAM (its host tables, graph plans,
+  runtime, vocabulary and prepared programs; see engine memory).
 - **Catalog targets are never `Unsupported`.** That remains a release defect.
 - **No slow fallback.** A family without kernels is refused with a reason, never run on a fallback.
 
-Shared fixtures of real GGUF headers with expected verdicts are tested on both sides; a change that
-adds support flips its fixture's expected verdict in the same change.
+Shared fixtures of real GGUF headers with expected verdicts (`inference/engine/fixtures/assessment`)
+are tested on both sides; a change that adds support flips its fixture's expected verdict in the
+same change.

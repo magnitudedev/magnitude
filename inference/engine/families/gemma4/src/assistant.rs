@@ -63,25 +63,30 @@ fn source_offset(kind: LayerKind) -> u64 {
     }
 }
 
+/// A draft that is not a head of the target it is bound to.
+fn mismatch(message: impl Into<String>) -> Error {
+    Error::mismatch(message)
+}
+
 /// Interpret an assistant drafter against its Gemma 4 `target`: the draft
 /// head it is. A draft that is not an assistant of this target is an error.
 pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<Head, Error> {
     match draft.value("general.architecture").and_then(Value::string) {
         Some(ASSISTANT_ARCHITECTURE) => {}
         architecture => {
-            return Err(invalid(format!(
+            return Err(mismatch(format!(
                 "unsupported Gemma assistant GGUF architecture {architecture:?}"
             )));
         }
     }
     if target.family.0 != crate::ARCHITECTURE {
-        return Err(invalid(format!(
+        return Err(mismatch(format!(
             "a Gemma assistant drafts for a Gemma 4 target, not {:?}",
             target.family.0
         )));
     }
     if target.head.is_some() || target.draft.is_some() {
-        return Err(invalid(
+        return Err(mismatch(
             "a Gemma assistant drafts for a target without a drafter",
         ));
     }
@@ -97,13 +102,13 @@ pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<
         || m.count("attention.shared_kv_layers")? != layers
         || m.count("embedding_length_per_layer_input")? != 0
     {
-        return Err(invalid(
+        return Err(mismatch(
             "every Gemma assistant layer is a prediction layer reading its target's history",
         ));
     }
     let target_width = m.integer("embedding_length_out")?;
     if target_width != decoder.hidden {
-        return Err(invalid(format!(
+        return Err(mismatch(format!(
             "Gemma assistant drafts for a target of width {target_width}, not {}",
             decoder.hidden
         )));
@@ -173,7 +178,7 @@ pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<
         };
         let source = target_layers
             .checked_sub(source_offset(kind))
-            .ok_or_else(|| invalid("Gemma assistant target has too few layers"))?;
+            .ok_or_else(|| mismatch("Gemma assistant target has too few layers"))?;
         // The history the assistant was trained to read is the one its
         // source layer keeps: a window layer the same window, a full layer
         // every row.
@@ -181,7 +186,7 @@ pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<
             .ok()
             .and_then(|block| decoder.history_domain(SublayerIndex { block, sublayer: 0 }));
         if source_domain != Some(geometry.domain) {
-            return Err(invalid(format!(
+            return Err(mismatch(format!(
                 "Gemma assistant layer {layer} reads target layer {source}, whose history is {source_domain:?}, as {:?}",
                 geometry.domain
             )));
@@ -227,6 +232,6 @@ pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<
         component: HeadComponent::Draft,
     };
     head.validate(decoder, target.inputs.coordinate_axes)
-        .map_err(|error| invalid(error.to_string()))?;
+        .map_err(|error| mismatch(error.to_string()))?;
     Ok(head)
 }

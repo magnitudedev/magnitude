@@ -1319,12 +1319,68 @@ pub enum CustomModelState {
     },
 }
 
-/// Why the engine cannot execute a model, typed where the engine raises it. Clients render a case
-/// they do not know with `detail`.
+/// Why the engine cannot execute a model. The engine updates independently of its clients, so the
+/// contract stays open: a reason this contract does not name yet arrives as `Unrecognized` with its
+/// tag, and clients render it with its `detail`. The service itself only emits `Known` reasons. A
+/// reason decodes as the first case it matches, so the schema is an `anyOf`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UnsupportedReason {
+    Known(KnownUnsupportedReason),
+    Unrecognized(UnrecognizedUnsupportedReason),
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for UnsupportedReason {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::ToSchema;
+        utoipa::openapi::schema::AnyOfBuilder::new()
+            .item(utoipa::openapi::Ref::from_schema_name(
+                KnownUnsupportedReason::name(),
+            ))
+            .item(utoipa::openapi::Ref::from_schema_name(
+                UnrecognizedUnsupportedReason::name(),
+            ))
+            .description(Some(
+                "Why the engine cannot execute a model; a tag this contract does not name yet \
+                 matches the unrecognized case.",
+            ))
+            .into()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for UnsupportedReason {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        use utoipa::PartialSchema;
+        schemas.push((
+            KnownUnsupportedReason::name().into(),
+            KnownUnsupportedReason::schema(),
+        ));
+        <KnownUnsupportedReason as utoipa::ToSchema>::schemas(schemas);
+        schemas.push((
+            UnrecognizedUnsupportedReason::name().into(),
+            UnrecognizedUnsupportedReason::schema(),
+        ));
+    }
+}
+
+impl From<KnownUnsupportedReason> for UnsupportedReason {
+    fn from(reason: KnownUnsupportedReason) -> Self {
+        Self::Known(reason)
+    }
+}
+
+/// A reason the engine raises, typed where it raises it.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum UnsupportedReason {
+pub enum KnownUnsupportedReason {
     Architecture {
         architecture: String,
     },
@@ -1360,6 +1416,16 @@ pub enum UnsupportedReason {
     },
     TiedOutputHead,
     Unreadable,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnrecognizedUnsupportedReason {
+    #[serde(rename = "_tag")]
+    pub tag: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub detail: Option<String>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1494,6 +1560,7 @@ pub struct AttachedDrafter {
     pub reference: DrafterReference,
     pub method: SpeculativeMethod,
     pub state: AttachedDrafterState,
+    pub update_available: bool,
 }
 
 /// The drafter a custom model should use: the recommended one, none, or an exact reference.
@@ -1517,6 +1584,8 @@ pub struct DrafterAttachment {
     pub drafter: DrafterChoice,
 }
 
+/// A model on this computer that is not a catalog model. `update_commit` is set only for an added
+/// model whose repository's `main` has moved to a commit where its target file has other content.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1546,6 +1615,9 @@ pub struct CustomModel {
     pub license: Option<String>,
     pub profile: ServingProfile,
     pub state: CustomModelState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub update_commit: Option<String>,
 }
 
 /// A GGUF found on this computer that the engine cannot execute.
@@ -1721,7 +1793,8 @@ pub enum CandidateInspectionRequest {
 
 /// One version of a candidate. `download_bytes` is what adding it downloads before any drafter:
 /// its files and the repository's projector, or nothing when it is already on this computer or
-/// is a local file used in place.
+/// is a local file used in place. `catalog_model` is the catalog model this version exactly is (the
+/// same repository, commit and file), installed or not: adding the version installs that model.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1735,6 +1808,9 @@ pub struct CandidateVersion {
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub assessment: Option<ModelAssessment>,
     pub recommended: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub catalog_model: Option<ModelId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub on_this_computer: Option<ModelId>,
@@ -2386,32 +2462,32 @@ mod custom_model_wire_tests {
     #[test]
     fn unsupported_reasons_are_pascal_tagged_with_camel_case_fields() {
         let reasons = vec![
-            UnsupportedReason::Architecture {
+            UnsupportedReason::Known(KnownUnsupportedReason::Architecture {
                 architecture: "deepseek4".to_owned(),
-            },
-            UnsupportedReason::WeightTypes {
+            }),
+            UnsupportedReason::Known(KnownUnsupportedReason::WeightTypes {
                 types: vec![WeightTypeCount {
                     ggml_type: "Q2_K".to_owned(),
                     tensor_count: 2,
                 }],
-            },
-            UnsupportedReason::Tokenizer {
+            }),
+            UnsupportedReason::Known(KnownUnsupportedReason::Tokenizer {
                 model: "gpt2".to_owned(),
                 pre: None,
-            },
-            UnsupportedReason::KernelDomain {
+            }),
+            UnsupportedReason::Known(KnownUnsupportedReason::KernelDomain {
                 backend: "metal".to_owned(),
                 entry: "matmul".to_owned(),
                 statics: vec![KernelStatic {
                     name: "head_dim".to_owned(),
                     value: 80,
                 }],
-            },
-            UnsupportedReason::TargetMismatch {
+            }),
+            UnsupportedReason::Known(KnownUnsupportedReason::TargetMismatch {
                 detail: "hidden size".to_owned(),
-            },
-            UnsupportedReason::TiedOutputHead,
-            UnsupportedReason::Unreadable,
+            }),
+            UnsupportedReason::Known(KnownUnsupportedReason::TiedOutputHead),
+            UnsupportedReason::Known(KnownUnsupportedReason::Unreadable),
         ];
         let encoded = serde_json::to_value(&reasons).expect("serialize");
         assert_eq!(
@@ -2438,14 +2514,42 @@ mod custom_model_wire_tests {
     }
 
     #[test]
+    fn unsupported_reason_tags_from_a_newer_engine_stay_readable() {
+        let reason: UnsupportedReason = serde_json::from_value(json!({
+            "_tag": "SlidingWindowPattern",
+            "detail": "interleaved sliding window",
+            "pattern": [1, 0, 1]
+        }))
+        .expect("deserialize");
+        assert_eq!(
+            reason,
+            UnsupportedReason::Unrecognized(UnrecognizedUnsupportedReason {
+                tag: "SlidingWindowPattern".to_owned(),
+                detail: Some("interleaved sliding window".to_owned()),
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&reason).expect("serialize"),
+            json!({ "_tag": "SlidingWindowPattern", "detail": "interleaved sliding window" })
+        );
+        assert_eq!(
+            serde_json::from_value::<UnsupportedReason>(json!({ "_tag": "Unreadable" }))
+                .expect("deserialize"),
+            UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)
+        );
+    }
+
+    #[test]
     fn unsupported_assessment_carries_reasons_and_detail() {
         let assessment = ModelAssessment::Unsupported {
             profile: Some(ServingProfile {
                 context_length: 4096,
             }),
-            reasons: vec![UnsupportedReason::UnrecognizedTensor {
-                name: "rope_freqs.weight".to_owned(),
-            }],
+            reasons: vec![UnsupportedReason::Known(
+                KnownUnsupportedReason::UnrecognizedTensor {
+                    name: "rope_freqs.weight".to_owned(),
+                },
+            )],
             detail: "unrecognized tensor".to_owned(),
         };
         assert_eq!(
@@ -2463,7 +2567,7 @@ mod custom_model_wire_tests {
     fn unreadable_assessment_serializes_without_a_profile() {
         let assessment = ModelAssessment::Unsupported {
             profile: None,
-            reasons: vec![UnsupportedReason::Unreadable],
+            reasons: vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)],
             detail: "truncated".to_owned(),
         };
         let encoded = json!({

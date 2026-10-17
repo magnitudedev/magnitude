@@ -4,8 +4,8 @@
 //! ([`magnitude_artifacts::gguf::inspect_header`]), which validates header bounds, tensor
 //! geometry and offsets; this module only interprets catalog and inventory metadata.
 
-use magnitude_artifacts::gguf::{Directory, Scalar, Value};
-use magnitude_service_contracts::models::SpeculativeMethod;
+use crate::candidate_files::RecognizedArchitectures;
+use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read};
@@ -28,29 +28,103 @@ pub struct GgufInspection {
     pub nextn_predict_layers: Option<u32>,
     pub tokenizer: Option<String>,
     pub base_models: Vec<GgufBaseModel>,
-    pub modalities: Vec<String>,
     pub tensor_storage_bytes: u64,
     /// Bytes from the start of the file through the aligned tensor-data offset.
     pub header_bytes: u64,
     pub header_digest: String,
+    /// The file's content sample (see [`content_sample_digest`]) when it was read from disk.
+    #[serde(default)]
+    pub content_sample: Option<String>,
     pub fingerprint_material: Vec<u8>,
-    pub role: GgufRole,
+    pub tensors: GgufTensors,
     #[serde(default)]
     pub license: Option<String>,
 }
 
-/// What a GGUF file is, read from its architecture and tensors rather than its name. A `Drafter`
-/// is packaged separately: DFlash-family drafts, Gemma assistants, prediction heads sharing their
-/// target's tables, and EAGLE-3 drafts (which no method serves yet).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// What a GGUF file is, read from its architecture and tensors rather than its name. Which
+/// architectures are projectors and separate drafters is the engine's: a `Drafter` declares an
+/// architecture the engine binds only as a drafter, or its tensors are a prediction head. Whether
+/// the engine binds it is the engine's verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgufRole {
-    Model {
-        embedded_mtp: bool,
-    },
+    Model { embedded_mtp: bool },
     Projector,
-    Drafter {
-        method: Option<SpeculativeMethod>,
-    },
+    Drafter,
+}
+
+/// What a GGUF's tensors hold, whichever architectures the engine knows: a model's blocks
+/// (with or without built-in prediction blocks), or a prediction head alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GgufTensors {
+    Model { embedded_mtp: bool },
+    PredictionHead,
+}
+
+impl GgufTensors {
+    /// A head file holds only its prediction blocks (each a full layer beside its `nextn.*`
+    /// tensors) and at most the shared embedding and head, or declares that it shares its target's
+    /// tables. A full model declaring the same architecture and prediction layers holds every
+    /// block.
+    #[must_use]
+    pub fn of(directory: &Directory, architecture: Option<&str>) -> Self {
+        let nextn_tensors = directory
+            .tensors
+            .iter()
+            .filter(|tensor| is_nextn_tensor(&tensor.name))
+            .count();
+        let nextn_blocks = directory
+            .tensors
+            .iter()
+            .filter(|tensor| is_nextn_tensor(&tensor.name))
+            .filter_map(|tensor| block_index(&tensor.name))
+            .collect::<std::collections::BTreeSet<_>>();
+        let only_prediction_blocks = !nextn_blocks.is_empty()
+            && directory
+                .tensors
+                .iter()
+                .filter_map(|tensor| block_index(&tensor.name))
+                .all(|block| nextn_blocks.contains(block));
+        let shares_target_tables = architecture.is_some_and(|architecture| {
+            matches!(
+                directory.value(&format!("{architecture}.nextn_shared_target_tensors")),
+                Some(Value::Scalar(Scalar::Bool(true)))
+            )
+        });
+        if shares_target_tables
+            || only_prediction_blocks
+            || (nextn_tensors > 0 && nextn_tensors == directory.tensors.len())
+        {
+            Self::PredictionHead
+        } else {
+            Self::Model {
+                embedded_mtp: nextn_tensors > 0,
+            }
+        }
+    }
+}
+
+/// A GGUF's role, from its declared architecture, its tensors and the engine's architectures.
+#[must_use]
+pub fn role(
+    architecture: Option<&str>,
+    tensors: GgufTensors,
+    architectures: &RecognizedArchitectures,
+) -> GgufRole {
+    match (architecture, tensors) {
+        (Some(PROJECTOR_ARCHITECTURE), _) => GgufRole::Projector,
+        (Some(architecture), _) if architectures.is_separate_drafter(architecture) => {
+            GgufRole::Drafter
+        }
+        (_, GgufTensors::PredictionHead) => GgufRole::Drafter,
+        (_, GgufTensors::Model { embedded_mtp }) => GgufRole::Model { embedded_mtp },
+    }
+}
+
+impl GgufInspection {
+    #[must_use]
+    pub fn role(&self, architectures: &RecognizedArchitectures) -> GgufRole {
+        role(self.architecture.as_deref(), self.tensors, architectures)
+    }
 }
 
 /// One `general.base_model.N.*` lineage entry.
@@ -96,14 +170,118 @@ pub fn inspect_complete(path: &Path) -> Result<GgufInspection, GgufError> {
         )));
     }
     let header_digest = header_digest(path, header_extent(&directory, actual))?;
-    interpret(&directory, header_digest, header_extent(&directory, actual))
+    with_content_sample(
+        path,
+        interpret(&directory, header_digest, header_extent(&directory, actual))?,
+    )
 }
 
 pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
     let directory = read_directory(path)?;
     let file_length = std::fs::metadata(path)?.len();
     let header_digest = header_digest(path, header_extent(&directory, file_length))?;
-    interpret(&directory, header_digest, header_extent(&directory, file_length))
+    with_content_sample(
+        path,
+        interpret(
+            &directory,
+            header_digest,
+            header_extent(&directory, file_length),
+        )?,
+    )
+}
+
+fn with_content_sample(
+    path: &Path,
+    mut inspection: GgufInspection,
+) -> Result<GgufInspection, GgufError> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    inspection.content_sample = Some(content_sample_digest(
+        &mut file,
+        inspection.header_bytes,
+        length,
+    )?);
+    Ok(inspection)
+}
+
+/// How much of each end of a file's tensor-data region its content sample reads.
+pub const CONTENT_SAMPLE_BYTES: u64 = 1024 * 1024;
+
+/// The lowercase hex SHA-256 of a file's header bytes, its length, and the first and last
+/// [`CONTENT_SAMPLE_BYTES`] of its tensor-data region: enough to tell files with the same header
+/// but different weights apart, without hashing a whole file.
+pub fn content_sample_digest(
+    reader: &mut (impl Read + io::Seek),
+    header_bytes: u64,
+    file_length: u64,
+) -> io::Result<String> {
+    use io::SeekFrom;
+    let mut digest = Sha256::new();
+    let mut copy = |reader: &mut (dyn ReadSeek), start: u64, length: u64| -> io::Result<()> {
+        reader.seek(SeekFrom::Start(start))?;
+        let copied = io::copy(&mut reader.take(length), &mut digest)?;
+        if copied == length {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file is shorter than its length",
+            ))
+        }
+    };
+    let header = header_bytes.min(file_length);
+    copy(reader, 0, header)?;
+    let data = file_length - header;
+    let first = data.min(CONTENT_SAMPLE_BYTES);
+    copy(reader, header, first)?;
+    let last_start = file_length
+        .saturating_sub(CONTENT_SAMPLE_BYTES)
+        .max(header + first);
+    copy(reader, last_start, file_length - last_start)?;
+    digest.update(file_length.to_le_bytes());
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+trait ReadSeek: Read + io::Seek {}
+impl<T: Read + io::Seek> ReadSeek for T {}
+
+/// The `local:` digest of a model: its shards' content samples, first shard first. Every
+/// identity of a file without a Hugging Face one, and every grouping of the same bytes, uses it.
+#[must_use]
+pub fn local_model_digest<'a>(shard_samples: impl IntoIterator<Item = &'a str>) -> String {
+    let mut digest = Sha256::new();
+    for sample in shard_samples {
+        digest.update(sample.as_bytes());
+        digest.update(b"\n");
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// The `local:` digest of a model on disk, from its shards' paths, first shard first.
+pub fn local_model_digest_of(shards: &[impl AsRef<Path>]) -> Result<String, GgufError> {
+    let samples = shards
+        .iter()
+        .map(|shard| {
+            let path = shard.as_ref();
+            let directory = read_directory(path)?;
+            let mut file = File::open(path)?;
+            let length = file.metadata()?.len();
+            Ok(content_sample_digest(
+                &mut file,
+                header_extent(&directory, length),
+                length,
+            )?)
+        })
+        .collect::<Result<Vec<_>, GgufError>>()?;
+    Ok(local_model_digest(samples.iter().map(String::as_str)))
+}
+
+/// The lowercase hex SHA-256 of a GGUF's header bytes on disk, through the aligned tensor-data
+/// offset.
+pub fn file_header_digest(path: &Path) -> Result<String, GgufError> {
+    let directory = read_directory(path)?;
+    let length = std::fs::metadata(path)?.len();
+    header_digest(path, header_extent(&directory, length))
 }
 
 /// The bytes of a GGUF that are its header: through the aligned tensor-data offset, or the whole
@@ -141,66 +319,13 @@ fn header_digest(path: &Path, header_bytes: u64) -> Result<String, GgufError> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-pub(crate) fn role(directory: &Directory, architecture: Option<&str>) -> GgufRole {
-    let nextn_tensors = directory
-        .tensors
-        .iter()
-        .filter(|tensor| is_nextn_tensor(&tensor.name))
-        .count();
-    // An MTP file extracted from its model keeps only the prediction blocks (each a full layer
-    // beside its `nextn.*` tensors, as Nemotron-H's are) and the shared embedding and head: every
-    // block tensor belongs to a block that has `nextn.*` tensors.
-    let nextn_blocks = directory
-        .tensors
-        .iter()
-        .filter(|tensor| is_nextn_tensor(&tensor.name))
-        .filter_map(|tensor| block_index(&tensor.name))
-        .collect::<std::collections::BTreeSet<_>>();
-    let only_prediction_blocks = !nextn_blocks.is_empty()
-        && directory
-            .tensors
-            .iter()
-            .filter_map(|tensor| block_index(&tensor.name))
-            .all(|block| nextn_blocks.contains(block));
-    let shares_target_tables = architecture.is_some_and(|architecture| {
-        matches!(
-            directory.value(&format!("{architecture}.nextn_shared_target_tensors")),
-            Some(Value::Scalar(Scalar::Bool(true)))
-        )
-    });
-    match architecture {
-        Some("clip") => GgufRole::Projector,
-        Some("dflash") => GgufRole::Drafter {
-            method: Some(if directory.tensor("markov_w1.weight").is_some() {
-                SpeculativeMethod::DSpark
-            } else if directory.tensor("selector_hidden.weight").is_some() {
-                SpeculativeMethod::DFlash2
-            } else {
-                SpeculativeMethod::DFlash
-            }),
-        },
-        Some("eagle3") => GgufRole::Drafter { method: None },
-        Some("gemma4-assistant") => GgufRole::Drafter {
-            method: Some(SpeculativeMethod::Mtp),
-        },
-        _ if shares_target_tables
-            || only_prediction_blocks
-            || (nextn_tensors > 0 && nextn_tensors == directory.tensors.len()) =>
-        {
-            GgufRole::Drafter {
-                method: Some(SpeculativeMethod::Mtp),
-            }
-        }
-        _ => GgufRole::Model {
-            embedded_mtp: nextn_tensors > 0,
-        },
-    }
-}
-
 /// The block a `blk.<index>.*` tensor belongs to.
 fn block_index(name: &str) -> Option<&str> {
     let (index, _) = name.strip_prefix("blk.")?.split_once('.')?;
-    index.bytes().all(|byte| byte.is_ascii_digit()).then_some(index)
+    index
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then_some(index)
 }
 
 fn is_nextn_tensor(name: &str) -> bool {
@@ -217,7 +342,7 @@ pub(crate) fn interpret(
     header_bytes: u64,
 ) -> Result<GgufInspection, GgufError> {
     let architecture = string_value(directory, "general.architecture");
-    let role = role(directory, architecture.as_deref());
+    let tensors = GgufTensors::of(directory, architecture.as_deref());
     let training_context_length = architecture
         .as_ref()
         .and_then(|architecture| u32_value(directory, &format!("{architecture}.context_length")))
@@ -243,15 +368,6 @@ pub(crate) fn interpret(
         })
         .filter(|base| base.name.is_some() || base.repo_url.is_some())
         .collect();
-    let modalities = if directory.metadata.iter().any(|entry| {
-        entry.name.contains("vision")
-            || entry.name.contains("clip")
-            || entry.name.contains("projector")
-    }) {
-        vec!["text".to_owned(), "image".to_owned()]
-    } else {
-        vec!["text".to_owned()]
-    };
     let file_type = directory
         .value("general.file_type")
         .and_then(Value::unsigned)
@@ -318,12 +434,12 @@ pub(crate) fn interpret(
         nextn_predict_layers,
         tokenizer: string_value(directory, "tokenizer.ggml.model"),
         base_models,
-        modalities,
         tensor_storage_bytes,
         header_bytes,
         header_digest,
+        content_sample: None,
         fingerprint_material,
-        role,
+        tensors,
     })
 }
 
@@ -697,9 +813,12 @@ mod tests {
     fn the_license_is_the_header_license_or_the_name_an_other_license_gives() {
         use crate::test_gguf::Meta;
         let license = |metadata: &[(&str, Meta<'_>)]| {
-            inspect_bytes(&crate::test_gguf::gguf_bytes(metadata, &["token_embd.weight"]))
-                .unwrap()
-                .license
+            inspect_bytes(&crate::test_gguf::gguf_bytes(
+                metadata,
+                &["token_embd.weight"],
+            ))
+            .unwrap()
+            .license
         };
         let arch = ("general.architecture", Meta::Str("llama"));
         assert_eq!(
@@ -720,10 +839,14 @@ mod tests {
     }
 
     #[test]
-    fn a_metadata_only_shard_without_trailing_padding_is_complete_and_its_whole_file_is_its_header() {
+    fn a_metadata_only_shard_without_trailing_padding_is_complete_and_its_whole_file_is_its_header()
+    {
         let mut bytes = crate::test_gguf::gguf_bytes(
             &[
-                ("general.architecture", crate::test_gguf::Meta::Str("qwen35moe")),
+                (
+                    "general.architecture",
+                    crate::test_gguf::Meta::Str("qwen35moe"),
+                ),
                 ("split.count", crate::test_gguf::Meta::U32(6)),
                 ("general.name", crate::test_gguf::Meta::Str("Shard")),
             ],
@@ -738,7 +861,10 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         for inspection in [inspect(&path).unwrap(), inspect_complete(&path).unwrap()] {
             assert_eq!(inspection.header_bytes, u64::try_from(bytes.len()).unwrap());
-            assert_eq!(inspection.header_digest, format!("{:x}", Sha256::digest(&bytes)));
+            assert_eq!(
+                inspection.header_digest,
+                format!("{:x}", Sha256::digest(&bytes))
+            );
         }
         assert_eq!(
             crate::candidate_files::local_header_digest(&path).unwrap(),
@@ -746,53 +872,55 @@ mod tests {
         );
     }
 
+    fn engine() -> RecognizedArchitectures {
+        RecognizedArchitectures::new(
+            ["qwen35", "qwen4exp", "llama", "nemotron_h_moe"],
+            ["dflash", "gemma4-assistant", "qwen4exp"],
+        )
+    }
+
     fn role_of(metadata: &[(&str, crate::test_gguf::Meta<'_>)], tensors: &[&str]) -> GgufRole {
         inspect_bytes(&crate::test_gguf::gguf_bytes(metadata, tensors))
             .unwrap()
-            .role
+            .role(&engine())
     }
 
     #[test]
-    fn roles_come_from_architecture_and_tensors() {
+    fn roles_come_from_the_engines_architectures_and_tensors() {
         use crate::test_gguf::Meta;
         let arch = |name| ("general.architecture", Meta::Str(name));
         assert_eq!(
-            role_of(&[arch("clip")], &["v.patch_embd.weight"]),
+            role_of(&[arch(PROJECTOR_ARCHITECTURE)], &["v.patch_embd.weight"]),
             GgufRole::Projector
         );
-        assert_eq!(
-            role_of(&[arch("dflash")], &["blk.0.attn_q.weight"]),
-            GgufRole::Drafter {
-                method: Some(SpeculativeMethod::DFlash)
-            }
-        );
-        assert_eq!(
-            role_of(
-                &[arch("dflash")],
-                &["blk.0.attn_q.weight", "markov_w1.weight"]
-            ),
-            GgufRole::Drafter {
-                method: Some(SpeculativeMethod::DSpark)
-            }
-        );
-        assert_eq!(
-            role_of(
-                &[arch("dflash")],
-                &["blk.0.attn_q.weight", "selector_hidden.weight"]
-            ),
-            GgufRole::Drafter {
-                method: Some(SpeculativeMethod::DFlash2)
-            }
-        );
+        for drafter in ["dflash", "gemma4-assistant"] {
+            assert_eq!(
+                role_of(&[arch(drafter)], &["blk.0.attn_q.weight"]),
+                GgufRole::Drafter,
+                "{drafter}"
+            );
+        }
         assert_eq!(
             role_of(&[arch("eagle3")], &["blk.0.attn_q.weight"]),
-            GgufRole::Drafter { method: None }
+            GgufRole::Model {
+                embedded_mtp: false
+            },
+            "an architecture the engine doesn't list is no drafter; the engine judges it"
         );
         assert_eq!(
-            role_of(&[arch("gemma4-assistant")], &["blk.0.attn_q.weight"]),
-            GgufRole::Drafter {
-                method: Some(SpeculativeMethod::Mtp)
-            }
+            inspect_bytes(&crate::test_gguf::gguf_bytes(
+                &[arch("dflash")],
+                &["blk.0.attn_q.weight"]
+            ))
+            .unwrap()
+            .role(&RecognizedArchitectures::new(
+                ["llama"],
+                ["gemma4-assistant"]
+            )),
+            GgufRole::Model {
+                embedded_mtp: false
+            },
+            "the drafter set is the engine's, not the service's"
         );
         assert_eq!(
             role_of(
@@ -802,16 +930,12 @@ mod tests {
                 ],
                 &["blk.4.nextn.enorm.weight", "blk.4.attn_q.weight"],
             ),
-            GgufRole::Drafter {
-                method: Some(SpeculativeMethod::Mtp)
-            },
+            GgufRole::Drafter,
             "a prediction head sharing its target's tables is a drafter"
         );
         assert_eq!(
             role_of(&[arch("qwen35")], &["blk.3.nextn.eh_proj.weight"]),
-            GgufRole::Drafter {
-                method: Some(SpeculativeMethod::Mtp)
-            },
+            GgufRole::Drafter,
             "a file of prediction-head tensors only is a drafter"
         );
         assert_eq!(
@@ -837,9 +961,7 @@ mod tests {
                     "blk.52.nextn.enorm.weight",
                 ],
             ),
-            GgufRole::Drafter {
-                method: Some(SpeculativeMethod::Mtp)
-            },
+            GgufRole::Drafter,
             "an MTP file keeping only its prediction blocks (bartowski's Nemotron-H mtp-*.gguf) is a drafter"
         );
         assert_eq!(

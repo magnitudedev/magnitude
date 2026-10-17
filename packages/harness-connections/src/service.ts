@@ -429,8 +429,16 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     if (renamed.length === 0) return []
     const models = uniqueModels(yield* resolveModels)
     if (models.length === 0) return yield* failure("sync", "No installed Magnitude models are available")
-    yield* syncEntries(renamed, models)
-    return renamed.map(({ harness }) => harness)
+    // Each connection moves on its own: one harness that can't be synced never keeps the others on an alias.
+    const outcomes = yield* Effect.forEach(renamed, (entry) => syncEntries([entry], models).pipe(
+      Effect.as(entry.harness),
+      Effect.either,
+    ))
+    const moved = outcomes.flatMap((outcome) => outcome._tag === "Right" ? [outcome.right] : [])
+    const failures = outcomes.flatMap((outcome) => outcome._tag === "Left" ? [outcome.left] : [])
+    if (moved.length === 0 && failures.length > 0) return yield* Effect.fail(failures[0]!)
+    yield* Effect.forEach(failures, (error) => Effect.logWarning(`Moving a harness selection to a renamed model failed: ${String(error)}`), { discard: true })
+    return moved
   })).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError ? error : failure("sync", String(error))))
 
   const disconnect = (harness: HarnessId) => provide(connectionTransaction(Effect.gen(function* () {

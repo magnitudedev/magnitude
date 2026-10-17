@@ -25,6 +25,7 @@ magnitude models drafter <model-id> <auto | none | drafter>
 magnitude models hide|unhide <model-id>
 magnitude models folders list
 magnitude models folders add|remove <path>
+magnitude models folders enable|disable <huggingface-cache | lm-studio | llama-cpp | ollama>
 magnitude connections list
 magnitude connections connect <harness> [--set-model <model-id>] [--install-skill]
 magnitude connections sync [harness]

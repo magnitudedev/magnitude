@@ -10,7 +10,7 @@ import { ErrorNotice, type NoticeContent } from "./error-notice"
 import { SettingsRow } from "./settings-row"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "./ui/dialog"
 import { SkeletonLine } from "./page-skeletons"
-import { FolderPicker } from "./folder-picker"
+import { FolderPicker, choosePath, useNativeOpenPath } from "./folder-picker"
 import { modelLocationErrorNotice } from "./candidate-errors"
 
 const locationNames: Record<ModelLocationKind, string> = { HuggingFaceCache: "Hugging Face cache", LmStudio: "LM Studio", LlamaCpp: "llama.cpp", Ollama: "Ollama", Folder: "Folder" }
@@ -112,6 +112,8 @@ export function ModelLocationsRow() {
   const removing = useAtomValue(client.Models.RemoveModelFolder)
   const [managing, setManaging] = useState(false)
   const [choosing, setChoosing] = useState(false)
+  const native = useNativeOpenPath()
+  const chooseFolder = choosePath(native, { kind: "folder", title: "Add a folder of models", defaultPath: Option.none() }, path => addFolder({ path }), () => setChoosing(true))
   const busy = toggling.waiting || adding.waiting || removing.waiting
   const notice: NoticeContent | undefined = busy ? undefined
     : Result.isFailure(adding) ? Option.match(Cause.failureOption(adding.cause), { onNone: () => ({ title: "The folder wasn’t added" }), onSome: modelLocationErrorNotice })
@@ -131,7 +133,7 @@ export function ModelLocationsRow() {
           <DialogDescription>Where Magnitude looks for GGUF files. It reads them and never changes them.</DialogDescription>
         </DialogHeader>
         {Result.isSuccess(locations) && <ModelLocationsManager locations={locations.value.locations} busy={busy} notice={notice}
-          onToggle={(kind, enabled) => setEnabled({ kind, enabled })} onRemove={path => removeFolder({ path })} onAdd={() => setChoosing(true)} />}
+          onToggle={(kind, enabled) => setEnabled({ kind, enabled })} onRemove={path => removeFolder({ path })} onAdd={chooseFolder} />}
       </DialogContent>
     </Dialog>
     <FolderPicker open={choosing} onOpenChange={setChoosing} initialPath={Option.none()} title="Add a folder of models"

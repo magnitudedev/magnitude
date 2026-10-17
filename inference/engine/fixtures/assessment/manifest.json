@@ -1,0 +1,367 @@
+{
+  "fixtures": [
+    {
+      "name": "qwen35-supported",
+      "description": "Catalog Qwen3.5 4B UD-Q4_K_XL (qwen35 family) with its catalog DFlash drafter.",
+      "target": [
+        {
+          "header": "headers/Qwen3.5-4B-UD-Q4_K_XL.gguf.gz",
+          "repository": "unsloth/Qwen3.5-4B-MTP-GGUF",
+          "revision": "86835bf9949e4d14d6860f7910b1340ad4f271a9",
+          "path": "Qwen3.5-4B-UD-Q4_K_XL.gguf"
+        }
+      ],
+      "draft": {
+        "header": "headers/Qwen3.5-4B-DFlash-Q8_0.gguf.gz",
+        "repository": "magnitudedev/Qwen3.5-4B-DFlash-GGUF",
+        "revision": "0094e74a88676605d53b79c7c3d26096335c9746",
+        "path": "Qwen3.5-4B-DFlash-Q8_0.gguf"
+      },
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "bound": "dflash"
+        }
+      }
+    },
+    {
+      "name": "qwen35-mismatched-dflash",
+      "description": "Catalog Qwen3.5 4B with the DFlash drafter trained for Qwen3.5 9B.",
+      "target": [
+        {
+          "header": "headers/Qwen3.5-4B-UD-Q4_K_XL.gguf.gz",
+          "repository": "unsloth/Qwen3.5-4B-MTP-GGUF",
+          "revision": "86835bf9949e4d14d6860f7910b1340ad4f271a9",
+          "path": "Qwen3.5-4B-UD-Q4_K_XL.gguf"
+        }
+      ],
+      "draft": {
+        "header": "headers/Qwen3.5-9B-DFlash-Q8_0.gguf.gz",
+        "repository": "magnitudedev/Qwen3.5-9B-DFlash-GGUF",
+        "revision": "58b69e4e18f40906a95320507b802899d50e5292",
+        "path": "Qwen3.5-9B-DFlash-Q8_0.gguf"
+      },
+      "method": "dflash",
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "rejected": [
+            {
+              "TargetMismatch": {
+                "detail": "draft width 4096 differs from the target's 2560"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "qwen35-q3km",
+      "description": "Qwen3.5 4B Q3_K_M: Q3_K tensors held widened as q6k; binds its built-in MTP head.",
+      "target": [
+        {
+          "header": "headers/Qwen3.5-4B-Q3_K_M.gguf.gz",
+          "repository": "unsloth/Qwen3.5-4B-MTP-GGUF",
+          "revision": "86835bf9949e4d14d6860f7910b1340ad4f271a9",
+          "path": "Qwen3.5-4B-Q3_K_M.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "bound": "mtp"
+        }
+      }
+    },
+    {
+      "name": "qwen35-iq2m",
+      "description": "Qwen3.5 4B UD-IQ2_M: IQ2_S and Q2_K tensors have no import.",
+      "target": [
+        {
+          "header": "headers/Qwen3.5-4B-UD-IQ2_M.gguf.gz",
+          "repository": "unsloth/Qwen3.5-4B-MTP-GGUF",
+          "revision": "86835bf9949e4d14d6860f7910b1340ad4f271a9",
+          "path": "Qwen3.5-4B-UD-IQ2_M.gguf"
+        }
+      ],
+      "expected": {
+        "target": {
+          "unsupported": [
+            {
+              "WeightTypes": {
+                "types": [
+                  {
+                    "ggml_type": "IQ2_S",
+                    "tensor_count": 89
+                  },
+                  {
+                    "ggml_type": "Q2_K",
+                    "tensor_count": 5
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "qwen4exp-supported",
+      "description": "Catalog Qwen3.8 Flash Next UD-Q4_K_XL (qwen4exp family), four shards.",
+      "target": [
+        {
+          "header": "headers/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf.gz",
+          "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+          "path": "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+        },
+        {
+          "header": "headers/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf.gz",
+          "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+          "path": "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf"
+        },
+        {
+          "header": "headers/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf.gz",
+          "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+          "path": "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf"
+        },
+        {
+          "header": "headers/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf.gz",
+          "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+          "path": "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported",
+        "drafter": "none"
+      }
+    },
+    {
+      "name": "qwen4exp-mtp-head",
+      "description": "Catalog Qwen3.8 Flash Next UD-Q4_K_XL with its catalog prediction head, packaged separately and sharing the target's token tables.",
+      "target": [
+        {
+          "header": "headers/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf.gz",
+          "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+          "path": "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+        },
+        {
+          "header": "headers/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf.gz",
+          "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+          "path": "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf"
+        },
+        {
+          "header": "headers/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf.gz",
+          "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+          "path": "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf"
+        },
+        {
+          "header": "headers/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf.gz",
+          "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+          "path": "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf"
+        }
+      ],
+      "draft": {
+        "header": "headers/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf.gz",
+        "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+        "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+        "path": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+      },
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "bound": "mtp"
+        }
+      }
+    },
+    {
+      "name": "llama-supported",
+      "description": "Catalog MiniCPM5 1B Q4_K_M (llama family).",
+      "target": [
+        {
+          "header": "headers/MiniCPM5-1B-Q4_K_M.gguf.gz",
+          "repository": "openbmb/MiniCPM5-1B-GGUF",
+          "revision": "3d55fac80935ae6456986ad2384b5cbcc4d6c948",
+          "path": "MiniCPM5-1B-Q4_K_M.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported",
+        "drafter": "none"
+      }
+    },
+    {
+      "name": "nemotron-h-supported",
+      "description": "Catalog Nemotron 3.5 Lightning 30B A3B NVFP4 (nemotron_h family).",
+      "target": [
+        {
+          "header": "headers/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf.gz",
+          "repository": "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+          "revision": "88d7ce0b0fa385c5108866ce5d33690927531a37",
+          "path": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported",
+        "drafter": "none"
+      }
+    },
+    {
+      "name": "lfm2-supported",
+      "description": "Catalog LFM2.5 2.6B Q4_K_M (lfm2 family).",
+      "target": [
+        {
+          "header": "headers/LFM2.5-2.6B-Q4_K_M.gguf.gz",
+          "repository": "LiquidAI/LFM2.5-2.6B-GGUF",
+          "revision": "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc",
+          "path": "LFM2.5-2.6B-Q4_K_M.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported",
+        "drafter": "none"
+      }
+    },
+    {
+      "name": "gemma4-supported",
+      "description": "Catalog Gemma 4 E2B QAT UD-Q4_K_XL (gemma4 family).",
+      "target": [
+        {
+          "header": "headers/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf.gz",
+          "repository": "unsloth/gemma-4-E2B-it-qat-GGUF",
+          "revision": "66a399f68ddd113b06dff02fca9523e55465d11d",
+          "path": "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported",
+        "drafter": "none"
+      }
+    },
+    {
+      "name": "muse-glimmer-supported",
+      "description": "Catalog Muse Glimmer 30B UD-Q4_K_XL (muse_glimmer family).",
+      "target": [
+        {
+          "header": "headers/Muse-Glimmer-30B-UD-Q4_K_XL.gguf.gz",
+          "repository": "unsloth/Muse-Glimmer-30B-GGUF",
+          "revision": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5",
+          "path": "Muse-Glimmer-30B-UD-Q4_K_XL.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported",
+        "drafter": "none"
+      }
+    },
+    {
+      "name": "hauhaucs-gemma4-q2kp",
+      "description": "HauhauCS Gemma 4 E2B Uncensored Aggressive Q2_K_P: Q2_K tensors have no import.",
+      "target": [
+        {
+          "header": "headers/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q2_K_P.gguf.gz",
+          "repository": "HauhauCS/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive",
+          "revision": "da8593c3e407afcd3e7da94ff2d69d77e2a28a48",
+          "path": "Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q2_K_P.gguf"
+        }
+      ],
+      "expected": {
+        "target": {
+          "unsupported": [
+            {
+              "WeightTypes": {
+                "types": [
+                  {
+                    "ggml_type": "Q2_K",
+                    "tensor_count": 147
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "deepseek4",
+      "description": "unsloth DeepSeek V4 Flash 0731 UD-Q2_K_XL, three shards: no deepseek4 family, I32 tensors and the joyai-llm pre-tokenizer.",
+      "target": [
+        {
+          "header": "headers/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf.gz",
+          "repository": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
+          "revision": "fbbb5b93fb787c21338159b0af3318bb3f4d9768",
+          "path": "UD-Q2_K_XL/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf"
+        },
+        {
+          "header": "headers/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00002-of-00003.gguf.gz",
+          "repository": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
+          "revision": "fbbb5b93fb787c21338159b0af3318bb3f4d9768",
+          "path": "UD-Q2_K_XL/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00002-of-00003.gguf"
+        },
+        {
+          "header": "headers/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00003-of-00003.gguf.gz",
+          "repository": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
+          "revision": "fbbb5b93fb787c21338159b0af3318bb3f4d9768",
+          "path": "UD-Q2_K_XL/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00003-of-00003.gguf"
+        }
+      ],
+      "expected": {
+        "target": {
+          "unsupported": [
+            {
+              "WeightTypes": {
+                "types": [
+                  {
+                    "ggml_type": "I32",
+                    "tensor_count": 3
+                  }
+                ]
+              }
+            },
+            {
+              "Architecture": {
+                "architecture": "deepseek4"
+              }
+            },
+            {
+              "Tokenizer": {
+                "model": "gpt2",
+                "pre": "joyai-llm"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "llama31-8b",
+      "description": "bartowski Meta Llama 3.1 8B Instruct Q4_K_M: rope frequency scaling stored as rope_freqs.weight. Its output head is untied.",
+      "target": [
+        {
+          "header": "headers/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf.gz",
+          "repository": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+          "revision": "bf5b95e96dac0462e2a09145ec66cae9a3f12067",
+          "path": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+        }
+      ],
+      "expected": {
+        "target": {
+          "unsupported": [
+            {
+              "UnrecognizedTensor": {
+                "name": "rope_freqs.weight"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

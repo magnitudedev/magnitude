@@ -88,8 +88,8 @@ fn every_unbound_tensor_is_named() {
 }
 
 #[test]
-fn a_malformed_header_names_no_reason() {
+fn a_header_missing_what_the_family_needs_is_unreadable() {
     let error = FamilyError::from(HeaderError::MissingMetadata("arch.block_count".into()));
-    assert!(error.reasons.is_empty());
+    assert_eq!(error.reasons, [UnsupportedReason::Unreadable]);
     assert_eq!(error.detail, "missing metadata arch.block_count");
 }

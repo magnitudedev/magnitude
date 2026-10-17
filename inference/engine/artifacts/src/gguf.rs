@@ -12,6 +12,9 @@ use std::{
     sync::Arc,
 };
 
+/// The `general.architecture` a multimodal projector declares.
+pub const PROJECTOR_ARCHITECTURE: &str = "clip";
+
 pub const DEFAULT_HEADER_LIMIT: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -5,8 +5,8 @@ import { join } from "node:path"
 import type { MagnitudeHealthResponse } from "@magnitudedev/acn-protocol"
 import { FetchHttpClient, HttpBody, HttpClient, HttpClientRequest, HttpServer, HttpServerRequest, HttpServerResponse } from "@effect/platform"
 import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
-import { Rpc, RpcGroup, RpcSerialization, RpcServer } from "@effect/rpc"
-import { Cause, Context, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Rpc, RpcClient, RpcGroup, RpcSerialization, RpcServer } from "@effect/rpc"
+import { Cause, Context, Effect, Exit, Layer, Option, Queue, Schema, Stream } from "effect"
 import { networkInterfaces } from "node:os"
 import { LOOPBACK_ONLY, type NetworkAccess } from "@magnitudedev/storage"
 import { IcnBinaryNotFound } from "@magnitudedev/icn"
@@ -14,7 +14,7 @@ import { describe, expect, it, vi } from "vitest"
 import { ACN_INSTANCE_ID } from "./identity"
 import { makeAcnServiceLifecycle } from "./service-lifecycle"
 import { makeRemoteAccess } from "./remote-access"
-import { ACN_PUBLIC_PORT, acnStartupFailureDetail, installAcnHealthRoutes, installAcnPublicRoutes, launchAcnServer, readNetworkAccess } from "./server"
+import { ACN_PUBLIC_PORT, acnRpcServerOptions, acnStartupFailureDetail, installAcnHealthRoutes, installAcnPublicRoutes, launchAcnServer, readNetworkAccess } from "./server"
 
 describe("ACN startup failure presentation", () => {
   it("finishes a delayed stopping report after application acquisition fails", async () => {
@@ -309,4 +309,47 @@ describe("network access read at startup", () => {
       expect(await read(dataDir)).toEqual(LOOPBACK_ONLY)
       expect((await saved(dataDir)).network.apiKey).toBeUndefined()
     }))
+})
+
+const DefectRpcs = RpcGroup.make(
+  Rpc.make("Boom", { success: Schema.String }),
+  Rpc.make("StreamChanges", { success: Schema.String, stream: true }),
+)
+
+describe("ACN RPC defects", () => {
+  it("fails only the request whose handler died, while a subscription on the same connection keeps receiving changes", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const changes = yield* Queue.unbounded<string>()
+      const router = yield* HttpLayerRouter.make
+      const protocol = yield* RpcServer.makeProtocolHttpRouter({ path: "/rpc" }).pipe(
+        Effect.provideService(HttpLayerRouter.HttpRouter, router),
+        Effect.provide(RpcSerialization.layerNdjson),
+      )
+      yield* RpcServer.make(DefectRpcs, acnRpcServerOptions).pipe(
+        Effect.provide(DefectRpcs.toLayer({
+          Boom: () => Effect.die(new Error("inspection defect")),
+          StreamChanges: () => Stream.fromQueue(changes),
+        })),
+        Effect.provideService(RpcServer.Protocol, protocol),
+        Effect.forkScoped,
+      )
+      const origin = loopbackOrigin(yield* listen(router, 0))
+      const client = yield* RpcClient.make(DefectRpcs).pipe(
+        Effect.provide(RpcClient.layerProtocolHttp({ url: `${origin}/rpc` }).pipe(
+          Layer.provide([FetchHttpClient.layer, RpcSerialization.layerNdjson]),
+        )),
+      )
+      const received = yield* Queue.unbounded<string>()
+      yield* client.StreamChanges().pipe(Stream.runForEach((change) => Queue.offer(received, change)), Effect.forkScoped)
+      yield* Queue.offer(changes, "before")
+      expect(yield* Queue.take(received)).toBe("before")
+
+      const boom = yield* client.Boom().pipe(Effect.exit)
+      expect(Exit.isFailure(boom)).toBe(true)
+
+      yield* Queue.offer(changes, "after")
+      expect(yield* Queue.take(received).pipe(Effect.timeout("2 seconds"))).toBe("after")
+      expect(Exit.isFailure(yield* client.Boom().pipe(Effect.exit))).toBe(true)
+    })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer))))
+  })
 })

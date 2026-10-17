@@ -41,7 +41,15 @@ fn directory(routed: bool) -> Directory {
         ("expert_used_count", 2),
         ("expert_feed_forward_length", 6),
         ("expert_shared_feed_forward_length", 8),
-    ] {
+    ]
+    .into_iter()
+    // A dense header has a feed-forward width and a routed one expert
+    // widths.
+    .filter(|(name, _)| match *name {
+        "feed_forward_length" => !routed,
+        name if name.starts_with("expert_") => routed,
+        _ => true,
+    }) {
         metadata.push(Metadata {
             name: format!("{architecture}.{name}"),
             value: Value::Scalar(Scalar::Unsigned(value)),
@@ -181,9 +189,6 @@ fn mtp_directory() -> Directory {
 
 fn routed_mtp_directory() -> Directory {
     let mut directory = directory(true);
-    directory
-        .metadata
-        .retain(|item| item.name != "qwen35moe.feed_forward_length");
     directory
         .metadata
         .iter_mut()

@@ -1,11 +1,12 @@
 import {
   AutomaticModelLocationKindSchema,
   CustomFormModelIdSchema,
-  DrafterChoiceSchema,
+  DrafterReferenceSchema,
   HuggingFaceRepositoryIdSchema,
   ModelHeaderDigestSchema,
   ModelIdSchema,
   parseModelId,
+  SpeculativeMethodSchema,
   type CustomFormModelId,
 } from '@magnitudedev/acn-protocol'
 import { Schema } from 'effect'
@@ -16,6 +17,7 @@ export const CustomModelDeclarationOriginSchema = Schema.Union(
   Schema.TaggedStruct('Added', {
     repository: HuggingFaceRepositoryIdSchema,
     commit: Schema.NonEmptyTrimmedString,
+    pendingCommit: Schema.optionalWith(Schema.NonEmptyTrimmedString, { as: 'Option', exact: true }),
   }),
   Schema.TaggedStruct('Imported', {
     path: PathSchema,
@@ -24,13 +26,27 @@ export const CustomModelDeclarationOriginSchema = Schema.Union(
 )
 export type CustomModelDeclarationOrigin = Schema.Schema.Type<typeof CustomModelDeclarationOriginSchema>
 
-/** An added or imported model: its pinned source, the target files (shards included), and its projector. */
+/**
+ * An added or imported model: its pinned source, the target files (shards included), and its projector. An added
+ * model being updated keeps serving its pinned commit while the newer `pendingCommit` downloads.
+ */
 export const CustomModelDeclarationSchema = Schema.Struct({
   origin: CustomModelDeclarationOriginSchema,
   target: Schema.NonEmptyArray(PathSchema),
   projector: Schema.optionalWith(PathSchema, { as: 'Option', exact: true }),
 })
 export type CustomModelDeclaration = Schema.Schema.Type<typeof CustomModelDeclarationSchema>
+
+/**
+ * A model's persisted drafter choice: automatic, none, or a reference with the method the engine binds it with,
+ * so ICN receives the drafter right after a restart, before any candidate is listed again.
+ */
+export const PersistedDrafterChoiceSchema = Schema.Union(
+  Schema.TaggedStruct('Auto', {}),
+  Schema.TaggedStruct('None', {}),
+  Schema.TaggedStruct('Reference', { reference: DrafterReferenceSchema, method: SpeculativeMethodSchema }),
+)
+export type PersistedDrafterChoice = Schema.Schema.Type<typeof PersistedDrafterChoiceSchema>
 
 const declarationMatchesId = (modelId: CustomFormModelId, declaration: CustomModelDeclaration): boolean => {
   const identity = parseModelId(modelId)
@@ -58,7 +74,7 @@ export const CustomModelsConfigSchema = Schema.Struct({
   ),
   hidden: Schema.optionalWith(Schema.Array(ModelIdSchema), { default: () => [] }),
   drafters: Schema.optionalWith(
-    Schema.Record({ key: CustomFormModelIdSchema, value: DrafterChoiceSchema }),
+    Schema.Record({ key: CustomFormModelIdSchema, value: PersistedDrafterChoiceSchema }),
     { default: () => ({}) },
   ),
   folders: Schema.optionalWith(Schema.Array(PathSchema), { default: () => [] }),

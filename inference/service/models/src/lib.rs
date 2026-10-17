@@ -29,6 +29,7 @@ mod snapshot_blobs;
 mod store_fs;
 #[cfg(test)]
 mod test_gguf;
+mod upstream_updates;
 mod validation;
 
 pub use cache::{
@@ -49,6 +50,7 @@ pub use custom_models::{
 };
 pub use download_service::ManagedModelDownloads;
 pub use inventory::{InventoryConfig, ManagedModelStore};
+pub use local_roots::llama_cpp_flat_prefix;
 pub use model_domains::{ManagedModelServices, ModelDomainResolver, managed_model_services};
 pub use package_service::{
     ServableModelBundleKey, canonical_package_id, servable_model_bundle_key,

@@ -1,6 +1,7 @@
 import { Data, Effect, Schema } from "effect"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { jsonDocument, renderFields, renderTable, runCommand } from "./output"
+import { DrafterNotUsable, ModelVersionNotRunnable } from "@magnitudedev/sdk"
+import { jsonDocument, renderCommandError, renderFields, renderTable, runCommand } from "./output"
 
 class ExpectedFailure extends Data.TaggedError("ExpectedFailure")<{
   readonly message: string
@@ -9,6 +10,26 @@ class ExpectedFailure extends Data.TaggedError("ExpectedFailure")<{
 afterEach(() => {
   process.exitCode = undefined
   vi.restoreAllMocks()
+})
+
+describe("service refusals", () => {
+  it("words a refused drafter from the engine's reasons, never its detail", () => {
+    const error = new DrafterNotUsable({ reference: "z-lab/d:dflash.gguf", reasons: [{ _tag: "TargetMismatch", detail: "PRIVATE" }] })
+    expect(renderCommandError(error, false)).toBe("This drafter can't be used with this model: Its drafter wasn't built for this model.\n")
+    expect(JSON.parse(renderCommandError(error, true))).toEqual({ error: {
+      message: "This drafter can't be used with this model: Its drafter wasn't built for this model.",
+      code: "drafter_not_usable",
+    } })
+  })
+
+  it("words an imported file the engine can't run with its reasons", () => {
+    const error = new ModelVersionNotRunnable({
+      reference: "/models/deepseek.gguf",
+      version: "deepseek.gguf",
+      verdict: { _tag: "Unsupported", reasons: [{ _tag: "Architecture", architecture: "deepseek4" }] },
+    })
+    expect(renderCommandError(error, false)).toBe("Magnitude can't run deepseek.gguf: No kernels for the deepseek4 architecture.\n")
+  })
 })
 
 describe("command output", () => {

@@ -1,6 +1,7 @@
 import { BunFileSystem } from "@effect/platform-bun"
-import { Effect, Layer, Option, Schema, Stream } from "effect"
+import { Effect, Layer, Option, Schema, Stream, SubscriptionRef } from "effect"
 import { describe, expect, it } from "vitest"
+import type { CustomModelsConfig } from "@magnitudedev/storage"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -16,6 +17,7 @@ import {
   DrafterCandidate as NativeDrafterCandidate,
   type ModelCandidate,
   type ModelDownload,
+  type ModelDownloadEncoded,
 } from "@magnitudedev/icn-protocol/schemas"
 import {
   CatalogFormModelIdSchema,
@@ -24,11 +26,13 @@ import {
   type LocalModelsState,
 } from "@magnitudedev/acn-protocol"
 import { CustomModelCommands, CustomModelCommandsLive, externalCatalogRemovalRefusal } from "./custom-model-commands"
+import { CatalogModelSync } from "./catalog-model-sync"
 import { CustomModelReconciler } from "./custom-model-reconciler"
-import { CustomModels } from "./custom-models"
+import { CustomModels, localModelsConfiguration } from "./custom-models"
 import { DrafterMethodsLive } from "./drafter-references"
 import { LocalModelSources, type CatalogModelSource } from "./local-model-sources"
 import { LocalModels, customModel } from "./local-models"
+import { customModelDownloads, type RelatedDownload } from "./custom-model-downloads"
 import { makeModelLocations } from "./model-locations"
 import {
   addedId,
@@ -39,6 +43,8 @@ import {
   importedId,
   makeTestCustomModels,
   nativeCustomModel,
+  nativeDownload,
+  readyModel,
   targetDownload,
   drafterDownload,
 } from "./custom-models.test-support"
@@ -60,7 +66,7 @@ const nativeCandidate = (overrides: Record<string, unknown> = {}) => Schema.deco
   ...overrides,
 })
 
-const inspection = (onThisComputer?: string) => Schema.decodeUnknownSync(CandidateInspection)({
+const inspection = (onThisComputer?: string, catalogModel?: string) => Schema.decodeUnknownSync(CandidateInspection)({
   source: { _tag: "HuggingFace", repository: "owner/model-GGUF", commit: "c0ffee" },
   displayName: "",
   versions: [
@@ -71,6 +77,7 @@ const inspection = (onThisComputer?: string) => Schema.decodeUnknownSync(Candida
       sizeBytes: 100,
       downloadBytes: 100,
       recommended: true,
+      ...(catalogModel === undefined ? {} : { catalogModel }),
       ...(onThisComputer === undefined ? {} : { onThisComputer }),
     },
     {
@@ -92,6 +99,7 @@ interface Recorded {
   readonly acknowledged: string[]
   readonly removedFiles: string[]
   readonly drafterRequests: unknown[]
+  readonly catalogSyncs: string[]
   pushes: number
   prunes: number
 }
@@ -105,10 +113,13 @@ const harness = (options: {
   readonly customModels?: ReturnType<typeof nativeCustomModel>[]
   readonly catalog?: readonly CatalogModelSource[]
   readonly catalogRows?: readonly LocalModelsState["models"][number][]
+  readonly catalogInstalled?: readonly string[]
+  readonly startDownload?: (bundle: unknown, forModel: string) => Option.Option<ModelDownload>
 } = {}) => {
   const recorded: Recorded = {
-    bundles: [], started: [], cancelled: [], acknowledged: [], removedFiles: [], drafterRequests: [], pushes: 0, prunes: 0,
+    bundles: [], started: [], cancelled: [], acknowledged: [], removedFiles: [], drafterRequests: [], catalogSyncs: [], pushes: 0, prunes: 0,
   }
+  const downloadList = Effect.runSync(SubscriptionRef.make<readonly ModelDownload[]>(options.downloads ?? []))
   const sourceModels = (options.customModels ?? [nativeCustomModel()]).map(customSource)
   const candidates: IcnCandidatesService = {
     search: () => Effect.succeed({
@@ -158,13 +169,15 @@ const harness = (options: {
     return Layer.mergeAll(
       Layer.succeed(IcnCandidates, candidates),
       Layer.succeed(IcnDownloads, {
-        get: Effect.succeed({ revision: 1, state: { downloads: [...(options.downloads ?? [])] } }),
-        changes: Stream.empty,
+        get: SubscriptionRef.get(downloadList).pipe(Effect.map((list) => ({ revision: 1, state: { downloads: [...list] } }))),
+        changes: downloadList.changes,
         initialized: Effect.succeed(true),
         refresh: Effect.void,
-        start: (bundle: unknown, forModel: string) => Effect.sync(() => {
+        start: (bundle: unknown, forModel: string) => Effect.gen(function* () {
           recorded.started.push({ bundle, forModel })
-          return Option.none()
+          const started = options.startDownload?.(bundle, forModel) ?? Option.none()
+          if (Option.isSome(started)) yield* SubscriptionRef.update(downloadList, (list) => [...list, started.value])
+          return started
         }),
         cancel: (id: string) => Effect.sync(() => { recorded.cancelled.push(id); return {} as ModelDownload }),
         acknowledgeFailure: (id: string) => Effect.sync(() => { recorded.acknowledged.push(id); return {} as ModelDownload }),
@@ -186,6 +199,13 @@ const harness = (options: {
       Layer.succeed(LocalModels, { state: Effect.succeed(localState) } as never),
       Layer.succeed(CustomModels, custom),
       Layer.succeed(CustomModelReconciler, { push: Effect.sync(() => { recorded.pushes += 1 }) }),
+      Layer.succeed(CatalogModelSync, {
+        installed: (modelId) => Effect.succeed((options.catalogInstalled ?? []).includes(modelId)),
+        sync: (modelId) => Effect.sync(() => {
+          recorded.catalogSyncs.push(modelId)
+          return { outcome: "Installing" as const }
+        }),
+      }),
       DrafterMethodsLive,
       makeModelLocations({ platform: "linux", env: { OLLAMA_MODELS: "/nonexistent/ollama" }, home: "/nonexistent-home" })
         .pipe(Layer.provide(BunFileSystem.layer)),
@@ -201,7 +221,7 @@ const harness = (options: {
         return yield* use(commands, models)
       }).pipe(Effect.provide(CustomModelCommandsLive.pipe(Layer.provideMerge(context))))
     }))
-  return { recorded, run }
+  return { recorded, run, downloadList }
 }
 
 describe("finding models", () => {
@@ -337,8 +357,8 @@ describe("adding models", () => {
       return { added, config: yield* models.get }
     }))
     expect(result.added).toMatchObject({ modelId: addedId, version: "Q4_K_M", outcome: "Started" })
-    expect(result.config.declarations[addedId]?.origin).toEqual({ _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" })
-    expect(result.config.drafters[addedId]).toEqual({ _tag: "Reference", reference: drafterReference })
+    expect(result.config.declarations[addedId]?.origin).toEqual({ _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee", pendingCommit: Option.none() })
+    expect(result.config.drafters[addedId]).toEqual({ _tag: "Reference", reference: drafterReference, method: { _tag: "DFlash" } })
     expect(recorded.bundles[0]).toMatchObject({
       source: { _tag: "HuggingFace", repository: "owner/model-GGUF", commit: "c0ffee" },
       target: ["model-Q4_K_M.gguf"],
@@ -348,14 +368,51 @@ describe("adding models", () => {
     expect(recorded.pushes).toBeGreaterThan(0)
   })
 
+  it("installs the catalog model a version exactly is instead of declaring a Hugging Face model", async () => {
+    const catalogModel = "qwen3.6-35b-a3b:gguf:q4"
+    const { run, recorded } = harness({ inspect: inspection(undefined, catalogModel) })
+    const result = await run((commands, models) => Effect.gen(function* () {
+      const before = yield* models.get
+      const added = yield* commands.addHuggingFaceModel({ repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false })
+      return { added, before, config: yield* models.get }
+    }))
+    expect(result.added).toEqual({ _tag: "Catalog", modelId: catalogModel, version: "Q4_K_M", outcome: "Started" })
+    expect(recorded.catalogSyncs).toEqual([catalogModel])
+    expect(result.config).toEqual(result.before)
+    expect(recorded.started).toEqual([])
+  })
+
+  it("reports an installed catalog model as already on this computer and installs nothing", async () => {
+    const catalogModel = "qwen3.6-35b-a3b:gguf:q4"
+    const { run, recorded } = harness({ inspect: inspection(catalogModel, catalogModel), catalogInstalled: [catalogModel] })
+    const added = await run((commands) => commands.addHuggingFaceModel({
+      repository, revision: Option.none(), version: Option.some("Q4_K_M"), drafter: { _tag: "Auto" }, force: false,
+    }))
+    expect(added).toEqual({ _tag: "Catalog", modelId: catalogModel, version: "Q4_K_M", outcome: "AlreadyOnThisComputer" })
+    expect(recorded.catalogSyncs).toEqual([])
+    expect(recorded.started).toEqual([])
+  })
+
+  it("refuses a drafter choice for a catalog model, which keeps its own", async () => {
+    const { run, recorded } = harness({ inspect: inspection(undefined, "qwen3.6-35b-a3b:gguf:q4") })
+    const result = await run((commands) => commands.addHuggingFaceModel({
+      repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "None" }, force: false,
+    }).pipe(Effect.either))
+    expect(result._tag === "Left" && result.left).toMatchObject({
+      _tag: "InvalidModelReference",
+      message: "owner/model-GGUF is the catalog model qwen3.6-35b-a3b:gguf:q4, which comes with its drafter.",
+    })
+    expect(recorded.catalogSyncs).toEqual([])
+  })
+
   it("downloads only the target when the chosen drafter is already on this computer", async () => {
     const { run, recorded } = harness({ drafters: [nativeCandidate({ onThisComputer: true })] })
     const result = await run((commands, models) => Effect.gen(function* () {
       const added = yield* commands.addHuggingFaceModel({ repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false })
       return { added, config: yield* models.get }
     }))
-    expect(result.added.drafter.pipe(Option.map(({ onThisComputer }) => onThisComputer))).toEqual(Option.some(true))
-    expect(result.config.drafters[addedId]).toEqual({ _tag: "Reference", reference: drafterReference })
+    expect(result.added._tag === "Custom" && result.added.drafter.pipe(Option.map(({ onThisComputer }) => onThisComputer))).toEqual(Option.some(true))
+    expect(result.config.drafters[addedId]).toEqual({ _tag: "Reference", reference: drafterReference, method: { _tag: "DFlash" } })
     expect(recorded.bundles[0]?.drafter).toEqual(Option.none())
   })
 
@@ -468,6 +525,71 @@ describe("adding models", () => {
   })
 })
 
+describe("importing a file Magnitude can't run", () => {
+  const unrunnable = (fields: Record<string, unknown>) => Schema.decodeUnknownSync(CandidateInspection)({
+    source: { _tag: "Local", path: "/models/deepseek.gguf" },
+    displayName: "DeepSeek",
+    versions: [],
+    ...fields,
+  })
+
+  it("refuses an unsupported version with the engine's reasons and declares nothing", async () => {
+    const { run, recorded } = harness({
+      config: customModelsConfig({ declarations: {} }),
+      inspect: unrunnable({ versions: [{
+        label: "IQ1_M", modelId: importedId, files: [{ path: "/models/deepseek.gguf", sizeBytes: 1 }], sizeBytes: 1, downloadBytes: 0, recommended: false,
+        assessment: { _tag: "Unsupported", profile: { contextLength: 4096 }, reasons: [{ _tag: "WeightTypes", types: [{ ggmlType: "IQ1_M", tensorCount: 3 }] }], detail: "" },
+      }] }),
+    })
+    const result = await run((commands, models) => Effect.gen(function* () {
+      const imported = yield* commands.importModelFile("/models/deepseek.gguf", { _tag: "Auto" }).pipe(Effect.either)
+      return { imported, config: yield* models.get }
+    }))
+    expect(result.imported._tag === "Left" && result.imported.left).toMatchObject({
+      _tag: "ModelVersionNotRunnable",
+      version: "deepseek.gguf",
+      verdict: { _tag: "Unsupported", reasons: [{ _tag: "WeightTypes", types: [{ ggmlType: "IQ1_M", tensorCount: 3 }] }] },
+    })
+    expect(result.config.declarations).toEqual({})
+    expect(recorded.started).toEqual([])
+  })
+
+  it("refuses an architecture without kernels with its reason", async () => {
+    const { run } = harness({
+      config: customModelsConfig({ declarations: {} }),
+      inspect: unrunnable({ unsupportedArchitecture: [{ _tag: "Architecture", architecture: "deepseek4" }] }),
+    })
+    const result = await run((commands) => commands.importModelFile("/models/deepseek.gguf", { _tag: "Auto" }).pipe(Effect.either))
+    expect(result._tag === "Left" && result.left).toMatchObject({
+      _tag: "ModelVersionNotRunnable",
+      version: "deepseek.gguf",
+      verdict: { _tag: "Unsupported", reasons: [{ _tag: "Architecture", architecture: "deepseek4" }] },
+    })
+  })
+})
+
+describe("adding a repository whose architecture has no kernels", () => {
+  it("refuses with the engine's reasons", async () => {
+    const { run, recorded } = harness({
+      inspect: Schema.decodeUnknownSync(CandidateInspection)({
+        source: { _tag: "HuggingFace", repository: "owner/model-GGUF", commit: "c0ffee" },
+        displayName: "DeepSeek",
+        versions: [],
+        unsupportedArchitecture: [{ _tag: "Architecture", architecture: "deepseek4" }],
+      }),
+    })
+    const result = await run((commands) => commands.addHuggingFaceModel({
+      repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false,
+    }).pipe(Effect.either))
+    expect(result._tag === "Left" && result.left).toMatchObject({
+      _tag: "ModelVersionNotRunnable",
+      version: "owner/model-GGUF",
+      verdict: { _tag: "Unsupported", reasons: [{ _tag: "Architecture", architecture: "deepseek4" }] },
+    })
+    expect(recorded.started).toEqual([])
+  })
+})
+
 describe("importing a folder", () => {
   it("refuses a folder as an imported model and declares nothing", async () => {
     const folder = mkdtempSync(join(tmpdir(), "gguf-import-"))
@@ -495,7 +617,11 @@ describe("drafter changes", () => {
       drafters: [nativeCandidate({ verdict: { _tag: "Rejected", reasons: [{ _tag: "TargetMismatch", detail: "x" }], detail: "hidden size" } })],
     })
     const result = await run((commands) => commands.setModelDrafter(foundId, { _tag: "Reference", reference: drafterReference }).pipe(Effect.either))
-    expect(result._tag === "Left" && result.left._tag).toBe("InvalidModelReference")
+    expect(result._tag === "Left" && result.left).toMatchObject({
+      _tag: "DrafterNotUsable",
+      reasons: [{ _tag: "TargetMismatch", detail: "x" }],
+    })
+    expect(JSON.stringify(result)).not.toContain("hidden size")
   })
 
   it("turns a drafter off without downloading anything", async () => {
@@ -505,6 +631,18 @@ describe("drafter changes", () => {
     ))
     expect(result.drafters[foundId]).toEqual({ _tag: "None" })
     expect(recorded.bundles).toEqual([])
+    expect(recorded.prunes).toBe(0)
+  })
+
+  it("keeps the drafter's files when it is turned off, so turning it back on downloads nothing", async () => {
+    const { run, recorded } = harness({ drafters: [nativeCandidate({ onThisComputer: true })] })
+    const chosen = await run((commands) => commands.setModelDrafter(foundId, { _tag: "None" }).pipe(
+      Effect.zipRight(commands.setModelDrafter(foundId, { _tag: "Auto" })),
+    ))
+    expect(recorded.prunes).toBe(0)
+    expect(recorded.removedFiles).toEqual([])
+    expect(chosen.drafterDownloadStarted).toBe(false)
+    expect(recorded.started).toEqual([])
   })
 
   it("says a drafter download started only when one did", async () => {
@@ -515,6 +653,36 @@ describe("drafter changes", () => {
     const missing = harness()
     expect((await missing.run((commands) => commands.setModelDrafter(foundId, { _tag: "Auto" }))).drafterDownloadStarted).toBe(true)
     expect(missing.recorded.started).toHaveLength(1)
+  })
+
+  it("keeps Auto, and picking the recommended drafter, saved as Auto; another drafter is pinned with its method", async () => {
+    const other = { _tag: "Local", path: "/drafters/dspark.gguf" } as const
+    const recommendedDrafter = {
+      category: "CatalogDrafter", reference: drafterReference, name: "Magnitude DFlash for Model", label: "Magnitude DFlash",
+      lineage: "Lineage", method: { _tag: "DFlash" }, onThisComputer: true, sizeBytes: 900, verdict: bound,
+    }
+    const { run } = harness({
+      customModels: [nativeCustomModel({ recommendedDrafter })],
+      drafters: [
+        nativeCandidate({ onThisComputer: true }),
+        nativeCandidate({
+          category: "NextToModel", reference: other, method: { _tag: "DSpark" }, onThisComputer: true,
+          verdict: { _tag: "Bound", method: { _tag: "DSpark" }, memoryBytes: 1 },
+        }),
+      ],
+    })
+    const saved = await run((commands, models) => Effect.gen(function* () {
+      yield* commands.setModelDrafter(foundId, { _tag: "Reference", reference: drafterReference })
+      const recommended = (yield* models.get).drafters[foundId]
+      yield* commands.setModelDrafter(foundId, { _tag: "Reference", reference: other })
+      const pinned = (yield* models.get).drafters[foundId]
+      yield* commands.setModelDrafter(foundId, { _tag: "Auto" })
+      const automatic = (yield* models.get).drafters[foundId]
+      return { recommended, pinned, automatic }
+    }))
+    expect(saved.recommended).toEqual({ _tag: "Auto" })
+    expect(saved.pinned).toEqual({ _tag: "Reference", reference: other, method: { _tag: "DSpark" } })
+    expect(saved.automatic).toEqual({ _tag: "Auto" })
   })
 
   it("refuses a model that is not on this computer", async () => {
@@ -606,7 +774,7 @@ describe("drafter and download recovery", () => {
 
   it("resumes a drafter download a restart interrupted when the service starts", async () => {
     const { run, recorded } = harness({
-      customModels: [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: drafterReference, state: { _tag: "NotInstalled" } } })],
+      customModels: [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: drafterReference, state: { _tag: "NotInstalled" }, updateAvailable: false } })],
     })
     await run(() => Effect.sleep("50 millis"))
     expect(recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: foundId }])
@@ -630,7 +798,7 @@ describe("drafter and download recovery", () => {
 
   it("downloads a missing attached drafter on Sync", async () => {
     const { run, recorded } = harness({
-      customModels: [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: drafterReference, state: { _tag: "NotInstalled" } } })],
+      customModels: [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: drafterReference, state: { _tag: "NotInstalled" }, updateAvailable: false } })],
     })
     const result = await run((commands) => commands.sync(foundId))
     expect(result.outcome).toBe("DownloadingDrafter")
@@ -651,16 +819,182 @@ describe("drafter updates", () => {
   }] as unknown as readonly CatalogModelSource[]
 
   it("updates a catalog drafter with a newer revision, and is current otherwise", async () => {
-    const withDrafter = (state: string) =>
-      [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: catalogDrafter, state: { _tag: state } } })]
-    const updating = harness({ customModels: withDrafter("NotInstalled"), catalog: catalog("Available") })
+    const withDrafter = (updateAvailable: boolean) =>
+      [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: catalogDrafter, state: { _tag: "Ready" }, updateAvailable } })]
+    // ICN reports the update on the drafter itself, whether or not its catalog model is installed.
+    const updating = harness({ customModels: withDrafter(true), catalog: catalog("NotInstalled") })
     expect((await updating.run((commands) => commands.sync(foundId))).outcome).toBe("Updating")
-    const current = harness({ customModels: withDrafter("Ready"), catalog: catalog("Current") })
+    const current = harness({ customModels: withDrafter(false), catalog: catalog("Current") })
     expect((await current.run((commands) => commands.sync(foundId))).outcome).toBe("AlreadyCurrent")
     expect(current.recorded.started).toEqual([])
     // Its catalog model's update is of other parts; the current drafter is already here.
-    const catalogOnly = harness({ customModels: withDrafter("Ready"), catalog: catalog("Available") })
+    const catalogOnly = harness({ customModels: withDrafter(false), catalog: catalog("Available") })
     expect((await catalogOnly.run((commands) => commands.sync(foundId))).outcome).toBe("AlreadyCurrent")
+  })
+})
+
+describe("added model updates", () => {
+  const newer = "b".repeat(40)
+  const sameRepositoryDrafter = { _tag: "HuggingFace", repository: "owner/model-GGUF", commit: "c0ffee", path: "mtp.gguf" } as const
+  const movedDrafter = { ...sameRepositoryDrafter, commit: newer }
+  const newerTarget = ["model-Q4_K_M.gguf", "model-Q4_K_M-part2.gguf"]
+  const addedReady = (updateCommit?: string) => nativeCustomModel({
+    modelId: addedId,
+    origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
+    files: [{ path: "/store/model-Q4_K_M.gguf", sizeBytes: 1_000 }],
+    drafter: { method: { _tag: "Mtp" }, reference: sameRepositoryDrafter, state: { _tag: "Ready" }, updateAvailable: false },
+    state: {
+      _tag: "Ready",
+      catalogAttribution: { _tag: "NotInCatalog" },
+      installation: { _tag: "Resolved", installedBytes: 1_000, ownership: "Magnitude", primaryPath: "/store/model-Q4_K_M.gguf" },
+      model: readyModel,
+    },
+    ...(updateCommit === undefined ? {} : { updateCommit }),
+  })
+  // At the newer commit the same version, named by its primary file, gains a second file and a projector.
+  const newerInspection = Schema.decodeUnknownSync(CandidateInspection)({
+    source: { _tag: "HuggingFace", repository: "owner/model-GGUF", commit: newer },
+    displayName: "",
+    projector: { path: "mmproj.gguf", sizeBytes: 10 },
+    versions: [{
+      label: "Q4_K_M",
+      modelId: addedId,
+      files: newerTarget.map((path) => ({ path, sizeBytes: 60 })),
+      sizeBytes: 120,
+      downloadBytes: 120,
+      recommended: true,
+    }],
+  })
+  const config = (pendingCommit?: string) => customModelsConfig({
+    declarations: {
+      [addedId]: {
+        origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee", ...(pendingCommit === undefined ? {} : { pendingCommit }) },
+        target: ["model-Q4_K_M.gguf"],
+      },
+    },
+    drafters: { [addedId]: { _tag: "Reference", reference: sameRepositoryDrafter, method: { _tag: "Mtp" } } },
+  })
+  const update = (state: ModelDownloadEncoded["state"]) =>
+    nativeDownload("update", addedId, { repository: "owner/model-GGUF", revision: newer, path: "model-Q4_K_M.gguf" }, state)
+  const running = update({ _tag: "Downloading", stage: "downloading", completedBytes: 30, totalBytes: 120, bytesPerSecond: 10 })
+  const movedCandidate = nativeCandidate({
+    category: "NextToModel", reference: movedDrafter, method: { _tag: "Mtp" }, verdict: { _tag: "Bound", method: { _tag: "Mtp" }, memoryBytes: 1 },
+  })
+  const updating = (options: { readonly pendingCommit?: string; readonly downloads?: readonly ModelDownload[]; readonly start?: boolean } = {}) => harness({
+    config: config(options.pendingCommit),
+    customModels: [addedReady(newer)],
+    inspect: newerInspection,
+    drafters: [movedCandidate],
+    downloads: options.downloads,
+    startDownload: options.start === false ? undefined : () => Option.some(running),
+  })
+  const pinnedCommit = (config: CustomModelsConfig) => {
+    const origin = config.declarations[addedId]?.origin
+    return origin?._tag === "Added" ? { commit: origin.commit, pendingCommit: origin.pendingCommit } : undefined
+  }
+  const settled = <A, E>(effect: Effect.Effect<A, E>) => effect.pipe(Effect.zipLeft(Effect.sleep("30 millis")))
+  /** The configuration once the update has settled as `expected` says, as the background settlement gets to it. */
+  const settledTo = (
+    models: Effect.Effect.Success<typeof CustomModels>,
+    expected: (pinned: ReturnType<typeof pinnedCommit>) => boolean,
+  ) => Effect.gen(function* () {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const current = yield* models.get
+      if (expected(pinnedCommit(current))) return current
+      yield* Effect.sleep("10 millis")
+    }
+    return yield* models.get
+  })
+
+  it("shows Update for an added model whose repository has a newer target, and Updating while it downloads", () => {
+    const row = (model: ReturnType<typeof nativeCustomModel>, related: readonly RelatedDownload[] = []) => Option.getOrThrow(customModel({
+      entry: customSource(model), assessment: undefined, instances: [], related, catalog: [],
+      drafterChoice: { _tag: "Auto" },
+    }))
+    expect(row(addedReady(newer)).acquisitionState._tag).toBe("UpdateAvailable")
+    expect(row(addedReady()).acquisitionState._tag).toBe("Installed")
+    // The download of the newer commit counts as the target's, so the model reads as updating, still installed.
+    const related = customModelDownloads(addedId, config(newer), [running])
+    expect(related.map(({ kind }) => kind)).toEqual(["Target"])
+    expect(row(addedReady(newer), related).acquisitionState).toMatchObject({
+      _tag: "Updating",
+      installation: { primaryPath: "/store/model-Q4_K_M.gguf" },
+      progress: { completedBytes: 30, totalBytes: 120 },
+    })
+  })
+
+  it("keeps serving the pinned commit while the update downloads, and pins the newer one only once it finishes", async () => {
+    const { run, recorded, downloadList } = updating()
+    const result = await run((commands, models) => Effect.gen(function* () {
+      const synced = yield* commands.sync(addedId)
+      const during = yield* settled(models.get)
+      yield* SubscriptionRef.set(downloadList, [update({ _tag: "Completed" })])
+      const after = yield* settledTo(models, (pinned) => pinned?.commit === newer)
+      return { synced, during, after }
+    }))
+    expect(result.synced.outcome).toBe("Updating")
+    expect(recorded.bundles[0]).toMatchObject({
+      source: { _tag: "HuggingFace", repository: "owner/model-GGUF", commit: newer },
+      target: newerTarget,
+      projector: Option.some({ path: "mmproj.gguf" }),
+      drafter: Option.some({ method: { _tag: "Mtp" }, reference: movedDrafter }),
+    })
+    expect(recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: addedId }])
+    // ICN keeps the old commit, so the old copy is still the model and serves.
+    expect(pinnedCommit(result.during)).toEqual({ commit: "c0ffee", pendingCommit: Option.some(newer) })
+    expect(localModelsConfiguration(result.during, []).declarations).toMatchObject([
+      { modelId: addedId, origin: { _tag: "Added", commit: "c0ffee" }, target: ["model-Q4_K_M.gguf"] },
+    ])
+    expect(result.during.drafters[addedId]).toEqual({ _tag: "Reference", reference: sameRepositoryDrafter, method: { _tag: "Mtp" } })
+    expect(result.after.declarations[addedId]).toEqual({
+      origin: { _tag: "Added", repository: "owner/model-GGUF", commit: newer, pendingCommit: Option.none() },
+      target: newerTarget,
+      projector: Option.some("mmproj.gguf"),
+    })
+    expect(result.after.drafters[addedId]).toEqual({ _tag: "Reference", reference: movedDrafter, method: { _tag: "Mtp" } })
+  })
+
+  it("abandons a cancelled or failed update and stays on the pinned commit", async () => {
+    for (const ended of [
+      update({ _tag: "Cancelled", completedBytes: 30, totalBytes: 120 }),
+      update({ _tag: "Failed", acknowledged: false, completedBytes: 30, totalBytes: 120, failure: { _tag: "Interrupted" } }),
+    ]) {
+      const { run, downloadList } = updating()
+      const result = await run((commands, models) => Effect.gen(function* () {
+        yield* commands.sync(addedId)
+        yield* settled(commands.cancelSync(addedId))
+        yield* SubscriptionRef.set(downloadList, [ended])
+        return yield* settledTo(models, (pinned) => Option.isNone(pinned?.pendingCommit ?? Option.none()))
+      }))
+      expect(pinnedCommit(result)).toEqual({ commit: "c0ffee", pendingCommit: Option.none() })
+      expect(result.drafters[addedId]).toEqual({ _tag: "Reference", reference: sameRepositoryDrafter, method: { _tag: "Mtp" } })
+    }
+  })
+
+  it("resumes an update a restart interrupted, and settles one that finished meanwhile", async () => {
+    const interrupted = updating({ pendingCommit: newer })
+    const resumed = await interrupted.run((_, models) => Effect.gen(function* () {
+      for (let attempt = 0; attempt < 200 && interrupted.recorded.started.length === 0; attempt += 1) yield* Effect.sleep("10 millis")
+      return yield* settled(models.get)
+    }))
+    expect(interrupted.recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: addedId }])
+    expect(pinnedCommit(resumed)).toEqual({ commit: "c0ffee", pendingCommit: Option.some(newer) })
+
+    const finished = updating({ pendingCommit: newer, downloads: [update({ _tag: "Completed" })] })
+    const pinned = await finished.run((_, models) => settledTo(models, (current) => current?.commit === newer))
+    expect(finished.recorded.started).toEqual([])
+    expect(pinnedCommit(pinned)).toEqual({ commit: newer, pendingCommit: Option.none() })
+  })
+
+  it("is current without a newer target and changes nothing", async () => {
+    const { run, recorded } = harness({ config: config(), customModels: [addedReady()], inspect: newerInspection })
+    const result = await run((commands, models) => Effect.gen(function* () {
+      const synced = yield* commands.sync(addedId)
+      return { synced, config: yield* models.get }
+    }))
+    expect(result.synced.outcome).toBe("AlreadyCurrent")
+    expect(pinnedCommit(result.config)).toEqual({ commit: "c0ffee", pendingCommit: Option.none() })
+    expect(recorded.started).toEqual([])
   })
 })
 

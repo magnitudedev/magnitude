@@ -383,7 +383,7 @@ fn model_class(error: &ModelUnavailable) -> Class {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_engine::error::UnsupportedModel;
+    use magnitude_engine::error::{UnsupportedModel, UnsupportedReason};
 
     #[test]
     fn transient_unavailability_asks_clients_to_retry_in_words_and_headers() {
@@ -450,7 +450,7 @@ mod tests {
             assert!(error.body.retryable);
         }
         let unsupported = ApiError::from(ServingError::Load(LoadError::Unsupported(
-            UnsupportedModel::invalid("unknown"),
+            UnsupportedModel::reason(UnsupportedReason::Unreadable, "unknown"),
         )));
         assert_eq!(unsupported.status, StatusCode::CONFLICT);
         assert_eq!(unsupported.body.code, "unsupported_model");

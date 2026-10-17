@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use magnitude_artifacts::gguf::{Directory, Value};
+use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Value};
 use magnitude_service_contracts::InventoryError;
 use serde::{Deserialize, Serialize};
 
@@ -50,39 +50,42 @@ impl RecognizedArchitectures {
         }
     }
 
-    /// Whether a Hub repository holds a drafter rather than a model: it declares a drafter
-    /// architecture the engine binds, is tagged for speculative decoding, or declares an
-    /// architecture of a drafter kind the engine doesn't bind (EAGLE, assistant and MTP-only
-    /// heads, DFlash variants). Drafters are offered in drafter lists, never as models.
+    /// Whether a GGUF declaring `architecture` is a separate drafter by its architecture alone:
+    /// one the engine binds only as a drafter. An architecture the engine also runs as a target (a
+    /// prediction head) is told apart by its tensors.
+    #[must_use]
+    pub fn is_separate_drafter(&self, architecture: &str) -> bool {
+        self.drafters.contains(architecture) && !self.targets.contains(architecture)
+    }
+
+    /// Whether a Hub repository holds a drafter rather than a model: it declares an architecture
+    /// the engine binds only as a drafter, or the Hub tags it for speculative decoding. Names
+    /// never decide. Drafters are offered in drafter lists, never as models.
     #[must_use]
     pub fn is_drafter_repository(&self, architecture: Option<&str>, tags: &[String]) -> bool {
         let tagged = tags.iter().any(|tag| {
             matches!(
                 tag.to_ascii_lowercase().as_str(),
-                "speculative-decoding" | "speculative-decoding-draft" | "draft-model" | "speculator"
+                "speculative-decoding"
+                    | "speculative-decoding-draft"
+                    | "draft-model"
+                    | "speculator"
             )
         });
-        let declared = architecture.is_some_and(|architecture| {
-            let architecture = architecture.to_ascii_lowercase();
-            (self.drafters.contains(&architecture) && !self.targets.contains(&architecture))
-                || (!self.targets.contains(&architecture)
-                    && (architecture.starts_with("eagle")
-                        || architecture.contains("dflash")
-                        || architecture.ends_with("assistant")
-                        || architecture.ends_with("mtp")))
-        });
-        tagged || declared
+        tagged || architecture.is_some_and(|architecture| self.is_separate_drafter(architecture))
     }
 }
-
-const PROJECTOR_ARCHITECTURE: &str = "clip";
 
 /// What a GGUF is for, read from its header.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CandidateFileRole {
-    Target { architecture: Option<String> },
+    Target {
+        architecture: Option<String>,
+    },
     Projector,
-    Drafter { architecture: String },
+    Drafter {
+        architecture: String,
+    },
     /// Quantization data that is not a model, such as an importance matrix.
     Auxiliary,
 }
@@ -97,40 +100,14 @@ impl CandidateFileRole {
             .value("general.architecture")
             .and_then(Value::string)
             .map(ToOwned::to_owned);
-        let Some(architecture) = architecture else {
-            return Self::Target { architecture: None };
-        };
-        if architecture == PROJECTOR_ARCHITECTURE
-            || directory
-                .metadata
-                .iter()
-                .any(|entry| entry.name.starts_with("clip.has_vision_encoder"))
-        {
-            return Self::Projector;
-        }
-        // A separate drafter declares a drafter architecture. One the engine also runs as a
-        // target (a prediction head) is a drafter only when it declares prediction layers.
-        let prediction_only = directory
-            .value(&format!("{architecture}.nextn_predict_layers"))
-            .is_some();
-        if architectures.drafters.contains(&architecture)
-            && (!architectures.targets.contains(&architecture) || prediction_only)
-        {
-            return Self::Drafter { architecture };
-        }
-        // A file its tensors show to be a drafter, whatever architecture it declares: an MTP head
-        // extracted from its model under the model's own architecture (a Nemotron-H `mtp-*.gguf`
-        // keeps only its prediction block, the embedding and the head), or a drafter kind the
-        // engine doesn't bind. It is offered as a drafter with the engine's verdict, never as a
-        // version of the model.
-        if matches!(
-            crate::gguf::role(directory, Some(&architecture)),
-            crate::gguf::GgufRole::Drafter { .. }
-        ) {
-            return Self::Drafter { architecture };
-        }
-        Self::Target {
-            architecture: Some(architecture),
+        let tensors = crate::gguf::GgufTensors::of(directory, architecture.as_deref());
+        match crate::gguf::role(architecture.as_deref(), tensors, architectures) {
+            crate::gguf::GgufRole::Projector => Self::Projector,
+            crate::gguf::GgufRole::Drafter => match architecture {
+                Some(architecture) => Self::Drafter { architecture },
+                None => Self::Target { architecture: None },
+            },
+            crate::gguf::GgufRole::Model { .. } => Self::Target { architecture },
         }
     }
 }
@@ -189,21 +166,17 @@ pub fn local_directory(path: &Path) -> Result<Directory, InventoryError> {
 }
 
 /// The lowercase hex sha256 of a GGUF's header bytes on disk, through the aligned tensor-data
-/// offset: the content identity of a file with no Hugging Face identity.
+/// offset: what assessments and drafter bytes are matched by.
 pub fn local_header_digest(path: &Path) -> Result<String, InventoryError> {
-    use sha2::Digest;
-    use std::io::Read;
-    let directory = local_directory(path)?;
-    let file_length = std::fs::metadata(path)
-        .map_err(|error| InventoryError::Io(format!("{}: {error}", path.display())))?
-        .len();
-    let length = usize::try_from(crate::gguf::header_extent(&directory, file_length))
-        .map_err(|_| InventoryError::Integrity("GGUF header is too large".to_owned()))?;
-    let mut header = vec![0_u8; length];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut header))
-        .map_err(|error| InventoryError::Io(format!("{}: {error}", path.display())))?;
-    Ok(format!("{:x}", sha2::Sha256::digest(&header)))
+    crate::gguf::file_header_digest(path)
+        .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))
+}
+
+/// The `local:` digest of a model on disk, from its shards first shard first (see
+/// [`crate::gguf::local_model_digest`]).
+pub fn local_model_digest(shards: &[PathBuf]) -> Result<String, InventoryError> {
+    crate::gguf::local_model_digest_of(shards)
+        .map_err(|error| InventoryError::Integrity(error.to_string()))
 }
 
 /// The Hugging Face repositories a GGUF names as its base models: `general.base_model.N.repo_url`,
@@ -287,7 +260,11 @@ pub fn group_ggufs(files: &[CandidateGguf]) -> Vec<GgufGroup> {
     for file in files {
         match split_shard(&file.path) {
             Some((prefix, index, total)) => {
-                let parent = file.path.parent().map(Path::to_path_buf).unwrap_or_default();
+                let parent = file
+                    .path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
                 shard_sets
                     .entry((parent, prefix, total))
                     .or_default()
@@ -460,7 +437,11 @@ pub fn model_presentation(
         .or_else(|| header_name.map(without_label))
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| without_label(stem));
-    let name = if name.trim().is_empty() { stem.to_owned() } else { name };
+    let name = if name.trim().is_empty() {
+        stem.to_owned()
+    } else {
+        name
+    };
     (name, label)
 }
 
@@ -510,7 +491,10 @@ mod tests {
     #[test]
     fn labels_follow_writer_conventions_and_fall_back_to_the_stem() {
         for (path, label) in [
-            ("Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf", "Q4_K_P"),
+            (
+                "Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf",
+                "Q4_K_P",
+            ),
             ("model-IQ2_M.gguf", "IQ2_M"),
             ("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", "UD-Q4_K_XL"),
             ("Q8_0/model-Q8_0-00001-of-00002.gguf", "Q8_0"),
@@ -526,7 +510,10 @@ mod tests {
             "Q4_0",
             "a name that isn't a quantization label gives way to the header's"
         );
-        assert_eq!(version_label(Path::new("weights.gguf"), Some("Q4_K - Medium")), "Q4_K_M");
+        assert_eq!(
+            version_label(Path::new("weights.gguf"), Some("Q4_K - Medium")),
+            "Q4_K_M"
+        );
         assert_eq!(
             version_label(Path::new("model-UD-Q4_K_XL.gguf"), Some("Q4_K - Medium")),
             "UD-Q4_K_XL"
@@ -539,7 +526,10 @@ mod tests {
             hugging_face_repository_from_url("https://huggingface.co/Qwen/Qwen3.6-35B-A3B"),
             Some("qwen/qwen3.6-35b-a3b".to_owned())
         );
-        assert_eq!(hugging_face_repository_from_url("https://example.com/a/b"), None);
+        assert_eq!(
+            hugging_face_repository_from_url("https://example.com/a/b"),
+            None
+        );
         assert_eq!(
             display_name("HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-GGUF"),
             "Qwen3.6 35B A3B Uncensored HauhauCS Aggressive"
@@ -547,18 +537,88 @@ mod tests {
     }
 
     #[test]
-    fn drafter_repositories_are_recognized_by_architecture_or_tag() {
-        let architectures =
-            RecognizedArchitectures::new(["qwen35", "qwen4exp"], ["dflash", "gemma4-assistant", "qwen4exp"]);
+    fn drafter_repositories_are_recognized_by_the_engines_drafter_architectures_or_hub_tags() {
+        let architectures = RecognizedArchitectures::new(
+            ["qwen35", "qwen4exp"],
+            ["dflash", "gemma4-assistant", "qwen4exp"],
+        );
         let tags = |tags: &[&str]| tags.iter().map(|tag| (*tag).to_owned()).collect::<Vec<_>>();
-        for architecture in ["dflash", "gemma4-assistant", "eagle3", "qwen35_mtp"] {
-            assert!(architectures.is_drafter_repository(Some(architecture), &[]), "{architecture}");
+        for architecture in ["dflash", "gemma4-assistant"] {
+            assert!(
+                architectures.is_drafter_repository(Some(architecture), &[]),
+                "{architecture}"
+            );
         }
-        assert!(architectures.is_drafter_repository(Some("qwen3"), &tags(&["gguf", "speculative-decoding"])));
+        assert!(
+            architectures
+                .is_drafter_repository(Some("qwen3"), &tags(&["gguf", "speculative-decoding"]))
+        );
+        for architecture in [
+            "eagle3",
+            "qwen35_mtp",
+            "llama-assistant",
+            "qwen3-dflash-like",
+        ] {
+            assert!(
+                !architectures.is_drafter_repository(Some(architecture), &[]),
+                "names never decide: {architecture}"
+            );
+        }
         assert!(!architectures.is_drafter_repository(Some("qwen35"), &tags(&["gguf"])));
         assert!(!architectures.is_drafter_repository(Some("qwen4exp"), &[]));
         assert!(!architectures.is_drafter_repository(Some("deepseek4"), &[]));
         assert!(!architectures.is_drafter_repository(None, &[]));
+    }
+
+    #[test]
+    fn a_qwen4exp_full_target_declaring_prediction_layers_stays_a_target_and_its_head_file_is_a_drafter()
+     {
+        use crate::test_gguf::{Meta, gguf_bytes};
+        let architectures = RecognizedArchitectures::new(["qwen4exp"], ["dflash", "qwen4exp"]);
+        let full = [
+            ("general.architecture", Meta::Str("qwen4exp")),
+            ("qwen4exp.block_count", Meta::U32(3)),
+            ("qwen4exp.nextn_predict_layers", Meta::U32(1)),
+        ];
+        let full_tensors = [
+            "token_embd.weight",
+            "output.weight",
+            "output_norm.weight",
+            "blk.0.attn_q.weight",
+            "blk.1.attn_q.weight",
+            "blk.2.attn_q.weight",
+            "blk.2.nextn.eh_proj.weight",
+            "blk.2.nextn.enorm.weight",
+        ];
+        assert_eq!(
+            classify_header(&gguf_bytes(&full, &full_tensors), &architectures)
+                .unwrap()
+                .role,
+            CandidateFileRole::Target {
+                architecture: Some("qwen4exp".to_owned())
+            }
+        );
+        let head = [
+            ("general.architecture", Meta::Str("qwen4exp")),
+            ("qwen4exp.block_count", Meta::U32(3)),
+            ("qwen4exp.nextn_predict_layers", Meta::U32(1)),
+            ("qwen4exp.nextn_shared_target_tensors", Meta::Bool(true)),
+        ];
+        let head_tensors = [
+            "blk.2.attn_q.weight",
+            "blk.2.ffn_up_exps.weight",
+            "blk.2.nextn.eh_proj.weight",
+            "blk.2.nextn.enorm.weight",
+            "blk.2.nextn.hnorm.weight",
+        ];
+        assert_eq!(
+            classify_header(&gguf_bytes(&head, &head_tensors), &architectures)
+                .unwrap()
+                .role,
+            CandidateFileRole::Drafter {
+                architecture: "qwen4exp".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -595,7 +655,10 @@ mod tests {
         );
         assert_eq!(
             CandidateFileRole::of(
-                &directory(&[("general.type", "model"), ("general.architecture", "qwen35")]),
+                &directory(&[
+                    ("general.type", "model"),
+                    ("general.architecture", "qwen35")
+                ]),
                 &architectures
             ),
             CandidateFileRole::Target {
@@ -641,7 +704,9 @@ mod tests {
             .chain(head_block)
             .collect::<Vec<_>>();
         assert_eq!(
-            classify_header(&gguf_bytes(&metadata, &mtp), &architectures).unwrap().role,
+            classify_header(&gguf_bytes(&metadata, &mtp), &architectures)
+                .unwrap()
+                .role,
             CandidateFileRole::Drafter {
                 architecture: "nemotron_h_moe".to_owned()
             }
@@ -658,7 +723,9 @@ mod tests {
         .chain(head_block)
         .collect::<Vec<_>>();
         assert_eq!(
-            classify_header(&gguf_bytes(&metadata, &model), &architectures).unwrap().role,
+            classify_header(&gguf_bytes(&metadata, &model), &architectures)
+                .unwrap()
+                .role,
             CandidateFileRole::Target {
                 architecture: Some("nemotron_h_moe".to_owned())
             }
@@ -683,14 +750,23 @@ mod tests {
                     "general.base_model.0.repo_url",
                     Scalar::String("https://huggingface.co/Qwen/Qwen3.6-35B-A3B".to_owned()),
                 ),
-                metadata("general.base_model.1.organization", Scalar::String("Qwen".to_owned())),
-                metadata("general.base_model.1.name", Scalar::String("Qwen3.5 4B".to_owned())),
+                metadata(
+                    "general.base_model.1.organization",
+                    Scalar::String("Qwen".to_owned()),
+                ),
+                metadata(
+                    "general.base_model.1.name",
+                    Scalar::String("Qwen3.5 4B".to_owned()),
+                ),
             ],
             tensors: Vec::new(),
         };
         assert_eq!(
             header_base_repositories(&directory),
-            BTreeSet::from(["qwen/qwen3.6-35b-a3b".to_owned(), "qwen/qwen3.5-4b".to_owned()])
+            BTreeSet::from([
+                "qwen/qwen3.6-35b-a3b".to_owned(),
+                "qwen/qwen3.5-4b".to_owned()
+            ])
         );
     }
 
@@ -706,7 +782,12 @@ mod tests {
             ("MiniCPM5 1B".to_owned(), Some("Q3_K_M".to_owned()))
         );
         assert_eq!(
-            model_presentation(Path::new("blobs/sha256-abc"), None, Some("Qwen3.5-4B-Q4_K_M"), None),
+            model_presentation(
+                Path::new("blobs/sha256-abc"),
+                None,
+                Some("Qwen3.5-4B-Q4_K_M"),
+                None
+            ),
             ("Qwen3.5 4B".to_owned(), None)
         );
         assert_eq!(
@@ -723,11 +804,21 @@ mod tests {
             ("new q40".to_owned(), Some("Q4_0".to_owned()))
         );
         assert_eq!(
-            model_presentation(Path::new("models/MiniCPM5-1B-q4_k_s.gguf"), None, None, None),
+            model_presentation(
+                Path::new("models/MiniCPM5-1B-q4_k_s.gguf"),
+                None,
+                None,
+                None
+            ),
             ("MiniCPM5 1B".to_owned(), Some("Q4_K_S".to_owned()))
         );
         assert_eq!(
-            model_presentation(Path::new("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"), None, None, None),
+            model_presentation(
+                Path::new("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+                None,
+                None,
+                None
+            ),
             ("Qwen3.6 35B A3B".to_owned(), Some("UD-Q4_K_XL".to_owned()))
         );
     }

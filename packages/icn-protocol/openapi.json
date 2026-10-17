@@ -2587,7 +2587,8 @@
         "required": [
           "reference",
           "method",
-          "state"
+          "state",
+          "updateAvailable"
         ],
         "properties": {
           "reference": {
@@ -2598,6 +2599,9 @@
           },
           "state": {
             "$ref": "#/components/schemas/AttachedDrafterState"
+          },
+          "updateAvailable": {
+            "type": "boolean"
           }
         },
         "additionalProperties": false
@@ -2823,7 +2827,7 @@
       },
       "CandidateVersion": {
         "type": "object",
-        "description": "One version of a candidate. `download_bytes` is what adding it downloads before any drafter:\nits files and the repository's projector, or nothing when it is already on this computer or\nis a local file used in place.",
+        "description": "One version of a candidate. `download_bytes` is what adding it downloads before any drafter:\nits files and the repository's projector, or nothing when it is already on this computer or\nis a local file used in place. `catalog_model` is the catalog model this version exactly is (the\nsame repository, commit and file), installed or not: adding the version installs that model.",
         "required": [
           "label",
           "modelId",
@@ -2860,6 +2864,9 @@
           },
           "recommended": {
             "type": "boolean"
+          },
+          "catalogModel": {
+            "$ref": "#/components/schemas/ModelId"
           },
           "onThisComputer": {
             "$ref": "#/components/schemas/ModelId"
@@ -4399,6 +4406,7 @@
       },
       "CustomModel": {
         "type": "object",
+        "description": "A model on this computer that is not a catalog model. `update_commit` is set only for an added\nmodel whose repository's `main` has moved to a commit where its target file has other content.",
         "required": [
           "modelId",
           "origin",
@@ -4452,6 +4460,9 @@
           },
           "state": {
             "$ref": "#/components/schemas/CustomModelState"
+          },
+          "updateCommit": {
+            "type": "string"
           }
         },
         "additionalProperties": false
@@ -6517,6 +6528,232 @@
           }
         },
         "additionalProperties": false
+      },
+      "KnownUnsupportedReason": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "architecture",
+              "_tag"
+            ],
+            "properties": {
+              "architecture": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Architecture"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "types",
+              "_tag"
+            ],
+            "properties": {
+              "types": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/WeightTypeCount"
+                }
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "WeightTypes"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "_tag"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "RopeScaling"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "_tag"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "UnrecognizedTensor"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "key",
+              "_tag"
+            ],
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "UnrecognizedMetadata"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "model",
+              "_tag"
+            ],
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "pre": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Tokenizer"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "ChatTemplate"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "backend",
+              "entry",
+              "statics",
+              "_tag"
+            ],
+            "properties": {
+              "backend": {
+                "type": "string"
+              },
+              "entry": {
+                "type": "string"
+              },
+              "statics": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/KernelStatic"
+                }
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "KernelDomain"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "backend",
+              "_tag"
+            ],
+            "properties": {
+              "backend": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Backend"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "detail",
+              "_tag"
+            ],
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "TargetMismatch"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "TiedOutputHead"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Unreadable"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A reason the engine raises, typed where it raises it."
       },
       "LocalModelRemoval": {
         "type": "object",
@@ -10450,6 +10687,20 @@
           }
         ]
       },
+      "UnrecognizedUnsupportedReason": {
+        "type": "object",
+        "required": [
+          "_tag"
+        ],
+        "properties": {
+          "_tag": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
       "UnsupportedLocalModel": {
         "type": "object",
         "description": "A GGUF found on this computer that the engine cannot execute.",
@@ -10483,230 +10734,15 @@
         "additionalProperties": false
       },
       "UnsupportedReason": {
-        "oneOf": [
+        "anyOf": [
           {
-            "type": "object",
-            "required": [
-              "architecture",
-              "_tag"
-            ],
-            "properties": {
-              "architecture": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Architecture"
-                ]
-              }
-            }
+            "$ref": "#/components/schemas/KnownUnsupportedReason"
           },
           {
-            "type": "object",
-            "required": [
-              "types",
-              "_tag"
-            ],
-            "properties": {
-              "types": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/WeightTypeCount"
-                }
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "WeightTypes"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "kind",
-              "_tag"
-            ],
-            "properties": {
-              "kind": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "RopeScaling"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "name",
-              "_tag"
-            ],
-            "properties": {
-              "name": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "UnrecognizedTensor"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "key",
-              "_tag"
-            ],
-            "properties": {
-              "key": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "UnrecognizedMetadata"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "model",
-              "_tag"
-            ],
-            "properties": {
-              "model": {
-                "type": "string"
-              },
-              "pre": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Tokenizer"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "ChatTemplate"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "backend",
-              "entry",
-              "statics",
-              "_tag"
-            ],
-            "properties": {
-              "backend": {
-                "type": "string"
-              },
-              "entry": {
-                "type": "string"
-              },
-              "statics": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/KernelStatic"
-                }
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "KernelDomain"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "backend",
-              "_tag"
-            ],
-            "properties": {
-              "backend": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Backend"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "detail",
-              "_tag"
-            ],
-            "properties": {
-              "detail": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "TargetMismatch"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "TiedOutputHead"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Unreadable"
-                ]
-              }
-            }
+            "$ref": "#/components/schemas/UnrecognizedUnsupportedReason"
           }
         ],
-        "description": "Why the engine cannot execute a model, typed where the engine raises it. Clients render a case\nthey do not know with `detail`."
+        "description": "Why the engine cannot execute a model; a tag this contract does not name yet matches the unrecognized case."
       },
       "Usage": {
         "type": "object",

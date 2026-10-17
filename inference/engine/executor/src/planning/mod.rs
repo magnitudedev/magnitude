@@ -13,7 +13,8 @@ mod weights;
 
 pub use assessment::{
     AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
-    AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, SealedGraphHostBytes,
+    AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, HostProcessBytes,
+    SealedGraphHostBytes,
 };
 pub use capabilities::{CapabilityPlan, MAX_DRAFT_PROPOSALS, PlannedMethod, draft_ladder};
 pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, ComponentSelection};

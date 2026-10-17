@@ -193,8 +193,9 @@ impl error::Error for Error {}
 
 impl Error {
     /// The unsupported features this error names. A draft that disagrees
-    /// with its target, or whose geometry or attention semantics are outside
-    /// what drafting admits, does not fit the target it was bound to.
+    /// with its target, or whose geometry, attention semantics or assembled
+    /// definition are outside what drafting admits, does not fit the target
+    /// it was bound to; one missing a key or weight it needs is `Unreadable`.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
             Self::Architecture(architecture) => vec![UnsupportedReason::Architecture {
@@ -210,7 +211,7 @@ impl Error {
                 )
                 .collect(),
             Self::RopeScaling(kind) => vec![UnsupportedReason::RopeScaling { kind: kind.clone() }],
-            Self::MissingCausality | Self::Geometry(_) | Self::Target(_) => {
+            Self::MissingCausality | Self::Geometry(_) | Self::Target(_) | Self::Definition(_) => {
                 vec![UnsupportedReason::TargetMismatch {
                     detail: self.to_string(),
                 }]
@@ -218,10 +219,19 @@ impl Error {
             Self::WeightShape { name, .. } => {
                 vec![UnsupportedReason::UnrecognizedTensor { name: name.clone() }]
             }
-            Self::Metadata { .. } | Self::MissingWeight(_) | Self::Definition(_) => Vec::new(),
+            Self::Metadata {
+                expected: PRESENT, ..
+            }
+            | Self::MissingWeight(_) => vec![UnsupportedReason::Unreadable],
+            Self::Metadata { key, .. } => {
+                vec![UnsupportedReason::UnrecognizedMetadata { key: key.clone() }]
+            }
         }
     }
 }
+
+/// What an [`Error::Metadata`] for a missing key expects.
+const PRESENT: &str = "present";
 
 impl From<HeaderError> for Error {
     fn from(error: HeaderError) -> Self {
@@ -232,7 +242,7 @@ impl From<HeaderError> for Error {
             },
             HeaderError::MissingMetadata(key) => Self::Metadata {
                 key,
-                expected: "present",
+                expected: PRESENT,
             },
             HeaderError::MetadataType { key, expected } => Self::Metadata { key, expected },
             HeaderError::MissingWeight(name) => Self::MissingWeight(name),

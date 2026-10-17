@@ -36,16 +36,16 @@ const sampleConfig = (): CustomModelsConfig => Schema.decodeUnknownSync(CustomMo
   },
   hidden: ["hf:owner/hidden/model.gguf"],
   drafters: {
-    "hf:owner/repo-GGUF/model-Q4_K_M.gguf": { _tag: "Reference", reference: drafter },
+    "hf:owner/repo-GGUF/model-Q4_K_M.gguf": { _tag: "Reference", reference: drafter, method: { _tag: "DFlash" } },
     [`local:${digest}`]: { _tag: "None" },
-    "hf:owner/other/model.gguf": { _tag: "Reference", reference: { _tag: "Local", path: "/drafters/unknown.gguf" } },
+    "hf:owner/other/model.gguf": { _tag: "Reference", reference: { _tag: "Local", path: "/drafters/unknown.gguf" }, method: { _tag: "DSpark" } },
   },
   folders: ["/Volumes/models"],
   disabledLocations: ["Ollama"],
 })
 
 describe("local-models configuration snapshot", () => {
-  it("delivers resolved roots, declarations, and drafters with their binding method", () => {
+  it("delivers resolved roots, declarations, and drafters with their persisted binding method", () => {
     const configuration = localModelsConfiguration(
       sampleConfig(),
       [
@@ -56,7 +56,6 @@ describe("local-models configuration snapshot", () => {
           { path: "/usr/share/ollama/.ollama/models", state: "NotFound" },
         ], state: "Found" },
       ],
-      (reference) => reference._tag === "HuggingFace" ? Option.some({ _tag: "DFlash" }) : Option.none(),
     )
     expect(configuration.roots).toEqual([
       { kind: "HuggingFaceCache", path: "/hf/hub", enabled: true },
@@ -82,11 +81,15 @@ describe("local-models configuration snapshot", () => {
     expect(configuration.drafters).toEqual([
       { modelId: "hf:owner/repo-GGUF/model-Q4_K_M.gguf", drafter: { _tag: "Reference", method: { _tag: "DFlash" }, reference: drafter } },
       { modelId: `local:${digest}`, drafter: { _tag: "None" } },
+      {
+        modelId: "hf:owner/other/model.gguf",
+        drafter: { _tag: "Reference", method: { _tag: "DSpark" }, reference: { _tag: "Local", path: "/drafters/unknown.gguf" } },
+      },
     ])
   })
 
   it("sends hidden models to ICN, which lists them apart without assessing them", () => {
-    expect(localModelsConfiguration(sampleConfig(), [], () => Option.none()).hidden).toEqual(["hf:owner/hidden/model.gguf"])
+    expect(localModelsConfiguration(sampleConfig(), []).hidden).toEqual(["hf:owner/hidden/model.gguf"])
   })
 })
 

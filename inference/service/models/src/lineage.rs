@@ -129,31 +129,46 @@ impl CatalogLineage {
     }
 
     /// The catalog model whose target repository or upstream intersects `lineage` (lowercased
-    /// repositories), as its first variant.
+    /// repositories), as its first variant: the first of [`Self::match_lineages`].
     pub async fn match_lineage(&self, lineage: &BTreeSet<String>) -> Option<CatalogLineageMatch> {
+        self.match_lineages(lineage).await.into_iter().next()
+    }
+
+    /// Every catalog model whose target repository or upstream intersects `lineage` (lowercased
+    /// repositories), each as its first variant, in catalog order.
+    pub async fn match_lineages(&self, lineage: &BTreeSet<String>) -> Vec<CatalogLineageMatch> {
         if lineage.is_empty() {
-            return None;
+            return Vec::new();
         }
         let upstreams = self.upstreams().await;
-        self.representatives().find(|candidate| {
-            let target = catalog_target(&candidate.model);
-            let target_repository = match &target.source {
-                ModelPackageSource::HuggingFace { repository, .. } => Some(repository.to_lowercase()),
-                ModelPackageSource::Local { .. } => None,
-            };
-            target_repository
-                .as_ref()
-                .is_some_and(|repository| lineage.contains(repository))
-                || upstreams
-                    .get(&candidate.model_id)
-                    .is_some_and(|upstream| !upstream.is_disjoint(lineage))
-        })
+        self.representatives()
+            .filter(|candidate| {
+                let target = catalog_target(&candidate.model);
+                let target_repository = match &target.source {
+                    ModelPackageSource::HuggingFace { repository, .. } => {
+                        Some(repository.to_lowercase())
+                    }
+                    ModelPackageSource::Local { .. } => None,
+                };
+                target_repository
+                    .as_ref()
+                    .is_some_and(|repository| lineage.contains(repository))
+                    || upstreams
+                        .get(&candidate.model_id)
+                        .is_some_and(|upstream| !upstream.is_disjoint(lineage))
+            })
+            .collect()
     }
 
     /// The upstream repositories of `model_id`'s catalog model (lowercased), with its target
     /// repository.
     pub async fn lineage_of(&self, model_id: &ModelId) -> BTreeSet<String> {
-        let mut lineage = self.upstreams().await.get(model_id).cloned().unwrap_or_default();
+        let mut lineage = self
+            .upstreams()
+            .await
+            .get(model_id)
+            .cloned()
+            .unwrap_or_default();
         if let Some(candidate) = self.variant(model_id)
             && let ModelPackageSource::HuggingFace { repository, .. } =
                 &catalog_target(&candidate.model).source
@@ -383,7 +398,8 @@ impl HubLineage {
             }
         }
         url.query_pairs_mut().append_pair("expand", "baseModels");
-        let response = crate::preview::send_hub_get(&self.models.http, url).await?;
+        let response =
+            crate::preview::send_hub_get(&self.models.http, self.models.hub_token(), url).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(InventoryError::NotFound(repository.to_owned()));
         }
@@ -493,8 +509,13 @@ mod tests {
             shape("other-4b:gguf:q4", "llama", 4_205_751_296),
         ];
         assert_eq!(
-            shape_match(&shapes, "qwen35", 4_205_751_296, "someone/Qwen3.5-4B-Abliterated-GGUF")
-                .map(|shape| shape.model_id.as_str()),
+            shape_match(
+                &shapes,
+                "qwen35",
+                4_205_751_296,
+                "someone/Qwen3.5-4B-Abliterated-GGUF"
+            )
+            .map(|shape| shape.model_id.as_str()),
             Some("qwen3.5-4b:gguf:q4"),
             "the same model without its MTP layers"
         );
@@ -525,12 +546,22 @@ mod tests {
         // weareapexcreators/Gemma-4-E2B-it-LocalAI declares no lineage, and its GGUF metadata
         // totals the E4B's parameter count.
         assert_eq!(
-            shape_match(&shapes, "gemma4", 7_518_069_290, "weareapexcreators/Gemma-4-E2B-it-LocalAI"),
+            shape_match(
+                &shapes,
+                "gemma4",
+                7_518_069_290,
+                "weareapexcreators/Gemma-4-E2B-it-LocalAI"
+            ),
             None
         );
         assert_eq!(
-            shape_match(&shapes, "gemma4", 7_518_069_290, "someone/Gemma-4-E4B-it-LocalAI")
-                .map(|shape| shape.model_id.as_str()),
+            shape_match(
+                &shapes,
+                "gemma4",
+                7_518_069_290,
+                "someone/Gemma-4-E4B-it-LocalAI"
+            )
+            .map(|shape| shape.model_id.as_str()),
             Some("gemma-4-e4b-it-qat:gguf:q4")
         );
         assert_eq!(

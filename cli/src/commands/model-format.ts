@@ -15,7 +15,7 @@ import {
 } from "@magnitudedev/client-common"
 import { findLocalModelById, type CatalogLocalModel, type LocalModel, type ModelCatalogState, type ModelId } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
-import { catalogProducts } from "./inference-client"
+import { addressableModels } from "./inference-client"
 import { formatContext } from "./inference-format"
 import { ModelCommandError } from "./model-references"
 
@@ -25,10 +25,11 @@ export const optional = <A, I>(schema: Schema.Schema<A, I, never>) =>
 export const plural = (count: number, singular: string, pluralForm = `${singular}s`) =>
   `${count} ${count === 1 ? singular : pluralForm}`
 
+/** The models a command can address by ID, hidden ones included. */
 export const requireLocalModels = (catalog: ModelCatalogState): Effect.Effect<readonly LocalModel[], ModelCommandError> =>
   catalog._tag === "Initializing"
     ? Effect.fail(new ModelCommandError({ message: "Local models are initializing. Try again shortly." }))
-    : Effect.succeed(catalogProducts(catalog))
+    : Effect.succeed(addressableModels(catalog))
 
 export const findModel = <M extends LocalModel>(
   models: readonly LocalModel[],

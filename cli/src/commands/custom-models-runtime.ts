@@ -24,7 +24,7 @@ import {
   parseDrafterArgument,
   type DrafterArgument,
 } from "./model-references"
-import { ensureTrailingNewline, jsonDocument, renderTable, runCommand, asJson, type JsonOption } from "./output"
+import { ensureTrailingNewline, jsonDocument, renderTable, commandEffect, asJson, type JsonOption } from "./output"
 
 const requirePath = (input: string, what: string): Effect.Effect<string, ModelCommandError> => {
   const trimmed = input.trim()
@@ -63,7 +63,7 @@ export const importFile = (client: CliModelsClient, path: string, argument: Draf
   return { path, ...imported } satisfies ImportResult
 })
 
-export const importModel = (pathInput: string, options: JsonOption & { readonly drafter?: string } = {}) => runCommand({
+export const importModel = (pathInput: string, options: JsonOption & { readonly drafter?: string } = {}) => commandEffect({
   effect: Effect.gen(function* () {
     const path = yield* requirePath(pathInput, "a path to a .gguf file")
     if (!path.toLowerCase().endsWith(".gguf")) {
@@ -104,7 +104,7 @@ export const setDrafter = (client: CliModelsClient, modelId: CustomFormModelId, 
     return { modelId, ...result } satisfies SetDrafterResult
   })
 
-export const setModelDrafter = (modelInput: string, drafterInput: string, options: JsonOption = {}) => runCommand({
+export const setModelDrafter = (modelInput: string, drafterInput: string, options: JsonOption = {}) => commandEffect({
   effect: Effect.gen(function* () {
     const modelId = yield* decodeCustomModelId(modelInput.trim(), catalogDrafterRefusal)
     const argument = yield* parseDrafterArgument(drafterInput)
@@ -119,14 +119,14 @@ const ModelIdJsonSchema = Schema.Struct({ modelId: ModelIdSchema })
 const modelIdJson = jsonDocument(ModelIdJsonSchema, (modelId: ModelId) => ({ modelId }))
 
 /** Found models, including a catalog model whose files are only in an external location; the service refuses others. */
-export const hideModel = (modelInput: string, options: JsonOption = {}) => runCommand({
+export const hideModel = (modelInput: string, options: JsonOption = {}) => commandEffect({
   effect: decodeModelId(modelInput.trim()).pipe(Effect.flatMap((modelId) =>
     withClient((client) => client.models.hideModel({ modelId }).pipe(Effect.as(modelId))))),
   render: (modelId) => `Hid ${modelId} from Magnitude. Its files are untouched.\nUnhide it: magnitude models unhide ${modelId}\n`,
   json: asJson(options, modelIdJson),
 })
 
-export const unhideModel = (modelInput: string, options: JsonOption = {}) => runCommand({
+export const unhideModel = (modelInput: string, options: JsonOption = {}) => commandEffect({
   effect: decodeModelId(modelInput.trim()).pipe(Effect.flatMap((modelId) =>
     withClient((client) => client.models.unhideModel({ modelId }).pipe(Effect.as(modelId))))),
   render: (modelId) => `${modelId} is visible in Magnitude again.\n`,
@@ -141,6 +141,7 @@ const LOCATION_NAMES: Record<ModelLocationKind, string> = {
   Folder: "Folder",
 }
 
+/** A directory's status as the person reads it. */
 const LOCATION_STATES: Record<ModelLocationState, string> = {
   Found: "Found",
   NotFound: "Not found",
@@ -192,7 +193,7 @@ export const renderModelLocations = (locations: readonly ModelLocation[]): strin
 
 export const ModelLocationsJsonSchema = Schema.Struct({ locations: Schema.Array(ModelLocationSchema) })
 
-export const listModelLocations = (options: JsonOption = {}) => runCommand({
+export const listModelLocations = (options: JsonOption = {}) => commandEffect({
   effect: withClient((client) => client.models.listModelLocations({})).pipe(Effect.map(({ locations }) => locations)),
   render: renderModelLocations,
   json: asJson(options, jsonDocument(ModelLocationsJsonSchema, (locations: readonly ModelLocation[]) => ({ locations }))),
@@ -201,14 +202,14 @@ export const listModelLocations = (options: JsonOption = {}) => runCommand({
 const FolderJsonSchema = Schema.Struct({ path: Schema.String })
 const folderJson = jsonDocument(FolderJsonSchema, (path: string) => ({ path }))
 
-export const addModelFolder = (pathInput: string, options: JsonOption = {}) => runCommand({
+export const addModelFolder = (pathInput: string, options: JsonOption = {}) => commandEffect({
   effect: requirePath(pathInput, "a folder path").pipe(Effect.flatMap((path) =>
     withClient((client) => client.models.addModelFolder({ path }).pipe(Effect.as(path))))),
   render: (path) => `Added ${path}. Magnitude watches it for GGUF files.\nSee them: magnitude models status\n`,
   json: asJson(options, folderJson),
 })
 
-export const removeModelFolder = (pathInput: string, options: JsonOption = {}) => runCommand({
+export const removeModelFolder = (pathInput: string, options: JsonOption = {}) => commandEffect({
   effect: requirePath(pathInput, "a folder path").pipe(Effect.flatMap((path) =>
     withClient((client) => client.models.removeModelFolder({ path }).pipe(Effect.as(path))))),
   render: (path) => `Removed ${path} from Magnitude's folders. Its files are untouched.\n`,
@@ -227,7 +228,7 @@ export const parseAutomaticLocation = (input: string): Option.Option<AutomaticMo
 
 const LocationEnabledJsonSchema = Schema.Struct({ location: AutomaticModelLocationKindSchema, enabled: Schema.Boolean })
 
-export const setModelLocationEnabled = (locationInput: string, enabled: boolean, options: JsonOption = {}) => runCommand({
+export const setModelLocationEnabled = (locationInput: string, enabled: boolean, options: JsonOption = {}) => commandEffect({
   effect: Option.match(parseAutomaticLocation(locationInput), {
     onNone: () => Effect.fail(new ModelCommandError({ message: `Unknown location "${locationInput}". Use huggingface-cache, lm-studio, llama-cpp, or ollama.` })),
     onSome: (kind) => withClient((client) => client.models.setModelLocationEnabled({ kind, enabled }).pipe(Effect.as(kind))),

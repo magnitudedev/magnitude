@@ -66,9 +66,9 @@ impl EngineConfiguration {
             Some(self.service.launch_rows()),
         )?;
         let definition = host.definition();
-        definition
-            .validate()
-            .map_err(|error| ResolveError::Unsupported(UnsupportedModel::invalid(error.to_string())))?;
+        definition.validate().map_err(|error| {
+            ResolveError::Unsupported(UnsupportedModel::unreadable(error.to_string()))
+        })?;
         let invalid = |reason: String| ResolveError::InvalidConfiguration { reason };
         let model = self
             .model

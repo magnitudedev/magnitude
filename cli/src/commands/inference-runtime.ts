@@ -13,7 +13,6 @@ import {
   targetPhysicalMemoryBytes,
 } from "@magnitudedev/client-common"
 import {
-  LocalInferenceHardwareSchema,
   LocalModelPreparationSchema,
   localModelDeprecation,
   type CatalogLocalModel,
@@ -29,14 +28,14 @@ import {
   withClient,
 } from "./inference-client"
 import { describeLocalHardware, formatContext } from "./inference-format"
-import { CatalogLocalModelJsonSchema, LocalModelJsonSchema } from "./json-schemas"
+import { CatalogModelJsonSchema, LocalInferenceHardwareJsonSchema, LocalModelJsonSchema } from "./json-schemas"
 import { decodeCatalogId, ModelCommandError } from "./model-references"
 import {
   ensureTrailingNewline,
   jsonDocument,
   renderFields,
   renderTable,
-  runCommand,
+  commandEffect,
   asJson,
   type JsonOption,
 } from "./output"
@@ -55,6 +54,11 @@ import {
   requireLocalModels,
 } from "./model-format"
 export * from "./hugging-face-runtime"
+
+/** Runs a command, whether it is an Effect or has already started. */
+export const execute = (command: Effect.Effect<void> | Promise<void>): Promise<void> =>
+  Effect.isEffect(command) ? Effect.runPromise(command) : command
+
 export * from "./custom-models-runtime"
 export * from "./models-status-runtime"
 
@@ -86,7 +90,7 @@ export const catalogStatusJson = jsonDocument(CatalogStatusJsonSchema, (catalog:
   preparation: catalog._tag === "Initializing" ? Option.none() : Option.some(catalog.localModelPreparation),
 }))
 
-export const showCatalogStatus = (options: JsonOption = {}) => runCommand({
+export const showCatalogStatus = (options: JsonOption = {}) => commandEffect({
   effect: withClient(readCatalog),
   render: renderCatalogStatus,
   json: asJson(options, catalogStatusJson),
@@ -165,7 +169,7 @@ export const renderCatalog = (catalog: ModelCatalogState): string => {
 
 export const CatalogListJsonSchema = Schema.Struct({
   initializing: Schema.Boolean,
-  models: Schema.Array(CatalogLocalModelJsonSchema),
+  models: Schema.Array(CatalogModelJsonSchema),
   assessing: Schema.Int,
   failed: Schema.Int,
   warnings: Schema.Array(Schema.String),
@@ -181,7 +185,7 @@ export const catalogListJson = jsonDocument(CatalogListJsonSchema, (catalog: Mod
   }
 })
 
-export const showModelCatalog = (options: JsonOption = {}) => runCommand({
+export const showModelCatalog = (options: JsonOption = {}) => commandEffect({
   effect: withClient(readCatalog),
   render: renderCatalog,
   json: asJson(options, catalogListJson),
@@ -237,7 +241,7 @@ export interface RecommendationsView {
 export const RecommendationsJsonSchema = Schema.Struct({
   initializing: Schema.Boolean,
   preference: Schema.String,
-  models: Schema.Array(CatalogLocalModelJsonSchema),
+  models: Schema.Array(CatalogModelJsonSchema),
 })
 
 export const recommendationsJson = jsonDocument(RecommendationsJsonSchema, (view: RecommendationsView) => ({
@@ -246,7 +250,7 @@ export const recommendationsJson = jsonDocument(RecommendationsJsonSchema, (view
   models: view.ranked,
 }))
 
-export const showRecommendations = (preferenceInput: string, limitInput: string, options: JsonOption = {}) => runCommand({
+export const showRecommendations = (preferenceInput: string, limitInput: string, options: JsonOption = {}) => commandEffect({
   effect: Effect.all([parsePreference(preferenceInput), parseLimit(limitInput)]).pipe(
     Effect.flatMap(([preference, limit]) => withClient((client) => Effect.gen(function* () {
       const [catalog, hardware] = yield* Effect.all([readCatalog(client), readHardware(client)])
@@ -365,11 +369,11 @@ export const renderCatalogDetail = ({ model, models }: CatalogDetailView): strin
   ].join("\n"))
 }
 
-export const CatalogDetailJsonSchema = Schema.Struct({ model: CatalogLocalModelJsonSchema })
+export const CatalogDetailJsonSchema = Schema.Struct({ model: CatalogModelJsonSchema })
 
 export const catalogDetailJson = jsonDocument(CatalogDetailJsonSchema, ({ model }: CatalogDetailView) => ({ model }))
 
-export const showCatalogModel = (modelInput: string, options: JsonOption = {}) => runCommand({
+export const showCatalogModel = (modelInput: string, options: JsonOption = {}) => commandEffect({
   effect: decodeCatalogId(modelInput).pipe(Effect.flatMap(modelId => withClient((client) => Effect.gen(function* () {
     const models = yield* requireLocalModels(yield* readCatalog(client))
     return { model: yield* findModel(models, modelId, "catalog model", isCatalogModel), models }
@@ -447,7 +451,7 @@ export const renderHardware = ({ hardware, models }: HardwareView): string => {
 }
 
 export const HardwareJsonSchema = Schema.Struct({
-  hardware: LocalInferenceHardwareSchema,
+  hardware: LocalInferenceHardwareJsonSchema,
   currentModel: optional(LocalModelJsonSchema),
 })
 
@@ -456,7 +460,7 @@ export const hardwareJson = jsonDocument(HardwareJsonSchema, ({ hardware, models
   currentModel: Option.fromNullable(currentModel(models)),
 }))
 
-export const showHardware = (options: JsonOption = {}) => runCommand({
+export const showHardware = (options: JsonOption = {}) => commandEffect({
   effect: withClient((client) => Effect.all({
     hardware: readHardware(client),
     catalog: readCatalog(client),

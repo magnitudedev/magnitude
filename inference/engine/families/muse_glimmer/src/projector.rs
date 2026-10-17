@@ -4,7 +4,7 @@
 //! three-stage erf-GELU adapter to the decoder width.
 
 use crate::{invalid, product, Error};
-use magnitude_artifacts::gguf::{Directory, Scalar, Value};
+use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value};
 use magnitude_family_common::{rotary, Tensors};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling,
@@ -81,7 +81,7 @@ pub fn describe_projector(
     output_hidden: u64,
     feature_epsilon: f64,
 ) -> Result<VisionDescription, Error> {
-    if directory.value("general.architecture").and_then(Value::string) != Some("clip")
+    if directory.value("general.architecture").and_then(Value::string) != Some(PROJECTOR_ARCHITECTURE)
         || directory.value("general.type").and_then(Value::string) != Some("mmproj")
         || directory.value("clip.has_vision_encoder")
             != Some(&Value::Scalar(Scalar::Bool(true)))

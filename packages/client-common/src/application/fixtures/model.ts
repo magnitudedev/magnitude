@@ -86,6 +86,7 @@ export const makeFoundModel = (
     sourceUrls: [],
   },
   drafter: Option.none(),
+  drafterChoice: { _tag: "Auto" },
   recommendedDrafter: Option.none(),
   acquisitionState: {
     _tag: "External",

@@ -314,11 +314,21 @@ export class ModelVersionNotRunnable extends Schema.TaggedError<ModelVersionNotR
   },
 ) {}
 
+/**
+ * A drafter the engine won't bind to this model, with the engine's reasons; no reasons means it
+ * wasn't checked. Clients word it from these facts.
+ */
+export class DrafterNotUsable extends Schema.TaggedError<DrafterNotUsable>()(
+  "DrafterNotUsable",
+  { reference: Schema.String, reasons: Schema.Array(UnsupportedReasonSchema) },
+) {}
+
 export const CustomModelMutationError = Schema.Union(
   InvalidModelReference,
   ModelSourceUnavailable,
   LocalModelMutationFailed,
   ModelVersionNotRunnable,
+  DrafterNotUsable,
 )
 export type CustomModelMutationError = Schema.Schema.Type<typeof CustomModelMutationError>
 

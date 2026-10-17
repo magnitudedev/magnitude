@@ -63,6 +63,7 @@ describe("host actions", () => {
           presentModel: () => Effect.void,
           resolveQuitFailure: () => Effect.void,
           retryService: Effect.void,
+          chooseOpenPath: () => Effect.succeed(Option.none()),
           application: Stream.never,
         }),
       })),

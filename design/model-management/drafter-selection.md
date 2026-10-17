@@ -91,16 +91,26 @@ Catalog models always use their catalog drafter.
 - Catalog models keep the catalog's drafter; it changes only through Update. They never offer a
   drafter change.
 - Every custom model can add, change, or turn off its drafter. The choice is a persisted
-  declaration keyed by `ModelId` and is delivered to ICN with the local-models configuration.
+  declaration keyed by `ModelId` and is delivered to ICN with the local-models configuration. A
+  chosen reference is persisted with the method the engine binds it with, so ICN receives it right
+  after a restart, offline included; ACN only validates that method against ICN's candidates later.
+  Choosing the recommended drafter is saved as automatic, never as a fixed reference, so a later
+  catalog drafter still applies. A model whose drafter is turned off is offered no recommended
+  drafter.
+- Magnitude's downloaded drafters are pruned only when no model still on this computer references
+  them: attached through its choice, or one it would use (its catalog drafter, a drafter from its
+  own repository, or its recommended drafter even while its drafter is turned off).
   Turned off, the model is a standalone bundle, which the engine serves plain: built-in MTP heads
   draft only through a bundle that declares them, never implicitly.
 - A found or imported model whose choice is automatic has no attached drafter until the
   recommended one is on this computer: ACN projects it without a drafter, and clients offer the
   recommended drafter ("Faster with a drafter · Add (size)"). A drafter the user chose that is
   missing with no download running is an interrupted download that Sync resumes, and that ACN
-  resumes by itself when the service starts. A catalog drafter has an update only when its catalog
-  model has one and its current drafter package is not on this computer; a catalog model's update
-  of other parts (its target or projector) is not its drafter's. An attached
+  resumes by itself when the service starts. A catalog drafter whose current revision is not on
+  this computer keeps serving with the earlier revision of that catalog model's drafter (matched by
+  catalog model and drafter role, never package ID), and ICN reports `updateAvailable` on the
+  attached drafter; ACN uses that flag as-is, whether or not the catalog model itself is installed.
+  A catalog model's update of other parts (its target or projector) is not its drafter's. An attached
   drafter's verdict is its own: the assessment's when it names the attached method, else ICN's
   verdict for the matching recommended candidate, never another drafter's.
 - Adding a drafter to a model whose target is present downloads only the drafter; one already on
@@ -113,8 +123,8 @@ Catalog models always use their catalog drafter.
   listed above and never discovers new drafters. The download names the model it is for, so the attached drafter
   shows its progress and failure whichever repository, the catalog's included, it comes from. A
   drafter in an external location remains externally owned.
-- When a catalog drafter gets a new revision, every model using it, catalog or custom, shows
-  Update.
+- When a catalog drafter gets a new revision, every model using it shows Update, catalog or not,
+  and whether or not its catalog model is installed.
 
 ## Conformance
 
@@ -124,3 +134,7 @@ Catalog models always use their catalog drafter.
 - Candidate order and tie-breaks are deterministic for equal inputs.
 - Catalog models never expose a drafter change; every custom model does.
 - Lineage never overrides a `Rejected` verdict.
+- A drafter choice the engine doesn't bind is refused with its reasons as data
+  (`DrafterNotUsable`), never with the engine's detail; clients word the reasons.
+- A custom model's projection carries its persisted drafter choice, so a drafter the user turned off
+  is never offered again as "Faster with a drafter · Add" and Change opens on No drafter.

@@ -124,3 +124,39 @@ fn process_limits(host: &HostMemoryStatus) -> serde_json::Value {
         "visibility": format!("{:?}", host.limit_visibility),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seismic::BackendName;
+
+    fn cpu_setup() -> AssessmentSetup {
+        AssessmentSetup::discover(
+            &DeviceCatalog::discover().expect("device catalog"),
+            DeviceRequest::Backend(BackendName::Cpu),
+            MemoryReserves::standard(),
+            serving_policy(),
+            standard_service_limits(),
+        )
+        .expect("the CPU backend is selectable")
+    }
+
+    #[test]
+    fn a_different_backend_or_hardware_is_a_different_environment() {
+        let mut setup = cpu_setup();
+        let id = environment_id(&setup);
+        assert_eq!(environment_id(&setup), id, "the identity is stable");
+
+        setup.selected.info.backend = BackendName::Metal;
+        let other_backend = environment_id(&setup);
+        assert_ne!(other_backend, id);
+
+        let mut setup = cpu_setup();
+        setup.selected.info.name = format!("{} (other)", setup.selected.info.name);
+        assert_ne!(environment_id(&setup), id);
+
+        let mut setup = cpu_setup();
+        setup.bandwidth.bytes_per_second += 1;
+        assert_ne!(environment_id(&setup), id);
+    }
+}

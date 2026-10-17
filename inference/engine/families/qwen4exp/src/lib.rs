@@ -18,13 +18,13 @@ use magnitude_artifacts::{
 use magnitude_family_common::Tensors;
 use magnitude_family_contracts::{
     ActivationDType, Block, Decoder, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId,
-    GateFunction, HistoryReads, HyperConnectionMixing, HyperConnectionWeights, HyperConnections,
-    Indexer, InputNorm, InputSemantics, ModelDefinition, NGramHash, NGramInput, Operator,
-    OutputForm, ResidualForm, Sublayer, WeightDescriptor,
+    GateFunction, HeadComponent, HistoryReads, HyperConnectionMixing, HyperConnectionWeights,
+    HyperConnections, Indexer, InputNorm, InputSemantics, ModelDefinition, NGramHash, NGramInput,
+    Operator, OutputForm, ResidualForm, Sublayer, WeightDescriptor,
 };
 use magnitude_family_qwen::{
-    Geometry, Metadata, MixerKind, Weight, check_projector_base, describe_projector, mixer_kinds,
-    product,
+    GEOMETRY_KEYS, Geometry, MIXER_KEYS, Metadata, MixerKind, ROUTED_KEYS, Weight,
+    check_projector_base, describe_projector, mixer_kinds, product,
 };
 
 pub use magnitude_family_qwen::Error;
@@ -36,6 +36,30 @@ pub const FAMILY_ID: &str = "qwen4exp";
 
 /// The family ids of every Qwen4 experimental architecture.
 pub const FAMILY_IDS: &[&str] = &[FAMILY_ID];
+
+/// The keys a target interprets beside the shared Qwen geometry, mixer and
+/// routed keys.
+const TARGET_KEYS: &[&str] = &[
+    "block_count",
+    "context_length",
+    "nextn_predict_layers",
+    "attention.compress_ratios",
+    "attention.indexer.head_count",
+    "attention.indexer.key_length",
+    "attention.indexer.top_k",
+    "embedding_length_per_layer_input",
+    "hyper_connection.count",
+    "hyper_connection.low_rank",
+    "ple.conv_kernel",
+    "ple.eos_token_id",
+    "ple.image_token_id",
+    "ple.head_offsets",
+    "ple.head_vocab_sizes",
+    "ple.heads_per_ngram",
+    "ple.layer_multipliers",
+    "ple.layers",
+    "ple.ngram_size",
+];
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::invalid(message)
@@ -84,9 +108,11 @@ struct NGramSite {
 }
 
 impl Extensions {
-    fn read(m: &Metadata, layers: &[MixerKind]) -> Result<Self, Error> {
+    /// `predictions` blocks follow the decoder's layers; their ratios are
+    /// the prediction head's to check.
+    fn read(m: &Metadata, layers: &[MixerKind], predictions: u64) -> Result<Self, Error> {
         let blocks = m.integers("attention.compress_ratios")?;
-        if blocks.len() != layers.len()
+        if blocks.len() as u64 != layers.len() as u64 + predictions
             || layers
                 .iter()
                 .zip(&blocks)
@@ -116,8 +142,15 @@ impl Extensions {
             reset: m
                 .value("ple.eos_token_id")?
                 .unsigned()
-                .ok_or_else(|| invalid("qwen4exp n-gram reset token must be an integer"))?,
+                .ok_or_else(|| m.malformed("ple.eos_token_id", "an integer"))?,
         };
+        // Media rows hash the token that stands in their place, which this
+        // key names.
+        if m.optional("ple.image_token_id")
+            .is_some_and(|token| token.unsigned().is_none())
+        {
+            return Err(m.malformed("ple.image_token_id", "an integer"));
+        }
         Ok(Self {
             streams: m.integer("hyper_connection.count")?,
             rank: m.integer("hyper_connection.low_rank")?,
@@ -253,13 +286,22 @@ pub fn inspect_components(
     identity: PackageIdentity,
 ) -> Result<ModelDefinition, Error> {
     recognize(directory)?;
-    let m = Metadata::new(directory, FAMILY_ID);
-    let layer_count = m.integer("block_count")?;
-    if m.optional("nextn_predict_layers").is_some() {
-        return Err(invalid(
-            "prediction-only packages must be bound to their target with inspect_head",
-        ));
-    }
+    let m = Metadata::new(
+        directory,
+        FAMILY_ID,
+        &[TARGET_KEYS, GEOMETRY_KEYS, MIXER_KEYS, ROUTED_KEYS].concat(),
+    )?;
+    let block_count = m.integer("block_count")?;
+    // Prediction blocks stored after the decoder's: at most one is admitted,
+    // as for a separate prediction package.
+    let predictions = match m.optional("nextn_predict_layers") {
+        None => 0,
+        Some(value) => value
+            .unsigned()
+            .filter(|layers| *layers <= 1 && *layers < block_count)
+            .ok_or_else(|| m.malformed("nextn_predict_layers", "at most one prediction layer"))?,
+    };
+    let layer_count = block_count - predictions;
     // Each real layer requires distinct stored weights. Reject impossible counts
     // before allocating architecture vectors from untrusted metadata.
     if layer_count > directory.tensors.len() as u64 {
@@ -268,7 +310,7 @@ pub fn inspect_components(
         ));
     }
     let layers = mixer_kinds(&m, layer_count)?;
-    let extensions = Extensions::read(&m, &layers)?;
+    let extensions = Extensions::read(&m, &layers, predictions)?;
     let geometry = Geometry::read(&m, true)?;
     let hidden = geometry.hidden;
     let embedding = directory
@@ -320,12 +362,11 @@ pub fn inspect_components(
         &mut |name, shape| tensor(&format!("{p}{name}"), shape),
         &ngram_table,
     )?);
-    tensors.finish()?;
     if let Some(projector) = projector {
         check_projector_base(directory, projector)?;
     }
     let vision = projector.map(describe_projector).transpose()?;
-    let definition = ModelDefinition {
+    let mut definition = ModelDefinition {
         family: FamilyId(FAMILY_ID.into()),
         artifact_identity: identity,
         inputs: InputSemantics { coordinate_axes: 3 },
@@ -358,6 +399,16 @@ pub fn inspect_components(
         vision,
         draft: None,
     };
+    if predictions > 0 {
+        let p = format!("blk.{layer_count}.");
+        definition.head = Some(head::prediction_head(
+            &m,
+            &definition,
+            HeadComponent::Target,
+            &mut |name, shape| tensor(&format!("{p}{name}"), shape),
+        )?);
+    }
+    tensors.finish()?;
     definition
         .validate()
         .map_err(|error| invalid(error.to_string()))?;

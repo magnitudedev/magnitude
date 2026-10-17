@@ -1061,6 +1061,7 @@ export const CustomLocalModelSchema = Schema.TaggedStruct("Custom", {
   origin: CustomModelOriginSchema,
   presentation: CustomModelPresentationSchema,
   drafter: Schema.optionalWith(AttachedDrafterSchema, { as: "Option", exact: true }),
+  drafterChoice: DrafterChoiceSchema,
   recommendedDrafter: Schema.optionalWith(DrafterCandidateSchema, { as: "Option", exact: true }),
   acquisitionState: CustomModelAcquisitionStateSchema,
   servingState: CustomLocalModelServingStateSchema,
@@ -1162,9 +1163,29 @@ export const CandidateVersionSchema = Schema.Struct({
   downloadBytes: NonNegativeSafeInteger,
   assessment: Schema.optionalWith(LocalModelAssessmentSchema, { as: "Option", exact: true }),
   recommended: Schema.Boolean,
+  catalogModel: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
   onThisComputer: Schema.optionalWith(ModelIdSchema, { as: "Option", exact: true }),
 })
 export type CandidateVersion = typeof CandidateVersionSchema.Type
+
+const AddOutcomeSchema = Schema.Literal("Started", "AlreadyOnThisComputer")
+
+/** What adding a version did: declared a custom model, or, for a version that is exactly a catalog model, installed that model. */
+export const AddedModelSchema = Schema.Union(
+  Schema.TaggedStruct("Custom", {
+    modelId: CustomFormModelIdSchema,
+    version: NonEmptyString,
+    drafter: Schema.optionalWith(DrafterCandidateSchema, { as: "Option", exact: true }),
+    outcome: AddOutcomeSchema,
+    drafterDownloadStarted: Schema.Boolean,
+  }),
+  Schema.TaggedStruct("Catalog", {
+    modelId: CatalogFormModelIdSchema,
+    version: NonEmptyString,
+    outcome: AddOutcomeSchema,
+  }),
+)
+export type AddedModel = typeof AddedModelSchema.Type
 
 /** The repository step: every version with the engine's verdict, before anything downloads. */
 export const CandidateInspectionSchema = Schema.Struct({

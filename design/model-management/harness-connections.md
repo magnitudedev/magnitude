@@ -139,7 +139,9 @@ is preserved. Without an explicit model, connection and sync do not change the h
 model or generic reasoning preferences, with one exception: when the harness's current Magnitude
 model is an ID that now names another model (a catalog model's alias, the ID its files had as a found
 model before an upgrade), sync moves the selection to the catalog ID. Each connector reads its own
-current Magnitude selection for this; connect and setup descriptions accept an alias the same way.
+current Magnitude selection for this; connect and setup descriptions accept an alias the same way,
+including the CLI's `connections connect --set-model`, which resolves the alias through the running
+service's catalog before writing the harness configuration in the person's own home.
 ACN applies this without a manual sync: once at start and whenever the catalog's aliases change, it
 subscribes to the local-model projection and reconciles only the connections in the manifest whose
 selection names an alias, through the same per-connection reconciliation sync uses. Harnesses

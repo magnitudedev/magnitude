@@ -61,4 +61,7 @@ describe("drafter list", () => {
     expect(attachedDrafterSelection(attached, candidates)).toEqual({ _tag: "Candidate", key: drafterKey(builtIn) })
     expect(attachedDrafterSelection(customModel(added), candidates)).toEqual({ _tag: "Auto" })
   })
+  it("opens Change on No drafter for a model whose drafter was turned off", () => {
+    expect(attachedDrafterSelection(customModel(added, { drafterChoice: { _tag: "None" }, recommendedDrafter: Option.some(recommended) }), candidates)).toEqual({ _tag: "None" })
+  })
 })

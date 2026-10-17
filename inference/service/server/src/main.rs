@@ -7,14 +7,16 @@ use clap::{Parser, Subcommand};
 use magnitude_executor::platform::MemoryReserves;
 use magnitude_service_api::{AppState, ServerIdentity, app};
 use magnitude_service_contracts::bootstrap_protocol::{IcnStartupRecord, IcnStartupRecordType};
+use magnitude_service_models::lineage::CatalogLineage;
 use magnitude_service_models::{
-    HuggingFaceDiscovery, InventoryConfig, ManagedModelDownloads, ManagedModelStore, ModelDomainResolver,
-    managed_model_services,
+    HuggingFaceDiscovery, InventoryConfig, ManagedModelDownloads, ManagedModelStore,
+    ModelDomainResolver, managed_model_services,
 };
 use magnitude_service_server::assessment::ManagedModelAssessments;
-use magnitude_service_models::lineage::CatalogLineage;
 use magnitude_service_server::assessment::assessor::ModelAssessor;
-use magnitude_service_server::assessment::candidates::{ManagedModelCandidates, engine_architectures};
+use magnitude_service_server::assessment::candidates::{
+    ManagedModelCandidates, engine_architectures,
+};
 use magnitude_service_server::assessment::environment::AssessmentEnvironment;
 use magnitude_service_server::build_identity;
 use magnitude_service_server::configurations::ResolvedConfigurations;
@@ -167,6 +169,10 @@ async fn run(command: Command) -> anyhow::Result<()> {
             }
             inventory_config.catalog_models = release_catalog.catalog().models.clone();
             inventory_config.catalog_header_digests = release_catalog.file_header_digests();
+            inventory_config.architectures = engine_architectures();
+            // The engine runs with implicit Hub credentials disabled; only an explicit HF_TOKEN is
+            // presented.
+            inventory_config.hub_token = std::env::var("HF_TOKEN").ok();
             let inventory = Arc::new(
                 ManagedModelStore::open(inventory_config)
                     .await
@@ -302,7 +308,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 println!("{}", env!("CARGO_PKG_VERSION"));
             }
         }
-        Command::InferenceWorker => unreachable!("the inference worker runs without the service runtime"),
+        Command::InferenceWorker => {
+            unreachable!("the inference worker runs without the service runtime")
+        }
     }
     Ok(())
 }
@@ -310,8 +318,12 @@ async fn run(command: Command) -> anyhow::Result<()> {
 fn read_local_models_configuration(
     path: &std::path::Path,
 ) -> anyhow::Result<magnitude_service_contracts::models::LocalModelsConfiguration> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read local-models configuration {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "failed to read local-models configuration {}",
+            path.display()
+        )
+    })?;
     serde_json::from_slice(&bytes)
         .with_context(|| format!("invalid local-models configuration {}", path.display()))
 }

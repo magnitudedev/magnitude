@@ -5,7 +5,6 @@ import type { LocalModelsConfiguration } from "@magnitudedev/icn-protocol/schema
 import { AcnChanges } from "./changes"
 import { CustomModels } from "./custom-models"
 import { CustomModelReconciler, CustomModelReconcilerLive, disappearedCustomModels } from "./custom-model-reconciler"
-import { DrafterMethodsLive } from "./drafter-references"
 import { ModelLocations } from "./model-locations"
 import { ModelSlotController } from "./model-slot-controller"
 import {
@@ -27,7 +26,7 @@ describe("custom model disappearance", () => {
 })
 
 describe("custom model reconciliation", () => {
-  it("relearns drafter methods, pushes the whole snapshot, and clears a slot whose model disappears", async () => {
+  it("pushes the persisted drafter method at once, corrects it from the engine's verdict, and clears a slot whose model disappears", async () => {
     const configured: LocalModelsConfiguration[] = []
     const cleared: string[] = []
     const published: string[] = []
@@ -44,7 +43,6 @@ describe("custom model reconciliation", () => {
           }]),
           list: () => Effect.succeed([]),
         }),
-        DrafterMethodsLive,
         Layer.succeed(IcnLocalModels, {
           configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
         } as never),
@@ -76,13 +74,21 @@ describe("custom model reconciliation", () => {
       yield* Effect.gen(function* () {
         const reconciler = yield* CustomModelReconciler
         yield* reconciler.push
+        yield* Effect.sleep("50 millis")
         yield* custom.modify((config) => Effect.succeed([undefined, { ...config, hidden: [foundId] }] as const))
         yield* Effect.sleep("50 millis")
       }).pipe(Effect.provide(layer))
+      expect((yield* custom.get).drafters[foundId]).toEqual({
+        _tag: "Reference", reference: drafterReference, method: { _tag: "DSpark" },
+      })
     })))
     const first = configured[0]!
     expect(first.roots).toEqual([{ kind: "HuggingFaceCache", path: "/h/.cache/huggingface/hub", enabled: true }])
     expect(first.drafters).toEqual([{
+      modelId: foundId,
+      drafter: { _tag: "Reference", method: { _tag: "DFlash" }, reference: drafterReference },
+    }])
+    expect(configured.at(-1)!.drafters).toEqual([{
       modelId: foundId,
       drafter: { _tag: "Reference", method: { _tag: "DSpark" }, reference: drafterReference },
     }])
@@ -92,12 +98,12 @@ describe("custom model reconciliation", () => {
     expect(configured.length).toBeGreaterThanOrEqual(2)
   })
 
-  it("relearns the drafter method of an added model still downloading from its declared repository file", async () => {
+  it("validates the drafter method of an added model still downloading against its declared repository file", async () => {
     const configured: LocalModelsConfiguration[] = []
     const requests: string[] = []
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const custom = yield* makeTestCustomModels(customModelsConfig({
-        drafters: { [addedId]: { _tag: "Reference", reference: drafterReference } },
+        drafters: { [addedId]: { _tag: "Reference", reference: drafterReference, method: { _tag: "DFlash" } } },
       }))
       const layer = CustomModelReconcilerLive.pipe(Layer.provide(Layer.mergeAll(
         Layer.succeed(CustomModels, custom),
@@ -106,7 +112,6 @@ describe("custom model reconciliation", () => {
           resolve: Effect.succeed([]),
           list: () => Effect.succeed([]),
         }),
-        DrafterMethodsLive,
         Layer.succeed(IcnLocalModels, {
           configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
         } as never),
@@ -135,11 +140,44 @@ describe("custom model reconciliation", () => {
         } as never),
         Layer.succeed(AcnChanges, { publish: () => Effect.void, stream: Stream.empty } as never),
       )))
-      yield* Effect.flatMap(CustomModelReconciler, (reconciler) => reconciler.push).pipe(Effect.provide(layer))
+      yield* Effect.flatMap(CustomModelReconciler, (reconciler) => reconciler.push.pipe(Effect.andThen(Effect.sleep("50 millis"))))
+        .pipe(Effect.provide(layer))
     })))
     expect(requests.slice(0, 2)).toEqual(["Model", "Candidate"])
     expect(configured[0]!.drafters).toEqual([{
       modelId: addedId,
+      drafter: { _tag: "Reference", method: { _tag: "DFlash" }, reference: drafterReference },
+    }])
+  })
+
+  it("delivers a chosen drafter right after a restart, while ICN can't list candidates", async () => {
+    const configured: LocalModelsConfiguration[] = []
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const custom = yield* makeTestCustomModels(customModelsConfig())
+      const layer = CustomModelReconcilerLive.pipe(Layer.provide(Layer.mergeAll(
+        Layer.succeed(CustomModels, custom),
+        Layer.succeed(ModelLocations, {
+          environment: { platform: "linux", env: {}, home: "/h" },
+          resolve: Effect.succeed([]),
+          list: () => Effect.succeed([]),
+        }),
+        Layer.succeed(IcnLocalModels, {
+          configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
+        } as never),
+        Layer.succeed(IcnCandidates, { drafters: () => Effect.fail(new Error("offline")) } as never),
+        Layer.succeed(ModelSlotController, {
+          state: Effect.succeed({ slots: {
+            primary: { _tag: "Unassigned", slotId: "primary" },
+            secondary: { _tag: "Unassigned", slotId: "secondary" },
+          } }),
+          updateModelSlot: () => Effect.void,
+        } as never),
+        Layer.succeed(AcnChanges, { publish: () => Effect.void, stream: Stream.empty } as never),
+      )))
+      yield* Effect.flatMap(CustomModelReconciler, (reconciler) => reconciler.push).pipe(Effect.provide(layer))
+    })))
+    expect(configured[0]!.drafters).toEqual([{
+      modelId: foundId,
       drafter: { _tag: "Reference", method: { _tag: "DFlash" }, reference: drafterReference },
     }])
   })
@@ -156,7 +194,6 @@ describe("custom model reconciliation", () => {
           resolve: Effect.succeed([]),
           list: () => Effect.succeed([]),
         }),
-        DrafterMethodsLive,
         Layer.succeed(IcnLocalModels, {
           configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
         } as never),

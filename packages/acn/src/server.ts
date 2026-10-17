@@ -96,6 +96,7 @@ import { CustomEndpointReconcilerLive } from "./custom-endpoint-reconciler"
 import { CustomModelsLive } from "./custom-models"
 import { CustomModelReconcilerLive } from "./custom-model-reconciler"
 import { CustomModelCommandsLive } from "./custom-model-commands"
+import { CatalogModelSyncLive } from "./catalog-model-sync"
 import { DrafterMethodsLive } from "./drafter-references"
 import { ModelLocationsLive } from "./model-locations"
 import { FileMentionSearcherLive } from "./file-mention-searcher"
@@ -300,6 +301,9 @@ const AcnProcessHandlersLive = Layer.scopedDiscard(
   })
 )
 
+/** A handler's defect fails only its own request; it never ends the server and every other client's requests and subscriptions. */
+export const acnRpcServerOptions = { disableFatalDefects: true } as const
+
 const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
   const storageBase = Layer.mergeAll(
     VersionLive(ACN_VERSION),
@@ -358,7 +362,8 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     withCloudUsage
   )
   const withCustomModelReconciliation = Layer.provideMerge(CustomModelReconcilerLive, withModelSlots)
-  const withCustomModelCommands = Layer.provideMerge(CustomModelCommandsLive, withCustomModelReconciliation)
+  const withCatalogModelSync = Layer.provideMerge(CatalogModelSyncLive, withCustomModelReconciliation)
+  const withCustomModelCommands = Layer.provideMerge(CustomModelCommandsLive, withCatalogModelSync)
   const withModelCommands = Layer.provideMerge(ModelCommandsLive, withCustomModelCommands)
   const withCustomEndpointReconciliation = Layer.provideMerge(
     CustomEndpointReconcilerLive,
@@ -859,7 +864,7 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
       const protocol = yield* makeAcnSubscriptionProtocol(rawProtocol).pipe(
         Effect.provide(applicationContext),
       )
-      yield* RpcServer.make(AcnRpcGroup).pipe(
+      yield* RpcServer.make(AcnRpcGroup, acnRpcServerOptions).pipe(
         Effect.provideService(RpcServer.Protocol, protocol),
         Effect.provide(applicationContext),
         Effect.forkIn(applicationScope),

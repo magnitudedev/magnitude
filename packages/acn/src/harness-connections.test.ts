@@ -1,7 +1,7 @@
 import { Effect, Fiber, Stream, SubscriptionRef } from "effect"
 import { describe, expect, it } from "vitest"
 import { HarnessIdSchema, type LocalModelsState } from "@magnitudedev/acn-protocol"
-import { moveHarnessSelectionsOnAliasChanges } from "./harness-connections"
+import { isolatedHarnessHome, moveHarnessSelectionsOnAliasChanges } from "./harness-connections"
 
 const alias = "hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf"
 const state = (aliases: readonly string[]) => ({
@@ -49,5 +49,19 @@ describe("harness selections after an upgrade", () => {
       return { before, after }
     }))
     expect(runs).toEqual({ before: 0, after: 1 })
+  })
+})
+
+describe("the harness home a service writes to", () => {
+  it("is the person's own home for their ~/.magnitude profile on Windows, whatever the path's case or separators", () => {
+    expect(isolatedHarnessHome("C:\\Users\\Ada\\.magnitude", "C:\\Users\\ada", "win32")).toBe(false)
+    expect(isolatedHarnessHome("c:/users/ada/.magnitude/", "C:\\Users\\Ada", "win32")).toBe(false)
+    expect(isolatedHarnessHome("C:\\Users\\Ada\\.magnitude-desktop-dev", "C:\\Users\\Ada", "win32")).toBe(true)
+  })
+
+  it("compares exactly elsewhere", () => {
+    expect(isolatedHarnessHome("/home/ada/.magnitude", "/home/ada", "linux")).toBe(false)
+    expect(isolatedHarnessHome("/home/ada/.magnitude-desktop-dev", "/home/ada", "linux")).toBe(true)
+    expect(isolatedHarnessHome("/Users/Ada/.magnitude", "/Users/ada", "darwin")).toBe(true)
   })
 })

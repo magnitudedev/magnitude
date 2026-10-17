@@ -100,7 +100,7 @@ pub use planning::{
     CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding, DenseBranchBinding,
     DenseScales, Dflash2Binding, DraftBlockBinding, DraftProgramPlan, EmbeddingBinding,
     ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding, FeedForwardProgramSlot,
-    GraphSlots, HeadBinding, HeadProgramPlan, HostTablePlan, ImportProgramSlot,
+    GraphSlots, HeadBinding, HeadProgramPlan, HostProcessBytes, HostTablePlan, ImportProgramSlot,
     MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding, MixerProgramSlot, ModelLoadPlan,
     NGramBinding, NativeGraphCharge, ParallelBinding, PerLayerBinding, PerLayerEntryBinding,
     PlannedDevice, PlannedMethod, ProgramPlan, ReadoutBinding, ReadoutClassChoice, ReadoutHead,

@@ -106,13 +106,12 @@ export const CustomModelsLive: Layer.Layer<
 }))
 
 /**
- * The whole snapshot ICN receives. ICN lists hidden models apart and never assesses them; a drafter
- * whose binding method is not yet known is omitted until the engine reports it.
+ * The whole snapshot ICN receives. ICN lists hidden models apart and never assesses them; a chosen
+ * drafter is delivered with its persisted method, so it is included right after a restart.
  */
 export const localModelsConfiguration = (
   config: CustomModelsConfig,
   locations: readonly ResolvedAutomaticLocation[],
-  methodOf: (reference: DrafterReference) => Option.Option<SpeculativeMethod>,
 ): LocalModelsConfiguration => ({
   roots: [
     ...locations.flatMap((location) => location.paths.map(({ path }): ModelRoot => ({
@@ -131,14 +130,8 @@ export const localModelsConfiguration = (
     projector: declaration.projector,
   })) as unknown as LocalModelsConfiguration["declarations"],
   hidden: config.hidden.filter((modelId) => !Schema.is(CatalogFormModelIdSchema)(modelId)),
-  drafters: Object.entries(config.drafters).flatMap(([modelId, choice]): readonly unknown[] => {
-    if (choice._tag !== "Reference") return [{ modelId, drafter: { _tag: choice._tag } }]
-    return Option.match(methodOf(choice.reference), {
-      onNone: () => [],
-      onSome: (method) => [{
-        modelId,
-        drafter: { _tag: "Reference", method, reference: nativeDrafterReference(choice.reference) },
-      }],
-    })
-  }) as unknown as LocalModelsConfiguration["drafters"],
+  drafters: Object.entries(config.drafters).map(([modelId, choice]): unknown => choice._tag === "Reference"
+    ? { modelId, drafter: { _tag: "Reference", method: choice.method, reference: nativeDrafterReference(choice.reference) } }
+    : { modelId, drafter: { _tag: choice._tag } }
+  ) as unknown as LocalModelsConfiguration["drafters"],
 })

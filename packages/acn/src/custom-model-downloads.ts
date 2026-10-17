@@ -16,7 +16,9 @@ export interface RelatedDownload {
 
 /**
  * Downloads in ICN's order that ACN started for this model. One that carries an added model's
- * declared target acquires that target; any other fetches its drafter alone.
+ * declared target file acquires that target, at its pinned commit or at a newer commit an update
+ * fetched (so an update that failed or was abandoned still reads as the target's); any other fetches
+ * its drafter alone.
  */
 export const customModelDownloads = (
   modelId: ModelId,
@@ -26,10 +28,10 @@ export const customModelDownloads = (
   const declaration = config.declarations[modelId as keyof CustomModelsConfig["declarations"]]
   const holdsTarget = (download: ModelDownload) => {
     if (declaration?.origin._tag !== "Added") return false
-    const { repository, commit } = declaration.origin
+    const { repository } = declaration.origin
     const primary = declaration.target[0]
-    return primary !== undefined
-      && bundlePackages(download.bundle).some((pkg) => packageHoldsFile(pkg, repository, commit, primary))
+    return primary !== undefined && bundlePackages(download.bundle).some((pkg) =>
+      pkg.source._tag === "HuggingFace" && packageHoldsFile(pkg, repository, pkg.source.revision, primary))
   }
   return downloads.flatMap((download): readonly RelatedDownload[] => Option.contains(download.forModel, modelId)
     ? [{ kind: holdsTarget(download) ? "Target" : "Drafter", download }]

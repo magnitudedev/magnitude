@@ -1,12 +1,15 @@
 import {
+  canonicalLocalModelId,
   HarnessIdSchema,
   ProviderModelIdSchema,
+  type ProviderModelId,
   type HarnessConnectOutcome,
   type HarnessConnectionStatus,
   type HarnessId,
 } from "@magnitudedev/sdk"
 import { Data, Effect, Option, Schema } from "effect"
 import { localHarnessConnections, requireLocalService } from "../server/local-harness-connections"
+import { addressableModels, readCatalog, withClient } from "./inference-client"
 import { renderFields, renderTable, runCommand } from "./output"
 
 class ConnectionsCommandError extends Data.TaggedError("ConnectionsCommandError")<{
@@ -23,6 +26,16 @@ const parseModel = (input: string | undefined) => input === undefined
       Effect.map(Option.some),
       Effect.mapError(() => new ConnectionsCommandError({ message: `Invalid model ID: ${input}` })),
     )
+
+/**
+ * The model an ID names now: an ID a catalog model's files had as a found model before an upgrade
+ * names that catalog model. A service this process can't ask leaves the ID as typed.
+ */
+export const canonicalModelId = (modelId: ProviderModelId): Effect.Effect<ProviderModelId> =>
+  withClient(readCatalog).pipe(
+    Effect.map((catalog): ProviderModelId => canonicalLocalModelId(addressableModels(catalog), modelId)),
+    Effect.orElseSucceed(() => modelId),
+  )
 
 /** Harness connections belong to the person running the command; this process writes them into their home. */
 const withConnections = <A>(use: (connections: Effect.Effect.Success<typeof localHarnessConnections>) => Effect.Effect<A, unknown>) =>
@@ -84,7 +97,7 @@ export const connectConnection = (
 ) => runCommand({
   effect: Effect.gen(function* () {
     const harness = yield* parseHarness(harnessInput)
-    const model = yield* parseModel(modelInput)
+    const model = yield* parseModel(modelInput).pipe(Effect.flatMap(Effect.transposeMapOption(canonicalModelId)))
     yield* requireLocalService
     const result = yield* withConnections(connections => connections.connect(harness, { model, installSkill, launchOnStartup: false }))
     const connection: HarnessConnectOutcome = {

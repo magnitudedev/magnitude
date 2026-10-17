@@ -1,7 +1,7 @@
 import { CommandExecutor, FileSystem, HttpClient, Path } from "@effect/platform"
 import { Context, Effect, Layer, Option, PubSub, Schedule, Stream } from "effect"
 import { homedir } from "node:os"
-import { dirname, join, resolve } from "node:path"
+import { dirname, join, posix, win32 } from "node:path"
 import {
   canonicalLocalModelId,
   HarnessConnectionFailed,
@@ -53,6 +53,16 @@ const aliasKey = ({ models }: LocalModelsState): string => models
   .join("\n")
 
 /**
+ * Whether this service's profile is not the person's own `~/.magnitude` (a development or test profile),
+ * so harness configuration goes to a separate home. Windows paths compare without regard to case.
+ */
+export const isolatedHarnessHome = (dataDir: string, home: string, platform: NodeJS.Platform): boolean => {
+  const pathApi = platform === "win32" ? win32 : posix
+  const normalized = (path: string) => platform === "win32" ? pathApi.resolve(path).toLowerCase() : pathApi.resolve(path)
+  return normalized(dataDir) !== normalized(pathApi.join(home, ".magnitude"))
+}
+
+/**
  * Once at start and whenever the catalog's aliases change, moves every connected harness whose selection
  * names an alias to the catalog ID, through the same reconciliation `connections sync` uses.
  */
@@ -83,7 +93,7 @@ export const AcnHarnessConnectionsLive = Layer.scoped(AcnHarnessConnections, Eff
     Effect.orElseSucceed(() => Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))),
     Effect.cached,
   )
-  const isolated = resolve(host.dataDir) !== resolve(join(homedir(), ".magnitude"))
+  const isolated = isolatedHarnessHome(host.dataDir, homedir(), process.platform)
   const service = yield* Effect.cached(Effect.gen(function* () {
     const values = yield* environment
     const executor = yield* harnessCommandExecutor(values)

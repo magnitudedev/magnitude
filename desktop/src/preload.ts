@@ -3,7 +3,7 @@ import { contextBridge, ipcRenderer } from "electron"
 import { RpcClient } from "@effect/rpc"
 import { Cause, Context, Effect, Exit, Fiber, Layer, ManagedRuntime, Option, Schema, Stream } from "effect"
 import { ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
-import { HostError, InferenceHostRpcs, type InferenceHostClient, type DesktopApi } from "./desktop-rpc"
+import { HostError, InferenceHostRpcs, OpenPathRequest, OpenPathResult, type InferenceHostClient, type DesktopApi } from "./desktop-rpc"
 import { makeElectronRpcClientLayer } from "./electron-rpc"
 class HostClient extends Context.Tag("InferenceHostClient")<HostClient, InferenceHostClient>() {}
 const runtime = ManagedRuntime.make(Layer.scoped(HostClient, RpcClient.make(InferenceHostRpcs)).pipe(Layer.provide(makeElectronRpcClientLayer(ipcRenderer))))
@@ -40,5 +40,6 @@ const api: DesktopApi = {
   setAppearance: preference => command(client => client.SetAppearance({ preference })),
   retry: () => command(client => client.Retry({})),
   resolveQuitFailure: decision => command(client => client.ResolveQuitFailure({ decision })),
+  chooseOpenPath: request => query(client => client.ChooseOpenPath(Schema.decodeUnknownSync(OpenPathRequest)(request))).then(Schema.encodeSync(OpenPathResult)),
 }
 contextBridge.exposeInMainWorld("__magnitudeDesktop", api)

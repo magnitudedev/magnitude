@@ -36,6 +36,7 @@ describe("model slot reconciliation", () => {
           sourceUrls: ["https://huggingface.co/owner/repository"],
         },
         drafter: Option.none(),
+        drafterChoice: { _tag: "Auto" },
         recommendedDrafter: Option.none(),
         acquisitionState: {
           _tag: "Unavailable",

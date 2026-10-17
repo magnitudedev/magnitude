@@ -888,7 +888,8 @@ impl ManagedModelStore {
             .filter(|component| {
                 matches!(
                     component.role,
-                    magnitude_service_contracts::ComponentRole::Weights | magnitude_service_contracts::ComponentRole::Shard
+                    magnitude_service_contracts::ComponentRole::Weights
+                        | magnitude_service_contracts::ComponentRole::Shard
                 )
             })
             .min_by_key(|component| component.shard_index.unwrap_or(0))
@@ -1153,9 +1154,10 @@ async fn download_component_once(
 }
 
 /// A component taken from a file already on this computer with the same content (the exact file
-/// in a Hugging Face cache) instead of fetched, verified like a download before it becomes the
-/// blob. The blob is a hard link to that file where the file system allows one, so the bytes are
-/// on disk once and nothing is written; otherwise it is a copy, cloned where the file system can.
+/// in a Hugging Face cache) instead of fetched. The blob is always Magnitude's own file, never a
+/// link to the other one: a copy-on-write clone where the file system supports one, so the bytes
+/// stay shared on disk until either file changes, otherwise a streamed copy. Either way it is
+/// verified in full like a download before it becomes the blob, and the other file is only read.
 async fn copy_local_component(
     source: &Path,
     component: &ModelComponent,
@@ -1173,36 +1175,20 @@ async fn copy_local_component(
     }
     discard_component_files(paths).await?;
     progress(0, DownloadStage::Verifying);
-    // The link is made at the blob path, never at the partial path a later download resumes
-    // into, so nothing Magnitude writes can reach the other file through it. It names the file
-    // itself: a Hugging Face snapshot entry is a symbolic link, which `link` would not follow.
-    let linked = match tokio::fs::canonicalize(source).await {
-        Ok(file) => tokio::fs::hard_link(&file, &paths.blob).await.is_ok(),
-        Err(_) => false,
-    };
-    if linked {
-        let result = async {
-            let integrity = verified_integrity(&paths.blob, component, progress, control).await?;
-            atomic_json(&paths.checkpoint, &integrity.record(component)).await?;
-            sync_parent(&paths.blob).await
-        }
-        .await;
-        if result.is_err() {
-            discard_component_files(paths).await?;
-        }
-        return result;
-    }
-    let copied = tokio::fs::copy(source, &paths.partial).await;
     let result = async {
-        if copied.map_err(download_io)? != component.size_bytes {
-            return Err(DownloadError {
-                kind: DownloadErrorKind::Integrity,
-                message: format!("unexpected size for {}", source.display()),
-                retryable: false,
-                resumable: false,
-            });
-        }
-        let integrity = verified_integrity(&paths.partial, component, progress, control).await?;
+        // The copy names the file itself: a Hugging Face snapshot entry is a symbolic link.
+        let source = tokio::fs::canonicalize(source).await.map_err(download_io)?;
+        let cloned = {
+            let (source, partial) = (source.clone(), paths.partial.clone());
+            tokio::task::spawn_blocking(move || clone_file(&source, &partial))
+                .await
+                .map_err(download_io)?
+        };
+        let integrity = if cloned {
+            verified_integrity(&paths.partial, component, progress, control).await?
+        } else {
+            streamed_copy(&source, &paths.partial, component, progress, control).await?
+        };
         atomic_json(&paths.checkpoint, &integrity.record(component)).await?;
         publish_verified_blob(paths).await
     }
@@ -1211,6 +1197,105 @@ async fn copy_local_component(
         discard_component_files(paths).await?;
     }
     result
+}
+
+/// Creates `destination` as a copy-on-write clone of `source` (APFS `clonefile`), sharing its
+/// extents until either file changes. False where the file system cannot clone, leaving nothing
+/// at `destination`.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn clone_file(source: &Path, destination: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+    let (Ok(source), Ok(destination)) = (
+        std::ffi::CString::new(source.as_os_str().as_bytes()),
+        std::ffi::CString::new(destination.as_os_str().as_bytes()),
+    ) else {
+        return false;
+    };
+    // SAFETY: both pointers are NUL-terminated paths that outlive the call. `clonefile` creates
+    // the destination atomically, so a failure leaves nothing behind.
+    unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), CLONE_NOFOLLOW) == 0 }
+}
+
+/// Creates `destination` as a copy-on-write clone of `source` (the `FICLONE` reflink of btrfs,
+/// XFS and bcachefs), sharing its extents until either file changes. False where the file system
+/// cannot clone, leaving nothing at `destination`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn clone_file(source: &Path, destination: &Path) -> bool {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let Ok(input) = File::open(source) else {
+        return false;
+    };
+    let Ok(output) = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(destination)
+    else {
+        return false;
+    };
+    // SAFETY: both descriptors are open for the duration of the call.
+    let cloned = unsafe { libc::ioctl(output.as_raw_fd(), libc::FICLONE, input.as_raw_fd()) } == 0;
+    if !cloned {
+        drop(output);
+        let _ = std::fs::remove_file(destination);
+    }
+    cloned
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android"
+)))]
+fn clone_file(_source: &Path, _destination: &Path) -> bool {
+    false
+}
+
+/// Copies `source` to the new partial file `destination`, hashing the bytes as they are written,
+/// and checks the copy is exactly `component`'s content.
+async fn streamed_copy(
+    source: &Path,
+    destination: &Path,
+    component: &ModelComponent,
+    progress: &mut impl FnMut(u64, DownloadStage),
+    control: &TransferControl,
+) -> Result<DownloadIntegrity, DownloadError> {
+    use tokio::io::AsyncReadExt as _;
+    let mut input = tokio::fs::File::open(source).await.map_err(download_io)?;
+    let mut output = tokio::fs::File::from_std(open_partial(destination)?);
+    let mut integrity = DownloadIntegrity::empty(component);
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    loop {
+        if control.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        let read = input.read(&mut buffer).await.map_err(download_io)?;
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..read])
+            .await
+            .map_err(download_io)?;
+        integrity.update(&buffer[..read])?;
+        if integrity.bytes > component.size_bytes {
+            return Err(DownloadError {
+                kind: DownloadErrorKind::Integrity,
+                message: format!("unexpected size for {}", source.display()),
+                retryable: false,
+                resumable: false,
+            });
+        }
+        progress(integrity.bytes, DownloadStage::Verifying);
+    }
+    output.flush().await.map_err(download_io)?;
+    output.sync_data().await.map_err(download_io)?;
+    integrity.verify(component)?;
+    Ok(integrity)
 }
 
 /// Reads `path` in full and checks it is exactly `component`'s content.
@@ -1700,6 +1785,63 @@ where
     }
 }
 
+/// A repository revision as the Hub reports it: the commit it resolves to and the content of each
+/// file there, the LFS SHA-256 where the file is stored in LFS.
+pub(crate) struct HubRevisionFiles {
+    pub(crate) commit: String,
+    pub(crate) files: std::collections::BTreeMap<String, HubFileContent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HubFileContent {
+    pub(crate) size: Option<u64>,
+    pub(crate) sha256: Option<String>,
+}
+
+impl ManagedModelStore {
+    /// Reads `revision` of `repository` through the same metadata request as acquisition, with
+    /// the `HF_TOKEN` credential when one is set and anonymously when the Hub rejects it.
+    pub(crate) async fn hub_revision_files(
+        &self,
+        repository: &str,
+        revision: &str,
+    ) -> Result<HubRevisionFiles, String> {
+        let api = resolve_with_credential_fallback(
+            self.hub_credential.as_ref(),
+            &self.client,
+            |client, token| async move {
+                hub_api_metadata(&client, token.as_deref(), repository, revision).await
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let commit = api
+            .sha
+            .filter(|commit| is_immutable_commit(commit))
+            .ok_or_else(|| {
+                format!("Hugging Face did not resolve {repository}@{revision} to a commit")
+            })?;
+        let files = api
+            .siblings
+            .into_iter()
+            .map(|sibling| {
+                let content = match sibling.lfs {
+                    Some(lfs) => HubFileContent {
+                        size: Some(lfs.size),
+                        sha256: Some(lfs.sha256.to_ascii_lowercase()),
+                    },
+                    None => HubFileContent {
+                        size: sibling.size,
+                        sha256: None,
+                    },
+                };
+                (sibling.rfilename, content)
+            })
+            .collect();
+        Ok(HubRevisionFiles { commit, files })
+    }
+}
+
 async fn resolve_package(
     client: &hf_hub::HFClient,
     token: Option<&str>,
@@ -2086,7 +2228,9 @@ fn watch_stream(receiver: watch::Receiver<ModelDownloadEvent>) -> DownloadEventS
     .boxed()
 }
 
-fn current_model_id(event: &ModelDownloadEvent) -> Option<magnitude_service_contracts::InventoryEntryId> {
+fn current_model_id(
+    event: &ModelDownloadEvent,
+) -> Option<magnitude_service_contracts::InventoryEntryId> {
     match event {
         ModelDownloadEvent::CheckingSpace { model_id, .. }
         | ModelDownloadEvent::Progress { model_id, .. } => Some(model_id.clone()),
@@ -2410,7 +2554,11 @@ mod tests {
         )
         .expect("inventory config");
         config.add_hugging_face_caches([hf_cache]);
-        let manager = Arc::new(ManagedModelStore::open(config).await.expect("model manager"));
+        let manager = Arc::new(
+            ManagedModelStore::open(config)
+                .await
+                .expect("model manager"),
+        );
         manager
             .ensure_installed_model_inventory()
             .await
@@ -2466,12 +2614,18 @@ mod tests {
         let listed = downloads.list().await.unwrap().downloads;
         assert_eq!(listed.len(), 1);
         assert_eq!(
-            listed[0].for_model.as_ref().map(|model| model.as_str().to_owned()),
+            listed[0]
+                .for_model
+                .as_ref()
+                .map(|model| model.as_str().to_owned()),
             Some(format!("local:{}", "a".repeat(64))),
             "the model a drafter is fetched for is echoed in its download"
         );
         let cancelled = downloads.cancel(&started.id).await.expect("cancellation");
-        assert!(matches!(cancelled.state, ModelDownloadState::Cancelled { .. }));
+        assert!(matches!(
+            cancelled.state,
+            ModelDownloadState::Cancelled { .. }
+        ));
         assert!(draft_work.is_cancelled());
     }
 
@@ -2886,7 +3040,9 @@ mod tests {
         let repo = source_repository(&endpoint, directory.path());
         let control = TransferControl::new(Duration::from_secs(60));
         let found = directory.path().join("found-blob");
-        tokio::fs::write(&found, &contents).await.expect("found file");
+        tokio::fs::write(&found, &contents)
+            .await
+            .expect("found file");
         let snapshot_entry = directory.path().join("found.gguf");
         std::os::unix::fs::symlink(&found, &snapshot_entry).expect("snapshot entry");
         let blobs = directory
@@ -2909,8 +3065,15 @@ mod tests {
         .expect("copied component");
         let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
         assert_eq!(tokio::fs::read(&paths.blob).await.expect("blob"), contents);
-        assert!(ranges.lock().expect("ranges").is_empty(), "nothing was fetched");
-        assert!(recover_completed_blob(&paths, &component).await.expect("recovery"));
+        assert!(
+            ranges.lock().expect("ranges").is_empty(),
+            "nothing was fetched"
+        );
+        assert!(
+            recover_completed_blob(&paths, &component)
+                .await
+                .expect("recovery")
+        );
         assert_eq!(tokio::fs::read(&found).await.expect("found file"), contents);
     }
 
@@ -2923,7 +3086,10 @@ mod tests {
             &["token_embd.weight"],
         );
         let digest = format!("{:x}", Sha256::digest(&contents));
-        let repository = temporary.path().join("hf-cache").join("models--owner--repository");
+        let repository = temporary
+            .path()
+            .join("hf-cache")
+            .join("models--owner--repository");
         let blob = repository.join("blobs").join(&digest);
         let snapshot = repository.join("snapshots").join("a".repeat(40));
         std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
@@ -2943,7 +3109,9 @@ mod tests {
         let present = model_component(&contents);
         let absent = model_component(b"other contents");
         let sources = manager.local_sources(&[present, absent]);
-        let found = sources[0].as_ref().expect("the cached blob is a local source");
+        let found = sources[0]
+            .as_ref()
+            .expect("the cached blob is a local source");
         assert_eq!(std::fs::read(found).unwrap(), contents);
         assert!(sources[1].is_none());
     }
@@ -2957,7 +3125,9 @@ mod tests {
         let repo = source_repository(&endpoint, directory.path());
         let control = TransferControl::new(Duration::from_secs(60));
         let changed = directory.path().join("changed.gguf");
-        tokio::fs::write(&changed, vec![8_u8; 64 * 1024]).await.expect("changed file");
+        tokio::fs::write(&changed, vec![8_u8; 64 * 1024])
+            .await
+            .expect("changed file");
         let blobs = directory
             .path()
             .join("hub")
@@ -2986,11 +3156,12 @@ mod tests {
         );
     }
 
-    /// An exact copy elsewhere on the same file system becomes the blob without writing its bytes
-    /// again: the blob is the same file, and nothing is fetched.
+    /// An exact copy elsewhere on this computer becomes Magnitude's own blob, a clone or a copy but
+    /// never a link to the other file, which is only read: its size, modification time and link
+    /// count stay as they were, and changing the blob leaves it alone.
     #[cfg(unix)]
     #[tokio::test]
-    async fn an_exact_local_copy_on_the_same_file_system_is_linked_not_copied() {
+    async fn an_exact_local_copy_becomes_a_separate_blob_and_the_other_file_is_untouched() {
         use std::os::unix::fs::MetadataExt as _;
         let contents = vec![5_u8; 64 * 1024];
         let component = model_component(&contents);
@@ -2999,7 +3170,16 @@ mod tests {
         let repo = source_repository(&endpoint, directory.path());
         let control = TransferControl::new(Duration::from_secs(60));
         let found = directory.path().join("found-blob");
-        tokio::fs::write(&found, &contents).await.expect("found file");
+        tokio::fs::write(&found, &contents)
+            .await
+            .expect("found file");
+        let past = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&found)
+            .and_then(|file| file.set_modified(past))
+            .expect("found file time");
+        let before = std::fs::metadata(&found).expect("found file");
         let snapshot_entry = directory.path().join("found.gguf");
         std::os::unix::fs::symlink(&found, &snapshot_entry).expect("snapshot entry");
         let blobs = directory
@@ -3021,15 +3201,94 @@ mod tests {
         .await
         .expect("component from the local copy");
         let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
-        assert!(std::fs::symlink_metadata(&paths.blob).expect("blob").is_file());
-        let blob = std::fs::metadata(&paths.blob).expect("blob");
-        let source = std::fs::metadata(&found).expect("found file");
-        assert_eq!((blob.dev(), blob.ino()), (source.dev(), source.ino()));
-        assert!(ranges.lock().expect("ranges").is_empty(), "nothing is fetched");
         assert!(
-            recover_completed_blob(&paths, &component).await.expect("recovery"),
-            "the linked blob is a complete, verified blob"
+            std::fs::symlink_metadata(&paths.blob)
+                .expect("blob")
+                .is_file()
         );
+        let blob = std::fs::metadata(&paths.blob).expect("blob");
+        let after = std::fs::metadata(&found).expect("found file");
+        assert_ne!((blob.dev(), blob.ino()), (after.dev(), after.ino()));
+        assert_eq!(blob.nlink(), 1);
+        assert_eq!(
+            (
+                after.ino(),
+                after.len(),
+                after.nlink(),
+                after.modified().unwrap()
+            ),
+            (
+                before.ino(),
+                before.len(),
+                before.nlink(),
+                before.modified().unwrap()
+            )
+        );
+        assert!(
+            ranges.lock().expect("ranges").is_empty(),
+            "nothing is fetched"
+        );
+        assert!(
+            recover_completed_blob(&paths, &component)
+                .await
+                .expect("recovery"),
+            "the copied blob is a complete, verified blob"
+        );
+
+        std::fs::write(&paths.blob, b"changed").expect("blob write");
+        assert_eq!(tokio::fs::read(&found).await.expect("found file"), contents);
+    }
+
+    /// Where the file system cannot clone, the blob is a streamed copy verified as it is written,
+    /// and a source with other bytes is refused without publishing anything.
+    #[tokio::test]
+    async fn a_streamed_copy_is_verified_and_a_mismatch_publishes_nothing() {
+        let contents = (0..3 * 1024 * 1024_u32)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let component = model_component(&contents);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let control = TransferControl::new(Duration::from_secs(60));
+        let found = directory.path().join("found.gguf");
+        tokio::fs::write(&found, &contents)
+            .await
+            .expect("found file");
+        let blobs = directory.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.expect("blobs");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+
+        let mut reported = 0;
+        let integrity = streamed_copy(
+            &found,
+            &paths.partial,
+            &component,
+            &mut |bytes, _| reported = bytes,
+            &control,
+        )
+        .await
+        .expect("streamed copy");
+        assert_eq!(integrity.bytes, component.size_bytes);
+        assert_eq!(reported, component.size_bytes);
+        assert_eq!(
+            tokio::fs::read(&paths.partial).await.expect("copy"),
+            contents
+        );
+        discard_component_files(&paths).await.expect("discard");
+
+        let other = directory.path().join("other.gguf");
+        let mut changed = contents.clone();
+        changed[17] ^= 1;
+        tokio::fs::write(&other, &changed)
+            .await
+            .expect("other file");
+        let error = copy_local_component(&other, &component, &paths, &mut |_, _| {}, &control)
+            .await
+            .expect_err("mismatched source");
+        assert!(matches!(error.kind, DownloadErrorKind::Integrity));
+        for path in [&paths.partial, &paths.blob, &paths.checkpoint] {
+            assert!(!path.exists(), "{} was left behind", path.display());
+        }
+        assert_eq!(tokio::fs::read(&other).await.expect("other file"), changed);
     }
 
     #[tokio::test]
@@ -3334,10 +3593,8 @@ mod tests {
             token: "expired".to_owned(),
         };
         let attempts = std::sync::Mutex::new(Vec::new());
-        let resolved = resolve_with_credential_fallback(
-            Some(&credential),
-            &hub_client(),
-            |_client, token| {
+        let resolved =
+            resolve_with_credential_fallback(Some(&credential), &hub_client(), |_client, token| {
                 attempts.lock().expect("attempts").push(token.clone());
                 async move {
                     match token {
@@ -3350,10 +3607,9 @@ mod tests {
                         None => Ok("resolved"),
                     }
                 }
-            },
-        )
-        .await
-        .expect("anonymous resolution");
+            })
+            .await
+            .expect("anonymous resolution");
 
         assert_eq!(resolved, "resolved");
         assert_eq!(
@@ -3369,10 +3625,8 @@ mod tests {
             token: "valid".to_owned(),
         };
         let attempts = std::sync::Mutex::new(Vec::new());
-        let error = resolve_with_credential_fallback(
-            Some(&credential),
-            &hub_client(),
-            |_client, token| {
+        let error =
+            resolve_with_credential_fallback(Some(&credential), &hub_client(), |_client, token| {
                 attempts.lock().expect("attempts").push(token);
                 async {
                     Err::<(), _>(DownloadError {
@@ -3382,13 +3636,15 @@ mod tests {
                         resumable: false,
                     })
                 }
-            },
-        )
-        .await
-        .expect_err("forbidden content");
+            })
+            .await
+            .expect_err("forbidden content");
 
         assert!(matches!(error.kind, DownloadErrorKind::SourceAccessDenied));
-        assert_eq!(*attempts.lock().expect("attempts"), vec![Some("valid".to_owned())]);
+        assert_eq!(
+            *attempts.lock().expect("attempts"),
+            vec![Some("valid".to_owned())]
+        );
     }
 
     #[tokio::test]

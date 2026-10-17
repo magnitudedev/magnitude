@@ -1,7 +1,7 @@
 //! The Qwen3-VL projector (`qwen3vl_merger`).
 
 use crate::{Error, product};
-use magnitude_artifacts::gguf::{Directory, Scalar, Value};
+use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value};
 use magnitude_family_common::Tensors;
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling, RowRange,
@@ -57,7 +57,7 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
     if directory
         .value("general.architecture")
         .and_then(Value::string)
-        != Some("clip")
+        != Some(PROJECTOR_ARCHITECTURE)
         || directory.value("general.type").and_then(Value::string) != Some("mmproj")
         || directory
             .value("clip.has_vision_encoder")

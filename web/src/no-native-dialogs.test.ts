@@ -18,10 +18,10 @@ describe("dialogs", () => {
   it("never prompts on unload", () => {
     expect(files.filter(file => /returnValue\s*=|preventDefault\(\)[^\n]*beforeunload|onbeforeunload/.test(readFileSync(file, "utf8")))).toEqual([])
   })
-  it("uses Electron's native dialogs only where no window can show the app's own", () => {
+  it("uses Electron's native dialogs only where no window can show the app's own, plus the native open dialog", () => {
     const main = readFileSync(join(root, "desktop/src/main.ts"), "utf8")
     const calls = [...main.matchAll(/dialog\.(show\w+)\(/g)].map(match => match[1])
-    expect(calls.sort()).toEqual(["showErrorBox", "showErrorBox", "showErrorBox", "showMessageBox"].sort())
+    expect(calls.sort()).toEqual(["showErrorBox", "showErrorBox", "showErrorBox", "showMessageBox", "showOpenDialog"].sort())
     expect(files.filter(file => !file.endsWith("main.ts") && /\bdialog\.show\w+\(/.test(readFileSync(file, "utf8")))).toEqual([])
   })
 })

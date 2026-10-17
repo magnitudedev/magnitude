@@ -130,6 +130,7 @@ const makeApplicationSession = Effect.gen(function* () {
     readAppearance: host.appearance.read,
     saveAppearance: (preference: AppearancePreference) => host.appearance.save(preference),
     clientWindow: host.window,
+    openPathDialog: Option.map(host.shell, shell => shell.chooseOpenPath),
     application,
   }
 })

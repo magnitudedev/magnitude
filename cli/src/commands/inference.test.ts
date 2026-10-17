@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   ADDED_MODEL_ID,
   catalogState,
+  doesNotFitAssessment,
   FOUND_MODEL_ID,
   makeAcquiringModel,
   makeAddedModel,
@@ -59,6 +60,7 @@ import {
   renderImport,
   renderInspection,
   downloadSizeLine,
+  execute,
   renderModelDetail,
   parseAutomaticLocation,
   renderModelLocations,
@@ -97,12 +99,12 @@ afterEach(() => {
   process.exitCode = undefined
 })
 
-const capture = async (command: () => Promise<void>) => {
+const capture = async (command: () => Effect.Effect<void> | Promise<void>) => {
   let stdout = ""
   let stderr = ""
   vi.spyOn(process.stdout, "write").mockImplementation((chunk) => { stdout += String(chunk); return true })
   vi.spyOn(process.stderr, "write").mockImplementation((chunk) => { stderr += String(chunk); return true })
-  await command()
+  await execute(command())
   return { stdout, stderr, exitCode: process.exitCode }
 }
 
@@ -406,9 +408,9 @@ describe("candidate inspection", () => {
 
   it("says when no version runs here and points local files at import", () => {
     const tooLarge = makeInspection({
-      versions: makeInspection().versions.map((version) => ({ ...version, recommended: false })),
+      versions: makeInspection().versions.map((version) => ({ ...version, recommended: false, assessment: Option.some(doesNotFitAssessment()) })),
     })
-    expect(renderInspection({ inspection: tooLarge, drafters: [], models: [] })).toContain("No version of this model runs on this computer.")
+    expect(renderInspection({ inspection: tooLarge, drafters: [], models: [] })).toContain("No version of this model runs on this computer. Every version is too large for this machine.")
     const nothingRuns = makeInspection({ versions: [makeInspection().versions[0]!, makeInspection().versions[3]!] })
     expect(renderInspection({ inspection: nothingRuns, drafters: [], models: [] })).toContain(
       "No version of this model runs on this computer. Some versions are too large for this machine, and Magnitude can't run the others: Uses Q2_K weights, which Magnitude doesn't support yet.",
@@ -436,6 +438,7 @@ describe("candidate inspection", () => {
 
 describe("pull and model mutations", () => {
   const added = (outcome: "Started" | "AlreadyOnThisComputer", drafter = Option.some(makeDrafterCandidate())) => ({
+    _tag: "Custom" as const,
     modelId: ADDED_MODEL_ID,
     version: "Q4_K_P",
     drafter,
@@ -657,8 +660,9 @@ describe("model status", () => {
       unsupported: [makeUnsupportedLocalModel(), makeUnsupportedLocalModel({ displayName: "Other" })],
       hidden: [makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") })],
     }))
-    expect(output).toMatch(/MODEL\s+SOURCE\s+MEMORY\s+CONTEXT\s+STATUS\s+MODEL ID/)
-    expect(output).not.toContain("qwen-test:gguf:q4")
+    expect(output).toMatch(/MODEL\s+SOURCE\s+VARIANT OF\s+DRAFTER\s+MEMORY\s+CONTEXT\s+STATUS\s+MODEL ID/)
+    expect(output).not.toMatch(/qwen-test:gguf:q4$/m)
+    expect(output).toContain("Qwen Test (qwen-test:gguf:q4)")
     expect(output).toContain("Hugging Face cache")
     expect(output).toContain("GGUF file")
     expect(output).toContain("Unavailable - The file was moved or deleted")
@@ -702,7 +706,7 @@ describe("model status", () => {
     const output = renderModelDetail({
       model,
       models: [makeCatalogModel(), model],
-      drafters: { _tag: "Listed", candidates: makeDrafterCandidates() },
+      drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false,
     })
     expect(output).toContain(`Source        Hugging Face · ${TEST_REPOSITORY}`)
     expect(output).toContain("Variant of    Qwen Test (qwen-test:gguf:q4)")
@@ -717,7 +721,7 @@ describe("model status", () => {
     const output = renderModelDetail({
       model: makeFoundModel(),
       models: [],
-      drafters: { _tag: "Unavailable", message: "Hugging Face is unreachable" },
+      drafters: { _tag: "Unavailable", message: "Hugging Face is unreachable" }, hidden: false,
     })
     expect(output).toContain("Drafter     None · Faster with a drafter · Add (900 MB)")
     expect(output).toContain("Drafter choices are unavailable: Hugging Face is unreachable")
@@ -734,7 +738,7 @@ describe("model status", () => {
         assessment: unsupportedAssessment("IQ1_M"),
       },
     })
-    const output = renderModelDetail({ model: unsupported, models: [], drafters: { _tag: "NotApplicable" } })
+    const output = renderModelDetail({ model: unsupported, models: [], drafters: { _tag: "NotApplicable" }, hidden: false })
     expect(output).toContain("Can't run     Uses IQ1_M weights, which Magnitude doesn't support yet")
     expect(renderModelsStatus(statusView({ models: [unsupported] }))).toContain("Can't run - Uses IQ1_M weights")
   })
@@ -804,7 +808,7 @@ describe("model locations", () => {
     expect(rendered).toContain("Ollama    Found       /home/ada/.ollama/models")
     expect(rendered).toContain("Ollama    Can't read  /usr/share/ollama/.ollama/models")
     expect(rendered).not.toContain("/var/lib/ollama")
-    expect(rendered).toContain("Can't read /usr/share/ollama/.ollama/models. Magnitude doesn’t have permission to read this folder. A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it to use those models here.")
+    expect(rendered).toContain("Can't read /usr/share/ollama/.ollama/models. Magnitude doesn’t have permission to read this folder. A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it, or set OLLAMA_MODELS to a folder you can read (Magnitude also scans the default folders).")
     expect(rendered).toContain("/srv/models  Can't read")
     expect(rendered).toContain("Can't read /srv/models. Magnitude doesn’t have permission to read this folder. Give your account read access to it.")
     expect(renderModelLocations([{ kind: "Ollama", paths: [{ path: "/o", state: "Unreadable" }], enabled: false, automatic: true, state: "Unreadable" }]))
@@ -857,7 +861,7 @@ describe("--json output", () => {
     expect((status.models as Record<string, unknown>[]).map(({ modelId }) => modelId)).toEqual([FOUND_MODEL_ID])
     expect((status.unsupported as Record<string, unknown>[])[0]).toMatchObject({ reasons: [{ _tag: "Architecture", architecture: "deepseek4" }] })
 
-    const detail = encode(modelDetailJson, { model: makeAddedModel(), models: [], drafters: { _tag: "Listed", candidates: makeDrafterCandidates() } })
+    const detail = encode(modelDetailJson, { model: makeAddedModel(), models: [], drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false })
     expect(detail.drafterCandidates).toHaveLength(3)
     expect(detail).not.toHaveProperty("drafterCandidatesUnavailable")
 
@@ -865,13 +869,13 @@ describe("--json output", () => {
       _tag: "HuggingFace",
       repository: TEST_REPOSITORY,
       versionRequested: false,
-      added: { modelId: ADDED_MODEL_ID, version: "Q4_K_P", drafter: Option.none(), outcome: "Started", drafterDownloadStarted: false },
+      added: { _tag: "Custom", modelId: ADDED_MODEL_ID, version: "Q4_K_P", drafter: Option.none(), outcome: "Started", drafterDownloadStarted: false },
     })
     expect(pull).toEqual({
       _tag: "HuggingFace",
       repository: TEST_REPOSITORY,
       versionRequested: false,
-      added: { modelId: ADDED_MODEL_ID, version: "Q4_K_P", outcome: "Started", drafterDownloadStarted: false },
+      added: { _tag: "Custom", modelId: ADDED_MODEL_ID, version: "Q4_K_P", outcome: "Started", drafterDownloadStarted: false },
     })
 
     expect(encode(catalogStatusJson, { _tag: "Initializing" })).toEqual({})
@@ -898,7 +902,7 @@ describe("--json output", () => {
     expect(encode(modelsStatusResultJson, { _tag: "Initializing" })).toEqual({ initializing: true, models: [], unsupported: [], hidden: [] })
     expect(encode(modelsStatusResultJson, { _tag: "List", view: statusView({ models: [makeFoundModel()] }) }))
       .toMatchObject({ initializing: false, models: [{ _tag: "Custom", modelId: FOUND_MODEL_ID }] })
-    expect(encode(modelsStatusResultJson, { _tag: "Detail", view: { model: makeFoundModel(), models: [], drafters: { _tag: "Unavailable", message: "offline" } } }))
+    expect(encode(modelsStatusResultJson, { _tag: "Detail", view: { model: makeFoundModel(), models: [], drafters: { _tag: "Unavailable", message: "offline" }, hidden: false } }))
       .toMatchObject({ model: { modelId: FOUND_MODEL_ID }, drafterCandidatesUnavailable: "offline" })
   })
 
@@ -958,8 +962,8 @@ describe("custom model license", () => {
   it("shows a custom model's license in its details when it is known", () => {
     const base = makeFoundModel()
     const licensed = makeFoundModel({ presentation: { ...base.presentation, license: Option.some("apache-2.0") } })
-    expect(renderModelDetail({ model: licensed, models: [], drafters: { _tag: "NotApplicable" } })).toMatch(/License\s+apache-2\.0/)
-    expect(renderModelDetail({ model: makeFoundModel({ presentation: { ...base.presentation, license: Option.none() } }), models: [], drafters: { _tag: "NotApplicable" } }))
+    expect(renderModelDetail({ model: licensed, models: [], drafters: { _tag: "NotApplicable" }, hidden: false })).toMatch(/License\s+apache-2\.0/)
+    expect(renderModelDetail({ model: makeFoundModel({ presentation: { ...base.presentation, license: Option.none() } }), models: [], drafters: { _tag: "NotApplicable" }, hidden: false }))
       .not.toContain("License")
   })
 })
@@ -985,7 +989,7 @@ describe("drafter updates", () => {
     const drafter = Option.getOrThrow(base.drafter)
     const found = makeFoundModel({ recommendedDrafter: Option.none(), drafter: Option.some({ ...drafter, updateAvailable: true }) })
     expect(renderModelsStatus(statusView({ models: [found] }))).toContain("Update available")
-    expect(renderModelDetail({ model: found, models: [], drafters: { _tag: "NotApplicable" } }))
+    expect(renderModelDetail({ model: found, models: [], drafters: { _tag: "NotApplicable" }, hidden: false }))
       .toContain(`Update      A newer drafter is available - magnitude catalog pull ${FOUND_MODEL_ID}`)
     const downloading = makeFoundModel({ drafter: Option.some({ ...drafter, updateAvailable: true, availability: { _tag: "Downloading", progress: { stage: "downloading", completedBytes: 1, totalBytes: 4, bytesPerSecond: Option.none() } } }) })
     expect(renderModelsStatus(statusView({ models: [downloading] }))).not.toContain("Update available")
@@ -1013,12 +1017,12 @@ describe("drafter updates", () => {
 })
 
 describe("--json internal identities", () => {
-  const internal = /"(assessmentId|environmentId)"/
+  const internal = /"(assessmentId|environmentId|rankingScores|fidelityRank|acceleratorId|memoryDomainId|deviceId|primaryPath|ownership|limitingResource)"/
   const loading = (model: CustomLocalModel): CustomLocalModel => model.acquisitionState._tag === "External"
     ? { ...model, acquisitionState: { ...model.acquisitionState, residencyState: { _tag: "Requested" } } }
     : model
 
-  it("never includes assessment or environment identities", () => {
+  it("never includes internal identities, managed paths, ownership, or ranking inputs", () => {
     const assessed = makeAddedModel().servingState as Extract<CustomLocalModel["servingState"], { _tag: "Assessed" }>
     const unrunnable = makeImportedModel({ servingState: { ...assessed, assessment: unsupportedAssessment("IQ1_M") } })
     const catalog = catalogState([makeCatalogModel(), makeFoundModel(), makeAddedModel()], [makeUnsupportedLocalModel()], [unrunnable])
@@ -1027,8 +1031,8 @@ describe("--json internal identities", () => {
       encode(catalogDetailJson, { model: makeCatalogModel(), models: [] }),
       encode(recommendationsJson, { catalog, models: [makeCatalogModel()], hardware: makeHardware(), preference: { label: "Balanced" }, ranked: [makeCatalogModel()] }),
       encode(modelsStatusJson, statusView({ models: [makeCatalogModel(), makeFoundModel(), makeAddedModel(), unrunnable], hidden: [makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") })] })),
-      encode(modelDetailJson, { model: makeAddedModel(), models: [], drafters: { _tag: "Listed", candidates: makeDrafterCandidates() } }),
-      encode(modelDetailJson, { model: makeInstalledCatalogModel(), models: [], drafters: { _tag: "NotApplicable" } }),
+      encode(modelDetailJson, { model: makeAddedModel(), models: [], drafters: { _tag: "Listed", candidates: makeDrafterCandidates() }, hidden: false }),
+      encode(modelDetailJson, { model: makeInstalledCatalogModel(), models: [], drafters: { _tag: "NotApplicable" }, hidden: false }),
       encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [] }),
       encode(hardwareJson, { hardware: makeHardware(), models: [loading(makeFoundModel())] }),
     ]

@@ -45,10 +45,10 @@ import { Cause, Effect, Option } from "effect"
 import { localModelAssessmentProfile, localModelDeprecation, type ProviderModelId, type CatalogLocalModel, type CustomLocalModel, type CustomModelAcquisitionState, type DrafterCandidate, type LocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
 import type { ApplicationSnapshot, AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessChange, type NetworkBind, type OwnerCapability } from "@magnitudedev/sdk"
-import { FolderPicker } from "./components/folder-picker"
+import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
 import { SettingsGroup, SettingsRow } from "./components/settings-row"
 import {
-  activeLocalModel, useAgentClient, type ApplicationPage, type HostNotice,
+  activeLocalModel, useAgentClient, type ApplicationPage,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
   formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory,
@@ -69,13 +69,14 @@ import { HarnessSetupList } from "./components/harness-setup"
 import { OtherApps } from "./components/other-apps"
 import { HuggingFaceLogo, LabLogo, ModelLogo, modelLab, modelLabs, type ModelLab } from "./components/model-logo"
 import { ModelsHeader } from "./components/models-header"
-import { AddModelDialog, type AddDialogRequest } from "./components/add-model-dialog"
+import { AddModelDialog, ggufOpenRequest, type AddDialogRequest } from "./components/add-model-dialog"
 import { DrafterPickerDialog } from "./components/drafter-list"
 import { CustomModelDetails, DrafterNotices, DrafterOffer, drafterUpdateAvailable } from "./components/custom-model-details"
 import { ModelRemoveAction } from "./components/model-remove-action"
-import { HiddenModels, SourceTag, UnsupportedModels } from "./components/local-model-lists"
-import { FoundModelsBanner, HuggingFaceLink, NoRecommendations } from "./components/discover-custom"
+import { SourceTag, UnsupportedModels } from "./components/local-model-lists"
+import { DiscoverSections, ModelsListing, acquiring, afterModelAdded, otherVersionsRequest, selectModels, type DiscoverRecommendationState } from "./components/models-page"
 import { ModelLocationsRow } from "./components/model-locations"
+import { HostNotices } from "./components/host-notices"
 
 const ALL_INTERFACES = "all"
 const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
@@ -124,9 +125,6 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false, 
     {content}
   </details>
 }
-/** A catalog or added model's download and the one-time optimization that follows it. */
-const acquiring = (acquisition: CustomModelAcquisitionState) =>
-  acquisition._tag === "Installing" || acquisition._tag === "Updating" || acquisition._tag === "Optimizing"
 const minutesRemaining = (seconds: number) => seconds < 60 ? "Less than 1 min" : `About ${Math.ceil(seconds / 60)} min`
 /** Tuning's time remaining from its observed rate; units are measured configurations, so they track time. */
 function useTuningEstimate(progress: ModelOptimizationProgress | null): string {
@@ -410,7 +408,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const stopResult = useLocalModelStopStatus()
   const hardware = useLocalInferenceHardware()
   const navigate = useNavigate()
-  const { unhide } = useLocalModelMutations()
+  const native = useNativeOpenPath()
   const [search, setSearch] = useState("")
   const filterOptions = installedOnly
     ? [{ value: "all", label: "All models" }, { value: "downloaded", label: "Downloaded" }, { value: "downloading", label: "Downloading" }, { value: "hidden", label: "Hidden" }]
@@ -446,26 +444,25 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const library = ordered.filter(model => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled"
     || !installedOnly && model.catalogData.support._tag === "Supported")
   const labOptions = modelLabs.filter(entry => library.some(model => modelLab(model) === entry))
-  const matchesLab = (model: LocalModel) => lab === null || modelLab(model) === lab
-  const selected: readonly LocalModel[] = filter === "hidden" ? hidden.filter(matchesLab) : library.filter(model => {
-    const acquisition = model.acquisitionState
-    const matchesFilter = filter === "all"
-      || filter === "fits" && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
-      || filter === "downloaded" && localModelIsInstalled(model)
-      || filter === "downloading" && acquiring(acquisition)
-    return matchesFilter && matchesLab(model)
-  })
-  const query = search.trim().toLowerCase()
-  const visible = selected.filter(model => `${formatLocalModelDisplayName(model)} ${model._tag === "Catalog" ? model.presentation.description : model.presentation.sourceLabel}`.toLowerCase().includes(query))
-  if (sort !== "recommended") visible.sort((a, b) => {
-    const byName = formatLocalModelDisplayName(a).localeCompare(formatLocalModelDisplayName(b), undefined, { numeric: true }) || a.modelId.localeCompare(b.modelId)
-    return sort === "smallest" ? a.storageBytes - b.storageBytes || byName : sort === "largest" ? b.storageBytes - a.storageBytes || byName : byName
-  })
+  const { selected, visible } = selectModels({ library, hidden, filter, lab, search, sort })
   const addFromHuggingFace = () => openDialog({ _tag: "Search", query: "" })
+  const addGgufFile = choosePath(native, ggufOpenRequest, path => openDialog({ _tag: "LocalFile", file: Option.some(path) }), () => openDialog({ _tag: "LocalFile", file: Option.none() }))
+  const stopFailure = Option.isSome(stopResult.failure) && <ErrorNotice title="Couldn’t stop the model" description={stopResult.failure.value} className="mt-5" />
+  const recommendationState: DiscoverRecommendationState = recommendationsPending ? "pending" : ranked.length > 0 ? "ranked" : Result.isSuccess(hardware) ? "none" : "unavailable"
+  const dialog = <AddModelDialog request={request} models={allModels} onClose={closeDialog} onAdded={afterModelAdded(closeDialog, navigate)} />
+  if (discover) return <>
+    <DiscoverSections hardware={<HardwareOverview />} found={custom} notice={stopFailure}
+      preference={<RecommendationPreference value={preference} onChange={setPreference} />}
+      recommendations={recommendationsPending
+        ? <RecommendationsSkeleton assessment={assessment} waitingForHardware={Result.isInitial(hardware)} />
+        : <Recommendations preference={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />}
+      state={recommendationState} onViewFound={() => navigate("models")} onAdd={addFromHuggingFace} onExplore={() => navigate("catalog")} />
+    {dialog}
+  </>
   return <>
-    {!discover && <ModelsHeader title={pageNames[page]} selectedCount={selected.length} matchingCount={visible.length} search={search} onSearch={setSearch}
+    <ModelsHeader title={pageNames[page]} selectedCount={selected.length} matchingCount={visible.length} search={search} onSearch={setSearch}
       action={installedOnly
-        ? <Button variant="outline" onClick={() => openDialog({ _tag: "LocalFile" })}><FilePlusIcon />Add GGUF file…</Button>
+        ? <Button variant="outline" onClick={addGgufFile}><FilePlusIcon />Add GGUF file…</Button>
         : <Button variant="outline" onClick={addFromHuggingFace}><HuggingFaceLogo />Add from Hugging Face</Button>}
       controls={<>
         <Select items={filterOptions} value={filter} onValueChange={value => { if (value !== null) setFilter(value) }}>
@@ -480,26 +477,16 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
           <SelectTrigger aria-label="Sort models"><span className="text-slate-500">Sort:</span><SelectValue /></SelectTrigger>
           <SelectContent>{sortOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
         </Select>
-      </>} />}
-    {discover && <HardwareOverview /> }
-    {discover && <FoundModelsBanner models={custom} onView={() => navigate("models")} />}
-    {Option.isSome(stopResult.failure) && <ErrorNotice title="Couldn’t stop the model" description={stopResult.failure.value} className="mt-5" />}
-    {discover && <RecommendationPreference value={preference} onChange={setPreference} />}
-    {!discover && assessment && !assessment.complete && <p className="mb-4 text-sm text-slate-500">Assessing models · {assessment.settledModels} of {assessment.totalModels}</p>}
-    {discover && (recommendationsPending
-      ? <RecommendationsSkeleton assessment={assessment} waitingForHardware={Result.isInitial(hardware)} />
-      : <Recommendations preference={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />)}
-    {discover && !recommendationsPending && ranked.length > 0 && <HuggingFaceLink onAdd={addFromHuggingFace} />}
-    {!discover && filter === "hidden" && <HiddenModels models={visible.filter((model): model is CustomLocalModel => model._tag === "Custom")} disabled={false} onUnhide={model => unhide(model.modelId)} />}
-    {!discover && filter !== "hidden" && <>
-    <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} models={allModels} showMemory={installedOnly} hardware={Result.value(hardware)}
-      {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})}
-      {...(page === "catalog" ? { onFindOtherVersions: () => openDialog({ _tag: "Search", query: model.presentation.displayName }) } : {})} />)}</div>
-    {visible.length === 0 && <p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
-    {installedOnly && <UnsupportedModels models={Result.isSuccess(unsupportedModels) ? unsupportedModels.value : []} />}
-    </>}
-    {discover && ranked.length === 0 && !recommendationsPending && Result.isSuccess(hardware) && <NoRecommendations onExplore={() => navigate("catalog")} onAdd={addFromHuggingFace} />}
-    <AddModelDialog request={request} models={allModels} onClose={closeDialog} onAdded={() => { closeDialog(); navigate("models") }} />
+      </>} />
+    {stopFailure}
+    {assessment && !assessment.complete && <p className="mb-4 text-sm text-slate-500">Assessing models · {assessment.settledModels} of {assessment.totalModels}</p>}
+    <ModelsListing filter={filter} models={visible}
+      card={model => <ModelCard key={model.modelId} model={model} models={allModels} showMemory={installedOnly} hardware={Result.value(hardware)}
+        {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})}
+        {...Option.match(otherVersionsRequest(page, model), { onNone: () => ({}), onSome: request => ({ onFindOtherVersions: () => openDialog(request) }) })} />}
+      empty={<p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
+      footer={installedOnly && <UnsupportedModels models={Result.isSuccess(unsupportedModels) ? unsupportedModels.value : []} />} />
+    {dialog}
   </>
 }
 function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; selectedModel: Option.Option<ProviderModelId> }) {
@@ -722,6 +709,8 @@ function ModelStorageRow() {
   const [choosing, setChoosing] = useState(false)
   const busy = saving.waiting
   const current = Result.isSuccess(settings) ? settings.value : null
+  const native = useNativeOpenPath()
+  const chooseFolder = choosePath(native, { kind: "folder", title: "Choose a folder for downloaded models", defaultPath: current ? Option.some(current.path) : Option.none() }, path => save({ path: Option.some(path) }), () => setChoosing(true))
   const failure = firstFailure([saving])
   const refusal = failure ? Option.flatMap(Cause.failureOption(failure.cause), error => error instanceof ServerSettingsFailed ? Option.some(error.message) : Option.none()) : Option.none<string>()
   return <>
@@ -732,7 +721,7 @@ function ModelStorageRow() {
       hint={current ? <span className="block truncate" title={current.path}>Current path is <span className="text-slate-700 dark:text-slate-300" data-testid="model-storage-path">{current.path}</span>{current.source === "Default" && " (default)"}</span>  : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="220px" /> : undefined}
       control={<>
         {(current?.source === "Configured" || (current && Option.isSome(current.warning))) && <Button size="sm" variant="ghost" disabled={busy} onClick={() => save({ path: Option.none() })}>Use default</Button>}
-        <Button size="sm" variant="outline" disabled={!current || busy} onClick={() => setChoosing(true)}><FolderOpenIcon />Change…</Button>
+        <Button size="sm" variant="outline" disabled={!current || busy} onClick={chooseFolder}><FolderOpenIcon />Change…</Button>
       </>} />
   </>
 }
@@ -938,17 +927,6 @@ function CannotReachMagnitude() {
     actions={<NoticeAction disabled={reconnecting.waiting} onClick={() => reconnect()}>Reconnect</NoticeAction>} />
 }
 /** Messages raised by Electron main while this window exists, such as a link that couldn't open. */
-function HostNotices() {
-  const session = useSession()
-  const notices = useAtomValue(session.notices)
-  const dismiss = useAtomSet(useMemo(() => Atom.fn((notice: HostNotice) => session.dismissNotice(notice)), [session]))
-  if (notices.length === 0) return null
-  return <div className="fixed bottom-4 left-4 z-50 flex w-96 max-w-[calc(100vw-2rem)] flex-col gap-2">
-    {notices.map((notice, index) => <div key={index} className="rounded-lg bg-white shadow-md dark:bg-slate-850">
-      <ErrorNotice title={notice.title} description={notice.description} actions={<NoticeAction onClick={() => dismiss(notice)}>Dismiss</NoticeAction>} />
-    </div>)}
-  </div>
-}
 /** Electron main couldn't confirm background work stopped while quitting; the user decides what happens next. */
 function QuitFailureDialog() {
   const session = useSession()

@@ -7,6 +7,14 @@ import { Schema } from "effect"
 export { ApplicationPage as Page, ModelTrayPresentation, HostAction as ApplicationAction, HostNotice } from "@magnitudedev/client-common/application/contracts"
 export class HostError extends Schema.TaggedError<HostError>()("HostError", { message: Schema.String }) {}
 const Unit = Schema.Struct({})
+export const OpenPathRequest = Schema.Struct({
+  kind: Schema.Literal("folder", "gguf"),
+  title: Schema.String,
+  defaultPath: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+})
+export type OpenPathRequest = typeof OpenPathRequest.Type
+export const OpenPathResult = Schema.Struct({ path: Schema.optionalWith(Schema.String, { as: "Option", exact: true }) })
+export const ChooseOpenPath = Rpc.make("ChooseOpenPath", { payload: OpenPathRequest, success: OpenPathResult, error: HostError }).pipe(atMostOnce)
 export const InferenceHostRpcs = RpcGroup.make(
   Rpc.make("Observe", { payload: Unit, success: ApplicationSnapshot, error: HostError, stream: true }),
   Rpc.make("Actions", { payload: Unit, success: ApplicationAction, error: HostError, stream: true }),
@@ -15,6 +23,7 @@ export const InferenceHostRpcs = RpcGroup.make(
   Rpc.make("SetAppearance", { payload: Schema.Struct({ preference: AppearancePreference }), success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("Retry", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("ResolveQuitFailure", { payload: Schema.Struct({ decision: QuitFailureDecision }), success: Unit, error: HostError }).pipe(atMostOnce),
+  ChooseOpenPath,
 )
 export type InferenceHostClient = RpcClient.FromGroup<typeof InferenceHostRpcs, RpcClientError.RpcClientError>
 export interface DesktopApi {
@@ -26,6 +35,7 @@ export interface DesktopApi {
   readonly setAppearance: (preference: AppearancePreference) => Promise<void>
   readonly retry: () => Promise<void>
   readonly resolveQuitFailure: (decision: QuitFailureDecision) => Promise<void>
+  readonly chooseOpenPath: (request: typeof OpenPathRequest.Encoded) => Promise<typeof OpenPathResult.Encoded>
 }
 
 export const DesktopRpcChannel = { request: "__magnitude:desktop-rpc:request", response: "__magnitude:desktop-rpc:response" } as const

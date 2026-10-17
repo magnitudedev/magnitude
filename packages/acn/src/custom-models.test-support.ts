@@ -63,7 +63,7 @@ export const customModelsConfig = (overrides: Record<string, unknown> = {}): Cus
         target: ["/models/imported.gguf"],
       },
     },
-    drafters: { [foundId]: { _tag: "Reference", reference: drafterReference } },
+    drafters: { [foundId]: { _tag: "Reference", reference: drafterReference, method: { _tag: "DFlash" } } },
     ...overrides,
   })
 

@@ -21,14 +21,14 @@ use magnitude_service_contracts::models::{
     CatalogInstallationOperation, CatalogInstallationOperationId, CatalogInstallationRemoval,
     CatalogInstallations, CatalogInstallationsResponse, CatalogModel, CatalogModelState,
     CatalogModels, CatalogModelsResponse, CustomModel, CustomModelOrigin, CustomModelState,
-    DrafterCandidatesRequest, DrafterCandidatesResponse, EffectiveModel, FoundSource, LocalModels,
-    DrafterPruning, LocalModelRemoval, LocalModelsConfiguration, LocalModelsResponse, ModelAssessment,
-    ModelAssessmentDomainSnapshot,
-    ModelAssessmentEntryState, ModelAssessmentSubject, ModelAssessments, ModelAssessmentsSnapshot,
-    ModelCandidate, ModelCandidates, ModelCapabilities, ModelDownload, ModelDownloadId,
-    ModelDownloads, ModelDownloadsResponse, ModelId, ModelInstance, ModelInstanceId,
-    ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadDevice, ModelLoadPlan,
-    ParsedModelId, ServableModelBundle, StartModelDownloadRequest, StartModelDownloadResponse,
+    DrafterCandidatesRequest, DrafterCandidatesResponse, DrafterPruning, EffectiveModel,
+    FoundSource, LocalModelRemoval, LocalModels, LocalModelsConfiguration, LocalModelsResponse,
+    ModelAssessment, ModelAssessmentDomainSnapshot, ModelAssessmentEntryState,
+    ModelAssessmentSubject, ModelAssessments, ModelAssessmentsSnapshot, ModelCandidate,
+    ModelCandidates, ModelCapabilities, ModelDownload, ModelDownloadId, ModelDownloads,
+    ModelDownloadsResponse, ModelId, ModelInstance, ModelInstanceId, ModelInstancesInvalidation,
+    ModelInstancesSnapshot, ModelLoadDevice, ModelLoadPlan, ParsedModelId, ServableModelBundle,
+    StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use magnitude_service_contracts::{
     ExecutionBackend, HardwareProvider, HardwareSnapshot, HuggingFaceModelCatalog,
@@ -321,7 +321,10 @@ pub fn app(state: AppState, serving: magnitude_serving::Serving) -> Router {
             "/api/v1/local-models/{model_id}/files",
             axum::routing::delete(remove_local_model_files),
         )
-        .route("/api/v1/local-models/drafters/prune", post(prune_local_drafters))
+        .route(
+            "/api/v1/local-models/drafters/prune",
+            post(prune_local_drafters),
+        )
         .route("/api/v1/candidates/inspect", post(inspect_model_candidate))
         .route("/api/v1/candidates/drafters", post(drafter_candidates))
         .route("/api/v1/candidates/bundle", post(candidate_bundle))
@@ -1243,7 +1246,9 @@ async fn remove_local_model_files(
     )
 )]
 #[tracing::instrument(name = "icn.local_models.prune_drafters", skip_all, err(Debug))]
-async fn prune_local_drafters(State(state): State<AppState>) -> Result<Json<DrafterPruning>, ApiError> {
+async fn prune_local_drafters(
+    State(state): State<AppState>,
+) -> Result<Json<DrafterPruning>, ApiError> {
     let result = local_models_domain(&state)?
         .prune_drafters()
         .await
@@ -2612,9 +2617,9 @@ mod tests {
     use magnitude_service_contracts::models::{
         CandidateFile, CandidateSource, CatalogInstallationAdmission, CatalogInstallationRemoval,
         CustomModelCatalogAttribution, CustomModelFile, DrafterCandidate, DrafterCategory,
-        DrafterLineage, DrafterReference, DrafterVerdict, ModelDomainInvalidation,
-        ModelDownloadState, ModelDownloadsInvalidation, ModelMetadata, ModelPackage,
-        ModelPackageId, ModelPackageProperties, ModelPackageSource, ReadyModel,
+        DrafterLineage, DrafterReference, DrafterVerdict, KnownUnsupportedReason,
+        ModelDomainInvalidation, ModelDownloadState, ModelDownloadsInvalidation, ModelMetadata,
+        ModelPackage, ModelPackageId, ModelPackageProperties, ModelPackageSource, ReadyModel,
         ResolvedModelInstallation, ServableModelBundle, ServingProfile, SpeculativeMethod,
         UnsupportedLocalModel, UnsupportedReason,
     };
@@ -2642,6 +2647,7 @@ mod tests {
             profile: ServingProfile {
                 context_length: 8192,
             },
+            update_commit: None,
             state: CustomModelState::Ready {
                 installation: ResolvedModelInstallation::Resolved {
                     installed_bytes: 100,
@@ -2696,9 +2702,11 @@ mod tests {
                         source: FoundSource::LmStudio,
                     },
                     path: "/lmstudio/deepseek.gguf".into(),
-                    reasons: vec![UnsupportedReason::Architecture {
-                        architecture: "deepseek4".to_owned(),
-                    }],
+                    reasons: vec![UnsupportedReason::Known(
+                        KnownUnsupportedReason::Architecture {
+                            architecture: "deepseek4".to_owned(),
+                        },
+                    )],
                     detail: "unsupported model family".to_owned(),
                 }],
             }
@@ -2815,6 +2823,7 @@ mod tests {
                         download_bytes: 100,
                         assessment: Some(fits_assessment()),
                         recommended: true,
+                        catalog_model: None,
                         on_this_computer: None,
                     }],
                     projector: None,

@@ -88,6 +88,11 @@ export const ModelCatalogLive: Layer.Layer<
     Stream.runForEach(() => changes.publish({ operation: Models.getCatalog._tag })),
     Effect.forkScoped,
   )
+  // A rescan follows a location becoming readable or disappearing, so its state is read again.
+  yield* local.changes.pipe(
+    Stream.runForEach(() => changes.publish({ operation: Models.listModelLocations._tag })),
+    Effect.forkScoped,
+  )
   return ModelCatalog.of({
     state: Effect.zipWith(providers.state, local.state, projectModelCatalog),
     changes: sourceChanges,

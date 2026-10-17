@@ -12,6 +12,13 @@ use crate::local_roots::is_partial_download;
 /// How long a location must be quiet before a change is reconciled.
 pub(crate) const WATCH_DEBOUNCE: Duration = Duration::from_millis(1_500);
 
+/// How often every enabled location is checked for becoming readable (after a permission change,
+/// say), so it is scanned as soon as it is, without a restart.
+pub(crate) const ROOT_RECHECK: Duration = Duration::from_secs(10);
+
+/// How often a location whose watch could not start is rescanned instead.
+pub(crate) const UNWATCHED_RESCAN: Duration = Duration::from_secs(60);
+
 /// One watch. `interest` is the configured path it stands for; events under an ancestor watched
 /// in place of a missing root count only on the way to that root.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -112,6 +119,7 @@ fn affected(event: &notify::Event, interests: &[PathBuf]) -> BTreeSet<PathBuf> {
 /// once the burst has settled. Dropping it stops watching.
 pub(crate) struct RootWatcher {
     targets: Vec<WatchTarget>,
+    unwatched: BTreeSet<PathBuf>,
     _watcher: notify::RecommendedWatcher,
     debounce: tokio::task::JoinHandle<()>,
 }
@@ -138,6 +146,7 @@ impl RootWatcher {
             })
             .inspect_err(|error| tracing::warn!(%error, "model location watcher could not start"))
             .ok()?;
+        let mut unwatched = BTreeSet::new();
         for target in &targets {
             let mode = if target.recursive {
                 RecursiveMode::Recursive
@@ -145,7 +154,12 @@ impl RootWatcher {
                 RecursiveMode::NonRecursive
             };
             if let Err(error) = watcher.watch(&target.path, mode) {
-                tracing::warn!(path = %target.path.display(), %error, "model location is not watched");
+                tracing::warn!(
+                    path = %target.path.display(),
+                    %error,
+                    "model location is not watched; it is rescanned periodically instead"
+                );
+                unwatched.insert(target.interest.clone());
             }
         }
         let debounce = runtime.spawn(async move {
@@ -162,6 +176,7 @@ impl RootWatcher {
         });
         Some(Self {
             targets,
+            unwatched,
             _watcher: watcher,
             debounce,
         })
@@ -169,6 +184,11 @@ impl RootWatcher {
 
     pub(crate) fn targets(&self) -> &[WatchTarget] {
         &self.targets
+    }
+
+    /// The configured paths whose watch could not start, which are rescanned periodically.
+    pub(crate) fn unwatched(&self) -> &BTreeSet<PathBuf> {
+        &self.unwatched
     }
 }
 

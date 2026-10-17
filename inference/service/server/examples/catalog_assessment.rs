@@ -92,6 +92,8 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
         required(&arguments, "--cache-root"),
     )?;
     config.catalog_models = release.catalog().models.clone();
+    config.architectures = magnitude_service_server::assessment::candidates::engine_architectures();
+    config.hub_token = std::env::var("HF_TOKEN").ok();
     let inventory = Arc::new(ManagedModelStore::open(config).await?);
     let resolver = ModelDomainResolver::new(inventory.clone(), release.catalog().clone());
     let downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()).await?);

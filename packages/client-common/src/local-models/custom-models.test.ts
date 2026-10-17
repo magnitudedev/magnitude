@@ -2,6 +2,7 @@ import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   CatalogFormModelIdSchema,
+  DrafterNotUsable,
   ModelVersionNotRunnable,
   UnsupportedReasonSchema,
   type CandidateVersion,
@@ -20,7 +21,7 @@ import {
   drafterCandidateSelectable,
   drafterCandidateWarning,
 } from "./drafter-presentation"
-import { modelVersionNotRunnableMessage, unsupportedReasonMessage, unsupportedReasonMessages } from "./failure-messages"
+import { drafterNotUsableMessage, modelVersionNotRunnableMessage, unsupportedReasonMessage, unsupportedReasonMessages } from "./failure-messages"
 import { noRunnableVersionReason } from "./candidate-versions"
 import {
   installedLocalModels,
@@ -45,6 +46,15 @@ describe("unsupported reasons in the UI", () => {
       version: "Q8_0",
       verdict: { _tag: "DoesNotFit", deficitBytes: 6 * 1024 ** 3 + 1 },
     }))).toBe("Q8_0 needs 6.1 GB more memory than this computer can provide.")
+  })
+
+  it("explains a refused drafter in the client's words, never the engine's detail", () => {
+    expect(drafterNotUsableMessage(new DrafterNotUsable({
+      reference: "z-lab/drafter:dflash.gguf",
+      reasons: [reason({ _tag: "TargetMismatch", detail: "hidden size 2048 != 4096" })],
+    }))).toBe("This drafter can't be used with this model: Its drafter wasn't built for this model.")
+    expect(drafterNotUsableMessage(new DrafterNotUsable({ reference: "x", reasons: [] })))
+      .toBe("This drafter can't be used with this model.")
   })
 
   it("words every known case as the product specifies", () => {
@@ -77,12 +87,14 @@ describe("unsupported reasons in the UI", () => {
     ])
   })
 
-  it("names every unsupported weight type and renders an unknown case generically", () => {
+  it("names every unsupported weight type and renders an unknown case with its detail", () => {
     expect(unsupportedReasonMessage(reason({
       _tag: "WeightTypes",
       types: [{ ggmlType: "Q2_K", tensorCount: 2 }, { ggmlType: "IQ1_M", tensorCount: 40 }, { ggmlType: "TQ1_0", tensorCount: 1 }],
     }))).toBe("Uses Q2_K, IQ1_M, and TQ1_0 weights, which Magnitude doesn't support yet")
     expect(unsupportedReasonMessage(reason({ _tag: "SlidingWindow", detail: "window 4096" })))
+      .toBe("Magnitude can't run this model (window 4096)")
+    expect(unsupportedReasonMessage(reason({ _tag: "SlidingWindow", detail: "" })))
       .toBe("Magnitude can't run this model")
   })
 
@@ -144,6 +156,7 @@ describe("drafter presentation", () => {
       downloadBytes: 3_680_000_000,
       assessment: Option.none(),
       recommended: true,
+      catalogModel: Option.none(),
       onThisComputer: Option.none(),
     } satisfies CandidateVersion
     const projector = Option.some({ path: "mmproj.gguf", sizeBytes: 670_000_000 })
@@ -182,6 +195,13 @@ describe("drafter presentation", () => {
       recommendedDrafter: Option.some(candidate({ onThisComputer: true })),
     })).pipe(Option.map(({ label }) => label))).toEqual(Option.some("Faster with a drafter · Add"))
     expect(customModelDrafterOffer(makeFoundModel())).toEqual(Option.none())
+  })
+
+  it("offers no drafter to a model whose drafter was turned off", () => {
+    expect(customModelDrafterOffer(makeFoundModel({
+      drafterChoice: { _tag: "None" },
+      recommendedDrafter: Option.some(candidate({})),
+    }))).toEqual(Option.none())
   })
 })
 

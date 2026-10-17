@@ -1,5 +1,5 @@
 import * as FileSystem from "@effect/platform/FileSystem"
-import { Context, Effect, Either, Layer, Option, Schedule, Schema } from "effect"
+import { Array as Arr, Context, Effect, Either, Layer, Option, Schedule, Schema, Stream } from "effect"
 import { dirname, basename, isAbsolute, normalize, sep } from "node:path"
 import {
   CandidateInspectionSchema,
@@ -7,6 +7,7 @@ import {
   CustomFormModelIdSchema,
   DirectoryAccessDenied,
   DirectoryNotFound,
+  DrafterNotUsable,
   HuggingFaceRepositoryIdSchema,
   HuggingFaceSearchResultSchema,
   InvalidDirectoryPath,
@@ -23,6 +24,7 @@ import {
   type CatalogFormModelId,
   type CustomFormModelId,
   type CustomLocalModel,
+  type AddedModel,
   type CustomModelMutationError,
   type DrafterCandidate,
   type DrafterChoice,
@@ -39,14 +41,17 @@ import {
   type ModelLocationKind,
 } from "@magnitudedev/acn-protocol"
 import {
+  bundlePackages,
   IcnCandidates,
   IcnDownloads,
   IcnLocalModels,
   IcnModelAssessments,
+  packageHoldsFile,
 } from "@magnitudedev/icn"
 import type * as Native from "@magnitudedev/icn-protocol/schemas"
 import type { GeneratedClientError } from "@magnitudedev/openapi-effect/client-runtime"
-import type { CustomModelDeclaration, CustomModelsConfig } from "@magnitudedev/storage"
+import type { CustomModelDeclaration, CustomModelsConfig, PersistedDrafterChoice } from "@magnitudedev/storage"
+import { CatalogModelSync } from "./catalog-model-sync"
 import { CustomModels } from "./custom-models"
 import { CustomModelReconciler } from "./custom-model-reconciler"
 import {
@@ -70,13 +75,6 @@ import { ModelLocations } from "./model-locations"
 import { drafterInput, parseModelReference, repositoryDisplayName } from "./model-references"
 import { productUnsupportedReasons } from "./unsupported-reasons"
 
-export interface AddedCustomModel {
-  readonly modelId: CustomFormModelId
-  readonly version: string
-  readonly drafter: Option.Option<DrafterCandidate>
-  readonly outcome: "Started" | "AlreadyOnThisComputer"
-  readonly drafterDownloadStarted: boolean
-}
 
 /** A drafter choice and whether choosing it started a drafter-only download. */
 export interface ChosenDrafter {
@@ -164,7 +162,7 @@ export interface CustomModelCommandsApi {
     readonly version: Option.Option<string>
     readonly drafter: DrafterChoice
     readonly force: boolean
-  }) => Effect.Effect<AddedCustomModel, CustomModelMutationError>
+  }) => Effect.Effect<AddedModel, CustomModelMutationError>
   readonly importModelFile: (path: string, drafter: DrafterChoice) => Effect.Effect<
     ChosenDrafter & { readonly modelId: CustomFormModelId; readonly outcome: "Started" | "AlreadyOnThisComputer" },
     CustomModelMutationError
@@ -284,14 +282,30 @@ export const interruptedByRestart = (model: CustomLocalModel): boolean =>
   (model.origin._tag === "Added" && model.acquisitionState._tag === "NotInstalled")
   || Option.exists(model.drafter, ({ availability }) => availability._tag === "DownloadFailed")
 
-/** The drafter choice persisted for a resolved candidate; nothing binding keeps Auto for ICN to resolve. */
-const persistedChoice = (requested: DrafterChoice, chosen: Option.Option<DrafterCandidate>): DrafterChoice =>
+/** A resolved candidate pinned with the method the engine binds it with; nothing binding keeps Auto. */
+const pinnedChoice = (requested: DrafterChoice, chosen: Option.Option<DrafterCandidate>): PersistedDrafterChoice =>
   requested._tag === "None"
-    ? requested
-    : Option.match(chosen, {
-        onNone: (): DrafterChoice => ({ _tag: "Auto" }),
-        onSome: ({ reference }): DrafterChoice => ({ _tag: "Reference", reference }),
+    ? { _tag: "None" }
+    : Option.match(Option.filter(chosen, ({ verdict }) => verdict._tag === "Bound"), {
+        onNone: (): PersistedDrafterChoice => ({ _tag: "Auto" }),
+        onSome: ({ reference, verdict }): PersistedDrafterChoice => verdict._tag === "Bound"
+          ? { _tag: "Reference", reference, method: verdict.method }
+          : { _tag: "Auto" },
       })
+
+/**
+ * The drafter choice persisted for a model: Auto stays Auto, as does picking the recommended drafter, so a
+ * later catalog drafter still applies; any other reference is pinned with its method.
+ */
+const persistedChoice = (
+  requested: DrafterChoice,
+  chosen: Option.Option<DrafterCandidate>,
+  recommended: Option.Option<DrafterReference>,
+): PersistedDrafterChoice => {
+  const recommendedPicked = requested._tag === "Reference" && Option.exists(recommended,
+    (reference) => drafterReferenceKey(reference) === drafterReferenceKey(requested.reference))
+  return requested._tag === "Auto" || recommendedPicked ? { _tag: "Auto" } : pinnedChoice(requested, chosen)
+}
 
 export const CustomModelCommandsLive: Layer.Layer<
   CustomModelCommands,
@@ -306,6 +320,7 @@ export const CustomModelCommandsLive: Layer.Layer<
   | CustomModelReconciler
   | DrafterMethods
   | ModelLocations
+  | CatalogModelSync
   | FileSystem.FileSystem
 > = Layer.scoped(CustomModelCommands, Effect.gen(function* () {
   const icn = yield* IcnCandidates
@@ -318,6 +333,7 @@ export const CustomModelCommandsLive: Layer.Layer<
   const reconciler = yield* CustomModelReconciler
   const methods = yield* DrafterMethods
   const locations = yield* ModelLocations
+  const catalogSync = yield* CatalogModelSync
   const fs = yield* FileSystem.FileSystem
 
   const environmentId = assessments.get.pipe(Effect.map(({ state }) => state.environmentId))
@@ -351,6 +367,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         downloadBytes: version.downloadBytes,
         assessment: Option.map(version.assessment, (assessment) => projectAssessment(environment, assessment)),
         recommended: version.recommended,
+        catalogModel: Option.flatMap(version.catalogModel, Schema.decodeUnknownOption(CatalogFormModelIdSchema)),
         onThisComputer: version.onThisComputer,
       }
     }))
@@ -372,9 +389,10 @@ export const CustomModelCommandsLive: Layer.Layer<
         : source._tag === "HuggingFace" ? repositoryDisplayName(source.repository) : basename(source.path),
       ...presentField("license", native.license),
       ...presentField("variantOf", native.variantOf),
-      versions: versions.map(({ assessment, onThisComputer, ...version }) => ({
+      versions: versions.map(({ assessment, catalogModel, onThisComputer, ...version }) => ({
         ...version,
         ...presentField("assessment", Option.map(assessment, (value) => Schema.encodeSync(LocalModelAssessmentSchema)(value))),
+        ...presentField("catalogModel", catalogModel),
         ...presentField("onThisComputer", onThisComputer),
       })),
       ...presentField("selectedVersion", Option.map(selected, ({ label }) => label)),
@@ -491,11 +509,9 @@ export const CustomModelCommandsLive: Layer.Layer<
       }),
     })
     if (candidate.verdict._tag !== "Bound") {
-      return yield* new InvalidModelReference({
+      return yield* new DrafterNotUsable({
         reference: key,
-        message: candidate.verdict._tag === "Rejected"
-          ? `This drafter can't be used with this model: ${candidate.verdict.detail}`
-          : "This drafter can't be used with this model.",
+        reasons: candidate.verdict._tag === "Rejected" ? candidate.verdict.reasons : [],
       })
     }
     return Option.some(candidate)
@@ -503,8 +519,10 @@ export const CustomModelCommandsLive: Layer.Layer<
 
   const candidateDrafter = (chosen: Option.Option<DrafterCandidate>) => Effect.gen(function* () {
     if (Option.isNone(chosen)) return Option.none<Native.CandidateDrafter>()
-    const { reference, verdict } = chosen.value
-    const method = verdict._tag === "Bound" ? Option.some(verdict.method) : yield* methods.get(reference)
+    const { reference, verdict, method: known } = chosen.value
+    const method = verdict._tag === "Bound"
+      ? Option.some(verdict.method)
+      : Option.isSome(known) ? known : yield* methods.get(reference)
     return Option.map(method, (value): Native.CandidateDrafter => ({
       method: value,
       reference: nativeDrafterReference(reference),
@@ -541,7 +559,164 @@ export const CustomModelCommandsLive: Layer.Layer<
     return true
   })
 
-  const persistDrafter = (modelId: CustomFormModelId, choice: DrafterChoice, declaration: Option.Option<CustomModelDeclaration>) =>
+  type AddedDeclaration = CustomModelDeclaration & { readonly origin: Extract<CustomModelDeclaration["origin"], { readonly _tag: "Added" }> }
+
+  /**
+   * An added model's version re-resolved at a newer commit: the same version, which its model ID
+   * names, with that commit's shards and projector, and a drafter from the same repository moved to
+   * that commit when it is still there.
+   */
+  const resolveAddedAt = (
+    modelId: CustomFormModelId,
+    declaration: AddedDeclaration,
+    commit: string,
+    chosen: Option.Option<DrafterCandidate>,
+  ) => Effect.gen(function* () {
+    const { repository } = declaration.origin
+    const native = yield* icn.inspect({ _tag: "HuggingFace", repository, revision: commit })
+      .pipe(Effect.mapError(candidateFailure(`${repository}@${commit}`)))
+    const version = native.versions.find((candidate) => candidate.modelId === modelId)
+    const target = version?.files.map(({ path }) => path) ?? []
+    if (!Arr.isNonEmptyReadonlyArray(target) || native.source._tag !== "HuggingFace") {
+      return yield* new LocalModelMutationFailed({
+        code: "custom_model_update_unavailable",
+        message: `${repository} no longer has this version at its newest commit.`,
+        retryable: false,
+      })
+    }
+    const source = { _tag: "HuggingFace" as const, repository, commit: native.source.commit }
+    const drafter = yield* Option.match(
+      Option.filter(chosen, ({ reference }) => reference._tag === "HuggingFace" && reference.repository === repository),
+      {
+        onNone: () => Effect.succeed(chosen),
+        // A drafter the new commit no longer has stays at the commit it was pinned to.
+        onSome: ({ reference }) => chooseDrafter(
+          { _tag: "Candidate", source, files: target },
+          { _tag: "Reference", reference: { ...reference, commit: source.commit } as DrafterReference },
+        ).pipe(Effect.orElseSucceed(() => chosen)),
+      },
+    )
+    const resolved: AddedDeclaration = {
+      origin: { _tag: "Added", repository, commit: source.commit, pendingCommit: Option.none() },
+      target,
+      projector: Option.map(native.projector, ({ path }) => path),
+    }
+    return { declaration: resolved, drafter }
+  })
+
+  /** The drafter a model fetches with its files: the attached one, else the persisted choice ICN has not bound yet. */
+  const drafterToFetch = (modelId: CustomFormModelId, config: CustomModelsConfig) => Effect.gen(function* () {
+    const attached = Option.flatMap(yield* rowFor(modelId), ({ drafter }) => drafter)
+    const configured = config.drafters[modelId]
+    const { catalogModels } = yield* sources.state
+    return Option.orElse(
+      Option.map(attached, (drafter): DrafterCandidate => ({
+        category: "Other", reference: drafter.reference, name: drafter.name, label: drafter.label,
+        sizeBytes: drafter.sizeBytes, lineage: "None", verdict: drafter.verdict, onThisComputer: false,
+        method: Option.none(),
+      })),
+      () => configured?._tag === "Reference" ? Option.some<DrafterCandidate>({
+        category: "Other", reference: configured.reference,
+        ...drafterReferenceNaming(configured.reference, catalogModels), sizeBytes: 0,
+        lineage: "None", verdict: { _tag: "None" }, onThisComputer: false, method: Option.some(configured.method),
+      }) : Option.none(),
+    )
+  })
+
+  /** Changes an added declaration still pending `commit`; a removed model or another update is left alone. */
+  const modifyPending = (
+    modelId: CustomFormModelId,
+    commit: string,
+    f: (declaration: AddedDeclaration, config: CustomModelsConfig) => CustomModelsConfig,
+  ) => customModels.modify((config) => {
+    const current = config.declarations[modelId]
+    const pending = current?.origin._tag === "Added" && Option.contains(current.origin.pendingCommit, commit)
+    return Effect.succeed([pending, pending ? f(current as AddedDeclaration, config) : config] as const)
+  })
+
+  /**
+   * Pins a downloaded update: the declaration takes the newer commit with its shards, projector and
+   * a moved same-repository drafter, so ICN serves the new copy and removes the one it replaced.
+   */
+  const finishUpdate = (modelId: CustomFormModelId, declaration: AddedDeclaration, commit: string) => Effect.gen(function* () {
+    const config = yield* customModels.get
+    const { declaration: pinned, drafter } = yield* resolveAddedAt(modelId, declaration, commit, yield* drafterToFetch(modelId, config))
+    const changed = yield* modifyPending(modelId, commit, (_, current) => {
+      const configured = current.drafters[modelId]
+      return {
+        ...current,
+        declarations: { ...current.declarations, [modelId]: pinned },
+        drafters: configured?._tag === "Reference"
+          ? { ...current.drafters, [modelId]: pinnedChoice(configured, drafter) }
+          : current.drafters,
+      }
+    })
+    if (changed) yield* settle
+  })
+
+  /** Abandons an update that was cancelled or failed: the model stays on its pinned commit and keeps serving. */
+  const abandonUpdate = (modelId: CustomFormModelId, commit: string) => modifyPending(modelId, commit, (declaration, config) => ({
+    ...config,
+    declarations: { ...config.declarations, [modelId]: { ...declaration, origin: { ...declaration.origin, pendingCommit: Option.none() } } },
+  }))
+
+  /**
+   * Fetches an added model's update at `commit` while it keeps serving its pinned commit, recording
+   * the commit as pending once the download is admitted. An update whose files are all here already
+   * is pinned at once.
+   */
+  const startUpdate = (modelId: CustomFormModelId, declaration: AddedDeclaration, commit: string) => Effect.gen(function* () {
+    const config = yield* customModels.get
+    const resolved = yield* resolveAddedAt(modelId, declaration, commit, yield* drafterToFetch(modelId, config))
+    const downloaded = Option.filter(resolved.drafter, ({ reference, onThisComputer }) => reference._tag === "Embedded" || !onThisComputer)
+    const bundle = yield* icn.bundle({
+      source: { _tag: "HuggingFace", repository: resolved.declaration.origin.repository, commit: resolved.declaration.origin.commit } as Native.CandidateSource,
+      target: [...resolved.declaration.target],
+      projector: Option.map(resolved.declaration.projector, (path) => ({ path, sizeBytes: 0 })),
+      drafter: yield* candidateDrafter(downloaded),
+    })
+    const download = yield* downloads.start(bundle, modelId)
+    yield* customModels.modify((current) => {
+      const latest = current.declarations[modelId]
+      return Effect.succeed([undefined, latest?.origin._tag !== "Added" ? current : {
+        ...current,
+        declarations: { ...current.declarations, [modelId]: { ...latest, origin: { ...latest.origin, pendingCommit: Option.some(commit) } } },
+      }] as const)
+    })
+    if (Option.isNone(download)) yield* finishUpdate(modelId, declaration, commit)
+  })
+
+  const pendingUpdateLock = yield* Effect.makeSemaphore(1)
+
+  /**
+   * Settles every pending update from its download: a finished one is pinned, a cancelled or failed one
+   * is abandoned, and one a restart left without a download is fetched again, keeping its bytes.
+   */
+  const settlePendingUpdates = pendingUpdateLock.withPermits(1)(Effect.gen(function* () {
+    const config = yield* customModels.get
+    const all = (yield* downloads.get).state.downloads
+    yield* Effect.forEach(Object.entries(config.declarations), ([id, declaration]) => {
+      if (declaration.origin._tag !== "Added" || Option.isNone(declaration.origin.pendingCommit)) return Effect.void
+      const modelId = id as CustomFormModelId
+      const added = declaration as AddedDeclaration
+      const commit = declaration.origin.pendingCommit.value
+      const { repository } = declaration.origin
+      const download = all.findLast((candidate) => Option.contains(candidate.forModel, modelId)
+        && bundlePackages(candidate.bundle).some((pkg) => packageHoldsFile(pkg, repository, commit, declaration.target[0])))
+      const step: Effect.Effect<unknown, unknown> = download === undefined
+        ? startUpdate(modelId, added, commit)
+        : downloadIsActive(download)
+          ? Effect.void
+          : download.state._tag === "Completed"
+            ? finishUpdate(modelId, added, commit)
+            : abandonUpdate(modelId, commit)
+      return step.pipe(Effect.catchAll((error) => Effect.logWarning(
+        `Unable to settle the update of ${modelId}: ${error instanceof Error ? error.message : String(error)}`,
+      )))
+    }, { discard: true })
+  }))
+
+  const persistDrafter = (modelId: CustomFormModelId, choice: PersistedDrafterChoice, declaration: Option.Option<CustomModelDeclaration>) =>
     customModels.modify((config) => Effect.succeed([undefined, {
       ...config,
       declarations: Option.match(declaration, {
@@ -554,7 +729,7 @@ export const CustomModelCommandsLive: Layer.Layer<
 
   const settle = reconciler.push.pipe(Effect.catchAll((error) => Effect.logWarning(error.message)))
 
-  /** After a model stops using a drafter, ICN deletes Magnitude's drafter packages no model uses. */
+  /** After a model is removed, ICN deletes Magnitude's drafter packages no model uses. */
   const pruneDrafters = localModels_.pruneDrafters.pipe(
     Effect.asVoid,
     Effect.catchAll((error) => Effect.logWarning(`Removing unused drafters failed: ${error.message}`)),
@@ -562,7 +737,7 @@ export const CustomModelCommandsLive: Layer.Layer<
 
   const toMutation = (cause: GeneratedClientError<unknown> | CustomModelMutationError): CustomModelMutationError =>
     cause._tag === "InvalidModelReference" || cause._tag === "ModelSourceUnavailable" || cause._tag === "LocalModelMutationFailed"
-      || cause._tag === "ModelVersionNotRunnable"
+      || cause._tag === "ModelVersionNotRunnable" || cause._tag === "DrafterNotUsable"
       ? cause
       : candidateFailure("model")(cause)
 
@@ -644,7 +819,11 @@ export const CustomModelCommandsLive: Layer.Layer<
         .pipe(Effect.mapError(candidateFailure(reference)))
       const inspection = yield* productInspection(native, { file: Option.none(), quant: version }, reference)
       if (Option.isSome(inspection.unsupportedArchitecture)) {
-        return yield* new InvalidModelReference({ reference, message: "Magnitude can't run this model's architecture." })
+        return yield* new ModelVersionNotRunnable({
+          reference,
+          version: Option.getOrElse(inspection.selectedVersion, () => repository),
+          verdict: { _tag: "Unsupported", reasons: inspection.unsupportedArchitecture.value },
+        })
       }
       const selected = inspection.versions.find(({ label }) => Option.contains(inspection.selectedVersion, label))
       if (selected === undefined) {
@@ -663,6 +842,21 @@ export const CustomModelCommandsLive: Layer.Layer<
       }
       const source = inspection.source
       if (source._tag !== "HuggingFace") return yield* new InvalidModelReference({ reference, message: "Not a Hugging Face repository." })
+      // A version that is exactly a catalog model is that model, with the catalog's drafter: install it, never declare it.
+      if (Option.isSome(selected.catalogModel)) {
+        const catalogModel = selected.catalogModel.value
+        if (drafter._tag !== "Auto") {
+          return yield* new InvalidModelReference({
+            reference,
+            message: `${reference} is the catalog model ${catalogModel}, which comes with its drafter.`,
+          })
+        }
+        if (yield* catalogSync.installed(catalogModel)) {
+          return { _tag: "Catalog" as const, modelId: catalogModel, version: selected.label, outcome: "AlreadyOnThisComputer" as const }
+        }
+        yield* catalogSync.sync(catalogModel)
+        return { _tag: "Catalog" as const, modelId: catalogModel, version: selected.label, outcome: "Started" as const }
+      }
       const existing = Option.flatMap(selected.onThisComputer, Schema.decodeUnknownOption(CustomFormModelIdSchema))
       const modelId = Option.getOrElse(existing, () => selected.modelId)
       const target: DrafterTarget = Option.isSome(existing)
@@ -672,16 +866,17 @@ export const CustomModelCommandsLive: Layer.Layer<
       const declaration: Option.Option<CustomModelDeclaration> = Option.isSome(existing)
         ? Option.none()
         : Option.some({
-            origin: { _tag: "Added", repository: source.repository, commit: source.commit },
+            origin: { _tag: "Added", repository: source.repository, commit: source.commit, pendingCommit: Option.none() },
             target: selected.files,
             projector: Option.map(inspection.projector, ({ path }) => path),
           })
-      yield* persistDrafter(modelId, persistedChoice(drafter, chosen), declaration)
+      yield* persistDrafter(modelId, pinnedChoice(drafter, chosen), declaration)
       yield* settle
       const drafterDownloadStarted = Option.isSome(declaration)
         ? yield* startAddedDownload(modelId, declaration.value, chosen).pipe(Effect.as(false))
         : yield* Option.match(chosen, { onNone: () => Effect.succeed(false), onSome: (value) => startDrafterOnly(modelId, target, value) })
       return {
+        _tag: "Custom" as const,
         modelId,
         version: selected.label,
         drafter: chosen,
@@ -701,10 +896,19 @@ export const CustomModelCommandsLive: Layer.Layer<
       const native = yield* icn.inspect({ _tag: "Local", path: parsed.path }).pipe(Effect.mapError(candidateFailure(reference)))
       const inspection = yield* productInspection(native, { file: Option.none(), quant: Option.none() }, reference)
       const version = inspection.versions[0]
-      if (version === undefined || Option.isSome(inspection.unsupportedArchitecture)
-        || Option.exists(version.assessment, ({ _tag }) => _tag === "Unsupported")) {
-        return yield* new InvalidModelReference({ reference, message: "Magnitude can't run this file." })
+      const assessment = version === undefined ? undefined : Option.getOrUndefined(version.assessment)
+      const unsupported = Option.orElse(
+        inspection.unsupportedArchitecture,
+        () => assessment?._tag === "Unsupported" ? Option.some(assessment.reasons) : Option.none(),
+      )
+      if (Option.isSome(unsupported)) {
+        return yield* new ModelVersionNotRunnable({
+          reference,
+          version: basename(parsed.path),
+          verdict: { _tag: "Unsupported", reasons: unsupported.value },
+        })
       }
+      if (version === undefined) return yield* new InvalidModelReference({ reference, message: "Magnitude can't run this file." })
       // The same bytes are one model: a file whose bytes are already a model on this computer is that model.
       const existing = Option.flatMap(version.onThisComputer, Schema.decodeUnknownOption(CustomFormModelIdSchema))
       const modelId = Option.getOrElse(existing, () => version.modelId)
@@ -716,6 +920,10 @@ export const CustomModelCommandsLive: Layer.Layer<
       const current = (yield* customModels.get).drafters[modelId]
       const requested = Option.isSome(existing) && drafter._tag === "Auto" && current !== undefined ? current : drafter
       const chosen = yield* chooseDrafter(target, requested)
+      const recommended = Option.flatMap(
+        Option.isSome(existing) ? yield* rowFor(modelId) : Option.none(),
+        ({ recommendedDrafter }) => Option.map(recommendedDrafter, ({ reference }) => reference),
+      )
       // A file without a Hugging Face identity is recorded where it is: a new model, or one more location of the
       // model that already has its bytes, which keeps that model's identity and origin. A file with a Hugging Face
       // identity is found where it is; only its drafter is recorded.
@@ -731,7 +939,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         declarations: declaration === undefined || config.declarations[version.modelId] !== undefined
           ? config.declarations
           : { ...config.declarations, [version.modelId]: declaration },
-        drafters: { ...config.drafters, [modelId]: persistedChoice(requested, chosen) },
+        drafters: { ...config.drafters, [modelId]: persistedChoice(requested, chosen, recommended) },
         hidden: config.hidden.filter((hidden) => hidden !== modelId),
       } satisfies CustomModelsConfig] as const))
       yield* settle
@@ -748,14 +956,17 @@ export const CustomModelCommandsLive: Layer.Layer<
     }).pipe(Effect.mapError(toMutation)),
 
     setModelDrafter: (modelId, drafter) => Effect.gen(function* () {
-      if (Option.isNone(yield* rowFor(modelId))) return yield* notFound(modelId)
+      const row = yield* rowFor(modelId)
+      if (Option.isNone(row)) return yield* notFound(modelId)
       const chosen = yield* chooseDrafter({ _tag: "Model", modelId }, drafter)
+      const recommended = Option.map(row.value.recommendedDrafter, ({ reference }) => reference)
       yield* customModels.modify((config) => Effect.succeed([undefined, {
         ...config,
-        drafters: { ...config.drafters, [modelId]: persistedChoice(drafter, chosen) },
+        drafters: { ...config.drafters, [modelId]: persistedChoice(drafter, chosen, recommended) },
       }] as const))
+      // Changing or turning off a drafter only changes the choice: the drafter stays on disk, so turning it back on
+      // downloads nothing. Unused drafters go when a model is removed.
       yield* settle
-      yield* pruneDrafters
       const drafterDownloadStarted = yield* Option.match(chosen, {
         onNone: () => Effect.succeed(false),
         onSome: (value) => startDrafterOnly(modelId, { _tag: "Model", modelId }, value),
@@ -871,7 +1082,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         () => configured?._tag === "Reference" ? Option.some<DrafterCandidate>({
           category: "Other", reference: configured.reference,
           ...drafterReferenceNaming(configured.reference, sourceState.catalogModels), sizeBytes: 0,
-          lineage: "None", verdict: { _tag: "None" }, onThisComputer: false, method: Option.none(),
+          lineage: "None", verdict: { _tag: "None" }, onThisComputer: false, method: Option.some(configured.method),
         }) : Option.none(),
       )
       const acquisition = Option.map(row, ({ acquisitionState }) => acquisitionState._tag)
@@ -881,6 +1092,15 @@ export const CustomModelCommandsLive: Layer.Layer<
       const current = { outcome: "AlreadyCurrent" as LocalModelSyncOutcome }
       if (targetMissing && declaration !== undefined) {
         return (yield* startAddedDownload(modelId, declaration, chosen)) ? { outcome: "Installing" as const } : current
+      }
+      const updateCommit = Option.flatMap(
+        Option.fromNullable(sourceState.customModels.find(({ id }) => id === modelId)),
+        ({ source }) => source.updateCommit,
+      )
+      if (declaration?.origin._tag === "Added" && Option.isSome(updateCommit) && !targetActive
+        && Option.exists(acquisition, (tag) => tag === "UpdateAvailable" || tag === "UpdateFailed")) {
+        yield* pendingUpdateLock.withPermits(1)(startUpdate(modelId, declaration as AddedDeclaration, updateCommit.value))
+        return { outcome: "Updating" as const }
       }
       const drafterUpdate = Option.exists(attached, ({ updateAvailable }) => updateAvailable)
       const drafterMissing = Option.exists(attached, ({ availability }) => availability._tag === "DownloadFailed")
@@ -924,6 +1144,10 @@ export const CustomModelCommandsLive: Layer.Layer<
     yield* Effect.forEach(interrupted, (model) => commands.sync(model.modelId as CustomFormModelId).pipe(
       Effect.catchAll((error) => Effect.logWarning(`Unable to resume the download of ${model.modelId}: ${error.message}`)),
     ), { discard: true })
+    // An update a restart interrupted resumes, one that finished or ended meanwhile settles, and from
+    // then on each update settles as its download changes.
+    yield* settlePendingUpdates
+    yield* Stream.merge(downloads.changes, customModels.changes).pipe(Stream.runForEach(() => settlePendingUpdates))
   }).pipe(Effect.forkScoped)
   return commands
 }))

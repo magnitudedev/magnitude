@@ -36,15 +36,19 @@ ModelId = hf:<owner>/<repository>/<repository-relative-GGUF-selector>
 Every other custom model uses:
 
 ```text
-ModelId = local:<header-digest>
+ModelId = local:<digest>
 ```
 
-The header digest is the lowercase hex SHA-256 of the primary GGUF's header bytes, through the
-aligned tensor-data offset. It is neither a package ID nor a full-file hash; external files are never
-hashed in full. The same bytes in two places are one model, and a moved file keeps its ID. A model
-with a Hugging Face identity (added, in the Hugging Face cache, in LM Studio's publisher/repository
-layout, a llama.cpp file name that parses to a repository, or an Ollama `hf.co/…` pull) uses its
-`hf:` ID wherever it is found.
+The digest is the lowercase hex SHA-256 over every shard's content sample, first shard first; a
+shard's sample covers its header bytes (through the aligned tensor-data offset), its length, and the
+first and last 1 MiB of its tensor data. Two files with the same header but different weights are
+two models, and no external file is ever hashed in full. It is neither a package ID nor a full-file
+hash. The same bytes in two places are one model (the grouping key and the ID are the same digest),
+and a moved file keeps its ID. A model with a Hugging Face identity (added, in the Hugging Face
+cache, in LM Studio's publisher/repository layout, or a llama.cpp file name that parses to a
+repository) uses its `hf:` ID wherever it is found. An Ollama model keeps its `local:` ID; its
+`hf.co/…` repository, and the repository file with its bytes, serve lineage and drafter matching
+only.
 
 Neither form names a drafter, revision, commit, path, or projector. The drafter of any model is
 configuration, as it is for catalog IDs. There is no `ModelVariantId`, `ModelTargetId`, catalog

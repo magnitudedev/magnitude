@@ -12,15 +12,14 @@ use futures_util::stream::BoxStream;
 use magnitude_artifacts::gguf::Encoding;
 use magnitude_service_contracts::models::{
     CandidateDrafter, CandidateFile, CandidateInspectionRequest, CandidateSource,
-    CatalogInstallationAdmission, CatalogInstallationRemoval, CatalogModels,
-    CatalogModelsResponse, CatalogSupport, CustomModel, CustomModelOrigin, CustomModelState,
-    DrafterCandidatesRequest, DrafterCategory, DrafterLineage, DrafterReference, DrafterVerdict,
-    HuggingFaceRepositoryId, LocalModelRemoval, LocalModels, LocalModelsConfiguration,
-    LocalModelsResponse, ModelAssessment, ModelCandidate, ModelCandidates,
-    ModelDomainInvalidation, ModelId, ModelParameterization, ModelReleaseDate,
-    ModelServingConfiguration, RecommendableModel, RecommendableModelCatalog,
-    ServableModelBundle, ServingProfile, SpeculativeDraftSource, SpeculativeMethod,
-    UnsupportedReason,
+    CatalogInstallationAdmission, CatalogInstallationRemoval, CatalogModels, CatalogModelsResponse,
+    CatalogSupport, CustomModel, CustomModelOrigin, CustomModelState, DrafterCandidatesRequest,
+    DrafterCategory, DrafterLineage, DrafterReference, DrafterVerdict, HuggingFaceRepositoryId,
+    KnownUnsupportedReason, LocalModelRemoval, LocalModels, LocalModelsConfiguration,
+    LocalModelsResponse, ModelAssessment, ModelCandidate, ModelCandidates, ModelDomainInvalidation,
+    ModelId, ModelParameterization, ModelReleaseDate, ModelServingConfiguration,
+    RecommendableModel, RecommendableModelCatalog, ServableModelBundle, ServingProfile,
+    SpeculativeDraftSource, SpeculativeMethod, UnsupportedReason,
 };
 use magnitude_service_contracts::{
     HuggingFaceRepositoryRequest, InventoryError, ModelPreviewSource,
@@ -82,7 +81,12 @@ impl Gguf {
 
     /// The encoded bytes of one metadata entry: its key, value type and value.
     fn entry(key: &str, value: &Meta) -> Vec<u8> {
-        fn array<T>(out: &mut Vec<u8>, element: u32, values: &[T], encode: impl Fn(&mut Vec<u8>, &T)) {
+        fn array<T>(
+            out: &mut Vec<u8>,
+            element: u32,
+            values: &[T],
+            encode: impl Fn(&mut Vec<u8>, &T),
+        ) {
             out.extend(9u32.to_le_bytes());
             out.extend(element.to_le_bytes());
             out.extend((values.len() as u64).to_le_bytes());
@@ -110,9 +114,15 @@ impl Gguf {
                 string(&mut out, value);
             }
             Meta::Strings(values) => array(&mut out, 8, values, |out, value| string(out, value)),
-            Meta::I32s(values) => array(&mut out, 5, values, |out, value| out.extend(value.to_le_bytes())),
-            Meta::U32s(values) => array(&mut out, 4, values, |out, value| out.extend(value.to_le_bytes())),
-            Meta::F32s(values) => array(&mut out, 6, values, |out, value| out.extend(value.to_le_bytes())),
+            Meta::I32s(values) => array(&mut out, 5, values, |out, value| {
+                out.extend(value.to_le_bytes())
+            }),
+            Meta::U32s(values) => array(&mut out, 4, values, |out, value| {
+                out.extend(value.to_le_bytes())
+            }),
+            Meta::F32s(values) => array(&mut out, 6, values, |out, value| {
+                out.extend(value.to_le_bytes())
+            }),
         }
         out
     }
@@ -282,7 +292,11 @@ fn dflash2() -> Gguf {
     gguf.set("dflash.selector_rank", Meta::U32(RANK as u32));
     gguf.set("dflash.selector_top_k", Meta::U32(4));
     for sublayer in ["attn", "ffn"] {
-        gguf.tensor(&format!("blk.0.{sublayer}_conv_base"), &[2, KERNEL, HIDDEN], Encoding::F32);
+        gguf.tensor(
+            &format!("blk.0.{sublayer}_conv_base"),
+            &[2, KERNEL, HIDDEN],
+            Encoding::F32,
+        );
         gguf.tensor(
             &format!("blk.0.{sublayer}_conv_proj.weight"),
             &[2 * KERNEL * (HIDDEN / GROUP), HIDDEN],
@@ -290,8 +304,16 @@ fn dflash2() -> Gguf {
         );
     }
     gguf.tensor("selector_hidden.weight", &[RANK, HIDDEN], Encoding::F32);
-    gguf.tensor("selector_predecessor.weight", &[VOCABULARY, RANK], Encoding::F32);
-    gguf.tensor("selector_successor.weight", &[VOCABULARY, RANK], Encoding::F32);
+    gguf.tensor(
+        "selector_predecessor.weight",
+        &[VOCABULARY, RANK],
+        Encoding::F32,
+    );
+    gguf.tensor(
+        "selector_successor.weight",
+        &[VOCABULARY, RANK],
+        Encoding::F32,
+    );
     gguf
 }
 
@@ -325,7 +347,10 @@ fn layout_tokenizer() -> Vec<(String, Meta)> {
         .collect::<Vec<_>>();
     vec![
         ("tokenizer.ggml.tokens".to_owned(), Meta::Strings(tokens)),
-        ("tokenizer.ggml.scores".to_owned(), Meta::F32s((0..VOCABULARY).map(|id| -(id as f32)).collect())),
+        (
+            "tokenizer.ggml.scores".to_owned(),
+            Meta::F32s((0..VOCABULARY).map(|id| -(id as f32)).collect()),
+        ),
         ("tokenizer.ggml.token_type".to_owned(), Meta::I32s(kinds)),
         ("tokenizer.ggml.merges".to_owned(), Meta::Strings(merges)),
     ]
@@ -373,23 +398,38 @@ fn layout_files() -> Vec<StubFile> {
     let mut bf16 = llama(32, Encoding::BF16);
     bf16.metadata.rotate_right(1);
     let bf16 = with_layout_tokenizer(bf16, 0, &[]);
-    let mut q8 = with_layout_tokenizer(llama(7, Encoding::Q8_0), 0, &["general.file_type", "tokenizer.chat_template"]);
-    q8.set("quantize.imatrix.file", Meta::Str("imatrix/imatrix.gguf".into()));
+    let mut q8 = with_layout_tokenizer(
+        llama(7, Encoding::Q8_0),
+        0,
+        &["general.file_type", "tokenizer.chat_template"],
+    );
+    q8.set(
+        "quantize.imatrix.file",
+        Meta::Str("imatrix/imatrix.gguf".into()),
+    );
     q8.set("quantize.imatrix.entries_count", Meta::U32(14));
     let mut q4 = with_layout_tokenizer(llama(15, Encoding::Q4K), 2, &["general.file_type"]);
-    q4.set("general.name", Meta::Str("Llama Layouts Abliterated Q4_K_M".into()));
+    q4.set(
+        "general.name",
+        Meta::Str("Llama Layouts Abliterated Q4_K_M".into()),
+    );
     let mut q2 = llama(10, Encoding::Q8_0);
     q2.encode_all(Encoding::Q8_0, Encoding::Q2K);
     q2.metadata.insert(
         2,
-        ("prism.hadamard.sign_values".to_owned(), Meta::I32s((0..40_000).collect())),
+        (
+            "prism.hadamard.sign_values".to_owned(),
+            Meta::I32s((0..40_000).collect()),
+        ),
     );
     let q2 = with_layout_tokenizer(q2, 0, &[]);
     let iq1 = with_layout_tokenizer(llama(29, Encoding::Q8_0), 0, &[]);
     let mut mtp = dflash(HIDDEN);
     mtp.metadata.extend(layout_tokenizer());
-    if let Some((_, Meta::I32s(kinds))) =
-        mtp.metadata.iter_mut().find(|(key, _)| key == "tokenizer.ggml.token_type")
+    if let Some((_, Meta::I32s(kinds))) = mtp
+        .metadata
+        .iter_mut()
+        .find(|(key, _)| key == "tokenizer.ggml.token_type")
     {
         kinds[3] = 1;
         kinds[VOCABULARY as usize - 10] = 4;
@@ -398,14 +438,19 @@ fn layout_files() -> Vec<StubFile> {
     let mut imatrix = Gguf::default();
     imatrix.set("general.type", Meta::Str("imatrix".into()));
     for block in 0..BLOCKS {
-        imatrix.tensor(&format!("blk.{block}.ffn_up.weight.in_sum2"), &[HIDDEN], Encoding::F32);
+        imatrix.tensor(
+            &format!("blk.{block}.ffn_up.weight.in_sum2"),
+            &[HIDDEN],
+            Encoding::F32,
+        );
     }
     let mut files = vec![
         StubFile::new("Llama-Layouts-BF16.gguf", &bf16),
         StubFile::new("Llama-Layouts-Q8_0.gguf", &q8),
         StubFile::new("Llama-Layouts-Q4_K_M.gguf", &q4),
         StubFile::new("Llama-Layouts-Q2_K.gguf", &q2),
-        StubFile::new("Llama-Layouts-IQ1_M.gguf", &iq1).with_tensor_type("blk.0.ffn_up.weight", 142),
+        StubFile::new("Llama-Layouts-IQ1_M.gguf", &iq1)
+            .with_tensor_type("blk.0.ffn_up.weight", 142),
         StubFile::new("MTP/mtp-Llama-Layouts.gguf", &mtp),
         StubFile::new("mmproj-F16.gguf", &projector()),
         StubFile::new("imatrix/imatrix.gguf", &imatrix),
@@ -533,7 +578,11 @@ impl StubHub {
                 range = Some(value.trim().to_owned());
             }
         }
-        let target = request_line.split_whitespace().nth(1).unwrap_or("/").to_owned();
+        let target = request_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("/")
+            .to_owned();
         let (path, query) = target.split_once('?').unwrap_or((&target, ""));
         let segments = path
             .trim_start_matches('/')
@@ -549,7 +598,12 @@ impl StubHub {
         let _ = connection.write_all(&body);
     }
 
-    fn route(&self, segments: &[String], query: &str, range: Option<&str>) -> (String, String, Vec<u8>) {
+    fn route(
+        &self,
+        segments: &[String],
+        query: &str,
+        range: Option<&str>,
+    ) -> (String, String, Vec<u8>) {
         let json = |value: serde_json::Value| {
             (
                 "200 OK".to_owned(),
@@ -618,7 +672,9 @@ impl StubHub {
                 let (start, end) = range
                     .and_then(|range| range.strip_prefix("bytes="))
                     .and_then(|range| range.split_once('-'))
-                    .map(|(start, end)| (start.parse::<u64>().unwrap(), end.parse::<u64>().unwrap()))
+                    .map(|(start, end)| {
+                        (start.parse::<u64>().unwrap(), end.parse::<u64>().unwrap())
+                    })
                     .unwrap_or((0, file.size_bytes - 1));
                 let body = (start..=end)
                     .map(|offset| file.header.get(offset as usize).copied().unwrap_or(0))
@@ -677,7 +733,8 @@ impl LocalModels for StubLocal {
 
     fn prune_drafters(
         &self,
-    ) -> BoxFuture<'_, Result<magnitude_service_contracts::models::DrafterPruning, InventoryError>> {
+    ) -> BoxFuture<'_, Result<magnitude_service_contracts::models::DrafterPruning, InventoryError>>
+    {
         Box::pin(async { Err(InventoryError::Unsupported("no drafters".to_owned())) })
     }
 
@@ -731,6 +788,7 @@ const LAYOUTS: &str = "layouts/Llama-Layouts-GGUF";
 const REJECTED: &str = "community/Llama-Rejected-GGUF";
 const PLAIN: &str = "community/Llama-Plain-GGUF";
 const LEGACY: &str = "community/Llama-Legacy-GGUF";
+const OTHER_SHAPE: &str = "other/Llama-Retokenized-GGUF";
 
 fn repository(seed: char, files: Vec<StubFile>, base_models: &[&str]) -> StubRepository {
     StubRepository {
@@ -750,11 +808,19 @@ fn hub() -> StubHub {
     let mut repositories = BTreeMap::new();
     repositories.insert(
         CATALOG_TARGET.to_owned(),
-        repository('a', vec![StubFile::new("llama-Q8_0.gguf", &q8)], &["base/Llama"]),
+        repository(
+            'a',
+            vec![StubFile::new("llama-Q8_0.gguf", &q8)],
+            &["base/Llama"],
+        ),
     );
     repositories.insert(
         CATALOG_DRAFT.to_owned(),
-        repository('b', vec![StubFile::new("dflash.gguf", &dflash(HIDDEN))], &["base/Llama"]),
+        repository(
+            'b',
+            vec![StubFile::new("dflash.gguf", &dflash(HIDDEN))],
+            &["base/Llama"],
+        ),
     );
     repositories.insert(
         COMMUNITY.to_owned(),
@@ -773,7 +839,11 @@ fn hub() -> StubHub {
     );
     repositories.insert(
         "community/Llama-Finetune".to_owned(),
-        repository('d', vec![StubFile::new("unused.gguf", &q8)], &["base/Llama"]),
+        repository(
+            'd',
+            vec![StubFile::new("unused.gguf", &q8)],
+            &["base/Llama"],
+        ),
     );
     repositories.insert(
         "vision/Llama-Vision-GGUF".to_owned(),
@@ -793,7 +863,11 @@ fn hub() -> StubHub {
     );
     repositories.insert(
         "unsloth/DeepSeek-V4-GGUF".to_owned(),
-        repository('f', vec![StubFile::new("deepseek-Q8_0.gguf", &deepseek)], &[]),
+        repository(
+            'f',
+            vec![StubFile::new("deepseek-Q8_0.gguf", &deepseek)],
+            &[],
+        ),
     );
     repositories.insert(
         SPECULATIVE.to_owned(),
@@ -821,23 +895,50 @@ fn hub() -> StubHub {
     );
     repositories.insert(
         PLAIN.to_owned(),
-        repository('3', vec![StubFile::new("llama-Q8_0.gguf", &q8)], &["community/Llama-Finetune"]),
+        repository(
+            '3',
+            vec![StubFile::new("llama-Q8_0.gguf", &q8)],
+            &["community/Llama-Finetune"],
+        ),
     );
     repositories.insert(
         LEGACY.to_owned(),
         repository(
             '4',
             vec![
-                StubFile::new("llama-Q4_0_4_4.gguf", &q8).with_tensor_type("blk.0.ffn_up.weight", 31),
+                StubFile::new("llama-Q4_0_4_4.gguf", &q8)
+                    .with_tensor_type("blk.0.ffn_up.weight", 31),
                 StubFile::new("llama-Q8_0.gguf", &q8),
             ],
             &[],
         ),
     );
     repositories.insert(LAYOUTS.to_owned(), repository('5', layout_files(), &[]));
+    // The same architecture with another vocabulary: another shape fingerprint.
+    let mut retokenized = llama(7, Encoding::Q8_0);
+    let mut other_tokens = tokens();
+    if let Some(last) = other_tokens.last_mut() {
+        last.push_str("-other");
+    }
+    retokenized.set("tokenizer.ggml.tokens", Meta::Strings(other_tokens));
+    repositories.insert(
+        OTHER_SHAPE.to_owned(),
+        repository(
+            '6',
+            vec![
+                StubFile::new("llama-Q8_0.gguf", &retokenized),
+                StubFile::new("dflash-narrow.gguf", &dflash(HIDDEN / 2)),
+            ],
+            &["base/Llama"],
+        ),
+    );
     repositories.insert(
         THIRD_PARTY.to_owned(),
-        repository('9', vec![StubFile::new("draft.gguf", &dflash(HIDDEN))], &["base/Llama"]),
+        repository(
+            '9',
+            vec![StubFile::new("draft.gguf", &dflash(HIDDEN))],
+            &["base/Llama"],
+        ),
     );
     let search_result = |id: &str, seed: char, architecture: &str, base_models: &[&str]| {
         serde_json::json!({
@@ -925,8 +1026,34 @@ async fn fixture(custom: Vec<CustomModel>) -> Fixture {
 }
 
 /// A fixture whose store has scanned the locations `local_models` names.
-async fn fixture_scanning(custom: Vec<CustomModel>, local_models: LocalModelsConfiguration) -> Fixture {
-    let (endpoint, hub) = hub().serve();
+async fn fixture_scanning(
+    custom: Vec<CustomModel>,
+    local_models: LocalModelsConfiguration,
+) -> Fixture {
+    fixture_with(custom, local_models, false, BTreeMap::new()).await
+}
+
+/// A fixture whose catalog lists, before Llama Test, "Other Llama": a retokenized Llama (another
+/// shape fingerprint) whose narrow DFlash drafter the engine rejects for Llama.
+async fn fixture_with_other_catalog_model() -> Fixture {
+    fixture_with(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        true,
+        BTreeMap::new(),
+    )
+    .await
+}
+
+async fn fixture_with(
+    custom: Vec<CustomModel>,
+    local_models: LocalModelsConfiguration,
+    other_catalog_model: bool,
+    extra_repositories: BTreeMap<String, StubRepository>,
+) -> Fixture {
+    let mut stub = hub();
+    stub.repositories.extend(extra_repositories);
+    let (endpoint, hub) = stub.serve();
     let directory = tempfile::tempdir().expect("temporary directory");
     let mut config = InventoryConfig::with_roots(
         directory.path().join("models"),
@@ -935,8 +1062,12 @@ async fn fixture_scanning(custom: Vec<CustomModel>, local_models: LocalModelsCon
     .expect("inventory config");
     config.hub_endpoint = Some(endpoint);
     config.local_models = local_models;
+    config.architectures = super::engine_architectures();
     let models = Arc::new(ManagedModelStore::open(config).await.expect("model store"));
-    models.ensure_model_inventory().await.expect("location scan");
+    models
+        .ensure_model_inventory()
+        .await
+        .expect("location scan");
     let target = hugging_face_package(&models, CATALOG_TARGET, "llama-Q8_0.gguf").await;
     let draft = hugging_face_package(&models, CATALOG_DRAFT, "dflash.gguf").await;
     let base = magnitude_service_contracts::models::CatalogBaseId::new("llama-test").unwrap();
@@ -970,6 +1101,21 @@ async fn fixture_scanning(custom: Vec<CustomModel>, local_models: LocalModelsCon
         }],
         diagnostics: Vec::new(),
     };
+    let mut catalog = catalog;
+    if other_catalog_model {
+        let mut other = catalog.models[0].clone();
+        other.model_id =
+            magnitude_service_contracts::models::CatalogBaseId::new("other-llama").unwrap();
+        other.display_name = "Other Llama".to_owned();
+        other.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+            target: hugging_face_package(&models, OTHER_SHAPE, "llama-Q8_0.gguf").await,
+            draft_source: SpeculativeDraftSource::Separate {
+                draft: hugging_face_package(&models, OTHER_SHAPE, "dflash-narrow.gguf").await,
+            },
+            method: SpeculativeMethod::DFlash,
+        };
+        catalog.models.insert(0, other);
+    }
     let lineage = CatalogLineage::new(Arc::clone(&models), catalog.clone());
     let resolver = ModelDomainResolver::new(Arc::clone(&models), catalog.clone());
     let assessor = Arc::new(ModelAssessor::new(
@@ -1071,7 +1217,7 @@ async fn inspection_groups_versions_and_reports_each_engine_verdict() {
     };
     assert!(matches!(
         reasons.as_slice(),
-        [UnsupportedReason::WeightTypes { types }] if types[0].ggml_type == "Q2_K"
+        [UnsupportedReason::Known(KnownUnsupportedReason::WeightTypes { types })] if types[0].ggml_type == "Q2_K"
     ));
     let recommended = inspection
         .versions
@@ -1085,7 +1231,10 @@ async fn inspection_groups_versions_and_reports_each_engine_verdict() {
         version(&inspection, "llama-Q8_0.gguf").on_this_computer,
         Some(on_disk.clone())
     );
-    assert_eq!(version(&inspection, "llama-Q4_K_M.gguf").on_this_computer, None);
+    assert_eq!(
+        version(&inspection, "llama-Q4_K_M.gguf").on_this_computer,
+        None
+    );
     assert_eq!(version(&inspection, "llama-Q8_0.gguf").model_id, on_disk);
     assert_eq!(
         version(&inspection, "llama-Q4_K_M.gguf").model_id.as_str(),
@@ -1099,11 +1248,16 @@ async fn a_local_file_is_identified_by_its_header_digest_unless_a_listed_model_h
     let (header, _) = llama(7, Encoding::Q8_0).bytes();
     let path = folder.path().join("model.gguf");
     std::fs::write(&path, header).unwrap();
-    let digest = magnitude_service_models::candidate_files::local_header_digest(&path).unwrap();
+    let digest =
+        magnitude_service_models::candidate_files::local_model_digest(&[path.clone()]).unwrap();
     let request = || CandidateInspectionRequest::Local { path: path.clone() };
 
     let unlisted = fixture(Vec::new()).await;
-    let inspection = unlisted.candidates.inspect(request()).await.expect("inspection");
+    let inspection = unlisted
+        .candidates
+        .inspect(request())
+        .await
+        .expect("inspection");
     let version = &inspection.versions[0];
     assert_eq!(version.model_id.as_str(), format!("local:{digest}"));
     assert_eq!(version.on_this_computer, None);
@@ -1121,7 +1275,11 @@ async fn a_local_file_is_identified_by_its_header_digest_unless_a_listed_model_h
         size_bytes: 0,
     }];
     let listed = fixture(vec![listed]).await;
-    let inspection = listed.candidates.inspect(request()).await.expect("inspection");
+    let inspection = listed
+        .candidates
+        .inspect(request())
+        .await
+        .expect("inspection");
     let version = &inspection.versions[0];
     assert_eq!(version.model_id, found);
     assert_eq!(version.on_this_computer, Some(found));
@@ -1131,7 +1289,9 @@ async fn a_local_file_is_identified_by_its_header_digest_unless_a_listed_model_h
 async fn a_copy_of_a_listed_model_elsewhere_is_already_on_this_computer_as_that_model() {
     let folder = tempfile::tempdir().expect("model folders");
     let (bytes, _) = llama(7, Encoding::Q8_0).bytes();
-    let found_path = folder.path().join("lmstudio/community/Llama-GGUF/llama-Q8_0.gguf");
+    let found_path = folder
+        .path()
+        .join("lmstudio/community/Llama-GGUF/llama-Q8_0.gguf");
     let copy = folder.path().join("Downloads/llama-copy.gguf");
     for path in [&found_path, &copy] {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1159,7 +1319,8 @@ async fn a_copy_of_a_listed_model_elsewhere_is_already_on_this_computer_as_that_
         Some(found),
         "the same bytes at another path are the model already listed"
     );
-    let digest = magnitude_service_models::candidate_files::local_header_digest(&copy).unwrap();
+    let digest =
+        magnitude_service_models::candidate_files::local_model_digest(&[copy.clone()]).unwrap();
     assert_eq!(
         inspection.versions[0].model_id.as_str(),
         format!("local:{digest}"),
@@ -1174,11 +1335,18 @@ async fn a_drafter_already_in_another_apps_folder_is_on_this_computer() {
     assert!(!candidates[0].on_this_computer, "{candidates:#?}");
 
     let lm_studio = tempfile::tempdir().expect("LM Studio folder");
-    let copy = lm_studio.path().join("someone/Mirror-GGUF/renamed-dflash.gguf");
+    let copy = lm_studio
+        .path()
+        .join("someone/Mirror-GGUF/renamed-dflash.gguf");
     std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
     let (header, length) = dflash(HIDDEN).bytes();
     std::fs::write(&copy, header).unwrap();
-    std::fs::OpenOptions::new().write(true).open(&copy).unwrap().set_len(length).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&copy)
+        .unwrap()
+        .set_len(length)
+        .unwrap();
     let fixture = fixture_scanning(
         Vec::new(),
         LocalModelsConfiguration {
@@ -1200,7 +1368,10 @@ async fn a_drafter_already_in_another_apps_folder_is_on_this_computer() {
     );
     let own = candidate_drafters(&fixture, COMMUNITY, 'c').await;
     assert_eq!(hugging_face_path(&own[0]), "dflash-draft.gguf");
-    assert!(own[0].on_this_computer, "a repository drafter's bytes elsewhere count too");
+    assert!(
+        own[0].on_this_computer,
+        "a repository drafter's bytes elsewhere count too"
+    );
     assert!(!own[1].on_this_computer, "a different drafter is not");
 
     use magnitude_service_models::CustomModelEnrichment as _;
@@ -1241,7 +1412,10 @@ async fn a_file_with_an_unknown_tensor_type_is_an_unreadable_version_not_a_faile
         panic!("the legacy file is unsupported: {:?}", legacy.assessment);
     };
     assert_eq!(profile, &None, "an unreadable file has no serving profile");
-    assert_eq!(reasons, &[UnsupportedReason::Unreadable]);
+    assert_eq!(
+        reasons,
+        &[UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)]
+    );
     assert!(detail.contains("unknown GGUF tensor type 31"), "{detail}");
     let encoded = serde_json::to_value(&legacy.assessment).expect("serialize");
     assert_eq!(encoded["_tag"], "Unsupported");
@@ -1271,7 +1445,8 @@ async fn a_symlinked_local_file_is_inspected_through_its_link_under_its_own_name
     std::fs::create_dir_all(&snapshot).unwrap();
     let link = snapshot.join("model-Q8_0.gguf");
     std::os::unix::fs::symlink("../../blobs/0123abcd", &link).unwrap();
-    let digest = magnitude_service_models::candidate_files::local_header_digest(&blob).unwrap();
+    let digest =
+        magnitude_service_models::candidate_files::local_model_digest(&[blob.clone()]).unwrap();
     let fixture = fixture(Vec::new()).await;
 
     for request in [link.clone(), snapshot.clone()] {
@@ -1309,12 +1484,15 @@ fn custom_model(model_id: ModelId, size_bytes: u64) -> CustomModel {
         profile: ServingProfile {
             context_length: 8192,
         },
+        update_commit: None,
         state: CustomModelState::Unavailable {
-            installation: magnitude_service_contracts::models::ResolvedModelInstallation::Resolved {
-                installed_bytes: size_bytes,
-                primary_path: PathBuf::from("/found/model.gguf"),
-                ownership: magnitude_service_contracts::models::ModelInstallationOwnership::External,
-            },
+            installation:
+                magnitude_service_contracts::models::ResolvedModelInstallation::Resolved {
+                    installed_bytes: size_bytes,
+                    primary_path: PathBuf::from("/found/model.gguf"),
+                    ownership:
+                        magnitude_service_contracts::models::ModelInstallationOwnership::External,
+                },
             failure: magnitude_service_contracts::models::ModelFailure {
                 code: "test".to_owned(),
                 message: "test".to_owned(),
@@ -1338,7 +1516,10 @@ async fn inspection_selects_the_smallest_projector_and_explains_unknown_architec
         .expect("vision inspection");
     assert_eq!(vision.versions.len(), 1);
     assert_eq!(
-        vision.projector.as_ref().map(|projector| projector.path.as_str()),
+        vision
+            .projector
+            .as_ref()
+            .map(|projector| projector.path.as_str()),
         Some("mmproj-F16.gguf")
     );
 
@@ -1353,11 +1534,23 @@ async fn inspection_selects_the_smallest_projector_and_explains_unknown_architec
         .expect("unsupported inspection");
     assert_eq!(
         deepseek.unsupported_architecture,
-        Some(vec![UnsupportedReason::Architecture {
-            architecture: "deepseek4".to_owned()
-        }])
+        Some(vec![UnsupportedReason::Known(
+            KnownUnsupportedReason::Architecture {
+                architecture: "deepseek4".to_owned()
+            }
+        )])
     );
-    assert!(deepseek.versions.iter().all(|version| version.assessment.is_none()));
+    assert!(
+        deepseek.versions.iter().all(|version| matches!(
+            &version.assessment,
+            Some(ModelAssessment::Unsupported { reasons, .. })
+                if reasons.contains(&UnsupportedReason::Known(KnownUnsupportedReason::Architecture {
+                    architecture: "deepseek4".to_owned()
+                }))
+        )),
+        "each version carries the engine's own reasons: {:?}",
+        deepseek.versions
+    );
 }
 
 /// The drafters offered for a Hugging Face candidate, with no explicit reference.
@@ -1439,7 +1632,7 @@ async fn a_drafter_in_the_model_repository_precedes_the_catalog_drafter() {
     assert!(matches!(
         &narrow.verdict,
         DrafterVerdict::Rejected { reasons, .. }
-            if matches!(reasons.as_slice(), [UnsupportedReason::TargetMismatch { .. }])
+            if matches!(reasons.as_slice(), [UnsupportedReason::Known(KnownUnsupportedReason::TargetMismatch { .. })])
     ));
     let catalog = &candidates[2];
     assert_eq!(
@@ -1459,7 +1652,10 @@ async fn a_drafter_in_the_model_repository_precedes_the_catalog_drafter() {
     assert_eq!(catalog.name, "Magnitude DFlash for Llama Test");
     assert_eq!(catalog.label, "Trained for Llama Test");
     assert_eq!(candidates[3].label, "Entered by you");
-    assert!(matches!(candidates[3].verdict, DrafterVerdict::Bound { .. }));
+    assert!(matches!(
+        candidates[3].verdict,
+        DrafterVerdict::Bound { .. }
+    ));
     assert_eq!(
         fixture.hub.drafter_searches.load(Ordering::SeqCst),
         0,
@@ -1478,10 +1674,22 @@ async fn repository_drafters_follow_the_method_order_at_any_path() {
     assert_eq!(
         listed,
         [
-            (DrafterCategory::NextToModel, Some(SpeculativeMethod::DFlash2)),
-            (DrafterCategory::NextToModel, Some(SpeculativeMethod::DSpark)),
-            (DrafterCategory::NextToModel, Some(SpeculativeMethod::DFlash)),
-            (DrafterCategory::CatalogDrafter, Some(SpeculativeMethod::DFlash)),
+            (
+                DrafterCategory::NextToModel,
+                Some(SpeculativeMethod::DFlash2)
+            ),
+            (
+                DrafterCategory::NextToModel,
+                Some(SpeculativeMethod::DSpark)
+            ),
+            (
+                DrafterCategory::NextToModel,
+                Some(SpeculativeMethod::DFlash)
+            ),
+            (
+                DrafterCategory::CatalogDrafter,
+                Some(SpeculativeMethod::DFlash)
+            ),
         ],
         "{candidates:#?}"
     );
@@ -1495,7 +1703,10 @@ async fn without_a_repository_drafter_the_catalog_drafter_is_preselected() {
     let fixture = fixture(Vec::new()).await;
     let candidates = candidate_drafters(&fixture, PLAIN, '3').await;
     assert_eq!(candidates.len(), 1, "{candidates:#?}");
-    assert_eq!(preselected(&candidates).category, DrafterCategory::CatalogDrafter);
+    assert_eq!(
+        preselected(&candidates).category,
+        DrafterCategory::CatalogDrafter
+    );
 
     let rejected = candidate_drafters(&fixture, REJECTED, '2').await;
     assert_eq!(
@@ -1503,9 +1714,15 @@ async fn without_a_repository_drafter_the_catalog_drafter_is_preselected() {
             .iter()
             .map(|candidate| candidate.category)
             .collect::<Vec<_>>(),
-        [DrafterCategory::NextToModel, DrafterCategory::CatalogDrafter]
+        [
+            DrafterCategory::NextToModel,
+            DrafterCategory::CatalogDrafter
+        ]
     );
-    assert!(matches!(rejected[0].verdict, DrafterVerdict::Rejected { .. }));
+    assert!(matches!(
+        rejected[0].verdict,
+        DrafterVerdict::Rejected { .. }
+    ));
     assert_eq!(
         preselected(&rejected).category,
         DrafterCategory::CatalogDrafter,
@@ -1518,7 +1735,8 @@ async fn without_a_repository_drafter_the_catalog_drafter_is_preselected() {
 async fn drafters_in_a_local_model_folder_precede_the_fingerprint_matched_catalog_drafter() {
     let fixture = fixture(Vec::new()).await;
     let folder = tempfile::tempdir().expect("model folder");
-    let write = |name: &str, gguf: &Gguf| std::fs::write(folder.path().join(name), gguf.bytes().0).unwrap();
+    let write =
+        |name: &str, gguf: &Gguf| std::fs::write(folder.path().join(name), gguf.bytes().0).unwrap();
     write("model.gguf", &llama(7, Encoding::Q8_0));
     write("dflash.gguf", &dflash(HIDDEN));
     write("dflash-narrow.gguf", &dflash(HIDDEN / 2));
@@ -1624,6 +1842,11 @@ async fn the_exact_catalog_target_and_a_catalog_model_use_only_the_catalog_draft
         .expect("drafter candidates")
         .candidates;
     assert_eq!(exact[0].lineage, DrafterLineage::Exact);
+    assert_eq!(
+        exact.len(),
+        1,
+        "an exact catalog target uses only its catalog drafter: {exact:#?}"
+    );
     let catalog = fixture
         .candidates
         .drafters(DrafterCandidatesRequest::Model {
@@ -1635,6 +1858,25 @@ async fn the_exact_catalog_target_and_a_catalog_model_use_only_the_catalog_draft
         .candidates;
     assert_eq!(catalog.len(), 1);
     assert_eq!(catalog[0].category, DrafterCategory::CatalogDrafter);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inspecting_a_catalog_repository_names_the_catalog_model_a_version_is() {
+    let fixture = fixture(Vec::new()).await;
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::HuggingFace {
+            repository: HuggingFaceRepositoryId::new(CATALOG_TARGET.to_owned()).unwrap(),
+            revision: commit('a'),
+        })
+        .await
+        .expect("inspection");
+    let version = version(&inspection, "llama-Q8_0.gguf");
+    assert_eq!(version.catalog_model.as_ref(), Some(&fixture.catalog_id));
+    assert_eq!(
+        version.on_this_computer, None,
+        "a catalog model not installed is not on this computer"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1652,9 +1894,16 @@ async fn a_repeated_inspection_reads_each_header_once_and_reports_download_sizes
     let requests = fixture.hub.header_requests.load(Ordering::SeqCst);
     let version = version(&first, "llama-Q8_0.gguf");
     let projector = first.projector.as_ref().expect("projector");
-    assert_eq!(version.download_bytes, version.size_bytes + projector.size_bytes);
+    assert_eq!(
+        version.download_bytes,
+        version.size_bytes + projector.size_bytes
+    );
 
-    let second = fixture.candidates.inspect(request).await.expect("cached inspection");
+    let second = fixture
+        .candidates
+        .inspect(request)
+        .await
+        .expect("cached inspection");
     assert_eq!(first, second);
     assert_eq!(
         fixture.hub.header_requests.load(Ordering::SeqCst),
@@ -1733,7 +1982,9 @@ async fn bundles_carry_the_exact_packages_a_rescan_produces() {
     assert_eq!(method, SpeculativeMethod::DFlash);
     assert_eq!(
         draft.id,
-        hugging_face_package(&fixture.models, CATALOG_DRAFT, "dflash.gguf").await.id
+        hugging_face_package(&fixture.models, CATALOG_DRAFT, "dflash.gguf")
+            .await
+            .id
     );
 
     let local = fixture
@@ -1771,7 +2022,9 @@ async fn the_recommended_drafter_of_a_catalog_model_is_its_catalog_drafter() {
 
 #[test]
 fn enrichment_answers_only_for_the_exact_target_it_was_computed_for() {
-    use magnitude_service_models::{CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts};
+    use magnitude_service_models::{
+        CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts,
+    };
     let enrichment = super::CandidateEnrichment::default();
     let model_id = ModelId::local(
         &magnitude_service_contracts::models::LocalModelDigest::new("a".repeat(64)).unwrap(),
@@ -1813,7 +2066,6 @@ fn enrichment_answers_only_for_the_exact_target_it_was_computed_for() {
         name: None,
         architecture: Some("llama"),
         base_models: &[],
-        embedded_mtp: false,
     };
     let (package_a, package_b) = (package("package_a"), package("package_b"));
     assert_eq!(enrichment.enrich(&facts(&package_a)), result);
@@ -1888,14 +2140,14 @@ async fn a_cold_inspection_reads_about_the_distinct_header_bytes_of_every_layout
         assert!(
             assessment.as_ref().is_some_and(|assessment| !matches!(
                 assessment,
-                ModelAssessment::Unsupported { reasons, .. } if reasons.contains(&UnsupportedReason::Unreadable)
+                ModelAssessment::Unsupported { reasons, .. } if reasons.contains(&UnsupportedReason::Known(KnownUnsupportedReason::Unreadable))
             )),
             "{file} is assessed from its exact header: {assessment:?}"
         );
     }
     assert!(matches!(
         &version(&inspection, "Llama-Layouts-IQ1_M.gguf").assessment,
-        Some(ModelAssessment::Unsupported { reasons, .. }) if reasons == &[UnsupportedReason::Unreadable]
+        Some(ModelAssessment::Unsupported { reasons, .. }) if reasons == &[UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)]
     ));
     assert!(
         served <= 2 * needed,
@@ -1928,4 +2180,546 @@ async fn a_cold_inspection_reads_about_the_distinct_header_bytes_of_every_layout
             });
         assert_eq!(digest, Some(expected), "{} is read exactly", file.path);
     }
+}
+
+fn write_complete(path: &std::path::Path, gguf: &Gguf) {
+    let (header, length) = gguf.bytes();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, header).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(length)
+        .unwrap();
+}
+
+/// llama.cpp keeps every repository's files flat in one root as `<owner>_<repository>_<file>`. A
+/// model whose repository's snapshot can't be read is offered only its own repository's flat
+/// drafters, never another repository's beside it; with the snapshot read, the repository's own
+/// drafter list replaces the folder entirely.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flat_llama_cpp_root_offers_only_the_models_own_repository_drafters() {
+    use magnitude_service_contracts::models::FoundSource;
+    let fixture = fixture(Vec::new()).await;
+    let root = tempfile::tempdir().expect("llama.cpp root");
+    let model = root.path().join("owner_Llama-GGUF_llama-Q8_0.gguf");
+    write_complete(&model, &llama(7, Encoding::Q8_0));
+    write_complete(
+        &root.path().join("owner_Llama-GGUF_dflash.gguf"),
+        &dflash(HIDDEN),
+    );
+    write_complete(
+        &root.path().join("other_Qwen-GGUF_dflash.gguf"),
+        &dflash(HIDDEN),
+    );
+    let found = CustomModelOrigin::Found {
+        source: FoundSource::LlamaCpp,
+    };
+
+    assert!(
+        super::drafter_folder(&found, Some("owner/Llama-GGUF"), true, Some(root.path())).is_none(),
+        "with its snapshot read, a known repository lists its own drafters, not the folder"
+    );
+    let added = CustomModelOrigin::Added {
+        repository: HuggingFaceRepositoryId::new("owner/Llama-GGUF".to_owned()).unwrap(),
+        commit: commit('a'),
+    };
+    assert!(
+        super::drafter_folder(&added, Some("owner/Llama-GGUF"), false, Some(root.path())).is_none()
+    );
+
+    let target = super::DrafterTarget {
+        material: fixture
+            .candidates
+            .local_target(model.clone(), None)
+            .expect("target material"),
+        repository: Some(("owner/Llama-GGUF".to_owned(), String::new())),
+        primary: None,
+        folder: super::drafter_folder(&found, Some("owner/Llama-GGUF"), false, Some(root.path())),
+        snapshot: None,
+        lineage: Default::default(),
+        catalog: None,
+    };
+    let offered = fixture.candidates.next_to_model(&target, None).await;
+    assert_eq!(
+        offered
+            .iter()
+            .map(|candidate| candidate.reference.clone())
+            .collect::<Vec<_>>(),
+        [DrafterReference::Local {
+            path: root.path().join("owner_Llama-GGUF_dflash.gguf")
+        }],
+        "{offered:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drafter_in_a_sibling_subfolder_is_not_in_this_folder() {
+    let fixture = fixture(Vec::new()).await;
+    let folder = tempfile::tempdir().expect("model folder");
+    write_complete(&folder.path().join("model.gguf"), &llama(7, Encoding::Q8_0));
+    write_complete(&folder.path().join("dflash.gguf"), &dflash(HIDDEN));
+    write_complete(&folder.path().join("other/dflash.gguf"), &dflash(HIDDEN));
+    let candidates = fixture
+        .candidates
+        .drafters(DrafterCandidatesRequest::Candidate {
+            candidate: ModelCandidate {
+                source: CandidateSource::Local {
+                    path: folder.path().to_path_buf(),
+                },
+                target: vec!["model.gguf".to_owned()],
+                projector: None,
+                drafter: None,
+            },
+            other: None,
+        })
+        .await
+        .expect("drafter candidates")
+        .candidates;
+    let local = candidates
+        .iter()
+        .filter(|candidate| candidate.category == DrafterCategory::NextToModel)
+        .map(|candidate| candidate.reference.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        local,
+        [DrafterReference::Local {
+            path: folder.path().join("dflash.gguf")
+        }]
+    );
+}
+
+/// A local Llama file whose header names `base` as its base model.
+fn local_llama_with_base(base: &str) -> (tempfile::TempDir, ModelCandidate) {
+    let folder = tempfile::tempdir().expect("model folder");
+    let mut gguf = llama(7, Encoding::Q8_0);
+    gguf.set("general.base_model.count", Meta::U32(1));
+    gguf.set(
+        "general.base_model.0.repo_url",
+        Meta::Str(format!("https://huggingface.co/{base}")),
+    );
+    write_complete(&folder.path().join("model.gguf"), &gguf);
+    let candidate = ModelCandidate {
+        source: CandidateSource::Local {
+            path: folder.path().to_path_buf(),
+        },
+        target: vec!["model.gguf".to_owned()],
+        projector: None,
+        drafter: None,
+    };
+    (folder, candidate)
+}
+
+async fn drafters_of(
+    fixture: &Fixture,
+    candidate: ModelCandidate,
+) -> Vec<magnitude_service_contracts::models::DrafterCandidate> {
+    fixture
+        .candidates
+        .drafters(DrafterCandidatesRequest::Candidate {
+            candidate,
+            other: None,
+        })
+        .await
+        .expect("drafter candidates")
+        .candidates
+}
+
+/// `general.base_model` drives the catalog match, and when two catalog models share the lineage
+/// the one whose shape fingerprint equals the target's wins over catalog order.
+#[tokio::test(flavor = "multi_thread")]
+async fn of_two_lineage_matches_the_one_with_the_targets_fingerprint_supplies_the_drafter() {
+    let fixture = fixture_with_other_catalog_model().await;
+    let (_folder, candidate) = local_llama_with_base("base/Llama");
+    let candidates = drafters_of(&fixture, candidate).await;
+    let catalog = candidates
+        .iter()
+        .filter(|candidate| candidate.category == DrafterCategory::CatalogDrafter)
+        .map(|candidate| (candidate.label.as_str(), candidate.lineage))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        catalog,
+        [("Trained for Llama Test", DrafterLineage::Lineage)],
+        "{candidates:#?}"
+    );
+}
+
+/// When the lineage-matched catalog model's drafter is rejected, the fingerprint-matched catalog
+/// model's drafter is offered and preselected.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_lineage_drafter_falls_back_to_the_fingerprint_matched_catalog_drafter() {
+    let fixture = fixture_with_other_catalog_model().await;
+    let (_folder, candidate) = local_llama_with_base(OTHER_SHAPE);
+    let candidates = drafters_of(&fixture, candidate).await;
+    let catalog = candidates
+        .iter()
+        .filter(|candidate| candidate.category == DrafterCategory::CatalogDrafter)
+        .map(|candidate| {
+            (
+                candidate.label.as_str(),
+                candidate.lineage,
+                is_bound(&candidate.verdict),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        catalog,
+        [
+            ("Trained for Other Llama", DrafterLineage::Lineage, false),
+            ("Trained for Llama Test", DrafterLineage::Fingerprint, true),
+        ],
+        "{candidates:#?}"
+    );
+    assert_eq!(
+        preselected(&candidates).reference,
+        DrafterReference::Catalog {
+            model_id: fixture.catalog_id.clone()
+        }
+    );
+}
+
+fn is_bound(verdict: &DrafterVerdict) -> bool {
+    matches!(verdict, DrafterVerdict::Bound { .. })
+}
+
+/// A listed model added at one commit is not the same version at another commit of its
+/// repository, even with the same Hub ID and file sizes; with no commit known, it still is.
+#[test]
+fn a_version_at_another_commit_is_not_the_added_model_at_its_own() {
+    use magnitude_service_models::candidate_files::{CandidateGguf, GgufGroup};
+    let model_id = ModelId::hugging_face(
+        &HuggingFaceRepositoryId::new(COMMUNITY.to_owned()).unwrap(),
+        &magnitude_service_contracts::models::HuggingFaceArtifactSelector::new(
+            "model.gguf".to_owned(),
+        )
+        .unwrap(),
+    );
+    let group = GgufGroup {
+        files: vec![CandidateGguf {
+            path: PathBuf::from("model.gguf"),
+            size_bytes: 100,
+        }],
+    };
+    let mut added = custom_model(model_id.clone(), 100);
+    added.origin = CustomModelOrigin::Added {
+        repository: HuggingFaceRepositoryId::new(COMMUNITY.to_owned()).unwrap(),
+        commit: commit('a'),
+    };
+    let at = |commit: &str, model: &CustomModel| {
+        super::on_this_computer(
+            std::slice::from_ref(model),
+            Some((&model_id, commit)),
+            &group,
+            &"0".repeat(64),
+            None,
+            None,
+        )
+    };
+    assert_eq!(at(&commit('a'), &added), Some(model_id.clone()));
+    assert_eq!(at(&commit('b'), &added), None);
+    let found = custom_model(model_id.clone(), 100);
+    assert_eq!(at(&commit('b'), &found), Some(model_id.clone()));
+}
+
+// Shared real-header fixtures ---------------------------------------------------------------
+
+/// One `inference/engine/fixtures/assessment` component.
+#[derive(serde::Deserialize, Clone)]
+struct FixtureComponent {
+    header: String,
+    repository: String,
+    revision: String,
+    path: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AssessmentFixture {
+    name: String,
+    target: Vec<FixtureComponent>,
+    draft: Option<FixtureComponent>,
+    expected: serde_json::Value,
+}
+
+/// The contract form of a reason in the engine's serde form: `"Unreadable"`, or
+/// `{ "WeightTypes": { "types": [{ "ggml_type": .. }] } }` with snake-case fields.
+fn contract_reason(engine: &serde_json::Value) -> serde_json::Value {
+    fn camel(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(fields) => fields
+                .iter()
+                .map(|(key, value)| {
+                    let mut parts = key.split('_');
+                    let first = parts.next().unwrap_or_default().to_owned();
+                    let key = parts.fold(first, |mut camel, part| {
+                        let mut chars = part.chars();
+                        if let Some(head) = chars.next() {
+                            camel.extend(head.to_uppercase());
+                            camel.push_str(chars.as_str());
+                        }
+                        camel
+                    });
+                    (key, camel(value))
+                })
+                .collect::<serde_json::Map<_, _>>()
+                .into(),
+            serde_json::Value::Array(values) => values.iter().map(camel).collect(),
+            other => other.clone(),
+        }
+    }
+    match engine {
+        serde_json::Value::String(tag) => serde_json::json!({ "_tag": tag }),
+        serde_json::Value::Object(variant) => {
+            let (tag, fields) = variant.iter().next().expect("one variant");
+            let mut reason = camel(fields).as_object().cloned().unwrap_or_default();
+            if tag == "KernelDomain"
+                && let Some(serde_json::Value::Array(statics)) = reason.get_mut("statics")
+            {
+                for entry in statics.iter_mut() {
+                    if let serde_json::Value::Array(pair) = entry.clone() {
+                        *entry = serde_json::json!({ "name": pair[0], "value": pair[1] });
+                    }
+                }
+            }
+            reason.insert("_tag".to_owned(), serde_json::json!(tag));
+            reason.into()
+        }
+        other => panic!("unexpected reason form {other}"),
+    }
+}
+
+/// Whether actual reasons are the expected ones: equal, except that a `TargetMismatch` detail
+/// only has to occur in the actual one.
+fn reasons_match(actual: &[UnsupportedReason], expected: &[serde_json::Value]) -> bool {
+    actual.len() == expected.len()
+        && actual.iter().zip(expected).all(|(actual, expected)| {
+            let actual = serde_json::to_value(actual).unwrap();
+            let expected = contract_reason(expected);
+            match (actual.get("_tag"), expected.get("detail")) {
+                (Some(tag), Some(detail)) if tag == "TargetMismatch" => {
+                    expected.get("_tag") == Some(tag)
+                        && actual["detail"]
+                            .as_str()
+                            .is_some_and(|actual| actual.contains(detail.as_str().unwrap()))
+                }
+                _ => actual == expected,
+            }
+        })
+}
+
+fn method_name(method: &SpeculativeMethod) -> String {
+    format!("{method:?}").to_lowercase()
+}
+
+/// The shared real-header fixtures, served from a stub Hugging Face hub and inspected through
+/// the service: every target's verdict and unsupported reasons, and each listed drafter's verdict
+/// (a separate draft's, or the built-in heads'), are the manifest's. Fingerprints are not compared:
+/// the fixtures' token strings are blanked.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_shared_real_header_fixtures_get_their_manifest_verdicts_through_the_service() {
+    use std::io::Read;
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/fixtures/assessment");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("manifest.json")).expect("manifest"))
+            .expect("manifest JSON");
+    let fixtures: Vec<AssessmentFixture> =
+        serde_json::from_value(manifest["fixtures"].clone()).expect("fixtures");
+
+    let mut repositories = BTreeMap::<String, StubRepository>::new();
+    for component in fixtures
+        .iter()
+        .flat_map(|fixture| fixture.target.iter().chain(fixture.draft.iter()))
+    {
+        let mut header = Vec::new();
+        flate2::read::GzDecoder::new(
+            std::fs::File::open(root.join(&component.header)).expect("fixture header"),
+        )
+        .read_to_end(&mut header)
+        .expect("gzipped header");
+        let directory = magnitude_artifacts::gguf::read_header(&header).expect("GGUF header");
+        let size_bytes = directory.data_offset
+            + directory
+                .tensors
+                .iter()
+                .map(|tensor| tensor.offset + tensor.nbytes)
+                .max()
+                .unwrap_or(0);
+        let repository = repositories
+            .entry(component.repository.clone())
+            .or_insert_with(|| StubRepository {
+                commit: component.revision.clone(),
+                files: Vec::new(),
+                card_base_models: Vec::new(),
+            });
+        assert_eq!(
+            repository.commit, component.revision,
+            "one commit per repository"
+        );
+        if !repository
+            .files
+            .iter()
+            .any(|file| file.path == component.path)
+        {
+            repository.files.push(StubFile {
+                path: component.path.clone(),
+                header,
+                size_bytes,
+            });
+        }
+    }
+    let fixture = fixture_with(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        repositories,
+    )
+    .await;
+
+    for case in &fixtures {
+        let primary = &case.target[0];
+        let inspection = fixture
+            .candidates
+            .inspect(CandidateInspectionRequest::HuggingFace {
+                repository: HuggingFaceRepositoryId::new(primary.repository.clone()).unwrap(),
+                revision: primary.revision.clone(),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{}: inspection failed: {error}", case.name));
+        let version = version(&inspection, &primary.path);
+        let assessment = version
+            .assessment
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}: no assessment", case.name));
+        match &case.expected["target"] {
+            serde_json::Value::String(supported) if supported == "supported" => assert!(
+                matches!(
+                    assessment,
+                    ModelAssessment::Fits { .. } | ModelAssessment::DoesNotFit { .. }
+                ),
+                "{}: {assessment:?}",
+                case.name
+            ),
+            expected => {
+                let expected = expected["unsupported"]
+                    .as_array()
+                    .expect("unsupported reasons");
+                let ModelAssessment::Unsupported { reasons, .. } = assessment else {
+                    panic!("{}: expected unsupported, got {assessment:?}", case.name);
+                };
+                assert!(
+                    reasons_match(reasons, expected),
+                    "{}: {reasons:?} != {expected:?}",
+                    case.name
+                );
+                continue;
+            }
+        }
+
+        let candidates = fixture
+            .candidates
+            .drafters(DrafterCandidatesRequest::Candidate {
+                candidate: ModelCandidate {
+                    source: CandidateSource::HuggingFace {
+                        repository: HuggingFaceRepositoryId::new(primary.repository.clone())
+                            .unwrap(),
+                        commit: primary.revision.clone(),
+                    },
+                    target: case
+                        .target
+                        .iter()
+                        .map(|component| component.path.clone())
+                        .collect(),
+                    projector: None,
+                    drafter: None,
+                },
+                other: case
+                    .draft
+                    .as_ref()
+                    .map(|draft| format!("{}@{}:{}", draft.repository, draft.revision, draft.path)),
+            })
+            .await
+            .unwrap_or_else(|error| panic!("{}: drafters failed: {error}", case.name))
+            .candidates;
+        let listed = match &case.draft {
+            Some(draft) => candidates.iter().find(|candidate| {
+                matches!(
+                    &candidate.reference,
+                    DrafterReference::HuggingFace { repository, path, .. }
+                        if repository.as_str() == draft.repository && *path == draft.path
+                )
+            }),
+            None => candidates
+                .iter()
+                .find(|candidate| candidate.category == DrafterCategory::BuiltIn),
+        };
+        match (&case.expected["drafter"], listed) {
+            (serde_json::Value::Null, None) => {}
+            (serde_json::Value::String(none), None) if none == "none" => {}
+            (expected, Some(candidate)) if expected.get("bound").is_some() => {
+                let DrafterVerdict::Bound { method, .. } = &candidate.verdict else {
+                    panic!("{}: expected bound, got {:?}", case.name, candidate.verdict);
+                };
+                assert_eq!(
+                    method_name(method),
+                    expected["bound"].as_str().unwrap(),
+                    "{}",
+                    case.name
+                );
+            }
+            (expected, Some(candidate)) if expected.get("rejected").is_some() => {
+                let DrafterVerdict::Rejected { reasons, .. } = &candidate.verdict else {
+                    panic!(
+                        "{}: expected rejected, got {:?}",
+                        case.name, candidate.verdict
+                    );
+                };
+                assert!(
+                    reasons_match(reasons, expected["rejected"].as_array().unwrap()),
+                    "{}: {reasons:?}",
+                    case.name
+                );
+            }
+            (expected, listed) => panic!("{}: expected {expected}, listed {listed:?}", case.name),
+        }
+    }
+}
+
+/// A repository whose base model is a finetune of the catalog model's base reaches the catalog
+/// model through two Hub lineage hops, and its catalog drafter is a lineage match.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_hop_hub_lineage_matches_the_catalog_drafter() {
+    let fixture = fixture(Vec::new()).await;
+    let candidates = candidate_drafters(&fixture, PLAIN, '3').await;
+    let catalog = candidates
+        .iter()
+        .find(|candidate| candidate.category == DrafterCategory::CatalogDrafter)
+        .expect("the catalog drafter");
+    assert_eq!(catalog.lineage, DrafterLineage::Lineage, "{candidates:#?}");
+}
+
+/// A drafter the user enters that shares no lineage with the model is labeled "Untested"; the
+/// engine's verdict alone decides whether it can be chosen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_entered_drafter_without_lineage_is_untested() {
+    let fixture = fixture(Vec::new()).await;
+    let drafters = tempfile::tempdir().expect("drafter folder");
+    let path = drafters.path().join("someone-dflash.gguf");
+    write_complete(&path, &dflash(HIDDEN));
+    let candidates = fixture
+        .candidates
+        .drafters(DrafterCandidatesRequest::Candidate {
+            candidate: hugging_face_candidate("vision/Llama-Vision-GGUF", 'e', "llama-Q8_0.gguf"),
+            other: Some(path.to_string_lossy().into_owned()),
+        })
+        .await
+        .expect("drafter candidates")
+        .candidates;
+    let entered = candidates
+        .iter()
+        .find(|candidate| candidate.category == DrafterCategory::Other)
+        .expect("the entered drafter");
+    assert_eq!(entered.lineage, DrafterLineage::None);
+    assert_eq!(entered.label, "Untested");
+    assert!(is_bound(&entered.verdict), "{:?}", entered.verdict);
 }

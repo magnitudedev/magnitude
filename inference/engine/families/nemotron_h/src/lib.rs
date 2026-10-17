@@ -111,7 +111,9 @@ impl fmt::Display for Error {
 impl error::Error for Error {}
 
 impl Error {
-    /// The unsupported features this error names.
+    /// The unsupported features this error names; a header missing what the
+    /// family needs, or whose values or layers contradict each other, is
+    /// `Unreadable`.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
             Self::UnknownMetadata(keys) => keys
@@ -126,7 +128,7 @@ impl Error {
             | Self::Metadata(_)
             | Self::Weight(_)
             | Self::Structure(_)
-            | Self::Definition(_) => Vec::new(),
+            | Self::Definition(_) => vec![UnsupportedReason::Unreadable],
         }
     }
 }

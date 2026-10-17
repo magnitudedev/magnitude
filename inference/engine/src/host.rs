@@ -90,9 +90,7 @@ impl AdmittedDefinition {
 
 /// Why a package's separate draft is not bound: the drafter family its
 /// `general.architecture` names could not interpret it against the target,
-/// or it names none. The target serves without it. A refusal naming no
-/// unsupported feature is a draft that does not fit its target
-/// ([`Self::unsupported`]).
+/// or it names none. The target serves without it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DraftUnavailable {
     /// A DFlash-family block drafter (`dflash`).
@@ -108,20 +106,14 @@ pub enum DraftUnavailable {
 impl DraftUnavailable {
     /// The refusal as the engine reports it for a drafter.
     pub fn unsupported(&self) -> UnsupportedModel {
-        let detail = self.to_string();
-        let mut reasons = match self {
+        let reasons = match self {
             Self::Block(error) => error.reasons(),
             Self::Assistant(error) | Self::PredictionHead(error) => error.reasons.clone(),
             Self::Architecture(architecture) => vec![UnsupportedReason::Architecture {
                 architecture: architecture.clone().unwrap_or_default(),
             }],
         };
-        if reasons.is_empty() {
-            reasons.push(UnsupportedReason::TargetMismatch {
-                detail: detail.clone(),
-            });
-        }
-        UnsupportedModel::new(reasons, detail)
+        UnsupportedModel::new(reasons, self.to_string())
     }
 }
 
@@ -235,7 +227,8 @@ impl HostArtifacts {
         let mut definition = declared.clone();
         definition.decoder.context_limit =
             resolve_served_context(served_context, declared.decoder.context_limit)?;
-        let unsupported = |detail: String| ResolveError::Unsupported(UnsupportedModel::invalid(detail));
+        let unsupported =
+            |detail: String| ResolveError::Unsupported(UnsupportedModel::unreadable(detail));
         if let Some(launch_rows) = launch_rows {
             let cells = image_cell_limit(&definition, launch_rows)
                 .map_err(|error| unsupported(error.to_string()))?;
@@ -407,13 +400,21 @@ impl HostArtifacts {
 /// A tokenizer whose vocabulary is not the model's: the package's tokenizer
 /// scheme is one this model cannot use.
 pub(crate) fn vocabulary_mismatch(payload: &TokenizerPayload) -> UnsupportedModel {
+    tokenizer_refusal(payload, "tokenizer vocabulary differs from model vocabulary")
+}
+
+/// The package's tokenizer scheme, refused for `detail`.
+pub(crate) fn tokenizer_refusal(
+    payload: &TokenizerPayload,
+    detail: impl Into<String>,
+) -> UnsupportedModel {
     let text = |key: &str| payload.value(key).and_then(Value::string).map(str::to_owned);
     UnsupportedModel::reason(
         UnsupportedReason::Tokenizer {
             model: text("tokenizer.ggml.model").unwrap_or_default(),
             pre: text("tokenizer.ggml.pre"),
         },
-        "tokenizer vocabulary differs from model vocabulary",
+        detail,
     )
 }
 
@@ -560,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_refusals_name_their_reasons_and_otherwise_a_target_mismatch() {
+    fn draft_refusals_name_their_reasons() {
         use magnitude_family_dflash::Error;
         let reasons = |unavailable: DraftUnavailable| unavailable.unsupported().reasons;
         assert_eq!(
@@ -585,7 +586,6 @@ mod tests {
             Error::Target("draft width 1024 differs from the target's 2048".into()),
             Error::Geometry("draft taps no target layer".into()),
             Error::MissingCausality,
-            Error::MissingWeight("fc.weight".into()),
         ] {
             let expected = error.to_string();
             let reasons = reasons(DraftUnavailable::Block(error));
@@ -598,11 +598,15 @@ mod tests {
             );
         }
         assert_eq!(
-            reasons(DraftUnavailable::PredictionHead(FamilyError::invalid(
+            reasons(DraftUnavailable::Block(Error::MissingWeight("fc.weight".into()))),
+            [UnsupportedReason::Unreadable]
+        );
+        assert_eq!(
+            reasons(DraftUnavailable::PredictionHead(FamilyError::mismatch(
                 "not a head of this target"
             ))),
             [UnsupportedReason::TargetMismatch {
-                detail: "prediction head: not a head of this target".into()
+                detail: "not a head of this target".into()
             }]
         );
     }

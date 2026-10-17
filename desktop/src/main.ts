@@ -47,6 +47,7 @@ import { type ApplicationSnapshot, type OwnedServiceState } from "@magnitudedev/
 import { HostError, ApplicationAction, InferenceHostRpcs, ModelTrayPresentation, type HostNotice, type Page } from "./desktop-rpc"
 import type { QuitFailureDecision } from "@magnitudedev/client-common/application/contracts"
 import { makeElectronRpcServerLayer } from "./electron-rpc"
+import { chooseOpenPath } from "./open-dialog"
 import { resolveHarnessEnvironment } from "@magnitudedev/harness-connections"
 import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { MAGNITUDE_VERSION } from "@magnitudedev/version"
@@ -414,6 +415,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     Retry: () => service.retry.pipe(Effect.as({})),
     ResolveQuitFailure: ({ decision }) => Ref.getAndSet(pendingQuitDecision, Option.none()).pipe(
       Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: pending => Deferred.succeed(pending, decision) })), Effect.as({})),
+    ChooseOpenPath: chooseOpenPath(options => dialog.showOpenDialog(window, options)),
   })
   yield* RpcServer.layer(InferenceHostRpcs).pipe(Layer.provide(handlers), Layer.provide(makeElectronRpcServerLayer(ipcMain)), Layer.build)
   window = yield* Effect.acquireRelease(Effect.sync(() => {

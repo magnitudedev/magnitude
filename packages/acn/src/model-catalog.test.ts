@@ -1,4 +1,4 @@
-import { Option } from "effect"
+import { Effect, Layer, Option, PubSub, Ref, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   PRIMARY_SLOT_ID,
@@ -8,7 +8,11 @@ import {
 } from "@magnitudedev/acn-protocol"
 import { ProviderIdSchema, ProviderModelIdSchema } from "@magnitudedev/providers/client"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
-import { projectModelCatalog } from "./model-catalog"
+import { Models } from "@magnitudedev/acn-protocol"
+import { AcnChanges, type AcnChangesApi } from "./changes"
+import { LocalModels } from "./local-models"
+import { ModelCatalog, ModelCatalogLive, projectModelCatalog } from "./model-catalog"
+import { ProviderModelCatalog } from "./provider-model-catalog"
 
 const remoteProviderId = ProviderIdSchema.make("remote-test")
 
@@ -117,5 +121,37 @@ describe("ACN model catalog projection", () => {
     if (result._tag !== "Refreshing") return
     expect(result.models).toHaveLength(1)
     expect(result.failures).toEqual([])
+  })
+})
+
+describe("model catalog changes", () => {
+  it("asks clients to reread model locations after every local model change", async () => {
+    const operations = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const localChanges = yield* PubSub.unbounded<void>()
+      const published = yield* Ref.make<readonly Parameters<AcnChangesApi["publish"]>[0][]>([])
+      const layer = ModelCatalogLive.pipe(Layer.provide(Layer.mergeAll(
+        Layer.succeed(ProviderModelCatalog, ProviderModelCatalog.of({
+          state: Effect.succeed({ providers: [], models: [] } as unknown as ProviderModelCatalogState),
+          changes: Stream.never,
+          refresh: () => Effect.void,
+        })),
+        Layer.succeed(LocalModels, LocalModels.of({
+          state: Effect.succeed(local()),
+          changes: Stream.fromPubSub(localChanges),
+          refresh: Effect.void,
+        })),
+        Layer.succeed(AcnChanges, AcnChanges.of({
+          publish: (change) => Ref.update(published, (all) => [...all, change]),
+          stream: Stream.never,
+        })),
+      )))
+      yield* Layer.build(layer)
+      yield* Effect.sleep("20 millis")
+      yield* PubSub.publish(localChanges, undefined)
+      yield* Effect.sleep("20 millis")
+      return (yield* Ref.get(published)).map((change) => change.operation)
+    })))
+    expect(operations).toContain(Models.listModelLocations._tag)
+    expect(operations).toContain(Models.getCatalog._tag)
   })
 })

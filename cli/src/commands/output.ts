@@ -1,7 +1,12 @@
 import { Cause, Data, Effect, Schema, type ParseResult } from "effect"
 import stringWidth from "string-width"
+import { drafterNotUsableMessage, modelVersionNotRunnableMessage } from "@magnitudedev/client-common"
+import { DrafterNotUsable, ModelVersionNotRunnable } from "@magnitudedev/sdk"
 
+/** A failure's product message; refusals the service states as facts are worded here, as on the desktop. */
 const messageOf = (error: unknown): string => {
+  if (error instanceof ModelVersionNotRunnable) return modelVersionNotRunnableMessage(error)
+  if (error instanceof DrafterNotUsable) return drafterNotUsableMessage(error)
   if (typeof error === "object" && error !== null) {
     const candidate = error as { readonly message?: unknown; readonly reason?: unknown }
     if (Object.hasOwn(candidate, "message") && typeof candidate.message === "string") return candidate.message
@@ -50,11 +55,14 @@ export interface JsonOption {
 export const asJson = <A>(options: JsonOption, document: JsonDocument<A>): JsonDocument<A> | undefined =>
   options.json === true ? document : undefined
 
-export const runCommand = <A>(options: {
+export interface CommandOptions<A> {
   readonly effect: Effect.Effect<A, unknown, never>
   readonly render: (result: A) => string
   readonly json?: JsonDocument<A>
-}): Promise<void> => Effect.runPromise(options.effect.pipe(
+}
+
+/** A command as one Effect: run it, print its text or JSON document, or print its error and set a nonzero exit. */
+export const commandEffect = <A>(options: CommandOptions<A>): Effect.Effect<void> => options.effect.pipe(
   Effect.flatMap((result) => options.json === undefined
     ? Effect.succeed(options.render(result))
     : options.json.encode(result).pipe(Effect.map((document) => `${JSON.stringify(document, null, 2)}\n`))),
@@ -67,7 +75,9 @@ export const runCommand = <A>(options: {
     process.exitCode = 1
   })),
   Effect.asVoid,
-))
+)
+
+export const runCommand = <A>(options: CommandOptions<A>): Promise<void> => Effect.runPromise(commandEffect(options))
 
 export const ensureTrailingNewline = (value: string): string =>
   `${value.replace(/\n+$/, "")}\n`

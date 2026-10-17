@@ -330,7 +330,9 @@ pub fn prepare_model_assessment(
         };
     let drafted = match &admitted.drafter {
         DrafterAdmission::None => Err(DrafterVerdict::None),
-        DrafterAdmission::Rejected(unsupported) => Err(rejected(unsupported.clone())),
+        DrafterAdmission::Rejected(unsupported) => {
+            Err(DrafterVerdict::Rejected(unsupported.clone()))
+        }
         DrafterAdmission::Candidate { definition, method } => environment
             .drafted(&admitted, definition, *method)
             .and_then(|(manifest, method)| {
@@ -338,11 +340,11 @@ pub fn prepare_model_assessment(
                     Ok((draft, execution)) => Ok((method, draft, execution)),
                     Err(Refusal::Unsupported(unsupported)) => Err(unsupported),
                     Err(Refusal::Failed(error)) => {
-                        Err(UnsupportedModel::invalid(error.to_string()))
+                        Err(UnsupportedModel::mismatch(error.to_string()))
                     }
                 }
             })
-            .map_err(rejected),
+            .map_err(DrafterVerdict::Rejected),
     };
     let (drafter, draft, execution) = match drafted {
         Ok((method, draft, execution)) => {
@@ -412,14 +414,12 @@ pub fn kernel_inventory(
             .drafted(&admitted, definition, *method)
             .and_then(|(manifest, _)| {
                 inventory(&manifest, backend)
-                    .unwrap_or_else(|error| Err(UnsupportedModel::invalid(error.to_string())))
+                    .unwrap_or_else(|error| Err(UnsupportedModel::mismatch(error.to_string())))
             }),
     };
     Ok(match drafted {
         Ok(requests) => KernelInventory::Requests(requests),
-        Err(unsupported) => {
-            KernelInventory::Unsupported(drafter_refusal(rejected_model(unsupported)))
-        }
+        Err(unsupported) => KernelInventory::Unsupported(drafter_refusal(unsupported)),
     })
 }
 
@@ -450,21 +450,6 @@ fn drafter_refusal(unsupported: UnsupportedModel) -> UnsupportedModel {
         unsupported.reasons,
         format!("the drafter is rejected: {}", unsupported.detail),
     )
-}
-
-/// A drafter refusal always names a reason: one naming no unsupported
-/// feature is a drafter that does not fit its target.
-fn rejected_model(mut unsupported: UnsupportedModel) -> UnsupportedModel {
-    if unsupported.reasons.is_empty() {
-        unsupported.reasons.push(UnsupportedReason::TargetMismatch {
-            detail: unsupported.detail.clone(),
-        });
-    }
-    unsupported
-}
-
-fn rejected(unsupported: UnsupportedModel) -> DrafterVerdict {
-    DrafterVerdict::Rejected(rejected_model(unsupported))
 }
 
 /// Why a manifest has no plan here: the material is refused on this
@@ -544,7 +529,7 @@ impl Environment<'_> {
         };
         let model = policy
             .resolve(definition)
-            .map_err(UnsupportedModel::invalid)?;
+            .map_err(UnsupportedModel::mismatch)?;
         let method = match model.method {
             ResolvedMethod::Mtp { .. } => SpeculativeMethod::Mtp,
             ResolvedMethod::DFlash { .. } => {
@@ -559,14 +544,14 @@ impl Environment<'_> {
                 }
             }
             ResolvedMethod::Plain => {
-                return Err(UnsupportedModel::invalid(
+                return Err(UnsupportedModel::mismatch(
                     "the drafter resolves to plain generation",
                 ));
             }
         };
         let manifest = self
             .manifest(admitted.headers.manifest(), definition.clone(), model)
-            .map_err(UnsupportedModel::invalid)?;
+            .map_err(UnsupportedModel::mismatch)?;
         Ok((manifest, method))
     }
 
@@ -648,7 +633,7 @@ enum DrafterAdmission {
 
 /// A header that is truncated or not a valid GGUF container.
 fn unreadable(error: &magnitude_artifacts::Error) -> UnsupportedModel {
-    UnsupportedModel::reason(UnsupportedReason::Unreadable, error.to_string())
+    UnsupportedModel::unreadable(error.to_string())
 }
 
 /// Admit `package` from its headers: the target's weight encodings, family
@@ -738,11 +723,8 @@ fn admit_drafter(
     definition: &ModelDefinition,
     layout: Layout,
 ) -> Result<DrafterAdmission, ModelAssessmentError> {
-    let rejected = |detail: &str| {
-        Ok(DrafterAdmission::Rejected(UnsupportedModel::invalid(
-            detail,
-        )))
-    };
+    let rejected =
+        |detail: &str| Ok(DrafterAdmission::Rejected(UnsupportedModel::mismatch(detail)));
     let Some(path) = &package.draft else {
         return match package.method {
             ModelMethod::Plain => Ok(DrafterAdmission::None),

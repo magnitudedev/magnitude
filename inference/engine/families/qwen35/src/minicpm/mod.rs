@@ -2,7 +2,7 @@
 pub mod inputs;
 
 use crate::{Error, invalid};
-use magnitude_artifacts::gguf::{Directory, Scalar, Value};
+use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value};
 use magnitude_family_common::Tensors;
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, MergerStage, PositionSampling, VisionActivation,
@@ -80,7 +80,7 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
     if directory
         .value("general.architecture")
         .and_then(Value::string)
-        != Some("clip")
+        != Some(PROJECTOR_ARCHITECTURE)
         || directory.value("general.type").and_then(Value::string) != Some("mmproj")
         || directory
             .value("clip.projector_type")

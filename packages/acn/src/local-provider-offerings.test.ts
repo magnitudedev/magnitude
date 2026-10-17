@@ -68,6 +68,7 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
         sourceUrls: [],
       },
       drafter: Option.none(),
+      drafterChoice: { _tag: "Auto" },
       recommendedDrafter: Option.none(),
       acquisitionState: { _tag: "External", installation, residencyState: { _tag: "Unloaded" } },
       servingState,

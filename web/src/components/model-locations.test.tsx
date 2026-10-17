@@ -3,9 +3,9 @@ import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import type { DirectoryListing, ModelLocation } from "@magnitudedev/sdk"
 import { ModelLocationsManager, modelLocationsSummary } from "./model-locations"
-import { DirectoryEntries } from "./folder-picker"
+import { DirectoryEntries, choosePath, type NativeOpenPath } from "./folder-picker"
 import { candidateErrorNotice, modelLocationErrorNotice } from "./candidate-errors"
-import { DirectoryNotFound, InvalidModelReference, ModelSourceUnavailable } from "@magnitudedev/sdk"
+import { DirectoryNotFound, DrafterNotUsable, InvalidModelReference, ModelSourceUnavailable } from "@magnitudedev/sdk"
 
 const locations: ModelLocation[] = [
   { kind: "HuggingFaceCache", paths: [
@@ -64,10 +64,17 @@ describe("model locations", () => {
     expect(html).toContain("/home/me/.ollama/models")
     expect(html).toContain("Can’t read · /usr/share/ollama/.ollama/models")
     expect(html).not.toContain("/var/lib/ollama")
-    expect(html).toContain("A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it to use those models here.")
     expect(html).toContain("Can’t read · /srv/models")
     expect(html).toContain("Give your account read access to it.")
     expect(html).not.toContain("Not found on this computer")
+  })
+  it("tells a system Ollama install to grant read access or set OLLAMA_MODELS, and only Ollama", () => {
+    const ollama: ModelLocation = { kind: "Ollama", paths: [{ path: "/usr/share/ollama/.ollama/models", state: "Unreadable" }], enabled: true, automatic: true, state: "Unreadable" }
+    const html = manager([ollama])
+    expect(html).toMatch(/Can’t read · \/usr\/share\/ollama\/.ollama\/models<\/span><span[^>]*>Magnitude doesn’t have permission to read this folder\. A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it, or set OLLAMA_MODELS to a folder you can read \(Magnitude also scans the default folders\)\.</)
+    const folder = manager([{ kind: "Folder", paths: [{ path: "/srv/models", state: "Unreadable" }], enabled: true, automatic: false, state: "Unreadable" }])
+    expect(folder).toContain("Give your account read access to it.")
+    expect(folder).not.toContain("OLLAMA_MODELS")
   })
   it("explains a first folder before any exist", () => {
     expect(manager(locations.slice(0, 1))).toContain("Add a folder of GGUF files no other app manages")
@@ -86,6 +93,16 @@ describe("model locations", () => {
     expect(unreadable).toMatchObject({ title: "Magnitude couldn’t read this model", description: "Magnitude couldn't read this file." })
     expect(unreadable.title).not.toMatch(/reach/i)
     expect(candidateErrorNotice(new Error("transport")).title).toBe("Couldn’t reach the Magnitude service")
+  })
+  it("words a refused drafter from the engine's reasons", () => {
+    expect(candidateErrorNotice(new DrafterNotUsable({
+      reference: "z-lab/drafter:dflash.gguf",
+      reasons: [{ _tag: "TargetMismatch", detail: "PRIVATE" }],
+    }))).toEqual({
+      title: "This drafter can’t be used",
+      description: "This drafter can't be used with this model: Its drafter wasn't built for this model.",
+      retryable: false,
+    })
   })
 })
 
@@ -107,5 +124,23 @@ describe("GGUF file picker", () => {
     const html = renderToStaticMarkup(<DirectoryEntries kind="folder" listing={listing} selectedFile={Option.none()} onOpen={() => {}} onSelectFile={() => {}} />)
     expect(html).not.toContain("qwen.gguf")
     expect(renderToStaticMarkup(<DirectoryEntries kind="gguf" listing={{ ...listing, directories: [], files: [] }} selectedFile={Option.none()} onOpen={() => {}} onSelectFile={() => {}} />)).toContain("No folders or GGUF files inside")
+  })
+})
+
+describe("native open dialog", () => {
+  const folder = { kind: "folder" as const, title: "Add a folder of models", defaultPath: Option.none<string>() }
+  it("uses the native dialog whenever the window has a native host, on any OS, and the in-app browser otherwise", () => {
+    const calls: string[] = []
+    const native: NativeOpenPath = (request, onChosen) => { calls.push(`native ${request.kind}`); onChosen("C:\\Models") }
+    choosePath(Option.some(native), folder, path => calls.push(`chose ${path}`), () => calls.push("browse"))()
+    expect(calls).toEqual(["native folder", "chose C:\\Models"])
+    calls.length = 0
+    choosePath(Option.none(), folder, path => calls.push(`chose ${path}`), () => calls.push("browse"))()
+    expect(calls).toEqual(["browse"])
+  })
+  it("adds nothing when the native dialog is cancelled", () => {
+    const calls: string[] = []
+    choosePath(Option.some(() => {}), folder, path => calls.push(path), () => calls.push("browse"))()
+    expect(calls).toEqual([])
   })
 })

@@ -13,6 +13,33 @@ export const removalKind = (model: LocalModel): RemovalKind => {
   return model.origin._tag === "Added" ? "delete" : model.origin._tag === "Imported" ? "forget" : "hide"
 }
 
+/** Whether the files Remove deletes are only Magnitude's copy, with the same bytes also in another location that keeps the model listed. */
+export const keepsExternalCopy = (model: LocalModel): boolean => {
+  const acquisition = model.acquisitionState
+  return removalKind(model) === "delete" && "installation" in acquisition && acquisition.installation.ownership === "Mixed"
+}
+
+/** The confirmation for Remove: forgetting a file, deleting only Magnitude's copy, or deleting the download. */
+export const removalConfirmation = (model: LocalModel, running: boolean): { readonly title: string; readonly description: string; readonly confirmLabel: string } => {
+  const name = formatLocalModelDisplayName(model)
+  const confirmLabel = running ? "Stop and remove" : "Remove"
+  if (removalKind(model) === "forget") return {
+    title: running ? `Stop ${name} and remove it from Magnitude?` : `Remove ${name} from Magnitude?`,
+    description: "The file stays where it is. You can add it again with Add GGUF file…",
+    confirmLabel: running ? confirmLabel : "Remove from Magnitude",
+  }
+  if (keepsExternalCopy(model)) return {
+    title: running ? `Stop ${name} and remove Magnitude’s copy?` : `Remove Magnitude’s copy of ${name}?`,
+    description: "Only the files Magnitude downloaded are deleted. The same model is also in another location on this computer, so it stays in My Models from there.",
+    confirmLabel,
+  }
+  return {
+    title: running ? `Stop ${name} and remove its downloaded files?` : `Remove the downloaded files for ${name}?`,
+    description: "You can download it again later.",
+    confirmLabel,
+  }
+}
+
 /** Remove for any model: deleting or forgetting asks first; hiding, offered with `onHide`, is undone from the Hidden filter. */
 export function ModelRemoveAction({ model, running, disabled, onRemove, onHide }: {
   model: LocalModel
@@ -28,11 +55,6 @@ export function ModelRemoveAction({ model, running, disabled, onRemove, onHide }
   const forget = kind === "forget"
   return <>
     <Button variant="ghost" size="icon" aria-label={forget ? `Remove ${name} from Magnitude` : `Remove ${name}`} title={forget ? "Remove from Magnitude" : "Remove download"} disabled={disabled} onClick={() => setConfirming(true)}><TrashIcon /></Button>
-    <ConfirmDialog open={confirming} onOpenChange={setConfirming} destructive={!forget}
-      title={forget
-        ? running ? `Stop ${name} and remove it from Magnitude?` : `Remove ${name} from Magnitude?`
-        : running ? `Stop ${name} and remove its downloaded files?` : `Remove the downloaded files for ${name}?`}
-      description={forget ? "The file stays where it is. You can add it again with Add GGUF file…." : "You can download it again later."}
-      confirmLabel={running ? "Stop and remove" : forget ? "Remove from Magnitude" : "Remove"} onConfirm={onRemove} />
+    <ConfirmDialog open={confirming} onOpenChange={setConfirming} destructive={!forget} {...removalConfirmation(model, running)} onConfirm={onRemove} />
   </>
 }

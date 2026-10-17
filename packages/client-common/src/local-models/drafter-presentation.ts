@@ -57,11 +57,11 @@ export const candidateDownloadBytes = (
   }
 }
 
-/** "Faster with a drafter · Add (0.9 GB)" for a custom model with no drafter and a recommended one. */
+/** "Faster with a drafter · Add (0.9 GB)" for a custom model with no drafter and a recommended one, unless its drafter was turned off. */
 export const customModelDrafterOffer = (
   model: CustomLocalModel,
 ): Option.Option<{ readonly label: string; readonly candidate: DrafterCandidate }> => {
-  if (Option.isSome(model.drafter)) return Option.none()
+  if (Option.isSome(model.drafter) || model.drafterChoice._tag === "None") return Option.none()
   return Option.map(model.recommendedDrafter, (candidate) => {
     const bytes = drafterCandidateDownloadBytes(candidate)
     return {

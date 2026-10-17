@@ -74,6 +74,7 @@ export const customModel = (origin: CustomModelOrigin, overrides: Partial<Custom
   origin,
   presentation: { displayName: "Qwen3.6 35B A3B Uncensored", variantLabel: ModelVariantLabelSchema.make("Q4_K_P"), sourceLabel: sourceLabel(origin), variantOf: Option.some(catalogId), license: Option.none(), sourceUrls: [] },
   drafter: Option.none(),
+  drafterChoice: { _tag: "Auto" },
   recommendedDrafter: Option.none(),
   acquisitionState: origin._tag === "Added"
     ? { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 23 * GB, primaryPath: "/models/qwen.gguf", ownership: "Magnitude" }, residencyState: { _tag: "Unloaded" } }
@@ -95,6 +96,7 @@ export const version = (label: string, overrides: Partial<CandidateVersion> = {}
   downloadBytes: overrides.sizeBytes ?? 23.4 * GB,
   assessment: Option.some(fits),
   recommended: false,
+  catalogModel: Option.none(),
   onThisComputer: Option.none(),
   ...overrides,
 })

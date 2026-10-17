@@ -53,7 +53,7 @@ import type {
   ReadyModel,
   UnsupportedLocalModel as NativeUnsupportedLocalModel,
 } from "@magnitudedev/icn-protocol/schemas"
-import type { CustomModelsConfig } from "@magnitudedev/storage"
+import type { CustomModelsConfig, PersistedDrafterChoice } from "@magnitudedev/storage"
 import {
   LocalModelSources,
   type CatalogModelSource,
@@ -393,19 +393,6 @@ const sourceUrls = (modelId: ModelId): readonly string[] => {
 
 const fileStem = (path: string) => (path.split(/[\\/]/).at(-1) ?? path).replace(/\.gguf$/i, "")
 
-/**
- * ICN resolves a catalog drafter to that catalog model's current drafter package, so one that is
- * present is current: the catalog model's own update (its target or projector, say) is not the
- * drafter's. A catalog drafter that isn't here while its catalog model has an update is one.
- */
-const catalogDrafterUpdateAvailable = (
-  catalog: readonly CatalogModelSource[],
-  reference: DrafterReference,
-  present: boolean,
-): boolean =>
-  reference._tag === "Catalog" && !present && catalog.some(({ id, source }) => id === reference.modelId
-    && source.localState._tag === "Installed" && source.localState.updateState._tag === "Available")
-
 export interface CustomModelInputs {
   readonly entry: CustomModelSource
   readonly assessment: CoordinatedLocalModelAssessment | undefined
@@ -467,7 +454,7 @@ export const attachedDrafter = (inputs: CustomModelInputs): Option.Option<Attach
       sizeBytes: Option.match(recommended, { onNone: () => 0, onSome: ({ sizeBytes }) => sizeBytes }),
       verdict,
       availability,
-      updateAvailable: catalogDrafterUpdateAvailable(catalog, reference, native.state._tag === "Ready"),
+      updateAvailable: native.updateAvailable,
     })
   }))
 }
@@ -489,10 +476,14 @@ export const customAcquisition = (
       : { _tag: "External", installation, residencyState })
   }
   const installed = installation === undefined ? undefined : { installation, residencyState }
+  // ICN reports a newer repository commit only when the added model's target has other content there.
   return Option.some(Option.match(currentDownload(related, "Target"), {
-    onNone: (): CustomModelAcquisitionState => installed === undefined
-      ? { _tag: "NotInstalled" }
-      : { _tag: "Installed", ...installed },
+    onNone: (): CustomModelAcquisitionState => {
+      if (installed === undefined) return { _tag: "NotInstalled" }
+      return Option.isSome(source.updateCommit)
+        ? { _tag: "UpdateAvailable", ...installed }
+        : { _tag: "Installed", ...installed }
+    },
     onSome: (download): CustomModelAcquisitionState => Option.match(transferProgress(download), {
       onSome: (progress): CustomModelAcquisitionState => installed === undefined
         ? { _tag: "Installing", progress }
@@ -547,6 +538,7 @@ export const customModel = (inputs: CustomModelInputs): Option.Option<CustomLoca
       sourceUrls: sourceUrls(entry.id),
     },
     drafter,
+    drafterChoice: inputs.drafterChoice,
     recommendedDrafter: Option.flatMap(entry.source.recommendedDrafter, (candidate) => Option.flatMap(
       productDrafterReference(candidate.reference),
       (reference) => productDrafterCandidate(candidate, catalog),
@@ -646,6 +638,12 @@ export interface LocalModelsInputs {
  * assesses them; a hidden external copy of a catalog model is one of them, under the ID its files have as
  * a found model. A found or imported model the engine cannot run joins the unsupported list.
  */
+/** A persisted drafter choice as clients see it; the persisted method is ICN's to receive. */
+const drafterChoice = (persisted: PersistedDrafterChoice | undefined): DrafterChoice =>
+  persisted === undefined ? { _tag: "Auto" }
+    : persisted._tag === "Reference" ? { _tag: "Reference", reference: persisted.reference }
+    : persisted
+
 export const projectLocalModels = (inputs: LocalModelsInputs): LocalModelsState => {
   const { source, assessment, operations, runtime, removals, config, downloads } = inputs
   const latestOperation = new Map(operations.map((operation) => [operation.modelId, operation]))
@@ -655,7 +653,7 @@ export const projectLocalModels = (inputs: LocalModelsInputs): LocalModelsState 
     instances: runtime,
     related: customModelDownloads(entry.id, config, downloads),
     catalog: source.catalogModels,
-    drafterChoice: config.drafters[entry.id] ?? { _tag: "Auto" },
+    drafterChoice: drafterChoice(config.drafters[entry.id]),
   })
   const custom = source.customModels.map((entry) => customInputs(
     entry,

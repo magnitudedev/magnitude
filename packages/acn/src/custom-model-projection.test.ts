@@ -1,6 +1,6 @@
-import { Option } from "effect"
+import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
-import type { ModelAssessmentsSnapshot } from "@magnitudedev/icn-protocol/schemas"
+import { UnsupportedReason, type ModelAssessmentsSnapshot } from "@magnitudedev/icn-protocol/schemas"
 import { customModel, projectLocalModels } from "./local-models"
 import { currentDownload, customModelDownloads } from "./custom-model-downloads"
 import type { LocalModelSourcesState } from "./local-model-sources"
@@ -62,6 +62,7 @@ const attachedDrafter = {
   method: { _tag: "DFlash" },
   reference: drafterReference,
   state: { _tag: "Ready" },
+  updateAvailable: false,
 }
 
 describe("custom model rows", () => {
@@ -159,30 +160,34 @@ describe("custom model rows", () => {
     const present = Option.getOrThrow(customModel(inputs(customSource(nativeCustomModel({ drafter: attachedDrafter })))))
     expect(Option.map(present.drafter, ({ availability }) => availability._tag)).toEqual(Option.some("Present"))
 
-    const catalogDrafter = (state: string) => customSource(nativeCustomModel({
-      drafter: { method: { _tag: "DFlash" }, reference: { _tag: "Catalog", modelId: "qwen3.6-35b-a3b:gguf:q4" }, state: { _tag: state } },
+    // ICN reports the update on the attached drafter: a catalog drafter serving its earlier revision
+    // while the catalog has a newer one. ACN shows it for every model using the drafter, whether or
+    // not the catalog model itself is installed.
+    const catalogDrafter = (updateAvailable: boolean) => customSource(nativeCustomModel({
+      drafter: {
+        method: { _tag: "DFlash" },
+        reference: { _tag: "Catalog", modelId: "qwen3.6-35b-a3b:gguf:q4" },
+        state: { _tag: "Ready" },
+        updateAvailable,
+      },
     }))
     const catalog = [{
       id: "qwen3.6-35b-a3b:gguf:q4",
       source: {
         displayName: "Qwen3.6 35B-A3B",
         desired: { speculativeMethod: Option.some({ _tag: "DFlash" }) },
-        localState: { _tag: "Installed", updateState: { _tag: "Available" } },
+        localState: { _tag: "NotInstalled" },
       },
     }] as never
-    expect(Option.map(Option.getOrThrow(customModel(inputs(catalogDrafter("NotInstalled"), {
-      catalog,
-      drafterChoice: { _tag: "Reference", reference: { _tag: "Catalog", modelId: "qwen3.6-35b-a3b:gguf:q4" } } as never,
-    }))).drafter,
-      ({ updateAvailable, name, label }) => ({ updateAvailable, name, label })))
+    expect(Option.map(Option.getOrThrow(customModel(inputs(catalogDrafter(true), { catalog }))).drafter,
+      ({ updateAvailable, name, label, availability }) => ({ updateAvailable, name, label, availability: availability._tag })))
       .toEqual(Option.some({
         updateAvailable: true,
         name: "Magnitude DFlash for Qwen3.6 35B-A3B",
         label: "Trained for Qwen3.6 35B-A3B",
+        availability: "Present",
       }))
-    // The catalog model's own update (a found exact target missing its projector, say) is not the
-    // drafter's: its current drafter is here.
-    expect(Option.map(Option.getOrThrow(customModel(inputs(catalogDrafter("Ready"), { catalog }))).drafter,
+    expect(Option.map(Option.getOrThrow(customModel(inputs(catalogDrafter(false), { catalog }))).drafter,
       ({ updateAvailable }) => updateAvailable)).toEqual(Option.some(false))
   })
 })
@@ -271,7 +276,7 @@ describe("custom model downloads", () => {
       repository: "magnitudedev/catalog-drafters", revision: "r1", path: "drafter.gguf",
     }, { _tag: "Downloading", completedBytes: 3, totalBytes: 9, stage: "downloading" })
     const config = customModelsConfig({
-      drafters: { [foundId]: { _tag: "Reference", reference: { _tag: "Catalog", modelId: "qwen3.6-35b-a3b:gguf:q4" } } },
+      drafters: { [foundId]: { _tag: "Reference", reference: { _tag: "Catalog", modelId: "qwen3.6-35b-a3b:gguf:q4" }, method: { _tag: "DFlash" } } },
     })
     expect(customModelDownloads(foundId, config, [catalogDrafter]).map(({ kind }) => kind)).toEqual(["Drafter"])
   })
@@ -507,6 +512,40 @@ describe("local models state", () => {
       { _tag: "Tokenizer", model: "gpt2", pre: Option.some("qwen2") },
       { _tag: "Tokenizer", model: "llama", pre: Option.none() },
       { _tag: "KernelDomain", backend: "metal", entry: "attention", statics: [["head_dim", 96]] },
+    ]])
+  })
+
+  it("renders a reason a newer engine raised as Unknown with its detail", () => {
+    const unsupportedId = "hf:unsloth/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf"
+    const decodeReasons = Schema.decodeUnknownSync(Schema.parseJson(Schema.Array(UnsupportedReason)))
+    const snapshot = assessments([unsupportedId]) as unknown as {
+      custom: { entries: Array<{ state: { profiles: unknown[] } }> }
+    }
+    snapshot.custom.entries[0]!.state.profiles = [{
+      _tag: "Unsupported",
+      profile: Option.some({ contextLength: 40_960 }),
+      reasons: decodeReasons(JSON.stringify([
+        { _tag: "SlidingWindowPattern", detail: "interleaved sliding window", pattern: [1, 0, 1] },
+        { _tag: "RopeScaling", kind: "longrope" },
+      ])),
+      detail: "interleaved sliding window",
+    }]
+    const state = projectLocalModels({
+      source: { ...sources([customSource(nativeCustomModel({
+        modelId: unsupportedId,
+        displayName: "Qwen3-0.6B-Q4_K_M",
+        files: [{ path: "/models/Qwen3-0.6B-Q4_K_M.gguf", sizeBytes: 1 }],
+      }))]), unsupported: [] },
+      assessment: snapshot as unknown as ModelAssessmentsSnapshot,
+      operations: [],
+      runtime: [],
+      removals: new Map(),
+      config: customModelsConfig(),
+      downloads: [],
+    })
+    expect(state.unsupported.map(({ reasons }) => reasons)).toEqual([[
+      { _tag: "Unknown", kind: "SlidingWindowPattern", detail: "interleaved sliding window" },
+      { _tag: "RopeScaling", kind: "longrope" },
     ]])
   })
 })

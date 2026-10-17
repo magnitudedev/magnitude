@@ -58,7 +58,7 @@ impl ModelFamily for NemotronHFamily {
         match usize::try_from(layer) {
             Ok(index) if index < sublayers.len() => Ok(TapPoint::Sublayer(sublayers[index])),
             Ok(index) if index == sublayers.len() => Ok(TapPoint::Exit),
-            _ => Err(FamilyError::invalid(format!(
+            _ => Err(FamilyError::mismatch(format!(
                 "target layer {layer} is beyond the model's {} layers",
                 sublayers.len()
             ))),

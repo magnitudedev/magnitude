@@ -45,7 +45,7 @@ import {
   type HuggingFaceReference,
   type PullReference,
 } from "./model-references"
-import { ensureTrailingNewline, jsonDocument, renderTable, runCommand, asJson, type JsonOption } from "./output"
+import { ensureTrailingNewline, jsonDocument, renderTable, commandEffect, asJson, type JsonOption } from "./output"
 
 const plural = (count: number, singular: string, pluralForm = `${singular}s`) =>
   `${count} ${count === 1 ? singular : pluralForm}`
@@ -137,7 +137,7 @@ export const readSearch = (
 export const searchHuggingFace = (
   query: string,
   options: JsonOption & { readonly all?: boolean; readonly limit?: string } = {},
-) => runCommand({
+) => commandEffect({
   effect: Effect.gen(function* () {
     const trimmed = query.trim()
     if (trimmed.length === 0) return yield* new ModelCommandError({ message: "Search query must not be empty" })
@@ -207,13 +207,58 @@ const inspectionHeader = (inspection: CandidateInspection, models: readonly Loca
 const isRunnable = (version: CandidateVersion) =>
   Option.exists(version.assessment, (assessment) => assessment._tag === "Fits")
 
-export const acquisitionHint = (inspection: CandidateInspection): string => Option.match(
-  Option.filter(chosenVersion(inspection), isRunnable), {
-    onNone: () => ["No version of this model runs on this computer.", ...Option.toArray(noRunnableVersionReason(inspection.versions))].join(" "),
-    onSome: (version) => inspection.source._tag === "HuggingFace"
-      ? `Download: magnitude catalog pull ${inspection.source.repository}:${version.label}`
-      : `Add: magnitude models import ${join(inspection.source.path, version.files[0]!)}`,
+const acquireCommand = (inspection: CandidateInspection, version: CandidateVersion, force = false): string =>
+  inspection.source._tag === "HuggingFace"
+    ? `magnitude catalog pull ${inspection.source.repository}:${version.label}${force ? " --force" : ""}`
+    : `magnitude models import ${join(inspection.source.path, version.files[0]!)}`
+
+const acquireLine = (inspection: CandidateInspection, version: CandidateVersion): string =>
+  Option.match(version.catalogModel, {
+    onNone: () => `${inspection.source._tag === "HuggingFace" ? "Download" : "Add"}: ${acquireCommand(inspection, version)}`,
+    onSome: (catalogModel) => `This is the catalog model ${catalogModel}, which comes with its drafter. Download: magnitude catalog pull ${catalogModel}`,
   })
+
+/** Why the version a reference named doesn't run here: its own verdict, never a statement about the whole repository. */
+const selectedVersionVerdict = (inspection: CandidateInspection, version: CandidateVersion): string =>
+  Option.match(version.assessment, {
+    onNone: () => `Magnitude hasn't checked ${version.label} yet.`,
+    onSome: (assessment) => {
+      switch (assessment._tag) {
+        case "Fits": return ""
+        case "DoesNotFit": {
+          const refusal = modelVersionNotRunnableMessage({ version: version.label, verdict: { _tag: "DoesNotFit", deficitBytes: assessment.deficitBytes } })
+          return inspection.source._tag === "HuggingFace"
+            ? `${refusal} Download it anyway with: ${acquireCommand(inspection, version, true)}`
+            : refusal
+        }
+        case "Unsupported":
+          return modelVersionNotRunnableMessage({ version: version.label, verdict: { _tag: "Unsupported", reasons: assessment.reasons } })
+      }
+    },
+  })
+
+export const acquisitionHint = (inspection: CandidateInspection): string => {
+  const chosen = chosenVersion(inspection)
+  if (Option.isSome(chosen) && isRunnable(chosen.value)) return acquireLine(inspection, chosen.value)
+  const recommended = Option.filter(Option.fromNullable(inspection.versions.find(({ recommended }) => recommended)), isRunnable)
+  if (Option.isSome(chosen) && Option.isSome(inspection.selectedVersion)) {
+    return [
+      selectedVersionVerdict(inspection, chosen.value),
+      ...Option.match(recommended, {
+        onNone: () => [inspection.versions.some(isRunnable)
+          ? "Other versions run here; see the table above."
+          : "No version of this model runs on this computer."],
+        onSome: (version) => [`The recommended version is ${version.label}. ${acquireLine(inspection, version)}`],
+      }),
+    ].join("\n")
+  }
+  if (inspection.versions.some(isRunnable)) {
+    return `Choose a version from the table: ${inspection.source._tag === "HuggingFace"
+      ? `magnitude catalog pull ${inspection.source.repository}:<VERSION>`
+      : "magnitude models import <file>"}`
+  }
+  return ["No version of this model runs on this computer.", ...Option.toArray(noRunnableVersionReason(inspection.versions))].join(" ")
+}
 
 /** "Download size: 3.7 GB (model 3.01 GB + projector 670 MB + drafter 685 MB)", omitting parts already here. */
 export const downloadSizeLine = (
@@ -307,7 +352,7 @@ export const readInspection = (client: CliModelsClient, reference: string) => Ef
   return { inspection, drafters, models: catalogProducts(catalog) } satisfies InspectionView
 })
 
-export const inspectCandidate = (input: string, options: JsonOption = {}) => runCommand({
+export const inspectCandidate = (input: string, options: JsonOption = {}) => commandEffect({
   effect: Effect.gen(function* () {
     const reference = input.trim()
     if (reference.length === 0) {
@@ -418,6 +463,17 @@ export const renderPull = (result: PullResult): string => {
   const { added } = result
   const name = `${result.repository}:${added.version}`
   const choice = result.versionRequested ? "" : " (the recommended version)"
+  if (added._tag === "Catalog") return ensureTrailingNewline(added.outcome === "Started"
+    ? [
+        `${name}${choice} is the catalog model ${added.modelId}, so Magnitude installs that model with its drafter.`,
+        `Model ID: ${added.modelId}`,
+        `Check progress: magnitude models status ${added.modelId}`,
+      ].join("\n")
+    : [
+        `${name}${choice} is the catalog model ${added.modelId}, which is already on this computer. Nothing to download.`,
+        `Model ID: ${added.modelId}`,
+        `Load it: magnitude models load ${added.modelId}`,
+      ].join("\n"))
   const drafter = `Drafter: ${Option.match(added.drafter, { onNone: () => "none", onSome: ({ name }) => name })}`
   const progress = `Check progress: magnitude models status ${added.modelId}`
   if (added.outcome === "Started") return ensureTrailingNewline([
@@ -503,7 +559,7 @@ export const pull = (
 export const pullModel = (
   modelInput: string,
   options: JsonOption & { readonly drafter?: string; readonly force?: boolean } = {},
-) => runCommand({
+) => commandEffect({
   effect: Effect.gen(function* () {
     const reference = yield* parsePullReference(modelInput.trim())
     if (reference._tag === "Catalog" && options.drafter !== undefined) {

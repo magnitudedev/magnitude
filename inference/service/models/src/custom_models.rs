@@ -15,21 +15,23 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use magnitude_service_contracts::models::{
-    AttachedDrafter, AttachedDrafterState, CustomModel, CustomModelCatalogAttribution,
-    CustomModelDeclaration, CustomModelDeclarationOrigin, CustomModelFile, CustomModelOrigin,
-    CustomModelState, DrafterCandidate, DrafterChoice, DrafterPruning, DrafterReference, EffectiveModel,
-    FoundSource, HuggingFaceArtifactSelector, HuggingFaceRepositoryId, InstalledCatalogAttribution,
-    InstalledModelPackage, LocalModelDigest, LocalModelRemoval, LocalModels,
+    AttachedDrafter, AttachedDrafterState, CatalogPackageRole, CustomModel,
+    CustomModelCatalogAttribution, CustomModelDeclaration, CustomModelDeclarationOrigin,
+    CustomModelFile, CustomModelOrigin, CustomModelState, DrafterCandidate, DrafterChoice,
+    DrafterPruning, DrafterReference, EffectiveModel, FoundSource, HuggingFaceArtifactSelector,
+    HuggingFaceRepositoryId, InstalledCatalogAttribution, InstalledModelPackage,
+    KnownUnsupportedReason, LocalModelDigest, LocalModelRemoval, LocalModels,
     LocalModelsConfiguration, LocalModelsResponse, ModelDomainInvalidation, ModelFailure,
-    ModelFileRole, ModelId, ModelPackage, ModelPackageId, ModelPackageInstallationOrigin,
-    ModelServingConfiguration, PackageValidation, RecommendableModelCatalog, ServableModelBundle,
-    ServingProfile, SpeculativeDraftSource, SpeculativeMethod, UnsupportedLocalModel,
-    UnsupportedReason,
+    ModelFileRole, ModelId, ModelInstallationOwnership, ModelPackage, ModelPackageId,
+    ModelPackageInstallationOrigin, ModelServingConfiguration, PackageValidation,
+    RecommendableModelCatalog, ResolvedModelInstallation, ServableModelBundle, ServingProfile,
+    SpeculativeDraftSource, SpeculativeMethod, UnsupportedLocalModel, UnsupportedReason,
 };
 use magnitude_service_contracts::{
     ExternalOrigin, HubFile, InventoryError, ModelLocation, ModelSource,
 };
 
+use crate::candidate_files::RecognizedArchitectures;
 use crate::catalog_models::catalog_id;
 use crate::gguf::{GgufBaseModel, GgufRole};
 use crate::inventory::{
@@ -55,7 +57,6 @@ pub struct CustomModelFacts<'a> {
     pub name: Option<&'a str>,
     pub architecture: Option<&'a str>,
     pub base_models: &'a [GgufBaseModel],
-    pub embedded_mtp: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -96,9 +97,10 @@ impl DrafterContent {
     /// The content of a package's single weights file, by the digest its file identity records.
     #[must_use]
     pub fn of_package(package: &ModelPackage) -> Option<Self> {
-        let mut weights = package.files.iter().filter(|file| {
-            matches!(file.role, ModelFileRole::Weights | ModelFileRole::Draft)
-        });
+        let mut weights = package
+            .files
+            .iter()
+            .filter(|file| matches!(file.role, ModelFileRole::Weights | ModelFileRole::Draft));
         let file = weights.next()?;
         if weights.next().is_some() {
             return None;
@@ -177,6 +179,11 @@ impl ModelDomainResolver {
 
     /// Republishes the local-models list after the enrichment's knowledge changed.
     pub fn custom_model_enrichment_changed(&self) {
+        self.local_models_changed();
+    }
+
+    /// Republishes the local-models list after something it shows changed without the inventory.
+    pub(crate) fn local_models_changed(&self) {
         self.local.generation.fetch_add(1, Ordering::AcqRel);
         self.publish_local_change();
     }
@@ -209,16 +216,48 @@ impl ModelDomainResolver {
             self.inventory.installed_packages.read().map_err(|_| {
                 InventoryError::Internal("installed package lock poisoned".to_owned())
             })?;
+        let catalog_drafters = self.catalog_drafter_revisions();
         let mut projection = project(
             &records,
             &configuration,
             &self.catalog,
             enrichment.as_ref(),
             &self.inventory.config.root,
+            &self.inventory.config.architectures,
+            &catalog_drafters,
+        );
+        self.upstream.annotate(
+            projection
+                .models
+                .iter_mut()
+                .chain(&mut projection.hidden)
+                .map(|projected| &mut projected.model),
+            &configuration.declarations,
         );
         projection.revision = installed.revision + self.local.generation.load(Ordering::Acquire);
         projection.reconciliation_complete = installed.reconciliation_complete;
         Ok(projection)
+    }
+
+    /// Every drafter package each catalog model has had: the packages recorded as its drafter
+    /// dependency, earlier revisions included, by catalog model.
+    fn catalog_drafter_revisions(&self) -> CatalogDrafterRevisions {
+        let mut revisions = CatalogDrafterRevisions::new();
+        if let Ok(affiliations) = self.inventory.catalog_affiliations.read() {
+            for affiliation in affiliations
+                .entries()
+                .filter(|affiliation| affiliation.role == CatalogPackageRole::Dependency)
+            {
+                revisions
+                    .entry(ModelId::catalog(
+                        &affiliation.model_id,
+                        &affiliation.variant_id,
+                    ))
+                    .or_default()
+                    .insert(affiliation.package_id.clone());
+            }
+        }
+        revisions
     }
 
     /// The separate drafter packages custom models use: the drafter each serves with, or downloads
@@ -257,15 +296,28 @@ impl ModelDomainResolver {
             .models
             .iter()
             .filter(|definition| {
-                custom.is_none()
-                    || present.contains(&crate::lineage::catalog_target(definition).id)
+                custom.is_none() || present.contains(&crate::lineage::catalog_target(definition).id)
             })
             .filter_map(|definition| separate_draft(&definition.configuration.bundle))
             .collect::<BTreeSet<_>>();
         used.extend(custom.into_iter().flatten());
-        let records = self.inventory.installed_packages.read().map_err(|_| {
-            InventoryError::Internal("installed package lock poisoned".to_owned())
-        })?;
+        // A drafter stays while any model here would use it: as its recommended drafter (even with
+        // its drafter turned off), or as a drafter from its own repository.
+        let projection = self.local_projection()?;
+        let projected = projection.models.iter().chain(&projection.hidden);
+        used.extend(
+            projected
+                .clone()
+                .filter_map(|model| model.candidate_drafter.clone()),
+        );
+        let repositories = projected
+            .filter_map(|model| model.lineage_repository.as_deref())
+            .map(str::to_lowercase)
+            .collect::<BTreeSet<_>>();
+        let records =
+            self.inventory.installed_packages.read().map_err(|_| {
+                InventoryError::Internal("installed package lock poisoned".to_owned())
+            })?;
         let unused = records
             .records
             .values()
@@ -274,12 +326,37 @@ impl ModelDomainResolver {
                 record
                     .primary
                     .as_ref()
-                    .is_some_and(|evidence| matches!(evidence.role, GgufRole::Drafter { .. }))
+                    .is_some_and(|evidence| {
+                        evidence.role(&self.inventory.config.architectures) == GgufRole::Drafter
+                    })
+            })
+            .filter(|record| {
+                !matches!(
+                    &record.installed.package.source,
+                    magnitude_service_contracts::models::ModelPackageSource::HuggingFace { repository, .. }
+                        if repositories.contains(&repository.to_lowercase())
+                )
             })
             .map(|record| record.installed.package.id.clone())
             .filter(|package_id| !used.contains(package_id))
             .collect::<BTreeSet<_>>();
         Ok(unused.into_iter().collect())
+    }
+
+    /// The Hub repository a custom model's lineage and drafters come from, when its files name
+    /// one: its Hugging Face identity's, or an Ollama `hf.co` pull's even when no repository file
+    /// has its bytes.
+    pub fn custom_model_lineage_repository(
+        &self,
+        model_id: &ModelId,
+    ) -> Result<Option<String>, InventoryError> {
+        let projection = self.local_projection()?;
+        Ok(projection
+            .models
+            .iter()
+            .chain(&projection.hidden)
+            .find(|projected| &projected.model.model_id == model_id)
+            .and_then(|projected| projected.lineage_repository.clone()))
     }
 
     pub(crate) fn custom_serving_configuration(
@@ -326,6 +403,8 @@ impl LocalProjection {
 
 struct ProjectedModel {
     model: CustomModel,
+    lineage_repository: Option<String>,
+    candidate_drafter: Option<ModelPackageId>,
     configuration: Result<ModelServingConfiguration, ModelFailure>,
     managed_packages: Vec<ModelPackageId>,
     drafter_pending: bool,
@@ -339,11 +418,14 @@ struct HubIdentity {
     current: bool,
 }
 
-/// One observed occurrence of a package, with what identity needs from it.
+/// One observed occurrence of a package, with what identity needs from it. `lineage_repository` is
+/// the Hub repository a location names without giving the file its identity: an Ollama `hf.co`
+/// pull's, which serves lineage and drafter matching only.
 struct Occurrence<'a> {
     record: &'a InstalledPackageRecord,
     evidence: Option<&'a PrimaryEvidence>,
     hub: Option<HubIdentity>,
+    lineage_repository: Option<String>,
     ollama_name: Option<&'a str>,
     base: PathBuf,
     primary: PathBuf,
@@ -356,9 +438,12 @@ impl Occurrence<'_> {
         self.record.installed.origin
     }
 
+    /// The same bytes, wherever they are: the model's `local:` digest and its primary file's size.
+    /// A model without a Hugging Face identity is identified by the same digest.
     fn content_key(&self) -> Option<(String, u64)> {
         self.evidence
-            .map(|evidence| (evidence.header_digest.clone(), self.primary_size))
+            .and_then(|evidence| evidence.local_digest.clone())
+            .map(|digest| (digest, self.primary_size))
     }
 
     fn found_source(&self) -> Option<FoundSource> {
@@ -440,55 +525,87 @@ fn occurrence<'a>(
         .map(|component| component.as_os_str().to_str())
         .collect::<Option<Vec<_>>>()
         .map(|parts| parts.join("/"));
-    let (hub, ollama_name) = match (&record.model.location, &record.model.source) {
-        (
-            ModelLocation::MagnitudeCache { .. } | ModelLocation::HuggingFaceCache { .. },
-            ModelSource::HuggingFace {
-                repository,
-                requested_revision,
-                commit,
-                ..
-            },
-        ) => (
-            selector
-                .as_deref()
-                .and_then(|selector| hub_file(repository, selector))
-                .map(|file| HubIdentity {
-                    file,
-                    commit: Some(commit.clone()),
-                    current: requested_revision == "main",
-                }),
-            None,
-        ),
-        (ModelLocation::External { origin, .. }, _) => {
-            let (hub, name) = match origin {
-                ExternalOrigin::LmStudio { hub } | ExternalOrigin::LlamaCpp { hub } => {
-                    (hub.as_ref(), None)
-                }
-                ExternalOrigin::Ollama { name, hub } => (hub.as_ref(), Some(name.as_str())),
-                ExternalOrigin::Folder | ExternalOrigin::Imported => (None, None),
-            };
+    let (hub, lineage_repository, ollama_name) =
+        match (&record.model.location, &record.model.source) {
             (
-                hub.map(|file| HubIdentity {
-                    file: file.clone(),
-                    commit: None,
-                    current: false,
-                }),
-                name,
-            )
-        }
-        _ => (None, None),
-    };
+                ModelLocation::MagnitudeCache { .. } | ModelLocation::HuggingFaceCache { .. },
+                ModelSource::HuggingFace {
+                    repository,
+                    requested_revision,
+                    commit,
+                    ..
+                },
+            ) => (
+                selector
+                    .as_deref()
+                    .and_then(|selector| hub_file(repository, selector))
+                    .map(|file| HubIdentity {
+                        file,
+                        commit: Some(commit.clone()),
+                        current: requested_revision == "main",
+                    }),
+                None,
+                None,
+            ),
+            // An Ollama model keeps its `local:` identity: its `hf.co` repository, and the repository
+            // file with its bytes once resolved, serve lineage and drafter matching only.
+            (
+                ModelLocation::External {
+                    origin: ExternalOrigin::Ollama { name, hub },
+                    ..
+                },
+                _,
+            ) => (
+                None,
+                hub.as_ref()
+                    .map(|file| file.repository.clone())
+                    .or_else(|| ollama_hub_repository(name)),
+                Some(name.as_str()),
+            ),
+            (ModelLocation::External { origin, .. }, _) => {
+                let hub = match origin {
+                    ExternalOrigin::LmStudio { hub } | ExternalOrigin::LlamaCpp { hub } => {
+                        hub.as_ref()
+                    }
+                    ExternalOrigin::Ollama { .. }
+                    | ExternalOrigin::Folder
+                    | ExternalOrigin::Imported => None,
+                };
+                (
+                    hub.map(|file| HubIdentity {
+                        file: file.clone(),
+                        commit: None,
+                        current: false,
+                    }),
+                    None,
+                    None,
+                )
+            }
+            _ => (None, None, None),
+        };
     Some(Occurrence {
         record,
         evidence: record.primary.as_ref(),
         hub,
+        lineage_repository,
         ollama_name,
         primary: base.join(&primary_file.path),
         primary_size: primary_file.size_bytes,
         base,
         precedence: origin_precedence(record.installed.origin),
     })
+}
+
+/// The repository of an Ollama `hf.co/<owner>/<repository>:<tag>` pull, by its name.
+fn ollama_hub_repository(name: &str) -> Option<String> {
+    let rest = name
+        .strip_prefix("hf.co/")
+        .or_else(|| name.strip_prefix("huggingface.co/"))?;
+    let repository = rest
+        .split_once(':')
+        .map_or(rest, |(repository, _)| repository);
+    HuggingFaceRepositoryId::new(repository).ok()?;
+    Some(repository.to_owned())
 }
 
 fn same_file(left: &Path, right: &Path) -> bool {
@@ -525,6 +642,16 @@ impl<'a> ContentGroup<'a> {
         self.occurrences
             .iter()
             .find_map(|occurrence| occurrence.hub.as_ref().map(|identity| &identity.file))
+    }
+
+    /// The Hub repository lineage and drafter matching use: the identity's, else one a location
+    /// names (an Ollama `hf.co` pull's).
+    fn lineage_repository(&self) -> Option<String> {
+        self.hub().map(|file| file.repository.clone()).or_else(|| {
+            self.occurrences
+                .iter()
+                .find_map(|occurrence| occurrence.lineage_repository.clone())
+        })
     }
 
     fn computed_id(&self) -> Option<ModelId> {
@@ -567,10 +694,17 @@ impl<'a> ContentGroup<'a> {
         &self,
         declarations: &'d [CustomModelDeclaration],
     ) -> Option<&'d CustomModelDeclaration> {
-        let matching = || declarations.iter().filter(|declaration| self.matches(declaration));
+        let matching = || {
+            declarations
+                .iter()
+                .filter(|declaration| self.matches(declaration))
+        };
         matching()
             .find(|declaration| {
-                matches!(declaration.origin, CustomModelDeclarationOrigin::Added { .. })
+                matches!(
+                    declaration.origin,
+                    CustomModelDeclarationOrigin::Added { .. }
+                )
             })
             .or_else(|| {
                 let found = self
@@ -616,6 +750,8 @@ fn project(
     catalog: &RecommendableModelCatalog,
     enrichment: &dyn CustomModelEnrichment,
     managed_root: &Path,
+    architectures: &RecognizedArchitectures,
+    catalog_drafters: &CatalogDrafterRevisions,
 ) -> LocalProjection {
     let occurrences = snapshot
         .records
@@ -655,7 +791,7 @@ fn project(
     for occurrence in &occurrences {
         match (occurrence.evidence, occurrence.content_key()) {
             (Some(evidence), Some(key)) => {
-                if matches!(evidence.role, GgufRole::Model { .. })
+                if matches!(evidence.role(architectures), GgufRole::Model { .. })
                     && !catalog_content.contains(&key)
                 {
                     groups.entry(key).or_default().push(occurrence);
@@ -708,6 +844,7 @@ fn project(
     let context = ModelContext {
         configuration,
         catalog,
+        catalog_drafters,
         enrichment,
         occurrences: &occurrences,
         present: &present,
@@ -779,7 +916,7 @@ fn unsupported_model(
             .unwrap_or_else(|| file_stem(&occurrence.primary)),
         origin,
         path: occurrence.primary.clone(),
-        reasons: vec![UnsupportedReason::Unreadable],
+        reasons: vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)],
         detail,
     })
 }
@@ -789,6 +926,7 @@ fn unsupported_model(
 struct ModelContext<'a> {
     configuration: &'a LocalModelsConfiguration,
     catalog: &'a RecommendableModelCatalog,
+    catalog_drafters: &'a CatalogDrafterRevisions,
     enrichment: &'a dyn CustomModelEnrichment,
     occurrences: &'a [Occurrence<'a>],
     present: &'a BTreeMap<ModelPackageId, &'a InstalledModelPackage>,
@@ -804,6 +942,7 @@ impl ModelContext<'_> {
         let ModelContext {
             configuration,
             catalog,
+            catalog_drafters,
             enrichment,
             occurrences,
             present,
@@ -832,7 +971,10 @@ impl ModelContext<'_> {
         let evidence = representative.evidence?;
         let hub = group.hub();
         let (presented_name, variant_label) = crate::candidate_files::model_presentation(
-            &hub.map_or_else(|| representative.primary.clone(), |hub| PathBuf::from(&hub.selector)),
+            &hub.map_or_else(
+                || representative.primary.clone(),
+                |hub| PathBuf::from(&hub.selector),
+            ),
             hub.map(|hub| hub.repository.as_str()),
             evidence.name.as_deref(),
             evidence.quantization.as_deref(),
@@ -841,7 +983,6 @@ impl ModelContext<'_> {
             (Some(name), None) => name.to_owned(),
             _ => presented_name,
         };
-        let embedded_mtp = matches!(evidence.role, GgufRole::Model { embedded_mtp: true });
         let facts = CustomModelFacts {
             model_id: &model_id,
             origin: &origin,
@@ -855,7 +996,6 @@ impl ModelContext<'_> {
             name: evidence.name.as_deref(),
             architecture: evidence.architecture.as_deref(),
             base_models: &evidence.base_models,
-            embedded_mtp,
         };
         let enriched = enrichment.enrich(&facts);
         let enrichment_known = enrichment.knows(&facts);
@@ -865,6 +1005,22 @@ impl ModelContext<'_> {
             .iter()
             .find(|attachment| attachment.model_id == model_id)
             .map_or(DrafterChoice::Auto, |attachment| attachment.drafter.clone());
+        // The drafter package this model would use as its recommended drafter, whatever its choice:
+        // a turned-off drafter stays referenced while the model is here.
+        let candidate_drafter = enriched.recommended_drafter.as_ref().and_then(|candidate| {
+            let resolved = resolve_drafter(
+                candidate.reference.clone(),
+                candidate.method.clone()?,
+                enrichment.drafter_content(&candidate.reference),
+                catalog,
+                catalog_drafters,
+                occurrences,
+            );
+            match resolved.source? {
+                SpeculativeDraftSource::Separate { draft } => Some(draft.id),
+                SpeculativeDraftSource::Embedded => None,
+            }
+        });
         let drafter = match &choice {
             DrafterChoice::None => None,
             DrafterChoice::Auto => enriched.recommended_drafter.as_ref().and_then(|candidate| {
@@ -876,7 +1032,14 @@ impl ModelContext<'_> {
         }
         .map(|(reference, method)| {
             let content = enrichment.drafter_content(&reference);
-            resolve_drafter(reference, method, embedded_mtp, content, catalog, occurrences)
+            resolve_drafter(
+                reference,
+                method,
+                content,
+                catalog,
+                catalog_drafters,
+                occurrences,
+            )
         });
 
         let profile = custom_profile(installed);
@@ -897,7 +1060,21 @@ impl ModelContext<'_> {
             bundle,
             profile: profile.clone(),
         };
-        let installation = resolved_installation(installed);
+        let mut installation = resolved_installation(installed);
+        // An added model whose same bytes are also in another location is partly Magnitude's.
+        if matches!(origin, CustomModelOrigin::Added { .. })
+            && group
+                .occurrences
+                .iter()
+                .any(|occurrence| occurrence.origin() != ModelPackageInstallationOrigin::Magnitude)
+            && group
+                .occurrences
+                .iter()
+                .any(|occurrence| occurrence.origin() == ModelPackageInstallationOrigin::Magnitude)
+        {
+            let ResolvedModelInstallation::Resolved { ownership, .. } = &mut installation;
+            *ownership = ModelInstallationOwnership::Mixed;
+        }
         let (state, configuration) = match effective_configuration_model(&serving, present) {
             EffectiveModel::Ready { model } => (
                 CustomModelState::Ready {
@@ -945,6 +1122,8 @@ impl ModelContext<'_> {
             .map(|file| file.size_bytes)
             .sum();
         Some(ProjectedModel {
+            lineage_repository: group.lineage_repository(),
+            candidate_drafter,
             drafter_pending: matches!(choice, DrafterChoice::Auto) && !enrichment_known,
             awaited_drafter: None,
             managed_packages: group
@@ -965,10 +1144,14 @@ impl ModelContext<'_> {
                 size_bytes,
                 projector,
                 drafter: drafter.map(|drafter| drafter.attached),
-                recommended_drafter: enriched.recommended_drafter,
+                // A model whose drafter is turned off is offered none.
+                recommended_drafter: enriched
+                    .recommended_drafter
+                    .filter(|_| choice != DrafterChoice::None),
                 license: enriched.license.or_else(|| evidence.license.clone()),
                 profile,
                 state,
+                update_commit: None,
             },
             configuration,
         })
@@ -992,18 +1175,20 @@ impl ModelContext<'_> {
                 DrafterChoice::Reference { reference, method } => Some(resolve_drafter(
                     reference.clone(),
                     method.clone(),
-                    false,
                     self.enrichment.drafter_content(reference),
                     self.catalog,
+                    self.catalog_drafters,
                     self.occurrences,
                 )),
                 DrafterChoice::Auto | DrafterChoice::None => None,
             });
         // The drafter it downloads with its target is in use while the target is still arriving.
-        let awaited_drafter = resolved.as_ref().and_then(|resolved| match &resolved.source {
-            Some(SpeculativeDraftSource::Separate { draft }) => Some(draft.id.clone()),
-            _ => None,
-        });
+        let awaited_drafter = resolved
+            .as_ref()
+            .and_then(|resolved| match &resolved.source {
+                Some(SpeculativeDraftSource::Separate { draft }) => Some(draft.id.clone()),
+                _ => None,
+            });
         let drafter = resolved.map(|resolved| resolved.attached);
         let (display_name, variant_label) = crate::candidate_files::model_presentation(
             Path::new(primary),
@@ -1012,6 +1197,8 @@ impl ModelContext<'_> {
             None,
         );
         Some(ProjectedModel {
+            lineage_repository: Some(repository.as_str().to_owned()),
+            candidate_drafter: None,
             model: CustomModel {
                 model_id: declaration.model_id.clone(),
                 origin: CustomModelOrigin::Added {
@@ -1038,6 +1225,7 @@ impl ModelContext<'_> {
                     context_length: DEFAULT_EXTERNAL_CONTEXT,
                 },
                 state: CustomModelState::NotInstalled,
+                update_commit: None,
             },
             configuration: Err(ModelFailure {
                 code: "model_not_installed".to_owned(),
@@ -1062,6 +1250,9 @@ pub(crate) fn separate_draft(bundle: &ServableModelBundle) -> Option<ModelPackag
     }
 }
 
+/// The drafter packages each catalog model has had, earlier revisions included.
+type CatalogDrafterRevisions = BTreeMap<ModelId, BTreeSet<ModelPackageId>>;
+
 struct ResolvedDrafter {
     attached: AttachedDrafter,
     source: Option<SpeculativeDraftSource>,
@@ -1077,11 +1268,14 @@ fn rejected(
             reference,
             method,
             state: AttachedDrafterState::Rejected {
-                reasons: vec![UnsupportedReason::TargetMismatch {
-                    detail: detail.clone(),
-                }],
+                reasons: vec![UnsupportedReason::Known(
+                    KnownUnsupportedReason::TargetMismatch {
+                        detail: detail.clone(),
+                    },
+                )],
                 detail,
             },
+            update_available: false,
         },
         source: None,
     }
@@ -1093,9 +1287,9 @@ fn rejected(
 fn resolve_drafter(
     reference: DrafterReference,
     method: SpeculativeMethod,
-    embedded_mtp: bool,
     content: Option<DrafterContent>,
     catalog: &RecommendableModelCatalog,
+    catalog_drafters: &CatalogDrafterRevisions,
     occurrences: &[Occurrence<'_>],
 ) -> ResolvedDrafter {
     let holding = |content: Option<&DrafterContent>, named: &dyn Fn(&Occurrence<'_>) -> bool| {
@@ -1115,6 +1309,7 @@ fn resolve_drafter(
                 reference,
                 method,
                 state: AttachedDrafterState::NotInstalled,
+                update_available: false,
             },
             source: None,
         },
@@ -1124,6 +1319,7 @@ fn resolve_drafter(
                     reference,
                     method,
                     state: AttachedDrafterState::Ready,
+                    update_available: false,
                 },
                 source: Some(SpeculativeDraftSource::Separate {
                     draft: occurrence.record.installed.package.clone(),
@@ -1134,31 +1330,25 @@ fn resolve_drafter(
                     reference,
                     method,
                     state: AttachedDrafterState::Rejected {
-                        reasons: vec![UnsupportedReason::Unreadable],
+                        reasons: vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)],
                         detail: failure.message,
                     },
+                    update_available: false,
                 },
                 source: None,
             },
         },
     };
-    let embedded = |reference: DrafterReference, method: SpeculativeMethod| {
-        if embedded_mtp {
-            ResolvedDrafter {
-                attached: AttachedDrafter {
-                    reference,
-                    method,
-                    state: AttachedDrafterState::Ready,
-                },
-                source: Some(SpeculativeDraftSource::Embedded),
-            }
-        } else {
-            rejected(
-                reference,
-                method,
-                "the model has no built-in prediction heads".to_owned(),
-            )
-        }
+    // Built-in prediction heads are always present; whether the engine binds them is its drafter
+    // verdict for the model's assessment, never decided here.
+    let embedded = |reference: DrafterReference, method: SpeculativeMethod| ResolvedDrafter {
+        attached: AttachedDrafter {
+            reference,
+            method,
+            state: AttachedDrafterState::Ready,
+            update_available: false,
+        },
+        source: Some(SpeculativeDraftSource::Embedded),
     };
     match &reference {
         DrafterReference::Embedded => embedded(reference, method),
@@ -1181,10 +1371,28 @@ fn resolve_drafter(
                 } => {
                     let content = DrafterContent::of_package(draft)
                         .map(|catalog_content| catalog_content.merge(content));
-                    let found = holding(content.as_ref(), &|occurrence| {
+                    let current = holding(content.as_ref(), &|occurrence| {
                         occurrence.record.installed.package.id == draft.id
                     });
-                    separate(reference, method, found)
+                    // A catalog drafter with a new revision keeps serving with the earlier
+                    // revision of that catalog model's drafter until it is updated.
+                    let earlier = || {
+                        let revisions = catalog_drafters.get(model_id)?;
+                        holding(None, &|occurrence| {
+                            revisions.contains(&occurrence.record.installed.package.id)
+                        })
+                    };
+                    match current {
+                        Some(current) => separate(reference, method, Some(current)),
+                        None => match earlier() {
+                            Some(earlier) => {
+                                let mut resolved = separate(reference, method, Some(earlier));
+                                resolved.attached.update_available = true;
+                                resolved
+                            }
+                            None => separate(reference, method, None),
+                        },
+                    }
                 }
                 ServableModelBundle::SpeculativeDecoding {
                     draft_source: SpeculativeDraftSource::Embedded,
@@ -1221,6 +1429,8 @@ fn resolve_drafter(
 pub struct ManagedLocalModels {
     resolver: Arc<ModelDomainResolver>,
     watcher: Mutex<Option<RootWatcher>>,
+    unwatched: Mutex<BTreeSet<PathBuf>>,
+    readable: Mutex<BTreeMap<PathBuf, bool>>,
     this: Weak<Self>,
 }
 
@@ -1229,14 +1439,89 @@ impl ManagedLocalModels {
         let models = Arc::new_cyclic(|this| Self {
             resolver,
             watcher: Mutex::new(None),
+            unwatched: Mutex::new(BTreeSet::new()),
+            readable: Mutex::new(BTreeMap::new()),
             this: this.clone(),
         });
         models.rewatch();
+        models.observe_readable_roots();
+        models.start_root_recheck();
         models
+    }
+
+    /// Records which enabled locations can be read now, the baseline `recheck_roots` compares to.
+    fn observe_readable_roots(&self) {
+        let Ok(configuration) = self.inventory().local_models_configuration() else {
+            return;
+        };
+        if let Ok(mut readable) = self.readable.lock() {
+            *readable = configuration
+                .roots
+                .iter()
+                .filter(|root| root.enabled)
+                .map(|root| (root.path.clone(), std::fs::read_dir(&root.path).is_ok()))
+                .collect();
+        }
+    }
+
+    /// Checks the enabled locations periodically: one that becomes readable, or appears, is scanned
+    /// right away, and one whose watch could not start is rescanned every `UNWATCHED_RESCAN`.
+    fn start_root_recheck(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let this = self.this.clone();
+        runtime.spawn(async move {
+            let mut interval = tokio::time::interval(crate::local_watch::ROOT_RECHECK);
+            let mut last_unwatched_rescan = tokio::time::Instant::now();
+            loop {
+                interval.tick().await;
+                let Some(models) = this.upgrade() else {
+                    return;
+                };
+                let rescan_unwatched =
+                    last_unwatched_rescan.elapsed() >= crate::local_watch::UNWATCHED_RESCAN;
+                if rescan_unwatched {
+                    last_unwatched_rescan = tokio::time::Instant::now();
+                }
+                models.recheck_roots(rescan_unwatched).await;
+            }
+        });
+    }
+
+    /// Rescans the enabled locations that became readable since the last check, and with
+    /// `rescan_unwatched` the ones whose watch could not start.
+    pub(crate) async fn recheck_roots(self: Arc<Self>, rescan_unwatched: bool) {
+        let Ok(configuration) = self.inventory().local_models_configuration() else {
+            return;
+        };
+        let mut affected = BTreeSet::new();
+        if let Ok(mut readable) = self.readable.lock() {
+            let enabled = configuration
+                .roots
+                .iter()
+                .filter(|root| root.enabled)
+                .map(|root| root.path.clone())
+                .collect::<BTreeSet<_>>();
+            readable.retain(|path, _| enabled.contains(path));
+            for path in enabled {
+                let now = std::fs::read_dir(&path).is_ok();
+                if readable.insert(path.clone(), now) == Some(false) && now {
+                    affected.insert(crate::inventory::canonical_or_self(&path));
+                }
+            }
+        }
+        if rescan_unwatched && let Ok(unwatched) = self.unwatched.lock() {
+            affected.extend(unwatched.iter().cloned());
+        }
+        if !affected.is_empty() {
+            self.rescan_after_change(affected).await;
+        }
     }
 
     pub(crate) fn installed_packages_changed(&self, _revision: u64) {
         self.resolver.publish_local_change();
+        self.resolver.upstream.wake();
     }
 
     fn inventory(&self) -> &ManagedModelStore {
@@ -1254,18 +1539,34 @@ impl ManagedLocalModels {
         let Ok(mut watcher) = self.watcher.lock() else {
             return;
         };
-        if watcher
-            .as_ref()
-            .is_some_and(|watcher| watcher.targets() == targets.as_slice())
-        {
+        // A watch that could not start (an unreadable location, say) is retried on every rewatch.
+        if watcher.as_ref().is_some_and(|watcher| {
+            watcher.targets() == targets.as_slice() && watcher.unwatched().is_empty()
+        }) {
             return;
         }
+        let interests = targets
+            .iter()
+            .map(|target| target.interest.clone())
+            .collect::<BTreeSet<_>>();
         let this = self.this.clone();
         *watcher = RootWatcher::start(targets, move |affected| {
             if let Some(models) = this.upgrade() {
                 tokio::spawn(async move { models.rescan_after_change(affected).await });
             }
         });
+        let unwatched = match watcher.as_ref() {
+            Some(watcher) => watcher.unwatched().clone(),
+            None => {
+                tracing::warn!(
+                    "model location watcher could not start; every location is rescanned periodically"
+                );
+                interests
+            }
+        };
+        if let Ok(mut current) = self.unwatched.lock() {
+            *current = unwatched;
+        }
     }
 
     async fn rescan_after_change(self: Arc<Self>, affected: BTreeSet<PathBuf>) {
@@ -1309,6 +1610,7 @@ impl LocalModels for ManagedLocalModels {
                     .generation
                     .fetch_add(1, Ordering::AcqRel);
                 self.resolver.publish_local_change();
+                self.resolver.upstream.wake();
                 self.rewatch();
             }
             Ok(configuration)
@@ -1436,9 +1738,11 @@ mod tests {
         ) -> Self {
             let root = temporary.path().canonicalize().unwrap();
             let store = root.join("store");
-            let mut config = InventoryConfig::with_roots(store.clone(), root.join("cache")).unwrap();
+            let mut config =
+                InventoryConfig::with_roots(store.clone(), root.join("cache")).unwrap();
             config.hub_endpoint = Some(endpoint);
             config.catalog_models = catalog.clone();
+            config.architectures = crate::test_gguf::engine_architectures();
             let inventory = Arc::new(ManagedModelStore::open(config).await.unwrap());
             inventory.ensure_installed_model_inventory().await.unwrap();
             let resolver = ModelDomainResolver::new(
@@ -1510,7 +1814,9 @@ mod tests {
     }
 
     fn local_id(path: &Path) -> ModelId {
-        ModelId::local(&LocalModelDigest::new(header_digest(path)).unwrap())
+        ModelId::local(
+            &LocalModelDigest::new(crate::gguf::local_model_digest_of(&[path]).unwrap()).unwrap(),
+        )
     }
 
     fn ids(models: &[CustomModel]) -> Vec<String> {
@@ -1703,10 +2009,12 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|model| matches!(
-                &model.source,
-                ModelSource::HuggingFace { repository, .. } if repository == "owner/Shared-GGUF"
-            ))
+            .find(|model| {
+                matches!(
+                    &model.source,
+                    ModelSource::HuggingFace { repository, .. } if repository == "owner/Shared-GGUF"
+                )
+            })
             .expect("inventory publishes the shared-blob snapshot");
         assert_eq!(
             model.location.components()[0].content,
@@ -1716,7 +2024,10 @@ mod tests {
             "the repository blob's name, not the shared store's, identifies the content"
         );
         let resolved = inventory.resolve_ready(&model.id).await.unwrap();
-        assert_eq!(resolved.components[0].path, snapshot.join("Shared-Q4_K_M.gguf"));
+        assert_eq!(
+            resolved.components[0].path,
+            snapshot.join("Shared-Q4_K_M.gguf")
+        );
         assert!(!inventory.plan_delete(&model.id).await.unwrap().supported);
         assert!(inventory.delete(&model.id).await.is_err());
         assert!(snapshot.join("Shared-Q4_K_M.gguf").is_file());
@@ -1876,7 +2187,10 @@ mod tests {
         assert_eq!(listed.models.len(), 4, "{:?}", ids(&listed.models));
         assert_eq!(source("hf:owner/Model-GGUF/Model-Q4_K_M.gguf"), llama_cpp);
         assert_eq!(source("hf:owner/Other-GGUF/Other-Q8_0.gguf"), llama_cpp);
-        assert_eq!(source("hf:bartowski/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf"), llama_cpp);
+        assert_eq!(
+            source("hf:bartowski/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf"),
+            llama_cpp
+        );
         assert_eq!(
             source("hf:owner/Shared-GGUF/Shared-Q4_K_M.gguf"),
             Some(CustomModelOrigin::Found {
@@ -1979,6 +2293,87 @@ mod tests {
         );
     }
 
+    /// A store a newer Ollama wrote only `manifests-v2/` in, with no `manifests/` at all, is read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ollama_store_with_only_manifests_v2_is_scanned() {
+        let fixture = Fixture::new().await;
+        let ollama = fixture.root.join("ollama");
+        let qwen = model_bytes("qwen v2 only");
+        let document = write_ollama(
+            &ollama,
+            "registry.ollama.ai",
+            "library",
+            "qwen3.5",
+            "0.8b",
+            &[("application/vnd.ollama.image.model", &qwen)],
+        );
+        fs::remove_dir_all(ollama.join("manifests")).unwrap();
+        write_ollama_v2(&ollama, "ollama.com", "library/qwen3.5/0.8b", &document);
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Ollama, &ollama)]))
+            .await;
+        assert_eq!(
+            listed
+                .models
+                .iter()
+                .map(|model| model.display_name.as_str())
+                .collect::<Vec<_>>(),
+            ["qwen3.5:0.8b"]
+        );
+    }
+
+    /// An added model whose same bytes are also in another tool's location is partly Magnitude's:
+    /// its ownership is Mixed, and Magnitude alone otherwise.
+    #[tokio::test]
+    async fn an_added_model_also_found_elsewhere_has_mixed_ownership() {
+        use magnitude_service_contracts::models::ModelInstallationOwnership;
+        let fixture = Fixture::new().await;
+        let commit = "c".repeat(40);
+        let repository = "owner/Added-GGUF";
+        let files = [("Added-Q4_K_M.gguf", model_bytes("added and found"))];
+        publish_managed(&fixture.store, repository, &commit, &files);
+        let cache = fixture.root.join("hf");
+        let id: ModelId = "hf:owner/Added-GGUF/Added-Q4_K_M.gguf".parse().unwrap();
+        let configuration = LocalModelsConfiguration {
+            roots: vec![root(ModelRootKind::HuggingFaceCache, &cache)],
+            declarations: vec![CustomModelDeclaration {
+                model_id: id.clone(),
+                origin: CustomModelDeclarationOrigin::Added {
+                    repository: HuggingFaceRepositoryId::new(repository).unwrap(),
+                    commit: commit.clone(),
+                },
+                target: vec!["Added-Q4_K_M.gguf".to_owned()],
+                projector: None,
+            }],
+            ..LocalModelsConfiguration::default()
+        };
+        let ownership = |listed: &LocalModelsResponse| {
+            let model = listed
+                .models
+                .iter()
+                .find(|model| model.model_id == id)
+                .unwrap();
+            match &model.state {
+                CustomModelState::Ready { installation, .. }
+                | CustomModelState::Unavailable { installation, .. } => {
+                    let ResolvedModelInstallation::Resolved { ownership, .. } = installation;
+                    *ownership
+                }
+                CustomModelState::NotInstalled => panic!("the added model is installed"),
+            }
+        };
+
+        let alone = fixture.apply(configuration.clone()).await;
+        assert_eq!(ownership(&alone), ModelInstallationOwnership::Magnitude);
+
+        publish_hf_cache(&cache, repository, &commit, &files);
+        let both = fixture.local.refresh_local().await.unwrap();
+        assert_eq!(ids(&both.models), [id.to_string()]);
+        assert_eq!(ownership(&both), ModelInstallationOwnership::Mixed);
+    }
+
     #[tokio::test]
     async fn several_ollama_roots_are_each_scanned_and_a_pull_in_both_is_one_model() {
         let fixture = Fixture::new().await;
@@ -2001,7 +2396,10 @@ mod tests {
             "library",
             "llama3",
             "8b",
-            &[("application/vnd.ollama.image.model", &model_bytes("user only"))],
+            &[(
+                "application/vnd.ollama.image.model",
+                &model_bytes("user only"),
+            )],
         );
         write_ollama(
             &system,
@@ -2009,7 +2407,10 @@ mod tests {
             "library",
             "gemma3",
             "4b",
-            &[("application/vnd.ollama.image.model", &model_bytes("system only"))],
+            &[(
+                "application/vnd.ollama.image.model",
+                &model_bytes("system only"),
+            )],
         );
 
         let listed = fixture
@@ -2183,8 +2584,13 @@ mod tests {
                         break;
                     }
                 }
-                let found = request_line.contains(&format!("/api/models/{repository}/revision/main"));
-                let (status, body) = if found { ("200 OK", body.as_slice()) } else { ("404 Not Found", &b""[..]) };
+                let found =
+                    request_line.contains(&format!("/api/models/{repository}/revision/main"));
+                let (status, body) = if found {
+                    ("200 OK", body.as_slice())
+                } else {
+                    ("404 Not Found", &b""[..])
+                };
                 let _ = write!(
                     connection,
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2197,11 +2603,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn an_ollama_hub_pull_takes_the_id_of_the_same_file_in_the_hugging_face_cache() {
+    async fn an_ollama_hub_pull_keeps_its_local_id_and_takes_its_lineage_from_the_repository() {
         let pulled = model_bytes("hub pull");
         let endpoint = serve_repository(
             "unsloth/Qwen3-8B-GGUF",
-            vec![("Qwen3-8B-Q4_K_M.gguf", pulled.clone()), ("Qwen3-8B-Q8_0.gguf", model_bytes("other"))],
+            vec![
+                ("Qwen3-8B-Q4_K_M.gguf", pulled.clone()),
+                ("Qwen3-8B-Q8_0.gguf", model_bytes("other")),
+            ],
         );
         let fixture = Fixture::with_hub(endpoint).await;
         let ollama = fixture.root.join("ollama");
@@ -2213,32 +2622,87 @@ mod tests {
             "Q4_K_M",
             &[("application/vnd.ollama.image.model", &pulled)],
         );
-        let expected = "hf:unsloth/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf";
-        let mut listed = fixture
+        let blob = ollama.join(format!("blobs/sha256-{}", sha256(&pulled)));
+        let local = local_id(&blob).to_string();
+        let listed = fixture
             .apply(roots(vec![root(ModelRootKind::Ollama, &ollama)]))
             .await;
-        for _ in 0..100 {
-            if ids(&listed.models) == [expected] {
-                break;
-            }
+        assert_eq!(
+            ids(&listed.models),
+            [local.clone()],
+            "an Ollama model keeps its local: ID"
+        );
+        assert_eq!(
+            listed.models[0].display_name,
+            "hf.co/unsloth/Qwen3-8B-GGUF:Q4_K_M"
+        );
+        let model_id: ModelId = local.parse().unwrap();
+        // Resolving the pull's file in its repository serves lineage only; the ID never changes.
+        for _ in 0..20 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            listed = fixture.local.refresh_local().await.unwrap();
+            let rescanned = fixture.local.refresh_local().await.unwrap();
+            assert_eq!(ids(&rescanned.models), [local.clone()]);
         }
-        assert_eq!(ids(&listed.models), [expected], "Ollama alone resolves the real file name");
+        assert_eq!(
+            fixture
+                .resolver
+                .custom_model_lineage_repository(&model_id)
+                .unwrap()
+                .as_deref(),
+            Some("unsloth/Qwen3-8B-GGUF")
+        );
 
         let hub = fixture.root.join("hf/hub");
-        publish_hf_cache(&hub, "unsloth/Qwen3-8B-GGUF", &"c".repeat(40), &[("Qwen3-8B-Q4_K_M.gguf", pulled)]);
+        publish_hf_cache(
+            &hub,
+            "unsloth/Qwen3-8B-GGUF",
+            &"c".repeat(40),
+            &[("Qwen3-8B-Q4_K_M.gguf", pulled)],
+        );
         let both = fixture
             .apply(roots(vec![
                 root(ModelRootKind::Ollama, &ollama),
                 root(ModelRootKind::HuggingFaceCache, &hub),
             ]))
             .await;
-        assert_eq!(ids(&both.models), [expected], "the same bytes in two locations are one model with one ID");
-        let cache_only = fixture
-            .apply(roots(vec![root(ModelRootKind::HuggingFaceCache, &hub)]))
+        assert_eq!(
+            both.models.len(),
+            1,
+            "the same bytes in two locations are one model: {:?}",
+            ids(&both.models)
+        );
+    }
+
+    /// An `hf.co` pull whose repository can't be read (offline, or no file has its bytes) still
+    /// takes its lineage from the repository its name gives.
+    #[tokio::test]
+    async fn an_unresolved_ollama_hub_pull_takes_its_lineage_from_its_name() {
+        let fixture = Fixture::new().await;
+        let ollama = fixture.root.join("ollama");
+        let pulled = model_bytes("unresolved pull");
+        write_ollama(
+            &ollama,
+            "hf.co",
+            "unsloth",
+            "Qwen3-8B-GGUF",
+            "Q4_K_M",
+            &[("application/vnd.ollama.image.model", &pulled)],
+        );
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Ollama, &ollama)]))
             .await;
-        assert_eq!(ids(&cache_only.models), [expected]);
+        let model_id = listed.models[0].model_id.clone();
+        assert!(model_id.as_str().starts_with("local:"));
+        assert_eq!(
+            fixture
+                .resolver
+                .custom_model_lineage_repository(&model_id)
+                .unwrap()
+                .as_deref(),
+            Some("unsloth/Qwen3-8B-GGUF")
+        );
+        assert_eq!(ollama_hub_repository("qwen3:8b"), None);
+        assert_eq!(ollama_hub_repository("someone/tool:latest"), None);
     }
 
     #[tokio::test]
@@ -2321,8 +2785,80 @@ mod tests {
         assert_eq!(after.models[0].files[0].path, second.join("renamed.gguf"));
     }
 
+    /// The `local:` identity covers more than the header: two files with the same header but
+    /// different weights are two models.
     #[tokio::test]
-    async fn identity_never_reads_tensor_data() {
+    async fn the_same_header_with_different_weights_is_two_models() {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        fs::create_dir_all(&folder).unwrap();
+        let bytes = model_bytes("same header");
+        let mut retrained = bytes.clone();
+        *retrained.last_mut().unwrap() ^= 0xff;
+        fs::write(folder.join("original.gguf"), &bytes).unwrap();
+        fs::write(folder.join("retrained.gguf"), &retrained).unwrap();
+        assert_eq!(
+            header_digest(&folder.join("original.gguf")),
+            header_digest(&folder.join("retrained.gguf"))
+        );
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &folder)]))
+            .await;
+        let mut expected = vec![
+            local_id(&folder.join("original.gguf")).to_string(),
+            local_id(&folder.join("retrained.gguf")).to_string(),
+        ];
+        expected.sort();
+        let mut listed_ids = ids(&listed.models);
+        listed_ids.sort();
+        assert_eq!(listed_ids, expected);
+        assert_ne!(expected[0], expected[1]);
+    }
+
+    /// The content sample of a 512 GiB file reads its header and two MiB of its weights, never the
+    /// rest.
+    #[test]
+    fn the_content_sample_of_a_huge_file_reads_a_few_megabytes() {
+        struct Counting<R> {
+            inner: R,
+            read: u64,
+        }
+        impl<R: std::io::Read> std::io::Read for Counting<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.inner.read(buffer)?;
+                self.read += read as u64;
+                Ok(read)
+            }
+        }
+        impl<R: std::io::Seek> std::io::Seek for Counting<R> {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("huge.gguf");
+        let header = model_bytes("huge");
+        let file = fs::File::create(&path).unwrap();
+        std::io::Write::write_all(&mut &file, &header).unwrap();
+        let length = 512 * 1024 * 1024 * 1024;
+        magnitude_service_utils::sparse_file::set_sparse_len(&file, length).unwrap();
+        drop(file);
+        let mut counting = Counting {
+            inner: fs::File::open(&path).unwrap(),
+            read: 0,
+        };
+        let header_bytes = crate::gguf::inspect(&path).unwrap().header_bytes;
+        crate::gguf::content_sample_digest(&mut counting, header_bytes, length).unwrap();
+        assert!(
+            counting.read <= header_bytes + 2 * crate::gguf::CONTENT_SAMPLE_BYTES,
+            "read {} bytes",
+            counting.read
+        );
+    }
+
+    #[tokio::test]
+    async fn a_huge_file_is_identified_without_reading_its_weights() {
         let fixture = Fixture::new().await;
         let folder = fixture.root.join("models");
         fs::create_dir_all(&folder).unwrap();
@@ -2339,7 +2875,7 @@ mod tests {
             fixture.apply(roots(vec![root(ModelRootKind::Folder, &folder)])),
         )
         .await
-        .expect("a 512 GiB file is identified from its header alone");
+        .expect("a 512 GiB file is identified from its header and a sample of its weights");
 
         assert_eq!(ids(&listed.models), [local_id(&path).to_string()]);
         let CustomModelState::Ready { model, .. } = &listed.models[0].state else {
@@ -2431,7 +2967,10 @@ mod tests {
         let attributed = |fixture: &Fixture| {
             let catalog = fixture.resolver.catalog_snapshot().unwrap();
             assert_eq!(catalog.models[0].aliases, [found_id.clone()]);
-            matches!(catalog.models[0].local_state, CatalogModelState::Installed { .. })
+            matches!(
+                catalog.models[0].local_state,
+                CatalogModelState::Installed { .. }
+            )
         };
 
         // Shown, the copy is the catalog model's (and the catalog remembers its package).
@@ -2440,7 +2979,10 @@ mod tests {
         assert!(listed.models.is_empty() && listed.hidden.is_empty());
         assert!(attributed(&fixture));
         assert_eq!(
-            fixture.resolver.canonical_model_id(found_id.clone()).unwrap(),
+            fixture
+                .resolver
+                .canonical_model_id(found_id.clone())
+                .unwrap(),
             catalog_model_id
         );
 
@@ -2450,13 +2992,20 @@ mod tests {
             }
             let listed = fixture.apply(hidden.clone()).await;
             assert!(listed.models.is_empty(), "restarted: {restarted}");
-            assert_eq!(ids(&listed.hidden), [found_id.to_string()], "restarted: {restarted}");
+            assert_eq!(
+                ids(&listed.hidden),
+                [found_id.to_string()],
+                "restarted: {restarted}"
+            );
             assert!(
                 !attributed(&fixture),
                 "the catalog model is not installed (restarted: {restarted})"
             );
             assert_eq!(
-                fixture.resolver.canonical_model_id(found_id.clone()).unwrap(),
+                fixture
+                    .resolver
+                    .canonical_model_id(found_id.clone())
+                    .unwrap(),
                 found_id
             );
             assert!(
@@ -2464,7 +3013,8 @@ mod tests {
                     .resolver
                     .assessment_configuration(&ModelAssessmentSubject::Catalog {
                         model_id: catalog_model_id.clone(),
-                        selection: magnitude_service_contracts::models::CatalogModelSelection::Effective,
+                        selection:
+                            magnitude_service_contracts::models::CatalogModelSelection::Effective,
                     })
                     .is_err(),
                 "the catalog ID no longer resolves to the hidden copy (restarted: {restarted})"
@@ -2473,7 +3023,10 @@ mod tests {
 
         let listed = fixture.apply(shown).await;
         assert!(listed.models.is_empty() && listed.hidden.is_empty());
-        assert!(attributed(&fixture), "unhidden, the copy is the catalog model's again");
+        assert!(
+            attributed(&fixture),
+            "unhidden, the copy is the catalog model's again"
+        );
         assert_eq!(
             fixture.resolver.canonical_model_id(found_id).unwrap(),
             catalog_model_id
@@ -2516,7 +3069,10 @@ mod tests {
                         break;
                     }
                 }
-                recorded.lock().unwrap().push(request_line.trim().to_owned());
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(request_line.trim().to_owned());
                 let file = files.iter().find(|(path, _)| {
                     request_line.contains(&format!("/{repository}/resolve/{commit}/{path}"))
                 });
@@ -2646,14 +3202,17 @@ mod tests {
             .filter(|request| request.starts_with("GET ") && request.contains("/resolve/"))
             .cloned()
             .collect::<Vec<_>>();
-        assert!(fetched.is_empty(), "no file bytes are downloaded: {fetched:?}");
+        assert!(
+            fetched.is_empty(),
+            "no file bytes are downloaded: {fetched:?}"
+        );
         assert_eq!(fs::read(snapshot.join("Model-Q4_K_M.gguf")).unwrap(), bytes);
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
             let identity = |path: PathBuf| {
                 let metadata = fs::metadata(path).unwrap();
-                (metadata.dev(), metadata.ino())
+                (metadata.dev(), metadata.ino(), metadata.nlink())
             };
             let installed = fixture
                 .store
@@ -2662,18 +3221,24 @@ mod tests {
                 .join("snapshots")
                 .join("a".repeat(40))
                 .join("Model-Q4_K_M.gguf");
-            assert_eq!(
-                identity(installed),
-                identity(snapshot.join("Model-Q4_K_M.gguf")),
-                "Magnitude's blob is the found file itself; its bytes are not written again"
+            let (_, installed_inode, installed_links) = identity(installed);
+            let (_, found_inode, found_links) = identity(snapshot.join("Model-Q4_K_M.gguf"));
+            assert_ne!(
+                installed_inode, found_inode,
+                "Magnitude's blob is its own copy, never a link to the found file"
             );
+            assert_eq!((installed_links, found_links), (1, 1));
         }
         // The copy holds the installed catalog model's content, so it is that model's and isn't
         // listed apart; its ID stays hidden, so removing Magnitude's copy hides it again.
         let listed = fixture.local.refresh_local().await.unwrap();
         assert!(listed.models.is_empty() && listed.hidden.is_empty());
         assert_eq!(
-            fixture.inventory().local_models_configuration().unwrap().hidden,
+            fixture
+                .inventory()
+                .local_models_configuration()
+                .unwrap()
+                .hidden,
             [found_id]
         );
     }
@@ -2717,7 +3282,7 @@ mod tests {
         assert_eq!(listed.unsupported[0].path, folder.join("broken.gguf"));
         assert_eq!(
             listed.unsupported[0].reasons,
-            [UnsupportedReason::Unreadable]
+            [UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)]
         );
         assert_eq!(
             listed.unsupported[0].origin,
@@ -2750,7 +3315,7 @@ mod tests {
         assert_eq!(listed.unsupported[0].path, folder.join("truncated.gguf"));
         assert_eq!(
             listed.unsupported[0].reasons,
-            [UnsupportedReason::Unreadable]
+            [UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)]
         );
     }
 
@@ -2788,7 +3353,9 @@ mod tests {
         write_model(&folder.join("model.gguf"), "imported");
         let declaration = CustomModelDeclaration {
             model_id: local_id(&folder.join("model.gguf")),
-            origin: CustomModelDeclarationOrigin::Imported { path: folder.clone() },
+            origin: CustomModelDeclarationOrigin::Imported {
+                path: folder.clone(),
+            },
             target: vec![folder.to_string_lossy().into_owned()],
             projector: None,
         };
@@ -2922,7 +3489,10 @@ mod tests {
             .await;
 
         assert_eq!(ids(&listed.models), [id.to_string()]);
-        assert!(matches!(listed.models[0].state, CustomModelState::Ready { .. }));
+        assert!(matches!(
+            listed.models[0].state,
+            CustomModelState::Ready { .. }
+        ));
         assert_eq!(listed.models[0].files[0].path, link);
         let inventory = fixture.inventory();
         let model = inventory
@@ -2930,10 +3500,15 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|model| matches!(
-                model.location,
-                ModelLocation::External { origin: ExternalOrigin::Imported, .. }
-            ))
+            .find(|model| {
+                matches!(
+                    model.location,
+                    ModelLocation::External {
+                        origin: ExternalOrigin::Imported,
+                        ..
+                    }
+                )
+            })
             .expect("the imported link is published");
         let resolved = inventory.resolve_ready(&model.id).await.unwrap();
         assert_eq!(resolved.components[0].path, link);
@@ -3186,6 +3761,7 @@ mod tests {
                 reference,
                 method: SpeculativeMethod::DFlash,
                 state: AttachedDrafterState::Ready,
+                update_available: false,
             })
         );
         let configuration = fixture.resolver.serving_configuration(&target).unwrap();
@@ -3260,14 +3836,21 @@ mod tests {
         let listed = fixture.apply(configuration).await;
         assert_eq!(ids(&listed.models), [target.to_string()]);
         assert_eq!(
-            listed.models[0].drafter.as_ref().map(|drafter| drafter.state.clone()),
+            listed.models[0]
+                .drafter
+                .as_ref()
+                .map(|drafter| drafter.state.clone()),
             Some(AttachedDrafterState::Ready),
             "a file with the drafter's header and size is that drafter, wherever it is"
         );
         let ServableModelBundle::SpeculativeDecoding {
             draft_source: SpeculativeDraftSource::Separate { draft },
             ..
-        } = fixture.resolver.serving_configuration(&target).unwrap().bundle
+        } = fixture
+            .resolver
+            .serving_configuration(&target)
+            .unwrap()
+            .bundle
         else {
             panic!("the model serves with the drafter found in LM Studio");
         };
@@ -3277,19 +3860,29 @@ mod tests {
         );
         assert!(
             !fixture.store.join("hub").exists()
-                || fs::read_dir(fixture.store.join("hub")).unwrap().next().is_none(),
+                || fs::read_dir(fixture.store.join("hub"))
+                    .unwrap()
+                    .next()
+                    .is_none(),
             "nothing is copied into Magnitude's store"
         );
 
         fs::remove_file(&in_lm_studio).unwrap();
         let after = fixture.local.refresh_local().await.unwrap();
         assert_eq!(
-            after.models[0].drafter.as_ref().map(|drafter| drafter.state.clone()),
+            after.models[0]
+                .drafter
+                .as_ref()
+                .map(|drafter| drafter.state.clone()),
             Some(AttachedDrafterState::NotInstalled),
             "when the copy disappears the drafter can be downloaded again"
         );
         assert!(matches!(
-            fixture.resolver.serving_configuration(&target).unwrap().bundle,
+            fixture
+                .resolver
+                .serving_configuration(&target)
+                .unwrap()
+                .bundle,
             ServableModelBundle::Standalone { .. }
         ));
 
@@ -3317,7 +3910,10 @@ mod tests {
             .push(root(ModelRootKind::HuggingFaceCache, &cache));
         let cached = fixture.apply(configuration).await;
         assert_eq!(
-            cached.models[0].drafter.as_ref().map(|drafter| drafter.state.clone()),
+            cached.models[0]
+                .drafter
+                .as_ref()
+                .map(|drafter| drafter.state.clone()),
             Some(AttachedDrafterState::Ready)
         );
     }
@@ -3353,7 +3949,10 @@ mod tests {
         };
         fixture.apply(attached.clone()).await;
         let kept = fixture.local.prune_drafters().await.unwrap();
-        assert!(kept.removed.is_empty(), "a drafter a model serves with is kept");
+        assert!(
+            kept.removed.is_empty(),
+            "a drafter a model serves with is kept"
+        );
         assert!(snapshot.join("Model-DFlash-Q8_0.gguf").exists());
 
         fixture
@@ -3366,7 +3965,165 @@ mod tests {
         assert_eq!(pruned.removed.len(), 1);
         assert!(pruned.freed_bytes > 0);
         assert!(!snapshot.join("Model-DFlash-Q8_0.gguf").exists());
-        assert!(folder.join("target.gguf").exists(), "the model's own files are never touched");
+        assert!(
+            folder.join("target.gguf").exists(),
+            "the model's own files are never touched"
+        );
+    }
+
+    /// Recommends each model its own drafter reference.
+    struct RecommendsEach(BTreeMap<ModelId, DrafterReference>);
+
+    impl CustomModelEnrichment for RecommendsEach {
+        fn enrich(&self, model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult {
+            CustomModelEnrichmentResult {
+                variant_of: None,
+                recommended_drafter: self
+                    .0
+                    .get(model.model_id)
+                    .map(|reference| DrafterCandidate {
+                        category: DrafterCategory::Other,
+                        reference: reference.clone(),
+                        name: "drafter".to_owned(),
+                        label: "Recommended".to_owned(),
+                        size_bytes: 1,
+                        lineage: DrafterLineage::Lineage,
+                        verdict: DrafterVerdict::Bound {
+                            method: SpeculativeMethod::DFlash,
+                            memory_bytes: 1,
+                        },
+                        on_this_computer: true,
+                        method: Some(SpeculativeMethod::DFlash),
+                    }),
+                license: None,
+            }
+        }
+
+        fn knows(&self, _model: &CustomModelFacts<'_>) -> bool {
+            true
+        }
+    }
+
+    struct PruningFixture {
+        fixture: Fixture,
+        folder: PathBuf,
+        models: [ModelId; 2],
+        drafters: [(DrafterReference, PathBuf); 2],
+    }
+
+    /// Two found models, each recommended its own Magnitude-downloaded drafter.
+    async fn pruning_fixture() -> PruningFixture {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("a.gguf"), "model a");
+        write_model(&folder.join("b.gguf"), "model b");
+        let models = [
+            local_id(&folder.join("a.gguf")),
+            local_id(&folder.join("b.gguf")),
+        ];
+        let drafter = |name: &str, seed: char| {
+            let repository = format!("magnitudedev/{name}-DFlash-GGUF");
+            let commit = seed.to_string().repeat(40);
+            let file = format!("{name}-DFlash-Q8_0.gguf");
+            let snapshot = publish_managed(
+                &fixture.store,
+                &repository,
+                &commit,
+                &[(&file, drafter_bytes(name))],
+            );
+            (
+                DrafterReference::HuggingFace {
+                    repository: HuggingFaceRepositoryId::new(repository.as_str()).unwrap(),
+                    commit,
+                    path: file.clone(),
+                },
+                snapshot.join(file),
+            )
+        };
+        let drafters = [drafter("A", 'a'), drafter("B", 'b')];
+        fixture
+            .resolver
+            .set_custom_model_enrichment(Arc::new(RecommendsEach(BTreeMap::from([
+                (models[0].clone(), drafters[0].0.clone()),
+                (models[1].clone(), drafters[1].0.clone()),
+            ]))));
+        PruningFixture {
+            fixture,
+            folder,
+            models,
+            drafters,
+        }
+    }
+
+    impl PruningFixture {
+        fn configuration(&self, choices: [DrafterChoice; 2]) -> LocalModelsConfiguration {
+            LocalModelsConfiguration {
+                roots: vec![root(ModelRootKind::Folder, &self.folder)],
+                drafters: self
+                    .models
+                    .iter()
+                    .cloned()
+                    .zip(choices)
+                    .map(|(model_id, drafter)| DrafterAttachment { model_id, drafter })
+                    .collect(),
+                ..LocalModelsConfiguration::default()
+            }
+        }
+
+        fn reference(&self, index: usize) -> DrafterChoice {
+            DrafterChoice::Reference {
+                reference: self.drafters[index].0.clone(),
+                method: SpeculativeMethod::DFlash,
+            }
+        }
+
+        async fn remove_model(&self, file: &str) -> DrafterPruning {
+            fs::remove_file(self.folder.join(file)).unwrap();
+            self.fixture.local.refresh_local().await.unwrap();
+            self.fixture.local.prune_drafters().await.unwrap()
+        }
+    }
+
+    /// Removing one model never deletes a drafter another model here would use: model A's
+    /// turned-off drafter stays while A is here, and goes once A is removed and nothing else
+    /// references it.
+    #[tokio::test]
+    async fn pruning_keeps_a_turned_off_drafter_while_its_model_is_here() {
+        let pruning = pruning_fixture().await;
+        pruning
+            .fixture
+            .apply(pruning.configuration([DrafterChoice::None, pruning.reference(1)]))
+            .await;
+
+        let removed_b = pruning.remove_model("b.gguf").await;
+        assert_eq!(removed_b.removed.len(), 1, "B's drafter goes with B");
+        assert!(!pruning.drafters[1].1.exists());
+        assert!(
+            pruning.drafters[0].1.exists(),
+            "A's turned-off drafter stays while A is here"
+        );
+
+        let removed_a = pruning.remove_model("a.gguf").await;
+        assert_eq!(removed_a.removed.len(), 1);
+        assert!(
+            !pruning.drafters[0].1.exists(),
+            "nothing references A's drafter now"
+        );
+    }
+
+    /// A drafter two models use survives removing one of them.
+    #[tokio::test]
+    async fn a_drafter_shared_by_two_models_survives_removing_one() {
+        let pruning = pruning_fixture().await;
+        pruning
+            .fixture
+            .apply(pruning.configuration([pruning.reference(0), pruning.reference(0)]))
+            .await;
+        pruning.remove_model("b.gguf").await;
+        assert!(
+            pruning.drafters[0].1.exists(),
+            "A still uses the shared drafter"
+        );
     }
 
     /// Removing a catalog model deletes its target and keeps its drafter while a found model uses
@@ -3428,7 +4185,10 @@ mod tests {
         };
         fixture.apply(using.clone()).await;
 
-        let plan = fixture.resolver.catalog_removal_plan(&catalog_model_id).unwrap();
+        let plan = fixture
+            .resolver
+            .catalog_removal_plan(&catalog_model_id)
+            .unwrap();
         assert_eq!(plan.package_ids, [target.id.clone()]);
 
         fixture
@@ -3437,11 +4197,120 @@ mod tests {
                 ..using
             })
             .await;
-        let plan = fixture.resolver.catalog_removal_plan(&catalog_model_id).unwrap();
+        let plan = fixture
+            .resolver
+            .catalog_removal_plan(&catalog_model_id)
+            .unwrap();
         assert_eq!(
             plan.package_ids.iter().collect::<BTreeSet<_>>(),
             BTreeSet::from([&target.id, &draft.id])
         );
+    }
+
+    /// A catalog drafter with a new revision in the catalog keeps serving with the earlier
+    /// revision installed for that catalog model, and reports that an update is available.
+    #[tokio::test]
+    async fn a_catalog_drafter_with_a_new_revision_serves_the_earlier_one_with_an_update() {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+        let fixture = Fixture::new().await;
+        publish_managed(
+            &fixture.store,
+            "owner/Model-GGUF",
+            &"a".repeat(40),
+            &[("Model-Q4_K_M.gguf", model_bytes("catalog target"))],
+        );
+        publish_managed(
+            &fixture.store,
+            "owner/Model-MTP-GGUF",
+            &"b".repeat(40),
+            &[("Model-MTP.gguf", drafter_bytes("catalog drafter"))],
+        );
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        let packages = fixture.inventory().list_installed().await.unwrap().packages;
+        let package = |repository: &str| {
+            packages
+                .iter()
+                .map(|entry| entry.package.clone())
+                .find(|package| matches!(
+                    &package.source,
+                    magnitude_service_contracts::models::ModelPackageSource::HuggingFace { repository: source, .. }
+                        if source == repository
+                ))
+                .unwrap()
+        };
+        let (target, old_draft) = (package("owner/Model-GGUF"), package("owner/Model-MTP-GGUF"));
+        let with_draft = |draft: ModelPackage| {
+            let mut definition = catalog_definition(target.clone());
+            definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+                target: target.clone(),
+                draft_source: SpeculativeDraftSource::Separate { draft },
+                method: SpeculativeMethod::Mtp,
+            };
+            definition
+        };
+        let catalog_model_id = catalog_id(&with_draft(old_draft.clone()));
+        // The installed drafter is recorded as the catalog model's drafter while it is current, and
+        // a found model using the current drafter has no update.
+        let fixture = fixture.restart(vec![with_draft(old_draft.clone())]).await;
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("found.gguf"), "found");
+        let found = local_id(&folder.join("found.gguf"));
+        let using = LocalModelsConfiguration {
+            roots: vec![root(ModelRootKind::Folder, &folder)],
+            drafters: vec![DrafterAttachment {
+                model_id: found.clone(),
+                drafter: DrafterChoice::Reference {
+                    reference: DrafterReference::Catalog {
+                        model_id: catalog_model_id.clone(),
+                    },
+                    method: SpeculativeMethod::Mtp,
+                },
+            }],
+            ..LocalModelsConfiguration::default()
+        };
+        let current = fixture.apply(using.clone()).await;
+        let attached = current
+            .models
+            .iter()
+            .find(|model| model.model_id == found)
+            .and_then(|model| model.drafter.clone())
+            .expect("the attached drafter");
+        assert_eq!(attached.state, AttachedDrafterState::Ready);
+        assert!(
+            !attached.update_available,
+            "a current drafter has no update"
+        );
+
+        let mut new_draft = old_draft.clone();
+        new_draft.id = ModelPackageId("owner-model-mtp-next-revision".to_owned());
+        for file in &mut new_draft.files {
+            file.sha256 = "f".repeat(64);
+        }
+        if let magnitude_service_contracts::models::ModelPackageSource::HuggingFace {
+            revision,
+            ..
+        } = &mut new_draft.source
+        {
+            *revision = "c".repeat(40);
+        }
+        let fixture = fixture.restart(vec![with_draft(new_draft)]).await;
+        let listed = fixture.apply(using).await;
+
+        let drafter = listed
+            .models
+            .iter()
+            .find(|model| model.model_id == found)
+            .and_then(|model| model.drafter.clone())
+            .expect("the attached drafter");
+        assert_eq!(drafter.state, AttachedDrafterState::Ready);
+        assert!(drafter.update_available, "{drafter:?}");
+        assert!(matches!(
+            fixture.resolver.serving_configuration(&found).unwrap().bundle,
+            ServableModelBundle::SpeculativeDecoding {
+                draft_source: SpeculativeDraftSource::Separate { draft },
+                ..
+            } if draft.id == old_draft.id
+        ));
     }
 
     /// After a restart mid-download, the drafter that finished before the target is kept for the
@@ -3485,7 +4354,10 @@ mod tests {
         assert_eq!(pending.models[0].state, CustomModelState::NotInstalled);
 
         let kept = fixture.local.prune_drafters().await.unwrap();
-        assert!(kept.removed.is_empty(), "the pending model's drafter is in use");
+        assert!(
+            kept.removed.is_empty(),
+            "the pending model's drafter is in use"
+        );
         assert!(snapshot.join("Model-DFlash-Q8_0.gguf").exists());
 
         fixture
@@ -3496,11 +4368,15 @@ mod tests {
             })
             .await;
         let pruned = fixture.local.prune_drafters().await.unwrap();
-        assert_eq!(pruned.removed.len(), 1, "once the model is removed its drafter goes too");
+        assert_eq!(
+            pruned.removed.len(),
+            1,
+            "once the model is removed its drafter goes too"
+        );
     }
 
     #[tokio::test]
-    async fn embedded_prediction_heads_attach_only_to_models_that_have_them() {
+    async fn built_in_prediction_heads_attach_as_chosen_and_the_engine_decides_whether_they_bind() {
         let fixture = Fixture::new().await;
         let folder = fixture.root.join("models");
         write_mtp_model(&folder.join("with-heads.gguf"), "heads");
@@ -3523,36 +4399,33 @@ mod tests {
             })
             .await;
 
-        assert!(matches!(
-            fixture
-                .resolver
-                .serving_configuration(&with_heads)
-                .unwrap()
-                .bundle,
-            ServableModelBundle::SpeculativeDecoding {
-                draft_source: SpeculativeDraftSource::Embedded,
-                ..
-            }
-        ));
-        assert!(matches!(
-            fixture
-                .resolver
-                .serving_configuration(&without_heads)
-                .unwrap()
-                .bundle,
-            ServableModelBundle::Standalone { .. }
-        ));
+        // Whether built-in heads bind is the engine's drafter verdict for the model's assessment
+        // ("MTP was requested but the target has no draft head"); the service attaches them as
+        // chosen and never judges the file itself.
+        for model_id in [&with_heads, &without_heads] {
+            assert!(matches!(
+                fixture
+                    .resolver
+                    .serving_configuration(model_id)
+                    .unwrap()
+                    .bundle,
+                ServableModelBundle::SpeculativeDecoding {
+                    draft_source: SpeculativeDraftSource::Embedded,
+                    method: SpeculativeMethod::Mtp,
+                    ..
+                }
+            ));
+        }
         let listed = fixture.local.list_local().await.unwrap();
-        let rejected = listed
-            .models
-            .iter()
-            .find(|model| model.model_id == without_heads)
-            .and_then(|model| model.drafter.as_ref())
-            .unwrap();
-        assert!(matches!(
-            rejected.state,
-            AttachedDrafterState::Rejected { .. }
-        ));
+        for model_id in [&with_heads, &without_heads] {
+            let drafter = listed
+                .models
+                .iter()
+                .find(|model| &model.model_id == model_id)
+                .and_then(|model| model.drafter.as_ref())
+                .unwrap();
+            assert_eq!(drafter.state, AttachedDrafterState::Ready);
+        }
     }
 
     #[tokio::test]
@@ -3575,7 +4448,11 @@ mod tests {
 
         assert!(
             matches!(
-                fixture.resolver.serving_configuration(&with_heads).unwrap().bundle,
+                fixture
+                    .resolver
+                    .serving_configuration(&with_heads)
+                    .unwrap()
+                    .bundle,
                 ServableModelBundle::Standalone { .. }
             ),
             "no drafter is a standalone bundle, which the engine serves plain"
@@ -3727,7 +4604,10 @@ mod tests {
                 .drafter
                 .as_ref()
                 .map(|drafter| (drafter.method.clone(), drafter.state.clone())),
-            Some((SpeculativeMethod::DFlash, AttachedDrafterState::NotInstalled))
+            Some((
+                SpeculativeMethod::DFlash,
+                AttachedDrafterState::NotInstalled
+            ))
         );
         assert!(matches!(
             fixture
@@ -3741,7 +4621,10 @@ mod tests {
         fixture.apply(attach(DrafterChoice::None)).await;
         let listed = fixture.local.list_local().await.unwrap();
         assert_eq!(listed.models[0].drafter, None);
-        assert!(listed.models[0].recommended_drafter.is_some());
+        assert_eq!(
+            listed.models[0].recommended_drafter, None,
+            "a model whose drafter is turned off is offered none"
+        );
     }
 
     #[tokio::test]
@@ -3877,6 +4760,68 @@ mod tests {
         // A location created after it was configured is noticed too.
         write_model(&later.join("model.gguf"), "later");
         assert!(eventually(&fixture.local, |listed| listed.models.len() == 1).await);
+    }
+
+    /// A location that could not be read (a permission it lacked, say) is scanned as soon as it
+    /// can be, without a restart.
+    #[tokio::test]
+    async fn a_location_that_becomes_readable_is_scanned_without_a_restart() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("model.gguf"), "model");
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&folder).is_ok() {
+            // Running as a user that reads everything (root): nothing to observe.
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &folder)]))
+            .await;
+        assert!(listed.models.is_empty());
+        Arc::clone(&fixture.local).recheck_roots(false).await;
+
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+        Arc::clone(&fixture.local).recheck_roots(false).await;
+        assert_eq!(fixture.local.list_local().await.unwrap().models.len(), 1);
+    }
+
+    /// A location whose watch could not start is rescanned periodically instead.
+    #[tokio::test]
+    async fn a_location_without_a_watch_is_rescanned_periodically() {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        fs::create_dir_all(&folder).unwrap();
+        fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &folder)]))
+            .await;
+        // As when the platform refuses the watch: no watcher, the location recorded as unwatched.
+        *fixture.local.watcher.lock().unwrap() = None;
+        *fixture.local.unwatched.lock().unwrap() =
+            BTreeSet::from([crate::inventory::canonical_or_self(&folder)]);
+        write_model(&folder.join("model.gguf"), "model");
+
+        Arc::clone(&fixture.local).recheck_roots(false).await;
+        assert!(fixture.local.list_local().await.unwrap().models.is_empty());
+        Arc::clone(&fixture.local).recheck_roots(true).await;
+        assert_eq!(fixture.local.list_local().await.unwrap().models.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_watch_that_cannot_start_is_reported_as_unwatched() {
+        let temporary = tempfile::tempdir().unwrap();
+        let missing = temporary.path().join("missing");
+        let watcher = RootWatcher::start(
+            vec![crate::local_watch::WatchTarget {
+                path: missing.clone(),
+                recursive: true,
+                interest: missing.clone(),
+            }],
+            |_| {},
+        )
+        .expect("the watcher starts");
+        assert_eq!(watcher.unwatched(), &BTreeSet::from([missing]));
     }
 
     #[test]

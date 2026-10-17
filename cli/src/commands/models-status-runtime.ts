@@ -9,6 +9,7 @@ import {
   localModelIsInstalled,
   localModelServingState,
   modelDownloadFailureMessage,
+  preselectedDrafterCandidate,
   unsupportedLocalModelSourceTag,
   unsupportedReasonMessages,
 } from "@magnitudedev/client-common"
@@ -20,6 +21,7 @@ import {
   localModelDeprecation,
   type CustomLocalModel,
   type DrafterCandidate,
+  type DrafterReference,
   type LocalModel,
   type ModelId,
   type UnsupportedLocalModel,
@@ -27,6 +29,7 @@ import {
 import { Effect, Option, Schema } from "effect"
 import { renderDrafterChoices } from "./drafter-output"
 import {
+  addressableModels,
   catalogProducts,
   readCatalog,
   withClient,
@@ -39,7 +42,7 @@ import {
   jsonDocument,
   renderFields,
   renderTable,
-  runCommand,
+  commandEffect,
   asJson,
   type JsonDocument,
   type JsonOption,
@@ -66,7 +69,7 @@ const modelMutation = (
   execute: (client: CliModelsClient, modelId: ModelId) => Effect.Effect<unknown, unknown>,
   render: (modelId: ModelId) => string,
   options: JsonOption,
-) => runCommand({
+) => commandEffect({
   effect: decodeModelId(modelInput).pipe(
     Effect.flatMap((modelId) => withClient(client => execute(client, modelId).pipe(Effect.as(modelId)))),
   ),
@@ -93,10 +96,10 @@ export const renderRemoval = (modelId: ModelId, origin: Option.Option<CustomLoca
   }
 }
 
-export const removeModel = (modelInput: string, options: JsonOption = {}) => runCommand({
+export const removeModel = (modelInput: string, options: JsonOption = {}) => commandEffect({
   effect: decodeModelId(modelInput).pipe(Effect.flatMap((modelId) => withClient((client) => Effect.gen(function* () {
     const origin = Option.flatMap(
-      Option.fromNullable(catalogProducts(yield* readCatalog(client)).find((model) => model.modelId === modelId)),
+      Option.fromNullable(addressableModels(yield* readCatalog(client)).find((model) => model.modelId === modelId)),
       (model) => model._tag === "Custom" ? Option.some(model.origin) : Option.none(),
     )
     yield* client.models.removeLocalModel({ modelId })
@@ -125,10 +128,9 @@ const drafterTransferStatus = (model: LocalModel): Option.Option<string> => {
   })
 }
 
-/** A newer revision of a custom model's attached catalog drafter exists and nothing is downloading it yet. */
+/** A newer revision of a custom model's attached catalog drafter exists. */
 export const drafterUpdateAvailable = (model: LocalModel): boolean =>
-  model._tag === "Custom" && Option.exists(model.drafter, ({ updateAvailable, availability }) =>
-    updateAvailable && availability._tag === "Present")
+  model._tag === "Custom" && Option.exists(model.drafter, ({ updateAvailable, availability }) => updateAvailable && availability._tag !== "Downloading")
 
 const readyStatus = (model: LocalModel): string => Option.getOrElse(
   Option.orElse(unsupportedAssessmentReason(model).pipe(Option.map((reason) => `Can't run - ${reason}`)),
@@ -164,6 +166,24 @@ const modelStatus = (model: LocalModel): string => {
 
 const sourceLabel = (model: LocalModel): string => model._tag === "Catalog" ? "Catalog" : model.presentation.sourceLabel
 
+const DRAFTER_TURNED_OFF = "Turned off"
+
+/** The catalog model a custom model is a variant of, by name when the catalog lists it. */
+const variantOfLabel = (model: LocalModel, models: readonly LocalModel[]): Option.Option<string> =>
+  model._tag === "Catalog" ? Option.none() : Option.map(model.presentation.variantOf, (variantOf) =>
+    Option.match(catalogVariantOfName(models, model.presentation.variantOf), {
+      onNone: () => variantOf,
+      onSome: (name) => `${name} (${variantOf})`,
+    }))
+
+/** The attached drafter, "Turned off", or the recommended drafter's offer when none is attached. */
+const drafterSummary = (model: CustomLocalModel): Option.Option<string> => Option.match(model.drafter, {
+  onSome: (drafter) => Option.some([drafter.name, ...Option.toArray(drafterTransferStatus(model))].join(" · ")),
+  onNone: () => model.drafterChoice._tag === "None"
+    ? Option.some(DRAFTER_TURNED_OFF)
+    : Option.map(customModelDrafterOffer(model), ({ label }) => label),
+})
+
 /** Catalog models on this computer or with local work, and every custom model the service lists. */
 const modelsForStatus = (models: readonly LocalModel[]): LocalModel[] => models
   .filter((model) => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled")
@@ -180,6 +200,7 @@ const unsupportedReasonLine = (model: UnsupportedLocalModel): string =>
   unsupportedReasonMessages(model.reasons).join(". ")
 
 export const renderModelsStatus = ({ models, unsupported, hidden, all }: ModelsStatusView): string => {
+  const catalogModels = [...models, ...hidden]
   const visible = modelsForStatus(models)
   const listed = all ? [...visible, ...hidden] : visible
   const isHidden = (model: LocalModel) => hidden.some(({ modelId }) => modelId === model.modelId)
@@ -211,6 +232,8 @@ export const renderModelsStatus = ({ models, unsupported, hidden, all }: ModelsS
     renderTable(listed, [
       { heading: "MODEL", value: formatLocalModelDisplayName },
       { heading: "SOURCE", value: sourceLabel },
+      { heading: "VARIANT OF", value: (model) => Option.getOrElse(variantOfLabel(model, catalogModels), () => "—") },
+      { heading: "DRAFTER", value: (model) => model._tag === "Catalog" ? "—" : Option.getOrElse(drafterSummary(model), () => "—") },
       { heading: "MEMORY", value: modelMemory },
       { heading: "CONTEXT", value: modelContext },
       { heading: "STATUS", value: (model) => isHidden(model) ? "Hidden" : modelStatus(model) },
@@ -272,13 +295,21 @@ const customSourceDetail = (model: CustomLocalModel): string => {
   }
 }
 
-const attachedDrafterLabel = (model: CustomLocalModel): string => Option.match(model.drafter, {
-  onNone: () => Option.match(customModelDrafterOffer(model), { onNone: () => "None", onSome: ({ label }) => `None · ${label}` }),
-  onSome: (drafter) => [
-    drafter.name,
-    ...Option.toArray(drafterTransferStatus(model)),
-  ].join(" · "),
-})
+const attachedDrafterLabel = (model: CustomLocalModel): string => Option.isNone(model.drafter) && model.drafterChoice._tag === "Auto"
+  ? Option.match(customModelDrafterOffer(model), { onNone: () => "None", onSome: ({ label }) => `None · ${label}` })
+  : Option.getOrElse(drafterSummary(model), () => "None")
+
+/** The drafter this model uses: none when turned off, the named one, or under auto the attached or preselected one. */
+const currentDrafter = (model: CustomLocalModel, candidates: readonly DrafterCandidate[]): Option.Option<DrafterReference> => {
+  switch (model.drafterChoice._tag) {
+    case "None": return Option.none()
+    case "Reference": return Option.some(model.drafterChoice.reference)
+    case "Auto": return Option.orElse(
+      Option.map(model.drafter, ({ reference }) => reference),
+      () => Option.map(preselectedDrafterCandidate(candidates), ({ reference }) => reference),
+    )
+  }
+}
 
 export type DrafterChoices =
   | { readonly _tag: "NotApplicable" }
@@ -289,17 +320,12 @@ export interface ModelDetailView {
   readonly model: LocalModel
   readonly models: readonly LocalModel[]
   readonly drafters: DrafterChoices
+  readonly hidden: boolean
 }
 
 const customFields = (model: CustomLocalModel, models: readonly LocalModel[]): readonly (readonly [string, string])[] => [
   ["Source", customSourceDetail(model)],
-  ...Option.match(model.presentation.variantOf, {
-    onNone: () => [],
-    onSome: (variantOf) => [["Variant of", Option.match(catalogVariantOfName(models, model.presentation.variantOf), {
-      onNone: () => variantOf,
-      onSome: (name) => `${name} (${variantOf})`,
-    })]] as const,
-  }),
+  ...Option.match(variantOfLabel(model, models), { onNone: () => [], onSome: (label) => [["Variant of", label]] as const }),
   ["Drafter", attachedDrafterLabel(model)],
   ...(drafterUpdateAvailable(model)
     ? [["Update", `A newer drafter is available - magnitude catalog pull ${model.modelId}`]] as const
@@ -316,7 +342,7 @@ const drafterSection = (view: ModelDetailView): string[] => {
     case "Unavailable": return ["", `Drafter choices are unavailable: ${view.drafters.message}`, change]
     case "Listed": return [
       "",
-      renderDrafterChoices(view.drafters.candidates, Option.map(model.drafter, ({ reference }) => reference)),
+      renderDrafterChoices(view.drafters.candidates, currentDrafter(model, view.drafters.candidates)),
       "",
       change,
     ]
@@ -329,6 +355,7 @@ export const renderModelDetail = (view: ModelDetailView): string => {
     formatLocalModelDisplayName(model),
     renderFields([
       ["Model ID", model.modelId],
+      ...(view.hidden ? [["Hidden", `Yes - unhide it: magnitude models unhide ${model.modelId}`]] as const : []),
       ...(model._tag === "Custom" ? customFields(model, models) : [["Source", "Catalog"] as const]),
       ...Option.match(model.presentation.license, { onNone: () => [], onSome: (license) => [["License", license] as const] }),
       ...supportFields(model, models),
@@ -344,12 +371,14 @@ export const renderModelDetail = (view: ModelDetailView): string => {
 
 export const ModelDetailJsonSchema = Schema.Struct({
   model: LocalModelJsonSchema,
+  hidden: Schema.Boolean,
   drafterCandidates: optional(Schema.Array(DrafterCandidateSchema)),
   drafterCandidatesUnavailable: optional(Schema.String),
 })
 
-export const modelDetailJson = jsonDocument(ModelDetailJsonSchema, ({ model, drafters }: ModelDetailView) => ({
+export const modelDetailJson = jsonDocument(ModelDetailJsonSchema, ({ model, drafters, hidden }: ModelDetailView) => ({
   model,
+  hidden,
   drafterCandidates: drafters._tag === "Listed" ? Option.some(drafters.candidates) : Option.none(),
   drafterCandidatesUnavailable: drafters._tag === "Unavailable" ? Option.some(drafters.message) : Option.none(),
 }))
@@ -389,20 +418,28 @@ export const readModelsStatus = (
 ): Effect.Effect<ModelsStatusResult, unknown> => Effect.gen(function* () {
   const catalog = yield* readCatalog(client)
   if (catalog._tag === "Initializing") return { _tag: "Initializing" as const }
-  const models = catalogProducts(catalog)
   if (Option.isNone(modelId)) return {
     _tag: "List" as const,
-    view: { models, unsupported: catalog.unsupportedLocalModels, hidden: catalog.hiddenLocalModels, all },
+    view: { models: catalogProducts(catalog), unsupported: catalog.unsupportedLocalModels, hidden: catalog.hiddenLocalModels, all },
   }
+  const models = addressableModels(catalog)
   const model = yield* findModel(models, modelId.value)
-  return { _tag: "Detail" as const, view: { model, models, drafters: yield* listModelDrafters(client, model) } }
+  return {
+    _tag: "Detail" as const,
+    view: {
+      model,
+      models,
+      drafters: yield* listModelDrafters(client, model),
+      hidden: catalog.hiddenLocalModels.some((hidden) => hidden.modelId === model.modelId),
+    },
+  }
 })
 
 export const renderModelsStatusResult = (result: ModelsStatusResult): string => result._tag === "Initializing"
   ? "Local models are initializing.\n"
   : result._tag === "List" ? renderModelsStatus(result.view) : renderModelDetail(result.view)
 
-export const showModelsStatus = (modelInput?: string, options: JsonOption & { readonly all?: boolean } = {}) => runCommand({
+export const showModelsStatus = (modelInput?: string, options: JsonOption & { readonly all?: boolean } = {}) => commandEffect({
   effect: (modelInput === undefined ? Effect.succeed(Option.none<ModelId>()) : decodeModelId(modelInput).pipe(Effect.map(Option.some))).pipe(
     Effect.flatMap((modelId) => withClient((client) => readModelsStatus(client, modelId, options.all === true))),
   ),
@@ -417,7 +454,7 @@ export const loadInstance = (modelInput: string, options: JsonOption = {}) => mo
   options,
 )
 
-export const stopInstance = (options: JsonOption = {}) => runCommand({
+export const stopInstance = (options: JsonOption = {}) => commandEffect({
   effect: withClient((client) => client.models.stop({})),
   render: () => "Stopped the active local model.\n",
   json: asJson(options, jsonDocument(Schema.Struct({}), () => ({}))),

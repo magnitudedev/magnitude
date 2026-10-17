@@ -9,14 +9,18 @@
 use magnitude_artifacts::gguf::Encoding;
 use magnitude_engine::{
     assessment::{
-        kernel_inventory, prepare_model_assessment, AssessmentSetup, DrafterVerdict,
-        KernelInventory, ModelPackagePaths, PreparedModelAssessment, SpeculativeMethod,
+        assess_model, kernel_inventory, prepare_model_assessment, AssessmentSetup,
+        DrafterVerdict, KernelInventory, ModelAssessment, ModelPackagePaths,
+        PreparedModelAssessment, SpeculativeMethod,
     },
     error::{UnsupportedModel, UnsupportedReason, WeightTypeCount},
     fingerprint::ModelFingerprint,
     options::{standard_service_limits, ModelMethod, ModelPolicy},
 };
-use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
+use magnitude_executor::{
+    assessment::ExecutionAssessment,
+    platform::{DeviceRequest, MemoryReserves},
+};
 use seismic::BackendName;
 use std::path::{Path, PathBuf};
 
@@ -764,4 +768,138 @@ fn an_unreadable_drafter_is_rejected_without_the_target() {
         panic!("a truncated drafter is rejected: {:?}", facts.drafter);
     };
     assert_eq!(rejection.reasons, [UnsupportedReason::Unreadable]);
+}
+
+
+/// The synthetic target with attention heads of `width`.
+fn llama_of_width(width: u64) -> Gguf {
+    let mut gguf = llama();
+    for key in ["key_length", "value_length"] {
+        gguf.set(&format!("llama.attention.{key}"), Meta::U32(width as u32));
+    }
+    gguf.set("llama.rope.dimension_count", Meta::U32(width as u32));
+    for block in 0..BLOCKS {
+        let name = |role: &str| format!("blk.{block}.{role}.weight");
+        gguf.tensor(&name("attn_q"), &[HEADS * width, HIDDEN], Encoding::Q8_0);
+        gguf.tensor(&name("attn_k"), &[KV_HEADS * width, HIDDEN], Encoding::Q8_0);
+        gguf.tensor(&name("attn_v"), &[KV_HEADS * width, HIDDEN], Encoding::Q8_0);
+        gguf.tensor(&name("attn_output"), &[HIDDEN, HEADS * width], Encoding::Q8_0);
+    }
+    gguf
+}
+
+/// The refusal of `package` on the CPU backend under `policy`, from both
+/// the device-free inventory and the assessment of the selected device:
+/// they classify alike.
+fn cpu_refusal(package: &ModelPackagePaths, policy: ModelPolicy) -> UnsupportedModel {
+    let KernelInventory::Unsupported(inventoried) =
+        kernel_inventory(package, &policy, &standard_service_limits(), BackendName::Cpu)
+            .unwrap_or_else(|error| panic!("operational failure: {error}"))
+    else {
+        panic!("the package is admitted");
+    };
+    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let setup = AssessmentSetup::discover(
+        &catalog,
+        DeviceRequest::Backend(BackendName::Cpu),
+        MemoryReserves::standard(),
+        policy,
+        standard_service_limits(),
+    )
+    .unwrap();
+    let PreparedModelAssessment::Unsupported {
+        unsupported: assessed,
+        ..
+    } = prepare_model_assessment(package, &setup)
+        .unwrap_or_else(|error| panic!("operational failure: {error}"))
+    else {
+        panic!("the package plans");
+    };
+    assert_eq!(inventoried.reasons, assessed.reasons);
+    assessed
+}
+
+#[test]
+fn a_form_the_backend_does_not_execute_names_the_backend() {
+    let scratch = Scratch::new("backend");
+    let target = llama().write(&scratch.file("target.gguf"));
+    let rotated = ModelPolicy {
+        kv_codec: magnitude_state::KvCodec::RotatedK4V4,
+        ..ModelPolicy::default()
+    };
+    assert_eq!(
+        cpu_refusal(&package(target), rotated).reasons,
+        [UnsupportedReason::Backend {
+            backend: "cpu".into()
+        }]
+    );
+
+    // A planner refusal of a validated definition names the backend too: no
+    // codec group divides a head width of 72.
+    let target = llama_of_width(72).write(&scratch.file("width-72.gguf"));
+    let refusal = cpu_refusal(&package(target), ModelPolicy::default());
+    assert_eq!(
+        refusal.reasons,
+        [UnsupportedReason::Backend {
+            backend: "cpu".into()
+        }],
+        "{}",
+        refusal.detail
+    );
+}
+
+#[test]
+fn a_kernel_call_outside_its_domain_names_the_kernel_and_its_statics() {
+    let scratch = Scratch::new("kernel-domain");
+    let target = llama_of_width(96).write(&scratch.file("target.gguf"));
+    let refusal = cpu_refusal(&package(target), ModelPolicy::default());
+    let [UnsupportedReason::KernelDomain {
+        backend,
+        entry,
+        statics,
+    }] = refusal.reasons.as_slice()
+    else {
+        panic!("a head width of 96 is outside a kernel domain: {refusal:?}");
+    };
+    assert_eq!(backend, "cpu");
+    assert!(!entry.is_empty());
+    assert!(!statics.is_empty());
+}
+
+/// Memory is charged as stored after import: Q3_K weights are held widened
+/// as q6k, so a Q3_K file is charged as its Q6_K twin though it is smaller.
+#[test]
+fn widened_weights_are_charged_as_resident() {
+    let scratch = Scratch::new("widened");
+    let charged = |encoding: Encoding, name: &str| {
+        let mut gguf = llama();
+        let mut stored = 0;
+        for block in 0..BLOCKS {
+            for role in ["ffn_gate", "ffn_up", "ffn_down"] {
+                let tensor = format!("blk.{block}.{role}.weight");
+                gguf.encode(&tensor, encoding);
+                stored += FEED_FORWARD * HIDDEN / encoding.block_elements()
+                    * encoding.block_bytes();
+            }
+        }
+        let target = gguf.write(&scratch.file(name));
+        let ModelAssessment::Assessed {
+            execution: ExecutionAssessment::Fits { domains, .. },
+            ..
+        } = assess_model(&package(target), &cpu_setup(), &[])
+            .unwrap_or_else(|error| panic!("operational failure: {error}"))
+        else {
+            panic!("{name} fits");
+        };
+        let required = domains
+            .iter()
+            .map(|domain| domain.required_bytes)
+            .collect::<Vec<_>>();
+        (stored, required)
+    };
+    let (q3k_stored, q3k_required) = charged(Encoding::Q3K, "q3k.gguf");
+    let (q6k_stored, q6k_required) = charged(Encoding::Q6K, "q6k.gguf");
+    assert!(q3k_stored < q6k_stored);
+    assert_eq!(q3k_required, q6k_required);
+    assert!(q3k_required.iter().all(|required| *required > q6k_stored));
 }

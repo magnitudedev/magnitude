@@ -3,7 +3,7 @@ import type { ReactNode } from "react"
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { Dialog } from "./ui/dialog"
-import { FindStepView, LocalFileSummary, LocalFileView, RepositoryFooter, RepositoryView, SearchResultsView, addVersionRequest, confirmAction, formatDownloads, initialVersion, parseModelReference, unsupportedVersionLabel, versionVerdict, type FindTab } from "./add-model-dialog"
+import { FindStepView, InspectedRepository, LocalFileSummary, LocalFileView, NativeFileChoice, ggufOpenRequest, RepositoryFooter, RepositoryView, SearchResultsView, VerdictLabel, addVersionRequest, confirmAction, formatDownloads, initialVersion, parseModelReference, unselectableVersionNotice, unsupportedVersionLabel, versionVerdict, type FindTab } from "./add-model-dialog"
 import { catalogId, catalogModel, drafterCandidate, inspection, repository, version, doesNotFit, unsupported, unreadable } from "../../test/models/fixtures"
 
 const inDialog = (node: ReactNode) => renderToStaticMarkup(<Dialog open>{node}</Dialog>)
@@ -68,13 +68,27 @@ describe("repository step", () => {
     expect(versionVerdict(version("Q8_K_P", { assessment: Option.some(doesNotFit) }))).toMatchObject({ label: "Too large for this machine", selectable: false })
     expect(versionVerdict(version("IQ2_M", { assessment: Option.some(unsupported({ _tag: "WeightTypes", types: [{ ggmlType: "IQ2_S", tensorCount: 100 }] })) }))).toMatchObject({ label: "Not supported yet", detail: "Uses IQ2_S weights, which Magnitude doesn't support yet", selectable: false })
   })
-  it("words unsupported versions briefly: planned support, not supported, or damaged", () => {
+  it("says Not supported only for an architecture without kernels, File is damaged when unreadable, and Not supported yet otherwise", () => {
     expect(unsupportedVersionLabel([{ _tag: "RopeScaling", kind: "yarn" }, { _tag: "TiedOutputHead" }])).toBe("Not supported yet")
     expect(unsupportedVersionLabel([{ _tag: "Backend", backend: "metal" }])).toBe("Not supported yet")
+    expect(unsupportedVersionLabel([{ _tag: "ChatTemplate" }])).toBe("Not supported yet")
+    expect(unsupportedVersionLabel([{ _tag: "Unknown", kind: "Sliding", detail: "x" }])).toBe("Not supported yet")
+    expect(unsupportedVersionLabel([{ _tag: "Unknown", kind: "Sliding", detail: "x" }, { _tag: "ChatTemplate" }])).toBe("Not supported yet")
     expect(unsupportedVersionLabel([{ _tag: "Architecture", architecture: "deepseek4" }])).toBe("Not supported")
     expect(unsupportedVersionLabel([{ _tag: "WeightTypes", types: [{ ggmlType: "IQ1_M", tensorCount: 1 }] }, { _tag: "Architecture", architecture: "deepseek4" }])).toBe("Not supported")
-    expect(unsupportedVersionLabel([{ _tag: "Unknown", kind: "Sliding", detail: "x" }])).toBe("Not supported")
     expect(unsupportedVersionLabel([{ _tag: "Unreadable" }, { _tag: "WeightTypes", types: [{ ggmlType: "IQ1_M", tensorCount: 1 }] }])).toBe("File is damaged")
+    expect(versionVerdict(version("Q4_K_P", { assessment: Option.none() }))).toMatchObject({ label: "Not checked yet", selectable: true })
+  })
+  it("shows an unknown reason's detail behind the version's verdict", () => {
+    const sliding = version("Q4_K_M", { assessment: Option.some(unsupported({ _tag: "Unknown", kind: "Sliding", detail: "sliding window 4096" })) })
+    expect(versionVerdict(sliding)).toMatchObject({ label: "Not supported yet", detail: "Magnitude can't run this model (sliding window 4096)", selectable: false })
+    const html = inDialog(<RepositoryView inspection={inspection({ versions: [version("Q4_K_P", { recommended: true }), sliding] })} models={models} selectedVersion={Option.some("Q4_K_P")} onSelectVersion={() => {}} />)
+    expect(html).toContain('Not supported yet<span class="sr-only">: Magnitude can&#x27;t run this model (sliding window 4096)</span>')
+  })
+  it("puts a verdict's reason on a focusable trigger, so keyboard users reach it", () => {
+    const html = renderToStaticMarkup(<VerdictLabel verdict={{ label: "Not supported yet", detail: "Uses IQ2_S weights, which Magnitude doesn't support yet", selectable: false, recommended: false }} />)
+    expect(html).toMatch(/^<button type="button"[^>]*>Not supported yet<span class="sr-only">: Uses IQ2_S weights, which Magnitude doesn&#x27;t support yet<\/span><\/button>$/)
+    expect(renderToStaticMarkup(<VerdictLabel verdict={{ label: "Fits your machine", selectable: true, recommended: false }} />)).not.toContain("<button")
   })
   it("starts on a linked file, then the pasted version, then the recommended one", () => {
     expect(initialVersion(inspection(), Option.some("Q8_K_P.gguf"))).toEqual(Option.some("Q8_K_P"))
@@ -101,7 +115,7 @@ describe("repository step", () => {
     expect(html).toContain("apache-2.0")
     expect(html).toContain("Too large for this machine")
     expect(html).toContain("Recommended")
-    expect(html).toContain('title="Uses Q2_K weights, which Magnitude doesn&#x27;t support yet">Not supported yet<')
+    expect(html).toContain('Not supported yet<span class="sr-only">: Uses Q2_K weights, which Magnitude doesn&#x27;t support yet</span></button>')
     expect(html).toContain("Already on this computer")
     expect(html).toContain("drafter list")
     expect(html).toContain('aria-label="Back to search"')
@@ -112,7 +126,7 @@ describe("repository step", () => {
     const damaged = version("Q3_K_M", { assessment: Option.some(unreadable) })
     expect(versionVerdict(damaged)).toMatchObject({ label: "File is damaged", detail: "The file is incomplete or damaged", selectable: false })
     const html = inDialog(<RepositoryView inspection={inspection({ versions: [version("Q4_K_P", { recommended: true }), damaged] })} models={models} selectedVersion={Option.some("Q4_K_P")} onSelectVersion={() => {}} />)
-    expect(html).toContain('title="The file is incomplete or damaged">File is damaged<')
+    expect(html).toContain('File is damaged<span class="sr-only">: The file is incomplete or damaged</span></button>')
     expect(html.match(/type="radio"[^>]*disabled=""/g)).toHaveLength(1)
   })
   it("explains why when no version runs on this computer", () => {
@@ -133,6 +147,39 @@ describe("repository step", () => {
     expect(html).toContain("Magnitude can’t run this model")
     expect(html).toContain("No kernels for the deepseek4 architecture")
     expect(html).not.toContain('type="radio"')
+  })
+  describe("a pasted or linked version that can't run here", () => {
+    const inspected = (overrides: Parameters<typeof inspection>[0], file: Option.Option<string>) =>
+      inDialog(<InspectedRepository inspection={inspection(overrides)} file={file} models={models} onAdded={() => {}} />)
+    const checkedRow = (html: string) => html.match(/<label data-selected="true"[^>]*>.*?<\/label>/)?.[0] ?? ""
+    it("highlights a pasted owner/repo:QUANT that is too large, with no Download, and asks for another version", () => {
+      const html = inspected({ selectedVersion: Option.some("Q8_K_P") }, Option.none())
+      expect(checkedRow(html)).toContain("Q8_K_P")
+      expect(checkedRow(html)).toMatch(/type="radio"[^>]*checked=""/)
+      expect(checkedRow(html)).toContain("Too large for this machine")
+      expect(html).toContain("Q8_K_P is too large for this machine")
+      expect(html).toContain("Pick another version to download.")
+      expect(html).not.toContain("Download (")
+      expect(html).not.toContain("Pinned to the current version")
+    })
+    it("highlights a deep-linked unsupported file with its reason, with no Download", () => {
+      const html = inspected({}, Option.some("Q2_K_P.gguf"))
+      expect(checkedRow(html)).toContain("Q2_K_P")
+      expect(html).toContain("Magnitude can’t run Q2_K_P")
+      expect(html).toContain("Uses Q2_K weights, which Magnitude doesn&#x27;t support yet. Pick another version to download.")
+      expect(html).not.toContain("Download (")
+    })
+    it("shows the nothing-runs footer when no version can run", () => {
+      const html = inspected({ versions: [version("Q8_K_P", { assessment: Option.some(doesNotFit) })] }, Option.some("Q8_K_P.gguf"))
+      expect(checkedRow(html)).toContain("Q8_K_P")
+      expect(html).toContain("No version of this model runs on this computer")
+      expect(html).not.toContain("Pick another version")
+      expect(html).not.toContain("Download (")
+    })
+    it("words each unselectable verdict", () => {
+      expect(unselectableVersionNotice(version("Q8_K_P", { assessment: Option.some(doesNotFit) }))).toEqual({ title: "Q8_K_P is too large for this machine", description: "Pick another version to download." })
+      expect(unselectableVersionNotice(version("Q3_K_M", { assessment: Option.some(unreadable) })).description).toBe("The file is incomplete or damaged. Pick another version to download.")
+    })
   })
   it("pins Hugging Face downloads and keeps local files in place", () => {
     const pinned = inDialog(<RepositoryFooter local={false} action={{ label: "Download (24.3 GB)", download: true }} pending={false} failure={undefined} onConfirm={() => {}} />)
@@ -162,6 +209,14 @@ describe("add GGUF file", () => {
     expect(html).toMatch(/aria-label="File".*file browser/)
     expect(html).toContain("Choose a GGUF file to see whether it runs on this machine.")
     expect(html).not.toContain('aria-label="Version"')
+  })
+  it("shows the file the native dialog chose, with Choose another file… in place of the in-app browser", () => {
+    const opened: unknown[] = []
+    const html = inDialog(<LocalFileView browser={<NativeFileChoice file={Option.some("C:\\Users\\me\\qwen.gguf")} open={request => { opened.push(request) }} onChosen={() => {}} />} file={Option.some(<p>chosen file</p>)} />)
+    expect(html).toContain("C:\\Users\\me\\qwen.gguf")
+    expect(html).toContain("Choose another file…")
+    expect(html).not.toContain('aria-label="Folder path"')
+    expect(ggufOpenRequest).toEqual({ kind: "gguf", title: "Add a GGUF file", defaultPath: Option.none() })
   })
   it("shows the chosen file below the picker", () => {
     const html = inDialog(<LocalFileView browser={<p>file browser</p>} file={Option.some(<p>chosen file</p>)} />)

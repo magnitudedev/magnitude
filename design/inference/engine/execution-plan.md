@@ -29,7 +29,9 @@ includes one history slab per history domain and the zero-seed bank slab per sto
 are heap claims.
 Those exact model terms alone do not establish fit: prepared graph resources, workspace, startup
 transients and the device's stable fit capacity are added as upper bounds derived from the same
-header-only program plan, so a fit result never undercounts. The graph-resource bound builds every
+header-only program plan, and so is the worker's host memory (the host tables, the graphs' sealed
+plans and bindings, and its runtime, vocabulary and prepared programs priced by costs measured on
+the backend; see [engine memory](memory.md)), so a fit result never undercounts. The graph-resource bound builds every
 graph the load prepares, so a kernel call outside its kernel's domain fails the assessment exactly
 as the load's kernel preparation fails, and both classify it `Unsupported`. Assessment results
 are complete: Fits, DoesNotFit or Unsupported; there is no unconfirmed fit.

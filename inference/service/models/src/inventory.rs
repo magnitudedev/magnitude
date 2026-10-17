@@ -14,14 +14,14 @@ use magnitude_service_contracts::models::{
 };
 use magnitude_service_contracts::{
     ComponentRole, ContentIdentity, HubCacheOwner, Integrity, InventoryEntryId, InventoryError,
-    InventoryModel,
-    InventoryProperties, LocalDeclaration, ModelAvailability, ModelComponent, ModelLocation,
-    ModelOperation, ModelSource,
+    InventoryModel, InventoryProperties, LocalDeclaration, ModelAvailability, ModelComponent,
+    ModelLocation, ModelOperation, ModelSource,
 };
 use magnitude_service_utils::file_cache::recover_map;
 use sha2::{Digest, Sha256};
 
 use crate::cache::{ModelCache, ModelIndexKind};
+use crate::candidate_files::RecognizedArchitectures;
 use crate::catalog_affiliations::CatalogAffiliations;
 use crate::download::blob_key;
 use crate::gguf;
@@ -92,22 +92,26 @@ impl InstalledPackageSnapshot {
         reconciliation_complete: bool,
         include: impl Fn(&InstalledModelPackage) -> bool,
     ) -> InstalledModelPackagesResponse {
-        let packages = self.records.values().filter(|record| include(&record.installed)).fold(
-            BTreeMap::<ModelPackageId, InstalledModelPackage>::new(),
-            |mut packages, record| {
-                packages
-                    .entry(record.installed.package.id.clone())
-                    .and_modify(|selected| {
-                        if origin_precedence(record.installed.origin)
-                            < origin_precedence(selected.origin)
-                        {
-                            *selected = record.installed.clone();
-                        }
-                    })
-                    .or_insert_with(|| record.installed.clone());
-                packages
-            },
-        );
+        let packages = self
+            .records
+            .values()
+            .filter(|record| include(&record.installed))
+            .fold(
+                BTreeMap::<ModelPackageId, InstalledModelPackage>::new(),
+                |mut packages, record| {
+                    packages
+                        .entry(record.installed.package.id.clone())
+                        .and_modify(|selected| {
+                            if origin_precedence(record.installed.origin)
+                                < origin_precedence(selected.origin)
+                            {
+                                *selected = record.installed.clone();
+                            }
+                        })
+                        .or_insert_with(|| record.installed.clone());
+                    packages
+                },
+            );
         InstalledModelPackagesResponse {
             revision,
             reconciliation_complete,
@@ -142,6 +146,8 @@ pub struct InventoryConfig {
     pub catalog_models: Vec<RecommendableModel>,
     pub catalog_header_digests: BTreeMap<String, String>,
     pub hub_endpoint: Option<String>,
+    pub hub_token: Option<String>,
+    pub architectures: RecognizedArchitectures,
 }
 
 pub(crate) fn catalog_target(model: &RecommendableModel) -> &ModelPackage {
@@ -213,6 +219,8 @@ impl InventoryConfig {
             disk_reserve_bytes: 2 * 1024 * 1024 * 1024,
             catalog_models: Vec::new(),
             catalog_header_digests: BTreeMap::new(),
+            hub_token: None,
+            architectures: RecognizedArchitectures::default(),
             hub_endpoint: None,
         })
     }
@@ -366,8 +374,9 @@ impl ManagedModelStore {
         let client = client_builder()
             .build()
             .map_err(|error| InventoryError::Upstream(error.to_string()))?;
-        let hub_credential = std::env::var("HF_TOKEN")
-            .ok()
+        let hub_credential = config
+            .hub_token
+            .clone()
             .filter(|token| !token.trim().is_empty())
             .map(|token| {
                 client_builder()
@@ -669,6 +678,14 @@ impl ManagedModelStore {
             observer.installed_packages_changed(revision);
         }
         Ok(())
+    }
+
+    /// The explicit Hugging Face token presented on Hub requests, when one is configured.
+    #[must_use]
+    pub fn hub_token(&self) -> Option<&str> {
+        self.hub_credential
+            .as_ref()
+            .map(|credential| credential.token.as_str())
     }
 
     pub fn root(&self) -> &Path {
@@ -1127,8 +1144,14 @@ fn scan(
                     let declared = &declared;
                     scope.spawn(move || {
                         let mut models = Vec::new();
-                        crate::local_roots::scan_root(root, declared, cache, &mut models)
-                            .map(|()| models)
+                        crate::local_roots::scan_root(
+                            root,
+                            declared,
+                            cache,
+                            &config.architectures,
+                            &mut models,
+                        )
+                        .map(|()| models)
                     })
                 })
                 .collect::<Vec<_>>()
@@ -1295,6 +1318,7 @@ fn scan_managed(
                 &commit,
                 &declared.for_snapshot(&repository, &commit, &snapshot),
                 cache,
+                &config.architectures,
                 output,
             )?;
             for package in config
@@ -1470,10 +1494,11 @@ fn append_discovered_groups(
     commit: &str,
     declared: &BTreeMap<PathBuf, PathBuf>,
     cache: &ModelCache,
+    architectures: &RecognizedArchitectures,
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
     let blobs = RepositoryBlobs::open(repository_root).map_err(io_error)?;
-    for group in discover_groups(snapshot, repository_root, cache, declared)? {
+    for group in discover_groups(snapshot, repository_root, cache, architectures, declared)? {
         let components = components_for_group(snapshot, &group, Some(&blobs))?;
         let Some(primary) = primary_path(snapshot, &components) else {
             continue;
@@ -1513,6 +1538,7 @@ pub(crate) fn scan_hf_cache(
     cache: &Path,
     declared: &DeclaredProjectors,
     inspections: &ModelCache,
+    architectures: &RecognizedArchitectures,
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
     if !cache.is_dir() {
@@ -1543,6 +1569,7 @@ pub(crate) fn scan_hf_cache(
                 &snapshot,
                 cache,
                 inspections,
+                architectures,
                 &declared.for_snapshot(&repository, &commit, &snapshot),
             )?;
             let blobs = RepositoryBlobs::open(&repo_root).map_err(io_error)?;
@@ -1734,7 +1761,6 @@ pub(crate) fn build_model(
                         training_context_length: inspection.training_context_length,
                         nextn_predict_layers: inspection.nextn_predict_layers,
                         tokenizer: inspection.tokenizer,
-                        modalities: inspection.modalities,
                         base_models: inspection
                             .base_models
                             .into_iter()
@@ -1919,7 +1945,7 @@ impl DeclaredProjectors {
 /// time so an unchanged location is rescanned without rereading headers.
 pub(crate) fn inspect_cached(cache: &ModelCache, path: &Path) -> Option<gguf::GgufInspection> {
     let metadata = path.metadata().ok()?;
-    let evidence = format!("gguf-file-v3\0{}", file_identity(path, &metadata));
+    let evidence = format!("gguf-file-v5\0{}", file_identity(path, &metadata));
     if let Some(inspection) = cache.read_index(ModelIndexKind::GgufInspection, &evidence) {
         return Some(inspection);
     }
@@ -1936,6 +1962,7 @@ pub(crate) fn discover_groups(
     root: &Path,
     containment_root: &Path,
     cache: &ModelCache,
+    architectures: &RecognizedArchitectures,
     declared: &BTreeMap<PathBuf, PathBuf>,
 ) -> Result<Vec<ModelGroup>, InventoryError> {
     let mut files = Vec::new();
@@ -1948,7 +1975,7 @@ pub(crate) fn discover_groups(
             groups.entry(prefix).or_default().push((index, total, path));
             continue;
         }
-        let role = inspect_cached(cache, &path).map(|inspection| inspection.role);
+        let role = inspect_cached(cache, &path).map(|inspection| inspection.role(architectures));
         match role {
             Some(gguf::GgufRole::Projector) => projectors.push(path),
             role => standalone.push((path, role)),
@@ -1984,7 +2011,7 @@ pub(crate) fn discover_groups(
             continue;
         }
         let first = shards[0].2.clone();
-        let role = inspect_cached(cache, &first).map(|inspection| inspection.role);
+        let role = inspect_cached(cache, &first).map(|inspection| inspection.role(architectures));
         if role == Some(gguf::GgufRole::Projector) {
             continue;
         }
@@ -2806,20 +2833,21 @@ mod tests {
                 weights_file_id: weights.id.clone(),
             },
         ];
-        let attribution = |target: ModelPackage, hidden: Vec<magnitude_service_contracts::models::ModelId>| {
-            let (store, cache, hf_cache) = (store.clone(), cache.clone(), hf_cache.clone());
-            async move {
-                let mut configured = InventoryConfig::with_roots(store, cache).unwrap();
-                configured.add_hugging_face_caches([hf_cache]);
-                configured.local_models.hidden = hidden;
-                configured.catalog_models = vec![catalog_model(target)];
-                let manager = ManagedModelStore::open(configured).await.unwrap();
-                manager.ensure_installed_model_inventory().await.unwrap();
-                manager.list_installed().await.unwrap().packages[0]
-                    .catalog_attribution
-                    .clone()
-            }
-        };
+        let attribution =
+            |target: ModelPackage, hidden: Vec<magnitude_service_contracts::models::ModelId>| {
+                let (store, cache, hf_cache) = (store.clone(), cache.clone(), hf_cache.clone());
+                async move {
+                    let mut configured = InventoryConfig::with_roots(store, cache).unwrap();
+                    configured.add_hugging_face_caches([hf_cache]);
+                    configured.local_models.hidden = hidden;
+                    configured.catalog_models = vec![catalog_model(target)];
+                    let manager = ManagedModelStore::open(configured).await.unwrap();
+                    manager.ensure_installed_model_inventory().await.unwrap();
+                    manager.list_installed().await.unwrap().packages[0]
+                        .catalog_attribution
+                        .clone()
+                }
+            };
 
         assert!(matches!(
             attribution(target.clone(), Vec::new()).await,
@@ -2847,7 +2875,10 @@ mod tests {
             &definition.model_id,
             &definition.variant_id,
         );
-        assert_eq!(resolver.canonical_model_id(found_id.clone()).unwrap(), catalog_id);
+        assert_eq!(
+            resolver.canonical_model_id(found_id.clone()).unwrap(),
+            catalog_id
+        );
         assert_eq!(
             resolver.canonical_model_id(catalog_id.clone()).unwrap(),
             catalog_id
@@ -2873,7 +2904,10 @@ mod tests {
                 diagnostics: Vec::new(),
             },
         );
-        assert_eq!(resolver.canonical_model_id(found_id.clone()).unwrap(), found_id);
+        assert_eq!(
+            resolver.canonical_model_id(found_id.clone()).unwrap(),
+            found_id
+        );
         assert_eq!(
             resolver.catalog_snapshot().unwrap().models[0].aliases,
             vec![found_id.clone()]
@@ -2944,8 +2978,12 @@ mod tests {
             },
         };
         let installed = |header_digests: BTreeMap<String, String>| {
-            let (store, cache, hf_cache, target) =
-                (store.clone(), cache.clone(), hf_cache.clone(), target.clone());
+            let (store, cache, hf_cache, target) = (
+                store.clone(),
+                cache.clone(),
+                hf_cache.clone(),
+                target.clone(),
+            );
             async move {
                 let mut configured = InventoryConfig::with_roots(store, cache).unwrap();
                 configured.add_hugging_face_caches([hf_cache]);
@@ -3200,6 +3238,7 @@ mod tests {
                 .canonicalize()
                 .expect("canonical temporary root"),
             &ModelCache::new(&temporary.path().join("cache")),
+            &RecognizedArchitectures::default(),
             &BTreeMap::new(),
         )
         .unwrap();
@@ -3223,6 +3262,7 @@ mod tests {
             &folder,
             &folder,
             &ModelCache::new(&temporary.path().join("cache")),
+            &RecognizedArchitectures::default(),
             &BTreeMap::new(),
         )
         .unwrap();
@@ -3251,7 +3291,14 @@ mod tests {
         fs::write(models.join("partial.gguf.part"), b"partial").unwrap();
         fs::write(models.join(".hidden.gguf"), b"resource fork").unwrap();
 
-        let groups = discover_groups(&models, &models, &cache, &BTreeMap::new()).unwrap();
+        let groups = discover_groups(
+            &models,
+            &models,
+            &cache,
+            &crate::test_gguf::engine_architectures(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
 
         let names = groups
             .iter()
@@ -3295,14 +3342,28 @@ mod tests {
         write_projector(&models.join("mmproj-f16.gguf"), "f16");
         write_projector(&models.join("mmproj-q8.gguf"), "q8");
 
-        let undeclared = discover_groups(&models, &models, &cache, &BTreeMap::new()).unwrap();
+        let undeclared = discover_groups(
+            &models,
+            &models,
+            &cache,
+            &RecognizedArchitectures::default(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(
             undeclared[0].projector, None,
             "two projectors are ambiguous"
         );
 
         let declared = BTreeMap::from([(models.join("model.gguf"), models.join("mmproj-q8.gguf"))]);
-        let groups = discover_groups(&models, &models, &cache, &declared).unwrap();
+        let groups = discover_groups(
+            &models,
+            &models,
+            &cache,
+            &RecognizedArchitectures::default(),
+            &declared,
+        )
+        .unwrap();
         assert_eq!(groups[0].projector, Some(models.join("mmproj-q8.gguf")));
     }
 

@@ -179,6 +179,32 @@ fn print_breakdown(
     let PreparedModelAssessment::Planned { execution, .. } = prepared else {
         return;
     };
+    let charge = execution.memory_charge();
+    let bounds = &charge.bounds;
+    let host = &bounds.host_process;
+    eprintln!(
+        "magnitude-assess: {}: memory {}",
+        model.target.display(),
+        json!({
+            "exact_resident_bytes": charge.exact_resident_bytes,
+            "state_bytes": charge.state_bytes,
+            "startup_state_bytes": charge.startup_state_bytes,
+            "prepared_resource_bytes": bounds.prepared_resource_bytes,
+            "startup_additional_bytes": bounds.startup_additional_bytes,
+            "component_upload_bytes": bounds.component_upload_bytes,
+            "serving_bytes": charge.serving_bytes,
+            "allocation_bytes": charge.allocation_bytes,
+            "host_table_bytes": charge.host_table_bytes,
+            "sealed_graph_host_bytes": bounds.sealed_graph_host_bytes.at_most,
+            "bound_graph_host_bytes": bounds.bound_graph_host_bytes,
+            "host_runtime_bytes": host.runtime,
+            "host_vocabulary_bytes": host.vocabulary,
+            "host_program_bytes": host.programs,
+            "host_vision_bytes": host.vision,
+            "kernels": host.kernels,
+            "host_bytes": charge.host_bytes().ok(),
+        })
+    );
     let demand = execution.demand();
     eprintln!(
         "magnitude-assess: {}: {} launches, {:.2} GB streamed per step",

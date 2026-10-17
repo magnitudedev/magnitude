@@ -1,4 +1,5 @@
-import { Effect, Fiber, Option, Schema, SubscriptionRef } from "effect"
+import { Effect, Fiber, Layer, Option, Schema, SubscriptionRef } from "effect"
+import { CatalogModelSyncLive } from "./catalog-model-sync"
 import { describe, expect, it } from "vitest"
 import { modelCommandFailure, type ModelCommandsApi } from "./model-commands"
 import { CustomModelCommands, type CustomModelCommandsApi } from "./custom-model-commands"
@@ -84,7 +85,7 @@ it("retries active and slot Stop against the exact stopping instance", async () 
     yield* commands.stopActiveModel
     yield* commands.stopSlot(PRIMARY_SLOT_ID)
   }).pipe(
-    Effect.provide(ModelCommandsLive),
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
     Effect.provideService(CustomModelCommands, customCommands),
     Effect.provideService(LocalModels, localModels),
     Effect.provideService(IcnInstances, { get: Effect.succeed(snapshot) } as never),
@@ -114,7 +115,7 @@ it("stops a running model before removing it, and removes an idle model without 
     const commands = yield* ModelCommands
     yield* commands.remove(Schema.decodeUnknownSync(ModelIdSchema)(model))
   }).pipe(
-    Effect.provide(ModelCommandsLive),
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
     Effect.provideService(CustomModelCommands, customCommands),
     Effect.provideService(LocalModels, localModels),
     Effect.provideService(IcnInstances, { get: Effect.succeed(snapshot) } as never),
@@ -145,7 +146,7 @@ it("reports whether a catalog sync installs, updates, or finds the model current
     const commands = yield* ModelCommands
     return (yield* commands.sync(Schema.decodeUnknownSync(ModelIdSchema)("model-a:gguf:test"))).outcome
   }).pipe(
-    Effect.provide(ModelCommandsLive),
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
     Effect.provideService(CustomModelCommands, customCommands),
     Effect.provideService(LocalModels, localModels),
     Effect.provideService(IcnInstances, { get: Effect.succeed({ revision: 1, instances: [] }) } as never),
@@ -179,7 +180,7 @@ describe("load acknowledgement", () => {
       Effect.runPromise(ModelCommands.pipe(
         Effect.flatMap(use),
         Effect.either,
-        Effect.provide(ModelCommandsLive),
+        Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
         Effect.provideService(CustomModelCommands, customCommands),
     Effect.provideService(LocalModels, localModels),
     Effect.provideService(CustomModelCommands, customCommands),

@@ -1,4 +1,4 @@
-import type { ModelAcquisitionFailure, ModelLocationKind, ModelVersionNotRunnable, UnsupportedReason } from "@magnitudedev/sdk"
+import type { DrafterNotUsable, ModelAcquisitionFailure, ModelLocationKind, ModelVersionNotRunnable, UnsupportedReason } from "@magnitudedev/sdk"
 import { formatMemorySize, formatStorageSize } from "../utils/format-bytes"
 
 export const modelDownloadFailureMessage = (failure: ModelAcquisitionFailure): string => {
@@ -34,7 +34,7 @@ export const unsupportedReasonMessage = (reason: UnsupportedReason): string => {
     case "KernelDomain":
     case "Backend": return "Its layer sizes aren't supported on this GPU"
     case "Unreadable": return "The file is incomplete or damaged"
-    case "Unknown": return "Magnitude can't run this model"
+    case "Unknown": return reason.detail.trim() === "" ? "Magnitude can't run this model" : `Magnitude can't run this model (${reason.detail.trim()})`
   }
 }
 
@@ -71,8 +71,14 @@ export const unsupportedReasonGroupMessage = ({ reason, count }: UnsupportedReas
 export const unsupportedReasonMessages = (reasons: ReadonlyArray<UnsupportedReason>): ReadonlyArray<string> =>
   unsupportedReasonGroups(reasons).map(unsupportedReasonGroupMessage)
 
+/** Why a drafter was refused for a model, in the client's words for the engine's reasons. */
+export const drafterNotUsableMessage = ({ reasons }: Pick<DrafterNotUsable, "reasons">): string =>
+  reasons.length === 0
+    ? "This drafter can't be used with this model."
+    : `This drafter can't be used with this model: ${unsupportedReasonMessages(reasons).join("; ")}.`
+
 /** Why a version was refused before anything downloaded. */
-export const modelVersionNotRunnableMessage = ({ version, verdict }: ModelVersionNotRunnable): string =>
+export const modelVersionNotRunnableMessage = ({ version, verdict }: Pick<ModelVersionNotRunnable, "version" | "verdict">): string =>
   verdict._tag === "Unsupported"
     ? `Magnitude can't run ${version}: ${unsupportedReasonMessages(verdict.reasons).join("; ")}.`
     : `${version} needs ${formatMemorySize(verdict.deficitBytes, { rounding: "up" })} more memory than this computer can provide.`
@@ -83,5 +89,5 @@ const joinWithAnd = (values: ReadonlyArray<string>): string =>
 /** Why a model location reads "Can’t read", and what the user can do about it. */
 export const unreadableModelLocationMessage = (kind: ModelLocationKind): string =>
   kind === "Ollama"
-    ? "Magnitude doesn’t have permission to read this folder. A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it to use those models here."
+    ? "Magnitude doesn’t have permission to read this folder. A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it, or set OLLAMA_MODELS to a folder you can read (Magnitude also scans the default folders)."
     : "Magnitude doesn’t have permission to read this folder. Give your account read access to it."

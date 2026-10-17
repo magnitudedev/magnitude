@@ -70,11 +70,16 @@ pub fn recognize(target: &Directory) -> Result<&'static dyn ModelFamily, Unsuppo
             },
             format!("no registered model family recognizes architecture {architecture:?}"),
         )),
-        (Some(first), Some(second)) => Err(UnsupportedModel::invalid(format!(
-            "architecture {architecture:?} is claimed by both the {} and {} families",
-            first.name(),
-            second.name()
-        ))),
+        (Some(first), Some(second)) => Err(UnsupportedModel::reason(
+            UnsupportedReason::Architecture {
+                architecture: architecture.to_owned(),
+            },
+            format!(
+                "architecture {architecture:?} is claimed by both the {} and {} families",
+                first.name(),
+                second.name()
+            ),
+        )),
     }
 }
 

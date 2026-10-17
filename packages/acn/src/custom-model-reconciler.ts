@@ -4,6 +4,7 @@ import {
   Models,
   type CustomFormModelId,
   type ModelId,
+  type SpeculativeMethod,
 } from "@magnitudedev/acn-protocol"
 import { IcnCandidates, IcnLocalModels } from "@magnitudedev/icn"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
@@ -11,7 +12,7 @@ import type { CustomModelsConfig } from "@magnitudedev/storage"
 import type * as Native from "@magnitudedev/icn-protocol/schemas"
 import { AcnChanges } from "./changes"
 import { CustomModels, localModelsConfiguration } from "./custom-models"
-import { DrafterMethods, drafterReferenceKey, productDrafterReference } from "./drafter-references"
+import { drafterReferenceKey, productDrafterReference } from "./drafter-references"
 import { ModelLocations } from "./model-locations"
 import { ModelSlotController } from "./model-slot-controller"
 
@@ -47,47 +48,58 @@ const pushFailed = () => new LocalModelMutationFailed({
 export const CustomModelReconcilerLive: Layer.Layer<
   CustomModelReconciler,
   never,
-  CustomModels | ModelLocations | DrafterMethods | IcnLocalModels | IcnCandidates | ModelSlotController | AcnChanges
+  CustomModels | ModelLocations | IcnLocalModels | IcnCandidates | ModelSlotController | AcnChanges
 > = Layer.scoped(CustomModelReconciler, Effect.gen(function* () {
   const customModels = yield* CustomModels
   const locations = yield* ModelLocations
-  const methods = yield* DrafterMethods
   const localModels = yield* IcnLocalModels
   const candidates = yield* IcnCandidates
   const slots = yield* ModelSlotController
   const changes = yield* AcnChanges
   const lock = yield* Effect.makeSemaphore(1)
 
-  // A drafter's binding method is engine knowledge; after a restart it is relearned from ICN's candidates.
-  // An added model still downloading has no files to list from, so its declared repository file is asked.
-  const learnMethods = (config: CustomModelsConfig) => Effect.forEach(
+  // A chosen drafter is delivered with its persisted method. ICN's candidates only validate it: a drafter
+  // the engine now binds with another method has its persisted method corrected. An added model still
+  // downloading has no files to list from, so its declared repository file is asked.
+  const validateMethods = (config: CustomModelsConfig) => Effect.forEach(
     Object.entries(config.drafters),
-    ([modelId, choice]) => Effect.gen(function* () {
-      if (choice._tag !== "Reference" || Option.isSome(yield* methods.get(choice.reference))) return
+    ([id, choice]) => Effect.gen(function* () {
+      if (choice._tag !== "Reference") return
+      const modelId = id as CustomFormModelId
       const key = drafterReferenceKey(choice.reference)
-      const learn = (request: unknown) => candidates.drafters(request as Native.DrafterCandidatesRequest).pipe(
+      const bound = (request: unknown) => candidates.drafters(request as Native.DrafterCandidatesRequest).pipe(
         Effect.orElseSucceed(() => []),
-        Effect.flatMap((listed) => Effect.forEach(listed, (candidate) => {
-          if (candidate.verdict._tag !== "Bound") return Effect.succeed(false)
+        Effect.map((listed) => Option.fromNullable(listed.find((candidate) => {
           const reference = productDrafterReference(candidate.reference)
-          return Option.isSome(reference) && drafterReferenceKey(reference.value) === key
-            ? methods.remember(choice.reference, candidate.verdict.method).pipe(Effect.as(true))
-            : Effect.succeed(false)
-        })),
-        Effect.map((learned) => learned.includes(true)),
+          return candidate.verdict._tag === "Bound" && Option.isSome(reference) && drafterReferenceKey(reference.value) === key
+        })).pipe(Option.flatMap((candidate) => candidate.verdict._tag === "Bound"
+          ? Option.some(candidate.verdict.method as SpeculativeMethod)
+          : Option.none()))),
       )
-      if (yield* learn({ _tag: "Model", modelId, other: Option.none() })) return
-      const declaration = config.declarations[modelId as keyof CustomModelsConfig["declarations"]]
-      if (declaration?.origin._tag !== "Added") return
-      yield* learn({
-        _tag: "Candidate",
-        candidate: {
-          source: { _tag: "HuggingFace", repository: declaration.origin.repository, commit: declaration.origin.commit },
-          target: [...declaration.target],
-          projector: Option.none(),
-          drafter: Option.none(),
-        },
-        other: Option.none(),
+      const declaration = config.declarations[modelId]
+      const method = yield* bound({ _tag: "Model", modelId, other: Option.none() }).pipe(
+        Effect.flatMap((method) => Option.isSome(method) || declaration?.origin._tag !== "Added"
+          ? Effect.succeed(method)
+          : bound({
+              _tag: "Candidate",
+              candidate: {
+                source: { _tag: "HuggingFace", repository: declaration.origin.repository, commit: declaration.origin.commit },
+                target: [...declaration.target],
+                projector: Option.none(),
+                drafter: Option.none(),
+              },
+              other: Option.none(),
+            })),
+      )
+      if (Option.isNone(method) || method.value._tag === choice.method._tag) return
+      const corrected = method.value
+      yield* customModels.modify((current) => {
+        const latest = current.drafters[modelId]
+        const stale = latest?._tag === "Reference" && drafterReferenceKey(latest.reference) === key
+          && latest.method._tag !== corrected._tag
+        return Effect.succeed([undefined, stale
+          ? { ...current, drafters: { ...current.drafters, [modelId]: { ...latest, method: corrected } } }
+          : current] as const)
       })
     }),
     { discard: true },
@@ -95,8 +107,7 @@ export const CustomModelReconcilerLive: Layer.Layer<
 
   const push = lock.withPermits(1)(Effect.gen(function* () {
     const config = yield* customModels.get
-    yield* learnMethods(config)
-    const configuration = localModelsConfiguration(config, yield* locations.resolve, yield* methods.snapshot)
+    const configuration = localModelsConfiguration(config, yield* locations.resolve)
     yield* localModels.configure(configuration).pipe(Effect.mapError(pushFailed))
   }))
 
@@ -115,12 +126,12 @@ export const CustomModelReconcilerLive: Layer.Layer<
     yield* Ref.set(previous, next)
     yield* push
     yield* changes.publish({ operation: Models.listModelLocations._tag })
+    yield* validateMethods(next)
   }).pipe(Effect.catchAllCause((cause) => Effect.logError("Unable to reconcile custom models").pipe(
     Effect.annotateLogs({ cause: Cause.pretty(cause).slice(0, 2_000) }),
   )))
 
-  // The first emission is the current choices: the spawn snapshot omitted drafters whose method was
-  // not yet known, and this push completes it. Every later change is compared with the last one seen.
+  // The first emission is the current choices. Every later change is compared with the last one seen.
   yield* customModels.changes.pipe(Stream.runForEach(reconcile), Effect.forkScoped)
 
   return CustomModelReconciler.of({ push })

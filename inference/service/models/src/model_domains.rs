@@ -12,11 +12,13 @@ use crate::catalog_installations::ManagedCatalogInstallations;
 use crate::catalog_models::ManagedCatalogModels;
 use crate::custom_models::{LocalModelsContext, ManagedLocalModels};
 use crate::inventory::{InstalledPackagesObserver, ManagedModelStore};
+use crate::upstream_updates::UpstreamUpdates;
 
 pub struct ModelDomainResolver {
     pub(crate) inventory: Arc<ManagedModelStore>,
     pub(crate) catalog: RecommendableModelCatalog,
     pub(crate) local: LocalModelsContext,
+    pub(crate) upstream: UpstreamUpdates,
 }
 
 impl ModelDomainResolver {
@@ -26,6 +28,7 @@ impl ModelDomainResolver {
             inventory,
             catalog,
             local: LocalModelsContext::new(),
+            upstream: UpstreamUpdates::new(),
         })
     }
 }
@@ -61,6 +64,7 @@ pub fn managed_model_services(
     let installations =
         ManagedCatalogInstallations::new(resolver.clone(), downloads, remover, optimizer);
     let local = ManagedLocalModels::new(resolver.clone());
+    crate::upstream_updates::start(&resolver);
     let catalog = ManagedCatalogModels::new(resolver, installations.clone(), {
         let local = Arc::downgrade(&local);
         move |catalog| Arc::new(ModelInventoryObserver { catalog, local })

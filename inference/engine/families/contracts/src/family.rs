@@ -14,8 +14,7 @@ use std::{error, fmt};
 
 /// A registered family rejected material it recognized: every unsupported
 /// feature it can name, and the developer text that describes the refusal.
-/// `reasons` is empty when the material is malformed rather than outside a
-/// supported feature set.
+/// `reasons` is never empty: malformed material is `Unreadable`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FamilyError {
     pub reasons: Vec<UnsupportedReason>,
@@ -23,19 +22,37 @@ pub struct FamilyError {
 }
 
 impl FamilyError {
-    /// A refusal with no typed cause.
+    /// Material whose header does not describe a model the family can
+    /// build: a required key or weight is missing, or values contradict
+    /// each other.
     pub fn invalid(detail: impl Into<String>) -> Self {
-        Self {
-            reasons: Vec::new(),
-            detail: detail.into(),
-        }
+        Self::unsupported(vec![UnsupportedReason::Unreadable], detail)
+    }
+
+    /// A metadata key present with a value the family does not read.
+    pub fn metadata(key: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::unsupported(
+            vec![UnsupportedReason::UnrecognizedMetadata { key: key.into() }],
+            detail,
+        )
+    }
+
+    /// A drafter, head or projector that disagrees with the target it is
+    /// bound to.
+    pub fn mismatch(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self::unsupported(
+            vec![UnsupportedReason::TargetMismatch {
+                detail: detail.clone(),
+            }],
+            detail,
+        )
     }
 
     pub fn unsupported(reasons: Vec<UnsupportedReason>, detail: impl Into<String>) -> Self {
-        Self {
-            reasons,
-            detail: detail.into(),
-        }
+        let detail = detail.into();
+        debug_assert!(!reasons.is_empty(), "a family refusal names no reason: {detail}");
+        Self { reasons, detail }
     }
 }
 
@@ -107,12 +124,13 @@ pub trait ModelFamily: Send + Sync {
         let blocks = definition.decoder.blocks.len() as u64;
         match layer.cmp(&blocks) {
             std::cmp::Ordering::Less => Ok(TapPoint::Sublayer(SublayerIndex {
-                block: u32::try_from(layer)
-                    .map_err(|_| FamilyError::invalid(format!("target layer {layer} exceeds u32")))?,
+                block: u32::try_from(layer).map_err(|_| {
+                    FamilyError::mismatch(format!("target layer {layer} exceeds u32"))
+                })?,
                 sublayer: 0,
             })),
             std::cmp::Ordering::Equal => Ok(TapPoint::Exit),
-            std::cmp::Ordering::Greater => Err(FamilyError::invalid(format!(
+            std::cmp::Ordering::Greater => Err(FamilyError::mismatch(format!(
                 "target layer {layer} is beyond the target's {blocks} layers"
             ))),
         }

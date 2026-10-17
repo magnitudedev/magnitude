@@ -44,6 +44,14 @@ describe("custom model details", () => {
     expect(renderToStaticMarkup(<DrafterOffer model={customModel(added)} disabled={false} onAdd={() => {}} />)).toBe("")
     expect(renderToStaticMarkup(<DrafterOffer model={customModel(added, { drafter: attached({ _tag: "Present" }), recommendedDrafter: Option.some(drafterCandidate()) })} disabled={false} onAdd={() => {}} />)).toBe("")
   })
+  it("offers no drafter, on the card or in Details, once the user turned it off", () => {
+    const turnedOff = customModel(added, { drafterChoice: { _tag: "None" }, recommendedDrafter: Option.some(drafterCandidate()) })
+    expect(renderToStaticMarkup(<DrafterOffer model={turnedOff} disabled={false} onAdd={() => {}} />)).toBe("")
+    const html = details(turnedOff)
+    expect(html).not.toContain("Faster with a drafter")
+    expect(html).toContain(">None<")
+    expect(html).toContain(">Change<")
+  })
   it("reports a drafter-only download's progress and failure, and nothing for a present drafter", () => {
     expect(notices(customModel(added, { drafter: attached({ _tag: "Present" }) }))).toBe("")
     expect(notices(customModel(added, { drafter: attached(downloading) }))).toContain("Downloading the drafter for Qwen3.6 35B A3B Uncensored (Q4_K_P) · 50%")
@@ -65,6 +73,7 @@ describe("custom model details", () => {
   })
   it("shows Update for any custom model whose catalog drafter has a newer revision, once nothing is downloading it", () => {
     expect(drafterUpdateAvailable(customModel(foundIn({ _tag: "Ollama" }), { drafter: attached({ _tag: "Present" }, true) }))).toBe(true)
+    expect(drafterUpdateAvailable(customModel(added, { drafter: attached({ _tag: "DownloadFailed", failure: { _tag: "NetworkUnavailable" } }, true) }))).toBe(true)
     expect(drafterUpdateAvailable(customModel(added, { drafter: attached(downloading, true) }))).toBe(false)
     expect(drafterUpdateAvailable(customModel(added, { drafter: attached({ _tag: "Present" }) }))).toBe(false)
     expect(drafterUpdateAvailable(customModel(added))).toBe(false)

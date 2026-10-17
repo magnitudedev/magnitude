@@ -1,3 +1,4 @@
+import type { ReactNode } from "react"
 import { CaretRightIcon, EyeIcon } from "@phosphor-icons/react"
 import { formatLocalModelDisplayName, unsupportedLocalModelSourceTag, unsupportedReasonMessages } from "@magnitudedev/client-common"
 import type { CustomLocalModel, UnsupportedLocalModel } from "@magnitudedev/sdk"
@@ -30,8 +31,13 @@ export function UnsupportedModels({ models }: { models: readonly UnsupportedLoca
   </details>
 }
 
-/** The Hidden filter: hidden models stay reachable, each with Unhide. */
-export function HiddenModels({ models, disabled, onUnhide }: { models: readonly CustomLocalModel[]; disabled: boolean; onUnhide: (model: CustomLocalModel) => void }) {
+/** Unhide, disabled while the command is pending so a second click can't send it twice. */
+export function UnhideButton({ pending, onUnhide }: { pending: boolean; onUnhide: () => void }) {
+  return <Button variant="outline" disabled={pending} onClick={onUnhide}><EyeIcon />Unhide</Button>
+}
+
+/** The Hidden filter: hidden models stay reachable, each with its Unhide action. */
+export function HiddenModels({ models, unhide }: { models: readonly CustomLocalModel[]; unhide: (model: CustomLocalModel) => ReactNode }) {
   if (models.length === 0) return <p className="py-8 text-slate-500">No hidden models. Models you hide from Magnitude appear here.</p>
   return <div className="grid items-start gap-5">{models.map(model => <article key={model.modelId} className={pageLayout.modelCard}>
     <div className={pageLayout.modelRow}>
@@ -39,7 +45,7 @@ export function HiddenModels({ models, disabled, onUnhide }: { models: readonly 
         <h2 className="flex flex-wrap items-center gap-2 text-lg font-semibold">{formatLocalModelDisplayName(model)}<SourceTag label={model.presentation.sourceLabel} /></h2>
         <p className="mt-1 text-sm text-slate-500">Hidden from Magnitude</p>
       </div></div>
-      <div className="flex justify-end"><Button variant="outline" disabled={disabled} onClick={() => onUnhide(model)}><EyeIcon />Unhide</Button></div>
+      <div className="flex justify-end">{unhide(model)}</div>
     </div>
   </article>)}</div>
 }

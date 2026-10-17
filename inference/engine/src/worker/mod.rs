@@ -375,7 +375,12 @@ fn load(
             .map_err(|_| internal("model vocabulary exceeds the host domain"))?;
         let binding =
             GenerationBinding::new(tokenizer, projection, CONSTRAINT_CACHE)
-                .map_err(|detail| LoadError::Unsupported(UnsupportedModel::invalid(detail)))?;
+                .map_err(|detail| {
+                    LoadError::Unsupported(crate::host::tokenizer_refusal(
+                        host_package.tokenizer(),
+                        detail,
+                    ))
+                })?;
         Ok((binding, chat))
     };
     let (

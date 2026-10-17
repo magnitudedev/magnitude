@@ -86,5 +86,10 @@ weights, which Magnitude doesn't support yet", and hidden models marked `Hidden`
 shows a hidden model again.
 
 `models folders list` shows the automatic locations and your own folders, each directory with its
-status: Found, Not found, Can't read, or Off. `models folders add <path>` watches a folder: GGUFs added later
-appear and deleted ones disappear. `models folders remove <path>` stops watching it.
+status: Found, Off, Not found, or Can't read. A directory Magnitude can't read is followed by what
+to do, such as giving your account read access to a system Ollama service's folder or setting
+`OLLAMA_MODELS` to a folder you can read. `models folders add <path>` watches a folder: GGUFs added
+later appear and deleted ones disappear. `models folders remove <path>` stops watching it.
+`models folders disable <location>` stops scanning an automatic location and `models folders enable
+<location>` scans it again, where the location is `huggingface-cache`, `lm-studio`, `llama-cpp`, or
+`ollama`; this applies to every directory of that location and never touches its files.

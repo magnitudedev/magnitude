@@ -11,20 +11,20 @@ use std::sync::{Arc, Weak};
 use magnitude_engine::assessment::{
     DrafterVerdict as EngineDrafterVerdict, ModelAssessment as EngineAssessment,
     ModelAssessmentError, ModelCapabilities as EngineCapabilities, ModelPackagePaths,
-    PreparedModelAssessment, SpeculativeMethod as EngineSpeculativeMethod,
-    finish_model_assessment, prepare_model_assessment,
+    PreparedModelAssessment, SpeculativeMethod as EngineSpeculativeMethod, finish_model_assessment,
+    prepare_model_assessment,
 };
 use magnitude_engine::error::{UnsupportedModel, UnsupportedReason as EngineUnsupportedReason};
 use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
 use magnitude_engine::options::ModelMethod;
 use magnitude_executor::assessment::{DomainFit, ExecutionAssessment, PerformanceEstimate};
 use magnitude_service_contracts::models::{
-    AssessmentEnvironmentId, InstalledModelPackages as _, MemoryAssessment, ModelAssessment,
-    DrafterVerdict, KernelStatic, ModelAssessmentId, ModelFingerprint, WeightTypeCount, ModelAssessmentProfile, ModelBundleInput,
-    ModelCapabilities, ModelFailure, UnsupportedReason,
+    AssessmentEnvironmentId, DrafterVerdict, InstalledModelPackages as _, KernelStatic,
+    KnownUnsupportedReason, MemoryAssessment, ModelAssessment, ModelAssessmentId,
+    ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure, ModelFingerprint,
     ModelPackageOperand, ModelReasoningCapabilities, ModelServingConfiguration,
-    PerformanceEvidence, ResolvedServableModelBundle, ServableModelBundle,
-    SpeculativeDraftSource, SpeculativeDraftSourceInput, SpeculativeMethod,
+    PerformanceEvidence, ResolvedServableModelBundle, ServableModelBundle, SpeculativeDraftSource,
+    SpeculativeDraftSourceInput, SpeculativeMethod, UnsupportedReason, WeightTypeCount,
 };
 use magnitude_service_contracts::{ComponentRole, InventoryError, MemoryDomainId, ResolvedModel};
 use magnitude_service_models::{
@@ -179,7 +179,10 @@ impl ModelAssessor {
     }
 
     /// Resolve and prepare one bundle from its headers.
-    pub async fn prepare_bundle(&self, configuration: ModelServingConfiguration) -> PreparationResult {
+    pub async fn prepare_bundle(
+        &self,
+        configuration: ModelServingConfiguration,
+    ) -> PreparationResult {
         let environment = Arc::clone(&self.environment);
         let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
         let resolved = self
@@ -508,11 +511,11 @@ pub(crate) fn model_assessment(
 
 /// A package the engine cannot execute has no engine-derived capabilities or template.
 fn unsupported_reason(reason: EngineUnsupportedReason) -> UnsupportedReason {
-    match reason {
+    UnsupportedReason::Known(match reason {
         EngineUnsupportedReason::Architecture { architecture } => {
-            UnsupportedReason::Architecture { architecture }
+            KnownUnsupportedReason::Architecture { architecture }
         }
-        EngineUnsupportedReason::WeightTypes { types } => UnsupportedReason::WeightTypes {
+        EngineUnsupportedReason::WeightTypes { types } => KnownUnsupportedReason::WeightTypes {
             types: types
                 .into_iter()
                 .map(|count| WeightTypeCount {
@@ -521,22 +524,24 @@ fn unsupported_reason(reason: EngineUnsupportedReason) -> UnsupportedReason {
                 })
                 .collect(),
         },
-        EngineUnsupportedReason::RopeScaling { kind } => UnsupportedReason::RopeScaling { kind },
+        EngineUnsupportedReason::RopeScaling { kind } => {
+            KnownUnsupportedReason::RopeScaling { kind }
+        }
         EngineUnsupportedReason::UnrecognizedTensor { name } => {
-            UnsupportedReason::UnrecognizedTensor { name }
+            KnownUnsupportedReason::UnrecognizedTensor { name }
         }
         EngineUnsupportedReason::UnrecognizedMetadata { key } => {
-            UnsupportedReason::UnrecognizedMetadata { key }
+            KnownUnsupportedReason::UnrecognizedMetadata { key }
         }
         EngineUnsupportedReason::Tokenizer { model, pre } => {
-            UnsupportedReason::Tokenizer { model, pre }
+            KnownUnsupportedReason::Tokenizer { model, pre }
         }
-        EngineUnsupportedReason::ChatTemplate => UnsupportedReason::ChatTemplate,
+        EngineUnsupportedReason::ChatTemplate => KnownUnsupportedReason::ChatTemplate,
         EngineUnsupportedReason::KernelDomain {
             backend,
             entry,
             statics,
-        } => UnsupportedReason::KernelDomain {
+        } => KnownUnsupportedReason::KernelDomain {
             backend,
             entry,
             statics: statics
@@ -544,13 +549,13 @@ fn unsupported_reason(reason: EngineUnsupportedReason) -> UnsupportedReason {
                 .map(|(name, value)| KernelStatic { name, value })
                 .collect(),
         },
-        EngineUnsupportedReason::Backend { backend } => UnsupportedReason::Backend { backend },
-        EngineUnsupportedReason::Unreadable => UnsupportedReason::Unreadable,
+        EngineUnsupportedReason::Backend { backend } => KnownUnsupportedReason::Backend { backend },
+        EngineUnsupportedReason::Unreadable => KnownUnsupportedReason::Unreadable,
         EngineUnsupportedReason::TargetMismatch { detail } => {
-            UnsupportedReason::TargetMismatch { detail }
+            KnownUnsupportedReason::TargetMismatch { detail }
         }
-        EngineUnsupportedReason::TiedOutputHead => UnsupportedReason::TiedOutputHead,
-    }
+        EngineUnsupportedReason::TiedOutputHead => KnownUnsupportedReason::TiedOutputHead,
+    })
 }
 
 fn unsupported_reasons(unsupported: UnsupportedModel) -> (Vec<UnsupportedReason>, String) {
@@ -606,13 +611,21 @@ fn unsupported_model(
     fingerprint: Option<ModelFingerprint>,
 ) -> CachedModelAssessment {
     let (reasons, detail) = unsupported_reasons(unsupported);
-    unsupported_assessment(Some(requested.profile), reasons, detail, fingerprint)
+    // A file the engine refused before establishing a context (and with no training context in its
+    // header) has no serving profile, never a zero-token one.
+    let profile = Some(requested.profile).filter(|profile| profile.context_length > 0);
+    unsupported_assessment(profile, reasons, detail, fingerprint)
 }
 
 /// A file whose header or bytes cannot be read: refused before the engine sees it, without a
 /// serving profile.
 pub(crate) fn unreadable_assessment(detail: String) -> CachedModelAssessment {
-    unsupported_assessment(None, vec![UnsupportedReason::Unreadable], detail, None)
+    unsupported_assessment(
+        None,
+        vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)],
+        detail,
+        None,
+    )
 }
 
 fn unsupported_assessment(
@@ -775,6 +788,42 @@ pub fn inventory_model_failure(error: InventoryError) -> ModelFailure {
 mod tests {
     use super::*;
 
+    /// An unsupported file whose context is unknown has no serving profile, never a zero-token one;
+    /// one with a context keeps it.
+    #[test]
+    fn an_unsupported_model_never_has_a_zero_context_profile() {
+        let profile = |context_length| ModelAssessmentProfile {
+            profile: magnitude_service_contracts::models::ServingProfile { context_length },
+            performance_context_tokens: Vec::new(),
+        };
+        let unsupported = || {
+            UnsupportedModel::reason(
+                EngineUnsupportedReason::Architecture {
+                    architecture: "deepseek4".to_owned(),
+                },
+                "no registered model family",
+            )
+        };
+        let profile_of = |assessment: CachedModelAssessment| match assessment.profile {
+            ModelAssessment::Unsupported { profile, .. } => profile,
+            other => panic!("not unsupported: {other:?}"),
+        };
+        assert_eq!(
+            profile_of(unsupported_model(profile(0), unsupported(), None)),
+            None
+        );
+        assert_eq!(
+            profile_of(unsupported_model(profile(4096), unsupported(), None)),
+            Some(magnitude_service_contracts::models::ServingProfile {
+                context_length: 4096
+            })
+        );
+        assert_eq!(
+            profile_of(unreadable_assessment("truncated".to_owned())),
+            None
+        );
+    }
+
     fn resolved_model(path: &str) -> ResolvedModel {
         use magnitude_service_contracts::{
             ContentId, InventoryEntryId, InventoryModel, InventoryProperties, ModelAvailability,
@@ -809,7 +858,6 @@ mod tests {
                     training_context_length: None,
                     nextn_predict_layers: None,
                     tokenizer: None,
-                    modalities: vec!["text".to_owned()],
                     base_models: Vec::new(),
                     evidence_fingerprint: "test".to_owned(),
                 },
@@ -856,10 +904,7 @@ mod tests {
         }
     }
 
-    fn speculative(
-        draft: bool,
-        method: SpeculativeMethod,
-    ) -> ResolvedServableModelBundle {
+    fn speculative(draft: bool, method: SpeculativeMethod) -> ResolvedServableModelBundle {
         ResolvedServableModelBundle::new(
             ServableModelBundle::SpeculativeDecoding {
                 target: package("target"),
@@ -985,7 +1030,10 @@ mod tests {
         let operational = preparation_error(ModelAssessmentError::Planning("busy".to_owned()));
         assert!(matches!(
             operational,
-            InventoryError::ModelOperation { retryable: true, .. }
+            InventoryError::ModelOperation {
+                retryable: true,
+                ..
+            }
         ));
     }
 

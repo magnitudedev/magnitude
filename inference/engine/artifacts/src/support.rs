@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// One cause a model or drafter cannot run. `TargetMismatch` is a drafter
-/// that does not fit its target; `Unreadable` is a truncated or invalid GGUF.
+/// or projector that does not fit its target; `Unreadable` is a truncated
+/// or invalid GGUF, or a header missing what its family needs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnsupportedReason {
     Architecture {

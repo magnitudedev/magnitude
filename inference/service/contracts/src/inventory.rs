@@ -474,7 +474,6 @@ pub enum InventoryProperties {
         training_context_length: Option<u32>,
         nextn_predict_layers: Option<u32>,
         tokenizer: Option<String>,
-        modalities: Vec<String>,
         base_models: Vec<String>,
         evidence_fingerprint: String,
     },

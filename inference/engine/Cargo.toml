@@ -41,6 +41,7 @@ harness = false
 
 [dev-dependencies]
 magnitude-family-common = { path = "families/common", features = ["catalog-headers"] }
+flate2.workspace = true
 
 [build-dependencies]
 sha2 = "=0.11.0"

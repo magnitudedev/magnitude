@@ -5,26 +5,28 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::future::BoxFuture;
 use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
+use magnitude_service_contracts::models::{
+    KnownUnsupportedReason, ModelId, ModelPackage, UnsupportedReason,
+};
 use magnitude_service_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, HuggingFaceModelCatalog,
     HuggingFaceModelSearchRequest, HuggingFaceModelSearchResult, HuggingFaceModelSearchResults,
     HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
-    Integrity, InventoryEntryId, InventoryError, ModelComponent, ModelLocation,
-    ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
+    Integrity, InventoryEntryId, InventoryError, ModelComponent, ModelLocation, ModelPreviewSource,
+    ModelSource, ResolvedComponent, ResolvedModel,
 };
-use magnitude_service_contracts::models::{ModelId, ModelPackage, UnsupportedReason};
 use reqwest::header::{CONTENT_RANGE, ETAG, IF_NONE_MATCH, RANGE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::cache::{ModelCacheWorkspace, ModelIndexKind};
 use crate::candidate_files::RecognizedArchitectures;
-use crate::lineage::CatalogLineage;
 use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::content_id;
 use crate::inventory::{ManagedModelStore, build_model, now};
+use crate::lineage::CatalogLineage;
 
 const MAX_HUB_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HUB_SIBLINGS: usize = 100_000;
@@ -96,7 +98,7 @@ impl HuggingFaceDiscovery {
         ] {
             url.query_pairs_mut().append_pair("expand", field);
         }
-        let response = send_hub_get(&self.models.http, url).await?;
+        let response = send_hub_get(&self.models.http, self.models.hub_token(), url).await?;
         if !response.status().is_success() {
             return Err(InventoryError::Upstream(format!(
                 "Hugging Face search returned HTTP {}",
@@ -134,9 +136,11 @@ impl HuggingFaceDiscovery {
                 if !request.include_unsupported {
                     continue;
                 }
-                result.unsupported = vec![UnsupportedReason::Architecture {
-                    architecture: result.architecture.clone().unwrap_or_default(),
-                }];
+                result.unsupported = vec![UnsupportedReason::Known(
+                    KnownUnsupportedReason::Architecture {
+                        architecture: result.architecture.clone().unwrap_or_default(),
+                    },
+                )];
             }
             kept.push((result, parameters));
         }
@@ -544,6 +548,7 @@ async fn refresh_hub_repository_snapshot(
 ) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
     let fetched = fetch_hub_model(
         http,
+        models.hub_token(),
         endpoint,
         &request.repository,
         request.revision.as_str(),
@@ -578,6 +583,7 @@ async fn refresh_hub_repository_snapshot(
 
 async fn fetch_hub_model(
     http: &reqwest::Client,
+    token: Option<&str>,
     endpoint: &str,
     repository: &str,
     revision: &str,
@@ -585,7 +591,6 @@ async fn fetch_hub_model(
 ) -> Result<HubModelFetch, InventoryError> {
     let url =
         revision_metadata_url(endpoint, repository, revision).map_err(InventoryError::Internal)?;
-    let token = hub_token();
     let response = send_hub_request(|| {
         let mut request = http.get(url.clone()).query(&[("blobs", "true")]);
         if let Some(token) = &token {
@@ -711,9 +716,10 @@ impl ManagedModelStore {
         let evidence = serde_json::to_string(source)
             .map_err(|error| InventoryError::Internal(error.to_string()))?;
         let cached = self.cached_preview_artifact(source).filter(|artifact| {
-            artifact.components.iter().all(|component| {
-                self.cache.has_header(&component.header_digest)
-            })
+            artifact
+                .components
+                .iter()
+                .all(|component| self.cache.has_header(&component.header_digest))
         });
         let artifact = match cached {
             Some(artifact) => artifact,
@@ -741,9 +747,10 @@ impl ManagedModelStore {
         let evidence = serde_json::to_string(source)
             .map_err(|error| InventoryError::Internal(error.to_string()))?;
         let cached = self.cached_preview_artifact(source).filter(|artifact| {
-            artifact.components.iter().all(|component| {
-                self.cache.has_header(&component.header_digest)
-            })
+            artifact
+                .components
+                .iter()
+                .all(|component| self.cache.has_header(&component.header_digest))
         });
         let artifact = match cached {
             Some(artifact) => artifact,
@@ -768,6 +775,7 @@ impl ManagedModelStore {
     ) -> Result<CachedArtifact, InventoryError> {
         let metadata = fetch_hub_model(
             &self.http,
+            self.hub_token(),
             self.client.endpoint(),
             &source.repository,
             &source.revision,
@@ -810,6 +818,7 @@ impl ManagedModelStore {
             };
             let header = fetch_header(
                 &self.http,
+                self.hub_token(),
                 self.client.endpoint(),
                 &source.repository,
                 &commit,
@@ -905,7 +914,10 @@ impl ManagedModelStore {
                 .map_err(|error| InventoryError::Io(error.to_string()))?;
             file.write_all(&bytes)
                 .and_then(|()| {
-                    magnitude_service_utils::sparse_file::set_sparse_len(&file, cached.component.size_bytes)
+                    magnitude_service_utils::sparse_file::set_sparse_len(
+                        &file,
+                        cached.component.size_bytes,
+                    )
                 })
                 .map_err(|error| InventoryError::Io(error.to_string()))?;
         }
@@ -1278,10 +1290,12 @@ fn component_relationship(
                 method: method.clone(),
             }
         }
-        magnitude_service_contracts::ModelPreviewComponentRole::Mtp => ComponentRelationship::MtpFor {
-            mtp: component.path.clone(),
-            model: primary.to_path_buf(),
-        },
+        magnitude_service_contracts::ModelPreviewComponentRole::Mtp => {
+            ComponentRelationship::MtpFor {
+                mtp: component.path.clone(),
+                model: primary.to_path_buf(),
+            }
+        }
     }
 }
 
@@ -1408,6 +1422,7 @@ fn resolve_url(
 #[derive(Clone)]
 pub(crate) struct RemoteRanges<'a> {
     http: &'a reqwest::Client,
+    token: Option<&'a str>,
     url: reqwest::Url,
     hub_host: Option<String>,
     logical_size: u64,
@@ -1416,6 +1431,7 @@ pub(crate) struct RemoteRanges<'a> {
 impl<'a> RemoteRanges<'a> {
     pub(crate) fn new(
         http: &'a reqwest::Client,
+        token: Option<&'a str>,
         endpoint: &str,
         repository: &str,
         commit: &str,
@@ -1425,6 +1441,7 @@ impl<'a> RemoteRanges<'a> {
         let url = resolve_url(endpoint, repository, commit, path)?;
         Ok(Self {
             http,
+            token,
             hub_host: url.host_str().map(ToOwned::to_owned),
             url,
             logical_size,
@@ -1436,7 +1453,11 @@ impl<'a> RemoteRanges<'a> {
     }
 
     /// Exactly the bytes `start..end` of the file.
-    pub(crate) async fn read(&mut self, start: usize, end: usize) -> Result<Vec<u8>, InventoryError> {
+    pub(crate) async fn read(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<u8>, InventoryError> {
         let range_length = end.saturating_sub(start);
         let expected_start = u64::try_from(start)
             .map_err(|_| InventoryError::Internal("range length overflow".to_owned()))?;
@@ -1448,9 +1469,9 @@ impl<'a> RemoteRanges<'a> {
             return Err(InventoryError::Internal("invalid header range".to_owned()));
         }
         let range = format!("bytes={start}-{}", end - 1);
-        let token = (self.url.host_str() == self.hub_host.as_deref())
-            .then(hub_token)
-            .flatten();
+        let token = self
+            .token
+            .filter(|_| self.url.host_str() == self.hub_host.as_deref());
         let url = self.url.clone();
         let mut response = send_hub_request(|| {
             let mut request = self.http.get(url.clone()).header(RANGE, &range);
@@ -1520,13 +1541,22 @@ impl<'a> RemoteRanges<'a> {
 /// when the engine's parser accepts it.
 async fn fetch_header(
     http: &reqwest::Client,
+    token: Option<&str>,
     endpoint: &str,
     repository: &str,
     commit: &str,
     path: &Path,
     logical_size: u64,
 ) -> Result<Vec<u8>, InventoryError> {
-    let mut remote = RemoteRanges::new(http, endpoint, repository, commit, path, logical_size)?;
+    let mut remote = RemoteRanges::new(
+        http,
+        token,
+        endpoint,
+        repository,
+        commit,
+        path,
+        logical_size,
+    )?;
     let header = crate::remote_header::read_header(&mut remote, &[]).await?;
     match header_verdict(header).await? {
         (header, Ok(())) => Ok(header),
@@ -1535,9 +1565,7 @@ async fn fetch_header(
 }
 
 /// A complete header and whether the engine's parser accepts it, or why not.
-async fn header_verdict(
-    header: Vec<u8>,
-) -> Result<(Vec<u8>, Result<(), String>), InventoryError> {
+async fn header_verdict(header: Vec<u8>) -> Result<(Vec<u8>, Result<(), String>), InventoryError> {
     tokio::task::spawn_blocking(move || {
         let verdict = match header_prefix(&header) {
             Ok(HeaderPrefix::Complete(length)) if length >= header.len() => Ok(()),
@@ -1626,20 +1654,14 @@ pub(crate) fn hub_access_required(with_token: bool) -> InventoryError {
     }
 }
 
-fn hub_token() -> Option<String> {
-    std::env::var("HF_TOKEN")
-        .ok()
-        .filter(|token| !token.trim().is_empty())
-}
-
 /// A Hub metadata GET with the explicit `HF_TOKEN` when present, retried on rate limits and server
 /// failures. A rejected credential (401) falls back to an anonymous request, so an expired token
 /// never hides public repositories.
 pub(crate) async fn send_hub_get(
     http: &reqwest::Client,
+    token: Option<&str>,
     url: reqwest::Url,
 ) -> Result<reqwest::Response, InventoryError> {
-    let token = hub_token();
     let response = send_hub_request(|| {
         let request = http.get(url.clone());
         match &token {
@@ -1716,7 +1738,10 @@ impl ManagedModelStore {
         }
         roots
             .into_iter()
-            .filter(|root| root.enabled && root.kind == magnitude_service_contracts::models::ModelRootKind::Ollama)
+            .filter(|root| {
+                root.enabled
+                    && root.kind == magnitude_service_contracts::models::ModelRootKind::Ollama
+            })
             .map(|root| crate::inventory::canonical_or_self(&root.path))
             .collect()
     }
@@ -1749,7 +1774,10 @@ fn classification_evidence(
     digest: &str,
     architectures: &crate::candidate_files::RecognizedArchitectures,
 ) -> String {
-    format!("candidate-classification-v3:{digest}:{}", architectures.key())
+    format!(
+        "candidate-classification-v3:{digest}:{}",
+        architectures.key()
+    )
 }
 
 fn remote_header_evidence(endpoint: &str, repository: &str, commit: &str, path: &Path) -> String {
@@ -1831,6 +1859,7 @@ impl ManagedModelStore {
         }
         let mut remote = RemoteRanges::new(
             &self.http,
+            self.hub_token(),
             self.client.endpoint(),
             repository,
             commit,
@@ -1954,7 +1983,9 @@ impl ManagedModelStore {
         architectures: &crate::candidate_files::RecognizedArchitectures,
         references: &[&[u8]],
     ) -> Result<(String, crate::candidate_files::HeaderClassification), InventoryError> {
-        if let Some(classified) = self.cached_hugging_face_classification(repository, commit, file, architectures) {
+        if let Some(classified) =
+            self.cached_hugging_face_classification(repository, commit, file, architectures)
+        {
             return Ok(classified);
         }
         let header = self
@@ -2040,13 +2071,19 @@ impl ManagedModelStore {
     #[must_use]
     pub fn has_installed_content(&self, content: &crate::DrafterContent) -> bool {
         self.installed_packages.read().is_ok_and(|snapshot| {
-            snapshot.records.values().any(|record| content.held_by(record))
+            snapshot
+                .records
+                .values()
+                .any(|record| content.held_by(record))
         })
     }
 
     /// Whether an installed package, in any location, is exactly `package_id`.
     #[must_use]
-    pub fn has_installed_package(&self, package_id: &magnitude_service_contracts::models::ModelPackageId) -> bool {
+    pub fn has_installed_package(
+        &self,
+        package_id: &magnitude_service_contracts::models::ModelPackageId,
+    ) -> bool {
         self.installed_packages.read().is_ok_and(|snapshot| {
             snapshot
                 .records
@@ -2488,7 +2525,11 @@ mod tests {
                         break;
                     }
                 }
-                let target = request_line.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let target = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_owned();
                 let (path, query) = target.split_once('?').unwrap_or((&target, ""));
                 let (status, body) = match routes(path, query) {
                     Some(body) => ("200 OK", serde_json::to_vec(&body).unwrap()),
@@ -2509,7 +2550,11 @@ mod tests {
     /// and counts the bytes it sends.
     fn serve_ranges(
         files: Vec<(&'static str, Vec<u8>)>,
-    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("range listener");
         let endpoint = format!("http://{}", listener.local_addr().expect("range address"));
@@ -2522,7 +2567,11 @@ mod tests {
                 let Ok(mut connection) = connection else {
                     return;
                 };
-                let (files, counted, sent) = (Arc::clone(&files), Arc::clone(&counted), Arc::clone(&sent_counted));
+                let (files, counted, sent) = (
+                    Arc::clone(&files),
+                    Arc::clone(&counted),
+                    Arc::clone(&sent_counted),
+                );
                 std::thread::spawn(move || {
                     counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let mut reader = BufReader::new(connection.try_clone().expect("stream"));
@@ -2543,8 +2592,15 @@ mod tests {
                         if let Some((header, value)) = line.split_once(':')
                             && header.eq_ignore_ascii_case("range")
                         {
-                            let (start, end) = value.trim().trim_start_matches("bytes=").split_once('-').unwrap();
-                            range = Some((start.parse::<usize>().unwrap(), end.parse::<usize>().unwrap()));
+                            let (start, end) = value
+                                .trim()
+                                .trim_start_matches("bytes=")
+                                .split_once('-')
+                                .unwrap();
+                            range = Some((
+                                start.parse::<usize>().unwrap(),
+                                end.parse::<usize>().unwrap(),
+                            ));
                         }
                     }
                     let file = &files[name.as_str()];
@@ -2595,7 +2651,10 @@ mod tests {
         tokenizer.extend_from_slice(&(tokens as u64).to_le_bytes());
         for token in 0..tokens {
             let value = format!("token-{token:07}");
-            push_string(&mut tokenizer, renamed.filter(|_| token == tokens / 2).unwrap_or(&value));
+            push_string(
+                &mut tokenizer,
+                renamed.filter(|_| token == tokens / 2).unwrap_or(&value),
+            );
         }
         push_string(&mut tokenizer, "general.file_type");
         tokenizer.extend_from_slice(&4_u32.to_le_bytes());
@@ -2629,23 +2688,42 @@ mod tests {
         };
         let commit = "a".repeat(40);
         let sibling = store
-            .hugging_face_gguf_header("owner/repo", &commit, &file("sibling.gguf", &sibling_file), &[])
+            .hugging_face_gguf_header(
+                "owner/repo",
+                &commit,
+                &file("sibling.gguf", &sibling_file),
+                &[],
+            )
             .await
             .unwrap();
         let same_length = header_length(&same).unwrap();
         assert!(same_length > 2 * 1024 * 1024);
         let before = sent.load(std::sync::atomic::Ordering::SeqCst);
         let shared = store
-            .hugging_face_gguf_header("owner/repo", &commit, &file("same.gguf", &same), &[&sibling.bytes])
+            .hugging_face_gguf_header(
+                "owner/repo",
+                &commit,
+                &file("same.gguf", &same),
+                &[&sibling.bytes],
+            )
             .await
             .unwrap();
-        assert_eq!(shared.bytes, same[..same_length], "the shared header is exactly the file's");
+        assert_eq!(
+            shared.bytes,
+            same[..same_length],
+            "the shared header is exactly the file's"
+        );
         assert!(
             sent.load(std::sync::atomic::Ordering::SeqCst) - before < 512 * 1024,
             "only the prefix, the verification windows and the remainder are read"
         );
         let different = store
-            .hugging_face_gguf_header("owner/repo", &commit, &file("renamed.gguf", &renamed), &[&sibling.bytes])
+            .hugging_face_gguf_header(
+                "owner/repo",
+                &commit,
+                &file("renamed.gguf", &renamed),
+                &[&sibling.bytes],
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2661,7 +2739,10 @@ mod tests {
         let mut file = crate::test_gguf::gguf_bytes(
             &[
                 ("general.architecture", crate::test_gguf::Meta::Str("llama")),
-                ("general.description", crate::test_gguf::Meta::Str(&description)),
+                (
+                    "general.description",
+                    crate::test_gguf::Meta::Str(&description),
+                ),
             ],
             &["token_embd.weight"],
         );
@@ -2670,6 +2751,7 @@ mod tests {
         let (endpoint, requests, sent) = serve_ranges(vec![("model-Q4_K_M.gguf", file.clone())]);
         let header = fetch_header(
             &reqwest::Client::new(),
+            None,
             &endpoint,
             "owner/repo",
             &"a".repeat(40),
@@ -2695,9 +2777,15 @@ mod tests {
                 let description = "x".repeat(length);
                 let mut file = crate::test_gguf::gguf_bytes(
                     &[
-                        ("general.architecture", crate::test_gguf::Meta::Str("qwen35moe")),
+                        (
+                            "general.architecture",
+                            crate::test_gguf::Meta::Str("qwen35moe"),
+                        ),
                         ("split.count", crate::test_gguf::Meta::U32(6)),
-                        ("general.description", crate::test_gguf::Meta::Str(&description)),
+                        (
+                            "general.description",
+                            crate::test_gguf::Meta::Str(&description),
+                        ),
                     ],
                     &[],
                 );
@@ -2714,12 +2802,19 @@ mod tests {
     async fn a_metadata_only_shard_without_trailing_padding_is_its_whole_header() {
         for description_bytes in [6 * 1024, 10 * 1024 * 1024] {
             let file = metadata_only_shard(description_bytes);
-            assert_ne!(file.len() % 32, 0, "the file ends before its aligned data offset");
-            assert!(matches!(header_prefix(&file), Ok(HeaderPrefix::Complete(length)) if length > file.len()));
+            assert_ne!(
+                file.len() % 32,
+                0,
+                "the file ends before its aligned data offset"
+            );
+            assert!(
+                matches!(header_prefix(&file), Ok(HeaderPrefix::Complete(length)) if length > file.len())
+            );
             let size = u64::try_from(file.len()).unwrap();
             let (endpoint, _, _) = serve_ranges(vec![("model-00001-of-00006.gguf", file.clone())]);
             let header = fetch_header(
                 &reqwest::Client::new(),
+                None,
                 &endpoint,
                 "owner/repo",
                 &"a".repeat(40),
@@ -2738,7 +2833,10 @@ mod tests {
         let mut file = crate::test_gguf::gguf_bytes(
             &[
                 ("general.architecture", crate::test_gguf::Meta::Str("llama")),
-                ("general.description", crate::test_gguf::Meta::Str(&description)),
+                (
+                    "general.description",
+                    crate::test_gguf::Meta::Str(&description),
+                ),
             ],
             &["token_embd.weight"],
         );
@@ -2748,6 +2846,7 @@ mod tests {
         let (endpoint, _, _) = serve_ranges(vec![("model.gguf", file.clone())]);
         let header = fetch_header(
             &reqwest::Client::new(),
+            None,
             &endpoint,
             "owner/repo",
             &"a".repeat(40),
@@ -2765,7 +2864,10 @@ mod tests {
         let mut file = crate::test_gguf::gguf_bytes(
             &[
                 ("general.architecture", crate::test_gguf::Meta::Str("llama")),
-                ("general.description", crate::test_gguf::Meta::Str(&description)),
+                (
+                    "general.description",
+                    crate::test_gguf::Meta::Str(&description),
+                ),
             ],
             &["token_embd.weight"],
         );
@@ -2774,6 +2876,7 @@ mod tests {
         let (endpoint, _, _) = serve_ranges(vec![("model.gguf", file)]);
         let error = fetch_header(
             &reqwest::Client::new(),
+            None,
             &endpoint,
             "owner/repo",
             &"a".repeat(40),
@@ -2813,6 +2916,7 @@ mod tests {
         });
         let error = fetch_header(
             &reqwest::Client::new(),
+            None,
             &endpoint,
             "google/gated-model-GGUF",
             &"a".repeat(40),
@@ -2821,7 +2925,12 @@ mod tests {
         )
         .await
         .unwrap_err();
-        let InventoryError::ModelOperation { code, message, retryable } = error else {
+        let InventoryError::ModelOperation {
+            code,
+            message,
+            retryable,
+        } = error
+        else {
             panic!("a refused gated file is a model operation failure: {error:?}");
         };
         assert_eq!(code, "hugging_face_access_required");
@@ -2882,7 +2991,10 @@ mod tests {
         let mut file = crate::test_gguf::gguf_bytes(
             &[
                 ("general.architecture", crate::test_gguf::Meta::Str("llama")),
-                ("general.description", crate::test_gguf::Meta::Str(&description)),
+                (
+                    "general.description",
+                    crate::test_gguf::Meta::Str(&description),
+                ),
             ],
             &["token_embd.weight"],
         );
@@ -2901,6 +3013,7 @@ mod tests {
         let (endpoint, requests, _) = serve_ranges(vec![("model-Q4_0_4_4.gguf", file)]);
         let error = fetch_header(
             &reqwest::Client::new(),
+            None,
             &endpoint,
             "owner/repo",
             &"a".repeat(40),
@@ -2921,6 +3034,133 @@ mod tests {
         );
     }
 
+    /// An explicit Hugging Face token is presented as a bearer credential on every Hub request:
+    /// search, repository resolution and header reads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_hf_token_is_sent_on_search_resolve_and_header_reads() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("hub listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("hub address"));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let recorded = Arc::clone(&seen);
+        let commit = "a".repeat(40);
+        let metadata = revision_metadata("owner/Repo-GGUF", &commit, &[]);
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(mut connection) = connection else {
+                    return;
+                };
+                let mut reader = BufReader::new(connection.try_clone().expect("stream"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut authorization = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("authorization")
+                    {
+                        authorization = Some(value.trim().to_owned());
+                    }
+                }
+                let target = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_owned();
+                let path = target
+                    .split_once('?')
+                    .map_or(target.as_str(), |(path, _)| path)
+                    .to_owned();
+                recorded.lock().unwrap().push((path.clone(), authorization));
+                let body = if path == "/api/models" {
+                    b"[]".to_vec()
+                } else if path.starts_with("/api/models/owner/Repo-GGUF/revision/") {
+                    serde_json::to_vec(&metadata).unwrap()
+                } else {
+                    vec![0_u8; 10]
+                };
+                let _ = write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = connection.write_all(&body);
+            }
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let mut config = crate::inventory::InventoryConfig::with_roots(
+            temporary.path().join("model-store"),
+            temporary.path().join("cache"),
+        )
+        .unwrap();
+        config.local_models.roots.clear();
+        config.hub_endpoint = Some(endpoint);
+        config.hub_token = Some("test-token".to_owned());
+        let store = Arc::new(ManagedModelStore::open(config).await.unwrap());
+
+        let discovery = HuggingFaceDiscovery::new(
+            Arc::clone(&store),
+            RecognizedArchitectures::new(["llama"], ["dflash"]),
+            CatalogLineage::new(
+                Arc::clone(&store),
+                catalog_with_target("catalog/Llama-GGUF", &commit),
+            ),
+            Arc::new(StubShapes),
+        );
+        discovery
+            .search(HuggingFaceModelSearchRequest {
+                query: "repo".to_owned(),
+                limit: 5,
+                include_unsupported: false,
+            })
+            .await
+            .expect("search");
+        let snapshot = refresh_hugging_face_repository(
+            &store,
+            HuggingFaceRepositoryRequest {
+                repository: "owner/Repo-GGUF".to_owned(),
+                revision: "main".to_owned(),
+            },
+        )
+        .await
+        .expect("resolve");
+        let _ = store
+            .hugging_face_gguf_header(
+                "owner/Repo-GGUF",
+                &snapshot.commit,
+                &snapshot.gguf_files[0],
+                &[],
+            )
+            .await;
+
+        let seen = seen.lock().unwrap().clone();
+        let kinds = |predicate: fn(&str) -> bool| {
+            seen.iter()
+                .filter(|(path, _)| predicate(path))
+                .map(|(_, authorization)| authorization.clone())
+                .collect::<Vec<_>>()
+        };
+        let bearer = Some("Bearer test-token".to_owned());
+        for (kind, requests) in [
+            ("search", kinds(|path| path == "/api/models")),
+            ("resolve", kinds(|path| path.contains("/revision/"))),
+            ("header read", kinds(|path| path.contains("/resolve/"))),
+        ] {
+            assert!(!requests.is_empty(), "no {kind} request: {seen:?}");
+            assert!(
+                requests
+                    .iter()
+                    .all(|authorization| *authorization == bearer),
+                "{kind}: {seen:?}"
+            );
+        }
+    }
+
     async fn stub_store(endpoint: String) -> (tempfile::TempDir, Arc<ManagedModelStore>) {
         let temporary = tempfile::tempdir().unwrap();
         let mut config = crate::inventory::InventoryConfig::with_roots(
@@ -2934,7 +3174,10 @@ mod tests {
         (temporary, store)
     }
 
-    fn catalog_with_target(repository: &str, commit: &str) -> magnitude_service_contracts::models::RecommendableModelCatalog {
+    fn catalog_with_target(
+        repository: &str,
+        commit: &str,
+    ) -> magnitude_service_contracts::models::RecommendableModelCatalog {
         use magnitude_service_contracts::models::*;
         let package = ModelPackage {
             id: ModelPackageId("package_catalog".to_owned()),
@@ -2967,14 +3210,18 @@ mod tests {
                 variant_id: CatalogVariantId::new("gguf:q8").unwrap(),
                 configuration: ModelServingConfiguration {
                     bundle: ServableModelBundle::Standalone { package },
-                    profile: ServingProfile { context_length: 8192 },
+                    profile: ServingProfile {
+                        context_length: 8192,
+                    },
                 },
                 display_name: "Llama Test".to_owned(),
                 variant_label: "Q8".to_owned(),
                 description: "A test model".to_owned(),
                 release_date: ModelReleaseDate::new("2026-01-01").unwrap(),
                 license: "apache-2.0".to_owned(),
-                parameterization: ModelParameterization::Dense { total_parameters: 1 },
+                parameterization: ModelParameterization::Dense {
+                    total_parameters: 1,
+                },
                 intelligence: 1,
                 support: CatalogSupport::Supported,
                 fidelity_rank: 1,
@@ -2984,7 +3231,11 @@ mod tests {
         }
     }
 
-    fn revision_metadata(repository: &str, commit: &str, base_models: &[&str]) -> serde_json::Value {
+    fn revision_metadata(
+        repository: &str,
+        commit: &str,
+        base_models: &[&str],
+    ) -> serde_json::Value {
         serde_json::json!({
             "id": repository,
             "sha": commit,
@@ -3027,19 +3278,34 @@ mod tests {
                     },
                 })
             };
+            let speculative = |mut result: serde_json::Value| {
+                result["tags"] = serde_json::json!(["gguf", "speculative-decoding"]);
+                result
+            };
             match path {
                 "/api/models" if query.contains("search=") => Some(serde_json::json!([
                     result("catalog/Llama-GGUF", 'a', "llama", &["base/Llama"]),
                     result("unsloth/DeepSeek-V4-GGUF", 'f', "deepseek4", &[]),
                     result("someone/Llama-DFlash-GGUF", 'd', "dflash", &["base/Llama"]),
-                    result("someone/Llama-EAGLE3-GGUF", 'b', "eagle3", &["base/Llama"]),
+                    speculative(result(
+                        "someone/Llama-EAGLE3-GGUF",
+                        'b',
+                        "eagle3",
+                        &["base/Llama"]
+                    )),
+                    result("someone/Llama-MTP-GGUF", '9', "llama", &[]),
                     result("vision/Llama-Vision-GGUF", 'e', "clip", &[]),
-                    result("community/Llama-Finetune-GGUF", 'c', "llama", &["community/Llama-Finetune"]),
+                    result(
+                        "community/Llama-Finetune-GGUF",
+                        'c',
+                        "llama",
+                        &["community/Llama-Finetune"]
+                    ),
                     result("anonymous/Llama-Uncensored-GGUF", '7', "llama", &[]),
                 ])),
-                path if path.starts_with("/api/models/catalog/Llama-GGUF/revision/") => {
-                    Some(revision_metadata("catalog/Llama-GGUF", &"a".repeat(40), &["base/Llama"]))
-                }
+                path if path.starts_with("/api/models/catalog/Llama-GGUF/revision/") => Some(
+                    revision_metadata("catalog/Llama-GGUF", &"a".repeat(40), &["base/Llama"]),
+                ),
                 "/api/models/community/Llama-Finetune" => Some(serde_json::json!({
                     "id": "community/Llama-Finetune",
                     "baseModels": { "relation": "finetune", "models": [{ "id": "base/Llama" }] },
@@ -3053,7 +3319,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn search_hides_unknown_architectures_excludes_the_catalog_and_drafters_and_resolves_lineage() {
+    async fn search_hides_unknown_architectures_excludes_the_catalog_and_drafters_and_resolves_lineage()
+     {
         let (endpoint, _) = search_hub();
         let (_temporary, store) = stub_store(endpoint).await;
         let catalog = catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40));
@@ -3079,17 +3346,19 @@ mod tests {
                 .map(|result| result.repository.as_str())
                 .collect::<Vec<_>>(),
             [
+                "someone/Llama-MTP-GGUF",
                 "vision/Llama-Vision-GGUF",
                 "community/Llama-Finetune-GGUF",
                 "anonymous/Llama-Uncensored-GGUF"
-            ]
+            ],
+            "a repository whose name says MTP is a model result: names never decide"
         );
         assert_eq!(
-            results.results[2].variant_of.as_ref().map(ModelId::as_str),
+            results.results[3].variant_of.as_ref().map(ModelId::as_str),
             Some("llama-test:gguf:q8"),
             "a repository without lineage matches the catalog model of its architecture and size"
         );
-        let community = &results.results[1];
+        let community = &results.results[2];
         assert_eq!(community.architecture.as_deref(), Some("llama"));
         assert_eq!(community.base_models, ["community/Llama-Finetune"]);
         assert_eq!(
@@ -3097,7 +3366,7 @@ mod tests {
             Some("llama-test:gguf:q8"),
             "lineage follows a second hop through the finetune"
         );
-        assert_eq!(results.results[0].variant_of, None);
+        assert_eq!(results.results[1].variant_of, None);
 
         let all = discovery
             .search(HuggingFaceModelSearchRequest {
@@ -3107,11 +3376,15 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(all.hidden_count, 1, "drafter repositories are not counted as hidden models");
+        assert_eq!(
+            all.hidden_count, 1,
+            "drafter repositories are not counted as hidden models"
+        );
         assert!(
             all.results
                 .iter()
-                .all(|result| !result.repository.contains("DFlash") && !result.repository.contains("EAGLE3")),
+                .all(|result| !result.repository.contains("DFlash")
+                    && !result.repository.contains("EAGLE3")),
             "drafter repositories are never model results"
         );
         let deepseek = all
@@ -3121,9 +3394,11 @@ mod tests {
             .expect("unsupported results are listed on request");
         assert_eq!(
             deepseek.unsupported,
-            [UnsupportedReason::Architecture {
-                architecture: "deepseek4".to_owned()
-            }]
+            [UnsupportedReason::Known(
+                KnownUnsupportedReason::Architecture {
+                    architecture: "deepseek4".to_owned()
+                }
+            )]
         );
     }
 
@@ -3153,7 +3428,10 @@ mod tests {
         let discovery = HuggingFaceDiscovery::new(
             Arc::clone(&store),
             RecognizedArchitectures::new(["llama"], ["dflash"]),
-            CatalogLineage::new(Arc::clone(&store), catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40))),
+            CatalogLineage::new(
+                Arc::clone(&store),
+                catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40)),
+            ),
             Arc::new(StubShapes),
         );
         let results = discovery
@@ -3208,7 +3486,9 @@ mod tests {
             .expect("an old cache entry is refetched");
         assert_eq!(snapshot.base_models, ["base/Llama"]);
         let observed = requests.load(std::sync::atomic::Ordering::SeqCst);
-        pinned_hugging_face_repository(&store, request).await.unwrap();
+        pinned_hugging_face_repository(&store, request)
+            .await
+            .unwrap();
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), observed);
     }
 
@@ -3261,7 +3541,10 @@ mod tests {
                 },
             }),
         );
-        assert!(store.read_model_assessment("fits without a drafter verdict").is_none());
+        assert!(
+            store
+                .read_model_assessment("fits without a drafter verdict")
+                .is_none()
+        );
     }
 }
-

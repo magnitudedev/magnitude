@@ -73,9 +73,8 @@ impl fmt::Display for ArtifactError {
 }
 
 /// Material this engine cannot execute here, with every cause the engine
-/// names and the developer text describing the refusal. `reasons` is empty
-/// only when the refusal has no typed cause (a malformed definition, a
-/// planner topology refusal); `detail` always describes it. Never retryable.
+/// names and the developer text describing the refusal. `reasons` is never
+/// empty. Never retryable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsupportedModel {
     pub reasons: Vec<UnsupportedReason>,
@@ -84,19 +83,31 @@ pub struct UnsupportedModel {
 
 impl UnsupportedModel {
     pub fn new(reasons: Vec<UnsupportedReason>, detail: impl Into<String>) -> Self {
-        Self {
-            reasons,
-            detail: detail.into(),
-        }
+        let detail = detail.into();
+        debug_assert!(!reasons.is_empty(), "a refusal names no reason: {detail}");
+        Self { reasons, detail }
     }
 
     pub fn reason(reason: UnsupportedReason, detail: impl Into<String>) -> Self {
         Self::new(vec![reason], detail)
     }
 
-    /// A refusal with no typed cause.
-    pub fn invalid(detail: impl Into<String>) -> Self {
-        Self::new(Vec::new(), detail)
+    /// Material whose header does not describe a model the engine can
+    /// build.
+    pub fn unreadable(detail: impl Into<String>) -> Self {
+        Self::reason(UnsupportedReason::Unreadable, detail)
+    }
+
+    /// A drafter or projector that disagrees with the target it is bound
+    /// to.
+    pub fn mismatch(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self::reason(
+            UnsupportedReason::TargetMismatch {
+                detail: detail.clone(),
+            },
+            detail,
+        )
     }
 
     /// The refusals of independent checks as one: every distinct reason in
@@ -131,7 +142,7 @@ impl From<magnitude_chat::TokenizerError> for UnsupportedModel {
         let detail = error.to_string();
         match error {
             magnitude_chat::TokenizerError::Unsupported(reasons) => Self::new(reasons, detail),
-            magnitude_chat::TokenizerError::Invalid(_) => Self::invalid(detail),
+            magnitude_chat::TokenizerError::Invalid(_) => Self::unreadable(detail),
         }
     }
 }
@@ -535,23 +546,25 @@ impl From<magnitude_scheduler::worker::Panicked> for UnloadCause {
 }
 
 /// Planner rejections of a recognized, validated definition are properties
-/// of the material on this execution path; the others are arithmetic or
-/// resource failures of the engine itself.
+/// of the material on this execution path: a form, operator, scale or
+/// layout the backend's planner does not execute. The others are arithmetic
+/// or resource failures of the engine itself.
 pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> PlanOutcome {
-    match error {
-        PlanError::Unsupported(reason) => PlanOutcome::Unsupported(UnsupportedModel::reason(
+    let unsupported = |detail: &dyn fmt::Display| {
+        PlanOutcome::Unsupported(UnsupportedModel::reason(
             UnsupportedReason::Backend {
                 backend: backend.as_str().to_owned(),
             },
-            format!("unsupported on the {} backend: {reason}", backend.as_str()),
-        )),
+            format!("unsupported on the {} backend: {detail}", backend.as_str()),
+        ))
+    };
+    match error {
+        PlanError::Unsupported(feature) => unsupported(&feature),
         error @ (PlanError::InvalidDefinition(_)
         | PlanError::Topology(_)
         | PlanError::UnsupportedOperator { .. }
         | PlanError::Deferred(_)
-        | PlanError::UnportedScale(_)) => {
-            PlanOutcome::Unsupported(UnsupportedModel::invalid(error.to_string()))
-        }
+        | PlanError::UnportedScale(_)) => unsupported(&error),
         error @ (PlanError::Arithmetic(_)
         | PlanError::ResourcePlanning(_)
         | PlanError::Resource(_)) => PlanOutcome::Internal(error.to_string()),

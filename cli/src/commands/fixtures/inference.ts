@@ -263,6 +263,7 @@ export const makeFoundModel = (overrides: Partial<CustomLocalModel> = {}): Custo
   origin: { _tag: "Found", source: { _tag: "HuggingFaceCache" } },
   presentation: customPresentation("Hugging Face cache"),
   drafter: Option.none(),
+  drafterChoice: { _tag: "Auto" },
   recommendedDrafter: Option.some(makeDrafterCandidate()),
   acquisitionState: {
     _tag: "External",
@@ -323,7 +324,7 @@ type CatalogSnapshotState = Exclude<ModelCatalogState, { readonly _tag: "Initial
 export const catalogState = (
   models: readonly LocalModel[] = [],
   unsupported: readonly UnsupportedLocalModel[] = [],
-  hidden: readonly CustomLocalModel[] = [],
+  hidden: readonly LocalModel[] = [],
 ): CatalogSnapshotState => ({
   _tag: "Ready",
   providers: [],
@@ -385,6 +386,7 @@ const version = (
   downloadBytes: Math.round(sizeGb * GB),
   assessment: Option.some(assessment),
   recommended: false,
+  catalogModel: Option.none(),
   onThisComputer: Option.none(),
   ...overrides,
 })

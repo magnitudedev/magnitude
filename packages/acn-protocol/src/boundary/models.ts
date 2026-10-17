@@ -14,6 +14,7 @@ import {
 } from "../errors"
 import {
   AutomaticModelLocationKindSchema,
+  AddedModelSchema,
   CandidateInspectionSchema,
   CustomFormModelIdSchema,
   DrafterCandidateSchema,
@@ -172,18 +173,11 @@ const ListModelLocations = Rpc.make("ListModelLocations", {
   error: LocalModelMutationFailed,
 }).pipe(replaySafe)
 
-const AddedCustomModelSchema = Schema.Struct({
-  modelId: CustomFormModelIdSchema,
-  version: NonEmptyString,
-  drafter: optional(DrafterCandidateSchema),
-  outcome: Schema.Literal("Started", "AlreadyOnThisComputer"),
-  drafterDownloadStarted: Schema.Boolean,
-})
-
 /**
  * Pins the repository's commit, picks the recommended version when none is named, and starts the download. A
  * version the engine can't run is refused, and one that needs more memory than this computer can provide is
- * refused unless `force` is set (ModelVersionNotRunnable).
+ * refused unless `force` is set (ModelVersionNotRunnable). A version that is exactly a catalog model is never
+ * declared as a custom model: the catalog model is installed instead, with its own drafter.
  */
 const AddHuggingFaceModel = Rpc.make("AddHuggingFaceModel", {
   payload: Schema.Struct({
@@ -193,7 +187,7 @@ const AddHuggingFaceModel = Rpc.make("AddHuggingFaceModel", {
     drafter: DrafterChoiceSchema,
     force: Schema.Boolean,
   }),
-  success: AddedCustomModelSchema,
+  success: AddedModelSchema,
   error: CustomModelMutationError,
 }).pipe(atMostOnce)
 

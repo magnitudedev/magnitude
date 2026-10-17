@@ -39,6 +39,7 @@ models import <path.gguf> [--drafter auto|none|<ref>]
 models drafter <model-id> <ref | auto | none>
 models hide <model-id> | unhide <model-id>
 models folders list | add <path> | remove <path>
+models folders enable <location> | disable <location>
 connections list | connect <harness> [--set-model <model-id>] [--install-skill]
 connections sync [harness] | remove <harness>
 docs [topic-id]
@@ -88,7 +89,13 @@ retryability flags, and stack traces.
 `--json` prints one machine-readable document of the same product facts the text form shows,
 including canonical IDs, structured unsupported reasons with their developer detail, and drafter
 verdicts. It never includes internal ACN/ICN identities, package structure, or prose meant only for
-terminals, and errors stay on stderr with a nonzero exit. Under `--json` every inference command
+terminals: no assessment or environment IDs, memory-domain, accelerator, or device identities
+(per-domain memory evidence and the domain-named limiting resource are omitted, and totals remain),
+managed installation paths or file ownership (installed size remains; a custom model's own file is
+its origin), or raw ranking inputs (ranking scores and fidelity rank). Catalog documents (`catalog
+list`, `show`, and `recommendations`) carry no acquisition or residency state. Each document is
+encoded through an explicit CLI JSON schema, so a protocol field reaches `--json` only when that
+schema names it. Errors stay on stderr with a nonzero exit. Under `--json` every inference command
 writes its error to stderr as one document, `{"error": {"message": <product message>, "code":
 <stable snake_case code>}}`, so stdout holds only a successful result. The code is the service's
 failure code when it has one, else the failure's kind. One shared command runner produces this
@@ -164,14 +171,18 @@ and `unhide` apply to found models, including a catalog model whose files are on
 location; `catalog remove` on such a model explains where the files are and points at `models hide`. `models folders list` shows the automatic locations and the
 user's folders, one row per directory: an automatic location lists each directory found or unreadable
 (every directory checked when none exists), each Found, Off, Not found, or Can't read, with what to
-do for each directory Magnitude can't read; `add` and `remove` manage the folders, and turning a
-location on or off applies to all its directories.
+do for each directory Magnitude can't read; `add` and `remove` manage the folders, and `enable` and
+`disable` turn an automatic location (`huggingface-cache`, `lm-studio`, `llama-cpp`, or `ollama`) on
+or off, which applies to all its directories.
 
 `models status` lists catalog models on the computer or with relevant acquisition/removal work and
-every visible custom model, with its source, followed by a footer counting models that can't run and
+every visible custom model, with its source, the catalog model it is a variant of, and its drafter
+(the attached drafter, "Turned off", or the recommended drafter's "Faster with a drafter · Add"),
+followed by a footer counting models that can't run and
 hidden models; `--all` lists those with their reasons and lists hidden models marked hidden. The addressed form adds Source, Variant of, Drafter,
 and the drafter candidates with their labels and verdicts. Addressed model commands
-accept every canonical model ID. One status field applies product priority:
+accept every canonical model ID, hidden models' included; the addressed form of a hidden model says
+it is hidden and how to unhide it. One status field applies product priority:
 removal, transfer, failures, load/stop, ready, update availability, then unloaded. An optimizing
 model reports `Optimizing` with its percentage once tuning is measured. The addressed
 form reports installation, transfer or optimization progress, runtime, memory, context, and

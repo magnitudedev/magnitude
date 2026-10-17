@@ -4,7 +4,7 @@
 //! interpreted; every vision tensor is bound once.
 
 use crate::{invalid, product, Error};
-use magnitude_artifacts::gguf::{Directory, Scalar, Value};
+use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value};
 use magnitude_family_common::{HeaderError, Tensors};
 use magnitude_family_contracts::{
     CellReduction, ImportTransform, LinearClamp, MergerStage, PositionSampling, RmsNorm,
@@ -136,7 +136,7 @@ pub fn describe_projector(
     directory: &Directory,
     output_hidden: u64,
 ) -> Result<VisionDescription, Error> {
-    if directory.value("general.architecture").and_then(Value::string) != Some("clip")
+    if directory.value("general.architecture").and_then(Value::string) != Some(PROJECTOR_ARCHITECTURE)
         || directory.value("general.type").and_then(Value::string) != Some("mmproj")
         || directory.value("clip.has_vision_encoder")
             != Some(&Value::Scalar(Scalar::Bool(true)))

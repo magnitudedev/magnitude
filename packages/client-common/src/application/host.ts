@@ -17,12 +17,20 @@ export interface HostAppearance {
   readonly save: (preference: AppearancePreference) => Effect.Effect<void, ApplicationHostFailed>
 }
 
-/** The native shell around the window: tray, menus, and requests raised by Electron main. */
+/** What the native open dialog chooses: a folder, or one GGUF file. */
+export interface HostOpenPathRequest {
+  readonly kind: "folder" | "gguf"
+  readonly title: string
+  readonly defaultPath: Option.Option<string>
+}
+
+/** The native shell around the window: tray, menus, the native open dialog, and requests raised by Electron main. */
 export interface HostShell {
   readonly actions: Stream.Stream<HostAction, ApplicationHostFailed>
   readonly presentModel: (value: typeof ModelTrayPresentation.Type) => Effect.Effect<void, ApplicationHostFailed>
   readonly resolveQuitFailure: (decision: QuitFailureDecision) => Effect.Effect<void, ApplicationHostFailed>
   readonly retryService: Effect.Effect<void, ApplicationHostFailed>
+  readonly chooseOpenPath: (request: HostOpenPathRequest) => Effect.Effect<Option.Option<string>, ApplicationHostFailed>
   /** The desktop owner's own view of the service and tray, available even when ACN is down. */
   readonly application: Stream.Stream<ApplicationSnapshot, ApplicationHostFailed>
 }

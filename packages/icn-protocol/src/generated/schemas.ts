@@ -134,6 +134,7 @@ export const AttachedDrafter = S.Struct({
   method: S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
   reference: S.suspend((): S.Schema<DrafterReference, DrafterReferenceEncoded> => DrafterReference),
   state: S.suspend((): S.Schema<AttachedDrafterState, AttachedDrafterStateEncoded> => AttachedDrafterState),
+  updateAvailable: S.Boolean,
 })
 export type AttachedDrafter = S.Schema.Type<typeof AttachedDrafter>
 export type AttachedDrafterEncoded = S.Schema.Encoded<typeof AttachedDrafter>
@@ -230,6 +231,10 @@ export type CandidateSourceEncoded = S.Schema.Encoded<typeof CandidateSource>
 export const CandidateVersion = S.Struct({
   assessment: S.optionalWith(
     S.suspend((): S.Schema<ModelAssessment, ModelAssessmentEncoded> => ModelAssessment),
+    { exact: true, as: "Option" },
+  ),
+  catalogModel: S.optionalWith(
+    S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
     { exact: true, as: "Option" },
   ),
   downloadBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -940,6 +945,7 @@ export const CustomModel = S.Struct({
   ),
   sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   state: S.suspend((): S.Schema<CustomModelState, CustomModelStateEncoded> => CustomModelState),
+  updateCommit: S.optionalWith(S.String, { exact: true, as: "Option" }),
   variantLabel: S.optionalWith(S.String, { exact: true, as: "Option" }),
   variantOf: S.optionalWith(
     S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
@@ -1756,6 +1762,71 @@ export const KernelStatic = S.Struct({
 })
 export type KernelStatic = S.Schema.Type<typeof KernelStatic>
 export type KernelStaticEncoded = S.Schema.Encoded<typeof KernelStatic>
+
+export const KnownUnsupportedReason = S.Union(
+  S.extend(
+    S.TaggedStruct("Architecture", {
+      architecture: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("WeightTypes", {
+      types: S.Array(S.suspend((): S.Schema<WeightTypeCount, WeightTypeCountEncoded> => WeightTypeCount)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("RopeScaling", {
+      kind: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("UnrecognizedTensor", {
+      name: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("UnrecognizedMetadata", {
+      key: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Tokenizer", {
+      model: S.String,
+      pre: S.optionalWith(S.String, { exact: true, as: "Option" }),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(S.TaggedStruct("ChatTemplate", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("KernelDomain", {
+      backend: S.String,
+      entry: S.String,
+      statics: S.Array(S.suspend((): S.Schema<KernelStatic, KernelStaticEncoded> => KernelStatic)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Backend", {
+      backend: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("TargetMismatch", {
+      detail: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(S.TaggedStruct("TiedOutputHead", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("Unreadable", {}), S.Record({ key: S.String, value: JsonValue })),
+)
+export type KnownUnsupportedReason = S.Schema.Type<typeof KnownUnsupportedReason>
+export type KnownUnsupportedReasonEncoded = S.Schema.Encoded<typeof KnownUnsupportedReason>
 
 export const LocalModelRemoval = S.Struct({
   freedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -3410,6 +3481,16 @@ export const ToolResultContent = S.Union(
 export type ToolResultContent = S.Schema.Type<typeof ToolResultContent>
 export type ToolResultContentEncoded = S.Schema.Encoded<typeof ToolResultContent>
 
+export const UnrecognizedUnsupportedReason = S.extend(
+  S.Struct({
+    _tag: S.String,
+    detail: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type UnrecognizedUnsupportedReason = S.Schema.Type<typeof UnrecognizedUnsupportedReason>
+export type UnrecognizedUnsupportedReasonEncoded = S.Schema.Encoded<typeof UnrecognizedUnsupportedReason>
+
 export const UnsupportedLocalModel = S.Struct({
   detail: S.String,
   displayName: S.String,
@@ -3421,66 +3502,10 @@ export type UnsupportedLocalModel = S.Schema.Type<typeof UnsupportedLocalModel>
 export type UnsupportedLocalModelEncoded = S.Schema.Encoded<typeof UnsupportedLocalModel>
 
 export const UnsupportedReason = S.Union(
-  S.extend(
-    S.TaggedStruct("Architecture", {
-      architecture: S.String,
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
+  S.suspend((): S.Schema<KnownUnsupportedReason, KnownUnsupportedReasonEncoded> => KnownUnsupportedReason),
+  S.suspend(
+    (): S.Schema<UnrecognizedUnsupportedReason, UnrecognizedUnsupportedReasonEncoded> => UnrecognizedUnsupportedReason,
   ),
-  S.extend(
-    S.TaggedStruct("WeightTypes", {
-      types: S.Array(S.suspend((): S.Schema<WeightTypeCount, WeightTypeCountEncoded> => WeightTypeCount)),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("RopeScaling", {
-      kind: S.String,
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("UnrecognizedTensor", {
-      name: S.String,
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("UnrecognizedMetadata", {
-      key: S.String,
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Tokenizer", {
-      model: S.String,
-      pre: S.optionalWith(S.String, { exact: true, as: "Option" }),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(S.TaggedStruct("ChatTemplate", {}), S.Record({ key: S.String, value: JsonValue })),
-  S.extend(
-    S.TaggedStruct("KernelDomain", {
-      backend: S.String,
-      entry: S.String,
-      statics: S.Array(S.suspend((): S.Schema<KernelStatic, KernelStaticEncoded> => KernelStatic)),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Backend", {
-      backend: S.String,
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("TargetMismatch", {
-      detail: S.String,
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(S.TaggedStruct("TiedOutputHead", {}), S.Record({ key: S.String, value: JsonValue })),
-  S.extend(S.TaggedStruct("Unreadable", {}), S.Record({ key: S.String, value: JsonValue })),
 )
 export type UnsupportedReason = S.Schema.Type<typeof UnsupportedReason>
 export type UnsupportedReasonEncoded = S.Schema.Encoded<typeof UnsupportedReason>

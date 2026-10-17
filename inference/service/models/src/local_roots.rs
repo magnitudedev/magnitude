@@ -12,11 +12,11 @@ use magnitude_service_contracts::models::{
 };
 use magnitude_service_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, ExternalOrigin, HubCacheOwner, HubFile,
-    Integrity,
-    InventoryError, LocalDeclaration, ModelComponent, ModelLocation, ModelSource,
+    Integrity, InventoryError, LocalDeclaration, ModelComponent, ModelLocation, ModelSource,
 };
 
 use crate::cache::{ModelCache, ModelIndexKind};
+use crate::candidate_files::RecognizedArchitectures;
 use crate::identity::{content_id, inventory_entry_id};
 use crate::inventory::{
     ArtifactCandidate, DeclaredProjectors, DiscoveryCandidate, ModelGroup, canonical_or_self,
@@ -56,19 +56,27 @@ pub(crate) fn scan_root(
     root: &ModelRoot,
     declared: &DeclaredProjectors,
     cache: &ModelCache,
+    architectures: &RecognizedArchitectures,
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
     if !root.path.is_dir() {
         return Ok(());
     }
     match root.kind {
-        ModelRootKind::HuggingFaceCache => {
-            scan_hf_cache(HubCacheOwner::HuggingFace, &root.path, declared, cache, output)
+        ModelRootKind::HuggingFaceCache => scan_hf_cache(
+            HubCacheOwner::HuggingFace,
+            &root.path,
+            declared,
+            cache,
+            architectures,
+            output,
+        ),
+        ModelRootKind::LmStudio => scan_lm_studio(&root.path, cache, architectures, output),
+        ModelRootKind::LlamaCpp => {
+            scan_llama_cpp(&root.path, declared, cache, architectures, output)
         }
-        ModelRootKind::LmStudio => scan_lm_studio(&root.path, cache, output),
-        ModelRootKind::LlamaCpp => scan_llama_cpp(&root.path, declared, cache, output),
         ModelRootKind::Ollama => scan_ollama(&root.path, cache, output),
-        ModelRootKind::Folder => scan_folder(&root.path, cache, output),
+        ModelRootKind::Folder => scan_folder(&root.path, cache, architectures, output),
     }
 }
 
@@ -149,9 +157,16 @@ fn relative_parts(root: &Path, path: &Path) -> Option<Vec<String>> {
 fn scan_lm_studio(
     root: &Path,
     cache: &ModelCache,
+    architectures: &RecognizedArchitectures,
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
-    for group in discover_groups(root, &canonical_or_self(root), cache, &BTreeMap::new())? {
+    for group in discover_groups(
+        root,
+        &canonical_or_self(root),
+        cache,
+        architectures,
+        &BTreeMap::new(),
+    )? {
         let hub = lm_studio_hub_file(root, &group.paths[0]);
         push_group(
             root,
@@ -189,10 +204,18 @@ fn scan_llama_cpp(
     root: &Path,
     declared: &DeclaredProjectors,
     cache: &ModelCache,
+    architectures: &RecognizedArchitectures,
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
     for hub in [root.to_path_buf(), root.join("hub")] {
-        scan_hf_cache(HubCacheOwner::LlamaCpp, &hub, declared, cache, output)?;
+        scan_hf_cache(
+            HubCacheOwner::LlamaCpp,
+            &hub,
+            declared,
+            cache,
+            architectures,
+            output,
+        )?;
     }
     let manifests = llama_cpp_manifests(root)?;
     let declared = manifests
@@ -208,10 +231,18 @@ fn scan_llama_cpp(
             let first = parts.next();
             first.is_some_and(|part| part.starts_with("models--"))
                 || (first.is_some_and(|part| part == "hub")
-                    && parts.next().is_some_and(|part| part.starts_with("models--")))
+                    && parts
+                        .next()
+                        .is_some_and(|part| part.starts_with("models--")))
         })
     };
-    for group in discover_groups(root, &canonical_or_self(root), cache, &declared)? {
+    for group in discover_groups(
+        root,
+        &canonical_or_self(root),
+        cache,
+        architectures,
+        &declared,
+    )? {
         if hub_layout(&group.paths[0]) {
             continue;
         }
@@ -235,7 +266,17 @@ fn scan_llama_cpp(
 }
 
 fn llama_cpp_local_name(owner: &str, repository: &str, remote: &str) -> String {
-    format!("{owner}_{repository}_{}", remote.replace('/', "_"))
+    format!(
+        "{}{}",
+        llama_cpp_flat_prefix(owner, repository),
+        remote.replace('/', "_")
+    )
+}
+
+/// The prefix llama.cpp gives every file of `owner/repository` it keeps flat in its cache root.
+#[must_use]
+pub fn llama_cpp_flat_prefix(owner: &str, repository: &str) -> String {
+    format!("{owner}_{repository}_")
 }
 
 fn llama_cpp_manifests(root: &Path) -> Result<BTreeMap<String, LlamaCppManifest>, InventoryError> {
@@ -551,9 +592,16 @@ fn ollama_components(root: &Path, manifest: &OllamaManifest) -> Option<Vec<Model
 fn scan_folder(
     root: &Path,
     cache: &ModelCache,
+    architectures: &RecognizedArchitectures,
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
-    for group in discover_groups(root, &canonical_or_self(root), cache, &BTreeMap::new())? {
+    for group in discover_groups(
+        root,
+        &canonical_or_self(root),
+        cache,
+        architectures,
+        &BTreeMap::new(),
+    )? {
         push_group(root, "folder", ExternalOrigin::Folder, &group, output)?;
     }
     Ok(())

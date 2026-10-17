@@ -14,10 +14,9 @@ use magnitude_service_contracts::models::{
 };
 use magnitude_service_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, ExternalOrigin, HubCacheOwner,
-    InventoryError,
-    InventoryModel, InventoryProperties, ModelAvailability, ModelComponent, ModelInventory,
-    ModelLocation,
-    ModelPreviewComponentSource, ModelPreviewSource, ModelSource, ResolvedModel,
+    InventoryError, InventoryModel, InventoryProperties, ModelAvailability, ModelComponent,
+    ModelInventory, ModelLocation, ModelPreviewComponentSource, ModelPreviewSource, ModelSource,
+    ResolvedModel,
 };
 use sha2::{Digest, Sha256};
 
@@ -52,7 +51,8 @@ pub(crate) struct ValidatedModelPackage {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PrimaryEvidence {
     pub(crate) header_digest: String,
-    pub(crate) role: crate::gguf::GgufRole,
+    pub(crate) local_digest: Option<String>,
+    pub(crate) tensors: crate::gguf::GgufTensors,
     pub(crate) name: Option<String>,
     pub(crate) architecture: Option<String>,
     pub(crate) base_models: Vec<crate::gguf::GgufBaseModel>,
@@ -63,10 +63,23 @@ pub(crate) struct PrimaryEvidence {
 }
 
 impl PrimaryEvidence {
+    fn with_local_digest(mut self, local_digest: Option<String>) -> Self {
+        self.local_digest = local_digest;
+        self
+    }
+
+    pub(crate) fn role(
+        &self,
+        architectures: &crate::candidate_files::RecognizedArchitectures,
+    ) -> crate::gguf::GgufRole {
+        crate::gguf::role(self.architecture.as_deref(), self.tensors, architectures)
+    }
+
     fn from_inspection(inspection: &crate::gguf::GgufInspection) -> Self {
         Self {
             header_digest: inspection.header_digest.clone(),
-            role: inspection.role.clone(),
+            local_digest: None,
+            tensors: inspection.tensors,
             name: inspection.name.clone(),
             architecture: inspection.architecture.clone(),
             base_models: inspection.base_models.clone(),
@@ -258,7 +271,14 @@ fn package_from_resolved_with(
     resolved: &ResolvedModel,
     inspect: impl Fn(&Path, &ContentIdentity) -> Option<crate::gguf::GgufInspection>,
     catalog_sha256: impl Fn(&ModelPackageSource, &ModelComponent, &str) -> Option<String>,
-) -> Result<(ModelPackage, Option<crate::gguf::GgufInspection>), InventoryError> {
+) -> Result<
+    (
+        ModelPackage,
+        Option<crate::gguf::GgufInspection>,
+        Option<String>,
+    ),
+    InventoryError,
+> {
     let model = &resolved.model;
     let source = package_source(model, resolved);
     let declared_components = model.location.components();
@@ -274,6 +294,7 @@ fn package_from_resolved_with(
     let mut files = Vec::with_capacity(declared_components.len());
     let mut ids_by_declared_path = BTreeMap::new();
     let mut inspections = Vec::new();
+    let mut samples = Vec::new();
     for (declared, resolved_component) in declared_components.iter().zip(&resolved.components) {
         let absolute = resolved_component.path.as_path();
         let inspection = matches!(model.properties, InventoryProperties::Inspected { .. })
@@ -281,6 +302,14 @@ fn package_from_resolved_with(
             .flatten();
         if let Some(inspection) = inspection.as_ref() {
             inspections.push((declared.role.clone(), inspection.clone()));
+        }
+        if matches!(declared.role, ComponentRole::Weights | ComponentRole::Shard) {
+            samples.push((
+                declared.shard_index,
+                inspection
+                    .as_ref()
+                    .and_then(|inspection| inspection.content_sample.clone()),
+            ));
         }
         let sha256 = match &declared.content {
             ContentIdentity::Sha256 { value }
@@ -352,6 +381,13 @@ fn package_from_resolved_with(
         .iter()
         .find(|(role, _)| matches!(role, ComponentRole::Weights | ComponentRole::Shard))
         .map(|(_, inspection)| inspection.clone());
+    samples.sort_by_key(|(index, _)| *index);
+    let local_digest = samples
+        .into_iter()
+        .map(|(_, sample)| sample)
+        .collect::<Option<Vec<_>>>()
+        .filter(|samples| !samples.is_empty())
+        .map(|samples| crate::gguf::local_model_digest(samples.iter().map(String::as_str)));
     Ok((
         ModelPackage {
             id,
@@ -361,6 +397,7 @@ fn package_from_resolved_with(
             properties,
         },
         primary,
+        local_digest,
     ))
 }
 
@@ -457,12 +494,15 @@ fn validated_package_from_resolved_with(
     inspect_gguf: impl Fn(&Path, &ContentIdentity) -> Option<crate::gguf::GgufInspection>,
     catalog_sha256: impl Fn(&ModelPackageSource, &ModelComponent, &str) -> Option<String>,
 ) -> Result<ValidatedModelPackage, InventoryError> {
-    let (package, primary) = package_from_resolved_with(resolved, inspect_gguf, catalog_sha256)?;
+    let (package, primary, local_digest) =
+        package_from_resolved_with(resolved, inspect_gguf, catalog_sha256)?;
     let validation = package_validation_for(&resolved.model, &package);
     Ok(ValidatedModelPackage {
         package,
         validation,
-        primary: primary.map(|inspection| PrimaryEvidence::from_inspection(&inspection)),
+        primary: primary.map(|inspection| {
+            PrimaryEvidence::from_inspection(&inspection).with_local_digest(local_digest)
+        }),
     })
 }
 
@@ -570,7 +610,9 @@ pub fn servable_model_bundle_key_for_bundle(
 
 /// The `hf:` ID a package from a Hugging Face repository has as a custom model: its repository and
 /// the path of its primary weights file.
-pub(crate) fn hub_model_id(package: &ModelPackage) -> Option<magnitude_service_contracts::models::ModelId> {
+pub(crate) fn hub_model_id(
+    package: &ModelPackage,
+) -> Option<magnitude_service_contracts::models::ModelId> {
     let ModelPackageSource::HuggingFace { repository, .. } = &package.source else {
         return None;
     };
@@ -585,7 +627,8 @@ pub(crate) fn hub_model_id(package: &ModelPackage) -> Option<magnitude_service_c
         .collect::<Option<Vec<_>>>()?
         .join("/");
     Some(magnitude_service_contracts::models::ModelId::hugging_face(
-        &magnitude_service_contracts::models::HuggingFaceRepositoryId::new(repository.clone()).ok()?,
+        &magnitude_service_contracts::models::HuggingFaceRepositoryId::new(repository.clone())
+            .ok()?,
         &magnitude_service_contracts::models::HuggingFaceArtifactSelector::new(selector).ok()?,
     ))
 }
@@ -713,7 +756,9 @@ impl ManagedModelStore {
                 .config
                 .catalog_models
                 .iter()
-                .filter(|catalog_model| exact_target_weights(catalog_target(catalog_model), package))
+                .filter(|catalog_model| {
+                    exact_target_weights(catalog_target(catalog_model), package)
+                })
                 .collect::<Vec<_>>();
             return match exact.as_slice() {
                 [] => InstalledCatalogAttribution::NotCatalogTarget,
@@ -896,7 +941,7 @@ impl ManagedModelStore {
 
     fn gguf_inspection_cache_key(path: &Path, content: &ContentIdentity) -> Option<String> {
         let evidence =
-            serde_json::to_vec(&("gguf-inspection-v4", content, path.metadata().ok()?.len()))
+            serde_json::to_vec(&("gguf-inspection-v6", content, path.metadata().ok()?.len()))
                 .ok()?;
         Some(format!("gguf_inspection_{:x}", Sha256::digest(evidence)))
     }
@@ -1366,7 +1411,6 @@ mod tests {
                     training_context_length: Some(32_768),
                     nextn_predict_layers: None,
                     tokenizer: None,
-                    modalities: vec!["text".to_owned(), "image".to_owned()],
                     base_models: Vec::new(),
                     evidence_fingerprint: "test".to_owned(),
                 },

@@ -12,13 +12,14 @@ import {
   type ModelLoadPlan,
   type SlotId,
 } from "@magnitudedev/acn-protocol"
-import { IcnCatalog, IcnCatalogInstallations, IcnClient, IcnInstances } from "@magnitudedev/icn"
+import { IcnCatalogInstallations, IcnClient, IcnInstances } from "@magnitudedev/icn"
 import { canonicalLocalModelId, projectInferenceLoadPlan } from "@magnitudedev/acn-protocol"
 import { LocalModels } from "./local-models"
 import { ModelSlotController } from "./model-slot-controller"
 import { LocalModelRemovals } from "./local-model-removals"
 import { icnCommandFailure, type IcnCommandError } from "./icn-command-failure"
 import { CustomModelCommands, externalCatalogRemovalRefusal } from "./custom-model-commands"
+import { CatalogModelSync } from "./catalog-model-sync"
 
 /** Commands by canonical model ID: a catalog ID addresses its installation, a custom ID its downloads. */
 export interface ModelCommandsApi {
@@ -40,10 +41,11 @@ export const modelCommandFailure = (operation: string, cause: IcnCommandError) =
 export const ModelCommandsLive: Layer.Layer<
   ModelCommands,
   never,
-  | IcnClient | IcnCatalog | IcnCatalogInstallations | IcnInstances | ModelSlotController | LocalModelRemovals
-  | CustomModelCommands | LocalModels
+  | IcnClient | IcnCatalogInstallations | IcnInstances | ModelSlotController | LocalModelRemovals
+  | CustomModelCommands | LocalModels | CatalogModelSync
 > = Layer.scoped(ModelCommands, Effect.gen(function* () {
   const custom = yield* CustomModelCommands
+  const catalogSync = yield* CatalogModelSync
   const localModels = yield* LocalModels
   /** A catalog model's alias (its files' ID as a found model, before an upgrade) names that catalog model. */
   const canonical = (modelId: ModelId) => localModels.state.pipe(
@@ -51,7 +53,6 @@ export const ModelCommandsLive: Layer.Layer<
   )
   const scope = yield* Effect.scope
   const client = yield* IcnClient
-  const catalog = yield* IcnCatalog
   const installations = yield* IcnCatalogInstallations
   const instances = yield* IcnInstances
   const slots = yield* ModelSlotController
@@ -100,17 +101,6 @@ export const ModelCommandsLive: Layer.Layer<
   ) => canonical(requested).pipe(Effect.flatMap((modelId) => Schema.is(CatalogFormModelIdSchema)(modelId)
     ? catalogCommand(modelId)
     : customCommand(Schema.decodeSync(CustomFormModelIdSchema)(modelId))))
-  const catalogSync = (modelId: CatalogFormModelId) => Effect.gen(function* () {
-    yield* removals.forget(modelId)
-    const installed = (yield* catalog.get).state.models
-      .some((model) => model.id === modelId && model.localState._tag === "Installed")
-    const admission = yield* client.catalog.installCatalogModel({ path: { model_id: modelId } }).pipe(
-      Effect.mapError((cause) => modelCommandFailure("sync", cause)),
-    )
-    yield* Effect.all([catalog.refresh, installations.refresh], { discard: true }).pipe(Effect.ignore)
-    const outcome: LocalModelSyncOutcome = admission._tag === "Current" ? "AlreadyCurrent" : installed ? "Updating" : "Installing"
-    return { outcome }
-  })
   const catalogCancel = (modelId: CatalogFormModelId) => operationFor(modelId).pipe(
       Effect.mapError((cause) => modelCommandFailure("cancel_sync", cause)),
       Effect.flatMap((operation) => operation === undefined
@@ -139,7 +129,7 @@ export const ModelCommandsLive: Layer.Layer<
     })),
   )
   return ModelCommands.of({
-    sync: (modelId) => byForm(modelId, catalogSync, custom.sync),
+    sync: (modelId) => byForm(modelId, catalogSync.sync, custom.sync),
     cancelSync: (modelId) => byForm(modelId, catalogCancel, custom.cancelSync),
     acknowledgeSyncFailure: (modelId) => byForm(modelId, catalogAcknowledge, custom.acknowledgeSyncFailure),
     remove: (modelId) => byForm(modelId, catalogRemove, (id) => stopModel(id).pipe(Effect.zipRight(custom.remove(id)))),

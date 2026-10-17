@@ -40,46 +40,73 @@ pub struct Metadata<'a> {
 }
 
 impl<'a> Metadata<'a> {
-    pub fn new(directory: &'a Directory, family: &str) -> Self {
-        Metadata {
-            directory,
-            prefix: format!("{family}."),
+    /// Reads `family.*` keys, refusing every one outside `keys` as
+    /// unrecognized metadata.
+    pub fn new(directory: &'a Directory, family: &str, keys: &[&str]) -> Result<Self, Error> {
+        let prefix = format!("{family}.");
+        let unknown = directory
+            .metadata
+            .iter()
+            .filter(|entry| {
+                entry
+                    .name
+                    .strip_prefix(&prefix)
+                    .is_some_and(|key| !keys.contains(&key))
+            })
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            let detail = format!("unknown Qwen metadata {unknown:?}");
+            return Err(Error::unsupported(
+                unknown
+                    .into_iter()
+                    .map(|key| UnsupportedReason::UnrecognizedMetadata { key })
+                    .collect(),
+                detail,
+            ));
         }
+        Ok(Metadata { directory, prefix })
     }
+    /// The full metadata name of `key`.
+    pub fn key(&self, key: &str) -> String {
+        format!("{}{key}", self.prefix)
+    }
+
+    /// A required key: a header without it does not describe a model of
+    /// the family.
     pub fn value(&self, key: &str) -> Result<&Value, Error> {
+        let key = self.key(key);
         self.directory
-            .value(&format!("{}{key}", self.prefix))
-            .ok_or_else(|| Error::invalid(format!("missing Qwen metadata {}{key}", self.prefix)))
+            .value(&key)
+            .ok_or_else(|| Error::invalid(format!("missing Qwen metadata {key}")))
     }
     pub fn optional(&self, key: &str) -> Option<&Value> {
-        self.directory.value(&format!("{}{key}", self.prefix))
+        self.directory.value(&self.key(key))
+    }
+    /// A key present with a value outside what its reader admits.
+    pub fn malformed(&self, key: &str, expected: &str) -> Error {
+        let key = self.key(key);
+        let detail = format!("{key} must be {expected}");
+        Error::metadata(key, detail)
     }
     pub fn integer(&self, key: &str) -> Result<u64, Error> {
         self.value(key)?
             .unsigned()
             .filter(|n| *n > 0)
-            .ok_or_else(|| {
-                Error::invalid(format!("{}{key} must be a positive integer", self.prefix))
-            })
+            .ok_or_else(|| self.malformed(key, "a positive integer"))
     }
     pub fn number(&self, key: &str) -> Result<f64, Error> {
         match self.value(key)? {
             Value::Scalar(Scalar::Float(n)) => Ok(*n),
             Value::Scalar(Scalar::Unsigned(n)) => Ok(*n as f64),
             Value::Scalar(Scalar::Signed(n)) => Ok(*n as f64),
-            _ => Err(Error::invalid(format!(
-                "{}{key} must be numeric",
-                self.prefix
-            ))),
+            _ => Err(self.malformed(key, "numeric")),
         }
     }
     /// An array of nonnegative integers.
     pub fn integers(&self, key: &str) -> Result<Vec<u64>, Error> {
         let Value::Array(values) = self.value(key)? else {
-            return Err(Error::invalid(format!(
-                "{}{key} must be an integer array",
-                self.prefix
-            )));
+            return Err(self.malformed(key, "an integer array"));
         };
         values
             .iter()
@@ -89,14 +116,43 @@ impl<'a> Metadata<'a> {
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                Error::invalid(format!(
-                    "{}{key} must hold nonnegative integers",
-                    self.prefix
-                ))
-            })
+            .ok_or_else(|| self.malformed(key, "an array of nonnegative integers"))
     }
 }
+
+/// The keys [`Geometry::read`] interprets in every Qwen 3.5 lineage
+/// artifact. `rope.scaling.type` is read to refuse scaled rotary.
+pub const GEOMETRY_KEYS: &[&str] = &[
+    "embedding_length",
+    "attention.head_count",
+    "attention.head_count_kv",
+    "attention.key_length",
+    "attention.value_length",
+    "attention.layer_norm_rms_epsilon",
+    "rope.dimension_count",
+    "rope.dimension_sections",
+    "rope.freq_base",
+    "rope.scaling.type",
+    "ssm.conv_kernel",
+    "ssm.group_count",
+    "ssm.inner_size",
+    "ssm.state_size",
+    "ssm.time_step_rank",
+];
+
+/// The keys [`Geometry::read`] interprets in a dense artifact.
+pub const DENSE_KEYS: &[&str] = &["feed_forward_length"];
+
+/// The keys [`Geometry::read`] interprets in a routed artifact.
+pub const ROUTED_KEYS: &[&str] = &[
+    "expert_count",
+    "expert_used_count",
+    "expert_feed_forward_length",
+    "expert_shared_feed_forward_length",
+];
+
+/// The keys [`mixer_kinds`] interprets.
+pub const MIXER_KEYS: &[&str] = &["attention.recurrent_layers", "full_attention_interval"];
 
 /// The mixer of one decoder layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,10 +182,10 @@ pub fn mixer_kinds(m: &Metadata, layer_count: u64) -> Result<Vec<MixerKind>, Err
             .map(|v| match v {
                 Scalar::Bool(true) => Ok(MixerKind::Recurrent),
                 Scalar::Bool(false) => Ok(MixerKind::Attention),
-                _ => Err(Error::invalid("invalid per-layer recurrent flags")),
+                _ => Err(m.malformed("attention.recurrent_layers", "per-layer booleans")),
             })
             .collect(),
-        _ => Err(Error::invalid("invalid per-layer recurrent flags")),
+        _ => Err(m.malformed("attention.recurrent_layers", "one boolean per layer")),
     }
 }
 

@@ -22,7 +22,8 @@ use magnitude_family_contracts::{
     VocabularyProjection, WeightDescriptor,
 };
 use magnitude_family_qwen::{
-    Geometry, Metadata, MixerKind, Weight, check_projector_base, mixer_kinds, product,
+    DENSE_KEYS, GEOMETRY_KEYS, Geometry, MIXER_KEYS, Metadata, MixerKind, ROUTED_KEYS, Weight,
+    check_projector_base, mixer_kinds, product,
 };
 
 pub use magnitude_family_qwen::Error;
@@ -53,6 +54,20 @@ pub const FAMILY_IDS: &[&str] = &["qwen35", "qwen35moe"];
 fn invalid(message: impl Into<String>) -> Error {
     Error::invalid(message)
 }
+
+/// The keys this family interprets beside the shared geometry and mixer
+/// keys.
+const QWEN35_KEYS: &[&str] = &[
+    "block_count",
+    "context_length",
+    "nextn_predict_layers",
+    "rope.section_order",
+];
+
+/// The rotary section order the catalog's MiniCPM-V conversions declare:
+/// the only declared order qualified on this family's rotary. Any other
+/// declared order is refused.
+const SECTION_ORDER: &str = "zyxt";
 
 /// Recognize the supported Qwen 3.5 architecture without interpreting its
 /// geometry or tensor roles.
@@ -121,20 +136,31 @@ pub fn inspect_components(
 ) -> Result<ModelDefinition, Error> {
     let architecture = recognize(directory)?;
     let family_id = architecture.family_id();
-    let m = Metadata::new(directory, family_id);
+    let width_keys = if architecture.is_routed() {
+        ROUTED_KEYS
+    } else {
+        DENSE_KEYS
+    };
+    let m = Metadata::new(
+        directory,
+        family_id,
+        &[QWEN35_KEYS, GEOMETRY_KEYS, MIXER_KEYS, width_keys].concat(),
+    )?;
+    if let Some(order) = m.optional("rope.section_order") {
+        if order.string() != Some(SECTION_ORDER) {
+            return Err(m.malformed("rope.section_order", "\"zyxt\""));
+        }
+    }
     let block_count = m.integer("block_count")?;
+    // More than one prediction layer is not admitted until its GGUF roles
+    // and execution semantics are qualified.
     let speculative = match m.optional("nextn_predict_layers") {
         None => 0,
         Some(v) => v
             .unsigned()
-            .filter(|n| *n < block_count)
-            .ok_or_else(|| invalid("nextn_predict_layers must be below block count"))?,
+            .filter(|n| *n <= 1 && *n < block_count)
+            .ok_or_else(|| m.malformed("nextn_predict_layers", "at most one prediction layer"))?,
     };
-    if speculative > 1 {
-        return Err(invalid(
-            "Qwen artifacts with more than one nextn prediction layer are not admitted until their GGUF roles and execution semantics are qualified",
-        ));
-    }
     let layer_count = block_count - speculative;
     // Each real layer requires distinct stored weights. Reject impossible counts
     // before allocating architecture vectors from untrusted metadata.

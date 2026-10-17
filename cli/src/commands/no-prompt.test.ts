@@ -17,6 +17,9 @@ const commands = [
   ["models", "import", "/models/q.gguf"], ["models", "drafter", "hf:owner/repo/q.gguf", "auto"],
   ["models", "hide", "hf:owner/repo/q.gguf"], ["models", "unhide", "hf:owner/repo/q.gguf"],
   ["models", "folders", "list"], ["models", "folders", "add", "/models"], ["models", "folders", "remove", "/models"],
+  ["models", "folders", "enable", "ollama"], ["models", "folders", "disable", "lm-studio"],
+  ["catalog", "pull", "owner/repo:Q4_K_M", "--drafter", "none"], ["models", "import", "/models/q.gguf", "--drafter", "built-in"],
+  ["catalog", "inspect", "https://huggingface.co/owner/repo"],
 ] as const
 
 describe("non-interactive inference commands", () => {

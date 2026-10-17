@@ -21,7 +21,7 @@ const config = {
   },
   hidden: ['hf:owner/repository/hidden.gguf'],
   drafters: {
-    [`local:${digest}`]: { _tag: 'Reference', reference: { _tag: 'Catalog', modelId: 'qwen3.6-35b-a3b:gguf:q4' } },
+    [`local:${digest}`]: { _tag: 'Reference', reference: { _tag: 'Catalog', modelId: 'qwen3.6-35b-a3b:gguf:q4' }, method: { _tag: 'DFlash' } },
     'hf:owner/repository/hidden.gguf': { _tag: 'None' },
   },
   folders: ['/Volumes/models'],

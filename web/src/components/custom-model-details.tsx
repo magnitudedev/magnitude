@@ -20,9 +20,9 @@ export const customModelSource = (model: CustomLocalModel): { readonly label: st
 
 const textButton = "h-auto px-1.5 py-0.5 text-xs"
 
-/** A newer revision of the custom model's attached catalog drafter exists, and nothing is downloading it yet. */
+/** A newer revision of the custom model's attached catalog drafter exists, and nothing is downloading it right now. */
 export const drafterUpdateAvailable = (model: LocalModel): boolean =>
-  model._tag === "Custom" && Option.exists(model.drafter, drafter => drafter.updateAvailable && drafter.availability._tag === "Present")
+  model._tag === "Custom" && Option.exists(model.drafter, drafter => drafter.updateAvailable && drafter.availability._tag !== "Downloading")
 
 const transferPercent = (progress: ModelTransferProgress) =>
   progress.totalBytes > 0 ? `${Math.floor(progress.completedBytes * 100 / progress.totalBytes)}%` : "Preparing"
