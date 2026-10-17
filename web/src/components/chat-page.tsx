@@ -74,7 +74,7 @@ export function ChatPage() {
   const abortRef = useRef<AbortController | null>(null)
   const streamingConversationIdRef = useRef<string | null>(null)
   const deletedConversationIdsRef = useRef(new Set<string>())
-  const endRef = useRef<HTMLDivElement>(null)
+  const messagesRef = useRef<HTMLDivElement>(null)
   const active = conversations.find(item => item.id === activeId) ?? null
   const selectedModel = (active?.model && models.includes(active.model) ? active.model : "") || preferredModel || models[0] || ""
 
@@ -114,7 +114,12 @@ export function ChatPage() {
     }
   }, [conversations])
 
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }) }, [active?.messages.length, active?.messages.at(-1)?.content])
+  // Scroll only the message pane. scrollIntoView() also scrolls ancestor containers,
+  // which can move the whole page and push the composer/Stop button below the viewport.
+  useEffect(() => {
+    const pane = messagesRef.current
+    if (pane) pane.scrollTo({ top: pane.scrollHeight, behavior: "auto" })
+  }, [active?.messages.length, active?.messages.at(-1)?.content])
 
   const createConversation = () => {
     const conversation: Conversation = {
@@ -324,7 +329,7 @@ export function ChatPage() {
       </header>
       {modelsError && <div role="alert" className="m-4 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100">{modelsError} <button type="button" className="ml-2 underline" onClick={() => window.location.reload()}>Retry</button></div>}
       {storageWarning && <p role="status" className="px-5 pt-3 text-xs text-amber-700 dark:text-amber-300">Browser storage is unavailable; history may be lost when you leave this page.</p>}
-      <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-5 sm:px-8" aria-label="Conversation messages" aria-live="polite">
+      <div ref={messagesRef} className="min-h-0 flex-1 space-y-5 overflow-y-auto overscroll-contain px-4 py-5 sm:px-8" aria-label="Conversation messages" aria-live="polite">
         {!active?.messages.length && <div className="mx-auto flex min-h-64 max-w-xl flex-col items-center justify-center text-center">
           <div className="mb-3 text-3xl text-blue-600">◈</div><h3 className="text-2xl font-semibold tracking-tight">Chat with your local model</h3>
           <p className="mt-2 text-sm leading-6 text-slate-500">Choose a model and ask a question. Text appears as it is generated. Your conversation history stays in this browser.</p>
@@ -334,7 +339,6 @@ export function ChatPage() {
           <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">{message.role === "user" ? "You" : "Magnitude"}</p>
           <p className="whitespace-pre-wrap break-words text-sm leading-7 text-slate-800 dark:text-slate-100">{message.content || (working && index === active.messages.length - 1 ? "Generating…" : "")}</p>
         </article>)}
-        <div ref={endRef} />
       </div>
       {error && <div role="alert" className="mx-4 mb-2 rounded-lg border border-red-200 bg-rose-200/30 p-3 text-sm text-red-800 dark:border-red-800 dark:bg-slate-900 dark:text-red-200">{error}</div>}
       <form onSubmit={send} className="shrink-0 border-t border-slate-200 bg-white p-3 dark:border-slate-750 dark:bg-slate-925 sm:p-5">
