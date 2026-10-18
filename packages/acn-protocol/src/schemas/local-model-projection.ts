@@ -15,6 +15,7 @@ import {
   type ModelResidency,
   type LocalModelServingState,
   type ServingProfile,
+  type SpeculativeMethod,
 } from "./model-state"
 
 /**
@@ -128,6 +129,13 @@ export const installedLocalModels = (
   state: LocalModelsState,
 ): readonly LocalModel[] =>
   state.models.filter(localModelIsInstalled)
+
+/** The name of the drafter a catalog model ships, such as "Magnitude DFlash for Qwen3.5 4B". */
+export const catalogDrafterName = (displayName: string, method: Option.Option<SpeculativeMethod>): string =>
+  Option.match(method, {
+    onNone: () => `Magnitude drafter for ${displayName}`,
+    onSome: (value) => `Magnitude ${value._tag === "Mtp" ? "MTP" : value._tag} for ${displayName}`,
+  })
 
 /** The tag naming where a custom model's files came from. */
 export const customModelSourceLabel = (origin: CustomModelOrigin): string => {

@@ -2,12 +2,15 @@ import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import type { AttachedDrafterAvailability } from "@magnitudedev/sdk"
-import { CustomModelDetails, DrafterNotices, DrafterOffer, customModelSource, drafterUpdateAvailable } from "./custom-model-details"
+import { CustomModelDrafterRow, CustomModelSource, DrafterNotices, DrafterOffer, customModelSource, drafterUpdateAvailable } from "./custom-model-details"
 import { added, attachedDrafter, catalogModel, customModel, drafterCandidate, foundIn, imported, repository } from "../../test/models/fixtures"
 
 const attached = (availability: AttachedDrafterAvailability, updateAvailable = false) => Option.some(attachedDrafter(availability, { updateAvailable }))
 const downloading: AttachedDrafterAvailability = { _tag: "Downloading", progress: { stage: "downloading", completedBytes: 450, totalBytes: 900, bytesPerSecond: Option.none() } }
-const details = (model: ReturnType<typeof customModel>) => renderToStaticMarkup(<CustomModelDetails model={model} variantOfName={Option.some("Qwen3.6 35B-A3B")} disabled={false} onChangeDrafter={() => {}} onTurnOffDrafter={() => {}} onAddDrafter={() => {}} />)
+const details = (model: ReturnType<typeof customModel>) => renderToStaticMarkup(<>
+  <CustomModelDrafterRow model={model} disabled={false} onChangeDrafter={() => {}} onTurnOffDrafter={() => {}} onAddDrafter={() => {}} />
+  <CustomModelSource model={model} variantOfName={Option.some("Qwen3.6 35B-A3B")} />
+</>)
 
 const notices = (model: ReturnType<typeof customModel>) => renderToStaticMarkup(<DrafterNotices model={model} disabled={false} onRetry={() => {}} onCancel={() => {}} onDismiss={() => {}} />)
 

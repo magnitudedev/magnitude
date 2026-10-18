@@ -10,14 +10,15 @@ import { ActionTooltip } from "./ui/tooltip"
 import { type HardwarePhoto } from "./hardware-photos"
 import { hardwareDetails } from "./hardware-details"
 import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
-import type { CatalogLocalModel, LocalInferenceHardware } from "@magnitudedev/sdk"
+import type { LocalInferenceHardware, LocalModel } from "@magnitudedev/sdk"
 
 /** An estimated speed's small slate info icon, explaining what the estimate leaves out. */
 export function SpeedInfo() {
   return <ActionTooltip label={localModelSpeedTooltip} trigger={<button type="button" aria-label={localModelSpeedTooltip} className="inline-flex rounded-sm text-slate-400 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-500 dark:hover:text-slate-300"><InfoIcon aria-hidden="true" className="size-3" /></button>} />
 }
 
-export function ModelRadar({ model }: { model: CatalogLocalModel }) {
+/** The five-axis capability profile for any model; a custom model's intelligence is never rated, so that axis stays empty. */
+export function ModelRadar({ model }: { model: LocalModel }) {
   const axes = localModelRadarAxes(model)
   if (Option.isNone(axes)) return <p className="py-12 text-center text-sm text-slate-500">{model.servingState._tag === "Assessing" ? "Waiting for model assessment" : "No performance profile is available for this configuration."}</p>
   const point = (index: number, radius: number) => {

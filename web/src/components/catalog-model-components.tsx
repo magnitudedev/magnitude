@@ -1,6 +1,5 @@
 import { LightningIcon } from "@phosphor-icons/react"
-import { Option } from "effect"
-import { catalogComponentDownloadLabel, catalogComponentName, catalogComponentOffers, catalogDrafterWithheldNote, formatStorageSize } from "@magnitudedev/client-common"
+import { catalogComponentDownloadLabel, catalogComponentName, catalogComponentOffers, catalogDrafterState, formatStorageSize } from "@magnitudedev/client-common"
 import type { CatalogComponent, CatalogLocalModel } from "@magnitudedev/sdk"
 import { Button } from "./ui/button"
 
@@ -13,18 +12,33 @@ export function CatalogDrafterOffer({ model, disabled, onDownload }: { model: Ca
   </Button>
 }
 
-/** In Details, each catalog component a found exact target lacks ("Image input · Download (1.0 GB)"), fetched alone. */
+const downloadButton = "h-auto px-1.5 py-0.5 text-xs"
+
+const catalogDrafterValue = (model: CatalogLocalModel, disabled: boolean, onDownload: (component: CatalogComponent) => void) => {
+  const state = catalogDrafterState(model)
+  switch (state._tag) {
+    case "Offer": return <><span className="text-slate-500">Not downloaded</span>
+      <Button variant="outline" size="unstyled" className={downloadButton} disabled={disabled} onClick={() => onDownload("Drafter")}>{catalogComponentDownloadLabel(state.offer)}</Button></>
+    case "Withheld": return <span className="text-slate-500">{state.note}</span>
+    case "Attached": return <span className="min-w-0 truncate" title={state.name}>{state.name}</span>
+    case "None": return <span className="text-slate-500">None</span>
+    case "Unknown": return <span className="text-slate-500">Not assessed</span>
+  }
+}
+
+/**
+ * The Drafter row of a catalog model's details, always shown like a custom model's, then each other catalog
+ * component a found exact target lacks ("Image input · Download (1.0 GB)"), fetched alone.
+ */
 export function CatalogComponentDetails({ model, disabled, onDownload }: { model: CatalogLocalModel; disabled: boolean; onDownload: (component: CatalogComponent) => void }) {
-  const offers = catalogComponentOffers(model)
-  const withheld = catalogDrafterWithheldNote(model)
-  if (offers.length === 0 && Option.isNone(withheld)) return null
+  const others = catalogComponentOffers(model).filter(({ component }) => component !== "Drafter")
   return <dl className="flex flex-wrap gap-x-8 gap-y-3">
-    {[
-      ...offers.map(offer => <div key={offer.component}><dt className="text-xs text-slate-500">{catalogComponentName(offer.component)}</dt><dd className="mt-1 flex items-center gap-2">
-        <span className="text-slate-500">Not downloaded</span>
-        <Button variant="outline" size="unstyled" className="h-auto px-1.5 py-0.5 text-xs" disabled={disabled} onClick={() => onDownload(offer.component)}>{catalogComponentDownloadLabel(offer)}</Button>
-      </dd></div>),
-      ...Option.toArray(Option.map(withheld, note => <div key="withheld"><dt className="text-xs text-slate-500">Drafter</dt><dd className="mt-1 text-slate-500">{note}</dd></div>)),
-    ]}
+    <div className="min-w-0"><dt className="text-xs text-slate-500">Drafter</dt><dd className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+      {catalogDrafterValue(model, disabled, onDownload)}
+    </dd></div>
+    {others.map(offer => <div key={offer.component}><dt className="text-xs text-slate-500">{catalogComponentName(offer.component)}</dt><dd className="mt-1 flex items-center gap-2">
+      <span className="text-slate-500">Not downloaded</span>
+      <Button variant="outline" size="unstyled" className={downloadButton} disabled={disabled} onClick={() => onDownload(offer.component)}>{catalogComponentDownloadLabel(offer)}</Button>
+    </dd></div>)}
   </dl>
 }

@@ -1,5 +1,6 @@
 import { Context, Effect, Layer, Option, Ref, Schema } from "effect"
 import {
+  catalogDrafterName,
   DrafterCandidateSchema,
   DrafterReferenceSchema,
   type DrafterCandidate,
@@ -35,8 +36,6 @@ export interface DrafterNaming {
   readonly label: string
 }
 
-const methodName = (method: SpeculativeMethod): string => method._tag === "Mtp" ? "MTP" : method._tag
-
 const fileName = (path: string): string => path.split(/[\\/]/).at(-1) ?? path
 
 /**
@@ -49,10 +48,7 @@ export const catalogDrafterNaming = (
 ): Option.Option<DrafterNaming> => Option.map(
   Option.fromNullable(catalog.find(({ id }) => id === modelId)),
   ({ source }) => ({
-    name: Option.match(source.desired.speculativeMethod, {
-      onNone: () => `Magnitude drafter for ${source.displayName}`,
-      onSome: (method) => `Magnitude ${methodName(method)} for ${source.displayName}`,
-    }),
+    name: catalogDrafterName(source.displayName, source.desired.speculativeMethod),
     label: `Trained for ${source.displayName}`,
   }),
 )

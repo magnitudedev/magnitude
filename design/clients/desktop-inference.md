@@ -94,10 +94,17 @@ children and marks it close-on-exec. The desktop retains package admission until
 service and update-helper children cannot inherit the lease and block their own installation.
 Recommendations order fitting assessed configurations using the shared preference. The remaining
 curated catalog stays discoverable with explicit pending, assessment-failed, or insufficient-memory
-explanations; every fitting model has a speed estimate. Details
-expose catalog license/source links, capabilities, context, and the estimated speed as one range
-(the radar's) with a dim note that it is a rough estimate and does not account for speculative
-decoding. Speed is a plain-decode estimate from memory bandwidth, accurate to roughly ±20% for most
+explanations; every fitting model has a speed estimate. A model card's Details have one layout for
+catalog and custom models alike: on the left the Drafter row (always present; for a catalog model the
+drafter it serves with, such as "Magnitude MTP for Gemma 4 26B-A4B", its download offer when the found
+target lacks it, Off with the reason when it fits only without it, or None), then the source (catalog
+Hugging Face links, or a custom model's Source and Variant of), then License and Context window; on
+the right the radar. The estimated speed appears only on the radar's Speed axis, as one range with an
+info tooltip saying it is a rough estimate that does not account for speculative decoding, never
+as a separate text block. A custom model's radar shows Intelligence as "Not rated" with that axis
+empty, since no score is inherited; its Fidelity comes from its own weight type on the catalog's
+scale (ten per weight bit, as the catalog ranks Q4 at 40 and Q8 at 80), and Speed, Fit, and
+Speculation come from its assessment and attached drafter as for a catalog model. Speed is a plain-decode estimate from memory bandwidth, accurate to roughly ±20% for most
 models, and is never shown as a per-context table of exact rates.
 Source links open HTTPS destinations in the system browser. Loading a different model asks
 explicitly before replacing observed active residency.
@@ -124,8 +131,8 @@ Custom models follow [the local-model product projection](../model-management/lo
   download and optimization progress.
 - **Catalog card Details** has "Find other versions on Hugging Face" under Sources, which opens the
   same dialog with Search prefilled with the model's name. It is never a button on the card.
-- **My Models** gives every model the same card, with a tag for where its files came from (none for
-  the catalog, "Hugging Face", "Ollama", "LM Studio", "Hugging Face cache", or the folder name), and
+- **My Models** gives every model the same card, with a tag for where its files came from ("Magnitude" for
+  a catalog model Magnitude downloaded, none for one whose weights are another app's, "Hugging Face", "Ollama", "LM Studio", "Hugging Face cache", or the folder name), and
   actions that follow who owns the files: Remove deletes catalog and added files, forgets an
   imported file, and is "Hide from Magnitude" for found models; added and imported models are never
   offered Hide, and ACN refuses to hide them. Details show Source (an added

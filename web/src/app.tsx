@@ -15,7 +15,6 @@ import { MagnitudeMark } from "./components/magnitude-mark"
 import {
   SidebarSimpleIcon,
   CaretDownIcon,
-  EyeIcon,
   ArrowUpRightIcon,
   StackIcon,
   SquaresFourIcon,
@@ -35,14 +34,13 @@ import {
   MoonIcon,
   FolderOpenIcon,
   BuildingsIcon,
-  MagnifyingGlassIcon,
   FilePlusIcon,
 } from "@phosphor-icons/react"
 import { CopyCommand } from "./components/copy-command"
 import { useId, useMemo, useRef, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
-import { localModelDeprecation, localModelServingProfile, type ProviderModelId, type CatalogComponent, type CatalogLocalModel, type CustomLocalModel, type CustomModelAcquisitionState, type DrafterCandidate, type LocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
+import { localModelDeprecation, type ProviderModelId, type CatalogComponent, type CatalogLocalModel, type CustomLocalModel, type CustomModelAcquisitionState, type DrafterCandidate, type LocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
 import type { ApplicationSnapshot, AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessChange, type NetworkBind, type OwnerCapability } from "@magnitudedev/sdk"
 import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
@@ -52,7 +50,7 @@ import {
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
   formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory,
-  catalogModelReplacement, performanceRangeSpeedLabel, localModelSpeedNote, catalogVariantOfName, customModelDrafterOffer, useCustomModels, useHiddenLocalModels, useUnsupportedLocalModels,
+  catalogModelReplacement, catalogVariantOfName, localModelSourceTag, customModelDrafterOffer, useCustomModels, useHiddenLocalModels, useUnsupportedLocalModels,
   LOCAL_MODEL_RANKING_SCALE_VALUES, catalogComponentOffers,
 } from "@magnitudedev/client-common"
 import { appearanceReadError } from "./appearance"
@@ -62,7 +60,8 @@ import { ConfirmDialog } from "./components/confirm-dialog"
 import { signOut, useDisconnectWarning, useRemoteAccess, viewerPlatform } from "./remote-access"
 import { useNarrowViewport } from "./lib/viewport"
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "./components/ui/alert-dialog"
-import { HardwareOverview, ModelRadar, SpeedInfo } from "./components/discovery-visuals"
+import { HardwareOverview, ModelRadar } from "./components/discovery-visuals"
+import { CatalogSources, ModelDetails } from "./components/model-details"
 import { MemoryBreakdown } from "./components/memory-breakdown"
 import { HarnessConnections, type CommandModel } from "./components/harness-connections"
 import { HarnessSetupList } from "./components/harness-setup"
@@ -71,7 +70,7 @@ import { HuggingFaceLogo, LabLogo, ModelLogo, modelLab, modelLabs, type ModelLab
 import { ModelsHeader } from "./components/models-header"
 import { AddModelDialog, ggufOpenRequest, type AddDialogRequest } from "./components/add-model-dialog"
 import { DrafterPickerDialog } from "./components/drafter-list"
-import { CustomModelDetails, DrafterNotices, DrafterOffer, drafterUpdateAvailable } from "./components/custom-model-details"
+import { CustomModelDrafterRow, CustomModelSource, DrafterNotices, DrafterOffer, drafterUpdateAvailable } from "./components/custom-model-details"
 import { CatalogComponentDetails, CatalogDrafterOffer } from "./components/catalog-model-components"
 import { ModelRemoveAction } from "./components/model-remove-action"
 import { SourceTag, UnsupportedModels } from "./components/local-model-lists"
@@ -88,44 +87,6 @@ const moveModelsCommand = (platform: string, from: string, to: string) => platfo
 const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
 const pageIcons = { discover: StackIcon, catalog: SquaresFourIcon, models: CubeIcon, connections: PlugIcon, usage: ChartBarIcon, status: PulseIcon, settings: SlidersIcon }
 
-/** `custom` leads the details: a custom model's source and drafter, or a catalog model's missing components. `onFindOtherVersions` adds Other versions to a catalog model's. */
-function ModelDetails({ model, radar = false, open, contentId, compact = false, custom, onFindOtherVersions }: { model: LocalModel; radar?: boolean; open?: boolean; contentId?: string; compact?: boolean; custom?: ReactNode; onFindOtherVersions?: () => void }) {
-  const serving = model.servingState
-  const content = (
-    <div className={compact ? "grid gap-5 text-sm" : "mt-3 grid items-start gap-8 border-t border-slate-200 pt-5 dark:border-slate-750 lg:grid-cols-2"}>
-      <div className={radar ? "space-y-5" : "contents"}>
-      <div className="min-w-0 space-y-5">
-        {custom}
-        <dl className="flex flex-wrap gap-x-8 gap-y-3">
-          <div><dt className="text-xs text-slate-500">License</dt><dd className="mt-1">{Option.getOrElse(model.presentation.license, () => "Not specified")}</dd></div>
-          {Option.match(localModelServingProfile(model), { onNone: () => null, onSome: (profile) => <div><dt className="text-xs text-slate-500">Context window</dt><dd className="mt-1">{profile.contextLength.toLocaleString()} tokens</dd></div> })}
-          {serving._tag === "Assessed" && serving.capabilities.vision && <div className="self-end"><TooltipProvider><ActionTooltip label="Supports vision" trigger={<button type="button" aria-label="Supports vision" className="rounded p-1 text-slate-500 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-200"><EyeIcon aria-hidden="true" className="size-4" /></button>} /></TooltipProvider></div>}
-        </dl>
-        {model._tag === "Catalog" && model.presentation.sourceUrls.length > 0 && <div><p className="mb-2 text-xs text-slate-500">Sources</p><div className="flex flex-wrap gap-x-4 gap-y-2">{model.presentation.sourceUrls.map(url => {
-          const source = new URL(url)
-          const label = source.hostname === "huggingface.co" ? `Hugging Face · ${source.pathname.split("/")[1]}` : source.hostname.replace(/^www\./, "")
-          return <a className="inline-flex items-center gap-1 text-sm text-slate-600 hover:underline dark:text-slate-300" key={url} href={url} title={url} target="_blank" rel="noreferrer">{label}<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a>
-        })}</div></div>}
-        {onFindOtherVersions && <div><p className="mb-2 text-xs text-slate-500">Other versions</p>
-          <button type="button" onClick={onFindOtherVersions} className="inline-flex items-center gap-1.5 rounded text-sm text-slate-600 hover:underline focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300"><MagnifyingGlassIcon aria-hidden="true" className="size-3.5" />Find other versions on Hugging Face</button>
-        </div>}
-      </div>
-      {serving._tag === "Failed" && <div className="min-w-0"><p className="mb-1 text-xs text-slate-500">Assessment</p><p className="break-words text-slate-600 dark:text-slate-300">{serving.failure.message}</p></div>}
-      {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && <div className="min-w-0">
-        <p className="mb-1 flex items-center gap-1.5 font-medium">Estimated speed on your machine<SpeedInfo /></p>
-        <p className="text-sm tabular-nums">{performanceRangeSpeedLabel(serving.assessment.performance, serving.assessment.profile.contextLength)}</p>
-        <p className="mt-1 text-xs text-slate-500">{localModelSpeedNote}</p>
-      </div>}
-      </div>
-      {radar && model._tag === "Catalog" && <ModelRadar model={model} />}
-    </div>
-  )
-  if (open !== undefined) return open ? <div id={contentId}>{content}</div> : null
-  return <details className="group mt-4 text-sm">
-    <summary className="flex cursor-pointer list-none items-center justify-end gap-1 rounded py-1 text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 [&::-webkit-details-marker]:hidden">Model details<CaretDownIcon aria-hidden="true" className="size-4 group-open:rotate-180" /></summary>
-    {content}
-  </details>
-}
 const minutesRemaining = (seconds: number) => seconds < 60 ? "Less than 1 min" : `About ${Math.ceil(seconds / 60)} min`
 /** Tuning's time remaining from its observed rate; units are measured configurations, so they track time. */
 function useTuningEstimate(progress: ModelOptimizationProgress | null): string {
@@ -310,7 +271,7 @@ function ModelCard({ model, models, showMemory = false, replacing, hardware, onF
   const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)} memory</span></>}</div>
   return <article className={pageLayout.modelCard}>
     <div className={pageLayout.modelRow}>
-      <div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div className="min-w-0"><h2 className="flex flex-wrap items-center gap-2 text-lg font-semibold">{formatLocalModelDisplayName(model)}{model._tag === "Custom" && <SourceTag label={model.presentation.sourceLabel} />}</h2>{status}</div></div>
+      <div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div className="min-w-0"><h2 className="flex flex-wrap items-center gap-2 text-lg font-semibold">{formatLocalModelDisplayName(model)}{Option.match(localModelSourceTag(model), { onNone: () => null, onSome: label => <SourceTag label={label} /> })}</h2>{status}</div></div>
       {Option.match(deprecation, {
         onNone: () => <ModelControls model={model} {...(replacing ? { replacing } : {})}>{detailsToggle}</ModelControls>,
         onSome: value => model._tag === "Catalog" && <DeprecatedModelControls model={model} replacement={catalogModelReplacement(models, value)}>{detailsToggle}</DeprecatedModelControls>,
@@ -318,7 +279,9 @@ function ModelCard({ model, models, showMemory = false, replacing, hardware, onF
       {model._tag === "Custom" && <CustomModelDrafter model={model} models={models} detailsOpen={detailsOpen} detailsId={detailsId} />}
       {model._tag === "Catalog" && !detailsOpen && catalogComponentOffers(model).some(({ component }) => component === "Drafter") && <div className="col-span-full -mt-2 pl-14"><CatalogDrafterOffer model={model} disabled={componentsDisabled} onDownload={downloadModelComponent} /></div>}
     </div>
-    {model._tag === "Catalog" && <ModelDetails model={model} radar open={detailsOpen} contentId={detailsId} custom={<CatalogComponentDetails model={model} disabled={componentsDisabled} onDownload={downloadModelComponent} />} {...(onFindOtherVersions ? { onFindOtherVersions } : {})} />}
+    {model._tag === "Catalog" && <ModelDetails model={model} radar open={detailsOpen} contentId={detailsId}
+      drafter={<CatalogComponentDetails model={model} disabled={componentsDisabled} onDownload={downloadModelComponent} />}
+      source={<CatalogSources model={model} />} {...(onFindOtherVersions ? { onFindOtherVersions } : {})} />}
   </article>
 }
 /** A custom model's drafter offer on its card, its details with drafter controls, and drafter notices. */
@@ -334,8 +297,9 @@ function CustomModelDrafter({ model, models, detailsOpen, detailsId }: { model: 
     {!detailsOpen && Option.isSome(customModelDrafterOffer(model)) && <div className="col-span-full -mt-2 pl-14"><DrafterOffer model={model} disabled={disabled} onAdd={add} /></div>}
     <DrafterNotices model={model} disabled={disabled} onRetry={() => install(model.modelId)} onCancel={() => cancel(model.modelId)} onDismiss={() => dismissFailure(model.modelId)} />
     <div className="col-span-full">
-      <ModelDetails model={model} open={detailsOpen} contentId={detailsId}
-        custom={<CustomModelDetails model={model} variantOfName={catalogVariantOfName(models, model.presentation.variantOf)} disabled={disabled} onChangeDrafter={change} onTurnOffDrafter={turnOff} onAddDrafter={add} />} />
+      <ModelDetails model={model} radar open={detailsOpen} contentId={detailsId}
+        drafter={<CustomModelDrafterRow model={model} disabled={disabled} onChangeDrafter={change} onTurnOffDrafter={turnOff} onAddDrafter={add} />}
+        source={<CustomModelSource model={model} variantOfName={catalogVariantOfName(models, model.presentation.variantOf)} />} />
     </div>
     <DrafterPickerDialog model={model} open={choosing} onOpenChange={setChoosing} onChoose={choice => setDrafter(model.modelId, choice)} />
   </>
@@ -359,7 +323,7 @@ function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; a
     </div>
     <div className="grid min-h-72">
       <div className={`col-start-1 row-start-1 min-w-0 ${view === "profile" ? "" : "invisible"}`} aria-hidden={view !== "profile"}><ModelRadar model={model} /></div>
-      <div className={`col-start-1 row-start-1 min-w-0 ${view === "details" ? "" : "invisible"}`} aria-hidden={view !== "details"}><ModelDetails model={model} compact open /></div>
+      <div className={`col-start-1 row-start-1 min-w-0 ${view === "details" ? "" : "invisible"}`} aria-hidden={view !== "details"}><ModelDetails model={model} compact open source={<CatalogSources model={model} />} /></div>
     </div>
     </div>
     {transferring && <div className="absolute inset-5 flex items-center justify-center overflow-y-auto" aria-label="Download panel">

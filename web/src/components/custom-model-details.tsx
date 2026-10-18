@@ -37,15 +37,32 @@ export function DrafterOffer({ model, disabled, onAdd }: { model: CustomLocalMod
   })
 }
 
-/** Source, Variant of, and the Drafter with Change and Turn off, for any non-catalog model. */
-export function CustomModelDetails({ model, variantOfName, disabled, onChangeDrafter, onTurnOffDrafter, onAddDrafter }: {
+/** The Drafter row of a custom model's details: the attached drafter with Change and Turn off, or the offer and Change. */
+export function CustomModelDrafterRow({ model, disabled, onChangeDrafter, onTurnOffDrafter, onAddDrafter }: {
   model: CustomLocalModel
-  variantOfName: Option.Option<string>
   disabled: boolean
   onChangeDrafter: () => void
   onTurnOffDrafter: () => void
   onAddDrafter: (candidate: DrafterCandidate) => void
 }) {
+  return <dl><div className="min-w-0"><dt className="text-xs text-slate-500">Drafter</dt><dd className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+    {Option.match(model.drafter, {
+      onSome: drafter => <>
+        <span className="min-w-0 truncate" title={drafter.name}>{drafter.name}{drafter.updateAvailable ? " · Update available" : ""}</span>
+        <DrafterOffer model={model} disabled={disabled} onAdd={onAddDrafter} />
+        <Button variant="outline" size="unstyled" className={textButton} disabled={disabled} onClick={onChangeDrafter}>Change</Button>
+        <Button variant="ghost" size="unstyled" className={textButton} disabled={disabled} onClick={onTurnOffDrafter}>Turn off</Button>
+      </>,
+      onNone: () => <>
+        {Option.isSome(customModelDrafterOffer(model)) ? <DrafterOffer model={model} disabled={disabled} onAdd={onAddDrafter} /> : <span className="text-slate-500">None</span>}
+        <Button variant="outline" size="unstyled" className={textButton} disabled={disabled} onClick={onChangeDrafter}>Change</Button>
+      </>,
+    })}
+  </dd></div></dl>
+}
+
+/** The Source of a custom model's details ("LM Studio · path", a pinned repository), and the catalog model it is a variant of. */
+export function CustomModelSource({ model, variantOfName }: { model: CustomLocalModel; variantOfName: Option.Option<string> }) {
   const source = customModelSource(model)
   return <dl className="grid gap-x-8 gap-y-3 sm:grid-cols-2">
     <div className="min-w-0"><dt className="text-xs text-slate-500">Source</dt><dd className="mt-1 truncate" title={source.label}>
@@ -55,20 +72,6 @@ export function CustomModelDetails({ model, variantOfName, disabled, onChangeDra
       })}
     </dd></div>
     {Option.isSome(variantOfName) && <div className="min-w-0"><dt className="text-xs text-slate-500">Variant of</dt><dd className="mt-1 truncate">{variantOfName.value}</dd></div>}
-    <div className="min-w-0 sm:col-span-2"><dt className="text-xs text-slate-500">Drafter</dt><dd className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
-      {Option.match(model.drafter, {
-        onSome: drafter => <>
-          <span className="min-w-0 truncate" title={drafter.name}>{drafter.name}{drafter.updateAvailable ? " · Update available" : ""}</span>
-          <DrafterOffer model={model} disabled={disabled} onAdd={onAddDrafter} />
-          <Button variant="outline" size="unstyled" className={textButton} disabled={disabled} onClick={onChangeDrafter}>Change</Button>
-          <Button variant="ghost" size="unstyled" className={textButton} disabled={disabled} onClick={onTurnOffDrafter}>Turn off</Button>
-        </>,
-        onNone: () => <>
-          {Option.isSome(customModelDrafterOffer(model)) ? <DrafterOffer model={model} disabled={disabled} onAdd={onAddDrafter} /> : <span className="text-slate-500">None</span>}
-          <Button variant="outline" size="unstyled" className={textButton} disabled={disabled} onClick={onChangeDrafter}>Change</Button>
-        </>,
-      })}
-    </dd></div>
   </dl>
 }
 

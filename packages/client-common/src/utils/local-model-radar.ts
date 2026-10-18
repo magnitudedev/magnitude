@@ -70,10 +70,8 @@ const speculationValue = (model: LocalModel): number => {
 const fidelityLabel = (rank: number): string =>
   rank >= 70 ? "Very high" : rank >= 45 ? "High" : rank >= 30 ? "Medium" : "Reduced"
 
-const shortVariantLabel = (model: LocalModel): string =>
-  String(model.presentation.variantLabel).match(/\b(?:IQ|Q)\d+(?:\.\d+)?\b/i)?.[0] ??
-  String(model.presentation.variantLabel).split(/[ _-]/, 1)[0] ??
-  String(model.presentation.variantLabel)
+const shortVariantLabel = (label: string): string =>
+  label.match(/\b(?:IQ|Q)\d+(?:\.\d+)?\b/i)?.[0] ?? label.split(/[ _-]/, 1)[0] ?? label
 
 const quantizationBits = (model: LocalModel): Option.Option<number> => {
   const serving = Option.getOrUndefined(localModelServingState(model))
@@ -88,12 +86,9 @@ const quantizationBits = (model: LocalModel): Option.Option<number> => {
   return Option.none()
 }
 
-const customFidelityLabel = (bits: Option.Option<number>): string =>
-  Option.match(bits, {
-    onNone: () => "Not assessed",
-    onSome: (value) =>
-      value >= 8 ? "Very high" : value >= 5 ? "High" : value >= 4 ? "Medium" : "Reduced",
-  })
+/** A custom model's fidelity rank on the catalog's scale, where a variant's rank is ten per weight bit (Q4 is 40, Q8 is 80). */
+const customFidelityRank = (model: LocalModel): Option.Option<number> =>
+  Option.map(quantizationBits(model), (bits) => bits * 10)
 
 const memoryFitLabel = (assessment: ModelAssessment): string => {
   const use = memoryUseRatio(assessment)
@@ -150,8 +145,11 @@ export const localModelRadarAxes = (
   const samples = assessment.performance
   const catalog = model._tag === "Catalog" ? Option.some(model.catalogData) : Option.none()
   const speculation = Option.getOrElse(localModelSpeculativeMethodLabel(model), () => "None")
-  const bits = quantizationBits(model)
-  const quantization = serving.metadata.quantization
+  const variant = String(model.presentation.variantLabel)
+  const fidelityRank = Option.match(catalog, {
+    onNone: () => customFidelityRank(model),
+    onSome: ({ fidelityRank }) => Option.some(fidelityRank),
+  })
   const axes: LocalModelRadarAxes = [
     {
       value: Option.map(catalog, ({ intelligence }) =>
@@ -159,7 +157,7 @@ export const localModelRadarAxes = (
       ),
       label: "INTELLIGENCE",
       detail: Option.match(catalog, {
-        onNone: () => "Not assessed",
+        onNone: () => "Not rated",
         onSome: ({ intelligence }) => `${intelligence}%`,
       }),
     },
@@ -186,15 +184,11 @@ export const localModelRadarAxes = (
       )})`,
     },
     {
-      value: Option.match(catalog, {
-        onNone: () => Option.map(bits, (value) => clamp01(value / 8)),
-        onSome: ({ fidelityRank }) => Option.some(clamp01(fidelityRank / 100)),
-      }),
+      value: Option.map(fidelityRank, (rank) => clamp01(rank / 100)),
       label: "FIDELITY",
-      detail: Option.match(catalog, {
-        onNone: () => `${customFidelityLabel(bits)} (${quantization})`,
-        onSome: ({ fidelityRank }) =>
-          `${fidelityLabel(fidelityRank)} (${shortVariantLabel(model)})`,
+      detail: Option.match(fidelityRank, {
+        onNone: () => `Not rated (${variant})`,
+        onSome: (rank) => `${fidelityLabel(rank)} (${shortVariantLabel(variant)})`,
       }),
     },
   ]

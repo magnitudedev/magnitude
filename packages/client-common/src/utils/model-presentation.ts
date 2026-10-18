@@ -2,6 +2,7 @@ import { Option } from "effect"
 import {
   customModelSourceLabel,
   formatModelDisplayName,
+  installedAcquisition,
   localModelServingState,
   type CatalogFormModelId,
   type CatalogDeprecation,
@@ -66,9 +67,11 @@ export const localModelSpeculativeMethodLabel = (model: LocalModel): Option.Opti
       ? Option.map(serving.speculativeMethod, formatSpeculativeMethod)
       : Option.none())
 
-/** The tag showing where a model's files came from; catalog models carry none. */
+/** The tag showing where a model's files came from: a custom model's source, or "Magnitude" for a catalog model Magnitude downloaded. */
 export const localModelSourceTag = (model: LocalModel): Option.Option<string> =>
-  model._tag === "Custom" ? Option.some(model.presentation.sourceLabel) : Option.none()
+  model._tag === "Custom"
+    ? Option.some(model.presentation.sourceLabel)
+    : installedAcquisition(model.acquisitionState)?.installation.ownership === "Magnitude" ? Option.some("Magnitude") : Option.none()
 
 export const unsupportedLocalModelSourceTag = (model: UnsupportedLocalModel): string =>
   customModelSourceLabel(model.origin)
