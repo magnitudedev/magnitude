@@ -1,23 +1,9 @@
 import { useState } from "react"
 import { EyeSlashIcon, TrashIcon } from "@phosphor-icons/react"
-import { catalogComponentName, formatLocalModelDisplayName } from "@magnitudedev/client-common"
-import { installedAcquisition, type LocalModel } from "@magnitudedev/sdk"
+import { catalogComponentName, formatLocalModelDisplayName, removalKind } from "@magnitudedev/client-common"
+import { type LocalModel } from "@magnitudedev/sdk"
 import { Button } from "./ui/button"
 import { ConfirmDialog } from "./confirm-dialog"
-
-/**
- * What Remove does follows who owns the files: delete Magnitude's own, forget an imported file, hide a found one, or,
- * for a catalog model whose weights are found elsewhere, delete only the parts Magnitude stores for it ("parts").
- */
-export type RemovalKind = "delete" | "forget" | "hide" | "parts"
-
-export const removalKind = (model: LocalModel): RemovalKind => {
-  if (model._tag === "Catalog") {
-    if (installedAcquisition(model.acquisitionState)?.installation.ownership !== "External") return "delete"
-    return model.storedComponents.length > 0 ? "parts" : "hide"
-  }
-  return model.origin._tag === "Added" ? "delete" : model.origin._tag === "Imported" ? "forget" : "hide"
-}
 
 /** Whether the files Remove deletes are only Magnitude's copy, with the same bytes also in another location that keeps the model listed. */
 export const keepsExternalCopy = (model: LocalModel): boolean => {

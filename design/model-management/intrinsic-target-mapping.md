@@ -28,7 +28,10 @@ model/quality evidence to the complete catalog `ModelId`. Attribution resolves i
 A package an added custom model declares (the same repository, commit and target files) that is not
 an exact current target is never attributed after step 1: a version added from a catalog model's
 repository is a custom model even when its intrinsic identity is the catalog target's, and an
-affiliation recorded for it earlier is forgotten.
+affiliation recorded for it earlier is forgotten. Packages are identified by their files' contents, so
+a version whose weights are a catalog target's bytes at another commit of its repository is that
+target's package (step 1): inspection reports it as the catalog model, and adding it installs the
+catalog model rather than declaring a custom one that could never be installed.
 
 An external exact target is the catalog model: it is never also a custom model, and the catalog
 reports the model installed with external ownership. It serves with every catalog component that is
@@ -45,9 +48,10 @@ one projector file, which is the one package without weights. The inventory then
 target package composed of the found weights and that projector package, installed where the weights
 are, and resolves it for serving to the found weights plus the stored projector. So fetching the
 projector (`install_catalog_component`) downloads and stores only the projector, and installing the
-catalog model fetches only the missing projector and drafter. Removal deletes only Magnitude's
-projector package and drafter and leaves the found file; a model with nothing of Magnitude's is
-retained as externally owned and is hidden instead. A projector or drafter that other variants of
+catalog model fetches only the missing projector and drafter. While the drafter is missing, a target
+with built-in heads that the engine binds and that keep the model fitting serves with them. Removal
+deletes only Magnitude's projector package and drafter and leaves the found file; a model with nothing
+of Magnitude's is retained as externally owned and Remove hides it instead. A projector or drafter that other variants of
 the same repository also list is kept only for another catalog model that is installed. When the found weights disappear, the composed
 target goes with them and the model is not installed; its full download then fetches the target and
 reuses the stored projector. A hidden copy composes nothing: installing the catalog model then makes

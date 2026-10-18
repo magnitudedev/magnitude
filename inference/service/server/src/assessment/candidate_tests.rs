@@ -26,7 +26,7 @@ use magnitude_service_contracts::{
 };
 use magnitude_service_models::lineage::CatalogLineage;
 use magnitude_service_models::{
-    InventoryConfig, ManagedModelStore, ModelDomainResolver, ReleaseCatalog,
+    CatalogDrafterFit, InventoryConfig, ManagedModelStore, ModelDomainResolver, ReleaseCatalog,
     refresh_hugging_face_repository,
 };
 use sha2::{Digest, Sha256};
@@ -2152,6 +2152,60 @@ async fn inspecting_a_catalog_repository_names_the_catalog_model_a_version_is() 
     );
 }
 
+/// QA (mac-m4, round 3c): pulling `openbmb/MiniCPM-V-4.7-1B-gguf:Q4_K_M` at the repository's
+/// newer main commit declared an added model, but its download held exactly the catalog target's
+/// bytes, so it installed as the catalog model and the added entry stayed "Assessing" forever. A
+/// version with the catalog target's bytes, at any commit of its repository, is that catalog
+/// model; other bytes or another repository are not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_with_the_catalog_targets_bytes_at_another_commit_is_the_catalog_model() {
+    let fixture = fixture(Vec::new()).await;
+    let ServableModelBundle::SpeculativeDecoding { target, .. } =
+        &fixture.lineage.catalog().models[0].configuration.bundle
+    else {
+        panic!("the catalog model has a drafter");
+    };
+    let weights = target
+        .files
+        .iter()
+        .filter(|file| file.role == magnitude_service_contracts::models::ModelFileRole::Weights)
+        .map(|file| (file.path.clone(), file.sha256.clone()))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        fixture
+            .lineage
+            .target_with_weights(&CATALOG_TARGET.to_uppercase(), &weights)
+            .map(|matched| matched.model_id),
+        Some(fixture.catalog_id.clone())
+    );
+    assert_eq!(
+        fixture
+            .lineage
+            .target_with_weights(COMMUNITY, &weights)
+            .map(|matched| matched.model_id),
+        None,
+        "the same bytes in another repository are found by content elsewhere, not here"
+    );
+    let other_bytes = weights
+        .iter()
+        .map(|(path, _)| (path.clone(), "f".repeat(64)))
+        .collect();
+    assert_eq!(
+        fixture
+            .lineage
+            .target_with_weights(CATALOG_TARGET, &other_bytes)
+            .map(|matched| matched.model_id),
+        None
+    );
+    assert_eq!(
+        fixture
+            .lineage
+            .target_with_weights(CATALOG_TARGET, &Default::default())
+            .map(|matched| matched.model_id),
+        None
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_repeated_inspection_reads_each_header_once_and_reports_download_sizes() {
     let fixture = fixture(Vec::new()).await;
@@ -4128,10 +4182,21 @@ async fn a_model_that_fits_only_served_plain_gets_no_automatic_drafter_even_with
     );
 
     let exact = drafters(QWEN_TARGET, '1').await;
-    assert_eq!(exact.len(), 1, "{exact:#?}");
-    assert_eq!(exact[0].category, DrafterCategory::CatalogDrafter);
-    assert!(is_bound(&exact[0].verdict));
-    assert!(!exact[0].automatic, "the exact catalog target serves plain");
+    assert_eq!(
+        exact
+            .iter()
+            .map(|candidate| candidate.category)
+            .collect::<Vec<_>>(),
+        [DrafterCategory::CatalogDrafter, DrafterCategory::BuiltIn],
+        "{exact:#?}"
+    );
+    for candidate in &exact {
+        assert!(is_bound(&candidate.verdict));
+        assert!(
+            !candidate.automatic,
+            "the exact catalog target serves plain"
+        );
+    }
     assert_eq!(
         fixture
             .candidates
@@ -4140,6 +4205,77 @@ async fn a_model_that_fits_only_served_plain_gets_no_automatic_drafter_even_with
             .expect("recommendation"),
         None,
         "the catalog model serves plain"
+    );
+    assert_eq!(
+        fixture
+            .candidates
+            .catalog_drafter_fit(&qwen_catalog_id())
+            .await
+            .expect("catalog drafter fit"),
+        CatalogDrafterFit {
+            withheld: true,
+            built_in_heads: false,
+        },
+        "served plain, never with heads that would stop it fitting"
+    );
+}
+
+/// QA (mac-m4, round 3c): the catalog's Qwen3.5 4B, its exact target found in a Hugging Face
+/// cache and its DFlash drafter not yet downloaded, served plain although its target has built-in
+/// MTP heads, while a found non-catalog Qwen3.5 4B in the same state drafted with its heads. A
+/// catalog model lists its built-in heads after its catalog drafter, and they serve while that
+/// drafter is not on this computer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalog_model_with_built_in_heads_serves_them_while_its_catalog_drafter_is_missing() {
+    let fixture = fixture_from(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::new(),
+        true,
+        cpu_environment(),
+    )
+    .await;
+    let catalog = fixture
+        .candidates
+        .drafters(DrafterCandidatesRequest::Model {
+            model_id: qwen_catalog_id(),
+            other: None,
+        })
+        .await
+        .expect("drafter candidates")
+        .candidates;
+    assert_eq!(
+        catalog
+            .iter()
+            .map(|candidate| (candidate.category, candidate.automatic))
+            .collect::<Vec<_>>(),
+        [
+            (DrafterCategory::CatalogDrafter, true),
+            (DrafterCategory::BuiltIn, true)
+        ],
+        "{catalog:#?}"
+    );
+    assert_eq!(
+        fixture
+            .candidates
+            .recommended_drafter(&qwen_catalog_id())
+            .await
+            .expect("recommendation")
+            .map(|candidate| candidate.category),
+        Some(DrafterCategory::CatalogDrafter),
+        "the catalog drafter stays the one recommended"
+    );
+    assert_eq!(
+        fixture
+            .candidates
+            .catalog_drafter_fit(&qwen_catalog_id())
+            .await
+            .expect("catalog drafter fit"),
+        CatalogDrafterFit {
+            withheld: false,
+            built_in_heads: true,
+        }
     );
 }
 

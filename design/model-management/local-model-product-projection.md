@@ -48,9 +48,11 @@ instances separately, then publishes one `LocalModel` union:
   it is a variant of, its attached and recommended drafters, serving
   state, and, for `Added` only, managed acquisition state. ICN names it: the repository's name when
   the file has a Hub identity (as the repository step does), else the GGUF's `general.name`, else
-  the file name, each without the quantization and with separators as spaces, and the quantization
-  its file names (`Q4_K_M`) as the variant label, else its header's `general.file_type` label; only
-  without either does ACN label it by bit width. ICN also gives its license when known: the Hub
+  the file name, each without the quantization and with separators as spaces, and as the variant
+  label its header's `general.file_type` label, kept as its file name spells it only when that names
+  the same weight type more precisely (`UD-Q4_K_XL` for a Q4_K_M header), as a candidate version is
+  labelled, so a renamed file is never labelled from its name; else the quantization its file name
+  spells; only without either does ACN label it by bit width. ICN also gives its license when known: the Hub
   card's when the repository is known, else the GGUF's `general.license` (its
   `general.license.name` when the license is `other`).
 
@@ -74,13 +76,15 @@ Actions follow who owns the files:
 | Added | Deletes Magnitude-owned files | New repository commit | Add, Change, Turn off |
 | Imported | Forgets the declaration; never touches the file | None | Add, Change, Turn off |
 | Found | Hide from Magnitude; never touches the files | None | Add, Change, Turn off |
-| Catalog, files only in an external location | Hide from Magnitude; Remove explains where the files are | New catalog revision | The catalog's |
+| Catalog, files only in an external location | Deletes only the parts Magnitude stores; with none, hides it like a found model | New catalog revision | The catalog's |
 
 A catalog model whose exact target is found externally serves with the catalog components that are on
 this computer. Each component it lacks is listed in `missingComponents` (`Projector` or `Drafter`, with
 its download bytes), never as `UpdateAvailable`; clients offer each one while the model is `Installed`
 ("Image input · Download", "Faster with a drafter · Add"), and `DownloadCatalogComponent` fetches only
-that component. A catalog model that fits this computer only without its catalog drafter is served
+that component. While its catalog drafter is missing, a target with built-in heads the engine binds,
+and that keep it fitting, serves with them; the drafter is still listed as missing. A catalog model that
+fits this computer only without its catalog drafter is served
 without it and carries `drafterWithheld`; it lists no `Drafter` component, and clients say the drafter
 is off because the model fits only without it (see [drafter selection](./drafter-selection.md)).
 
@@ -88,7 +92,8 @@ Adding a drafter to a model whose target is present downloads only the drafter. 
 drafter gets a new revision, every model using it shows Update. Hide applies only to found models
 (including a catalog model whose files are only in an external location); ACN refuses to hide an
 added or imported model (`managed_model_not_hideable`) and points to Remove. Importing a file
-refuses a folder.
+refuses a folder. Importing a file whose bytes are an installed catalog target's (a copy, or a link to
+one) is that catalog model: the import reports it as already on this computer and records nothing.
 
 The same projection publishes a small preparation summary derived directly from the current ICN
 source and assessment snapshots: local-model scan completion and the custom-model count (catalog
@@ -129,9 +134,9 @@ A catalog drafter or projector in Magnitude's store beside external weights leav
 `External`; those parts are listed as `storedComponents`. Remove deletes only what Magnitude stores:
 for a `Mixed` model its copy of the weights (it stays listed from its external copy), for an
 `External` model with stored components only those components (it keeps running from the found
-file), and an `External` model with none is hidden instead (Hide, `magnitude models hide`). The
-removal gate checks for stored components, not ownership alone, so Remove's guidance points to Hide
-only when Remove has nothing to delete, and Hide applies to every `External` model.
+file), and an `External` model with none is hidden instead, as Remove hides any found model, and
+says so ("Hid … from Magnitude"). The removal gate checks for stored components, not ownership alone,
+and Hide applies to every `External` model.
 An installation's optimization projects as `Optimizing`, an installed-family state that carries
 residency and optimization progress (stage, completed and total units, and the device once known).
 Installing or Updating moves to `Optimizing` and then to `Installed`; cancellation, a load, or a

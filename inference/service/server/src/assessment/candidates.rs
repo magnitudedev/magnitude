@@ -30,7 +30,7 @@ use magnitude_service_contracts::models::{
     SpeculativeDraftSource, SpeculativeMethod,
 };
 use magnitude_service_contracts::{
-    ComponentRole, HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest,
+    ComponentRole, ContentIdentity, HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest,
     HuggingFaceRepositorySnapshot, InventoryError, ModelPreviewComponentRole,
     ModelPreviewComponentSource, ModelPreviewSource, ResolvedModel,
 };
@@ -43,9 +43,9 @@ use magnitude_service_models::lineage::{
     CatalogLineage, CatalogLineageMatch,
 };
 use magnitude_service_models::{
-    CachedModelAssessment, CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts,
-    DrafterContent, ManagedModelStore, ModelDomainResolver, ServableModelBundleKey,
-    refresh_hugging_face_repository,
+    CachedModelAssessment, CatalogDrafterFit, CustomModelEnrichment, CustomModelEnrichmentResult,
+    CustomModelFacts, DrafterContent, ManagedModelStore, ModelDomainResolver,
+    ServableModelBundleKey, refresh_hugging_face_repository,
 };
 use sha2::{Digest, Sha256};
 
@@ -181,7 +181,7 @@ struct CatalogFacts {
 struct CandidateEnrichment {
     results: std::sync::RwLock<BTreeMap<(ModelId, String), (u64, CustomModelEnrichmentResult)>>,
     drafter_contents: std::sync::RwLock<BTreeMap<String, DrafterContent>>,
-    withheld_catalog_drafters: std::sync::RwLock<BTreeMap<ModelId, bool>>,
+    catalog_drafter_fits: std::sync::RwLock<BTreeMap<ModelId, CatalogDrafterFit>>,
 }
 
 impl CandidateEnrichment {
@@ -229,18 +229,17 @@ impl CandidateEnrichment {
     }
 
     fn knows_catalog_drafter_fit(&self, model_id: &ModelId) -> bool {
-        self.withheld_catalog_drafters
+        self.catalog_drafter_fits
             .read()
-            .is_ok_and(|withheld| withheld.contains_key(model_id))
+            .is_ok_and(|fits| fits.contains_key(model_id))
     }
 
-    /// Record whether a catalog model serves without its drafter; whether that changed what it
-    /// serves.
-    fn record_catalog_drafter_fit(&self, model_id: ModelId, withheld: bool) -> bool {
-        let Ok(mut known) = self.withheld_catalog_drafters.write() else {
+    /// Record how a catalog model serves without its drafter; whether that changed what it serves.
+    fn record_catalog_drafter_fit(&self, model_id: ModelId, fit: CatalogDrafterFit) -> bool {
+        let Ok(mut known) = self.catalog_drafter_fits.write() else {
             return false;
         };
-        known.insert(model_id, withheld).unwrap_or(false) != withheld
+        known.insert(model_id, fit).unwrap_or_default() != fit
     }
 
     /// Record a drafter reference's bytes; whether they are new.
@@ -290,10 +289,12 @@ impl CustomModelEnrichment for CandidateEnrichment {
             .and_then(|contents| contents.get(&reference_key(reference)).cloned())
     }
 
-    fn withholds_catalog_drafter(&self, model_id: &ModelId) -> bool {
-        self.withheld_catalog_drafters
+    fn catalog_drafter_fit(&self, model_id: &ModelId) -> CatalogDrafterFit {
+        self.catalog_drafter_fits
             .read()
-            .is_ok_and(|withheld| withheld.get(model_id).copied().unwrap_or(false))
+            .ok()
+            .and_then(|fits| fits.get(model_id).copied())
+            .unwrap_or_default()
     }
 }
 
@@ -352,20 +353,18 @@ impl ManagedModelCandidates {
         ))
     }
 
-    /// Whether a catalog model serves without its catalog drafter: the engine binds the drafter,
-    /// and the model fits served plain and not with it. Catalog models use their catalog drafter
-    /// unless it doesn't fit; one that fits only without it still loads, served plain.
-    async fn withholds_catalog_drafter(&self, model_id: &ModelId) -> Result<bool, InventoryError> {
+    /// How a catalog model serves without its catalog drafter. Catalog models use their catalog
+    /// drafter unless it doesn't fit: withheld when the engine binds it and the model fits served
+    /// plain and not with it, so the model still loads, served plain. Its built-in heads serve
+    /// while the drafter is not on this computer when they are automatic: the engine binds them
+    /// and they keep the model fitting.
+    async fn catalog_drafter_fit(
+        &self,
+        model_id: &ModelId,
+    ) -> Result<CatalogDrafterFit, InventoryError> {
         let target = self.model_target(model_id).await?;
-        Ok(self
-            .enumerate_drafters(&target, None, true)
-            .await?
-            .iter()
-            .any(|candidate| {
-                candidate.category == DrafterCategory::CatalogDrafter
-                    && is_bound(&candidate.verdict)
-                    && !candidate.automatic
-            }))
+        let candidates = self.enumerate_drafters(&target, None, false).await?;
+        Ok(catalog_drafter_fit(&candidates))
     }
 
     /// A custom model's lineage hint and recommended drafter.
@@ -515,9 +514,9 @@ impl ManagedModelCandidates {
                     {
                         continue;
                     }
-                    match candidates.withholds_catalog_drafter(&model.id).await {
-                        Ok(withheld) => {
-                            if enrichment.record_catalog_drafter_fit(model.id, withheld) {
+                    match candidates.catalog_drafter_fit(&model.id).await {
+                        Ok(fit) => {
+                            if enrichment.record_catalog_drafter_fit(model.id, fit) {
                                 resolver.catalog_drafter_fit_changed();
                             }
                         }
@@ -1211,6 +1210,8 @@ impl ManagedModelCandidates {
             .zip(assessments)
             .filter_map(|(group, assessment)| {
                 let model_id = hugging_face_model_id(&snapshot.repository, &group.group)?;
+                // The catalog target at its commit, or its bytes at another commit of its
+                // repository, which install as that catalog model all the same.
                 let catalog_model = self
                     .lineage
                     .exact_target(
@@ -1218,6 +1219,12 @@ impl ManagedModelCandidates {
                         &snapshot.commit,
                         &group.group.primary().path,
                     )
+                    .or_else(|| {
+                        self.lineage.target_with_weights(
+                            &snapshot.repository,
+                            &snapshot_weights(&snapshot, &group.group)?,
+                        )
+                    })
                     .map(|matched| matched.model_id);
                 let on_this_computer = catalog_model
                     .clone()
@@ -1363,15 +1370,23 @@ impl ManagedModelCandidates {
             .copied()
             .zip(assessments)
             .filter_map(|(group, assessment)| {
-                let on_this_computer = on_this_computer(
-                    self.models(),
-                    &custom,
-                    None,
-                    &group.group,
-                    &group.header_digest,
-                    group.local_digest.as_deref(),
-                    Some(&root),
-                );
+                // A file with an installed catalog target's bytes (a copy, or a link to one) is
+                // that catalog model, which is on this computer.
+                let catalog_model = group.local_digest.as_deref().and_then(|digest| {
+                    self.models()
+                        .catalog_model_with_content(digest, group.group.primary().size_bytes)
+                });
+                let on_this_computer = catalog_model.clone().or_else(|| {
+                    on_this_computer(
+                        self.models(),
+                        &custom,
+                        None,
+                        &group.group,
+                        &group.header_digest,
+                        group.local_digest.as_deref(),
+                        Some(&root),
+                    )
+                });
                 // A file a listed model is found at keeps that model's identity (a Hugging Face one
                 // when its location gives it); any other file, a copy of a listed model's bytes
                 // included, is identified by its header digest.
@@ -1381,7 +1396,7 @@ impl ManagedModelCandidates {
                     group,
                     assessment,
                     model_id,
-                    catalog_model: None,
+                    catalog_model,
                     on_this_computer,
                 })
             })
@@ -1835,20 +1850,47 @@ impl ManagedModelCandidates {
                 regardless_of_fit(candidate)
             }
         };
+        let embedded_catalog = matched.as_ref().is_some_and(|(matched, _)| {
+            matches!(
+                &matched.model.configuration.bundle,
+                ServableModelBundle::SpeculativeDecoding {
+                    draft_source: SpeculativeDraftSource::Embedded,
+                    ..
+                }
+            )
+        });
+        // The target's built-in heads, when it has any and the catalog drafter isn't them.
+        let built_in = || {
+            let verdict = verdict_of(&own.profile);
+            (!embedded_catalog && !matches!(verdict, DrafterVerdict::None)).then(|| {
+                decide(DrafterCandidate {
+                    category: DrafterCategory::BuiltIn,
+                    automatic: is_bound(&verdict) && fits(&own.profile),
+                    reference: DrafterReference::Embedded,
+                    name: embedded_drafter_name(bound_method(&verdict).as_ref()),
+                    label: "Built into this model".to_owned(),
+                    size_bytes: 0,
+                    lineage: DrafterLineage::Exact,
+                    method: bound_method(&verdict),
+                    verdict,
+                    on_this_computer: true,
+                })
+            })
+        };
         // A catalog model, and a file that is exactly a catalog model's target, use only that
-        // catalog model's drafter, unless it would keep a model that fits without it from fitting.
+        // catalog model's drafter, unless it would keep a model that fits without it from fitting,
+        // and their built-in heads, which serve while that drafter is not on this computer.
         let exact_catalog = matches!(&matched, Some((_, DrafterLineage::Exact)));
         if target.catalog.is_some() || exact_catalog {
             let Some((matched, lineage)) = &matched else {
                 return Ok(DrafterList::default());
             };
+            let catalog = self
+                .catalog_drafter(&target, matched, *lineage)
+                .await
+                .map(decide);
             return Ok(DrafterList {
-                candidates: self
-                    .catalog_drafter(&target, matched, *lineage)
-                    .await
-                    .map(decide)
-                    .into_iter()
-                    .collect(),
+                candidates: in_choice_order(catalog.into_iter().chain(built_in()).collect()),
                 entered: None,
             });
         }
@@ -1879,31 +1921,8 @@ impl ManagedModelCandidates {
                 break;
             }
         }
-        let embedded_catalog = matched.as_ref().is_some_and(|(matched, _)| {
-            matches!(
-                &matched.model.configuration.bundle,
-                ServableModelBundle::SpeculativeDecoding {
-                    draft_source: SpeculativeDraftSource::Embedded,
-                    ..
-                }
-            )
-        });
-        if !embedded_catalog && !done(&candidates) {
-            let verdict = verdict_of(&own.profile);
-            if !matches!(verdict, DrafterVerdict::None) {
-                candidates.push(decide(DrafterCandidate {
-                    category: DrafterCategory::BuiltIn,
-                    automatic: is_bound(&verdict) && fits(&own.profile),
-                    reference: DrafterReference::Embedded,
-                    name: embedded_drafter_name(bound_method(&verdict).as_ref()),
-                    label: "Built into this model".to_owned(),
-                    size_bytes: 0,
-                    lineage: DrafterLineage::Exact,
-                    method: bound_method(&verdict),
-                    verdict,
-                    on_this_computer: true,
-                }));
-            }
+        if !done(&candidates) {
+            candidates.extend(built_in());
         }
         let mut candidates = in_choice_order(candidates);
         let mut entered = None;
@@ -2526,6 +2545,37 @@ fn download_bytes(candidate: &DrafterCandidate) -> u64 {
         0
     } else {
         candidate.size_bytes
+    }
+}
+
+/// Each file of a version with its SHA-256 as the snapshot lists it; `None` when any is unknown.
+fn snapshot_weights(
+    snapshot: &HuggingFaceRepositorySnapshot,
+    group: &GgufGroup,
+) -> Option<BTreeSet<(PathBuf, String)>> {
+    group
+        .files
+        .iter()
+        .map(
+            |file| match &snapshot_file(snapshot, &file.path).ok()?.content {
+                ContentIdentity::Sha256 { value } => Some((file.path.clone(), value.clone())),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+/// How a catalog model serves without its catalog drafter, from its drafter candidates.
+fn catalog_drafter_fit(candidates: &[DrafterCandidate]) -> CatalogDrafterFit {
+    CatalogDrafterFit {
+        withheld: candidates.iter().any(|candidate| {
+            candidate.category == DrafterCategory::CatalogDrafter
+                && is_bound(&candidate.verdict)
+                && !candidate.automatic
+        }),
+        built_in_heads: candidates
+            .iter()
+            .any(|candidate| candidate.category == DrafterCategory::BuiltIn && candidate.automatic),
     }
 }
 

@@ -57,6 +57,27 @@ impl LaunchCosts {
             .or_insert(seconds);
     }
 
+    /// A plain launch (one target row) took `seconds`. The machine's speed
+    /// moves every launch alike (another process taking the CPU, or giving
+    /// it back), so each other measurement moves with the plain one's mean:
+    /// a launch no longer taken keeps its cost relative to a plain decode
+    /// rather than the seconds it took on a machine that was busier or
+    /// freer, until it is measured again.
+    fn record_plain(&mut self, seconds: f64) {
+        let before = self.verify.get(&1).copied();
+        Self::record(&mut self.verify, 1, seconds);
+        let Some(before) = before.filter(|before| *before > 0.0) else {
+            return;
+        };
+        let factor = self.verify[&1] / before;
+        for (_, mean) in self.verify.iter_mut().filter(|(rows, _)| **rows != 1) {
+            *mean *= factor;
+        }
+        for mean in self.draft.values_mut() {
+            *mean *= factor;
+        }
+    }
+
     /// The most the measurements prove a launch of `size` costs at least: a
     /// larger launch costs no less than a smaller one. A larger launch
     /// proves nothing about a smaller one (a 16-row launch costs more than
@@ -587,6 +608,7 @@ impl DraftController {
             TimedLaunch::Draft => {
                 LaunchCosts::record(&mut costs.draft, size, duration.as_secs_f64())
             }
+            TimedLaunch::Target if size == 1 => costs.record_plain(duration.as_secs_f64()),
             TimedLaunch::Target => {
                 LaunchCosts::record(&mut costs.verify, size, duration.as_secs_f64())
             }

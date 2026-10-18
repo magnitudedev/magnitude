@@ -90,41 +90,6 @@ export interface ExternalModelFiles {
   readonly location: Option.Option<ModelLocationKind>
 }
 
-const locationPhrase = (files: ExternalModelFiles): string => Option.match(files.location, {
-  onNone: () => files.path,
-  onSome: (kind) => {
-    switch (kind) {
-      case "HuggingFaceCache": return `your Hugging Face cache (${files.path})`
-      case "LmStudio": return `LM Studio's models folder (${files.path})`
-      case "LlamaCpp": return `the llama.cpp cache (${files.path})`
-      case "Ollama": return `Ollama's models folder (${files.path})`
-      case "Folder": return files.path
-    }
-  },
-})
-
-const deleteElsewhere = (location: Option.Option<ModelLocationKind>): string => Option.match(location, {
-  onNone: () => "or delete the files yourself",
-  onSome: (kind) => {
-    switch (kind) {
-      case "HuggingFaceCache": return "or delete it with the Hugging Face CLI (`hf cache rm`)"
-      case "LmStudio": return "or delete it in LM Studio"
-      case "Ollama": return "or delete it with `ollama rm`"
-      case "LlamaCpp":
-      case "Folder": return "or delete the files yourself"
-    }
-  },
-})
-
-/** Why Remove leaves a catalog model found outside Magnitude's store, and what to do instead. */
-export const externalCatalogRemovalRefusal = (modelId: CatalogFormModelId, files: ExternalModelFiles) =>
-  new LocalModelMutationFailed({
-    code: "model_removal_retained_external",
-    message: `${modelId} uses files in ${locationPhrase(files)}, which Magnitude never deletes. `
-      + `Hide it with \`magnitude models hide ${modelId}\`, ${deleteElsewhere(files.location)}.`,
-    retryable: false,
-  })
-
 const catalogHideRefusal = (modelId: ModelId) => new LocalModelMutationFailed({
   code: "catalog_model_not_hideable",
   message: `${modelId} is a catalog model. Remove it with \`magnitude catalog remove ${modelId}\` instead.`,
@@ -147,6 +112,11 @@ const containingLocation = (path: string, locations: readonly ModelLocation[]): 
     .sort((left, right) => right.directory.length - left.directory.length)[0]?.kind)
 
 /** Custom-model commands: finding and adding models, drafters, hiding, and model locations. */
+export interface DrafterChoices {
+  readonly candidates: readonly DrafterCandidate[]
+  readonly entered: Option.Option<DrafterCandidate>
+}
+
 export interface CustomModelCommandsApi {
   readonly searchHuggingFace: (request: {
     readonly query: string
@@ -154,10 +124,11 @@ export interface CustomModelCommandsApi {
     readonly all: boolean
   }) => Effect.Effect<HuggingFaceSearchResponse, ModelCandidateError>
   readonly inspectCandidate: (reference: string) => Effect.Effect<CandidateInspection, ModelCandidateError>
+  /** The drafter choices, and the listed candidate a different drafter (`other`) resolves to. */
   readonly listDrafterCandidates: (
     target: DrafterTarget,
     other: Option.Option<string>,
-  ) => Effect.Effect<readonly DrafterCandidate[], ModelCandidateError>
+  ) => Effect.Effect<DrafterChoices, ModelCandidateError>
   readonly addHuggingFaceModel: (request: {
     readonly repository: HuggingFaceRepositoryId
     readonly revision: Option.Option<string>
@@ -166,7 +137,7 @@ export interface CustomModelCommandsApi {
     readonly force: boolean
   }) => Effect.Effect<AddedModel, CustomModelMutationError>
   readonly importModelFile: (path: string, drafter: DrafterChoice) => Effect.Effect<
-    ChosenDrafter & { readonly modelId: CustomFormModelId; readonly outcome: "Started" | "AlreadyOnThisComputer" },
+    ChosenDrafter & { readonly modelId: ModelId; readonly outcome: "Started" | "AlreadyOnThisComputer" },
     CustomModelMutationError
   >
   readonly setModelDrafter: (
@@ -506,10 +477,8 @@ export const CustomModelCommandsLive: Layer.Layer<
    * hand), checked again as a different drafter so it shows as Other with its verdict. A pinned file that resolves to a
    * listed candidate adds no row, and one that can't be checked now is left out rather than failing the list.
    */
-  const listDrafterCandidates = (target: DrafterTarget, other: Option.Option<string>) => Effect.gen(function* () {
-    const { candidates } = yield* listNativeDrafterCandidates(target, other)
-    if (target._tag !== "Model" || Option.isSome(other)) return candidates
-    const pinned = (yield* customModels.get).drafters[target.modelId as CustomFormModelId]
+  const withPinnedDrafter = (modelId: ModelId, target: DrafterTarget, candidates: readonly DrafterCandidate[]) => Effect.gen(function* () {
+    const pinned = (yield* customModels.get).drafters[modelId as CustomFormModelId]
     if (pinned?._tag !== "Reference") return candidates
     const listed = new Set(candidates.map(({ reference }) => drafterReferenceKey(reference)))
     if (listed.has(drafterReferenceKey(pinned.reference))) return candidates
@@ -526,10 +495,16 @@ export const CustomModelCommandsLive: Layer.Layer<
     })
   })
 
+  const listDrafterCandidates = (target: DrafterTarget, other: Option.Option<string>) => Effect.gen(function* () {
+    const listed = yield* listNativeDrafterCandidates(target, other)
+    if (target._tag !== "Model" || Option.isSome(other)) return listed
+    return { candidates: yield* withPinnedDrafter(target.modelId, target, listed.candidates), entered: Option.none() }
+  })
+
   /** The drafter a choice resolves to; a rejected or unknown reference is refused, never attached. */
   const chooseDrafter = (target: DrafterTarget, choice: DrafterChoice) => Effect.gen(function* () {
     if (choice._tag === "None") return Option.none<DrafterCandidate>()
-    const candidates = yield* listDrafterCandidates(target, Option.none())
+    const { candidates } = yield* listDrafterCandidates(target, Option.none())
     if (choice._tag === "Auto") return preselectedDrafterCandidate(candidates)
     const key = drafterReferenceKey(choice.reference)
     const matching = (list: readonly DrafterCandidate[]) =>
@@ -977,6 +952,17 @@ export const CustomModelCommandsLive: Layer.Layer<
         })
       }
       if (version === undefined) return yield* new InvalidModelReference({ reference, message: "Magnitude can't run this file." })
+      // A file with a catalog model's bytes is that catalog model, which comes with its drafter: nothing is recorded.
+      if (Option.isSome(version.catalogModel)) {
+        const catalogModel = version.catalogModel.value
+        if (drafter._tag !== "Auto") {
+          return yield* new InvalidModelReference({
+            reference,
+            message: `${reference} is the catalog model ${catalogModel}, which comes with its drafter.`,
+          })
+        }
+        return { modelId: catalogModel, drafter: Option.none(), outcome: "AlreadyOnThisComputer" as const, drafterDownloadStarted: false }
+      }
       // The same bytes are one model: a file whose bytes are already a model on this computer is that model.
       const existing = Option.flatMap(version.onThisComputer, Schema.decodeUnknownOption(CustomFormModelIdSchema))
       const modelId = Option.getOrElse(existing, () => version.modelId)

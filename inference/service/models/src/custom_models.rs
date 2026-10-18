@@ -93,12 +93,22 @@ pub trait CustomModelEnrichment: Send + Sync + 'static {
     fn drafter_content(&self, _reference: &DrafterReference) -> Option<DrafterContent> {
         None
     }
-    /// Whether a catalog model serves without its catalog drafter, because it fits served plain
-    /// and not with that drafter. When this changes it calls
+    /// How a catalog model serves without its catalog drafter. When this changes it calls
     /// [`ModelDomainResolver::catalog_drafter_fit_changed`].
-    fn withholds_catalog_drafter(&self, _model_id: &ModelId) -> bool {
-        false
+    fn catalog_drafter_fit(&self, _model_id: &ModelId) -> CatalogDrafterFit {
+        CatalogDrafterFit::default()
     }
+}
+
+/// How a catalog model serves without its catalog drafter, which depends on the release material
+/// and this computer, never on the files here. `withheld`: it fits served plain and not with that
+/// drafter, so it is served plain whether or not the drafter is here. `built_in_heads`: its target
+/// has built-in heads the engine binds and that keep it fitting, which serve while the catalog
+/// drafter is not on this computer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CatalogDrafterFit {
+    pub withheld: bool,
+    pub built_in_heads: bool,
 }
 
 /// The bytes of a drafter's GGUF: the digest of its header and its size, and its Hub SHA-256 when
@@ -197,13 +207,13 @@ impl ModelDomainResolver {
         self.custom_model_enrichment_changed();
     }
 
-    /// Whether a catalog model serves without its catalog drafter, because it fits served plain
-    /// and not with that drafter.
-    pub(crate) fn withholds_catalog_drafter(&self, model_id: &ModelId) -> bool {
+    /// How a catalog model serves without its catalog drafter.
+    pub(crate) fn catalog_drafter_fit(&self, model_id: &ModelId) -> CatalogDrafterFit {
         self.local
             .enrichment
             .read()
-            .is_ok_and(|enrichment| enrichment.withholds_catalog_drafter(model_id))
+            .map(|enrichment| enrichment.catalog_drafter_fit(model_id))
+            .unwrap_or_default()
     }
 
     /// Republishes the local-models list after the enrichment's knowledge changed.
@@ -3376,6 +3386,65 @@ mod tests {
         );
     }
 
+    /// QA (linux-debian, round 3c): importing a link to a file holding a catalog target's bytes
+    /// started a new model under an ID nothing listed, since those bytes are the catalog model's.
+    /// The store names the catalog model whose installed target, in any location, has a file's
+    /// bytes, so the import answers with that catalog model.
+    #[tokio::test]
+    async fn a_copy_of_an_installed_catalog_targets_bytes_is_that_catalog_model() {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+
+        let fixture = Fixture::new().await;
+        let cache = fixture.root.join("hf");
+        let bytes = model_bytes("catalog target");
+        publish_hf_cache(
+            &cache,
+            "owner/Model-GGUF",
+            &"a".repeat(40),
+            &[("Model-Q4_K_M.gguf", bytes.clone())],
+        );
+        let shown = roots(vec![root(ModelRootKind::HuggingFaceCache, &cache)]);
+        fixture.apply(shown.clone()).await;
+        let found = fixture.inventory().list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        let catalog = vec![catalog_definition(found)];
+        let fixture = fixture.restart(catalog.clone()).await;
+        fixture.apply(shown).await;
+
+        let copy = fixture.root.join("models/R/renamed-q8.gguf");
+        fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        fs::write(&copy, &bytes).unwrap();
+        let link = fixture.root.join("stash/link-to-renamed.gguf");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&copy, &link).unwrap();
+        #[cfg(not(unix))]
+        fs::copy(&copy, &link).unwrap();
+        let digest = crate::gguf::local_model_digest_of(&[&link]).unwrap();
+        assert_eq!(
+            fixture
+                .inventory()
+                .catalog_model_with_content(&digest, bytes.len() as u64),
+            Some(catalog_id(&catalog[0]))
+        );
+        assert_eq!(
+            fixture
+                .inventory()
+                .catalog_model_with_content(&digest, bytes.len() as u64 + 1),
+            None
+        );
+        let other = fixture.root.join("models/other.gguf");
+        fs::write(&other, model_bytes("other")).unwrap();
+        assert_eq!(
+            fixture.inventory().catalog_model_with_content(
+                &crate::gguf::local_model_digest_of(&[&other]).unwrap(),
+                fs::metadata(&other).unwrap().len()
+            ),
+            None
+        );
+    }
+
     /// A Hub serving one repository's metadata and file metadata at `commit`, recording every
     /// request; it never serves file contents.
     fn serve_metadata_only(
@@ -4438,6 +4507,85 @@ mod tests {
             "the declaration still names it while ACN keeps it"
         );
         assert!(after.models[0].files[0].path.starts_with(&cache));
+    }
+
+    /// QA (mac-m4, round 3c): importing a file byte-identical to an added model said it was that
+    /// model, yet listed a second entry under the file's own `local:` ID. Adding a version previews its
+    /// headers first, and the preview's header-only files were inspected through the cache keyed
+    /// by content, so the downloaded file with the same SHA-256 took the preview's content sample
+    /// (read from zeros) and a `local:` digest no copy of its bytes has. A downloaded added model and
+    /// a copy of it are one model.
+    #[tokio::test]
+    async fn a_previewed_then_downloaded_model_has_its_own_bytes_digest() {
+        let commit = "c".repeat(40);
+        let repository = "owner/Added-GGUF";
+        let mut bytes = model_bytes("previewed");
+        let length = bytes.len();
+        for (index, byte) in bytes[length - 32..].iter_mut().enumerate() {
+            *byte = index as u8 + 1;
+        }
+        let (endpoint, _) = serve_files(vec![(
+            repository,
+            commit.clone(),
+            vec![("Added-Q4_K_M.gguf", bytes.clone())],
+        )]);
+        let fixture = Fixture::with_hub(endpoint).await;
+        let snapshot = crate::refresh_hugging_face_repository(
+            &fixture.resolver.inventory,
+            magnitude_service_contracts::HuggingFaceRepositoryRequest {
+                repository: repository.to_owned(),
+                revision: commit.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        fixture
+            .inventory()
+            .hugging_face_package(
+                &magnitude_service_contracts::ModelPreviewSource {
+                    repository: repository.to_owned(),
+                    revision: commit.clone(),
+                    primary_gguf: PathBuf::from("Added-Q4_K_M.gguf"),
+                    additional_components: Vec::new(),
+                },
+                &snapshot,
+            )
+            .await
+            .unwrap();
+
+        publish_managed(
+            &fixture.store,
+            repository,
+            &commit,
+            &[("Added-Q4_K_M.gguf", bytes.clone())],
+        );
+        let copy = fixture.root.join("Downloads/Added-copy.gguf");
+        fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        fs::write(&copy, &bytes).unwrap();
+        let added_id: ModelId = "hf:owner/Added-GGUF/Added-Q4_K_M.gguf".parse().unwrap();
+        let listed = fixture
+            .apply(LocalModelsConfiguration {
+                declarations: vec![
+                    CustomModelDeclaration {
+                        model_id: added_id.clone(),
+                        origin: CustomModelDeclarationOrigin::Added {
+                            repository: HuggingFaceRepositoryId::new(repository).unwrap(),
+                            commit: commit.clone(),
+                        },
+                        target: vec!["Added-Q4_K_M.gguf".to_owned()],
+                        projector: None,
+                    },
+                    CustomModelDeclaration {
+                        model_id: local_id(&copy),
+                        origin: CustomModelDeclarationOrigin::Imported { path: copy.clone() },
+                        target: vec![copy.to_string_lossy().into_owned()],
+                        projector: None,
+                    },
+                ],
+                ..LocalModelsConfiguration::default()
+            })
+            .await;
+        assert_eq!(ids(&listed.models), [added_id.to_string()], "{listed:#?}");
     }
 
     /// Removing an added model whose same bytes are also in Ollama or the llama.cpp cache deletes

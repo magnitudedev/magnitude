@@ -20,6 +20,7 @@ const customCommands = {
   sync: (modelId: string) => Effect.sync(() => { customCalls.push(`custom sync ${modelId}`); return { outcome: "Installing" as const } }),
   cancelSync: (modelId: string) => Effect.sync(() => { customCalls.push(`custom cancel ${modelId}`); return {} }),
   acknowledgeSyncFailure: (modelId: string) => Effect.sync(() => { customCalls.push(`custom acknowledge ${modelId}`); return {} }),
+  hide: (modelId: string) => Effect.sync(() => { customCalls.push(`custom hide ${modelId}`) }),
   externalCatalogFiles: (modelId: string) => Effect.succeed(modelId === "model-c:gguf:test"
     ? Option.some({ path: "/home/ada/.cache/huggingface/hub/models--o--r/snapshots/c/m.gguf", location: Option.some("HuggingFaceCache") })
     : Option.none()),
@@ -170,12 +171,10 @@ it("stops a running model before removing it, and removes an idle model without 
   await Effect.runPromise(remove("model-a:gguf:test"))
   await Effect.runPromise(remove("model-b:gguf:test"))
   await Effect.runPromise(remove("hf:owner/repo/model-Q4_K_M.gguf"))
-  const external = await Effect.runPromise(remove("model-c:gguf:test").pipe(Effect.flip))
+  await Effect.runPromise(remove("model-c:gguf:test"))
   expect(calls).toEqual(["stop loaded-instance", "remove model-a:gguf:test", "remove model-b:gguf:test"])
-  expect(external.message).toBe("model-c:gguf:test uses files in your Hugging Face cache "
-    + "(/home/ada/.cache/huggingface/hub/models--o--r/snapshots/c/m.gguf), which Magnitude never deletes. "
-    + "Hide it with `magnitude models hide model-c:gguf:test`, or delete it with the Hugging Face CLI (`hf cache rm`).")
   expect(customCalls).toContain("custom remove hf:owner/repo/model-Q4_K_M.gguf")
+  expect(customCalls).toContain("custom hide model-c:gguf:test")
 })
 
 it("removes only the parts Magnitude stores for a catalog model whose weights are found elsewhere, and hides one without any", async () => {
@@ -225,11 +224,10 @@ it("removes only the parts Magnitude stores for a catalog model whose weights ar
   expect(await Effect.runPromise(remove(["Projector", "Drafter"], { _tag: "Removed", reclaimedBytes: 2 }))).toEqual({})
   expect(calls).toEqual(["remove qwen3.5-4b:gguf:q4"])
 
-  // With nothing of Magnitude's, Remove never reaches ICN and points to Hide, which applies to this model.
-  const hidden = await Effect.runPromise(remove([], { _tag: "Removed", reclaimedBytes: 0 }).pipe(Effect.flip))
-  expect(hidden._tag === "LocalModelMutationFailed" && hidden.code).toBe("model_removal_retained_external")
-  expect(hidden.message).toContain("magnitude models hide qwen3.5-4b:gguf:q4")
-  expect(hidden.message).not.toContain("catalog remove")
+  // With nothing of Magnitude's, Remove never reaches ICN and hides the found copy, as it hides any found model.
+  customCalls.length = 0
+  expect(await Effect.runPromise(remove([], { _tag: "Removed", reclaimedBytes: 0 }))).toEqual({})
+  expect(customCalls).toEqual(["custom hide qwen3.5-4b:gguf:q4"])
   expect(calls).toHaveLength(1)
 
   // Parts another model still uses stay; ICN retains them and the guidance is Hide, never Remove again.

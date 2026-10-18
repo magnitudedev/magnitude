@@ -549,3 +549,44 @@ fn looks_carry_across_short_requests_so_drafting_that_stopped_can_resume() {
         "short requests over predictable text draft again"
     );
 }
+
+/// The CPU while another process holds most of it: every launch takes
+/// longer, the drafter's most.
+const CONTENDED_CPU: Costs = Costs {
+    draft: |generated| if generated == 0 { 0.0 } else { 90.0 },
+    verify: |rows| 110.0 + 40.0 * (rows - 1) as f64,
+};
+
+/// QA (linux-arch, round 3c): on a CPU shared with another long run,
+/// drafting stopped after two requests and never came back. Launches that
+/// stop being taken keep the cost they measured, so once the machine is free
+/// again the plain decode got faster while the drafted rounds stayed priced
+/// as on the busy machine, and no look was ever worth taking. Drafting that
+/// stopped resumes when the text turns predictable on the freed machine.
+#[test]
+fn drafting_stopped_on_a_busy_cpu_resumes_once_it_is_free() {
+    let load = warmed(&Stream::of(&[(400, UNPREDICTABLE)]), CONTENDED_CPU);
+    let off = adaptive(&Stream::of(&[(60, UNPREDICTABLE)]), CONTENDED_CPU, &load);
+    assert!(
+        off.rounds
+            .iter()
+            .filter(|(choice, _)| choice.generated > 0)
+            .count()
+            * 4
+            <= off.rounds.len(),
+        "drafting that doesn't pay is mostly off: {}",
+        off.rounds()
+    );
+    let predictable = Stream::of(&[(30, PREDICTABLE)]);
+    let resumed = (0..20)
+        .map(|_| adaptive(&predictable, CPU, &load))
+        .position(|run| {
+            run.rounds
+                .iter()
+                .any(|(choice, _)| !choice.look && choice.verified > 0)
+        });
+    assert!(
+        resumed.is_some(),
+        "short requests over predictable text on the freed CPU draft again"
+    );
+}

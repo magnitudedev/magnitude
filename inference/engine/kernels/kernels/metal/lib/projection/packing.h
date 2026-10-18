@@ -120,9 +120,11 @@ inline float4 packing_scale(float4 value) {
 
 // The packed codes of a weight format, the one place its packed forms and
 // its packing bound (`packing_bound`) read them from. Every format with
-// integer codes has them: the formats whose codes' low four bits are one
-// plane (Q4_K and q4g32s; Q5_K, Q6_K, q5g32s and q5g32 with their plane of
-// high bits) and those whose values are 8 bits (Q8_0 and iq4g32). The codes
+// integer codes has them but the vector-coded ones (iq2xs and iq3xxs, whose
+// bound `packing_bound` reads from their decoded grid codes): the formats
+// whose codes' low four bits are one plane (Q4_K and q4g32s; Q5_K, Q6_K,
+// q5g32s and q5g32 with their plane of high bits) and those whose values are
+// 8 bits (Q8_0 and iq4g32). The codes
 // enter minus `centre`, half their range. A block has `folds` runs of
 // 32 / folds columns under one weight scale each (Q6_K scales 16 columns), a
 // sum pair and a bound per run (`folds` 0: no packed codes). A lane's `words`

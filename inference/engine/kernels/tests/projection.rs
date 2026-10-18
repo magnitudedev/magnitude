@@ -3674,8 +3674,9 @@ fn dense_output_reference(
 }
 
 /// `packing_bound` on Metal equals its portable body over every format with
-/// integer codes, at a row count that leaves padding rows in a tile, with
-/// the runs the registry gives the format.
+/// integer codes, the vector-coded ones (IQ2_XS, IQ3_XXS) included, at a row
+/// count that leaves padding rows in a tile, with the runs the registry gives
+/// the format.
 #[test]
 fn packing_bound_matches_its_portable_body() {
     let module = module();
@@ -3692,6 +3693,8 @@ fn packing_bound_matches_its_portable_body() {
             Repr::Q4g32s,
             Repr::Q5g32s,
             Repr::Q5g32,
+            Repr::Iq2xs,
+            Repr::Iq3xxs,
         ] {
             let (rows, k) = (40, 512);
             let w = weight(repr, rows, k, 17, 1.0);

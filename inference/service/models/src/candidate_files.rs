@@ -480,7 +480,13 @@ pub fn model_presentation(
                 .unwrap_or(name)
         })
         .unwrap_or_default();
-    let label = quantization_label(stem).or_else(|| header_label(header_quantization));
+    // Header first, as for a candidate version (`version_label`): files are renamed freely.
+    let label = match header_quantization {
+        Some(quantization) if header_label(Some(quantization)).is_some() => {
+            Some(version_label(primary, Some(quantization)))
+        }
+        _ => quantization_label(stem),
+    };
     let without_label = |text: &str| {
         let cleaned = match quantization_label(text) {
             Some(label) => {
@@ -1061,6 +1067,49 @@ mod tests {
                 None
             ),
             ("Qwen3.6 35B A3B".to_owned(), Some("UD-Q4_K_XL".to_owned()))
+        );
+    }
+
+    /// QA (linux-arch and mac-m1, round 3c): a found Q4_K_M or Q5_K_M file renamed
+    /// `renamed-q8.gguf` was labelled "Q8" from its name, while inspecting it said its header's
+    /// type. A found model's label is its header's, as a candidate version's is; a name keeps its
+    /// writer's spelling only of that same weight type.
+    #[test]
+    fn a_found_models_label_comes_from_its_header_before_its_file_name() {
+        assert_eq!(
+            model_presentation(
+                Path::new("models/R/renamed-q8.gguf"),
+                None,
+                Some("Qwen3.5-0.8B"),
+                Some("Q4_K - Medium")
+            ),
+            ("Qwen3.5 0.8B".to_owned(), Some("Q4_K_M".to_owned()))
+        );
+        assert_eq!(
+            model_presentation(
+                Path::new("renamed-q8.gguf"),
+                None,
+                Some("4cd563d5"),
+                Some("Q5_K - Medium")
+            )
+            .1,
+            Some("Q5_K_M".to_owned())
+        );
+        assert_eq!(
+            model_presentation(
+                Path::new("Qwen3.5-4B-UD-Q4_K_XL.gguf"),
+                Some("unsloth/Qwen3.5-4B-GGUF"),
+                None,
+                Some("Q4_K - Medium")
+            )
+            .1,
+            Some("UD-Q4_K_XL".to_owned()),
+            "a name spelling the header's type more precisely keeps it"
+        );
+        assert_eq!(
+            model_presentation(Path::new("renamed-q8.gguf"), None, None, None).1,
+            Some("Q8".to_owned()),
+            "without a header type, the name's"
         );
     }
 }

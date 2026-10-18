@@ -2099,7 +2099,7 @@ impl ManagedModelStore {
         let prepared = self
             .prepare_preview_from_repository_snapshot(source, snapshot)
             .await?;
-        let package = self.inspect_package_from_resolved(&prepared.model)?.package;
+        let package = crate::package_service::preview_package(&prepared.model)?;
         Ok((package, prepared))
     }
 
@@ -2112,6 +2112,43 @@ impl ManagedModelStore {
                 .records
                 .values()
                 .any(|record| content.held_by(record))
+        })
+    }
+
+    /// The catalog model whose installed target, in any location, has these bytes: the `local:`
+    /// digest and primary size of a file on disk. A copy of a catalog target's bytes, wherever it
+    /// is, is that catalog model.
+    #[must_use]
+    pub fn catalog_model_with_content(
+        &self,
+        local_digest: &str,
+        primary_size: u64,
+    ) -> Option<ModelId> {
+        let snapshot = self.installed_packages.read().ok()?;
+        snapshot.records.values().find_map(|record| {
+            let magnitude_service_contracts::models::InstalledCatalogAttribution::Attributed {
+                model_id,
+                variant_id,
+            } = &record.installed.catalog_attribution
+            else {
+                return None;
+            };
+            let primary = record
+                .installed
+                .package
+                .files
+                .iter()
+                .filter(|file| {
+                    file.role == magnitude_service_contracts::models::ModelFileRole::Weights
+                })
+                .min_by(|left, right| left.path.cmp(&right.path))?;
+            (primary.size_bytes == primary_size
+                && record
+                    .primary
+                    .as_ref()
+                    .and_then(|evidence| evidence.local_digest.as_deref())
+                    == Some(local_digest))
+            .then(|| ModelId::catalog(model_id, variant_id))
         })
     }
 

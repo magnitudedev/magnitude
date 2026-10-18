@@ -173,12 +173,16 @@ const InspectModelCandidate = Rpc.make("InspectModelCandidate", {
 }).pipe(replaySafe)
 
 /** Drafters for a target in preselection order; `other` adds any reference with the engine's verdict. */
+/** A target's drafter choices; with `other`, also the listed candidate that different drafter is. */
 const ListDrafterCandidates = Rpc.make("ListDrafterCandidates", {
   payload: Schema.Struct({
     target: DrafterTargetSchema,
     other: optional(NonEmptyString),
   }),
-  success: Schema.Struct({ candidates: Schema.Array(DrafterCandidateSchema) }),
+  success: Schema.Struct({
+    candidates: Schema.Array(DrafterCandidateSchema),
+    entered: optional(DrafterCandidateSchema),
+  }),
   error: ModelCandidateError,
 }).pipe(replaySafe)
 
@@ -208,10 +212,11 @@ const AddHuggingFaceModel = Rpc.make("AddHuggingFaceModel", {
 
 /** Declares one GGUF by path, referenced in place; never copies or deletes it. A file whose bytes are already a
  * model on this computer is that model: one more location, with the outcome AlreadyOnThisComputer. */
+/** Imports a GGUF file; a file whose bytes are already a model (a catalog model included) is that model. */
 const ImportModelFile = Rpc.make("ImportModelFile", {
   payload: Schema.Struct({ path: NonEmptyString, drafter: DrafterChoiceSchema }),
   success: Schema.Struct({
-    modelId: CustomFormModelIdSchema,
+    modelId: ModelIdSchema,
     drafter: optional(DrafterCandidateSchema),
     outcome: Schema.Literal("Started", "AlreadyOnThisComputer"),
     drafterDownloadStarted: Schema.Boolean,

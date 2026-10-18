@@ -169,7 +169,7 @@ describe("model mutations accept hf: and local: IDs", () => {
     expect(json).toEqual({ modelId })
   })
 
-  it("catalog remove of a found catalog model deletes only the parts Magnitude stores, and points to Hide without any", async () => {
+  it("catalog remove of a found catalog model deletes only the parts Magnitude stores, and hides it without any", async () => {
     const weightsPath = "/home/ada/.cache/huggingface/hub/models--unsloth--Qwen3.5-4B-MTP-GGUF/snapshots/c/Qwen3.5-4B-UD-Q4_K_XL.gguf"
     const found = (storedComponents: readonly ("Projector" | "Drafter")[]) => makeInstalledCatalogModel({
       acquisitionState: {
@@ -193,18 +193,17 @@ describe("model mutations accept hf: and local: IDs", () => {
     ].join("\n"))
     expect(json).toEqual({ modelId: withParts.modelId })
 
-    // With nothing of Magnitude's, the service refuses and points to Hide, which this model takes.
-    const message = `${withParts.modelId} uses files in your Hugging Face cache (${weightsPath}), which Magnitude never deletes. `
-      + `Hide it with \`magnitude models hide ${withParts.modelId}\`, or delete it with the Hugging Face CLI (\`hf cache delete\`).`
-    const { client } = fakeService({
+    // With nothing of Magnitude's, Remove hides the found copy, as it hides any found model, and says so
+    // (QA linux-arch round 3c: it refused here while a found Hugging Face cache model was hidden).
+    const hidden = await runBoth({
       getCatalog: succeed(catalogState([found([])])),
-      removeLocalModel: () => Effect.fail({ _tag: "LocalModelMutationFailed", code: "model_removal_retained_external", message, retryable: false }),
-    })
-    const refused = await capture(removeModel(withParts.modelId), client)
-    expect(refused.stdout).toBe("")
-    expect(refused.stderr).toContain(`magnitude models hide ${withParts.modelId}`)
-    expect(refused.stderr).not.toContain("catalog remove")
-    expect(refused.exitCode).toBe(1)
+      removeLocalModel: succeed(),
+    }, (options) => removeModel(withParts.modelId, options))
+    expect(hidden.text).toBe([
+      `Hid ${withParts.modelId} from Magnitude. Its files are untouched.`,
+      `Unhide it: magnitude models unhide ${withParts.modelId}`,
+      "",
+    ].join("\n"))
   })
 
   it("models hide fails with the service's error for an ID that isn't on this computer", async () => {
@@ -354,7 +353,7 @@ describe("adding models with a drafter", () => {
     const { text, json, models } = await runBoth({
       inspectModelCandidate: succeed(makeInspection()),
       getCatalog: succeed(catalogState([makeCatalogModel()])),
-      listDrafterCandidates: succeed({ candidates: makeDrafterCandidates() }),
+      listDrafterCandidates: succeed({ candidates: makeDrafterCandidates(), entered: Option.none() }),
     }, (options) => commandEffect({
       effect: withClient((client) => readInspection(client, candidateReference(link))),
       render: renderInspection,
@@ -377,7 +376,7 @@ describe("hidden models are addressable", () => {
   it("shows a hidden model's status, saying it is hidden", async () => {
     const { text, json, models } = await runBoth({
       getCatalog: succeed(catalogState([makeAddedModel()], [], [hidden])),
-      listDrafterCandidates: succeed({ candidates: makeDrafterCandidates() }),
+      listDrafterCandidates: succeed({ candidates: makeDrafterCandidates(), entered: Option.none() }),
     }, (options) => showModelsStatus(hidden.modelId, options))
     expect(models.listDrafterCandidates).toHaveBeenCalledWith({ target: { _tag: "Model", modelId: hidden.modelId }, other: Option.none() })
     expect(text).toContain(`Model ID    ${hidden.modelId}`)
@@ -388,7 +387,7 @@ describe("hidden models are addressable", () => {
   it("reports a visible model as not hidden", async () => {
     const { json } = await runBoth({
       getCatalog: succeed(catalogState([makeAddedModel()], [], [hidden])),
-      listDrafterCandidates: succeed({ candidates: [] }),
+      listDrafterCandidates: succeed({ candidates: [], entered: Option.none() }),
     }, (options) => showModelsStatus(ADDED_MODEL_ID, options))
     expect(json).toMatchObject({ model: { modelId: ADDED_MODEL_ID }, hidden: false })
   })

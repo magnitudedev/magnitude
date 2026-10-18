@@ -45,8 +45,8 @@ pub use catalog_acquisition::{AcquiredCatalogModel, AcquiredDrafter, AcquiredFil
 pub use catalog_installations::ManagedCatalogInstallations;
 pub use catalog_models::{CatalogRemovalPlan, ManagedCatalogModels};
 pub use custom_models::{
-    CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts, DrafterContent,
-    ManagedLocalModels,
+    CatalogDrafterFit, CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts,
+    DrafterContent, ManagedLocalModels,
 };
 pub use download_service::ManagedModelDownloads;
 pub use inventory::{InventoryConfig, ManagedModelStore};

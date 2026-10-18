@@ -13,8 +13,10 @@ import {
   localModelServingState,
   modelDownloadFailureMessage,
   preselectedDrafterCandidate,
+  removalKind,
   unsupportedLocalModelSourceTag,
   unsupportedReasonMessages,
+  type RemovalKind,
 } from "@magnitudedev/client-common"
 import {
   CatalogFormModelIdSchema,
@@ -90,7 +92,6 @@ export const cancelDownload = (modelInput: string, options: JsonOption = {}) => 
   options,
 )
 
-/** What removing a model did, which follows who owns its files. */
 /** The parts Magnitude stores for a catalog model whose weights are found elsewhere, and where those weights are. */
 export interface StoredCatalogParts {
   readonly components: readonly CatalogComponent[]
@@ -106,9 +107,10 @@ export const storedCatalogParts = (model: LocalModel): Option.Option<StoredCatal
     : Option.none()
 }
 
+/** What removing a model did, which follows who owns its files (`removalKind`): a found model, a catalog model's found copy included, is hidden. */
 export const renderRemoval = (
   modelId: ModelId,
-  origin: Option.Option<CustomLocalModel["origin"]>,
+  kind: Option.Option<RemovalKind>,
   parts: Option.Option<StoredCatalogParts> = Option.none(),
 ): string => {
   if (Option.isSome(parts)) {
@@ -117,25 +119,24 @@ export const renderRemoval = (
       + `It still runs from ${parts.value.weightsPath}, which Magnitude never deletes.\n`
       + `To stop listing it: magnitude models hide ${modelId}\n`
   }
-  if (Schema.is(CatalogFormModelIdSchema)(modelId)) {
-    return `Removed ${modelId} from this computer.\nThe model remains available in the catalog.\n`
-  }
-  switch (Option.getOrUndefined(origin)?._tag) {
-    case "Imported": return `Forgot ${modelId}. Magnitude never deletes your file; it stays where it is.\n`
-    case "Found": return `Hid ${modelId} from Magnitude. Its files are untouched.\nUnhide it: magnitude models unhide ${modelId}\n`
-    default: return `Removed ${modelId}.\nMagnitude deleted only its own copy; files other apps manage are untouched.\n`
+  switch (Option.getOrUndefined(kind)) {
+    case "hide": return `Hid ${modelId} from Magnitude. Its files are untouched.\nUnhide it: magnitude models unhide ${modelId}\n`
+    case "forget": return `Forgot ${modelId}. Magnitude never deletes your file; it stays where it is.\n`
+    default: return Schema.is(CatalogFormModelIdSchema)(modelId)
+      ? `Removed ${modelId} from this computer.\nThe model remains available in the catalog.\n`
+      : `Removed ${modelId}.\nMagnitude deleted only its own copy; files other apps manage are untouched.\n`
   }
 }
 
 export const removeModel = (modelInput: string, options: JsonOption = {}) => commandEffect({
   effect: decodeModelId(modelInput).pipe(Effect.flatMap((modelId) => withClient((client) => Effect.gen(function* () {
     const model = Option.fromNullable(addressableModels(yield* readCatalog(client)).find((candidate) => candidate.modelId === modelId))
-    const origin = Option.flatMap(model, (found) => found._tag === "Custom" ? Option.some(found.origin) : Option.none())
+    const kind = Option.map(model, removalKind)
     const parts = Option.flatMap(model, storedCatalogParts)
     yield* client.models.removeLocalModel({ modelId })
-    return { modelId, origin, parts }
+    return { modelId, kind, parts }
   })))),
-  render: ({ modelId, origin, parts }) => renderRemoval(modelId, origin, parts),
+  render: ({ modelId, kind, parts }) => renderRemoval(modelId, kind, parts),
   json: asJson(options, jsonDocument(ModelIdJsonSchema, ({ modelId }: { readonly modelId: ModelId }) => ({ modelId }))),
 })
 

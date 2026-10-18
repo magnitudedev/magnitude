@@ -397,7 +397,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       ListDrafterCandidates: ({ target, other }) =>
         observeRpcDefects(
           "ListDrafterCandidates",
-          customModelCommands.listDrafterCandidates(target, other).pipe(Effect.map((candidates) => ({ candidates }))),
+          customModelCommands.listDrafterCandidates(target, other),
         ),
 
       ListModelLocations: () =>

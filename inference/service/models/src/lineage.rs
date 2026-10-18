@@ -107,6 +107,38 @@ impl CatalogLineage {
             .map(catalog_match)
     }
 
+    /// The catalog variant whose target weights in `repository` are exactly `weights`, each path
+    /// with its SHA-256, at whatever commit: such a file is that catalog target's bytes, which
+    /// install as that catalog model (packages are identified by their files' contents).
+    #[must_use]
+    pub fn target_with_weights(
+        &self,
+        repository: &str,
+        weights: &BTreeSet<(PathBuf, String)>,
+    ) -> Option<CatalogLineageMatch> {
+        if weights.is_empty() {
+            return None;
+        }
+        self.catalog
+            .models
+            .iter()
+            .find(|model| {
+                let target = catalog_target(model);
+                matches!(
+                    &target.source,
+                    ModelPackageSource::HuggingFace { repository: target_repository, .. }
+                        if target_repository.eq_ignore_ascii_case(repository)
+                ) && target
+                    .files
+                    .iter()
+                    .filter(|file| file.role == ModelFileRole::Weights)
+                    .map(|file| (file.path.clone(), file.sha256.clone()))
+                    .collect::<BTreeSet<_>>()
+                    == *weights
+            })
+            .map(catalog_match)
+    }
+
     /// The first variant (in catalog order) of every catalog model.
     pub fn representatives(&self) -> impl Iterator<Item = CatalogLineageMatch> + '_ {
         let mut seen = BTreeSet::new();

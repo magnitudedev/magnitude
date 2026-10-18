@@ -538,6 +538,13 @@ pub(crate) fn validated_package_from_resolved(
     )
 }
 
+/// The package a header-only preview describes. Its files hold headers and no weights, so they are
+/// inspected apart from the inspection cache, which is keyed by content: a preview's content sample
+/// (read from zeros) must never stand in for the downloaded file's with the same SHA-256.
+pub(crate) fn preview_package(resolved: &ResolvedModel) -> Result<ModelPackage, InventoryError> {
+    validated_package_from_resolved(resolved).map(|validated| validated.package)
+}
+
 fn installed_path(model: &InventoryModel, resolved: &ResolvedModel) -> PathBuf {
     match &model.location {
         ModelLocation::Directory { root, .. } | ModelLocation::External { root, .. } => {
@@ -1021,7 +1028,7 @@ impl ManagedModelStore {
 
     fn gguf_inspection_cache_key(path: &Path, content: &ContentIdentity) -> Option<String> {
         let evidence =
-            serde_json::to_vec(&("gguf-inspection-v7", content, path.metadata().ok()?.len()))
+            serde_json::to_vec(&("gguf-inspection-v8", content, path.metadata().ok()?.len()))
                 .ok()?;
         Some(format!("gguf_inspection_{:x}", Sha256::digest(evidence)))
     }
@@ -1331,7 +1338,7 @@ impl ManagedModelStore {
                         additional_components,
                     })
                     .await?;
-                let resolved_package = self.inspect_package_from_resolved(&prepared.model)?.package;
+                let resolved_package = preview_package(&prepared.model)?;
                 if resolved_package.id != package.id {
                     return Err(InventoryError::Integrity(format!(
                         "source-backed package {} resolved as {}",

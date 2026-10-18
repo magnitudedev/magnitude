@@ -75,7 +75,9 @@ automatically. ACN passes a drafter the user entered to ICN as `owner/repo[@revi
 a link, `owner/repo/path.gguf`, or `hf:owner/repo/path.gguf`, and a local path as an absolute path.
 A different drafter that is the same file as a listed candidate (the catalog drafter's package, or
 the same repository, commit and path) is that candidate: ICN reports the listed reference the entry
-resolves to, no second row is added, and choosing it attaches (and saves) that candidate. Once
+resolves to, ACN returns that candidate as `entered` with the list, no second row is added, and
+choosing it attaches (and saves) that candidate (the CLI resolves a typed reference to `entered`
+first). Once
 chosen, any other different drafter stays in the model's list (after the candidates above, as a
 different drafter with its verdict) and is marked as the one in use, in every client.
 **No drafter** is always available. The preselected candidate's label reads "Recommended · ",
@@ -107,7 +109,10 @@ assessment of exactly what adding it installs: its target and projector with its
 plain when none is preselected, so the installed model gets the same verdict.
 Catalog models always use their catalog drafter unless it doesn't fit, including one whose exact target is found in
 another app's location: it serves with the catalog drafter as soon as that drafter is on this computer (a
-projector it lacks never blocks it), and otherwise offers the drafter-only download. A catalog model that fits
+projector it lacks never blocks it), and otherwise offers the drafter-only download, serving meanwhile with its
+target's built-in heads when they are automatic: a catalog model's candidates are its catalog drafter, then its
+built-in heads, and ICN records per catalog model whether those heads are automatic, alongside whether the catalog
+drafter is withheld. A catalog model that fits
 served plain and not with its catalog drafter is served plain instead of being refused: ICN works this out once
 per catalog model (it depends on the release material and this computer, not on the files here), the catalog
 projection then serves and assesses the model's target alone, reports `drafterWithheld`, and offers no drafter

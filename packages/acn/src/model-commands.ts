@@ -21,7 +21,7 @@ import { LocalModels } from "./local-models"
 import { ModelSlotController } from "./model-slot-controller"
 import { LocalModelRemovals } from "./local-model-removals"
 import { icnCommandFailure, type IcnCommandError } from "./icn-command-failure"
-import { CustomModelCommands, externalCatalogRemovalRefusal } from "./custom-model-commands"
+import { CustomModelCommands } from "./custom-model-commands"
 import { CatalogModelSync } from "./catalog-model-sync"
 
 /** Commands by canonical model ID: a catalog ID addresses its installation, a custom ID its downloads. */
@@ -153,11 +153,12 @@ export const ModelCommandsLive: Layer.Layer<
   const storesComponents = (modelId: CatalogFormModelId) => localModels.state.pipe(Effect.map(({ models, hidden }) =>
     [...models, ...hidden].some((model) => model._tag === "Catalog" && model.modelId === modelId && model.storedComponents.length > 0)))
   // Remove never deletes files Magnitude doesn't own. A catalog model whose weights are found elsewhere loses only
-  // the parts Magnitude stores for it and keeps running from the found file; with none, it is hidden instead.
+  // the parts Magnitude stores for it and keeps running from the found file; with none, it is hidden instead, as
+  // Remove hides any found model.
   const catalogRemove = (modelId: CatalogFormModelId) => Effect.all([custom.externalCatalogFiles(modelId), storesComponents(modelId)]).pipe(
-    Effect.flatMap(([external, stored]) => Option.isSome(external) && !stored
-      ? Effect.fail(externalCatalogRemovalRefusal(modelId, external.value))
-      : stopModel(modelId).pipe(Effect.zipRight(removals.remove(modelId)))),
+    Effect.flatMap(([external, stored]) => stopModel(modelId).pipe(Effect.zipRight(Option.isSome(external) && !stored
+      ? custom.hide(modelId).pipe(Effect.as({}))
+      : removals.remove(modelId)))),
   )
   return ModelCommands.of({
     sync: (modelId) => byForm(modelId, catalogSync.sync, custom.sync),

@@ -26,7 +26,7 @@ import {
   HuggingFaceRepositoryIdSchema,
   type LocalModelsState,
 } from "@magnitudedev/acn-protocol"
-import { CustomModelCommands, CustomModelCommandsLive, externalCatalogRemovalRefusal } from "./custom-model-commands"
+import { CustomModelCommands, CustomModelCommandsLive } from "./custom-model-commands"
 import { CatalogModelSync } from "./catalog-model-sync"
 import { CustomModelReconciler } from "./custom-model-reconciler"
 import { CustomModels, localModelsConfiguration } from "./custom-models"
@@ -379,7 +379,7 @@ describe("finding models", () => {
         nativeCandidate({ category: "BuiltIn", reference: { _tag: "Embedded" }, label: "Built in", lineage: "Exact", sizeBytes: 0 }),
       ],
     })
-    const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.some("z-lab/d:dflash.gguf")))
+    const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.some("z-lab/d:dflash.gguf")).pipe(Effect.map(({ candidates }) => candidates)))
     expect(result.map(({ label }) => label)).toEqual(["Large", "Small", "Magnitude DFlash", "Built in"])
     expect(recorded.drafterRequests[0]).toMatchObject({ _tag: "Model", modelId: foundId, other: Option.some("z-lab/d:dflash.gguf") })
   })
@@ -399,7 +399,7 @@ describe("a drafter entered by hand", () => {
       config: pinnedByHand,
       draftersFor: ({ other }) => Effect.succeed(Option.isSome(other) ? listed([nativeCandidate(), entered], entered) : listed([nativeCandidate()])),
     })
-    const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.none()))
+    const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.none()).pipe(Effect.map(({ candidates }) => candidates)))
     expect(result.map(({ category, reference }) => [category, reference])).toEqual([
       ["CatalogDrafter", drafterReference],
       ["Other", hand],
@@ -411,13 +411,13 @@ describe("a drafter entered by hand", () => {
 
   it("is not checked again when ICN lists it, and is left out when it can't be checked", async () => {
     const nextToModel = harness({ config: pinnedByHand, drafters: [nativeCandidate(), nativeCandidate({ category: "NextToModel", reference: hand })] })
-    await nextToModel.run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.none()))
+    await nextToModel.run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.none()).pipe(Effect.map(({ candidates }) => candidates)))
     expect(nextToModel.recorded.drafterRequests).toHaveLength(1)
     const failing = harness({
       config: pinnedByHand,
       draftersFor: ({ other }) => Option.isSome(other) ? Effect.fail({ _tag: "NotFound", message: "gone" }) : Effect.succeed(listed([nativeCandidate()])),
     })
-    const result = await failing.run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.none()))
+    const result = await failing.run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.none()).pipe(Effect.map(({ candidates }) => candidates)))
     expect(result.map(({ category }) => category)).toEqual(["CatalogDrafter"])
   })
 })
@@ -435,7 +435,7 @@ describe("a drafter entered by hand that is a listed candidate's file", () => {
       config: customModelsConfig({ drafters: { [foundId]: { _tag: "Reference", reference: catalogFile, method: { _tag: "DFlash" } } } }),
       draftersFor: resolvesToCatalog,
     })
-    const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.none()))
+    const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.none()).pipe(Effect.map(({ candidates }) => candidates)))
     expect(result.map(({ category, reference }) => [category, reference])).toEqual([["CatalogDrafter", drafterReference]])
   })
 
@@ -661,6 +661,41 @@ describe("adding models", () => {
     expect(result.config.drafters[foundId]).toEqual({ _tag: "None" })
     expect(result.config.drafters[importedId]).toBeUndefined()
     expect(recorded.started).toEqual([])
+  })
+})
+
+describe("importing a catalog model's bytes", () => {
+  const catalogModel = "minicpm5-1b:gguf:q4"
+  const catalogBytes = (path: string) => Schema.decodeUnknownSync(CandidateInspection)({
+    source: { _tag: "Local", path },
+    displayName: "Renamed",
+    versions: [{
+      label: "Q4_K_M", modelId: importedId, catalogModel, onThisComputer: catalogModel,
+      files: [{ path, sizeBytes: 1 }], sizeBytes: 1, downloadBytes: 0, recommended: true,
+    }],
+  })
+
+  // QA (linux-debian, round 3c): a link to a file holding the catalog target's bytes returned
+  // "Started" with a `local:` ID that no listing knew.
+  it("is that catalog model, already on this computer, and records nothing", async () => {
+    const config = customModelsConfig({ declarations: {}, drafters: {} })
+    const { run, recorded } = harness({ inspect: catalogBytes("/stash/link-to-renamed.gguf"), config })
+    const result = await run((commands, models) => Effect.gen(function* () {
+      const imported = yield* commands.importModelFile("/stash/link-to-renamed.gguf", { _tag: "Auto" })
+      return { imported, config: yield* models.get }
+    }))
+    expect(result.imported).toEqual({
+      modelId: catalogModel, drafter: Option.none(), outcome: "AlreadyOnThisComputer", drafterDownloadStarted: false,
+    })
+    expect(result.config.declarations).toEqual({})
+    expect(result.config.drafters).toEqual({})
+    expect(recorded.started).toEqual([])
+  })
+
+  it("refuses a drafter choice, since the catalog model keeps its own", async () => {
+    const { run } = harness({ inspect: catalogBytes("/models/copy.gguf"), config: customModelsConfig({ declarations: {} }) })
+    const failure = await run((commands) => commands.importModelFile("/models/copy.gguf", { _tag: "None" }).pipe(Effect.flip))
+    expect(failure.message).toContain(`is the catalog model ${catalogModel}`)
   })
 })
 
@@ -1078,7 +1113,7 @@ describe("drafter and download recovery", () => {
         state: { _tag: "NotInstalled" },
       })],
     })
-    const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: addedId }, Option.none()))
+    const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: addedId }, Option.none()).pipe(Effect.map(({ candidates }) => candidates)))
     expect(result.map(({ label }) => label)).toEqual(["Magnitude DFlash"])
     expect(recorded.drafterRequests.at(-1)).toMatchObject({
       _tag: "Candidate",
@@ -1355,9 +1390,7 @@ describe("catalog models found elsewhere", () => {
       return { files, hidden: (yield* models.get).hidden }
     }))
     expect(result.hidden).toEqual([alias])
-    const refusal = externalCatalogRemovalRefusal(external, Option.getOrThrow(result.files))
-    expect(refusal.message).toContain(`magnitude models hide ${external}`)
-    expect(refusal.message).not.toContain("catalog remove")
+    expect(Option.isSome(result.files)).toBe(true)
   })
 
   it("hides a catalog model whose external copy is already hidden again without change, and unhides it by its catalog ID", async () => {
@@ -1382,12 +1415,6 @@ describe("catalog models found elsewhere", () => {
     const { run } = harness({ catalogRows: [catalogRow(external, "External", systemOllama)] })
     const files = await run((commands) => commands.externalCatalogFiles(external))
     expect(files).toEqual(Option.some({ path: systemOllama, location: Option.some("Ollama") }))
-  })
-
-  it("explains that Remove never deletes files in another tool's location", () => {
-    expect(externalCatalogRemovalRefusal(external, { path: "/o/models/blob", location: Option.some("Ollama") }).message)
-      .toBe(`${external} uses files in Ollama's models folder (/o/models/blob), which Magnitude never deletes. `
-        + `Hide it with \`magnitude models hide ${external}\`, or delete it with \`ollama rm\`.`)
   })
 })
 

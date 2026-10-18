@@ -494,11 +494,11 @@ describe("pull and model mutations", () => {
     expect(renderSetDrafter({ modelId, drafter: Option.none(), drafterDownloadStarted: false })).toBe(`Turned off the drafter for ${modelId}.\n`)
     expect(renderSetDrafter({ modelId, drafter: Option.none(), drafterDownloadStarted: false }, "Auto"))
       .toBe(`No drafter is known to work with ${modelId}, so it runs without one.\n`)
-    expect(renderRemoval(modelId, Option.some({ _tag: "Imported", path: "/models/q.gguf" })))
+    expect(renderRemoval(modelId, Option.some("forget")))
       .toBe(`Forgot ${modelId}. Magnitude never deletes your file; it stays where it is.\n`)
-    expect(renderRemoval(FOUND_MODEL_ID, Option.some({ _tag: "Found", source: { _tag: "Ollama" } })))
+    expect(renderRemoval(FOUND_MODEL_ID, Option.some("hide")))
       .toContain(`Hid ${FOUND_MODEL_ID} from Magnitude. Its files are untouched.`)
-    expect(renderRemoval(ADDED_MODEL_ID, Option.some({ _tag: "Added", repository: TEST_REPOSITORY, commit: TEST_COMMIT })))
+    expect(renderRemoval(ADDED_MODEL_ID, Option.some("delete")))
       .toContain("Magnitude deleted only its own copy")
     expect(renderSetDrafter({ modelId, drafter: Option.some(makeDrafterCandidate()), drafterDownloadStarted: true }))
       .toContain(`Downloading the drafter.\nCheck progress: magnitude models status ${modelId}`)
@@ -564,7 +564,7 @@ describe("pull and model mutations", () => {
     })
     const { client, models } = fakeClient({
       inspectModelCandidate: () => Effect.succeed(makeInspection({ selectedVersion: Option.some("Q6_K_P") })),
-      listDrafterCandidates: () => Effect.succeed({ candidates: [makeDrafterCandidate(), other] }),
+      listDrafterCandidates: () => Effect.succeed({ candidates: [makeDrafterCandidate(), other], entered: Option.none() }),
       addHuggingFaceModel: () => Effect.succeed(added("Started", Option.some(other))),
     })
     const input = `${TEST_REPOSITORY}:Q6_K_P`
@@ -610,7 +610,7 @@ describe("pull and model mutations", () => {
       verdict: { _tag: "Rejected", reasons: [{ _tag: "TargetMismatch", detail: "x" }], detail: "x" },
     })
     const { client, models } = fakeClient({
-      listDrafterCandidates: () => Effect.succeed({ candidates: [rejected] }),
+      listDrafterCandidates: () => Effect.succeed({ candidates: [rejected], entered: Option.none() }),
       setModelDrafter: () => Effect.succeed({ drafter: Option.none() }),
     })
     const result = await run(setDrafter(client, FOUND_MODEL_ID, drafterArgument("z-lab/Other-DFlash/d.gguf")))
@@ -619,6 +619,22 @@ describe("pull and model mutations", () => {
       left: { message: "z-lab/Other-DFlash/d.gguf can't be used as a drafter for this model: Its drafter wasn't built for this model." },
     })
     expect(models.setModelDrafter).not.toHaveBeenCalled()
+  })
+
+  // QA (mac-m1, round 3c): the catalog drafter typed by hand as a Hugging Face file was refused
+  // ("couldn't find a drafter"), since its listed row is the catalog candidate, not an Other row.
+  it("resolves a Hugging Face reference to the listed catalog drafter it is", async () => {
+    const catalog = makeDrafterCandidate()
+    const { client, models } = fakeClient({
+      listDrafterCandidates: () => Effect.succeed({ candidates: [catalog], entered: Option.some(catalog) }),
+      setModelDrafter: () => Effect.succeed({ drafter: Option.some(catalog), drafterDownloadStarted: false }),
+    })
+    const result = await run(setDrafter(client, FOUND_MODEL_ID, drafterArgument("magnitudedev/Qwen-Test-DFlash-GGUF/Qwen-Test-DFlash-Q8_0.gguf")))
+    expect(result).toMatchObject({ _tag: "Right" })
+    expect(models.setModelDrafter).toHaveBeenCalledWith({
+      modelId: FOUND_MODEL_ID,
+      drafter: { _tag: "Reference", reference: catalog.reference },
+    })
   })
 
   it("sets a catalog drafter without a lookup", async () => {
@@ -786,7 +802,7 @@ describe("model status", () => {
     const model = makeFoundModel()
     const { client, models } = fakeClient({
       getCatalog: () => Effect.succeed(catalogState([model], [makeUnsupportedLocalModel()])),
-      listDrafterCandidates: () => Effect.succeed({ candidates: makeDrafterCandidates() }),
+      listDrafterCandidates: () => Effect.succeed({ candidates: makeDrafterCandidates(), entered: Option.none() }),
     })
     const detail = await run(readModelsStatus(client, Option.some(model.modelId), false))
     expect(models.listDrafterCandidates).toHaveBeenCalledWith({ target: { _tag: "Model", modelId: model.modelId }, other: Option.none() })

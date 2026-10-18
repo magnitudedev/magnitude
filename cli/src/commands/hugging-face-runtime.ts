@@ -406,8 +406,10 @@ const lookUpDrafter = (
 ): Effect.Effect<DrafterChoice, unknown> => client.models.listDrafterCandidates({
   target,
   other: Option.some(reference),
-}).pipe(Effect.flatMap(({ candidates }) => {
-  const found = candidates.find(({ category }) => category === "Other")
+}).pipe(Effect.flatMap(({ candidates, entered }) => {
+  // The listed candidate the reference is (the catalog drafter's own file included), else its own row.
+  const found = Option.getOrUndefined(entered)
+    ?? candidates.find(({ category }) => category === "Other")
     ?? candidates.find((candidate) => drafterReferenceMatches(reference, candidate.reference))
   if (found === undefined) {
     return Effect.fail(new ModelCommandError({ message: `Magnitude couldn't find a drafter at ${reference}.` }))

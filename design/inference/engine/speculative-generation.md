@@ -329,7 +329,11 @@ generated count and each target launch by rows, per context class and per number
 of requests sharing the launch. Nothing is forecast. A launch not yet measured
 costs at least what a smaller one measured, and at least what the same launch
 measured at a shorter context; a larger launch proves nothing about a smaller
-one. With nothing measured every width costs the same.
+one. With nothing measured every width costs the same. The machine's speed moves
+every launch alike, so each plain launch (one target row) scales every other
+measurement of its context class and request count with its mean: a launch no
+longer taken keeps its cost relative to a plain decode, not the seconds it took on
+a machine another process made busier or freer, until it is measured again.
 
 **Choice.** Expected tokens are one plus the acceptance of each verified depth;
 a round's time is its two launches. Three rules:
