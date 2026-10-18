@@ -75,6 +75,17 @@
 #define REPACK_IQ3XXS 1
 #define REPACK_GRID_BYTES 3u
 #define REPACK_GRID_FACTOR 0.25
+// Byte offset of sub-block b's u32 of signs and scale.
+#define REPACK_GRID_AUX(b) (66u + 4u * (b))
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_XXS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2XXS)
+// block_iq2_xxs: d (f16) | eight u32 pairs, one per 32 values: four 8-bit
+// grid indices of eight values, then four 7-bit sign groups and the 4-bit
+// scale. The resident entries are two bytes, the factor d / 8.
+#define REPACK_GRID 1
+#define REPACK_IQ2XXS 1
+#define REPACK_GRID_BYTES 2u
+#define REPACK_GRID_FACTOR 0.125
+#define REPACK_GRID_AUX(b) (6u + 8u * (b))
 #else
 #error "repack_weight binding is not a registered GGUF-to-resident conversion"
 #endif
@@ -216,20 +227,29 @@ uint repack_word(uint64_t gp, uint offset) {
 #if defined(REPACK_GRID)
 // Resident vector-code entry `e` (values 8e .. 8e + 7) of the source block:
 // the grid indices, then the seven signs (registry `gguf_iq2_xs`,
-// `gguf_iq3_xxs`).
+// `gguf_iq3_xxs`, `gguf_iq2_xxs`).
 uint repack_grid_entry(uint64_t gp, uint e) {
 #if defined(REPACK_IQ3XXS)
     const uint block = e / 4u, group = e % 4u;
     return repack_byte(gp, 2u + 8u * block + 2u * group) | (repack_byte(gp, 3u + 8u * block + 2u * group) << 8)
-        | (((repack_word(gp, 66u + 4u * block) >> (7u * group)) & 127u) << 16);
+        | (((repack_word(gp, REPACK_GRID_AUX(block)) >> (7u * group)) & 127u) << 16);
+#elif defined(REPACK_IQ2XXS)
+    const uint block = e / 4u, group = e % 4u;
+    return repack_byte(gp, 2u + 8u * block + group)
+        | (((repack_word(gp, REPACK_GRID_AUX(block)) >> (7u * group)) & 127u) << 8);
 #else
     return repack_byte(gp, 2u + 2u * e) | (repack_byte(gp, 3u + 2u * e) << 8);
 #endif
 }
 
-// Word `w` of entries `first .. first + 3`, packed little-endian
-// (an entry may straddle two words).
+// Word `w` of entries `first .. first + 3`, packed little-endian.
 uint repack_grid_word(uint64_t gp, uint first, uint w) {
+#if !defined(REPACK_IQ3XXS)
+    // Sixteen-bit entries (iq2xs, iq2xxs): two a word. (NVIDIA's compiler
+    // traps on iq2xxs entries through the straddling loop below.)
+    return repack_grid_entry(gp, first + 2u * w) | (repack_grid_entry(gp, first + 2u * w + 1u) << 16);
+#else
+    // Three-byte entries straddle words.
     const uint bits = 8u * REPACK_GRID_BYTES;
     uint value = 0u;
     for (uint e = (32u * w) / bits; e < 4u && e * bits < 32u * w + 32u; ++e) {
@@ -306,11 +326,11 @@ void repack_write_scales(uint64_t gp, uint64_t to) {
         }
         element_u32_put(to + 4ul * w, value);
     }
-#elif defined(REPACK_IQ3XXS)
+#elif defined(REPACK_GRID_AUX)
     // Sub-block b's scale is the top nibble of its u32, nibble b of the plane.
     uint value = 0u;
     for (uint b = 0u; b < 8u; ++b)
-        value |= (repack_byte(gp, 69u + 4u * b) >> 4) << (4u * b);
+        value |= (repack_byte(gp, REPACK_GRID_AUX(b) + 3u) >> 4) << (4u * b);
     element_u32_put(to, value);
 #elif defined(REPACK_GRID)
     element_u32_put(to, repack_word(gp, 66u));

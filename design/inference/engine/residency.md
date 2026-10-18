@@ -48,14 +48,22 @@ scale fields bit for bit: the 4-bit coded family (a codebook and one scale per 3
 `q4g32s` offset codes with f16 scales, `mxfp4g32` E2M1 with an E8M0 exponent per 32, `nvfp4g16`
 E2M1 with a UE4M3 scale per 16, beside `iq4g32`) and the 5-bit `q5g32s` (f16 scale) and `q5g32`
 (f16 scale and minimum). E2M1 −0 imports as +0, as the reference dequantization decodes it. A
-scale field that is NaN in its format (E8M0 0xff, UE4M3 0x7f) decodes as NaN. A second-level
+scale field that is NaN in its format (E8M0 0xff, UE4M3 0x7f) decodes as NaN. IQ2_XXS, IQ2_XS
+and IQ3_XXS import into vector-coded representations of their own (`iq2xxs`, `iq2xs`,
+`iq3xxs`): each eight-value entry (its grid indices and seven sign bits, the eighth of even
+parity) and each 4-bit sub-block scale code move bit for bit, and the f16 block scale becomes an
+F32 factor scaled by a power of two, exactly. A second-level
 scale (NVFP4's per-tensor or per-expert F32 `.scale`) is a separate stored tensor, not part of the
 representation: the weight's bytes import as stored, and the scale becomes resident beside it as
 one F32 value per matrix (a stored single value repeats per matrix of a stack), keyed and charged
 with the weight identically by header assessment and load. Entries apply it to their F32
 accumulator through an accumulator-scale port; no import or family folds it into another weight.
+A scaled weight's stored `.input_scale` (the activation scale of kernels that quantize their
+inputs to FP4) is checked to the scale's shape and acknowledged, never imported: activations stay
+in the activation dtype, so the product needs only the weight's scale.
 A missing or misshapen scale, a scaled weight dequantized for dense-only kernels, and a scaled
-weight bound by an entry without a scale port are refused at plan time, so the model is
+weight bound without its scale (by an entry without a scale port, or by an operator that binds
+the port absent) are refused at plan time, so the model is
 `Unsupported` rather than failing on a device.
 The canonical output projection retains its packed representation. Eligible Q4_0 and Q8_0
 sources can also provide lossless bounded-selection views, as five

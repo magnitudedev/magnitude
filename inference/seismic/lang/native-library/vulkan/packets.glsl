@@ -7,7 +7,7 @@
 // (codes 2i/2i+1 in the low/high nibble of byte i), plus its slice of the
 // high-bit plane (q5k: one u32, q6k: one uvec2), its local coefficients and
 // its super factors; a q8 packet is two 16-byte loads of int8 codes; a
-// vector-coded (iq2xs, iq3xxs) packet is its four grid entries, one a
+// vector-coded (iq2xs, iq3xxs, iq2xxs) packet is its four grid entries, one a
 // sub-step, decoded through the grid. A packet is consumed in four
 // 8-element sub-steps. Each sub-step decodes its codes as
 // exact small integers in two vec4s, `even` (elements 0,2,4,6) and `odd`
@@ -51,8 +51,10 @@
 // IQ4_NL blocks of a row whose width is not a multiple of 256 (iq4g32s): the
 // IQ4 table with one f16 scale per 32.
 #define PACKETS_IQ4S 15
+// The vector-coded IQ2_XXS kind.
+#define PACKETS_IQ2XXS 16
 // Every kind, as PROJECTION_GEMM_KINDS bits.
-#define PACKETS_ALL_KINDS 0xffff
+#define PACKETS_ALL_KINDS 0x1ffff
 
 // Coefficient groups per packet (q6k, nvfp4g16, iq2xs: one per 16 elements).
 uint packets_groups(const int kind) {
@@ -60,7 +62,9 @@ uint packets_groups(const int kind) {
 }
 
 // Vector codes through a grid.
-bool packets_grid(const int kind) { return kind == PACKETS_IQ2XS || kind == PACKETS_IQ3XXS; }
+bool packets_grid(const int kind) {
+    return kind == PACKETS_IQ2XS || kind == PACKETS_IQ3XXS || kind == PACKETS_IQ2XXS;
+}
 
 // The kind has a per-group bias term (the factored `bias * sum(x)`).
 bool packets_biased(const int kind) {
@@ -177,22 +181,28 @@ float packets_ue4m3_half(uint raw) {
     return raw == 0x7fu ? uintBitsToFloat(0x7fc00000u) : e == 0u ? float(m) * 0.0009765625 : normal;
 }
 
-// Vector codes (the registry's grid codes: iq2xs, iq3xxs). An entry of the
-// grids plane codes eight values: grid indices name their magnitudes
+// Vector codes (the registry's grid codes: iq2xs, iq3xxs, iq2xxs). An entry
+// of the grids plane codes eight values: grid indices name their magnitudes
 // (<seismic/grids.glsl>), and seven sign bits, completed by an eighth of even
-// parity, their signs. Every 16 (iq2xs) or 32 (iq3xxs) values have an odd
-// scale code 2s + 1 (a nibble of the scales plane) and every 256 one f32
-// factor: value = factor * (2s + 1) * code, every product exact.
+// parity, their signs. Every 16 (iq2xs) or 32 (iq3xxs, iq2xxs) values have
+// an odd scale code 2s + 1 (a nibble of the scales plane) and every 256 one
+// f32 factor: value = factor * (2s + 1) * code, every product exact.
 
 // Entry `step` of a packet's entries: iq2xs sixteen-bit entries (a 9-bit
-// index into the 512-point grid, then the signs), iq3xxs three-byte entries
-// (two 8-bit indices into the 256-point grid of four values, then the
-// signs). Its grid point (lanes 0..3 in x, 4..7 in y) and its sign bits.
+// index into the 512-point grid, then the signs), iq2xxs sixteen-bit entries
+// (an 8-bit index into the 256-point grid, then the signs), iq3xxs
+// three-byte entries (two 8-bit indices into the 256-point grid of four
+// values, then the signs). Its grid point (lanes 0..3 in x, 4..7 in y) and
+// its sign bits.
 void packets_grid_entry(const int kind, uvec4 entries, uint step, out uvec2 point, out uint signs) {
     if (kind == PACKETS_IQ2XS) {
         const uint entry = (entries[step >> 1] >> (16u * (step & 1u))) & 0xffffu;
         point = grids_iq2xs[entry & 511u];
         signs = entry >> 9;
+    } else if (kind == PACKETS_IQ2XXS) {
+        const uint entry = (entries[step >> 1] >> (16u * (step & 1u))) & 0xffffu;
+        point = grids_iq2xxs[entry & 255u];
+        signs = (entry >> 8) & 127u;
     } else {
         const uint word = (3u * step) >> 2, shift = (24u * step) & 31u;
         const uint spill = shift > 8u ? entries[word + 1u] << (32u - shift) : 0u;
@@ -285,13 +295,16 @@ packets_packet packets_load(const int kind, uint64_t row, packets_rows16 geometr
         packet.scale0 = seismic_f16_to_f32(uint16_t(element_u16_at(row + geometry.supers + 2ul * p)));
     } else if (packets_grid(kind)) {
         // The packet's four entries (8 or 12 bytes), its scale code field
-        // (iq2xs: a byte of two codes; iq3xxs: a nibble) and its group's
-        // factor.
+        // (iq2xs: a byte of two codes; iq3xxs, iq2xxs: a nibble) and its
+        // group's factor.
         const uint block = p >> 3, local = p & 7u;
         uint field;
         if (kind == PACKETS_IQ2XS) {
             packet.low.xy = element_uvec2_at(row + geometry.codes + 8ul * p);
             field = element_u8_at(row + geometry.scales + 8ul * block + uint64_t(local));
+        } else if (kind == PACKETS_IQ2XXS) {
+            packet.low.xy = element_uvec2_at(row + geometry.codes + 8ul * p);
+            field = (element_u8_at(row + geometry.scales + 4ul * block + uint64_t(local >> 1)) >> (4u * (local & 1u))) & 15u;
         } else {
             const uint64_t entries = row + geometry.codes + 12ul * p;
             packet.low.xyz = uvec3(element_u32_at(entries), element_u32_at(entries + 4ul), element_u32_at(entries + 8ul));

@@ -1,7 +1,6 @@
 use super::specialization::{Specializer, Tuning};
 use super::tuning::readout_choice::{
     QualifiedRecipe, ReadoutContender, ReadoutRecipe, RecipePreparation, RecipeState,
-    declared_statics,
 };
 use super::tuning::streams::{StreamMixDownTuning, StreamMixUpTuning};
 use super::tuning::{
@@ -733,93 +732,11 @@ impl<'a> Preparation<'a> {
             low_planes,
             scale_extent,
         };
-        if !recipe.admissible(device) {
-            return Ok(None);
-        }
-        let bound = seismic::NativeSpecialization::new()
-            .with_static("V", vocabulary)
-            .with_static("D", hidden)
-            .with_static("PT", parts)
-            .with_static("NM", norm_extent)
-            .with_static("P", low_planes);
-        let digest = magnitude_kernels::readout_top_rows::native_digest_with(
-            device,
-            magnitude_kernels::readout_top_rows::Elements {
-                NW: norm,
-                A: activation,
-            },
-            &bound,
-        )
-        .map_err(|error| CatalogFailure::Preparation {
-            entry: "readout_recipe",
-            bindings: format!("{scope:?}"),
-            outcome: error.to_string(),
-        })?;
-        let refine_bound =
-            declared_statics::<magnitude_kernels::readout_refine_rows::Entry>(device, &bound)?;
-        let exact_bound =
-            declared_statics::<magnitude_kernels::readout_exact_rows::Entry>(device, &bound)?;
-        let additional_digests = [
-            magnitude_kernels::readout_refine_rows::native_digest_with(
-                device,
-                magnitude_kernels::readout_refine_rows::Elements { A: activation },
-                &refine_bound,
-            ),
-            magnitude_kernels::readout_exact_rows::native_digest_with(
-                device,
-                magnitude_kernels::readout_exact_rows::Elements { A: activation },
-                &exact_bound,
-            ),
-            magnitude_kernels::readout_planes_rows::native_digest_with(
-                device,
-                magnitude_kernels::readout_planes_rows::Elements {
-                    NW: norm,
-                    A: activation,
-                },
-                &bound,
-            ),
-            if prepared {
-                magnitude_kernels::readout_project_rows::native_digest_with(
-                    device,
-                    magnitude_kernels::readout_project_rows::Elements {
-                        OW: weight,
-                        A: activation,
-                    },
-                    &seismic::NativeSpecialization::new()
-                        .with_static("V", vocabulary)
-                        .with_static("D", hidden)
-                        .with_static("S", vocabulary)
-                        .with_static("I", 0)
-                        .with_static("WS", scale_extent),
-                )
-            } else {
-                magnitude_kernels::readout_head_rows::native_digest_with(
-                    device,
-                    magnitude_kernels::readout_head_rows::Elements {
-                        NW: norm,
-                        OW: weight,
-                        A: activation,
-                    },
-                    &seismic::NativeSpecialization::new()
-                        .with_static("V", vocabulary)
-                        .with_static("D", hidden)
-                        .with_static("PT", parts)
-                        .with_static("NM", norm_extent)
-                        .with_static("WS", scale_extent),
-                )
-            },
-        ]
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| CatalogFailure::Preparation {
-            entry: "readout_recipe",
-            bindings: format!("{scope:?}"),
-            outcome: error.to_string(),
-        })?;
+        let [top, levels @ ..] = recipe.digests(device)?;
         let preparation_key = format!(
-            "readout-physical-programs/device={:?}/top={digest}/levels={:?}",
+            "readout-physical-programs/device={:?}/top={top}/levels={:?}",
             device.tuning_identity(),
-            &additional_digests[..3],
+            &levels[..3],
         );
         let preparation = self
             .recipe_states
@@ -828,7 +745,7 @@ impl<'a> Preparation<'a> {
             .entry(preparation_key)
             .or_insert_with(|| Rc::new(RefCell::new(None)))
             .clone();
-        let digest = format!("{digest}/{additional_digests:?}");
+        let digest = format!("{top}/{levels:?}");
         let norm_identity = norm_plan.map_or_else(
             || "no-norm".to_owned(),
             |plan| format!("{:?}", plan.storage_identity()),

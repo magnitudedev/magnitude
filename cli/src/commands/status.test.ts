@@ -45,7 +45,7 @@ describe("Magnitude service definitions", () => {
     const output = renderStatus({
       status, address: "127.0.0.1:11101", version: Option.none(),
       startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" },
-      owner: Option.some({ _tag: "Headless" }), reach: Option.none(), server: false, failing: Option.none(), loaded: Option.none(), elsewhere: Option.none(),
+      owner: Option.some({ _tag: "Headless", service: false }), reach: Option.none(), server: false, failing: Option.none(), loaded: Option.none(), elsewhere: Option.none(),
     })
     expect(output).toContain(`Runtime         ${status}`)
     expect(output).toContain("Owner           Headless")
@@ -118,7 +118,7 @@ describe("Magnitude service definitions", () => {
     const output = renderStatus({
       status: "Ready", address: "127.0.0.1:10100", version: Option.some("1.0.0"),
       startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Observed", model: Option.none() },
-      owner: Option.some({ _tag: "Headless" }),
+      owner: Option.some({ _tag: "Headless", service: false }),
       reach: Option.some({ endpoint: "http://127.0.0.1:10100", configPath: "/var/lib/magnitude/config.json", service: true,
         network: Option.some({ enabled: true, bind: Option.none(), port: 10100, pending: false, interfaces: [{ name: "eth0", address: "10.0.0.4", kind: "lan" }] }) }),
       server: true, failing: Option.none(), loaded: Option.none(), elsewhere: Option.none(),

@@ -2,6 +2,9 @@
 # strip, rewrite debug sections, or otherwise alter embedded native executables.
 %global __os_install_post %{nil}
 %global debug_package %{nil}
+# Bundled binaries can share build IDs with other apps, but their global links
+# would point at different application directories and conflict during install.
+%global _build_id_links none
 %define _binary_payload w2.xzdio
 
 Name: <%= name %>

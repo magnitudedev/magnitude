@@ -593,14 +593,18 @@ mod tests {
         root.canonicalize().expect("canonical fixture")
     }
 
-    /// Every backend's grid tables are the registry's points: an IQ2_XS
-    /// point as its (low, high) words, an IQ3_XXS point as one word.
+    /// Every backend's grid tables are the registry's points: an IQ2_XS or
+    /// IQ2_XXS point as its (low, high) words, an IQ3_XXS point as one word.
     #[test]
     fn native_grids_are_the_registrys() {
-        let expected = crate::grids::IQ2XS_GRID
-            .iter()
-            .flat_map(|point| [*point & 0xffff_ffff, *point >> 32])
+        let words = |points: &'static [u64]| {
+            points
+                .iter()
+                .flat_map(|point| [*point & 0xffff_ffff, *point >> 32])
+        };
+        let expected = words(&crate::grids::IQ2XS_GRID)
             .chain(crate::grids::IQ3XXS_GRID.iter().copied())
+            .chain(words(&crate::grids::IQ2XXS_GRID))
             .collect::<Vec<_>>();
         for name in ["grids.h", "grids.cuh", "grids.glsl"] {
             let (_, text) = NATIVE_LIBRARY

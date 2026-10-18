@@ -73,7 +73,10 @@ not an assumption about filesystem API calls. Installed-consumer acceptance must
 launch without sandbox-disabling test flags, verify the canonical CLI/application-menu path and
 window class, and preserve the matched application/service bytes.
 RPM packaging disables build-root rewriting of the prebuilt payload, including stripping and debug
-section extraction. Pacman packages are assembled from the staged payload with bsdtar, following
+section extraction, and disables global build-ID link generation while preserving embedded build IDs.
+Linux package validation rejects entries under `/usr/lib/.build-id`: bundled binaries must coexist
+with other applications carrying the same upstream builds without claiming shared lookup links.
+Pacman packages are assembled from the staged payload with bsdtar, following
 makepkg's archive layout, so the Ubuntu build host needs no Arch tooling; bsdtar records root
 ownership and the sandbox helper's setuid mode in both the archive and its file manifest. The desktop carries Magnitude's license alongside Electron's existing notices.
 Each DEB/RPM/pacman producer emits a schema-validated artifact record for the final copied package,

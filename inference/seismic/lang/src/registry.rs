@@ -1485,6 +1485,7 @@ pub(crate) mod internals {
             ("gguf_nvfp4", 36, 64, "nvfp4g16"),
             ("gguf_iq2_xs", 74, 256, "iq2xs"),
             ("gguf_iq3_xxs", 98, 256, "iq3xxs"),
+            ("gguf_iq2_xxs", 66, 256, "iq2xxs"),
         ];
         for (name, packet_size, logical_group, _) in external_specs {
             representations.push(RepresentationInfo {
@@ -2140,6 +2141,54 @@ pub(crate) mod internals {
                             width: 16,
                         }))),
                         exponent: -2,
+                    }]),
+                ));
+            }
+            "gguf_iq2_xxs" => {
+                // block_iq2_xxs: d (f16) | eight u32 pairs, one per 32
+                // values: four 8-bit grid indices of eight values, then four
+                // 7-bit sign groups and the 4-bit scale. Entry `e` (values
+                // 8e..8e+8 of sub-block e / 4) is
+                // `qs[8 (e / 4) + e % 4] | signs (e % 4) << 8`.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::PackedEntries(
+                        (0..32)
+                            .map(|entry| {
+                                let (block, group) = (entry / 4, entry % 4);
+                                RepackExpr::BitOr(
+                                    Box::new(RepackExpr::SourceBits {
+                                        bit: (2 + 8 * block + group) * 8,
+                                        width: 8,
+                                    }),
+                                    Box::new(RepackExpr::ShiftLeft {
+                                        value: Box::new(RepackExpr::SourceBits {
+                                            bit: (6 + 8 * block) * 8 + 7 * group,
+                                            width: 7,
+                                        }),
+                                        bits: 8,
+                                    }),
+                                )
+                            })
+                            .collect(),
+                    ),
+                ));
+                push(plane(
+                    "coefficients",
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..32)
+                            .map(|bit| (6 + 8 * (bit / 4)) * 8 + 28 + bit % 4)
+                            .collect(),
+                    ),
+                ));
+                push(plane(
+                    "scale_factor",
+                    PlaneRepackRecipe::DenseValues(vec![RepackExpr::ScaleF32 {
+                        value: Box::new(RepackExpr::F16ToF32(Box::new(RepackExpr::SourceBits {
+                            bit: 0,
+                            width: 16,
+                        }))),
+                        exponent: -3,
                     }]),
                 ));
             }
@@ -3150,7 +3199,7 @@ mod tests {
     /// plane payloads; in `rows32` a chunk is its 32 rows' 32 columns.
     #[test]
     fn grids_interleave_whole_entries_row_by_row() {
-        for (name, entry_bytes) in [("iq2xs", 2u64), ("iq3xxs", 3)] {
+        for (name, entry_bytes) in [("iq2xs", 2u64), ("iq3xxs", 3), ("iq2xxs", 2)] {
             for (layout_name, tile, chunk) in [("mma16", 16u64, 64u64), ("rows32", 32, 32)] {
                 let layout = row_layout(&format!("{name}@{layout_name}"));
                 let k = 512u64;

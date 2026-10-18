@@ -1100,6 +1100,25 @@ pub(crate) const REPRS: &[Repr] = &[
             bias_sign: 1,
         },
     },
+    // GGUF IQ2_XXS: vector codes of eight values (an 8-bit grid index and 7
+    // sign bits, in a 16-bit entry), an odd 4-bit scale `2 s + 1` per 32 and
+    // one f32 factor `d / 8` per 256: ggml's `d (0.5 + s) / 4` exactly.
+    Repr {
+        name: "iq2xxs",
+        packing_axis: PackingAxisRule::Last,
+        group: 32,
+        bits: IQ2XXS_CODES.entry_bits(),
+        code: CodeInterpretation::Grid(&IQ2XXS_CODES),
+        float_code: None,
+        coefficients: Coefficients::Hierarchical {
+            factor_group: 256,
+            factor_dtype: DType::F32,
+            bits: 4,
+            interpretation: CodeInterpretation::Table(&ODD_SCALES),
+            bias: false,
+            bias_sign: 1,
+        },
+    },
 ];
 
 pub(crate) static IQ2XS_CODES: GridCodes = GridCodes {
@@ -1114,6 +1133,13 @@ pub(crate) static IQ3XXS_CODES: GridCodes = GridCodes {
     index_bits: 8,
     entry_bits: 24,
     points: &crate::grids::IQ3XXS_GRID,
+};
+
+pub(crate) static IQ2XXS_CODES: GridCodes = GridCodes {
+    lanes: 8,
+    index_bits: 8,
+    entry_bits: 16,
+    points: &crate::grids::IQ2XXS_GRID,
 };
 
 /// The odd scale codes `2 s + 1` of a 4-bit IQ sub-block scale `s`.

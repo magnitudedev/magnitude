@@ -99,7 +99,12 @@ approaches the floor raises it here, never a per-backend constant elsewhere.
 The heap's standing reports its holdings by class, each used domain's newly observed headroom,
 and its band. Every allocation, including startup imports, optional
 components, workspace growth and numerical state slab growth, has a claim before it occurs.
-The heap exists from the opened device's first startup allocation: startup claims are heap
+The heap exists from the opened device's first startup allocation. Program preparation
+claims its planned invocation buffers plus peak qualification fixtures before forming
+any kernel, including during a Prepare request; the loaded domain inherits this same
+heap. A preparation refusal reports the normal memory-pressure or insufficient-memory
+outcome rather than an internal kernel error. The load diagnostics include the enforced
+device limit and refused peak demand alongside its charges. Startup claims are heap
 claims, each held through its allocation, and the loaded domain inherits the same heap, so no
 separate preclaim check or capacity table decides beside it. A refused startup claim fails the
 load, naming the domain that refused it (the allocation domain, or host RAM for a dedicated
@@ -323,6 +328,12 @@ distress, and a dedicated device's own memory has none.
 Process limits are the visible ones. Inside a container the container's own cgroup limit is
 visible while cgroups above it may be hidden; hidden ancestors bound nothing beyond host headroom,
 so a contained process plans and claims against its own limit and host headroom.
+Linux cgroup usage includes file cache: live headroom credits clean inactive file
+pages that the kernel can reclaim within that cgroup. Raw usage remains observable;
+anonymous memory, active cache, dirty/writeback pages and unknown reclaimability
+receive no credit. Ancestor observations use hierarchical counters. Process address
+space, data-segment and Windows commit limits receive no physical-cache credit.
+Host availability and every applicable limit still bound claims, with the same reserves.
 
 An unavailable required observation is Blind: residency and growth wait on memory
 immediately, and a continuous second of Blind is treated as Reclaim. If Reclaim persists for one

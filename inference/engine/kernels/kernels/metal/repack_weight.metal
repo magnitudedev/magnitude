@@ -93,6 +93,17 @@
 #define REPACK_IQ3XXS 1
 #define REPACK_GRID_FACTOR 0.25f
 #define REPACK_CODE_BITS 3u
+// Byte offset of sub-block b's u32 of signs and scale.
+#define REPACK_GRID_AUX(b) (66u + 4u * (b))
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_XXS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2XXS)
+// block_iq2_xxs: d (f16) | eight u32 pairs, one per 32 values: four 8-bit
+// grid indices of eight values, then four 7-bit sign groups and the 4-bit
+// scale. The resident factor is d / 8.
+#define REPACK_GRID 1
+#define REPACK_IQ2XXS 1
+#define REPACK_GRID_FACTOR 0.125f
+#define REPACK_CODE_BITS 2u
+#define REPACK_GRID_AUX(b) (6u + 8u * (b))
 #else
 #error "repack_weight binding is not a registered GGUF-to-resident conversion"
 #endif
@@ -176,14 +187,17 @@ constant uint iq3s_grid[512] = {
 #if defined(REPACK_GRID)
 // Resident vector-code entry `e` (values 8e .. 8e + 7) of a source block: the
 // grid indices, then the seven signs (registry `gguf_iq2_xs`,
-// `gguf_iq3_xxs`).
+// `gguf_iq3_xxs`, `gguf_iq2_xxs`).
 inline uint grid_entry(device const uchar *in, uint e) {
+#if defined(REPACK_GRID_AUX)
+    uint block = e / 4, group = e % 4, aux = REPACK_GRID_AUX(block);
+    uint signs = uint(in[aux]) | (uint(in[aux + 1]) << 8) | (uint(in[aux + 2]) << 16) | (uint(in[aux + 3]) << 24);
+#endif
 #if defined(REPACK_IQ3XXS)
-    uint block = e / 4, group = e % 4;
-    uint signs = uint(in[66 + 4 * block]) | (uint(in[67 + 4 * block]) << 8) | (uint(in[68 + 4 * block]) << 16) |
-                 (uint(in[69 + 4 * block]) << 24);
     return uint(in[2 + 8 * block + 2 * group]) | (uint(in[3 + 8 * block + 2 * group]) << 8) |
            (((signs >> (7 * group)) & 127u) << 16);
+#elif defined(REPACK_IQ2XXS)
+    return uint(in[2 + 8 * block + group]) | (((signs >> (7 * group)) & 127u) << 8);
 #else
     return uint(in[2 + 2 * e]) | (uint(in[3 + 2 * e]) << 8);
 #endif
@@ -298,9 +312,10 @@ inline void write_scales(device const uchar *in, device uchar *out) {
 #elif defined(REPACK_IQ3S)
     // Both halves of 32-value sub-block b take 1 + 2 s, s its four-bit scale.
     for (uint j = 0; j < 16; ++j) out[j] = uchar(1u + 2u * ((uint(in[106 + j / 4]) >> (4 * (j / 2 % 2))) & 15u));
-#elif defined(REPACK_IQ3XXS)
+#elif defined(REPACK_GRID_AUX)
     // Sub-block b's scale is the top nibble of its u32, nibble b of the plane.
-    for (uint j = 0; j < 4; ++j) out[j] = uchar((in[69 + 8 * j] >> 4) | (in[73 + 8 * j] & 0xf0u));
+    for (uint j = 0; j < 4; ++j)
+        out[j] = uchar((in[REPACK_GRID_AUX(2 * j) + 3] >> 4) | (in[REPACK_GRID_AUX(2 * j + 1) + 3] & 0xf0u));
 #elif defined(REPACK_GRID)
     for (uint j = 0; j < 8; ++j) out[j] = in[66 + j];
 #endif

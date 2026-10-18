@@ -900,20 +900,20 @@ typedef Coded4<E2M1Codes, E8M0Scale, false, true> MXFP4;
 typedef Coded4<E2M1Codes, UE4M3Scale, false, true> NVFP4;
 
 // ---------------------------------------------------------------------------
-// Vector-coded weights (the registry's grid codes: iq2xs, iq3xxs). An entry
-// of the grids plane codes eight values: grid indices name their magnitudes
-// (<seismic/grids.cuh>), and seven sign bits, completed by an eighth of even
-// parity, their signs. Entries cannot be split across fragment lanes, so a
+// Vector-coded weights (the registry's grid codes: iq2xs, iq3xxs, iq2xxs). An
+// entry of the grids plane codes eight values: grid indices name their
+// magnitudes (<seismic/grids.cuh>), and seven sign bits, completed by an
+// eighth of even parity, their signs. Entries cannot be split across fragment lanes, so a
 // tile's grids plane is [k-block][row][k-block bytes] (registry
 // `PackedRowLayout::code_bit`): lane (g, t) reads the k-block bytes of rows
 // g and g + 8 whole (the four lanes of a row share each load) and forms its
 // slots of step s from lanes 2t, 2t + 1 of entries 2s (k 2t, 2t + 1) and
 // 2s + 1 (k 2t + 8, 2t + 9). From the slots on every path is q8's: the
 // codes are s8 (magnitudes up to 62), exact 16-bit operands and s8
-// fragments. Every 16 (iq2xs) or 32 (iq3xxs) values have an odd scale code
-// 2s + 1 (a nibble of the scales plane) and every 256 one f32 factor: value
-// = factor * (2s + 1) * code, exact in F32. Rows hold whole 256-value
-// groups.
+// fragments. Every 16 (iq2xs) or 32 (iq3xxs, iq2xxs) values have an odd
+// scale code 2s + 1 (a nibble of the scales plane) and every 256 one f32
+// factor: value = factor * (2s + 1) * code, exact in F32. Rows hold whole
+// 256-value groups.
 
 // The eight lane sign bits of an entry's seven: the eighth makes the count
 // of set bits even.
@@ -944,6 +944,12 @@ struct Iq2XsGrid {
         return seismic_ld_nc_u32(reinterpret_cast<const u32 *>(grids::iq2xs) + 2 * (entry & 511u) + t / 2) >>
                (16 * (t % 2));
     }
+    // Entry e whole: its eight magnitudes (lanes 0..3 in x) and eight signs.
+    __device__ static __forceinline__ uint2 point(const u32 (&w)[WORDS], int e, u32 &signs) {
+        const u32 entry = (w[e / 2] >> (16 * (e % 2))) & 0xFFFFu;
+        signs = grid_signs(entry >> 9);
+        return seismic_ld_nc_v2(grids::iq2xs + (entry & 511u));
+    }
 };
 
 // iq3xxs: three-byte entries (two 8-bit indices into the 256-point grid of
@@ -972,6 +978,39 @@ struct Iq3XxsGrid {
         const u32 entry = ((w[word] >> shift) | spill) & 0xFFFFFFu;
         signs = grid_signs((entry >> 16) & 127u) >> (2 * t);
         return seismic_ld_nc_u32(grids::iq3xxs + ((entry >> (8 * (t / 2))) & 255u)) >> (16 * (t % 2));
+    }
+    __device__ static __forceinline__ uint2 point(const u32 (&w)[WORDS], int e, u32 &signs) {
+        const int word = 3 * e / 4, shift = 8 * (3 * e % 4);
+        const u32 spill = shift > 8 ? w[word + 1] << (32 - shift) : 0u;
+        const u32 entry = ((w[word] >> shift) | spill) & 0xFFFFFFu;
+        signs = grid_signs((entry >> 16) & 127u);
+        return make_uint2(seismic_ld_nc_u32(grids::iq3xxs + (entry & 255u)),
+                          seismic_ld_nc_u32(grids::iq3xxs + ((entry >> 8) & 255u)));
+    }
+};
+
+// iq2xxs: sixteen-bit entries (an 8-bit index into the 256-point grid, then
+// the signs); a scale per 32 values.
+struct Iq2XxsGrid {
+    static constexpr int WORDS = 4;
+    static constexpr int GROUP = 32;
+    static constexpr int SCALE_WORDS = 1;
+    __device__ static __forceinline__ void load(const u8 *global, u32 (&w)[WORDS]) {
+        Iq2XsGrid::load(global, w);
+    }
+    __device__ static __forceinline__ void load_shared(const u8 *shared, u32 (&w)[WORDS]) {
+        Iq2XsGrid::load_shared(shared, w);
+    }
+    __device__ static __forceinline__ u32 lanes(const u32 (&w)[WORDS], int e, u32 t, u32 &signs) {
+        const u32 entry = (w[e / 2] >> (16 * (e % 2))) & 0xFFFFu;
+        signs = grid_signs((entry >> 8) & 127u) >> (2 * t);
+        return seismic_ld_nc_u32(reinterpret_cast<const u32 *>(grids::iq2xxs) + 2 * (entry & 255u) + t / 2) >>
+               (16 * (t % 2));
+    }
+    __device__ static __forceinline__ uint2 point(const u32 (&w)[WORDS], int e, u32 &signs) {
+        const u32 entry = (w[e / 2] >> (16 * (e % 2))) & 0xFFFFu;
+        signs = grid_signs((entry >> 8) & 127u);
+        return seismic_ld_nc_v2(grids::iq2xxs + (entry & 255u));
     }
 };
 
@@ -1528,6 +1567,9 @@ namespace packets { typedef IQ2XS W0; }
 #elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_IQ3XXS)
 namespace packets { typedef IQ3XXS W0; }
 #define KERNEL_W0_AT(pointer) PACKETS_MAKE_GRID(IQ3XXS, KERNEL_W0, pointer)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_IQ2XXS)
+namespace packets { typedef IQ2XXS W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_GRID(IQ2XXS, KERNEL_W0, pointer)
 #else
 #error "KERNEL_W0: unsupported weight representation"
 #endif
@@ -1583,6 +1625,9 @@ namespace packets { typedef IQ2XS W1; }
 #elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_IQ3XXS)
 namespace packets { typedef IQ3XXS W1; }
 #define KERNEL_W1_AT(pointer) PACKETS_MAKE_GRID(IQ3XXS, KERNEL_W1, pointer)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_IQ2XXS)
+namespace packets { typedef IQ2XXS W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_GRID(IQ2XXS, KERNEL_W1, pointer)
 #else
 #error "KERNEL_W1: unsupported weight representation"
 #endif
@@ -1638,6 +1683,9 @@ namespace packets { typedef IQ2XS W2; }
 #elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_IQ3XXS)
 namespace packets { typedef IQ3XXS W2; }
 #define KERNEL_W2_AT(pointer) PACKETS_MAKE_GRID(IQ3XXS, KERNEL_W2, pointer)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_IQ2XXS)
+namespace packets { typedef IQ2XXS W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_GRID(IQ2XXS, KERNEL_W2, pointer)
 #else
 #error "KERNEL_W2: unsupported weight representation"
 #endif
@@ -1693,6 +1741,9 @@ namespace packets { typedef IQ2XS W3; }
 #elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_IQ3XXS)
 namespace packets { typedef IQ3XXS W3; }
 #define KERNEL_W3_AT(pointer) PACKETS_MAKE_GRID(IQ3XXS, KERNEL_W3, pointer)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_IQ2XXS)
+namespace packets { typedef IQ2XXS W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_GRID(IQ2XXS, KERNEL_W3, pointer)
 #else
 #error "KERNEL_W3: unsupported weight representation"
 #endif

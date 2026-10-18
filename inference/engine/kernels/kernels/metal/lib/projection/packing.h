@@ -427,24 +427,51 @@ constant ushort packing_iq4_pairs[256] = {
     0xf101, 0xf118, 0xf12d, 0xf13f, 0xf14f, 0xf15d, 0xf16a, 0xf176, 0xf181, 0xf18d, 0xf199, 0xf1a6,
     0xf1b5, 0xf1c5, 0xf1d9, 0xf1f1,
 };
+// The codes of an IQ4 table format (iq4g32, iq4g32s): the table's values +
+// 128, eight bits each.
+template <typename W>
+struct packing_iq4_codes {
+    typedef uint place;
+    typedef packing_bytes::words words;
+    static place at(thread const Weights<W> &w, uint n, uint x) {
+        return w.codes_at(n, 16u, 0u) + (x >> 1) * 4u;
+    }
+    // A row tile's rows of one block are adjacent: 16 bytes a row. The
+    // lane's four bytes of codes become its eight values.
+    static words load(thread const Weights<W> &w, place at, uint g) {
+        const uint codes = *reinterpret_cast<device const uint *>(w.base + at + g * 16u * w.layout.tile);
+        return uint2(uint(packing_iq4_pairs[codes & 0xffu]) | (uint(packing_iq4_pairs[(codes >> 8) & 0xffu]) << 16),
+            uint(packing_iq4_pairs[(codes >> 16) & 0xffu]) | (uint(packing_iq4_pairs[codes >> 24]) << 16));
+    }
+};
 template <>
 struct packing_codes<packets::IQ4> {
     static constant constexpr bool available = packing_forms;
     static constant constexpr uint centre = 128, folds = 1, residue = 1;
     static constant constexpr bool biased = false;
     typedef packing_iq4_factors factors;
-    typedef uint place;
-    typedef packing_bytes::words words;
-    static place at(thread const Weights<packets::IQ4> &w, uint n, uint x) {
-        return w.codes_at(n, 16u, 0u) + (x >> 1) * 4u;
-    }
-    // A row tile's rows of one block are adjacent: 16 bytes a row. The
-    // lane's four bytes of codes become its eight values.
-    static words load(thread const Weights<packets::IQ4> &w, place at, uint g) {
-        const uint codes = *reinterpret_cast<device const uint *>(w.base + at + g * 16u * w.layout.tile);
-        return uint2(uint(packing_iq4_pairs[codes & 0xffu]) | (uint(packing_iq4_pairs[(codes >> 8) & 0xffu]) << 16),
-            uint(packing_iq4_pairs[(codes >> 16) & 0xffu]) | (uint(packing_iq4_pairs[codes >> 24]) << 16));
-    }
+    typedef packing_iq4_codes<packets::IQ4> codes;
+    typedef codes::place place;
+    typedef codes::words words;
+    static place at(thread const Weights<packets::IQ4> &w, uint n, uint x) { return codes::at(w, n, x); }
+    static words load(thread const Weights<packets::IQ4> &w, place at, uint g) { return codes::load(w, at, g); }
+    static half2 step(words codes, uint s) { return packing_bytes::step(codes, s); }
+    template <uint RESIDUE>
+    static uint2 planes(words codes, uint x) { return packing_bytes::planes<RESIDUE>(codes, x); }
+};
+// iq4g32s: iq4g32's codes under q4g32s's F16 scale per 32 columns, whose
+// factors bound the table's values as iq4g32's do.
+template <>
+struct packing_codes<packets::IQ4G32S> {
+    static constant constexpr bool available = packing_forms;
+    static constant constexpr uint centre = 128, folds = 1, residue = 1;
+    static constant constexpr bool biased = false;
+    typedef packing_g32s_factors factors;
+    typedef packing_iq4_codes<packets::IQ4G32S> codes;
+    typedef codes::place place;
+    typedef codes::words words;
+    static place at(thread const Weights<packets::IQ4G32S> &w, uint n, uint x) { return codes::at(w, n, x); }
+    static words load(thread const Weights<packets::IQ4G32S> &w, place at, uint g) { return codes::load(w, at, g); }
     static half2 step(words codes, uint s) { return packing_bytes::step(codes, s); }
     template <uint RESIDUE>
     static uint2 planes(words codes, uint x) { return packing_bytes::planes<RESIDUE>(codes, x); }

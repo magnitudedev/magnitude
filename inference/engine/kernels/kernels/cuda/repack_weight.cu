@@ -81,6 +81,13 @@
 #define REPACK_IQ3XXS 1
 #define REPACK_GRID_FACTOR 0.25f
 #define REPACK_CODE_BITS 3u
+#define REPACK_GRID_AUX(b) (66u + 4u * (b))
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_XXS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2XXS)
+#define REPACK_GRID 1
+#define REPACK_IQ2XXS 1
+#define REPACK_GRID_FACTOR 0.125f
+#define REPACK_CODE_BITS 2u
+#define REPACK_GRID_AUX(b) (6u + 8u * (b))
 #else
 #error "repack_weight binding is not a registered GGUF-to-resident conversion"
 #endif
@@ -168,12 +175,15 @@ __constant__ u32 iq3s_grid[512] = {
 #if defined(REPACK_GRID)
 // Resident vector-code entry `e` of a source block (`metal/repack_weight.metal`).
 __device__ __forceinline__ u32 grid_entry(const u8 *in, u32 e) {
+#if defined(REPACK_GRID_AUX)
+    const u32 block = e / 4, group = e % 4, aux = REPACK_GRID_AUX(block);
+    const u32 signs = (u32)in[aux] | ((u32)in[aux + 1] << 8) | ((u32)in[aux + 2] << 16) | ((u32)in[aux + 3] << 24);
+#endif
 #if defined(REPACK_IQ3XXS)
-    const u32 block = e / 4, group = e % 4;
-    const u32 signs = (u32)in[66 + 4 * block] | ((u32)in[67 + 4 * block] << 8) | ((u32)in[68 + 4 * block] << 16) |
-                      ((u32)in[69 + 4 * block] << 24);
     return (u32)in[2 + 8 * block + 2 * group] | ((u32)in[3 + 8 * block + 2 * group] << 8) |
            (((signs >> (7 * group)) & 127u) << 16);
+#elif defined(REPACK_IQ2XXS)
+    return (u32)in[2 + 8 * block + group] | (((signs >> (7 * group)) & 127u) << 8);
 #else
     return (u32)in[2 + 2 * e] | ((u32)in[3 + 2 * e] << 8);
 #endif
@@ -277,9 +287,10 @@ __device__ __forceinline__ void write_scales(const u8 *in, u8 *out) {
 #elif defined(REPACK_IQ3S)
     // Both halves of 32-value sub-block b take 1 + 2 s, s its four-bit scale.
     for (u32 j = 0; j < 16; ++j) out[j] = (u8)(1u + 2u * ((in[106 + j / 4] >> (4 * (j / 2 % 2))) & 15u));
-#elif defined(REPACK_IQ3XXS)
+#elif defined(REPACK_GRID_AUX)
     // Sub-block b's scale is the top nibble of its u32, nibble b of the plane.
-    for (u32 j = 0; j < 4; ++j) out[j] = (u8)((in[69 + 8 * j] >> 4) | (in[73 + 8 * j] & 0xf0u));
+    for (u32 j = 0; j < 4; ++j)
+        out[j] = (u8)((in[REPACK_GRID_AUX(2 * j) + 3] >> 4) | (in[REPACK_GRID_AUX(2 * j + 1) + 3] & 0xf0u));
 #elif defined(REPACK_GRID)
     for (u32 j = 0; j < 8; ++j) out[j] = in[66 + j];
 #endif

@@ -1269,7 +1269,7 @@ impl Format for Q8 {
 }
 
 /// A vector-coded representation (the GGUF IQ grids: registry `iq2xs`,
-/// `iq3xxs`). Per storage group of 256 values: 32 entries, each coding eight
+/// `iq3xxs`, `iq2xxs`). Per storage group of 256 values: 32 entries, each coding eight
 /// values through a grid (`GridSpec::codes`), one 4-bit scale code `s` per
 /// `GridSpec::GROUP` values, and one f32 factor. A value is
 /// `(factor * (2 s + 1)) * code`, the scale and the value each rounded once
@@ -1350,6 +1350,30 @@ impl GridSpec for Iq3XxsGrid {
             let high = crate::grids::IQ3XXS_GRID[usize::from(packet[3 * e + 1])];
             let point = low | (high << 32);
             let signs = u32::from(packet[3 * e + 2] & 127);
+            codes[8 * e..8 * e + 8].copy_from_slice(&grid_codes(point, signs));
+        }
+        codes
+    }
+}
+
+/// Registry `iq2xxs`: sixteen-bit entries (an 8-bit index into the 256-point
+/// grid, then 7 sign bits), a scale per 32 values.
+#[derive(Clone, Copy, Debug)]
+pub struct Iq2XxsGrid;
+
+impl GridSpec for Iq2XxsGrid {
+    const NAME: &'static str = "iq2xxs@rows16";
+    const ROWS8_NAME: &'static str = "iq2xxs@rows8";
+    const ENTRY_BYTES: usize = 64;
+    const GROUP: usize = 32;
+
+    #[inline(always)]
+    fn codes(entries: &[u8], local: usize) -> [i8; PACKET] {
+        let mut codes = [0i8; PACKET];
+        for e in 0..4 {
+            let at = 2 * (4 * local + e);
+            let point = crate::grids::IQ2XXS_GRID[usize::from(entries[at])];
+            let signs = u32::from(entries[at + 1] & 127);
             codes[8 * e..8 * e + 8].copy_from_slice(&grid_codes(point, signs));
         }
         codes
@@ -1459,9 +1483,10 @@ impl<G: GridSpec> Rows8Format for Grid<G> {
     const ROWS8_NAME: &'static str = G::ROWS8_NAME;
 }
 
-/// The two vector-coded formats.
+/// The vector-coded formats.
 pub type Iq2Xs = Grid<Iq2XsGrid>;
 pub type Iq3Xxs = Grid<Iq3XxsGrid>;
+pub type Iq2Xxs = Grid<Iq2XxsGrid>;
 
 /// A 4-bit coded representation (the `c4g{16,32}` family): a 4-bit code
 /// names one of sixteen exact integer values, and every `GROUP` values share

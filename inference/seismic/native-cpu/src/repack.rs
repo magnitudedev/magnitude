@@ -10,7 +10,8 @@
 
 use crate::element::f16_to_f32;
 use crate::weights::{
-    Format, Iq2Xs, Iq3Xxs, Iq4, Iq4S, Mxfp4, Nvfp4, Q4G32, Q4K, Q5G32, Q5K, Q6K, Q8, RowGeometry,
+    Format, Iq2Xs, Iq2Xxs, Iq3Xxs, Iq4, Iq4S, Mxfp4, Nvfp4, Q4G32, Q4K, Q5G32, Q5K, Q6K, Q8,
+    RowGeometry,
 };
 use std::marker::PhantomData;
 
@@ -314,6 +315,43 @@ impl Conversion for GgufIq3Xxs {
     fn supers(packet: &[u8], out: &mut [u8]) {
         let d = f16_to_f32(u16::from_le_bytes([packet[0], packet[1]]));
         out.copy_from_slice(&(d * 0.25).to_le_bytes());
+    }
+}
+
+/// GGUF iq2_xxs into iq2xxs: entry `e` (values `8 e ..`) is its sub-block's
+/// grid index `e % 4` and sign group `e % 4`, a sixteen-bit entry; each
+/// sub-block's 4-bit scale code moves; the f16 `d` becomes the f32 factor
+/// `d / 8`, exactly.
+struct GgufIq2Xxs;
+
+impl Conversion for GgufIq2Xxs {
+    const SOURCE: &'static str = "gguf_iq2_xxs";
+    type Target = Iq2Xxs;
+    const PACKET_BYTES: usize = 66;
+    const GROUP: usize = 256;
+    const BITS: u32 = 0;
+    const GRID_BYTES: usize = 64;
+    const SCALE_BYTES: usize = 4;
+    const SUPER_BYTES: usize = 4;
+
+    fn grids(packet: &[u8], out: &mut [u8]) {
+        for (entry, out) in out.chunks_exact_mut(2).enumerate() {
+            let (block, group) = (entry / 4, entry % 4);
+            let word = u32::from_le_bytes(packet[6 + 8 * block..10 + 8 * block].try_into().unwrap());
+            out[0] = packet[2 + 8 * block + group];
+            out[1] = ((word >> (7 * group)) & 127) as u8;
+        }
+    }
+    fn scales(packet: &[u8], out: &mut [u8]) {
+        out.fill(0);
+        for block in 0..8 {
+            let scale = packet[9 + 8 * block] >> 4;
+            out[block / 2] |= scale << (4 * (block % 2));
+        }
+    }
+    fn supers(packet: &[u8], out: &mut [u8]) {
+        let d = f16_to_f32(u16::from_le_bytes([packet[0], packet[1]]));
+        out.copy_from_slice(&(d * 0.125).to_le_bytes());
     }
 }
 
@@ -629,13 +667,15 @@ const fn conversion<C: Conversion>(
     }
 }
 
-static CONVERSIONS: [RowConversion; 32] = [
+static CONVERSIONS: [RowConversion; 34] = [
     conversion::<GgufIq4NlBlock>("iq4g32s@rows16", false, &[16, 2]),
     conversion::<GgufIq4NlBlock>("iq4g32s@rows8", true, &[16, 2]),
     conversion::<GgufIq2Xs>("iq2xs@rows16", false, &[64, 8, 4]),
     conversion::<GgufIq3Xxs>("iq3xxs@rows16", false, &[96, 4, 4]),
+    conversion::<GgufIq2Xxs>("iq2xxs@rows16", false, &[64, 4, 4]),
     conversion::<GgufIq2Xs>("iq2xs@rows8", true, &[64, 8, 4]),
     conversion::<GgufIq3Xxs>("iq3xxs@rows8", true, &[96, 4, 4]),
+    conversion::<GgufIq2Xxs>("iq2xxs@rows8", true, &[64, 4, 4]),
     conversion::<GgufQ4_0>("q4g32s@rows16", false, &[16, 2]),
     conversion::<GgufQ5<false>>("q5g32s@rows16", false, &[16, 4, 2]),
     conversion::<GgufQ5<true>>("q5g32@rows16", false, &[16, 4, 4]),

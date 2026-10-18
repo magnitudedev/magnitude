@@ -870,6 +870,8 @@ void projection_gemm_load_b(int kind, const uint threads, projection_weights w, 
         projection_gemm_load_b_of(PACKETS_IQ2XS, threads, w, first, count, rows, k0, k, regs);
     else if (projection_gemm_kind_is(kind, PACKETS_IQ3XXS))
         projection_gemm_load_b_of(PACKETS_IQ3XXS, threads, w, first, count, rows, k0, k, regs);
+    else if (projection_gemm_kind_is(kind, PACKETS_IQ2XXS))
+        projection_gemm_load_b_of(PACKETS_IQ2XXS, threads, w, first, count, rows, k0, k, regs);
     else if (projection_gemm_kind_is(kind, PACKETS_BF16))
         projection_gemm_load_b_of(PACKETS_BF16, threads, w, first, count, rows, k0, k, regs);
     else if (projection_gemm_kind_is(kind, PACKETS_F16))
@@ -906,6 +908,8 @@ void projection_gemm_store_b(int kind, const uint threads, projection_gemm_b reg
         projection_gemm_store_b_of(PACKETS_IQ2XS, threads, regs, count, tile_row0, spacing, b_word);
     else if (projection_gemm_kind_is(kind, PACKETS_IQ3XXS))
         projection_gemm_store_b_of(PACKETS_IQ3XXS, threads, regs, count, tile_row0, spacing, b_word);
+    else if (projection_gemm_kind_is(kind, PACKETS_IQ2XXS))
+        projection_gemm_store_b_of(PACKETS_IQ2XXS, threads, regs, count, tile_row0, spacing, b_word);
     else if (projection_gemm_kind_is(kind, PACKETS_BF16))
         projection_gemm_store_b_of(PACKETS_BF16, threads, regs, count, tile_row0, spacing, b_word);
     else if (projection_gemm_kind_is(kind, PACKETS_F16))

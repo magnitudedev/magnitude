@@ -310,6 +310,20 @@ fn domain_statics(
     }
 }
 
+/// [`domain_statics`] of `E` on `device`'s backend: a call site that drives
+/// several entries from one set of `values` gives each only what it declares.
+pub(crate) fn entry_statics<E: Entry>(
+    device: &Device,
+    bindings: &str,
+    values: &[(&str, u64)],
+) -> Result<NativeSpecialization, CatalogFailure> {
+    let implementation =
+        seismic::generated::native_implementation_for_backend::<E>(device.backend())
+            .map_err(|error| failure(E::NAME, bindings, error.to_string()))?
+            .ok_or_else(|| failure(E::NAME, bindings, "native implementation absent".into()))?;
+    domain_statics(&implementation, E::NAME, bindings, values)
+}
+
 impl<'a> Specializer<'a> {
     pub fn new(device: &'a Device) -> Self {
         Self {

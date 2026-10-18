@@ -166,7 +166,7 @@ fn prepare_only(
         .and_then(|package| {
             let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
             crate::execution::search(
-                &catalog,
+                Rc::new(catalog),
                 &manifest,
                 &package,
                 Rc::new(move |progress| {

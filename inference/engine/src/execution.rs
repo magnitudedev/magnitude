@@ -92,6 +92,7 @@ pub fn build_native_domain(
 /// draft and the attested programs, prepared from the kernel cache's stored
 /// tuning records.
 pub(crate) struct PreparedPrograms {
+    startup: StartupClaims,
     pub draft: ExecutionPlanDraft,
     pub opened: OpenedPlatform,
     pub programs: AttestedPrograms,
@@ -108,6 +109,7 @@ pub(crate) struct PreparedPrograms {
 /// A manifest's model planned on its selected and opened device: where a
 /// search and a load both start, so both derive the same tuning keys.
 struct PlannedModel {
+    startup: StartupClaims,
     draft: ExecutionPlanDraft,
     opened: OpenedPlatform,
     backend: BackendName,
@@ -119,7 +121,7 @@ struct PlannedModel {
 
 /// Select and open the manifest's device and plan the model on it.
 fn plan_on_device(
-    catalog: &DeviceCatalog,
+    catalog: Rc<DeviceCatalog>,
     manifest: &ExecutionManifest,
     package: &Package,
     progress: &dyn Fn(LoadProgress),
@@ -136,7 +138,7 @@ fn plan_on_device(
     // exact selector from the host is re-resolved here; a missing or
     // ambiguous match is refused, never substituted.
     let reserves = manifest.reserves;
-    let selected = platform::select_device(catalog, manifest.path, manifest.device, &reserves)
+    let selected = platform::select_device(&catalog, manifest.path, manifest.device, &reserves)
         .map_err(platform_error)?;
     let backend = selected.info.backend;
     let topology = catalog.topology();
@@ -169,7 +171,7 @@ fn plan_on_device(
         .map_err(|error| internal(error.to_string()))?;
     report_load_phase("device selection and planning", &mut phase_started);
     let opened = platform::open_selected(
-        catalog,
+        &catalog,
         draft.device().selector(),
         PlatformConfig {
             path: manifest.path,
@@ -189,7 +191,24 @@ fn plan_on_device(
         .unwrap_or_else(magnitude_executor::NumericalProfile::standard)
         .resolve()
         .map_err(internal)?;
+    let mut startup = StartupClaims {
+        heap: DeviceHeap::open(catalog, reserves, Rc::new(opened.device().clone()))
+            .map_err(|error| platform_error(PlatformError::Memory(error)))?,
+        allocation_domain: MemoryDomain::of(opened.selector(), pool),
+        held: None,
+    };
+    // Preparation allocates fixed invocation buffers and runs qualification
+    // fixtures before any model weights are imported. It is part of startup,
+    // so it must claim its peak through the same heap as later allocations.
+    let workspace = AttestedPrograms::planned_invocation_workspace_bytes(draft.programs(), backend)
+        .map_err(|error| internal(format!("program preparation workspace: {error:?}")))?;
+    let qualification = AttestedPrograms::qualification_peak_bytes(draft.load()).map_err(internal)?;
+    let preparation_peak = workspace
+        .checked_add(qualification)
+        .ok_or_else(|| internal("program preparation peak byte count overflows"))?;
+    startup.claim("program preparation", preparation_peak, 0)?;
     Ok(PlannedModel {
+        startup,
         draft,
         opened,
         backend,
@@ -225,12 +244,13 @@ fn tuning_report(
 /// unit's record as it stands. Nothing is prepared for serving and the model
 /// is not imported: the process ends here, and a load reads the records.
 pub(crate) fn search(
-    catalog: &DeviceCatalog,
+    catalog: Rc<DeviceCatalog>,
     manifest: &ExecutionManifest,
     package: &Package,
     progress: Rc<dyn Fn(LoadProgress)>,
 ) -> Result<(), LoadError> {
     let PlannedModel {
+        startup: _startup,
         draft,
         opened,
         kernel_cache,
@@ -348,7 +368,7 @@ pub enum LoadAttempt<L> {
 /// stops unprepared or prepares the unit at its canonical default, as
 /// `unprepared` says.
 fn prepare(
-    catalog: &DeviceCatalog,
+    catalog: Rc<DeviceCatalog>,
     manifest: &ExecutionManifest,
     package: &Package,
     unprepared: UnpreparedUnits,
@@ -368,6 +388,7 @@ fn prepare(
         }
     }
     let PlannedModel {
+        startup,
         draft,
         opened,
         backend,
@@ -431,6 +452,7 @@ fn prepare(
     );
     report_load_memory("programs prepared", opened.device());
     Ok(LoadAttempt::Loaded(PreparedPrograms {
+        startup,
         draft,
         opened,
         programs,
@@ -451,7 +473,9 @@ pub(crate) fn build(
     unprepared: UnpreparedUnits,
     progress: Rc<dyn Fn(LoadProgress)>,
 ) -> Result<LoadAttempt<NativeDomain>, LoadError> {
+    let catalog = Rc::new(catalog);
     let PreparedPrograms {
+        mut startup,
         draft,
         opened,
         mut programs,
@@ -459,7 +483,7 @@ pub(crate) fn build(
         pool,
         capacity,
         workers,
-    } = match prepare(&catalog, manifest, &package, unprepared, progress.clone())? {
+    } = match prepare(catalog.clone(), manifest, &package, unprepared, progress.clone())? {
         LoadAttempt::Loaded(prepared) => prepared,
         LoadAttempt::Unprepared => return Ok(LoadAttempt::Unprepared),
     };
@@ -620,13 +644,6 @@ pub(crate) fn build(
     let state_graphs = programs
         .state_graphs()
         .ok_or_else(|| internal("qualified program set has no state graphs"))?;
-    let catalog = Rc::new(catalog);
-    let mut startup = StartupClaims {
-        heap: DeviceHeap::open(catalog.clone(), reserves, device.clone())
-            .map_err(|error| platform_error(PlatformError::Memory(error)))?,
-        allocation_domain: MemoryDomain::of(device_selector, pool),
-        held: None,
-    };
     startup.claim("graph scratch", plan.bytes().scratch, 0)?;
     let resources = ResourceAllocator::allocate(
         &execution_plan,
@@ -844,6 +861,8 @@ fn report_load_memory(moment: &str, device: &seismic::Device) {
             "device_charged_bytes": usage.charged,
             "device_held_bytes": usage.held,
             "device_unallocated_bytes": usage.unallocated,
+            "device_limit_bytes": usage.limit,
+            "device_refused_demand_bytes": usage.refused_demand,
             "peak_footprint_bytes": seismic::ProcessMemory::peak_footprint(),
         })
     );

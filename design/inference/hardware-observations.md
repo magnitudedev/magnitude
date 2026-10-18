@@ -17,6 +17,11 @@ Physical CPU topology is optional descriptive metadata. It is cached per ICN pro
 
 Each execution device is identified by its serialized Seismic device selector (`metal:<registry-id>`, `cuda:<uuid>`, `vulkan:<uuid>`, `host-cpu`), the same identity a load plan names as its device; there is no native index or separate physical identity. Its backend is one of `cpu`, `metal`, `cuda`, or `vulkan`, and clients choose the display label. A device that discovery found but that is below its backend's floor carries its unavailability reason, so an old driver is reported instead of silently falling back to CPU; absence of a reason means the device is usable. The floor includes what only a probe can establish (a Vulkan device's fused `fma` and fp32 rounding), so discovery runs those probes once per process and a device it reports usable does not later fail to open for a compatibility reason. ACN's accelerators are the usable devices only: a GPU below its floor never runs a model, so a machine whose only GPU is below its floor is presented, assessed and loaded as CPU-only.
 
+CPU discovery also enforces the native instruction-set floor: x86 requires SSE3, SSSE3,
+SSE4.1, SSE4.2 and POPCNT (the x86v2 tier); AVX is not required. A virtual CPU
+missing that floor remains visible with its unavailability reason and is refused by
+assessment and selection before kernel preparation.
+
 The snapshot is the service process's own Seismic topology and host memory status; the service
 holds no device for it. Discovery measures the memory each dedicated GPU's driver lets one process
 use, once per process and before anything is allocated ([engine memory](engine/memory.md)): a CUDA

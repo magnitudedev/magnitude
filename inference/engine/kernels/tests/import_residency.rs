@@ -19,10 +19,11 @@ fn dense_bytes(name: &str, values: &[f32]) -> Vec<u8> {
 }
 
 /// GGUF sources and their resident representations.
-const FORMATS: [(&str, &str); 16] = [
+const FORMATS: [(&str, &str); 17] = [
     ("gguf_iq4_nl_block", "iq4g32s"),
     ("gguf_iq2_xs", "iq2xs"),
     ("gguf_iq3_xxs", "iq3xxs"),
+    ("gguf_iq2_xxs", "iq2xxs"),
     ("gguf_q8_0", "q8g32s"),
     ("gguf_q3_k", "q6k"),
     ("gguf_q4_k", "q4k"),
@@ -149,12 +150,33 @@ fn ggml_iq3_xxs(block: &[u8]) -> Vec<f32> {
     out
 }
 
-/// IQ2_XS and IQ3_XXS have representations of their own whose vector codes
-/// are ggml's grid entries: every stored value decodes, in every layout, to
-/// ggml's own dequantization bit for bit, over blocks reaching every grid
-/// point and sign pattern.
+/// ggml's `dequantize_row_iq2_xxs` for one 66-byte block, in its operation
+/// order: `db = d * (0.5 + s) * 0.25`, then `db * grid * sign`.
+fn ggml_iq2_xxs(block: &[u8]) -> Vec<f32> {
+    let d = f16_value(u16::from_le_bytes([block[0], block[1]]));
+    let mut out = Vec::with_capacity(256);
+    for ib32 in 0..8 {
+        let qs = &block[2 + 8 * ib32..6 + 8 * ib32];
+        let aux = u32::from_le_bytes(block[6 + 8 * ib32..10 + 8 * ib32].try_into().unwrap());
+        let db = d * (0.5 + (aux >> 28) as f32) * 0.25;
+        for l in 0..4 {
+            let grid = seismic_lang::grids::IQ2XXS_GRID[usize::from(qs[l])].to_le_bytes();
+            let signs = ggml_ksigns((aux >> (7 * l)) & 127);
+            for j in 0..8 {
+                let sign = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+                out.push(db * f32::from(grid[j]) * sign);
+            }
+        }
+    }
+    out
+}
+
+/// IQ2_XS, IQ3_XXS and IQ2_XXS have representations of their own whose
+/// vector codes are ggml's grid entries: every stored value decodes, in every
+/// layout, to ggml's own dequantization bit for bit, over blocks reaching
+/// every grid point and sign pattern.
 #[test]
-fn iq2_xs_and_iq3_xxs_import_exactly_as_ggml_dequantizes() {
+fn iq2_xs_iq3_xxs_and_iq2_xxs_import_exactly_as_ggml_dequantizes() {
     let blocks = 64u64;
     for (source_name, resident, block_bytes, reference) in [
         (
@@ -164,6 +186,7 @@ fn iq2_xs_and_iq3_xxs_import_exactly_as_ggml_dequantizes() {
             ggml_iq2_xs as fn(&[u8]) -> Vec<f32>,
         ),
         ("gguf_iq3_xxs", "iq3xxs", 98, ggml_iq3_xxs),
+        ("gguf_iq2_xxs", "iq2xxs", 66, ggml_iq2_xxs),
     ] {
         let mut bytes = source_bytes(blocks * block_bytes as u64, 13);
         for (index, block) in bytes.chunks_exact_mut(block_bytes).enumerate() {
@@ -174,6 +197,20 @@ fn iq2_xs_and_iq3_xxs_import_exactly_as_ggml_dequantizes() {
                 for slot in 0..32 {
                     let code = ((index * 32 + slot) as u32).wrapping_mul(40_503) as u16;
                     block[2 + 2 * slot..4 + 2 * slot].copy_from_slice(&code.to_le_bytes());
+                }
+            } else if source_name == "gguf_iq2_xxs" {
+                // Each sub-block's four grid indices, then its four sign
+                // groups and its scale, walking every index, sign group and
+                // scale across the blocks.
+                for ib32 in 0..8 {
+                    let at = 2 + 8 * ib32;
+                    let mut aux = (((index * 8 + ib32) % 16) as u32) << 28;
+                    for l in 0..4 {
+                        let slot = index * 32 + 4 * ib32 + l;
+                        block[at + l] = slot as u8;
+                        aux |= ((slot as u32 * 5) & 127) << (7 * l);
+                    }
+                    block[at + 4..at + 8].copy_from_slice(&aux.to_le_bytes());
                 }
             } else {
                 for slot in 0..64 {
