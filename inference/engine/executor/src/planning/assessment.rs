@@ -32,7 +32,8 @@ pub struct AssessmentMemoryTerms {
     pub history_per_token: u64,
     pub recurrent_per_bank: u64,
     /// Recurrent banks one conversation holds: its accepted bank, every
-    /// in-flight successor the planned lookahead keeps, and the pristine seed.
+    /// in-flight successor the planned lookahead keeps, the checkpoints the
+    /// prefix cache retains of it, and the pristine seed.
     pub recurrent_banks: u64,
     pub fit_depth: u64,
     /// Host-resident gathered tables (model-family plan §3.7): claims in the
@@ -701,6 +702,15 @@ impl AssessmentHeaderBounds {
     }
 }
 
+/// The checkpoints the prefix cache retains of one conversation's turn: its
+/// prompt one row before its end, the deepest point a repeat of the prompt
+/// resumes from, and its whole path once the reply ends, which the next turn
+/// extends. Each pins a recurrent bank; their history rows are the
+/// conversation's own. Retained prefixes are released before a claim is
+/// refused, but a load holds them while it has room, so the workload counts
+/// them.
+const CONVERSATION_CHECKPOINTS: usize = 2;
+
 impl AssessmentMemoryTerms {
     /// The standard assessment workload is one conversation at the lesser
     /// of the supported context and 100,000 tokens. Method state and optional
@@ -732,13 +742,14 @@ impl AssessmentMemoryTerms {
             .checked_add(history_row_bytes(&layout.head_history)?)
             .ok_or("history row bytes overflow")?;
         let recurrent_per_bank = recurrent_bank_bytes(&layout.target_recurrent)?;
-        // The state store's own capacity rule for one live conversation: its
+        // The state store's own capacity rule for one conversation: its
         // accepted bank, its in-flight step (and that step's queued successor
-        // under lookahead) and the permanently pristine zero seed.
+        // under lookahead), the checkpoints the prefix cache retains of it,
+        // and the permanently pristine zero seed.
         let recurrent_banks = BankCapacity {
             active: 1,
             in_flight: 1 + usize::from(limits.lookahead),
-            retained: 0,
+            retained: CONVERSATION_CHECKPOINTS,
         }
         .storage_total()
         .map_err(|error| error.to_string())?;
@@ -2475,8 +2486,9 @@ mod tests {
         assert_eq!(terms.vision_weights, 0);
         assert_eq!(terms.history_per_token, 2 * 64 * 2);
         assert_eq!(terms.recurrent_per_bank, 0);
-        // Accepted bank, one in-flight successor, pristine seed.
-        assert_eq!(terms.recurrent_banks, 3);
+        // Accepted bank, one in-flight successor, the prompt-boundary and
+        // terminal checkpoints, pristine seed.
+        assert_eq!(terms.recurrent_banks, 5);
         assert_eq!(terms.fit_depth, 128);
         assert_eq!(terms.history_at_fit_depth().unwrap(), 128 * 2 * 64 * 2);
         let pipelined = AssessmentMemoryTerms::derive(
@@ -2488,7 +2500,7 @@ mod tests {
             fixture_limits(true),
         )
         .unwrap();
-        assert_eq!(pipelined.recurrent_banks, 4);
+        assert_eq!(pipelined.recurrent_banks, 6);
         assert!(
             AssessmentMemoryTerms::derive(
                 &definition,

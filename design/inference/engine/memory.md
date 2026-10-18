@@ -448,7 +448,11 @@ slabs has none.
 Callers retain logical identities and published placement snapshots, never mutable physical bank
 indices.
 
-Assessment charges history per domain at slab granularity: a Token domain by the rows of the
+Assessment's recurrent banks for one conversation are its accepted bank, its in-flight successors,
+the two checkpoints the prefix cache retains of it (the prompt's boundary and the finished turn), and
+the pristine seed, rounded to whole bank slabs. Retained prefixes are released before a claim is
+refused, but a load holds them while it has room. Assessment charges history per domain at slab
+granularity: a Token domain by the rows of the
 assessed context, and a Window(n) domain by its steady footprint of `n` plus one advance per live
 history and `n` per checkpoint, independent of the context, each rounded up to whole pages (plus
 one page for a window's partially released first page) and then to whole slabs of the domain.
