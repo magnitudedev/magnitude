@@ -386,6 +386,19 @@ static napi_value interactive_desktop(napi_env env, napi_callback_info info) {
 }
 #endif
 
+#ifdef _WIN32
+/* Services always run in session 0; interactive logons never do. */
+static napi_value service_session(napi_env env, napi_callback_info info) {
+  (void)info;
+  DWORD session = 0;
+  if (!ProcessIdToSessionId(GetCurrentProcessId(), &session))
+    return failure(env, "Cannot inspect the current Windows session");
+  napi_value result;
+  napi_get_boolean(env, session == 0, &result);
+  return result;
+}
+#endif
+
 #ifdef __linux__
 /* Authorization changes credentials; the privileged command must retain its caller's lifetime. */
 static napi_value guard_installer(napi_env env, napi_callback_info info) {
@@ -480,6 +493,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"createPrivateContent", NULL, create_private_content, NULL, NULL, NULL, napi_default, NULL},
     {"validatePrivateContent", NULL, private_content, NULL, NULL, NULL, napi_default, NULL},
     {"isInteractiveDesktop", NULL, interactive_desktop, NULL, NULL, NULL, napi_default, NULL},
+    {"isServiceSession", NULL, service_session, NULL, NULL, NULL, napi_default, NULL},
 #endif
   };
   napi_define_properties(env, exports, sizeof(methods) / sizeof(methods[0]), methods);

@@ -5,8 +5,10 @@ import { NativeHost } from "./index"
 import { requestApplication } from "./application-control"
 import { ApplicationOpenUrl } from "@magnitudedev/sdk/desktop-host"
 import { isUpdateInstallationActive } from "./update-installation-lease"
+import { occupiedMessage } from "./service-port"
 
 export class ApplicationOwnershipFailed extends Schema.TaggedError<ApplicationOwnershipFailed>()("ApplicationOwnershipFailed", { message: Schema.String }) {}
+export class ApplicationServiceRunning extends Schema.TaggedError<ApplicationServiceRunning>()("ApplicationServiceRunning", { message: Schema.String }) {}
 const applicationAlreadyRunning = (directory: string) => Effect.gen(function* () {
   const owner = yield* Effect.gen(function* () {
     const native = yield* NativeHost
@@ -61,6 +63,10 @@ export const acquireApplicationOwner = (directory: string, request: ApplicationO
     )
     if (Option.isNone(observed)) { yield* Effect.sleep("100 millis"); continue }
     const response = observed.value
+    // A service manager would restart a service the desktop stopped, so only a terminal serve yields.
+    if (response.owner._tag === "Headless" && response.owner.service) {
+      return yield* new ApplicationServiceRunning({ message: occupiedMessage(Number(new URL(response.endpoint).port), true) })
+    }
     const forwarded = yield* requestApplication(socketPath, response.owner._tag === "Desktop" ? request.intent : "Yield").pipe(
       Effect.map(Option.some), Effect.catchTags({ ApplicationControlUnavailable: () => Effect.succeed(Option.none()),
         ApplicationControlClosed: () => Effect.succeed(Option.none()) }),

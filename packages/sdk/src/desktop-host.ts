@@ -37,9 +37,10 @@ export const TrayRegistration = Schema.Union(
   Schema.TaggedStruct("Unavailable", { message: Schema.String }), Schema.TaggedStruct("Closed", {}),
 )
 export type TrayRegistration = typeof TrayRegistration.Type
+/** A Headless owner started as a Windows service is never taken over by the desktop. */
 export const ApplicationOwner = Schema.Union(
   Schema.TaggedStruct("Desktop", { tray: TrayRegistration }),
-  Schema.TaggedStruct("Headless", {}),
+  Schema.TaggedStruct("Headless", { service: Schema.optionalWith(Schema.Boolean, { default: () => false, exact: true }) }),
 )
 export type ApplicationOwner = typeof ApplicationOwner.Type
 export const ApplicationSnapshot = Schema.Struct({

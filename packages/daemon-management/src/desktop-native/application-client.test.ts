@@ -26,7 +26,7 @@ describe("desktop client startup", () => {
         }).pipe(Effect.zipRight(observe)),
         request: () => Effect.sync(() => {
           observations++
-          return launched && observations >= 3 ? ready : { ...ready, owner: { _tag: "Headless" as const } }
+          return launched && observations >= 3 ? ready : { ...ready, owner: { _tag: "Headless" as const, service: false } }
         }),
       })
       expect((yield* client.ensure("ShowWindow")).owner._tag).toBe("Desktop")
@@ -42,7 +42,7 @@ describe("desktop client startup", () => {
       launch: (_, observe) => Effect.sync(() => { launches++ }).pipe(Effect.zipRight(observe)),
       request: () => Effect.gen(function* () {
         requests++
-        if (requests === 1) return { ...ready, owner: { _tag: "Headless" as const } }
+        if (requests === 1) return { ...ready, owner: { _tag: "Headless" as const, service: false } }
         if (requests === 2) return yield* new ApplicationControlClosed()
         if (requests === 3) return yield* new ApplicationControlUnavailable({ message: "retiring" })
         return ready
@@ -64,7 +64,7 @@ describe("desktop client startup", () => {
     const malformed = makeApplicationClient({
       launch: (_, observe) => Effect.sync(() => { launches++ }).pipe(Effect.zipRight(observe)),
       request: () => Effect.suspend(() => launches === 0
-        ? Effect.succeed({ ...ready, owner: { _tag: "Headless" as const } })
+        ? Effect.succeed({ ...ready, owner: { _tag: "Headless" as const, service: false } })
         : new ApplicationControlFailed({ message: "Invalid control frame" })),
     })
     const result = await Effect.runPromise(malformed.ensure("ShowWindow").pipe(Effect.either))

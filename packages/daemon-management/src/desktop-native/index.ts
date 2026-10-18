@@ -10,6 +10,7 @@ export class NativeHostUnavailable extends Schema.TaggedError<NativeHostUnavaila
 /** The opaque lock remains strongly reachable until its Effect scope closes. */
 export interface NativeHost {
   readonly requireInteractiveDesktop: Effect.Effect<void, NativeHostUnavailable>
+  readonly isServiceSession: Effect.Effect<boolean, NativeHostUnavailable>
   readonly localAppDataDirectory: Effect.Effect<string, NativeHostUnavailable>
   readonly acquireOwnership: (path: string) => Effect.Effect<Option.Option<object>, NativeHostUnavailable, Scope.Scope>
   readonly guardParent: (descriptor: number) => Effect.Effect<void, NativeHostUnavailable>
@@ -20,6 +21,7 @@ export const NativeHost = Context.GenericTag<NativeHost>("@magnitudedev/daemon-m
 
 interface NativeBindings {
   readonly isInteractiveDesktop: () => unknown
+  readonly isServiceSession: () => unknown
   readonly localAppDataDirectory: () => unknown
   readonly acquireLock: (path: string) => object | null
   readonly releaseLock: (lock: object) => void
@@ -47,6 +49,10 @@ export const nativeHostLayerFromLoader = (load: () => unknown): Layer.Layer<Nati
           message: "Magnitude requires a graphical Windows session. Start the desktop app in your desktop session; headless commands can then control it.",
         }))),
       ),
+      isServiceSession: process.platform !== "win32" ? Effect.succeed(false) : Effect.try({
+        try: () => bindings.isServiceSession(),
+        catch: () => new NativeHostUnavailable({ message: "Cannot inspect the Windows session." }),
+      }).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.Boolean)), Effect.mapError(() => new NativeHostUnavailable({ message: "Cannot inspect the Windows session." }))),
       localAppDataDirectory: Effect.try({
         try: () => bindings.localAppDataDirectory(),
         catch: error => new NativeHostUnavailable({ message: String(error) }),

@@ -64,6 +64,7 @@ export const runHeadlessApplication = (options: {
   const addon = applicationNativeHostPath(options.runtime, process.platform, process.arch)
   // Only the Magnitude command launcher contains a Windows server's process tree.
   if (process.platform === "win32") yield* native.guardParent(0).pipe(Effect.mapError(() => new HeadlessApplicationFailed({ message: windowsUncontainedServe })))
+  const serviceStarted = yield* native.isServiceSession.pipe(Effect.mapError(error => new HeadlessApplicationFailed({ message: error.message })))
   const owner = yield* acquireApplicationOwner(options.stateDirectory, { _tag: "Headless" }, options.profile.sharedControl)
   if (owner._tag !== "Owner") return yield* new HeadlessApplicationFailed({ message: "Magnitude is already running." })
   if (yield* isUpdateInstallationActive(options.stateDirectory)) return yield* new HeadlessApplicationFailed({ message: "A Magnitude update is being installed. Run `magnitude serve` when it finishes." })
@@ -113,7 +114,7 @@ export const runHeadlessApplication = (options: {
   const service = yield* makeApplicationService({ ...options, output: "Foreground", admission: "Immediate", owner: ownerAgent })
   yield* service.changes.pipe(Stream.runForEach(state => Ref.set(serviceState, Option.some(state))), Effect.forkScoped)
   const control: ApplicationControlOptions = {
-    snapshot: service.state.pipe(Effect.map(state => ({ version: 1 as const, pid: process.pid, endpoint: options.profile.endpoint, owner: { _tag: "Headless" as const }, service: state }))),
+    snapshot: service.state.pipe(Effect.map(state => ({ version: 1 as const, pid: process.pid, endpoint: options.profile.endpoint, owner: { _tag: "Headless" as const, service: serviceStarted }, service: state }))),
     dispatch: intent => intent === "Yield" || intent === "Quit" ? Deferred.succeed(stop, intent === "Yield" ? "DesktopTakeover" : "Requested").pipe(Effect.asVoid) : Effect.void,
     login: () => new LoginStartupFailed({ message: "Login startup belongs to the desktop app. Open Magnitude to change it." }),
     update,

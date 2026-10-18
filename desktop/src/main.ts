@@ -127,7 +127,11 @@ const program = Effect.scoped(Effect.gen(function* () {
   const owner = yield* acquireApplicationOwner(stateDir, { _tag: "Desktop", intent: Option.match(launchLink, {
     onNone: () => background ? "EnsureRunning" as const : "ShowWindow" as const,
     onSome: url => ({ _tag: "OpenUrl" as const, url }),
-  }) })
+  }) }).pipe(Effect.catchTag("ApplicationServiceRunning", error => Effect.sync(() => {
+    if (!background) dialog.showErrorBox("Magnitude can’t start", error.message)
+    return { _tag: "ServiceRunning" as const }
+  })))
+  if (owner._tag === "ServiceRunning") return "Quit" as const
   if (owner._tag === "Forwarded") { exiting = true; app.quit(); return }
   if (yield* isUpdateInstallationActive(stateDir)) return "Quit" as const
   if (process.platform === "darwin" && app.isPackaged) {

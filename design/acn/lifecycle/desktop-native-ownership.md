@@ -26,6 +26,8 @@ Unavailable or invalid observation retains a generic contention error and never 
 Desktop forwards intent to an existing Desktop, or requests Yield from a
 Headless owner and waits for native lock acquisition within one 60-second deadline. Yield replies
 precede teardown and acknowledge the request, not completed retirement. Desktop ignores Yield.
+A Windows Headless owner running in session 0 marks its snapshot as service-started; Desktop never
+requests Yield from it, since its service manager would restart it, and exits explaining how to stop it.
 Only lock acquisition after the predecessor releases ownership permits replacement. Missing control
 during cold startup or teardown, including an empty closed connection, permits bounded retry; malformed replies and access failures remain
 errors. Lock acquisition is not service readiness.

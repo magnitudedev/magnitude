@@ -6,6 +6,7 @@ import { Deferred, Effect, Exit, Fiber, Option, Ref, Schema, Scope, TestClock, T
 import { describe, expect, it } from "vitest"
 import { ApplicationSnapshot, type ApplicationIntent } from "@magnitudedev/sdk/desktop-host"
 import { acquireApplicationMaintenance, acquireApplicationOwner } from "./application-owner"
+import { occupiedMessage } from "./service-port"
 import { requestApplication, serveApplicationControl } from "./application-control"
 import { acquireUpdateInstallationLease } from "./update-installation-lease"
 import { nativeHostLayer } from "./index"
@@ -25,7 +26,7 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
     const intents = yield* Ref.make<ApplicationIntent[]>([])
     yield* serveApplicationControl(first.socketPath, {
       snapshot: Effect.succeed({ ...snapshot, owner: owner === "Desktop"
-        ? { _tag: "Desktop", tray: { _tag: "Registered" } } : { _tag: "Headless" } }),
+        ? { _tag: "Desktop", tray: { _tag: "Registered" } } : { _tag: "Headless", service: false } }),
       login: noLogin, update: noUpdate, dispatch: intent => Ref.update(intents, values => [...values, intent]),
     })
     const startup = yield* acquireApplicationOwner(root, { _tag: "Headless" }).pipe(Effect.flip)
@@ -134,6 +135,30 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
     })).pipe(Effect.provide(nativeHostLayer(addon))))
   })
 
+  it.each([true, false])("with a service-started server %s, takes over only a terminal serve", async service => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const root = yield* directory
+      const firstScope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(firstScope, Exit.void))
+      const first = yield* acquireApplicationOwner(root, { _tag: "Headless" }).pipe(Effect.provideService(Scope.Scope, firstScope))
+      if (first._tag !== "Owner") return yield* Effect.die("Expected initial owner")
+      const intents = yield* Ref.make<ApplicationIntent[]>([])
+      yield* serveApplicationControl(first.socketPath, { snapshot: Effect.succeed({ ...snapshot, owner: { _tag: "Headless", service } }),
+        login: noLogin, update: noUpdate, dispatch: intent => Ref.update(intents, values => [...values, intent]).pipe(
+          Effect.zipRight(intent === "Yield" ? Effect.forkDaemon(Scope.close(firstScope, Exit.void)) : Effect.void), Effect.asVoid),
+      }).pipe(Effect.provideService(Scope.Scope, firstScope))
+      const desktop = yield* acquireApplicationOwner(root, { _tag: "Desktop", intent: "ShowWindow" }).pipe(Effect.either, Effect.timeout("5 seconds"))
+      if (service) {
+        expect(desktop._tag === "Left" && desktop.left).toMatchObject({ _tag: "ApplicationServiceRunning", message: occupiedMessage(11101, true) })
+        expect(yield* Ref.get(intents)).toEqual(["Observe"])
+        expect(yield* acquireApplicationMaintenance(root).pipe(Effect.isFailure)).toBe(true)
+      } else {
+        expect(desktop._tag === "Right" && desktop.right._tag).toBe("Owner")
+        expect(yield* Ref.get(intents)).toEqual(["Observe", "Yield"])
+      }
+    })).pipe(Effect.provide(nativeHostLayer(addon))))
+  })
+
   it("waits for actual lock release after headless Yield acknowledgement", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const root = yield* directory
@@ -157,7 +182,7 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
 })
 
 it("round trips both owner forms and rejects the obsolete snapshot shape", () => {
-  for (const owner of [{ _tag: "Headless" }, { _tag: "Desktop", tray: { _tag: "Registered" } }] as const) {
+  for (const owner of [{ _tag: "Headless", service: false }, { _tag: "Headless", service: true }, { _tag: "Desktop", tray: { _tag: "Registered" } }] as const) {
     const value = { ...snapshot, owner }
     expect(Schema.decodeUnknownSync(ApplicationSnapshot)(Schema.encodeSync(ApplicationSnapshot)(value))).toEqual(value)
   }
