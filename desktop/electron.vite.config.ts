@@ -128,6 +128,16 @@ export default defineConfig({
       "process.versions": "{}",
     },
     optimizeDeps: {
+      // Workspace packages are served as source, so the startup scan reads them too; otherwise their
+      // dependencies are found mid-load and the re-optimization leaves the first window blank.
+      entries: [
+        "index.html",
+        "server-conflict.html",
+        "../web/src/**/*.{ts,tsx}",
+        "../packages/{client-common,sdk,acn-protocol,effect-query,utils,generate-id}/src/**/*.{ts,tsx}",
+        "!**/*.test.{ts,tsx}",
+        "!**/fixtures/**",
+      ],
       exclude: [
         "@magnitudedev/sdk",
           "@magnitudedev/sdk/desktop-host",
