@@ -107,6 +107,17 @@ static void require_stage_removed(LPCWSTR payload, const char *message) {
   WCHAR *leaf = wcsrchr(container, L'\\'); require(leaf != NULL, "stage payload has a container"); *leaf = 0;
   require(GetFileAttributesW(container) == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND, message);
 }
+/* Windows 10 and Server 2022 open a rename's target directory sharing only read and write, so
+   any retained handle with DELETE on the stage makes every rename into it fail. Opening the
+   container the same way reproduces that conflict on every Windows version. */
+static void require_stage_accepts_renames(LPCWSTR payload, const char *message) {
+  WCHAR container[32768]; wcscpy(container, payload);
+  WCHAR *leaf = wcsrchr(container, L'\\'); require(leaf != NULL, "stage payload has a container"); *leaf = 0;
+  HANDLE target = CreateFileW(container, FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+  require(target != INVALID_HANDLE_VALUE, message);
+  CloseHandle(target);
+}
 #define RESOLVE_FUNCTION(library, variable, name) do { \
   FARPROC pointer = GetProcAddress(library, name); \
   require(pointer != NULL && sizeof(pointer) == sizeof(variable), "resolve " name); \
@@ -136,6 +147,7 @@ static void check_replacement(HMODULE library) {
   require(hold() == ERROR_SUCCESS, "hold actual application lease");
   WCHAR payload[32768], root[32768], file[32768];
   require(create_stage(payload, 32768) == ERROR_SUCCESS, "prepare actual private installation stage");
+  require_stage_accepts_renames(payload, "the retained stage accepts renames into it on Windows 10");
   require(GetCurrentDirectoryW(32768, root) > 0 && wcslen(root) < 32000, "replacement fixture working directory");
   wcscat(root, L"\\replacement installation");
   PSECURITY_DESCRIPTOR descriptor = NULL;

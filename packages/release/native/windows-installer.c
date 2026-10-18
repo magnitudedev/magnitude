@@ -539,17 +539,35 @@ static DWORD clear_scratch(HANDLE directory, unsigned depth) {
   HeapFree(GetProcessHeap(), 0, buffer);
   return error;
 }
+static DWORD stage_paths(WCHAR parent[32768], WCHAR container[32768], WCHAR payload[32768]);
+/* The retained stage handle never holds DELETE, because replacement and rollback rename
+   directories into the stage (see open_installation_directory). Removal reopens the container
+   only after that handle is released, and deletes it only while it is the same directory. An
+   empty container is harmless and reused, so removing it is optional. */
+static void remove_empty_stage(void) {
+  BY_HANDLE_FILE_INFORMATION retained, reopened;
+  BOOL known = GetFileInformationByHandle(stageDirectory, &retained);
+  CloseHandle(stageDirectory); stageDirectory = INVALID_HANDLE_VALUE;
+  WCHAR parent[32768], container[32768], payload[32768];
+  if (!known || stage_paths(parent, container, payload)) return;
+  HANDLE directory = INVALID_HANDLE_VALUE;
+  if (open_absolute_without_reparse(container, wcslen(container), DELETE | FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_DIRECTORY_FILE, &directory)) return;
+  if (GetFileInformationByHandle(directory, &reopened) &&
+      reopened.dwVolumeSerialNumber == retained.dwVolumeSerialNumber &&
+      reopened.nFileIndexHigh == retained.nFileIndexHigh && reopened.nFileIndexLow == retained.nFileIndexLow) {
+    FILE_DISPOSITION_INFO remove = {TRUE};
+    SetFileInformationByHandle(directory, FileDispositionInfo, &remove, sizeof(remove));
+  }
+  CloseHandle(directory);
+}
 /* Clears extraction scratch and removes the then-empty container, after a finished or a
    failed install alike. A retained previous tree keeps the container for recovery. */
 __declspec(dllexport) DWORD WINAPI CleanupStage(void) {
   if (!leaseHeld || stageDirectory == INVALID_HANDLE_VALUE) return ERROR_INVALID_HANDLE;
   DWORD error = require_absent_child(stageDirectory, L"previous");
   if (!error) error = clear_scratch(stageDirectory, 0);
-  if (!error) {
-    FILE_DISPOSITION_INFO remove = {TRUE};
-    if (!SetFileInformationByHandle(stageDirectory, FileDispositionInfo, &remove, sizeof(remove))) error = GetLastError();
-  }
-  if (!error) { CloseHandle(stageDirectory); stageDirectory = INVALID_HANDLE_VALUE; }
+  if (!error) remove_empty_stage();
   return error;
 }
 static DWORD stage_paths(WCHAR parent[32768], WCHAR container[32768], WCHAR payload[32768]) {
@@ -581,7 +599,7 @@ __declspec(dllexport) DWORD WINAPI CreateStage(LPWSTR output, DWORD capacity) {
   SECURITY_ATTRIBUTES attributes = {sizeof(attributes), descriptor, FALSE};
   if (!CreateDirectoryW(container, &attributes) && GetLastError() != ERROR_ALREADY_EXISTS) error = GetLastError();
   if (!error) {
-    stageDirectory = CreateFileW(container, READ_CONTROL | DELETE | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY,
+    stageDirectory = CreateFileW(container, READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | FILE_ADD_SUBDIRECTORY,
       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (stageDirectory == INVALID_HANDLE_VALUE) error = GetLastError();

@@ -148,7 +148,10 @@ authenticates the installer, waits for silent setup, and refreshes command PATH 
 Both executable signatures require the configured publisher and a timestamp. Fresh installation publishes a complete staged payload by same-volume rename.
 A private installer-owned scratch container permits recovery after interrupted extraction; cleanup
 is relative to retained handles and cannot follow directory redirections. A completed install or update
-removes the emptied container; only a retained previous tree keeps it. Existing unsafe scratch
+removes the emptied container; only a retained previous tree keeps it. Because Windows 10 kernels
+(including Server 2022) refuse to rename an entry into a directory while any handle to it holds
+delete access, the retained container handle never holds it; removal reopens the same directory
+after that handle is released. Existing unsafe scratch
 permissions are rejected without repair. The installed uninstaller is the sole removal record and
 must match its executing self-copy before mutation. Payload removal rejects redirected paths,
 preserves unrelated installed files, and retains the exact removal record until required cleanup

@@ -77,6 +77,20 @@ describe("Windows installer stage", () => {
     const finish = install.slice(install.indexOf("FinishReplacement"), install.indexOf("Goto installed"))
     expect(finish).toMatch(/\$\{If\} \$0 != 0[^]*StrCpy \$Stage ""\s*\$\{Else\}\s*Call CleanupStage\s*\$\{EndIf\}/)
   })
+  it("keeps the stage through an update over an installed version until the previous files are retired", () => {
+    const update = install.slice(install.indexOf('${If} $PreviousVersion != ""'), install.indexOf('Rename "$Stage" "$INSTDIR"'))
+    const begin = update.indexOf("::BeginReplacement(")
+    const finish = update.indexOf("::FinishReplacement(")
+    expect(begin).toBeGreaterThan(-1)
+    expect(finish).toBeGreaterThan(begin)
+    expect(update.indexOf("Call CleanupStage")).toBeGreaterThan(finish)
+    expect(update.match(/Call CleanupStage/g)).toHaveLength(1)
+  })
+  it("restores the previous installation before an update failure clears the stage", () => {
+    const failure = install.slice(install.indexOf("replacementRegistrationFailed:"), install.indexOf("registrationFailed:", install.indexOf("replacementRegistrationFailed:") + 1))
+    expect(failure.indexOf("::RollbackReplacement(")).toBeGreaterThan(-1)
+    expect(failure.indexOf("Call CleanupStage")).toBeGreaterThan(failure.indexOf("::RollbackReplacement("))
+  })
 })
 
 describe("Windows installer source boundary", () => {

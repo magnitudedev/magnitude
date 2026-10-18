@@ -95,6 +95,7 @@ try {
   $process.Dispose()
 }
 Assert-Version '1.2.4'
+if (Test-Path (Join-Path $env:LOCALAPPDATA 'Programs\Magnitude-installation-stage')) { throw 'Update left its installation stage behind' }
 Assert-CliPath
 if ((Get-ItemProperty $run).'dev.magnitude.desktop' -ne $startup) { throw 'Update changed startup preference' }
 Invoke-Installer (Join-Path $installation 'Uninstall Magnitude.exe') 0
