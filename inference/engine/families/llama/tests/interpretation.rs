@@ -313,3 +313,22 @@ fn recognized_packages_are_bound_strictly() {
         Err(Error::Projector)
     );
 }
+
+/// Absent head widths and rotary dimension read as llama.cpp reads them: the embedding width per
+/// head, and the whole head (Mistral 7B v0.3's GGUFs state none of them).
+#[test]
+fn absent_head_widths_are_the_embedding_width_per_head() {
+    let stated = inspect(&minicpm5()).unwrap();
+    let mut absent = minicpm5();
+    let hidden = absent.value("llama.embedding_length").and_then(Value::unsigned).unwrap();
+    let heads = absent.value("llama.attention.head_count").and_then(Value::unsigned).unwrap();
+    let width = absent.value("llama.attention.key_length").and_then(Value::unsigned).unwrap();
+    assert_eq!(hidden / heads, width, "this header's widths are the defaults");
+    absent.metadata.retain(|entry| {
+        !matches!(
+            entry.name.as_str(),
+            "llama.attention.key_length" | "llama.attention.value_length" | "llama.rope.dimension_count"
+        )
+    });
+    assert_eq!(inspect(&absent).unwrap(), stated);
+}

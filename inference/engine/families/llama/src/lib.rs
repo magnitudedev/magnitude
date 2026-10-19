@@ -324,16 +324,27 @@ pub fn inspect_components(
     let intermediate = m.integer("feed_forward_length")?;
     let heads = m.integer("attention.head_count")?;
     let kv_heads = m.integer("attention.head_count_kv")?;
-    let width = m.integer("attention.key_length")?;
+    // As llama.cpp reads them, absent head widths are the embedding width per head and an absent
+    // rotary dimension is the whole head.
+    if !hidden.is_multiple_of(heads) {
+        return Err(Error::Geometry(
+            "embedding width is not a whole number of heads".into(),
+        ));
+    }
+    let width = m
+        .optional_integer("attention.key_length")?
+        .unwrap_or(hidden / heads);
     let epsilon = m.positive_number("attention.layer_norm_rms_epsilon")?;
     let base = m.positive_number("rope.freq_base")?;
     let vocabulary = m.integer("vocab_size")?;
-    if m.integer("attention.value_length")? != width {
+    if m.optional_integer("attention.value_length")?.unwrap_or(width) != width {
         return Err(Error::Geometry(
             "value head width differs from key head width".into(),
         ));
     }
-    if m.integer("rope.dimension_count")? != width || !width.is_multiple_of(2) {
+    if m.optional_integer("rope.dimension_count")?.unwrap_or(width) != width
+        || !width.is_multiple_of(2)
+    {
         return Err(Error::Geometry(
             "rotary must cover the whole even head width".into(),
         ));
