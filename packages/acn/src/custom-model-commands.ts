@@ -121,7 +121,6 @@ export interface CustomModelCommandsApi {
   readonly searchHuggingFace: (request: {
     readonly query: string
     readonly limit: Option.Option<number>
-    readonly all: boolean
   }) => Effect.Effect<HuggingFaceSearchResponse, ModelCandidateError>
   readonly inspectCandidate: (reference: string) => Effect.Effect<CandidateInspection, ModelCandidateError>
   /** The drafter choices, and the listed candidate a different drafter (`other`) resolves to. */
@@ -825,14 +824,12 @@ export const CustomModelCommandsLive: Layer.Layer<
   })
 
   const commands = CustomModelCommands.of({
-    searchHuggingFace: ({ query, limit, all }) => icn.search({
+    searchHuggingFace: ({ query, limit }) => icn.search({
       query,
       limit: Option.getOrElse(limit, () => 20),
-      includeUnsupported: Option.some(all),
     }).pipe(
       Effect.mapError(candidateFailure(query)),
-      Effect.map(({ results, hiddenCount }) => ({
-        hiddenCount,
+      Effect.map(({ results }) => ({
         results: results.flatMap((result) => {
           const repository = Schema.decodeUnknownOption(HuggingFaceRepositoryIdSchema)(result.repository)
           if (Option.isNone(repository)) return []
@@ -842,6 +839,7 @@ export const CustomModelCommandsLive: Layer.Layer<
             uploader: repository.value.split("/")[0],
             ...presentField("variantOf", result.variantOf),
             downloads: Option.getOrElse(result.downloads, () => 0),
+            gated: result.gated,
             ...presentField("architecture", Option.filter(result.architecture, (value) => value.length > 0)),
             ...presentField("unsupported", Option.some(result.unsupported).pipe(Option.filter((reasons) => reasons.length > 0),
               Option.map((reasons) => productUnsupportedReasons(reasons, "")))),

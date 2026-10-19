@@ -3,7 +3,7 @@ import { Cause, Exit, Option } from "effect"
 import { Result, useAtomRefresh, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { ArrowLeftIcon, ArrowUpRightIcon, DownloadSimpleIcon, LinkIcon, MagnifyingGlassIcon, PlusIcon } from "@phosphor-icons/react"
 import {
-  candidateDownloadBytes, catalogVariantOfName, formatStorageSize, noRunnableVersionReason, unsupportedReasonMessages, useAgentClient,
+  candidateDownloadBytes, catalogVariantOfName, formatStorageSize, noRunnableVersionReason, GATED_SEARCH_RESULT_LABEL, searchResultUnsupportedMessage, unsupportedReasonMessages, useAgentClient,
   type AddModelRequest,
 } from "@magnitudedev/client-common"
 import type { CandidateInspection, CandidateVersion, DrafterCandidate, DrafterChoice, HuggingFaceRepositoryId, HuggingFaceSearchResponse, HuggingFaceSearchResult, LocalModel, UnsupportedReason } from "@magnitudedev/sdk"
@@ -98,7 +98,7 @@ function FindStep({ tab, query, models, onChange, onOpen }: {
 
 function SearchResults({ query, models, onOpen }: { query: string; models: readonly LocalModel[]; onOpen: (reference: string) => void }) {
   const client = useAgentClient()
-  const search = client.Models.SearchHuggingFaceModels({ query, limit: Option.none(), all: false })
+  const search = client.Models.SearchHuggingFaceModels({ query, limit: Option.none() })
   const result = useAtomValue(search).result
   const retry = useAtomRefresh(search)
   const state: SearchState = Result.isSuccess(result) ? { _tag: "Loaded", response: result.value }
@@ -148,33 +148,35 @@ export function FindStepView({ tab, onTab, typed, onType, onSearch, results, pas
   </>
 }
 
-/** Supported repositories with uploader, lineage, and downloads, then the count hidden for unsupported architectures. */
+/** Repositories with uploader, the catalog model each is a variant of, and downloads; those Magnitude can't run are shown disabled with why. */
 export function SearchResultsView({ state, models, onOpen, onRetry }: { state: SearchState; models: readonly LocalModel[]; onOpen: (repository: string) => void; onRetry: () => void }) {
   switch (state._tag) {
     case "Idle": return null
     case "Loading": return <div aria-busy="true" aria-label="Searching Hugging Face" className="space-y-2 py-1">{[0, 1, 2].map(index => <SkeletonLine key={index} className="h-10" width={index % 2 ? "80%" : "95%"} />)}</div>
     case "Failed": return <ErrorNotice {...state.notice} actions={<NoticeAction onClick={onRetry}>Try again</NoticeAction>} />
     case "Loaded": {
-      const { results, hiddenCount } = state.response
-      return <div>
-        {results.length === 0
-          ? <p className="py-6 text-center text-sm text-slate-500">No supported GGUF repositories match this search.</p>
-          : <ul aria-label="Search results" className="divide-y divide-slate-200 overflow-hidden rounded-lg border border-slate-200 dark:divide-slate-750 dark:border-slate-750">
-            {results.map(result => <li key={result.repository}><SearchResultRow result={result} models={models} onOpen={() => onOpen(result.repository)} /></li>)}
-          </ul>}
-        {hiddenCount > 0 && <p className="mt-2 text-xs text-slate-500">{hiddenCount} more {hiddenCount === 1 ? "result uses an architecture" : "results use architectures"} Magnitude doesn’t run</p>}
-      </div>
+      const { results } = state.response
+      return results.length === 0
+        ? <p className="py-6 text-center text-sm text-slate-500">No GGUF repositories match this search.</p>
+        : <ul aria-label="Search results" className="divide-y divide-slate-200 overflow-hidden rounded-lg border border-slate-200 dark:divide-slate-750 dark:border-slate-750">
+          {results.map(result => <li key={result.repository}><SearchResultRow result={result} models={models} onOpen={() => onOpen(result.repository)} /></li>)}
+        </ul>
     }
   }
 }
 
 function SearchResultRow({ result, models, onOpen }: { result: HuggingFaceSearchResult; models: readonly LocalModel[]; onOpen: () => void }) {
   const variantOf = catalogVariantOfName(models, result.variantOf)
-  return <button type="button" onClick={onOpen} className="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800">
+  const unsupported = Option.map(result.unsupported, searchResultUnsupportedMessage)
+  const detail = Option.match(unsupported, {
+    onSome: reason => reason,
+    onNone: () => [result.uploader, ...(Option.isSome(variantOf) ? [`Variant of ${variantOf.value}`] : []), ...(result.gated ? [GATED_SEARCH_RESULT_LABEL] : [])].join(" · "),
+  })
+  return <button type="button" onClick={onOpen} disabled={Option.isSome(unsupported)} className="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-blue-500 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent dark:hover:bg-slate-800 dark:disabled:hover:bg-transparent">
     <NamedLogo lab={variantLab(result.variantOf, result.displayName)} name={result.displayName} className="size-6" />
     <span className="min-w-0 flex-1">
       <span className="block truncate text-sm font-medium" title={result.repository}>{result.displayName}</span>
-      <span className="block truncate text-xs text-slate-500">{result.uploader}{Option.isSome(variantOf) ? ` · Variant of ${variantOf.value}` : ""}</span>
+      <span className="block truncate text-xs text-slate-500">{detail}</span>
     </span>
     <span className="shrink-0 whitespace-nowrap text-xs tabular-nums text-slate-500">{formatDownloads(result.downloads)}</span>
   </button>
@@ -226,7 +228,7 @@ function BackButton({ onBack }: { onBack: () => void }) {
 
 /** The short verdict for versions the engine can't run: damaged, an architecture without kernels, or anything else not supported yet. */
 export const unsupportedVersionLabel = (reasons: readonly UnsupportedReason[]): string =>
-  reasons.some(reason => reason._tag === "Unreadable") ? "File is damaged"
+  reasons.some(reason => reason._tag === "Unreadable") ? "Can't read this file"
     : reasons.some(reason => reason._tag === "Architecture") ? "Not supported"
     : "Not supported yet"
 

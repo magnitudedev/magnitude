@@ -14,7 +14,7 @@ magnitude catalog status
 magnitude catalog list
 magnitude catalog show|cancel|remove <model-id>
 magnitude catalog recommendations [--preference <value>] [--limit <count>]
-magnitude catalog search <query> [--all] [--limit <count>]
+magnitude catalog search <query> [--limit <count>]
 magnitude catalog inspect <huggingface-url | owner/repo | owner/repo:QUANT | path.gguf>
 magnitude catalog pull <model-id | owner/repo[:QUANT] | huggingface-url> [--drafter auto|none|<drafter>] [--force]
 magnitude models status [model-id] [--all]

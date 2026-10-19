@@ -205,7 +205,7 @@ describe("inference command surface", () => {
       "catalog list": { arguments: [], options: [] },
       "catalog show": { arguments: ["<model-id>"], options: [] },
       "catalog recommendations": { arguments: [], options: ["--preference", "--limit"] },
-      "catalog search": { arguments: ["<query>"], options: ["--all", "--limit"] },
+      "catalog search": { arguments: ["<query>"], options: ["--limit"] },
       "catalog inspect": { arguments: ["<reference>"], options: [] },
       "catalog pull": { arguments: ["<model>"], options: ["--drafter", "--force", "--only"] },
       "catalog cancel": { arguments: ["<model-id>"], options: [] },
@@ -306,8 +306,8 @@ describe("catalog renderers", () => {
 })
 
 describe("Hugging Face search", () => {
-  it("lists supported repositories and counts hidden results", () => {
-    const output = renderSearch({ query: "qwen test", all: false, response: makeSearchResponse(), models: [makeCatalogModel()] })
+  it("lists repositories with the catalog model each is a variant of", () => {
+    const output = renderSearch({ query: "qwen test", response: makeSearchResponse(), models: [makeCatalogModel()] })
     expect(output).toBe([
       "Hugging Face models matching \"qwen test\"",
       "",
@@ -315,35 +315,30 @@ describe("Hugging Face search", () => {
       "Qwen Test Uncensored   HauhauCS   Qwen Test   48K        HauhauCS/Qwen-Test-Uncensored-GGUF",
       "Qwen Test abliterated  huihui-ai  —           912        huihui-ai/Qwen-Test-abliterated-GGUF",
       "",
-      "3 more results use architectures Magnitude doesn't run.",
-      "List them: magnitude catalog search \"qwen test\" --all",
-      "",
       "Inspect one: magnitude catalog inspect <repository>",
       "",
     ].join("\n"))
   })
 
-  it("lists unsupported results with reasons under --all", () => {
-    const response = makeSearchResponse({ results: [makeUnsupportedSearchResult()], hiddenCount: 0 })
-    const output = renderSearch({ query: "deepseek", all: true, response, models: [] })
-    expect(output).toContain("No Hugging Face models that run in Magnitude match \"deepseek\".")
-    expect(output).toContain("Can't run in Magnitude")
-    expect(output).toContain("No kernels for the deepseek4 architecture")
-    expect(output).toContain("unsloth/DeepSeek-V4-Flash-GGUF")
-    expect(output).not.toContain("--all")
+  it("labels a repository whose files need access on Hugging Face", () => {
+    const [first, ...rest] = makeSearchResponse().results
+    const output = renderSearch({ query: "qwen test", response: makeSearchResponse({ results: [{ ...first!, gated: true }, ...rest] }), models: [makeCatalogModel()] })
+    expect(output).toContain("Qwen Test Uncensored · Requires access on Hugging Face")
   })
 
-  it("names one result in the footer correctly", () => {
-    const output = renderSearch({ query: "x", all: false, response: makeSearchResponse({ hiddenCount: 1 }), models: [] })
-    expect(output).toContain("1 more result uses architectures Magnitude doesn't run.")
-  })
-
-  it("prints no hidden-count footer under --all, where unsupported results are listed", () => {
-    const response = makeSearchResponse({ results: [makeUnsupportedSearchResult()], hiddenCount: 1 })
-    const output = renderSearch({ query: "deepseek", all: true, response, models: [] })
-    expect(output).toContain("Can't run in Magnitude")
-    expect(output).not.toContain("more result")
-    expect(output).not.toContain("List them")
+  it("lists results of architectures Magnitude doesn't run apart, with why", () => {
+    const response = makeSearchResponse({ results: [...makeSearchResponse().results, makeUnsupportedSearchResult()] })
+    const output = renderSearch({ query: "qwen test", response, models: [makeCatalogModel()] })
+    expect(output).toContain([
+      "Can't run in Magnitude",
+      "",
+      "MODEL              REASON                               REPOSITORY",
+      "DeepSeek V4 Flash  Magnitude doesn't run deepseek4 yet  unsloth/DeepSeek-V4-Flash-GGUF",
+    ].join("\n"))
+    expect(output.split("Can't run in Magnitude")[0]).not.toContain("DeepSeek")
+    const only = renderSearch({ query: "deepseek", response: makeSearchResponse({ results: [makeUnsupportedSearchResult()] }), models: [] })
+    expect(only).toContain("No Hugging Face models that run in Magnitude match \"deepseek\".")
+    expect(only).not.toContain("Inspect one")
   })
 })
 
@@ -903,7 +898,7 @@ describe("--json output", () => {
       versions: [recommended!, { ...recommended!, label: "Q3_K_M", recommended: false, assessment: Option.some(unreadableAssessment()) }],
     })
     const output = renderInspection({ inspection, drafters: [], models: [] })
-    expect(output).toMatch(/Q3_K_M.*Unsupported: The file is incomplete or damaged/)
+    expect(output).toMatch(/Q3_K_M.*Unsupported: Magnitude can't read this file/)
     const document = encode(inspectionJson, { inspection, drafters: [], models: [] })
     const unreadable = (document.inspection as { versions: Record<string, unknown>[] }).versions[1]!.assessment
     expect(unreadable).toMatchObject({ _tag: "Unsupported", reasons: [{ _tag: "Unreadable" }] })
@@ -944,10 +939,10 @@ describe("--json output", () => {
       searchHuggingFaceModels: () => Effect.succeed(makeSearchResponse()),
       getCatalog: () => Effect.succeed(catalogState()),
     })
-    const effect = readSearch(client, "qwen", Option.some(5), false)
+    const effect = readSearch(client, "qwen", Option.some(5))
     const json = await capture(() => runCommand({ effect, render: renderSearch, json: asJson({ json: true }, searchJson) }))
     expect(json.stderr).toBe("")
-    expect(JSON.parse(json.stdout)).toMatchObject({ hiddenCount: 3 })
+    expect(JSON.parse(json.stdout).results).toHaveLength(2)
     expect(json.stdout.endsWith("}\n")).toBe(true)
     const text = await capture(() => runCommand({ effect, render: renderSearch, json: asJson({}, searchJson) }))
     expect(text.stdout).toContain("Hugging Face models matching \"qwen\"")

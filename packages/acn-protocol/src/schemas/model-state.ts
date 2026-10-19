@@ -1165,13 +1165,13 @@ export const HuggingFaceSearchResultSchema = Schema.Struct({
   downloads: NonNegativeSafeInteger,
   architecture: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
   unsupported: Schema.optionalWith(Schema.NonEmptyArray(UnsupportedReasonSchema), { as: "Option", exact: true }),
+  gated: Schema.Boolean,
 })
 export type HuggingFaceSearchResult = typeof HuggingFaceSearchResultSchema.Type
 
-/** Supported repositories, plus unsupported ones only when every result was requested. */
+/** Repositories of every architecture, unsupported ones last. */
 export const HuggingFaceSearchResponseSchema = Schema.Struct({
   results: Schema.Array(HuggingFaceSearchResultSchema),
-  hiddenCount: NonNegativeSafeInteger,
 })
 export type HuggingFaceSearchResponse = typeof HuggingFaceSearchResponseSchema.Type
 

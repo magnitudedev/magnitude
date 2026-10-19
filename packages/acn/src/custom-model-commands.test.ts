@@ -136,11 +136,9 @@ const harness = (options: {
   const sourceModels = (options.customModels ?? [nativeCustomModel()]).map(customSource)
   const candidates: IcnCandidatesService = {
     search: () => Effect.succeed({
-      hiddenCount: 4,
       results: [{
         repository: "HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive",
         architecture: Option.some("qwen35moe"),
-        baseModels: [],
         commit: "c",
         downloads: Option.some(12),
         gated: false,
@@ -150,6 +148,18 @@ const harness = (options: {
         tags: [],
         unsupported: [],
         variantOf: Option.some("qwen3.6-35b-a3b:gguf:q4"),
+      }, {
+        repository: "unsloth/DeepSeek-V4-Flash-GGUF",
+        architecture: Option.some("deepseek4"),
+        commit: "d",
+        downloads: Option.some(3),
+        gated: true,
+        private: false,
+        lastModified: Option.none(),
+        likes: Option.none(),
+        tags: [],
+        unsupported: [{ _tag: "Architecture", architecture: "deepseek4" }],
+        variantOf: Option.none(),
       }],
     }) as never,
     resolveRepository: () => Effect.die("unused"),
@@ -240,10 +250,15 @@ const harness = (options: {
 }
 
 describe("finding models", () => {
-  it("maps search results with uploader, variant, and hidden count", async () => {
+  it("maps search results with uploader, variant, and an unsupported architecture's reason", async () => {
     const { run } = harness()
-    const result = await run((commands) => commands.searchHuggingFace({ query: "qwen", limit: Option.none(), all: false }))
-    expect(result.hiddenCount).toBe(4)
+    const result = await run((commands) => commands.searchHuggingFace({ query: "qwen", limit: Option.none() }))
+    expect(result.results[1]).toMatchObject({
+      displayName: "DeepSeek V4 Flash",
+      variantOf: Option.none(),
+      unsupported: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]),
+      gated: true,
+    })
     expect(result.results[0]).toMatchObject({
       displayName: "Qwen3.6 35B A3B Uncensored HauhauCS Aggressive",
       uploader: "HauhauCS",
@@ -251,6 +266,7 @@ describe("finding models", () => {
       downloads: 12,
       architecture: Option.some("qwen35moe"),
       unsupported: Option.none(),
+      gated: false,
     })
   })
 

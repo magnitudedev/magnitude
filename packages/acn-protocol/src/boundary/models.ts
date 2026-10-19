@@ -154,12 +154,11 @@ const optional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
 
 const NonEmptyString = Schema.String.pipe(Schema.minLength(1))
 
-/** Supported GGUF repositories on Hugging Face; `all` also lists unsupported ones with their reasons. */
+/** GGUF repositories on Hugging Face; those of architectures Magnitude doesn't run carry their reasons. */
 const SearchHuggingFaceModels = Rpc.make("SearchHuggingFaceModels", {
   payload: Schema.Struct({
     query: Schema.String,
     limit: optional(Schema.Int.pipe(Schema.between(1, 100))),
-    all: Schema.Boolean,
   }),
   success: HuggingFaceSearchResponseSchema,
   error: ModelCandidateError,

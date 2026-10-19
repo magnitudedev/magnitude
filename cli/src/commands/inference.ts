@@ -35,7 +35,6 @@ export const registerInferenceCommands = (program: Command): void => {
   catalog.command("search")
     .description("Search Hugging Face for GGUF models that run in Magnitude")
     .argument("<query>", "Model name or words to search for")
-    .option("--all", "Also list results Magnitude can't run, with the reason")
     .option("--limit <count>", "Maximum results to request, from 1 to 100")
     .option("--json", JSON_HELP)
     .action((query, options) => loadRuntime().then(({ execute, searchHuggingFace }) => execute(searchHuggingFace(query, options))))

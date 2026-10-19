@@ -34,7 +34,7 @@ export const unsupportedReasonMessage = (reason: UnsupportedReason): string => {
     case "TargetMismatch": return "Its drafter wasn't built for this model"
     case "KernelDomain":
     case "Backend": return `Its layer sizes aren't supported on this ${backendDevice(reason.backend)}`
-    case "Unreadable": return "The file is incomplete or damaged"
+    case "Unreadable": return "Magnitude can't read this file"
     case "UnsupportedFormat": return "Stored in a format Magnitude can't read yet"
     case "Unknown": return reason.detail.trim() === "" ? "Magnitude can't run this model" : `Magnitude can't run this model (${reason.detail.trim()})`
   }
@@ -83,6 +83,17 @@ export const unsupportedReasonGroupMessage = ({ reason, count }: UnsupportedReas
 /** Every distinct user-facing reason, in the engine's order, with identical reasons said once. */
 export const unsupportedReasonMessages = (reasons: ReadonlyArray<UnsupportedReason>): ReadonlyArray<string> =>
   unsupportedReasonGroups(reasons).map(unsupportedReasonGroupMessage)
+
+/** Why a Hugging Face search result can't be added: the architecture Magnitude doesn't run yet, or model files it can't read. */
+export const searchResultUnsupportedMessage = (reasons: ReadonlyArray<UnsupportedReason>): string => {
+  const architecture = reasons.find((reason) => reason._tag === "Architecture")
+  if (architecture?._tag === "Architecture") return `Magnitude doesn't run ${architecture.architecture} yet`
+  if (reasons.some((reason) => reason._tag === "Unreadable")) return "Magnitude can't read this repository's model files"
+  return unsupportedReasonMessages(reasons).join(". ")
+}
+
+/** The label on a search result whose files need access granted on Hugging Face. */
+export const GATED_SEARCH_RESULT_LABEL = "Requires access on Hugging Face"
 
 /** Why a drafter was refused for a model, in the client's words for the engine's reasons. */
 export const drafterNotUsableMessage = ({ reasons }: Pick<DrafterNotUsable, "reasons">): string =>

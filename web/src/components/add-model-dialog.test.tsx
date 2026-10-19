@@ -2,6 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server"
 import type { ReactNode } from "react"
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
+import { HuggingFaceRepositoryIdSchema } from "@magnitudedev/sdk"
 import { Dialog } from "./ui/dialog"
 import { FindStepView, InspectedRepository, LocalFileSummary, LocalFileView, NativeFileChoice, ggufOpenRequest, RepositoryFooter, RepositoryView, SearchResultsView, VerdictLabel, addVersionRequest, confirmAction, formatDownloads, initialVersion, parseModelReference, revealVersionRow, revealsVersion, unselectableVersionNotice, unsupportedVersionLabel, versionVerdict, type FindTab } from "./add-model-dialog"
 import { catalogId, catalogModel, drafterCandidate, inspection, repository, version, doesNotFit, unsupported, unreadable } from "../../test/models/fixtures"
@@ -39,22 +40,35 @@ describe("find step", () => {
     expect(invalid).toContain('aria-invalid="true"')
     expect(invalid).toContain("That isn’t a Hugging Face link.")
   })
-  it("lists results with uploader, lineage, and downloads, then counts the hidden ones", () => {
+  it("lists results with uploader, the catalog model each is a variant of, and downloads", () => {
     const html = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loaded", response: {
-      hiddenCount: 4,
-      results: [{ repository, displayName: "Huihui Qwen3.6 35B A3B abliterated", uploader: "huihui-ai", variantOf: Option.some(catalogId), downloads: 172_100, architecture: Option.some("qwen35moe"), unsupported: Option.none() }],
+      results: [{ repository, displayName: "Huihui Qwen3.6 35B A3B abliterated", uploader: "huihui-ai", variantOf: Option.some(catalogId), downloads: 172_100, architecture: Option.some("qwen35moe"), unsupported: Option.none(), gated: false }],
     } }} />)
     expect(html).toContain("Huihui Qwen3.6 35B A3B abliterated")
     expect(html).toContain("huihui-ai · Variant of Qwen3.6 35B-A3B")
     expect(html).toContain(formatDownloads(172_100))
     expect(html).toContain("Qwen logo")
-    expect(html).toContain("4 more results use architectures Magnitude doesn’t run")
+    expect(html).not.toMatch(/<button[^>]*disabled=""/)
+  })
+  it("shows a result of an architecture Magnitude doesn't run disabled, with why", () => {
+    const html = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loaded", response: {
+      results: [{ repository: HuggingFaceRepositoryIdSchema.make("unsloth/DeepSeek-V4-Flash-GGUF"), displayName: "DeepSeek V4 Flash", uploader: "unsloth", variantOf: Option.none(), downloads: 900, architecture: Option.some("deepseek4"), unsupported: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]), gated: false }],
+    } }} />)
+    expect(html).toContain("DeepSeek V4 Flash")
+    expect(html).toContain("Magnitude doesn&#x27;t run deepseek4 yet")
+    expect(html).toMatch(/<button[^>]*disabled=""/)
+  })
+  it("labels a gated result and keeps it clickable", () => {
+    const html = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loaded", response: {
+      results: [{ repository: HuggingFaceRepositoryIdSchema.make("orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF"), displayName: "Qwen3.8 Flash Next Uncensored", uploader: "orcarouter", variantOf: Option.none(), downloads: 900, architecture: Option.some("qwen35"), unsupported: Option.none(), gated: true }],
+    } }} />)
+    expect(html).toContain("orcarouter · Requires access on Hugging Face")
+    expect(html).not.toMatch(/<button[^>]*disabled=""/)
   })
   it("distinguishes searching, no matches, and a failed search", () => {
     expect(renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loading" }} />)).toContain('aria-busy="true"')
-    const empty = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loaded", response: { results: [], hiddenCount: 1 } }} />)
-    expect(empty).toContain("No supported GGUF repositories match this search.")
-    expect(empty).toContain("1 more result uses an architecture Magnitude doesn’t run")
+    const empty = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loaded", response: { results: [] } }} />)
+    expect(empty).toContain("No GGUF repositories match this search.")
     const failed = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Failed", notice: { title: "Couldn’t reach Hugging Face" } }} />)
     expect(failed).toContain("Couldn’t reach Hugging Face")
     expect(failed).toContain("Try again")
@@ -68,7 +82,7 @@ describe("repository step", () => {
     expect(versionVerdict(version("Q8_K_P", { assessment: Option.some(doesNotFit) }))).toMatchObject({ label: "Too large for this machine", selectable: false })
     expect(versionVerdict(version("IQ2_M", { assessment: Option.some(unsupported({ _tag: "WeightTypes", types: [{ ggmlType: "IQ2_S", tensorCount: 100 }] })) }))).toMatchObject({ label: "Not supported yet", detail: "Uses IQ2_S weights, which Magnitude doesn't support yet", selectable: false })
   })
-  it("says Not supported only for an architecture without kernels, File is damaged when unreadable, and Not supported yet otherwise", () => {
+  it("says Not supported only for an architecture without kernels, Can't read this file when unreadable, and Not supported yet otherwise", () => {
     expect(unsupportedVersionLabel([{ _tag: "RopeScaling", kind: "yarn" }, { _tag: "TiedOutputHead" }])).toBe("Not supported yet")
     expect(unsupportedVersionLabel([{ _tag: "Backend", backend: "metal" }])).toBe("Not supported yet")
     expect(unsupportedVersionLabel([{ _tag: "ChatTemplate" }])).toBe("Not supported yet")
@@ -76,7 +90,7 @@ describe("repository step", () => {
     expect(unsupportedVersionLabel([{ _tag: "Unknown", kind: "Sliding", detail: "x" }, { _tag: "ChatTemplate" }])).toBe("Not supported yet")
     expect(unsupportedVersionLabel([{ _tag: "Architecture", architecture: "deepseek4" }])).toBe("Not supported")
     expect(unsupportedVersionLabel([{ _tag: "WeightTypes", types: [{ ggmlType: "IQ1_M", tensorCount: 1 }] }, { _tag: "Architecture", architecture: "deepseek4" }])).toBe("Not supported")
-    expect(unsupportedVersionLabel([{ _tag: "Unreadable" }, { _tag: "WeightTypes", types: [{ ggmlType: "IQ1_M", tensorCount: 1 }] }])).toBe("File is damaged")
+    expect(unsupportedVersionLabel([{ _tag: "Unreadable" }, { _tag: "WeightTypes", types: [{ ggmlType: "IQ1_M", tensorCount: 1 }] }])).toBe("Can't read this file")
     expect(versionVerdict(version("Q4_K_P", { assessment: Option.none() }))).toMatchObject({ label: "Not checked yet", selectable: true })
   })
   it("shows an unknown reason's detail behind the version's verdict", () => {
@@ -124,9 +138,9 @@ describe("repository step", () => {
   })
   it("shows an unreadable version, which has no serving profile, as damaged and unselectable", () => {
     const damaged = version("Q3_K_M", { assessment: Option.some(unreadable) })
-    expect(versionVerdict(damaged)).toMatchObject({ label: "File is damaged", detail: "The file is incomplete or damaged", selectable: false })
+    expect(versionVerdict(damaged)).toMatchObject({ label: "Can't read this file", detail: "Magnitude can't read this file", selectable: false })
     const html = inDialog(<RepositoryView inspection={inspection({ versions: [version("Q4_K_P", { recommended: true }), damaged] })} models={models} selectedVersion={Option.some("Q4_K_P")} onSelectVersion={() => {}} />)
-    expect(html).toContain('File is damaged<span class="sr-only">: The file is incomplete or damaged</span></button>')
+    expect(html).toContain('Can&#x27;t read this file<span class="sr-only">: Magnitude can&#x27;t read this file</span></button>')
     expect(html.match(/type="radio"[^>]*disabled=""/g)).toHaveLength(1)
   })
   it("explains why when no version runs on this computer", () => {
@@ -178,7 +192,7 @@ describe("repository step", () => {
     })
     it("words each unselectable verdict", () => {
       expect(unselectableVersionNotice(version("Q8_K_P", { assessment: Option.some(doesNotFit) }))).toEqual({ title: "Q8_K_P is too large for this machine", description: "Pick another version to download." })
-      expect(unselectableVersionNotice(version("Q3_K_M", { assessment: Option.some(unreadable) })).description).toBe("The file is incomplete or damaged. Pick another version to download.")
+      expect(unselectableVersionNotice(version("Q3_K_M", { assessment: Option.some(unreadable) })).description).toBe("Magnitude can't read this file. Pick another version to download.")
     })
   })
   it("pins Hugging Face downloads and keeps local files in place", () => {

@@ -21,7 +21,7 @@ import {
   drafterCandidateSelectable,
   drafterCandidateWarning,
 } from "./drafter-presentation"
-import { drafterNotUsableMessage, modelVersionNotRunnableMessage, unsupportedReasonMessage, unsupportedReasonMessages } from "./failure-messages"
+import { drafterNotUsableMessage, modelVersionNotRunnableMessage, searchResultUnsupportedMessage, unsupportedReasonMessage, unsupportedReasonMessages } from "./failure-messages"
 import { noRunnableVersionReason } from "./candidate-versions"
 import {
   installedLocalModels,
@@ -90,7 +90,7 @@ describe("unsupported reasons in the UI", () => {
       "Its drafter wasn't built for this model",
       "Its layer sizes aren't supported on this GPU",
       "Its layer sizes aren't supported on this GPU",
-      "The file is incomplete or damaged",
+      "Magnitude can't read this file",
       "Stored in a format Magnitude can't read yet",
     ])
   })
@@ -118,6 +118,13 @@ describe("unsupported reasons in the UI", () => {
       .toBe("Magnitude can't run this model (window 4096)")
     expect(unsupportedReasonMessage(reason({ _tag: "SlidingWindow", detail: "" })))
       .toBe("Magnitude can't run this model")
+  })
+
+  it("says a search result's architecture isn't run yet", () => {
+    expect(searchResultUnsupportedMessage([reason({ _tag: "Architecture", architecture: "deepseek4" })]))
+      .toBe("Magnitude doesn't run deepseek4 yet")
+    expect(searchResultUnsupportedMessage([reason({ _tag: "Unreadable" })]))
+      .toBe("Magnitude can't read this repository's model files")
   })
 
   it("collapses reasons that read the same", () => {

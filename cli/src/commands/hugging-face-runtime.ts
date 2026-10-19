@@ -5,7 +5,9 @@ import {
   formatStorageSize,
   modelVersionNotRunnableMessage,
   noRunnableVersionReason,
+  GATED_SEARCH_RESULT_LABEL,
   preselectedDrafterCandidate,
+  searchResultUnsupportedMessage,
   unsupportedReasonGroupMessage,
   unsupportedReasonGroups,
   type UnsupportedReasonGroup,
@@ -67,30 +69,25 @@ const variantOfLabel = (models: readonly LocalModel[], variantOf: Option.Option<
 
 export interface SearchView {
   readonly query: string
-  readonly all: boolean
   readonly response: HuggingFaceSearchResponse
   readonly models: readonly LocalModel[]
 }
 
 const reasonsLine = (reasons: readonly UnsupportedReason[]) => unsupportedReasonMessages(reasons).join(". ")
 
-export const renderSearch = ({ query, all, response, models }: SearchView): string => {
+export const renderSearch = ({ query, response, models }: SearchView): string => {
   const supported = response.results.filter(({ unsupported }) => Option.isNone(unsupported))
   const unsupported = response.results.flatMap((result) => Option.match(result.unsupported, {
     onNone: () => [],
     onSome: (reasons) => [{ result, reasons }],
   }))
-  const footer = response.hiddenCount > 0 && !all ? [
-    `${plural(response.hiddenCount, "more result uses", "more results use")} architectures Magnitude doesn't run.`,
-    `List them: magnitude catalog search ${quoted(query)} --all`,
-  ] : []
   const supportedSection = supported.length === 0
     ? [`No Hugging Face models that run in Magnitude match ${quoted(query)}.`]
     : [
         `Hugging Face models matching ${quoted(query)}`,
         "",
         renderTable(supported, [
-          { heading: "MODEL", value: ({ displayName }) => displayName },
+          { heading: "MODEL", value: ({ displayName, gated }) => gated ? `${displayName} · ${GATED_SEARCH_RESULT_LABEL}` : displayName },
           { heading: "UPLOADER", value: ({ uploader }) => uploader },
           { heading: "VARIANT OF", value: ({ variantOf }) => variantOfLabel(models, variantOf) },
           { heading: "DOWNLOADS", value: ({ downloads }) => formatDownloads(downloads) },
@@ -103,14 +100,13 @@ export const renderSearch = ({ query, all, response, models }: SearchView): stri
     "",
     renderTable(unsupported, [
       { heading: "MODEL", value: ({ result }) => result.displayName },
-      { heading: "REASON", value: ({ reasons }) => reasonsLine(reasons) },
+      { heading: "REASON", value: ({ reasons }) => searchResultUnsupportedMessage(reasons) },
       { heading: "REPOSITORY", value: ({ result }) => result.repository },
     ]).trimEnd(),
   ]
   return ensureTrailingNewline([
     ...supportedSection,
     ...unsupportedSection,
-    ...(footer.length > 0 ? ["", ...footer] : []),
     ...(supported.length > 0 ? ["", "Inspect one: magnitude catalog inspect <repository>"] : []),
   ].join("\n"))
 }
@@ -131,22 +127,20 @@ export const readSearch = (
   client: CliModelsClient,
   query: string,
   limit: Option.Option<number>,
-  all: boolean,
 ) => Effect.all({
-  response: client.models.searchHuggingFaceModels({ query, limit, all }),
+  response: client.models.searchHuggingFaceModels({ query, limit }),
   catalog: readCatalog(client),
-}).pipe(Effect.map(({ response, catalog }): SearchView => ({ query, all, response, models: catalogProducts(catalog) })))
+}).pipe(Effect.map(({ response, catalog }): SearchView => ({ query, response, models: catalogProducts(catalog) })))
 
 export const searchHuggingFace = (
   query: string,
-  options: JsonOption & { readonly all?: boolean; readonly limit?: string } = {},
+  options: JsonOption & { readonly limit?: string } = {},
 ) => commandEffect({
   effect: Effect.gen(function* () {
     const trimmed = query.trim()
     if (trimmed.length === 0) return yield* new ModelCommandError({ message: "Search query must not be empty" })
     const limit = yield* parseSearchLimit(options.limit)
-    const all = options.all === true
-    return yield* withClient((client) => readSearch(client, trimmed, limit, all))
+    return yield* withClient((client) => readSearch(client, trimmed, limit))
   }),
   render: renderSearch,
   json: asJson(options, searchJson),

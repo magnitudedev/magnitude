@@ -27,9 +27,9 @@ magnitude models status <model-id>
 magnitude models load <model-id>
 ```
 
-`catalog search` lists only repositories whose architecture Magnitude runs, with the uploader, the
-catalog model each is a variant of, and downloads. A footer counts the results it hid; `--all`
-lists them with the reason. `catalog show <model-id>` prints the search that finds other versions
+`catalog search` lists repositories with the uploader, the catalog model each is a variant of, and
+downloads. Results whose architecture Magnitude doesn't run follow in their own table with that
+reason. `catalog show <model-id>` prints the search that finds other versions
 of a catalog model.
 
 `catalog inspect` accepts a huggingface.co link, `owner/repo`, `owner/repo:QUANT`, or a local GGUF
