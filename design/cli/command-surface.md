@@ -30,7 +30,7 @@ server setup | remove
 status
 hardware
 catalog status | list | show <model-id> | recommendations [--preference <value>] [--limit <count>]
-catalog search <query> [--all] [--limit <count>]
+catalog search <query> [--limit <count>]
 catalog inspect <huggingface-url | owner/repo | owner/repo:QUANT>
 catalog pull <model-id | owner/repo[:QUANT]> [--drafter auto|none|<ref>] [--force] [--only projector|drafter]
 catalog cancel <model-id> | remove <model-id>
@@ -140,9 +140,9 @@ documentation command for interpreting the evidence and ranking methodology.
 `catalog search` command that finds other versions of it. Successful `catalog recommendations`
 output ends with a hint line for adding a model from Hugging Face.
 
-`catalog search` lists supported Hugging Face repositories with uploader, the catalog model each is
-a variant of, and downloads; unsupported results are counted in a footer and `--all` lists them with
-their reason. `catalog inspect` prints the repository step: versions with sizes and the engine's
+`catalog search` lists Hugging Face repositories with uploader, the catalog model each is a variant
+of, and downloads; results of architectures Magnitude doesn't run follow in their own table with
+that reason. `catalog inspect` prints the repository step: versions with sizes and the engine's
 verdict, the recommended version, and drafter choices in
 [drafter selection](../model-management/drafter-selection.md) order with their labels. It accepts a
 Hugging Face URL and makes no changes.

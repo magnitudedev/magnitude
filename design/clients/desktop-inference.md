@@ -112,13 +112,16 @@ explicitly before replacing observed active residency.
 Custom models follow [the local-model product projection](../model-management/local-model-product-projection.md):
 
 - **Add from Hugging Face** is one dialog with two steps. The find step has Search and Paste a link
-  (a Hugging Face URL, `owner/repo`, or `owner/repo:QUANT`). Results list only repositories whose
-  architecture the engine runs, with display name, uploader, "Variant of <catalog model>" when
-  lineage resolves, and downloads; a footer counts results hidden for unsupported architectures, and
-  repositories the catalog uses are never listed as new models. The repository step shows the
-  repository link, Variant of, and license; one row per version (shards grouped) with its size and
+  (a Hugging Face URL, `owner/repo`, or `owner/repo:QUANT`). Results list repositories with display name,
+  uploader, "Variant of <catalog model>" when the repository's GGUF has a catalog model's shape, and
+  downloads; a repository whose architecture the engine doesn't run is shown disabled with "Magnitude
+  doesn't run <architecture> yet", and repositories the catalog uses are never listed as new models. The repository step shows the
+  repository link, Variant of, and license; one row per version (shards grouped), labelled by its quantization (versions sharing one are
+  told apart by built-in MTP heads in the header, `Q4_K_M · MTP`, then by the quantization or name
+  words their files differ in, `Q4_0 · QAD`, and by the file path only when nothing else differs),
+  with its size and
   the engine's verdict (Recommended, Fits your machine, Too large for this machine, Not supported
-  yet with the reason on hover, Not supported for an architecture without kernels, or File is damaged), never a verdict from the file name; the drafter choices
+  yet with the reason on hover, Not supported for an architecture without kernels, or Can't read this file), never a verdict from the file name; the drafter choices
   preselected per [drafter selection](../model-management/drafter-selection.md) with "Use a different
   drafter…"; and "Pinned to the current version of this repository" with Download and its total size
   (target, drafter, projector). A version already on this computer is marked so and Download becomes

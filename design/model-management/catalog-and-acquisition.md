@@ -36,15 +36,43 @@ Catalog membership, artifact presence, download activity, package validation, as
 offering, slot selection, and runtime residency remain separate facts.
 
 Hugging Face search, repository resolution, and candidate inspection are service-owned
-observational queries. Search returns GGUF repositories with immutable commit identities, lineage
-(`baseModels`, and the catalog model a result is a variant of), and a count of results hidden because
-the engine recognizes none of their architectures; the Hub's repository-level architecture is only
-a prefilter against the engine's recognized-architecture list. Repositories the catalog uses are
+observational queries. Search returns GGUF repositories with immutable commit identities and the catalog model each is a
+variant of. A repository whose Hub architecture the engine doesn't recognize is still returned,
+marked unsupported with that architecture; the Hub's repository-level architecture is only a
+prefilter against the engine's recognized-architecture list. Repositories the catalog uses are
 never returned as new models, and drafter repositories (a drafter architecture, such as DFlash,
-EAGLE, a Gemma assistant or MTP-only heads, or the Hub's speculative-decoding tags) are neither
-results nor counted as hidden: they are offered only in drafter lists. "Variant of" follows the
-Hub `baseModels` (two hops); a repository whose lineage reaches no catalog model is a variant of
-none, since an architecture and a size don't say which model a file is. Results are ordered with those of unsupported architectures last, then repositories whose
+EAGLE, a Gemma assistant or MTP-only heads, or the Hub's speculative-decoding tags) are never
+results: they are offered only in drafter lists. "Variant of" and the architecture shown come from
+the repository's model file, found by size and header: its GGUFs (a sharded set by its total size,
+read at its first shard; `mmproj` projector files excluded) largest first, skipping a file whose
+header names no architecture, a projector's or a separate drafter's (an importance matrix, an MTP
+or DFlash drafter), up to three reads. Each read is the file's first 64 KiB in one ranged GET: the
+metadata up to the tokenizer's token list and the list's element count, which give the engine's
+shape fingerprint without the token table digest. When the prefix holds no shape (a writer put the
+shape keys after the token list) or a near miss of a catalog model's (same architecture, width and
+vocabulary, where a later key such as an appended MTP head count may settle it), the whole header
+is read by the remote header reader. The shape comes from metadata alone: tensor types never
+affect it (weight support is decided at inspection, where a tensor type id the engine doesn't know
+is an unsupported weight type named `type <id>`, never a damaged file). The result is a variant of the first
+catalog model, in catalog order, whose fingerprint has that shape. The header's architecture
+replaces the Hub's; a repository the engine doesn't run is unsupported with that architecture, and
+one whose headers were read but hold no model file (no architecture, a projector's, or the pieces
+of a layer-split model, which repeat its metadata over fewer tensors than its blocks) is unsupported
+as unreadable; one whose files read are all drafters' (a separate drafter architecture, or a single
+file declaring prediction layers over fewer tensors than blocks, as an MTP block) is a drafter
+repository and no result. A split set's shards are never judged by their tensor count: the listing
+groups them, and a first shard may hold only the metadata. A repository whose listing holds no GGUF at all (the Hub's
+gguf filter also matches a tag) is no result. A query that is a Hugging Face link
+(`https://huggingface.co/owner/repo/…`, `hf.co/owner/repo`) searches for that repository. What a repository's commit holds is cached, so it is read once; reads
+run with bounded concurrency. A failed or slow read (any status but success, a timeout, a listing
+that can't be resolved, a gated repository's refused files) is unknown: it is retried next time,
+never cached, never fails the search, and leaves the row exactly as the Hub's search describes it.
+Only a GGUF header read with a successful status makes a row unreadable, and only a successful
+listing (the search's own `siblings`, or the commit's file listing) makes it no result. A rate
+limit (HTTP 429) is never retried: it pauses every request to that host for its `Retry-After` (at
+most a minute), during which a request fails at once without being sent, so a search returns its
+rows as the Hub described them instead of hammering it. Gated results carry `gated`, and
+clients label them as needing access on Hugging Face. Results are ordered with those of unsupported architectures last, then repositories whose
 name is exactly the query (ignoring case, separators, a trailing `GGUF` and an uploader's `Org_`
 prefix), then by downloads. Resolution returns the requested repository's immutable snapshot and
 GGUF file evidence. Candidate inspection groups a repository's or path's GGUFs into versions (shards

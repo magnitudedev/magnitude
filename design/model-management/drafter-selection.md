@@ -52,12 +52,14 @@ commit, read once and cached with that commit's snapshot; catalog fingerprints c
 header bundle.
 
 The product side matches only on engine-supplied fingerprints and declared lineage; it never parses
-headers or file names. "Variant of" shown to users is a display hint: the exact catalog target or
-lineage match, and the fingerprint match only for a file whose lineage names no base model (an
-Ollama library model, a file without metadata). A fingerprint never overrides declared lineage,
-because models of one architecture and size can share every fingerprinted dimension and the
-tokenizer (Qwen3.5 27B and Qwen3.8 27B do); it still offers that catalog model's drafter. The
-engine verdict alone decides compatibility.
+headers or file names. "Variant of" shown to users (a search result, an inspected candidate, a
+custom model) is a display hint decided by shape alone, by one rule: the exact catalog target is
+its catalog model, and anything else is a variant of the first catalog model, in catalog order,
+whose fingerprint has its shape (every fingerprinted dimension but the token table). Declared
+lineage never decides it. Models of one architecture and size can share every dimension and the
+tokenizer (Qwen3.5 27B and Qwen3.8 27B do), so the first of them in catalog order is named. Drafter
+selection still ranks lineage above the fingerprint, as above. The engine verdict alone decides
+compatibility.
 
 ## Candidates
 
@@ -104,9 +106,12 @@ drafter, is preselected. "Without a drafter" is the model served plain (`ModelMe
 automatic method, which takes built-in heads; the heads are a candidate like any other, judged with them. When the
 model doesn't fit even without a drafter, fit doesn't decide. The rule holds for every origin and every path: the
 candidate list, the recommended drafter, and the attachment, which takes only automatic candidates. A user-entered
-drafter is never automatic. A candidate version's verdict (the repository step, `catalog inspect`) is the
-assessment of exactly what adding it installs: its target and projector with its preselected drafter, or served
-plain when none is preselected, so the installed model gets the same verdict.
+drafter is never automatic. Inspection composes only the recommended version with its preselected drafter (or
+serves it plain when none is preselected), exactly what adding it installs; every other version carries its plain
+verdict, whose fit equals the installed one's (an automatic drafter never breaks a fit). A version the user selects
+gets its drafter list, with each candidate's composed verdict, from the per-version drafter candidates (the dialog
+loads them for the selected version; `catalog inspect owner/repo:QUANT` lists them for the named version).
+Composing every version would assess each with every drafter candidate.
 Catalog models always use their catalog drafter unless it doesn't fit, including one whose exact target is found in
 another app's location: it serves with the catalog drafter as soon as that drafter is on this computer (a
 projector it lacks never blocks it), and otherwise offers the drafter-only download, serving meanwhile with its
