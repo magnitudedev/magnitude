@@ -78,6 +78,13 @@ Actions follow who owns the files:
 | Found | Hide from Magnitude; never touches the files | None | Add, Change, Turn off |
 | Catalog, files only in an external location | Deletes only the parts Magnitude stores; with none, hides it like a found model | New catalog revision | The catalog's |
 
+`UpdateAvailable` carries the update's `parts`: `Model` when the new revision's weights differ,
+`ImageInput` when only its projector does, and `Drafter` when its separate drafter does. The engine
+derives them from the catalog packages a newer revision needs fetched, so an update always names at least
+one part, and clients say which (for example in the Update tooltip). An added model's update, a new
+repository commit for its target, is always `Model`; a newer revision of its attached drafter is shown on
+the drafter, not as `UpdateAvailable`.
+
 A catalog model whose exact target is found externally serves with the catalog components that are on
 this computer. Each component it lacks is listed in `missingComponents` (`Projector` or `Drafter`, with
 its download bytes), never as `UpdateAvailable`; clients offer each one while the model is `Installed`

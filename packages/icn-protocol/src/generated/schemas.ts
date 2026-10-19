@@ -515,6 +515,7 @@ export const CatalogModelUpdate = S.Union(
   S.extend(S.TaggedStruct("Current", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
     S.TaggedStruct("Available", {
+      parts: S.Array(S.suspend((): S.Schema<CatalogUpdatePart, CatalogUpdatePartEncoded> => CatalogUpdatePart)),
       requiredDownloadBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -565,6 +566,10 @@ export const CatalogSupport = S.Union(
 )
 export type CatalogSupport = S.Schema.Type<typeof CatalogSupport>
 export type CatalogSupportEncoded = S.Schema.Encoded<typeof CatalogSupport>
+
+export const CatalogUpdatePart = S.Union(S.Literal("Model"), S.Literal("Projector"), S.Literal("Drafter"))
+export type CatalogUpdatePart = S.Schema.Type<typeof CatalogUpdatePart>
+export type CatalogUpdatePartEncoded = S.Schema.Encoded<typeof CatalogUpdatePart>
 
 export const ChatCompletionChoice = S.Struct({
   finish_reason: S.String,

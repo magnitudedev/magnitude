@@ -3716,6 +3716,7 @@
             "type": "object",
             "required": [
               "requiredDownloadBytes",
+              "parts",
               "_tag"
             ],
             "properties": {
@@ -3723,6 +3724,12 @@
                 "type": "integer",
                 "format": "int64",
                 "minimum": 0
+              },
+              "parts": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CatalogUpdatePart"
+                }
               },
               "_tag": {
                 "type": "string",
@@ -3859,6 +3866,15 @@
           }
         ],
         "description": "What the release promises for a catalog model. It is independent of assessment, which says\nwhat one device can do with it."
+      },
+      "CatalogUpdatePart": {
+        "type": "string",
+        "description": "What a catalog update brings: new model weights, a new projector (image input), or a new drafter.",
+        "enum": [
+          "Model",
+          "Projector",
+          "Drafter"
+        ]
       },
       "ChatCompletionChoice": {
         "type": "object",

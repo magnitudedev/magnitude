@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Array, Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
   LocalModelsStateSchema,
   LocalModelAssessmentSchema,
@@ -251,8 +251,10 @@ export const catalogAcquisition = (
   }
   if (installed === undefined) return { _tag: "NotInstalled" }
   const updateState = model.localState.updateState as CatalogModelUpdate
-  return updateState._tag === "Available"
-    ? { _tag: "UpdateAvailable", ...installed }
+  // ICN reports an update only with something to fetch, so its parts are never empty.
+  const parts = updateState._tag === "Available" ? updateState.parts.map(part => part === "Projector" ? "ImageInput" as const : part) : []
+  return Array.isNonEmptyReadonlyArray(parts)
+    ? { _tag: "UpdateAvailable", ...installed, parts }
     : { _tag: "Installed", ...installed }
 }
 
@@ -484,7 +486,7 @@ export const customAcquisition = (
     onNone: (): CustomModelAcquisitionState => {
       if (installed === undefined) return { _tag: "NotInstalled" }
       return Option.isSome(source.updateCommit)
-        ? { _tag: "UpdateAvailable", ...installed }
+        ? { _tag: "UpdateAvailable", ...installed, parts: ["Model"] }
         : { _tag: "Installed", ...installed }
     },
     onSome: (download): CustomModelAcquisitionState => Option.match(transferProgress(download), {

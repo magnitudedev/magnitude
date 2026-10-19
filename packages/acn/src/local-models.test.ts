@@ -284,6 +284,19 @@ describe("catalog acquisition projection", () => {
     expect(catalogAcquisition(model, operation, { _tag: "Unloaded" })).toMatchObject({ _tag: "Installed" })
   })
 
+  it("names what a catalog update brings, calling a new projector image input", () => {
+    const model = {
+      desired: { metadata: { storageBytes: 7 } },
+      localState: {
+        _tag: "Installed",
+        installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/model.gguf", ownership: "Magnitude" },
+        updateState: { _tag: "Available", requiredDownloadBytes: 1_500, parts: ["Projector", "Drafter"] },
+      },
+    } as unknown as CatalogModel
+
+    expect(catalogAcquisition(model, undefined, { _tag: "Unloaded" })).toMatchObject({ _tag: "UpdateAvailable", parts: ["ImageInput", "Drafter"] })
+  })
+
   it("projects post-download optimization as an installed model with its tuning progress", () => {
     const installation = { _tag: "Resolved", installedBytes: 1, primaryPath: "/model.gguf", ownership: "Magnitude" }
     const model = {

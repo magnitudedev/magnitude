@@ -513,6 +513,10 @@ const InstalledModelFields = {
   residencyState: ModelResidencySchema,
 } as const
 
+/** What an update brings: new model weights, new image input (a projector), or a new drafter. */
+export const ModelUpdatePartSchema = Schema.Literal("Model", "ImageInput", "Drafter")
+export type ModelUpdatePart = typeof ModelUpdatePartSchema.Type
+
 /**
  * The single per-model materialization lifecycle: what exists on disk, the one
  * transfer that may be running for it, and — once bits exist — the model's
@@ -525,7 +529,7 @@ export const LocalModelAcquisitionStateSchema = Schema.Union(
   /** Acknowledged failure returns to NotInstalled. */
   Schema.TaggedStruct("InstallFailed", { failure: ModelAcquisitionFailureSchema }),
   Schema.TaggedStruct("Installed", InstalledModelFields),
-  Schema.TaggedStruct("UpdateAvailable", InstalledModelFields),
+  Schema.TaggedStruct("UpdateAvailable", { ...InstalledModelFields, parts: Schema.NonEmptyArray(ModelUpdatePartSchema) }),
   Schema.TaggedStruct("Updating", {
     ...InstalledModelFields,
     progress: ModelTransferProgressSchema,

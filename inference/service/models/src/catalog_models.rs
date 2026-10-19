@@ -9,6 +9,7 @@ use magnitude_service_contracts::models::{
     CatalogBaseId, CatalogComponent, CatalogInstallationAdmission, CatalogInstallationRemoval,
     CatalogMissingComponent, CatalogModel, CatalogModelState, CatalogVariantId,
     CatalogModelUpdate, CatalogModels, CatalogModelsResponse, CatalogPackageRole, CatalogSupport,
+    CatalogUpdatePart,
     EffectiveModel,
     InstalledCatalogAttribution, InstalledModelPackage, ModelAssessmentSubject,
     ModelDomainInvalidation, ModelFailure, ModelId, ModelInstallation, ModelInstallationOwnership,
@@ -704,6 +705,7 @@ fn catalog_model(
                     } else {
                         CatalogModelUpdate::Available {
                             required_download_bytes: resolution.required_download_bytes,
+                            parts: resolution.update_parts,
                         }
                     },
                     missing_components: resolution.missing_components,
@@ -753,6 +755,7 @@ struct CatalogResolution<'a> {
     missing_desired_package_ids: Vec<ModelPackageId>,
     superseded_package_ids: Vec<ModelPackageId>,
     required_download_bytes: u64,
+    update_parts: Vec<CatalogUpdatePart>,
     missing_components: Vec<CatalogMissingComponent>,
     drafter_withheld: bool,
     state: CatalogMaterialState<'a>,
@@ -919,6 +922,26 @@ fn catalog_resolution<'a>(
         .filter(|(package, _)| !present.contains_key(&package.id))
         .map(|(package, _)| download_bytes(package))
         .sum::<u64>();
+    // A missing target whose weights are all here differs only in its projector: an image input update.
+    let missing_parts = desired_packages
+        .iter()
+        .filter(|(package, _)| !present.contains_key(&package.id) && download_bytes(package) > 0)
+        .map(|(package, role)| match role {
+            CatalogPackageRole::Dependency => CatalogUpdatePart::Drafter,
+            CatalogPackageRole::Target
+                if package
+                    .files
+                    .iter()
+                    .filter(|file| file.role != ModelFileRole::Projector)
+                    .all(|file| present_files.contains(&file.id)) =>
+            {
+                CatalogUpdatePart::Projector
+            }
+            CatalogPackageRole::Target => CatalogUpdatePart::Model,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let projector_package = catalog_projector_package(catalog_target(definition));
     let superseded_package_ids = affiliations
         .iter()
@@ -1008,6 +1031,7 @@ fn catalog_resolution<'a>(
         _ => None,
     });
     let mut required_download_bytes = missing_bytes;
+    let mut update_parts = missing_parts;
     let mut missing_components = Vec::new();
     let state = if targets.is_empty() {
         CatalogMaterialState::NotInstalled
@@ -1021,6 +1045,7 @@ fn catalog_resolution<'a>(
     } else if let Some(target) = current_target {
         if superseded_package_ids.is_empty() {
             required_download_bytes = 0;
+            update_parts = Vec::new();
             missing_components = current_target_missing_components(
                 definition,
                 &target.package,
@@ -1072,6 +1097,7 @@ fn catalog_resolution<'a>(
         missing_desired_package_ids,
         superseded_package_ids,
         required_download_bytes,
+        update_parts,
         missing_components,
         drafter_withheld: false,
         state,
@@ -1941,6 +1967,7 @@ mod tests {
             &BTreeSet::new(),
         );
         assert_eq!(resolution.required_download_bytes, 600 + 900);
+        assert_eq!(resolution.update_parts, [CatalogUpdatePart::Projector, CatalogUpdatePart::Drafter]);
         assert!(resolution.missing_components.is_empty());
     }
 
@@ -1999,6 +2026,7 @@ mod tests {
             update_state:
                 CatalogModelUpdate::Available {
                     required_download_bytes,
+                    ref parts,
                 },
             ..
         } = model.local_state
@@ -2007,6 +2035,7 @@ mod tests {
         };
         assert_eq!(installed_bytes, 10);
         assert_eq!(required_download_bytes, 20);
+        assert_eq!(parts, &[CatalogUpdatePart::Model]);
     }
 
     #[test]

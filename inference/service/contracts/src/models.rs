@@ -1201,7 +1201,17 @@ pub enum CatalogModelUpdate {
     #[serde(rename_all = "camelCase")]
     Available {
         required_download_bytes: u64,
+        parts: Vec<CatalogUpdatePart>,
     },
+}
+
+/// What a catalog update brings: new model weights, a new projector (image input), or a new drafter.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CatalogUpdatePart {
+    Model,
+    Projector,
+    Drafter,
 }
 
 /// A part of a catalog model's bundle that can be fetched on its own: the projector that gives
