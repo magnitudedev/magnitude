@@ -1542,7 +1542,6 @@ export type HealthResponse = S.Schema.Type<typeof HealthResponse>
 export type HealthResponseEncoded = S.Schema.Encoded<typeof HealthResponse>
 
 export const HuggingFaceModelSearchRequest = S.Struct({
-  includeUnsupported: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
   limit: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   query: S.String,
 })
@@ -1551,7 +1550,6 @@ export type HuggingFaceModelSearchRequestEncoded = S.Schema.Encoded<typeof Huggi
 
 export const HuggingFaceModelSearchResult = S.Struct({
   architecture: S.optionalWith(S.String, { exact: true, as: "Option" }),
-  baseModels: S.Array(S.String),
   commit: S.String,
   downloads: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   gated: S.Boolean,
@@ -1570,7 +1568,6 @@ export type HuggingFaceModelSearchResult = S.Schema.Type<typeof HuggingFaceModel
 export type HuggingFaceModelSearchResultEncoded = S.Schema.Encoded<typeof HuggingFaceModelSearchResult>
 
 export const HuggingFaceModelSearchResults = S.Struct({
-  hiddenCount: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   results: S.Array(
     S.suspend(
       (): S.Schema<HuggingFaceModelSearchResult, HuggingFaceModelSearchResultEncoded> => HuggingFaceModelSearchResult,

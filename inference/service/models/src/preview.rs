@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use magnitude_service_contracts::models::{
-    KnownUnsupportedReason, ModelId, ModelPackage, UnsupportedReason,
+    KnownUnsupportedReason, ModelFingerprint, ModelId, ModelPackage, UnsupportedReason,
 };
 use magnitude_service_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, HuggingFaceModelCatalog,
@@ -27,6 +27,7 @@ use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::content_id;
 use crate::inventory::{ManagedModelStore, build_model, now};
 use crate::lineage::CatalogLineage;
+use crate::search_shape::{CatalogFingerprints, RepositoryModel};
 
 const MAX_HUB_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HUB_SIBLINGS: usize = 100_000;
@@ -38,7 +39,7 @@ const MAX_MODEL_COMPONENTS: u32 = 256;
 const MAX_COMPONENT_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const HUB_REQUEST_ATTEMPTS: usize = 3;
 const HUB_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
-const SEARCH_LINEAGE_CONCURRENCY: usize = 4;
+const SEARCH_SHAPE_CONCURRENCY: usize = 8;
 
 /// Live Hub search and immutable resolution for the service's API. Catalog publication and
 /// managed inventory do not depend on these queries.
@@ -46,6 +47,7 @@ pub struct HuggingFaceDiscovery {
     models: Arc<ManagedModelStore>,
     architectures: RecognizedArchitectures,
     lineage: Arc<CatalogLineage>,
+    catalog: Arc<dyn CatalogFingerprints>,
     searches: tokio::sync::Mutex<BTreeMap<String, (Instant, HuggingFaceModelSearchResults)>>,
 }
 
@@ -55,11 +57,13 @@ impl HuggingFaceDiscovery {
         models: Arc<ManagedModelStore>,
         architectures: RecognizedArchitectures,
         lineage: Arc<CatalogLineage>,
+        catalog: Arc<dyn CatalogFingerprints>,
     ) -> Self {
         Self {
             models,
             architectures,
             lineage,
+            catalog,
             searches: tokio::sync::Mutex::new(BTreeMap::new()),
         }
     }
@@ -91,11 +95,14 @@ impl HuggingFaceDiscovery {
             "private",
             "gated",
             "gguf",
-            "baseModels",
+            "siblings",
         ] {
             url.query_pairs_mut().append_pair("expand", field);
         }
-        let response = send_hub_get(&self.models.http, self.models.hub_token(), url).await?;
+        let response = send_hub_get(&self.models.http, self.models.hub_token(), url.clone()).await?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(hub_rate_limited(hub_pause(&url).unwrap_or(DEFAULT_RATE_LIMIT_PAUSE)));
+        }
         if !response.status().is_success() {
             return Err(InventoryError::Upstream(format!(
                 "Hugging Face search returned HTTP {}",
@@ -107,9 +114,17 @@ impl HuggingFaceDiscovery {
         )
         .map_err(|error| InventoryError::Upstream(error.to_string()))?;
         let catalog_repositories = self.lineage.repositories();
-        let mut hidden_count = 0_u32;
         let mut kept = Vec::new();
         for model in metadata {
+            // A listing the search itself returned that names no GGUF: nothing in it can be added
+            // (the Hub's gguf filter also matches a tag). No listing says nothing.
+            if model
+                .siblings
+                .as_ref()
+                .is_some_and(|siblings| !siblings.iter().any(|sibling| valid_gguf_path(Path::new(&sibling.rfilename))))
+            {
+                continue;
+            }
             let Some(mut result) = model.into_contract() else {
                 continue;
             };
@@ -120,30 +135,29 @@ impl HuggingFaceDiscovery {
             {
                 continue;
             }
-            if !self
-                .architectures
-                .admits_repository(result.architecture.as_deref())
-            {
-                hidden_count = hidden_count.saturating_add(1);
-                if !request.include_unsupported {
-                    continue;
-                }
+            if let Some(architecture) = result.architecture.clone().filter(|architecture| {
+                !self.architectures.admits_repository(Some(architecture))
+            }) {
                 result.unsupported = vec![UnsupportedReason::Known(
-                    KnownUnsupportedReason::Architecture {
-                        architecture: result.architecture.clone().unwrap_or_default(),
-                    },
+                    KnownUnsupportedReason::Architecture { architecture },
                 )];
             }
             kept.push(result);
         }
+        let catalog = if kept.iter().any(|result| result.unsupported.is_empty()) {
+            self.catalog.catalog_fingerprints().await
+        } else {
+            Vec::new()
+        };
+        let catalog = &catalog;
         let mut results = futures_util::stream::iter(kept)
             .map(|mut result| async move {
-                if result.unsupported.is_empty() {
-                    result.variant_of = self.variant_of(&result).await;
-                }
-                result
+                let model = !result.unsupported.is_empty()
+                    || self.read_model_file(&mut result, catalog).await;
+                model.then_some(result)
             })
-            .buffered(SEARCH_LINEAGE_CONCURRENCY)
+            .buffered(SEARCH_SHAPE_CONCURRENCY)
+            .filter_map(std::future::ready)
             .collect::<Vec<_>>()
             .await;
         results.sort_by_key(|result| {
@@ -153,37 +167,72 @@ impl HuggingFaceDiscovery {
                 std::cmp::Reverse(result.downloads.unwrap_or(0)),
             )
         });
-        Ok(HuggingFaceModelSearchResults {
-            results,
-            hidden_count,
-        })
+        Ok(HuggingFaceModelSearchResults { results })
     }
 
-    /// The catalog model a result derives from: its repository and direct base models first,
-    /// then one more hop through finetunes. A repository whose lineage reaches no catalog model is
-    /// a variant of none: an architecture and a size don't say which model a file is.
-    async fn variant_of(&self, result: &HuggingFaceModelSearchResult) -> Option<ModelId> {
-        let mut direct = BTreeSet::from([result.repository.to_lowercase()]);
-        direct.extend(result.base_models.iter().map(|base| base.to_lowercase()));
-        if let Some(matched) = self.lineage.match_lineage(&direct).await {
-            return Some(matched.model_id);
+    /// What `result`'s model file says: its header's architecture, which is unsupported when the
+    /// engine doesn't run it, and the first catalog model whose shape fingerprint it has. Names and
+    /// declared lineage never decide. A repository whose headers were read and hold no model file
+    /// (no architecture, a projector's or a drafter's, or a layer-split piece) is unreadable,
+    /// whatever the Hub's repository-level architecture says; a read that failed or timed out
+    /// (a gated repository's refused files among them) leaves the result as the Hub describes it.
+    /// `false` for a repository whose files read are all drafters' (a prediction head alone, as an
+    /// MTP block): drafters are offered only in drafter lists, never as results.
+    async fn read_model_file(
+        &self,
+        result: &mut HuggingFaceModelSearchResult,
+        catalog: &[(ModelId, ModelFingerprint)],
+    ) -> bool {
+        let hub_projector = result.architecture.as_deref()
+            == Some(magnitude_artifacts::gguf::PROJECTOR_ARCHITECTURE);
+        match crate::search_shape::repository_model(
+            &self.models,
+            &self.architectures,
+            catalog,
+            &result.repository,
+            &result.commit,
+        )
+        .await
+        {
+            Some(RepositoryModel::Model {
+                architecture,
+                shape,
+            }) => {
+                result.architecture = Some(architecture.clone());
+                if !self.architectures.targets.contains(&architecture) {
+                    result.unsupported = vec![UnsupportedReason::Known(
+                        KnownUnsupportedReason::Architecture { architecture },
+                    )];
+                    return true;
+                }
+                result.variant_of = shape.and_then(|shape| shape.variant_of(catalog));
+            }
+            Some(RepositoryModel::Unreadable) => {
+                result.unsupported = vec![UnsupportedReason::Known(
+                    KnownUnsupportedReason::Unreadable,
+                )];
+            }
+            None if hub_projector => {
+                result.unsupported = vec![UnsupportedReason::Known(
+                    KnownUnsupportedReason::Architecture {
+                        architecture: magnitude_artifacts::gguf::PROJECTOR_ARCHITECTURE.to_owned(),
+                    },
+                )];
+            }
+            Some(RepositoryModel::Drafter) => return false,
+            None => {}
         }
-        let lineage = self
-            .lineage
-            .hub()
-            .lineage(&result.repository, Some(result.base_models.clone()))
-            .await;
-        self.lineage
-            .match_lineage(&lineage)
-            .await
-            .map(|matched| matched.model_id)
+        true
     }
 }
 
-/// Whether a repository's name is exactly the query: the same words, ignoring case, separators
+/// Whether a repository is exactly the query: its `owner/repository`, or its name in the same words, ignoring case, separators
 /// and a trailing `GGUF`, with or without an uploader's `Org_` prefix (`bartowski/Qwen_Qwen3.5-4B-GGUF`
 /// is exactly "Qwen3.5 4B").
 fn names_exactly(repository: &str, query: &str) -> bool {
+    if repository.eq_ignore_ascii_case(query) {
+        return true;
+    }
     let words = |text: &str| {
         text.to_lowercase()
             .split(|character: char| !(character.is_alphanumeric() || character == '.'))
@@ -210,7 +259,10 @@ impl HuggingFaceModelCatalog for HuggingFaceDiscovery {
         request: HuggingFaceModelSearchRequest,
     ) -> BoxFuture<'_, Result<HuggingFaceModelSearchResults, InventoryError>> {
         Box::pin(async move {
-            let query = request.query.trim();
+            // A pasted Hugging Face link (`https://huggingface.co/owner/repo/…`, `hf.co/owner/repo`)
+            // searches for its repository.
+            let repository = crate::candidate_files::hugging_face_repository_from_url(&request.query);
+            let query = repository.as_deref().unwrap_or(request.query.trim());
             if query.is_empty()
                 || query.len() > MAX_HUB_SEARCH_QUERY_BYTES
                 || request.limit == 0
@@ -220,12 +272,7 @@ impl HuggingFaceModelCatalog for HuggingFaceDiscovery {
                     "Hugging Face search requires a non-empty query of at most {MAX_HUB_SEARCH_QUERY_BYTES} bytes and a limit between 1 and {MAX_HUB_SEARCH_RESULTS}"
                 )));
             }
-            let cache_key = format!(
-                "{}:{}:{}",
-                query.to_lowercase(),
-                request.limit,
-                request.include_unsupported
-            );
+            let cache_key = format!("{}:{}", query.to_lowercase(), request.limit);
             {
                 let mut searches = self.searches.lock().await;
                 searches.retain(|_, (captured, _)| captured.elapsed() <= HUB_SEARCH_TTL);
@@ -380,8 +427,13 @@ struct HubSearchModel {
     tags: Vec<String>,
     #[serde(default)]
     gguf: Option<serde_json::Value>,
-    #[serde(default, rename = "baseModels")]
-    base_models: Option<serde_json::Value>,
+    #[serde(default)]
+    siblings: Option<Vec<HubSearchSibling>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HubSearchSibling {
+    rfilename: String,
 }
 
 impl HubSearchModel {
@@ -392,11 +444,6 @@ impl HubSearchModel {
             .and_then(|gguf| gguf.get("architecture"))
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
-        let base_models = self
-            .base_models
-            .as_ref()
-            .map(crate::lineage::hub_base_model_ids)
-            .unwrap_or_default();
         Some(HuggingFaceModelSearchResult {
             repository: self.id,
             commit: immutable_commit(self.sha?)?,
@@ -407,7 +454,6 @@ impl HubSearchModel {
             private: self.private.unwrap_or(false),
             tags: self.tags,
             architecture,
-            base_models,
             variant_of: None,
             unsupported: Vec::new(),
         })
@@ -610,15 +656,78 @@ async fn fetch_hub_model(
 }
 
 fn retryable_hub_status(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+    status.is_server_error()
 }
 
-async fn send_hub_request(
+/// The longest pause a Hub `Retry-After` imposes, and the pause when it names none.
+const MAX_RATE_LIMIT_PAUSE: Duration = Duration::from_secs(60);
+const DEFAULT_RATE_LIMIT_PAUSE: Duration = Duration::from_secs(30);
+
+/// Until when each host (`host:port`) asked this process to stop sending requests (HTTP 429). A
+/// host's rate limit covers every request to it, so no request goes out until it passes.
+static HUB_PAUSES: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+fn host_key(url: &reqwest::Url) -> String {
+    format!(
+        "{}:{}",
+        url.host_str().unwrap_or_default(),
+        url.port_or_known_default().unwrap_or_default()
+    )
+}
+
+/// How long `url`'s host has asked this process to wait, if it has.
+pub(crate) fn hub_pause(url: &reqwest::Url) -> Option<Duration> {
+    let pauses = HUB_PAUSES.lock().ok()?;
+    pauses
+        .get(&host_key(url))
+        .and_then(|until| until.checked_duration_since(Instant::now()))
+        .filter(|left| !left.is_zero())
+}
+
+fn note_rate_limit(url: &reqwest::Url, response: &reqwest::Response) {
+    let pause = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_RATE_LIMIT_PAUSE, Duration::from_secs)
+        .min(MAX_RATE_LIMIT_PAUSE);
+    if let Ok(mut pauses) = HUB_PAUSES.lock() {
+        pauses.insert(host_key(url), Instant::now() + pause);
+    }
+}
+
+pub(crate) fn hub_rate_limited(left: Duration) -> InventoryError {
+    InventoryError::ModelOperation {
+        code: "hugging_face_rate_limited".to_owned(),
+        message: format!(
+            "Hugging Face is limiting requests from this computer. Try again in {} seconds, or set HF_TOKEN for a higher limit.",
+            left.as_secs().max(1)
+        ),
+        retryable: true,
+    }
+}
+
+/// One Hub request, retried on server failures. A rate limit (HTTP 429) is never retried: it
+/// pauses every request to that host for its `Retry-After` (at most a minute), and a request
+/// during a pause fails at once without being sent.
+pub(crate) async fn send_hub_request(
     mut request: impl FnMut() -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, InventoryError> {
     let mut last_failure = None;
     for attempt in 0..HUB_REQUEST_ATTEMPTS {
-        match request().send().await {
+        let (client, built) = request().build_split();
+        let built = built.map_err(|error| InventoryError::Internal(error.to_string()))?;
+        let url = built.url().clone();
+        if let Some(left) = hub_pause(&url) {
+            return Err(hub_rate_limited(left));
+        }
+        match client.execute(built).await {
+            Ok(response) if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                note_rate_limit(&url, &response);
+                return Ok(response);
+            }
             Ok(response)
                 if retryable_hub_status(response.status())
                     && attempt + 1 < HUB_REQUEST_ATTEMPTS =>
@@ -1378,7 +1487,7 @@ pub(crate) async fn bounded_response_bytes(
 }
 
 /// The Hub URL of one file of a repository at a commit.
-fn resolve_url(
+pub(crate) fn resolve_url(
     endpoint: &str,
     repository: &str,
     commit: &str,
@@ -1579,7 +1688,9 @@ pub(crate) fn header_prefix(prefix: &[u8]) -> Result<HeaderPrefix, InventoryErro
     let temporary =
         tempfile::NamedTempFile::new().map_err(|error| InventoryError::Io(error.to_string()))?;
     fs::write(temporary.path(), prefix).map_err(|error| InventoryError::Io(error.to_string()))?;
-    let directory = match magnitude_artifacts::gguf::inspect_header(temporary.path()) {
+    let directory = match crate::gguf::known_tensors(magnitude_artifacts::gguf::inspect_header(
+        temporary.path(),
+    )) {
         Ok(directory) => directory,
         Err(magnitude_artifacts::Error::Truncated { .. }) => return Ok(HeaderPrefix::Truncated),
         Err(magnitude_artifacts::Error::Io(error))
@@ -2472,8 +2583,8 @@ mod tests {
     }
 
     #[test]
-    fn retries_only_rate_limits_and_server_failures() {
-        assert!(retryable_hub_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+    fn retries_only_server_failures_never_a_rate_limit() {
+        assert!(!retryable_hub_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
         assert!(retryable_hub_status(reqwest::StatusCode::BAD_GATEWAY));
         assert!(!retryable_hub_status(reqwest::StatusCode::NOT_FOUND));
         assert!(!retryable_hub_status(reqwest::StatusCode::UNAUTHORIZED));
@@ -2572,7 +2683,7 @@ mod tests {
         }
     }
 
-    /// A minimal Hub: search, commit-pinned repository metadata and lineage, from a route table.
+    /// A minimal Hub: search and commit-pinned repository metadata, from a route table.
     fn serve_hub(
         routes: impl Fn(&str, &str) -> Option<serde_json::Value> + Send + Sync + 'static,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
@@ -3069,8 +3180,8 @@ mod tests {
         }
     }
 
-    /// The Linux QA lanes saw one inspect pull 446 MB to 1.1 GB for files with unknown tensor
-    /// types, and every retry pull it again. A header proven invalid stops at the probe that
+    /// The Linux QA lanes saw one inspect pull 446 MB to 1.1 GB for files with invalid headers,
+    /// and every retry pull it again. A header proven invalid stops at the probe that
     /// proves it, and the verdict is cached for the immutable file, so a retry fetches nothing.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unreadable_header_costs_one_probe_once_and_nothing_on_retry() {
@@ -3084,10 +3195,10 @@ mod tests {
             .windows(name.len())
             .position(|window| window == name)
             .unwrap()
-            + name.len()
-            + 4
-            + 8;
-        file[type_at..type_at + 4].copy_from_slice(&31_u32.to_le_bytes());
+            + name.len();
+        // A rank no GGUF tensor has: the header's structure reads to its end, and the parser
+        // refuses it.
+        file[type_at..type_at + 4].copy_from_slice(&5_u32.to_le_bytes());
         file.resize(file.len() + 256 * 1024 * 1024, 0);
         let (endpoint, _, sent) = serve_ranges(vec![("model-Q4_0_4_4.gguf", file.clone())]);
         let (_temporary, store) = stub_store(endpoint).await;
@@ -3105,7 +3216,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(&error, InventoryError::Integrity(detail) if detail == "unknown GGUF tensor type 31"),
+                matches!(&error, InventoryError::Integrity(detail) if detail.contains("invalid or duplicate tensor directory entry")),
                 "attempt {attempt}: {error:?}"
             );
         }
@@ -3135,10 +3246,10 @@ mod tests {
             .windows(name.len())
             .position(|window| window == name)
             .unwrap()
-            + name.len()
-            + 4
-            + 8;
-        file[type_at..type_at + 4].copy_from_slice(&31_u32.to_le_bytes());
+            + name.len();
+        // A rank no GGUF tensor has: the header's structure reads to its end, and the parser
+        // refuses it.
+        file[type_at..type_at + 4].copy_from_slice(&5_u32.to_le_bytes());
         file.resize(file.len() + 64 * 1024 * 1024, 0);
         let size = u64::try_from(file.len()).unwrap();
         let (endpoint, requests, _) = serve_ranges(vec![("model-Q4_0_4_4.gguf", file)]);
@@ -3155,7 +3266,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(&error, InventoryError::Integrity(detail) if detail == "unknown GGUF tensor type 31"),
+            matches!(&error, InventoryError::Integrity(detail) if detail.contains("invalid or duplicate tensor directory entry")),
             "{error:?}"
         );
         assert_eq!(
@@ -3241,12 +3352,12 @@ mod tests {
                 Arc::clone(&store),
                 catalog_with_target("catalog/Llama-GGUF", &commit),
             ),
+            StubCatalog::empty(),
         );
         discovery
             .search(HuggingFaceModelSearchRequest {
                 query: "repo".to_owned(),
                 limit: 5,
-                include_unsupported: false,
             })
             .await
             .expect("search");
@@ -3388,6 +3499,7 @@ mod tests {
                     "downloads": 7,
                     "tags": ["gguf"],
                     "gguf": { "architecture": architecture, "total": 8_030_000_000_u64 },
+                    "siblings": [{ "rfilename": "model-Q4_K_M.gguf" }],
                     "baseModels": {
                         "relation": "quantized",
                         "models": base.iter().map(|id| serde_json::json!({ "id": id })).collect::<Vec<_>>(),
@@ -3411,31 +3523,19 @@ mod tests {
                     )),
                     result("someone/Llama-MTP-GGUF", '9', "llama", &[]),
                     result("vision/Llama-Vision-GGUF", 'e', "clip", &[]),
-                    result(
-                        "community/Llama-Finetune-GGUF",
-                        'c',
-                        "llama",
-                        &["community/Llama-Finetune"]
-                    ),
+                    result("community/Llama-Finetune-GGUF", 'c', "llama", &["base/Llama"]),
                     result("anonymous/Llama-Uncensored-GGUF", '7', "llama", &[]),
                 ])),
                 path if path.starts_with("/api/models/catalog/Llama-GGUF/revision/") => Some(
                     revision_metadata("catalog/Llama-GGUF", &"a".repeat(40), &["base/Llama"]),
                 ),
-                "/api/models/community/Llama-Finetune" => Some(serde_json::json!({
-                    "id": "community/Llama-Finetune",
-                    "baseModels": { "relation": "finetune", "models": [{ "id": "base/Llama" }] },
-                })),
-                path if path.starts_with("/api/models/") && !path.contains("/revision/") => {
-                    Some(serde_json::json!({ "id": path.trim_start_matches("/api/models/") }))
-                }
                 _ => None,
             }
         })
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn search_hides_unknown_architectures_excludes_the_catalog_and_drafters_and_resolves_lineage()
+    async fn search_lists_unknown_architectures_as_unsupported_and_excludes_the_catalog_and_drafters()
      {
         let (endpoint, _) = search_hub();
         let (_temporary, store) = stub_store(endpoint).await;
@@ -3444,16 +3544,15 @@ mod tests {
             Arc::clone(&store),
             RecognizedArchitectures::new(["llama"], ["dflash"]),
             CatalogLineage::new(Arc::clone(&store), catalog),
+            StubCatalog::empty(),
         );
         let results = discovery
             .search(HuggingFaceModelSearchRequest {
                 query: "llama".to_owned(),
                 limit: 10,
-                include_unsupported: false,
             })
             .await
             .unwrap();
-        assert_eq!(results.hidden_count, 1);
         assert_eq!(
             results
                 .results
@@ -3462,58 +3561,851 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "someone/Llama-MTP-GGUF",
-                "vision/Llama-Vision-GGUF",
                 "community/Llama-Finetune-GGUF",
-                "anonymous/Llama-Uncensored-GGUF"
+                "anonymous/Llama-Uncensored-GGUF",
+                "unsloth/DeepSeek-V4-GGUF",
+                "vision/Llama-Vision-GGUF",
             ],
-            "a repository whose name says MTP is a model result: names never decide"
-        );
-        assert_eq!(
-            results.results[3].variant_of, None,
-            "a repository whose lineage reaches no catalog model is a variant of none, whatever \
-             its architecture and size"
-        );
-        let community = &results.results[2];
-        assert_eq!(community.architecture.as_deref(), Some("llama"));
-        assert_eq!(community.base_models, ["community/Llama-Finetune"]);
-        assert_eq!(
-            community.variant_of.as_ref().map(ModelId::as_str),
-            Some("llama-test:gguf:q8"),
-            "lineage follows a second hop through the finetune"
-        );
-        assert_eq!(results.results[1].variant_of, None);
-
-        let all = discovery
-            .search(HuggingFaceModelSearchRequest {
-                query: "llama".to_owned(),
-                limit: 10,
-                include_unsupported: true,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            all.hidden_count, 1,
-            "drafter repositories are not counted as hidden models"
+            "a repository whose name says MTP is a model result: names never decide; drafter \
+             repositories are never model results"
         );
         assert!(
-            all.results
+            results.results[..3]
                 .iter()
-                .all(|result| !result.repository.contains("DFlash")
-                    && !result.repository.contains("EAGLE3")),
-            "drafter repositories are never model results"
+                .all(|result| result.unsupported.is_empty() && result.variant_of.is_none()),
+            "declared lineage never makes a result a variant"
         );
-        let deepseek = all
-            .results
-            .iter()
-            .find(|result| result.repository == "unsloth/DeepSeek-V4-GGUF")
-            .expect("unsupported results are listed on request");
         assert_eq!(
-            deepseek.unsupported,
+            results.results[4].unsupported,
+            [UnsupportedReason::Known(KnownUnsupportedReason::Architecture {
+                architecture: "clip".to_owned()
+            })],
+            "a repository the Hub describes by a projector, whose model file can't be read, is \
+             shown as the Hub describes it: not runnable"
+        );
+        assert_eq!(
+            results.results[3].unsupported,
             [UnsupportedReason::Known(
                 KnownUnsupportedReason::Architecture {
                     architecture: "deepseek4".to_owned()
                 }
-            )]
+            )],
+            "an unsupported architecture is listed with its reason"
+        );
+    }
+
+    /// Each catalog model's fingerprint, supplied directly.
+    struct StubCatalog(Vec<(ModelId, ModelFingerprint)>);
+
+    impl StubCatalog {
+        fn empty() -> Arc<dyn CatalogFingerprints> {
+            Arc::new(Self(Vec::new()))
+        }
+    }
+
+    impl CatalogFingerprints for StubCatalog {
+        fn catalog_fingerprints(&self) -> BoxFuture<'_, Vec<(ModelId, ModelFingerprint)>> {
+            Box::pin(async move { self.0.clone() })
+        }
+    }
+
+    /// One repository of a stub Hub: its search fields and its GGUFs, each with its listed size
+    /// and the bytes served for it (`None`: the file refuses reads).
+    struct StubRepository {
+        id: &'static str,
+        architecture: Option<&'static str>,
+        gated: bool,
+        files: Vec<(&'static str, u64, Option<Vec<u8>>)>,
+        listing_429s: usize,
+        file_429s: usize,
+    }
+
+    impl StubRepository {
+        fn new(id: &'static str, architecture: Option<&'static str>) -> Self {
+            Self {
+                id,
+                architecture,
+                gated: false,
+                files: Vec::new(),
+                listing_429s: 0,
+                file_429s: 0,
+            }
+        }
+
+        /// The first `listing` requests for its file listing and the first `files` requests for
+        /// its files are refused with HTTP 429 (`Retry-After: 1`), whose body is `body` (a GGUF
+        /// header, to prove a refusal is never read as one).
+        fn throttled(mut self, listing: usize, files: usize) -> Self {
+            self.listing_429s = listing;
+            self.file_429s = files;
+            self
+        }
+
+        fn file(mut self, path: &'static str, size: u64, bytes: Option<Vec<u8>>) -> Self {
+            self.files.push((path, size, bytes));
+            self
+        }
+
+        fn commit(&self) -> String {
+            let digest = Sha256::digest(self.id.as_bytes());
+            digest.iter().take(20).map(|byte| format!("{byte:02x}")).collect()
+        }
+    }
+
+    /// A Hub that answers search with `repositories`, their commit-pinned metadata, and range
+    /// requests for their files, counting the file requests and the file bytes it serves.
+    fn serve_repositories(
+        repositories: Vec<StubRepository>,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::Ordering;
+        let search = serde_json::to_vec(&repositories
+            .iter()
+            .map(|repository| {
+                let mut gguf = serde_json::json!({});
+                if let Some(architecture) = repository.architecture {
+                    gguf["architecture"] = serde_json::json!(architecture);
+                }
+                serde_json::json!({
+                    "id": repository.id,
+                    "sha": repository.commit(),
+                    "downloads": 7,
+                    "gated": if repository.gated { serde_json::json!("auto") } else { serde_json::json!(false) },
+                    "tags": ["gguf"],
+                    "gguf": gguf,
+                    "siblings": repository.files.iter().map(|(path, ..)| serde_json::json!({ "rfilename": path })).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>())
+        .unwrap();
+        let mut routes = BTreeMap::<String, Vec<u8>>::new();
+        let mut files = BTreeMap::<String, Vec<u8>>::new();
+        let mut throttled = BTreeMap::<String, usize>::new();
+        for repository in &repositories {
+            let commit = repository.commit();
+            let siblings = repository
+                .files
+                .iter()
+                .map(|(path, size, _)| {
+                    let digest = Sha256::digest(format!("{}/{path}", repository.id).as_bytes());
+                    serde_json::json!({
+                        "rfilename": path,
+                        "size": size,
+                        "lfs": {
+                            "sha256": digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                            "size": size,
+                        },
+                    })
+                })
+                .collect::<Vec<_>>();
+            throttled.insert(
+                format!("/api/models/{}/revision/{commit}", repository.id),
+                repository.listing_429s,
+            );
+            routes.insert(
+                format!("/api/models/{}/revision/{commit}", repository.id),
+                serde_json::to_vec(&serde_json::json!({
+                    "id": repository.id,
+                    "sha": commit,
+                    "tags": ["gguf"],
+                    "siblings": siblings,
+                }))
+                .unwrap(),
+            );
+            for (path, _, bytes) in &repository.files {
+                throttled.insert(format!("/{}/resolve/{commit}/{path}", repository.id), repository.file_429s);
+                if let Some(bytes) = bytes {
+                    files.insert(format!("/{}/resolve/{commit}/{path}", repository.id), bytes.clone());
+                }
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("hub listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("hub address"));
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (counted, sent_counted) = (Arc::clone(&requests), Arc::clone(&sent));
+        let shared = Arc::new((search, routes, files, std::sync::Mutex::new(throttled)));
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(mut connection) = connection else {
+                    return;
+                };
+                let (shared, counted, sent) = (
+                    Arc::clone(&shared),
+                    Arc::clone(&counted),
+                    Arc::clone(&sent_counted),
+                );
+                std::thread::spawn(move || {
+                    let (search, routes, files, throttled) = &*shared;
+                    let mut reader = BufReader::new(connection.try_clone().expect("stream"));
+                    let mut request_line = String::new();
+                    let _ = reader.read_line(&mut request_line);
+                    let target = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_owned();
+                    let path = target.split_once('?').map_or(target.as_str(), |(path, _)| path);
+                    let mut range = None;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some((header, value)) = line.split_once(':')
+                            && header.eq_ignore_ascii_case("range")
+                        {
+                            let (start, end) = value
+                                .trim()
+                                .trim_start_matches("bytes=")
+                                .split_once('-')
+                                .unwrap();
+                            range = Some((
+                                start.parse::<usize>().unwrap(),
+                                end.parse::<usize>().unwrap(),
+                            ));
+                        }
+                    }
+                    let json = |connection: &mut std::net::TcpStream, body: &[u8]| {
+                        let _ = write!(
+                            connection,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = connection.write_all(body);
+                    };
+                    if path == "/api/models" {
+                        return json(&mut connection, search);
+                    }
+                    if !path.starts_with("/api/") {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let refused = throttled
+                        .lock()
+                        .unwrap()
+                        .get_mut(path)
+                        .is_some_and(|left| *left > 0 && { *left -= 1; true });
+                    if refused {
+                        // A refusal whose body is a well-formed GGUF header of a projector: read as
+                        // file bytes, it would make the repository look like it holds no model.
+                        let body = crate::test_gguf::gguf_bytes(
+                            &[("general.architecture", crate::test_gguf::Meta::Str("clip"))],
+                            &["v.patch_embd.weight"],
+                        );
+                        let _ = write!(
+                            connection,
+                            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = connection.write_all(&body);
+                        return;
+                    }
+                    if let Some(body) = routes.get(path) {
+                        return json(&mut connection, body);
+                    }
+                    if path.starts_with("/api/") {
+                        let _ = write!(connection, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        return;
+                    }
+                    let Some(file) = files.get(path) else {
+                        let _ = write!(connection, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        return;
+                    };
+                    let (start, end) = range.unwrap_or((0, file.len() - 1));
+                    let end = end.min(file.len() - 1);
+                    let body = &file[start..=end];
+                    sent.fetch_add(body.len(), Ordering::SeqCst);
+                    let _ = write!(
+                        connection,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
+                        body.len(),
+                        file.len()
+                    );
+                    let _ = connection.write_all(body);
+                });
+            }
+        });
+        (endpoint, requests, sent)
+    }
+
+    /// A discovery over `store` running `targets` (and `dflash` as a drafter), whose catalog is
+    /// `catalog`.
+    fn shape_discovery(
+        store: &Arc<ManagedModelStore>,
+        targets: &[&str],
+        catalog: Vec<(ModelId, ModelFingerprint)>,
+    ) -> HuggingFaceDiscovery {
+        HuggingFaceDiscovery::new(
+            Arc::clone(store),
+            RecognizedArchitectures::new(targets.iter().copied(), ["dflash"]),
+            CatalogLineage::new(
+                Arc::clone(store),
+                catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40)),
+            ),
+            Arc::new(StubCatalog(catalog)),
+        )
+    }
+
+    async fn search_all(discovery: &HuggingFaceDiscovery) -> BTreeMap<String, HuggingFaceModelSearchResult> {
+        discovery
+            .search(HuggingFaceModelSearchRequest {
+                query: "model".to_owned(),
+                limit: 10,
+            })
+            .await
+            .unwrap()
+            .results
+            .into_iter()
+            .map(|result| (result.repository.clone(), result))
+            .collect()
+    }
+
+    fn catalog_fingerprint(fixture: &str) -> ModelFingerprint {
+        crate::search_shape::ModelShape::from_header_prefix(&crate::test_gguf::fixture_header(fixture))
+            .unwrap()
+            .fingerprint()
+    }
+
+    /// An importance matrix: quantization data with no architecture.
+    fn imatrix() -> Vec<u8> {
+        crate::test_gguf::gguf_bytes(
+            &[("general.type", crate::test_gguf::Meta::Str("imatrix"))],
+            &["blk.0.attn_q.weight.in_sum2"],
+        )
+    }
+
+    fn architecture_only(architecture: &str) -> Vec<u8> {
+        crate::test_gguf::gguf_bytes(
+            &[("general.architecture", crate::test_gguf::Meta::Str(architecture))],
+            &["token_embd.weight"],
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_result_is_a_variant_of_the_catalog_model_whose_shape_its_header_has() {
+        use crate::test_gguf::fixture_header;
+        use std::sync::atomic::Ordering;
+        let (endpoint, requests, sent) = serve_repositories(vec![
+            StubRepository::new("HauhauCS/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive", Some("gemma4"))
+                .file("mmproj-Gemma-4-E2B-f16.gguf", 9_000_000_000, None)
+                .file(
+                    "Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q2_K_P.gguf",
+                    2_000_000_000,
+                    Some(fixture_header("Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q2_K_P")),
+                ),
+            StubRepository::new("someone/Qwen3.5-4B-GGUF", Some("qwen35")).file(
+                "Qwen3.5-4B-Q3_K_M.gguf",
+                2_000_000_000,
+                Some(fixture_header("Qwen3.5-4B-Q3_K_M")),
+            ),
+            StubRepository::new("broken/Gemma-4-GGUF", Some("gemma4"))
+                .file("missing-Q4_K_M.gguf", 2_000_000_000, None),
+        ]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let gemma: ModelId = "gemma-test:gguf:q4".parse().unwrap();
+        let catalog = vec![(gemma.clone(), catalog_fingerprint("gemma-4-E2B-it-qat-UD-Q4_K_XL"))];
+        let variants = |results: BTreeMap<String, HuggingFaceModelSearchResult>| {
+            results
+                .into_iter()
+                .map(|(repository, result)| (repository, result.variant_of, result.unsupported.is_empty()))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            ("HauhauCS/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive".to_owned(), Some(gemma.clone()), true),
+            ("broken/Gemma-4-GGUF".to_owned(), None, true),
+            ("someone/Qwen3.5-4B-GGUF".to_owned(), None, true),
+        ];
+        let discovery = shape_discovery(&store, &["gemma4", "qwen35"], catalog.clone());
+        assert_eq!(
+            variants(search_all(&discovery).await),
+            expected,
+            "a repository declaring no lineage is a variant by its header's shape; an unknown \
+             shape and a failed read are variants of none, and a failed read never fails a row the \
+             Hub names a runnable architecture for"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 3, "one read per result");
+        assert!(
+            sent.load(Ordering::SeqCst) <= 2 * crate::search_shape::SHAPE_PREFIX_BYTES,
+            "each read is one prefix"
+        );
+
+        let sent_before = sent.load(Ordering::SeqCst);
+        let discovery = shape_discovery(&store, &["gemma4", "qwen35"], catalog);
+        assert_eq!(variants(search_all(&discovery).await), expected);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            4,
+            "what a repository holds is cached; only the failed read is tried again"
+        );
+        assert_eq!(sent.load(Ordering::SeqCst), sent_before);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_model_file_is_the_largest_gguf_whose_header_is_a_model() {
+        use crate::test_gguf::fixture_header;
+        use std::sync::atomic::Ordering;
+        let (endpoint, requests, _) = serve_repositories(vec![
+            StubRepository::new("someone/Gemma-4-E2B-GGUF", Some("gemma4"))
+                .file("mmproj-F16.gguf", 20_000_000_000, None)
+                .file("imatrix_unsloth.gguf", 9_000_000_000, Some(imatrix()))
+                .file(
+                    "MTP/mtp-Gemma-4-E2B-BF16.gguf",
+                    8_000_000_000,
+                    Some(fixture_header("Qwen3.5-4B-DFlash-Q8_0")),
+                )
+                .file(
+                    "BF16/Gemma-4-E2B-BF16-00001-of-00002.gguf",
+                    3_500_000_000,
+                    Some(fixture_header("Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q2_K_P")),
+                )
+                .file("BF16/Gemma-4-E2B-BF16-00002-of-00002.gguf", 3_500_000_000, None)
+                .file(
+                    "Gemma-4-E2B-Q4_K_M.gguf",
+                    5_000_000_000,
+                    Some(fixture_header("Qwen3.5-4B-Q3_K_M")),
+                ),
+        ]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let gemma: ModelId = "gemma-test:gguf:q4".parse().unwrap();
+        let discovery = shape_discovery(
+            &store,
+            &["gemma4", "qwen35"],
+            vec![(gemma.clone(), catalog_fingerprint("gemma-4-E2B-it-qat-UD-Q4_K_XL"))],
+        );
+        let result = &search_all(&discovery).await["someone/Gemma-4-E2B-GGUF"];
+        assert_eq!(
+            result.variant_of,
+            Some(gemma),
+            "the projector is never read, the importance matrix and the drafter are skipped by \
+             their headers, and a sharded set counts its total size (7 GB, above the 5 GB file)"
+        );
+        assert_eq!(result.architecture.as_deref(), Some("gemma4"));
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_hub_architecture_comes_from_the_model_file() {
+        use crate::test_gguf::fixture_header;
+        let mut refused = StubRepository::new("someone/Refused-GGUF", None)
+            .file("Refused-Q4_K_M.gguf", 2_000_000_000, None);
+        refused.gated = true;
+        let (endpoint, _, _) = serve_repositories(vec![
+            StubRepository::new("someone/Qwen3.5-4B-GGUF", None).file(
+                "Qwen3.5-4B-Q3_K_M.gguf",
+                2_000_000_000,
+                Some(fixture_header("Qwen3.5-4B-Q3_K_M")),
+            ),
+            StubRepository::new("someone/Image-GGUF", None)
+                .file("image-Q8_0.gguf", 2_000_000_000, Some(architecture_only("qwen_image"))),
+            StubRepository::new("someone/Matrix-GGUF", None)
+                .file("imatrix.gguf", 13_000_000, Some(imatrix())),
+            StubRepository::new("someone/Unreachable-GGUF", None)
+                .file("model-Q4_K_M.gguf", 2_000_000_000, None),
+            StubRepository::new("someone/Mistral-7B-GGUF", None)
+                .file("Mistral-7B-Q8_0.gguf", 2_000_000_000, Some(fixture_header("Qwen3.5-4B-Q3_K_M")))
+                .file("Mistral-7B-bf16.gguf", 0, None),
+            refused,
+        ]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let results = search_all(&shape_discovery(&store, &["qwen35"], Vec::new())).await;
+        let state = |repository: &str| {
+            let result = &results[repository];
+            (result.architecture.clone(), result.unsupported.clone(), result.gated)
+        };
+        let unreadable = vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)];
+        assert_eq!(state("someone/Qwen3.5-4B-GGUF"), (Some("qwen35".to_owned()), Vec::new(), false));
+        assert_eq!(
+            state("someone/Image-GGUF"),
+            (
+                Some("qwen_image".to_owned()),
+                vec![UnsupportedReason::Known(KnownUnsupportedReason::Architecture {
+                    architecture: "qwen_image".to_owned()
+                })],
+                false
+            )
+        );
+        assert_eq!(
+            state("someone/Matrix-GGUF"),
+            (None, unreadable, false),
+            "headers read that name no model architecture are unreadable"
+        );
+        assert_eq!(
+            state("someone/Unreachable-GGUF"),
+            (None, Vec::new(), false),
+            "a failed read leaves the row as the Hub describes it"
+        );
+        assert_eq!(
+            state("someone/Mistral-7B-GGUF"),
+            (None, Vec::new(), false),
+            "a listing that can't be resolved (an empty file in it) is a failed read, not an \
+             unreadable repository"
+        );
+        assert_eq!(
+            state("someone/Refused-GGUF"),
+            (None, Vec::new(), true),
+            "a gated repository whose files are refused stays listed; the client says it needs access"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_near_miss_is_read_from_the_whole_header_where_later_keys_settle_it() {
+        use crate::header_layout::{Layout, walk};
+        use crate::search_shape::{ModelShape, SHAPE_PREFIX_BYTES};
+        use crate::test_gguf::fixture_header;
+        let fixture = "Qwen3.5-4B-Q3_K_M";
+        let header = fixture_header(fixture);
+        // The MTP head count moved after the token list, as tools that append MTP heads write it.
+        let Ok(Layout::Complete { entries, .. }) = walk(&header) else {
+            panic!("complete header");
+        };
+        let entry = |key: &str| entries.iter().find(|entry| entry.key == key).unwrap();
+        let (nextn, tokens) = (entry("qwen35.nextn_predict_layers"), entry("tokenizer.ggml.tokens"));
+        let mut moved = header[..nextn.start].to_vec();
+        moved.extend_from_slice(&header[nextn.end..tokens.end]);
+        moved.extend_from_slice(&header[nextn.start..nextn.end]);
+        moved.extend_from_slice(&header[tokens.end..]);
+        let prefix_shape = ModelShape::from_header_prefix(&moved[..SHAPE_PREFIX_BYTES]).unwrap();
+        let catalog_shape = ModelShape::from_header_prefix(&header).unwrap();
+        assert_ne!(prefix_shape, catalog_shape, "the prefix counts the MTP layer as a block");
+        assert_eq!(ModelShape::from_header_prefix(&moved), Some(catalog_shape.clone()));
+        let length = moved.len() as u64;
+        let (endpoint, _, sent) = serve_repositories(vec![
+            StubRepository::new("someone/Qwen3.5-4B-MTP-GGUF", Some("qwen35"))
+                .file("Qwen3.5-4B-MTP-Q3_K_M.gguf", length, Some(moved)),
+        ]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let qwen: ModelId = "qwen-test:gguf:q4".parse().unwrap();
+        let results = search_all(&shape_discovery(
+            &store,
+            &["qwen35"],
+            vec![(qwen.clone(), catalog_shape.fingerprint())],
+        ))
+        .await;
+        assert_eq!(results["someone/Qwen3.5-4B-MTP-GGUF"].variant_of, Some(qwen));
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst) > SHAPE_PREFIX_BYTES);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_tensor_type_never_affects_the_shape() {
+        use crate::search_shape::{ModelShape, SHAPE_PREFIX_BYTES};
+        use crate::test_gguf::fixture_header;
+        let fixture = "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ3_XS";
+        let mut header = fixture_header(fixture);
+        let catalog_shape = ModelShape::from_header_prefix(&header).unwrap();
+        // The output head's type becomes one no parser knows, as a new quantization's would be.
+        let name = b"output.weight";
+        let at = header
+            .windows(8 + name.len())
+            .rposition(|window| window[..8] == (name.len() as u64).to_le_bytes() && &window[8..] == name)
+            .unwrap()
+            + 8
+            + name.len();
+        let rank = u32::from_le_bytes(header[at..at + 4].try_into().unwrap()) as usize;
+        let encoding = at + 4 + 8 * rank;
+        header[encoding..encoding + 4].copy_from_slice(&200_u32.to_le_bytes());
+        assert!(magnitude_artifacts::gguf::read_header(&header).is_err());
+        assert_eq!(ModelShape::from_header_prefix(&header[..SHAPE_PREFIX_BYTES]), None);
+        let length = header.len() as u64;
+        let (endpoint, _, _) = serve_repositories(vec![
+            StubRepository::new("someone/Bonsai-27B-GGUF", Some("qwen35"))
+                .file("Bonsai-27B-PTQ1_0.gguf", length, Some(header)),
+        ]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let qwen: ModelId = "qwen-test:gguf:q4".parse().unwrap();
+        let results = search_all(&shape_discovery(
+            &store,
+            &["qwen35"],
+            vec![(qwen.clone(), catalog_shape.fingerprint())],
+        ))
+        .await;
+        let result = &results["someone/Bonsai-27B-GGUF"];
+        assert_eq!(result.variant_of, Some(qwen), "the shape comes from metadata alone");
+        assert!(result.unsupported.is_empty(), "weight support is decided at inspection");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pasted_hugging_face_link_searches_for_its_repository() {
+        let (endpoint, _) = serve_hub(|path, query| {
+            (path == "/api/models").then(|| {
+                if query.contains("search=unsloth%2Fqwen3.5-9b-gguf&") {
+                    serde_json::json!([{
+                        "id": "unsloth/Qwen3.5-9B-GGUF",
+                        "sha": "a".repeat(40),
+                        "downloads": 7,
+                        "tags": ["gguf"],
+                        "gguf": { "architecture": "qwen35" },
+                    }])
+                } else {
+                    serde_json::json!([])
+                }
+            })
+        });
+        let (_temporary, store) = stub_store(endpoint).await;
+        let discovery = shape_discovery(&store, &["qwen35"], Vec::new());
+        for query in [
+            "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF",
+            "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/blob/main/Qwen3.5-9B-Q4_K_M.gguf",
+            "hf.co/unsloth/Qwen3.5-9B-GGUF",
+            "unsloth/Qwen3.5-9B-GGUF",
+        ] {
+            let results = discovery
+                .search(HuggingFaceModelSearchRequest {
+                    query: query.to_owned(),
+                    limit: 10,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                results
+                    .results
+                    .iter()
+                    .map(|result| result.repository.as_str())
+                    .collect::<Vec<_>>(),
+                ["unsloth/Qwen3.5-9B-GGUF"],
+                "{query}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repositories_without_a_model_file_are_left_out_or_unreadable() {
+        let piece = crate::test_gguf::gguf_bytes(
+            &[
+                ("general.architecture", crate::test_gguf::Meta::Str("llama")),
+                ("llama.block_count", crate::test_gguf::Meta::U32(32)),
+            ],
+            &["output.weight"],
+        );
+        let head = crate::test_gguf::gguf_bytes(
+            &[
+                ("general.architecture", crate::test_gguf::Meta::Str("qwen4exp")),
+                ("qwen4exp.block_count", crate::test_gguf::Meta::U32(49)),
+                ("qwen4exp.nextn_predict_layers", crate::test_gguf::Meta::U32(1)),
+            ],
+            &["blk.48.nextn.eh_proj.weight"],
+        );
+        let (endpoint, requests, _) = serve_repositories(vec![
+            StubRepository::new("someone/Roleplay-1B", None),
+            StubRepository::new("paperniuk/Qwen3.8-Flash-Next-MTP-block", Some("qwen4exp"))
+                .file("Qwen3.8-Flash-Next-MTP-block.gguf", 1_519_036_352, Some(head)),
+            StubRepository::new("meshllm/Llama-8B-layers", Some("llama"))
+                .file("projectors/projector-00000.gguf", 3_000_000_000, Some(architecture_only("clip")))
+                .file("shared/output.gguf", 900_000_000, Some(piece.clone()))
+                .file("layers/layer-00000.gguf", 280_000_000, Some(piece.clone())),
+            // A split set's first shard holds only some of the set's tensors, fewer than its
+            // blocks too, and is still the model.
+            StubRepository::new("someone/Llama-405B-GGUF", Some("llama"))
+                .file("BF16/Llama-405B-BF16-00001-of-00002.gguf", 50_000_000_000, Some(piece))
+                .file("BF16/Llama-405B-BF16-00002-of-00002.gguf", 50_000_000_000, None),
+        ]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let results = search_all(&shape_discovery(&store, &["llama", "qwen4exp"], Vec::new())).await;
+        assert!(
+            !results.contains_key("someone/Roleplay-1B"),
+            "a repository holding no GGUF at all is no result: nothing in it can be added"
+        );
+        assert_eq!(
+            results["meshllm/Llama-8B-layers"].unsupported,
+            [UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)],
+            "pieces of a layer-split model repeat its metadata over fewer tensors than its blocks: \
+             no file holds the model"
+        );
+        assert_eq!(
+            results["someone/Llama-405B-GGUF"].unsupported,
+            Vec::new(),
+            "a split set's shards are never taken for layer-split pieces"
+        );
+        assert_eq!(results["someone/Llama-405B-GGUF"].architecture.as_deref(), Some("llama"));
+        assert!(
+            !results.contains_key("paperniuk/Qwen3.8-Flash-Next-MTP-block"),
+            "a prediction head alone (prediction layers over fewer tensors than blocks) is a \
+             drafter repository, offered only in drafter lists"
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    /// A rate limit (HTTP 429) on a file listing or a header read is unknown, never a verdict: the
+    /// row stays as the Hub's search describes it, its refusal body is never read as a GGUF, the
+    /// outcome isn't cached, and no further request goes to the Hub until its `Retry-After` passes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rate_limit_leaves_rows_as_the_hub_describes_them_and_is_not_cached() {
+        use crate::test_gguf::fixture_header;
+        use std::sync::atomic::Ordering;
+        let gemma = || Some(fixture_header("Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q2_K_P"));
+        let (endpoint, requests, _) = serve_repositories(vec![
+            StubRepository::new("someone/Listing-Refused-GGUF", Some("gemma4"))
+                .file("model-Q4_K_M.gguf", 2_000_000_000, gemma())
+                .throttled(1, 0),
+            StubRepository::new("someone/Header-Refused-GGUF", Some("gemma4"))
+                .file("model-Q4_K_M.gguf", 2_000_000_000, gemma())
+                .throttled(0, 1),
+        ]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let catalog = vec![(
+            "gemma-test:gguf:q4".parse::<ModelId>().unwrap(),
+            catalog_fingerprint("gemma-4-E2B-it-qat-UD-Q4_K_XL"),
+        )];
+        let state = |results: &BTreeMap<String, HuggingFaceModelSearchResult>, repository: &str| {
+            let result = &results[repository];
+            (result.architecture.clone(), result.unsupported.clone(), result.variant_of.clone())
+        };
+        let plain = (Some("gemma4".to_owned()), Vec::new(), None);
+        let results = search_all(&shape_discovery(&store, &["gemma4"], catalog.clone())).await;
+        assert_eq!(state(&results, "someone/Listing-Refused-GGUF"), plain, "a refused listing keeps the row");
+        assert_eq!(
+            state(&results, "someone/Header-Refused-GGUF"),
+            plain,
+            "a refused header read keeps the row, and its body is never read as a projector's header"
+        );
+        assert!(
+            requests.load(Ordering::SeqCst) <= 2,
+            "after the first refusal no request goes out until Retry-After passes"
+        );
+
+        // A refusal paused the host, so a read the pause stopped was never sent; its stub refusal
+        // may still be pending and pause the next search once more. Once each refusal is spent,
+        // every read happens: none was cached.
+        let mut variants = Vec::new();
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            let results = search_all(&shape_discovery(&store, &["gemma4"], catalog.clone())).await;
+            variants = ["someone/Listing-Refused-GGUF", "someone/Header-Refused-GGUF"]
+                .map(|repository| state(&results, repository).2)
+                .to_vec();
+            if variants.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        assert_eq!(
+            variants,
+            vec![Some("gemma-test:gguf:q4".parse::<ModelId>().unwrap()); 2],
+            "a refusal was never cached, so each read happens once allowed"
+        );
+    }
+
+    /// The listing shapes of real large repositories: shard sets in subfolders whose first shard
+    /// holds the metadata and only a few tensors (AtomicChat's Qwen3.8 Flash Next sets, 693 MB of
+    /// 85 GB), a 19-shard set at the root (a 405B llama), and large single files beside them
+    /// (projectors, an importance matrix). Each set's first shard is the model.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shard_sets_with_a_metadata_first_shard_are_the_model() {
+        let metadata_shard = |architecture: &'static str| {
+            crate::test_gguf::gguf_bytes(
+                &[
+                    ("general.architecture", crate::test_gguf::Meta::Str(architecture)),
+                    ("llama.block_count", crate::test_gguf::Meta::U32(126)),
+                    ("qwen4exp.block_count", crate::test_gguf::Meta::U32(48)),
+                ],
+                &["token_embd.weight"],
+            )
+        };
+        let mut flash = StubRepository::new("AtomicChat/Qwen3.8-Flash-Next-GGUF", Some("qwen4exp"))
+            .file("mmproj-Qwen3.8-Flash-Next-BF16.gguf", 907_542_784, Some(architecture_only("clip")))
+            .file("imatrix.gguf", 580_038_688, Some(imatrix()));
+        const FLASH: [&str; 28] = [
+            "Q4/Flash-Q4-00001-of-00028.gguf", "Q4/Flash-Q4-00002-of-00028.gguf", "Q4/Flash-Q4-00003-of-00028.gguf",
+            "Q4/Flash-Q4-00004-of-00028.gguf", "Q4/Flash-Q4-00005-of-00028.gguf", "Q4/Flash-Q4-00006-of-00028.gguf",
+            "Q4/Flash-Q4-00007-of-00028.gguf", "Q4/Flash-Q4-00008-of-00028.gguf", "Q4/Flash-Q4-00009-of-00028.gguf",
+            "Q4/Flash-Q4-00010-of-00028.gguf", "Q4/Flash-Q4-00011-of-00028.gguf", "Q4/Flash-Q4-00012-of-00028.gguf",
+            "Q4/Flash-Q4-00013-of-00028.gguf", "Q4/Flash-Q4-00014-of-00028.gguf", "Q4/Flash-Q4-00015-of-00028.gguf",
+            "Q4/Flash-Q4-00016-of-00028.gguf", "Q4/Flash-Q4-00017-of-00028.gguf", "Q4/Flash-Q4-00018-of-00028.gguf",
+            "Q4/Flash-Q4-00019-of-00028.gguf", "Q4/Flash-Q4-00020-of-00028.gguf", "Q4/Flash-Q4-00021-of-00028.gguf",
+            "Q4/Flash-Q4-00022-of-00028.gguf", "Q4/Flash-Q4-00023-of-00028.gguf", "Q4/Flash-Q4-00024-of-00028.gguf",
+            "Q4/Flash-Q4-00025-of-00028.gguf", "Q4/Flash-Q4-00026-of-00028.gguf", "Q4/Flash-Q4-00027-of-00028.gguf",
+            "Q4/Flash-Q4-00028-of-00028.gguf",
+        ];
+        for (index, path) in FLASH.iter().enumerate() {
+            flash = if index == 0 {
+                flash.file(path, 693_000_000, Some(metadata_shard("qwen4exp")))
+            } else {
+                flash.file(path, 3_000_000_000, None)
+            };
+        }
+        let mut llama = StubRepository::new("etemiz/Llama-3.1-405B-Inst-GGUF", Some("llama"));
+        const LLAMA: [&str; 19] = [
+            "llama-3.1-405b-IQ1_M-00001-of-00019.gguf", "llama-3.1-405b-IQ1_M-00002-of-00019.gguf",
+            "llama-3.1-405b-IQ1_M-00003-of-00019.gguf", "llama-3.1-405b-IQ1_M-00004-of-00019.gguf",
+            "llama-3.1-405b-IQ1_M-00005-of-00019.gguf", "llama-3.1-405b-IQ1_M-00006-of-00019.gguf",
+            "llama-3.1-405b-IQ1_M-00007-of-00019.gguf", "llama-3.1-405b-IQ1_M-00008-of-00019.gguf",
+            "llama-3.1-405b-IQ1_M-00009-of-00019.gguf", "llama-3.1-405b-IQ1_M-00010-of-00019.gguf",
+            "llama-3.1-405b-IQ1_M-00011-of-00019.gguf", "llama-3.1-405b-IQ1_M-00012-of-00019.gguf",
+            "llama-3.1-405b-IQ1_M-00013-of-00019.gguf", "llama-3.1-405b-IQ1_M-00014-of-00019.gguf",
+            "llama-3.1-405b-IQ1_M-00015-of-00019.gguf", "llama-3.1-405b-IQ1_M-00016-of-00019.gguf",
+            "llama-3.1-405b-IQ1_M-00017-of-00019.gguf", "llama-3.1-405b-IQ1_M-00018-of-00019.gguf",
+            "llama-3.1-405b-IQ1_M-00019-of-00019.gguf",
+        ];
+        for (index, path) in LLAMA.iter().enumerate() {
+            llama = if index == 0 {
+                llama.file(path, 5_000_000_000, Some(metadata_shard("llama")))
+            } else {
+                llama.file(path, 5_000_000_000, None)
+            };
+        }
+        let (endpoint, requests, _) = serve_repositories(vec![flash, llama]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let results = search_all(&shape_discovery(&store, &["qwen4exp", "llama"], Vec::new())).await;
+        for (repository, architecture) in [
+            ("AtomicChat/Qwen3.8-Flash-Next-GGUF", "qwen4exp"),
+            ("etemiz/Llama-3.1-405B-Inst-GGUF", "llama"),
+        ] {
+            assert_eq!(results[repository].unsupported, Vec::new(), "{repository}");
+            assert_eq!(results[repository].architecture.as_deref(), Some(architecture));
+        }
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "each set's first shard is read once, the largest group first"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shape_keys_after_the_token_list_are_read_from_the_whole_header() {
+        use crate::search_shape::{ModelShape, SHAPE_PREFIX_BYTES};
+        use crate::test_gguf::fixture_header;
+        use std::sync::atomic::Ordering;
+        let fixture = "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ3_XS";
+        let header = fixture_header(fixture);
+        assert_eq!(
+            ModelShape::from_header_prefix(&header[..SHAPE_PREFIX_BYTES]),
+            None,
+            "this writer puts the embedding length and head counts after the token list"
+        );
+        let header_length = header.len();
+        let (endpoint, requests, sent) = serve_repositories(vec![
+            StubRepository::new("HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF", Some("qwen35"))
+                .file(
+                    "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-IQ3_XS.gguf",
+                    header_length as u64,
+                    Some(header),
+                ),
+        ]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let qwen: ModelId = "qwen-test:gguf:q4".parse().unwrap();
+        let catalog = vec![(qwen.clone(), catalog_fingerprint(fixture))];
+        let variant = || async {
+            search_all(&shape_discovery(&store, &["qwen35"], catalog.clone()))
+                .await
+                .into_values()
+                .next()
+                .unwrap()
+                .variant_of
+        };
+        assert_eq!(variant().await, Some(qwen.clone()));
+        let (read_requests, read_bytes) =
+            (requests.load(Ordering::SeqCst), sent.load(Ordering::SeqCst));
+        assert!(
+            read_bytes <= header_length + 2 * SHAPE_PREFIX_BYTES,
+            "the fallback reads header bytes only: {read_bytes} for {header_length}"
+        );
+        assert_eq!(variant().await, Some(qwen));
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            read_requests,
+            "a shape read from the whole header is cached like any other"
         );
     }
 
@@ -3547,12 +4439,12 @@ mod tests {
                 Arc::clone(&store),
                 catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40)),
             ),
+            StubCatalog::empty(),
         );
         let results = discovery
             .search(HuggingFaceModelSearchRequest {
                 query: "llama 8b".to_owned(),
                 limit: 10,
-                include_unsupported: true,
             })
             .await
             .unwrap();

@@ -647,12 +647,11 @@ impl ModelPreviewComponentRole {
 pub struct HuggingFaceModelSearchRequest {
     pub query: String,
     pub limit: u32,
-    #[serde(default)]
-    pub include_unsupported: bool,
 }
 
-/// One repository. `unsupported` is empty for a repository whose architecture the engine runs;
-/// unsupported repositories are listed only when the request includes them.
+/// One repository. `unsupported` is empty for a repository whose architecture the engine runs,
+/// else it names that architecture. `variant_of` is the catalog model whose shape fingerprint the
+/// repository's GGUF has.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -674,21 +673,19 @@ pub struct HuggingFaceModelSearchResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub architecture: Option<String>,
-    pub base_models: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub variant_of: Option<crate::models::ModelId>,
     pub unsupported: Vec<crate::models::UnsupportedReason>,
 }
 
-/// Supported results, catalog repositories excluded. `hidden_count` counts the results left out
-/// because the engine does not run their architecture.
+/// Results of every architecture, unsupported ones last; catalog and drafter repositories
+/// excluded.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HuggingFaceModelSearchResults {
     pub results: Vec<HuggingFaceModelSearchResult>,
-    pub hidden_count: u32,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

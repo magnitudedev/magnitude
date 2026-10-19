@@ -6073,23 +6073,19 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
-          },
-          "includeUnsupported": {
-            "type": "boolean"
           }
         },
         "additionalProperties": false
       },
       "HuggingFaceModelSearchResult": {
         "type": "object",
-        "description": "One repository. `unsupported` is empty for a repository whose architecture the engine runs;\nunsupported repositories are listed only when the request includes them.",
+        "description": "One repository. `unsupported` is empty for a repository whose architecture the engine runs,\nelse it names that architecture. `variant_of` is the catalog model whose shape fingerprint the\nrepository's GGUF has.",
         "required": [
           "repository",
           "commit",
           "gated",
           "private",
           "tags",
-          "baseModels",
           "unsupported"
         ],
         "properties": {
@@ -6127,12 +6123,6 @@
           "architecture": {
             "type": "string"
           },
-          "baseModels": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
           "variantOf": {
             "$ref": "#/components/schemas/ModelId"
           },
@@ -6147,10 +6137,9 @@
       },
       "HuggingFaceModelSearchResults": {
         "type": "object",
-        "description": "Supported results, catalog repositories excluded. `hidden_count` counts the results left out\nbecause the engine does not run their architecture.",
+        "description": "Results of every architecture, unsupported ones last; catalog and drafter repositories\nexcluded.",
         "required": [
-          "results",
-          "hiddenCount"
+          "results"
         ],
         "properties": {
           "results": {
@@ -6158,11 +6147,6 @@
             "items": {
               "$ref": "#/components/schemas/HuggingFaceModelSearchResult"
             }
-          },
-          "hiddenCount": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
           }
         },
         "additionalProperties": false

@@ -2242,11 +2242,9 @@ mod tests {
                         private: false,
                         tags: vec!["gguf".to_owned()],
                         architecture: Some("qwen35moe".to_owned()),
-                        base_models: vec!["Qwen/Qwen3.6-35B-A3B".to_owned()],
                         variant_of: Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()),
                         unsupported: Vec::new(),
                     }],
-                    hidden_count: 3,
                 })
             })
         }
@@ -2368,15 +2366,10 @@ mod tests {
                 .unwrap();
         assert_eq!(search_body["results"][0]["repository"], "owner/model");
         assert_eq!(
-            search_body["results"][0]["baseModels"][0],
-            "Qwen/Qwen3.6-35B-A3B"
-        );
-        assert_eq!(
             search_body["results"][0]["variantOf"],
             "qwen3.6-35b-a3b:gguf:q4"
         );
         assert!(search_body["results"][0].get("lastModified").is_none());
-        assert_eq!(search_body["hiddenCount"], 3);
 
         let resolve = test_app(state)
             .oneshot(
