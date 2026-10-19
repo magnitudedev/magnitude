@@ -22,9 +22,9 @@ use futures_util::future::BoxFuture;
 use magnitude_engine::error::{RequestError, UnloadCause};
 use magnitude_engine::worker::EngineClient;
 use magnitude_engine::worker::protocol::MemoryObservation;
-use magnitude_executor::platform::{DomainThresholds, HostDistress, host_distress};
+use magnitude_executor::platform::{DomainThresholds, Fit, HostDistress, MemoryReserves};
 use magnitude_service_contracts::models::{ModelInstanceId, ModelReleaseReason};
-use seismic::{DeviceCatalog, DeviceTopology};
+use seismic::Devices;
 use tokio::time::Instant;
 
 use super::worker::worker_exit_code;
@@ -55,28 +55,32 @@ pub trait HostMemoryObserver: Send + Sync + 'static {
 
 /// System RAM observed through the service's own device catalog.
 pub struct SeismicHostMemory {
-    catalog: Arc<DeviceCatalog>,
+    catalog: Arc<Devices>,
+    reserves: MemoryReserves,
 }
 
 impl SeismicHostMemory {
-    pub fn new(catalog: Arc<DeviceCatalog>) -> Self {
-        Self { catalog }
+    /// Host RAM of `catalog`'s inventory, read through fit with `reserves`.
+    pub fn new(catalog: Arc<Devices>, reserves: MemoryReserves) -> Self {
+        Self { catalog, reserves }
     }
 }
 
 impl HostMemoryObserver for SeismicHostMemory {
+    /// Host RAM's headroom within process limits, and distress, as fit reads them from one host
+    /// reading ([`seismic::Inventory::host_status`], [`Fit::host_ram`]): nothing of volumes,
+    /// grants or opened executors is read.
     fn sample(&self) -> Result<HostMemorySample, String> {
-        let status = self
+        let topology = self.catalog.topology();
+        let reading = self
             .catalog
-            .host_memory_status()
+            .inventory()
+            .host_status()
             .map_err(|error| error.to_string())?;
+        let host = Fit::host_ram(&topology, &reading, &self.reserves);
         Ok(HostMemorySample {
-            headroom_bytes: status
-                .limits
-                .iter()
-                .map(|limit| limit.remaining_bytes())
-                .fold(status.headroom.bytes, u64::min),
-            distress: host_distress(&status),
+            headroom_bytes: host.headroom_bytes,
+            distress: host.distress,
         })
     }
 }
@@ -187,7 +191,6 @@ impl MemorySupervisor {
         worker: Arc<dyn ResidencyWorker>,
         engine: Arc<dyn SupervisedEngine>,
         context_window_tokens: u32,
-        topology: Arc<DeviceTopology>,
     ) {
         self.inner.state.lock().expect("supervisor state lock").supervised = Some(Supervised {
             instance_id: instance_id.clone(),
@@ -199,7 +202,6 @@ impl MemorySupervisor {
             instance_id,
             engine,
             context_window_tokens,
-            topology,
         ));
     }
 }
@@ -385,7 +387,6 @@ impl Inner {
         instance_id: ModelInstanceId,
         engine: Arc<dyn SupervisedEngine>,
         context_window_tokens: u32,
-        topology: Arc<DeviceTopology>,
     ) {
         let mut published = None;
         loop {
@@ -405,7 +406,7 @@ impl Inner {
                 // A closed engine is the worker check's to report.
                 Err(_) => return,
             };
-            let allocation = instance_allocation(&topology, context_window_tokens, &observation.census);
+            let allocation = instance_allocation(context_window_tokens, &observation.census);
             if published.as_ref() != Some(&allocation) {
                 published = Some(allocation.clone());
                 self.notifier.send(ResidencyNotification::AllocationObserved {
@@ -461,8 +462,8 @@ mod tests {
         fn observe(&self) -> BoxFuture<'_, Result<MemoryObservation, RequestError>> {
             Box::pin(async {
                 Ok(MemoryObservation {
-                    census: magnitude_engine::census::AllocationCensus { domains: Vec::new() },
-                    domains: Vec::new(),
+                    census: magnitude_engine::census::AllocationCensus { stores: Vec::new() },
+                    stores: Vec::new(),
                 })
             })
         }

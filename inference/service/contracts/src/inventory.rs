@@ -7,7 +7,8 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
-/// Stable identity of one physical memory pool.
+/// Stable identity of one store, a place bytes live: `system` for host RAM, otherwise the
+/// store's own identity (a device's memory by its physical device).
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -63,6 +64,31 @@ impl HardwareDeviceId {
 }
 
 impl std::fmt::Display for HardwareDeviceId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Stable cross-process identity of one piece of hardware: the serialized Seismic physical
+/// identity (`host`, `registry:<id>` or `uuid:<uuid>`), which every executor viewing it shares.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HardwarePhysicalDeviceId(String);
+
+impl HardwarePhysicalDeviceId {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for HardwarePhysicalDeviceId {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
     }
@@ -443,15 +469,6 @@ pub enum InventoryProperties {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum HardwareMemoryDomainKind {
-    System,
-    PhysicalDevice,
-    UnifiedMemory,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum HardwareDeviceKind {
     Cpu,
     Gpu,
@@ -460,39 +477,30 @@ pub enum HardwareDeviceKind {
     Unknown,
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HardwareDeviceMemoryLimitKind {
-    RecommendedWorkingSet,
-}
-
+/// One backend's handle on a physical device.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HardwareDeviceMemoryLimit {
-    pub kind: HardwareDeviceMemoryLimitKind,
-    pub total_bytes: u64,
-    pub stable_bytes: u64,
-    pub current_free_bytes: Option<u64>,
-}
-
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HardwareDevice {
+pub struct HardwareExecutor {
     pub id: HardwareDeviceId,
     pub backend: ExecutionBackend,
     pub name: String,
     pub description: String,
-    pub kind: HardwareDeviceKind,
-    #[serde(default)]
-    pub memory_limit: Option<HardwareDeviceMemoryLimit>,
-    /// Why discovery found this device but it is not an execution candidate, for example a driver
-    /// below its backend's floor. Absent means the device is usable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub unavailable_reason: Option<String>,
+    /// The access paths device storage is allocated from, in order.
+    pub device_placement: Vec<u32>,
+    /// The access paths upload storage is allocated from, in order.
+    pub upload_placement: Vec<u32>,
+    pub availability: HardwareExecutorAvailability,
+}
+
+/// Whether an executor can run: with its device placement's stable fit, or
+/// the reason it cannot.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HardwareExecutorAvailability {
+    Available { stable_capacity_bytes: u64 },
+    Unavailable { reason: String },
 }
 
 /// An execution backend compiled into the inference engine.
@@ -506,29 +514,131 @@ pub enum ExecutionBackend {
     Vulkan,
 }
 
+/// One piece of hardware, with every executor that views it.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HardwareSystemMemory {
-    pub physical_capacity_bytes: u64,
-    pub physical_available_bytes: u64,
-    pub allocation_capacity_bytes: u64,
-    pub allocation_headroom_bytes: u64,
-    pub assess_reserve_bytes: u64,
-    pub abort_reserve_bytes: u64,
+pub struct HardwarePhysicalDevice {
+    pub id: HardwarePhysicalDeviceId,
+    pub kind: HardwareDeviceKind,
+    pub executors: Vec<HardwareExecutor>,
 }
 
+/// A place bytes live, and what the service plans against in it.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HardwareMemoryDomain {
+pub struct HardwareStore {
     pub id: MemoryDomainId,
-    pub kind: HardwareMemoryDomainKind,
     pub total_capacity_bytes: u64,
+    /// The interface that reported the capacity.
+    pub capacity_basis: HardwareReportedBy,
+    /// The capacity within process limits, less the planning reserve.
     pub stable_capacity_bytes: u64,
+    /// The capacity within process limits.
+    pub allocation_capacity_bytes: u64,
+    pub planning_reserve_bytes: u64,
+    pub emergency_reserve_bytes: u64,
+}
+
+/// Host RAM, memory the OS manages, with what the OS reports of it.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareHostRam {
+    pub store: HardwareStore,
+    /// What the OS reports available to every program, before this
+    /// process's limits.
+    pub available_bytes: u64,
+    /// What this process may still take: the OS's availability within every
+    /// process limit.
+    pub current_free_bytes: u64,
+}
+
+/// A volume, with the space the OS reports available to this process.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareObservedStore {
+    pub store: HardwareStore,
+    pub current_free_bytes: u64,
+}
+
+/// Memory the OS does not manage, owned by one physical device. Its headroom
+/// is what opened executors leave, which only a resident worker reads.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareDeviceMemory {
+    pub physical_device_id: HardwarePhysicalDeviceId,
+    pub store: HardwareStore,
     pub current_free_bytes: Option<u64>,
-    pub shares_system_memory: bool,
-    pub devices: Vec<HardwareDevice>,
+}
+
+/// The interface, and the figure of it, a reported value comes from.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareReportedBy {
+    LinuxMemTotal,
+    MacOsMemsize,
+    WindowsTotalPhys,
+    LinuxMemAvailable,
+    MachMovablePages,
+    WindowsPhysicalAndCommit,
+    CpuAddressSpace,
+    MetalMaxBufferLength,
+    MetalRecommendedWorkingSet,
+    MetalWorkingSetUnallocated,
+    CudaTotalMemory,
+    CudaUsableMemory,
+    CudaFree,
+    VulkanHeap,
+    VulkanHeapBudget,
+    VulkanHeaps,
+    VulkanHeapsBeyondDedicated,
+    VulkanMaxAllocation,
+    CudaTotalBeyondDedicated,
+    MetalWorkingSetBeyondDedicated,
+    DxgiDedicatedMemory,
+    CudaMemoryClockBusWidth,
+    FilesystemSize,
+    FilesystemAvailable,
+}
+
+/// An executor reading and writing a store directly, under its grant.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareAccessPath {
+    /// Index in this snapshot's access paths; placements reference this index.
+    pub id: u32,
+    pub executor: HardwareDeviceId,
+    pub store: MemoryDomainId,
+    pub grant: Option<HardwareGrant>,
+}
+
+/// What an executor's driver lets this process place along one path.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareGrant {
+    pub bytes: u64,
+    /// The interface that reported the grant.
+    pub basis: HardwareReportedBy,
+    /// What is left of the grant, where a reading without an opened
+    /// executor reports it.
+    pub remaining_bytes: Option<u64>,
+}
+
+/// Bytes moved between two stores by an executor's copy mechanism.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareTransferPath {
+    pub from: MemoryDomainId,
+    pub to: MemoryDomainId,
+    pub executor: HardwareDeviceId,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -544,7 +654,6 @@ pub struct HardwareSnapshot {
     /// OS-reported physical CPU cores, independent of process scheduling limits.
     pub physical_cores: Option<usize>,
     pub logical_cores: usize,
-    pub system_memory: HardwareSystemMemory,
     /// Engine build identity: engine version plus kernel bundle identity.
     pub native_build: String,
     /// Backends compiled into the engine build.
@@ -554,15 +663,35 @@ pub struct HardwareSnapshot {
     #[serde(default)]
     pub backend_diagnostics: Vec<HardwareBackendDiagnostic>,
     pub topology_fingerprint: String,
-    pub memory_domains: Vec<HardwareMemoryDomain>,
+    pub physical_devices: Vec<HardwarePhysicalDevice>,
+    /// The executor the service's device selection takes: the one every load runs on. None when
+    /// no executor can run (each one's unavailability says why).
+    pub selected_executor: Option<HardwareDeviceId>,
+    /// Memory the OS manages; every machine has it.
+    pub host_ram: HardwareHostRam,
+    pub device_memory: Vec<HardwareDeviceMemory>,
+    /// The filesystems of the model store and the kernel cache.
+    pub volumes: Vec<HardwareObservedStore>,
+    pub access_paths: Vec<HardwareAccessPath>,
+    pub transfer_paths: Vec<HardwareTransferPath>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HardwareBackendDiagnostic {
-    pub backend: ExecutionBackend,
+    pub source: HardwareDiagnosticSource,
     pub message: String,
+}
+
+/// What a discovery diagnostic is about: one backend's enumeration, or the
+/// OS's adapter interface (DXGI).
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HardwareDiagnosticSource {
+    Backend { backend: ExecutionBackend },
+    Adapters,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

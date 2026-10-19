@@ -15,6 +15,7 @@
 pub(crate) mod abi;
 mod admission;
 mod batch;
+mod budget;
 mod comparison;
 #[cfg(feature = "coverage")]
 pub mod coverage;
@@ -23,13 +24,13 @@ pub(crate) use batch::{NativeTensorBatch, NativeTensorBatchCompletion};
 mod bundle_identity_tests;
 pub mod cpu;
 mod cuda;
-mod deadline;
 pub mod graph;
 mod graph_replays;
 #[cfg(test)]
 mod handoff_tests;
 mod observation;
 pub mod plan;
+mod point;
 pub mod replay;
 pub mod sampling;
 pub mod search;
@@ -61,6 +62,8 @@ use crate::driver::{
     collect_native_access, typed_buffer, write_zeros, Allocation, DeviceCompletion,
 };
 pub(crate) use crate::formation::FormationClass;
+pub use budget::{Footprint, Linear, Observed, Quote};
+pub use point::KernelPoint;
 use crate::artifacts::ArtifactKey;
 use crate::formation::{Compile, Keyed, ProgramFormer};
 use seismic_compiler::errors::{ExecutionError, InvocationError, PreparationError};
@@ -2272,8 +2275,9 @@ impl DeviceCompletion for RouteSubmission {
 
 /// Submitted native work. It retains the formed functions it executes;
 /// allocation fences keep every touched storage alive and order host access
-/// until the work completes.
-pub(crate) struct NativeSubmission {
+/// until the work completes. Opaque outside the runtime: its seconds are
+/// read through [`seismic_measure::Pending`].
+pub struct NativeSubmission {
     route: Arc<RouteSubmission>,
     _retained: Arc<dyn std::any::Any + Send + Sync>,
 }
@@ -2659,51 +2663,6 @@ fn read_word(bytes: &[u8], word: usize) -> u64 {
     )
 }
 
-/// Timing of one prepared native implementation over rotated argument sets.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Measurement {
-    /// Per-call device seconds of every sample.
-    pub samples: Vec<f64>,
-    pub median: f64,
-    /// Median absolute deviation of the samples.
-    pub deviation: f64,
-    /// Calls per sample submission.
-    pub repetitions: usize,
-    /// Distinct bytes the rotation reads and writes.
-    pub rotation_bytes: u64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct MeasureOptions {
-    /// Measured submissions.
-    pub samples: usize,
-    /// Minimum device time of one sample; sets the repetition count.
-    pub min_sample_seconds: f64,
-}
-
-impl Default for MeasureOptions {
-    fn default() -> Self {
-        Self {
-            samples: 7,
-            min_sample_seconds: 0.002,
-        }
-    }
-}
-
-fn median(samples: &[f64]) -> f64 {
-    median_of(samples.to_vec())
-}
-
-fn median_of(mut values: Vec<f64>) -> f64 {
-    values.sort_by(f64::total_cmp);
-    let middle = values.len() / 2;
-    if values.len() % 2 == 0 {
-        (values[middle - 1] + values[middle]) / 2.0
-    } else {
-        values[middle]
-    }
-}
-
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
@@ -2727,7 +2686,7 @@ mod tests {
         module
             .capture_native_asset(entry, BackendName::Metal, "kernel void wide() {}\n".into())
             .expect("asset capture");
-        let device = crate::devices::Catalog::discover()
+        let device = crate::devices::Devices::discover(&[])
             .expect("device discovery")
             .open_backend(BackendName::Metal)
             .expect("Metal device");

@@ -18,13 +18,15 @@ use magnitude_service_contracts::models::{
     ModelAssessmentDomainSnapshot, ModelAssessmentEntryState, ModelAssessments, ModelId,
     ModelPackageId,
 };
+use magnitude_executor::platform::MemoryReserves;
 use magnitude_service_models::{
-    InventoryConfig, ManagedModelDownloads, ManagedModelStore, ModelDomainResolver,
-    load_release_catalog, managed_model_services,
+    InventoryConfig, ManagedModelDownloads, ModelDomainResolver, load_release_catalog,
+    managed_model_services,
 };
 use magnitude_service_server::assessment::ManagedModelAssessments;
 use magnitude_service_server::assessment::assessor::ModelAssessor;
 use magnitude_service_server::assessment::environment::AssessmentEnvironment;
+use magnitude_service_server::model_store::{ServedStore, open_served_store};
 use serde_json::json;
 
 const POLL: Duration = Duration::from_millis(20);
@@ -92,13 +94,14 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
         required(&arguments, "--cache-root"),
     )?;
     config.catalog_models = release.catalog().models.clone();
-    let inventory = Arc::new(ManagedModelStore::open(config).await?);
+    let ServedStore {
+        store: inventory,
+        devices: catalog,
+    } = open_served_store(config, MemoryReserves::standard()).await?;
     let resolver = ModelDomainResolver::new(inventory.clone(), release.catalog().clone());
     let downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()).await?);
     let services = managed_model_services(resolver.clone(), downloads, Arc::new(NoCatalogEffects), Arc::new(NoCatalogEffects))?;
-    let environment = Arc::new(AssessmentEnvironment::establish(
-        &seismic::DeviceCatalog::discover()?,
-    )?);
+    let environment = Arc::new(AssessmentEnvironment::establish(&catalog)?);
     let environment_established = started.elapsed();
     let assessor = Arc::new(ModelAssessor::new(inventory, resolver, release, environment));
     let pool = ManagedModelAssessments::start(

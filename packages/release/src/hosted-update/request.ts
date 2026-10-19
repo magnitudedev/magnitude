@@ -30,7 +30,7 @@ const Label = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(96), Sche
 const Reason = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(200), Schema.pattern(/^[\x20-\x7E]+$/))
 const Count = Schema.NumberFromString.pipe(Schema.int(), Schema.nonNegative())
 export const UpdateHardwareFields = Schema.Struct({
-  backend: Schema.Literal("cpu", "metal", "cuda", "vulkan"),
+  backend: Schema.optionalWith(Schema.Literal("cpu", "metal", "cuda", "vulkan"), { as: "Option", exact: true }),
   gpu_name: Schema.optionalWith(Label, { as: "Option", exact: true }),
   gpu_kind: Schema.optionalWith(Schema.Literal("discrete", "integrated"), { as: "Option", exact: true }),
   gpu_memory_gb: Schema.optionalWith(Count, { as: "Option", exact: true }),
@@ -61,7 +61,7 @@ export const UpdateRequestFields = Schema.Struct({
   outcome_version: Schema.optionalWith(Version, { as: "Option", exact: true }),
   outcome_reason: Schema.optionalWith(UpdateOutcomeReason, { as: "Option", exact: true }),
   outcome_from: Schema.optionalWith(Version, { as: "Option", exact: true }),
-  backend: Schema.optionalWith(UpdateHardwareFields.fields.backend, { as: "Option", exact: true }),
+  backend: UpdateHardwareFields.fields.backend,
   gpu_name: UpdateHardwareFields.fields.gpu_name,
   gpu_kind: UpdateHardwareFields.fields.gpu_kind,
   gpu_memory_gb: UpdateHardwareFields.fields.gpu_memory_gb,

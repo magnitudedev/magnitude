@@ -21,7 +21,7 @@ use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_output,
     routed_route, routed_route_shared,
 };
-use seismic::{Element, Tensor};
+use seismic::{BuildError, Element, Tensor};
 
 /// The routed geometry every case of one binding shares.
 #[derive(Clone, Copy, Debug)]
@@ -122,7 +122,7 @@ fn scores(
     rows: u64,
     shape: RoutedShape,
     seed: u64,
-) -> Result<Tensor, String> {
+) -> Result<Tensor, BuildError> {
     inputs.activation(Element::f32(), &[rows, shape.selected], seed)
 }
 
@@ -219,7 +219,7 @@ impl EntryTuning for RoutedRouteTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let (shape, rows) = (self.shape, point.rows);
         let normalize = i32::from(self.normalize(inputs)?);
         let (parts, norm) = inputs.input_form(&self.scopes, shape.hidden)?;
@@ -324,7 +324,7 @@ impl EntryTuning for RoutedRouteSharedTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let scopes = TuningInputs::rotation_scopes(&self.route.scopes, point);
         self.route
             .rotation(inputs, point)?
@@ -412,10 +412,10 @@ impl EntryTuning for RoutedGroupTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let (shape, rows) = (self.shape, point.rows);
         let blocks = grouped_blocks(rows, shape.experts, shape.selected)?;
-        let table = |extents: &[u64]| -> Result<CaseState, String> {
+        let table = |extents: &[u64]| -> Result<CaseState, BuildError> {
             let tensor = inputs.scratch(Element::i32(), extents)?;
             inputs.state(tensor, 0..extents[0])
         };
@@ -521,7 +521,7 @@ impl EntryTuning for RoutedExpandTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let shape = self.shape;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
@@ -610,7 +610,7 @@ impl EntryTuning for RoutedChoicesTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let shape = self.shape;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
@@ -720,7 +720,7 @@ impl EntryTuning for RoutedOutputTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let (shape, rows) = (self.shape, point.rows);
         let (streams, inject) = inputs.join(&self.scopes)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
@@ -833,7 +833,7 @@ impl EntryTuning for RoutedExpertsTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let (shape, rows) = (self.shape, point.rows);
         let (order, _, table) = group(&routes(rows, shape), rows, shape)?;
         let blocks = table.len() as u64;
@@ -946,7 +946,7 @@ impl EntryTuning for RoutedCombineTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let (shape, rows) = (self.shape, point.rows);
         let (_, inverse, table) = group(&routes(rows, shape), rows, shape)?;
         let blocks = table.len() as u64;

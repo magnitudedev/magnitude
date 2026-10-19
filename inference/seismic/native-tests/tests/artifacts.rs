@@ -7,8 +7,8 @@
 //! (compiled into the binary) keeps nothing.
 
 use seismic::{
-    ArtifactKey, ArtifactStore, Availability, BackendName, Device, DeviceCatalog, DeviceOptions,
-    Element, NativeSpecialization, Tensor,
+    ArtifactKey, ArtifactStore, Availability, BackendName, Device, DeviceOptions, Devices, Element,
+    NativeSpecialization, Tensor,
 };
 use seismic_native_tests::split_sum;
 use std::collections::HashMap;
@@ -69,26 +69,26 @@ impl ArtifactStore for RecordingStore {
     }
 }
 
-/// The available devices of `backends`, opened from a fresh catalog with
+/// The available devices of `backends`, opened from fresh `Devices` with
 /// `store`, so nothing formed by an earlier open is reused in this process.
 fn devices_of(backends: &[BackendName], store: &Arc<RecordingStore>) -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().expect("device discovery");
-    let topology = catalog.topology();
+    let devices = Devices::discover(&[]).expect("device discovery");
+    let topology = devices.topology();
     backends
         .iter()
         .copied()
         .filter_map(|backend| {
             topology
-                .devices()
+                .executors()
                 .iter()
                 .find(|device| {
-                    device.backend == backend
-                        && matches!(device.availability, Availability::Available)
+                    device.backend() == backend
+                        && matches!(device.availability(), Availability::Available)
                 })
-                .map(|device| device.id)
+                .map(|device| device.id())
         })
         .map(|id| {
-            catalog
+            devices
                 .open_with(
                     id,
                     DeviceOptions {

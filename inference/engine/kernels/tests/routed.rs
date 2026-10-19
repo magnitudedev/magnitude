@@ -289,7 +289,7 @@ fn assert_close(name: &str, actual: &[f32], expected: &[f64], tolerance: f64) {
 /// CUDA, else Metal; `SEISMIC_TEST_BACKEND` explicitly selects CUDA or Vulkan
 /// and requires that backend to open.
 fn native_device() -> Option<seismic::Device> {
-    let catalog = seismic::DeviceCatalog::discover().ok()?;
+    let catalog = seismic::Devices::discover(&[]).ok()?;
     match std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() {
         // A selected backend must open: never skip silently.
         Some("cuda") => Some(
@@ -311,7 +311,7 @@ fn native_device() -> Option<seismic::Device> {
 
 /// The GPU device of `native_device` when present, and the CPU device.
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     native_device()
         .into_iter()
         .chain(std::iter::once(
@@ -1205,7 +1205,7 @@ fn packed_weight(
 }
 
 fn packed_router_matches_dense_decoding(representation: &str, backend: seismic::BackendName) {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let Ok(device) = catalog.open_backend(backend) else {
         return;
     };
@@ -3079,7 +3079,7 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
 /// LANES; the choices' product.
 #[test]
 fn metal_35b_shared_route_keeps_every_bit() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let Ok(device) = catalog.open_backend(seismic::BackendName::Metal) else {
         return;
     };

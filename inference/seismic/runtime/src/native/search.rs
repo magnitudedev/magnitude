@@ -1,5 +1,5 @@
 //! What a native search ranks configurations by: the objective ([`Cost`]),
-//! what tells two configurations apart at a point ([`PointKey`]), and the
+//! what tells two configurations apart at a point ([`LaunchKey`]), and the
 //! constants a search is run with ([`SearchSettings`]).
 //!
 //! The objective is expected elapsed service: each tuning point contributes
@@ -9,7 +9,7 @@
 //! therefore scales with how long its workload runs, a point without
 //! demand contributes nothing, and classes of points do not renormalize
 //! it. A point votes only between configurations that run
-//! different work there ([`PointKey`]); configurations with the same key at
+//! different work there ([`LaunchKey`]); configurations with the same key at
 //! a point share one measurement of it, and two configurations are
 //! compared over the points that tell them apart.
 //!
@@ -30,7 +30,7 @@ pub type ParameterValues = BTreeMap<String, u64>;
 /// same work there: the point cannot tell them apart, so it is measured once
 /// for all of them and does not vote between them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct PointKey {
+pub struct LaunchKey {
     pub launches: Vec<usize>,
     pub values: ParameterValues,
 }
@@ -39,19 +39,19 @@ pub struct PointKey {
 /// demand-weighted contribution relative to the complete canonical workload.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Cost {
-    points: Vec<(PointKey, f64)>,
+    points: Vec<(LaunchKey, f64)>,
 }
 
 impl Cost {
     /// `points` in the tuning points' order.
-    pub fn new(points: Vec<(PointKey, f64)>) -> Self {
+    pub fn new(points: Vec<(LaunchKey, f64)>) -> Self {
         Self { points }
     }
 
     /// Expected elapsed service relative to the same invocation demand at
     /// the reference. Region identities do not independently renormalize cost.
     pub fn relative(
-        keys: Vec<PointKey>,
+        keys: Vec<LaunchKey>,
         demand: &[f64],
         medians: &[f64],
         reference: &[f64],
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn costs_are_compared_over_the_points_that_tell_configurations_apart() {
-        let key = |name: &str, value: u64, launch: usize| PointKey {
+        let key = |name: &str, value: u64, launch: usize| LaunchKey {
             launches: vec![launch],
             values: [(name.to_string(), value)].into_iter().collect(),
         };
@@ -166,7 +166,7 @@ mod tests {
     fn zero_demand_witnesses_have_no_service_vote() {
         let keys = || {
             vec![
-                PointKey {
+                LaunchKey {
                     launches: vec![0],
                     values: ParameterValues::new()
                 };
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn invocation_demand_ranks_global_elapsed_service() {
-        let key = |launch: usize| PointKey {
+        let key = |launch: usize| LaunchKey {
             launches: vec![launch],
             values: ParameterValues::new(),
         };

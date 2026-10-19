@@ -4,8 +4,7 @@
 //! wall time (NVRTC compilation plus module load) is printed.
 
 use seismic::{
-    Availability, BackendName, Device, DeviceCatalog, Element, NativeKernel, NativeSpecialization,
-    Tensor,
+    Availability, BackendName, Device, Devices, Element, NativeKernel, NativeSpecialization, Tensor,
 };
 use seismic_native_tests::{
     ptx_approximate, ptx_cp_async, ptx_dp4a_s8, ptx_dp4a_u8s8, ptx_ldmatrix, ptx_ldmatrix_trans,
@@ -15,16 +14,16 @@ use seismic_native_tests::{
 use std::time::Instant;
 
 fn cuda_devices() -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().expect("device discovery");
-    let available = catalog.topology().devices().iter().any(|device| {
-        device.backend == BackendName::Cuda
-            && matches!(device.availability, Availability::Available)
+    let devices = Devices::discover(&[]).expect("device discovery");
+    let available = devices.topology().executors().iter().any(|device| {
+        device.backend() == BackendName::Cuda
+            && matches!(device.availability(), Availability::Available)
     });
     if !available {
         eprintln!("no available CUDA device; the CUDA device-library fixtures do not run");
         return Vec::new();
     }
-    vec![catalog
+    vec![devices
         .open_backend(BackendName::Cuda)
         .unwrap_or_else(|error| panic!("available CUDA device must open: {error}"))]
 }

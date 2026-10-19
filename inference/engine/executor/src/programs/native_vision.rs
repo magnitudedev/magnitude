@@ -965,6 +965,11 @@ pub struct NativeVisionProgram {
 }
 
 impl NativeVisionProgram {
+    /// Visit the graph constants the program binds.
+    pub(crate) fn visit_constants(&self, visit: &mut dyn FnMut(&seismic::Tensor)) {
+        self.graphs.constants.iter().for_each(visit);
+    }
+
     pub(crate) fn new(graphs: BoundVisionGraphs) -> Self {
         Self { graphs }
     }

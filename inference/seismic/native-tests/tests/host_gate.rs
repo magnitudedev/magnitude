@@ -5,15 +5,15 @@
 //! submitting thread, so its gate blocks that thread until another opens it.
 
 use seismic::{
-    Availability, BackendName, Device, DeviceCatalog, Element, NativeGraphFamily,
-    NativeGraphMetadata, NativeSpecialization, Tensor, Timeline, TimelineNode,
+    Availability, BackendName, Device, Devices, Element, NativeGraphFamily, NativeGraphMetadata,
+    NativeSpecialization, Tensor, Timeline, TimelineNode,
 };
 use seismic_native_tests::scale_rows;
 use std::time::Duration;
 
 fn devices() -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().expect("device discovery");
-    let topology = catalog.topology();
+    let devices = Devices::discover(&[]).expect("device discovery");
+    let topology = devices.topology();
     [
         BackendName::Cpu,
         BackendName::Metal,
@@ -22,12 +22,12 @@ fn devices() -> Vec<Device> {
     ]
     .into_iter()
     .filter(|backend| {
-        topology.devices().iter().any(|device| {
-            device.backend == *backend && matches!(device.availability, Availability::Available)
+        topology.executors().iter().any(|device| {
+            device.backend() == *backend && matches!(device.availability(), Availability::Available)
         })
     })
     .map(|backend| {
-        catalog
+        devices
             .open_backend(backend)
             .expect("available device opens")
     })
@@ -190,7 +190,7 @@ fn an_open_gate_lets_the_run_through() {
 /// A run's every timeline node must be bound, to a timeline of its device.
 #[test]
 fn a_run_binds_every_timeline_node() {
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -229,7 +229,7 @@ fn a_run_binds_every_timeline_node() {
 /// A plan with timeline nodes holds the host heap its topology plans.
 #[test]
 fn timeline_nodes_are_in_the_planned_host_heap() {
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();

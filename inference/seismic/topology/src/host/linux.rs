@@ -7,29 +7,79 @@
 //! unified hierarchy. Ancestors hidden by a cgroup namespace or a container's
 //! mount are reported as such, never presumed unlimited.
 
-use super::{
-    HeadroomBasis, HeadroomEstimate, HostCapacity, HostMeasurements, HostSample, LimitVisibility,
-    ProcessLimitKind, ProcessMemoryLimit,
-};
-use crate::devices::{CapacityBasis, ObservationError};
+use super::{HostSample, LimitVisibility, ObservationError, ProcessLimitKind, ProcessMemoryLimit};
+use crate::model::{Reported, ReportedBy};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
-pub(super) fn capacity() -> Result<HostCapacity, String> {
+/// The `/proc/cpuinfo` fields that identify a processor (x86's and Arm's):
+/// every processor's, heterogeneous cores included, and no live clock,
+/// utilization or calibration counter.
+const CPU_IDENTITY_FIELDS: [&str; 16] = [
+    "processor",
+    "vendor_id",
+    "cpu family",
+    "model",
+    "model name",
+    "stepping",
+    "flags",
+    "Features",
+    "CPU implementer",
+    "CPU architecture",
+    "CPU variant",
+    "CPU part",
+    "CPU revision",
+    "Hardware",
+    "Revision",
+    "Serial",
+];
+
+pub(super) fn cpu_identity() -> Result<String, String> {
+    let report = std::fs::read_to_string("/proc/cpuinfo").map_err(|error| error.to_string())?;
+    let fields = report
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            let key = key.trim();
+            CPU_IDENTITY_FIELDS
+                .contains(&key)
+                .then(|| format!("{key}={}", value.trim()))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if fields.is_empty() {
+        return Err("/proc/cpuinfo reports no CPU identity".into());
+    }
+    Ok(fields.into_iter().collect::<Vec<_>>().join(";"))
+}
+
+pub(super) fn capacity() -> Result<Reported<u64>, String> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").map_err(|error| error.to_string())?;
     let bytes = kib_field(&meminfo, "MemTotal:")
         .ok_or_else(|| "/proc/meminfo MemTotal is absent or invalid".to_owned())?;
-    Ok(HostCapacity {
-        bytes,
-        basis: CapacityBasis::OsUsableRam,
-    })
+    Ok(Reported::new(bytes, ReportedBy::LinuxMemTotal))
+}
+
+/// `uname(2)`: the kernel's name, release and version.
+pub(super) fn os_build() -> Result<String, String> {
+    let mut name = unsafe { std::mem::zeroed::<libc::utsname>() };
+    if unsafe { libc::uname(&mut name) } != 0 {
+        return Err(format!("uname failed: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: `uname` fills each field with a NUL-terminated string.
+    let text = |field: &[libc::c_char]| {
+        unsafe { std::ffi::CStr::from_ptr(field.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    Ok(format!(
+        "{} {} {}",
+        text(&name.sysname),
+        text(&name.release),
+        text(&name.version)
+    ))
 }
 
 pub(super) fn sample() -> Result<HostSample, ObservationError> {
     let meminfo = read("/proc/meminfo")?;
-    let sampled_at = SystemTime::now();
-    let mem_free_bytes = kib_field(&meminfo, "MemFree:")
-        .ok_or_else(|| ObservationError::Failed("/proc/meminfo MemFree is absent".into()))?;
     let mem_available_bytes = kib_field(&meminfo, "MemAvailable:").ok_or_else(|| {
         ObservationError::Unsupported(
             "/proc/meminfo has no MemAvailable estimate (Linux 3.14+ required)".into(),
@@ -38,15 +88,7 @@ pub(super) fn sample() -> Result<HostSample, ObservationError> {
     let mut limits = resource_limits()?;
     let limit_visibility = cgroup_limits(Path::new("/"), &mut limits)?;
     Ok(HostSample {
-        sampled_at,
-        measurements: HostMeasurements::Linux {
-            mem_free_bytes,
-            mem_available_bytes,
-        },
-        headroom: HeadroomEstimate {
-            bytes: mem_available_bytes,
-            basis: HeadroomBasis::LinuxMemAvailable,
-        },
+        headroom: Reported::new(mem_available_bytes, ReportedBy::LinuxMemAvailable),
         limits,
         limit_visibility,
         // `MemAvailable` is the kernel's estimate of what is usable without

@@ -18,7 +18,7 @@ use magnitude_kernels::{
     draft_rows, readout_head_rows, readout_project_rows, readout_selected_rows, sample_rows,
     shape_rows,
 };
-use seismic::{Element, Tensor};
+use seismic::{BuildError, Element, Tensor};
 
 /// Candidate tokens of a `readout_selected_rows` tuning point.
 const SELECTED_TOKENS: u64 = 256;
@@ -86,7 +86,7 @@ impl EntryTuning for DraftRowsTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let table = inputs.weight(WeightScope::Target, WeightKind::Embedding)?;
         let [vocabulary, hidden] = table.extents()[..] else {
             return Err("the draft embedding table is not a matrix".into());
@@ -242,7 +242,7 @@ impl EntryTuning for HeadRowsTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let weight = inputs.weight(self.projection_scope, WeightKind::Output)?;
         let [vocabulary, hidden] = weight.extents()[..] else {
             return Err("the output weight is not a matrix".into());
@@ -338,7 +338,7 @@ impl EntryTuning for SelectedRowsTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let head = HeadRowsTuning {
             projection_scope: WeightScope::Target,
             norm_scope: WeightScope::Target,
@@ -438,7 +438,7 @@ impl EntryTuning for PreparedProjectionTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let weight = inputs.weight(self.scope, self.kind)?;
         let [vocabulary, hidden] = weight.extents()[..] else {
             return Err("prepared projection weight is not a matrix".into());
@@ -487,7 +487,7 @@ fn logits(
     rows: u64,
     vocabulary: u64,
     seed: u64,
-) -> Result<Tensor, String> {
+) -> Result<Tensor, BuildError> {
     inputs.activation(Element::f32(), &[rows, vocabulary], seed)
 }
 
@@ -533,7 +533,7 @@ impl EntryTuning for ShapeRowsTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let rows = point.rows;
         let vocabulary = self.vocabulary;
         // A typical sampling configuration with every stage active:
@@ -617,7 +617,7 @@ impl EntryTuning for SampleRowsTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let rows = point.rows;
         let words = self.vocabulary.div_ceil(32);
         let draws = (0..rows * 6)

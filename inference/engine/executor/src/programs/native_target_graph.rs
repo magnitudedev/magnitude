@@ -3,8 +3,8 @@
 //! edge and intermediate allocation.
 
 use crate::device_table::ResidentTable;
-use crate::stored_table::{SelectionNotice, StoredTable};
 use crate::operators::{self, MixerKind, PairedBlock, paired_block};
+use crate::stored_table::{SelectionNotice, StoredTable};
 use crate::streamed_table::StreamedTable;
 use crate::{
     ModelLoadPlan, ResidentTarget, ResourceLimits, StateResourcePlan, TargetBlockProgramSlot,
@@ -1507,7 +1507,11 @@ impl PreparedTargetGraphs {
             true => None,
             false => Some(SelectionNotice::new(
                 &resident.embedding.tensor().device(),
-                self.entries.keys().map(|(rows, _)| *rows).max().unwrap_or(1),
+                self.entries
+                    .keys()
+                    .map(|(rows, _)| *rows)
+                    .max()
+                    .unwrap_or(1),
             )?),
         };
         let graphs = BoundTargetGraphs {
@@ -1639,6 +1643,19 @@ pub(crate) struct BoundTargetGraphs {
 }
 
 impl BoundTargetGraphs {
+    fn constant_storage(&self) -> impl Iterator<Item = &seismic::Tensor> {
+        self.constants
+            .iter()
+            .chain(&self.taps)
+            .chain(self.per_layer.as_ref().map(|per_layer| &per_layer.rows))
+            .chain(&self.token_rows)
+    }
+
+    /// Visit the graph constants the bindings hold.
+    pub(crate) fn visit_constants(&self, visit: &mut dyn FnMut(&seismic::Tensor)) {
+        self.constant_storage().for_each(visit);
+    }
+
     /// The host heap the bindings hold beyond the prepared graphs they
     /// share: each binding's own (`BoundNativeGraphPlan::host_heap`) and the
     /// vectors that hold the blocks' bindings, at their capacities. The
@@ -1786,16 +1803,11 @@ mod token_rows_tests {
 
 impl BoundTargetGraphs {
     pub(crate) fn constant_bytes(&self) -> Result<u64, &'static str> {
-        self.constants
-            .iter()
-            .chain(&self.taps)
-            .chain(self.per_layer.as_ref().map(|per_layer| &per_layer.rows))
-            .chain(&self.token_rows)
-            .try_fold(0u64, |bytes, tensor| {
-                bytes
-                    .checked_add(tensor.storage_bytes())
-                    .ok_or("target graph constant charge overflows")
-            })
+        self.constant_storage().try_fold(0u64, |bytes, tensor| {
+            bytes
+                .checked_add(tensor.storage_bytes())
+                .ok_or("target graph constant charge overflows")
+        })
     }
 
     pub(crate) fn entry(
@@ -2743,7 +2755,9 @@ impl PreparedTargetBlockGraph {
         graph
             .export(&parts.output)
             .map_err(|error| error.to_string())?;
-        if let Some(residual) = &parts.residual { graph.export(residual).map_err(|error| error.to_string())?; }
+        if let Some(residual) = &parts.residual {
+            graph.export(residual).map_err(|error| error.to_string())?;
+        }
         let plan = graph.seal().map_err(|error| error.to_string())?;
         // The graph's constants are the family's values, and its vectors
         // hold exactly their elements: what it owns then follows from its
@@ -2926,7 +2940,9 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             return Err("an n-gram input in an attention block".into());
         }
     };
-    let residual = (block_index + 1 == geometry.blocks.len() && load.residual_conditioning().is_some()).then(|| output.clone());
+    let residual = (block_index + 1 == geometry.blocks.len()
+        && load.residual_conditioning().is_some())
+    .then(|| output.clone());
     // The last block ends with the decoder's exit site, whose partials the
     // readout sums.
     let output = match (streams, streams_entries, &geometry.exit.norm) {
@@ -3053,7 +3069,9 @@ fn checked_block_graph_draft(
         &mut constants,
     )?;
     GraphDraft::export(&mut graph, &parts.output)?;
-    if let Some(residual) = &parts.residual { GraphDraft::export(&mut graph, residual)?; }
+    if let Some(residual) = &parts.residual {
+        GraphDraft::export(&mut graph, residual)?;
+    }
     let owned = owned_vectors_heap(weights.len(), constants.len(), parts.state.ports().len());
     Ok((graph, constants, owned))
 }

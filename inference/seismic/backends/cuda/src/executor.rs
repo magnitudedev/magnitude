@@ -37,6 +37,37 @@ pub struct MemoryInfo {
 }
 
 impl Device {
+    /// The accounts the device's own allocations are charged to: `device`
+    /// for device memory (blocks, reservations' granules, graphs' driver
+    /// memory), `upload` for mapped host memory. Set once, before the
+    /// device allocates.
+    pub fn set_allocation_accounts(
+        &self,
+        device: Arc<dyn seismic_compiler::executable::MemoryAccount>,
+        upload: Arc<dyn seismic_compiler::executable::MemoryAccount>,
+    ) {
+        assert!(
+            self.context.device_account.set(device).is_ok(),
+            "device account is installed once"
+        );
+        assert!(
+            self.context.upload_account.set(upload).is_ok(),
+            "upload account is installed once"
+        );
+    }
+
+    /// The account the device's pinned staging is charged to: host RAM's.
+    /// Set once, before the device allocates.
+    pub fn set_host_memory_account(
+        &self,
+        account: Arc<dyn seismic_compiler::executable::MemoryAccount>,
+    ) {
+        assert!(
+            self.context.host_account.set(account).is_ok(),
+            "host memory account is set once before execution"
+        );
+    }
+
     pub fn open(ordinal: u32) -> Result<Self, ExecutionError> {
         let driver = Driver::load().map_err(ExecutionError::SubmissionFailed)?;
         let ordinal = i32::try_from(ordinal).map_err(|_| {
@@ -119,9 +150,7 @@ impl Device {
         let bytes = usize::try_from(bytes).map_err(|_| {
             ExecutionError::AllocationFailed("CUDA allocation exceeds host address space".into())
         })?;
-        HostMapped::new(&self.context, bytes)
-            .map(Buffer::mapped)
-            .map_err(allocation_error)
+        HostMapped::new(&self.context, bytes).map(Buffer::mapped)
     }
 
     /// Whether this device reserves address ranges and backs them in place
@@ -152,9 +181,10 @@ impl Device {
             })
         };
         let (committed, reserved) = (host(committed)?, host(reserved)?);
-        let reservation =
-            Arc::new(Reservation::new(&self.context, reserved).map_err(allocation_error)?);
-        reservation.commit(committed).map_err(allocation_error)?;
+        let reservation = Arc::new(
+            Reservation::new(&self.context, reserved).map_err(allocation_error(reserved as u64))?,
+        );
+        reservation.commit(committed)?;
         self.zero(reservation.base, committed)?;
         Ok(Buffer::reserved(reservation, committed))
     }
@@ -180,7 +210,7 @@ impl Device {
             })?;
         let kept = buffer.len() as usize;
         if committed > kept {
-            reservation.commit(committed).map_err(allocation_error)?;
+            reservation.commit(committed)?;
             if let Err(error) = self.zero(reservation.base + kept as u64, committed - kept) {
                 // The new granules are not published yet. Restore the old
                 // prefix before returning so its backing and charge agree.
@@ -196,7 +226,7 @@ impl Device {
             // Driver failures after the first unmap cannot be reported while
             // leaving the old allocation valid, so `commit` treats them as
             // fatal rather than handing back a mismatched old view.
-            reservation.commit(committed).map_err(allocation_error)?;
+            reservation.commit(committed)?;
         }
         Ok(Buffer::reserved(reservation.clone(), committed))
     }
@@ -550,8 +580,7 @@ impl Submission {
         if total == 0 {
             return Ok(());
         }
-        let mut staging =
-            PinnedUpload::new(&self.device.context, total).map_err(allocation_error)?;
+        let mut staging = PinnedUpload::new(&self.device.context, total)?;
         let mut segments = Vec::with_capacity(uploads.len());
         let mut source_offset = 0usize;
         for (buffer, bytes) in uploads {
@@ -826,11 +855,24 @@ fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
         ))
     })
 }
-pub(crate) fn allocation_error(error: DriverError) -> ExecutionError {
-    if error.is_device_loss() {
-        ExecutionError::DeviceLost(error.to_string())
-    } else {
-        ExecutionError::AllocationFailed(error.to_string())
+/// The error of an allocation of `bytes` the driver failed: a device loss,
+/// a capacity refusal where the driver is out of memory
+/// (`CUDA_ERROR_OUT_OF_MEMORY`), as every backend reports one, else a
+/// failure.
+pub(crate) fn allocation_error(bytes: u64) -> impl FnOnce(DriverError) -> ExecutionError {
+    /// `CUDA_ERROR_OUT_OF_MEMORY`.
+    const OUT_OF_MEMORY: i32 = 2;
+    move |error| {
+        if error.is_device_loss() {
+            ExecutionError::DeviceLost(error.to_string())
+        } else if error.code == OUT_OF_MEMORY {
+            ExecutionError::AllocationCapacity {
+                required: bytes.into(),
+                available: 0,
+            }
+        } else {
+            ExecutionError::AllocationFailed(error.to_string())
+        }
     }
 }
 fn submission_error(error: DriverError) -> ExecutionError {

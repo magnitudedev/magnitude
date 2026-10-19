@@ -401,7 +401,7 @@ pub struct ReadyInfo {
     pub resources: ResourcePlanSummary,
     pub path: ExecutionPath,
     /// The device the worker resolved and opened.
-    pub device: seismic::DeviceSelector,
+    pub device: seismic::ExecutorSelector,
     /// The backend of the opened device the native path executes on.
     pub backend: seismic::BackendName,
     /// The memory heap's standing when readiness was published.

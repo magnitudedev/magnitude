@@ -9,6 +9,7 @@ use magnitude_kernels::{
     readout_project_rows, readout_selected_rows, sample_rows, shape_rows,
 };
 mod cuda_common;
+mod timing_common;
 
 use cuda_common::*;
 use seismic::{Device, Element, Layout, NativeSpecialization, Tensor};
@@ -1601,10 +1602,11 @@ fn cuda_gemm_timings() {
     let Some(device) = cuda() else { return };
     let absent_scale = f32_tensor(&device, &[0], &[]);
     let mut rng = Rng(37);
-    let options = seismic::MeasureOptions {
-        samples: 15,
+    let options = seismic::measure::Measure {
+        samples: std::num::NonZeroUsize::new(15).unwrap(),
         min_sample_seconds: 0.002,
     };
+    let measure = |point| timing_common::measured(point, &options);
     let rounds: usize =
         std::env::var("CUDA_TIMING_ROUNDS").map_or(3, |value| value.parse().unwrap());
     let shapes: Vec<(&str, usize, usize)> = match std::env::var("CUDA_TIMING_SHAPES") {
@@ -1677,7 +1679,7 @@ fn cuda_gemm_timings() {
                                 up_bound: &absent_scale,
                             })
                             .collect();
-                        expand_times.push(expand.measure(args, &options).unwrap().median);
+                        expand_times.push(measure(expand.point(args).unwrap()).median);
                         let args = (0..rotation)
                             .map(|r| dense_output::Args {
                                 residual: &residual,
@@ -1688,7 +1690,7 @@ fn cuda_gemm_timings() {
                                 down_bound: &absent_scale,
                             })
                             .collect();
-                        output_times.push(output.measure(args, &options).unwrap().median);
+                        output_times.push(measure(output.point(args).unwrap()).median);
                     }
                     let (best, median) = summary(expand_times);
                     println!(
@@ -1716,10 +1718,11 @@ fn cuda_projection_timings() {
     let Some(device) = cuda() else { return };
     let absent_scale = f32_tensor(&device, &[0], &[]);
     let mut rng = Rng(29);
-    let options = seismic::MeasureOptions {
-        samples: 15,
+    let options = seismic::measure::Measure {
+        samples: std::num::NonZeroUsize::new(15).unwrap(),
         min_sample_seconds: 0.002,
     };
+    let measure = |point| timing_common::measured(point, &options);
     let (h, f) = (2560usize, 9216usize);
     // Rotations exceed the 24 MiB L2.
     let rotation = 4;
@@ -1759,7 +1762,7 @@ fn cuda_projection_timings() {
                         up_bound: &absent_scale,
                     })
                     .collect();
-                let measured = expand.measure(args, &options).unwrap();
+                let measured = measure(expand.point(args).unwrap());
                 println!(
                     "expand {format:?} M={m} K={h} N=2x{f} {mapping:?}: {:.1} us, {:.0} GB/s, {:.2} TFLOP/s",
                     measured.median * 1e6,
@@ -1777,7 +1780,7 @@ fn cuda_projection_timings() {
                         down_bound: &absent_scale,
                     })
                     .collect();
-                let measured = output.measure(args, &options).unwrap();
+                let measured = measure(output.point(args).unwrap());
                 println!(
                     "output {format:?} M={m} K={f} N={h} {mapping:?}: {:.1} us, {:.0} GB/s, {:.2} TFLOP/s",
                     measured.median * 1e6,
@@ -1796,10 +1799,11 @@ fn cuda_projection_timings() {
 fn cuda_head_timings() {
     let Some(device) = cuda() else { return };
     let mut rng = Rng(31);
-    let options = seismic::MeasureOptions {
-        samples: 15,
+    let options = seismic::measure::Measure {
+        samples: std::num::NonZeroUsize::new(15).unwrap(),
         min_sample_seconds: 0.002,
     };
+    let measure = |point| timing_common::measured(point, &options);
     let (d, v) = (2560usize, 65536usize);
     let heads: Vec<Tensor> = (0..2)
         .map(|_| timing_weight(&device, Format::Q6K, v, d))
@@ -1841,7 +1845,7 @@ fn cuda_head_timings() {
                     weight_scale: &absent_scale,
                 })
                 .collect();
-            let measured = kernel.measure(args, &options).unwrap();
+            let measured = measure(kernel.point(args).unwrap());
             println!(
                 "head Q6K O={o} K={d} N={v} {mapping:?}: {:.1} us, {:.0} GB/s, {:.2} TFLOP/s",
                 measured.median * 1e6,

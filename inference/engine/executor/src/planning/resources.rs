@@ -229,10 +229,11 @@ impl DecodedHistoryForm {
 pub struct ResourceCapacity {
     /// Stable capacity of the selected device's physical allocation domain.
     pub domain_bytes: u64,
-    /// Whether the selected device forms Metal tensor operations: its own
-    /// probe (`seismic::DeviceInfo::forms_tensor_operations`), which decides
-    /// the graph classes a plan has, so assessment and load plan the same
-    /// graphs. A plan for no concrete device states which it assumes.
+    /// Whether the selected device forms Metal tensor operations, as its
+    /// executor reports (`seismic::Executor::forms_tensor_operations`):
+    /// it decides the graph classes a plan has, so assessment and load plan
+    /// the same graphs. A plan for no concrete device states which it
+    /// assumes.
     pub tensor_operations: TensorOperations,
 }
 
@@ -1370,7 +1371,7 @@ fn state_store_plan(
 mod slab_plan_tests {
     use super::*;
     use magnitude_state::LayerRef;
-    use seismic::{BackendName, DType, DeviceCatalog};
+    use seismic::{BackendName, DType};
 
     #[test]
     fn listed_history_classes_bound_capacity_for_small_and_large_extents() {
@@ -1461,7 +1462,7 @@ mod slab_plan_tests {
                 + banks.slab_bytes
         );
         let device = Rc::new(
-            DeviceCatalog::discover()
+            seismic::Devices::discover(&[])
                 .unwrap()
                 .open_backend(BackendName::Cpu)
                 .unwrap(),

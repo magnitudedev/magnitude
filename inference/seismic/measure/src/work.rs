@@ -1,0 +1,54 @@
+//! What is timed: a [`Work`], which submits passes of itself to a device
+//! and reports their seconds. The runtime implements it for its measurable
+//! execution features (a formed kernel's rotation of calls, a sealed
+//! graph's runs); this crate knows nothing of devices.
+
+/// Submitted passes of a [`Work`], queued and not waited on; for work timed
+/// on the host, already complete ([`Work::submit`]).
+pub trait Pending<E> {
+    /// The seconds of the submission, once it completes (waiting for it):
+    /// device time where the work is timed on the device.
+    fn seconds(&self) -> Result<f64, E>;
+    /// Wait for the submission and report its outcome.
+    fn wait(&self) -> Result<(), E>;
+}
+
+/// Work a held clock gauges with: a fresh placement of the work it was made
+/// from ([`Work::gauge`]), submitting passes the same way.
+pub trait Gauge<E> {
+    /// Submit `passes` passes as one unit of work, without waiting.
+    fn submit(&self, passes: usize) -> Result<Box<dyn Pending<E>>, E>;
+}
+
+/// Work this crate times: passes of it are submitted as one unit and
+/// timed, each sample queued behind a pass that is not.
+pub trait Work {
+    type Error;
+    type Pending: Pending<Self::Error>;
+    /// Submit `passes` passes over the work as one unit, without waiting.
+    /// Work timed on the host (from its submission to its completion) runs
+    /// its passes before this returns: its pending passes are complete, and
+    /// a session's lead before a sample has completed when the sample is
+    /// submitted.
+    fn submit(&self, passes: usize) -> Result<Self::Pending, Self::Error>;
+    /// The calls one pass makes: a sample's seconds per call divide by it.
+    fn calls_per_pass(&self) -> usize;
+    /// A fresh placement of the same work, for a clock to gauge with: a
+    /// gauge's work is its own, separate from what it raises the device
+    /// for.
+    fn gauge(&self) -> Result<Box<dyn Gauge<Self::Error>>, Self::Error>;
+}
+
+impl<W: Work> Work for &W {
+    type Error = W::Error;
+    type Pending = W::Pending;
+    fn submit(&self, passes: usize) -> Result<Self::Pending, Self::Error> {
+        (**self).submit(passes)
+    }
+    fn calls_per_pass(&self) -> usize {
+        (**self).calls_per_pass()
+    }
+    fn gauge(&self) -> Result<Box<dyn Gauge<Self::Error>>, Self::Error> {
+        (**self).gauge()
+    }
+}

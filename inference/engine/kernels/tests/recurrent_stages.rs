@@ -11,9 +11,11 @@
 
 use magnitude_kernels::{gated_delta_chunk, gated_delta_step};
 use seismic::{
-    BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor,
+    BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
     Tensor,
 };
+
+mod timing_common;
 
 const SENTINEL: f32 = 7.25;
 
@@ -1025,7 +1027,7 @@ fn check(label: &str, case: &Case, actual: &Outcome, expected: &Outcome, toleran
 }
 
 fn metal() -> Option<Device> {
-    DeviceCatalog::discover()
+    seismic::Devices::discover(&[])
         .ok()
         .and_then(|catalog| catalog.open_backend(BackendName::Metal).ok())
 }
@@ -1033,7 +1035,7 @@ fn metal() -> Option<Device> {
 /// Metal when present and the CPU device. (Vulkan's mappings are checked in
 /// `vulkan_recurrent.rs`, CUDA's in `cuda_recurrent.rs`.)
 fn devices() -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     catalog
         .open_backend(BackendName::Metal)
         .ok()
@@ -2150,10 +2152,11 @@ fn metal_recurrent_timings() {
     let Some(device) = metal() else {
         return;
     };
-    let options = seismic::MeasureOptions {
-        samples: 15,
+    let options = seismic::measure::Measure {
+        samples: std::num::NonZeroUsize::new(15).unwrap(),
         min_sample_seconds: 0.01,
     };
+    let measure = |point| timing_common::measured(point, &options);
     let slot = |rows, previous, following| slot(rows, rows, previous, following);
     for (label, rows, slots) in [
         ("step 1 row", 1usize, vec![slot(1, 1, 2)]),
@@ -2189,14 +2192,14 @@ fn metal_recurrent_timings() {
             for step_rows in [32u64, 16, 64] {
                 let kernel = case.native_step(&device, Element::bf16(), step_rows);
                 let args = rotation.iter_mut().map(|t| t.step_args(&case)).collect();
-                let measured = kernel.measure(args, &options).unwrap();
+                let measured = measure(kernel.point(args).unwrap());
                 println!("{label} ROWS {step_rows}: {:.1} us", measured.median * 1e6);
             }
         } else {
             for chunk_rows in CHUNK_ROWS {
                 let kernel = case.native_chunk(&device, Element::bf16(), chunk_rows);
                 let args = rotation.iter_mut().map(|t| t.chunk_args(&case)).collect();
-                let measured = kernel.measure(args, &options).unwrap();
+                let measured = measure(kernel.point(args).unwrap());
                 let launches = launch_medians(&device, || {
                     for t in rotation.iter_mut() {
                         kernel.call(t.chunk_args(&case)).unwrap();

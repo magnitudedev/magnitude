@@ -16,6 +16,7 @@ applies_to:
 
 | Concern | Owner |
 | ------- | ----- |
+| Hardware graph and observations | Seismic topology/runtime |
 | Device bandwidth, decode costs, per-model memory fit, executability, performance, capabilities | Engine |
 | Device selection for assessment (the rule loads use) | Engine |
 | Assessment environment identity, targets, pool, cache, deadlines, publication | Service |
@@ -54,8 +55,8 @@ Every cached assessment is keyed by the environment identity, a digest of:
   decode costs and the bandwidth table);
 - the backend, device selector and device name;
 - the resolved bandwidth and its source;
-- the normalized stable topology: devices, memory relationships and capacities, without live free
-  memory or process-local revisions;
+- the normalized stable topology: physical devices, executors, stores, paths and capacities,
+  without live free memory or process-local revisions;
 - the process memory limits that bound stable fit capacity;
 - the reserve policy (`MemoryReserves`) and the engine serving configuration.
 
@@ -117,8 +118,9 @@ Every assessed profile produces one complete result:
 A catalog model is never `Unsupported`: an engine `Unsupported` for a catalog target is a release
 defect, settled as `Dropped` with an OpenTelemetry error. A family the engine does not implement
 carries no capabilities and an empty template fingerprint. Memory domains are named `system` for
-host RAM and by device selector for dedicated device memory. Results publish atomically through the
-revisioned assessment snapshot; one target's failure never invalidates siblings.
+host RAM and by stable physical store identity for dedicated device memory. Results publish
+atomically through the revisioned assessment snapshot; one target's failure never invalidates
+siblings.
 
 Every exact target receives one attempt. An operational, malformed-material, timeout, or resolution
 failure creates no cache entry and settles the target as `Dropped`; it is not re-admitted by a

@@ -35,7 +35,7 @@ const store = (outcome: Option.Option<UpdateOutcome>, reported: Ref.Ref<number>)
   recordFailure: () => Effect.void, complete: () => Effect.void, discard: Effect.void, removeAbandonedTransfers: Effect.void,
 })
 const hardwareSource = (hardware: Option.Option<UpdateHardware>) => ({ current: Effect.succeed(hardware) })
-const cuda: UpdateHardware = { backend: "cuda", gpu_name: Option.some("NVIDIA A10-8Q"), gpu_kind: Option.some("discrete"), gpu_memory_gb: Option.some(8), gpu_count: Option.some(1),
+const cuda: UpdateHardware = { backend: Option.some("cuda"), gpu_name: Option.some("NVIDIA A10-8Q"), gpu_kind: Option.some("discrete"), gpu_memory_gb: Option.some(8), gpu_count: Option.some(1),
   gpu_unused_reason: Option.none(), cpu_model: Option.some("AMD EPYC 7V13"), cpu_cores: Option.some(12), memory_gb: Option.some(110) }
 const metadata = Schema.decodeUnknownSync(UpdateClientMetadata)({ version: "1.0.0", os: "windows", os_version: "11", arch: "x64", package: "windows-exe" })
 const options = { origin: "https://example.com", metadata, dataDirectory: "/unused", userAgent: "fixture", sign: () => Effect.succeed("unused"), trustedPublishers: new Map() }

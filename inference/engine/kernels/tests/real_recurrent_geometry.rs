@@ -2,7 +2,7 @@
 //! Run only with MAGNITUDE_REAL_RECURRENT_FIXTURE set to its generated directory.
 
 use magnitude_kernels::{attention_output, gated_delta_project, gated_delta_step, repack_weight};
-use seismic::{BackendName, Device, DeviceCatalog, Element, SlabRegion, SlabTensor, Tensor};
+use seismic::{BackendName, Device, Element, SlabRegion, SlabTensor, Tensor};
 use std::{fs, path::Path};
 
 fn bytes(path: &Path, name: &str, extension: &str) -> Vec<u8> {
@@ -136,7 +136,7 @@ fn report(path: &Path, label: &str, actual: Vec<f32>) {
 
 /// Metal and the CPU device.
 fn devices() -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     vec![
         catalog.open_backend(BackendName::Metal).unwrap(),
         catalog.open_backend(BackendName::Cpu).unwrap(),

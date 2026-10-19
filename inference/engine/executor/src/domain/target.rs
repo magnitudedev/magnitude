@@ -1511,7 +1511,7 @@ mod causal_cache_tests {
 
     #[test]
     fn compressed_causal_rows_read_prepared_prior_but_media_keeps_dense_block() {
-        let Ok(catalog) = seismic::DeviceCatalog::discover() else {
+        let Ok(catalog) = seismic::Devices::discover(&[]) else {
             return;
         };
         let Ok(device) = catalog.open_backend(seismic::BackendName::Cpu) else {

@@ -1,8 +1,8 @@
-//! Read-only load planning (integration spec §4.2, §7.3): which device a load
-//! of a resolved configuration would use and how much of that device's
-//! allocation domain it claims at startup. Opens no device, reads no weight
-//! payload and allocates nothing; a load repeats device resolution and makes
-//! live claims.
+//! Read-only load planning (integration spec §4.2, §7.3): which executor a
+//! load of a resolved configuration would use and how much it claims at
+//! startup, charged along the executor's placement. Opens no
+//! device, reads no weight payload and allocates nothing; a load repeats
+//! device resolution and makes live claims.
 
 use crate::error::{classify_graph, classify_plan, classify_platform, PlanOutcome, PreviewError};
 use crate::options::ExecutionManifest;
@@ -12,20 +12,20 @@ use magnitude_executor::{
     AssessmentGraphResourceBounds, AssessmentHeaderBounds, AssessmentMemoryTerms,
     ResourceCapacity, ResourcePlanner,
 };
-use seismic::{BackendName, DeviceCatalog, DeviceSelector};
+use seismic::{BackendName, Devices, ExecutorSelector};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadPreview {
     /// The served context ceiling.
     pub context_tokens: u64,
-    /// The device a load would open, by its cross-process identity.
-    pub device: DeviceSelector,
+    /// The executor a load would open, by its cross-process identity.
+    pub device: ExecutorSelector,
     pub backend: BackendName,
-    /// The load's startup peak claim in the device's allocation domain:
-    /// resident weights, initial state, prepared resources and the startup
-    /// transient. History growth is elastic and claimed as it grows, so it is
-    /// not included.
+    /// The load's startup peak claim, across the stores of the executor's
+    /// placement: resident weights, initial state, prepared resources and
+    /// the startup transient. History growth is elastic and claimed as it
+    /// grows, so it is not included.
     pub required_bytes: u64,
 }
 
@@ -38,7 +38,7 @@ fn internal(reason: impl Into<String>) -> PreviewError {
 impl ExecutionManifest {
     /// Preview a load of this manifest on `catalog`. Only the manifest is read, so a host that
     /// shares its host artifacts elsewhere can still preview.
-    pub fn preview(&self, catalog: &DeviceCatalog) -> Result<LoadPreview, PreviewError> {
+    pub fn preview(&self, catalog: &Devices) -> Result<LoadPreview, PreviewError> {
         let manifest = self;
         let selected = platform::select_device(
             catalog,
@@ -47,7 +47,7 @@ impl ExecutionManifest {
             &manifest.reserves,
         )
         .map_err(|error| PreviewError::from(classify_platform(error)))?;
-        let backend = selected.info.backend;
+        let backend = selected.info.backend();
         let draft = plan_execution(manifest, &selected).map_err(|error| match error {
             ExecutionPlanningError::Plan(error) => classify_plan(error, backend).into(),
             error => PreviewError::from(PlanOutcome::Internal(error.to_string())),
@@ -72,7 +72,7 @@ impl ExecutionManifest {
             ResourceCapacity {
                 domain_bytes: selected.assessment_capacity_bytes,
                 tensor_operations: magnitude_executor::TensorOperations::of(
-                    selected.tensor_operations,
+                    selected.info.forms_tensor_operations(),
                 ),
             },
         )
@@ -118,7 +118,7 @@ impl ExecutionManifest {
         .ok_or_else(|| internal("startup byte count overflow"))?;
         Ok(LoadPreview {
             context_tokens: definition.decoder.context_limit,
-            device: selected.info.selector,
+            device: selected.info.selector(),
             backend,
             required_bytes,
         })

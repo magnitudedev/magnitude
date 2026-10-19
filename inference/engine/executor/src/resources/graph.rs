@@ -41,11 +41,11 @@ impl NativeGraphPool {
         let workspace = (0..charge.activations)
             .map(|_| family.new_slot_in(arena, charge.upload_regions))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| super::AllocationError::Device(error.to_string()))?;
+            .map_err(super::AllocationError::Workflow)?;
         let output = (0..charge.output_slots)
             .map(|_| family.new_output_slot())
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| super::AllocationError::Device(error.to_string()))?;
+            .map_err(super::AllocationError::Tensor)?;
         let activation_bytes = charge
             .upload_bytes
             .checked_mul(charge.upload_regions as u64)

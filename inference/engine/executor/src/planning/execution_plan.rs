@@ -9,13 +9,13 @@ use crate::{ExecutionPath, error::PlanError, platform::SelectedDevice};
 use magnitude_artifacts::PackageManifest;
 use magnitude_family_contracts::ModelDefinition;
 use magnitude_state::KvCodec;
-use seismic::{BackendName, DeviceSelector};
+use seismic::{BackendName, ExecutorSelector};
 
 /// The planned device by Seismic identity. The selector, not a name or
 /// ordinal, is what the executing process resolves and opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlannedDevice {
-    selector: DeviceSelector,
+    selector: ExecutorSelector,
     backend: BackendName,
     name: String,
     assessment_capacity_bytes: u64,
@@ -23,7 +23,7 @@ pub struct PlannedDevice {
 }
 
 impl PlannedDevice {
-    pub fn selector(&self) -> DeviceSelector {
+    pub fn selector(&self) -> ExecutorSelector {
         self.selector
     }
 
@@ -41,7 +41,7 @@ impl PlannedDevice {
     }
 
     /// Whether the device forms Metal tensor operations
-    /// (`SelectedDevice::tensor_operations`).
+    /// (`Executor::forms_tensor_operations`).
     pub fn tensor_operations(&self) -> bool {
         self.tensor_operations
     }
@@ -259,7 +259,7 @@ impl ExecutionPlanner {
             capabilities,
             policy,
         } = Self::backend_plan(
-            device.info.backend,
+            device.info.backend(),
             manifest,
             definition,
             selection,
@@ -270,11 +270,11 @@ impl ExecutionPlanner {
         )?;
         Ok(ExecutionPlanDraft {
             device: PlannedDevice {
-                selector: device.info.selector,
+                selector: device.info.selector(),
                 backend,
-                name: device.info.name.clone(),
+                name: device.info.name().to_owned(),
                 assessment_capacity_bytes: device.assessment_capacity_bytes,
-                tensor_operations: device.tensor_operations,
+                tensor_operations: device.info.forms_tensor_operations(),
             },
             components,
             load,

@@ -1,5 +1,6 @@
 import { Option } from "effect"
 import type {
+  LocalInferenceBackend,
   LocalInferenceHardware,
   LocalInferenceMemoryDomainId,
   ModelInstanceAllocation,
@@ -35,6 +36,19 @@ export interface HardwareMemoryView {
 
 const MIB = 1024 ** 2
 
+/** The memory domains an accelerator places on: every domain any of its executors places on. */
+export const acceleratorMemoryDomainIds = (
+  accelerator: LocalInferenceHardware["accelerators"][number],
+): ReadonlySet<LocalInferenceMemoryDomainId> =>
+  new Set(accelerator.executors.flatMap(({ memoryDomainIds }) => memoryDomainIds))
+
+/** The backend an accelerator runs on: the backend of the executor the engine selects, if it is one of the accelerator's. */
+export const acceleratorBackend = (
+  hardware: LocalInferenceHardware,
+  accelerator: LocalInferenceHardware["accelerators"][number],
+): Option.Option<LocalInferenceBackend> => Option.flatMap(hardware.selectedDeviceId, selected =>
+  Option.fromNullable(accelerator.executors.find(({ deviceId }) => deviceId === selected)?.backend))
+
 const domainLabel = (
   hardware: LocalInferenceHardware,
   domain: LocalInferenceHardware["memoryDomains"][number],
@@ -42,7 +56,7 @@ const domainLabel = (
 ): string => {
   if (domain.kind === "System") return "System memory"
   const accelerators = hardware.accelerators.filter((accelerator) =>
-    accelerator.memoryDomainId === domain.memoryDomainId)
+    acceleratorMemoryDomainIds(accelerator).has(domain.memoryDomainId))
   const name = [...new Set(accelerators.map(({ name }) => name.trim()).filter(Boolean))].join(" + ")
   return domain.kind === "UnifiedMemory"
     ? `${name || Option.getOrElse(hardware.processor, () => "System")} · Unified memory`
@@ -67,7 +81,8 @@ export const deriveHardwareMemoryView = (
   const explicitFallbackIds = Option.isSome(modelAllocation)
     ? []
     : options.participatingDomainIds ?? []
-  const acceleratorDomainIds = hardware.accelerators.map(({ memoryDomainId }) => memoryDomainId)
+  const acceleratorDomainIds = hardware.accelerators.flatMap((accelerator) =>
+    [...acceleratorMemoryDomainIds(accelerator)])
   const fallbackModelServingDomainIds = new Set(explicitFallbackIds.length > 0
     ? explicitFallbackIds
     : options.fallbackToAccelerators === false

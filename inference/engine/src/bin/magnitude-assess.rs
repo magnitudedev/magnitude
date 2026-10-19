@@ -3,8 +3,9 @@
 //! Prepares every model from its headers and assesses it against stable
 //! memory capacity and the device's memory bandwidth; prints one JSON object
 //! per model, shaped like the service's per-profile assessment result, with
-//! the model's capabilities and template fingerprint alongside. Opens no
-//! device.
+//! the model's capabilities and template fingerprint alongside. With
+//! `--topology`, prints the device topology and its discovery diagnostics
+//! instead. Opens no device.
 
 use magnitude_engine::{
     assessment::{
@@ -18,7 +19,7 @@ use magnitude_executor::{
     assessment::{BandwidthSource, DeviceClass, DomainFit, ExecutionAssessment, step_seconds},
     platform::{DeviceRequest, MemoryReserves},
 };
-use seismic::DeviceCatalog;
+use seismic::{Devices, DiagnosticSource, StoreId, StoreIdentity};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -30,11 +31,15 @@ struct Options {
     depths: Vec<u32>,
     /// Print the parts of the step at each depth.
     breakdown: bool,
+    /// Print the topology and its discovery diagnostics rather than assess
+    /// models.
+    topology: bool,
     models: Vec<ModelPackagePaths>,
 }
 
 const USAGE: &str = "magnitude-assess --device auto|metal|cuda|vulkan|cpu \
-     [--depths 25000,50000,75000] [--breakdown] TARGET.gguf[,[PROJECTOR.gguf][,DRAFT.gguf]]...";
+     [--depths 25000,50000,75000] [--breakdown] \
+     (--topology | TARGET.gguf[,[PROJECTOR.gguf][,DRAFT.gguf]]...)";
 
 fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
     args.next()
@@ -45,6 +50,7 @@ fn parse() -> Result<Options, String> {
     let mut device = None;
     let mut depths = STANDARD_DEPTHS.to_vec();
     let mut breakdown = false;
+    let mut topology = false;
     let mut models = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -67,6 +73,7 @@ fn parse() -> Result<Options, String> {
                     .collect::<Result<_, _>>()?
             }
             "--breakdown" => breakdown = true,
+            "--topology" => topology = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -89,13 +96,16 @@ fn parse() -> Result<Options, String> {
             }
         }
     }
-    if models.is_empty() {
-        return Err(format!("no model given\n{USAGE}"));
+    if topology == !models.is_empty() {
+        return Err(format!(
+            "give --topology or models, not both or neither\n{USAGE}"
+        ));
     }
     Ok(Options {
         device: device.ok_or("--device is required")?,
         depths,
         breakdown,
+        topology,
         models,
     })
 }
@@ -115,7 +125,20 @@ fn main() {
 /// Returns whether every model produced a result.
 fn run() -> Result<bool, String> {
     let options = parse()?;
-    let catalog = DeviceCatalog::discover().map_err(|error| error.to_string())?;
+    // The directory of each model is a served path: its assessed load reads
+    // from that volume.
+    let mut served = Vec::new();
+    for model in &options.models {
+        let directory = std::path::absolute(&model.target)
+            .map_err(|error| error.to_string())?
+            .parent()
+            .ok_or_else(|| format!("{} has no directory", model.target.display()))?
+            .to_path_buf();
+        if !served.contains(&directory) {
+            served.push(directory);
+        }
+    }
+    let catalog = Devices::discover(&served).map_err(|error| error.to_string())?;
     // The standalone engine's defaults: one conversation per batch.
     let setup = AssessmentSetup::discover(
         &catalog,
@@ -137,12 +160,40 @@ fn run() -> Result<bool, String> {
             }
         ),
     };
+    let executor = &setup.selected.info;
     eprintln!(
         "magnitude-assess: {} ({}): {:.0} GB/s, {source}",
-        setup.selected.info.name,
-        setup.selected.info.backend.as_str(),
+        executor.name(),
+        executor.backend().as_str(),
         setup.bandwidth.bytes_per_second as f64 / 1e9
     );
+    if options.topology {
+        // Why a backend or adapter is absent from the graph (an absent
+        // driver, an enumeration failure), as discovery retained it.
+        let diagnostics = setup
+            .topology
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| {
+                let source = match diagnostic.source {
+                    DiagnosticSource::Backend(backend) => json!({ "backend": backend.as_str() }),
+                    DiagnosticSource::Adapters => json!("adapters"),
+                };
+                json!({ "source": source, "message": diagnostic.message })
+            })
+            .collect::<Vec<_>>();
+        let topology: Value = serde_json::from_str(&setup.topology.normalized())
+            .expect("the normalized topology is JSON");
+        println!(
+            "{}",
+            json!({
+                "topology": topology,
+                "diagnostics": diagnostics,
+                "executor": executor.selector().to_string(),
+            })
+        );
+        return Ok(true);
+    }
     let mut complete = true;
     for model in &options.models {
         let started = Instant::now();
@@ -271,12 +322,14 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
     object
 }
 
-/// Host RAM is the `system` domain; a dedicated device's memory is named by
-/// the device's selector.
-fn domain_id(setup: &AssessmentSetup, domain: seismic::MemoryPoolId) -> String {
-    if domain == setup.topology.host_pool().id {
-        "system".to_owned()
-    } else {
-        setup.selected.info.selector.to_string()
+/// Host RAM is the `system` domain; another store is named by its identity.
+fn domain_id(setup: &AssessmentSetup, domain: StoreId) -> String {
+    match setup
+        .topology
+        .store_identity(domain)
+        .expect("assessment domain belongs to topology")
+    {
+        StoreIdentity::HostRam => "system".to_owned(),
+        identity => identity.to_string(),
     }
 }

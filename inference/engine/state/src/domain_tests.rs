@@ -3,13 +3,13 @@
 //! identity with the one-domain store.
 
 use super::*;
-use seismic::{BackendName, DeviceCatalog};
+use seismic::BackendName;
 
 const TOKEN: HistoryDomainId = HistoryDomainId(0);
 const WINDOW: HistoryDomainId = HistoryDomainId(1);
 
 fn cpu_device() -> Option<Rc<Device>> {
-    DeviceCatalog::discover()
+    seismic::Devices::discover(&[])
         .ok()
         .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
         .map(Rc::new)
@@ -365,7 +365,7 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
 
     // Reclaim frees whichever slab the window does not occupy; the next
     // growth adds the lowest unbacked index again.
-    let before = device.memory_usage().charged;
+    let before = device.storage_usage(seismic::StorageKind::Device).charged;
     let released = bindings.shrink(ShrinkPolicy::Reclaim).unwrap();
     let occupied_slabs = state
         .history_ranges(WINDOW)
@@ -376,7 +376,7 @@ fn window_rows_cross_slab_edges_and_reuse_freed_slabs() {
     assert!(backed.len() <= 2);
     assert!(occupied_slabs.is_subset(&backed));
     if released > 0 {
-        assert!(device.memory_usage().charged < before);
+        assert!(device.storage_usage(seismic::StorageKind::Device).charged < before);
     }
     check(&state);
     for _ in 0..600 {
@@ -411,9 +411,9 @@ fn freed_window_slab_index_is_reused_by_growth() {
     // Trimming released every row of slab 0, so it holds no referenced row
     // and the release rule frees it.
     assert_eq!(store.occupied_rows(WINDOW), 8);
-    let charged = device.memory_usage().charged;
+    let charged = device.storage_usage(seismic::StorageKind::Device).charged;
     assert!(store.shrink(ShrinkPolicy::Reclaim).unwrap() > 0);
-    assert!(device.memory_usage().charged < charged);
+    assert!(device.storage_usage(seismic::StorageKind::Device).charged < charged);
     assert_eq!(arena.borrow().backed, BTreeSet::from([1]));
     assert_eq!(store.compactions(), Compactions::default());
     // Growth backs the lowest unbacked index, the freed slab 0, again.
@@ -497,15 +497,15 @@ fn shrink_and_census_cover_every_domain() {
         .holding_census(&[Holder::State(&state)], &[], &[])
         .unwrap();
     assert_eq!(census.total(), store.committed_bytes());
-    assert_eq!(census.total(), device.memory_usage().charged);
+    assert_eq!(census.total(), device.storage_usage(seismic::StorageKind::Device).charged);
     assert_eq!(
         census.live,
         40 * store.history_row_bytes(TOKEN) + 16 * store.history_row_bytes(WINDOW)
     );
-    let charged = device.memory_usage().charged;
+    let charged = device.storage_usage(seismic::StorageKind::Device).charged;
     // Idle keeps each domain's occupied slabs and one spare.
     assert_eq!(store.shrink(ShrinkPolicy::Idle).unwrap(), slab_bytes);
-    assert!(device.memory_usage().charged < charged);
+    assert!(device.storage_usage(seismic::StorageKind::Device).charged < charged);
     assert_eq!(store.domains[TOKEN.0].arena.borrow().backed.len(), 1);
     assert_eq!(store.domains[WINDOW.0].arena.borrow().backed.len(), 2);
     assert_eq!(
@@ -695,7 +695,7 @@ fn a_single_token_domain_is_the_one_domain_store() {
     let first = commit(first, 3);
     assert_eq!(first.history_ranges(TOKEN), [(0, 13)]);
     assert_eq!(first.history_start(TOKEN), 0);
-    assert_eq!(store.committed_bytes(), device.memory_usage().charged);
+    assert_eq!(store.committed_bytes(), device.storage_usage(seismic::StorageKind::Device).charged);
 }
 
 /// A Token domain and one selected-attention indexer of blocks of four: its

@@ -50,6 +50,8 @@ members = [
   "seismic/cli",
   "seismic/compiler",
   "seismic/runtime",
+  "seismic/measure",
+  "seismic/topology",
   "seismic/api",
   "seismic/build",
   "seismic/corpus",
@@ -82,6 +84,8 @@ default-members = [
   "seismic/cli",
   "seismic/compiler",
   "seismic/runtime",
+  "seismic/measure",
+  "seismic/topology",
   "seismic/api",
   "seismic/build",
   "seismic/corpus",
@@ -93,6 +97,8 @@ edition = "2021"
 license = "UNLICENSED"
 
 [workspace.dependencies]
+seismic-topology = { path = "seismic/topology" }
+seismic-measure = { path = "seismic/measure" }
 seismic-estimator-metal = { path = "seismic/estimator/metal" }
 seismic-ir = { path = "seismic/ir" }
 seismic-native-target = { path = "seismic/native-target" }

@@ -50,7 +50,7 @@ pub use in_flight::{
 };
 use in_flight::{PrimingFlight, TargetWork, decode_selected};
 pub use ownership::OpenRequirements;
-pub use state::MemoryChargeReconciliation;
+pub use state::{MemoryChargeReconciliation, StoreAllocation};
 pub use target::TargetHostTiming;
 pub(crate) use target::{
     AppendedRuns, accepted_history, cached_causal_domain, indexer_domain, indexer_history,
@@ -741,18 +741,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Bytes of the model's host-resident tables held in host RAM.
     pub fn host_table_bytes(&self) -> u64 {
         self.memory.borrow().host_table_bytes()
-    }
-
-    /// Bytes of the target's stored tables in host RAM rather than the
-    /// device's own memory: those of a dedicated device whose host-shared
-    /// storage is host RAM (`platform::shared_role`); 0 elsewhere.
-    pub fn host_stored_table_bytes(&self) -> Result<u64, String> {
-        let role = crate::platform::shared_role(self.memory.borrow().device().info())
-            .map_err(|error| error.to_string())?;
-        match role {
-            crate::platform::DomainRole::Allocation => Ok(0),
-            crate::platform::DomainRole::Staging => self.execution.load().shared_table_bytes(),
-        }
     }
 
     /// Refuse a launch whose vocabulary work the load did not plan: more

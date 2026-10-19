@@ -7,8 +7,8 @@ use seismic_lang::entry::ElementBindings;
 
 #[test]
 fn cpu_helper_products_preserve_captured_contents_and_unit_effects() {
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "binding-composition.seismic".into(),
         text: r#"fn twice(x: &tensor[4] f32) -> tensor[4] f32:
@@ -121,8 +121,8 @@ fn unit_effect(x: &mut tensor[4] f32) -> f32:
 
 #[test]
 fn cpu_repeat_transports_actual_tensor_views_and_fresh_instances() {
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "repeat-products.seismic".into(),
         text: r#"fn zero(x: &tensor[2,2] f32) -> f32:
@@ -242,8 +242,8 @@ fn cpu_repeat_uses_nonzero_offset_and_rectangular_transpose_composition() {
         .into(),
     }]))
     .unwrap();
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
     let kernel = Arc::new(
         crate::api::kernel::prepare(
             &module,
@@ -283,8 +283,8 @@ fn cpu_overlapping_store_preserves_rhs_and_root_descriptor() {
             .into(),
     }]))
     .unwrap();
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
     let kernel = Arc::new(
         crate::api::kernel::prepare(
             &module,
@@ -357,8 +357,8 @@ fn captured(x: &tensor[3,4] f32) -> tensor[6] f32:
         .into(),
     }]))
     .unwrap();
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
     for (name, shape, expected, expected_input) in [
         (
             "transposed",
@@ -497,8 +497,8 @@ fn partial(x: &tensor[2,3] f32) -> tensor[1] f32:
         .into(),
     }]))
     .unwrap();
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
     for (name, expected) in [
         ("carried", vec![1_f32, 17., 4., 3., 2., 6.]),
         ("partial", vec![1.]),
@@ -545,8 +545,8 @@ fn cpu_return_boundary_rounds_scalar_and_tensor_elements() {
         path: "return-rounding.seismic".into(),
         text: "fn scalar(x: f32) -> f16:\n    return x\n\nfn tensor(x: &tensor[2] f32) -> tensor[2] f16:\n    return to_owned(x)\n\nfn stored(x: &tensor[2] f32) -> tensor[2] f16:\n    let mut y = tensor[2] f16\n    y[:] = to_owned(x)\n    return y\n".into(),
     }])).unwrap();
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
     let options = || {
         PreparationOptions::feedback(
             PrecisionPolicy::Exact,

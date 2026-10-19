@@ -85,7 +85,7 @@ pub fn run(
                 .and_then(|()| file.write_all(b"\n").map_err(|error| error.to_string()))?;
         }
     }
-    let device = engine.device().info().name.clone();
+    let device = engine.device().info().name().to_owned();
     Ok((
         json!({
             "proposed": proposed,

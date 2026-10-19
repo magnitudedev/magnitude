@@ -26,7 +26,7 @@
 //! library) and `all`.
 
 use seismic::dynamic::{Function, Module, Scalar, SignatureType, Tensor, TensorAccess, Value};
-use seismic::{BackendName, Device, DeviceCatalog, Element, Layout, NativeSpecialization};
+use seismic::{BackendName, Device, Element, Layout, NativeSpecialization};
 use seismic_lang::checked::{CheckedModule, NativeImplementation};
 use seismic_lang::registry::{bf16_round, f16_bits};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -2918,7 +2918,7 @@ fn golden() {
         Ok("compare") => Mode::Compare,
         other => panic!("GOLDEN_MODE must be record or compare, got {other:?}"),
     };
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     // `GOLDEN_BACKEND=vulkan` selects Vulkan (never chosen by default: a CUDA
     // host also has a Vulkan device).
     let backends = match std::env::var("GOLDEN_BACKEND").ok().as_deref() {

@@ -16,11 +16,12 @@ use super::{
     weight_bytes_by_component,
 };
 use crate::assessment::DomainFit;
-use crate::platform::{DomainRole, FitCapacity};
+use crate::platform::{DomainRole, Fit, FitMode, StorageDemand};
 use crate::{AttestedPrograms, GraphError};
 use magnitude_family_contracts::ModelDefinition;
 use magnitude_state::{BankCapacity, KvCodec, ModelStateLayout};
-use seismic::{BackendName, MemoryPoolId};
+use seismic::BackendName;
+use seismic::{DeviceTopology, Executor, Status, StorageKind, StoreId};
 
 /// Exact resident and per-state terms of the standard workload, derived
 /// without opening a device or reading tensor payloads.
@@ -108,9 +109,8 @@ pub struct AssessmentMemoryCharge {
     /// unified-memory device and the staging domain of a dedicated one.
     pub host_table_bytes: u64,
     /// The stored tables' host-shared bytes, part of `allocation_bytes` and
-    /// `serving_bytes`: held in the domain the device's host-shared storage
-    /// consumes (`platform::shared_role`), host RAM on a dedicated device
-    /// whose shared storage is not its own memory.
+    /// `serving_bytes`: upload storage, held where the executor's upload
+    /// placement lands (`assess_fit`), host RAM for CUDA's pinned memory.
     pub shared_table_bytes: u64,
 }
 
@@ -127,7 +127,7 @@ pub enum AssessmentFitVerdict {
     Fits,
     /// The domain with the largest deficit limits the load.
     DoesNotFit {
-        limiting: MemoryPoolId,
+        limiting: StoreId,
         deficit_bytes: u64,
     },
 }
@@ -563,89 +563,104 @@ impl AssessmentMemoryTerms {
 }
 
 impl AssessmentMemoryCharge {
-    /// Compare the charge with every domain's stable fit capacity
-    /// (`platform::fit_capacities`). A domain's remaining bytes are
-    /// `capacity − reserve − required`; the workload fits when none is
-    /// negative, and otherwise the domain with the largest deficit limits it.
-    /// `shared` is the role of the domain the device's host-shared storage
-    /// consumes (`platform::shared_role`): the stored tables' bytes are
-    /// charged there, so a dedicated device whose shared storage is host
-    /// RAM holds them in its staging domain, not its own memory.
+    /// Whether the charge fits `executor` at stable capacity: its device
+    /// storage (the allocation less the shared tables), its upload storage
+    /// (the shared tables) and its host RAM (host tables, sealed graphs'
+    /// host bytes, and the staging fit charges there) placed by
+    /// [`Fit::demand`], which alone interprets placements, stores, grants
+    /// and reserves. Returns each store the demand reached, with what it
+    /// required and what of its room remains (negative: its deficit), and
+    /// the verdict: fits, or the store of the largest deficit. A store's
+    /// room is what fit can place there along the executor's placements
+    /// beside the same host demand, so a grant below the store (Metal's
+    /// working set, CUDA's usable memory) bounds it; its capacity is that
+    /// room with the store's planning reserve.
     pub fn assess_fit(
         self,
-        capacities: &[(DomainRole, FitCapacity)],
-        shared: DomainRole,
+        topology: &DeviceTopology,
+        executor: &Executor,
+        status: &Status,
+        reserves: &crate::platform::MemoryReserves,
     ) -> Result<AssessmentFit, String> {
-        if !capacities
-            .iter()
-            .any(|(role, _)| *role == DomainRole::Allocation)
-        {
-            return Err("fit capacities have no allocation domain".into());
-        }
-        // Host tables and the sealed graph plans are system RAM: the staging
-        // domain of a dedicated device, the allocation domain of a unified
-        // one.
-        let dedicated = capacities
-            .iter()
-            .any(|(role, _)| *role == DomainRole::Staging);
-        if shared == DomainRole::Staging && !dedicated {
-            return Err(
-                "host-shared storage outside the allocation domain of a unified device".into(),
-            );
-        }
-        let with_tables = |bytes: u64| {
-            bytes
-                .checked_add(self.host_table_bytes)
-                .and_then(|bytes| bytes.checked_add(self.bounds.sealed_graph_host_bytes.at_most))
-                .ok_or_else(|| "domain charge with host tables overflows".to_owned())
+        let fit = Fit::new(topology, status, reserves);
+        // The staging window is part of `allocation_bytes`
+        // (`startup_additional_bytes`); fit decides whether host RAM also
+        // holds it as a demand of its own.
+        let host = self
+            .host_table_bytes
+            .checked_add(self.bounds.sealed_graph_host_bytes.at_most)
+            .and_then(|bytes| bytes.checked_add(fit.host_staging(executor, self.staging_bytes)))
+            .ok_or("host charge overflow")?;
+        let device = self
+            .allocation_bytes
+            .checked_sub(self.shared_table_bytes)
+            .ok_or("shared storage exceeds the allocation charge")?;
+        let place = |device, upload| {
+            fit.demand(
+                &[
+                    StorageDemand {
+                        executor: executor.id(),
+                        kind: StorageKind::Device,
+                        bytes: device,
+                    },
+                    StorageDemand {
+                        executor: executor.id(),
+                        kind: StorageKind::Upload,
+                        bytes: upload,
+                    },
+                ],
+                &[(topology.host_ram().id(), host)],
+                FitMode::Stable,
+            )
+            .map_err(|error| error.to_string())
         };
-        // The stored tables' bytes, charged with the weights, move to host
-        // RAM where the device's shared storage is host RAM.
-        let shared_in_host = match shared {
-            DomainRole::Allocation => 0,
-            DomainRole::Staging => self.shared_table_bytes,
-        };
-        let domains = capacities
-            .iter()
-            .map(|&(role, capacity)| {
-                let required_bytes = match role {
-                    DomainRole::Allocation if dedicated => self
-                        .allocation_bytes
-                        .checked_sub(shared_in_host)
-                        .ok_or("stored tables exceed the allocation charge")?,
-                    DomainRole::Allocation => with_tables(self.allocation_bytes)?,
-                    DomainRole::Staging => with_tables(self.staging_bytes)?
-                        .checked_add(shared_in_host)
-                        .ok_or("domain charge with stored tables overflows")?,
-                };
-                let signed = |bytes: u64| {
-                    i64::try_from(bytes).map_err(|_| "domain byte count exceeds i64".to_owned())
-                };
-                let remaining_bytes = signed(capacity.capacity_bytes)?
-                    .checked_sub(signed(capacity.reserve_bytes)?)
-                    .and_then(|bytes| bytes.checked_sub(signed(required_bytes).ok()?))
-                    .ok_or("domain remaining bytes overflow")?;
-                Ok(DomainFit {
-                    role,
-                    domain: capacity.domain,
-                    capacity_bytes: capacity.capacity_bytes,
-                    required_bytes,
-                    reserve_bytes: capacity.reserve_bytes,
-                    remaining_bytes,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let verdict = match domains
+        let result = place(device, self.shared_table_bytes)?;
+        // Each store's room: what the placements can place there at most.
+        let rooms = place(u64::MAX, u64::MAX)?.placed;
+        let mut domains = Vec::new();
+        for (store, placed) in result.placed {
+            let reserve = fit
+                .store(store)
+                .map_err(|error| error.to_string())?
+                .thresholds
+                .planning_bytes;
+            let room = rooms
+                .iter()
+                .find(|(of, _)| *of == store)
+                .map(|(_, bytes)| *bytes)
+                .expect("a store the demand reached is one its placements reach");
+            let missing = result
+                .refused
+                .iter()
+                .filter(|refusal| refusal.store == store)
+                .map(|refusal| refusal.missing_bytes)
+                .sum::<u64>();
+            let required_bytes = placed.checked_add(missing).ok_or("store demand overflow")?;
+            let remaining_bytes = if missing == 0 {
+                i64::try_from(room.saturating_sub(placed))
+                    .map_err(|_| "fit remainder exceeds i64")?
+            } else {
+                -i64::try_from(missing).map_err(|_| "fit deficit exceeds i64")?
+            };
+            domains.push(DomainFit {
+                role: DomainRole::of(topology, executor, store),
+                domain: store,
+                capacity_bytes: room.saturating_add(reserve),
+                required_bytes,
+                reserve_bytes: reserve,
+                remaining_bytes,
+            });
+        }
+        let verdict = domains
             .iter()
             .filter(|domain| domain.remaining_bytes < 0)
-            .min_by_key(|domain| domain.remaining_bytes)
-        {
-            None => AssessmentFitVerdict::Fits,
-            Some(limiting) => AssessmentFitVerdict::DoesNotFit {
-                limiting: limiting.domain,
-                deficit_bytes: limiting.remaining_bytes.unsigned_abs(),
-            },
-        };
+            .max_by_key(|domain| domain.remaining_bytes.unsigned_abs())
+            .map_or(AssessmentFitVerdict::Fits, |domain| {
+                AssessmentFitVerdict::DoesNotFit {
+                    limiting: domain.domain,
+                    deficit_bytes: domain.remaining_bytes.unsigned_abs(),
+                }
+            });
         Ok(AssessmentFit { verdict, domains })
     }
 }
@@ -654,6 +669,7 @@ impl AssessmentMemoryCharge {
 mod tests {
     use super::*;
     use magnitude_kernels::dense_output;
+    use seismic::fixtures::recorded;
     use seismic::{BackendName, Element, Layout, NativeGraphMetadata};
 
     #[test]
@@ -681,7 +697,14 @@ mod tests {
             BackendName::Cpu,
             &[("DW", Element::f32()), ("A", Element::f32())],
             "down_weight",
-            &[("M", 4), ("O", 2), ("H", 16), ("F", 32), ("DS", 0), ("DB", 0)],
+            &[
+                ("M", 4),
+                ("O", 2),
+                ("H", 16),
+                ("F", 32),
+                ("DS", 0),
+                ("DB", 0),
+            ],
         )
         .unwrap();
         assert_eq!(
@@ -695,7 +718,14 @@ mod tests {
         let results = seismic::generated::checked_native_tensor_results::<dense_output::Entry>(
             BackendName::Cpu,
             &[("DW", Element::f32()), ("A", Element::f32())],
-            &[("M", 4), ("O", 2), ("H", 16), ("F", 32), ("DS", 0), ("DB", 0)],
+            &[
+                ("M", 4),
+                ("O", 2),
+                ("H", 16),
+                ("F", 32),
+                ("DS", 0),
+                ("DB", 0),
+            ],
         )
         .unwrap();
         assert_eq!(
@@ -709,7 +739,14 @@ mod tests {
         let call = seismic::generated::checked_native_graph_call::<dense_output::Entry>(
             BackendName::Cpu,
             &[("DW", Element::f32()), ("A", Element::f32())],
-            &[("M", 4), ("O", 2), ("H", 16), ("F", 32), ("DS", 0), ("DB", 0)],
+            &[
+                ("M", 4),
+                ("O", 2),
+                ("H", 16),
+                ("F", 32),
+                ("DS", 0),
+                ("DB", 0),
+            ],
         )
         .unwrap();
         let seismic::generated::CheckedNativeGraphCall::Checked {
@@ -2331,205 +2368,319 @@ mod tests {
         );
     }
 
+    const GIB: u64 = 1 << 30;
+
+    /// Status of an unopened machine whose host RAM `by` reports: assessment
+    /// plans on stable fit, which no headroom changes.
+    fn unopened(by: seismic::ReportedBy) -> Status {
+        Status {
+            sample: seismic::Sample {
+                taken: std::time::SystemTime::now(),
+                host_ram: Ok(seismic::HostStatus {
+                    headroom: seismic::Reported::new(16 * GIB, by),
+                    limits: Vec::new(),
+                    limit_visibility: seismic::LimitVisibility::Complete,
+                    displacement: None,
+                    kernel_pressure: None,
+                }),
+                volumes: Vec::new(),
+                grants: Vec::new(),
+            },
+            runtime: Default::default(),
+        }
+    }
+
+    fn executor(topology: &DeviceTopology, backend: BackendName) -> &Executor {
+        topology
+            .executors()
+            .iter()
+            .find(|executor| executor.backend() == backend)
+            .unwrap()
+    }
+
+    /// The machine's one device memory store.
+    fn device_memory(topology: &DeviceTopology) -> StoreId {
+        topology
+            .stores()
+            .iter()
+            .find(|store| matches!(store.kind(), seismic::StoreKind::DeviceMemory(_)))
+            .unwrap()
+            .id()
+    }
+
+    /// The fit of `store` in `fit`.
+    fn domain(fit: &AssessmentFit, store: StoreId) -> DomainFit {
+        *fit.domains
+            .iter()
+            .find(|domain| domain.domain == store)
+            .unwrap()
+    }
+
+    /// Each store a load charges is fitted on its own against its capacity
+    /// less its planning reserve, and the store with the largest deficit
+    /// limits the load. On the M4 Pro's CPU the load, its host tables and
+    /// its sealed graph plans are one domain, host RAM; the RTX 3090's CUDA
+    /// charges its allocation to the 3090's memory and its staged upload,
+    /// host tables and sealed graph plans to host RAM.
     #[test]
     fn fit_is_decided_per_domain_against_capacity_less_reserve() {
-        let host = seismic::DeviceCatalog::discover()
-            .unwrap()
-            .topology()
-            .host_pool()
-            .id;
-        let domain = |capacity_bytes, reserve_bytes| FitCapacity {
-            domain: host,
-            kind: seismic::MemoryPoolKind::HostRam,
-            capacity_bytes,
-            reserve_bytes,
+        let reserves = crate::platform::MemoryReserves::standard();
+        let m4_pro = recorded::m4_pro();
+        let status = unopened(seismic::ReportedBy::MachMovablePages);
+        let cpu = executor(&m4_pro, BackendName::Cpu);
+        let host_ram = m4_pro.host_ram().id();
+        let host = Fit::new(&m4_pro, &status, &reserves)
+            .store(host_ram)
+            .unwrap();
+        let mut unified = AssessmentMemoryCharge {
+            host_table_bytes: 30,
+            ..fixture_charge(host.stable_bytes - 50, 0)
         };
-        // Unified memory: one allocation domain.
-        let unified = [(DomainRole::Allocation, domain(1_000, 100))];
-        let fits = fixture_charge(900, 0)
-            .assess_fit(&unified, DomainRole::Allocation)
+        unified.bounds.sealed_graph_host_bytes = SealedGraphHostBytes {
+            at_most: 20,
+            at_least: 15,
+        };
+        let fits = unified
+            .assess_fit(&m4_pro, cpu, &status, &reserves)
             .unwrap();
         assert_eq!(fits.verdict, AssessmentFitVerdict::Fits);
         assert_eq!(
             fits.domains,
-            vec![DomainFit {
+            [DomainFit {
                 role: DomainRole::Allocation,
-                domain: host,
-                capacity_bytes: 1_000,
-                required_bytes: 900,
-                reserve_bytes: 100,
+                domain: host_ram,
+                capacity_bytes: host.capacity_bytes,
+                required_bytes: host.stable_bytes,
+                reserve_bytes: host.thresholds.planning_bytes,
                 remaining_bytes: 0,
             }]
         );
-        let short = fixture_charge(901, 0)
-            .assess_fit(&unified, DomainRole::Allocation)
-            .unwrap();
+        let short = AssessmentMemoryCharge {
+            host_table_bytes: 31,
+            ..unified
+        }
+        .assess_fit(&m4_pro, cpu, &status, &reserves)
+        .unwrap();
         assert_eq!(
             short.verdict,
             AssessmentFitVerdict::DoesNotFit {
-                limiting: host,
+                limiting: host_ram,
                 deficit_bytes: 1,
             }
         );
         assert_eq!(short.domains[0].remaining_bytes, -1);
 
-        // A dedicated device also charges its staged upload to host RAM.
-        let dedicated = [
-            (DomainRole::Allocation, domain(1_000, 100)),
-            (DomainRole::Staging, domain(500, 200)),
-        ];
-        let both = fixture_charge(800, 300)
-            .assess_fit(&dedicated, DomainRole::Allocation)
-            .unwrap();
+        let rtx3090 = recorded::rtx3090();
+        let status = unopened(seismic::ReportedBy::LinuxMemAvailable);
+        let cuda = executor(&rtx3090, BackendName::Cuda);
+        let (gpu, host_ram) = (device_memory(&rtx3090), rtx3090.host_ram().id());
+        let fit = Fit::new(&rtx3090, &status, &reserves);
+        let (own, host) = (fit.store(gpu).unwrap(), fit.store(host_ram).unwrap());
+        // CUDA's room is its usable memory less the store's planning
+        // reserve, below the store's own fit.
+        let room = fit.placement(cuda, StorageKind::Device).unwrap().stable_bytes;
+        assert!(room < own.stable_bytes);
+        let dedicated = |allocation, staging| {
+            AssessmentMemoryCharge {
+                host_table_bytes: 30,
+                ..fixture_charge(allocation, staging)
+            }
+            .assess_fit(&rtx3090, cuda, &status, &reserves)
+            .unwrap()
+        };
+        let both = dedicated(room, host.stable_bytes - 30);
         assert_eq!(both.verdict, AssessmentFitVerdict::Fits);
-        assert_eq!(both.domains[1].required_bytes, 300);
-        assert_eq!(both.domains[1].remaining_bytes, 0);
-        let staging = fixture_charge(800, 350)
-            .assess_fit(&dedicated, DomainRole::Allocation)
-            .unwrap();
+        assert_eq!(
+            domain(&both, gpu),
+            DomainFit {
+                role: DomainRole::Allocation,
+                domain: gpu,
+                capacity_bytes: room + own.thresholds.planning_bytes,
+                required_bytes: room,
+                reserve_bytes: own.thresholds.planning_bytes,
+                remaining_bytes: 0,
+            }
+        );
+        assert_eq!(domain(&both, host_ram).role, DomainRole::Staging);
+        assert_eq!(domain(&both, host_ram).required_bytes, host.stable_bytes);
+        assert_eq!(domain(&both, host_ram).remaining_bytes, 0);
+        // Staging 50 bytes beyond host RAM's fit: host RAM limits the load.
+        let staging = dedicated(room, host.stable_bytes - 30 + 50);
         assert_eq!(
             staging.verdict,
             AssessmentFitVerdict::DoesNotFit {
-                limiting: host,
+                limiting: host_ram,
                 deficit_bytes: 50,
             }
         );
-        assert_eq!(staging.domains[0].remaining_bytes, 100);
-        assert_eq!(staging.domains[1].remaining_bytes, -50);
+        assert_eq!(domain(&staging, gpu).remaining_bytes, 0);
+        assert_eq!(domain(&staging, host_ram).remaining_bytes, -50);
         // The largest deficit limits the load.
-        let worst = fixture_charge(1_000, 310)
-            .assess_fit(&dedicated, DomainRole::Allocation)
-            .unwrap();
+        let worst = dedicated(room + 100, host.stable_bytes - 30 + 50);
         assert_eq!(
             worst.verdict,
             AssessmentFitVerdict::DoesNotFit {
-                limiting: host,
+                limiting: gpu,
                 deficit_bytes: 100,
             }
         );
-        // A reserve above capacity leaves a negative remainder, not an error.
-        let tiny = [(DomainRole::Allocation, domain(100, 200))];
-        assert_eq!(
-            fixture_charge(1, 0)
-                .assess_fit(&tiny, DomainRole::Allocation)
-                .unwrap()
-                .verdict,
-            AssessmentFitVerdict::DoesNotFit {
-                limiting: host,
-                deficit_bytes: 101,
-            }
-        );
-        assert!(
-            fixture_charge(1, 0)
-                .assess_fit(
-                    &[(DomainRole::Staging, domain(100, 0))],
-                    DomainRole::Allocation
-                )
-                .is_err()
-        );
-
-        // Host tables are system RAM: charged to a unified device's
-        // allocation domain, and to a dedicated device's staging domain.
-        let tables = AssessmentMemoryCharge {
-            host_table_bytes: 50,
-            ..fixture_charge(800, 300)
-        };
-        let unified_tables = tables.assess_fit(&unified, DomainRole::Allocation).unwrap();
-        assert_eq!(unified_tables.domains[0].required_bytes, 850);
-        let dedicated_tables = tables
-            .assess_fit(&dedicated, DomainRole::Allocation)
-            .unwrap();
-        assert_eq!(dedicated_tables.domains[0].required_bytes, 800);
-        assert_eq!(dedicated_tables.domains[1].required_bytes, 350);
-
-        // The sealed graph plans are system RAM beside the tables.
-        let mut sealed = tables;
-        // A load is held to a domain by the most they may hold.
-        sealed.bounds.sealed_graph_host_bytes = SealedGraphHostBytes {
-            at_most: 20,
-            at_least: 15,
-        };
-        let unified_sealed = sealed.assess_fit(&unified, DomainRole::Allocation).unwrap();
-        assert_eq!(unified_sealed.domains[0].required_bytes, 870);
-        let dedicated_sealed = sealed
-            .assess_fit(&dedicated, DomainRole::Allocation)
-            .unwrap();
-        assert_eq!(dedicated_sealed.domains[0].required_bytes, 800);
-        assert_eq!(dedicated_sealed.domains[1].required_bytes, 370);
     }
 
-    /// A stored table's slots and directory are charged where the device's
-    /// host-shared storage lives: unified memory and a device whose shared
-    /// storage is its own memory hold them in the allocation domain, and a
-    /// discrete GPU whose shared storage is host RAM (CUDA's pinned memory)
-    /// in host RAM, where a load that does not fit is refused although the
-    /// device's own memory holds everything else.
+    /// The staging window is part of the allocation charge. An executor
+    /// whose device storage is placed on host RAM (Metal on the M4 Pro,
+    /// CUDA on GB10, Vulkan on Strix Halo and Lunar Lake) holds it there
+    /// once, inside the allocation: its staging adds nothing. A dedicated
+    /// device's staging window (CUDA on the RTX 3090) is host RAM's, beside
+    /// the allocation in its own memory.
     #[test]
-    fn stored_tables_are_charged_in_the_domain_of_shared_storage() {
-        // Pool identities are the catalog's; the domains are told apart by
-        // role.
-        let host = seismic::DeviceCatalog::discover()
+    fn staging_is_charged_to_host_ram_once() {
+        let reserves = crate::platform::MemoryReserves::standard();
+        let (allocation, staged, tables) = (8 * GIB, 2 * GIB, 30);
+        let assess = |topology: &DeviceTopology, executor: &Executor, status: &Status, staging| {
+            AssessmentMemoryCharge {
+                host_table_bytes: tables,
+                ..fixture_charge(allocation, staging)
+            }
+            .assess_fit(topology, executor, status, &reserves)
             .unwrap()
-            .topology()
-            .host_pool()
-            .id;
-        let gpu = host;
-        let domain = |id, kind, capacity_bytes, reserve_bytes| FitCapacity {
-            domain: id,
-            kind,
-            capacity_bytes,
-            reserve_bytes,
         };
-        let device = domain(gpu, seismic::MemoryPoolKind::DeviceLocal, 1_000, 100);
-        let ram = domain(host, seismic::MemoryPoolKind::HostRam, 500, 200);
-        let dedicated = [(DomainRole::Allocation, device), (DomainRole::Staging, ram)];
-        // 900 device bytes, 250 of them stored tables; 100 staged.
-        let charge = AssessmentMemoryCharge {
-            shared_table_bytes: 250,
-            ..fixture_charge(900, 100)
+        use seismic::ReportedBy::{LinuxMemAvailable, MachMovablePages, WindowsPhysicalAndCommit};
+        for (topology, backend, by) in [
+            (recorded::m4_pro(), BackendName::Metal, MachMovablePages),
+            (recorded::gb10(), BackendName::Cuda, LinuxMemAvailable),
+            (
+                recorded::strix_halo_linux(),
+                BackendName::Vulkan,
+                LinuxMemAvailable,
+            ),
+            (
+                recorded::lunar_lake(),
+                BackendName::Vulkan,
+                WindowsPhysicalAndCommit,
+            ),
+        ] {
+            let status = unopened(by);
+            let executor = executor(&topology, backend);
+            let host_ram = topology.host_ram().id();
+            let staging = assess(&topology, executor, &status, staged);
+            assert_eq!(staging.verdict, AssessmentFitVerdict::Fits);
+            assert_eq!(
+                domain(&staging, host_ram).required_bytes,
+                allocation + tables,
+                "{backend:?} on {}",
+                executor.name()
+            );
+            assert_eq!(staging, assess(&topology, executor, &status, 0));
+        }
+
+        let rtx3090 = recorded::rtx3090();
+        let status = unopened(seismic::ReportedBy::LinuxMemAvailable);
+        let cuda = executor(&rtx3090, BackendName::Cuda);
+        let (gpu, host_ram) = (device_memory(&rtx3090), rtx3090.host_ram().id());
+        let staging = assess(&rtx3090, cuda, &status, staged);
+        assert_eq!(domain(&staging, gpu).required_bytes, allocation);
+        assert_eq!(domain(&staging, host_ram).required_bytes, tables + staged);
+    }
+
+    /// Metal's working set bounds only its device storage: host-resident
+    /// tables are mapped pages, not Metal buffers, so host RAM holds them
+    /// beside it, and the store's room for the load is the tables with the
+    /// working set's room.
+    #[test]
+    fn host_demand_sits_beside_the_metal_working_set() {
+        let reserves = crate::platform::MemoryReserves::standard();
+        let m4_pro = recorded::m4_pro();
+        let status = unopened(seismic::ReportedBy::MachMovablePages);
+        let metal = executor(&m4_pro, BackendName::Metal);
+        let host_ram = m4_pro.host_ram().id();
+        let fit = Fit::new(&m4_pro, &status, &reserves);
+        let room = fit.placement(metal, StorageKind::Device).unwrap().stable_bytes;
+        let host = fit.store(host_ram).unwrap();
+        assert!(room + GIB < host.stable_bytes);
+        let assess = |device| {
+            AssessmentMemoryCharge {
+                host_table_bytes: GIB,
+                ..fixture_charge(device, 0)
+            }
+            .assess_fit(&m4_pro, metal, &status, &reserves)
+            .unwrap()
         };
-        // Device-local shared storage: everything on the device.
-        let local = charge
-            .assess_fit(&dedicated, DomainRole::Allocation)
-            .unwrap();
-        assert_eq!(local.verdict, AssessmentFitVerdict::Fits);
-        assert_eq!(local.domains[0].required_bytes, 900);
-        assert_eq!(local.domains[1].required_bytes, 100);
-        // Host shared storage: the tables move to host RAM, beside the
-        // staged upload, and overflow it.
-        let pinned = charge.assess_fit(&dedicated, DomainRole::Staging).unwrap();
-        assert_eq!(pinned.domains[0].required_bytes, 650);
-        assert_eq!(pinned.domains[1].required_bytes, 350);
-        assert_eq!(pinned.domains[0].remaining_bytes, 250);
-        assert_eq!(pinned.domains[1].remaining_bytes, -50);
+        let full = assess(room);
+        assert_eq!(full.verdict, AssessmentFitVerdict::Fits);
         assert_eq!(
-            pinned.verdict,
-            AssessmentFitVerdict::DoesNotFit {
-                limiting: host,
-                deficit_bytes: 50,
+            domain(&full, host_ram),
+            DomainFit {
+                role: DomainRole::Allocation,
+                domain: host_ram,
+                capacity_bytes: room + GIB + host.thresholds.planning_bytes,
+                required_bytes: room + GIB,
+                reserve_bytes: host.thresholds.planning_bytes,
+                remaining_bytes: 0,
             }
         );
-        // With room in host RAM it fits, and the device keeps 350 free.
-        let roomy = [
-            (DomainRole::Allocation, device),
-            (
-                DomainRole::Staging,
-                domain(host, seismic::MemoryPoolKind::HostRam, 600, 200),
-            ),
-        ];
-        let fits = charge.assess_fit(&roomy, DomainRole::Staging).unwrap();
-        assert_eq!(fits.verdict, AssessmentFitVerdict::Fits);
-        assert_eq!(fits.domains[0].remaining_bytes, 250);
-        // Unified memory has no other domain to hold them in.
-        let unified = [(DomainRole::Allocation, ram)];
-        assert!(charge.assess_fit(&unified, DomainRole::Staging).is_err());
         assert_eq!(
-            charge
-                .assess_fit(&unified, DomainRole::Allocation)
-                .unwrap()
-                .domains[0]
-                .required_bytes,
-            900
+            assess(room + 1).verdict,
+            AssessmentFitVerdict::DoesNotFit {
+                limiting: host_ram,
+                deficit_bytes: 1,
+            }
+        );
+    }
+
+    /// A stored table's storage (upload storage, behind `Tensor::shared`) is
+    /// charged where its executor's upload placement lands: on the RTX 3090,
+    /// CUDA's pinned host RAM, where a load whose host RAM is full is
+    /// refused though the 3090's memory holds the rest, and Vulkan's device
+    /// memory (ReBAR), where the same load fits.
+    #[test]
+    fn stored_tables_are_charged_in_the_domain_of_shared_storage() {
+        let reserves = crate::platform::MemoryReserves::standard();
+        let topology = recorded::rtx3090();
+        let status = unopened(seismic::ReportedBy::LinuxMemAvailable);
+        let (gpu, host_ram) = (device_memory(&topology), topology.host_ram().id());
+        let fit = Fit::new(&topology, &status, &reserves);
+        let (own, host) = (fit.store(gpu).unwrap(), fit.store(host_ram).unwrap());
+        let cuda = executor(&topology, BackendName::Cuda);
+        let vulkan = executor(&topology, BackendName::Vulkan);
+        let charge = |staging, executor| {
+            AssessmentMemoryCharge {
+                shared_table_bytes: GIB,
+                ..fixture_charge(own.stable_bytes, staging)
+            }
+            .assess_fit(&topology, executor, &status, &reserves)
+            .unwrap()
+        };
+        let pinned = charge(0, cuda);
+        assert_eq!(pinned.verdict, AssessmentFitVerdict::Fits);
+        assert_eq!(domain(&pinned, gpu).required_bytes, own.stable_bytes - GIB);
+        // What remains of CUDA's room there: its usable memory less the
+        // reserve, below the store's own fit.
+        let room = fit.placement(cuda, StorageKind::Device).unwrap().stable_bytes;
+        assert_eq!(
+            domain(&pinned, gpu).remaining_bytes,
+            i64::try_from(room - (own.stable_bytes - GIB)).unwrap()
+        );
+        assert_eq!(domain(&pinned, host_ram).required_bytes, GIB);
+        let local = charge(0, vulkan);
+        assert_eq!(local.verdict, AssessmentFitVerdict::Fits);
+        assert_eq!(domain(&local, gpu).required_bytes, own.stable_bytes);
+        assert_eq!(domain(&local, host_ram).required_bytes, 0);
+        // Staging takes host RAM's fit.
+        let crowded = charge(host.stable_bytes, cuda);
+        assert_eq!(
+            crowded.verdict,
+            AssessmentFitVerdict::DoesNotFit {
+                limiting: host_ram,
+                deficit_bytes: GIB,
+            }
+        );
+        assert_eq!(
+            domain(&crowded, gpu).remaining_bytes,
+            domain(&pinned, gpu).remaining_bytes
+        );
+        assert_eq!(
+            charge(host.stable_bytes, vulkan).verdict,
+            AssessmentFitVerdict::Fits
         );
     }
 }

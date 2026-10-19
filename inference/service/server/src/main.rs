@@ -8,7 +8,7 @@ use magnitude_executor::platform::MemoryReserves;
 use magnitude_service_api::{AppState, ServerIdentity, app};
 use magnitude_service_contracts::bootstrap_protocol::{IcnStartupRecord, IcnStartupRecordType};
 use magnitude_service_models::{
-    HuggingFaceDiscovery, InventoryConfig, ManagedModelDownloads, ManagedModelStore, ModelDomainResolver,
+    HuggingFaceDiscovery, InventoryConfig, ManagedModelDownloads, ModelDomainResolver,
     managed_model_services,
 };
 use magnitude_service_server::assessment::ManagedModelAssessments;
@@ -17,6 +17,7 @@ use magnitude_service_server::assessment::environment::AssessmentEnvironment;
 use magnitude_service_server::build_identity;
 use magnitude_service_server::configurations::ResolvedConfigurations;
 use magnitude_service_server::hardware::HardwareInventory;
+use magnitude_service_server::model_store::{ServedStore, open_served_store};
 use magnitude_service_server::residency::controller::{
     MODEL_IDLE_TIMEOUT, ModelInstances, ResidencyEnvironment,
 };
@@ -130,23 +131,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
             let release_catalog = Arc::new(open_installation_catalog(&installation)?);
             let worker_launcher = WorkerLauncher::current()?;
             let reserves = MemoryReserves::standard();
-            let catalog = Arc::new(
-                tokio::task::spawn_blocking(seismic::DeviceCatalog::discover)
-                    .await
-                    .context("device discovery task failed")?
-                    .context("device discovery failed")?,
-            );
-            // Every model is assessed on the device a load selects, established once from the
-            // discovered devices: selection, host memory and bandwidth.
-            let assessment_environment = {
-                let catalog = Arc::clone(&catalog);
-                Arc::new(
-                    tokio::task::spawn_blocking(move || AssessmentEnvironment::establish(&catalog))
-                        .await
-                        .context("assessment environment task failed")?
-                        .context("failed to establish the assessment environment")?,
-                )
-            };
             let inventory_root = match model_store {
                 Some(root) => root,
                 None => InventoryConfig::default_root()
@@ -161,11 +145,21 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 .context("invalid model inventory configuration")?;
             inventory_config.hf_cache_dirs.extend(hf_caches);
             inventory_config.catalog_models = release_catalog.catalog().models.clone();
-            let inventory = Arc::new(
-                ManagedModelStore::open(inventory_config)
-                    .await
-                    .context("failed to initialize model inventory")?,
-            );
+            let ServedStore {
+                store: inventory,
+                devices: catalog,
+            } = open_served_store(inventory_config, reserves).await?;
+            // Every model is assessed on the device a load selects, established once from the
+            // discovered topology: selection, a status sample and bandwidth.
+            let assessment_environment = {
+                let catalog = Arc::clone(&catalog);
+                Arc::new(
+                    tokio::task::spawn_blocking(move || AssessmentEnvironment::establish(&catalog))
+                        .await
+                        .context("assessment environment task failed")?
+                        .context("failed to establish the assessment environment")?,
+                )
+            };
             let model_downloads = Arc::new(
                 ManagedModelDownloads::open(inventory.clone())
                     .await
@@ -189,7 +183,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     kernel_directory,
                     reserves,
                 )),
-                host_memory: Arc::new(SeismicHostMemory::new(catalog.clone())),
+                host_memory: Arc::new(SeismicHostMemory::new(catalog.clone(), reserves)),
                 catalog: catalog.clone(),
                 reserves,
                 idle_timeout: MODEL_IDLE_TIMEOUT,
@@ -224,7 +218,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 )
                 .with_model_assessments(assessments)
                 .with_hardware(Arc::new(HardwareInventory::new(
-                    catalog,
+                    Arc::clone(catalog.inventory()),
                     reserves,
                     Arc::new(instances.clone()),
                 )))
@@ -280,7 +274,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 println!("{}", env!("CARGO_PKG_VERSION"));
             }
         }
-        Command::InferenceWorker => unreachable!("the inference worker runs without the service runtime"),
+        Command::InferenceWorker => {
+            unreachable!("the inference worker runs without the service runtime")
+        }
     }
     Ok(())
 }

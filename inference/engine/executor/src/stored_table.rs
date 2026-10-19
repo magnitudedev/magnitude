@@ -592,7 +592,7 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic::{BackendName, DeviceCatalog, Element};
+    use seismic::{BackendName, Element};
 
     const ROWS: u64 = 4096;
     const WIDTH: u64 = 160;
@@ -614,7 +614,7 @@ mod tests {
         let mut bytes = vec![0xee; 100];
         bytes.extend((0..ROWS).flat_map(row));
         std::fs::write(&path, &bytes).unwrap();
-        let device = DeviceCatalog::discover()
+        let device = seismic::Devices::discover(&[])
             .unwrap()
             .open_backend(BackendName::Cpu)
             .unwrap();

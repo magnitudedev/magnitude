@@ -181,6 +181,21 @@ impl DriverApiVersion {
     }
 }
 
+/// What the backend's kernels require of a device: the `sm_80` emission
+/// floor and the driver floor.
+fn admit_device(
+    name: &str,
+    compute_capability: ComputeCapability,
+    driver_api: DriverApiVersion,
+) -> Result<(), TargetError> {
+    if compute_capability < ComputeCapability::SM80 {
+        return Err(TargetError::UnsupportedDevice(format!(
+            "{name}: compute capability {compute_capability} is below the sm_80 emission floor"
+        )));
+    }
+    admit_driver(driver_api)
+}
+
 /// The driver floor of the backend: below it, the bundled NVRTC's CUBIN is
 /// not guaranteed to load.
 fn admit_driver(driver_api: DriverApiVersion) -> Result<(), TargetError> {
@@ -343,6 +358,9 @@ mod attr {
     pub const INTEGRATED: i32 = 18;
     pub const MEMORY_CLOCK_RATE: i32 = 36;
     pub const GLOBAL_MEMORY_BUS_WIDTH: i32 = 37;
+    /// `CU_DEVICE_ATTRIBUTE_NUMA_CONFIG`: whether the device's memory is an
+    /// OS NUMA node.
+    pub const NUMA_CONFIG: i32 = 130;
 }
 
 fn unavailable(error: DriverError) -> TargetError {
@@ -351,13 +369,15 @@ fn unavailable(error: DriverError) -> TargetError {
 
 /// The single-allocation limit of a CUDA device: one `cuMemAlloc` can at
 /// most cover the device's total memory. This is the `TargetLimits` value and
-/// the catalog's published allocation limit; it is not available memory.
+/// the executor's reported allocation limit in the topology; it is not
+/// available memory.
 pub fn max_allocation_bytes(total_memory_bytes: u64) -> u64 {
     total_memory_bytes
 }
 
-/// Cheap unopened catalog identity. Constructing this value does not retain
-/// a primary context, create a stream, run probes, or assemble a profile.
+/// Cheap unopened device identity, as discovery reads it. Constructing this
+/// value does not retain a primary context, create a stream, run probes, or
+/// assemble a profile.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DeviceDescriptor {
     pub ordinal: u32,
@@ -374,6 +394,63 @@ pub struct DeviceDescriptor {
     /// integrated device, or when the driver reports either as zero or does
     /// not report it.
     pub memory_bandwidth: Option<u64>,
+    /// `cuDriverGetVersion`.
+    pub driver_api: DriverApiVersion,
+    /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR` / `_MINOR`.
+    pub compute_capability: ComputeCapability,
+    /// `CU_DEVICE_ATTRIBUTE_NUMA_CONFIG`: the device's memory is an OS NUMA
+    /// node, which the OS manages as host memory.
+    pub numa_node: bool,
+    /// `cuDeviceGetLuid`: the OS adapter's LUID, in `LUID` memory layout,
+    /// where the driver reports one (WDDM). It identifies nothing across
+    /// boots; it matches the memory the OS reports as dedicated to the
+    /// adapter.
+    pub luid: Option<[u8; 8]>,
+}
+
+impl DeviceDescriptor {
+    /// Whether the backend's kernels can run on the device: the reason when
+    /// they cannot.
+    pub fn admission(&self) -> Result<(), TargetError> {
+        admit_device(&self.name, self.compute_capability, self.driver_api)
+    }
+}
+
+/// Whether device `ordinal` can read and write device `peer`'s memory
+/// directly (`cuDeviceCanAccessPeer`), without a context.
+pub fn can_access_peer(ordinal: u32, peer: u32) -> Result<bool, TargetError> {
+    let driver = Driver::load().map_err(TargetError::DeviceUnavailable)?;
+    let device = |ordinal: u32| {
+        c_int::try_from(ordinal).map_err(|_| {
+            TargetError::DeviceUnavailable(format!("ordinal {ordinal} exceeds the driver ABI"))
+        })
+    };
+    let mut access = 0;
+    unsafe {
+        driver
+            .check(
+                (driver.device_can_access_peer)(&mut access, device(ordinal)?, device(peer)?),
+                "peer access",
+            )
+            .map_err(unavailable)?;
+    }
+    Ok(access != 0)
+}
+
+fn read_compute_capability(
+    driver: &Driver,
+    device: c_int,
+) -> Result<ComputeCapability, TargetError> {
+    let unsigned = |key: i32| -> Result<u16, TargetError> {
+        let value = driver.attribute(key, device).map_err(unavailable)?;
+        u16::try_from(value).map_err(|_| {
+            TargetError::UnsupportedDevice(format!("device attribute {key} reports {value}"))
+        })
+    };
+    Ok(ComputeCapability {
+        major: unsigned(attr::COMPUTE_CAPABILITY_MAJOR)?,
+        minor: unsigned(attr::COMPUTE_CAPABILITY_MINOR)?,
+    })
 }
 
 /// Number of CUDA devices the driver reports; zero (or no driver) is
@@ -405,9 +482,13 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
     let mut name = [0 as std::ffi::c_char; 256];
     let mut memory = 0usize;
     let mut uuid = [0u8; 16];
+    let mut version = 0;
     unsafe {
         driver
             .check((driver.device_get)(&mut handle, device), "device selection")
+            .map_err(unavailable)?;
+        driver
+            .check((driver.driver_version)(&mut version), "driver version")
             .map_err(unavailable)?;
         driver
             .check(
@@ -453,6 +534,12 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
         memory_bandwidth: clock_khz.zip(bus_bits).and_then(|(clock, bus)| {
             memory_bandwidth(u64::try_from(clock).ok()?, u64::try_from(bus).ok()?)
         }),
+        driver_api: DriverApiVersion(u32::try_from(version).map_err(|_| {
+            TargetError::UnsupportedDriver(format!("driver API version {version}"))
+        })?),
+        compute_capability: read_compute_capability(&driver, device)?,
+        numa_node: numa_node(&driver, device)?,
+        luid: luid(&driver, device)?,
     })
 }
 
@@ -475,6 +562,43 @@ mod memory_bandwidth_tests {
         // RTX 5090: 14,001 MHz on 512 bits.
         assert_eq!(memory_bandwidth(14_001_000, 512), Some(1_792_128_000_000));
         assert_eq!(memory_bandwidth(0, 384), None);
+    }
+}
+
+/// `CUDA_ERROR_INVALID_VALUE`.
+const INVALID_VALUE: i32 = 1;
+/// `CUDA_ERROR_NOT_SUPPORTED`.
+const NOT_SUPPORTED: i32 = 801;
+
+/// Whether the device's memory is an OS NUMA node
+/// (`CU_DEVICE_ATTRIBUTE_NUMA_CONFIG` is `CU_DEVICE_NUMA_CONFIG_NUMA_NODE`).
+/// A driver that does not know the attribute rejects it as an invalid value:
+/// it states no NUMA node for the device.
+fn numa_node(driver: &Driver, device: c_int) -> Result<bool, TargetError> {
+    /// `CU_DEVICE_NUMA_CONFIG_NUMA_NODE`.
+    const NUMA_NODE: i32 = 1;
+    match driver.attribute(attr::NUMA_CONFIG, device) {
+        Ok(config) => Ok(config == NUMA_NODE),
+        Err(error) if error.code == INVALID_VALUE => Ok(false),
+        Err(error) => Err(unavailable(error)),
+    }
+}
+
+/// `cuDeviceGetLuid`, which only a driver under WDDM supports: elsewhere the
+/// device has no OS adapter LUID.
+fn luid(driver: &Driver, device: c_int) -> Result<Option<[u8; 8]>, TargetError> {
+    let Some(device_luid) = driver.device_luid else {
+        return Ok(None);
+    };
+    let mut luid = [0 as std::ffi::c_char; 8];
+    let mut node_mask: std::ffi::c_uint = 0;
+    match driver.check(
+        unsafe { device_luid(luid.as_mut_ptr(), &mut node_mask, device) },
+        "device LUID",
+    ) {
+        Ok(()) => Ok(Some(luid.map(|byte| byte as u8))),
+        Err(error) if error.code == NOT_SUPPORTED => Ok(None),
+        Err(error) => Err(unavailable(error)),
     }
 }
 
@@ -519,26 +643,12 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
     let hardware = unsafe { CStr::from_ptr(name.as_ptr()) }
         .to_string_lossy()
         .into_owned();
-    let major = unsigned(attr::COMPUTE_CAPABILITY_MAJOR)?;
-    let minor = unsigned(attr::COMPUTE_CAPABILITY_MINOR)?;
-    let compute_capability = ComputeCapability {
-        major: u16::try_from(major).map_err(|_| {
-            TargetError::UnsupportedDevice(format!("compute capability major {major}"))
-        })?,
-        minor: u16::try_from(minor).map_err(|_| {
-            TargetError::UnsupportedDevice(format!("compute capability minor {minor}"))
-        })?,
-    };
-    if compute_capability < ComputeCapability::SM80 {
-        return Err(TargetError::UnsupportedDevice(format!(
-            "{hardware}: compute capability {compute_capability} is below the sm_80 emission floor"
-        )));
-    }
+    let compute_capability = read_compute_capability(&driver, device)?;
     let driver_api =
         DriverApiVersion(u32::try_from(version).map_err(|_| {
             TargetError::UnsupportedDriver(format!("driver API version {version}"))
         })?);
-    admit_driver(driver_api)?;
+    admit_device(&hardware, compute_capability, driver_api)?;
     let blackwell_100_family = in_blackwell_100_family(compute_capability, driver_api);
     let ptx = if blackwell_100_family {
         PtxTarget::BLACKWELL_100_FAMILY

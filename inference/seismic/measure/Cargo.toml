@@ -1,0 +1,12 @@
+[package]
+name = "seismic-measure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Measuring work on a device, generically: the timing session, the
+# sustained clock, the sampling statistics and deadlines
+# (specs/26-10-18/device-topology.md §2.6). It depends on no device or other
+# Seismic crate: what it times is a `Work`.
+[dependencies]
+serde.workspace = true

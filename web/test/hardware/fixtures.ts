@@ -5,11 +5,12 @@ const GiB = 1024 ** 3
 export const identity = (manufacturer: string, model: string, formFactor = "Unknown") => Schema.decodeUnknownSync(MachineIdentityObservation)({ _tag: "Identified", manufacturer, model, formFactor })
 export const hardware = (processor: string, memory: number, cores: number, accelerators: readonly { name: string; memory: number; shared?: boolean }[] = [], physicalCores?: number) => Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
   platform: processor.startsWith("Apple") ? "MacOS" : "Linux", architecture: processor.startsWith("Apple") || processor === "NVIDIA GB10" ? "Arm64" : "X64", processor,
-  ...(physicalCores === undefined ? {} : { physicalCores }), logicalCores: cores, totalSystemMemoryBytes: memory * GiB, availableSystemMemoryBytes: memory * GiB / 2,
-  systemAllocationCapacityBytes: memory * GiB, systemAllocationHeadroomBytes: memory * GiB / 2, abortReserveBytes: GiB,
-  accelerators: accelerators.map((gpu, i) => ({ acceleratorId: `gpu-${i}`, name: gpu.name, backend: processor.startsWith("Apple") ? "metal" : "cuda", memoryDomainId: gpu.shared ? "system" : `gpu-${i}` })),
-  memoryDomains: [{ memoryDomainId: "system", kind: accelerators.some(gpu => gpu.shared) ? "UnifiedMemory" : "System", totalBytes: memory * GiB, stableCapacityBytes: memory * GiB, sharesSystemMemory: true },
-    ...accelerators.flatMap((gpu, i) => gpu.shared ? [] : [{ memoryDomainId: `gpu-${i}`, kind: "PhysicalDevice", totalBytes: gpu.memory * GiB, stableCapacityBytes: gpu.memory * GiB, sharesSystemMemory: false }])],
+  ...(physicalCores === undefined ? {} : { physicalCores }), logicalCores: cores, totalSystemMemoryBytes: memory * GiB,
+  accelerators: accelerators.map((gpu, i) => ({ acceleratorId: `gpu-${i}`, name: gpu.name, executors: [{ deviceId: `executor-${i}`, backend: processor.startsWith("Apple") ? "metal" : "cuda", memoryDomainIds: [gpu.shared ? "system" : `gpu-${i}`] }] })),
+  // The engine takes the first GPU's executor, or the host CPU without one.
+  selectedDeviceId: accelerators.length > 0 ? "executor-0" : "host-cpu",
+  memoryDomains: [{ memoryDomainId: "system", kind: accelerators.some(gpu => gpu.shared) ? "UnifiedMemory" : "System", totalBytes: memory * GiB },
+    ...accelerators.flatMap((gpu, i) => gpu.shared ? [] : [{ memoryDomainId: `gpu-${i}`, kind: "PhysicalDevice", totalBytes: gpu.memory * GiB }])],
 })
 export const hardwareScenarios = [
   { label: "CPU inference laptop", identity: identity("Dell Inc.", "XPS 15 9530", "Portable"), value: hardware("13th Gen Intel(R) Core(TM) i7-13700H", 32, 20, [], 14) },

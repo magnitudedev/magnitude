@@ -47,11 +47,12 @@ pub use tuning::pinned as pinned_tuning;
 pub use tuning::survey as tuning_survey;
 pub(crate) use tuning::workload as tuning_workload;
 pub use tuning::{
-    NumericalProfile, PinnedChoice, PointShape, ROTATION_LAYERS, Receipt, ResolvedNumericalProfile,
-    SEARCH_VERSION, STANDARD_TUNING_BUDGET, SearchProgress, TRACE_SCHEMA, TUNING_CONTEXTS,
-    TUNING_ROWS, TracedWork, TunedEntry, TuningContext, TuningEvent, TuningLimits, TuningObserver,
-    TuningOrigin, TuningRoom, TuningSettings, TuningTrace, TuningWeightSource, UnpreparedUnits,
-    UnreportedTuning, ZeroTuningWeights, attention_points, row_points,
+    MIN_SAMPLE_SECONDS, NumericalProfile, PinnedChoice, PointShape, ROTATION_LAYERS, Receipt,
+    ResolvedNumericalProfile, SEARCH_SETTINGS, SEARCH_VERSION, STANDARD_TUNING_BUDGET,
+    SearchProgress, TRACE_SCHEMA, TUNING_CONTEXTS, TUNING_ROWS, TracedWork, TunedEntry,
+    TuningContext, TuningEvent, TuningLimits, TuningObserver, TuningOrigin, TuningRoom,
+    TuningSettings, TuningTrace, TuningWeightSource, UnpreparedUnits, UnreportedTuning,
+    ZeroTuningWeights, attention_points, row_points,
 };
 pub(crate) use vision::VisionKernels;
 
@@ -224,7 +225,7 @@ mod qualification_tests {
 
     #[test]
     fn packed_recurrent_prepares_with_the_qwen_4b_binding() {
-        let catalog = seismic::DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Devices::discover(&[]).unwrap();
         let Ok(device) = catalog.open_backend(BackendName::Metal) else {
             return;
         };

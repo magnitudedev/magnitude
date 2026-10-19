@@ -82,11 +82,7 @@ pub fn open_device(
 fn discover_device(device: &MetalDevice) -> Result<DeviceDescription<Metal>, TargetError> {
     let handle = device.handle();
     let raw = handle.raw();
-    let language = probe_language_version(handle).ok_or_else(|| {
-        TargetError::UnsupportedToolchain(
-            "the Metal compiler accepts none of the language versions this backend emits".into(),
-        )
-    })?;
+    let language = language(handle)?;
     let size = raw.maxThreadsPerThreadgroup();
     let facts = MetalFacts {
         device_name: handle.name(),
@@ -506,6 +502,17 @@ pub fn operating_system() -> String {
     NSProcessInfo::processInfo()
         .operatingSystemVersionString()
         .to_string()
+}
+
+/// What the backend requires of a device: a compiler that accepts one of
+/// the language versions it emits (no GPU family is required). The highest
+/// accepted version, or why the device cannot run the backend's kernels.
+pub fn language(device: &crate::DeviceHandle) -> Result<LanguageVersion, TargetError> {
+    probe_language_version(device).ok_or_else(|| {
+        TargetError::UnsupportedToolchain(
+            "the Metal compiler accepts none of the language versions this backend emits".into(),
+        )
+    })
 }
 
 /// The highest language version accepted by the runtime compiler.

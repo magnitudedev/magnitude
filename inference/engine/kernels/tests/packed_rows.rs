@@ -11,7 +11,7 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 
 #[test]
 fn packed_stages_accept_repacked_q8_weights_and_bf16_activations() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [
         seismic::BackendName::Metal,
         seismic::BackendName::Cuda,

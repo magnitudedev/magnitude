@@ -13,7 +13,7 @@ use magnitude_executor::{
     ExecutionPath,
     platform::{DeviceRequest, MemoryReserves},
 };
-use seismic::{BackendName, DeviceCatalog, MemoryPoolKind};
+use seismic::{BackendName, Devices, StoreKind};
 use std::path::PathBuf;
 
 fn model() -> ResolvedEngineConfiguration {
@@ -63,11 +63,11 @@ impl Window {
         for byte in ballast.iter_mut().step_by(4096) {
             *byte = 1;
         }
-        let catalog = DeviceCatalog::discover().unwrap();
+        let catalog = Devices::discover(&[]).unwrap();
         let reserve = MemoryReserves::standard()
             .for_domain(
-                MemoryPoolKind::HostRam,
-                catalog.topology().host_pool().capacity_bytes,
+                &StoreKind::HostRam,
+                catalog.topology().host_ram().capacity().value,
             )
             .planning_bytes;
         let used = std::fs::read_to_string(group.join("memory.current"))
@@ -147,16 +147,16 @@ fn qualification_deficit_is_retryable_and_recovers() {
 #[ignore = "run under an explicitly selected QEMU CPU with MAGNITUDE_TEST_CPU_AVAILABLE"]
 fn virtual_cpu_availability_is_enforced_before_open() {
     let expected = std::env::var("MAGNITUDE_TEST_CPU_AVAILABLE").unwrap() == "true";
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = Devices::discover(&[]).unwrap();
     let topology = catalog.topology();
     let cpu = topology
-        .devices()
+        .executors()
         .iter()
-        .find(|device| device.backend == BackendName::Cpu)
+        .find(|device| device.backend() == BackendName::Cpu)
         .unwrap();
-    eprintln!("virtual CPU: {:?}", cpu.availability);
+    eprintln!("virtual CPU: {:?}", cpu.availability());
     assert_eq!(
-        matches!(cpu.availability, seismic::Availability::Available),
+        matches!(cpu.availability(), seismic::Availability::Available),
         expected
     );
     let opened = catalog.open_backend(BackendName::Cpu);
@@ -175,8 +175,11 @@ fn virtual_cpu_availability_is_enforced_before_open() {
 #[ignore = "requires a real model; reports a load under the enclosing VM or cgroup"]
 fn probe_model_load() {
     let resolved = model();
-    let catalog = DeviceCatalog::discover().unwrap();
-    eprintln!("before load: {:?}", catalog.host_memory_status().unwrap());
+    let catalog = Devices::discover(&[]).unwrap();
+    eprintln!(
+        "before load: {:?}",
+        catalog.status().sample.host_ram.unwrap()
+    );
     match build_native_domain(&resolved.manifest, resolved.host.shared_package()) {
         Ok(_) => eprintln!("probe: model loaded and warmed up"),
         Err(error) => panic!("probe: {error}"),

@@ -2,7 +2,6 @@
 //! executor domain. Every device-bound value is created inside the numerical
 //! worker that runs this.
 
-use crate::census::MemoryDomain;
 use crate::error::{
     ArtifactError, InsufficientMemory, LoadError, classify_catalog, classify_plan,
     classify_platform,
@@ -19,11 +18,11 @@ use magnitude_executor::{
     TokenId, TracedWork, TunedEntry, TuningCacheKey, TuningContext, TuningEvent, TuningObserver,
     TuningOrigin, TuningSettings, TuningTrace, UnpreparedUnits, WeightImportError, WorkKind,
     memory::{ClaimId, HoldingClass},
-    platform::{self, DeviceRequest, DomainRole, OpenedPlatform, PlatformConfig, PlatformError},
+    platform::{self, DeviceRequest, OpenedPlatform, PlatformConfig, PlatformError},
     require_normal,
 };
 use magnitude_family_contracts::{HeadHistory, InputLayout, PreparedModelInput, TokenPlan};
-use seismic::{BackendName, DeviceCatalog, DeviceMemory, DeviceSelector, MemoryPoolKind};
+use seismic::{BackendName, Devices, ExecutorSelector};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,8 +37,7 @@ pub(crate) struct NativeDomain {
     /// The domain's one right to change its stores' bindings.
     pub bindings: StateBindings,
     pub plan: ResourcePlan,
-    pub device: DeviceSelector,
-    pub pool: MemoryPoolKind,
+    pub device: ExecutorSelector,
 }
 
 fn internal(reason: impl Into<String>) -> LoadError {
@@ -63,7 +61,7 @@ pub fn load_native_domain(
     package: Arc<Package>,
     unprepared: UnpreparedUnits,
 ) -> Result<LoadAttempt<(ExecutorDomain, StateBindings, ResourcePlan)>, LoadError> {
-    let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
+    let catalog = Devices::discover(&[]).map_err(|error| internal(error.to_string()))?;
     Ok(
         match build(catalog, manifest, package, unprepared, Rc::new(|_| {}))? {
             LoadAttempt::Loaded(built) => {
@@ -97,7 +95,6 @@ pub(crate) struct PreparedPrograms {
     pub opened: OpenedPlatform,
     pub programs: AttestedPrograms,
     pub backend: BackendName,
-    pub pool: MemoryPoolKind,
     pub capacity: ResourceCapacity,
     /// The load's one set of worker threads: everything its preparation
     /// does off the calling thread runs on these and no others. It is lent
@@ -113,7 +110,6 @@ struct PlannedModel {
     draft: ExecutionPlanDraft,
     opened: OpenedPlatform,
     backend: BackendName,
-    pool: MemoryPoolKind,
     capacity: ResourceCapacity,
     kernel_cache: Option<Arc<KernelCache>>,
     numerical_profile: magnitude_executor::ResolvedNumericalProfile,
@@ -121,7 +117,7 @@ struct PlannedModel {
 
 /// Select and open the manifest's device and plan the model on it.
 fn plan_on_device(
-    catalog: Rc<DeviceCatalog>,
+    catalog: Rc<Devices>,
     manifest: &ExecutionManifest,
     package: &Package,
     progress: &dyn Fn(LoadProgress),
@@ -140,20 +136,12 @@ fn plan_on_device(
     let reserves = manifest.reserves;
     let selected = platform::select_device(&catalog, manifest.path, manifest.device, &reserves)
         .map_err(platform_error)?;
-    let backend = selected.info.backend;
-    let topology = catalog.topology();
-    let pool = match &selected.info.memory {
-        DeviceMemory::Established(memory) => {
-            topology
-                .pool(memory.allocation_pool)
-                .ok_or_else(|| internal("the selected device's pool is not in its topology"))?
-                .kind
-        }
-        DeviceMemory::Unsupported { reason } => return Err(internal(reason.clone())),
-    };
+    let backend = selected.info.backend();
     let capacity = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes,
-        tensor_operations: magnitude_executor::TensorOperations::of(selected.tensor_operations),
+        tensor_operations: magnitude_executor::TensorOperations::of(
+            selected.info.forms_tensor_operations(),
+        ),
     };
     // The same derivation metadata-only assessment and preview plan through.
     let draft =
@@ -194,7 +182,6 @@ fn plan_on_device(
     let mut startup = StartupClaims {
         heap: DeviceHeap::open(catalog, reserves, Rc::new(opened.device().clone()))
             .map_err(|error| platform_error(PlatformError::Memory(error)))?,
-        allocation_domain: MemoryDomain::of(opened.selector(), pool),
         held: None,
     };
     // Preparation allocates fixed invocation buffers and runs qualification
@@ -212,7 +199,6 @@ fn plan_on_device(
         draft,
         opened,
         backend,
-        pool,
         capacity,
         kernel_cache,
         numerical_profile,
@@ -244,7 +230,7 @@ fn tuning_report(
 /// unit's record as it stands. Nothing is prepared for serving and the model
 /// is not imported: the process ends here, and a load reads the records.
 pub(crate) fn search(
-    catalog: Rc<DeviceCatalog>,
+    catalog: Rc<Devices>,
     manifest: &ExecutionManifest,
     package: &Package,
     progress: Rc<dyn Fn(LoadProgress)>,
@@ -368,7 +354,7 @@ pub enum LoadAttempt<L> {
 /// stops unprepared or prepares the unit at its canonical default, as
 /// `unprepared` says.
 fn prepare(
-    catalog: Rc<DeviceCatalog>,
+    catalog: Rc<Devices>,
     manifest: &ExecutionManifest,
     package: &Package,
     unprepared: UnpreparedUnits,
@@ -392,7 +378,6 @@ fn prepare(
         draft,
         opened,
         backend,
-        pool,
         capacity,
         kernel_cache,
         numerical_profile,
@@ -457,7 +442,6 @@ fn prepare(
         opened,
         programs,
         backend,
-        pool,
         capacity,
         workers,
     }))
@@ -467,7 +451,7 @@ fn prepare(
 /// tuning unit without a stored record, which it meets while its programs
 /// are prepared, before anything of the model is placed.
 pub(crate) fn build(
-    catalog: DeviceCatalog,
+    catalog: Devices,
     manifest: &ExecutionManifest,
     package: Arc<Package>,
     unprepared: UnpreparedUnits,
@@ -480,7 +464,6 @@ pub(crate) fn build(
         opened,
         mut programs,
         backend,
-        pool,
         capacity,
         workers,
     } = match prepare(catalog.clone(), manifest, &package, unprepared, progress.clone())? {
@@ -685,27 +668,16 @@ pub(crate) fn build(
             .host_table_bytes()
             .map_err(|error| internal(error.to_string()))?,
     )?;
-    // The stored tables' slots and directories, part of the target's
-    // weights, are allocated where the device's host-shared storage lives:
-    // on a dedicated device whose shared storage is host RAM, they are
-    // claimed there, beside the staged upload, not in its own memory.
-    let shared_in_host = match magnitude_executor::platform::shared_role(device.info())
-        .map_err(|error| platform_error(PlatformError::Memory(error)))?
-    {
-        DomainRole::Allocation => 0,
-        DomainRole::Staging => execution_plan
-            .load()
-            .shared_table_bytes()
-            .map_err(|error| internal(error.to_string()))?,
-    };
-    startup.claim(
+    // Stored-table slots and directories are upload storage; imported
+    // tensors are device storage, of which the upload window is staged.
+    let shared_bytes = execution_plan.load().shared_table_bytes().map_err(internal)?;
+    startup.claim_storage(
         "target import",
         target_peak
-            .checked_sub(shared_in_host)
+            .checked_sub(shared_bytes)
             .ok_or_else(|| internal("stored tables exceed the target import peak"))?,
-        target_upload
-            .checked_add(shared_in_host)
-            .ok_or_else(|| internal("target import staging byte count overflow"))?,
+        shared_bytes,
+        target_upload,
     )?;
     let import_progress = progress.clone();
     let import_device = device.clone();
@@ -740,7 +712,8 @@ pub(crate) fn build(
     let import = residency.mapped_import_report();
     if import.windows != 0 {
         eprintln!(
-            "magnitude-engine: mapped import {} weights in {} windows: map {:.3} s, prepare {:.3} s, submit {:.3} s, wait {:.3} s, publish {:.3} s",
+            "magnitude-engine: mapped import {} weights in {} windows: map {:.3} s, \
+             prepare {:.3} s, submit {:.3} s, wait {:.3} s, publish {:.3} s",
             import.weights,
             import.windows,
             import.mapping.as_secs_f64(),
@@ -828,7 +801,6 @@ pub(crate) fn build(
         bindings,
         plan,
         device: device_selector,
-        pool,
     }))
 }
 
@@ -857,9 +829,10 @@ fn report_load_memory(moment: &str, device: &seismic::Device) {
             "graphics_bytes": memory.graphics_bytes,
             "mapped_bytes": memory.mapped_bytes,
             "rest_bytes": memory.rest_bytes(),
-            "device_charged_bytes": device.memory_usage().charged,
-            "device_limit_bytes": device.memory_usage().limit,
-            "device_refused_demand_bytes": device.memory_usage().refused_demand,
+            "device_charged_bytes": device.storage_usage(seismic::StorageKind::Device).charged,
+            "device_limit_bytes": device.storage_usage(seismic::StorageKind::Device).limit,
+            "device_refused_demand_bytes":
+                device.storage_usage(seismic::StorageKind::Device).refused_demand,
             "peak_footprint_bytes": seismic::ProcessMemory::peak_footprint(),
         })
     );
@@ -871,25 +844,34 @@ fn report_load_memory(moment: &str, device: &seismic::Device) {
 /// next claim follows it.
 struct StartupClaims {
     heap: DeviceHeap,
-    /// The device's allocation domain; a dedicated device stages through
-    /// host RAM.
-    allocation_domain: MemoryDomain,
     held: Option<ClaimId>,
 }
 
 impl StartupClaims {
-    /// Claim `allocation` additional bytes of the device's allocation domain,
-    /// `staged` of which a dedicated device also stages through host RAM. A
-    /// host-backed device has no staging domain: its staged bytes are part
-    /// of `allocation`. Releases the previous startup claim, whose
-    /// allocation Seismic now charges.
+    /// Claim `allocation` additional bytes of the device's storage, `staged`
+    /// of which the backend stages through host RAM; fit charges the staged
+    /// bytes to host RAM as well only where host RAM is not a store of the
+    /// device's placement (`Fit::host_staging`). Releases the previous
+    /// startup claim, whose allocation Seismic now charges.
     fn claim(&mut self, purpose: &str, allocation: u64, staged: u64) -> Result<(), LoadError> {
+        self.claim_storage(purpose, allocation, 0, staged)
+    }
+
+    /// [`Self::claim`] with `upload` bytes of upload storage beside the
+    /// `allocation` device bytes.
+    fn claim_storage(
+        &mut self,
+        purpose: &str,
+        allocation: u64,
+        upload: u64,
+        staged: u64,
+    ) -> Result<(), LoadError> {
         if let Some(held) = self.held.take() {
             self.heap.release(held);
         }
         let claim = self
             .heap
-            .claim(allocation, staged, HoldingClass::Model)
+            .claim_storage(allocation, upload, staged, HoldingClass::Model)
             .map_err(|refusal| self.refusal(purpose, refusal))?;
         self.held = Some(claim);
         Ok(())
@@ -907,27 +889,30 @@ impl StartupClaims {
     }
 
     fn refusal(&self, purpose: &str, refusal: ClaimRefusal) -> LoadError {
-        let domain = |role: DomainRole| match role {
-            DomainRole::Allocation => self.allocation_domain,
-            DomainRole::Staging => MemoryDomain::HostRam,
+        let identity = |store| {
+            let topology = self.heap.device().topology();
+            topology
+                .store_identity(store)
+                .expect("refused store belongs to the opened topology")
         };
         match refusal {
             ClaimRefusal::Blind(error) => platform_error(PlatformError::Memory(error)),
-            ClaimRefusal::Reclaim { role, distress } => LoadError::MemoryPressure {
+            ClaimRefusal::Reclaim { store, distress, .. } => LoadError::MemoryPressure {
                 purpose: match distress {
                     Some(distress) => format!("{purpose} ({distress})"),
                     None => format!("{purpose} (memory at or below the planning reserve)"),
                 },
-                domain: domain(role),
+                store: identity(store),
             },
             ClaimRefusal::Deficit {
-                role,
+                store,
                 constraint,
                 required,
                 available,
+                ..
             } => LoadError::InsufficientMemory {
                 purpose: format!("{purpose} ({constraint})"),
-                domain: domain(role),
+                store: identity(store),
                 memory: InsufficientMemory {
                     required,
                     available,
@@ -951,11 +936,12 @@ impl StartupClaims {
 /// Run one throwaway single-row forward before readiness, so a broken device
 /// path fails the load instead of the first request, and the process's
 /// one-time first-forward cost is paid here. No row class carries its own
-/// first-use cost, so one row suffices. An enabled drafter that keeps its own history also receives one
-/// state-only priming row (`primes_drafter`), so its component import and
-/// binding complete before readiness; a draft head reading the target's
-/// history keeps none, and its component was imported and bound at load. The
-/// request's state advances are aborted, so no state survives it.
+/// first-use cost, so one row suffices. An enabled drafter that keeps its
+/// own history also receives one state-only priming row (`primes_drafter`),
+/// so its component import and binding complete before readiness; a draft
+/// head reading the target's history keeps none, and its component was
+/// imported and bound at load. The request's state advances are aborted, so
+/// no state survives it.
 /// The bindings travel with the forward and return with it.
 fn warm_up(
     domain: &mut ExecutorDomain,
@@ -1067,11 +1053,13 @@ impl TuningObserver for TuningReport {
                 programs,
                 forming_seconds,
             } => eprintln!(
-                "magnitude-engine: formed {programs} untuned programs for the load in {forming_seconds:.2} s"
+                "magnitude-engine: formed {programs} untuned programs for the load in \
+                 {forming_seconds:.2} s"
             ),
             TuningEvent::Budget(budget) => {
                 eprintln!(
-                    "magnitude-engine: tuning budget {:.2} s: {} pieces of work used {:.2} s, {:.2} s unused, {:.2} s over; {} offered pieces did not fit",
+                    "magnitude-engine: tuning budget {:.2} s: {} pieces of work used {:.2} s, \
+                     {:.2} s unused, {:.2} s over; {} offered pieces did not fit",
                     budget.budget_seconds,
                     budget.stages,
                     budget.used_seconds,
@@ -1110,7 +1098,11 @@ impl TuningObserver for TuningReport {
                 if let Some(progress) = &tuned.progress {
                     let standing = progress.standing;
                     eprintln!(
-                        "magnitude-engine: searched {} [{}]: share {:.1}% of step time; {} pieces of work: {} of the {} configurations asked for measured, {} programs formed, serving {:.3} of the defaults; building {:.2} s, references {:.2} s, forming {:.2} s, measuring {:.2} s, validating {:.2} s",
+                        "magnitude-engine: searched {} [{}]: share {:.1}% of step time; {} \
+                         pieces of work: {} of the {} configurations asked for measured, {} \
+                         programs formed, serving {:.3} of the defaults; building {:.2} s, \
+                         references {:.2} s, forming {:.2} s, measuring {:.2} s, validating \
+                         {:.2} s",
                         tuned.entry,
                         tuned.bindings,
                         progress.share * 100.0,
@@ -1127,7 +1119,8 @@ impl TuningObserver for TuningReport {
                     );
                 }
                 eprintln!(
-                    "magnitude-engine: tuned {} [{}] in {:.2} s ({origin}, {}): {:?} ({} measured, {} excluded, {} qualification rejections)",
+                    "magnitude-engine: tuned {} [{}] in {:.2} s ({origin}, {}): {:?} ({} \
+                     measured, {} excluded, {} qualification rejections)",
                     tuned.entry,
                     tuned.bindings,
                     tuned.seconds,

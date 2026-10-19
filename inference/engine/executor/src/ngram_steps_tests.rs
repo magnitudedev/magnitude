@@ -117,7 +117,7 @@ fn forward(request: RequestId, kind: WorkKind, tokens: &[u32], position: usize, 
 /// claims the queued lookahead and reads its token rows from the selection.
 #[test]
 fn an_ngram_decoder_steps_on_host_and_selected_tokens() {
-    let Ok(catalog) = seismic::DeviceCatalog::discover() else {
+    let Ok(catalog) = seismic::Devices::discover(&[]) else {
         return;
     };
     let directory = std::env::temp_dir().join(format!(
@@ -226,7 +226,7 @@ fn run(
 /// Load `definition` from `package` on `backend` as the engine's load
 /// does, lookahead on; `None` without such a device.
 fn load(
-    catalog: &seismic::DeviceCatalog,
+    catalog: &seismic::Devices,
     definition: &Rc<ModelDefinition>,
     package: &Package,
     backend: seismic::BackendName,
@@ -241,7 +241,7 @@ fn load(
     .ok()?;
     let device = Rc::new(
         catalog
-            .open(catalog.resolve(selected.info.selector).unwrap())
+            .open(catalog.resolve(selected.info.selector()).unwrap())
             .unwrap(),
     );
     let limits = ResourceLimits {
@@ -256,7 +256,7 @@ fn load(
     };
     let capacity = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes.min(1024 * 1024 * 1024),
-        tensor_operations: crate::TensorOperations::of(selected.tensor_operations),
+        tensor_operations: crate::TensorOperations::of(selected.info.forms_tensor_operations()),
     };
     let draft = ExecutionPlanner::prepare(
         &selected,
@@ -362,7 +362,7 @@ fn load(
     let plan = execution.resources().clone();
     let target_state = plan.allocate_target_state(device.clone()).unwrap();
     let heap = crate::DeviceHeap::open(
-        Rc::new(seismic::DeviceCatalog::discover().unwrap()),
+        Rc::new(seismic::Devices::discover(&[]).unwrap()),
         reserves,
         device,
     )

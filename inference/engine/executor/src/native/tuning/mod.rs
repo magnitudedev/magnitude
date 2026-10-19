@@ -188,7 +188,7 @@ use magnitude_family_contracts::{
 #[cfg(feature = "tuning-survey")]
 use seismic::Strategy;
 use seismic::{
-    Configuration, DType, Device, Element, NativeImplementation, NativeSpecialization,
+    BuildError, Configuration, DType, Device, Element, NativeImplementation, NativeSpecialization,
     ParameterValues, SearchSettings, SearchStop, Standing, Tensor, TensorError, TuneError,
     TuningInitializer, TuningResult, TuningTime,
 };
@@ -1105,12 +1105,14 @@ pub(crate) trait EntryTuning: Clone + 'static {
     fn workload(&self, _cases: usize) -> seismic::WorkloadRotation {
         seismic::WorkloadRotation::All
     }
-    /// The argument sets of one point, cycling distinct layers.
+    /// The argument sets of one point, cycling distinct layers. An
+    /// allocation the device refuses is [`BuildError::Refused`], which
+    /// prices the point at its demand rather than failing the unit.
     fn rotation(
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String>;
+    ) -> Result<Vec<Self::Case>, BuildError>;
     fn args<'a>(case: &'a mut Self::Case) -> <Self::Entry as seismic::Entry>::Args<'a>;
     /// The states `case` lends through `&mut` parameters, by parameter name;
     /// none for an entry without them. Seismic rejects a point that binds a
@@ -1278,7 +1280,7 @@ pub struct StageRecord {
     pub spent: seismic::Spent,
     /// What each raise of the device's clock did within the piece, and
     /// each establishment of its gauge, in order.
-    pub raises: Vec<seismic::Raise>,
+    pub raises: Vec<seismic::measure::Raise>,
     pub publishing_seconds: f64,
     /// The unit's served choice changed.
     pub promoted: bool,
@@ -1293,12 +1295,14 @@ pub struct StageRecord {
 /// than the load will hold, and it has ended before the load begins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TuningRoom {
-    /// What may still be charged on the device's allocation domain.
+    /// What may still be charged along device storage's placement: its
+    /// live ceiling (`Fit::placement`).
     pub device_bytes: u64,
-    /// What may still be claimed of host RAM, where the device's memory is
-    /// apart from the host's. None where it is the host's: the two are one
-    /// domain, which `device_bytes` bounds.
-    pub host_bytes: Option<u64>,
+    /// What may still be claimed of host RAM, including compilation.
+    pub host_bytes: u64,
+    /// Device storage's placement includes host RAM, so the device's
+    /// charges and the host's growth share host RAM's ceiling.
+    pub host_shared: bool,
 }
 
 /// What a search held, against the ceiling it is held to.
@@ -1310,10 +1314,10 @@ pub struct TuningRoom {
 /// its charges on the device ([`seismic::MemoryUsage::charged`]) and the
 /// host bytes of reference observations. Tuning's whole footprint, which
 /// also holds host buffers, compiles and records, is read as each piece
-/// ends and reported against its ceiling. The whole footprint is the process's and, where the
-/// device's allocations lie outside it (`device_separate`), the device's
-/// charges beside it, so that ceiling, peak and margin count the same
-/// bytes on every backend.
+/// ends and reported against its ceiling. The whole footprint is the
+/// process's and, where the device's allocations lie outside it
+/// (`device_separate`), the device's charges beside it, so that ceiling,
+/// peak and margin count the same bytes on every backend.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TuningMemory {
     /// The most tuning's charges on the device may reach
@@ -1333,10 +1337,10 @@ pub struct TuningMemory {
     pub process_began_bytes: Option<u64>,
     pub process_peak_footprint_bytes: Option<u64>,
     pub process_ended_bytes: Option<u64>,
-    /// The device's allocations lie outside the process's footprint (a
-    /// CUDA or Vulkan device, whose memory the driver holds): tuning's whole
-    /// footprint is then the process's and the device's charges together.
-    /// Elsewhere the process's footprint already counts them.
+    /// The runtime reports that the device's allocations lie outside the
+    /// process's footprint: tuning's whole footprint is then the process's
+    /// and the device's charges together. Elsewhere the process's footprint
+    /// already counts them.
     pub device_separate: bool,
     /// What tuning's whole footprint may grow by, where the device's memory
     /// is the host's and the two are one domain: the device ceiling. None
@@ -1349,13 +1353,9 @@ pub struct TuningMemory {
     /// That ceiling less that growth: negative when tuning's whole
     /// footprint passed it.
     pub footprint_margin_bytes: Option<i64>,
-    /// Where the device's memory is apart from the host's
-    /// (`device_separate`), the two do not substitute, and tuning is held
-    /// in each: its charges on the device to `ceiling_bytes`, and what the
-    /// process's footprint has grown by since tuning began to this, the
-    /// host RAM the platform lets the engine claim
-    /// ([`TuningRoom::host_bytes`]). None where the device's memory is the
-    /// host's, which `footprint_ceiling_bytes` bounds as one.
+    /// Host RAM the platform lets the engine claim, including compiles and
+    /// process growth. Shared device placement also obeys the coupled
+    /// `footprint_ceiling_bytes`.
     pub host_ceiling_bytes: Option<u64>,
     /// The most the process's footprint had grown since tuning began: the
     /// peak of the footprint ([`seismic::ProcessMemory::footprint_peak`])
@@ -1491,14 +1491,15 @@ fn process_peak_bytes() -> Option<u64> {
     None
 }
 
-/// Whether `device`'s allocations lie outside this process's footprint: the
-/// driver of a CUDA or Vulkan device holds them, while a CPU device's are
-/// the process's own memory and a Metal device's count in its footprint.
+/// Whether the device's allocations are held by its driver beside the
+/// process's footprint rather than in it
+/// ([`Device::allocations_in_process_footprint`]: CUDA and Vulkan driver
+/// memory is not in it, CPU and Metal allocations are). It decides whether
+/// tuning's whole footprint adds the device's charges to the process's,
+/// whatever store the executor places on: what the footprint reading
+/// already counts is a fact of the runtime, not of the placement.
 fn device_separate(device: &Device) -> bool {
-    match device.backend() {
-        seismic::BackendName::Cuda | seismic::BackendName::Vulkan => true,
-        seismic::BackendName::Cpu | seismic::BackendName::Metal => false,
-    }
+    !device.allocations_in_process_footprint()
 }
 
 /// The process's physical footprint now, where the system reports one: what
@@ -1545,7 +1546,7 @@ impl TuningMemory {
     /// the device since tuning began.
     fn held(&self, device: &Device) -> u64 {
         device
-            .memory_usage()
+            .storage_usage(seismic::StorageKind::Device)
             .charged
             .saturating_sub(self.began_bytes)
     }
@@ -1570,24 +1571,56 @@ impl TuningMemory {
     /// in; none without a ceiling. Where that domain is the host's, two
     /// readings hold at once and what is free is the lesser room: its
     /// charges on the device, and everything it holds, the host's growth
-    /// included, each under the device's ceiling. Where the device's memory is apart, this
-    /// is the device's room alone and the host has its own
-    /// ([`TuningMemory::host_free`]).
+    /// included, each under the device's ceiling. Where the device's memory
+    /// is apart, this is the device's room alone and the host has its own
+    /// ([`TuningMemory::host_free`]). Either is held to what the runtime
+    /// lets device storage still take ([`Device::storage_available`]: its
+    /// placement's paths, grants and stores, and its limit), so a piece the
+    /// runtime would refuse is not admitted.
     fn free(&self, device: &Device) -> Option<u64> {
         let charged = self
             .ceiling_bytes
             .map(|ceiling| ceiling.saturating_sub(self.held(device)));
-        if self.device_separate {
-            return charged;
-        }
         let whole = self
             .footprint_ceiling_bytes
             .zip(self.held_whole(device))
             .map(|(ceiling, held)| ceiling.saturating_sub(held));
-        match (charged, whole) {
+        let free = match (charged, whole) {
             (Some(charged), Some(whole)) => Some(charged.min(whole)),
             (charged, whole) => charged.or(whole),
+        };
+        let enforced = device.storage_available(seismic::StorageKind::Device);
+        free.map(|free| free.min(enforced))
+    }
+
+    /// The one rule by which host work shares the device's room: what host
+    /// work adding `host` bytes to the process's footprint, beside device
+    /// work charging `device` bytes, takes of [`Self::free`] beyond those
+    /// device bytes. Where device storage's placement includes host RAM
+    /// (`TuningRoom::host_shared`), tuning's device charges and its host
+    /// growth share host RAM's ceiling (spec §2.8), which [`Self::free`]
+    /// holds the whole footprint to (`footprint_ceiling_bytes`): there,
+    /// where the device's allocations lie outside the process's footprint
+    /// (`device_separate`), all of `host` adds to `device`; where they lie
+    /// inside it (CPU, Metal), the footprint's growth already counts the
+    /// work's own device bytes, so only what exceeds them adds. Elsewhere
+    /// host RAM is a domain apart ([`Self::host_free`]) and host work takes
+    /// nothing of the device's room.
+    fn shared_host_bytes(&self, host: u64, device: u64) -> u64 {
+        if !self.shares_host_ceiling() {
+            0
+        } else if self.device_separate {
+            host
+        } else {
+            host.saturating_sub(device)
         }
+    }
+
+    /// Whether tuning's device charges and its host growth share host
+    /// RAM's ceiling: device storage's placement includes host RAM
+    /// (`TuningRoom::host_shared`).
+    fn shares_host_ceiling(&self) -> bool {
+        self.footprint_ceiling_bytes.is_some()
     }
 
     /// What the process's footprint has grown by since tuning began: its
@@ -1663,7 +1696,11 @@ impl TuningMemory {
             self.breakdown_peak = seismic::ProcessMemory::read();
         }
         self.process_peak_footprint_bytes = self.process_peak_footprint_bytes.max(footprint);
-        self.peak_bytes = self.peak_bytes.max(device.memory_usage().high_water);
+        self.peak_bytes = self.peak_bytes.max(
+            device
+                .storage_usage(seismic::StorageKind::Device)
+                .high_water,
+        );
         self.held_peak_bytes = self
             .held_peak_bytes
             .max(within.saturating_sub(self.began_bytes))
@@ -1700,14 +1737,25 @@ impl TuningMemory {
 
     /// The threads the host's room affords compiles that run at once, each
     /// at the price a thread's compile was observed to hold
-    /// (`compile_host_bytes`); none where the host is not a domain apart,
-    /// and nothing is then bounded. Before a compile has been observed no
-    /// room can be divided by its price, and compiles run one at a time.
+    /// (`compile_host_bytes`): within host RAM's own room, and within the
+    /// device's room where they share it ([`Self::shared_host_bytes`]);
+    /// none where neither bounds them. Before a compile has been observed
+    /// no room can be divided by its price, and compiles run one at a time.
     /// Owed work is not refused, so it is afforded one thread at the
     /// least.
-    fn compile_threads(&self) -> Option<usize> {
+    fn compile_threads(&self, device: &Device) -> Option<usize> {
         let price = self.compile_host_bytes;
-        match self.host_free() {
+        // Compiles are host work of no device bytes: where host RAM's
+        // ceiling is shared, all their bytes take of the device's room.
+        let shared = self.free(device).filter(|_| self.shares_host_ceiling());
+        let host = match (self.host_free(), shared) {
+            (allocation::HostRoom::Free(host), Some(shared)) => {
+                allocation::HostRoom::Free(host.min(shared))
+            }
+            (allocation::HostRoom::Unbounded, Some(shared)) => allocation::HostRoom::Free(shared),
+            (host, _) => host,
+        };
+        match host {
             allocation::HostRoom::Unbounded => None,
             _ if price == 0 => Some(1),
             allocation::HostRoom::Free(free) => Some((free / price) as usize),
@@ -2214,13 +2262,13 @@ impl TuningInputs<'_, '_> {
 
     /// The resident weight of one role, imported from the artifact into the
     /// resident representation and layout.
-    pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, String> {
+    pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, BuildError> {
         self.weights.weight(scope, kind)
     }
 
     /// A weight's packing bound operand, as loading binds it: its bound, or
     /// an absent one (zero extent).
-    pub fn bound(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, String> {
+    pub fn bound(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, BuildError> {
         match self.weights.bound(scope, kind)? {
             Some(bound) => Ok(bound),
             None => self.unit_scale(0),
@@ -2236,7 +2284,7 @@ impl TuningInputs<'_, '_> {
         kind: WeightKind,
         element: Element,
         extent: u64,
-    ) -> Result<Tensor, String> {
+    ) -> Result<Tensor, BuildError> {
         if extent == 0 {
             self.scratch(element, &[0])
         } else {
@@ -2249,7 +2297,7 @@ impl TuningInputs<'_, '_> {
         &mut self,
         scope: WeightScope,
         kind: WeightKind,
-    ) -> Result<Tensor, String> {
+    ) -> Result<Tensor, BuildError> {
         let plan = weights::weight_plan(self.weights.load(), scope, kind)?;
         let key = format!(
             "shared_weight:{:?}:{:?}",
@@ -2266,7 +2314,7 @@ impl TuningInputs<'_, '_> {
 
     /// A unit accumulator-scale port of `extent` (absent at 0): the scale's
     /// value does not bear on a configuration's timing or agreement.
-    pub fn unit_scale(&self, extent: u64) -> Result<Tensor, String> {
+    pub fn unit_scale(&self, extent: u64) -> Result<Tensor, BuildError> {
         let count = usize::try_from(extent).map_err(|_| "scale extent exceeds usize")?;
         self.f32s(&[extent], &vec![1.0; count])
     }
@@ -2277,7 +2325,7 @@ impl TuningInputs<'_, '_> {
         element: Element,
         extents: &[u64],
         seed: u64,
-    ) -> Result<Tensor, String> {
+    ) -> Result<Tensor, BuildError> {
         let dtype = element
             .dtype()
             .ok_or_else(|| format!("tuning activations are not {}", element.name()))?;
@@ -2293,68 +2341,78 @@ impl TuningInputs<'_, '_> {
         element: Element,
         extents: &[u64],
         generate: impl FnOnce(usize) -> Result<Vec<u8>, String>,
-    ) -> Result<Tensor, String> {
+    ) -> Result<Tensor, BuildError> {
         let count = element_count(extents)?;
         if element.dtype().is_none() {
-            return Err(format!(
+            return Err(BuildError::Failed(format!(
                 "generated tuning tensors are not {}",
                 element.name()
-            ));
+            )));
         }
         let bytes = generate(count)?;
-        Tensor::from_host(self.device, element, extents, &bytes).map_err(|error| error.to_string())
+        Ok(Tensor::from_host(self.device, element, extents, &bytes)?)
     }
 
     /// An `i32` tensor of `values`.
-    pub fn i32s(&self, extents: &[u64], values: &[i32]) -> Result<Tensor, String> {
+    pub fn i32s(&self, extents: &[u64], values: &[i32]) -> Result<Tensor, BuildError> {
         let bytes = values
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        Tensor::from_host(self.device, Element::i32(), extents, &bytes)
-            .map_err(|error| error.to_string())
+        Ok(Tensor::from_host(
+            self.device,
+            Element::i32(),
+            extents,
+            &bytes,
+        )?)
     }
 
     /// A `u32` tensor of `values`.
-    pub fn u32s(&self, extents: &[u64], values: &[u32]) -> Result<Tensor, String> {
+    pub fn u32s(&self, extents: &[u64], values: &[u32]) -> Result<Tensor, BuildError> {
         let bytes = values
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        Tensor::from_host(self.device, Element::u32(), extents, &bytes)
-            .map_err(|error| error.to_string())
+        Ok(Tensor::from_host(
+            self.device,
+            Element::u32(),
+            extents,
+            &bytes,
+        )?)
     }
 
     /// An `f32` tensor of `values`.
-    pub fn f32s(&self, extents: &[u64], values: &[f32]) -> Result<Tensor, String> {
+    pub fn f32s(&self, extents: &[u64], values: &[f32]) -> Result<Tensor, BuildError> {
         let bytes = values
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        Tensor::from_host(self.device, Element::f32(), extents, &bytes)
-            .map_err(|error| error.to_string())
+        Ok(Tensor::from_host(
+            self.device,
+            Element::f32(),
+            extents,
+            &bytes,
+        )?)
     }
 
     /// The `out_rows` gather selecting every one of `rows` rows in order.
-    pub fn every_row(&self, rows: u64) -> Result<Tensor, String> {
+    pub fn every_row(&self, rows: u64) -> Result<Tensor, BuildError> {
         let count = i32::try_from(rows).map_err(|_| "tuning rows exceed i32")?;
         self.i32s(&[rows], &(0..count).collect::<Vec<_>>())
     }
 
     /// A zeroed tensor owned by the case: outputs and tables the entry
     /// overwrites.
-    pub fn scratch(&self, element: Element, extents: &[u64]) -> Result<Tensor, String> {
-        Tensor::zeros(self.device, element, extents).map_err(|error| error.to_string())
+    pub fn scratch(&self, element: Element, extents: &[u64]) -> Result<Tensor, BuildError> {
+        Ok(Tensor::zeros(self.device, element, extents)?)
     }
 
     /// `tensor` lent to a `&mut` parameter that writes leading-axis rows
     /// `written`; their current contents are what every validated invocation
     /// starts from.
-    pub fn state(&self, tensor: Tensor, written: Range<u64>) -> Result<CaseState, String> {
-        let region = tensor
-            .slice_leading(written.start, written.end)
-            .map_err(|error| error.to_string())?;
-        let initial = region.read_to_host().map_err(|error| error.to_string())?;
+    pub fn state(&self, tensor: Tensor, written: Range<u64>) -> Result<CaseState, BuildError> {
+        let region = tensor.slice_leading(written.start, written.end)?;
+        let initial = region.read_to_host()?;
         Ok(CaseState {
             backing: tensor.clone(),
             tensor,
@@ -2373,7 +2431,7 @@ impl TuningInputs<'_, '_> {
         source: Tensor,
         view: u64,
         written: Range<u64>,
-    ) -> Result<CaseState, String> {
+    ) -> Result<CaseState, BuildError> {
         let extents = source.extents();
         let rows = *extents.first().ok_or("slab tuning state has no row axis")?;
         if view == 0 || view > rows || written.start >= written.end || written.end > view {
@@ -2387,33 +2445,18 @@ impl TuningInputs<'_, '_> {
                 element: source.element(),
                 row_shape: extents[1..].to_vec(),
             }],
-        )
-        .map_err(|error| error.to_string())?;
-        slab.add_slab().map_err(|error| error.to_string())?;
-        let bytes = source
-            .slice_leading(0, view)
-            .map_err(|error| error.to_string())?
-            .read_to_host()
-            .map_err(|error| error.to_string())?;
-        slab.region_rows(0, 0, view)
-            .map_err(|error| error.to_string())?
-            .write_from_host(&bytes)
-            .map_err(|error| error.to_string())?;
-        let region = slab
-            .region_rows(0, written.start, written.end - written.start)
-            .map_err(|error| error.to_string())?;
-        let tensor = slab.logical_region(0).map_err(|error| error.to_string())?;
+        )?;
+        slab.add_slab()?;
+        let bytes = source.slice_leading(0, view)?.read_to_host()?;
+        slab.region_rows(0, 0, view)?.write_from_host(&bytes)?;
+        let region = slab.region_rows(0, written.start, written.end - written.start)?;
+        let tensor = slab.logical_region(0)?;
         Ok(CaseState {
             tensor,
             written,
-            initial: region
-                .read_to_host()
-                .map_err(|error| error.to_string())?
-                .into(),
+            initial: region.read_to_host()?.into(),
             region,
-            backing: slab
-                .region_rows(0, 0, view)
-                .map_err(|error| error.to_string())?,
+            backing: slab.region_rows(0, 0, view)?,
             _slab: Some(Arc::new(slab)),
         })
     }
@@ -2423,8 +2466,8 @@ impl TuningInputs<'_, '_> {
     pub fn shared(
         &mut self,
         name: String,
-        build: impl FnOnce(&Self) -> Result<Tensor, String>,
-    ) -> Result<Tensor, String> {
+        build: impl FnOnce(&Self) -> Result<Tensor, BuildError>,
+    ) -> Result<Tensor, BuildError> {
         if let Some(tensor) = self.shared.get(&name) {
             return Ok(tensor.clone());
         }
@@ -2933,10 +2976,12 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
             .next()
             .expect("a unit performs the work it named")
             .stage;
-        let charged_before = tuner.device.memory_usage().charged;
+        let device = tuner.device;
+        let usage = || device.storage_usage(seismic::StorageKind::Device);
+        let charged_before = usage().charged;
         let host_before = seismic::ProcessMemory::footprint_now();
         let peak_before = seismic::ProcessMemory::footprint_peak();
-        tuner.device.restart_memory_high_water();
+        device.restart_memory_high_water();
         let longest = (**self).perform(tuner, before)?;
         let unit = unit_name((**self).key());
         // What the piece added at its most: where the footprint's peak
@@ -2950,14 +2995,11 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
                 .map_or(after, |(_, peak)| peak.max(after));
             tuner.memory.host_piece(&unit, most.saturating_sub(before));
         }
-        tuner.memory.piece(
-            unit,
-            stage,
-            charged_before,
-            tuner.device.memory_usage().charged,
-        );
-        let within = tuner.device.memory_usage().high_water;
-        tuner.memory.observe(tuner.device, within);
+        tuner
+            .memory
+            .piece(unit, stage, charged_before, usage().charged);
+        let within = usage().high_water;
+        tuner.memory.observe(device, within);
         tuner.report_progress();
         Ok(longest)
     }
@@ -3016,6 +3058,10 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
 
     fn host_free(tuner: &Tuner<'a>) -> allocation::HostRoom {
         tuner.memory.host_free()
+    }
+
+    fn shared_host_extra(tuner: &Tuner<'a>, host: u64, device: u64) -> u64 {
+        tuner.memory.shared_host_bytes(host, device)
     }
 
     fn host_footprint(&self, tuner: &Tuner<'a>) -> Option<u64> {
@@ -3217,7 +3263,7 @@ impl<'a, T: EntryTuning> CaseUnit<'a, T> {
         artifacts.threads = Some(
             tuner
                 .memory
-                .compile_threads()
+                .compile_threads(tuner.device)
                 .map_or(width, |threads| threads.clamp(1, width)),
         );
         let took = self
@@ -3824,10 +3870,10 @@ impl<'a> Tuner<'a> {
     /// returned first; owed work then runs in turn if it must. Nothing
     /// where the host is not a domain apart.
     fn narrow_publication(&mut self) -> Option<seismic::Narrowed> {
-        let mut threads = self.memory.compile_threads()?;
+        let mut threads = self.memory.compile_threads(self.device)?;
         if threads == 0 {
             self.memory.return_freed_pages();
-            threads = self.memory.compile_threads()?;
+            threads = self.memory.compile_threads(self.device)?;
         }
         Some(self.workers().narrowed(threads))
     }
@@ -3899,9 +3945,7 @@ impl<'a> Tuner<'a> {
             ),
             room(
                 "footprint",
-                self.memory
-                    .footprint_ceiling_bytes
-                    .filter(|_| !self.memory.device_separate),
+                self.memory.footprint_ceiling_bytes,
                 self.memory.held_whole(self.device),
                 charged,
             ),
@@ -4101,7 +4145,10 @@ impl<'a> Tuner<'a> {
         else {
             unreachable!("a census follows the count");
         };
-        self.memory.began_bytes = self.device.memory_usage().charged;
+        self.memory.began_bytes = self
+            .device
+            .storage_usage(seismic::StorageKind::Device)
+            .charged;
         self.memory.device_separate = device_separate(self.device);
         // The search holds no more than the platform lets the engine claim
         // ([`TuningRoom`]). Where the device's memory is the host's, its
@@ -4110,11 +4157,8 @@ impl<'a> Tuner<'a> {
         // platform's own room.
         if let Some(room) = self.room {
             self.memory.ceiling_bytes = Some(room.device_bytes);
-            if self.memory.device_separate {
-                self.memory.host_ceiling_bytes = room.host_bytes;
-            } else {
-                self.memory.footprint_ceiling_bytes = Some(room.device_bytes);
-            }
+            self.memory.host_ceiling_bytes = Some(room.host_bytes);
+            self.memory.footprint_ceiling_bytes = room.host_shared.then_some(room.host_bytes);
         }
         // The units' canonical programs and the untuned entries compile
         // together on the load's worker threads: a compile needs nothing of
@@ -4186,7 +4230,7 @@ impl<'a> Tuner<'a> {
             let observed = grounded.len();
             let threads = self
                 .memory
-                .compile_threads()
+                .compile_threads(self.device)
                 .map_or(1, |threads| threads.max(1))
                 .min(observed.max(1))
                 .min(groundings.len() - observed);
@@ -4268,7 +4312,10 @@ impl<'a> Tuner<'a> {
                 (key, count)
             })
             .collect::<HashMap<_, _>>();
-        self.memory.mandatory_bytes = self.device.memory_usage().charged;
+        self.memory.mandatory_bytes = self
+            .device
+            .storage_usage(seismic::StorageKind::Device)
+            .charged;
         self.memory.peak_bytes = self.memory.mandatory_bytes;
         let searches = !launches.is_empty() || !self.composed_counted.is_empty();
         self.first_load_search = searches;
@@ -4409,7 +4456,10 @@ impl<'a> Tuner<'a> {
             );
         drop(threads);
         self.memory.no_room = self.no_room(&units, &report);
-        self.memory.ended_bytes = self.device.memory_usage().charged;
+        self.memory.ended_bytes = self
+            .device
+            .storage_usage(seismic::StorageKind::Device)
+            .charged;
         let ended = self.memory.ended_bytes;
         self.memory.observe(self.device, ended);
         self.memory.process_peak_bytes = process_peak_bytes();
@@ -5148,7 +5198,7 @@ impl<T: EntryTuning> seismic::PointSource<'static, T::Entry> for CanonicalPoints
     fn served(&self) -> Vec<BTreeMap<String, u64>> {
         self.case.served_dimensions(self.shapes)
     }
-    fn build(&mut self, _: usize) -> Result<seismic::PointInputs<'static>, String> {
+    fn build(&mut self, _: usize) -> Result<seismic::PointInputs<'static>, BuildError> {
         Err("canonical formation cannot construct numerical observations".into())
     }
 }
@@ -5189,7 +5239,7 @@ impl<T: EntryTuning> seismic::PointSource<'static, T::Entry> for UnitPoints<'_, 
         self.case.served_dimensions(self.shapes)
     }
 
-    fn build(&mut self, point: usize) -> Result<seismic::PointInputs<'static>, String> {
+    fn build(&mut self, point: usize) -> Result<seismic::PointInputs<'static>, BuildError> {
         if self.cases.points[point].is_none() {
             let built = self.case.rotation(&mut self.inputs, &self.shapes[point])?;
             if self.cases.guard.is_none()

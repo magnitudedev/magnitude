@@ -39,6 +39,19 @@ pub enum ResidentTable {
 }
 
 impl ResidentTable {
+    /// Visit the tensors the table holds beside its weight: a streamed
+    /// table's directory and staging, a stored table's directory.
+    pub(crate) fn visit_extra_storage(&self, visit: &mut dyn FnMut(&seismic::Tensor)) {
+        match self {
+            Self::Whole => {}
+            Self::Streamed(table) => {
+                visit(&table.directory);
+                visit(&table.staging);
+            }
+            Self::Stored(table) => visit(table.directory()),
+        }
+    }
+
     /// A table the device holds whole: a row is its own index.
     pub fn whole() -> Self {
         Self::Whole
@@ -535,7 +548,7 @@ fn staging(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic::{BackendName, DeviceCatalog, Element};
+    use seismic::{BackendName, Element};
 
     /// The three F32 values of table row `row`: `10·row + column`.
     fn row(row: u64) -> Vec<u8> {
@@ -575,7 +588,7 @@ mod tests {
     /// held, in four slots with staging for a step that brings one row,
     /// seeded with the rows `kept` keeps.
     fn device_table(kept: Option<&Path>) -> Rc<DeviceTable> {
-        let catalog = DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Devices::discover(&[]).unwrap();
         let device = catalog.open_backend(BackendName::Cpu).unwrap();
         let table = DeviceTable::new(
             &device,

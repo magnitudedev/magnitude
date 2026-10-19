@@ -1033,30 +1033,29 @@ export const GrammarTriggerResponse = S.Union(
 export type GrammarTriggerResponse = S.Schema.Type<typeof GrammarTriggerResponse>
 export type GrammarTriggerResponseEncoded = S.Schema.Encoded<typeof GrammarTriggerResponse>
 
-export const HardwareBackendDiagnostic = S.Struct({
-  backend: S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend),
-  message: S.String,
-})
-export type HardwareBackendDiagnostic = S.Schema.Type<typeof HardwareBackendDiagnostic>
-export type HardwareBackendDiagnosticEncoded = S.Schema.Encoded<typeof HardwareBackendDiagnostic>
-
-export const HardwareDevice = S.Struct({
-  backend: S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend),
-  description: S.String,
-  id: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
-  kind: S.suspend((): S.Schema<HardwareDeviceKind, HardwareDeviceKindEncoded> => HardwareDeviceKind),
-  memory_limit: S.optionalWith(
+export const HardwareAccessPath = S.Struct({
+  executor: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
+  grant: S.optionalWith(
     S.Union(
       S.Null,
-      S.suspend((): S.Schema<HardwareDeviceMemoryLimit, HardwareDeviceMemoryLimitEncoded> => HardwareDeviceMemoryLimit),
+      S.suspend((): S.Schema<HardwareGrant, HardwareGrantEncoded> => HardwareGrant),
     ),
     { exact: true, as: "Option" },
   ),
-  name: S.String,
-  unavailable_reason: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  id: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  store: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
 })
-export type HardwareDevice = S.Schema.Type<typeof HardwareDevice>
-export type HardwareDeviceEncoded = S.Schema.Encoded<typeof HardwareDevice>
+export type HardwareAccessPath = S.Schema.Type<typeof HardwareAccessPath>
+export type HardwareAccessPathEncoded = S.Schema.Encoded<typeof HardwareAccessPath>
+
+export const HardwareBackendDiagnostic = S.Struct({
+  message: S.String,
+  source: S.suspend(
+    (): S.Schema<HardwareDiagnosticSource, HardwareDiagnosticSourceEncoded> => HardwareDiagnosticSource,
+  ),
+})
+export type HardwareBackendDiagnostic = S.Schema.Type<typeof HardwareBackendDiagnostic>
+export type HardwareBackendDiagnosticEncoded = S.Schema.Encoded<typeof HardwareBackendDiagnostic>
 
 export const HardwareDeviceId = S.String
 export type HardwareDeviceId = S.Schema.Type<typeof HardwareDeviceId>
@@ -1072,48 +1071,139 @@ export const HardwareDeviceKind = S.Union(
 export type HardwareDeviceKind = S.Schema.Type<typeof HardwareDeviceKind>
 export type HardwareDeviceKindEncoded = S.Schema.Encoded<typeof HardwareDeviceKind>
 
-export const HardwareDeviceMemoryLimit = S.Struct({
+export const HardwareDeviceMemory = S.Struct({
   current_free_bytes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
     exact: true,
     as: "Option",
   }),
-  kind: S.suspend(
-    (): S.Schema<HardwareDeviceMemoryLimitKind, HardwareDeviceMemoryLimitKindEncoded> => HardwareDeviceMemoryLimitKind,
+  physical_device_id: S.suspend(
+    (): S.Schema<HardwarePhysicalDeviceId, HardwarePhysicalDeviceIdEncoded> => HardwarePhysicalDeviceId,
   ),
-  stable_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  total_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  store: S.suspend((): S.Schema<HardwareStore, HardwareStoreEncoded> => HardwareStore),
 })
-export type HardwareDeviceMemoryLimit = S.Schema.Type<typeof HardwareDeviceMemoryLimit>
-export type HardwareDeviceMemoryLimitEncoded = S.Schema.Encoded<typeof HardwareDeviceMemoryLimit>
+export type HardwareDeviceMemory = S.Schema.Type<typeof HardwareDeviceMemory>
+export type HardwareDeviceMemoryEncoded = S.Schema.Encoded<typeof HardwareDeviceMemory>
 
-export const HardwareDeviceMemoryLimitKind = S.Literal("recommended_working_set")
-export type HardwareDeviceMemoryLimitKind = S.Schema.Type<typeof HardwareDeviceMemoryLimitKind>
-export type HardwareDeviceMemoryLimitKindEncoded = S.Schema.Encoded<typeof HardwareDeviceMemoryLimitKind>
+export const HardwareDiagnosticSource = S.Union(
+  S.extend(
+    S.Struct({
+      backend: S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend),
+      type: S.Literal("backend"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      type: S.Literal("adapters"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type HardwareDiagnosticSource = S.Schema.Type<typeof HardwareDiagnosticSource>
+export type HardwareDiagnosticSourceEncoded = S.Schema.Encoded<typeof HardwareDiagnosticSource>
 
-export const HardwareMemoryDomain = S.Struct({
-  current_free_bytes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+export const HardwareExecutor = S.Struct({
+  availability: S.suspend(
+    (): S.Schema<HardwareExecutorAvailability, HardwareExecutorAvailabilityEncoded> => HardwareExecutorAvailability,
+  ),
+  backend: S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend),
+  description: S.String,
+  device_placement: S.Array(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0))),
+  id: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
+  name: S.String,
+  upload_placement: S.Array(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0))),
+})
+export type HardwareExecutor = S.Schema.Type<typeof HardwareExecutor>
+export type HardwareExecutorEncoded = S.Schema.Encoded<typeof HardwareExecutor>
+
+export const HardwareExecutorAvailability = S.Union(
+  S.extend(
+    S.Struct({
+      stable_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      type: S.Literal("available"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      reason: S.String,
+      type: S.Literal("unavailable"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type HardwareExecutorAvailability = S.Schema.Type<typeof HardwareExecutorAvailability>
+export type HardwareExecutorAvailabilityEncoded = S.Schema.Encoded<typeof HardwareExecutorAvailability>
+
+export const HardwareGrant = S.Struct({
+  basis: S.suspend((): S.Schema<HardwareReportedBy, HardwareReportedByEncoded> => HardwareReportedBy),
+  bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  remaining_bytes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
     exact: true,
     as: "Option",
   }),
-  devices: S.Array(S.suspend((): S.Schema<HardwareDevice, HardwareDeviceEncoded> => HardwareDevice)),
-  id: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
-  kind: S.suspend((): S.Schema<HardwareMemoryDomainKind, HardwareMemoryDomainKindEncoded> => HardwareMemoryDomainKind),
-  shares_system_memory: S.Boolean,
-  stable_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  total_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
-export type HardwareMemoryDomain = S.Schema.Type<typeof HardwareMemoryDomain>
-export type HardwareMemoryDomainEncoded = S.Schema.Encoded<typeof HardwareMemoryDomain>
+export type HardwareGrant = S.Schema.Type<typeof HardwareGrant>
+export type HardwareGrantEncoded = S.Schema.Encoded<typeof HardwareGrant>
 
-export const HardwareMemoryDomainKind = S.Union(
-  S.Literal("system"),
-  S.Literal("physical_device"),
-  S.Literal("unified_memory"),
+export const HardwareHostRam = S.Struct({
+  available_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  current_free_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  store: S.suspend((): S.Schema<HardwareStore, HardwareStoreEncoded> => HardwareStore),
+})
+export type HardwareHostRam = S.Schema.Type<typeof HardwareHostRam>
+export type HardwareHostRamEncoded = S.Schema.Encoded<typeof HardwareHostRam>
+
+export const HardwareObservedStore = S.Struct({
+  current_free_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  store: S.suspend((): S.Schema<HardwareStore, HardwareStoreEncoded> => HardwareStore),
+})
+export type HardwareObservedStore = S.Schema.Type<typeof HardwareObservedStore>
+export type HardwareObservedStoreEncoded = S.Schema.Encoded<typeof HardwareObservedStore>
+
+export const HardwarePhysicalDevice = S.Struct({
+  executors: S.Array(S.suspend((): S.Schema<HardwareExecutor, HardwareExecutorEncoded> => HardwareExecutor)),
+  id: S.suspend((): S.Schema<HardwarePhysicalDeviceId, HardwarePhysicalDeviceIdEncoded> => HardwarePhysicalDeviceId),
+  kind: S.suspend((): S.Schema<HardwareDeviceKind, HardwareDeviceKindEncoded> => HardwareDeviceKind),
+})
+export type HardwarePhysicalDevice = S.Schema.Type<typeof HardwarePhysicalDevice>
+export type HardwarePhysicalDeviceEncoded = S.Schema.Encoded<typeof HardwarePhysicalDevice>
+
+export const HardwarePhysicalDeviceId = S.String
+export type HardwarePhysicalDeviceId = S.Schema.Type<typeof HardwarePhysicalDeviceId>
+export type HardwarePhysicalDeviceIdEncoded = S.Schema.Encoded<typeof HardwarePhysicalDeviceId>
+
+export const HardwareReportedBy = S.Union(
+  S.Literal("linux_mem_total"),
+  S.Literal("mac_os_memsize"),
+  S.Literal("windows_total_phys"),
+  S.Literal("linux_mem_available"),
+  S.Literal("mach_movable_pages"),
+  S.Literal("windows_physical_and_commit"),
+  S.Literal("cpu_address_space"),
+  S.Literal("metal_max_buffer_length"),
+  S.Literal("metal_recommended_working_set"),
+  S.Literal("metal_working_set_unallocated"),
+  S.Literal("cuda_total_memory"),
+  S.Literal("cuda_usable_memory"),
+  S.Literal("cuda_free"),
+  S.Literal("vulkan_heap"),
+  S.Literal("vulkan_heap_budget"),
+  S.Literal("vulkan_heaps"),
+  S.Literal("vulkan_heaps_beyond_dedicated"),
+  S.Literal("vulkan_max_allocation"),
+  S.Literal("cuda_total_beyond_dedicated"),
+  S.Literal("metal_working_set_beyond_dedicated"),
+  S.Literal("dxgi_dedicated_memory"),
+  S.Literal("cuda_memory_clock_bus_width"),
+  S.Literal("filesystem_size"),
+  S.Literal("filesystem_available"),
 )
-export type HardwareMemoryDomainKind = S.Schema.Type<typeof HardwareMemoryDomainKind>
-export type HardwareMemoryDomainKindEncoded = S.Schema.Encoded<typeof HardwareMemoryDomainKind>
+export type HardwareReportedBy = S.Schema.Type<typeof HardwareReportedBy>
+export type HardwareReportedByEncoded = S.Schema.Encoded<typeof HardwareReportedBy>
 
 export const HardwareSnapshot = S.Struct({
+  access_paths: S.Array(S.suspend((): S.Schema<HardwareAccessPath, HardwareAccessPathEncoded> => HardwareAccessPath)),
   architecture: S.String,
   backend_diagnostics: S.optionalWith(
     S.Array(
@@ -1123,34 +1213,59 @@ export const HardwareSnapshot = S.Struct({
   ),
   captured_at: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   cpu_model: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
-  enabled_backends: S.Array(S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend)),
-  logical_cores: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  memory_domains: S.Array(
-    S.suspend((): S.Schema<HardwareMemoryDomain, HardwareMemoryDomainEncoded> => HardwareMemoryDomain),
+  device_memory: S.Array(
+    S.suspend((): S.Schema<HardwareDeviceMemory, HardwareDeviceMemoryEncoded> => HardwareDeviceMemory),
   ),
+  enabled_backends: S.Array(S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend)),
+  host_ram: S.suspend((): S.Schema<HardwareHostRam, HardwareHostRamEncoded> => HardwareHostRam),
+  logical_cores: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   native_build: S.String,
   physical_cores: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
     exact: true,
     as: "Option",
   }),
+  physical_devices: S.Array(
+    S.suspend((): S.Schema<HardwarePhysicalDevice, HardwarePhysicalDeviceEncoded> => HardwarePhysicalDevice),
+  ),
   platform: S.String,
-  system_memory: S.suspend((): S.Schema<HardwareSystemMemory, HardwareSystemMemoryEncoded> => HardwareSystemMemory),
+  selected_executor: S.optionalWith(
+    S.Union(
+      S.Null,
+      S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
+    ),
+    { exact: true, as: "Option" },
+  ),
   system_product_name: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   topology_fingerprint: S.String,
+  transfer_paths: S.Array(
+    S.suspend((): S.Schema<HardwareTransferPath, HardwareTransferPathEncoded> => HardwareTransferPath),
+  ),
+  volumes: S.Array(
+    S.suspend((): S.Schema<HardwareObservedStore, HardwareObservedStoreEncoded> => HardwareObservedStore),
+  ),
 })
 export type HardwareSnapshot = S.Schema.Type<typeof HardwareSnapshot>
 export type HardwareSnapshotEncoded = S.Schema.Encoded<typeof HardwareSnapshot>
 
-export const HardwareSystemMemory = S.Struct({
-  abort_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+export const HardwareStore = S.Struct({
   allocation_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  allocation_headroom_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  assess_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  physical_available_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  physical_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  capacity_basis: S.suspend((): S.Schema<HardwareReportedBy, HardwareReportedByEncoded> => HardwareReportedBy),
+  emergency_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  id: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
+  planning_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  stable_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  total_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
-export type HardwareSystemMemory = S.Schema.Type<typeof HardwareSystemMemory>
-export type HardwareSystemMemoryEncoded = S.Schema.Encoded<typeof HardwareSystemMemory>
+export type HardwareStore = S.Schema.Type<typeof HardwareStore>
+export type HardwareStoreEncoded = S.Schema.Encoded<typeof HardwareStore>
+
+export const HardwareTransferPath = S.Struct({
+  executor: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
+  from: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
+  to: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
+})
+export type HardwareTransferPath = S.Schema.Type<typeof HardwareTransferPath>
+export type HardwareTransferPathEncoded = S.Schema.Encoded<typeof HardwareTransferPath>
 
 export const HealthResponse = S.Struct({
   apiVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),

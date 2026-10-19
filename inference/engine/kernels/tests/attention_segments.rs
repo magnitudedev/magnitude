@@ -10,9 +10,12 @@
 // runs hold the GPU lock on a measurement host).
 
 use magnitude_kernels::attention_decode;
-use seismic::{BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
+use seismic::{BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
 
 include!("attention_common/fixtures.rs");
+
+mod timing_common;
+use timing_common::Timed;
 
 fn history_slabs(device: &Device, rows: usize, kv: usize, width: usize, values: &[f32]) -> (SlabTensor, Tensor) {
     let mut slabs = SlabTensor::new(device, rows as u64, rows as u64,
@@ -100,7 +103,7 @@ fn decode_time_by_segment_count_on(device: &Device) {
                 let (_key_slabs, mut history_key) = history_slabs(device, t, kv, w, &case.history_key);
                 let (_value_slabs, mut history_value) = history_slabs(device, t, kv, w, &case.history_value);
                 let measurement = kernel
-                    .measure(
+                    .time(
                         vec![attention_decode::Args {
                             query: &query,
                             gate: &gate,

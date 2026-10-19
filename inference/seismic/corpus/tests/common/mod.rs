@@ -14,7 +14,7 @@ use seismic::dynamic::{
     TensorAccess, Value,
 };
 use seismic::{
-    BackendName, BigUint, Device, DeviceCatalog, Element, FeedbackOptions, PrecisionPolicy,
+    BackendName, BigUint, Device, Devices, Element, FeedbackOptions, PrecisionPolicy,
     PreparationOptions,
 };
 use seismic_corpus::inputs::{generate, literal_bits, GeneratedArgument};
@@ -47,7 +47,7 @@ pub fn corpus_path(relative: &str) -> PathBuf {
 
 /// The backend's device; a missing device is a test failure, never a skip.
 pub fn device(backend: BackendName) -> Device {
-    DeviceCatalog::discover()
+    Devices::discover(&[])
         .expect("device discovery")
         .open_backend(backend)
         .unwrap_or_else(|e| panic!("{} device required: {e}", backend.as_str()))

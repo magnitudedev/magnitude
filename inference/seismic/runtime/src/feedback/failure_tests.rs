@@ -3,6 +3,7 @@ use super::*;
 use seismic_compiler::feedback::{FeedbackOptions, ObservationCase, ObservationProtocol};
 use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 use seismic_lang::entry::{ElementBindings, LogicalEntry};
+use seismic_topology::StorageKind;
 
 fn validate_failure<T: TargetFamily, E: NativeExecutor<T>>(
     prepared: &Prepared<T, E>,
@@ -100,8 +101,8 @@ fn validate_failure<T: TargetFamily, E: NativeExecutor<T>>(
     );
 }
 fn native_failure(backend: registry::BackendName) {
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(backend).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(backend).unwrap();
     let module=check_source(SourceSet::new(vec![SourceFile {path:"failed-native-outcome.seismic".into(),text:
         "fn probe(dst: &mut tensor[2] i32, divisor: i32):\n    dst[0] = 7\n    let unused = 42 / divisor\n    dst[1] = 9\n\nfn before_alloc(dst: &mut tensor[2] i32, divisor: i32):\n    parallel for i in 0..1:\n        dst[i] = 7\n        let stopped = 42 / divisor\n        let mut local = tensor[1] i32\n        local[0] = 29\n        dst[i+1] = local[0]\n\nfn before_store(dst: &mut tensor[2] i32, divisor: i32):\n    dst[0] = 7\n    let failed_rhs = dst / divisor\n    dst[:] = failed_rhs\n\nfn returned(dst: &mut tensor[2] i32, divisor: i32) -> tensor[2] i32:\n    dst[0] = 7\n    return dst + dst\n".into()}])).unwrap();
     for (name, failed) in [
@@ -150,8 +151,8 @@ fn metal_observer_retains_failed_source_prefix() {
 }
 
 fn reached_private_allocation_preserves_prefix(source: &str) {
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "reached-private.seismic".into(),
         text: source.into(),
@@ -180,8 +181,8 @@ fn reached_private_allocation_preserves_prefix(source: &str) {
         )
         .unwrap(),
     );
-    let baseline = device.memory_usage().charged;
-    device.set_memory_limit(Some(baseline + 4096));
+    let baseline = device.storage_usage(StorageKind::Device).charged;
+    device.set_storage_limit(StorageKind::Device, Some(baseline + 4096));
     let mut args = EncodedArgs::new();
     args.push_tensor(output.clone());
     args.push_scalar(crate::api::kernel::EncodedScalar::I32(0));
@@ -197,7 +198,7 @@ fn reached_private_allocation_preserves_prefix(source: &str) {
     );
     assert_eq!(output.read_to_host().unwrap(), 7i32.to_le_bytes());
     assert_eq!(
-        device.memory_usage().charged,
+        device.storage_usage(StorageKind::Device).charged,
         baseline,
         "failed run released its private backing"
     );
@@ -220,8 +221,8 @@ fn cpu_reached_private_allocation_skips_backing_after_source_failure() {
 // These exercise the required schedule placement. Native-segment local
 // reservation envelopes are a different physical placement's contract.
 fn reached_geometry_outcome(source: &str, with_inputs: bool, expected: &[i32]) {
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "reached-geometry.seismic".into(),
         text: source.into(),
@@ -260,8 +261,8 @@ fn reached_geometry_outcome(source: &str, with_inputs: bool, expected: &[i32]) {
     let output = tensor(&[4], &[0; 4]);
     let input = tensor(&[8, 2], &[0; 16]);
     let visible = tensor(&[4, 2], &[0, 0, 1, 4, 0, 8, 4, 5]);
-    let baseline = device.memory_usage().charged;
-    device.set_memory_limit(Some(baseline + 4096));
+    let baseline = device.storage_usage(StorageKind::Device).charged;
+    device.set_storage_limit(StorageKind::Device, Some(baseline + 4096));
     let mut args = EncodedArgs::new();
     if with_inputs {
         args.push_tensor(input.clone());
@@ -276,7 +277,7 @@ fn reached_geometry_outcome(source: &str, with_inputs: bool, expected: &[i32]) {
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
     assert_eq!(
-        device.memory_usage().charged,
+        device.storage_usage(StorageKind::Device).charged,
         baseline,
         "completed region releases private instances"
     );

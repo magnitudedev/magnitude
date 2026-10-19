@@ -3,13 +3,15 @@
 //! memory, conditional (`when`) launches and scratch, graphs with
 //! host-written inputs, asynchronous submission, measurement and tuning.
 
+use seismic::measure::{measure, Measure};
 use seismic::{
-    Availability, BackendName, CallError, Device, DeviceCatalog, Element, Exclusion,
-    InvocationError, MeasureOptions, NativeGraphFamily, NativeSpecialization, NumericalRequirement,
-    Outcome, SearchPlan, SearchSettings, Stage, Strategy, SurveyPlan, Tensor, TraceDetail,
-    TuneError, TuningInitializer, TuningMethod, TuningPoint, UnitPlan,
+    Availability, BackendName, CallError, Device, Devices, Element, Exclusion, InvocationError,
+    NativeGraphFamily, NativeSpecialization, NumericalRequirement, Outcome, SearchPlan,
+    SearchSettings, Stage, StorageKind, Strategy, SurveyPlan, Tensor, TraceDetail, TuneError,
+    TuningInitializer, TuningMethod, TuningPoint, UnitPlan,
 };
 use seismic_native_tests::{accumulate, gated_sum, scale_rows, scoped_scale, split_sum};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 /// The range every non-empty scratch arena reserves at its start for `sync`
@@ -46,11 +48,12 @@ fn search_hinted(hints: &[(&str, u64)]) -> Strategy {
     Strategy::Search(plan)
 }
 
-/// Every backend the catalog reports available on this host; each must open.
+/// Every backend whose executor the topology reports available on this
+/// host; each must open.
 fn devices() -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().expect("device discovery");
-    let topology = catalog.topology();
-    let devices = [
+    let devices = Devices::discover(&[]).expect("device discovery");
+    let topology = devices.topology();
+    let opened = [
         BackendName::Cpu,
         BackendName::Metal,
         BackendName::Cuda,
@@ -58,21 +61,21 @@ fn devices() -> Vec<Device> {
     ]
     .into_iter()
     .filter(|backend| {
-        topology.devices().iter().any(|device| {
-            device.backend == *backend && matches!(device.availability, Availability::Available)
+        topology.executors().iter().any(|device| {
+            device.backend() == *backend && matches!(device.availability(), Availability::Available)
         })
     })
     .map(|backend| {
-        catalog
+        devices
             .open_backend(backend)
             .unwrap_or_else(|error| panic!("available {backend:?} device must open: {error}"))
     })
     .collect::<Vec<_>>();
     eprintln!(
         "native route backends: {:?}",
-        devices.iter().map(Device::backend).collect::<Vec<_>>()
+        opened.iter().map(Device::backend).collect::<Vec<_>>()
     );
-    devices
+    opened
 }
 
 fn f32_tensor(device: &Device, extents: &[u64], values: &[f32]) -> Tensor {
@@ -118,8 +121,8 @@ fn statics(n: u64) -> NativeSpecialization {
 
 #[test]
 fn metal_launch_scopes_form_and_execute_independently() {
-    let catalog = DeviceCatalog::discover().expect("device discovery");
-    let Ok(device) = catalog.open_backend(BackendName::Metal) else {
+    let devices = Devices::discover(&[]).expect("device discovery");
+    let Ok(device) = devices.open_backend(BackendName::Metal) else {
         return;
     };
     let implementation = scoped_scale::native_implementation(&device)
@@ -154,8 +157,8 @@ fn metal_launch_scopes_form_and_execute_independently() {
 /// program is formed a second time.
 #[test]
 fn serving_the_tuned_choice_forms_nothing_again() {
-    let catalog = DeviceCatalog::discover().expect("device discovery");
-    let Ok(device) = catalog.open_backend(BackendName::Metal) else {
+    let devices = Devices::discover(&[]).expect("device discovery");
+    let Ok(device) = devices.open_backend(BackendName::Metal) else {
         return;
     };
     let small = f32_tensor(&device, &[7], &exact_values(7));
@@ -186,8 +189,8 @@ fn serving_the_tuned_choice_forms_nothing_again() {
 
 #[test]
 fn metal_scoped_tuning_searches_launches_separately() {
-    let catalog = DeviceCatalog::discover().expect("device discovery");
-    let Ok(device) = catalog.open_backend(BackendName::Metal) else {
+    let devices = Devices::discover(&[]).expect("device discovery");
+    let Ok(device) = devices.open_backend(BackendName::Metal) else {
         return;
     };
     let small = f32_tensor(&device, &[7], &exact_values(7));
@@ -255,8 +258,8 @@ fn metal_scoped_tuning_searches_launches_separately() {
 /// another thread, and the unit's work then compiles nothing itself.
 #[test]
 fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothing() {
-    let catalog = DeviceCatalog::discover().expect("device discovery");
-    let Ok(device) = catalog.open_backend(BackendName::Metal) else {
+    let devices = Devices::discover(&[]).expect("device discovery");
+    let Ok(device) = devices.open_backend(BackendName::Metal) else {
         return;
     };
     let small = f32_tensor(&device, &[7], &exact_values(7));
@@ -302,7 +305,7 @@ fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothin
     let mut discovered = None;
     while let Some(work) = unit.next() {
         if work.stage == Stage::Measure && discovered.is_none() {
-            discovered = Some(device.memory_usage().charged);
+            discovered = Some(device.storage_usage(StorageKind::Device).charged);
         }
         let ended = if let Some(forming) = unit.forming() {
             assert_eq!(work.stage, Stage::Measure);
@@ -327,7 +330,7 @@ fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothin
         };
         // What a piece holds is the device's charges and the process's
         // host bytes: no less than the charges.
-        let charged = device.memory_usage().charged;
+        let charged = device.storage_usage(StorageKind::Device).charged;
         assert!(ended >= charged);
         if work.stage == Stage::Measure {
             held.push((unit.standing().measured, charged));
@@ -358,7 +361,10 @@ fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothin
     assert!(unit.holds_inputs());
     unit.release(&mut source);
     assert!(!unit.holds_inputs());
-    assert!(device.memory_usage().charged < discovered, "{held:?}");
+    assert!(
+        device.storage_usage(StorageKind::Device).charged < discovered,
+        "{held:?}"
+    );
     let result = unit.terminal().unwrap();
     let TuningMethod::Search {
         groups: 2,
@@ -377,8 +383,8 @@ fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothin
 
 #[test]
 fn metal_scoped_tuning_without_budget_serves_its_formed_defaults() {
-    let catalog = DeviceCatalog::discover().expect("device discovery");
-    let Ok(device) = catalog.open_backend(BackendName::Metal) else {
+    let devices = Devices::discover(&[]).expect("device discovery");
+    let Ok(device) = devices.open_backend(BackendName::Metal) else {
         return;
     };
     let small = f32_tensor(&device, &[7], &exact_values(7));
@@ -590,18 +596,20 @@ fn measurement_reports_device_time() {
         let rotation = (0..3)
             .map(|_| f32_tensor(&device, &[4096], &exact_values(4096)))
             .collect::<Vec<_>>();
-        let measurement = kernel
-            .measure(
-                rotation.iter().map(|x| split_sum::Args { x }).collect(),
-                &MeasureOptions {
-                    samples: 3,
-                    min_sample_seconds: 0.0005,
-                },
-            )
+        let point = kernel
+            .point(rotation.iter().map(|x| split_sum::Args { x }).collect())
             .unwrap();
+        assert!(point.rotation_bytes() >= 3 * 4096 * 4);
+        let measurement = measure(
+            point,
+            &Measure {
+                samples: NonZeroUsize::new(3).unwrap(),
+                min_sample_seconds: 0.0005,
+            },
+        )
+        .unwrap();
         assert_eq!(measurement.samples.len(), 3);
         assert!(measurement.median > 0.0, "{:?}", device.backend());
-        assert!(measurement.rotation_bytes >= 3 * 4096 * 4);
     }
 }
 
@@ -755,7 +763,7 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
 
 #[test]
 fn a_search_freezes_all_positive_demand_representatives_before_candidates() {
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -830,7 +838,7 @@ fn already_expired_work_keeps_an_unmeasured_default_without_running_witnesses() 
     use std::cell::Cell;
     use std::rc::Rc;
     use std::time::Instant;
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -879,7 +887,7 @@ fn expiry_during_reset_preserves_the_choice_without_rejecting_the_candidate() {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::time::Instant;
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -969,7 +977,7 @@ fn expiry_during_reset_preserves_the_choice_without_rejecting_the_candidate() {
 fn a_numerical_observation_is_made_once_per_point_and_key() {
     use std::cell::Cell;
     use std::rc::Rc;
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -1054,7 +1062,7 @@ fn a_numerical_observation_is_made_once_per_point_and_key() {
 fn the_census_retains_the_default_at_its_performance_invocations() {
     use std::cell::Cell;
     use std::rc::Rc;
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -1114,7 +1122,7 @@ fn the_census_retains_the_default_at_its_performance_invocations() {
 
 #[test]
 fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -1289,7 +1297,7 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
 
 #[test]
 fn a_spent_budget_still_forms_and_serves_the_canonical_defaults() {
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -1341,7 +1349,7 @@ fn a_spent_budget_still_forms_and_serves_the_canonical_defaults() {
 
 #[test]
 fn a_search_choice_passes_validation_at_every_point_or_gives_way_to_the_defaults() {
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -2497,12 +2505,12 @@ fn a_reserved_tensor_recommits_away_from_a_held_view() {
         held.clone().write_from_host(&encoded).unwrap();
         let prior = old.observe_storage();
         let old_charge = prior.charged_bytes().unwrap();
-        let baseline = device.memory_usage().charged;
-        device.set_memory_limit(Some(baseline));
+        let baseline = device.storage_usage(StorageKind::Device).charged;
+        device.set_storage_limit(StorageKind::Device, Some(baseline));
         assert!(old.recommitted(16).is_err());
-        assert_eq!(device.memory_usage().charged, baseline);
+        assert_eq!(device.storage_usage(StorageKind::Device).charged, baseline);
         assert_eq!(prior.charged_bytes(), Some(old_charge));
-        device.set_memory_limit(None);
+        device.set_storage_limit(StorageKind::Device, None);
         let new = old.recommitted(16).unwrap();
         assert!(!new.shares_allocation(&old));
         if device.backend() == BackendName::Cuda {
@@ -2510,7 +2518,7 @@ fn a_reserved_tensor_recommits_away_from_a_held_view() {
         }
         assert_eq!(prior.charged_bytes(), Some(old_charge));
         assert_eq!(
-            device.memory_usage().charged,
+            device.storage_usage(StorageKind::Device).charged,
             baseline + new.storage_bytes()
         );
         drop(old);
@@ -2519,7 +2527,7 @@ fn a_reserved_tensor_recommits_away_from_a_held_view() {
         drop(held);
         assert_eq!(prior.charged_bytes(), None);
         assert_eq!(
-            device.memory_usage().charged,
+            device.storage_usage(StorageKind::Device).charged,
             baseline + new.storage_bytes() - old_charge
         );
     }
@@ -2529,16 +2537,16 @@ fn a_reserved_tensor_recommits_away_from_a_held_view() {
 fn an_exclusive_reserved_tensor_shrinks_under_its_existing_charge() {
     for device in devices() {
         let old = Tensor::reserved(&device, Element::f32(), &[128, 256], 64).unwrap();
-        let before = device.memory_usage().charged;
+        let before = device.storage_usage(StorageKind::Device).charged;
         let old_charge = old.storage_bytes();
-        device.set_memory_limit(Some(before));
+        device.set_storage_limit(StorageKind::Device, Some(before));
         let result = old.recommitted(16);
-        device.set_memory_limit(None);
+        device.set_storage_limit(StorageKind::Device, None);
         if device.backend() == BackendName::Cuda {
             let new = result.unwrap();
             assert_eq!(new.committed_rows(), 16);
             assert_eq!(
-                device.memory_usage().charged,
+                device.storage_usage(StorageKind::Device).charged,
                 before - old_charge + new.storage_bytes()
             );
         } else {
@@ -2562,14 +2570,14 @@ fn a_failed_second_recommit_preserves_the_first_plane() {
             .unwrap()
             .write_from_host(&encoded)
             .unwrap();
-        let baseline = device.memory_usage().charged;
+        let baseline = device.storage_usage(StorageKind::Device).charged;
         let first_grown = first.recommitted(96).unwrap();
-        let with_first_growth = device.memory_usage().charged;
-        device.set_memory_limit(Some(with_first_growth));
+        let with_first_growth = device.storage_usage(StorageKind::Device).charged;
+        device.set_storage_limit(StorageKind::Device, Some(with_first_growth));
         assert!(second.recommitted(96).is_err());
-        device.set_memory_limit(None);
+        device.set_storage_limit(StorageKind::Device, None);
         drop(first_grown);
-        assert_eq!(device.memory_usage().charged, baseline);
+        assert_eq!(device.storage_usage(StorageKind::Device).charged, baseline);
         assert_eq!(read_f32(&first.slice_leading(0, 1).unwrap()), original);
     }
 }
@@ -2823,7 +2831,7 @@ fn a_disagreeing_candidate_ahead_in_its_rounds_is_witnessed_and_excluded() {
 #[test]
 fn a_search_of_launch_groups_keeps_the_defaults_when_every_candidate_disagrees() {
     use seismic_native_tests::scoped_wrong_default;
-    let Ok(device) = DeviceCatalog::discover()
+    let Ok(device) = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Metal)
     else {
@@ -3185,9 +3193,10 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
                 })
                 .collect()
         }
-        fn build(&mut self, point: usize) -> Result<PointInputs<'static>, String> {
-            let state = Tensor::zeros(self.device, Element::f32(), &[self.held[point] / 4])
-                .map_err(|error| error.to_string())?;
+        fn build(&mut self, point: usize) -> Result<PointInputs<'static>, seismic::BuildError> {
+            // The device's refusal converts to a typed refusal, which is what
+            // classifies the build as one that did not fit.
+            let state = Tensor::zeros(self.device, Element::f32(), &[self.held[point] / 4])?;
             let x = f32_tensor(self.device, &[self.n], &exact_values(self.n as usize));
             self.kept[point] = Some(state);
             Ok(seismic::point_inputs::<split_sum::Entry>(
@@ -3199,7 +3208,7 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
         }
     }
 
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -3225,8 +3234,8 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
     assert_eq!(unit.next().unwrap().stage, Stage::Discovery);
     unit.perform(&mut source, None).unwrap();
     // The second point's state is refused by the device's limit.
-    let charged = device.memory_usage().charged;
-    device.set_memory_limit(Some(charged + large / 2));
+    let charged = device.storage_usage(StorageKind::Device).charged;
+    device.set_storage_limit(StorageKind::Device, Some(charged + large / 2));
     let work = unit.next().unwrap();
     assert_eq!(work.stage, Stage::Discovery);
     assert_eq!(work.footprint.unpriced, 1, "an unbuilt point has no price");
@@ -3248,7 +3257,7 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
         work.footprint.priced
     );
     // With room for it, the same point is discovered.
-    device.set_memory_limit(None);
+    device.set_storage_limit(StorageKind::Device, None);
     unit.perform(&mut source, None).unwrap();
     assert_ne!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
 }
@@ -3285,12 +3294,14 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
                 })
                 .collect()
         }
-        fn build(&mut self, point: usize) -> Result<PointInputs<'static>, String> {
+        fn build(&mut self, point: usize) -> Result<PointInputs<'static>, seismic::BuildError> {
             let x = f32_tensor(self.device, &[self.n], &exact_values(self.n as usize));
             self.kept[point] = Some(x.clone());
             if self.clamp == Some(point) {
-                self.device
-                    .set_memory_limit(Some(self.device.memory_usage().charged));
+                self.device.set_storage_limit(
+                    StorageKind::Device,
+                    Some(self.device.storage_usage(StorageKind::Device).charged),
+                );
             }
             Ok(seismic::point_inputs::<split_sum::Entry>(
                 vec![split_sum::Args { x: &x }],
@@ -3301,7 +3312,7 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
         }
     }
 
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -3342,7 +3353,7 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
     assert!(work.footprint.priced > 0);
     // With room for it, the same point is discovered.
     source.clamp = None;
-    device.set_memory_limit(None);
+    device.set_storage_limit(StorageKind::Device, None);
     unit.perform(&mut source, None).unwrap();
     assert_ne!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
 }

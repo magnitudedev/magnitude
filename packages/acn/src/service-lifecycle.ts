@@ -7,7 +7,6 @@ import {
   type AcnStartupProgress,
   type AcnStopping,
   type AcnStoppingReason,
-  type StartupBackend,
 } from "@magnitudedev/acn-protocol"
 import type { HardwareSnapshot } from "@magnitudedev/icn-protocol/schemas"
 import { HttpServerRequest, HttpServerResponse } from "@effect/platform"
@@ -28,7 +27,6 @@ export interface AcnStopRequest {
 interface AcnRuntimeState {
   readonly lifecycle: AcnHealthState
   readonly rpc: Option.Option<AcnRpcApplication>
-  readonly backend: Option.Option<StartupBackend>
 }
 
 export interface AcnServiceLifecycleApi {
@@ -66,7 +64,6 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
         progress: Option.none(),
       }),
       rpc: Option.none(),
-      backend: Option.none(),
     })
     const transitionLock = yield* Effect.makeSemaphore(1)
     const stopping = yield* Deferred.make<AcnStopping>()
@@ -91,7 +88,6 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
       yield* replaceState({
         lifecycle: next,
         rpc: Option.none(),
-        backend: current.backend,
       })
       yield* Deferred.succeed(stopping, next)
       return true
@@ -122,7 +118,6 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
                 progress,
               }),
               rpc: current.rpc,
-              backend: typeof activity === "object" && activity._tag === "PreparingBackend" ? Option.some(activity.backend) : current.backend,
             })
           }),
         )
@@ -135,14 +130,21 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
           if (current.lifecycle._tag !== "Starting") {
             return yield* Effect.dieMessage("ACN became ready more than once")
           }
+          // A snapshot whose placements do not resolve breaks ICN's contract, as in the hardware projection.
+          const summary = yield* Option.match(hardware, {
+            onNone: () => Effect.succeed(Option.none()),
+            onSome: snapshot => summarizeInferenceHardware(snapshot).pipe(
+              Effect.map(Option.some),
+              Effect.orDie,
+            ),
+          })
           yield* replaceState({
             lifecycle: AcnServiceLifecycleFsm.transition(
               current.lifecycle,
               "Ready",
-              { hardware: Option.map(hardware, snapshot => summarizeInferenceHardware(current.backend, snapshot)) },
+              { hardware: summary },
             ),
             rpc: Option.some(rpc),
-            backend: current.backend,
           })
         }).pipe(Effect.uninterruptible),
       )

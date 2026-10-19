@@ -6,10 +6,13 @@ use magnitude_state::{
     GrowthChoice, Holder, RowDemand, ShrinkPolicy, StateHoldingCensus, StoreCopy,
 };
 
-/// A comparison with Seismic's live charge. `unattributed` remains explicit
-/// for any storage whose owner has not yet been classified.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A comparison with Seismic's logical allocation charge. `unattributed`
+/// remains explicit for storage without a classified owner. `stores` also
+/// includes physical backend holdings (block slack and native resources),
+/// classified as compute.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryChargeReconciliation {
+    pub stores: Vec<StoreAllocation>,
     pub charged: u64,
     pub target_state: StateHoldingCensus,
     pub head_state: Option<StateHoldingCensus>,
@@ -24,23 +27,163 @@ pub struct MemoryChargeReconciliation {
 }
 
 impl MemoryChargeReconciliation {
-    pub fn complete(self) -> bool {
+    pub fn complete(&self) -> bool {
         self.unattributed == 0
+    }
+}
+
+/// One store's charge by the class the census reports it in (integration
+/// spec §9.2).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoreAllocation {
+    pub store: seismic::StoreIdentity,
+    /// Target weights, bound graph constants, the pristine recurrent seed
+    /// and host-resident tables.
+    pub model_bytes: u64,
+    /// Per-conversation state and the features it owns, external views of
+    /// released state included.
+    pub context_bytes: u64,
+    /// Every charge no classified holder makes: prepared programs, graph
+    /// pools and the backend's own holdings (block slack, native resources).
+    pub compute_bytes: u64,
+    /// Optional components (MTP head, vision), resident or dormant.
+    pub auxiliary_bytes: u64,
+}
+
+/// The class of a holder the census visits. Compute has no holder: it is
+/// what a store is charged beyond every visited holder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HolderClass {
+    Model,
+    Context,
+    Auxiliary,
+}
+
+/// What visited holders hold in one store, by class.
+#[derive(Clone, Copy, Debug, Default)]
+struct HeldBytes {
+    model: u64,
+    context: u64,
+    auxiliary: u64,
+}
+
+impl HeldBytes {
+    fn of(&mut self, class: HolderClass) -> &mut u64 {
+        match class {
+            HolderClass::Model => &mut self.model,
+            HolderClass::Context => &mut self.context,
+            HolderClass::Auxiliary => &mut self.auxiliary,
+        }
+    }
+}
+
+/// The one classification of a device's charges: every holder's physical
+/// allocations, each counted once whatever holds it, by store and class.
+/// Holders are visited through callbacks that return nothing, so the
+/// census keeps the first failure and [`StoreCensus::finish`] reports it.
+#[derive(Default)]
+struct StoreCensus {
+    seen: std::collections::BTreeSet<u64>,
+    stores: std::collections::BTreeMap<seismic::StoreId, HeldBytes>,
+    failure: Option<String>,
+}
+
+impl StoreCensus {
+    fn fail(&mut self, failure: impl Into<String>) {
+        self.failure.get_or_insert_with(|| failure.into());
+    }
+
+    fn observe(&mut self, observer: &seismic::TensorStorageObserver, class: HolderClass) {
+        if !self.seen.insert(observer.identity()) {
+            return;
+        }
+        for (store, bytes) in observer.store_charges().into_iter().flatten() {
+            let held = self.stores.entry(store).or_default().of(class);
+            match held.checked_add(bytes) {
+                Some(total) => *held = total,
+                None => self.fail("store census overflows"),
+            }
+        }
+    }
+
+    fn tensor(&mut self, tensor: &Tensor, class: HolderClass) {
+        self.observe(&tensor.observe_storage(), class);
+    }
+
+    /// Move the permanent seed's bytes `charges`, part of its state store's
+    /// context storage, to the model class.
+    fn seed(&mut self, charges: Result<Vec<(seismic::StoreId, u64)>, String>) {
+        let charges = match charges {
+            Ok(charges) => charges,
+            Err(error) => return self.fail(error),
+        };
+        for (store, bytes) in charges {
+            let Some(held) = self.stores.get_mut(&store) else {
+                return self.fail("seed is absent from its state store");
+            };
+            match (
+                held.context.checked_sub(bytes),
+                held.model.checked_add(bytes),
+            ) {
+                (Some(context), Some(model)) => {
+                    held.context = context;
+                    held.model = model;
+                }
+                _ => return self.fail("seed exceeds its state store's charge"),
+            }
+        }
+    }
+
+    /// Each store `device` charges, its compute bytes what no visited holder
+    /// holds there.
+    fn finish(mut self, device: &seismic::Device) -> Result<Vec<StoreAllocation>, String> {
+        if let Some(failure) = self.failure {
+            return Err(failure);
+        }
+        let topology = device.topology();
+        let allocations = device
+            .store_charges()
+            .into_iter()
+            .map(|(store, charged)| {
+                let held = self.stores.remove(&store).unwrap_or_default();
+                let classified = held
+                    .model
+                    .checked_add(held.context)
+                    .and_then(|bytes| bytes.checked_add(held.auxiliary))
+                    .ok_or("store census overflows")?;
+                Ok(StoreAllocation {
+                    store: topology
+                        .store_identity(store)
+                        .expect("charged store belongs to the opened topology"),
+                    model_bytes: held.model,
+                    context_bytes: held.context,
+                    compute_bytes: charged
+                        .checked_sub(classified)
+                        .ok_or("classified bytes exceed the store's charge")?,
+                    auxiliary_bytes: held.auxiliary,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if !self.stores.is_empty() {
+            return Err("a holder's allocation is in a store the device does not charge".into());
+        }
+        Ok(allocations)
     }
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
     pub(super) fn allocate_boundary(&mut self) -> Result<FeatureRef, DomainError> {
         let head = self.definition.head.as_ref();
-        let width = head.map_or(self.definition.decoder.hidden, |head| head.conditioning_width(&self.definition.decoder));
-        let element = if head.is_some_and(|head| head.residual_conditioning()) { seismic::Element::f32() } else { seismic::Element::dense(crate::planning::activation_dtype(self.definition.decoder.activation_dtype)) };
+        let decoder = &self.definition.decoder;
+        let width = head.map_or(decoder.hidden, |head| head.conditioning_width(decoder));
+        let element = if head.is_some_and(|head| head.residual_conditioning()) {
+            seismic::Element::f32()
+        } else {
+            seismic::Element::dense(crate::planning::activation_dtype(decoder.activation_dtype))
+        };
         let bytes = self.head_conditioning_bytes() as u64;
         let claim = self.claim_device_growth(bytes, 0, HoldingClass::Live)?;
-        let tensor = Tensor::zeros(
-            self.domain.device(),
-            element,
-            &[1, width],
-        );
+        let tensor = Tensor::zeros(self.domain.device(), element, &[1, width]);
         self.release_claim(claim);
         let tensor = tensor.map_err(|error| DomainError::Input(error.to_string()))?;
         self.domain
@@ -73,7 +216,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         self.orphan_lookahead(bindings)
             .map_err(|error| error.to_string())?;
-        let before = self.domain.device().memory_usage().charged;
+        let before = self
+            .domain
+            .device()
+            .storage_usage(seismic::StorageKind::Device)
+            .charged;
         self.family.unbind_optional();
         if let Some(loader) = &self.head_loader {
             loader.unload();
@@ -82,7 +229,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             loader.unload();
         }
         self.sync_optional_holding()?;
-        let after = self.domain.device().memory_usage().charged;
+        let after = self
+            .domain
+            .device()
+            .storage_usage(seismic::StorageKind::Device)
+            .charged;
         before
             .checked_sub(after)
             .ok_or_else(|| "optional component release increased Seismic's charge".to_owned())
@@ -149,11 +300,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .and_then(|bytes| bytes.checked_add(bound_constants))
             .and_then(|bytes| bytes.checked_add(external_pins))
             .ok_or("classified charge sum overflows")?;
-        let charged = self.domain.device().memory_usage().charged;
+        let device = self.domain.device();
+        let charged = seismic::StorageKind::ALL
+            .into_iter()
+            .map(|kind| device.storage_usage(kind).charged)
+            .sum::<u64>();
         let unattributed = charged
             .checked_sub(classified)
             .ok_or("classified holdings exceed Seismic's charge")?;
+        let stores = self.store_census()?;
         Ok(MemoryChargeReconciliation {
+            stores,
             charged,
             target_state,
             head_state,
@@ -166,6 +323,32 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             external_pins,
             unattributed,
         })
+    }
+
+    /// Every store the device charges, by class: the one place a holder is
+    /// assigned its class.
+    fn store_census(&self) -> Result<Vec<StoreAllocation>, String> {
+        let mut census = StoreCensus::default();
+        self.family
+            .visit_model_storage(&mut |tensor| census.tensor(tensor, HolderClass::Model));
+        for store in std::iter::once(&self.target_store).chain(&self.head_store) {
+            store.visit_storage(&mut |observer| census.observe(observer, HolderClass::Context));
+            census.seed(
+                store
+                    .seed_store_charges()
+                    .map_err(|error| error.to_string()),
+            );
+        }
+        self.domain.visit_owned_feature_storage(&mut |observer| {
+            census.observe(observer, HolderClass::Context)
+        });
+        if let Some(loader) = &self.head_loader {
+            loader.visit_storage(&mut |tensor| census.tensor(tensor, HolderClass::Auxiliary));
+        }
+        if let Some(loader) = &self.vision_loader {
+            loader.visit_storage(&mut |tensor| census.tensor(tensor, HolderClass::Auxiliary));
+        }
+        census.finish(self.domain.device())
     }
 
     /// Account for each state arena from resident requests, retained resume
@@ -627,13 +810,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// counts that no request or launch holds, crediting only Seismic's
     /// measured decrease.
     fn release_idle_graph_slots(&mut self) -> Result<u64, DomainError> {
-        let before = self.domain.device().memory_usage().charged;
+        let before = self
+            .domain
+            .device()
+            .storage_usage(seismic::StorageKind::Device)
+            .charged;
         if self.resources.release_idle_slots() == 0 {
             return Ok(0);
         }
         self.sync_static_holding().map_err(DomainError::Input)?;
+        let after = self
+            .domain
+            .device()
+            .storage_usage(seismic::StorageKind::Device)
+            .charged;
         before
-            .checked_sub(self.domain.device().memory_usage().charged)
+            .checked_sub(after)
             .ok_or_else(|| DomainError::invariant("graph slot release increased Seismic's charge"))
     }
 

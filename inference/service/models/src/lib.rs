@@ -35,7 +35,7 @@ pub use catalog_installations::ManagedCatalogInstallations;
 pub use catalog_models::{CatalogRemovalPlan, ManagedCatalogModels};
 pub use discovered_models::ManagedDiscoveredModels;
 pub use download_service::ManagedModelDownloads;
-pub use inventory::{InventoryConfig, ManagedModelStore};
+pub use inventory::{DownloadSpace, InventoryConfig, ManagedModelStore};
 pub use model_domains::{ManagedModelServices, ModelDomainResolver, managed_model_services};
 pub use package_service::{
     ServableModelBundleKey, canonical_package_id, servable_model_bundle_key,

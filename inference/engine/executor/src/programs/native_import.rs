@@ -290,14 +290,14 @@ fn shaped(tensor: &Tensor, view: &[u64; 3], role: &str) -> Result<Tensor, Submit
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic::{BackendName, DeviceCatalog, Element};
+    use seismic::{BackendName, Element};
 
     #[test]
     fn staged_source_streams_the_exact_file_range() {
         use magnitude_artifacts::FileSource;
         use std::{fs, sync::Arc};
 
-        let catalog = DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Devices::discover(&[]).unwrap();
         let device = catalog.open_backend(BackendName::Cpu).unwrap();
         let values = (0..(1024 * 1024 + 16))
             .map(|index| (index as u8).wrapping_mul(17))
@@ -380,7 +380,7 @@ mod tests {
     /// off the 16-row tile.
     #[test]
     fn packed_import_writes_a_shaped_resident_tensor() {
-        let catalog = DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Devices::discover(&[]).unwrap();
         let Ok(device) = catalog.open_backend(BackendName::Metal) else {
             return;
         };
@@ -430,7 +430,7 @@ mod tests {
         use seismic::{HostRegion, ReadOnlyMappedRegion};
         use std::{fs, sync::Arc};
 
-        let catalog = DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Devices::discover(&[]).unwrap();
         let Ok(device) = catalog.open_backend(BackendName::Metal) else {
             return;
         };
@@ -495,7 +495,7 @@ mod tests {
         use seismic::{HostRegion, ReadOnlyMappedRegion};
         use std::{fs, sync::Arc};
 
-        let catalog = DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Devices::discover(&[]).unwrap();
         let Ok(device) = catalog.open_backend(BackendName::Metal) else {
             return;
         };

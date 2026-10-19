@@ -290,14 +290,22 @@ impl DirectGraphBuilder {
     /// Instantiate the graph. The driver memory instantiation takes, which
     /// no allocation charges, is measured as the change in the device's free
     /// memory across it and counted as memory the device holds until the
-    /// graph is dropped.
+    /// graph is dropped. The driver has taken it once the graph exists, so
+    /// it is recorded to the device account, never refused.
     pub fn instantiate(self) -> Result<DirectGraph, ExecutionError> {
         let before = self.device.memory_info()?.free_bytes;
         let exec = self.graph.instantiate().map_err(submission)?;
         let device_bytes = before.saturating_sub(self.device.memory_info()?.free_bytes);
+        let charge = self
+            .device
+            .context()
+            .device_account
+            .get()
+            .map(|account| account.record(device_bytes));
         let held = self.device.graph_bytes().clone();
         held.fetch_add(device_bytes, std::sync::atomic::Ordering::Relaxed);
         Ok(DirectGraph {
+            _charge: charge,
             exec,
             device_bytes,
             held,
@@ -312,6 +320,7 @@ pub struct DirectGraph {
     exec: driver::GraphExec,
     device_bytes: u64,
     held: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    _charge: Option<Box<dyn seismic_compiler::executable::MemoryHold>>,
 }
 
 impl DirectGraph {
@@ -337,7 +346,7 @@ pub struct HostWord {
 impl HostWord {
     /// A word at 0.
     pub fn new(device: &Device) -> Result<Self, ExecutionError> {
-        let mapped = driver::HostMapped::new(device.context(), 4).map_err(submission)?;
+        let mapped = driver::HostMapped::new(device.context(), 4)?;
         mapped.write_at(0, &0u32.to_le_bytes());
         Ok(Self { mapped })
     }

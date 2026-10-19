@@ -5,8 +5,8 @@ use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 use seismic_lang::entry::ElementBindings;
 
 fn source_products_and_failures(backend: registry::BackendName) {
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(backend).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(backend).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "source-cohort.seismic".into(),
         text: r#"fn piece(choose: bool) -> tensor[1] i32:
@@ -174,8 +174,8 @@ fn metal_source_products_and_failure_prefixes() {
 
 fn source_scalar_failures(backend: registry::BackendName) {
     use crate::api::kernel::EncodedScalar;
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(backend).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(backend).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "source-scalar-failures.seismic".into(),
         text: r#"fn divide(x: i32, divisor: i32, out: &mut tensor[1] i32):

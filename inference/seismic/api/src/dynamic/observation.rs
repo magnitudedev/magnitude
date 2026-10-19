@@ -305,7 +305,7 @@ mod tests {
     use super::*;
     #[test]
     fn dynamic_check_compares_failed_source_state_without_mutating_callers() {
-        let catalog = DeviceCatalog::discover().unwrap();
+        let catalog = Devices::discover(&[]).unwrap();
         let device = catalog.open_backend(BackendName::Cpu).unwrap();
         let module=Module::source(
             "fn probe(dst: &mut tensor[2] i32, divisor: i32):\n    dst[0] = 7\n    let unused = 42 / divisor\n    dst[1] = 9\n",

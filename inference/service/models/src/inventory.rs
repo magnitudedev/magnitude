@@ -106,7 +106,6 @@ pub struct InventoryConfig {
     pub cache_root: PathBuf,
     pub hf_cache_dirs: Vec<PathBuf>,
     pub max_concurrent_downloads: usize,
-    pub disk_reserve_bytes: u64,
     pub catalog_models: Vec<RecommendableModel>,
 }
 
@@ -136,6 +135,16 @@ pub(crate) fn catalog_packages(
 }
 
 impl InventoryConfig {
+    /// Validate the configuration and establish the paths the store serves, which hardware
+    /// volume discovery reads ([`ManagedModelStore::served_paths`]).
+    async fn prepare_roots(&self) -> Result<(), InventoryError> {
+        validate_config(self)?;
+        ensure_store_layout(&self.root).await?;
+        tokio::fs::create_dir_all(&self.cache_root)
+            .await
+            .map_err(io_error)
+    }
+
     pub fn default_root() -> Result<PathBuf, InventoryError> {
         let home = std::env::var_os("HOME").ok_or_else(|| {
             InventoryError::InvalidRequest(
@@ -165,7 +174,6 @@ impl InventoryConfig {
             cache_root,
             hf_cache_dirs: Vec::new(),
             max_concurrent_downloads: 2,
-            disk_reserve_bytes: 2 * 1024 * 1024 * 1024,
             catalog_models: Vec::new(),
         })
     }
@@ -173,6 +181,7 @@ impl InventoryConfig {
 
 pub struct ManagedModelStore {
     pub(crate) config: InventoryConfig,
+    pub(crate) download_space: Arc<dyn DownloadSpace>,
     pub(crate) client: HFClient,
     pub(crate) hub_credential: Option<HubCredential>,
     pub(crate) http: reqwest::Client,
@@ -195,6 +204,34 @@ pub struct ManagedModelStore {
     installed_packages_observer: Arc<RwLock<Option<Weak<dyn InstalledPackagesObserver>>>>,
 }
 
+/// The space a download may take on the model store's volume, above the
+/// volume's reserve. The composition root supplies it from the engine's fit
+/// owner (`magnitude_executor::platform::volume_space`), which owns the
+/// reserve.
+pub trait DownloadSpace: Send + Sync {
+    /// The bytes a download may still write to the volume now.
+    fn available_bytes(&self) -> Result<u64, InventoryError>;
+}
+
+impl<F, E> DownloadSpace for F
+where
+    F: Fn() -> Result<u64, E> + Send + Sync,
+    E: std::fmt::Display,
+{
+    fn available_bytes(&self) -> Result<u64, InventoryError> {
+        self().map_err(|error| InventoryError::Internal(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+impl ManagedModelStore {
+    /// [`Self::open`] with download space without bound, for tests that
+    /// download nothing.
+    pub(crate) async fn open_unbounded(config: InventoryConfig) -> Result<Self, InventoryError> {
+        Self::open(config, Arc::new(|| Ok::<_, InventoryError>(u64::MAX))).await
+    }
+}
+
 pub(crate) trait InstalledPackagesObserver: Send + Sync {
     fn installed_packages_changed(&self, revision: u64);
 }
@@ -211,6 +248,7 @@ impl Clone for ManagedModelStore {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
+            download_space: Arc::clone(&self.download_space),
             client: self.client.clone(),
             hub_credential: self.hub_credential.clone(),
             http: self.http.clone(),
@@ -277,9 +315,13 @@ impl ManagedModelStore {
         &self.cache
     }
 
-    pub async fn open(config: InventoryConfig) -> Result<Self, InventoryError> {
-        validate_config(&config)?;
-        ensure_store_layout(&config.root).await?;
+    /// Open the store of `config`, whose downloads take the space
+    /// `download_space` reports.
+    pub async fn open(
+        config: InventoryConfig,
+        download_space: Arc<dyn DownloadSpace>,
+    ) -> Result<Self, InventoryError> {
+        config.prepare_roots().await?;
         // The engine runs with implicit Hub credentials disabled, so this client is anonymous; only
         // an explicit HF_TOKEN is presented, through the credentialed client.
         let client_builder = || HFClient::builder().cache_dir(config.root.join("hub"));
@@ -300,6 +342,7 @@ impl ManagedModelStore {
         let cache = ModelCache::new(&config.cache_root);
         let catalog_affiliations = CatalogAffiliations::load(&config.root);
         let manager = Self {
+            download_space,
             download_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
             config,
             client,
@@ -481,6 +524,12 @@ impl ManagedModelStore {
 
     pub fn root(&self) -> &Path {
         &self.config.root
+    }
+
+    /// The paths the store serves, which exist once it is open: the volumes of its own root,
+    /// which downloads write, and of the derived cache. Discovery serves them.
+    pub fn served_paths(&self) -> Vec<PathBuf> {
+        vec![self.config.root.clone(), self.config.cache_root.clone()]
     }
 
     /// Ensure the model currently selected by the process has an inventory
@@ -2204,7 +2253,7 @@ mod tests {
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
         config.catalog_models = vec![catalog_model(package.clone())];
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         let models = manager.list().await.unwrap();
         assert_eq!(
@@ -2241,7 +2290,7 @@ mod tests {
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
 
@@ -2264,7 +2313,7 @@ mod tests {
 
         let mut initial = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
         initial.hf_cache_dirs.push(hf_cache.clone());
-        let manager = ManagedModelStore::open(initial).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(initial).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         let package = manager.list_installed().await.unwrap().packages[0]
             .package
@@ -2274,7 +2323,7 @@ mod tests {
         let mut configured = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
         configured.hf_cache_dirs.push(hf_cache.clone());
         configured.catalog_models = vec![catalog_model(package.clone())];
-        let manager = ManagedModelStore::open(configured).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(configured).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
         assert_eq!(
@@ -2292,7 +2341,7 @@ mod tests {
         let mut updated = InventoryConfig::with_roots(store, cache).unwrap();
         updated.hf_cache_dirs.push(hf_cache);
         updated.catalog_models = vec![catalog_model(future_package)];
-        let manager = ManagedModelStore::open(updated).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(updated).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
         assert!(matches!(
@@ -2306,7 +2355,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let model_path = temporary.path().join("active.gguf");
         write_minimal_gguf(&model_path);
-        let manager = ManagedModelStore::open(
+        let manager = ManagedModelStore::open_unbounded(
             InventoryConfig::with_roots(
                 temporary.path().join("store"),
                 temporary.path().join("cache"),
@@ -2334,7 +2383,7 @@ mod tests {
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(manager.list_installed().await.unwrap().packages.len(), 1);
 
@@ -2351,7 +2400,7 @@ mod tests {
     #[tokio::test]
     async fn installed_package_query_never_waits_for_reconciliation() {
         let temporary = tempfile::tempdir().unwrap();
-        let manager = ManagedModelStore::open(
+        let manager = ManagedModelStore::open_unbounded(
             InventoryConfig::with_roots(
                 temporary.path().join("store"),
                 temporary.path().join("cache"),
@@ -2384,7 +2433,7 @@ mod tests {
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
 
         manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
@@ -2415,7 +2464,7 @@ mod tests {
     async fn managed_download_publication_only_requires_structural_inspection() {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
-        let manager = ManagedModelStore::open(
+        let manager = ManagedModelStore::open_unbounded(
             InventoryConfig::with_roots(store.clone(), temporary.path().join("cache")).unwrap(),
         )
         .await
@@ -2580,7 +2629,9 @@ mod tests {
 
         let mut config = InventoryConfig::with_roots(store.clone(), cache_root.clone()).unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open(config.clone()).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(config.clone())
+            .await
+            .unwrap();
         assert!(manager.models.read().unwrap().is_empty());
         manager.ensure_model_inventory().await.unwrap();
         let (first, second) = tokio::join!(manager.list(), manager.list());
@@ -2600,7 +2651,9 @@ mod tests {
         assert!(persisted.get("version").is_none());
 
         fs::remove_file(source.join("model.gguf")).unwrap();
-        let reopened = ManagedModelStore::open(config.clone()).await.unwrap();
+        let reopened = ManagedModelStore::open_unbounded(config.clone())
+            .await
+            .unwrap();
         let warm = reopened.list().await.unwrap();
         assert!(warm.is_empty());
         reopened.ensure_model_inventory().await.unwrap();
@@ -2636,7 +2689,7 @@ mod tests {
         )
         .unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
 
         // Leave the invalid tree in place beyond the first retry boundary. A one-shot startup
         // reconciliation would have exited permanently before the tree is repaired.
@@ -2679,7 +2732,9 @@ mod tests {
 
         let mut config = InventoryConfig::with_roots(store.clone(), cache_root.clone()).unwrap();
         config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open(config.clone()).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(config.clone())
+            .await
+            .unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(manager.list().await.unwrap().len(), 2);
 
@@ -2694,7 +2749,9 @@ mod tests {
         models.insert(malformed_id, serde_json::json!({ "invalid": true }));
         fs::write(&index_path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
 
-        let reopened = ManagedModelStore::open(config.clone()).await.unwrap();
+        let reopened = ManagedModelStore::open_unbounded(config.clone())
+            .await
+            .unwrap();
         reopened.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(reopened.list().await.unwrap().len(), 2);
 
@@ -2707,13 +2764,15 @@ mod tests {
             .path();
         fs::write(one_metadata, b"not json").unwrap();
         fs::write(&index_path, b"not json").unwrap();
-        let corrupted = ManagedModelStore::open(config.clone()).await.unwrap();
+        let corrupted = ManagedModelStore::open_unbounded(config.clone())
+            .await
+            .unwrap();
         corrupted.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(corrupted.list().await.unwrap().len(), 2);
 
         fs::remove_file(&index_path).unwrap();
         fs::create_dir(&index_path).unwrap();
-        let uncached = ManagedModelStore::open(config).await.unwrap();
+        let uncached = ManagedModelStore::open_unbounded(config).await.unwrap();
         uncached.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(uncached.list().await.unwrap().len(), 2);
     }

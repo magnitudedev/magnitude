@@ -15,7 +15,7 @@ use magnitude_engine::options::{
     ExecutionManifest, ModelPolicy, PackageOptions, ProjectorSelection, standard_service_limits,
 };
 use magnitude_executor::ExecutionPath;
-use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
+use magnitude_executor::platform::MemoryReserves;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
     InstalledModelPackages as _, ModelBundleInput, ModelPackageId, ModelPackageOperand,
@@ -27,7 +27,7 @@ use magnitude_service_models::{
 };
 
 use crate::assessment::assessor::engine_material;
-use crate::assessment::environment::serving_policy;
+use crate::assessment::environment::{SERVING_DEVICE, serving_policy};
 
 /// Resolved configurations kept for reuse. A resolution holds the model's tokenizer and
 /// templates, so only the few most recently used models are kept.
@@ -177,7 +177,7 @@ fn engine_configuration(
         context_tokens: None,
         service: standard_service_limits(),
         path: ExecutionPath::Native,
-        device: DeviceRequest::Automatic,
+        device: SERVING_DEVICE,
         kernel_cache: Some(kernel_directory),
         reserves,
     }

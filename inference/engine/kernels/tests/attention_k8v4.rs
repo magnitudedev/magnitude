@@ -10,12 +10,15 @@ use magnitude_kernels::{
     attention_prefill_k8v4,
 };
 use seismic::{
-    BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor,
+    BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
     Tensor,
 };
 use seismic_lang::registry::{f16_bits, f16_to_f32};
 
 include!("attention_common/fixtures.rs");
+
+mod timing_common;
+use timing_common::Timed;
 
 const KEY_BITS: u32 = 8;
 const VALUE_BITS: u32 = 4;
@@ -460,7 +463,7 @@ macro_rules! prefill_args {
 /// Vulkan) and the CPU. A selected backend must open so qualification cannot
 /// pass by silently running on another device.
 fn k8v4_devices() -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     if let Ok(selected) = std::env::var("SEISMIC_TEST_BACKEND") {
         let backend = match selected.as_str() {
             "metal" => BackendName::Metal,
@@ -3064,7 +3067,7 @@ fn decode_timing_on(device: &Device) {
                 bound = Bound::new(device, &encoded);
             }
             let affine = kernel
-                .measure(
+                .time(
                     vec![args!(attention_decode_k8v4, bound, encoded.case)],
                     &TIMING,
                 )
@@ -3100,7 +3103,7 @@ fn decode_timing_on(device: &Device) {
                 })
                 .map(|dense_kernel| {
                     dense_kernel
-                        .measure(
+                        .time(
                             vec![dense_args!(attention_decode, bound, dense, encoded.case)],
                             &TIMING,
                         )
@@ -3298,7 +3301,7 @@ fn prefill_timing_on(device: &Device) {
                 }
             }
             let affine = kernel
-                .measure(vec![prefill_args!(bound, encoded.case)], &TIMING)
+                .time(vec![prefill_args!(bound, encoded.case)], &TIMING)
                 .unwrap()
                 .median;
             if gemma12b {
@@ -3332,9 +3335,9 @@ fn prefill_timing_on(device: &Device) {
             )
             .unwrap();
             let dense_time = dense_kernel
-                .measure(
+                .time(
                     vec![dense_args!(attention_prefill, bound, dense, encoded.case,
-                        selection: &bound.selection, block_slots: &bound.block_slots)],
+                    selection: &bound.selection, block_slots: &bound.block_slots)],
                     &TIMING,
                 )
                 .unwrap()
@@ -3357,7 +3360,7 @@ fn prefill_timing_on(device: &Device) {
 /// reproduce or explain the historical Gemma output corruption.
 #[test]
 fn gemma_head_geometry_matches_synthetic_reference() {
-    let device = DeviceCatalog::discover()
+    let device = seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Metal)
         .unwrap();
@@ -3404,7 +3407,7 @@ fn gemma_head_geometry_matches_synthetic_reference() {
 #[test]
 #[ignore = "manual reference-preparation diagnostic: currently takes minutes in initialization-region construction"]
 fn gemma_g8_tuning_uses_portable_reference() {
-    let device = DeviceCatalog::discover()
+    let device = seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Metal)
         .unwrap();
@@ -3477,7 +3480,7 @@ fn gemma_g8_tuning_uses_portable_reference() {
 #[test]
 #[ignore = "manual diagnostic: the historical Metal configuration is numerically defective without shader instrumentation"]
 fn gemma_form_decode_configurations_agree() {
-    let device = DeviceCatalog::discover()
+    let device = seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Metal)
         .unwrap();
@@ -3596,7 +3599,7 @@ fn gemma_tuner_rejects_corrupted_fresh_only_attention() {
 }
 
 fn gemma_fresh_only_with_scale(scale: f64) {
-    let device = DeviceCatalog::discover()
+    let device = seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Metal)
         .unwrap();

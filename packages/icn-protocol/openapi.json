@@ -3897,60 +3897,52 @@
         ],
         "description": "Lazy grammar triggers. The engine's grammars are never lazy, so responses\ncarry none; the shape remains part of the published contract."
       },
-      "HardwareBackendDiagnostic": {
+      "HardwareAccessPath": {
         "type": "object",
-        "required": [
-          "backend",
-          "message"
-        ],
-        "properties": {
-          "backend": {
-            "$ref": "#/components/schemas/ExecutionBackend"
-          },
-          "message": {
-            "type": "string"
-          }
-        },
-        "additionalProperties": false
-      },
-      "HardwareDevice": {
-        "type": "object",
+        "description": "An executor reading and writing a store directly, under its grant.",
         "required": [
           "id",
-          "backend",
-          "name",
-          "description",
-          "kind"
+          "executor",
+          "store"
         ],
         "properties": {
           "id": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Index in this snapshot's access paths; placements reference this index.",
+            "minimum": 0
+          },
+          "executor": {
             "$ref": "#/components/schemas/HardwareDeviceId"
           },
-          "backend": {
-            "$ref": "#/components/schemas/ExecutionBackend"
+          "store": {
+            "$ref": "#/components/schemas/MemoryDomainId"
           },
-          "name": {
-            "type": "string"
-          },
-          "description": {
-            "type": "string"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/HardwareDeviceKind"
-          },
-          "memory_limit": {
+          "grant": {
             "oneOf": [
               {
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/HardwareDeviceMemoryLimit"
+                "$ref": "#/components/schemas/HardwareGrant"
               }
             ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwareBackendDiagnostic": {
+        "type": "object",
+        "required": [
+          "source",
+          "message"
+        ],
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/HardwareDiagnosticSource"
           },
-          "unavailable_reason": {
-            "type": "string",
-            "description": "Why discovery found this device but it is not an execution candidate, for example a driver\nbelow its backend's floor. Absent means the device is usable."
+          "message": {
+            "type": "string"
           }
         },
         "additionalProperties": false
@@ -3969,26 +3961,19 @@
           "unknown"
         ]
       },
-      "HardwareDeviceMemoryLimit": {
+      "HardwareDeviceMemory": {
         "type": "object",
+        "description": "Memory the OS does not manage, owned by one physical device. Its headroom\nis what opened executors leave, which only a resident worker reads.",
         "required": [
-          "kind",
-          "total_bytes",
-          "stable_bytes"
+          "physical_device_id",
+          "store"
         ],
         "properties": {
-          "kind": {
-            "$ref": "#/components/schemas/HardwareDeviceMemoryLimitKind"
+          "physical_device_id": {
+            "$ref": "#/components/schemas/HardwarePhysicalDeviceId"
           },
-          "total_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "stable_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
+          "store": {
+            "$ref": "#/components/schemas/HardwareStore"
           },
           "current_free_bytes": {
             "type": [
@@ -4001,65 +3986,266 @@
         },
         "additionalProperties": false
       },
-      "HardwareDeviceMemoryLimitKind": {
-        "type": "string",
-        "enum": [
-          "recommended_working_set"
-        ]
+      "HardwareDiagnosticSource": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "backend",
+              "type"
+            ],
+            "properties": {
+              "backend": {
+                "$ref": "#/components/schemas/ExecutionBackend"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "backend"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "adapters"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What a discovery diagnostic is about: one backend's enumeration, or the\nOS's adapter interface (DXGI)."
       },
-      "HardwareMemoryDomain": {
+      "HardwareExecutor": {
         "type": "object",
+        "description": "One backend's handle on a physical device.",
         "required": [
           "id",
-          "kind",
-          "total_capacity_bytes",
-          "stable_capacity_bytes",
-          "shares_system_memory",
-          "devices"
+          "backend",
+          "name",
+          "description",
+          "device_placement",
+          "upload_placement",
+          "availability"
         ],
         "properties": {
           "id": {
-            "$ref": "#/components/schemas/MemoryDomainId"
+            "$ref": "#/components/schemas/HardwareDeviceId"
           },
-          "kind": {
-            "$ref": "#/components/schemas/HardwareMemoryDomainKind"
+          "backend": {
+            "$ref": "#/components/schemas/ExecutionBackend"
           },
-          "total_capacity_bytes": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "device_placement": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "The access paths device storage is allocated from, in order."
+          },
+          "upload_placement": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "The access paths upload storage is allocated from, in order."
+          },
+          "availability": {
+            "$ref": "#/components/schemas/HardwareExecutorAvailability"
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwareExecutorAvailability": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "stable_capacity_bytes",
+              "type"
+            ],
+            "properties": {
+              "stable_capacity_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "available"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "type"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "unavailable"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Whether an executor can run: with its device placement's stable fit, or\nthe reason it cannot."
+      },
+      "HardwareGrant": {
+        "type": "object",
+        "description": "What an executor's driver lets this process place along one path.",
+        "required": [
+          "bytes",
+          "basis"
+        ],
+        "properties": {
+          "bytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
           },
-          "stable_capacity_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
+          "basis": {
+            "$ref": "#/components/schemas/HardwareReportedBy",
+            "description": "The interface that reported the grant."
           },
-          "current_free_bytes": {
+          "remaining_bytes": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int64",
+            "description": "What is left of the grant, where a reading without an opened\nexecutor reports it.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwareHostRam": {
+        "type": "object",
+        "description": "Host RAM, memory the OS manages, with what the OS reports of it.",
+        "required": [
+          "store",
+          "available_bytes",
+          "current_free_bytes"
+        ],
+        "properties": {
+          "store": {
+            "$ref": "#/components/schemas/HardwareStore"
+          },
+          "available_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What the OS reports available to every program, before this\nprocess's limits.",
             "minimum": 0
           },
-          "shares_system_memory": {
-            "type": "boolean"
+          "current_free_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What this process may still take: the OS's availability within every\nprocess limit.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwareObservedStore": {
+        "type": "object",
+        "description": "A volume, with the space the OS reports available to this process.",
+        "required": [
+          "store",
+          "current_free_bytes"
+        ],
+        "properties": {
+          "store": {
+            "$ref": "#/components/schemas/HardwareStore"
           },
-          "devices": {
+          "current_free_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwarePhysicalDevice": {
+        "type": "object",
+        "description": "One piece of hardware, with every executor that views it.",
+        "required": [
+          "id",
+          "kind",
+          "executors"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/HardwarePhysicalDeviceId"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/HardwareDeviceKind"
+          },
+          "executors": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/HardwareDevice"
+              "$ref": "#/components/schemas/HardwareExecutor"
             }
           }
         },
         "additionalProperties": false
       },
-      "HardwareMemoryDomainKind": {
+      "HardwarePhysicalDeviceId": {
         "type": "string",
+        "description": "Stable cross-process identity of one piece of hardware: the serialized Seismic physical\nidentity (`host`, `registry:<id>` or `uuid:<uuid>`), which every executor viewing it shares."
+      },
+      "HardwareReportedBy": {
+        "type": "string",
+        "description": "The interface, and the figure of it, a reported value comes from.",
         "enum": [
-          "system",
-          "physical_device",
-          "unified_memory"
+          "linux_mem_total",
+          "mac_os_memsize",
+          "windows_total_phys",
+          "linux_mem_available",
+          "mach_movable_pages",
+          "windows_physical_and_commit",
+          "cpu_address_space",
+          "metal_max_buffer_length",
+          "metal_recommended_working_set",
+          "metal_working_set_unallocated",
+          "cuda_total_memory",
+          "cuda_usable_memory",
+          "cuda_free",
+          "vulkan_heap",
+          "vulkan_heap_budget",
+          "vulkan_heaps",
+          "vulkan_heaps_beyond_dedicated",
+          "vulkan_max_allocation",
+          "cuda_total_beyond_dedicated",
+          "metal_working_set_beyond_dedicated",
+          "dxgi_dedicated_memory",
+          "cuda_memory_clock_bus_width",
+          "filesystem_size",
+          "filesystem_available"
         ]
       },
       "HardwareSnapshot": {
@@ -4069,11 +4255,15 @@
           "platform",
           "architecture",
           "logical_cores",
-          "system_memory",
           "native_build",
           "enabled_backends",
           "topology_fingerprint",
-          "memory_domains"
+          "physical_devices",
+          "host_ram",
+          "device_memory",
+          "volumes",
+          "access_paths",
+          "transfer_paths"
         ],
         "properties": {
           "captured_at": {
@@ -4111,9 +4301,6 @@
             "type": "integer",
             "minimum": 0
           },
-          "system_memory": {
-            "$ref": "#/components/schemas/HardwareSystemMemory"
-          },
           "native_build": {
             "type": "string",
             "description": "Engine build identity: engine version plus kernel bundle identity."
@@ -4135,55 +4322,122 @@
           "topology_fingerprint": {
             "type": "string"
           },
-          "memory_domains": {
+          "physical_devices": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/HardwareMemoryDomain"
+              "$ref": "#/components/schemas/HardwarePhysicalDevice"
+            }
+          },
+          "selected_executor": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HardwareDeviceId",
+                "description": "The executor the service's device selection takes: the one every load runs on. None when\nno executor can run (each one's unavailability says why)."
+              }
+            ]
+          },
+          "host_ram": {
+            "$ref": "#/components/schemas/HardwareHostRam",
+            "description": "Memory the OS manages; every machine has it."
+          },
+          "device_memory": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareDeviceMemory"
+            }
+          },
+          "volumes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareObservedStore"
+            },
+            "description": "The filesystems of the model store and the kernel cache."
+          },
+          "access_paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareAccessPath"
+            }
+          },
+          "transfer_paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareTransferPath"
             }
           }
         },
         "additionalProperties": false
       },
-      "HardwareSystemMemory": {
+      "HardwareStore": {
         "type": "object",
+        "description": "A place bytes live, and what the service plans against in it.",
         "required": [
-          "physical_capacity_bytes",
-          "physical_available_bytes",
+          "id",
+          "total_capacity_bytes",
+          "capacity_basis",
+          "stable_capacity_bytes",
           "allocation_capacity_bytes",
-          "allocation_headroom_bytes",
-          "assess_reserve_bytes",
-          "abort_reserve_bytes"
+          "planning_reserve_bytes",
+          "emergency_reserve_bytes"
         ],
         "properties": {
-          "physical_capacity_bytes": {
+          "id": {
+            "$ref": "#/components/schemas/MemoryDomainId"
+          },
+          "total_capacity_bytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
           },
-          "physical_available_bytes": {
+          "capacity_basis": {
+            "$ref": "#/components/schemas/HardwareReportedBy",
+            "description": "The interface that reported the capacity."
+          },
+          "stable_capacity_bytes": {
             "type": "integer",
             "format": "int64",
+            "description": "The capacity within process limits, less the planning reserve.",
             "minimum": 0
           },
           "allocation_capacity_bytes": {
             "type": "integer",
             "format": "int64",
+            "description": "The capacity within process limits.",
             "minimum": 0
           },
-          "allocation_headroom_bytes": {
+          "planning_reserve_bytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
           },
-          "assess_reserve_bytes": {
+          "emergency_reserve_bytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwareTransferPath": {
+        "type": "object",
+        "description": "Bytes moved between two stores by an executor's copy mechanism.",
+        "required": [
+          "from",
+          "to",
+          "executor"
+        ],
+        "properties": {
+          "from": {
+            "$ref": "#/components/schemas/MemoryDomainId"
           },
-          "abort_reserve_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
+          "to": {
+            "$ref": "#/components/schemas/MemoryDomainId"
+          },
+          "executor": {
+            "$ref": "#/components/schemas/HardwareDeviceId"
           }
         },
         "additionalProperties": false
@@ -4823,7 +5077,7 @@
       },
       "MemoryDomainId": {
         "type": "string",
-        "description": "Stable identity of one physical memory pool."
+        "description": "Stable identity of one store, a place bytes live: `system` for host RAM, otherwise the\nstore's own identity (a device's memory by its physical device)."
       },
       "MemoryShortage": {
         "oneOf": [

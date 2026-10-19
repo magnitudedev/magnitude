@@ -21,7 +21,7 @@ use crate::operators::gated_delta::graph::CHUNKED_ROWS;
 use crate::{StateSpaceBinding, StateSpaceShape};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, attention_project, state_space_chunk, state_space_step};
-use seismic::{Element, Tensor};
+use seismic::{BuildError, Element, Tensor};
 
 /// Banks of a tuning arena: the zero seed, the bank the slot reads and the
 /// bank it publishes to.
@@ -117,7 +117,7 @@ impl EntryTuning for StateSpaceProjectTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let hidden = self.binding.shape.hidden;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
@@ -219,7 +219,7 @@ impl EntryTuning for StateSpaceOutputTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let shape = self.binding.shape;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
@@ -305,7 +305,7 @@ impl StateSpaceState {
         scope: WeightScope,
         rows: u64,
         seed: u64,
-    ) -> Result<StateSpaceStateCase, String> {
+    ) -> Result<StateSpaceStateCase, BuildError> {
         let shape = &self.shape;
         let tables = inputs.batch(rows, 0, &[Vec::new()], 0)?;
         let slots = tables.actual_slots;
@@ -394,7 +394,7 @@ macro_rules! state_entry {
                 &self,
                 inputs: &mut TuningInputs<'_, '_>,
                 point: &PointShape,
-            ) -> Result<Vec<Self::Case>, String> {
+            ) -> Result<Vec<Self::Case>, BuildError> {
                 TuningInputs::rotation_scopes(&self.0.scopes, point)
                     .into_iter()
                     .enumerate()

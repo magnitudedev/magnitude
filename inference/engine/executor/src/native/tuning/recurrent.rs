@@ -21,7 +21,7 @@ use magnitude_kernels::{
     attention_output, gated_delta_chunk, gated_delta_project, gated_delta_project_convolved,
     gated_delta_step, gated_delta_step_convolved,
 };
-use seismic::{Element, Tensor};
+use seismic::{BuildError, Element, Tensor};
 
 /// Banks of a tuning arena: the zero seed, the bank the slot reads and the
 /// bank it publishes to.
@@ -157,7 +157,7 @@ impl EntryTuning for RecurrentProjectTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         TuningInputs::rotation_scopes(&self.shape.scopes, point)
             .into_iter()
             .enumerate()
@@ -269,7 +269,7 @@ impl EntryTuning for RecurrentOutputTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let (streams, inject) = inputs.join(&self.shape.scopes)?;
         TuningInputs::rotation_scopes(&self.shape.scopes, point)
             .into_iter()
@@ -341,7 +341,7 @@ pub(crate) struct SlotTables {
 }
 
 impl SlotTables {
-    fn new(inputs: &mut TuningInputs<'_, '_>, rows: u64) -> Result<Self, String> {
+    fn new(inputs: &mut TuningInputs<'_, '_>, rows: u64) -> Result<Self, BuildError> {
         let tables = inputs.batch(rows, 0, &[Vec::new()], 0)?;
         let slots = tables.actual_slots;
         let segments = tables.segments[..=slots]
@@ -370,7 +370,7 @@ fn window_state(
     shape: &RecurrentShape,
     activation: Element,
     seed: u64,
-) -> Result<CaseState, String> {
+) -> Result<CaseState, BuildError> {
     let window = inputs.activation(
         activation,
         &[
@@ -389,7 +389,7 @@ fn delta_tape_states(
     inputs: &mut TuningInputs<'_, '_>,
     shape: &RecurrentShape,
     seed: u64,
-) -> Result<(CaseState, CaseState), String> {
+) -> Result<(CaseState, CaseState), BuildError> {
     let delta = inputs.activation(
         Element::f32(),
         &[TUNING_BANKS, shape.value_heads, shape.width, shape.width],
@@ -454,7 +454,7 @@ impl RecurrentState {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<RecurrentStateCase>, String> {
+    ) -> Result<Vec<RecurrentStateCase>, BuildError> {
         let codes = self.codes(inputs)?;
         TuningInputs::rotation_scopes(&self.shape.scopes, point)
             .into_iter()
@@ -480,7 +480,7 @@ impl RecurrentState {
         rows: u64,
         seed: u64,
         codes: RecurrentCodes,
-    ) -> Result<RecurrentStateCase, String> {
+    ) -> Result<RecurrentStateCase, BuildError> {
         let shape = &self.shape;
         let tables = SlotTables::new(inputs, rows)?;
         let window = window_state(inputs, shape, self.activation, seed + 2)?;
@@ -538,7 +538,7 @@ macro_rules! state_entry {
                 &self,
                 inputs: &mut TuningInputs<'_, '_>,
                 point: &PointShape,
-            ) -> Result<Vec<Self::Case>, String> {
+            ) -> Result<Vec<Self::Case>, BuildError> {
                 self.0.rotation(inputs, point)
             }
 
@@ -626,7 +626,7 @@ impl EntryTuning for RecurrentProjectConvolvedTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let shape = &self.0.shape;
         let projections = self.0.rotation(inputs, point)?;
         TuningInputs::rotation_scopes(&shape.scopes, point)
@@ -729,7 +729,7 @@ impl EntryTuning for RecurrentStepConvolvedTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let state = &self.0;
         let shape = &state.shape;
         let codes = state.codes(inputs)?;

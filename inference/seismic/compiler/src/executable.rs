@@ -1554,6 +1554,20 @@ fn compile_steps<B: seismic_native_target::TargetFamily>(
     out
 }
 
+/// A lifetime-owned charge for memory a backend allocates internally.
+pub trait MemoryHold: Send + Sync {}
+impl<T: Send + Sync> MemoryHold for T {}
+
+/// The runtime's accounting boundary for native memory ownership.
+/// Backends retain the returned hold for exactly the native allocation's life.
+pub trait MemoryAccount: Send + Sync {
+    fn available(&self) -> u64;
+    fn reserve(&self, bytes: u64) -> Result<Box<dyn MemoryHold>, ExecutionError>;
+    /// Record driver-owned memory whose size is observable only after the
+    /// native operation. It consumes subsequent admission headroom.
+    fn record(&self, bytes: u64) -> Box<dyn MemoryHold>;
+}
+
 /// Device services a backend provides to the generic runtime.
 pub trait DeviceService<T: seismic_native_target::TargetFamily>: Send + Sync + 'static {
     type Buffer: Clone + Send + Sync + 'static;

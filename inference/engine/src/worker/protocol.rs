@@ -11,7 +11,7 @@
 //! The encoding (serde) is versioned with the engine build: both ends
 //! exchange [`EngineBuild`] first and refuse a mismatch.
 
-use crate::census::{AllocationCensus, MemoryDomain};
+use crate::census::AllocationCensus;
 use crate::error::{LoadError, RequestError, UnloadCause};
 use crate::options::{ExecutionManifest, ReadyInfo};
 use magnitude_chat::ConstraintPlan;
@@ -19,6 +19,7 @@ use magnitude_executor::UnpreparedUnits;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
 use magnitude_scheduler::prefix_cache::PrefixRetention;
+use seismic::StoreIdentity;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -141,22 +142,21 @@ pub struct ExecutionTimings {
 }
 
 /// A loaded worker's observation of its memory (integration spec §5.4,
-/// §9.2): what the model holds and what each domain it uses has left.
+/// §9.2): what the model holds and what each store it uses has left.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryObservation {
     /// The heap's standing, classified.
     pub census: AllocationCensus,
-    /// A fresh reading of every memory domain the loaded device uses: its
-    /// allocation domain first, then host RAM for a dedicated device's
-    /// staged uploads.
-    pub domains: Vec<DomainHeadroom>,
+    /// A fresh reading of every store the loaded executor's placements
+    /// reach, and host RAM, in store order.
+    pub stores: Vec<StoreHeadroom>,
 }
 
-/// One memory domain's observed available bytes. Only the worker observes a
-/// dedicated device's live memory: it has the device open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DomainHeadroom {
-    pub domain: MemoryDomain,
+/// One store's observed available bytes. Only the worker observes a
+/// device store's live memory: it has the executor open.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreHeadroom {
+    pub store: StoreIdentity,
     /// Available bytes bounded by every applicable process limit; this
     /// process's existing charges are already absent from it.
     pub headroom_bytes: u64,
@@ -200,39 +200,36 @@ pub enum WorkerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::census::DomainAllocation;
     use crate::error::InsufficientMemory;
     use crate::options::InputModalities;
-    use seismic::DeviceSelector;
+    use magnitude_executor::StoreAllocation;
 
     fn round_trip<T: Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
         postcard::from_bytes(&postcard::to_allocvec(value).unwrap()).unwrap()
     }
 
-    /// Memory observations, their failure and a domain-qualified load
+    /// Memory observations, their failure and a store-qualified load
     /// refusal survive the process encoding.
     #[test]
     fn memory_values_round_trip_through_the_worker_encoding() {
-        let device = MemoryDomain::DeviceLocal {
-            device: DeviceSelector::Cuda { uuid: [7; 16] },
-        };
+        let device = StoreIdentity::DeviceMemory(seismic::PhysicalIdentity::Uuid([7; 16]));
         let observation = MemoryObservation {
             census: AllocationCensus {
-                domains: vec![DomainAllocation {
-                    domain: device,
+                stores: vec![StoreAllocation {
+                    store: device.clone(),
                     model_bytes: 1,
                     context_bytes: 2,
                     compute_bytes: 3,
                     auxiliary_bytes: 4,
                 }],
             },
-            domains: vec![
-                DomainHeadroom {
-                    domain: device,
+            stores: vec![
+                StoreHeadroom {
+                    store: device.clone(),
                     headroom_bytes: 5,
                 },
-                DomainHeadroom {
-                    domain: MemoryDomain::HostRam,
+                StoreHeadroom {
+                    store: StoreIdentity::HostRam,
                     headroom_bytes: 6,
                 },
             ],
@@ -260,7 +257,7 @@ mod tests {
         assert_eq!(decoded, failed);
         let refusal = LoadError::InsufficientMemory {
             purpose: "target import".into(),
-            domain: MemoryDomain::HostRam,
+            store: StoreIdentity::HostRam,
             memory: InsufficientMemory {
                 required: 8,
                 available: 9,

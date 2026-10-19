@@ -1001,7 +1001,7 @@ mod tests {
         BankCapacity, CodecSpec, ComponentDescriptor, ComponentSpec, HistoryDomainLayout,
         HistoryDomainPlan, LayerRef, StateStore, StoreBindings,
     };
-    use seismic::{BackendName, DType, Device, DeviceCatalog};
+    use seismic::{BackendName, DType, Device};
 
     const TOKEN: HistoryDomainId = HistoryDomainId(0);
 
@@ -1030,7 +1030,7 @@ mod tests {
 
     #[test]
     fn abort_recovers_source_and_releases_tentative_capacity() {
-        let Some(device) = DeviceCatalog::discover()
+        let Some(device) = seismic::Devices::discover(&[])
             .ok()
             .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
         else {
@@ -1100,7 +1100,7 @@ mod tests {
 
     #[test]
     fn successors_follow_in_flight_advances_and_attach_to_their_commits() {
-        let Some(device) = DeviceCatalog::discover()
+        let Some(device) = seismic::Devices::discover(&[])
             .ok()
             .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
         else {
@@ -1185,7 +1185,7 @@ mod tests {
 
     #[test]
     fn codec_conversion_reserves_and_publishes_only_after_completion() {
-        let Some(device) = DeviceCatalog::discover()
+        let Some(device) = seismic::Devices::discover(&[])
             .ok()
             .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())
         else {
@@ -1277,7 +1277,7 @@ mod tests {
     }
 
     fn recurrent_store(context: usize, in_flight: usize) -> Option<StoreBindings> {
-        let device = DeviceCatalog::discover()
+        let device = seismic::Devices::discover(&[])
             .ok()
             .and_then(|catalog| catalog.open_backend(BackendName::Cpu).ok())?;
         Some(

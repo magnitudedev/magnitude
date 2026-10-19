@@ -19,7 +19,7 @@ use magnitude_executor::{
     DEFAULT_KERNEL_CACHE_BYTES,
 };
 use magnitude_state::KvCodec;
-use seismic::{BackendName, DeviceCatalog};
+use seismic::BackendName;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ fn prepare_every_entry(
         .map(|relative| PathBuf::from(home.clone() + *relative))
         .find(|path| path.exists())
         .unwrap_or_else(|| panic!("none of {candidates:?} exists under {home}"));
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let reserves = MemoryReserves::standard();
     let selected = platform::select_device(
         &catalog,

@@ -11,7 +11,7 @@
 //! bits, and every floating subject's error is within α rounding steps of
 //! its governing type: `sqrt(error_power / step_power) <= α`.
 use super::comparison::{Difference, SubjectComparison, SubjectMeasurement};
-use super::search::PointKey;
+use super::search::LaunchKey;
 use super::tune::{Configuration, Exclusion, Outcome, TuningDisposition, TuningResult};
 use seismic_lang::types::DType;
 use serde::{Deserialize, Serialize};
@@ -69,12 +69,12 @@ impl GoverningStep {
 }
 
 /// One candidate's measurements at one point: every subject of every
-/// rotation. `key` is what determines them there ([`PointKey`]): candidates
+/// rotation. `key` is what determines them there ([`LaunchKey`]): candidates
 /// with the same key at a point run the same work and share the observation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NumericalObservation {
     pub point: String,
-    pub key: PointKey,
+    pub key: LaunchKey,
     pub rotations: Vec<Vec<SubjectMeasurement>>,
 }
 
@@ -326,7 +326,7 @@ mod tests {
     fn observation(subjects: Vec<SubjectMeasurement>) -> NumericalObservation {
         NumericalObservation {
             point: "m512".into(),
-            key: PointKey {
+            key: LaunchKey {
                 launches: vec![0],
                 values: [("PACK".to_owned(), 1)].into(),
             },
@@ -455,7 +455,7 @@ mod tests {
                 .map(|(point, ratio)| {
                     observations.push(NumericalObservation {
                         point: (*point).into(),
-                        key: PointKey {
+                        key: LaunchKey {
                             launches: vec![0],
                             values: [("ROWS".to_owned(), rows)].into(),
                         },
@@ -469,7 +469,7 @@ mod tests {
         let timed = |confirmed: bool| {
             let measured = vec![PointMeasurement {
                 point: "m1".into(),
-                key: PointKey {
+                key: LaunchKey {
                     launches: vec![0],
                     values: Default::default(),
                 },

@@ -10,21 +10,51 @@
 //! to the device's memory budget: the engine reads the budget less usage as
 //! its headroom, and a block kept empty would hide released storage from it.
 //! A block's unallocated space counts against that budget too, so a new
-//! device-local block never exceeds the room the caller grants beyond the
-//! free space device-local blocks already hold, and when a doubled block
-//! does not fit that room the block holds only its allocation: an
-//! allocation that fits its grant never grows the device's usage past it. That free space is device
-//! memory this process holds beyond its charges
-//! ([`Memory::device_local_slack`]). Host-visible blocks are persistently
-//! mapped.
+//! block of a kind the caller's room bounds never exceeds that room beyond
+//! the free space such blocks already hold, and when a doubled block does
+//! not fit that room the block holds only its allocation: an allocation
+//! that fits its grant never grows the device's usage past it. That free
+//! space is memory this process holds beyond its charges
+//! ([`Memory::room_bounded_slack`], and per kind [`Memory::free_bytes`]).
+//! Host-visible blocks are persistently mapped.
 
 use crate::device::{call, Inner};
+use crate::instance::Instance;
 use ash::vk;
 use seismic_compiler::blocks::{block_bytes, FreeRanges, BLOCK_CAP_BYTES};
 use seismic_compiler::errors::ExecutionError;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 /// Every allocation starts at least this aligned.
 const MINIMUM_ALIGNMENT: u64 = 16;
+
+/// A storage kind the topology places: device storage, or upload storage
+/// behind `Tensor::shared`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlacedStorage {
+    Device,
+    Upload,
+}
+
+impl From<PlacedStorage> for StorageKind {
+    fn from(storage: PlacedStorage) -> Self {
+        match storage {
+            PlacedStorage::Device => Self::Device,
+            PlacedStorage::Upload => Self::Upload,
+        }
+    }
+}
+
+/// The account new blocks of `storage` are charged to: those on `heap`, or
+/// on every heap.
+pub struct AllocationAccount {
+    /// The storage kind whose blocks it is charged.
+    pub storage: PlacedStorage,
+    /// The heap whose blocks it is charged; none for every heap.
+    pub heap: Option<u32>,
+    /// The account itself.
+    pub account: Arc<dyn seismic_compiler::executable::MemoryAccount>,
+}
 
 /// What an allocation is for; each kind has its own memory type and blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +69,7 @@ pub(crate) enum StorageKind {
 }
 
 struct Block {
+    heap: u32,
     memory: vk::DeviceMemory,
     buffer: vk::Buffer,
     address: u64,
@@ -47,6 +78,8 @@ struct Block {
     mapped: *mut u8,
     dedicated: bool,
     free: Mutex<FreeRanges>,
+    /// The block's charge to its kind's account, released with the block.
+    _charge: Option<Box<dyn seismic_compiler::executable::MemoryHold>>,
 }
 
 // The mapping is plain host memory; ranges are handed out exclusively.
@@ -73,10 +106,28 @@ impl Block {
 /// The blocks of one storage kind.
 struct Pool {
     kind: StorageKind,
-    memory_type: u32,
-    mapped: bool,
-    device_local: bool,
+    /// The memory types new blocks are allocated from, in order: each of
+    /// these is passed over when its heap cannot hold the block, and `last`
+    /// is left to the driver.
+    passable: Vec<PoolType>,
+    last: PoolType,
+    /// Whether the caller's room bounds the kind's blocks: device or upload
+    /// storage whose first type is device-local. Staging never is.
+    room_bounded: bool,
     blocks: Mutex<Vec<Arc<Block>>>,
+    /// Bytes of the device's own ranges in the kind's blocks (argument
+    /// chunks, staging), which live until the device is destroyed: held,
+    /// charged to no allocation.
+    internal: AtomicU64,
+}
+
+/// One memory type a pool allocates blocks from.
+#[derive(Clone, Copy, Debug)]
+struct PoolType {
+    memory_type: u32,
+    heap: u32,
+    /// Host-visible and coherent: its blocks are persistently mapped.
+    mapped: bool,
 }
 
 impl Pool {
@@ -95,75 +146,89 @@ impl Pool {
             .expect("a live range's block belongs to its pool");
         Some(blocks.remove(index))
     }
+
+    /// The free space of the kind's blocks.
+    fn free_bytes(&self) -> u64 {
+        self.blocks
+            .lock()
+            .expect("pool lock is never poisoned")
+            .iter()
+            .map(|block| block.ranges().free_bytes())
+            .sum()
+    }
 }
 
 pub(crate) struct Memory {
     pools: [Pool; 3],
-    /// Device-local bytes of the device's own ranges (argument chunks,
-    /// staging), which live until the device is destroyed: held, charged
-    /// to no allocation.
-    internal: std::sync::atomic::AtomicU64,
+    /// The heaps device storage is allocated from, whose usage the device's
+    /// memory budget reads.
+    device_heaps: Vec<u32>,
     block_cap: u64,
     max_allocation: u64,
+    /// Where heap budgets are read.
+    instance: &'static Instance,
+    physical: vk::PhysicalDevice,
+    host_account: Mutex<Option<Arc<dyn seismic_compiler::executable::MemoryAccount>>>,
+    accounts: Mutex<Vec<AllocationAccount>>,
 }
 
 impl Memory {
+    /// Device, upload and staging storage on the types `facts.allocation`
+    /// names (`Allocation::of`, which discovery reports).
     pub(crate) fn new(
-        properties: &vk::PhysicalDeviceMemoryProperties,
         facts: &crate::Facts,
+        instance: &'static Instance,
+        physical: vk::PhysicalDevice,
     ) -> Result<Self, String> {
-        let types = &properties.memory_types[..properties.memory_type_count as usize];
-        let find = |required: vk::MemoryPropertyFlags, preferred: vk::MemoryPropertyFlags| {
-            let candidates = || {
-                types
-                    .iter()
-                    .enumerate()
-                    .filter(move |(_, kind)| kind.property_flags.contains(required))
+        let layout = &facts.memory;
+        let pool = |kind, types: &[u32], room_bounded: bool| -> Result<Pool, String> {
+            let pool_type = |memory_type: u32| {
+                let reported = layout.types[memory_type as usize];
+                PoolType {
+                    memory_type,
+                    heap: reported.heap,
+                    mapped: reported.mappable(),
+                }
             };
-            candidates()
-                .find(|(_, kind)| kind.property_flags.contains(preferred))
-                .or_else(|| candidates().next())
-                .map(|(index, kind)| (index as u32, kind.property_flags))
+            let (&last, passable) = types
+                .split_last()
+                .ok_or_else(|| format!("no memory type for {kind:?} storage"))?;
+            Ok(Pool {
+                kind,
+                passable: passable.iter().copied().map(pool_type).collect(),
+                last: pool_type(last),
+                room_bounded,
+                blocks: Mutex::new(Vec::new()),
+                internal: AtomicU64::new(0),
+            })
         };
-        let visible =
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-        // Unified memory (integrated GPUs, lavapipe): the device-local heap
-        // is host-visible, so device storage is mapped too.
-        let unified = facts.host_visible_device_local_bytes == facts.device_local_bytes;
-        let device = if unified {
-            find(local | visible, local | visible)
-        } else {
-            find(local, local)
-        }
-        .ok_or("no device-local memory type")?;
-        // A small BAR window (typically 256 MiB) is not spent on upload
-        // regions; ReBAR/SAM and unified memory are. Every upload type is
-        // HOST_COHERENT (`visible`): host writes need no flush.
-        let upload = if facts.uploads_device_local() {
-            find(local | visible, local | visible)
-        } else {
-            find(visible, visible)
-        }
-        .ok_or("no host-visible coherent memory type")?;
-        let staging = find(visible, visible | vk::MemoryPropertyFlags::HOST_CACHED)
-            .ok_or("no host-visible coherent memory type")?;
-        let pool = |kind, (memory_type, flags): (u32, vk::MemoryPropertyFlags)| Pool {
-            kind,
-            memory_type,
-            mapped: flags.contains(visible),
-            device_local: flags.contains(local),
-            blocks: Mutex::new(Vec::new()),
+        // Placed storage is what the caller's room grants when its first
+        // type is device-local.
+        let placed = |kind, types: &[u32]| {
+            let first = *types
+                .first()
+                .ok_or_else(|| format!("no memory type for {kind:?} storage"))?;
+            pool(kind, types, layout.types[first as usize].device_local)
         };
+        let staging = facts
+            .allocation
+            .staging
+            .ok_or("no host staging memory type")?;
         Ok(Self {
             pools: [
-                pool(StorageKind::Device, device),
-                pool(StorageKind::Upload, upload),
-                pool(StorageKind::Staging, staging),
+                placed(StorageKind::Device, &facts.allocation.device)?,
+                placed(StorageKind::Upload, &facts.allocation.upload)?,
+                // Staging is host RAM's, charged to the host account, which
+                // the caller's room does not grant, whatever heap it is on.
+                pool(StorageKind::Staging, &[staging], false)?,
             ],
-            internal: std::sync::atomic::AtomicU64::new(0),
+            device_heaps: crate::Allocation::heaps(layout, &facts.allocation.device),
             block_cap: facts.limits.max_allocation_bytes.min(BLOCK_CAP_BYTES),
             max_allocation: facts.limits.max_allocation_bytes,
+            instance,
+            physical,
+            host_account: Mutex::new(None),
+            accounts: Mutex::new(Vec::new()),
         })
     }
 
@@ -174,27 +239,78 @@ impl Memory {
             .expect("every storage kind has a pool")
     }
 
-    /// Free space held by device-local blocks: device usage that no
+    /// The account new staging blocks are charged to. The native logical
+    /// device is the process's: reopening its runtime view binds later
+    /// blocks to the current topology, and existing blocks keep their holds
+    /// on the shared ledgers.
+    pub(crate) fn set_host_memory_account(
+        &self,
+        account: Arc<dyn seismic_compiler::executable::MemoryAccount>,
+    ) {
+        *self
+            .host_account
+            .lock()
+            .expect("host accounting lock poisoned") = Some(account);
+    }
+
+    /// The accounts new device and upload blocks are charged to.
+    pub(crate) fn set_allocation_accounts(&self, accounts: Vec<AllocationAccount>) {
+        *self
+            .accounts
+            .lock()
+            .expect("allocation accounting lock poisoned") = accounts;
+    }
+
+    /// The account a new block of `kind` on `heap` is charged to.
+    fn account(
+        &self,
+        kind: StorageKind,
+        heap: u32,
+    ) -> Option<Arc<dyn seismic_compiler::executable::MemoryAccount>> {
+        let storage = match kind {
+            StorageKind::Staging => {
+                return self
+                    .host_account
+                    .lock()
+                    .expect("host accounting lock poisoned")
+                    .clone();
+            }
+            StorageKind::Device => PlacedStorage::Device,
+            StorageKind::Upload => PlacedStorage::Upload,
+        };
+        self.accounts
+            .lock()
+            .expect("allocation accounting lock poisoned")
+            .iter()
+            .find(|account| account.storage == storage && account.heap.is_none_or(|of| of == heap))
+            .map(|account| account.account.clone())
+    }
+
+    /// Free space held by room-bounded blocks: device usage that no
     /// allocation charges.
-    pub(crate) fn device_local_slack(&self) -> u64 {
+    pub(crate) fn room_bounded_slack(&self) -> u64 {
         self.pools
             .iter()
-            .filter(|pool| pool.device_local)
-            .map(|pool| {
-                pool.blocks
-                    .lock()
-                    .expect("pool lock is never poisoned")
-                    .iter()
-                    .map(|block| block.ranges().free_bytes())
-                    .sum::<u64>()
-            })
+            .filter(|pool| pool.room_bounded)
+            .map(Pool::free_bytes)
             .sum()
     }
 
+    /// The free space of `kind`'s blocks.
+    pub(crate) fn free_bytes(&self, kind: StorageKind) -> u64 {
+        self.pool(kind).free_bytes()
+    }
+
+    /// Bytes of the device's own ranges in `kind`'s blocks.
+    pub(crate) fn internal_bytes(&self, kind: StorageKind) -> u64 {
+        self.pool(kind).internal.load(Ordering::Relaxed)
+    }
+
     /// A range of `bytes`. `room`, when given, is the device usage the
-    /// caller may add: a new device-local block is sized within it less the
-    /// free space device-local blocks already hold, and an allocation that
-    /// needs a block larger than that is refused as a capacity shortfall.
+    /// caller may add: a new block of a room-bounded kind is sized within it
+    /// less the free space room-bounded blocks already hold, and an
+    /// allocation that needs a block larger than that is refused as a
+    /// capacity shortfall.
     pub(crate) fn allocate(
         &self,
         device: &ash::Device,
@@ -214,8 +330,8 @@ impl Memory {
         let pool = self.pool(kind);
         // Read before taking this pool's lock: the slack spans every pool.
         let room = room
-            .filter(|_| pool.device_local)
-            .map(|room| room.saturating_sub(self.device_local_slack()));
+            .filter(|_| pool.room_bounded)
+            .map(|room| room.saturating_sub(self.room_bounded_slack()));
         let mut blocks = pool.blocks.lock().expect("pool lock is never poisoned");
         let found = blocks
             .iter()
@@ -233,9 +349,48 @@ impl Memory {
                     .filter(|block| !block.dedicated)
                     .map(|block| block.bytes)
                     .max();
-                let size = block_bytes(largest, self.block_cap, bytes, room, 1)?;
                 let dedicated = bytes > self.block_cap;
-                let block = create_block(device, pool, size, dedicated)?;
+                // A type whose heap's budget cannot hold the block, or whose
+                // heap refuses it, is passed over for the next; the last
+                // type, with none after it, is left to the driver.
+                let budgets = if pool.passable.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::device::heap_budgets(self.instance, self.physical)
+                };
+                // What a block of `candidate` may take: the caller's room,
+                // what its account has available and, when given, what its
+                // heap's budget leaves; none bounds it when none is given.
+                let bound = |candidate: &PoolType, heap_room: Option<u64>| {
+                    let account = self.account(kind, candidate.heap);
+                    let available = account.as_ref().map(|account| account.available());
+                    let within = [heap_room, available, room].into_iter().flatten().min();
+                    (account, within)
+                };
+                let mut found = None;
+                for candidate in &pool.passable {
+                    let heap = budgets[candidate.heap as usize];
+                    let (account, within) =
+                        bound(candidate, Some(heap.budget.saturating_sub(heap.usage)));
+                    match block_bytes(largest, self.block_cap, bytes, within, 1).and_then(|size| {
+                        create_block(device, *candidate, size, dedicated, account.as_ref())
+                    }) {
+                        Ok(block) => {
+                            found = Some(block);
+                            break;
+                        }
+                        Err(ExecutionError::AllocationCapacity { .. }) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                let block = match found {
+                    Some(block) => block,
+                    None => {
+                        let (account, within) = bound(&pool.last, None);
+                        let size = block_bytes(largest, self.block_cap, bytes, within, 1)?;
+                        create_block(device, pool.last, size, dedicated, account.as_ref())?
+                    }
+                };
                 let offset = block
                     .take(bytes, alignment)
                     .expect("a new block holds its first allocation");
@@ -252,7 +407,7 @@ impl Memory {
     }
 
     /// A range for the device's own use (argument chunks, staging), kept
-    /// until the device is destroyed and counted as held when device-local.
+    /// until the device is destroyed and counted as held by its kind.
     pub(crate) fn allocate_internal(
         &self,
         device: &ash::Device,
@@ -261,32 +416,27 @@ impl Memory {
         alignment: u64,
     ) -> Result<Range, ExecutionError> {
         let range = self.allocate(device, kind, bytes, alignment, None)?;
-        if self.pool(kind).device_local {
-            self.internal
-                .fetch_add(range.bytes, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.pool(kind)
+            .internal
+            .fetch_add(range.bytes, Ordering::Relaxed);
         Ok(range)
     }
 
-    /// Bytes of every device-local block.
-    pub(crate) fn device_local_block_bytes(&self) -> u64 {
+    /// Bytes of every block on the heaps device storage is allocated from:
+    /// what of those heaps' usage the device's blocks account for.
+    pub(crate) fn device_heap_block_bytes(&self) -> u64 {
         self.pools
             .iter()
-            .filter(|pool| pool.device_local)
             .map(|pool| {
                 pool.blocks
                     .lock()
                     .expect("pool lock is never poisoned")
                     .iter()
+                    .filter(|block| self.device_heaps.contains(&block.heap))
                     .map(|block| block.bytes)
                     .sum::<u64>()
             })
             .sum()
-    }
-
-    /// Device-local bytes of the device's own ranges.
-    pub(crate) fn internal_device_local(&self) -> u64 {
-        self.internal.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Return `range` to its block, and free the block once it holds no
@@ -321,9 +471,10 @@ fn destroy_block(device: &ash::Device, block: &Block) {
 
 fn create_block(
     device: &ash::Device,
-    pool: &Pool,
+    pool: PoolType,
     bytes: u64,
     dedicated: bool,
+    account: Option<&Arc<dyn seismic_compiler::executable::MemoryAccount>>,
 ) -> Result<Arc<Block>, ExecutionError> {
     let allocation = |error: ExecutionError| match error {
         ExecutionError::SubmissionFailed(message) => ExecutionError::AllocationFailed(message),
@@ -351,6 +502,16 @@ fn create_block(
             pool.memory_type
         )));
     }
+    let charge = match account
+        .map(|account| account.reserve(requirements.size))
+        .transpose()
+    {
+        Ok(charge) => charge,
+        Err(error) => {
+            unsafe { device.destroy_buffer(buffer, None) };
+            return Err(error);
+        }
+    };
     let mut flags =
         vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
     let allocate = vk::MemoryAllocateInfo::default()
@@ -405,6 +566,7 @@ fn create_block(
         device.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
     };
     Ok(Arc::new(Block {
+        heap: pool.heap,
         memory,
         buffer,
         address,
@@ -412,6 +574,7 @@ fn create_block(
         mapped,
         dedicated,
         free: Mutex::new(FreeRanges::new(bytes)),
+        _charge: charge,
     }))
 }
 
@@ -516,6 +679,7 @@ mod tests {
 
     fn block(bytes: u64) -> Arc<Block> {
         Arc::new(Block {
+            heap: 0,
             memory: vk::DeviceMemory::null(),
             buffer: vk::Buffer::null(),
             address: 0,
@@ -523,6 +687,7 @@ mod tests {
             mapped: std::ptr::null_mut(),
             dedicated: false,
             free: Mutex::new(FreeRanges::new(bytes)),
+            _charge: None,
         })
     }
 
@@ -558,10 +723,15 @@ mod tests {
         const SLAB: u64 = 64 << 20;
         let pool = Pool {
             kind: StorageKind::Device,
-            memory_type: 0,
-            mapped: false,
-            device_local: true,
+            passable: Vec::new(),
+            last: PoolType {
+                memory_type: 0,
+                heap: 0,
+                mapped: false,
+            },
+            room_bounded: true,
             blocks: Mutex::new(Vec::new()),
+            internal: AtomicU64::new(0),
         };
         let blocks = (0..4).map(|_| block(16 * SLAB)).collect::<Vec<_>>();
         pool.blocks.lock().unwrap().extend(blocks.iter().cloned());

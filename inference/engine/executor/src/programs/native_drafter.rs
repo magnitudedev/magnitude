@@ -52,6 +52,15 @@ pub enum NativeDrafterProgram {
 }
 
 impl NativeDrafterProgram {
+    /// Visit the graph constants the drafter's program binds.
+    pub(crate) fn visit_constants(&self, visit: &mut dyn FnMut(&seismic::Tensor)) {
+        match self {
+            Self::Head(program) => program.visit_constants(visit),
+            Self::SharedHead(program) => program.visit_constants(visit),
+            Self::Draft(program) => program.visit_constants(visit),
+        }
+    }
+
     pub(crate) fn constant_bytes(&self) -> Result<u64, &'static str> {
         match self {
             Self::Head(program) => program.constant_bytes(),

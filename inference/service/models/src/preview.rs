@@ -1527,7 +1527,7 @@ mod tests {
             crate::inventory::InventoryConfig::with_roots(store.clone(), cache_root.clone())
                 .unwrap();
         config.hf_cache_dirs.clear();
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
         let _ = fs::remove_dir_all(&cache_root);
         fs::write(&cache_root, b"not a directory").unwrap();
 
@@ -1710,7 +1710,7 @@ mod tests {
         )
         .unwrap();
         config.hf_cache_dirs.clear();
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
 
         for (index, fixture) in fixtures.into_iter().enumerate() {
             let inspection = crate::gguf::inspect(&fixture).unwrap();

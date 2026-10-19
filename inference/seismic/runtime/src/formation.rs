@@ -19,7 +19,7 @@
 //! whichever call formed it.
 
 use crate::artifacts::{ArtifactKey, ArtifactStore};
-use crate::native::tune::Linear;
+use crate::native::Linear;
 use seismic_native_target::workers::Workers;
 use seismic_native_target::{
     NativeCompilationError, ProgramCache, ProgramEntry, ProgramSource, Toolchain,

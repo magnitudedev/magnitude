@@ -78,6 +78,8 @@ driver! {
     device_name: unsafe extern "system" fn(*mut c_char, c_int, c_int) -> ResultCode => "cuDeviceGetName",
     device_attribute: unsafe extern "system" fn(*mut c_int, c_int, c_int) -> ResultCode => "cuDeviceGetAttribute",
     device_total_memory: unsafe extern "system" fn(*mut usize, c_int) -> ResultCode => "cuDeviceTotalMem_v2",
+    device_can_access_peer: unsafe extern "system" fn(*mut c_int, c_int, c_int) -> ResultCode
+        => "cuDeviceCanAccessPeer",
     memory_info: unsafe extern "system" fn(*mut usize, *mut usize) -> ResultCode => "cuMemGetInfo_v2",
     driver_version: unsafe extern "system" fn(*mut c_int) -> ResultCode => "cuDriverGetVersion",
     primary_context_retain: unsafe extern "system" fn(*mut Handle, c_int) -> ResultCode => "cuDevicePrimaryCtxRetain",
@@ -130,6 +132,9 @@ driver! {
         // Driver API 11.4+: identifies the exposed device, including a MIG
         // partition, rather than its parent GPU.
         device_uuid_v2: unsafe extern "system" fn(*mut [u8; 16], c_int) -> ResultCode => "cuDeviceGetUuid_v2",
+        // Driver API 10.0+: the OS adapter LUID, supported under WDDM only.
+        device_luid: unsafe extern "system" fn(*mut c_char, *mut c_uint, c_int) -> ResultCode
+            => "cuDeviceGetLuid",
         // Driver API 12.0+: explicitly built kernel graphs (direct-native replay).
         graph_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuGraphCreate",
         graph_add_kernel_node: unsafe extern "system" fn(*mut Handle, Handle, *const Handle, usize, *const KernelNodeParams) -> ResultCode => "cuGraphAddKernelNode_v2",
@@ -256,6 +261,9 @@ pub(crate) struct Context {
     /// default stream it would also wait for every later queued launch of
     /// the blocking execution streams (a pipelined next step).
     transfer: Handle,
+    pub(crate) host_account: OnceLock<Arc<dyn seismic_compiler::executable::MemoryAccount>>,
+    pub(crate) device_account: OnceLock<Arc<dyn seismic_compiler::executable::MemoryAccount>>,
+    pub(crate) upload_account: OnceLock<Arc<dyn seismic_compiler::executable::MemoryAccount>>,
 }
 
 // The raw handle is an opaque driver object usable from any thread once made
@@ -277,6 +285,9 @@ impl Context {
             raw,
             ordinal,
             transfer: std::ptr::null_mut(),
+            host_account: OnceLock::new(),
+            device_account: OnceLock::new(),
+            upload_account: OnceLock::new(),
         };
         let mut transfer = std::ptr::null_mut();
         {
@@ -666,6 +677,7 @@ pub(crate) struct Reservation {
     granularity: usize,
     /// Physical allocation handles, mapped in order from `base`.
     granules: std::sync::Mutex<Vec<u64>>,
+    charges: std::sync::Mutex<Vec<Box<dyn seismic_compiler::executable::MemoryHold>>>,
     context: Arc<Context>,
 }
 
@@ -698,6 +710,7 @@ impl Reservation {
         }
         Ok(Self {
             base,
+            charges: std::sync::Mutex::new(Vec::new()),
             reserved,
             granularity,
             granules: std::sync::Mutex::new(Vec::new()),
@@ -712,7 +725,27 @@ impl Reservation {
     /// Back exactly the granules covering the leading `bytes`: map new ones
     /// read-write for this device, or unmap and release the tail. Precondition
     /// for a shrink: no device work still touches the released range.
-    pub fn commit(&self, bytes: usize) -> Result<(), DriverError> {
+    /// Each granule backed is charged to the device account before it is
+    /// mapped, and released with its granule.
+    pub fn commit(&self, bytes: usize) -> Result<(), seismic_compiler::errors::ExecutionError> {
+        let mut charges = self
+            .charges
+            .lock()
+            .expect("native reservation charge lock poisoned");
+        let wanted = bytes.div_ceil(self.granularity);
+        let mut extra = Vec::new();
+        if let Some(account) = self.context.device_account.get() {
+            for _ in charges.len()..wanted {
+                extra.push(account.reserve(self.granularity as u64)?);
+            }
+        }
+        self.commit_native(bytes)
+            .map_err(crate::executor::allocation_error(bytes as u64))?;
+        charges.truncate(wanted);
+        charges.extend(extra);
+        Ok(())
+    }
+    fn commit_native(&self, bytes: usize) -> Result<(), DriverError> {
         assert!(
             bytes <= self.reserved,
             "Reservation::commit precondition: {bytes} bytes exceed the {}-byte reservation",
@@ -1084,6 +1117,7 @@ pub(crate) struct HostMapped {
     pub device: u64,
     pub bytes: usize,
     context: Arc<Context>,
+    _charge: Option<Box<dyn seismic_compiler::executable::MemoryHold>>,
 }
 
 // The CUDA driver owns the pinned allocation; host access is plain memory
@@ -1092,27 +1126,44 @@ unsafe impl Send for HostMapped {}
 unsafe impl Sync for HostMapped {}
 
 impl HostMapped {
-    pub fn new(context: &Arc<Context>, bytes: usize) -> Result<Self, DriverError> {
+    /// Mapped host memory of `bytes`, charged to the upload account.
+    pub fn new(
+        context: &Arc<Context>,
+        bytes: usize,
+    ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
         // CU_MEMHOSTALLOC_DEVICEMAP
         const DEVICE_MAP: c_uint = 2;
-        let _current = context.enter()?;
+        let failed = || crate::executor::allocation_error(bytes as u64);
+        let charge = context
+            .upload_account
+            .get()
+            .map(|account| account.reserve(bytes.max(1) as u64))
+            .transpose()?;
+        let _current = context.enter().map_err(failed())?;
         let mut host = std::ptr::null_mut();
         unsafe {
-            context.driver.check(
-                (context.driver.host_alloc)(&mut host, bytes.max(1), DEVICE_MAP),
-                "mapped host allocation",
-            )?;
+            context
+                .driver
+                .check(
+                    (context.driver.host_alloc)(&mut host, bytes.max(1), DEVICE_MAP),
+                    "mapped host allocation",
+                )
+                .map_err(failed())?;
             // Owned from here, so a failed mapping query frees it.
             let mut mapped = Self {
                 host: host.cast(),
                 device: 0,
                 bytes,
                 context: context.clone(),
+                _charge: charge,
             };
-            context.driver.check(
-                (context.driver.host_device_pointer)(&mut mapped.device, host, 0),
-                "mapped host device pointer",
-            )?;
+            context
+                .driver
+                .check(
+                    (context.driver.host_device_pointer)(&mut mapped.device, host, 0),
+                    "mapped host device pointer",
+                )
+                .map_err(failed())?;
             Ok(mapped)
         }
     }
@@ -1169,6 +1220,7 @@ pub(crate) struct PinnedUpload {
     pointer: *mut u8,
     bytes: usize,
     context: Arc<Context>,
+    _charge: Option<Box<dyn seismic_compiler::executable::MemoryHold>>,
 }
 
 // The CUDA driver owns the pinned allocation and accepts it from any host
@@ -1176,19 +1228,33 @@ pub(crate) struct PinnedUpload {
 unsafe impl Send for PinnedUpload {}
 
 impl PinnedUpload {
-    pub fn new(context: &Arc<Context>, bytes: usize) -> Result<Self, DriverError> {
-        let _current = context.enter()?;
+    /// Pinned host staging of `bytes`, charged to the host account.
+    pub fn new(
+        context: &Arc<Context>,
+        bytes: usize,
+    ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
+        let failed = || crate::executor::allocation_error(bytes as u64);
+        let charge = context
+            .host_account
+            .get()
+            .map(|account| account.reserve(bytes.max(1) as u64))
+            .transpose()?;
+        let _current = context.enter().map_err(failed())?;
         let mut pointer = std::ptr::null_mut();
         unsafe {
-            context.driver.check(
-                (context.driver.allocate_host)(&mut pointer, bytes.max(1)),
-                "pinned host allocation",
-            )?;
+            context
+                .driver
+                .check(
+                    (context.driver.allocate_host)(&mut pointer, bytes.max(1)),
+                    "pinned host allocation",
+                )
+                .map_err(failed())?;
         }
         Ok(Self {
             pointer: pointer.cast(),
             bytes,
             context: context.clone(),
+            _charge: charge,
         })
     }
 

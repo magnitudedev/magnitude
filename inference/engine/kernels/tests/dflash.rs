@@ -306,13 +306,13 @@ fn entries_match_on(device: &Device) {
 
 #[test]
 fn dflash_entries_match_the_host_model_on_cpu() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     entries_match_on(&catalog.open_backend(BackendName::Cpu).unwrap());
 }
 
 #[test]
 fn dflash_entries_match_the_host_model_on_accelerators() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
         let Ok(device) = catalog.open_backend(backend) else {
             continue;

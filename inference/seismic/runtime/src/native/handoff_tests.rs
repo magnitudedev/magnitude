@@ -103,8 +103,8 @@ fn abandoned_native_handoff_does_not_keep_the_device_alive() {
         path: "handoff-lifetime.seismic".into(),
         text: "fn project[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut y = tensor[N] f32\n    for i in 0..N:\n        y[i] = x[i]\n    return y\n\nnative project for cpu from \"project.rs\":\n    static (N)\n    launch project:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
     }])).unwrap();
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(BackendName::Cpu).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(BackendName::Cpu).unwrap();
     let weak = Arc::downgrade(&device);
     let formed = NativePrepared::prepare(
         &device,
@@ -183,8 +183,8 @@ fn a_promotion_withdraws_the_handoff_it_replaces_and_serving_takes_the_last() {
         path: "handoff-promotion.seismic".into(),
         text: "fn project[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut y = tensor[N] f32\n    for i in 0..N:\n        y[i] = x[i]\n    return y\n\nnative project for cpu from \"project.rs\":\n    static (N)\n    launch project:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
     }])).unwrap();
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(BackendName::Cpu).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(BackendName::Cpu).unwrap();
     // The handoff is keyed by specialization; the static stands for
     // whatever distinguishes one choice of a unit from the next.
     let form = |rows| {

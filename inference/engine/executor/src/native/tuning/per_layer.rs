@@ -73,7 +73,7 @@ impl EntryTuning for PerLayerGateTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, seismic::BuildError> {
         let b = self.binding;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()

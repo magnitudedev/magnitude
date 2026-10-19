@@ -507,14 +507,14 @@ impl<'a> Specializer<'a> {
 mod tests {
     use super::*;
     use magnitude_kernels::routed_output;
-    use seismic::{BackendName, DeviceCatalog};
+    use seismic::BackendName;
 
     /// The load's twin of graph construction's domain check: a down
     /// projection wider than the Metal kernel's register budget admits is
     /// refused before any tuning, naming the call's statics.
     #[test]
     fn statics_outside_the_kernel_domain_are_refused() {
-        let Ok(device) = DeviceCatalog::discover()
+        let Ok(device) = seismic::Devices::discover(&[])
             .unwrap()
             .open_backend(BackendName::Metal)
         else {

@@ -1,86 +1,128 @@
-import { Effect, Option, Schema } from "effect"
-import { describe, expect, it } from "vitest"
+import { Effect, Either, Option, Schema } from "effect"
+import { expect, it } from "vitest"
 import { HardwareSnapshot } from "@magnitudedev/icn-protocol/schemas"
-import type * as InferenceSchema from "@magnitudedev/icn-protocol/schemas"
 import { projectInferenceHardware, summarizeInferenceHardware } from "./inference-projection"
 
-const snapshot = (physical?: number | null, memoryDomains: readonly unknown[] = []) => Schema.decodeUnknownSync(HardwareSnapshot)({
-  captured_at: 1, platform: "linux", architecture: "x86_64", cpu_model: "AMD EPYC 7742",
-  logical_cores: 4, ...(physical === undefined ? {} : { physical_cores: physical }),
-  system_memory: { physical_capacity_bytes: 64, physical_available_bytes: 32, allocation_capacity_bytes: 64,
-    allocation_headroom_bytes: 32, assess_reserve_bytes: 1, abort_reserve_bytes: 1 },
-  native_build: "test", enabled_backends: [], topology_fingerprint: "test", memory_domains: memoryDomains,
+const store = (id: string) => ({
+  id, total_capacity_bytes: 64, stable_capacity_bytes: 60, allocation_capacity_bytes: 64,
+  planning_reserve_bytes: 4, emergency_reserve_bytes: 1, capacity_basis: "linux_mem_total",
 })
-it("preserves machine-wide physical topology independently of process parallelism", () => {
-  const value = Effect.runSync(projectInferenceHardware(snapshot(128)))
+const host = { store: store("system"), available_bytes: 40, current_free_bytes: 32 }
+const executor = (id: string, backend: string, paths: number[], reason?: string) => ({
+  id, backend, name: "Test GPU", description: "Test GPU", device_placement: paths, upload_placement: paths,
+  availability: reason === undefined ? { type: "available", stable_capacity_bytes: 60 }
+    : { type: "unavailable", reason },
+})
+const gpu = {
+  id: "physical-gpu", kind: "integrated_gpu", executors: [executor("cuda:0", "cuda", [0]), executor("vulkan:0", "vulkan", [1])],
+}
+const cpu = { id: "host", kind: "cpu", executors: [executor("host-cpu", "cpu", [])] }
+const paths = [
+  { id: 0, executor: "cuda:0", store: "system", grant: null },
+  { id: 1, executor: "vulkan:0", store: "system", grant: null },
+]
+const fields = (overrides: Record<string, unknown> = {}) => ({
+  captured_at: 1, platform: "linux", architecture: "x86_64", cpu_model: "AMD EPYC 7742", logical_cores: 4,
+  native_build: "test", enabled_backends: [], topology_fingerprint: "test", host_ram: host, device_memory: [],
+  volumes: [], physical_devices: [cpu], selected_executor: "host-cpu", access_paths: [], transfer_paths: [], ...overrides,
+})
+const snapshot = (overrides: Record<string, unknown> = {}) => Schema.decodeUnknownSync(HardwareSnapshot)(fields(overrides))
+
+it("preserves machine-wide physical core counts independently of process parallelism", () => {
+  const value = Effect.runSync(projectInferenceHardware(snapshot({ physical_cores: 128 })))
   expect(value.physicalCores).toEqual(Option.some(128))
   expect(value.logicalCores).toBe(4)
   expect(value.processor).toEqual(Option.some("AMD EPYC 7742"))
 })
 it.each([undefined, null, 0])("keeps an unavailable physical core observation absent: %s", count => {
-  expect(Effect.runSync(projectInferenceHardware(snapshot(count))).physicalCores).toEqual(Option.none())
+  expect(Effect.runSync(projectInferenceHardware(snapshot(count === undefined ? {} : { physical_cores: count }))).physicalCores).toEqual(Option.none())
 })
-it("lists only devices a model can run on as accelerators", () => {
-  const device = (id: string, kind: string, reason?: string) => ({
-    id, backend: id === "host-cpu" ? "cpu" : "vulkan", name: id, description: id, kind,
-    ...(reason === undefined ? {} : { unavailable_reason: reason }),
-  })
-  const value = Effect.runSync(projectInferenceHardware(snapshot(8, [{
-    id: "system", kind: "system", total_capacity_bytes: 64, stable_capacity_bytes: 32, shares_system_memory: true,
-    devices: [
-      device("host-cpu", "cpu"),
-      device("vulkan:00000000-0000-0000-0000-000000000001", "integrated_gpu",
-        "it lacks VK_KHR_shader_fma and its fma is not fused beside a NoContraction multiply-add"),
-      device("vulkan:00000000-0000-0000-0000-000000000002", "integrated_gpu"),
-    ],
-  }])))
-  expect(value.accelerators.map(({ acceleratorId }) => acceleratorId))
-    .toEqual(["vulkan:00000000-0000-0000-0000-000000000002"])
+it("groups backend executors by reported physical identity", () => {
+  const value = Effect.runSync(projectInferenceHardware(snapshot({ physical_devices: [cpu, gpu], access_paths: paths })))
+  expect(value.accelerators).toHaveLength(1)
+  expect(value.accelerators[0]?.executors.map(e => e.deviceId)).toEqual(["cuda:0", "vulkan:0"])
+  expect(value.memoryDomains).toHaveLength(1)
+  expect(value.memoryDomains[0]?.kind).toBe("UnifiedMemory")
 })
-
-describe("summarizeInferenceHardware", () => {
-  const device = (fields: Partial<InferenceSchema.HardwareDevice> & Pick<InferenceSchema.HardwareDevice, "id" | "backend" | "name" | "kind">): InferenceSchema.HardwareDevice => ({
-    description: fields.name, memory_limit: Option.none(), unavailable_reason: Option.none(), ...fields,
-  })
-  const domain = (fields: Partial<InferenceSchema.HardwareMemoryDomain> & Pick<InferenceSchema.HardwareMemoryDomain, "id" | "kind" | "devices">): InferenceSchema.HardwareMemoryDomain => ({
-    current_free_bytes: Option.none(), shares_system_memory: fields.kind !== "physical_device", stable_capacity_bytes: 0, total_capacity_bytes: 0, ...fields,
-  })
-  const snapshot = (fields: Partial<InferenceSchema.HardwareSnapshot>): InferenceSchema.HardwareSnapshot => ({
-    architecture: "x86_64", captured_at: 1, cpu_model: Option.some("AMD EPYC 7V13 64-Core Processor"), enabled_backends: ["cpu", "cuda", "vulkan"],
-    logical_cores: 12, memory_domains: [], native_build: "test", physical_cores: Option.some(6), platform: "windows",
-    system_memory: { abort_reserve_bytes: 0, allocation_capacity_bytes: 0, allocation_headroom_bytes: 0, assess_reserve_bytes: 0, physical_available_bytes: 0, physical_capacity_bytes: 118111600640 },
-    system_product_name: Option.none(), topology_fingerprint: "f", backend_diagnostics: Option.none(), ...fields,
-  })
-  const cudaCard = domain({ id: "gpu-1", kind: "physical_device", total_capacity_bytes: 8589934592, devices: [
-    device({ id: "cuda:0", backend: "cuda", name: "NVIDIA A10-8Q", kind: "gpu", memory_limit: Option.some({ kind: "recommended_working_set", total_bytes: 8589934592, stable_bytes: 8000000000, current_free_bytes: Option.none() }) }),
-    device({ id: "vulkan:0", backend: "vulkan", name: "NVIDIA A10-8Q", kind: "gpu" }),
-  ] })
-
-  it("describes the GPU the loaded backend runs on and counts a card once across backends", () => {
-    const summary = summarizeInferenceHardware(Option.some({ _tag: "Cuda", hardwareLabel: "NVIDIA A10-8Q" }), snapshot({ memory_domains: [cudaCard] }))
-    expect(summary).toEqual({ backend: "cuda", gpuName: Option.some("NVIDIA A10-8Q"), gpuKind: Option.some("discrete"), gpuMemoryBytes: Option.some(8589934592), gpuCount: 1,
-      gpuUnusedReason: Option.none(), cpuModel: Option.some("AMD EPYC 7V13 64-Core Processor"), cpuCores: Option.some(6), memoryBytes: 118111600640 })
-  })
-  it("explains an unused GPU from its own reason, then the backend diagnostic, then the selection policy", () => {
-    const unavailable = domain({ id: "gpu-1", kind: "physical_device", total_capacity_bytes: 8589934592, devices: [
-      device({ id: "cuda:0", backend: "cuda", name: "NVIDIA A10-8Q", kind: "gpu", unavailable_reason: Option.some("its CUDA context could not be created: driver too old") }) ] })
-    expect(summarizeInferenceHardware(Option.some({ _tag: "Cpu", hardwareLabel: "CPU" }), snapshot({ memory_domains: [unavailable] })).gpuUnusedReason)
-      .toEqual(Option.some("its CUDA context could not be created: driver too old"))
-    const onVulkan = summarizeInferenceHardware(Option.some({ _tag: "Vulkan", hardwareLabel: "NVIDIA A10-8Q" }), snapshot({ memory_domains: [cudaCard],
-      backend_diagnostics: Option.some([{ backend: "cuda", message: "no CUDA-capable device is detected" }]) }))
-    expect([onVulkan.backend, Option.getOrNull(onVulkan.gpuName), Option.getOrNull(onVulkan.gpuUnusedReason)]).toEqual(["vulkan", "NVIDIA A10-8Q", null])
-    const integrated = domain({ id: "system", kind: "system", total_capacity_bytes: 34359738368, devices: [
-      device({ id: "vulkan:0", backend: "vulkan", name: "Intel(R) Iris(R) Xe Graphics", kind: "integrated_gpu" }) ] })
-    const onCpu = summarizeInferenceHardware(Option.some({ _tag: "Cpu", hardwareLabel: "CPU" }), snapshot({ memory_domains: [integrated] }))
-    expect([onCpu.backend, Option.getOrNull(onCpu.gpuName), onCpu.gpuCount, Option.getOrNull(onCpu.gpuUnusedReason)])
-      .toEqual(["cpu", null, 1, "vulkan: integrated GPU is not selected automatically"])
-    const diagnosed = summarizeInferenceHardware(Option.some({ _tag: "Cpu", hardwareLabel: "CPU" }), snapshot({ memory_domains: [cudaCard],
-      backend_diagnostics: Option.some([{ backend: "cuda", message: "no CUDA-capable device is detected" }, { backend: "vulkan", message: "no Vulkan loader" }]) }))
-    expect(Option.getOrNull(diagnosed.gpuUnusedReason)).toBe("cuda: no CUDA-capable device is detected")
-  })
-  it("falls back to logical cores and reports no GPU fields on a machine without one", () => {
-    const summary = summarizeInferenceHardware(Option.none(), snapshot({ physical_cores: Option.none(), cpu_model: Option.none() }))
-    expect(summary).toEqual({ backend: "cpu", gpuName: Option.none(), gpuKind: Option.none(), gpuMemoryBytes: Option.none(), gpuCount: 0,
-      gpuUnusedReason: Option.none(), cpuModel: Option.none(), cpuCores: Option.some(12), memoryBytes: 118111600640 })
-  })
+it("retains both stores in a placement", () => {
+  const deviceMemory = { physical_device_id: gpu.id, store: store("vram"), current_free_bytes: null }
+  const value = Effect.runSync(projectInferenceHardware(snapshot({
+    device_memory: [deviceMemory], physical_devices: [cpu, { ...gpu, executors: [executor("vulkan:0", "vulkan", [0, 1])] }],
+    access_paths: [{ ...paths[1], id: 0, store: "vram" }, paths[1]],
+  })))
+  expect(value.accelerators[0]?.executors[0]?.memoryDomainIds).toEqual(["vram", "system"])
+  expect(value.memoryDomains.map(domain => [domain.memoryDomainId, domain.kind, domain.availableBytes])).toEqual([
+    ["system", "UnifiedMemory", Option.some(32)],
+    ["vram", "PhysicalDevice", Option.none()],
+  ])
+})
+it("omits unavailable executors and CPU physical devices from accelerators", () => {
+  const value = Effect.runSync(projectInferenceHardware(snapshot({
+    physical_devices: [{ ...gpu, executors: [executor("cuda:0", "cuda", [], "driver too old"), gpu.executors[1]] },
+      { id: "host", kind: "cpu", executors: [executor("host-cpu", "cpu", [])] }], access_paths: paths,
+  })))
+  expect(value.accelerators.map(a => a.executors.map(e => e.deviceId))).toEqual([["vulkan:0"]])
+})
+it("rejects missing placement references", () => {
+  expect(Effect.runSync(Effect.either(projectInferenceHardware(snapshot({ physical_devices: [gpu] }))))._tag).toBe("Left")
+  expect(Effect.runSync(Effect.either(summarizeInferenceHardware(snapshot({ physical_devices: [gpu] }))))._tag)
+    .toBe("Left")
+})
+it("reports no backend and no selected executor when no executor can run", () => {
+  const unsupported = { ...cpu, executors: [executor("host-cpu", "cpu", [], "CPU execution requires x86-64-v2")] }
+  const value = snapshot({ physical_devices: [unsupported], selected_executor: null })
+  expect(Effect.runSync(projectInferenceHardware(value)).selectedDeviceId).toEqual(Option.none())
+  expect(Effect.runSync(summarizeInferenceHardware(value)).backend).toEqual(Option.none())
+})
+it("rejects a selected executor that is not reported", () => {
+  const value = snapshot({ selected_executor: "cuda:9" })
+  expect(Effect.runSync(Effect.either(projectInferenceHardware(value)))._tag).toBe("Left")
+  expect(Effect.runSync(Effect.either(summarizeInferenceHardware(value)))._tag).toBe("Left")
+})
+it("rejects a device placement on a store that is not a memory domain", () => {
+  const volume = { store: store("volume"), current_free_bytes: 8 }
+  const value = projectInferenceHardware(snapshot({
+    volumes: [volume], physical_devices: [gpu],
+    access_paths: [paths[0], { ...paths[1], store: "volume" }],
+  }))
+  expect(Effect.runSync(Effect.either(value))._tag).toBe("Left")
+})
+it("admits no snapshot without host RAM and its free reading", () => {
+  const { host_ram: _, ...withoutHost } = fields()
+  for (const invalid of [withoutHost, fields({ host_ram: { store: host.store } })]) {
+    expect(Either.isLeft(Schema.decodeUnknownEither(HardwareSnapshot)(invalid))).toBe(true)
+  }
+})
+it("summarizes the selected executor and counts one GPU across backend views", () => {
+  const summary = Effect.runSync(summarizeInferenceHardware(
+    snapshot({ physical_devices: [gpu], selected_executor: "cuda:0", access_paths: paths, physical_cores: 8 })))
+  expect(summary).toMatchObject({ backend: Option.some("cuda"), gpuName: Option.some("Test GPU"), gpuKind: Option.some("integrated"),
+    gpuCount: 1, gpuMemoryBytes: Option.some(64), cpuCores: Option.some(8), memoryBytes: 64 })
+})
+it("reports a GPU's memory as its own memory's total, or what its grant lets it place in host RAM", () => {
+  const vram = { physical_device_id: gpu.id, store: { ...store("vram"), total_capacity_bytes: 24 }, current_free_bytes: null }
+  const gpuMemory = (accessPaths: unknown[], deviceMemory: unknown[] = []) => Effect.runSync(summarizeInferenceHardware(
+    snapshot({ physical_devices: [{ ...gpu, executors: [executor("vulkan:0", "vulkan", [0, 1])] }], selected_executor: "vulkan:0",
+      access_paths: accessPaths, device_memory: deviceMemory }))).gpuMemoryBytes
+  const granted = (id: number, bytes: number) => ({ id, executor: "vulkan:0", store: "system",
+    grant: { bytes, basis: "vulkan_heaps", remaining_bytes: null } })
+  // Two host heaps share the driver's total.
+  expect(gpuMemory([granted(0, 10), granted(1, 20)])).toEqual(Option.some(30))
+  // Its own memory, then host RAM beyond it.
+  expect(gpuMemory([{ id: 0, executor: "vulkan:0", store: "vram", grant: null }, granted(1, 8)], [vram]))
+    .toEqual(Option.some(32))
+})
+it("explains an unused GPU from its own reason, then the backend diagnostic, the build, and otherwise as not selected", () => {
+  const reason = (executors: unknown[], overrides: Record<string, unknown> = {}) => Effect.runSync(summarizeInferenceHardware(
+    snapshot({ physical_devices: [cpu, { ...gpu, executors }], access_paths: paths, ...overrides }))).gpuUnusedReason
+  expect(reason([executor("cuda:0", "cuda", [], "driver too old")])).toEqual(Option.some("driver too old"))
+  const diagnostic = { source: { type: "backend", backend: "cuda" }, message: "no driver" }
+  expect(reason([gpu.executors[0]], { backend_diagnostics: [diagnostic] })).toEqual(Option.some("cuda: no driver"))
+  expect(reason([gpu.executors[0]])).toEqual(Option.some("cuda: not available in this build"))
+  expect(reason([gpu.executors[0]], { enabled_backends: ["cuda"] })).toEqual(Option.some("cuda: not selected"))
+})
+it("reports no GPU fields on a CPU-only machine", () => {
+  const summary = Effect.runSync(summarizeInferenceHardware(snapshot({ cpu_model: null })))
+  expect(summary).toEqual({ backend: Option.some("cpu"), gpuName: Option.none(), gpuKind: Option.none(), gpuMemoryBytes: Option.none(),
+    gpuCount: 0, gpuUnusedReason: Option.none(), cpuModel: Option.none(), cpuCores: Option.some(4), memoryBytes: 64 })
 })

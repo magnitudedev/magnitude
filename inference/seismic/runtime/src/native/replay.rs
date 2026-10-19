@@ -30,10 +30,10 @@
 //! samples each configuration independently.
 
 use super::plan::{self, ParameterAddress, PlanError, PlannedPoint};
-use super::sampling::{Tally, Verdict};
-use super::search::{Cost, ParameterValues, PointKey, SearchSettings};
+use super::search::{Cost, LaunchKey, ParameterValues, SearchSettings};
 use super::tune::{Configuration, GroupSearch, Outcome, PointMeasurement, TuningResult};
 use seismic_lang::checked::NativeSpecialization;
+use seismic_measure::{median, Tally, Verdict};
 use std::collections::{BTreeSet, HashMap};
 
 /// How the replayed evaluator costs configurations.
@@ -50,7 +50,7 @@ pub enum Objective {
 /// One point of a recorded configuration.
 #[derive(Clone, Debug)]
 struct RecordedPoint {
-    key: PointKey,
+    key: LaunchKey,
     samples: Vec<f64>,
     /// The median of every recorded sample.
     time: f64,
@@ -95,16 +95,6 @@ impl std::fmt::Display for RecordingError {
 
 impl std::error::Error for RecordingError {}
 
-fn median(values: &mut [f64]) -> f64 {
-    values.sort_by(f64::total_cmp);
-    let middle = values.len() / 2;
-    if values.len() % 2 == 1 {
-        values[middle]
-    } else {
-        (values[middle - 1] + values[middle]) / 2.0
-    }
-}
-
 impl Recording {
     pub fn new(result: &TuningResult) -> Result<Self, RecordingError> {
         let parameters = result
@@ -137,7 +127,7 @@ impl Recording {
                             Ok(RecordedPoint {
                                 key: point.key.clone(),
                                 samples: point.samples.clone(),
-                                time: median(&mut point.samples.clone()),
+                                time: median(&point.samples),
                             })
                         })
                         .collect::<Result<Vec<_>, _>>()?,
@@ -311,13 +301,18 @@ impl Replayed<'_> {
     /// recorded one, or under independent sampling one no other
     /// configuration has. An excluded configuration has none recorded: it
     /// is asked for, and found excluded.
-    fn key(&self, index: Option<usize>, point: usize, specialization: &NativeSpecialization) -> PointKey {
+    fn key(
+        &self,
+        index: Option<usize>,
+        point: usize,
+        specialization: &NativeSpecialization,
+    ) -> LaunchKey {
         let recorded = index
             .and_then(|index| self.recording.points[index].as_ref())
             .filter(|_| self.objective == Objective::Keyed);
         match recorded {
             Some(points) => points[point].key.clone(),
-            None => PointKey {
+            None => LaunchKey {
                 launches: Vec::new(),
                 values: specialization.params().clone(),
             },
@@ -372,9 +367,9 @@ impl plan::Domain for Replayed<'_> {
     fn forecast(
         &self,
         point: usize,
-        _baseline: &PointKey,
+        _baseline: &LaunchKey,
         specialization: &NativeSpecialization,
-    ) -> PointKey {
+    ) -> LaunchKey {
         let index = self
             .recording
             .positions
@@ -456,7 +451,7 @@ impl Recorded<'_> {
     fn measure(
         &mut self,
         index: usize,
-        shared: &mut HashMap<(usize, PointKey), f64>,
+        shared: &mut HashMap<(usize, LaunchKey), f64>,
     ) -> Option<Vec<PointMeasurement>> {
         let recording = self.domain.recording;
         let points = recording.points[index].as_ref()?;
@@ -687,7 +682,7 @@ mod tests {
                     .collect();
                 let point = |label: &str, name: &str, base: f64, spread: f64| PointMeasurement {
                     point: label.into(),
-                    key: PointKey {
+                    key: LaunchKey {
                         launches: vec![0],
                         values: [(name.to_string(), values[name])].into_iter().collect(),
                     },

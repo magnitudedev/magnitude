@@ -2514,6 +2514,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "magnitude-executor",
  "magnitude-service-contracts",
  "magnitude-service-models",
  "serde_json",
@@ -4020,9 +4021,11 @@ version = "0.1.0"
 dependencies = [
  "seismic-compiler",
  "seismic-lang",
+ "seismic-measure",
  "seismic-native-cpu",
  "seismic-runtime",
  "seismic-std",
+ "seismic-topology",
  "self_cell",
  "sha2 0.10.9",
 ]
@@ -4136,6 +4139,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "seismic-measure"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "seismic-metal"
 version = "0.1.0"
 dependencies = [
@@ -4197,10 +4207,12 @@ dependencies = [
  "seismic-cuda",
  "seismic-ir",
  "seismic-lang",
+ "seismic-measure",
  "seismic-metal",
  "seismic-native-cpu",
  "seismic-native-target",
  "seismic-std",
+ "seismic-topology",
  "seismic-vulkan",
  "serde",
  "serde_json",
@@ -4213,6 +4225,23 @@ name = "seismic-std"
 version = "0.1.0"
 dependencies = [
  "seismic-lang",
+]
+
+[[package]]
+name = "seismic-topology"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "seismic-cpu",
+ "seismic-cuda",
+ "seismic-lang",
+ "seismic-metal",
+ "seismic-native-cpu",
+ "seismic-vulkan",
+ "serde",
+ "serde_json",
+ "windows",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

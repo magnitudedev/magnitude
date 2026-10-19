@@ -11,16 +11,17 @@
 use super::NativePrepared;
 use super::admission::{NumericalObservation, NumericalRequirement, admit};
 use super::comparison::{COMPARISON_VERSION, SubjectMeasurement, compare};
-use super::deadline::{Deadline, WorkError};
+use super::budget::PointPrices;
 use super::observation::{Observation, ReferencePages, StateRegion, Subject, observe, subjects};
-use super::search::PointKey;
-use super::timing::{PointPrices, PointTiming};
+use super::search::LaunchKey;
+use super::timing::PointTiming;
 use super::tune::{Exclusion, TuneError, TuningInitializer, TuningPoint};
 use crate::api::{
     device::DeviceInner,
     kernel::{DecodedValue, EncodedArgs},
 };
 use seismic_lang::entry::LogicalEntry;
+use seismic_measure::{Deadline, WorkError};
 use sha2::{Digest, Sha256};
 use std::{
     cell::{Cell, RefCell},
@@ -63,7 +64,7 @@ struct Inputs<'a> {
 ///
 /// What a candidate publishes at a point is determined by the work it runs
 /// there (the launches active at the point and the values of the parameters
-/// they read: its [`PointKey`]), the point's inputs, the default it is
+/// they read: its [`LaunchKey`]), the point's inputs, the default it is
 /// measured against and the comparison. The last three are fixed for a
 /// point of a unit, so an observation is keyed by point and key, and a
 /// candidate whose key at a point was observed before takes that
@@ -72,7 +73,7 @@ struct Inputs<'a> {
 struct Evidence {
     /// In the order made.
     observations: Vec<NumericalObservation>,
-    by_key: HashMap<(String, PointKey), usize>,
+    by_key: HashMap<(String, LaunchKey), usize>,
     /// The observations each artifact was held to, in the order reached.
     by_artifact: HashMap<String, Vec<usize>>,
 }
@@ -233,7 +234,7 @@ impl<'a> PreparedPoint<'a> {
         let began = Instant::now();
         timing.initialize = inputs.initialize.clone();
         if let Some(reset) = &inputs.initialize {
-            reset.borrow_mut()().map_err(|error| Exclusion::Execution(error.to_string()))?;
+            reset.borrow_mut()().map_err(Exclusion::execution)?;
         }
         timing.placed(began.elapsed());
         Ok(())
@@ -253,7 +254,7 @@ impl<'a> PreparedPoint<'a> {
                 .map(|rotation| inputs.rotation[*rotation].clone())
                 .collect(),
         )
-        .map_err(|error| Exclusion::Execution(error.to_string()))?;
+        .map_err(Exclusion::execution)?;
         witnesses.track(self.prices.clone());
         witnesses.initialize = inputs.initialize.clone();
         Ok(witnesses)
@@ -273,7 +274,7 @@ impl<'a> PreparedPoint<'a> {
         &self,
         mut timing: Option<&mut PointTiming<'a>>,
         kernel: &Arc<NativePrepared>,
-        key: &dyn Fn(Vec<usize>) -> PointKey,
+        key: &dyn Fn(Vec<usize>) -> LaunchKey,
         deadline: Deadline,
     ) -> Result<Option<usize>, WorkError<Exclusion>> {
         if let Some(timing) = timing.as_deref_mut() {
@@ -368,7 +369,7 @@ impl<'a> PreparedPoint<'a> {
         &self,
         timing: Option<&mut PointTiming<'a>>,
         kernel: &Arc<NativePrepared>,
-        key: &dyn Fn(Vec<usize>) -> PointKey,
+        key: &dyn Fn(Vec<usize>) -> LaunchKey,
         deadline: Deadline,
     ) -> Result<(), WorkError<Exclusion>> {
         let Some(observed) = self.observe_before(timing, kernel, key, deadline)? else {
@@ -385,7 +386,7 @@ impl<'a> PreparedPoint<'a> {
     /// Whether a candidate formed as `artifact` whose work here is `key`
     /// owes no witness here ([`PreparedPoint::observe_before`]): it is the
     /// reference itself, or that work was observed here before.
-    pub(super) fn witnessed(&self, artifact: &str, key: &PointKey) -> bool {
+    pub(super) fn witnessed(&self, artifact: &str, key: &LaunchKey) -> bool {
         let shared = &self.shared;
         artifact == shared.default.artifact().0
             || shared

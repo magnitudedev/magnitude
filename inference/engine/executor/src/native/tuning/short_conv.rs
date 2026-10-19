@@ -88,7 +88,7 @@ impl EntryTuning for ShortConvProjectTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, seismic::BuildError> {
         let hidden = self.binding.shape.hidden;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
@@ -187,7 +187,7 @@ impl EntryTuning for ShortConvOutputTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, seismic::BuildError> {
         let shape = self.binding.shape;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()

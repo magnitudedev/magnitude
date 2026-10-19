@@ -4,6 +4,7 @@
 //! gated rows the state entries publish. Tests return early without CUDA.
 
 mod cuda_common;
+mod timing_common;
 
 use cuda_common::*;
 use magnitude_kernels::{attention_output, attention_project, gated_delta_project};
@@ -323,10 +324,11 @@ fn cuda_attention_output_matches_host_model() {
 #[ignore = "timing; run explicitly on the measurement host"]
 fn cuda_projection_block_timings() {
     let Some(device) = cuda() else { return };
-    let options = seismic::MeasureOptions {
-        samples: 15,
+    let options = seismic::measure::Measure {
+        samples: std::num::NonZeroUsize::new(15).unwrap(),
         min_sample_seconds: 0.002,
     };
+    let measure = |point| timing_common::measured(point, &options);
     let (h, nk, nv, w) = (2560usize, 16usize, 32usize, 128usize);
     let (qkv, z) = ((2 * nk + nv) * w, nv * w);
     let rotation = 4;
@@ -389,7 +391,7 @@ fn cuda_projection_block_timings() {
                     gate_bound: &no_bound,
                 })
                 .collect();
-            let measured = kernel.measure(args, &options).unwrap();
+            let measured = measure(kernel.point(args).unwrap());
             println!(
                 "recurrent project M={m} K={h} N={} {mapping:?}: {:.1} us, {:.0} GB/s, {:.2} TFLOP/s",
                 qkv + z + 2 * nv,
@@ -423,7 +425,7 @@ fn cuda_projection_block_timings() {
                     output_bound: &no_bound,
                 })
                 .collect();
-            let measured = kernel.measure(args, &options).unwrap();
+            let measured = measure(kernel.point(args).unwrap());
             println!(
                 "recurrent output M={m} K={z} N={h} {mapping:?}: {:.1} us, {:.0} GB/s, {:.2} TFLOP/s",
                 measured.median * 1e6,

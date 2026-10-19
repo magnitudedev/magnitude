@@ -10,6 +10,8 @@ use magnitude_kernels::{
 };
 use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
 
+mod timing_common;
+
 fn bf16_round(value: f32) -> f32 {
     let bits = value.to_bits();
     f32::from_bits((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
@@ -523,13 +525,13 @@ fn entries_match_on(device: &Device) {
 
 #[test]
 fn dflash2_entries_match_the_host_model_on_cpu() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     entries_match_on(&catalog.open_backend(BackendName::Cpu).unwrap());
 }
 
 #[test]
 fn dflash2_entries_match_the_host_model_on_accelerators() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
         let Ok(device) = catalog.open_backend(backend) else {
             continue;
@@ -541,7 +543,7 @@ fn dflash2_entries_match_the_host_model_on_accelerators() {
 #[test]
 #[ignore = "one-sample full-vocabulary readout timing on the measurement host"]
 fn time_top_k_full_vocabulary() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [BackendName::Metal, BackendName::Cuda] {
         let Ok(device) = catalog.open_backend(backend) else {
             continue;
@@ -577,19 +579,20 @@ fn time_top_k_full_vocabulary() {
                         .unwrap(),
                 )
                 .unwrap();
-                let measured = kernel
-                    .measure(
-                        vec![draft_top_k::Args {
-                            logits: &logits,
-                            candidates: &mut candidates,
-                            unary: &mut unary,
-                        }],
-                        &seismic::MeasureOptions {
-                            samples: 1,
-                            min_sample_seconds: 0.0,
-                        },
-                    )
+                let point = kernel
+                    .point(vec![draft_top_k::Args {
+                        logits: &logits,
+                        candidates: &mut candidates,
+                        unary: &mut unary,
+                    }])
                     .unwrap();
+                let measured = timing_common::measured(
+                    point,
+                    &seismic::measure::Measure {
+                        samples: std::num::NonZeroUsize::MIN,
+                        min_sample_seconds: 0.0,
+                    },
+                );
                 eprintln!(
                     "{backend:?} top_k V={vocabulary} M={rows} K={count} seconds={:.9}",
                     measured.median
@@ -601,7 +604,7 @@ fn time_top_k_full_vocabulary() {
 
 #[test]
 fn partitioned_top_k_matches_full_vocabulary_on_accelerators() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [BackendName::Metal, BackendName::Cuda] {
         let Ok(device) = catalog.open_backend(backend) else {
             continue;

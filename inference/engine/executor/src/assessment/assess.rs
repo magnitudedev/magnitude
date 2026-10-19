@@ -10,14 +10,14 @@ use super::AssessmentError;
 use super::bandwidth::DeviceBandwidth;
 use super::demand::DecodeDemand;
 use super::estimate::{PerformanceEstimate, estimate_performance, performance_depths};
-use crate::platform::{DomainRole, MemoryReserves, fit_capacities};
+use crate::platform::{DomainRole, MemoryReserves};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryCharge, AssessmentMemoryTerms, ExecutionPlanDraft, ResourceCapacity,
     ResourcePlanner,
 };
 use magnitude_family_contracts::ModelDefinition;
-use seismic::{DeviceTopology, HostMemoryStatus, MemoryPoolId};
+use seismic::{DeviceTopology, Status, StoreId};
 
 /// Engine inputs to one assessment. No service profile or model identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,7 +33,10 @@ pub struct AssessmentRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DomainFit {
     pub role: DomainRole,
-    pub domain: MemoryPoolId,
+    pub domain: StoreId,
+    /// What the executor's placements can hold in the store, within the
+    /// store and the grants of the paths into it, with its planning
+    /// reserve.
     pub capacity_bytes: u64,
     pub required_bytes: u64,
     /// The domain's planning reserve.
@@ -53,7 +56,7 @@ pub enum ExecutionAssessment {
     DoesNotFit {
         fit_context_tokens: u32,
         domains: Vec<DomainFit>,
-        limiting: MemoryPoolId,
+        limiting: StoreId,
         deficit_bytes: u64,
     },
 }
@@ -158,27 +161,19 @@ pub fn finish_execution_assessment(
     prepared: &PreparedExecutionAssessment,
     draft: &ExecutionPlanDraft,
     topology: &DeviceTopology,
-    host: &HostMemoryStatus,
+    status: &Status,
     bandwidth: DeviceBandwidth,
     request: &AssessmentRequest,
 ) -> Result<ExecutionAssessment, AssessmentError> {
-    let device = topology
-        .devices()
-        .iter()
-        .find(|device| device.selector == draft.device().selector())
-        .ok_or_else(|| {
-            AssessmentError::Memory(format!(
-                "planned device {} is absent from the topology",
-                draft.device().selector()
-            ))
-        })?;
-    let capacities = fit_capacities(topology, device, host, &request.reserves)
-        .map_err(|error| AssessmentError::Memory(error.to_string()))?;
-    let shared = crate::platform::shared_role(device)
-        .map_err(|error| AssessmentError::Memory(error.to_string()))?;
+    let device = topology.resolve(draft.device().selector()).ok_or_else(|| {
+        AssessmentError::Memory(format!(
+            "planned device {} is absent from the topology",
+            draft.device().selector()
+        ))
+    })?;
     let fit = prepared
         .charge
-        .assess_fit(&capacities, shared)
+        .assess_fit(topology, device, status, &request.reserves)
         .map_err(AssessmentError::Memory)?;
     let fit_context_tokens = prepared.fit_context_tokens;
     match fit.verdict {
@@ -210,12 +205,12 @@ pub fn assess_execution(
     definition: &ModelDefinition,
     draft: &ExecutionPlanDraft,
     topology: &DeviceTopology,
-    host: &HostMemoryStatus,
+    status: &Status,
     bandwidth: DeviceBandwidth,
     request: &AssessmentRequest,
 ) -> Result<ExecutionAssessment, AssessmentError> {
     let prepared = prepare_execution_assessment(definition, draft, request.context_limit)?;
-    finish_execution_assessment(&prepared, draft, topology, host, bandwidth, request)
+    finish_execution_assessment(&prepared, draft, topology, status, bandwidth, request)
 }
 
 #[cfg(test)]
@@ -229,13 +224,13 @@ mod tests {
 
     struct Environment {
         topology: std::sync::Arc<DeviceTopology>,
-        host: HostMemoryStatus,
+        status: Status,
         draft: ExecutionPlanDraft,
         definition: ModelDefinition,
     }
 
     fn environment(context_limit: u64) -> Environment {
-        let catalog = seismic::DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Devices::discover(&[]).unwrap();
         let selected = crate::platform::select_device(
             &catalog,
             ExecutionPath::Native,
@@ -271,7 +266,7 @@ mod tests {
         .unwrap();
         Environment {
             topology: catalog.topology(),
-            host: catalog.host_memory_status().unwrap(),
+            status: catalog.status(),
             draft,
             definition,
         }
@@ -295,7 +290,7 @@ mod tests {
             &environment.definition,
             &environment.draft,
             &environment.topology,
-            &environment.host,
+            &environment.status,
             BANDWIDTH,
             request,
         )
@@ -330,7 +325,11 @@ mod tests {
                 .all(|estimate| estimate.tokens_per_second.is_finite()
                     && estimate.tokens_per_second > 0.0)
         );
-        assert_eq!(domains[0].role, DomainRole::Allocation);
+        assert!(
+            domains
+                .iter()
+                .any(|domain| domain.role == DomainRole::Allocation)
+        );
         assert!(domains.iter().all(|domain| domain.remaining_bytes >= 0));
         for domain in &domains {
             assert_eq!(
@@ -368,7 +367,7 @@ mod tests {
                 &environment.definition,
                 &environment.draft,
                 &environment.topology,
-                &environment.host,
+                &environment.status,
                 BANDWIDTH,
                 &request(256, &[64]),
             ),

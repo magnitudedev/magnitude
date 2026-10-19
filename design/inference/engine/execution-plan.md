@@ -660,7 +660,7 @@ lists none, which spares it tuning and forming kernels no form of which it can s
 one on tensor operations, and on simdgroup matrices for 128-, 256- and 512-column heads; CUDA
 has F16 operand staging for the affine entry's32-,64-,128-,256- and512-column heads
 (`planning::reads_decoded_history`). The tensor operations fact is the device's own probe
-(`DeviceInfo::forms_tensor_operations` before it is opened, which planning and assessment read;
+(`Executor::forms_tensor_operations` before it is opened, which planning and assessment read;
 graph preparation fails if the opened device disagrees).
 The draft head's and the separate draft's graphs list none.
 

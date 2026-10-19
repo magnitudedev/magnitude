@@ -6,7 +6,7 @@
 include!("attention.rs");
 
 fn cuda() -> Option<Device> {
-    DeviceCatalog::discover()
+    seismic::Devices::discover(&[])
         .ok()?
         .open_backend(BackendName::Cuda)
         .ok()
@@ -233,10 +233,11 @@ fn cuda_eight_query_group_decode_and_prefill_match_host_model() {
 #[ignore = "timing; run explicitly on the measurement host"]
 fn cuda_attention_timings() {
     let Some(device) = cuda() else { return };
-    let options = seismic::MeasureOptions {
-        samples: 15,
+    let options = seismic::measure::Measure {
+        samples: std::num::NonZeroUsize::new(15).unwrap(),
         min_sample_seconds: 0.002,
     };
+    let measure = |point| timing_common::measured(point, &options);
     for context in [256usize, 4096, 16384] {
         let rows = vec![Row {
             spans: vec![(0, context as i32 - 1)],
@@ -255,7 +256,7 @@ fn cuda_attention_timings() {
                 .iter_mut()
                 .map(|bound| args!(attention_decode, bound, case))
                 .collect();
-            let measured = kernel.measure(args, &options).unwrap();
+            let measured = measure(kernel.point(args).unwrap());
             let bytes = (context * QWEN.kv * QWEN.w() * 2 * 2) as f64;
             println!(
                 "decode context {context} PARTS,WARPS,SLICES {config:?}: {:.1} us, KV read {:.0} GB/s",
@@ -282,9 +283,11 @@ fn cuda_attention_timings() {
         let mut bound = Bound::new(&device, &case);
         for config in PREFILL_CONFIGS {
             let kernel = cuda_prefill(&device, QWEN, config);
-            let measured = kernel
-                .measure(vec![args!(attention_prefill, bound, case)], &options)
-                .unwrap();
+            let measured = measure(
+                kernel
+                    .point(vec![args!(attention_prefill, bound, case)])
+                    .unwrap(),
+            );
             println!(
                 "prefill {rows} rows after {history} history WARPS,SPLIT_GROUPS {config:?}: {:.1} us",
                 measured.median * 1e6

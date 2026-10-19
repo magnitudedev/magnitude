@@ -79,7 +79,7 @@ impl ImportSource {
             // it as a kernel source.
             _ => unsafe { Tensor::uninitialized(device, weight.upload, &[count]) }
                 .map(Self::Staged)
-                .map_err(|error| AllocationError::Device(error.to_string())),
+                .map_err(AllocationError::Tensor),
         }
     }
 
@@ -183,15 +183,14 @@ impl ImportWindow {
         }
         let window = source
             .map_window(start, end - start)
-            .map_err(|error| AllocationError::Device(error.to_string()))?;
+            .map_err(|error| AllocationError::Mapping(error.to_string()))?;
         let mapped_bytes = window.mapped_len() as u64;
         let pointer = std::ptr::NonNull::new(window.as_ref().as_ref().as_ptr() as *mut u8)
             .ok_or_else(|| invalid("mapped artifact window has no address"))?;
         // SAFETY: the window owns the immutable mapped range through every
         // device view and every in-flight submission using it.
         let host = unsafe { HostRegion::new(pointer, window.mapped_len(), window.clone()) };
-        let region = ReadOnlyMappedRegion::new(device, host)
-            .map_err(|error| AllocationError::Device(error.to_string()))?;
+        let region = ReadOnlyMappedRegion::new(device, host).map_err(AllocationError::Tensor)?;
         Ok(Self {
             source,
             start,
@@ -209,7 +208,7 @@ impl ImportWindow {
         _start: u64,
         _end: u64,
     ) -> Result<Self, AllocationError> {
-        Err(AllocationError::Device(
+        Err(AllocationError::Mapping(
             "mapped import windows require a Unix host".into(),
         ))
     }
@@ -239,7 +238,7 @@ impl ImportWindow {
                 &[count],
                 self.data_offset + offset - self.start,
             )
-            .map_err(|error| AllocationError::Device(error.to_string()))
+            .map_err(AllocationError::Tensor)
     }
 }
 
@@ -274,20 +273,42 @@ impl fmt::Debug for ImportWorkspaceLease {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AllocationError {
-    Device(String),
+    /// A tensor, region or arena the device could not allocate, its
+    /// capacity refusals among them.
+    Tensor(seismic::TensorError),
+    /// A graph slot the device could not form, its capacity refusals (a
+    /// slot's tensors) among them.
+    Workflow(seismic::WorkflowError),
+    /// An artifact window the host could not map: never a capacity
+    /// refusal.
+    Mapping(String),
     Plan(InvariantError),
 }
 
 impl fmt::Display for AllocationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Device(error) => write!(formatter, "resource allocation: {error}"),
+            Self::Tensor(error) => write!(formatter, "resource allocation: {error}"),
+            Self::Workflow(error) => write!(formatter, "resource allocation: {error}"),
+            Self::Mapping(error) => write!(formatter, "resource allocation: {error}"),
             Self::Plan(error) => error.fmt(formatter),
         }
     }
 }
 
 impl std::error::Error for AllocationError {}
+
+impl From<AllocationError> for seismic::BuildError {
+    /// An allocation the device refused for capacity is a refusal;
+    /// anything else a failure.
+    fn from(error: AllocationError) -> Self {
+        match error {
+            AllocationError::Tensor(error)
+            | AllocationError::Workflow(seismic::WorkflowError::TensorView(error)) => error.into(),
+            other => Self::Failed(other.to_string()),
+        }
+    }
+}
 
 /// Numerical graph slots authorized by one ResourcePlan. Import sources are
 /// allocated separately during component materialization.
@@ -461,7 +482,7 @@ impl ResourceAllocator {
         state_graphs: &PreparedStateCopyGraphs,
     ) -> Result<AllocatedResources, AllocationError> {
         if device.backend() != execution.device().backend()
-            || device.info().name != execution.device().name()
+            || device.info().name() != execution.device().name()
         {
             return Err(AllocationError::Plan(InvariantError {
                 context: "resource allocator",
@@ -477,7 +498,7 @@ impl ResourceAllocator {
         };
         let arena = device
             .execution_arena(plan.arena_bytes())
-            .map_err(|error| AllocationError::Device(error.to_string()))?;
+            .map_err(AllocationError::Tensor)?;
         let graph_charge = plan.target_graph();
         if !admitted(target_graphs.family(), graph_charge)
             || target_graphs.runs_per_step() != graph_charge.upload_regions

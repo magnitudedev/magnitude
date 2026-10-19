@@ -13,7 +13,7 @@ import {
 
 const device = { deviceId: "metal:0", backend: "metal" } as unknown as ModelLoadDevice
 const hardware = Option.some({
-  accelerators: [{ acceleratorId: "metal:0", name: "Apple M3 Max", backend: "metal", memoryDomainId: "unified" }],
+  accelerators: [{ acceleratorId: "apple", name: "Apple M3 Max", executors: [{ deviceId: "metal:0", backend: "metal", memoryDomainIds: ["unified"] }] }],
 } as unknown as LocalInferenceHardware)
 
 describe("model optimization wording", () => {
