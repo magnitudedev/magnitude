@@ -595,6 +595,21 @@
           ]
         }
       }
+    },
+    {
+      "name": "qwen35-9b-finetune-with-base-projector",
+      "description": "DavidAU Qwen3.5 9B Defiant Fable Heretic Q4_K_M, a finetune whose header names a different base model than its repository's mmproj-BF16.gguf projector (also in headers/). It runs; the engine boundary test binds that projector by its width, never by names.",
+      "target": [
+        {
+          "header": "headers/Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-Q4_K_M.gguf.gz",
+          "repository": "DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF",
+          "revision": "d5f3139249b7ee2535c20ab81125c9a6ab0c4915",
+          "path": "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-Q4_K_M.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported"
+      }
     }
   ]
 }

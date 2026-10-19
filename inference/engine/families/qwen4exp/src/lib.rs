@@ -24,7 +24,7 @@ use magnitude_family_contracts::{
 };
 use magnitude_family_qwen::{
     GEOMETRY_KEYS, Geometry, MIXER_KEYS, Metadata, MixerKind, ROUTED_KEYS, Weight,
-    check_projector_base, describe_projector, mixer_kinds, product,
+    check_projector_width, describe_projector, mixer_kinds, product,
 };
 
 pub use magnitude_family_qwen::Error;
@@ -363,7 +363,7 @@ pub fn inspect_components(
         &ngram_table,
     )?);
     if let Some(projector) = projector {
-        check_projector_base(directory, projector)?;
+        check_projector_width(projector, hidden)?;
     }
     let vision = projector.map(describe_projector).transpose()?;
     let mut definition = ModelDefinition {

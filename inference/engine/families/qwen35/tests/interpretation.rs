@@ -279,7 +279,7 @@ fn projector() -> Directory {
         scalar("clip.vision.patch_size", Scalar::Unsigned(2)),
         scalar("clip.vision.spatial_merge_size", Scalar::Unsigned(2)),
         scalar("clip.vision.image_size", Scalar::Unsigned(4)),
-        scalar("clip.vision.projection_dim", Scalar::Unsigned(6)),
+        scalar("clip.vision.projection_dim", Scalar::Unsigned(8)),
         scalar(
             "clip.vision.attention.layer_norm_epsilon",
             Scalar::Float(1e-6),
@@ -330,8 +330,8 @@ fn projector() -> Directory {
         ("v.post_ln.bias", vec![4]),
         ("mm.0.weight", vec![16, 16]),
         ("mm.0.bias", vec![16]),
-        ("mm.2.weight", vec![6, 16]),
-        ("mm.2.bias", vec![6]),
+        ("mm.2.weight", vec![8, 16]),
+        ("mm.2.bias", vec![8]),
     ] {
         add(name, &shape);
     }
@@ -547,8 +547,8 @@ fn projector_description_validates_roles_and_fused_qkv_ranges() {
         Some(ArtifactIdentity([2; 32]))
     );
 
-    // A derived target (a quantization) names its own file and its base
-    // model; the projector pairs with the base model.
+    // A derived target (a finetune) may name any base model: the projector
+    // pairs by its output width, never by names.
     let mut derived = directory(false);
     for (name, value) in [
         ("general.name", "fixture-Q4_K_M"),
@@ -569,7 +569,18 @@ fn projector_description_validates_roles_and_fused_qkv_ranges() {
         name: "general.base_model.0.name".into(),
         value: Value::Scalar(Scalar::String("other".into())),
     });
-    assert!(inspect_components(&derived, Some(&projector), identity).is_err());
+    assert!(inspect_components(&derived, Some(&projector), identity.clone()).is_ok());
+    let mut narrow = projector.clone();
+    for metadata in &mut narrow.metadata {
+        if metadata.name == "clip.vision.projection_dim" {
+            metadata.value = Value::Scalar(Scalar::Unsigned(6));
+        }
+    }
+    let refused = inspect_components(&derived, Some(&narrow), identity).unwrap_err();
+    assert!(
+        matches!(refused.reasons.as_slice(), [magnitude_artifacts::UnsupportedReason::TargetMismatch { .. }]),
+        "{refused:?}"
+    );
 
     let mut malformed = projector;
     malformed.tensors.push(TensorDescriptor {

@@ -23,7 +23,7 @@ use magnitude_family_contracts::{
 };
 use magnitude_family_qwen::{
     DENSE_KEYS, GEOMETRY_KEYS, Geometry, MIXER_KEYS, Metadata, MixerKind, ROUTED_KEYS, Weight,
-    check_projector_base, mixer_kinds, product,
+    check_projector_width, mixer_kinds, product,
 };
 
 pub use magnitude_family_qwen::Error;
@@ -241,7 +241,7 @@ pub fn inspect_components(
     };
     tensors.finish()?;
     if let Some(projector) = projector {
-        check_projector_base(directory, projector)?;
+        check_projector_width(projector, hidden)?;
     }
     let vision = projector
         .map(|projector| {

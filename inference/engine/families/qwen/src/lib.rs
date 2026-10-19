@@ -435,22 +435,16 @@ impl Geometry {
     }
 }
 
-/// Rejects a projector whose base model differs from the target's. A derived
-/// target (a quantization, a fine-tune) names its base model exactly as the
-/// projector does; an original model is its own base.
-pub fn check_projector_base(directory: &Directory, projector: &Directory) -> Result<(), Error> {
-    let target_base = directory
-        .value("general.base_model.0.name")
-        .and_then(Value::string)
-        .or_else(|| directory.value("general.name").and_then(Value::string));
-    let projector_base = projector
-        .value("general.base_model.0.name")
-        .and_then(Value::string);
-    if target_base
-        .zip(projector_base)
-        .is_some_and(|(target, projected)| target != projected)
+/// Rejects a projector whose output width isn't the target's embedding width: it can't feed this
+/// decoder. Names (a base model's) never decide; a fine-tune keeps its base's width.
+pub fn check_projector_width(projector: &Directory, hidden: u64) -> Result<(), Error> {
+    match projector
+        .value("clip.vision.projection_dim")
+        .and_then(Value::unsigned)
     {
-        return Err(Error::invalid("projector base model differs from target"));
+        Some(width) if width != hidden => Err(Error::mismatch(format!(
+            "projector width {width} differs from the target's {hidden}"
+        ))),
+        _ => Ok(()),
     }
-    Ok(())
 }
