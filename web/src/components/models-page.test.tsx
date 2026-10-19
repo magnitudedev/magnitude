@@ -3,7 +3,7 @@ import type { ReactElement } from "react"
 import { describe, expect, it, vi } from "vitest"
 import { Option } from "effect"
 import type { ModelId } from "@magnitudedev/sdk"
-import { DiscoverSections, HiddenModelUnhide, ModelsListing, afterModelAdded, otherVersionsRequest, selectModels } from "./models-page"
+import { DiscoverSections, HiddenModelUnhide, ModelsListing, addFromHuggingFace, afterModelAdded, otherVersionsRequest, selectModels } from "./models-page"
 import { ModelsHeader } from "./models-header"
 import { modelLabs } from "./model-logo"
 import { added, catalogModel, customModel, doesNotFit, foundIn } from "../../test/models/fixtures"
@@ -110,5 +110,19 @@ describe("discover", () => {
     expect(none).toContain("Explore Catalog")
     expect(none).toContain("Add from Hugging Face")
     expect(none.indexOf("recommendations")).toBeLessThan(none.indexOf("No fitting recommendations"))
+  })
+})
+
+describe("Add from Hugging Face", () => {
+  it("switches Discover to Catalog with the dialog open over it, and opens in place on Catalog", () => {
+    const openInPlace = vi.fn()
+    const openOnCatalog = vi.fn()
+    addFromHuggingFace("discover", openInPlace, openOnCatalog)()
+    expect(openOnCatalog).toHaveBeenCalledWith({ _tag: "Search", query: "" })
+    expect(openInPlace).not.toHaveBeenCalled()
+    openOnCatalog.mockClear()
+    addFromHuggingFace("catalog", openInPlace, openOnCatalog)()
+    expect(openInPlace).toHaveBeenCalledWith({ _tag: "Search", query: "" })
+    expect(openOnCatalog).not.toHaveBeenCalled()
   })
 })

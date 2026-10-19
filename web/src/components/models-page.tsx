@@ -1,6 +1,6 @@
 import type { ReactNode } from "react"
 import { Option } from "effect"
-import { formatLocalModelDisplayName, localModelIsInstalled, useLocalModelCommandStatus, useLocalModelMutations, type ApplicationPage } from "@magnitudedev/client-common"
+import { formatLocalModelDisplayName, localModelIsInstalled, useLocalModelCommandStatus, useLocalModelMutations, type AddModelRequest, type ApplicationPage } from "@magnitudedev/client-common"
 import type { CustomLocalModel, CustomModelAcquisitionState, LocalModel } from "@magnitudedev/sdk"
 import { HiddenModels, UnhideButton } from "./local-model-lists"
 import { FoundModelsBanner, HuggingFaceLink, NoRecommendations } from "./discover-custom"
@@ -43,6 +43,16 @@ export const selectModels = ({ library, hidden, filter, lab, search, sort }: {
 /** Find other versions on Hugging Face: only a Catalog page's catalog cards, searching for the model's name. */
 export const otherVersionsRequest = (page: ApplicationPage, model: LocalModel): Option.Option<AddDialogRequest> =>
   page === "catalog" && model._tag === "Catalog" ? Option.some({ _tag: "Search", query: model.presentation.displayName }) : Option.none()
+
+/**
+ * Add from Hugging Face opens the dialog where catalog and custom models live: in place on Catalog,
+ * and from Discover by switching to Catalog with the dialog open over it.
+ */
+export const addFromHuggingFace = (page: ApplicationPage, openInPlace: (request: AddDialogRequest) => void, openOnCatalog: (request: AddModelRequest) => void) => () => {
+  const request = { _tag: "Search", query: "" } as const
+  if (page === "discover") openOnCatalog(request)
+  else openInPlace(request)
+}
 
 /** Adding a model closes the dialog and shows it in My Models, where its download progresses. */
 export const afterModelAdded = (closeDialog: () => void, navigate: (page: ApplicationPage) => void) => () => {

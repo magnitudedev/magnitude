@@ -4,8 +4,8 @@ import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { HuggingFaceRepositoryIdSchema } from "@magnitudedev/sdk"
 import { Dialog } from "./ui/dialog"
-import { FindStepView, InspectedRepository, LocalFileSummary, LocalFileView, NativeFileChoice, ggufOpenRequest, RepositoryFooter, RepositoryView, SearchResultsView, VerdictLabel, addVersionRequest, confirmAction, formatDownloads, initialVersion, parseModelReference, revealVersionRow, revealsVersion, unselectableVersionNotice, unsupportedVersionLabel, versionVerdict, type FindTab } from "./add-model-dialog"
-import { catalogId, catalogModel, drafterCandidate, inspection, repository, version, doesNotFit, unsupported, unreadable } from "../../test/models/fixtures"
+import { FindStepView, InspectedRepository, InspectingRepositoryView, InspectionStatus, InspectionVersionList, PLACEHOLDER_VERSION_ROWS, inspectionPhaseText, placeholderVersionRows, referencePreview, searchResultPreview, LocalFileSummary, LocalFileView, NativeFileChoice, ggufOpenRequest, RepositoryFooter, RepositoryView, SearchResultsView, VerdictLabel, addVersionRequest, confirmAction, formatDownloads, initialVersion, parseModelReference, revealVersionRow, revealsVersion, unselectableVersionNotice, unsupportedVersionLabel, versionVerdict, type FindTab } from "./add-model-dialog"
+import { catalogId, catalogModel, drafterCandidate, inspection, repository, version, doesNotFit, fits, unsupported, unreadable } from "../../test/models/fixtures"
 
 const inDialog = (node: ReactNode) => renderToStaticMarkup(<Dialog open>{node}</Dialog>)
 const models = [catalogModel()]
@@ -42,7 +42,7 @@ describe("find step", () => {
   })
   it("lists results with uploader, the catalog model each is a variant of, and downloads", () => {
     const html = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loaded", response: {
-      results: [{ repository, displayName: "Huihui Qwen3.6 35B A3B abliterated", uploader: "huihui-ai", variantOf: Option.some(catalogId), downloads: 172_100, architecture: Option.some("qwen35moe"), unsupported: Option.none(), gated: false }],
+      results: [{ repository, displayName: "Huihui Qwen3.6 35B A3B abliterated", uploader: "huihui-ai", variantOf: Option.some(catalogId), downloads: 172_100, architecture: Option.some("qwen35moe"), unsupported: Option.none(), gated: false, versionCount: Option.none() }],
     } }} />)
     expect(html).toContain("Huihui Qwen3.6 35B A3B abliterated")
     expect(html).toContain("huihui-ai · Variant of Qwen3.6 35B-A3B")
@@ -52,7 +52,7 @@ describe("find step", () => {
   })
   it("shows a result of an architecture Magnitude doesn't run disabled, with why", () => {
     const html = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loaded", response: {
-      results: [{ repository: HuggingFaceRepositoryIdSchema.make("unsloth/DeepSeek-V4-Flash-GGUF"), displayName: "DeepSeek V4 Flash", uploader: "unsloth", variantOf: Option.none(), downloads: 900, architecture: Option.some("deepseek4"), unsupported: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]), gated: false }],
+      results: [{ repository: HuggingFaceRepositoryIdSchema.make("unsloth/DeepSeek-V4-Flash-GGUF"), displayName: "DeepSeek V4 Flash", uploader: "unsloth", variantOf: Option.none(), downloads: 900, architecture: Option.some("deepseek4"), unsupported: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]), gated: false, versionCount: Option.none() }],
     } }} />)
     expect(html).toContain("DeepSeek V4 Flash")
     expect(html).toContain("Magnitude doesn&#x27;t run deepseek4 yet")
@@ -60,7 +60,7 @@ describe("find step", () => {
   })
   it("labels a gated result and keeps it clickable", () => {
     const html = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loaded", response: {
-      results: [{ repository: HuggingFaceRepositoryIdSchema.make("orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF"), displayName: "Qwen3.8 Flash Next Uncensored", uploader: "orcarouter", variantOf: Option.none(), downloads: 900, architecture: Option.some("qwen35"), unsupported: Option.none(), gated: true }],
+      results: [{ repository: HuggingFaceRepositoryIdSchema.make("orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF"), displayName: "Qwen3.8 Flash Next Uncensored", uploader: "orcarouter", variantOf: Option.none(), downloads: 900, architecture: Option.some("qwen35"), unsupported: Option.none(), gated: true, versionCount: Option.none() }],
     } }} />)
     expect(html).toContain("orcarouter · Requires access on Hugging Face")
     expect(html).not.toMatch(/<button[^>]*disabled=""/)
@@ -199,7 +199,7 @@ describe("repository step", () => {
     const pinned = inDialog(<RepositoryFooter local={false} action={{ label: "Download (24.3 GB)", download: true }} pending={false} failure={undefined} onConfirm={() => {}} />)
     expect(pinned).toContain("Pinned to the current version of this repository")
     expect(pinned).toContain("Download (24.3 GB)")
-    const local = inDialog(<RepositoryFooter local action={{ label: "Add", download: false }} pending failure={{ title: "Couldn’t add this model" }} onConfirm={() => {}} />)
+    const local = inDialog(<RepositoryFooter local action={{ label: "Add", download: false }} pending failure={{ title: "Couldn’t add this model", retryable: true }} onConfirm={() => {}} />)
     expect(local).toContain("never moves or deletes it")
     expect(local).toContain("Couldn’t add this model")
     expect(local).toMatch(/<button[^>]*disabled=""/)
@@ -268,5 +268,91 @@ describe("a version the dialog opens on", () => {
     expect(revealsVersion("Q4_K_M", Option.some("Q4_K_M"), Option.some("Q4_K_M"))).toBe(true)
     expect(revealsVersion("Q8_0", Option.some("Q4_K_M"), Option.some("Q4_K_M"))).toBe(false)
     expect(revealsVersion("Q4_K_M", Option.some("Q4_K_M"), Option.none())).toBe(false)
+  })
+})
+
+describe("a repository being inspected", () => {
+  it("names each phase with how much of it is done", () => {
+    expect(inspectionPhaseText({ _tag: "ReadingHeaders", completed: 4, total: 11 })).toBe("Reading file headers · 4 of 11")
+    expect(inspectionPhaseText({ _tag: "CheckingVersions", completed: 7, total: 11 })).toBe("Checking versions on this computer · 7 of 11")
+    expect(inspectionPhaseText({ _tag: "CheckingDrafters", version: "Q4_K_M", completed: 1, total: 3 })).toBe("Checking drafters for Q4_K_M · 1 of 3")
+    expect(inspectionPhaseText({ _tag: "CheckingDrafters", version: "Q4_K_M", completed: 0, total: 0 })).toBe("Checking drafters for Q4_K_M")
+  })
+  it("lists every version with its size, a verdict once checked and Checking… until then", () => {
+    const html = inDialog(<InspectionVersionList versions={[
+      { label: "Q8_0", sizeBytes: 8_000_000_000, assessment: Option.some(doesNotFit) },
+      { label: "Q4_K_M", sizeBytes: 4_000_000_000, assessment: Option.some(fits) },
+      { label: "Q2_K", sizeBytes: 2_000_000_000, assessment: Option.none() },
+    ]} />)
+    expect(html.match(/<li/g)).toHaveLength(3)
+    expect(html).toContain("Too large for this machine")
+    expect(html).toContain("Fits your machine")
+    expect(html).not.toContain("Recommended")
+    expect(html.match(/Checking…/g)).toHaveLength(1)
+    expect(html.indexOf("Q2_K")).toBeLessThan(html.indexOf("Checking…"))
+  })
+  it("shows the phase over a progress bar, and what it is reading before any progress", () => {
+    const html = inDialog(<InspectionStatus reading="Reading the repository…" progress={Option.some({ phase: { _tag: "CheckingVersions", completed: 2, total: 3 }, versions: [] })} />)
+    expect(html).toContain("Checking versions on this computer · 2 of 3")
+    expect(html).toContain('aria-valuenow="67"')
+    const reading = inDialog(<InspectionStatus reading="Reading the repository…" progress={Option.none()} />)
+    expect(reading).toContain("Reading the repository…")
+    expect(reading).toContain('aria-valuenow="0"')
+  })
+})
+
+describe("one dialog layout through the whole flow", () => {
+  const rows = (html: string, tag: string) => html.match(new RegExp(`<${tag}[^>]*class="flex min-h-10 items-center gap-3 px-3 py-2 text-sm`, "g")) ?? []
+  const header = <p>repository header</p>
+  const progress = (versions: number) => Option.some({
+    phase: { _tag: "ReadingHeaders" as const, completed: versions, total: versions },
+    versions: Array.from({ length: versions }, (_, index) => ({ label: `Q${index}_K`, sizeBytes: 1_000_000_000, assessment: Option.none() })),
+  })
+  const layout = (html: string) => ({
+    header: html.indexOf("repository header") >= 0 && html.indexOf("repository header") < html.indexOf('data-slot="dialog-body"'),
+    bodies: html.match(/data-slot="dialog-body"/g)?.length ?? 0,
+    footerInBody: html.indexOf('data-slot="step-footer"') > html.indexOf('data-slot="dialog-body"'),
+  })
+  it("shows placeholder version rows, the status line and a disabled Download from the first frame", () => {
+    const html = inDialog(<InspectingRepositoryView header={header} progress={Option.none()} />)
+    expect(layout(html)).toEqual({ header: true, bodies: 1, footerInBody: true })
+    expect(rows(html, "div")).toHaveLength(PLACEHOLDER_VERSION_ROWS)
+    expect(html).toContain("Reading the repository…")
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>.*Download<\/button>/)
+  })
+  it("keeps the placeholders until the files are known, then one row per version in the same frame", () => {
+    expect(rows(inDialog(<InspectingRepositoryView header={header} progress={progress(0)} />), "div")).toHaveLength(PLACEHOLDER_VERSION_ROWS)
+    const known = inDialog(<InspectingRepositoryView header={header} progress={progress(11)} />)
+    expect(rows(known, "div")).toHaveLength(0)
+    expect(rows(known, "li")).toHaveLength(11)
+    expect(layout(known)).toEqual({ header: true, bodies: 1, footerInBody: true })
+  })
+  it("shows as many placeholder rows as the search counted versions, within a dialog's worth", () => {
+    expect(placeholderVersionRows(Option.some(3))).toBe(3)
+    expect(placeholderVersionRows(Option.some(40))).toBe(12)
+    expect(placeholderVersionRows(Option.none())).toBe(PLACEHOLDER_VERSION_ROWS)
+    const html = inDialog(<InspectingRepositoryView header={header} placeholderRows={placeholderVersionRows(Option.some(3))} progress={Option.none()} />)
+    expect(rows(html, "div")).toHaveLength(3)
+  })
+  it("gives inspected version rows the frame they had while being checked", () => {
+    const html = inDialog(<RepositoryView inspection={inspection()} models={models} selectedVersion={Option.some("Q4_K_P")} onSelectVersion={() => {}} />)
+    expect(rows(html, "label")).toHaveLength(inspection().versions.length)
+    expect(html.match(/data-slot="dialog-body"/g)).toHaveLength(1)
+  })
+  it("scrolls search results below a fixed title, tabs and search field", () => {
+    const html = find("search", { results: <p>search results</p> })
+    expect(html.indexOf('aria-label="Search Hugging Face"')).toBeLessThan(html.indexOf('data-slot="dialog-body"'))
+    expect(html.indexOf('data-slot="dialog-body"')).toBeLessThan(html.indexOf("search results"))
+  })
+  it("holds the local file footer in place before a file is chosen", () => {
+    const html = inDialog(<LocalFileView browser={<p>file browser</p>} file={Option.none()} />)
+    expect(html).toContain('data-slot="step-footer"')
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>.*Add<\/button>/)
+  })
+  it("names the repository from the search result, or from a pasted reference, before it is inspected", () => {
+    const result = { repository, displayName: "Huihui Qwen3.6 35B A3B abliterated", uploader: "huihui-ai", variantOf: Option.some(catalogId), downloads: 1, architecture: Option.none(), unsupported: Option.none(), gated: false, versionCount: Option.some(4) }
+    expect(searchResultPreview(result)).toEqual({ displayName: "Huihui Qwen3.6 35B A3B abliterated", repository: Option.some(repository), variantOf: Option.some(catalogId), versionCount: Option.some(4) })
+    expect(referencePreview("https://huggingface.co/unsloth/Qwen3-GGUF/blob/main/x.gguf")).toEqual({ displayName: "Qwen3-GGUF", repository: Option.some("unsloth/Qwen3-GGUF"), variantOf: Option.none(), versionCount: Option.none() })
+    expect(referencePreview("unsloth/Qwen3-GGUF:Q4_K_M").repository).toEqual(Option.some("unsloth/Qwen3-GGUF"))
   })
 })

@@ -5,7 +5,7 @@ import type { DirectoryListing, ModelLocation } from "@magnitudedev/sdk"
 import { ModelLocationsManager, modelLocationsSummary } from "./model-locations"
 import { DirectoryEntries, choosePath, type NativeOpenPath } from "./folder-picker"
 import { candidateErrorNotice, modelLocationErrorNotice } from "./candidate-errors"
-import { DirectoryNotFound, DrafterNotUsable, InvalidModelReference, ModelRepositoryNotFound, ModelSourceUnavailable } from "@magnitudedev/sdk"
+import { DirectoryNotFound, DrafterNotUsable, HuggingFaceAccessRequired, InvalidModelReference, ModelRepositoryNotFound, ModelSourceUnavailable } from "@magnitudedev/sdk"
 
 const locations: ModelLocation[] = [
   { kind: "HuggingFaceCache", paths: [
@@ -86,10 +86,9 @@ describe("model locations", () => {
     expect(candidateErrorNotice(new ModelSourceUnavailable({ reason: "SourceUnreachable", message: "PRIVATE", retryable: true }))).toMatchObject({ title: "Couldn’t reach Hugging Face", retryable: true })
     expect(candidateErrorNotice(new ModelSourceUnavailable({ reason: "ServiceUnreachable", message: "PRIVATE", retryable: true })).title).toBe("Couldn’t reach the Magnitude service")
     expect(JSON.stringify(candidateErrorNotice(new ModelSourceUnavailable({ reason: "Unavailable", message: "PRIVATE", retryable: false })))).not.toContain("PRIVATE")
-    const access = "This repository requires accepting its terms on Hugging Face and an access token. Set HF_TOKEN to a token from an account that has accepted them, then try again."
-    expect(candidateErrorNotice(new ModelSourceUnavailable({ reason: "AccessRequired", message: access, retryable: false })))
-      .toMatchObject({ title: "This repository needs access", description: access, retryable: false })
-    const missing = "Repository not found, or it's private or gated. Check the name, or set HF_TOKEN if you have access."
+    expect(candidateErrorNotice(new HuggingFaceAccessRequired({ repository: "google/gemma-4-GGUF", access: "AcceptTerms", message: "PRIVATE" })))
+      .toMatchObject({ title: "Accept this model’s terms on Hugging Face", retryable: true })
+    const missing = "Repository not found, or it's private or gated. Check the name, or sign in to Hugging Face if you have access."
     expect(candidateErrorNotice(new ModelRepositoryNotFound({ reference: "nobody-xyz/does-not-exist-GGUF", message: missing })))
       .toEqual({ title: "Magnitude can’t find this repository", description: missing, retryable: false })
     const unreadable = candidateErrorNotice(new ModelSourceUnavailable({ reason: "Unreadable", message: "Magnitude couldn't read this file.", retryable: false }))

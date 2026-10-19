@@ -46,7 +46,7 @@ import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessCh
 import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
 import { SettingsGroup, SettingsRow } from "./components/settings-row"
 import {
-  activeLocalModel, useAgentClient, type ApplicationPage,
+  activeLocalModel, useAgentClient, type AddModelRequest, type ApplicationPage,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
   formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory,
@@ -74,8 +74,9 @@ import { CustomModelDrafterRow, CustomModelSource, DrafterNotices, DrafterOffer,
 import { CatalogComponentDetails, CatalogDrafterOffer } from "./components/catalog-model-components"
 import { ModelRemoveAction } from "./components/model-remove-action"
 import { SourceTag, UnsupportedModels } from "./components/local-model-lists"
-import { DiscoverSections, ModelsListing, acquiring, afterModelAdded, otherVersionsRequest, selectModels, type DiscoverRecommendationState } from "./components/models-page"
+import { DiscoverSections, ModelsListing, acquiring, addFromHuggingFace, afterModelAdded, otherVersionsRequest, selectModels, type DiscoverRecommendationState } from "./components/models-page"
 import { ModelLocationsRow } from "./components/model-locations"
+import { HuggingFaceRow } from "./components/hugging-face"
 import { HostNotices } from "./components/host-notices"
 
 const ALL_INTERFACES = "all"
@@ -394,6 +395,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const setPreference = useAtomSet(useMemo(() => Atom.fn((index: number) => session.setRankingPreference(index)), [session]))
   const linkedRequest = useAtomValue(session.addModelRequest)
   const clearLinkedRequest = useAtomSet(useMemo(() => Atom.fn((_: void) => session.clearAddModelRequest), [session]))
+  const requestAddModel = useAtomSet(useMemo(() => Atom.fn((next: AddModelRequest) => session.requestAddModel(next)), [session]))
   const [pageRequest, setPageRequest] = useState(Option.none<AddDialogRequest>())
   const request: Option.Option<AddDialogRequest> = Option.isSome(linkedRequest) ? linkedRequest : pageRequest
   const openDialog = (next: AddDialogRequest) => setPageRequest(Option.some(next))
@@ -414,7 +416,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     || !installedOnly && model.catalogData.support._tag === "Supported")
   const labOptions = modelLabs.filter(entry => library.some(model => modelLab(model) === entry))
   const { selected, visible } = selectModels({ library, hidden, filter, lab, search, sort })
-  const addFromHuggingFace = () => openDialog({ _tag: "Search", query: "" })
+  const openAddFromHuggingFace = addFromHuggingFace(page, openDialog, requestAddModel)
   const addGgufFile = choosePath(native, ggufOpenRequest, path => openDialog({ _tag: "LocalFile", file: Option.some(path) }), () => openDialog({ _tag: "LocalFile", file: Option.none() }))
   const stopFailure = Option.isSome(stopResult.failure) && <ErrorNotice title="Couldn’t stop the model" description={stopResult.failure.value} className="mt-5" />
   const recommendationState: DiscoverRecommendationState = recommendationsPending ? "pending" : ranked.length > 0 ? "ranked" : Result.isSuccess(hardware) ? "none" : "unavailable"
@@ -425,14 +427,14 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
       recommendations={recommendationsPending
         ? <RecommendationsSkeleton assessment={assessment} waitingForHardware={Result.isInitial(hardware)} />
         : <Recommendations preference={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />}
-      state={recommendationState} onViewFound={() => navigate("models")} onAdd={addFromHuggingFace} onExplore={() => navigate("catalog")} />
+      state={recommendationState} onViewFound={() => navigate("models")} onAdd={openAddFromHuggingFace} onExplore={() => navigate("catalog")} />
     {dialog}
   </>
   return <>
     <ModelsHeader title={pageNames[page]} selectedCount={selected.length} matchingCount={visible.length} search={search} onSearch={setSearch}
       action={installedOnly
         ? <Button variant="outline" onClick={addGgufFile}><FilePlusIcon />Add GGUF file…</Button>
-        : <Button variant="outline" onClick={addFromHuggingFace}><HuggingFaceLogo />Add from Hugging Face</Button>}
+        : <Button variant="outline" onClick={openAddFromHuggingFace}><HuggingFaceLogo />Add from Hugging Face</Button>}
       controls={<>
         <Select items={filterOptions} value={filter} onValueChange={value => { if (value !== null) setFilter(value) }}>
           <SelectTrigger aria-label="Filter models"><SelectValue /></SelectTrigger>
@@ -855,7 +857,7 @@ function SettingsPage() {
   const { storagePending, networkPending } = useRestartPending()
   useAtomMount(useMemo(() => Atom.make(Effect.all([Atom.refresh(client.Configuration.GetModelStorage({})), Atom.refresh(client.Configuration.GetNetworkAccess({})), Atom.refresh(client.Models.ListModelLocations({}))], { discard: true })), [client]))
   return <>
-    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><ModelLocationsRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
+    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><ModelLocationsRow /><HuggingFaceRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
     <SettingsGroup label="About"><AboutRow /></SettingsGroup>
     {remote && <SettingsGroup label="This browser"><SignOutRow /></SettingsGroup>}
     {(storagePending || networkPending) && <div aria-hidden="true" className="h-44" />}
