@@ -38,5 +38,22 @@ export default defineConfig({
   build: {
     outDir: "dist",
     target: "esnext",
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes("/node_modules/")) return;
+          if (
+            id.includes("/node_modules/effect/") ||
+            id.includes("/node_modules/@effect-atom/") ||
+            id.includes("/node_modules/@effect/")
+          ) return "vendor-effect";
+          if (
+            id.includes("/node_modules/react/") ||
+            id.includes("/node_modules/react-dom/") ||
+            id.includes("/node_modules/scheduler/")
+          ) return "vendor-react";
+        },
+      },
+    },
   },
 });
