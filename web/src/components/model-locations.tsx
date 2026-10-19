@@ -113,7 +113,7 @@ export function ModelLocationsRow() {
   const [managing, setManaging] = useState(false)
   const [choosing, setChoosing] = useState(false)
   const native = useNativeOpenPath()
-  const chooseFolder = choosePath(native, { kind: "folder", title: "Add a folder of models", defaultPath: Option.none() }, path => addFolder({ path }), () => setChoosing(true))
+  const chooseFolder = choosePath(native, { title: "Add a folder of models", defaultPath: Option.none() }, path => addFolder({ path }), () => setChoosing(true))
   const busy = toggling.waiting || adding.waiting || removing.waiting
   const notice: NoticeContent | undefined = busy ? undefined
     : Result.isFailure(adding) ? Option.match(Cause.failureOption(adding.cause), { onNone: () => ({ title: "The folder wasn’t added" }), onSome: modelLocationErrorNotice })

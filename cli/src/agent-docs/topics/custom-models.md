@@ -2,17 +2,14 @@
 
 Magnitude runs any GGUF whose model family the engine has kernels for, not only catalog models:
 other quantizations, finetunes, merges, and abliterated or uncensored versions. Models come from
-three places:
+two places:
 
 - **Hugging Face, through Magnitude.** `catalog pull owner/repo[:QUANT]` downloads into Magnitude's
   own store. `catalog remove` deletes that copy.
-- **A GGUF file.** `models import <path.gguf>` uses the file where it is. Magnitude never moves or
-  deletes it; `catalog remove` only forgets it. A file with the same bytes as a model already on this
-  computer is that model: the import says so and keeps the model's ID and source.
 - **Found on this computer.** The Hugging Face cache, LM Studio, the llama.cpp cache, Ollama, and
   folders you add are scanned for GGUFs. These files belong to their apps; `models hide` hides a
-  found model without touching its files. Models added from Hugging Face or imported can't be
-  hidden; `catalog remove` removes them.
+  found model without touching its files. Models added from Hugging Face can't be hidden;
+  `catalog remove` removes them.
 
 Model IDs are `hf:<owner>/<repo>/<file>` when a model has a Hugging Face identity and
 `local:<header digest>` otherwise. The same bytes found in two places are one model.
@@ -61,7 +58,7 @@ Within one source, methods go DFlash2, DSpark, DFlash, a separate MTP file, then
 and ties go to the smaller download. Magnitude never searches Hugging Face for drafters. A drafter
 you name is checked like the others but is never chosen automatically.
 
-`--drafter` on `catalog pull` and `models import`, and `models drafter <model-id> <drafter>`, take:
+`--drafter` on `catalog pull`, and `models drafter <model-id> <drafter>`, take:
 
 - `auto`: the preselected drafter (the default);
 - `none`: no drafter;
@@ -73,7 +70,7 @@ you name is checked like the others but is never chosen automatically.
 A drafter the engine rejects for the model is refused with the reason. One whose lineage doesn't
 match is allowed and marked untested. Catalog models keep the drafter Magnitude ships with them, so
 `models drafter` refuses them. `models status <model-id>` shows the drafter in use and every choice
-with its label, its verdict, and the argument that selects it. A found or imported model whose
+with its label, its verdict, and the argument that selects it. A found or added model whose
 recommended drafter isn't on this computer shows "Faster with a drafter · Add"; `models drafter
 <model-id> auto` downloads only the drafter. A drafter whose bytes are already in any location, another
 app's included, is used where it is and never downloaded. When a catalog drafter gets a new revision,

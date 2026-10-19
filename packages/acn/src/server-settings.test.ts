@@ -116,30 +116,19 @@ describe("directory browsing", () => {
   it("lists visible child folders in name order with the parent", async () => {
     const root = fresh()
     for (const name of ["b", "a10", "a2", ".hidden"]) mkdirSync(join(root, name))
-    writeFileSync(join(root, "file.txt"), "")
-    const listing = await run(fresh(), Effect.flatMap(ServerSettings, service => service.browseDirectories(Option.some(root), false)))
+    writeFileSync(join(root, "model.gguf"), "")
+    const listing = await run(fresh(), Effect.flatMap(ServerSettings, service => service.browseDirectories(Option.some(root))))
     expect(listing.directories.map(entry => entry.name)).toEqual(["a2", "a10", "b"])
-    expect(listing.files).toEqual([])
     expect(listing.parent).toEqual(Option.some(join(root, "..").replace(/\/$/, "")).pipe(Option.map(path => join(path))))
   })
 
-  it("lists GGUF files only when the picker asks for them", async () => {
-    const root = fresh()
-    mkdirSync(join(root, "nested"))
-    writeFileSync(join(root, "model.GGUF"), "1234")
-    writeFileSync(join(root, "notes.txt"), "")
-    const listing = await run(fresh(), Effect.flatMap(ServerSettings, service => service.browseDirectories(Option.some(root), true)))
-    expect(listing.directories.map(entry => entry.name)).toEqual(["nested"])
-    expect(listing.files).toEqual([{ name: "model.GGUF", path: join(root, "model.GGUF"), sizeBytes: 4 }])
-  })
-
   it("fails clearly for a folder that cannot be read", async () => {
-    const result = await run(fresh(), Effect.flatMap(ServerSettings, service => service.browseDirectories(Option.some(join(fresh(), "missing")), false)).pipe(Effect.either))
+    const result = await run(fresh(), Effect.flatMap(ServerSettings, service => service.browseDirectories(Option.some(join(fresh(), "missing")))).pipe(Effect.either))
     expect(result._tag).toBe("Left")
   })
 
   it("has no parent at the filesystem root", async () => {
-    const listing = await run(fresh(), Effect.flatMap(ServerSettings, service => service.browseDirectories(Option.some("/"), false)))
+    const listing = await run(fresh(), Effect.flatMap(ServerSettings, service => service.browseDirectories(Option.some("/"))))
     expect(listing.parent).toEqual(Option.none())
   })
 })

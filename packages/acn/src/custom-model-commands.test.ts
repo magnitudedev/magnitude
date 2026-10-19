@@ -716,86 +716,9 @@ describe("adding models", () => {
     expect(recorded.bundles[0]).toMatchObject({ source: { _tag: "Local", path: "/models" }, target: ["found-Q8_0.gguf"] })
   })
 
-  it("imports a GGUF in place under its header-digest identity", async () => {
-    const { run } = harness({
-      inspect: Schema.decodeUnknownSync(CandidateInspection)({
-        source: { _tag: "Local", path: "/models/imported.gguf" },
-        displayName: "Imported",
-        versions: [{ label: "Q4_0", modelId: importedId, files: [{ path: "/models/imported.gguf", sizeBytes: 1 }], sizeBytes: 1, downloadBytes: 0, recommended: true }],
-      }),
-      config: customModelsConfig({ declarations: {} }),
-    })
-    const result = await run((commands, models) => Effect.gen(function* () {
-      const imported = yield* commands.importModelFile("/models/imported.gguf", { _tag: "None" })
-      return { imported, config: yield* models.get }
-    }))
-    expect(result.imported).toMatchObject({ modelId: importedId, outcome: "Started" })
-    expect(result.config.declarations[importedId]?.origin).toMatchObject({ _tag: "Imported", path: "/models/imported.gguf" })
-    expect(result.config.drafters[importedId]).toEqual({ _tag: "None" })
-  })
-
-  it("imports a copy of a found model as that model: one more location, never a replacement", async () => {
-    const config = customModelsConfig({ declarations: {}, drafters: { [foundId]: { _tag: "None" } } })
-    const { run, recorded } = harness({
-      inspect: Schema.decodeUnknownSync(CandidateInspection)({
-        source: { _tag: "Local", path: "/copies/copy.gguf" },
-        displayName: "Copy",
-        versions: [{
-          label: "Q8_0", modelId: importedId, onThisComputer: foundId,
-          files: [{ path: "/copies/copy.gguf", sizeBytes: 1 }], sizeBytes: 1, downloadBytes: 0, recommended: true,
-        }],
-      }),
-      config,
-    })
-    const result = await run((commands, models) => Effect.gen(function* () {
-      const imported = yield* commands.importModelFile("/copies/copy.gguf", { _tag: "Auto" })
-      return { imported, config: yield* models.get }
-    }))
-    expect(result.imported).toMatchObject({ modelId: foundId, outcome: "AlreadyOnThisComputer" })
-    expect(result.config.declarations[importedId]?.origin).toMatchObject({ _tag: "Imported", path: "/copies/copy.gguf" })
-    expect(result.config.declarations[foundId]).toBeUndefined()
-    expect(result.config.drafters[foundId]).toEqual({ _tag: "None" })
-    expect(result.config.drafters[importedId]).toBeUndefined()
-    expect(recorded.started).toEqual([])
-  })
 })
 
-describe("importing a catalog model's bytes", () => {
-  const catalogModel = "minicpm5-1b:gguf:q4"
-  const catalogBytes = (path: string) => Schema.decodeUnknownSync(CandidateInspection)({
-    source: { _tag: "Local", path },
-    displayName: "Renamed",
-    versions: [{
-      label: "Q4_K_M", modelId: importedId, catalogModel, onThisComputer: catalogModel,
-      files: [{ path, sizeBytes: 1 }], sizeBytes: 1, downloadBytes: 0, recommended: true,
-    }],
-  })
-
-  // QA (linux-debian, round 3c): a link to a file holding the catalog target's bytes returned
-  // "Started" with a `local:` ID that no listing knew.
-  it("is that catalog model, already on this computer, and records nothing", async () => {
-    const config = customModelsConfig({ declarations: {}, drafters: {} })
-    const { run, recorded } = harness({ inspect: catalogBytes("/stash/link-to-renamed.gguf"), config })
-    const result = await run((commands, models) => Effect.gen(function* () {
-      const imported = yield* commands.importModelFile("/stash/link-to-renamed.gguf", { _tag: "Auto" })
-      return { imported, config: yield* models.get }
-    }))
-    expect(result.imported).toEqual({
-      modelId: catalogModel, drafter: Option.none(), outcome: "AlreadyOnThisComputer", drafterDownloadStarted: false,
-    })
-    expect(result.config.declarations).toEqual({})
-    expect(result.config.drafters).toEqual({})
-    expect(recorded.started).toEqual([])
-  })
-
-  it("refuses a drafter choice, since the catalog model keeps its own", async () => {
-    const { run } = harness({ inspect: catalogBytes("/models/copy.gguf"), config: customModelsConfig({ declarations: {} }) })
-    const failure = await run((commands) => commands.importModelFile("/models/copy.gguf", { _tag: "None" }).pipe(Effect.flip))
-    expect(failure.message).toContain(`is the catalog model ${catalogModel}`)
-  })
-})
-
-describe("importing through a link", () => {
+describe("a declaration left by a link", () => {
   const otherImportedId = CustomFormModelIdSchema.make(`local:${"b".repeat(64)}`)
   const linkedFiles = () => {
     const root = mkdtempSync(join(tmpdir(), "magnitude-links-"))
@@ -808,49 +731,7 @@ describe("importing through a link", () => {
     symlinkSync(link, second)
     return { root, file, link, second }
   }
-  const linkInspection = (path: string, onThisComputer?: string) => Schema.decodeUnknownSync(CandidateInspection)({
-    source: { _tag: "Local", path },
-    displayName: "Linked",
-    versions: [{
-      label: "Q4_K_M", modelId: importedId, ...(onThisComputer === undefined ? {} : { onThisComputer }),
-      files: [{ path, sizeBytes: 4 }], sizeBytes: 4, downloadBytes: 0, recommended: true,
-    }],
-  })
   const importedDeclaration = (path: string) => ({ origin: { _tag: "Imported", path, headerDigest: "b".repeat(64) }, target: [path] })
-
-  it("declares nothing for a link to a file a found model already lists", async () => {
-    const { root, file, link } = linkedFiles()
-    try {
-      const { run } = harness({
-        config: customModelsConfig({ declarations: {}, drafters: {} }),
-        customModels: [nativeCustomModel({ files: [{ path: file, sizeBytes: 4 }] })],
-        inspect: linkInspection(link, foundId),
-      })
-      const result = await run((commands, models) => Effect.gen(function* () {
-        const imported = yield* commands.importModelFile(link, { _tag: "None" })
-        return { imported, config: yield* models.get }
-      }))
-      expect(result.imported).toMatchObject({ modelId: foundId, outcome: "AlreadyOnThisComputer" })
-      expect(result.config.declarations).toEqual({})
-    } finally {
-      rmSync(root, { recursive: true, force: true })
-    }
-  })
-
-  it("declares a file reached through a second link only once", async () => {
-    const { root, link, second } = linkedFiles()
-    try {
-      const { run } = harness({
-        config: customModelsConfig({ declarations: { [otherImportedId]: importedDeclaration(link) }, drafters: {} }),
-        customModels: [],
-        inspect: linkInspection(second),
-      })
-      const config = await run((commands, models) => commands.importModelFile(second, { _tag: "None" }).pipe(Effect.zipRight(models.get)))
-      expect(Object.keys(config.declarations)).toEqual([otherImportedId])
-    } finally {
-      rmSync(root, { recursive: true, force: true })
-    }
-  })
 
   it("forgets a declaration left by a link when the model it names is removed", async () => {
     const { root, file, link } = linkedFiles()
@@ -907,49 +788,6 @@ describe("hiding a model that isn't on this computer", () => {
   })
 })
 
-describe("importing a file Magnitude can't run", () => {
-  const unrunnable = (fields: Record<string, unknown>) => Schema.decodeUnknownSync(CandidateInspection)({
-    source: { _tag: "Local", path: "/models/deepseek.gguf" },
-    displayName: "DeepSeek",
-    versions: [],
-    ...fields,
-  })
-
-  it("refuses an unsupported version with the engine's reasons and declares nothing", async () => {
-    const { run, recorded } = harness({
-      config: customModelsConfig({ declarations: {} }),
-      inspect: unrunnable({ versions: [{
-        label: "IQ1_M", modelId: importedId, files: [{ path: "/models/deepseek.gguf", sizeBytes: 1 }], sizeBytes: 1, downloadBytes: 0, recommended: false,
-        assessment: { _tag: "Unsupported", profile: { contextLength: 4096 }, reasons: [{ _tag: "WeightTypes", types: [{ ggmlType: "IQ1_M", tensorCount: 3 }] }], detail: "" },
-      }] }),
-    })
-    const result = await run((commands, models) => Effect.gen(function* () {
-      const imported = yield* commands.importModelFile("/models/deepseek.gguf", { _tag: "Auto" }).pipe(Effect.either)
-      return { imported, config: yield* models.get }
-    }))
-    expect(result.imported._tag === "Left" && result.imported.left).toMatchObject({
-      _tag: "ModelVersionNotRunnable",
-      version: "deepseek.gguf",
-      verdict: { _tag: "Unsupported", reasons: [{ _tag: "WeightTypes", types: [{ ggmlType: "IQ1_M", tensorCount: 3 }] }] },
-    })
-    expect(result.config.declarations).toEqual({})
-    expect(recorded.started).toEqual([])
-  })
-
-  it("refuses an architecture without kernels with its reason", async () => {
-    const { run } = harness({
-      config: customModelsConfig({ declarations: {} }),
-      inspect: unrunnable({ unsupportedArchitecture: [{ _tag: "Architecture", architecture: "deepseek4" }] }),
-    })
-    const result = await run((commands) => commands.importModelFile("/models/deepseek.gguf", { _tag: "Auto" }).pipe(Effect.either))
-    expect(result._tag === "Left" && result.left).toMatchObject({
-      _tag: "ModelVersionNotRunnable",
-      version: "deepseek.gguf",
-      verdict: { _tag: "Unsupported", reasons: [{ _tag: "Architecture", architecture: "deepseek4" }] },
-    })
-  })
-})
-
 describe("adding a repository whose architecture has no kernels", () => {
   it("refuses with the engine's reasons", async () => {
     const { run, recorded } = harness({
@@ -969,27 +807,6 @@ describe("adding a repository whose architecture has no kernels", () => {
       verdict: { _tag: "Unsupported", reasons: [{ _tag: "Architecture", architecture: "deepseek4" }] },
     })
     expect(recorded.started).toEqual([])
-  })
-})
-
-describe("importing a folder", () => {
-  it("refuses a folder as an imported model and declares nothing", async () => {
-    const folder = mkdtempSync(join(tmpdir(), "gguf-import-"))
-    try {
-      const { run, recorded } = harness({ config: customModelsConfig({ declarations: {} }) })
-      const result = await run((commands, models) => Effect.gen(function* () {
-        const imported = yield* commands.importModelFile(folder, { _tag: "Auto" }).pipe(Effect.either)
-        return { imported, config: yield* models.get }
-      }))
-      expect(result.imported._tag === "Left" && result.imported.left).toMatchObject({
-        _tag: "InvalidModelReference",
-        message: `${folder} is a folder. Choose a GGUF file, or add the folder as a model location.`,
-      })
-      expect(result.config.declarations).toEqual({})
-      expect(recorded.started).toEqual([])
-    } finally {
-      rmSync(folder, { recursive: true, force: true })
-    }
   })
 })
 

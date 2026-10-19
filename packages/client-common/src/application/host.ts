@@ -17,9 +17,8 @@ export interface HostAppearance {
   readonly save: (preference: AppearancePreference) => Effect.Effect<void, ApplicationHostFailed>
 }
 
-/** What the native open dialog chooses: a folder, or one GGUF file. */
+/** What the native open dialog chooses: one folder. */
 export interface HostOpenPathRequest {
-  readonly kind: "folder" | "gguf"
   readonly title: string
   readonly defaultPath: Option.Option<string>
 }

@@ -16,16 +16,14 @@ import { HuggingFaceLogo, NamedLogo, variantLab } from "./model-logo"
 import { DrafterList, drafterChoice, selectedDrafterCandidate, useDrafterCandidates, type DrafterSelection } from "./drafter-list"
 import { candidateErrorNotice, type CandidateNotice } from "./candidate-errors"
 import { CandidateErrorNotice } from "./hugging-face"
-import { DirectoryBrowser, useDirectoryBrowser, useNativeOpenPath, type NativeOpenPath } from "./folder-picker"
 import { ActionTooltip, TooltipProvider } from "./ui/tooltip"
 
-/** What the dialog opens on: the app's own requests, plus Add GGUF file…, with the file the native dialog chose or none to pick in-app. */
-export type AddDialogRequest = AddModelRequest | { readonly _tag: "LocalFile"; readonly file: Option.Option<string> }
+/** What the dialog opens on: a search, or a Hugging Face repository (and file) to inspect. */
+export type AddDialogRequest = AddModelRequest
 
 type Step =
   | { readonly _tag: "Find"; readonly tab: FindTab; readonly query: string }
   | { readonly _tag: "Repository"; readonly reference: string; readonly file: Option.Option<string>; readonly preview: RepositoryPreview }
-  | { readonly _tag: "LocalFile"; readonly file: Option.Option<string> }
 
 export type FindTab = "search" | "paste"
 
@@ -33,7 +31,6 @@ const initialStep = (request: AddDialogRequest): Step => {
   switch (request._tag) {
     case "Search": return { _tag: "Find", tab: "search", query: request.query }
     case "HuggingFace": return { _tag: "Repository", reference: request.repository, file: request.file, preview: referencePreview(request.repository) }
-    case "LocalFile": return { _tag: "LocalFile", file: request.file }
   }
 }
 
@@ -83,7 +80,6 @@ export function AddModelDialog({ request, models, onClose, onAdded }: {
 function AddModelFlow({ request, models, onAdded }: { request: AddDialogRequest; models: readonly LocalModel[]; onAdded: () => void }) {
   const [step, setStep] = useState(() => initialStep(request))
   const [find, setFind] = useState<{ tab: FindTab; query: string }>(() => step._tag === "Find" ? { tab: step.tab, query: step.query } : { tab: "search", query: "" })
-  if (step._tag === "LocalFile") return <LocalFileStep initialFile={step.file} models={models} onAdded={onAdded} />
   if (step._tag === "Find") return <FindStep tab={find.tab} query={find.query} models={models}
     onChange={next => setFind(next)} onOpen={(reference, preview) => setStep({ _tag: "Repository", reference, file: Option.none(), preview })} />
   return <RepositoryStep reference={step.reference} preview={step.preview} file={step.file} models={models} onAdded={onAdded}
@@ -436,7 +432,7 @@ export function InspectedRepository({ inspection, file, models, onBack, onAdded 
   const source = inspection.source
   if (Option.isNone(version) || !versionVerdict(version.value).selectable || Option.isSome(inspection.unsupportedArchitecture) || source._tag !== "HuggingFace") return <RepositoryView {...header} />
   return <VersionWithDrafters key={version.value.label} version={version.value} header={header} onAdded={onAdded}
-    target={{ _tag: "Repository", repository: source.repository, commit: source.commit }} />
+    target={{ repository: source.repository, commit: source.commit }} />
 }
 
 function VersionWithDrafters({ version, header, target, onAdded }: {
@@ -449,19 +445,15 @@ function VersionWithDrafters({ version, header, target, onAdded }: {
   return <RepositoryView {...header} drafters={drafters} footer={footer} />
 }
 
-/** What adding a version names: a Hugging Face repository pinned to the inspected commit, or the GGUF file the user chose. */
-export type AddTarget =
-  | { readonly _tag: "Repository"; readonly repository: HuggingFaceRepositoryId; readonly commit: string }
-  | { readonly _tag: "File"; readonly path: string }
+/** What adding a version names: a Hugging Face repository pinned to the inspected commit. */
+export type AddTarget = { readonly repository: HuggingFaceRepositoryId; readonly commit: string }
 
-/** The command that adds a version: a Hugging Face repository is added at its version; a chosen file is imported by its own path. */
+/** The command that adds a version: the repository at the inspected commit, that version, and the chosen drafter. */
 export const addVersionRequest = (target: AddTarget, version: CandidateVersion, drafter: DrafterChoice) =>
-  target._tag === "File"
-    ? { _tag: "Import" as const, request: { path: target.path, drafter } }
-    : { _tag: "Add" as const, request: { repository: target.repository, revision: Option.some(target.commit), version: Option.some(version.label), drafter, force: false } }
+  ({ repository: target.repository, revision: Option.some(target.commit), version: Option.some(version.label), drafter, force: false })
 
 /**
- * This confirmation's own Add or Import: the mutation's state is shared by every opening of the
+ * This confirmation's own Add: the mutation's state is shared by every opening of the
  * dialog, so a pending or failed add from an earlier one shows nothing here until this one submits.
  */
 export const submissionState = (submitted: boolean, state: Result.Result<unknown, unknown>): { readonly pending: boolean; readonly failure: CandidateNotice | undefined } => ({
@@ -480,134 +472,19 @@ function useVersionConfirmation(inspection: CandidateInspection, version: Candid
   const findingDrafters = !Result.isSuccess(candidates) && !Result.isFailure(candidates)
   const add = useAtomSet(client.Models.AddHuggingFaceModel, { mode: "promiseExit" })
   const adding = useAtomValue(client.Models.AddHuggingFaceModel)
-  const importFile = useAtomSet(client.Models.ImportModelFile, { mode: "promiseExit" })
-  const importing = useAtomValue(client.Models.ImportModelFile)
   const [submitted, setSubmitted] = useState(false)
-  const { pending, failure } = submissionState(submitted, target._tag === "File" ? importing : adding)
+  const { pending, failure } = submissionState(submitted, adding)
   const confirm = () => {
     setSubmitted(true)
     const done = (exit: Exit.Exit<unknown, unknown>) => { if (Exit.isSuccess(exit)) onAdded() }
-    const command = addVersionRequest(target, version, drafterChoice(selection, list))
-    if (command._tag === "Import") void importFile(command.request).then(done)
-    else void add(command.request).then(done)
+    void add(addVersionRequest(target, version, drafterChoice(selection, list))).then(done)
   }
   return {
     drafters: Result.isFailure(candidates) ? <ErrorNotice severity="warning" title="Couldn’t list drafters" description="The recommended drafter is still used when you add this model." />
       : findingDrafters ? <div aria-busy="true" aria-label="Finding drafters" className="space-y-2"><p className="text-xs text-slate-500">Finding drafters for this version…</p><SkeletonLine className="h-10" width="100%" /><SkeletonLine className="h-10" width="100%" /></div>
       : <DrafterList candidates={list} selection={selection} onSelect={setSelection} otherPending={otherPending} otherFailure={otherFailure} onCheckOther={checkOther} />,
-    footer: <RepositoryFooter local={target._tag === "File"} action={confirmAction(inspection, version, selectedDrafterCandidate(selection, list))} pending={pending || findingDrafters} failure={failure} onConfirm={confirm} />,
+    footer: <RepositoryFooter action={confirmAction(inspection, version, selectedDrafterCandidate(selection, list))} pending={pending || findingDrafters} failure={failure} onConfirm={confirm} />,
   }
-}
-
-const localFileNote = "Magnitude uses this file where it is and never moves or deletes it."
-
-export const ggufOpenRequest = { kind: "gguf", title: "Add a GGUF file", defaultPath: Option.none() } as const
-
-/** Add GGUF file…: the repository step with the chosen file in place of the version list; the native dialog chooses it when the window has one. */
-function LocalFileStep({ initialFile, models, onAdded }: { initialFile: Option.Option<string>; models: readonly LocalModel[]; onAdded: () => void }) {
-  const native = useNativeOpenPath()
-  const [file, setFile] = useState(initialFile)
-  const inspection = Option.map(file, path => <LocalFileInspection key={path} path={path} models={models} onAdded={onAdded} />)
-  return Option.match(native, {
-    onSome: open => <LocalFileView browser={<NativeFileChoice file={file} open={open} onChosen={path => setFile(Option.some(path))} />} file={inspection} />,
-    onNone: () => <BrowsedLocalFile file={file} onChosen={path => setFile(Option.some(path))} inspection={inspection} />,
-  })
-}
-
-function BrowsedLocalFile({ file, onChosen, inspection }: { file: Option.Option<string>; onChosen: (path: string) => void; inspection: Option.Option<ReactNode> }) {
-  const browser = useDirectoryBrowser("gguf", Option.none())
-  return <LocalFileView browser={<DirectoryBrowser browser={browser} selectedFile={file} onSelectFile={onChosen} />} file={inspection} />
-}
-
-/** The file the native dialog chose, with a button that opens it again. */
-export function NativeFileChoice({ file, open, onChosen }: { file: Option.Option<string>; open: NativeOpenPath; onChosen: (path: string) => void }) {
-  return <div className="flex items-center gap-2">
-    <span className="min-w-0 flex-1 truncate font-mono text-xs text-slate-600 dark:text-slate-300" title={Option.getOrUndefined(file)}>{Option.getOrElse(file, () => "No file chosen")}</span>
-    <Button size="sm" variant="outline" className="shrink-0" onClick={() => open(ggufOpenRequest, onChosen)}>{Option.isSome(file) ? "Choose another file…" : "Choose a file…"}</Button>
-  </div>
-}
-
-/** The Add GGUF file step: the file picker on top, then the chosen file's verdict, drafters, and Add. */
-export function LocalFileView({ browser, file }: { browser: ReactNode; file: Option.Option<ReactNode> }) {
-  return <>
-    <DialogHeader>
-      <DialogTitle>Add a GGUF file</DialogTitle>
-      <DialogDescription>A GGUF file on the computer running Magnitude. {localFileNote}</DialogDescription>
-    </DialogHeader>
-    <DialogBody>
-      <section aria-label="File" className="space-y-2">
-        <h3 className="font-heading text-sm font-semibold">File</h3>
-        {browser}
-      </section>
-      {Option.getOrElse(file, () => <>
-        <p className="text-sm text-slate-500">Choose a GGUF file to see whether it runs on this machine.</p>
-        <LocalFilePendingFooter status={<p className="text-xs text-slate-500">{localFileNote}</p>} />
-      </>)}
-    </DialogBody>
-  </>
-}
-
-/** The local file footer before the file can be added: a note or the inspection's status, beside Add disabled. */
-function LocalFilePendingFooter({ status }: { status: ReactNode }) {
-  return <StepFooter><StepActions status={status} action={<Button className="shrink-0" disabled><PlusIcon />Add</Button>} /></StepFooter>
-}
-
-/** The chosen file's row while it is read, the same size as the row it becomes. */
-function LocalFilePlaceholder() {
-  return <section aria-label="Chosen file" aria-busy="true" className={chosenFileRow}>
-    <SkeletonLine className="size-6" width="100%" />
-    <span className="min-w-0 flex-1">
-      <SkeletonLine className="h-5" width="60%" />
-      <SkeletonLine className="h-4" width="40%" />
-    </span>
-    <SkeletonLine className="h-5 w-24" width="100%" />
-  </section>
-}
-
-const chosenFileRow = "flex items-center gap-3 rounded-lg border border-slate-200 px-3 py-2.5 dark:border-slate-750"
-
-function LocalFileInspection({ path, models, onAdded }: { path: string; models: readonly LocalModel[]; onAdded: () => void }) {
-  const { view, retry } = useInspection(path)
-  if (view._tag === "Failed") return <InspectionFailure error={view.error} onRetry={retry} />
-  if (view._tag === "Reading" || view._tag === "Inspecting") return <>
-    <LocalFilePlaceholder />
-    <LocalFilePendingFooter status={<InspectionStatus progress={view._tag === "Inspecting" ? Option.some(view.progress) : Option.none()} reading="Reading the file…" />} />
-  </>
-  const { inspection } = view
-  const version = inspection.versions[0]
-  if (version === undefined || Option.isSome(inspection.unsupportedArchitecture) || !versionVerdict(version).selectable) {
-    return <LocalFileSummary inspection={inspection} models={models} />
-  }
-  return <LocalFileVersion path={path} inspection={inspection} version={version} models={models} onAdded={onAdded} />
-}
-
-function LocalFileVersion({ path, inspection, version, models, onAdded }: { path: string; inspection: CandidateInspection; version: CandidateVersion; models: readonly LocalModel[]; onAdded: () => void }) {
-  const { drafters, footer } = useVersionConfirmation(inspection, version, { _tag: "File", path }, onAdded)
-  return <LocalFileSummary inspection={inspection} models={models} drafters={drafters} footer={footer} />
-}
-
-/** The chosen file's name, lineage, size and one engine verdict, then its drafters and Add. */
-export function LocalFileSummary({ inspection, models, drafters, footer }: { inspection: CandidateInspection; models: readonly LocalModel[]; drafters?: ReactNode; footer?: ReactNode }) {
-  const variantOf = catalogVariantOfName(models, inspection.variantOf)
-  const version = inspection.versions[0]
-  const verdict = version === undefined ? undefined : versionVerdict(version)
-  const facts = [...(Option.isSome(variantOf) ? [`Variant of ${variantOf.value}`] : []), ...Option.toArray(inspection.license)]
-  return <>
-    <section aria-label="Chosen file" className={chosenFileRow}>
-      <NamedLogo lab={variantLab(inspection.variantOf, inspection.displayName)} name={inspection.displayName} className="size-6" />
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-sm font-medium">{inspection.displayName}</span>
-        <span className="block min-h-4 truncate text-xs text-slate-500">{facts.join(" · ")}</span>
-      </span>
-      {version !== undefined && <span className="shrink-0 text-xs tabular-nums text-slate-500">{formatStorageSize(version.sizeBytes)}</span>}
-      {verdict !== undefined && Option.isNone(inspection.unsupportedArchitecture) && <span className="shrink-0 text-xs"><VerdictLabel verdict={verdict} /></span>}
-    </section>
-    {Option.isSome(inspection.unsupportedArchitecture)
-      ? <ErrorNotice severity="info" title="Magnitude can’t run this model" description={`${unsupportedReasonMessages(inspection.unsupportedArchitecture.value).join(". ")}.`} />
-      : version === undefined && <p className="text-sm text-slate-500">This file isn’t a GGUF model Magnitude can read.</p>}
-    {drafters && <DrafterSection>{drafters}</DrafterSection>}
-    {footer}
-  </>
 }
 
 function DrafterSection({ children }: { children: ReactNode }) {
@@ -619,10 +496,10 @@ function DrafterSection({ children }: { children: ReactNode }) {
 }
 
 /** Pinned-version note, any failure to add, and Download with its total or Add. */
-export function RepositoryFooter({ local, action, pending, failure, onConfirm }: { local: boolean; action: { label: string; download: boolean }; pending: boolean; failure: CandidateNotice | undefined; onConfirm: () => void }) {
+export function RepositoryFooter({ action, pending, failure, onConfirm }: { action: { label: string; download: boolean }; pending: boolean; failure: CandidateNotice | undefined; onConfirm: () => void }) {
   return <StepFooter>
     {failure && <CandidateErrorNotice notice={failure} />}
-    <StepActions status={<p className="text-xs text-slate-500">{local ? localFileNote : "Pinned to the current version of this repository"}</p>}
+    <StepActions status={<p className="text-xs text-slate-500">Pinned to the current version of this repository</p>}
       action={<Button className="shrink-0" disabled={pending} onClick={onConfirm}>{action.download ? <DownloadSimpleIcon /> : <PlusIcon />}{action.label}</Button>} />
   </StepFooter>
 }

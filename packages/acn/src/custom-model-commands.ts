@@ -19,7 +19,6 @@ import {
   HuggingFaceAccessRequired,
   ModelVersionNotRunnable,
   PathNotDirectory,
-  parseModelId,
   preselectedDrafterCandidate,
   type AutomaticModelLocationKind,
   type CandidateInspection,
@@ -141,10 +140,6 @@ export interface CustomModelCommandsApi {
     readonly drafter: DrafterChoice
     readonly force: boolean
   }) => Effect.Effect<AddedModel, CustomModelMutationError>
-  readonly importModelFile: (path: string, drafter: DrafterChoice) => Effect.Effect<
-    ChosenDrafter & { readonly modelId: ModelId; readonly outcome: "Started" | "AlreadyOnThisComputer" },
-    CustomModelMutationError
-  >
   readonly setModelDrafter: (
     modelId: CustomFormModelId,
     drafter: DrafterChoice,
@@ -984,91 +979,6 @@ export const CustomModelCommandsLive: Layer.Layer<
         _tag: "Custom" as const,
         modelId,
         version: selected.label,
-        drafter: chosen,
-        outcome: Option.isSome(existing) ? "AlreadyOnThisComputer" as const : "Started" as const,
-        drafterDownloadStarted,
-      }
-    }).pipe(Effect.catchAll(toMutation)),
-
-    importModelFile: (path, drafter) => Effect.gen(function* () {
-      const reference = path
-      const parsed = yield* parse(path.startsWith("~") || isAbsolute(path) ? path : `./${path}`)
-      if (parsed._tag !== "Local") return yield* new InvalidModelReference({ reference, message: "Choose a GGUF file." })
-      const info = yield* fs.stat(parsed.path).pipe(Effect.option)
-      if (Option.exists(info, ({ type }) => type === "Directory")) {
-        return yield* new InvalidModelReference({ reference, message: `${parsed.path} is a folder. Choose a GGUF file, or add the folder as a model location.` })
-      }
-      const native = yield* icn.inspect({ _tag: "Local", path: parsed.path }).pipe(Effect.catchAll(candidateFailed(reference)))
-      const inspection = yield* productInspection(native, { file: Option.none(), quant: Option.none() }, reference)
-      const version = inspection.versions[0]
-      const assessment = version === undefined ? undefined : Option.getOrUndefined(version.assessment)
-      const unsupported = Option.orElse(
-        inspection.unsupportedArchitecture,
-        () => assessment?._tag === "Unsupported" ? Option.some(assessment.reasons) : Option.none(),
-      )
-      if (Option.isSome(unsupported)) {
-        return yield* new ModelVersionNotRunnable({
-          reference,
-          version: basename(parsed.path),
-          verdict: { _tag: "Unsupported", reasons: unsupported.value },
-        })
-      }
-      if (version === undefined) return yield* new InvalidModelReference({ reference, message: "Magnitude can't run this file." })
-      // A file with a catalog model's bytes is that catalog model, which comes with its drafter: nothing is recorded.
-      if (Option.isSome(version.catalogModel)) {
-        const catalogModel = version.catalogModel.value
-        if (drafter._tag !== "Auto") {
-          return yield* new InvalidModelReference({
-            reference,
-            message: `${reference} is the catalog model ${catalogModel}, which comes with its drafter.`,
-          })
-        }
-        return { modelId: catalogModel, drafter: Option.none(), outcome: "AlreadyOnThisComputer" as const, drafterDownloadStarted: false }
-      }
-      // The same bytes are one model: a file whose bytes are already a model on this computer is that model.
-      const existing = Option.flatMap(version.onThisComputer, Schema.decodeUnknownOption(CustomFormModelIdSchema))
-      const modelId = Option.getOrElse(existing, () => version.modelId)
-      const identity = parseModelId(version.modelId)
-      const target: DrafterTarget = Option.isSome(existing)
-        ? { _tag: "Model", modelId }
-        : { _tag: "Candidate", source: inspection.source, files: version.files }
-      // A model already here keeps its drafter unless the import names one or turns it off.
-      const current = (yield* customModels.get).drafters[modelId]
-      const requested = Option.isSome(existing) && drafter._tag === "Auto" && current !== undefined ? current : drafter
-      const chosen = yield* chooseDrafter(target, requested)
-      const recommended = Option.flatMap(
-        Option.isSome(existing) ? yield* rowFor(modelId) : Option.none(),
-        ({ recommendedDrafter }) => Option.map(recommendedDrafter, ({ reference }) => reference),
-      )
-      // A file without a Hugging Face identity is recorded where it is: a new model, or one more location of the
-      // model that already has its bytes, which keeps that model's identity and origin. A file with a Hugging Face
-      // identity is found where it is; only its drafter is recorded. Links are followed first: a file already
-      // listed or declared, through a link or its own path, is recorded once.
-      const file = yield* realPath(parsed.path)
-      const listed = (yield* Effect.forEach(Option.isSome(existing) ? yield* modelFiles(modelId) : [], realPath)).includes(file)
-      const declared = (yield* importedDeclarationsOf(yield* customModels.get, [file], Option.none())).length > 0
-      const declaration: CustomModelDeclaration | undefined = identity._tag === "Local" && !listed && !declared
-        ? {
-            origin: { _tag: "Imported", path: parsed.path, headerDigest: identity.headerDigest },
-            target: [parsed.path],
-            projector: Option.map(inspection.projector, ({ path: projector }) => projector),
-          }
-        : undefined
-      yield* customModels.modify((config) => Effect.succeed([undefined, {
-        ...config,
-        declarations: declaration === undefined || config.declarations[version.modelId] !== undefined
-          ? config.declarations
-          : { ...config.declarations, [version.modelId]: declaration },
-        drafters: { ...config.drafters, [modelId]: persistedChoice(requested, chosen, recommended) },
-        hidden: config.hidden.filter((hidden) => hidden !== modelId),
-      } satisfies CustomModelsConfig] as const))
-      yield* settle
-      const drafterDownloadStarted = yield* Option.match(chosen, {
-        onNone: () => Effect.succeed(false),
-        onSome: (value) => startDrafterOnly(modelId, target, value),
-      })
-      return {
-        modelId,
         drafter: chosen,
         outcome: Option.isSome(existing) ? "AlreadyOnThisComputer" as const : "Started" as const,
         drafterDownloadStarted,

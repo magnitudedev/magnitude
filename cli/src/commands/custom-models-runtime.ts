@@ -6,7 +6,6 @@ import {
   Models,
   type AutomaticModelLocationKind,
   type CustomFormModelId,
-  type DrafterCandidate,
   type ModelId,
   type ModelLocation,
   type ModelLocationKind,
@@ -32,49 +31,6 @@ const requirePath = (input: string, what: string): Effect.Effect<string, ModelCo
     ? Effect.fail(new ModelCommandError({ message: `Expected ${what}` }))
     : Effect.succeed(absolutePath(trimmed))
 }
-
-const drafterLine = (drafter: Option.Option<DrafterCandidate>) =>
-  `Drafter: ${Option.match(drafter, { onNone: () => "none", onSome: ({ name }) => name })}`
-
-export const ImportResultSchema = Schema.extend(
-  Schema.Struct({ path: Schema.String }),
-  Models.importModelFile.successSchema,
-)
-export type ImportResult = typeof ImportResultSchema.Type
-
-export const renderImport = (result: ImportResult): string => ensureTrailingNewline([
-  result.outcome === "AlreadyOnThisComputer"
-    ? `Already on this computer: ${result.path} has the same bytes as ${result.modelId}, so it is that model. Magnitude never moves or deletes it.`
-    : `Added ${result.path}. Magnitude uses the file where it is and never moves or deletes it.`,
-  drafterLine(result.drafter),
-  `Model ID: ${result.modelId}`,
-  result.drafterDownloadStarted
-    ? `Check progress: magnitude models status ${result.modelId}`
-    : `Load it: magnitude models load ${result.modelId}`,
-].join("\n"))
-
-export const importFile = (client: CliModelsClient, path: string, argument: DrafterArgument) => Effect.gen(function* () {
-  const drafter = yield* resolveDrafterChoice(client, {
-    _tag: "Candidate",
-    source: { _tag: "Local", path },
-    files: [path],
-  }, argument)
-  const imported = yield* client.models.importModelFile({ path, drafter })
-  return { path, ...imported } satisfies ImportResult
-})
-
-export const importModel = (pathInput: string, options: JsonOption & { readonly drafter?: string } = {}) => commandEffect({
-  effect: Effect.gen(function* () {
-    const path = yield* requirePath(pathInput, "a path to a .gguf file")
-    if (!path.toLowerCase().endsWith(".gguf")) {
-      return yield* new ModelCommandError({ message: `Expected a .gguf file: ${path}` })
-    }
-    const drafterArgument = yield* parseDrafterArgument(options.drafter ?? "auto")
-    return yield* withClient((client) => importFile(client, path, drafterArgument))
-  }),
-  render: renderImport,
-  json: asJson(options, jsonDocument(ImportResultSchema, (result: ImportResult) => result)),
-})
 
 export const catalogDrafterRefusal = (modelId: string): string =>
   `${modelId} is a catalog model. Catalog models keep the drafter Magnitude ships with them; it changes only when you update with \`magnitude catalog pull ${modelId}\`.`

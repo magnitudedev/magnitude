@@ -32,7 +32,6 @@ import {
   MoonIcon,
   FolderOpenIcon,
   BuildingsIcon,
-  FilePlusIcon,
 } from "@phosphor-icons/react"
 import { CopyCommand } from "./components/copy-command"
 import { useMemo, useRef, useState, type ReactNode } from "react"
@@ -66,7 +65,7 @@ import { HarnessSetupList } from "./components/harness-setup"
 import { OtherApps } from "./components/other-apps"
 import { HuggingFaceLogo, LabLogo, ModelLogo, modelLab, modelLabs, type ModelLab } from "./components/model-logo"
 import { ModelsHeader } from "./components/models-header"
-import { AddModelDialog, ggufOpenRequest, type AddDialogRequest } from "./components/add-model-dialog"
+import { AddModelDialog, type AddDialogRequest } from "./components/add-model-dialog"
 import { drafterUpdateAvailable } from "./components/custom-model-details"
 import { ModelRemoveAction } from "./components/model-remove-action"
 import { UnsupportedModels } from "./components/local-model-lists"
@@ -299,7 +298,6 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const stopResult = useLocalModelStopStatus()
   const hardware = useLocalInferenceHardware()
   const navigate = useNavigate()
-  const native = useNativeOpenPath()
   const [search, setSearch] = useState("")
   const filterOptions = installedOnly
     ? [{ value: "all", label: "All models" }, { value: "downloaded", label: "Downloaded" }, { value: "downloading", label: "Downloading" }, { value: "hidden", label: "Hidden" }]
@@ -338,7 +336,6 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const labOptions = modelLabs.filter(entry => library.some(model => modelLab(model) === entry))
   const { selected, visible } = selectModels({ library, hidden, filter, lab, search, sort })
   const openAddFromHuggingFace = addFromHuggingFace(page, openDialog, requestAddModel)
-  const addGgufFile = choosePath(native, ggufOpenRequest, path => openDialog({ _tag: "LocalFile", file: Option.some(path) }), () => openDialog({ _tag: "LocalFile", file: Option.none() }))
   const stopFailure = Option.isSome(stopResult.failure) && <ErrorNotice title="Couldn’t stop the model" description={stopResult.failure.value} className="mt-5" />
   const recommendationState: DiscoverRecommendationState = recommendationsPending ? "pending" : ranked.length > 0 ? "ranked" : Result.isSuccess(hardware) ? "none" : "unavailable"
   const dialog = <AddModelDialog request={request} models={allModels} onClose={closeDialog} onAdded={afterModelAdded(closeDialog, navigate)} />
@@ -353,9 +350,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   </>
   return <>
     <ModelsHeader title={pageNames[page]} selectedCount={selected.length} matchingCount={visible.length} search={search} onSearch={setSearch}
-      action={installedOnly
-        ? <Button variant="outline" onClick={addGgufFile}><FilePlusIcon />Add GGUF file…</Button>
-        : <Button variant="outline" onClick={openAddFromHuggingFace}><HuggingFaceLogo />Add from Hugging Face</Button>}
+      action={installedOnly ? null : <Button variant="outline" onClick={openAddFromHuggingFace}><HuggingFaceLogo />Add from Hugging Face</Button>}
       controls={<>
         <Select items={filterOptions} value={filter} onValueChange={value => { if (value !== null) setFilter(value) }}>
           <SelectTrigger aria-label="Filter models"><SelectValue /></SelectTrigger>
@@ -607,7 +602,7 @@ function ModelStorageRow() {
   const busy = saving.waiting
   const current = Result.isSuccess(settings) ? settings.value : null
   const native = useNativeOpenPath()
-  const chooseFolder = choosePath(native, { kind: "folder", title: "Choose a folder for downloaded models", defaultPath: current ? Option.some(current.path) : Option.none() }, path => save({ path: Option.some(path) }), () => setChoosing(true))
+  const chooseFolder = choosePath(native, { title: "Choose a folder for downloaded models", defaultPath: current ? Option.some(current.path) : Option.none() }, path => save({ path: Option.some(path) }), () => setChoosing(true))
   const failure = firstFailure([saving])
   const refusal = failure ? Option.flatMap(Cause.failureOption(failure.cause), error => error instanceof ServerSettingsFailed ? Option.some(error.message) : Option.none()) : Option.none<string>()
   return <>

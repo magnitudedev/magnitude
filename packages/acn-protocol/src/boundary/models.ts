@@ -221,20 +221,6 @@ const AddHuggingFaceModel = Rpc.make("AddHuggingFaceModel", {
   error: CustomModelMutationError,
 }).pipe(atMostOnce)
 
-/** Declares one GGUF by path, referenced in place; never copies or deletes it. A file whose bytes are already a
- * model on this computer is that model: one more location, with the outcome AlreadyOnThisComputer. */
-/** Imports a GGUF file; a file whose bytes are already a model (a catalog model included) is that model. */
-const ImportModelFile = Rpc.make("ImportModelFile", {
-  payload: Schema.Struct({ path: NonEmptyString, drafter: DrafterChoiceSchema }),
-  success: Schema.Struct({
-    modelId: ModelIdSchema,
-    drafter: optional(DrafterCandidateSchema),
-    outcome: Schema.Literal("Started", "AlreadyOnThisComputer"),
-    drafterDownloadStarted: Schema.Boolean,
-  }),
-  error: CustomModelMutationError,
-}).pipe(atMostOnce)
-
 /** Adds, changes, or turns off a custom model's drafter; downloads only the drafter when needed. */
 const SetModelDrafter = Rpc.make("SetModelDrafter", {
   payload: Schema.Struct({ modelId: CustomFormModelIdSchema, drafter: DrafterChoiceSchema }),
@@ -298,7 +284,6 @@ export const Models = {
   listDrafterCandidates: ListDrafterCandidates,
   listModelLocations: ListModelLocations,
   addHuggingFaceModel: AddHuggingFaceModel,
-  importModelFile: ImportModelFile,
   setModelDrafter: SetModelDrafter,
   hideModel: HideModel,
   unhideModel: UnhideModel,

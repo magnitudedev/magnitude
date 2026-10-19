@@ -33,7 +33,7 @@ const host: ApplicationHost = {
     presentModel: value => call(() => bridge.presentModel(Schema.encodeSync(ModelTrayPresentation)(value))),
     resolveQuitFailure: decision => call(() => bridge.resolveQuitFailure(decision)),
     retryService: call(() => bridge.retry()),
-    chooseOpenPath: request => call(() => bridge.chooseOpenPath({ kind: request.kind, title: request.title, ...Option.match(request.defaultPath, { onNone: () => ({}), onSome: defaultPath => ({ defaultPath }) }) })).pipe(
+    chooseOpenPath: request => call(() => bridge.chooseOpenPath({ title: request.title, ...Option.match(request.defaultPath, { onNone: () => ({}), onSome: defaultPath => ({ defaultPath }) }) })).pipe(
       Effect.flatMap(Schema.decodeUnknown(OpenPathResult)),
       Effect.mapError(error => error instanceof ApplicationHostFailed ? error : new ApplicationHostFailed({ message: "The file dialog returned an unexpected result." })),
       Effect.map(result => result.path),

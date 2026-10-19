@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { HuggingFaceRepositoryIdSchema } from "@magnitudedev/sdk"
 import { Dialog } from "./ui/dialog"
-import { FindStepView, InspectedRepository, InspectingRepositoryView, InspectionStatus, InspectionVersionList, PLACEHOLDER_VERSION_ROWS, inspectionPhaseText, placeholderVersionRows, referencePreview, searchResultPreview, LocalFileSummary, LocalFileView, NativeFileChoice, ggufOpenRequest, RepositoryFooter, RepositoryView, SearchResultsView, VerdictLabel, addVersionRequest, confirmAction, formatDownloads, initialVersion, parseModelReference, revealVersionRow, revealsVersion, unselectableVersionNotice, unsupportedVersionLabel, versionVerdict, type FindTab } from "./add-model-dialog"
+import { FindStepView, InspectedRepository, InspectingRepositoryView, InspectionStatus, InspectionVersionList, PLACEHOLDER_VERSION_ROWS, inspectionPhaseText, placeholderVersionRows, referencePreview, searchResultPreview, RepositoryFooter, RepositoryView, SearchResultsView, VerdictLabel, addVersionRequest, confirmAction, formatDownloads, initialVersion, parseModelReference, revealVersionRow, revealsVersion, unselectableVersionNotice, unsupportedVersionLabel, versionVerdict, type FindTab } from "./add-model-dialog"
 import { catalogId, catalogModel, drafterCandidate, inspection, repository, version, doesNotFit, fits, unsupported, unreadable } from "../../test/models/fixtures"
 
 const inDialog = (node: ReactNode) => renderToStaticMarkup(<Dialog open>{node}</Dialog>)
@@ -195,64 +195,17 @@ describe("repository step", () => {
       expect(unselectableVersionNotice(version("Q3_K_M", { assessment: Option.some(unreadable) })).description).toBe("Magnitude can't read this file. Pick another version to download.")
     })
   })
-  it("pins Hugging Face downloads and keeps local files in place", () => {
-    const pinned = inDialog(<RepositoryFooter local={false} action={{ label: "Download (24.3 GB)", download: true }} pending={false} failure={undefined} onConfirm={() => {}} />)
+  it("pins Hugging Face downloads to the inspected version", () => {
+    const pinned = inDialog(<RepositoryFooter action={{ label: "Download (24.3 GB)", download: true }} pending={false} failure={undefined} onConfirm={() => {}} />)
     expect(pinned).toContain("Pinned to the current version of this repository")
     expect(pinned).toContain("Download (24.3 GB)")
-    const local = inDialog(<RepositoryFooter local action={{ label: "Add", download: false }} pending failure={{ title: "Couldn’t add this model", retryable: true }} onConfirm={() => {}} />)
-    expect(local).toContain("never moves or deletes it")
-    expect(local).toContain("Couldn’t add this model")
-    expect(local).toMatch(/<button[^>]*disabled=""/)
+    const failed = inDialog(<RepositoryFooter action={{ label: "Add", download: false }} pending failure={{ title: "Couldn’t add this model", retryable: true }} onConfirm={() => {}} />)
+    expect(failed).toContain("Couldn’t add this model")
+    expect(failed).toMatch(/<button[^>]*disabled=""/)
   })
-})
-
-describe("add GGUF file", () => {
-  const localFile = (overrides: Parameters<typeof inspection>[0] = {}) => inspection({
-    source: { _tag: "Local", path: "/Users/me/models/qwen.gguf" }, license: Option.none(), versions: [version("Q4_K_P")], ...overrides,
-  })
-  it("imports the chosen file by its own path, never the folder the inspection read it from", () => {
-    expect(addVersionRequest({ _tag: "File", path: "/Users/me/gguf-import/MiniCPM5-2B-Q4_K_M.gguf" }, version("Q4_K_M"), { _tag: "Auto" }))
-      .toEqual({ _tag: "Import", request: { path: "/Users/me/gguf-import/MiniCPM5-2B-Q4_K_M.gguf", drafter: { _tag: "Auto" } } })
-    expect(addVersionRequest({ _tag: "Repository", repository, commit: "c0ffee" }, version("Q4_K_P"), { _tag: "None" }))
-      .toEqual({ _tag: "Add", request: { repository, revision: Option.some("c0ffee"), version: Option.some("Q4_K_P"), drafter: { _tag: "None" }, force: false } })
-  })
-  it("opens on the file picker, in place of the version list, until a file is chosen", () => {
-    const html = inDialog(<LocalFileView browser={<p>file browser</p>} file={Option.none()} />)
-    expect(html).toContain("Add a GGUF file")
-    expect(html).toContain("never moves or deletes it")
-    expect(html).toMatch(/aria-label="File".*file browser/)
-    expect(html).toContain("Choose a GGUF file to see whether it runs on this machine.")
-    expect(html).not.toContain('aria-label="Version"')
-  })
-  it("shows the file the native dialog chose, with Choose another file… in place of the in-app browser", () => {
-    const opened: unknown[] = []
-    const html = inDialog(<LocalFileView browser={<NativeFileChoice file={Option.some("C:\\Users\\me\\qwen.gguf")} open={request => { opened.push(request) }} onChosen={() => {}} />} file={Option.some(<p>chosen file</p>)} />)
-    expect(html).toContain("C:\\Users\\me\\qwen.gguf")
-    expect(html).toContain("Choose another file…")
-    expect(html).not.toContain('aria-label="Folder path"')
-    expect(ggufOpenRequest).toEqual({ kind: "gguf", title: "Add a GGUF file", defaultPath: Option.none() })
-  })
-  it("shows the chosen file below the picker", () => {
-    const html = inDialog(<LocalFileView browser={<p>file browser</p>} file={Option.some(<p>chosen file</p>)} />)
-    expect(html.indexOf("file browser")).toBeLessThan(html.indexOf("chosen file"))
-    expect(html).not.toContain("Choose a GGUF file to see")
-  })
-  it("gives the chosen file its engine verdict, lineage, and size, then its drafters and Add", () => {
-    const html = inDialog(<LocalFileSummary inspection={localFile()} models={models} drafters={<p>drafter list</p>} footer={<p>add footer</p>} />)
-    expect(html).toContain("Qwen3.6 35B A3B Uncensored HauhauCS Aggressive")
-    expect(html).toContain("Variant of Qwen3.6 35B-A3B")
-    expect(html).toContain("23.4 GB")
-    expect(html).toContain("Fits your machine")
-    expect(html.indexOf("drafter list")).toBeLessThan(html.indexOf("add footer"))
-    expect(html).not.toContain('type="radio"')
-  })
-  it("explains a file the engine can't run or that doesn't fit, with nothing to add", () => {
-    const tooLarge = inDialog(<LocalFileSummary inspection={localFile({ versions: [version("Q8_K_P", { assessment: Option.some(doesNotFit) })] })} models={models} />)
-    expect(tooLarge).toContain("Too large for this machine")
-    const unsupportedFile = inDialog(<LocalFileSummary inspection={localFile({ unsupportedArchitecture: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]) })} models={models} />)
-    expect(unsupportedFile).toContain("Magnitude can’t run this model")
-    expect(unsupportedFile).toContain("No kernels for the deepseek4 architecture")
-    expect(unsupportedFile).not.toContain("Fits your machine")
+  it("adds the inspected repository at its commit with the chosen version and drafter", () => {
+    expect(addVersionRequest({ repository, commit: "c0ffee" }, version("Q4_K_P"), { _tag: "None" }))
+      .toEqual({ repository, revision: Option.some("c0ffee"), version: Option.some("Q4_K_P"), drafter: { _tag: "None" }, force: false })
   })
 })
 
@@ -343,11 +296,6 @@ describe("one dialog layout through the whole flow", () => {
     const html = find("search", { results: <p>search results</p> })
     expect(html.indexOf('aria-label="Search Hugging Face"')).toBeLessThan(html.indexOf('data-slot="dialog-body"'))
     expect(html.indexOf('data-slot="dialog-body"')).toBeLessThan(html.indexOf("search results"))
-  })
-  it("holds the local file footer in place before a file is chosen", () => {
-    const html = inDialog(<LocalFileView browser={<p>file browser</p>} file={Option.none()} />)
-    expect(html).toContain('data-slot="step-footer"')
-    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>.*Add<\/button>/)
   })
   it("names the repository from the search result, or from a pasted reference, before it is inspected", () => {
     const result = { repository, displayName: "Huihui Qwen3.6 35B A3B abliterated", uploader: "huihui-ai", variantOf: Option.some(catalogId), downloads: 1, architecture: Option.none(), unsupported: Option.none(), gated: false, versionCount: Option.some(4) }

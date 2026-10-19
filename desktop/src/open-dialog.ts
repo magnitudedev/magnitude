@@ -2,12 +2,11 @@ import type { OpenDialogOptions, OpenDialogReturnValue } from "electron"
 import { Effect, Option } from "effect"
 import { HostError, type OpenPathRequest } from "./desktop-rpc"
 
-/** The native open dialog for a request: one folder, or one `.gguf` file, on every desktop OS. */
+/** The native open dialog for a request: one folder, on every desktop OS. */
 export const openDialogOptions = (request: OpenPathRequest): OpenDialogOptions => ({
   title: request.title,
   ...Option.match(request.defaultPath, { onNone: () => ({}), onSome: defaultPath => ({ defaultPath }) }),
-  properties: request.kind === "folder" ? ["openDirectory", "createDirectory", "dontAddToRecent"] : ["openFile", "dontAddToRecent"],
-  ...(request.kind === "gguf" ? { filters: [{ name: "GGUF models", extensions: ["gguf"] }] } : {}),
+  properties: ["openDirectory", "createDirectory", "dontAddToRecent"],
 })
 
 /** ChooseOpenPath for Electron main: shows the native dialog and answers the chosen path, or none when cancelled. */

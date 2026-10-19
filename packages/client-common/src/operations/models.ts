@@ -188,15 +188,6 @@ const AddHuggingFaceModel = mutation(
   }
 );
 
-const ImportModelFile = mutation(
-  Rpcs.importModelFile,
-  (client) => client.models.importModelFile,
-  {
-    scope: ({ path }) => Mutation.MutationScope(`local-model-source:file:${path}`),
-    synchronize: () => synchronizeCatalog,
-  }
-);
-
 const SetModelDrafter = mutation(
   Rpcs.setModelDrafter,
   (client) => client.models.setModelDrafter,
@@ -270,7 +261,6 @@ export const Models = Group.make({
   LoadSlot,
   StopSlot,
   AddHuggingFaceModel,
-  ImportModelFile,
   SetModelDrafter,
   HideModel,
   UnhideModel,

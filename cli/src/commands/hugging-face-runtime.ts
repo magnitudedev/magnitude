@@ -36,7 +36,6 @@ import {
   type UnsupportedReason,
 } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
-import { join } from "node:path"
 import { renderDrafterChoices } from "./drafter-output"
 import { catalogProducts, readCatalog, withClient, type CliModelsClient } from "./inference-client"
 import { CandidateInspectionJsonSchema } from "./json-schemas"
@@ -205,14 +204,16 @@ const inspectionHeader = (inspection: CandidateInspection, models: readonly Loca
   return [inspection.displayName, ...(details.length > 0 ? [details.join(" · ")] : [])]
 }
 
-const acquireCommand = (inspection: CandidateInspection, version: CandidateVersion, force = false): string =>
-  inspection.source._tag === "HuggingFace"
-    ? `magnitude catalog pull ${inspection.source.repository}:${version.label}${force ? " --force" : ""}`
-    : `magnitude models import ${join(inspection.source.path, version.files[0]!)}`
+const acquireCommand = (repository: string, version: CandidateVersion, force = false): string =>
+  `magnitude catalog pull ${repository}:${version.label}${force ? " --force" : ""}`
+
+/** The repository a Hugging Face inspection pinned; the CLI inspects nothing else. */
+const inspectedRepository = (inspection: CandidateInspection): string =>
+  inspection.source._tag === "HuggingFace" ? inspection.source.repository : inspection.displayName
 
 const acquireLine = (inspection: CandidateInspection, version: CandidateVersion): string =>
   Option.match(version.catalogModel, {
-    onNone: () => `${inspection.source._tag === "HuggingFace" ? "Download" : "Add"}: ${acquireCommand(inspection, version)}`,
+    onNone: () => `Download: ${acquireCommand(inspectedRepository(inspection), version)}`,
     onSome: (catalogModel) => `This is the catalog model ${catalogModel}, which comes with its drafter. Download: magnitude catalog pull ${catalogModel}`,
   })
 
@@ -225,9 +226,7 @@ const selectedVersionVerdict = (inspection: CandidateInspection, version: Candid
         case "Fits": return ""
         case "DoesNotFit": {
           const refusal = modelVersionNotRunnableMessage({ version: version.label, verdict: { _tag: "DoesNotFit", deficitBytes: assessment.deficitBytes } })
-          return inspection.source._tag === "HuggingFace"
-            ? `${refusal} Download it anyway with: ${acquireCommand(inspection, version, true)}`
-            : refusal
+          return `${refusal} Download it anyway with: ${acquireCommand(inspectedRepository(inspection), version, true)}`
         }
         case "Unsupported":
           return modelVersionNotRunnableMessage({ version: version.label, verdict: { _tag: "Unsupported", reasons: assessment.reasons } })
@@ -251,9 +250,7 @@ export const acquisitionHint = (inspection: CandidateInspection): string => {
     ].join("\n")
   }
   if (inspection.versions.some(isRunnable)) {
-    return `Choose a version from the table: ${inspection.source._tag === "HuggingFace"
-      ? `magnitude catalog pull ${inspection.source.repository}:<VERSION>`
-      : "magnitude models import <file>"}`
+    return `Choose a version from the table: magnitude catalog pull ${inspectedRepository(inspection)}:<VERSION>`
   }
   return ["No version of this model runs on this computer.", ...Option.toArray(noRunnableVersionReason(inspection.versions))].join(" ")
 }
@@ -323,9 +320,6 @@ export const inspectionJson = jsonDocument(InspectionJsonSchema, ({ inspection, 
   drafters,
 }))
 
-/** What the service is asked to inspect: Hugging Face forms as typed, local paths made absolute. */
-export const candidateReference = (input: string): string =>
-  isLocalPathReference(input) ? absolutePath(input) : input
 
 const candidateDrafterTarget = (
   inspection: CandidateInspection,
@@ -353,10 +347,10 @@ export const readInspection = (client: CliModelsClient, reference: string) => Ef
 export const inspectCandidate = (input: string, options: JsonOption = {}) => commandEffect({
   effect: Effect.gen(function* () {
     const reference = input.trim()
-    if (reference.length === 0) {
-      return yield* new ModelCommandError({ message: "Expected a Hugging Face link, owner/repo[:QUANT], or a GGUF path" })
+    if (reference.length === 0 || isLocalPathReference(reference)) {
+      return yield* new ModelCommandError({ message: "Expected a Hugging Face link or owner/repo[:QUANT]" })
     }
-    return yield* withClient((client) => readInspection(client, candidateReference(reference)))
+    return yield* withClient((client) => readInspection(client, reference))
   }),
   render: renderInspection,
   json: asJson(options, inspectionJson),

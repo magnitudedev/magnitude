@@ -41,7 +41,6 @@ import {
   catalogListJson,
   hardwareJson,
   hideModel,
-  importModel,
   inspectionJson,
   listModelLocations,
   loadInstance,
@@ -52,7 +51,6 @@ import {
   readInspection,
   renderInspection,
   renderPull,
-  candidateReference,
   recommendationsJson,
   removeModel,
   removeModelFolder,
@@ -338,16 +336,6 @@ describe("adding models with a drafter", () => {
     })
   })
 
-  it("models import --drafter built-in sends the embedded drafter", async () => {
-    const modelId = CustomFormModelIdSchema.make(`local:${"e".repeat(64)}`)
-    const { text, json, models } = await runBoth({
-      importModelFile: succeed({ modelId, drafter: Option.none(), outcome: "Started", drafterDownloadStarted: false }),
-    }, (options) => importModel("/models/q.gguf", { ...options, drafter: "built-in" }))
-    expect(models.importModelFile).toHaveBeenCalledWith({ path: "/models/q.gguf", drafter: { _tag: "Reference", reference: { _tag: "Embedded" } } })
-    expect(text).toContain(`Model ID: ${modelId}`)
-    expect(json).toEqual({ path: "/models/q.gguf", modelId, outcome: "Started", drafterDownloadStarted: false })
-  })
-
   it("catalog inspect passes a huggingface.co link through and prints the repository step", async () => {
     const link = `https://huggingface.co/${TEST_REPOSITORY}`
     const { text, json, models } = await runBoth({
@@ -355,7 +343,7 @@ describe("adding models with a drafter", () => {
       getCatalog: succeed(catalogState([makeCatalogModel()])),
       listDrafterCandidates: succeed({ candidates: makeDrafterCandidates(), entered: Option.none() }),
     }, (options) => commandEffect({
-      effect: withClient((client) => readInspection(client, candidateReference(link))),
+      effect: withClient((client) => readInspection(client, link)),
       render: renderInspection,
       json: asJson(options, inspectionJson),
     }))

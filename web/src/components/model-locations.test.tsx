@@ -108,34 +108,28 @@ describe("model locations", () => {
   })
 })
 
-describe("GGUF file picker", () => {
+describe("folder browser", () => {
   const listing: DirectoryListing = {
     path: "/Users/me/models", parent: Option.some("/Users/me"),
     directories: [{ name: "drafts", path: "/Users/me/models/drafts" }],
-    files: [{ name: "qwen.gguf", path: "/Users/me/models/qwen.gguf", sizeBytes: 23_400_000_000 }],
   }
-  it("lists GGUF files with their sizes and marks the chosen one", () => {
-    const html = renderToStaticMarkup(<DirectoryEntries kind="gguf" listing={listing} selectedFile={Option.some("/Users/me/models/qwen.gguf")} onOpen={() => {}} onSelectFile={() => {}} />)
+  it("lists the parent and the subfolders", () => {
+    const html = renderToStaticMarkup(<DirectoryEntries listing={listing} onOpen={() => {}} />)
     expect(html).toContain("Parent folder")
     expect(html).toContain("drafts")
-    expect(html).toContain("qwen.gguf")
-    expect(html).toContain("23.4 GB")
-    expect(html).toContain('aria-pressed="true"')
   })
-  it("shows only folders when choosing a folder", () => {
-    const html = renderToStaticMarkup(<DirectoryEntries kind="folder" listing={listing} selectedFile={Option.none()} onOpen={() => {}} onSelectFile={() => {}} />)
-    expect(html).not.toContain("qwen.gguf")
-    expect(renderToStaticMarkup(<DirectoryEntries kind="gguf" listing={{ ...listing, directories: [], files: [] }} selectedFile={Option.none()} onOpen={() => {}} onSelectFile={() => {}} />)).toContain("No folders or GGUF files inside")
+  it("says when a folder has no subfolders", () => {
+    expect(renderToStaticMarkup(<DirectoryEntries listing={{ ...listing, directories: [] }} onOpen={() => {}} />)).toContain("No folders inside")
   })
 })
 
 describe("native open dialog", () => {
-  const folder = { kind: "folder" as const, title: "Add a folder of models", defaultPath: Option.none<string>() }
+  const folder = { title: "Add a folder of models", defaultPath: Option.none<string>() }
   it("uses the native dialog whenever the window has a native host, on any OS, and the in-app browser otherwise", () => {
     const calls: string[] = []
-    const native: NativeOpenPath = (request, onChosen) => { calls.push(`native ${request.kind}`); onChosen("C:\\Models") }
+    const native: NativeOpenPath = (request, onChosen) => { calls.push(`native ${request.title}`); onChosen("C:\\Models") }
     choosePath(Option.some(native), folder, path => calls.push(`chose ${path}`), () => calls.push("browse"))()
-    expect(calls).toEqual(["native folder", "chose C:\\Models"])
+    expect(calls).toEqual(["native Add a folder of models", "chose C:\\Models"])
     calls.length = 0
     choosePath(Option.none(), folder, path => calls.push(`chose ${path}`), () => calls.push("browse"))()
     expect(calls).toEqual(["browse"])

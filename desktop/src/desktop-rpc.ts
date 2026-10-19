@@ -8,7 +8,6 @@ export { ApplicationPage as Page, ModelTrayPresentation, HostAction as Applicati
 export class HostError extends Schema.TaggedError<HostError>()("HostError", { message: Schema.String }) {}
 const Unit = Schema.Struct({})
 export const OpenPathRequest = Schema.Struct({
-  kind: Schema.Literal("folder", "gguf"),
   title: Schema.String,
   defaultPath: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
 })

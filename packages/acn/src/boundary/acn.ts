@@ -329,7 +329,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
 
       GetModelStorage: () => observeRpcDefects("GetModelStorage", serverSettings.modelStorage),
       SetModelStorage: ({ path }) => observeRpcDefects("SetModelStorage", serverSettings.setModelStorage(path).pipe(Effect.as({}))),
-      BrowseDirectories: ({ path, ggufFiles }) => observeRpcDefects("BrowseDirectories", serverSettings.browseDirectories(path, ggufFiles)),
+      BrowseDirectories: ({ path }) => observeRpcDefects("BrowseDirectories", serverSettings.browseDirectories(path)),
       GetNetworkAccess: () => observeRpcDefects("GetNetworkAccess", serverSettings.networkAccess),
       SetNetworkAccess: change => observeRpcDefects("SetNetworkAccess", serverSettings.setNetworkAccess(change).pipe(Effect.as({}))),
       RegenerateNetworkApiKey: () => observeRpcDefects("RegenerateNetworkApiKey", serverSettings.regenerateNetworkApiKey.pipe(Effect.as({}))),
@@ -422,8 +422,6 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       AddHuggingFaceModel: (request) =>
         observeRpcDefects("AddHuggingFaceModel", customModelCommands.addHuggingFaceModel(request)),
 
-      ImportModelFile: ({ path, drafter }) =>
-        observeRpcDefects("ImportModelFile", customModelCommands.importModelFile(path, drafter)),
 
       SetModelDrafter: ({ modelId, drafter }) =>
         observeRpcDefects(

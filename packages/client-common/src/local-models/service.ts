@@ -81,7 +81,6 @@ const makeLocalModels = Effect.gen(function* () {
   const hide = effectQuery.Models.HideModel
   const unhide = effectQuery.Models.UnhideModel
   const addFromHuggingFace = effectQuery.Models.AddHuggingFaceModel
-  const importFile = effectQuery.Models.ImportModelFile
   const stopStatus = Atom.make((get): LocalModelStopStatus => {
     const result = get(stop)
     return { pending: result.waiting, failure: Result.isFailure(result) && !result.waiting ? Option.some("The model may still be running. Try stopping it again.") : Option.none() }
@@ -150,8 +149,6 @@ const makeLocalModels = Effect.gen(function* () {
       readonly drafter: DrafterChoice
       readonly force: boolean
     }) => Mutation.execute(addFromHuggingFace, input).pipe(provideRegistry),
-    importFile: (path: string, drafter: DrafterChoice) =>
-      Mutation.execute(importFile, { path, drafter }).pipe(provideRegistry),
   }
 })
 

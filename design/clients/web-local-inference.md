@@ -47,8 +47,8 @@ The ordinary shell contains a dedicated Settings surface for local inference:
 - Models is the searchable installed-model library. It lists downloaded catalog models and every
   custom model with its source tag, and exposes only artifact-level actions: reveal the
   daemon-published installed target path, and the ownership-following Remove (delete for catalog
-  and added models, forget for imported files, Hide from Magnitude for found models). Its header
-  offers Add GGUF file…, and models that can't run collapse into one expandable line with their
+  and added models, forget for imported files, Hide from Magnitude for found models). Its header has
+  no add action (models are added from Catalog), and models that can't run collapse into one expandable line with their
   reasons and no actions. Slot selection, residency, favorites, transfer activity, and load controls do not belong
   on this surface. A deprecated installed model is labeled, names its replacement, and offers one
   switch action that downloads the replacement until it is installed; best-effort models are

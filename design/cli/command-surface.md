@@ -35,7 +35,6 @@ catalog inspect <huggingface-url | owner/repo | owner/repo:QUANT>
 catalog pull <model-id | owner/repo[:QUANT]> [--drafter auto|none|<ref>] [--force] [--only projector|drafter]
 catalog cancel <model-id> | remove <model-id>
 models status [model-id] [--all] | load <model-id> | stop
-models import <path.gguf> [--drafter auto|none|<ref>]
 models drafter <model-id> <ref | auto | none>
 models hide <model-id> | unhide <model-id>
 models folders list | add <path> | remove <path>
@@ -169,7 +168,7 @@ whose exact target was found on this computer without it (`DownloadCatalogCompon
 to catalog models and not with `--drafter` or `--force`. Pull, cancel, and removal validate only
 argument syntax before delegating directly to their authoritative mutations.
 
-`models import` adds one GGUF file in place, with the same drafter choice. `models drafter` adds,
+`models drafter` adds,
 changes, or turns off the drafter of a custom model and is refused for catalog models. `models hide`
 and `unhide` apply to found models, including a catalog model whose files are only in an external
 location; `catalog remove` on such a model explains where the files are and points at `models hide`. `models folders list` shows the automatic locations and the

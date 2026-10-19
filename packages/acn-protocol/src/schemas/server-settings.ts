@@ -16,13 +16,10 @@ export const ModelStorageChange = Schema.Struct({ path: optional(Schema.String) 
 export type ModelStorageChange = typeof ModelStorageChange.Type
 
 export const DirectoryEntry = Schema.Struct({ name: Schema.String, path: Schema.String })
-export const DirectoryFileEntry = Schema.Struct({ name: Schema.String, path: Schema.String, sizeBytes: Schema.NonNegativeInt })
-/** `files` lists GGUF files only when the browse asked for them, and is empty otherwise. */
 export const DirectoryListing = Schema.Struct({
   path: Schema.String,
   parent: optional(Schema.String),
   directories: Schema.Array(DirectoryEntry),
-  files: Schema.Array(DirectoryFileEntry),
 })
 export type DirectoryListing = typeof DirectoryListing.Type
 

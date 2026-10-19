@@ -44,7 +44,6 @@ import {
   catalogStatusJson,
   hardwareJson,
   hideModel,
-  importModel,
   inspectCandidate,
   inspectionJson,
   loadInstance,
@@ -57,7 +56,6 @@ import {
   renderCatalog,
   renderCatalogDetail,
   renderCatalogStatus,
-  renderImport,
   renderInspection,
   downloadSizeLine,
   execute,
@@ -78,8 +76,6 @@ import {
   showRecommendations,
   unhideModel,
   versionVerdict,
-  importFile,
-  ImportResultSchema,
   ModelLocationsJsonSchema,
   modelsStatusResultJson,
   catalogDetailJson,
@@ -90,7 +86,6 @@ import {
   readSearch,
   renderModelsStatusResult,
   setDrafter,
-  type ImportResult,
   type ModelsStatusView,
 } from "./inference-runtime"
 
@@ -151,9 +146,8 @@ describe("inference argument validation", () => {
     [() => searchHuggingFace("  "), "Search query must not be empty"],
     [() => searchHuggingFace("qwen", { limit: "101" }), "Limit must be an integer from 1 to 100"],
     [() => searchHuggingFace("qwen", { limit: "0" }), "Limit must be an integer from 1 to 100"],
-    [() => inspectCandidate(" "), "Expected a Hugging Face link, owner/repo[:QUANT], or a GGUF path"],
-    [() => importModel("/models/readme.txt"), "Expected a .gguf file: /models/readme.txt"],
-    [() => importModel(""), "Expected a path to a .gguf file"],
+    [() => inspectCandidate(" "), "Expected a Hugging Face link or owner/repo[:QUANT]"],
+    [() => inspectCandidate("/models/qwen.gguf"), "Expected a Hugging Face link or owner/repo[:QUANT]"],
     [() => setModelDrafter("test:gguf:q4", "auto"),
       "test:gguf:q4 is a catalog model. Catalog models keep the drafter Magnitude ships with them; it changes only when you update with `magnitude catalog pull test:gguf:q4`."],
     [() => setModelDrafter("garbage", "auto"), "Invalid model ID: garbage"],
@@ -177,15 +171,15 @@ describe("inference command surface", () => {
       "status", "list", "show", "recommendations", "search", "inspect", "pull", "cancel", "remove",
     ])
     expect(root.commands[2]!.commands.map((command) => command.name())).toEqual([
-      "status", "load", "stop", "import", "drafter", "hide", "unhide", "folders",
+      "status", "load", "stop", "drafter", "hide", "unhide", "folders",
     ])
-    expect(root.commands[2]!.commands[7]!.commands.map((command) => command.name())).toEqual(["list", "add", "remove", "enable", "disable"])
+    expect(root.commands[2]!.commands[6]!.commands.map((command) => command.name())).toEqual(["list", "add", "remove", "enable", "disable"])
     expect(root.commands[2]!.commands[2]!.registeredArguments.map((argument) => argument.required)).toEqual([false])
   })
 
   it("accepts --json on every inference command", () => {
     const leaves = leafCommands(program())
-    expect(leaves.length).toBe(22)
+    expect(leaves.length).toBe(21)
     for (const command of leaves) {
       expect(command.options.map(({ long }) => long), command.name()).toContain("--json")
     }
@@ -213,7 +207,6 @@ describe("inference command surface", () => {
       "models status": { arguments: ["[model-id]"], options: ["--all"] },
       "models load": { arguments: ["<model-id>"], options: [] },
       "models stop": { arguments: ["[model-id]"], options: [] },
-      "models import": { arguments: ["<path>"], options: ["--drafter"] },
       "models drafter": { arguments: ["<model-id>", "<drafter>"], options: [] },
       "models hide": { arguments: ["<model-id>"], options: [] },
       "models unhide": { arguments: ["<model-id>"], options: [] },
@@ -237,7 +230,6 @@ describe("inference command surface", () => {
     [["catalog", "search"]],
     [["catalog", "inspect"]],
     [["catalog", "pull"]],
-    [["models", "import"]],
     [["models", "drafter", "hf:a/b/c.gguf"]],
     [["models", "hide"]],
     [["models", "unhide"]],
@@ -410,12 +402,6 @@ describe("candidate inspection", () => {
     expect(renderInspection({ inspection: nothingRuns, drafters: [], models: [] })).toContain(
       "No version of this model runs on this computer. Some versions are too large for this machine, and Magnitude can't run the others: Uses Q2_K weights, which Magnitude doesn't support yet.",
     )
-    const local = makeInspection({
-      source: { _tag: "Local", path: "/models" },
-      versions: [{ ...makeInspection().versions[2]!, label: "Q4_K_M", files: ["qwen.gguf"] }],
-    })
-    expect(renderInspection({ inspection: local, drafters: [], models: [] }).trimEnd().split("\n").at(-1))
-      .toBe("Add: magnitude models import /models/qwen.gguf")
   })
 
   it("marks verdicts", () => {
@@ -475,17 +461,8 @@ describe("pull and model mutations", () => {
     expect(renderPull({ _tag: "Custom", modelId: ADDED_MODEL_ID, outcome: "AlreadyCurrent" })).toBe(`${ADDED_MODEL_ID} is up to date.\n`)
   })
 
-  it("renders import and drafter acknowledgements", () => {
+  it("renders drafter and removal acknowledgements", () => {
     const modelId = CustomFormModelIdSchema.make(`local:${"b".repeat(64)}`)
-    expect(renderImport({ path: "/models/q.gguf", modelId, drafter: Option.none(), outcome: "Started", drafterDownloadStarted: false })).toBe([
-      "Added /models/q.gguf. Magnitude uses the file where it is and never moves or deletes it.",
-      "Drafter: none",
-      `Model ID: ${modelId}`,
-      `Load it: magnitude models load ${modelId}`,
-      "",
-    ].join("\n"))
-    expect(renderImport({ path: "/copies/q.gguf", modelId: FOUND_MODEL_ID, drafter: Option.none(), outcome: "AlreadyOnThisComputer", drafterDownloadStarted: false }))
-      .toContain(`Already on this computer: /copies/q.gguf has the same bytes as ${FOUND_MODEL_ID}, so it is that model.`)
     expect(renderSetDrafter({ modelId, drafter: Option.none(), drafterDownloadStarted: false })).toBe(`Turned off the drafter for ${modelId}.\n`)
     expect(renderSetDrafter({ modelId, drafter: Option.none(), drafterDownloadStarted: false }, "Auto"))
       .toBe(`No drafter is known to work with ${modelId}, so it runs without one.\n`)
@@ -639,17 +616,6 @@ describe("pull and model mutations", () => {
       modelId: FOUND_MODEL_ID,
       drafter: { _tag: "Reference", reference: { _tag: "Catalog", modelId: "qwen-test:gguf:q4" } },
     })
-  })
-
-  it("imports a file with the chosen drafter", async () => {
-    const modelId = CustomFormModelIdSchema.make(`local:${"c".repeat(64)}`)
-    const { client, models } = fakeClient({ importModelFile: () => Effect.succeed({ modelId, drafter: Option.none(), outcome: "Started" }) })
-    const result = await run(importFile(client, "/models/q.gguf", drafterArgument("built-in")))
-    expect(models.importModelFile).toHaveBeenCalledWith({
-      path: "/models/q.gguf",
-      drafter: { _tag: "Reference", reference: { _tag: "Embedded" } },
-    })
-    expect(result).toMatchObject({ _tag: "Right", right: { path: "/models/q.gguf", modelId } })
   })
 })
 
@@ -956,16 +922,9 @@ describe("--json output", () => {
       .toMatchObject({ model: { modelId: FOUND_MODEL_ID }, drafterCandidatesUnavailable: "offline" })
   })
 
-  it("encodes model locations and acknowledgements", () => {
+  it("encodes model locations", () => {
     const locations = encode(jsonDocument(ModelLocationsJsonSchema, (value: ReturnType<typeof makeLocations>) => ({ locations: value })), makeLocations())
     expect(locations.locations).toHaveLength(4)
-    expect(encode(jsonDocument(ImportResultSchema, (value: ImportResult) => value), {
-      path: "/m/q.gguf",
-      modelId: CustomFormModelIdSchema.make(`local:${"d".repeat(64)}`),
-      drafter: Option.none(),
-      outcome: "Started",
-      drafterDownloadStarted: false,
-    })).toEqual({ path: "/m/q.gguf", modelId: `local:${"d".repeat(64)}`, outcome: "Started", drafterDownloadStarted: false })
   })
 
   it.each([

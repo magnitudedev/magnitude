@@ -14,11 +14,11 @@ const commands = [
   ["catalog", "search", "qwen"], ["catalog", "inspect", "owner/repo"], ["catalog", "pull", "owner/repo:Q4_K_M"],
   ["catalog", "pull", "test:gguf:q4"], ["catalog", "cancel", "test:gguf:q4"], ["catalog", "remove", "test:gguf:q4"],
   ["models", "status"], ["models", "status", "--all"], ["models", "load", "test:gguf:q4"], ["models", "stop"],
-  ["models", "import", "/models/q.gguf"], ["models", "drafter", "hf:owner/repo/q.gguf", "auto"],
+  ["models", "drafter", "hf:owner/repo/q.gguf", "auto"],
   ["models", "hide", "hf:owner/repo/q.gguf"], ["models", "unhide", "hf:owner/repo/q.gguf"],
   ["models", "folders", "list"], ["models", "folders", "add", "/models"], ["models", "folders", "remove", "/models"],
   ["models", "folders", "enable", "ollama"], ["models", "folders", "disable", "lm-studio"],
-  ["catalog", "pull", "owner/repo:Q4_K_M", "--drafter", "none"], ["models", "import", "/models/q.gguf", "--drafter", "built-in"],
+  ["catalog", "pull", "owner/repo:Q4_K_M", "--drafter", "none"],
   ["catalog", "inspect", "https://huggingface.co/owner/repo"],
   ["hf", "login"], ["hf", "status"], ["hf", "logout"],
 ] as const
