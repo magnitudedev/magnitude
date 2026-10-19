@@ -1,9 +1,9 @@
 import { Effect, Schedule } from "effect";
 import { Models as Rpcs } from "@magnitudedev/sdk";
 import { Group, Mutation, QueryClient } from "@magnitudedev/effect-query";
-import { type SlotId } from "@magnitudedev/sdk";
+import { type CandidateInspectionUpdate, type SlotId } from "@magnitudedev/sdk";
 import { turnAdmissionScope } from "./configuration";
-import { mutation, query } from "./bind";
+import { mutation, query, streamQuery } from "./bind";
 
 const GetServingUsage = query(Rpcs.getServingUsage, client => client.models.getServingUsage, {
   staleTime: 0, refresh: Schedule.spaced("5 seconds"),
@@ -155,10 +155,14 @@ const SearchHuggingFaceModels = query(
   { staleTime: "1 minute" }
 );
 
-const InspectModelCandidate = query(
-  Rpcs.inspectModelCandidate,
-  (client) => client.models.inspectModelCandidate,
-  { staleTime: "5 minutes" }
+/**
+ * The same inspection as it goes: the latest progress, then the inspection, which stays cached so
+ * reopening the repository shows it at once.
+ */
+const StreamModelCandidateInspection = streamQuery(
+  Rpcs.streamModelCandidateInspection,
+  (client) => client.models.streamModelCandidateInspection,
+  { reduce: (_, update): CandidateInspectionUpdate => update, gcTime: "5 minutes" }
 );
 
 const ListDrafterCandidates = query(
@@ -249,7 +253,7 @@ export const Models = Group.make({
   GetLocalEnvironment,
   PreviewSlotLoad,
   SearchHuggingFaceModels,
-  InspectModelCandidate,
+  StreamModelCandidateInspection,
   ListDrafterCandidates,
   ListModelLocations,
   RefreshCatalog,

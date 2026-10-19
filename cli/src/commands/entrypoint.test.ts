@@ -32,7 +32,7 @@ describe("headless CLI entrypoint", () => {
     expect(result.stderr).toContain(argument.startsWith("--") ? "unknown option" : "too many arguments")
     expect(result.stdout).toBe("")
   })
-  it.each(["", "catalog", "models", "connections", "status", "serve", "docs", "update"])("supports finite help for %s", async (command) => {
+  it.each(["", "catalog", "models", "connections", "hf", "status", "serve", "docs", "update"])("supports finite help for %s", async (command) => {
     const result = await invoke([...(command ? [command] : []), "--help"])
     expect(result.code).toBe(0)
     expect(result.stdout).toContain("Usage:")
@@ -60,6 +60,7 @@ describe("headless CLI entrypoint", () => {
     ["models", "status"], ["models", "status", "test:gguf:q4"],
     ["models", "load", "test:gguf:q4"], ["models", "stop"],
     ["connections", "connect", "pi"], ["connections", "sync", "pi"],
+    ["hf", "login"], ["hf", "status"], ["hf", "logout"],
   ])("%j requires an existing owner without creating a profile", async (...args) => {
     const root = await mkdtemp(join(tmpdir(), "mag-connect-only-"))
     const profile = join(root, "absent")

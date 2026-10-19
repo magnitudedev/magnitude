@@ -1,4 +1,4 @@
-import { Duration, Effect, Layer, Option, Redacted } from "effect";
+import { Duration, Effect, Layer, Option } from "effect";
 import * as FileSystem from "@effect/platform/FileSystem";
 import { SystemError } from "@effect/platform/Error";
 import * as BunContext from "@effect/platform-bun/BunContext";
@@ -54,7 +54,6 @@ const config = (host: "127.0.0.1" | "::1" = "127.0.0.1") =>
     forceShutdownTimeout: Duration.seconds(2),
     outputLimitBytes: 64 * 1024,
     logFile: Option.none(),
-    huggingFaceToken: Option.none(),
   });
 
 describe("ICN managed launch", () => {
@@ -99,18 +98,10 @@ describe("ICN managed launch", () => {
     expect(args).not.toContain("--context-size");
   });
 
-  it("forwards an explicit Hugging Face token and never an implicit one", () => {
-    const withoutToken = icnChildEnvironment(config(), {}, "secret", {})
-    expect(withoutToken.HF_HUB_DISABLE_IMPLICIT_TOKEN).toBe("1")
-    expect(withoutToken).not.toHaveProperty("HF_TOKEN")
-    const withToken = icnChildEnvironment(
-      new IcnLifecycleConfig({ ...config(), huggingFaceToken: Option.some(Redacted.make("hf_token")) }),
-      {},
-      "secret",
-      {},
-    )
-    expect(withToken.HF_TOKEN).toBe("hf_token")
-    expect(withToken.HF_HUB_DISABLE_IMPLICIT_TOKEN).toBe("1")
+  it("never gives ICN a Hugging Face token through its environment", () => {
+    const environment = icnChildEnvironment({}, "secret", {})
+    expect(environment.HF_HUB_DISABLE_IMPLICIT_TOKEN).toBe("1")
+    expect(environment).not.toHaveProperty("HF_TOKEN")
   });
 
   it("writes the local-models snapshot named at spawn", async () => {

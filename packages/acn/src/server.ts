@@ -95,6 +95,7 @@ import { CustomEndpointsLive } from "./custom-endpoints"
 import { CustomEndpointReconcilerLive } from "./custom-endpoint-reconciler"
 import { CustomModelsLive } from "./custom-models"
 import { CustomModelReconcilerLive } from "./custom-model-reconciler"
+import { HuggingFaceAccountLive, HuggingFaceOAuthConfigLive } from "./hugging-face-account"
 import { CustomModelCommandsLive } from "./custom-model-commands"
 import { CatalogModelSyncLive } from "./catalog-model-sync"
 import { DrafterMethodsLive } from "./drafter-references"
@@ -335,8 +336,12 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     AcnStorageChangesLive,
     Layer.provideMerge(AcnChangesLive, withSubscriptions),
   )
-  const localServices = addLocalInferenceServices(
+  const withHuggingFace = Layer.provideMerge(
+    HuggingFaceAccountLive.pipe(Layer.provide(HuggingFaceOAuthConfigLive)),
     withChanges,
+  )
+  const localServices = addLocalInferenceServices(
+    withHuggingFace,
     dataDir
   )
   const withSharedClient = Layer.provideMerge(

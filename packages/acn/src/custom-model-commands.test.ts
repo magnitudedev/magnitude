@@ -14,6 +14,7 @@ import {
 } from "@magnitudedev/icn"
 import {
   CandidateInspection,
+  CandidateInspectionProgress,
   DrafterCandidate as NativeDrafterCandidate,
   type ModelCandidate,
   type ModelDownload,
@@ -30,6 +31,7 @@ import { CustomModelCommands, CustomModelCommandsLive } from "./custom-model-com
 import { CatalogModelSync } from "./catalog-model-sync"
 import { CustomModelReconciler } from "./custom-model-reconciler"
 import { CustomModels, localModelsConfiguration } from "./custom-models"
+import { HuggingFaceAccount } from "./hugging-face-account"
 import { DrafterMethodsLive } from "./drafter-references"
 import { LocalModelSources, type CatalogModelSource } from "./local-model-sources"
 import { LocalModels, catalogAcquisition, customModel } from "./local-models"
@@ -95,6 +97,16 @@ const inspection = (onThisComputer?: string, catalogModel?: string) => Schema.de
   ],
 })
 
+const progressOf = (phase: unknown, assessments: readonly unknown[]) => Schema.decodeUnknownSync(CandidateInspectionProgress)({
+  phase,
+  versions: [
+    { label: "Q4_K_M", sizeBytes: 100, ...(assessments[0] === undefined ? {} : { assessment: assessments[0] }) },
+    { label: "Q2_K", sizeBytes: 50, ...(assessments[1] === undefined ? {} : { assessment: assessments[1] }) },
+  ],
+})
+
+const unsupportedQ2K = { _tag: "Unsupported", profile: { contextLength: 4096 }, reasons: [{ _tag: "WeightTypes", types: [{ ggmlType: "Q2_K", tensorCount: 2 }] }], detail: "" }
+
 interface DrafterList {
   readonly candidates: readonly NativeDrafterCandidate[]
   readonly entered: Option.Option<NativeDrafterCandidate["reference"]>
@@ -120,6 +132,8 @@ const harness = (options: {
   readonly config?: ReturnType<typeof customModelsConfig>
   readonly inspect?: ReturnType<typeof inspection>
   readonly inspectFailure?: unknown
+  readonly progress?: readonly ReturnType<typeof progressOf>[]
+  readonly progressFailure?: unknown
   readonly drafters?: readonly NativeDrafterCandidate[]
   readonly draftersFor?: (request: { readonly other: Option.Option<string> }) => Effect.Effect<DrafterList, unknown>
   readonly downloads?: readonly ModelDownload[]
@@ -127,6 +141,7 @@ const harness = (options: {
   readonly catalog?: readonly CatalogModelSource[]
   readonly catalogRows?: readonly LocalModelsState["models"][number][]
   readonly catalogInstalled?: readonly string[]
+  readonly signedIn?: boolean
   readonly startDownload?: (bundle: unknown, forModel: string) => Option.Option<ModelDownload>
 } = {}) => {
   const recorded: Recorded = {
@@ -166,6 +181,12 @@ const harness = (options: {
     inspect: () => options.inspectFailure === undefined
       ? Effect.succeed(options.inspect ?? inspection())
       : Effect.fail(options.inspectFailure as never),
+    inspectWithProgress: () => Stream.concat(
+      Stream.fromIterable((options.progress ?? []).map((progress) => ({ _tag: "Progress" as const, progress }))),
+      options.progressFailure === undefined
+        ? Stream.make({ _tag: "Inspected" as const, inspection: options.inspect ?? inspection() })
+        : Stream.fail(options.progressFailure as never),
+    ) as never,
     drafters: (request) => Effect.suspend(() => {
       recorded.drafterRequests.push(request)
       return options.draftersFor?.(request as { readonly other: Option.Option<string> })
@@ -232,6 +253,11 @@ const harness = (options: {
         downloadComponent: () => Effect.succeed({ started: false }),
       }),
       DrafterMethodsLive,
+      Layer.succeed(HuggingFaceAccount, {
+        account: Effect.succeed(options.signedIn
+          ? { _tag: "SignedIn" as const, username: "ada", avatarUrl: Option.none() }
+          : { _tag: "SignedOut" as const, reason: Option.none() }),
+      } as never),
       makeModelLocations({ platform: "linux", env: { OLLAMA_MODELS: "/nonexistent/ollama" }, home: "/nonexistent-home" })
         .pipe(Layer.provide(BunFileSystem.layer)),
       BunFileSystem.layer,
@@ -280,6 +306,42 @@ describe("finding models", () => {
       "hf:owner/model-GGUF/model-Q2_K.gguf",
     ])
     expect(result.versions[1]?.assessment.pipe(Option.map(({ _tag }) => _tag))).toEqual(Option.some("Unsupported"))
+  })
+
+  it("relays the inspection's progress in order, each verdict projected, then the inspection", async () => {
+    const { run } = harness({
+      progress: [
+        progressOf({ _tag: "ReadingHeaders", completed: 1, total: 2 }, []),
+        progressOf({ _tag: "CheckingVersions", completed: 1, total: 2 }, [undefined, unsupportedQ2K]),
+        progressOf({ _tag: "CheckingDrafters", version: "Q4_K_M", completed: 0, total: 1 }, [undefined, unsupportedQ2K]),
+      ],
+    })
+    const updates = await run((commands) => Stream.runCollect(commands.inspectCandidateWithProgress("owner/model-GGUF:q2_k")))
+    const [reading, checking, drafters, done] = [...updates]
+    expect([...updates].map(({ _tag }) => _tag)).toEqual(["Inspecting", "Inspecting", "Inspecting", "Inspected"])
+    expect(reading?._tag === "Inspecting" && reading.progress.phase).toEqual({ _tag: "ReadingHeaders", completed: 1, total: 2 })
+    expect(checking?._tag === "Inspecting" && checking.progress.versions.map(({ label, assessment }) =>
+      [label, Option.map(assessment, ({ _tag }) => _tag)])).toEqual([["Q4_K_M", Option.none()], ["Q2_K", Option.some("Unsupported")]])
+    expect(drafters?._tag === "Inspecting" && drafters.progress.phase).toEqual({ _tag: "CheckingDrafters", version: "Q4_K_M", completed: 0, total: 1 })
+    expect(done?._tag === "Inspected" && done.inspection.selectedVersion).toEqual(Option.some("Q2_K"))
+  })
+
+  it("reports a failure after the inspection's progress began as the request/response inspection would", async () => {
+    const { run } = harness({
+      progress: [progressOf({ _tag: "ReadingHeaders", completed: 0, total: 2 }, [])],
+      progressFailure: {
+        _tag: "GeneratedClientRemoteError",
+        status: 200,
+        body: { error: { type: "server_error", code: "inventory_error", message: "upstream model service failed: timed out" } },
+      },
+    })
+    const result = await run((commands) => Stream.runCollect(commands.inspectCandidateWithProgress("owner/model-GGUF")).pipe(Effect.either))
+    expect(result._tag === "Left" && result.left).toMatchObject({
+      _tag: "ModelSourceUnavailable",
+      reason: "SourceUnreachable",
+      message: "upstream model service failed: timed out",
+      retryable: true,
+    })
   })
 
   it("projects an unreadable version without a serving profile", async () => {
@@ -340,44 +402,60 @@ describe("finding models", () => {
     expect(unreachable._tag === "Left" && unreachable.left).toMatchObject({ _tag: "ModelSourceUnavailable", reason: "ServiceUnreachable", retryable: true })
   })
 
-  it("asks for Hugging Face access and a token for a gated repository", async () => {
-    const gated = harness({
+  it("asks to sign in to Hugging Face, or to accept the terms, for a gated repository", async () => {
+    const refused = (code: string, signedIn: boolean) => harness({
+      signedIn,
       inspectFailure: {
         _tag: "GeneratedClientRemoteError",
         status: 409,
-        body: { error: { code: "hugging_face_access_required", message: "GGUF header request returned HTTP 401 Unauthorized" } },
+        body: { error: { code, message: "GGUF header request returned HTTP 401 Unauthorized" } },
       },
     })
-    const result = await gated.run((commands) => commands.addHuggingFaceModel({
+    const add = (commands: Effect.Effect.Success<typeof CustomModelCommands>) => commands.addHuggingFaceModel({
       repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false
-    }).pipe(Effect.either))
-    expect(result._tag === "Left" && result.left).toMatchObject({
-      _tag: "ModelSourceUnavailable",
-      reason: "AccessRequired",
-      message: "This repository requires accepting its terms on Hugging Face and an access token. Set HF_TOKEN to a token from an account that has accepted them, then try again.",
-      retryable: false,
+    }).pipe(Effect.either)
+    const signIn = await refused("hugging_face_sign_in_required", false).run(add)
+    expect(signIn._tag === "Left" && signIn.left).toMatchObject({
+      _tag: "HuggingFaceAccessRequired",
+      repository,
+      access: "SignIn",
+      message: "Sign in to Hugging Face to use this model.",
     })
+    const terms = await refused("hugging_face_terms_required", true).run((commands) =>
+      commands.inspectCandidate(`https://huggingface.co/${repository}`).pipe(Effect.either))
+    expect(terms._tag === "Left" && terms.left).toMatchObject({
+      _tag: "HuggingFaceAccessRequired",
+      repository,
+      access: "AcceptTerms",
+      message: "Accept this model's terms on Hugging Face, then try again. Some models also need the author's approval.",
+    })
+    expect(JSON.stringify(terms)).not.toMatch(/HF_TOKEN/)
   })
 
   it("says a repository Hugging Face won't show may be missing, private or gated, for inspect and add", async () => {
-    const missing = harness({
+    const missing = (signedIn: boolean) => harness({
+      signedIn,
       inspectFailure: {
         _tag: "GeneratedClientRemoteError",
         status: 409,
         body: { error: { code: "hugging_face_repository_not_found", message: "Repository not found" } },
       },
     })
-    const message = "Repository not found, or it's private or gated. Check the name, or set HF_TOKEN if you have access."
-    const inspected = await missing.run((commands) => commands.inspectCandidate("nobody-xyz/does-not-exist-GGUF").pipe(Effect.either))
+    const message = "Repository not found, or it's private or gated. Check the name, or sign in to Hugging Face if you have access."
+    const inspected = await missing(false).run((commands) => commands.inspectCandidate("nobody-xyz/does-not-exist-GGUF").pipe(Effect.either))
     expect(inspected._tag === "Left" && inspected.left).toMatchObject({
       _tag: "ModelRepositoryNotFound",
       reference: "nobody-xyz/does-not-exist-GGUF",
       message,
     })
-    const added = await missing.run((commands) => commands.addHuggingFaceModel({
+    const added = await missing(false).run((commands) => commands.addHuggingFaceModel({
       repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false
     }).pipe(Effect.either))
     expect(added._tag === "Left" && added.left).toMatchObject({ _tag: "ModelRepositoryNotFound", message })
+    const signedIn = await missing(true).run((commands) => commands.inspectCandidate("nobody-xyz/does-not-exist-GGUF").pipe(Effect.either))
+    expect(signedIn._tag === "Left" && signedIn.left).toMatchObject({
+      message: "Repository not found, or your Hugging Face account doesn't have access to it. Check the name.",
+    })
   })
 
   it("refuses a version the repository does not have", async () => {

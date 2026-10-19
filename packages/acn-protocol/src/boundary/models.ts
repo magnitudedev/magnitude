@@ -18,6 +18,7 @@ import {
   AddedModelSchema,
   CatalogComponentSchema,
   CandidateInspectionSchema,
+  CandidateInspectionUpdateSchema,
   CustomFormModelIdSchema,
   DrafterCandidateSchema,
   DrafterChoiceSchema,
@@ -171,6 +172,17 @@ const InspectModelCandidate = Rpc.make("InspectModelCandidate", {
   error: ModelCandidateError,
 }).pipe(replaySafe)
 
+/**
+ * The same inspection as it goes: its progress in order, then the inspection itself. Like every ACN
+ * subscription, it stays open after the inspection until the subscriber leaves.
+ */
+const StreamModelCandidateInspection = Rpc.make("StreamModelCandidateInspection", {
+  payload: Schema.Struct({ reference: NonEmptyString }),
+  success: CandidateInspectionUpdateSchema,
+  error: ModelCandidateError,
+  stream: true,
+})
+
 /** Drafters for a target in preselection order; `other` adds any reference with the engine's verdict. */
 /** A target's drafter choices; with `other`, also the listed candidate that different drafter is. */
 const ListDrafterCandidates = Rpc.make("ListDrafterCandidates", {
@@ -282,6 +294,7 @@ export const Models = {
   previewSlotLoad: PreviewSlotLoad,
   searchHuggingFaceModels: SearchHuggingFaceModels,
   inspectModelCandidate: InspectModelCandidate,
+  streamModelCandidateInspection: StreamModelCandidateInspection,
   listDrafterCandidates: ListDrafterCandidates,
   listModelLocations: ListModelLocations,
   addHuggingFaceModel: AddHuggingFaceModel,

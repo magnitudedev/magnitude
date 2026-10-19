@@ -2,7 +2,7 @@ import type { LocalModel, MagnitudeClient, ModelCatalogState } from "@magnituded
 import { Context, Effect, type Scope } from "effect"
 import { existingAcnConnection } from "../server/acn-connection"
 
-export type CliModelsClient = Pick<MagnitudeClient, "models">
+export type CliModelsClient = Pick<MagnitudeClient, "models" | "huggingFace">
 
 /** How inference commands reach the service; by default the running Magnitude service, acquired only when a command needs it. */
 export class CliModelsConnection extends Context.Reference<CliModelsConnection>()("CliModelsConnection", {

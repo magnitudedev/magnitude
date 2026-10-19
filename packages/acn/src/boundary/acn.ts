@@ -40,6 +40,7 @@ import { SessionInspector } from "../session-inspector";
 import { ServerSettings } from "../server-settings";
 import { AcnHarnessConnections } from "../harness-connections";
 import { AcnOwner, requestOwner, watchApplicationOwner } from "../application-owner";
+import { HuggingFaceAccount } from "../hugging-face-account";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -77,6 +78,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const serverSettings = yield* ServerSettings;
     const harnessConnections = yield* AcnHarnessConnections;
     const owner = yield* AcnOwner;
+    const huggingFace = yield* HuggingFaceAccount;
     const ownerRequest = (name: string, request: Parameters<typeof requestOwner>[0]) => observeRpcDefects(name, requestOwner(request).pipe(Effect.provideService(AcnOwner, owner)));
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
@@ -333,6 +335,13 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       RegenerateNetworkApiKey: () => observeRpcDefects("RegenerateNetworkApiKey", serverSettings.regenerateNetworkApiKey.pipe(Effect.as({}))),
       GetServerMachine: () => observeRpcDefects("GetServerMachine", serverSettings.machine),
 
+      GetHuggingFaceAccount: () => observeRpcDefects("GetHuggingFaceAccount", huggingFace.account),
+      StartHuggingFaceSignIn: () => observeRpcDefects("StartHuggingFaceSignIn", huggingFace.startBrowserSignIn),
+      StartHuggingFaceDeviceSignIn: () => observeRpcDefects("StartHuggingFaceDeviceSignIn", huggingFace.startDeviceSignIn),
+      GetHuggingFaceSignInAttempt: ({ attemptId }) => observeRpcDefects("GetHuggingFaceSignInAttempt", huggingFace.attemptOutcome(attemptId)),
+      CancelHuggingFaceSignIn: ({ attemptId }) => observeRpcDefects("CancelHuggingFaceSignIn", huggingFace.cancelSignIn(attemptId).pipe(Effect.as({}))),
+      SignOutOfHuggingFace: () => observeRpcDefects("SignOutOfHuggingFace", huggingFace.signOut.pipe(Effect.as({}))),
+
       WatchHarnessConnections: () => observeRpcStreamDefects("WatchHarnessConnections", harnessConnections.watch),
       ConnectHarness: request => observeRpcDefects("ConnectHarness", harnessConnections.connect(request)),
       SyncHarnessConnections: ({ harness }) => observeRpcDefects("SyncHarnessConnections", harnessConnections.sync(harness).pipe(Effect.as({}))),
@@ -393,6 +402,13 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
 
       InspectModelCandidate: ({ reference }) =>
         observeRpcDefects("InspectModelCandidate", customModelCommands.inspectCandidate(reference)),
+
+      // Like every ACN subscription, it stays open after its last update until the subscriber leaves.
+      StreamModelCandidateInspection: ({ reference }) =>
+        observeRpcStreamDefects(
+          "StreamModelCandidateInspection",
+          customModelCommands.inspectCandidateWithProgress(reference).pipe(Stream.concat(Stream.never)),
+        ),
 
       ListDrafterCandidates: ({ target, other }) =>
         observeRpcDefects(

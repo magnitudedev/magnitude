@@ -42,10 +42,11 @@ models folders list | add <path> | remove <path>
 models folders enable <location> | disable <location>
 connections list | connect <harness> [--set-model <model-id>] [--install-skill]
 connections sync [harness] | remove <harness>
+hf login | status | logout
 docs [topic-id]
 ```
 
-Every inference command (`hardware`, `catalog`, `models`) accepts `--json`. Nothing prompts:
+Every inference command (`hardware`, `catalog`, `models`) and every `hf` command accepts `--json`. Nothing prompts:
 ambiguity resolves the way the desktop's defaults do, and the choice is printed. Removed output flags are not retained as aliases.
 The acquisition command remains `catalog pull`. Plugins call the SDK over RPC instead of the CLI.
 
@@ -64,6 +65,7 @@ The acquisition command remains `catalog pull`. Plugins call the SDK over RPC in
   operations, imports, drafters, hidden models, model locations, and runtime residency.
 - `connections` reports harness installation and observed configuration integrity, and writes
   harness configuration for the person running the command, from the CLI process.
+- `hf` signs the service in to and out of Hugging Face and reports the account it uses.
 
 Catalog output never includes acquisition or residency state, except that `catalog inspect` marks a
 version already on this computer. Model-status output never includes
@@ -196,6 +198,34 @@ actionable failure details without historical or internal operation state.
 Load acknowledges admission and prints the focused status command; it never claims readiness from
 the load acknowledgement. Load and stop delegate directly to their authoritative mutations. Magnitude has one active local
 residency slot, so stop remains unaddressed.
+
+## Hugging Face account
+
+There is one Hugging Face sign-in, owned by the service and shared with the desktop. The CLI never
+sees, accepts, or reads a token: no pasted token, no `HF_TOKEN`. `hf login` uses the device
+flow so it works over SSH and headless: it starts a device sign-in, prints the verification page,
+the code, and how long the code is valid, and never opens a browser. The service polls Hugging Face;
+the CLI follows its own attempt (by the attempt ID the start returned) about once a second until it
+ends, so another client's sign-in or an account left signed in by an earlier attempt never answers
+for it. It then prints “Signed in to Hugging Face as <username>” and exits 0, or prints the shared
+reason (declined, expired, failed) and exits 1. An attempt cancelled elsewhere fails as cancelled,
+and one replaced by a newer sign-in fails as superseded. Ctrl+C or a termination signal cancels
+this attempt, and only it, before exiting with status 130. Under `--json`, login prints exactly two
+lines on success: the device sign-in `{attemptId, verificationUri, verificationUriComplete?, userCode, expiresIn, interval}`
+(seconds; `verificationUriComplete` only when Hugging Face returns it), then the account; a failure leaves only the first line on stdout
+and writes the usual error document, whose code names the reason
+(`hugging_face_sign_in_denied`, `_expired`, `_failed`, `_cancelled`, `_superseded`).
+
+`hf status` prints the account: signed in as whom, a sign-in in progress, or signed out
+with the reason and the login command. `hf logout` removes the service's saved sign-in.
+Under `--json` both print the account document, `{"_tag": "SignedIn", "username", "avatarUrl"?}`,
+`{"_tag": "SigningIn", "method"}`, or `{"_tag": "SignedOut", "reason"?}`.
+
+A gated repository is refused with what it needs. Without a sign-in: “Sign in to Hugging Face to
+use this model. Run `magnitude hf login`.” Without accepted terms: “Accept this model's
+terms on Hugging Face: <repository page> — then try again. Some models also need the author's
+approval.” The same wording applies to commands the service refuses with
+`HuggingFaceAccessRequired` and to download failures in model status.
 
 ## Connections
 

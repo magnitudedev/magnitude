@@ -11,7 +11,6 @@ import {
   formatStorageSize,
   localModelIsInstalled,
   localModelServingState,
-  modelDownloadFailureMessage,
   preselectedDrafterCandidate,
   removalKind,
   unsupportedLocalModelSourceTag,
@@ -36,6 +35,7 @@ import {
 } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
 import { renderDrafterChoices } from "./drafter-output"
+import { downloadFailureText, drafterRepository, modelRepository } from "./hugging-face-access"
 import {
   addressableModels,
   catalogProducts,
@@ -149,12 +149,12 @@ const unsupportedAssessmentReason = (model: LocalModel): Option.Option<string> =
 
 const drafterTransferStatus = (model: LocalModel): Option.Option<string> => {
   if (model._tag !== "Custom") return Option.none()
-  return Option.flatMap(model.drafter, ({ availability }) => {
+  return Option.flatMap(model.drafter, ({ availability, reference }) => {
     switch (availability._tag) {
       case "Present": return Option.none()
       case "Downloading": return Option.some(
         `Downloading drafter ${percent(availability.progress.completedBytes, availability.progress.totalBytes)}`)
-      case "DownloadFailed": return Option.some(`Drafter download failed - ${modelDownloadFailureMessage(availability.failure)}`)
+      case "DownloadFailed": return Option.some(`Drafter download failed - ${downloadFailureText(availability.failure, drafterRepository(reference))}`)
     }
   })
 }
@@ -183,8 +183,8 @@ const modelStatus = (model: LocalModel): string => {
     case "Removing": return "Removing"
     case "Installing": return `Downloading ${percent(acquisition.progress.completedBytes, acquisition.progress.totalBytes)}`
     case "Updating": return `Updating ${percent(acquisition.progress.completedBytes, acquisition.progress.totalBytes)}`
-    case "InstallFailed": return `Failed - ${modelDownloadFailureMessage(acquisition.failure)}`
-    case "UpdateFailed": return `Failed - ${modelDownloadFailureMessage(acquisition.failure)}`
+    case "InstallFailed": return `Failed - ${downloadFailureText(acquisition.failure, modelRepository(model.modelId))}`
+    case "UpdateFailed": return `Failed - ${downloadFailureText(acquisition.failure, modelRepository(model.modelId))}`
     case "Optimizing": return formatModelOptimization(acquisition.progress)
     case "RemoveFailed": return `Failed - ${acquisition.failure.message}`
     case "NotInstalled": return "Not installed"
@@ -310,7 +310,7 @@ const installationFields = (model: LocalModel): readonly (readonly [string, stri
   ]
   if (state._tag === "InstallFailed" || state._tag === "UpdateFailed") return [
     ["Installation", "Failed"],
-    ["Reason", modelDownloadFailureMessage(state.failure)],
+    ["Reason", downloadFailureText(state.failure, modelRepository(model.modelId))],
   ]
   if (state._tag === "RemoveFailed") return [["Installation", "Removal failed"], ["Reason", state.failure.message]]
   if (state._tag === "External") return [["Files", "On this computer, managed outside Magnitude"]]

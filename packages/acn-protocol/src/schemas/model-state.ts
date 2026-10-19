@@ -6,6 +6,7 @@ import {
   ReasoningEffortSchema,
 } from "@magnitudedev/ai/provider/model"
 import { FSM } from "@magnitudedev/utils"
+import { HuggingFaceAccessSchema } from "./hugging-face"
 
 const { defineFSM } = FSM
 
@@ -499,6 +500,7 @@ export const ModelAcquisitionFailureSchema = Schema.Union(
     availableBytes: NonNegativeSafeInteger,
   }),
   Schema.TaggedStruct("SourceUnavailable", {}),
+  Schema.TaggedStruct("HuggingFaceAccessRequired", { access: HuggingFaceAccessSchema }),
   Schema.TaggedStruct("NetworkUnavailable", {}),
   Schema.TaggedStruct("LocalStorageFailure", {}),
   Schema.TaggedStruct("CorruptDownload", {}),
@@ -1166,6 +1168,7 @@ export const HuggingFaceSearchResultSchema = Schema.Struct({
   architecture: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
   unsupported: Schema.optionalWith(Schema.NonEmptyArray(UnsupportedReasonSchema), { as: "Option", exact: true }),
   gated: Schema.Boolean,
+  versionCount: Schema.optionalWith(PositiveSafeInteger, { as: "Option", exact: true }),
 })
 export type HuggingFaceSearchResult = typeof HuggingFaceSearchResultSchema.Type
 
@@ -1239,6 +1242,35 @@ export const CandidateInspectionSchema = Schema.Struct({
   message: () => "a candidate's selected version must be listed and at most one version is recommended",
 }))
 export type CandidateInspection = typeof CandidateInspectionSchema.Type
+
+/** What an inspection is doing and how much of it is done; a drafter total counts the drafter checks known so far. */
+export const CandidateInspectionPhaseSchema = Schema.Union(
+  Schema.TaggedStruct("ReadingHeaders", { completed: NonNegativeSafeInteger, total: NonNegativeSafeInteger }),
+  Schema.TaggedStruct("CheckingVersions", { completed: NonNegativeSafeInteger, total: NonNegativeSafeInteger }),
+  Schema.TaggedStruct("CheckingDrafters", { version: NonEmptyString, completed: NonNegativeSafeInteger, total: NonNegativeSafeInteger }),
+)
+export type CandidateInspectionPhase = typeof CandidateInspectionPhaseSchema.Type
+
+/** A version as an inspection in progress knows it: label, size, and its plain verdict once checked. */
+export const CandidateVersionProgressSchema = Schema.Struct({
+  label: NonEmptyString,
+  sizeBytes: NonNegativeSafeInteger,
+  assessment: Schema.optionalWith(LocalModelAssessmentSchema, { as: "Option", exact: true }),
+})
+export type CandidateVersionProgress = typeof CandidateVersionProgressSchema.Type
+
+export const CandidateInspectionProgressSchema = Schema.Struct({
+  phase: CandidateInspectionPhaseSchema,
+  versions: Schema.Array(CandidateVersionProgressSchema),
+})
+export type CandidateInspectionProgress = typeof CandidateInspectionProgressSchema.Type
+
+/** An inspection as it goes: its progress, in order, then the inspection itself. */
+export const CandidateInspectionUpdateSchema = Schema.Union(
+  Schema.TaggedStruct("Inspecting", { progress: CandidateInspectionProgressSchema }),
+  Schema.TaggedStruct("Inspected", { inspection: CandidateInspectionSchema }),
+)
+export type CandidateInspectionUpdate = typeof CandidateInspectionUpdateSchema.Type
 
 /** What a drafter list is for: an existing model, or a candidate's chosen files. */
 export const DrafterTargetSchema = Schema.Union(

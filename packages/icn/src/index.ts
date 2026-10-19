@@ -8,3 +8,4 @@ export * from "./provider/index.js";
 export * from "./instances/index.js";
 export * from "./downloads/index.js";
 export * from "./candidates/index.js";
+export * from "./hugging-face/index.js";

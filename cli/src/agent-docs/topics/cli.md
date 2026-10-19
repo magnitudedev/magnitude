@@ -30,6 +30,7 @@ magnitude connections list
 magnitude connections connect <harness> [--set-model <model-id>] [--install-skill]
 magnitude connections sync [harness]
 magnitude connections remove <harness>
+magnitude hf login|status|logout
 magnitude docs [topic-id]
 ```
 
@@ -53,7 +54,7 @@ Each command prints only the product information relevant to that operation. Col
 use borderless tables when the rows are directly comparable; detail commands use labeled fields.
 Exact model and harness IDs are always printed so their output can be used in later commands.
 
-Every `hardware`, `catalog`, and `models` command accepts `--json` and then prints one JSON document
+Every `hardware`, `catalog`, `models`, and `hf` command accepts `--json` and then prints one JSON document
 of the same facts instead of text, with exact IDs, structured reasons a model can't run (with the
 engine's developer `detail`), and drafter verdicts. Optional fields are omitted when absent. Errors
 stay on stderr with a nonzero exit in both modes; with `--json` an error is one JSON document,
@@ -72,6 +73,16 @@ for GGUF models, reading headers only and never changing those files. Assessment
 model for the current hardware, including compatibility, memory fit, serving configuration,
 acceleration, and expected speed. See `magnitude docs custom-models` for adding models from Hugging
 Face or disk, drafters, and model locations.
+
+`hf login` signs Magnitude in to Hugging Face for gated models, private repositories, and
+higher download limits. It prints a page and a code to enter on any device, waits until the sign-in
+finishes, and never opens a browser, so it works over SSH. The sign-in belongs to the Magnitude
+service and is shared with the desktop app; Magnitude never asks for a token.
+It waits for its own attempt, exits nonzero when that attempt is declined, expires, fails, or is
+replaced by a newer sign-in, and Ctrl+C cancels it. With
+`--json` it prints the code document (`attemptId`, `verificationUri`, `verificationUriComplete` when Hugging Face returns it, `userCode`, `expiresIn`, `interval`) and
+then the account, one JSON line each. `hf status` shows the account and `hf
+logout` signs out.
 
 `connections connect --install-skill` installs or refreshes the bundled Magnitude skill in the selected
 harness's supported user-wide location before applying the connection.

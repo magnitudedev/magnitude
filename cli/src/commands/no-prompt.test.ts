@@ -20,6 +20,7 @@ const commands = [
   ["models", "folders", "enable", "ollama"], ["models", "folders", "disable", "lm-studio"],
   ["catalog", "pull", "owner/repo:Q4_K_M", "--drafter", "none"], ["models", "import", "/models/q.gguf", "--drafter", "built-in"],
   ["catalog", "inspect", "https://huggingface.co/owner/repo"],
+  ["hf", "login"], ["hf", "status"], ["hf", "logout"],
 ] as const
 
 describe("non-interactive inference commands", () => {

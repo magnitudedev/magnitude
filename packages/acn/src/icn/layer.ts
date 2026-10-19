@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { nativeWindowsJobOwnerLayer, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native";
 import { WindowsIcnChildSpawner } from "./windows-child";
-import { Duration, Effect, Layer, Option, Redacted, Ref, Schema } from "effect";
+import { Duration, Effect, Layer, Option, Ref, Schema } from "effect";
 import type { LocalModelsConfiguration } from "@magnitudedev/icn-protocol/schemas";
 import { EMPTY_CUSTOM_MODELS_CONFIG, MagnitudeStorage, resolveUsableModelStoreLocation } from "@magnitudedev/storage";
 import {
@@ -26,6 +26,7 @@ import {
   IcnCandidatesLive,
   makeIcnModelAssessments,
   makeIcnClient,
+  makeIcnHuggingFaceCredential,
   makeIcnProcess,
   UnixIcnChildSpawner,
   makeIcnHardware,
@@ -37,6 +38,7 @@ import {
 import { ACN_VERSION } from "../version";
 import { hostDiscoveryEnvironment, resolveAutomaticLocations } from "./discovery-roots";
 import { localModelsConfiguration } from "../custom-models";
+import { HuggingFaceCredentialDeliveryLive } from "../hugging-face-credential-delivery";
 import { AcnServiceLifecycle } from "../service-lifecycle";
 
 const artifactProgress = (
@@ -179,10 +181,6 @@ const makeProcess = (dataDir: string, modelStore: string, localModels: LocalMode
       forceShutdownTimeout: Duration.millis(500),
       outputLimitBytes: 256 * 1024,
       logFile: Option.some(join(dataDir, "logs", "inference.log")),
-      huggingFaceToken: Option.map(
-        Option.fromNullable(process.env.HF_TOKEN?.trim()).pipe(Option.filter((token) => token.length > 0)),
-        Redacted.make,
-      ),
     })
   ).pipe(Layer.provide(process.platform === "win32"
     ? WindowsIcnChildSpawner.pipe(Layer.provide(Layer.merge(
@@ -298,7 +296,11 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
   );
   const supervisedProcess = Layer.provideMerge(makeSupervision(), process);
   const withClient = Layer.provideMerge(makeIcnClient(), supervisedProcess);
-  const withEvents = Layer.provideMerge(makeIcnEvents(), withClient);
+  const withHubCredential = Layer.provideMerge(
+    HuggingFaceCredentialDeliveryLive.pipe(Layer.provideMerge(makeIcnHuggingFaceCredential())),
+    withClient,
+  );
+  const withEvents = Layer.provideMerge(makeIcnEvents(), withHubCredential);
   const withHardware = Layer.provideMerge(makeIcnHardware(), withEvents);
   const withCatalog = Layer.provideMerge(makeIcnCatalog(), withHardware);
   const withLocalModels = Layer.provideMerge(makeIcnLocalModels(), withCatalog);

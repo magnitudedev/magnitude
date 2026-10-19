@@ -40,7 +40,9 @@ any version already on this computer, then lists drafter choices and the exact c
 `catalog pull` with no quant picks the recommended version and says so. It pins the repository's
 current commit and prints the model ID. If that version is already on this computer, only the
 drafter downloads. A version Magnitude can't run is refused with the reason; one that needs more
-memory than this computer can provide is refused unless you pass `--force`. A catalog model ID keeps working exactly as before. A custom model ID updates
+memory than this computer can provide is refused unless you pass `--force`. A gated repository
+says what it needs: run `magnitude hf login` to sign in, or accept the model's terms on
+its Hugging Face page (some models also need the author's approval), then try again. A catalog model ID keeps working exactly as before. A custom model ID updates
 that model: an added model to its repository's newer commit, and any model to a newer revision of
 its catalog drafter.
 

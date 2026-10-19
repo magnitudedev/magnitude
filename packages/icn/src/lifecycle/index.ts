@@ -24,7 +24,6 @@ import {
   Layer,
   Option,
   Random,
-  Redacted,
   Ref,
   Schedule,
   Schema,
@@ -122,7 +121,6 @@ export class IcnLifecycleConfig extends Schema.Class<IcnLifecycleConfig>(
   ),
   outputLimitBytes: PositiveInt,
   logFile: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-  huggingFaceToken: Schema.optionalWith(Schema.Redacted(NonEmpty), { as: "Option", exact: true }),
 }) {}
 
 export interface ResolvedIcnBinary {
@@ -395,10 +393,10 @@ export const writeLocalModelsConfiguration = (storage: IcnStorageConfig) =>
 
 /**
  * ICN's output is recorded, not shown: plain text, and a per-request line only on failure. ICN never
- * reads a token file; an explicit token reaches gated repositories and raises rate limits.
+ * reads a token from its environment or a token file; ACN delivers the Hugging Face credential at
+ * runtime.
  */
 export const icnChildEnvironment = (
-  config: IcnLifecycleConfig,
   binaryEnvironment: Readonly<Record<string, string>>,
   authorization: string,
   inherited: Readonly<Record<string, string | undefined>> = globalThis.process.env,
@@ -408,10 +406,6 @@ export const icnChildEnvironment = (
   ...binaryEnvironment,
   MAGNITUDE_ICN_AUTH_TOKEN: authorization,
   HF_HUB_DISABLE_IMPLICIT_TOKEN: "1",
-  ...Option.match(config.huggingFaceToken, {
-    onNone: () => ({}),
-    onSome: (token) => ({ HF_TOKEN: Redacted.value(token) }),
-  }),
 });
 
 const acquireIcn = (input: IcnLifecycleConfig) =>
@@ -439,7 +433,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         const process = yield* children.spawn(new IcnChildLaunch({
           executable: installationNativePath(binary.path),
           arguments: renderIcnArguments(config, instanceId, binary.installation),
-          environment: icnChildEnvironment(config, binary.environment, authorization),
+          environment: icnChildEnvironment(binary.environment, authorization),
           gracefulShutdownTimeout: config.gracefulShutdownTimeout,
           forceShutdownTimeout: config.forceShutdownTimeout,
         }));

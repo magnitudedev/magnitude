@@ -14,6 +14,7 @@ import { Sessions } from "./sessions"
 import { Configuration } from "./configuration"
 import { Connections } from "./connections"
 import { Application } from "./application"
+import { HuggingFace } from "./hugging-face"
 
 export const MagnitudeRpcs = {
   projects: Projects,
@@ -31,5 +32,6 @@ export const MagnitudeRpcs = {
   configuration: Configuration,
   connections: Connections,
   application: Application,
+  huggingFace: HuggingFace,
 }
 export const AcnRpcGroup = rpcGroup(MagnitudeRpcs)

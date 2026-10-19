@@ -1,17 +1,20 @@
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
 import { Chunk, Effect, Exit, Queue, Ref, Scope } from "effect"
+import { redactSecrets } from "./redact-secrets"
 
 export interface LogFile {
   readonly append: (text: string | Uint8Array) => Effect.Effect<void>
 }
 
 const encoder = new TextEncoder()
+const decoder = new TextDecoder()
 
 /**
  * A diagnostic log of at most `maxBytes`, rotated once to `<file>.1`. Appending never blocks or fails
  * the caller: output queues (dropping when the disk falls behind) and a scoped fiber writes it, and a
  * file that cannot be opened or written is skipped. Closing the scope writes what is still queued.
+ * Hugging Face tokens and `Authorization` credentials are redacted before anything is written.
  */
 export const openLogFile = (file: string, maxBytes: number) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
@@ -52,6 +55,6 @@ export const openLogFile = (file: string, maxBytes: number) => Effect.gen(functi
     Effect.flatMap(first => Queue.takeAll(queue).pipe(Effect.flatMap(rest => write([first, ...Chunk.toReadonlyArray(rest)])))),
   )).pipe(Effect.forever, Effect.forkScoped)
   return {
-    append: text => Queue.offer(queue, typeof text === "string" ? encoder.encode(text) : text).pipe(Effect.asVoid),
+    append: text => Queue.offer(queue, encoder.encode(redactSecrets(typeof text === "string" ? text : decoder.decode(text)))).pipe(Effect.asVoid),
   } satisfies LogFile
 })

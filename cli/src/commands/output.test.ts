@@ -23,7 +23,7 @@ describe("service refusals", () => {
   })
 
   it("says a repository Hugging Face won't show may be missing, private or gated, with a typed code", () => {
-    const message = "Repository not found, or it's private or gated. Check the name, or set HF_TOKEN if you have access."
+    const message = "Repository not found, or it's private or gated. Check the name, or sign in to Hugging Face if you have access."
     const error = new ModelRepositoryNotFound({ reference: "nobody-xyz/does-not-exist-GGUF", message })
     expect(renderCommandError(error, false)).toBe(`${message}\n`)
     expect(JSON.parse(renderCommandError(error, true))).toEqual({ error: { message, code: "model_repository_not_found" } })

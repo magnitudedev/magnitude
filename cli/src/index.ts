@@ -6,6 +6,7 @@ import { registerStatusCommand } from "./commands/status"
 import { registerServeCommand } from "./commands/serve"
 import { registerInferenceCommands } from "./commands/inference"
 import { registerConnectionsCommand } from "./commands/connections"
+import { registerHuggingFaceCommand } from "./commands/hugging-face-account"
 import { registerServerCommand } from "./commands/server"
 import { admitsPkexecCommand } from "./startup/pkexec-admission"
 
@@ -26,6 +27,7 @@ program.command("native-runtime-check", { hidden: true })
 registerServeCommand(program)
 registerServerCommand(program)
 registerInferenceCommands(program)
+registerHuggingFaceCommand(program)
 registerConnectionsCommand(program)
 registerUpdateCommand(program)
 registerDocsCommand(program)

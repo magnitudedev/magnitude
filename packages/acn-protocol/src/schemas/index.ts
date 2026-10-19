@@ -1,6 +1,7 @@
 export * from "./json"
 export * from "./attachments"
 export * from "./provider-auth"
+export * from "./hugging-face"
 export * from "./cloud-usage"
 export * from "./display"
 export * from "./events"

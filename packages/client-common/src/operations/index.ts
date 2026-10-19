@@ -8,6 +8,7 @@ import { Connections } from "./connections";
 import { Display } from "./display";
 import { Files } from "./files";
 import { Git } from "./git";
+import { HuggingFace } from "./hugging-face";
 import { Models } from "./models";
 import { ProjectFiles } from "./project-files";
 import { Projects } from "./projects";
@@ -31,6 +32,7 @@ export const AcnQueries = Group.make({
   Changes,
   Sessions,
   Configuration,
+  HuggingFace,
 });
 export {
   Agent,
@@ -42,6 +44,7 @@ export {
   Display,
   Files,
   Git,
+  HuggingFace,
   Models,
   ProjectFiles,
   Projects,

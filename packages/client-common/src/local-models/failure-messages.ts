@@ -1,5 +1,6 @@
 import type { DrafterNotUsable, ModelAcquisitionFailure, ModelLocationKind, ModelVersionNotRunnable, UnsupportedReason } from "@magnitudedev/sdk"
 import { formatMemorySize, formatStorageSize } from "../utils/format-bytes"
+import { huggingFaceAccessMessage } from "../hugging-face/account"
 
 export const modelDownloadFailureMessage = (failure: ModelAcquisitionFailure): string => {
   switch (failure._tag) {
@@ -9,6 +10,7 @@ export const modelDownloadFailureMessage = (failure: ModelAcquisitionFailure): s
         Math.max(0, failure.requiredBytes - failure.availableBytes),
       )} and try again.`
     case "SourceUnavailable": return "This model is not available from its source."
+    case "HuggingFaceAccessRequired": return huggingFaceAccessMessage(failure.access)
     case "NetworkUnavailable":
       return "Couldn’t reach the model source. Check your connection and try again."
     case "CorruptDownload": return "The downloaded file couldn’t be verified. Try the download again."

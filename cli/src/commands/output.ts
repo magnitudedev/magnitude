@@ -1,12 +1,14 @@
-import { Cause, Data, Effect, Schema, type ParseResult } from "effect"
+import { Cause, Data, Effect, Option, Schema, type ParseResult } from "effect"
 import stringWidth from "string-width"
 import { drafterNotUsableMessage, modelVersionNotRunnableMessage } from "@magnitudedev/client-common"
-import { DrafterNotUsable, ModelVersionNotRunnable } from "@magnitudedev/sdk"
+import { DrafterNotUsable, HuggingFaceAccessRequired, ModelVersionNotRunnable } from "@magnitudedev/sdk"
+import { huggingFaceAccessText } from "./hugging-face-access"
 
 /** A failure's product message; refusals the service states as facts are worded here, as on the desktop. */
 const messageOf = (error: unknown): string => {
   if (error instanceof ModelVersionNotRunnable) return modelVersionNotRunnableMessage(error)
   if (error instanceof DrafterNotUsable) return drafterNotUsableMessage(error)
+  if (error instanceof HuggingFaceAccessRequired) return huggingFaceAccessText(error.access, Option.some(error.repository))
   if (typeof error === "object" && error !== null) {
     const candidate = error as { readonly message?: unknown; readonly reason?: unknown }
     if (Object.hasOwn(candidate, "message") && typeof candidate.message === "string") return candidate.message

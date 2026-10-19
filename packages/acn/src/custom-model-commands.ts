@@ -16,12 +16,15 @@ import {
   LocalModelMutationFailed,
   ModelRepositoryNotFound,
   ModelSourceUnavailable,
+  HuggingFaceAccessRequired,
   ModelVersionNotRunnable,
   PathNotDirectory,
   parseModelId,
   preselectedDrafterCandidate,
   type AutomaticModelLocationKind,
   type CandidateInspection,
+  type CandidateInspectionProgress,
+  type CandidateInspectionUpdate,
   type CatalogFormModelId,
   type CustomFormModelId,
   type CustomLocalModel,
@@ -75,6 +78,7 @@ import { LocalModelSources } from "./local-model-sources"
 import { LocalModels, projectAssessment } from "./local-models"
 import { ModelLocations } from "./model-locations"
 import { drafterInput, parseModelReference, repositoryDisplayName } from "./model-references"
+import { HuggingFaceAccount } from "./hugging-face-account"
 import { productUnsupportedReasons } from "./unsupported-reasons"
 
 
@@ -123,6 +127,8 @@ export interface CustomModelCommandsApi {
     readonly limit: Option.Option<number>
   }) => Effect.Effect<HuggingFaceSearchResponse, ModelCandidateError>
   readonly inspectCandidate: (reference: string) => Effect.Effect<CandidateInspection, ModelCandidateError>
+  /** The same inspection as it goes: its progress in order, then the inspection itself. */
+  readonly inspectCandidateWithProgress: (reference: string) => Stream.Stream<CandidateInspectionUpdate, ModelCandidateError>
   /** The drafter choices, and the listed candidate a different drafter (`other`) resolves to. */
   readonly listDrafterCandidates: (
     target: DrafterTarget,
@@ -172,17 +178,32 @@ const remoteMessage = (cause: GeneratedClientError<unknown>): string => {
   return "The inference service could not read this model."
 }
 
-/** The product message for a repository whose terms must be accepted with an access token. */
-export const accessRequiredMessage = "This repository requires accepting its terms on Hugging Face and an access token. "
-  + "Set HF_TOKEN to a token from an account that has accepted them, then try again."
+/** The product message for a gated repository while Magnitude isn't signed in to Hugging Face. */
+export const signInRequiredMessage = "Sign in to Hugging Face to use this model."
+
+/** The product message for a gated repository whose terms the signed-in account hasn't accepted. */
+export const termsRequiredMessage = "Accept this model's terms on Hugging Face, then try again. "
+  + "Some models also need the author's approval."
 
 /** The product message for a repository Hugging Face won't show: missing, private or gated. */
-export const repositoryNotFoundMessage = "Repository not found, or it's private or gated. "
-  + "Check the name, or set HF_TOKEN if you have access."
+export const repositoryNotFoundMessage = (signedIn: boolean): string => signedIn
+  ? "Repository not found, or your Hugging Face account doesn't have access to it. Check the name."
+  : "Repository not found, or it's private or gated. Check the name, or sign in to Hugging Face if you have access."
+
+/** The Hugging Face repository a reference names: a link, owner/repo, owner/repo:QUANT or owner/repo@commit. */
+export const referencedRepository = (reference: string): string =>
+  /^(?:https?:\/\/(?:www\.)?(?:huggingface\.co|hf\.co)\/)?([\w.-]+\/[\w.-]+)/.exec(reference.trim())?.[1] ?? reference
 
 /** The product message for a file whose contents Magnitude couldn't read. */
 export const unreadableFileMessage = "Magnitude couldn't read this file. It may be incomplete, damaged, "
   + "or use a format Magnitude doesn't support yet."
+
+/** The ICN error type: a failure reported after an inspection stream began has no status of its own. */
+const remoteType = (cause: GeneratedClientError<unknown>): string | undefined => {
+  if (cause._tag !== "GeneratedClientRemoteError") return undefined
+  const type = (cause.body as { readonly error?: { readonly type?: unknown } } | undefined)?.error?.type
+  return typeof type === "string" ? type : undefined
+}
 
 const remoteCode = (cause: GeneratedClientError<unknown>): string | undefined => {
   if (cause._tag !== "GeneratedClientRemoteError") return undefined
@@ -191,24 +212,27 @@ const remoteCode = (cause: GeneratedClientError<unknown>): string | undefined =>
 }
 
 /**
- * A rejected reference is the caller's to fix. A repository that needs access and a file that
- * can't be read get product messages; other Hugging Face and file failures keep the inference
+ * A rejected reference is the caller's to fix. A gated repository, one Hugging Face won't show
+ * (worded by whether Magnitude is signed in to Hugging Face) and a file that can't be read get
+ * product messages; other Hugging Face and file failures keep the inference
  * service's own message. Only a connection that never reached it is a service reachability
  * failure, and a response that doesn't match the contract is never presented as one.
  */
-const candidateFailure = (reference: string) => (cause: GeneratedClientError<unknown>): ModelCandidateError => {
+export const candidateFailure = (reference: string, signedIn: boolean) => (cause: GeneratedClientError<unknown>): ModelCandidateError => {
   switch (cause._tag) {
     case "GeneratedClientRemoteError": {
       if (cause.status === 400 || cause.status === 404) return new InvalidModelReference({ reference, message: remoteMessage(cause) })
       switch (remoteCode(cause)) {
-        case "hugging_face_access_required":
-          return new ModelSourceUnavailable({ reason: "AccessRequired", message: accessRequiredMessage, retryable: false })
+        case "hugging_face_sign_in_required":
+          return new HuggingFaceAccessRequired({ repository: referencedRepository(reference), access: "SignIn", message: signInRequiredMessage })
+        case "hugging_face_terms_required":
+          return new HuggingFaceAccessRequired({ repository: referencedRepository(reference), access: "AcceptTerms", message: termsRequiredMessage })
         case "hugging_face_repository_not_found":
-          return new ModelRepositoryNotFound({ reference, message: repositoryNotFoundMessage })
+          return new ModelRepositoryNotFound({ reference, message: repositoryNotFoundMessage(signedIn) })
         case "integrity_failed":
           return new ModelSourceUnavailable({ reason: "Unreadable", message: unreadableFileMessage, retryable: false })
         default: {
-          const retryable = cause.status === 409 || cause.status >= 500
+          const retryable = cause.status === 409 || cause.status >= 500 || remoteType(cause) === "server_error"
           return new ModelSourceUnavailable({
             reason: retryable ? "SourceUnreachable" : "Unavailable",
             message: remoteMessage(cause),
@@ -242,6 +266,7 @@ const notFound = (modelId: ModelId) => new LocalModelMutationFailed({
 
 const commandFailed = (operation: string) => (cause: GeneratedClientError<unknown> | ModelCandidateError) =>
   cause._tag === "InvalidModelReference" || cause._tag === "ModelRepositoryNotFound" || cause._tag === "ModelSourceUnavailable"
+    || cause._tag === "HuggingFaceAccessRequired"
     ? new LocalModelMutationFailed({ code: `custom_model_${operation}_failed`, message: cause.message, retryable: true })
     : new LocalModelMutationFailed({
         code: `custom_model_${operation}_failed`,
@@ -300,6 +325,7 @@ export const CustomModelCommandsLive: Layer.Layer<
   | DrafterMethods
   | ModelLocations
   | CatalogModelSync
+  | HuggingFaceAccount
   | FileSystem.FileSystem
 > = Layer.scoped(CustomModelCommands, Effect.gen(function* () {
   const icn = yield* IcnCandidates
@@ -314,8 +340,13 @@ export const CustomModelCommandsLive: Layer.Layer<
   const locations = yield* ModelLocations
   const catalogSync = yield* CatalogModelSync
   const fs = yield* FileSystem.FileSystem
+  const huggingFace = yield* HuggingFaceAccount
 
   const environmentId = assessments.get.pipe(Effect.map(({ state }) => state.environmentId))
+
+  const candidateFailed = (reference: string) => (cause: GeneratedClientError<unknown>) => huggingFace.account.pipe(
+    Effect.flatMap((account) => Effect.fail(candidateFailure(reference, account._tag === "SignedIn")(cause))),
+  )
 
   const parse = (reference: string) => Either.match(parseModelReference(reference, locations.environment), {
     onLeft: (message) => Effect.fail(new InvalidModelReference({ reference, message })),
@@ -390,13 +421,42 @@ export const CustomModelCommandsLive: Layer.Layer<
     const native = yield* icn.inspect(parsed._tag === "HuggingFace"
       ? { _tag: "HuggingFace", repository: parsed.repository, revision: parsed.revision }
       : { _tag: "Local", path: parsed.path },
-    ).pipe(Effect.mapError(candidateFailure(reference)))
+    ).pipe(Effect.catchAll(candidateFailed(reference)))
     return yield* productInspection(
       native,
       parsed._tag === "HuggingFace" ? parsed : { file: Option.none(), quant: Option.none() },
       reference,
     )
   })
+
+  const productProgress = (environment: string, native: Native.CandidateInspectionProgress): CandidateInspectionProgress => ({
+    phase: native.phase._tag === "CheckingDrafters"
+      ? { _tag: "CheckingDrafters", version: native.phase.version, completed: native.phase.completed, total: native.phase.total }
+      : { _tag: native.phase._tag, completed: native.phase.completed, total: native.phase.total },
+    versions: native.versions.map((version) => ({
+      label: version.label,
+      sizeBytes: version.sizeBytes,
+      assessment: Option.map(version.assessment, (assessment) => projectAssessment(environment, assessment)),
+    })),
+  })
+
+  const inspectWithProgress = (reference: string) => Stream.unwrap(Effect.gen(function* () {
+    const parsed = yield* parse(reference)
+    const environment = yield* environmentId
+    return icn.inspectWithProgress(parsed._tag === "HuggingFace"
+      ? { _tag: "HuggingFace", repository: parsed.repository, revision: parsed.revision }
+      : { _tag: "Local", path: parsed.path },
+    ).pipe(
+      Stream.catchAll((cause) => Stream.fromEffect(candidateFailed(reference)(cause))),
+      Stream.mapEffect((event): Effect.Effect<CandidateInspectionUpdate, ModelCandidateError> => event._tag === "Progress"
+        ? Effect.succeed({ _tag: "Inspecting", progress: productProgress(environment, event.progress) })
+        : productInspection(
+          event.inspection,
+          parsed._tag === "HuggingFace" ? parsed : { file: Option.none(), quant: Option.none() },
+          reference,
+        ).pipe(Effect.map((inspection) => ({ _tag: "Inspected", inspection })))),
+    )
+  }))
 
   /** The ICN drafter target and, when its files are readable, the same target as a candidate for bundles. */
   interface NativeTarget {
@@ -448,7 +508,7 @@ export const CustomModelCommandsLive: Layer.Layer<
     const { request } = yield* nativeTarget(target)
     const label = Option.getOrElse(other, () => target._tag === "Model" ? target.modelId : target.files[0])
     const entered = Option.map(other, (input) => drafterInput(input, locations.environment))
-    const native = yield* icn.drafters(request(entered)).pipe(Effect.mapError(candidateFailure(label)))
+    const native = yield* icn.drafters(request(entered)).pipe(Effect.catchAll(candidateFailed(label)))
     const { catalogModels } = yield* sources.state
     const candidates = native.candidates.flatMap((candidate) => Option.toArray(productDrafterCandidate(candidate, catalogModels)))
     yield* Effect.forEach(candidates, (candidate) => candidate.verdict._tag === "Bound"
@@ -586,7 +646,7 @@ export const CustomModelCommandsLive: Layer.Layer<
   ) => Effect.gen(function* () {
     const { repository } = declaration.origin
     const native = yield* icn.inspect({ _tag: "HuggingFace", repository, revision: commit })
-      .pipe(Effect.mapError(candidateFailure(`${repository}@${commit}`)))
+      .pipe(Effect.catchAll(candidateFailed(`${repository}@${commit}`)))
     const version = native.versions.find((candidate) => candidate.modelId === modelId)
     const target = version?.files.map(({ path }) => path) ?? []
     if (!Arr.isNonEmptyReadonlyArray(target) || native.source._tag !== "HuggingFace") {
@@ -747,11 +807,12 @@ export const CustomModelCommandsLive: Layer.Layer<
     Effect.catchAll((error) => Effect.logWarning(`Removing unused drafters failed: ${error.message}`)),
   )
 
-  const toMutation = (cause: GeneratedClientError<unknown> | CustomModelMutationError): CustomModelMutationError =>
+  const toMutation = (cause: GeneratedClientError<unknown> | CustomModelMutationError): Effect.Effect<never, CustomModelMutationError> =>
     cause._tag === "InvalidModelReference" || cause._tag === "ModelRepositoryNotFound" || cause._tag === "ModelSourceUnavailable"
       || cause._tag === "LocalModelMutationFailed" || cause._tag === "ModelVersionNotRunnable" || cause._tag === "DrafterNotUsable"
-      ? cause
-      : candidateFailure("model")(cause)
+      || cause._tag === "HuggingFaceAccessRequired"
+      ? Effect.fail(cause)
+      : candidateFailed("model")(cause)
 
   const rowFor = (modelId: ModelId) => localModels.state.pipe(Effect.map((state) => Option.fromNullable(
     [...state.models, ...state.hidden].find((model): model is CustomLocalModel => model._tag === "Custom" && model.modelId === modelId),
@@ -828,7 +889,7 @@ export const CustomModelCommandsLive: Layer.Layer<
       query,
       limit: Option.getOrElse(limit, () => 20),
     }).pipe(
-      Effect.mapError(candidateFailure(query)),
+      Effect.catchAll(candidateFailed(query)),
       Effect.map(({ results }) => ({
         results: results.flatMap((result) => {
           const repository = Schema.decodeUnknownOption(HuggingFaceRepositoryIdSchema)(result.repository)
@@ -840,6 +901,7 @@ export const CustomModelCommandsLive: Layer.Layer<
             ...presentField("variantOf", result.variantOf),
             downloads: Option.getOrElse(result.downloads, () => 0),
             gated: result.gated,
+            ...presentField("versionCount", result.versionCount),
             ...presentField("architecture", Option.filter(result.architecture, (value) => value.length > 0)),
             ...presentField("unsupported", Option.some(result.unsupported).pipe(Option.filter((reasons) => reasons.length > 0),
               Option.map((reasons) => productUnsupportedReasons(reasons, "")))),
@@ -850,12 +912,14 @@ export const CustomModelCommandsLive: Layer.Layer<
 
     inspectCandidate: inspect,
 
+    inspectCandidateWithProgress: inspectWithProgress,
+
     listDrafterCandidates,
 
     addHuggingFaceModel: ({ repository, revision, version, drafter, force }) => Effect.gen(function* () {
       const reference = Option.match(version, { onNone: () => repository, onSome: (quant) => `${repository}:${quant}` })
       const native = yield* icn.inspect({ _tag: "HuggingFace", repository, revision: Option.getOrElse(revision, () => "main") })
-        .pipe(Effect.mapError(candidateFailure(reference)))
+        .pipe(Effect.catchAll(candidateFailed(reference)))
       const inspection = yield* productInspection(native, { file: Option.none(), quant: version }, reference)
       if (Option.isSome(inspection.unsupportedArchitecture)) {
         return yield* new ModelVersionNotRunnable({
@@ -924,7 +988,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         outcome: Option.isSome(existing) ? "AlreadyOnThisComputer" as const : "Started" as const,
         drafterDownloadStarted,
       }
-    }).pipe(Effect.mapError(toMutation)),
+    }).pipe(Effect.catchAll(toMutation)),
 
     importModelFile: (path, drafter) => Effect.gen(function* () {
       const reference = path
@@ -934,7 +998,7 @@ export const CustomModelCommandsLive: Layer.Layer<
       if (Option.exists(info, ({ type }) => type === "Directory")) {
         return yield* new InvalidModelReference({ reference, message: `${parsed.path} is a folder. Choose a GGUF file, or add the folder as a model location.` })
       }
-      const native = yield* icn.inspect({ _tag: "Local", path: parsed.path }).pipe(Effect.mapError(candidateFailure(reference)))
+      const native = yield* icn.inspect({ _tag: "Local", path: parsed.path }).pipe(Effect.catchAll(candidateFailed(reference)))
       const inspection = yield* productInspection(native, { file: Option.none(), quant: Option.none() }, reference)
       const version = inspection.versions[0]
       const assessment = version === undefined ? undefined : Option.getOrUndefined(version.assessment)
@@ -1009,7 +1073,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         outcome: Option.isSome(existing) ? "AlreadyOnThisComputer" as const : "Started" as const,
         drafterDownloadStarted,
       }
-    }).pipe(Effect.mapError(toMutation)),
+    }).pipe(Effect.catchAll(toMutation)),
 
     setModelDrafter: (modelId, drafter) => Effect.gen(function* () {
       const row = yield* rowFor(modelId)
@@ -1028,7 +1092,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         onSome: (value) => startDrafterOnly(modelId, { _tag: "Model", modelId }, value),
       })
       return { drafter: chosen, drafterDownloadStarted }
-    }).pipe(Effect.mapError(toMutation)),
+    }).pipe(Effect.catchAll(toMutation)),
 
     hide: (requested) => Effect.gen(function* () {
       // An alias names its catalog model. A catalog model found only in an external location is hidden by its

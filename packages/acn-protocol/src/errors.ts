@@ -3,6 +3,7 @@ import { ProjectIdSchema } from "./schemas/project"
 import { RelativePathSchema } from "./schemas/paths"
 import { ProjectFileTextSnapshotSchema } from "./schemas/project-files"
 import { SlotIdSchema, UnsupportedReasonSchema } from "./schemas/model-state"
+import { HuggingFaceAccessSchema } from "./schemas/hugging-face"
 
 export class SessionNotFound extends Schema.TaggedError<SessionNotFound>()(
   "SessionNotFound",
@@ -274,13 +275,11 @@ export class InvalidModelReference extends Schema.TaggedError<InvalidModelRefere
 
 /**
  * Why a model source couldn't be used: the inference service didn't answer, Hugging Face didn't
- * answer, the repository needs accepted terms and an access token, the file couldn't be read, or
- * the model isn't available.
+ * answer, the file couldn't be read, or the model isn't available.
  */
 export const ModelSourceUnavailableReasonSchema = Schema.Literal(
   "ServiceUnreachable",
   "SourceUnreachable",
-  "AccessRequired",
   "Unreadable",
   "Unavailable",
 )
@@ -302,10 +301,27 @@ export class ModelRepositoryNotFound extends Schema.TaggedError<ModelRepositoryN
   { reference: Schema.String, message: Schema.String },
 ) {}
 
+/**
+ * A gated Hugging Face repository refused its files: Magnitude isn't signed in to Hugging Face
+ * (`SignIn`), or the signed-in account hasn't accepted the repository's terms or been approved
+ * (`AcceptTerms`).
+ */
+export class HuggingFaceAccessRequired extends Schema.TaggedError<HuggingFaceAccessRequired>()(
+  "HuggingFaceAccessRequired",
+  { repository: Schema.String, access: HuggingFaceAccessSchema, message: Schema.String },
+) {}
+
+/** A Hugging Face sign-in couldn't start or a sign-out couldn't be saved. */
+export class HuggingFaceSignInFailed extends Schema.TaggedError<HuggingFaceSignInFailed>()(
+  "HuggingFaceSignInFailed",
+  { message: Schema.String },
+) {}
+
 export const ModelCandidateError = Schema.Union(
   InvalidModelReference,
   ModelRepositoryNotFound,
   ModelSourceUnavailable,
+  HuggingFaceAccessRequired,
 )
 export type ModelCandidateError = Schema.Schema.Type<typeof ModelCandidateError>
 
@@ -339,6 +355,7 @@ export const CustomModelMutationError = Schema.Union(
   InvalidModelReference,
   ModelRepositoryNotFound,
   ModelSourceUnavailable,
+  HuggingFaceAccessRequired,
   LocalModelMutationFailed,
   ModelVersionNotRunnable,
   DrafterNotUsable,
