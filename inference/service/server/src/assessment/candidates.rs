@@ -43,7 +43,7 @@ use magnitude_service_models::lineage::{
     CatalogLineage, CatalogLineageMatch,
 };
 use magnitude_service_models::{
-    CachedModelAssessment, CatalogDrafterFit, CustomModelEnrichment, CustomModelEnrichmentResult,
+    CachedModelAssessment, CatalogDrafterFit, CatalogFingerprints, ModelShape, CustomModelEnrichment, CustomModelEnrichmentResult,
     CustomModelFacts, DrafterContent, ManagedModelStore, ModelDomainResolver,
     ServableModelBundleKey, refresh_hugging_face_repository,
 };
@@ -163,8 +163,8 @@ struct ClassifiedGroup {
     role: CandidateFileRole,
     header_digest: String,
     local_digest: Option<String>,
-    base_repositories: BTreeSet<String>,
     quantization: Option<String>,
+    embedded_mtp: bool,
     unreadable: Option<String>,
 }
 
@@ -385,14 +385,13 @@ impl ManagedModelCandidates {
         let matches = self
             .catalog_matches(exact, &target.lineage, plain.fingerprint.as_ref())
             .await;
-        let variant_of = variant_of(
-            &matches,
-            &target.lineage,
-            target
-                .repository
-                .as_ref()
-                .map(|(repository, _)| repository.as_str()),
-        );
+        let variant_of = match matches
+            .first()
+            .filter(|(_, lineage)| *lineage == DrafterLineage::Exact)
+        {
+            Some((exact, _)) => Some(exact.model_id.clone()),
+            None => self.shape_variant_of(plain.fingerprint.as_ref()).await,
+        };
         let catalog_drafters = matches
             .into_iter()
             .map(|(matched, _)| matched.model_id)
@@ -1052,11 +1051,12 @@ impl ManagedModelCandidates {
         if let Some(detail) = &group.unreadable {
             return Some(super::assessor::unreadable_assessment(detail.clone()));
         }
-        // Every readable version gets the engine's verdict, an architecture it doesn't recognize
-        // included, so its reasons are the engine's own.
+        // Every readable version gets the engine's plain verdict, an architecture it doesn't
+        // recognize included, so its reasons are the engine's own. Its drafter (built-in heads
+        // among them) is composed only for the recommended version; see `compose_recommended`.
         if let Some(cached) = identity
             .and_then(|identity| {
-                self.assessment_evidence(&identity, None, &ModelMethod::Auto)
+                self.assessment_evidence(&identity, None, &ModelMethod::Plain)
                     .ok()
             })
             .and_then(|evidence| self.models().read_model_assessment(&evidence))
@@ -1067,7 +1067,7 @@ impl ManagedModelCandidates {
             .await
             .map_err(|error| tracing::warn!(%error, "candidate version material is unavailable"))
             .ok()?;
-        self.assess(&material, None, ModelMethod::Auto)
+        self.assess(&material, None, ModelMethod::Plain)
             .await
             .map_err(|error| tracing::warn!(%error, "candidate version assessment failed"))
             .ok()
@@ -1076,6 +1076,32 @@ impl ManagedModelCandidates {
     /// A version's verdict is the one adding it gives the installed model: its target and
     /// projector with the drafter preselected for it (see `enumerate_drafters`). An unsupported
     /// version keeps its own verdict, and so does one whose drafters can't be worked out.
+    /// The versions' verdicts with the recommended version's composed with its preselected drafter,
+    /// as it installs; every other version keeps its plain verdict, and its drafters and composed
+    /// verdict come from the per-version drafter candidates when it is selected. Composing every
+    /// version would assess each with every drafter candidate.
+    async fn compose_recommended(
+        &self,
+        source: &CandidateSource,
+        targets: &[&ClassifiedGroup],
+        mut assessments: Vec<Option<CachedModelAssessment>>,
+        projector: Option<CandidateFile>,
+    ) -> Vec<Option<CachedModelAssessment>> {
+        let recommended = recommended_version(
+            targets
+                .iter()
+                .zip(&assessments)
+                .map(|(group, assessment)| (*group, assessment.as_ref())),
+        );
+        if let Some(index) = recommended {
+            let plain = assessments[index].take();
+            assessments[index] = self
+                .with_preselected_drafter(version_candidate(source, targets[index], projector), plain)
+                .await;
+        }
+        assessments
+    }
+
     async fn with_preselected_drafter(
         &self,
         candidate: ModelCandidate,
@@ -1097,7 +1123,8 @@ impl ManagedModelCandidates {
 
     /// The assessment of a candidate with its preselected drafter, assessed exactly as its drafter
     /// candidate was (so it is a cache hit): served plain when none is preselected, as the
-    /// installed model is, or `None` when it uses its built-in heads.
+    /// installed model is, with its built-in heads when those are preselected, or `None` when the
+    /// preselected candidate names no method (its plain verdict stands).
     async fn preselected_assessment(
         &self,
         candidate: &ModelCandidate,
@@ -1113,7 +1140,12 @@ impl ManagedModelCandidates {
             return Ok(None);
         };
         let engine = match &chosen.reference {
-            DrafterReference::Embedded => return Ok(None),
+            DrafterReference::Embedded => {
+                return Ok(Some(
+                    self.assess(&target.material, None, ModelMethod::Auto)
+                        .await?,
+                ));
+            }
             DrafterReference::Catalog { .. } => engine_method(&method),
             DrafterReference::HuggingFace { .. } | DrafterReference::Local { .. } => {
                 ModelMethod::Auto
@@ -1193,16 +1225,8 @@ impl ManagedModelCandidates {
             commit: snapshot.commit.clone(),
         };
         let projector_file = projector.map(|projector| candidate_file(projector.group.primary()));
-        let mut pending = Vec::new();
-        for (group, assessment) in targets.iter().zip(assessments) {
-            pending.push(self.with_preselected_drafter(
-                version_candidate(&source, group, projector_file.clone()),
-                assessment,
-            ));
-        }
-        let assessments = futures_util::stream::iter(pending)
-            .buffered(assessment_concurrency())
-            .collect::<Vec<_>>()
+        let assessments = self
+            .compose_recommended(&source, &targets, assessments, projector_file.clone())
             .await;
         let versions = targets
             .iter()
@@ -1249,26 +1273,7 @@ impl ManagedModelCandidates {
                 })
             })
             .collect::<Vec<_>>();
-        let mut lineage = self
-            .lineage
-            .hub()
-            .lineage(&snapshot.repository, Some(snapshot.base_models.clone()))
-            .await;
-        lineage.extend(
-            targets
-                .iter()
-                .flat_map(|group| group.base_repositories.iter().cloned()),
-        );
-        let fingerprint = versions
-            .iter()
-            .find_map(|version| version.assessment.as_ref()?.fingerprint.clone());
-        let variant_of = variant_of(
-            &self
-                .catalog_matches(None, &lineage, fingerprint.as_ref())
-                .await,
-            &lineage,
-            Some(snapshot.repository.as_str()),
-        );
+        let variant_of = self.inspection_variant_of(&versions).await;
         let projector_bytes = projector.map_or(0, |projector| projector.group.size_bytes());
         Ok(CandidateInspection {
             source: CandidateSource::HuggingFace {
@@ -1354,16 +1359,8 @@ impl ManagedModelCandidates {
             .await;
         let source = CandidateSource::Local { path: root.clone() };
         let projector_file = projector.map(|projector| candidate_file(projector.group.primary()));
-        let mut pending = Vec::new();
-        for (group, assessment) in targets.iter().zip(assessments) {
-            pending.push(self.with_preselected_drafter(
-                version_candidate(&source, group, projector_file.clone()),
-                assessment,
-            ));
-        }
-        let assessments = futures_util::stream::iter(pending)
-            .buffered(assessment_concurrency())
-            .collect::<Vec<_>>()
+        let assessments = self
+            .compose_recommended(&source, &targets, assessments, projector_file.clone())
             .await;
         let versions = targets
             .iter()
@@ -1401,20 +1398,7 @@ impl ManagedModelCandidates {
                 })
             })
             .collect::<Vec<_>>();
-        let lineage = targets
-            .iter()
-            .flat_map(|group| group.base_repositories.iter().cloned())
-            .collect::<BTreeSet<_>>();
-        let fingerprint = versions
-            .iter()
-            .find_map(|version| version.assessment.as_ref()?.fingerprint.clone());
-        let variant_of = variant_of(
-            &self
-                .catalog_matches(None, &lineage, fingerprint.as_ref())
-                .await,
-            &lineage,
-            None,
-        );
+        let variant_of = self.inspection_variant_of(&versions).await;
         let name = selected
             .as_ref()
             .and_then(|selected| selected.file_stem())
@@ -1456,19 +1440,22 @@ impl ManagedModelCandidates {
             readable
                 .iter()
                 .filter_map(|group| match &group.role {
-                    CandidateFileRole::Target { architecture } => {
-                        Some(architecture.clone().unwrap_or_default())
-                    }
+                    CandidateFileRole::Target { architecture } => Some(architecture.clone()),
                     _ => None,
                 })
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .map(|architecture| {
-                    magnitude_service_contracts::models::UnsupportedReason::Known(
-                        magnitude_service_contracts::models::KnownUnsupportedReason::Architecture {
-                            architecture,
-                        },
-                    )
+                    // A file whose header names no architecture can't be read as a model, as in
+                    // search; an architecture is never empty.
+                    magnitude_service_contracts::models::UnsupportedReason::Known(match architecture {
+                        Some(architecture) => {
+                            magnitude_service_contracts::models::KnownUnsupportedReason::Architecture {
+                                architecture,
+                            }
+                        }
+                        None => magnitude_service_contracts::models::KnownUnsupportedReason::Unreadable,
+                    })
                 })
                 .collect(),
         )
@@ -1540,6 +1527,35 @@ impl ManagedModelCandidates {
                 catalog
             })
             .await
+    }
+
+    /// The catalog model a model of `fingerprint`'s shape is a variant of, by the rule search uses
+    /// (see `ModelShape::variant_of`).
+    async fn shape_variant_of(&self, fingerprint: Option<&ModelFingerprint>) -> Option<ModelId> {
+        ModelShape::of(fingerprint?).variant_of(&self.catalog_facts().await.fingerprints)
+    }
+
+    /// The catalog model an inspected candidate is a variant of: the catalog model a version is,
+    /// else the shape match of the first version whose header states a shape, read from its
+    /// metadata as search reads it (so a weight type the engine doesn't run never hides it), else
+    /// of the first version the engine fingerprinted.
+    async fn inspection_variant_of(&self, versions: &[AssessedVersion<'_>]) -> Option<ModelId> {
+        if let Some(catalog_model) = versions.iter().find_map(|version| version.catalog_model.clone()) {
+            return Some(catalog_model);
+        }
+        let header_shape = versions.iter().find_map(|version| {
+            let bytes = self.models().cached_header(&version.group.header_digest)?;
+            ModelShape::from_header_prefix(&bytes)
+        });
+        match header_shape {
+            Some(shape) => shape.variant_of(&self.catalog_facts().await.fingerprints),
+            None => {
+                let fingerprint = versions
+                    .iter()
+                    .find_map(|version| version.assessment.as_ref()?.fingerprint.clone());
+                self.shape_variant_of(fingerprint.as_ref()).await
+            }
+        }
     }
 
     /// The catalog models a target derives from, best first: an exact catalog target alone; else
@@ -2333,6 +2349,12 @@ impl ManagedModelCandidates {
     }
 }
 
+impl CatalogFingerprints for ManagedModelCandidates {
+    fn catalog_fingerprints(&self) -> BoxFuture<'_, Vec<(ModelId, ModelFingerprint)>> {
+        Box::pin(async move { self.catalog_facts().await.fingerprints.clone() })
+    }
+}
+
 impl ModelCandidates for ManagedModelCandidates {
     fn inspect(
         &self,
@@ -2580,25 +2602,6 @@ fn catalog_drafter_fit(candidates: &[DrafterCandidate]) -> CatalogDrafterFit {
 }
 
 /// The candidates automatic choice may take, in its order (see `DrafterCandidate::automatic`).
-/// The catalog model a target is a variant of, for display: its exact catalog target or lineage
-/// match, else its fingerprint match only when its lineage names no base model at all (an Ollama
-/// library model, a file without metadata). A fingerprint never overrides a declared lineage:
-/// models of one architecture and size often share every dimension and the tokenizer (Qwen3.5 27B
-/// and Qwen3.8 27B do), so it says which drafters bind, not which model this is.
-fn variant_of(
-    matches: &[(CatalogLineageMatch, DrafterLineage)],
-    lineage: &BTreeSet<String>,
-    repository: Option<&str>,
-) -> Option<ModelId> {
-    let declared = lineage
-        .iter()
-        .any(|named| repository.is_none_or(|repository| !named.eq_ignore_ascii_case(repository)));
-    matches
-        .iter()
-        .find(|(_, kind)| *kind != DrafterLineage::Fingerprint || !declared)
-        .map(|(matched, _)| matched.model_id.clone())
-}
-
 fn automatic(candidates: Vec<DrafterCandidate>) -> Vec<DrafterCandidate> {
     candidates
         .into_iter()
@@ -2807,8 +2810,8 @@ fn classified_group(
 ) -> ClassifiedGroup {
     ClassifiedGroup {
         role: classification.role,
-        base_repositories: classification.base_repositories,
         quantization: classification.quantization,
+        embedded_mtp: classification.embedded_mtp,
         header_digest,
         local_digest: None,
         group,
@@ -2823,8 +2826,8 @@ fn unreadable_group(group: GgufGroup, detail: String) -> ClassifiedGroup {
         role: CandidateFileRole::Target { architecture: None },
         header_digest: String::new(),
         local_digest: None,
-        base_repositories: BTreeSet::new(),
         quantization: None,
+        embedded_mtp: false,
         group,
         unreadable: Some(detail),
     }
@@ -2846,8 +2849,8 @@ fn classify_local(
                 .ok()?;
             Some(ClassifiedGroup {
                 role: classification.role,
-                base_repositories: classification.base_repositories,
                 quantization: classification.quantization,
+                embedded_mtp: classification.embedded_mtp,
                 header_digest: gguf.inspection.header_digest,
                 local_digest: local_digest(
                     store,
@@ -3164,47 +3167,23 @@ fn candidate_versions(
     versions: Vec<AssessedVersion<'_>>,
     projector_bytes: Option<u64>,
 ) -> Vec<CandidateVersion> {
-    let fits = |assessment: &Option<CachedModelAssessment>| {
-        matches!(
-            assessment.as_ref().map(|assessment| &assessment.profile),
-            Some(ModelAssessment::Fits { .. })
-        )
-    };
-    let recommended = versions
-        .iter()
-        .enumerate()
-        .filter(|(_, version)| fits(&version.assessment))
-        .max_by_key(|(_, version)| {
-            (
-                version
-                    .group
-                    .quantization
-                    .as_deref()
-                    .is_some_and(is_q4_k_class),
-                version.group.group.size_bytes(),
-            )
-        })
-        .map(|(index, _)| index);
-    let mut labels = BTreeMap::<String, usize>::new();
-    for version in &versions {
-        *labels
-            .entry(version_label(
-                &version.group.group.primary().path,
-                version.group.quantization.as_deref(),
-            ))
-            .or_default() += 1;
-    }
+    let recommended = recommended_version(
+        versions
+            .iter()
+            .map(|version| (version.group, version.assessment.as_ref())),
+    );
+    let labels = distinct_labels(
+        &versions
+            .iter()
+            .map(|version| (&version.group.group, version.group.quantization.as_deref(), version.group.embedded_mtp))
+            .collect::<Vec<_>>(),
+    );
     versions
         .into_iter()
+        .zip(labels)
         .enumerate()
-        .map(|(index, version)| {
+        .map(|(index, (version, label))| {
             let group = version.group;
-            let label = version_label(&group.group.primary().path, group.quantization.as_deref());
-            let label = if labels.get(&label).copied().unwrap_or(0) > 1 {
-                path_string(&group.group.primary().path)
-            } else {
-                label
-            };
             CandidateVersion {
                 label,
                 model_id: version.model_id,
@@ -3221,6 +3200,99 @@ fn candidate_versions(
             }
         })
         .collect()
+}
+
+/// The recommended version: the largest fitting Q4_K-class version, else the largest fitting one.
+fn recommended_version<'a>(
+    versions: impl Iterator<Item = (&'a ClassifiedGroup, Option<&'a CachedModelAssessment>)>,
+) -> Option<usize> {
+    versions
+        .enumerate()
+        .filter(|(_, (_, assessment))| {
+            matches!(
+                assessment.map(|assessment| &assessment.profile),
+                Some(ModelAssessment::Fits { .. })
+            )
+        })
+        .max_by_key(|(_, (group, _))| {
+            (
+                group.quantization.as_deref().is_some_and(is_q4_k_class),
+                group.group.size_bytes(),
+            )
+        })
+        .map(|(index, _)| index)
+}
+
+/// Each version's label, distinct among its candidate's: its quantization label (see
+/// `version_label`); among versions sharing one, `· MTP` for those whose header carries built-in
+/// prediction heads; then the quantization each file's name spells, where those differ; then the
+/// name words that tell them apart (those not every one of them has, `· QAD` for `…-QAD-Q4_0`
+/// beside `…-Q4_0`); and the file path only when even those don't.
+fn distinct_labels(versions: &[(&GgufGroup, Option<&str>, bool)]) -> Vec<String> {
+    fn duplicated(labels: &[String]) -> BTreeMap<String, Vec<usize>> {
+        let mut by_label = BTreeMap::<String, Vec<usize>>::new();
+        for (index, label) in labels.iter().enumerate() {
+            by_label.entry(label.clone()).or_default().push(index);
+        }
+        by_label.retain(|_, indices| indices.len() > 1);
+        by_label
+    }
+    let mut labels = versions
+        .iter()
+        .map(|(group, quantization, _)| version_label(&group.primary().path, *quantization))
+        .collect::<Vec<_>>();
+    for indices in duplicated(&labels).into_values() {
+        if indices.iter().any(|&index| versions[index].2 != versions[indices[0]].2) {
+            for &index in &indices {
+                if versions[index].2 {
+                    labels[index].push_str(" · MTP");
+                }
+            }
+        }
+    }
+    // A header label shared by files whose names spell different quantizations (`UD-Q8_K_XL` and
+    // `Q8_0`, both Q8_0 by their headers) takes each file's own spelling.
+    for indices in duplicated(&labels).into_values() {
+        let named = indices
+            .iter()
+            .map(|&index| version_label(&versions[index].0.primary().path, None))
+            .collect::<Vec<_>>();
+        for (position, &index) in indices.iter().enumerate() {
+            if named.iter().filter(|other| **other == named[position]).count() == 1 {
+                let heads = if labels[index].ends_with(" · MTP") { " · MTP" } else { "" };
+                labels[index] = format!("{}{heads}", named[position]);
+            }
+        }
+    }
+    let words = |index: usize| {
+        let name = versions[index].0.primary().path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default().to_owned();
+        name.split(['-', '.'])
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    for indices in duplicated(&labels).into_values() {
+        let shared = indices
+            .iter()
+            .map(|&index| words(index).into_iter().collect::<BTreeSet<_>>())
+            .reduce(|left, right| left.intersection(&right).cloned().collect())
+            .unwrap_or_default();
+        for &index in &indices {
+            let distinct = words(index)
+                .into_iter()
+                .filter(|word| !shared.contains(word) && !(versions[index].2 && word.eq_ignore_ascii_case("mtp")))
+                .collect::<Vec<_>>();
+            if !distinct.is_empty() {
+                labels[index] = format!("{} · {}", labels[index], distinct.join("-"));
+            }
+        }
+    }
+    for indices in duplicated(&labels).into_values() {
+        for index in indices {
+            labels[index] = path_string(&versions[index].0.primary().path);
+        }
+    }
+    labels
 }
 
 /// `(repository, revision, path)` from `owner/repo`, `owner/repo:path`, `owner/repo/path`,
@@ -3372,6 +3444,51 @@ mod tests {
                     magnitude_service_contracts::models::KnownUnsupportedReason::Unreadable
                 )
             ]
+        );
+    }
+
+    #[test]
+    fn duplicate_quantization_labels_are_told_apart_by_header_then_by_the_words_that_differ() {
+        let group = |path: &str| GgufGroup {
+            files: vec![CandidateGguf {
+                path: PathBuf::from(path),
+                size_bytes: 1,
+            }],
+        };
+        let lfm = [group("LFM2.5-1.2B-Instruct-Q4_0.gguf"), group("LFM2.5-1.2B-Instruct-QAD-Q4_0.gguf")];
+        assert_eq!(
+            distinct_labels(&[(&lfm[0], Some("Q4_0"), false), (&lfm[1], Some("Q4_0"), false)]),
+            ["Q4_0", "Q4_0 · QAD"]
+        );
+        let fable = [
+            group("Fable-NEO-MAX-Q8_0.gguf"),
+            group("Fable-NEO-MAX-MTP-Q8_0.gguf"),
+            group("Fable-plusIQ-NEO-MAX-MTP-Q8_0.gguf"),
+            group("Fable-plusIQ-TOOLS-NEO-MAX-MTP-Q8_0.gguf"),
+            group("Fable-NEO-MAX-Q6_K.gguf"),
+        ];
+        assert_eq!(
+            distinct_labels(&[
+                (&fable[0], Some("Q8_0"), false),
+                (&fable[1], Some("Q8_0"), true),
+                (&fable[2], Some("Q8_0"), true),
+                (&fable[3], Some("Q8_0"), true),
+                (&fable[4], Some("Q6_K"), false),
+            ]),
+            ["Q8_0", "Q8_0 · MTP", "Q8_0 · MTP · plusIQ", "Q8_0 · MTP · plusIQ-TOOLS", "Q6_K"],
+            "built-in heads come from the header; only words that differ are added"
+        );
+        let same = [group("a/model-Q4_K_M.gguf"), group("b/model-Q4_K_M.gguf")];
+        assert_eq!(
+            distinct_labels(&[(&same[0], Some("Q4_K_M"), false), (&same[1], Some("Q4_K_M"), false)]),
+            ["a/model-Q4_K_M.gguf", "b/model-Q4_K_M.gguf"],
+            "files whose names differ in no word are told apart by their paths"
+        );
+        let gemma = [group("gemma-4-12b-it-Q8_0.gguf"), group("gemma-4-12b-it-UD-Q8_K_XL.gguf")];
+        assert_eq!(
+            distinct_labels(&[(&gemma[0], Some("Q8_0"), false), (&gemma[1], Some("Q8_0"), false)]),
+            ["Q8_0", "UD-Q8_K_XL"],
+            "one header label over two spelled quantizations takes each name's spelling"
         );
     }
 

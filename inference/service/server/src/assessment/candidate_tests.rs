@@ -947,8 +947,9 @@ fn hub() -> StubHub {
         repository(
             '4',
             vec![
-                StubFile::new("llama-Q4_0_4_4.gguf", &q8)
-                    .with_tensor_type("blk.0.ffn_up.weight", 31),
+                // A newer quantization: a tensor type id and a file type the engine doesn't know.
+                StubFile::new("llama-PTQ1_0.gguf", &llama(143, Encoding::Q8_0))
+                    .with_tensor_type("blk.0.ffn_up.weight", 200),
                 StubFile::new("llama-Q8_0.gguf", &q8),
             ],
             &[],
@@ -1315,6 +1316,19 @@ async fn inspection_groups_versions_and_reports_each_engine_verdict() {
         .map(|version| version.files[0].path.as_str())
         .collect::<Vec<_>>();
     assert_eq!(recommended, ["llama-Q4_K_M.gguf"]);
+    let drafter = |file: &str| match &version(&inspection, file).assessment {
+        Some(ModelAssessment::Fits { drafter, .. }) => drafter.clone(),
+        other => panic!("{file} fits: {other:?}"),
+    };
+    assert!(
+        matches!(drafter("llama-Q4_K_M.gguf"), DrafterVerdict::Bound { .. }),
+        "the recommended version is composed with its preselected drafter, as it installs"
+    );
+    assert_eq!(
+        drafter("llama-Q8_0.gguf"),
+        DrafterVerdict::None,
+        "another version keeps its plain verdict; its drafters come with its own drafter list"
+    );
     assert_eq!(version(&inspection, "llama-Q4_K_M.gguf").label, "Q4_K_M");
     assert_eq!(
         version(&inspection, "llama-Q8_0.gguf").on_this_computer,
@@ -1539,8 +1553,11 @@ async fn a_drafter_already_in_another_apps_folder_is_on_this_computer() {
     assert_eq!(known.size_bytes, std::fs::metadata(&copy).unwrap().len());
 }
 
+/// A tensor type id the engine doesn't know (a quantization newer than it, as PTQ1_0 is) is an
+/// unsupported weight type, named by its id, never a damaged file; the header's metadata still gives
+/// the shape, so the candidate is still a variant of its catalog model.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_file_with_an_unknown_tensor_type_is_an_unreadable_version_not_a_failed_inspection() {
+async fn an_unknown_tensor_type_is_an_unsupported_weight_type_and_keeps_the_variant() {
     let fixture = fixture(Vec::new()).await;
     let inspection = fixture
         .candidates
@@ -1549,34 +1566,28 @@ async fn a_file_with_an_unknown_tensor_type_is_an_unreadable_version_not_a_faile
             revision: "main".to_owned(),
         })
         .await
-        .expect("one unreadable file never fails the repository");
+        .expect("a file of an unknown weight type never fails the repository");
 
     assert_eq!(inspection.versions.len(), 2);
     assert_eq!(inspection.unsupported_architecture, None);
-    let legacy = version(&inspection, "llama-Q4_0_4_4.gguf");
-    let Some(ModelAssessment::Unsupported {
-        profile,
-        reasons,
-        detail,
-    }) = &legacy.assessment
-    else {
-        panic!("the legacy file is unsupported: {:?}", legacy.assessment);
+    assert_eq!(inspection.variant_of.as_ref(), Some(&fixture.catalog_id));
+    let newer = version(&inspection, "llama-PTQ1_0.gguf");
+    let Some(ModelAssessment::Unsupported { reasons, detail, .. }) = &newer.assessment else {
+        panic!("the file is unsupported: {:?}", newer.assessment);
     };
-    assert_eq!(profile, &None, "an unreadable file has no serving profile");
     assert_eq!(
         reasons,
-        &[UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)]
+        &[UnsupportedReason::Known(KnownUnsupportedReason::WeightTypes {
+            types: vec![magnitude_service_contracts::models::WeightTypeCount {
+                ggml_type: "type 200".to_owned(),
+                tensor_count: 1,
+            }]
+        })]
     );
-    assert!(detail.contains("unknown GGUF tensor type 31"), "{detail}");
-    let encoded = serde_json::to_value(&legacy.assessment).expect("serialize");
-    assert_eq!(encoded["_tag"], "Unsupported");
-    assert!(
-        encoded.get("profile").is_none(),
-        "an unreadable version serializes without a profile: {encoded}"
-    );
+    assert!(detail.contains("unknown GGUF tensor types 200"), "{detail}");
     assert_eq!(
-        legacy.model_id.as_str(),
-        format!("hf:{LEGACY}/llama-Q4_0_4_4.gguf")
+        newer.model_id.as_str(),
+        format!("hf:{LEGACY}/llama-PTQ1_0.gguf")
     );
     assert!(matches!(
         version(&inspection, "llama-Q8_0.gguf").assessment,
@@ -1701,6 +1712,49 @@ async fn inspection_selects_the_smallest_projector_and_explains_unknown_architec
         )),
         "each version carries the engine's own reasons: {:?}",
         deepseek.versions
+    );
+}
+
+/// A file whose header names no architecture (a bare tensor container, as diffusion GGUFs are)
+/// is unreadable, never an architecture without a name, so the client can decode it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_naming_no_architecture_is_unreadable_never_an_empty_architecture() {
+    let image = Gguf {
+        metadata: Vec::new(),
+        tensors: vec![("img_in.weight".to_owned(), vec![64, 64], Encoding::Q8_0)],
+    };
+    let fixture = fixture_with(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::from([(
+            "someone/Image-GGUF".to_owned(),
+            repository('8', vec![StubFile::new("image-Q8_0.gguf", &image)], &[]),
+        )]),
+    )
+    .await;
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::HuggingFace {
+            repository: HuggingFaceRepositoryId::new("someone/Image-GGUF".to_owned()).unwrap(),
+            revision: "main".to_owned(),
+        })
+        .await
+        .expect("inspection");
+    let unreadable = UnsupportedReason::Known(KnownUnsupportedReason::Unreadable);
+    assert_eq!(inspection.unsupported_architecture, Some(vec![unreadable.clone()]));
+    assert!(
+        inspection.versions.iter().all(|version| matches!(
+            &version.assessment,
+            Some(ModelAssessment::Unsupported { reasons, .. })
+                if reasons.contains(&unreadable)
+                    && !reasons.iter().any(|reason| matches!(
+                        reason,
+                        UnsupportedReason::Known(KnownUnsupportedReason::Architecture { .. })
+                    ))
+        )),
+        "{:?}",
+        inspection.versions
     );
 }
 
@@ -2495,8 +2549,13 @@ async fn a_cold_inspection_reads_about_the_distinct_header_bytes_of_every_layout
     }
     assert!(matches!(
         &version(&inspection, "Llama-Layouts-IQ1_M.gguf").assessment,
-        Some(ModelAssessment::Unsupported { reasons, .. }) if reasons == &[UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)]
-    ));
+        Some(ModelAssessment::Unsupported { reasons, .. }) if reasons == &[UnsupportedReason::Known(KnownUnsupportedReason::WeightTypes {
+            types: vec![magnitude_service_contracts::models::WeightTypeCount {
+                ggml_type: "type 142".to_owned(),
+                tensor_count: 1,
+            }]
+        })]
+    ), "a tensor type id the engine doesn't know is an unsupported weight type");
     assert!(
         served <= 2 * needed,
         "{served} bytes served for {needed} distinct header bytes"
@@ -2718,13 +2777,11 @@ fn local_llama_with_base(base: &str) -> (tempfile::TempDir, ModelCandidate) {
     (folder, candidate)
 }
 
-/// "Variant of" never comes from a fingerprint alone when the file declares a lineage: models of
-/// one architecture and size can share every dimension and the tokenizer (Qwen3.5 27B and Qwen3.8
-/// 27B do), so a file naming a base model the catalog doesn't know is a variant of none, though its
-/// fingerprint still offers that catalog model's drafter. A file declaring no lineage at all is
-/// matched by its fingerprint.
+/// "Variant of" is the shape match alone, as in search: a file naming a base model the catalog
+/// doesn't know is still a variant of the catalog model whose shape it has, and so is a file
+/// declaring no lineage. Its fingerprint also offers that catalog model's drafter.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_fingerprint_names_the_variant_only_of_a_file_without_lineage() {
+async fn variant_of_is_the_shape_match_whatever_lineage_a_file_declares() {
     let fixture = fixture(Vec::new()).await;
     let (unrelated, candidate) = local_llama_with_base("someone/Unrelated-Base");
     let inspection = fixture
@@ -2734,7 +2791,7 @@ async fn a_fingerprint_names_the_variant_only_of_a_file_without_lineage() {
         })
         .await
         .expect("inspection");
-    assert_eq!(inspection.variant_of, None);
+    assert_eq!(inspection.variant_of.as_ref(), Some(&fixture.catalog_id));
     let drafters = drafters_of(&fixture, candidate).await;
     assert!(
         drafters.iter().any(|candidate| candidate.category == DrafterCategory::CatalogDrafter
@@ -2888,6 +2945,48 @@ struct AssessmentFixture {
 
 fn fixtures_root() -> PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/fixtures/assessment")
+}
+
+/// Search reads a shape from a header's first bytes: every fixture target whose fingerprint the
+/// engine computes from its header alone has that fingerprint's shape, and the shape of its first
+/// bytes is the same whenever they hold one.
+#[test]
+fn search_shapes_agree_with_engine_fingerprints() {
+    use magnitude_service_models::{ModelShape, SHAPE_PREFIX_BYTES};
+    use std::io::Read;
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fixtures_root().join("manifest.json")).expect("manifest"),
+    )
+    .expect("manifest json");
+    let fixtures: Vec<AssessmentFixture> =
+        serde_json::from_value(manifest["fixtures"].clone()).expect("fixtures");
+    let (mut compared, mut from_prefix) = (0, 0);
+    for fixture in fixtures {
+        let mut header = Vec::new();
+        flate2::read::GzDecoder::new(
+            std::fs::File::open(fixtures_root().join(&fixture.target[0].header)).unwrap(),
+        )
+        .read_to_end(&mut header)
+        .unwrap();
+        let Ok(fingerprint) = magnitude_engine::fingerprint::ModelFingerprint::from_directory(
+            &magnitude_artifacts::gguf::read_header(&header).unwrap(),
+        ) else {
+            continue;
+        };
+        let fingerprint = crate::assessment::assessor::model_fingerprint(fingerprint);
+        let shape = ModelShape::from_header_prefix(&header)
+            .unwrap_or_else(|| panic!("{} has a shape", fixture.name));
+        assert!(shape.matches(&fingerprint), "{}: {shape:?} {fingerprint:?}", fixture.name);
+        compared += 1;
+        if let Some(prefix) =
+            ModelShape::from_header_prefix(&header[..header.len().min(SHAPE_PREFIX_BYTES)])
+        {
+            assert_eq!(prefix, shape, "{}", fixture.name);
+            from_prefix += 1;
+        }
+    }
+    assert!(compared > 10, "{compared} fixtures compared");
+    assert!(from_prefix > 10, "{from_prefix} of {compared} shapes read from a prefix");
 }
 
 /// A shared fixture's header (`headers/<name>.gz`) served as the repository file `path`, sized as
