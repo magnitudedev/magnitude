@@ -411,17 +411,26 @@ fn audited_encoding_ids_and_block_geometry_match_pinned_ggml() {
     }
 }
 
+/// A removed or unknown type id is a weight type this parser doesn't know, never a damaged header:
+/// it is named with its tensor count, and the rest of the directory is still read.
 #[test]
-fn removed_or_unknown_encoding_ids_are_invalid() {
-    for type_id in [4, 5, 31, 32, 33, 36, 37, 38, 42, u32::MAX] {
+fn removed_or_unknown_encoding_ids_are_reported_with_the_rest_of_the_directory() {
+    for type_id in [4, 5, 31, 32, 33, 36, 37, 38, 42, 200, u32::MAX] {
         let error = gguf::read_directory(
-            &mut Cursor::new(container(false, &[("weight", vec![32], type_id, 0)], &[])),
+            &mut Cursor::new(container(
+                false,
+                &[("weight", vec![32], type_id, 0), ("norm", vec![32], 0, 32)],
+                &[],
+            )),
             gguf::DEFAULT_HEADER_LIMIT,
         )
         .unwrap_err();
-        assert!(
-            matches!(error, Error::Invalid(message) if message == format!("unknown GGUF tensor type {type_id}"))
-        );
+        let Error::UnknownTensorTypes { types, directory } = &error else {
+            panic!("{type_id}: {error:?}");
+        };
+        assert_eq!(types, &[(type_id, 1)]);
+        assert!(directory.tensor("norm").is_some() && directory.tensor("weight").is_none());
+        assert!(!error.unreadable());
     }
 }
 

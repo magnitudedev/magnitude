@@ -59,8 +59,11 @@ and the chat layer reads `tokenizer.*` the same way; any other such key is unrec
 Every other namespace configures nothing and is ignored whatever it holds: `general.*` describes
 the model, and container and uploader namespaces (`split.*`, `quantize.*`, `imatrix.*`,
 `mradermacher.*`, `unsloth.*` and the like) record how the file was made. A family may read a named
-key outside its namespace, such as a projector's base-model name, but never refuses one it does not
-know. The rule is shared by every family, so a quantizer's provenance stamp never decides a verdict.
+key outside its namespace, but never refuses one it does not know, and names (a model's or a base
+model's) never decide a verdict: a projector binds when its output width
+(`clip.vision.projection_dim`) is the target's embedding width, and a header naming no architecture
+is unreadable. Absent head widths read as llama.cpp reads them. The rule is shared by every family,
+so a quantizer's provenance stamp never decides a verdict.
 
 An input row's token also names the rows it reads of a gathered table, by the table's row rule. A
 token table's row is the token. An n-gram table's rows hash the token with its predecessors: order

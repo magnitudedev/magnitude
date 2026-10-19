@@ -109,9 +109,10 @@ impl DraftUnavailable {
         let reasons = match self {
             Self::Block(error) => error.reasons(),
             Self::Assistant(error) | Self::PredictionHead(error) => error.reasons.clone(),
-            Self::Architecture(architecture) => vec![UnsupportedReason::Architecture {
-                architecture: architecture.clone().unwrap_or_default(),
+            Self::Architecture(Some(architecture)) => vec![UnsupportedReason::Architecture {
+                architecture: architecture.clone(),
             }],
+            Self::Architecture(None) => vec![UnsupportedReason::Unreadable],
         };
         UnsupportedModel::new(reasons, self.to_string())
     }

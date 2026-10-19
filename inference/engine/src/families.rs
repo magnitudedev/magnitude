@@ -54,10 +54,15 @@ pub fn architectures() -> Architectures {
 
 /// The one family that claims `target`'s architecture.
 pub fn recognize(target: &Directory) -> Result<&'static dyn ModelFamily, UnsupportedModel> {
-    let architecture = target
+    let Some(architecture) = target
         .value("general.architecture")
         .and_then(Value::string)
-        .unwrap_or_default();
+        .filter(|architecture| !architecture.is_empty())
+    else {
+        return Err(UnsupportedModel::unreadable(
+            "the header names no architecture",
+        ));
+    };
     let mut matches = FAMILIES
         .iter()
         .copied()
@@ -114,6 +119,18 @@ mod tests {
                     architecture: architecture.into()
                 }]
             );
+        }
+    }
+
+    #[test]
+    fn a_header_naming_no_architecture_is_unreadable_never_an_empty_architecture() {
+        let mut silent = declaring("");
+        for metadata in [silent.metadata.clone(), Vec::new()] {
+            silent.metadata = metadata;
+            let Err(unsupported) = recognize(&silent) else {
+                panic!("nothing recognizes a header without an architecture");
+            };
+            assert_eq!(unsupported.reasons, [UnsupportedReason::Unreadable]);
         }
     }
 

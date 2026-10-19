@@ -746,6 +746,7 @@ fn read_directory_with_payload<R: Read + Seek>(
     }
 
     let mut tensors = Vec::new();
+    let mut unknown = std::collections::BTreeMap::<u32, u32>::new();
     names.clear();
     for _ in 0..tensor_count {
         let name = reader.string()?;
@@ -758,8 +759,14 @@ fn read_directory_with_payload<R: Read + Seek>(
         let mut shape = (0..rank)
             .map(|_| reader.u64())
             .collect::<Result<Vec<_>, _>>()?;
-        let encoding = Encoding::try_from(reader.u32()?)?;
+        let type_id = reader.u32()?;
         let offset = reader.u64()?;
+        // A type id this parser doesn't know is a newer quantization, not a damaged header: the
+        // rest of the directory is still read, and the ids are reported together.
+        let Ok(encoding) = Encoding::try_from(type_id) else {
+            *unknown.entry(type_id).or_default() += 1;
+            continue;
+        };
         if shape.contains(&0) || shape[0] % encoding.block_elements() != 0 {
             return Err(invalid(format!(
                 "invalid block geometry on tensor {name:?}"
@@ -810,14 +817,21 @@ fn read_directory_with_payload<R: Read + Seek>(
         end = next;
     }
 
-    Ok(Directory {
+    let directory = Directory {
         version,
         byte_order: reader.order,
         alignment,
         data_offset,
         metadata,
         tensors,
-    })
+    };
+    if !unknown.is_empty() {
+        return Err(Error::UnknownTensorTypes {
+            types: unknown.into_iter().collect(),
+            directory: Box::new(directory),
+        });
+    }
+    Ok(directory)
 }
 
 #[derive(Clone, Debug)]

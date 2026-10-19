@@ -517,12 +517,9 @@ fn truncated_and_invalid_files_are_unreadable_and_missing_files_are_operational(
     let bytes = llama().bytes();
     let truncated = scratch.file("truncated.gguf");
     std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
-    let mut unknown_type = llama();
-    unknown_type.tensor_type("blk.0.ffn_up.weight", &[FEED_FORWARD, HIDDEN], 99);
-    let unknown_type = unknown_type.write(&scratch.file("unknown-type.gguf"));
     let not_gguf = scratch.file("not.gguf");
     std::fs::write(&not_gguf, b"not a model at all").unwrap();
-    for path in [truncated, unknown_type, not_gguf] {
+    for path in [truncated, not_gguf] {
         let KernelInventory::Unsupported(unsupported) = inventory(&package(path.clone())) else {
             panic!("{} is admitted", path.display());
         };
@@ -952,4 +949,66 @@ fn embedded_mtp_heads_stay_bound_beside_a_projector() {
             facts.drafter
         );
     }
+}
+
+/// A projector binds by its width, never by names: DavidAU's Qwen3.5 9B finetune names another
+/// base model than its repository's projector does, and plans with vision beside it; a projector
+/// of another width (Qwen3.5 0.8B's) is a mismatch, never an unreadable target.
+#[test]
+fn a_projector_binds_by_its_width_not_the_base_model_names() {
+    let scratch = Scratch::new("projector-width");
+    let target = real_header(
+        &scratch,
+        "Qwen3.5-9B-The-Defiant-Fable-Uncnr-Heretic-NEO-MAX-Q4_K_M.gguf",
+    );
+    let own = real_header(&scratch, "mmproj-BF16.gguf");
+    let narrow = real_header(&scratch, "mmproj-F16.gguf");
+    let with = |projector: PathBuf| ModelPackagePaths {
+        projector: Some(projector),
+        ..package(target.clone())
+    };
+    let PreparedModelAssessment::Planned { facts, .. } = prepared(&with(own)) else {
+        panic!("the finetune plans beside its base model's projector");
+    };
+    assert!(facts.capabilities.vision);
+    let PreparedModelAssessment::Unsupported { unsupported, .. } = prepared(&with(narrow)) else {
+        panic!("a projector of another width can't feed this decoder");
+    };
+    assert!(
+        matches!(
+            unsupported.reasons.as_slice(),
+            [UnsupportedReason::TargetMismatch { .. }]
+        ),
+        "{:?}",
+        unsupported.reasons
+    );
+}
+
+/// A tensor type id the engine doesn't know (a quantization newer than it) is an unsupported
+/// weight type named by its id, never an unreadable file.
+#[test]
+fn an_unknown_tensor_type_is_an_unsupported_weight_type() {
+    let scratch = Scratch::new("unknown-type");
+    let target = llama().write(&scratch.file("target.gguf"));
+    let mut bytes = std::fs::read(&target).unwrap();
+    let name = b"blk.0.ffn_up.weight";
+    let mut key = (name.len() as u64).to_le_bytes().to_vec();
+    key.extend_from_slice(name);
+    let at = bytes.windows(key.len()).position(|window| window == key).unwrap() + key.len();
+    let rank = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let encoding = at + 4 + rank * 8;
+    bytes[encoding..encoding + 4].copy_from_slice(&200_u32.to_le_bytes());
+    std::fs::write(&target, &bytes).unwrap();
+    let PreparedModelAssessment::Unsupported { unsupported, .. } = prepared(&package(target)) else {
+        panic!("an unknown weight type doesn't run");
+    };
+    assert_eq!(
+        unsupported.reasons,
+        [UnsupportedReason::WeightTypes {
+            types: vec![magnitude_artifacts::WeightTypeCount {
+                ggml_type: "type 200".into(),
+                tensor_count: 1,
+            }]
+        }]
+    );
 }

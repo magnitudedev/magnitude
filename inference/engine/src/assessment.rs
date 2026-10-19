@@ -648,9 +648,19 @@ enum DrafterAdmission {
     Rejected(UnsupportedModel),
 }
 
-/// A header that is truncated or not a valid GGUF container.
-fn unreadable(error: &magnitude_artifacts::Error) -> UnsupportedModel {
-    UnsupportedModel::unreadable(error.to_string())
+/// The verdict an artifact error is: weight types the parser doesn't know are unsupported weight
+/// types, and a header that is truncated or not a valid GGUF container is unreadable. Any other
+/// error (a source that couldn't be read) is no verdict.
+fn artifact_refusal(error: &magnitude_artifacts::Error) -> Option<UnsupportedModel> {
+    if let Some(types) = error.unknown_weight_types() {
+        return Some(UnsupportedModel::reason(
+            UnsupportedReason::WeightTypes { types },
+            error.to_string(),
+        ));
+    }
+    error
+        .unreadable()
+        .then(|| UnsupportedModel::unreadable(error.to_string()))
 }
 
 /// Admit `package` from its headers: the target's weight encodings, family
@@ -668,13 +678,15 @@ fn admit(
         source,
     ) {
         Ok(headers) => headers,
-        Err(error) if error.unreadable() => {
-            return Ok(Admission::Unsupported {
-                unsupported: unreadable(&error),
-                fingerprint: None,
-            });
-        }
-        Err(error) => return Err(ModelAssessmentError::Artifact(error)),
+        Err(error) => match artifact_refusal(&error) {
+            Some(unsupported) => {
+                return Ok(Admission::Unsupported {
+                    unsupported,
+                    fingerprint: None,
+                });
+            }
+            None => return Err(ModelAssessmentError::Artifact(error)),
+        },
     };
     let target = headers.target();
     let fingerprint = ModelFingerprint::from_directory(target).ok();
@@ -772,10 +784,10 @@ fn admit_drafter(
     }
     match headers.add_draft_from(path, source) {
         Ok(()) => {}
-        Err(error) if error.unreadable() => {
-            return Ok(DrafterAdmission::Rejected(unreadable(&error)));
-        }
-        Err(error) => return Err(ModelAssessmentError::Artifact(error)),
+        Err(error) => match artifact_refusal(&error) {
+            Some(unsupported) => return Ok(DrafterAdmission::Rejected(unsupported)),
+            None => return Err(ModelAssessmentError::Artifact(error)),
+        },
     }
     let draft = headers.draft().expect("the draft component was just added");
     let mut refusals = Vec::new();
