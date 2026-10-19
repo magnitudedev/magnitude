@@ -159,12 +159,6 @@ impl CatalogLineage {
             .find(|candidate| &candidate.model_id == model_id)
     }
 
-    /// The catalog model whose target repository or upstream intersects `lineage` (lowercased
-    /// repositories), as its first variant: the first of [`Self::match_lineages`].
-    pub async fn match_lineage(&self, lineage: &BTreeSet<String>) -> Option<CatalogLineageMatch> {
-        self.match_lineages(lineage).await.into_iter().next()
-    }
-
     /// Every catalog model whose target repository or upstream intersects `lineage` (lowercased
     /// repositories), each as its first variant, in catalog order.
     pub async fn match_lineages(&self, lineage: &BTreeSet<String>) -> Vec<CatalogLineageMatch> {
@@ -436,7 +430,7 @@ impl HubLineage {
 
 /// Repository IDs in a Hub `baseModels` value: `{relation, models: [{id}]}`, or a list of those.
 #[must_use]
-pub(crate) fn hub_base_model_ids(value: &serde_json::Value) -> Vec<String> {
+fn hub_base_model_ids(value: &serde_json::Value) -> Vec<String> {
     let mut ids = Vec::new();
     let mut collect = |entry: &serde_json::Value| {
         if let Some(models) = entry.get("models").and_then(serde_json::Value::as_array) {

@@ -244,6 +244,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     inventory.clone(),
                     architectures,
                     lineage,
+                    candidates.clone(),
                 )))
                 .with_model_candidates(candidates)
                 .with_identity(ServerIdentity {

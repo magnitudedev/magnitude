@@ -24,6 +24,7 @@ mod model_projection;
 mod package_service;
 mod preview;
 mod remote_header;
+mod search_shape;
 mod service;
 mod snapshot_blobs;
 mod store_fs;
@@ -57,6 +58,7 @@ pub use package_service::{
     servable_model_bundle_key_for_bundle, serving_configuration_fingerprint,
     speculative_servable_model_bundle_key,
 };
+pub use search_shape::{CatalogFingerprints, ModelShape, SHAPE_PREFIX_BYTES};
 pub use preview::{
     HuggingFaceDiscovery, PreparedPreview, PreparedPreviewHeader, RemoteGgufHeader,
     pinned_hugging_face_repository, refresh_hugging_face_repository,

@@ -471,7 +471,7 @@ fn valid_https_url(value: &str) -> bool {
         && !value.chars().any(char::is_whitespace)
 }
 
-fn is_projector_path(path: &Path) -> bool {
+pub(crate) fn is_projector_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
