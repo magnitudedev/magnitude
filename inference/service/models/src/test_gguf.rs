@@ -118,3 +118,16 @@ pub(crate) fn engine_architectures() -> crate::candidate_files::RecognizedArchit
         ["dflash", "gemma4-assistant", "qwen4exp"],
     )
 }
+
+/// A real GGUF header from the engine's assessment fixtures, decompressed.
+pub(crate) fn fixture_header(name: &str) -> Vec<u8> {
+    use std::io::Read;
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../engine/fixtures/assessment/headers")
+        .join(format!("{name}.gguf.gz"));
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(std::fs::File::open(&path).expect("fixture"))
+        .read_to_end(&mut bytes)
+        .expect("gzipped fixture");
+    bytes
+}

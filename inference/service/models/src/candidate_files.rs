@@ -124,7 +124,7 @@ impl CandidateFileRole {
 
 /// Inspect one GGUF header held in memory (every byte through the aligned tensor-data offset).
 pub fn header_directory(header: &[u8]) -> Result<Directory, InventoryError> {
-    magnitude_artifacts::gguf::read_header(header)
+    crate::gguf::known_tensors(magnitude_artifacts::gguf::read_header(header))
         .and_then(|directory| directory.require_execution_byte_order().map(|()| directory))
         .map_err(|error| InventoryError::Integrity(error.to_string()))
 }
@@ -153,6 +153,7 @@ pub struct HeaderClassification {
     pub base_repositories: BTreeSet<String>,
     pub quantization: Option<String>,
     pub declared_bytes: u64,
+    pub embedded_mtp: bool,
 }
 
 impl HeaderClassification {
@@ -175,7 +176,14 @@ pub fn classify_header(
     architectures: &RecognizedArchitectures,
 ) -> Result<HeaderClassification, InventoryError> {
     let (directory, inspection) = header_inspection(header)?;
+    let architecture = directory
+        .value("general.architecture")
+        .and_then(Value::string);
     Ok(HeaderClassification {
+        embedded_mtp: matches!(
+            crate::gguf::GgufTensors::of(&directory, architecture),
+            crate::gguf::GgufTensors::Model { embedded_mtp: true }
+        ),
         role: CandidateFileRole::of(&directory, architectures),
         base_repositories: header_base_repositories(&directory),
         quantization: inspection.quantization,
@@ -185,7 +193,7 @@ pub fn classify_header(
 
 /// The header directory of a GGUF on disk (every shard's, for a split file's first shard).
 pub fn local_directory(path: &Path) -> Result<Directory, InventoryError> {
-    magnitude_artifacts::gguf::inspect_header(path)
+    crate::gguf::known_tensors(magnitude_artifacts::gguf::inspect_header(path))
         .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))
 }
 
@@ -261,12 +269,15 @@ pub fn base_model_repositories(base_models: &[crate::gguf::GgufBaseModel]) -> BT
 /// `owner/repository` from a Hugging Face model URL, lowercased for lineage comparison.
 #[must_use]
 pub fn hugging_face_repository_from_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    let url = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let url = url.strip_prefix("www.").unwrap_or(url);
     let rest = url
-        .trim()
-        .strip_prefix("https://huggingface.co/")
-        .or_else(|| url.trim().strip_prefix("http://huggingface.co/"))
-        .or_else(|| url.trim().strip_prefix("huggingface.co/"))
-        .or_else(|| url.trim().strip_prefix("hf.co/"))?;
+        .strip_prefix("huggingface.co/")
+        .or_else(|| url.strip_prefix("hf.co/"))?;
     let mut parts = rest.split(['/', '?', '#']).filter(|part| !part.is_empty());
     let owner = parts.next()?;
     let repository = parts.next()?;

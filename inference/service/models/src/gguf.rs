@@ -256,7 +256,7 @@ fn read_counted(file: &mut Counted) -> Result<LocalGgufRead, GgufError> {
             )));
         }
     }
-    let directory = magnitude_artifacts::gguf::read_header(&bytes[..header_end])
+    let directory = known_tensors(magnitude_artifacts::gguf::read_header(&bytes[..header_end]))
         .and_then(|directory| directory.require_execution_byte_order().map(|()| directory))
         .map_err(GgufError::Header)?;
     let declared = declared_length(&directory);
@@ -284,6 +284,18 @@ fn read_counted(file: &mut Counted) -> Result<LocalGgufRead, GgufError> {
         },
         header: bytes,
     })
+}
+
+/// A parsed header, or for one whose tensors use type ids the parser doesn't know (a quantization
+/// newer than it), the directory of its other tensors: its metadata, roles and identity are intact,
+/// and whether the engine runs those types is the engine's verdict, never the service's.
+pub fn known_tensors(
+    parsed: Result<Directory, magnitude_artifacts::Error>,
+) -> Result<Directory, magnitude_artifacts::Error> {
+    match parsed {
+        Err(magnitude_artifacts::Error::UnknownTensorTypes { directory, .. }) => Ok(*directory),
+        parsed => parsed,
+    }
 }
 
 /// The length a file with this header has when it holds every byte of tensor data its directory
@@ -559,11 +571,12 @@ pub(crate) fn interpret(
         })
         .filter(|base| base.name.is_some() || base.repo_url.is_some())
         .collect();
+    // `general.*` describes the file and never decides: a file type this service doesn't know
+    // (a quantization newer than it) is no declared quantization, and the label comes from the name.
     let file_type = directory
         .value("general.file_type")
         .and_then(Value::unsigned)
-        .map(FileType::from_raw)
-        .transpose()?;
+        .and_then(|raw| FileType::from_raw(raw).ok());
     let tensor_storage_bytes = directory.tensors.iter().try_fold(0_u64, |total, tensor| {
         total.checked_add(tensor.nbytes).ok_or_else(|| {
             GgufError::Header(magnitude_artifacts::Error::Invalid(
