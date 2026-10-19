@@ -1,0 +1,74 @@
+import { describe, expect, it } from "vitest"
+import { Option } from "effect"
+import { ModelReleaseDateSchema, type CatalogLocalModel, type CustomLocalModel } from "@magnitudedev/sdk"
+import { modelCardDrafter, modelCardStatus, modelSubtitle, modelUpdateDescription } from "./model-card-state"
+import { added, attachedDrafter, catalogModel, customModel, drafterCandidate, foundIn, imported } from "../../test/models/fixtures"
+
+const moe = (): CatalogLocalModel => {
+  const model = catalogModel()
+  return { ...model, catalogData: { ...model.catalogData, releaseDate: ModelReleaseDateSchema.make("2020-01-01"), parameterization: { architecture: "mixtureOfExperts", totalParameters: 35_000_000_000, activeParameters: 3_000_000_000 } } }
+}
+
+describe("model card subtitle", () => {
+  it("names the maker and release age on Catalog, and the maker and size on My Models", () => {
+    expect(modelSubtitle(moe(), [moe()], "catalog")).toMatch(/^Qwen · \d+ days ago$/)
+    expect(modelSubtitle(moe(), [moe()], "models")).toBe("Qwen · 35B total · 3B active")
+  })
+  it("names an added model's uploader and the catalog model it is a variant of, never its source", () => {
+    expect(modelSubtitle(customModel(added), [catalogModel()], "models")).toBe("HauhauCS · Variant of Qwen3.6 35B-A3B")
+    expect(modelSubtitle(customModel(foundIn({ _tag: "LmStudio" })), [catalogModel()], "models")).toBe("Qwen · Variant of Qwen3.6 35B-A3B")
+  })
+})
+
+describe("model card drafter", () => {
+  it("offers a catalog model's missing drafter and shows the one it serves with", () => {
+    expect(modelCardDrafter({ ...catalogModel(), missingComponents: [{ component: "Drafter", downloadBytes: 59_200_000 }] })).toEqual({ _tag: "Add" })
+    expect(modelCardDrafter(catalogModel())).toEqual({ _tag: "None", changeable: false })
+    expect(modelCardDrafter({ ...catalogModel(), drafterWithheld: true })._tag).toBe("Withheld")
+  })
+  it("lets a custom model change its drafter in place, with Update when a newer revision exists", () => {
+    const attached = modelCardDrafter(customModel(added, { drafter: Option.some(attachedDrafter({ _tag: "Present" }, { updateAvailable: true })) }))
+    expect(attached).toMatchObject({ _tag: "Attached", title: "Magnitude DFlash for Qwen3.6 35B-A3B", changeable: true, update: true })
+    expect(modelCardDrafter(customModel(imported))).toEqual({ _tag: "None", changeable: true })
+  })
+  it("offers the recommended drafter only while none is attached or turned off", () => {
+    expect(modelCardDrafter(customModel(added, { recommendedDrafter: Option.some(drafterCandidate()) }))).toEqual({ _tag: "Add" })
+    expect(modelCardDrafter(customModel(added, { drafterChoice: { _tag: "None" }, recommendedDrafter: Option.some(drafterCandidate()) }))).toEqual({ _tag: "None", changeable: true })
+  })
+  it("shows a drafter-only download's progress in the cell", () => {
+    const downloading = attachedDrafter({ _tag: "Downloading", progress: { stage: "downloading", completedBytes: 450, totalBytes: 900, bytesPerSecond: Option.none() } })
+    expect(modelCardDrafter(customModel(added, { drafter: Option.some(downloading) }))).toEqual({ _tag: "Adding", percent: 50 })
+  })
+})
+
+describe("model card status", () => {
+  it("says where the model is, from not downloaded to running", () => {
+    expect(modelCardStatus({ ...catalogModel(), acquisitionState: { _tag: "NotInstalled" } }, Option.none())).toEqual({ label: "Not downloaded", tone: "absent" })
+    expect(modelCardStatus(catalogModel(), Option.none())).toEqual({ label: "Downloaded", tone: "stored" })
+    expect(modelCardStatus(customModel(foundIn({ _tag: "LmStudio" })), Option.none())).toEqual({ label: "On this computer", tone: "stored" })
+    const running = customModel(added, { acquisitionState: { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/m.gguf", ownership: "Magnitude" }, residencyState: { _tag: "Ready" } } as never })
+    expect(modelCardStatus(running, Option.none())).toEqual({ label: "Running", tone: "ready" })
+  })
+})
+
+describe("model update description", () => {
+  const updating = (parts: readonly ["Model" | "ImageInput" | "Drafter", ...("Model" | "ImageInput" | "Drafter")[]]): CatalogLocalModel => {
+    const model = catalogModel()
+    return { ...model, acquisitionState: { ...(model.acquisitionState as Extract<CatalogLocalModel["acquisitionState"], { _tag: "Installed" }>), _tag: "UpdateAvailable", parts } }
+  }
+  it("offers a drafter-only catalog update in the Drafter cell, not as the model's Update", () => {
+    expect(modelCardDrafter(updating(["Drafter"]))).toEqual({ _tag: "Add" })
+    expect(modelCardDrafter(updating(["Model", "Drafter"]))).toEqual({ _tag: "None", changeable: false })
+  })
+  it("says which part of a catalog model is new", () => {
+    expect(modelUpdateDescription(updating(["Drafter"]))).toEqual(Option.some("A newer version of the drafter is available."))
+    expect(modelUpdateDescription(updating(["Model"]))).toEqual(Option.some("A newer version of the model is available."))
+    expect(modelUpdateDescription(updating(["Model", "ImageInput", "Drafter"]))).toEqual(Option.some("Newer versions of the model, image input and drafter are available."))
+  })
+  it("says an added model's repository has a newer version, and nothing without an update", () => {
+    const added_ = customModel(added)
+    const installed = added_.acquisitionState as Extract<CustomLocalModel["acquisitionState"], { _tag: "Installed" }>
+    expect(modelUpdateDescription({ ...added_, acquisitionState: { ...installed, _tag: "UpdateAvailable", parts: ["Model"] } })).toEqual(Option.some("The Hugging Face repository has a newer version of this model."))
+    expect(modelUpdateDescription(catalogModel())).toEqual(Option.none())
+  })
+})

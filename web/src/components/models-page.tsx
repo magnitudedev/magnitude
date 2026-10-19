@@ -77,7 +77,7 @@ export function ModelsListing({ filter, models, card, empty, footer }: {
 }) {
   if (filter === "hidden") return <HiddenModels models={models.filter((model): model is CustomLocalModel => model._tag === "Custom")} unhide={model => <HiddenModelUnhide model={model} />} />
   return <>
-    <div className="grid items-start gap-5">{models.map(card)}</div>
+    <div className="grid items-start gap-3">{models.map(card)}</div>
     {models.length === 0 && empty}
     {footer}
   </>

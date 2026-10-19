@@ -10,6 +10,8 @@ import {
   type CatalogSupport,
   type LocalInferenceBackend,
   type LocalModel,
+  type ModelParameterization,
+  type ModelReleaseDate,
   type ModelVariantLabel,
   type SpeculativeMethod,
   type UnsupportedLocalModel,
@@ -85,3 +87,23 @@ export const catalogVariantOfName = (
 ): Option.Option<string> => Option.flatMap(variantOf, (modelId) =>
   Option.fromNullable(models.find((model) =>
     model._tag === "Catalog" && catalogBase(model.modelId) === catalogBase(modelId))?.presentation.displayName))
+
+const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1_000
+
+/** How long ago a catalog model was released, in whole local calendar days ("93 days ago"). */
+export const formatModelReleaseAge = (releaseDate: ModelReleaseDate, now = new Date()): string => {
+  const [year, month, day] = releaseDate.split("-").map(Number) as [number, number, number]
+  const elapsed = Math.max(0, Math.round((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - Date.UTC(year, month - 1, day)) / MILLISECONDS_PER_DAY))
+  return elapsed === 0 ? "Today" : elapsed === 1 ? "1 day ago" : `${elapsed} days ago`
+}
+
+const formatParameterCount = (parameters: number): string => {
+  const billions = parameters / 1_000_000_000
+  return `${billions >= 10 ? Math.round(billions) : Math.round(billions * 10) / 10}B`
+}
+
+/** A model's size in parameters: "27B" for a dense model, "26B total · 4B active" for a mixture of experts. */
+export const formatModelParameters = (parameterization: ModelParameterization): string =>
+  parameterization.architecture === "dense"
+    ? formatParameterCount(parameterization.totalParameters)
+    : `${formatParameterCount(parameterization.totalParameters)} total · ${formatParameterCount(parameterization.activeParameters)} active`

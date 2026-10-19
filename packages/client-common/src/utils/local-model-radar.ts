@@ -198,3 +198,24 @@ export const localModelRadarAxes = (
     ? Option.some(axes)
     : Option.none()
 }
+
+/** How much of this computer's usable memory the model needs when it fits, from 0 to 1. */
+export const localModelMemoryUse = (model: LocalModel): Option.Option<number> => {
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  return serving?._tag === "Assessed" && serving.assessment._tag === "Fits" ? Option.some(memoryUseRatio(serving.assessment)) : Option.none()
+}
+
+/** What a model card states beyond its fit: catalog intelligence and the estimated speed range. */
+export interface LocalModelFacts {
+  readonly intelligence: Option.Option<number>
+  readonly speed: Option.Option<string>
+}
+
+export const localModelFacts = (model: LocalModel): LocalModelFacts => {
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  const fits = serving?._tag === "Assessed" && serving.assessment._tag === "Fits" ? serving.assessment : undefined
+  return {
+    intelligence: model._tag === "Catalog" ? Option.some(model.catalogData.intelligence) : Option.none(),
+    speed: fits === undefined ? Option.none() : Option.some(performanceRangeSpeedLabel(fits.performance, fits.profile.contextLength)),
+  }
+}

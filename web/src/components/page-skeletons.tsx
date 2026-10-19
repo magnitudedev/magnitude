@@ -63,17 +63,17 @@ export function RecommendationsSkeleton({ assessment, waitingForHardware = false
 }
 export function ModelCardsSkeleton({ library = false }: { library?: boolean }) {
   return <LoadingRegion label={library ? "Loading your models" : "Loading catalog models"}>
-    <div className="grid items-start gap-5">{[0,1,2,3].map(index => <article key={index} className={pageLayout.modelCard}><div className={pageLayout.modelRow}>
-      <div className="flex min-w-0 items-center gap-4"><Skeleton className="size-10 shrink-0" /><div className="min-w-0 flex-1"><SkeletonLine className="h-7 text-lg" width={index%2 ? "85%" : "70%"} />{library && <SkeletonLine className="mt-1 h-5 text-sm" width="55%" />}</div></div>
-      <div className="flex flex-wrap gap-2"><Skeleton className="h-8 w-20" /><Skeleton className={`h-8 ${library ? "w-28" : "w-40"}`} />{library && <Skeleton className="size-8" />}</div>
-    </div></article>)}</div>
+    <div className="grid items-start gap-3">{[0,1,2,3].map(index => <article key={index} className="overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-850">
+      <div className="flex items-center gap-4 px-5 py-4"><Skeleton className="size-10 shrink-0" /><div className="min-w-0 flex-1"><SkeletonLine className="h-6 text-[15px]" width={index%2 ? "55%" : "40%"} /><SkeletonLine className="h-4 text-xs" width={library ? "30%" : "22%"} /></div><Skeleton className="h-8 w-36" /></div>
+      <div className="grid grid-cols-3 gap-px border-t border-slate-200 bg-slate-200 lg:grid-cols-5 dark:border-slate-750 dark:bg-slate-750">{[0,1,2,3,4].map(cell => <div key={cell} className="bg-white px-4 py-2.5 dark:bg-slate-850"><SkeletonLine className="h-6 text-[13px]" width="65%" /></div>)}</div>
+    </article>)}</div>
   </LoadingRegion>
 }
 export function ModelsSkeleton({ page }: { page: "discover" | "catalog" | "models" }) {
   if (page === "discover") return <><HardwarePending /><RecommendationPreference /><RecommendationsSkeleton /></>
   return <>
     <div className={pageLayout.modelHeader}><h1 className={pageLayout.pageTitle}>{page === "models" ? "My Models" : "Catalog"}</h1><Skeleton className={`h-8 ${page === "models" ? "w-36" : "w-48"}`} /></div>
-    <div className={pageLayout.catalogToolbar}><Skeleton className={`h-8 ${pageLayout.modelSearch}`} /><div className="flex flex-wrap items-center gap-2"><Skeleton className="h-8 w-32" /><Skeleton className="h-8 w-28" /><Skeleton className="h-8 w-44" /></div></div>
+    <div className={pageLayout.catalogToolbar}><Skeleton className={`h-8 ${pageLayout.modelSearch}`} /><div className="flex flex-wrap items-center gap-2"><Skeleton className="h-8 w-32" /><Skeleton className="h-8 w-28" /><Skeleton className="h-8 w-36" /></div></div>
     <ModelCardsSkeleton library={page === "models"} />
   </>
 }

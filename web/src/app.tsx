@@ -14,7 +14,6 @@ import { Progress } from "./components/ui/progress"
 import { MagnitudeMark } from "./components/magnitude-mark"
 import {
   SidebarSimpleIcon,
-  CaretDownIcon,
   ArrowUpRightIcon,
   StackIcon,
   SquaresFourIcon,
@@ -27,7 +26,6 @@ import {
   DownloadSimpleIcon,
   CircleNotchIcon,
   SquareIcon,
-  TrashIcon,
   XIcon,
   MonitorIcon,
   SunIcon,
@@ -37,10 +35,10 @@ import {
   FilePlusIcon,
 } from "@phosphor-icons/react"
 import { CopyCommand } from "./components/copy-command"
-import { useId, useMemo, useRef, useState, type ReactNode } from "react"
+import { useMemo, useRef, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
-import { localModelDeprecation, type ProviderModelId, type CatalogComponent, type CatalogLocalModel, type CustomLocalModel, type CustomModelAcquisitionState, type DrafterCandidate, type LocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
+import { type ProviderModelId, type CatalogLocalModel, type CustomModelAcquisitionState, type LocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
 import type { ApplicationSnapshot, AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessChange, type NetworkBind, type OwnerCapability } from "@magnitudedev/sdk"
 import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
@@ -49,9 +47,9 @@ import {
   activeLocalModel, useAgentClient, type AddModelRequest, type ApplicationPage,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
-  formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory,
-  catalogModelReplacement, catalogVariantOfName, localModelSourceTag, customModelDrafterOffer, useCustomModels, useHiddenLocalModels, useUnsupportedLocalModels,
-  LOCAL_MODEL_RANKING_SCALE_VALUES, catalogComponentOffers,
+  formatStorageSize, formatTransferRate, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory,
+  useCustomModels, useHiddenLocalModels, useUnsupportedLocalModels,
+  LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
 import { appearanceReadError } from "./appearance"
 import { useNavigate, useServerPlatform, useSession } from "./session"
@@ -69,15 +67,14 @@ import { OtherApps } from "./components/other-apps"
 import { HuggingFaceLogo, LabLogo, ModelLogo, modelLab, modelLabs, type ModelLab } from "./components/model-logo"
 import { ModelsHeader } from "./components/models-header"
 import { AddModelDialog, ggufOpenRequest, type AddDialogRequest } from "./components/add-model-dialog"
-import { DrafterPickerDialog } from "./components/drafter-list"
-import { CustomModelDrafterRow, CustomModelSource, DrafterNotices, DrafterOffer, drafterUpdateAvailable } from "./components/custom-model-details"
-import { CatalogComponentDetails, CatalogDrafterOffer } from "./components/catalog-model-components"
+import { drafterUpdateAvailable } from "./components/custom-model-details"
 import { ModelRemoveAction } from "./components/model-remove-action"
-import { SourceTag, UnsupportedModels } from "./components/local-model-lists"
+import { UnsupportedModels } from "./components/local-model-lists"
 import { DiscoverSections, ModelsListing, acquiring, addFromHuggingFace, afterModelAdded, otherVersionsRequest, selectModels, type DiscoverRecommendationState } from "./components/models-page"
 import { ModelLocationsRow } from "./components/model-locations"
 import { HuggingFaceRow } from "./components/hugging-face"
 import { HostNotices } from "./components/host-notices"
+import { ModelCard } from "./components/model-card"
 
 const ALL_INTERFACES = "all"
 const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
@@ -177,34 +174,6 @@ function DownloadProgress({ acquisition, modelName, onCancel, pending = false, l
     {onCancel && <div className="mt-7 flex justify-center">{cancelButton("")}</div>}
   </div>
 }
-/** One step from a deprecated model to its replacement: download it, or load it once downloaded. */
-function SwitchToReplacement({ target }: { target: CatalogLocalModel }) {
-  const { install, load } = useLocalModelMutations()
-  const command = useLocalModelCommandStatus(target.modelId)
-  const fits = target.servingState._tag === "Assessed" && target.servingState.assessment._tag === "Fits"
-  const transferring = target.acquisitionState._tag === "Installing" || target.acquisitionState._tag === "Updating"
-  return <>
-    <Button disabled={command.pending || transferring || !fits} onClick={() => localModelIsInstalled(target) ? load(target.modelId) : install(target.modelId)}>Switch to {formatLocalModelDisplayName(target)}</Button>
-  </>
-}
-/** An installed deprecated model is removable and offers one step to its replacement; it never loads. */
-function DeprecatedModelControls({ model, replacement, children }: { model: CatalogLocalModel; replacement: Option.Option<CatalogLocalModel>; children?: ReactNode }) {
-  const { remove, hide } = useLocalModelMutations()
-  const command = useLocalModelCommandStatus(model.modelId)
-  const replacementCommand = useLocalModelCommandStatus(Option.match(replacement, { onNone: () => model.modelId, onSome: target => target.modelId }))
-  const acquisition = model.acquisitionState
-  const pending = command.pending || acquisition._tag === "Removing"
-  return <TooltipProvider><div className="contents">
-    <div className="flex flex-wrap items-center justify-end gap-2">{children}
-      {Option.match(replacement, { onNone: () => null, onSome: target => <SwitchToReplacement target={target} /> })}
-      {localModelIsInstalled(model) && <ModelRemoveAction model={model} running={false} disabled={pending} onRemove={() => remove(model.modelId)} onHide={() => hide(model.modelId)} />}
-    </div>
-    {Option.isSome(replacement) && replacementCommand.failures.map(failure => <ErrorNotice key={`replacement-${failure.operation}`} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
-    <ErrorNotice severity="info" title={Option.isSome(replacement) ? "A replacement model is available" : "This model is no longer supported"} description={Option.isSome(replacement) ? `Switch to ${formatLocalModelDisplayName(replacement.value)} to continue receiving support.` : "Choose another model from Catalog."} className="col-span-full mt-3" />
-    {acquisition._tag === "RemoveFailed" && <ErrorNotice {...modelRemovalNotice(acquisition.failure)} className="col-span-full mt-3" />}
-    {command.failures.map(failure => <ErrorNotice key={failure.operation} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
-  </div></TooltipProvider>
-}
 const updateLabel = (model: LocalModel) => model._tag === "Catalog"
   ? "New files are available for this model, usually an updated drafter for faster responses."
   : model.acquisitionState._tag === "UpdateAvailable" ? "The repository has a newer version of this model."
@@ -257,54 +226,6 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
       description={`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}.`} confirmLabel="Load model" onConfirm={() => load(model.modelId)} />}
   </div></TooltipProvider>
 }
-function ModelCard({ model, models, showMemory = false, replacing, hardware, onFindOtherVersions }: { model: LocalModel; models: readonly LocalModel[]; showMemory?: boolean; replacing?: string; hardware: Option.Option<LocalInferenceHardware>; onFindOtherVersions?: () => void }) {
-  const [detailsOpen, setDetailsOpen] = useState(false)
-  const detailsId = useId()
-  const { downloadComponent } = useLocalModelMutations()
-  const componentsDisabled = useLocalModelCommandStatus(model.modelId).pending
-  const downloadModelComponent = (component: CatalogComponent) => downloadComponent(model.modelId, component)
-  const deprecation = localModelDeprecation(model)
-  const detailsToggle = <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}>Details<CaretDownIcon aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
-  const acquisition = model.acquisitionState
-  const residency = "residencyState" in acquisition ? acquisition.residencyState : undefined
-  const stored = acquisition._tag === "External" ? "On this computer" : "Downloaded"
-  const statusLabel = acquisition._tag === "Removing" ? "Removing…" : acquisition._tag === "RemoveFailed" ? "Removal failed" : acquisition._tag === "Unavailable" ? "Files unavailable" : residency?._tag === "Ready" ? "Loaded" : residency?._tag === "Unloaded" || residency?._tag === "Stopped" ? stored : residency?._tag === "Failed" ? "Not loaded" : residency?._tag === "Requested" ? "Preparing…" : residency?._tag === "Loading" ? describeModelLoadStage(residency.stage, residency.plannedAllocation, hardware) : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag === "InstallFailed" ? "Not downloaded" : acquisition._tag === "UpdateFailed" ? "Update incomplete" : acquisition._tag === "UpdateAvailable" ? "Update available" : acquisition._tag)
-  const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)} memory</span></>}</div>
-  return <article className={pageLayout.modelCard}>
-    <div className={pageLayout.modelRow}>
-      <div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div className="min-w-0"><h2 className="flex flex-wrap items-center gap-2 text-lg font-semibold">{formatLocalModelDisplayName(model)}{Option.match(localModelSourceTag(model), { onNone: () => null, onSome: label => <SourceTag label={label} /> })}</h2>{status}</div></div>
-      {Option.match(deprecation, {
-        onNone: () => <ModelControls model={model} {...(replacing ? { replacing } : {})}>{detailsToggle}</ModelControls>,
-        onSome: value => model._tag === "Catalog" && <DeprecatedModelControls model={model} replacement={catalogModelReplacement(models, value)}>{detailsToggle}</DeprecatedModelControls>,
-      })}
-      {model._tag === "Custom" && <CustomModelDrafter model={model} models={models} detailsOpen={detailsOpen} detailsId={detailsId} />}
-      {model._tag === "Catalog" && !detailsOpen && catalogComponentOffers(model).some(({ component }) => component === "Drafter") && <div className="col-span-full -mt-2 pl-14"><CatalogDrafterOffer model={model} disabled={componentsDisabled} onDownload={downloadModelComponent} /></div>}
-    </div>
-    {model._tag === "Catalog" && <ModelDetails model={model} radar open={detailsOpen} contentId={detailsId}
-      drafter={<CatalogComponentDetails model={model} disabled={componentsDisabled} onDownload={downloadModelComponent} />}
-      source={<CatalogSources model={model} />} {...(onFindOtherVersions ? { onFindOtherVersions } : {})} />}
-  </article>
-}
-/** A custom model's drafter offer on its card, its details with drafter controls, and drafter notices. */
-function CustomModelDrafter({ model, models, detailsOpen, detailsId }: { model: CustomLocalModel; models: readonly LocalModel[]; detailsOpen: boolean; detailsId: string }) {
-  const { setDrafter, install, cancel, dismissFailure } = useLocalModelMutations()
-  const command = useLocalModelCommandStatus(model.modelId)
-  const [choosing, setChoosing] = useState(false)
-  const disabled = command.pending || model.acquisitionState._tag === "Removing"
-  const change = () => setChoosing(true)
-  const turnOff = () => setDrafter(model.modelId, { _tag: "None" })
-  const add = (candidate: DrafterCandidate) => setDrafter(model.modelId, { _tag: "Reference", reference: candidate.reference })
-  return <>
-    {!detailsOpen && Option.isSome(customModelDrafterOffer(model)) && <div className="col-span-full -mt-2 pl-14"><DrafterOffer model={model} disabled={disabled} onAdd={add} /></div>}
-    <DrafterNotices model={model} disabled={disabled} onRetry={() => install(model.modelId)} onCancel={() => cancel(model.modelId)} onDismiss={() => dismissFailure(model.modelId)} />
-    <div className="col-span-full">
-      <ModelDetails model={model} radar open={detailsOpen} contentId={detailsId}
-        drafter={<CustomModelDrafterRow model={model} disabled={disabled} onChangeDrafter={change} onTurnOffDrafter={turnOff} onAddDrafter={add} />}
-        source={<CustomModelSource model={model} variantOfName={catalogVariantOfName(models, model.presentation.variantOf)} />} />
-    </div>
-    <DrafterPickerDialog model={model} open={choosing} onOpenChange={setChoosing} onChoose={choice => setDrafter(model.modelId, choice)} />
-  </>
-}
 function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; active: ReturnType<typeof activeLocalModel> }) {
   const client = useAgentClient()
   const navigate = useNavigate()
@@ -324,7 +245,7 @@ function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; a
     </div>
     <div className="grid min-h-72">
       <div className={`col-start-1 row-start-1 min-w-0 ${view === "profile" ? "" : "invisible"}`} aria-hidden={view !== "profile"}><ModelRadar model={model} /></div>
-      <div className={`col-start-1 row-start-1 min-w-0 ${view === "details" ? "" : "invisible"}`} aria-hidden={view !== "details"}><ModelDetails model={model} compact open source={<CatalogSources model={model} />} /></div>
+      <div className={`col-start-1 row-start-1 min-w-0 ${view === "details" ? "" : "invisible"}`} aria-hidden={view !== "details"}><ModelDetails model={model} source={<CatalogSources model={model} />} /></div>
     </div>
     </div>
     {transferring && <div className="absolute inset-5 flex items-center justify-center overflow-y-auto" aria-label="Download panel">
@@ -452,9 +373,14 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     {stopFailure}
     {assessment && !assessment.complete && <p className="mb-4 text-sm text-slate-500">Assessing models · {assessment.settledModels} of {assessment.totalModels}</p>}
     <ModelsListing filter={filter} models={visible}
-      card={model => <ModelCard key={model.modelId} model={model} models={allModels} showMemory={installedOnly} hardware={Result.value(hardware)}
-        {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})}
-        {...Option.match(otherVersionsRequest(page, model), { onNone: () => ({}), onSome: request => ({ onFindOtherVersions: () => openDialog(request) }) })} />}
+      card={model => {
+        const shared = {
+          model, models: allModels, hardware: Result.value(hardware),
+          ...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {}),
+          ...Option.match(otherVersionsRequest(page, model), { onNone: () => ({}), onSome: request => ({ onFindOtherVersions: () => openDialog(request) }) }),
+        }
+        return <ModelCard key={model.modelId} page={installedOnly ? "models" : "catalog"} {...shared} />
+      }}
       empty={<p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
       footer={installedOnly && <UnsupportedModels models={Result.isSuccess(unsupportedModels) ? unsupportedModels.value : []} />} />
     {dialog}
