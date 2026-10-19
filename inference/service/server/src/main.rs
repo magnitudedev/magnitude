@@ -88,6 +88,8 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // SAFETY: no other thread has started yet.
+    unsafe { magnitude_service_server::isolate_hub_credentials() };
     magnitude_executor::platform::relax_gpu_watchdog();
     let cli = Cli::parse();
     match cli.command {
@@ -177,9 +179,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
             inventory_config.catalog_models = release_catalog.catalog().models.clone();
             inventory_config.catalog_header_digests = release_catalog.file_header_digests();
             inventory_config.architectures = engine_architectures();
-            // The engine runs with implicit Hub credentials disabled; only an explicit HF_TOKEN is
-            // presented.
-            inventory_config.hub_token = std::env::var("HF_TOKEN").ok();
             let inventory = Arc::new(
                 ManagedModelStore::open(inventory_config)
                     .await

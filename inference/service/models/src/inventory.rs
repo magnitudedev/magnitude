@@ -200,7 +200,6 @@ pub struct InventoryConfig {
     pub catalog_models: Vec<RecommendableModel>,
     pub catalog_header_digests: BTreeMap<String, String>,
     pub hub_endpoint: Option<String>,
-    pub hub_token: Option<String>,
     pub architectures: RecognizedArchitectures,
 }
 
@@ -316,17 +315,32 @@ impl InventoryConfig {
             disk_reserve_bytes: 2 * 1024 * 1024 * 1024,
             catalog_models: Vec::new(),
             catalog_header_digests: BTreeMap::new(),
-            hub_token: None,
             architectures: RecognizedArchitectures::default(),
             hub_endpoint: None,
         })
     }
 }
 
+/// A Hub client presenting `token`, or an anonymous one. ICN starts with implicit Hub credentials
+/// disabled (`isolate_hub_credentials` in the service), so an anonymous client never picks up a
+/// token from the environment or the Hugging Face token file.
+fn hub_client(config: &InventoryConfig, token: Option<String>) -> Result<HFClient, InventoryError> {
+    let mut builder = HFClient::builder().cache_dir(config.root.join("hub"));
+    if let Some(endpoint) = &config.hub_endpoint {
+        builder = builder.endpoint(endpoint.clone());
+    }
+    if let Some(token) = token {
+        builder = builder.token(token);
+    }
+    builder
+        .build()
+        .map_err(|error| InventoryError::Upstream(error.to_string()))
+}
+
 pub struct ManagedModelStore {
     pub(crate) config: InventoryConfig,
     pub(crate) client: HFClient,
-    pub(crate) hub_credential: Option<HubCredential>,
+    hub_credential: Arc<RwLock<Option<HubCredential>>>,
     pub(crate) http: reqwest::Client,
     pub(crate) models: Arc<RwLock<BTreeMap<InventoryEntryId, InventoryModel>>>,
     pub(crate) operations:
@@ -369,7 +383,7 @@ impl Clone for ManagedModelStore {
         Self {
             config: self.config.clone(),
             client: self.client.clone(),
-            hub_credential: self.hub_credential.clone(),
+            hub_credential: Arc::clone(&self.hub_credential),
             http: self.http.clone(),
             models: Arc::clone(&self.models),
             operations: Arc::clone(&self.operations),
@@ -575,30 +589,7 @@ impl ManagedModelStore {
     pub async fn open(config: InventoryConfig) -> Result<Self, InventoryError> {
         validate_config(&config)?;
         ensure_store_layout(&config.root).await?;
-        // The engine runs with implicit Hub credentials disabled, so this client is anonymous; only
-        // an explicit HF_TOKEN is presented, through the credentialed client.
-        let client_builder = || {
-            let builder = HFClient::builder().cache_dir(config.root.join("hub"));
-            match &config.hub_endpoint {
-                Some(endpoint) => builder.endpoint(endpoint.clone()),
-                None => builder,
-            }
-        };
-        let client = client_builder()
-            .build()
-            .map_err(|error| InventoryError::Upstream(error.to_string()))?;
-        let hub_credential = config
-            .hub_token
-            .clone()
-            .filter(|token| !token.trim().is_empty())
-            .map(|token| {
-                client_builder()
-                    .token(token.clone())
-                    .build()
-                    .map(|client| HubCredential { client, token })
-                    .map_err(|error| InventoryError::Upstream(error.to_string()))
-            })
-            .transpose()?;
+        let client = hub_client(&config, None)?;
         let cache = ModelCache::new(&config.cache_root);
         let catalog_affiliations = CatalogAffiliations::load(&config.root);
         let local_models = Arc::new(RwLock::new(config.local_models.clone()));
@@ -606,7 +597,7 @@ impl ManagedModelStore {
             download_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
             config,
             client,
-            hub_credential,
+            hub_credential: Arc::new(RwLock::new(None)),
             http: reqwest::Client::new(),
             models: Arc::new(RwLock::new(BTreeMap::new())),
             operations: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
@@ -893,12 +884,43 @@ impl ManagedModelStore {
         Ok(())
     }
 
-    /// The explicit Hugging Face token presented on Hub requests, when one is configured.
+    /// The Hugging Face token presented on Hub requests, when one is configured.
     #[must_use]
-    pub fn hub_token(&self) -> Option<&str> {
+    pub fn hub_token(&self) -> Option<String> {
+        self.hub_credential().map(|credential| credential.token)
+    }
+
+    pub(crate) fn hub_credential(&self) -> Option<HubCredential> {
         self.hub_credential
-            .as_ref()
-            .map(|credential| credential.token.as_str())
+            .read()
+            .ok()
+            .and_then(|credential| credential.clone())
+    }
+
+    /// Replaces the Hugging Face token presented on every later Hub request; `None` makes them
+    /// anonymous. Every clone of this store shares the credential.
+    pub fn configure_hub_credential(&self, token: Option<String>) -> Result<(), InventoryError> {
+        let credential = match token {
+            Some(token) => {
+                let token = token.trim().to_owned();
+                if token.is_empty() {
+                    return Err(InventoryError::InvalidRequest(
+                        "a Hugging Face token must not be empty".to_owned(),
+                    ));
+                }
+                Some(HubCredential {
+                    client: hub_client(&self.config, Some(token.clone()))?,
+                    token,
+                })
+            }
+            None => None,
+        };
+        *self
+            .hub_credential
+            .write()
+            .map_err(|_| InventoryError::Internal("Hub credential lock poisoned".to_owned()))? =
+            credential;
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {

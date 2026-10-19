@@ -1873,6 +1873,87 @@ pub struct CandidateInspection {
     pub unsupported_architecture: Option<Vec<UnsupportedReason>>,
 }
 
+/// What an inspection is doing, with how much of it is done: reading each file's GGUF header,
+/// checking each version against this computer, then checking the drafters of the version it
+/// recommends. A drafter total counts the drafter checks known so far, so it can grow.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum CandidateInspectionPhase {
+    ReadingHeaders { completed: u32, total: u32 },
+    CheckingVersions { completed: u32, total: u32 },
+    CheckingDrafters { version: String, completed: u32, total: u32 },
+}
+
+/// A version as an inspection in progress knows it: its label and size, and its plain verdict
+/// once checked. While headers are read, the rows are the repository's GGUFs named by their files;
+/// from the version checks on, they are the versions the inspection returns.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateVersionProgress {
+    pub label: String,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub assessment: Option<ModelAssessment>,
+}
+
+/// How far an inspection has got, each version's verdict included as soon as it is known.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateInspectionProgress {
+    pub phase: CandidateInspectionPhase,
+    pub versions: Vec<CandidateVersionProgress>,
+}
+
+/// One event of an inspection's stream: progress, in order, then the inspection itself.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum CandidateInspectionEvent {
+    Progress { progress: CandidateInspectionProgress },
+    Inspected { inspection: CandidateInspection },
+}
+
+/// Where an inspection reports its progress; `none` discards it.
+#[derive(Clone, Default)]
+pub struct CandidateInspectionProgressSink(
+    Option<std::sync::Arc<dyn Fn(CandidateInspectionProgress) + Send + Sync>>,
+);
+
+impl CandidateInspectionProgressSink {
+    pub fn new(report: impl Fn(CandidateInspectionProgress) + Send + Sync + 'static) -> Self {
+        Self(Some(std::sync::Arc::new(report)))
+    }
+
+    #[must_use]
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    #[must_use]
+    pub fn is_reporting(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub fn report(&self, progress: CandidateInspectionProgress) {
+        if let Some(report) = &self.0 {
+            report(progress);
+        }
+    }
+}
+
+impl fmt::Debug for CandidateInspectionProgressSink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("CandidateInspectionProgressSink")
+            .field(&self.is_reporting())
+            .finish()
+    }
+}
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
@@ -2415,10 +2496,18 @@ pub trait LocalModels: Send + Sync + 'static {
 
 /// Files not yet added: inspection, drafter enumeration and assessment, all header-only.
 pub trait ModelCandidates: Send + Sync + 'static {
+    /// Inspects a candidate, reporting its progress to `progress` as it goes.
+    fn inspect_with_progress(
+        &self,
+        request: CandidateInspectionRequest,
+        progress: CandidateInspectionProgressSink,
+    ) -> BoxFuture<'_, Result<CandidateInspection, InventoryError>>;
     fn inspect(
         &self,
         request: CandidateInspectionRequest,
-    ) -> BoxFuture<'_, Result<CandidateInspection, InventoryError>>;
+    ) -> BoxFuture<'_, Result<CandidateInspection, InventoryError>> {
+        self.inspect_with_progress(request, CandidateInspectionProgressSink::none())
+    }
     fn drafters(
         &self,
         request: DrafterCandidatesRequest,

@@ -2618,10 +2618,12 @@ name = "magnitude-service-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "flate2",
  "futures-util",
+ "hf-hub",
  "http-body-util",
  "libc",
  "magnitude-artifacts",
@@ -2634,8 +2636,10 @@ dependencies = [
  "magnitude-serving",
  "opentelemetry 0.32.0",
  "opentelemetry-appender-tracing",
+ "opentelemetry-http 0.32.0",
  "opentelemetry-otlp 0.32.0",
  "opentelemetry_sdk 0.32.1",
+ "reqwest",
  "seismic",
  "serde",
  "serde_json",

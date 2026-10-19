@@ -357,8 +357,9 @@ impl HubLineage {
             }
         }
         url.query_pairs_mut().append_pair("expand", "baseModels");
+        let token = self.models.hub_token();
         let response =
-            crate::preview::send_hub_get(&self.models.http, self.models.hub_token(), url).await?;
+            crate::preview::send_hub_get(&self.models.http, token.as_deref(), url).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(InventoryError::NotFound(repository.to_owned()));
         }

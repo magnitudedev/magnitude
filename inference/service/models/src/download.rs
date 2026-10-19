@@ -11,6 +11,7 @@ use hf_hub::HFError;
 use magnitude_service_contracts::models::ModelPackage;
 use magnitude_service_contracts::{
     ContentIdentity, DownloadEventStream, DownloadFailure, DownloadFileProgress, DownloadStage,
+    HuggingFaceAccess,
     Integrity, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
     ModelComponent, ModelDownloadEvent, ModelLocation, ModelSource,
 };
@@ -303,7 +304,9 @@ enum DownloadErrorKind {
     },
     SourceUnavailable,
     CredentialRejected,
-    SourceAccessDenied,
+    SourceAccessDenied {
+        credentialed: bool,
+    },
     MissingSource,
     Network,
     Integrity,
@@ -322,6 +325,14 @@ struct DownloadError {
 }
 
 impl DownloadError {
+    /// Records that the request the Hub refused with 403 presented the configured token.
+    fn presented_credential(mut self, credentialed: bool) -> Self {
+        if let DownloadErrorKind::SourceAccessDenied { credentialed: denied } = &mut self.kind {
+            *denied |= credentialed;
+        }
+        self
+    }
+
     fn resumable(&self) -> bool {
         self.resumable
     }
@@ -340,10 +351,20 @@ impl DownloadError {
                 required_bytes: *required_bytes,
                 available_bytes: *available_bytes,
             },
-            DownloadErrorKind::SourceUnavailable
-            | DownloadErrorKind::CredentialRejected
-            | DownloadErrorKind::SourceAccessDenied
-            | DownloadErrorKind::MissingSource => DownloadFailure::SourceUnavailable,
+            DownloadErrorKind::CredentialRejected
+            | DownloadErrorKind::SourceAccessDenied {
+                credentialed: false,
+            } => DownloadFailure::HuggingFaceAccessRequired {
+                access: HuggingFaceAccess::SignIn,
+            },
+            DownloadErrorKind::SourceAccessDenied { credentialed: true } => {
+                DownloadFailure::HuggingFaceAccessRequired {
+                    access: HuggingFaceAccess::AcceptTerms,
+                }
+            }
+            DownloadErrorKind::SourceUnavailable | DownloadErrorKind::MissingSource => {
+                DownloadFailure::SourceUnavailable
+            }
             DownloadErrorKind::Network => DownloadFailure::NetworkUnavailable,
             DownloadErrorKind::Integrity => DownloadFailure::CorruptDownload,
             DownloadErrorKind::FileSystem => DownloadFailure::LocalStorageFailure,
@@ -637,8 +658,8 @@ impl ManagedModelStore {
         })?;
         let required = package.components();
         let control = &operation.control;
-        let (repo, commit) = resolve_with_credential_fallback(
-            self.hub_credential.as_ref(),
+        let ((repo, commit), credentialed) = resolve_with_credential_fallback(
+            self.hub_credential(),
             &self.client,
             |client, token| async move {
                 resolve_package(
@@ -860,7 +881,8 @@ impl ManagedModelStore {
                 },
                 &operation.control,
             )
-            .await?;
+            .await
+            .map_err(|error| error.presented_credential(credentialed))?;
         }
 
         if let Some(last) = components.last() {
@@ -1761,28 +1783,34 @@ fn inventory_download_error(error: InventoryError) -> DownloadError {
 
 /// A configured Hub credential is presented first. Hugging Face rejects an expired or revoked token
 /// outright, even for public repositories, so a rejected credential falls back to anonymous access
-/// rather than making every public package unavailable.
+/// rather than making every public package unavailable. Also returns whether the resolution that
+/// succeeded presented the credential.
 async fn resolve_with_credential_fallback<T, F, Fut>(
-    credential: Option<&HubCredential>,
+    credential: Option<HubCredential>,
     anonymous: &hf_hub::HFClient,
     resolve: F,
-) -> Result<T, DownloadError>
+) -> Result<(T, bool), DownloadError>
 where
     F: Fn(hf_hub::HFClient, Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<T, DownloadError>>,
 {
     let Some(credential) = credential else {
-        return resolve(anonymous.clone(), None).await;
+        return resolve(anonymous.clone(), None)
+            .await
+            .map(|resolved| (resolved, false));
     };
-    match resolve(credential.client.clone(), Some(credential.token.clone())).await {
+    match resolve(credential.client, Some(credential.token)).await {
+        Ok(resolved) => Ok((resolved, true)),
         Err(error) if matches!(error.kind, DownloadErrorKind::CredentialRejected) => {
             tracing::warn!(
                 reason = %error,
-                "Hugging Face rejected the configured HF_TOKEN; retrying anonymously"
+                "Hugging Face rejected the configured token; retrying anonymously"
             );
-            resolve(anonymous.clone(), None).await
+            resolve(anonymous.clone(), None)
+                .await
+                .map(|resolved| (resolved, false))
         }
-        resolved => resolved,
+        Err(error) => Err(error.presented_credential(true)),
     }
 }
 
@@ -1801,14 +1829,14 @@ pub(crate) struct HubFileContent {
 
 impl ManagedModelStore {
     /// Reads `revision` of `repository` through the same metadata request as acquisition, with
-    /// the `HF_TOKEN` credential when one is set and anonymously when the Hub rejects it.
+    /// the configured Hub credential when there is one and anonymously when the Hub rejects it.
     pub(crate) async fn hub_revision_files(
         &self,
         repository: &str,
         revision: &str,
     ) -> Result<HubRevisionFiles, String> {
-        let api = resolve_with_credential_fallback(
-            self.hub_credential.as_ref(),
+        let (api, _) = resolve_with_credential_fallback(
+            self.hub_credential(),
             &self.client,
             |client, token| async move {
                 hub_api_metadata(&client, token.as_deref(), repository, revision).await
@@ -2081,7 +2109,9 @@ async fn hub_api_metadata(
         return Err(DownloadError {
             kind: match status.as_u16() {
                 401 => DownloadErrorKind::CredentialRejected,
-                403 => DownloadErrorKind::SourceAccessDenied,
+                403 => DownloadErrorKind::SourceAccessDenied {
+                    credentialed: token.is_some(),
+                },
                 404 => DownloadErrorKind::MissingSource,
                 _ if retryable => DownloadErrorKind::Network,
                 _ => DownloadErrorKind::InvalidRequest,
@@ -2167,7 +2197,12 @@ fn reqwest_download_error(error: reqwest::Error) -> DownloadError {
 fn map_hf_error(error: HFError) -> DownloadError {
     let (kind, retryable) = match &error {
         HFError::AuthRequired { .. } => (DownloadErrorKind::CredentialRejected, false),
-        HFError::Forbidden { .. } => (DownloadErrorKind::SourceAccessDenied, false),
+        HFError::Forbidden { .. } => (
+            DownloadErrorKind::SourceAccessDenied {
+                credentialed: false,
+            },
+            false,
+        ),
         HFError::RepoNotFound { .. }
         | HFError::RevisionNotFound { .. }
         | HFError::EntryNotFound { .. } => (DownloadErrorKind::MissingSource, false),
@@ -3595,7 +3630,7 @@ mod tests {
         };
         let attempts = std::sync::Mutex::new(Vec::new());
         let resolved =
-            resolve_with_credential_fallback(Some(&credential), &hub_client(), |_client, token| {
+            resolve_with_credential_fallback(Some(credential), &hub_client(), |_client, token| {
                 attempts.lock().expect("attempts").push(token.clone());
                 async move {
                     match token {
@@ -3612,7 +3647,7 @@ mod tests {
             .await
             .expect("anonymous resolution");
 
-        assert_eq!(resolved, "resolved");
+        assert_eq!(resolved, ("resolved", false));
         assert_eq!(
             *attempts.lock().expect("attempts"),
             vec![Some("expired".to_owned()), None]
@@ -3627,11 +3662,13 @@ mod tests {
         };
         let attempts = std::sync::Mutex::new(Vec::new());
         let error =
-            resolve_with_credential_fallback(Some(&credential), &hub_client(), |_client, token| {
+            resolve_with_credential_fallback(Some(credential), &hub_client(), |_client, token| {
                 attempts.lock().expect("attempts").push(token);
                 async {
                     Err::<(), _>(DownloadError {
-                        kind: DownloadErrorKind::SourceAccessDenied,
+                        kind: DownloadErrorKind::SourceAccessDenied {
+                            credentialed: false,
+                        },
                         message: String::new(),
                         retryable: false,
                         resumable: false,
@@ -3641,7 +3678,16 @@ mod tests {
             .await
             .expect_err("forbidden content");
 
-        assert!(matches!(error.kind, DownloadErrorKind::SourceAccessDenied));
+        assert!(matches!(
+            error.kind,
+            DownloadErrorKind::SourceAccessDenied { credentialed: true }
+        ));
+        assert_eq!(
+            error.to_failure(),
+            Some(DownloadFailure::HuggingFaceAccessRequired {
+                access: HuggingFaceAccess::AcceptTerms
+            })
+        );
         assert_eq!(
             *attempts.lock().expect("attempts"),
             vec![Some("valid".to_owned())]
@@ -3659,5 +3705,34 @@ mod tests {
         .expect("anonymous resolution");
 
         assert_eq!(*attempts.lock().expect("attempts"), vec![None]);
+    }
+
+    #[test]
+    fn refused_hub_files_ask_to_sign_in_unless_a_token_was_presented() {
+        let failure = |kind| {
+            DownloadError {
+                kind,
+                message: String::new(),
+                retryable: false,
+                resumable: false,
+            }
+            .to_failure()
+        };
+        let sign_in = Some(DownloadFailure::HuggingFaceAccessRequired {
+            access: HuggingFaceAccess::SignIn,
+        });
+        assert_eq!(failure(DownloadErrorKind::CredentialRejected), sign_in);
+        assert_eq!(
+            failure(DownloadErrorKind::SourceAccessDenied {
+                credentialed: false
+            }),
+            sign_in
+        );
+        assert_eq!(
+            failure(DownloadErrorKind::SourceAccessDenied { credentialed: true }),
+            Some(DownloadFailure::HuggingFaceAccessRequired {
+                access: HuggingFaceAccess::AcceptTerms
+            })
+        );
     }
 }

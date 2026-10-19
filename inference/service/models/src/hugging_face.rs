@@ -1,4 +1,4 @@
-/// The explicit `HF_TOKEN` credential and the Hub client that presents it.
+/// The Hugging Face token ACN configured and the Hub client that presents it.
 #[derive(Clone)]
 pub(crate) struct HubCredential {
     pub(crate) client: hf_hub::HFClient,

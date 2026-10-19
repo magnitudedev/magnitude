@@ -114,6 +114,7 @@ magnitude-service-contracts = { path = "service/contracts" }
 magnitude-service-utils = { path = "service/utils" }
 magnitude-service-models = { path = "service/models" }
 anyhow = "1.0.100"
+async-trait = "0.1.92"
 axum = "0.8.9"
 base64 = "0.22.1"
 bytes = "1.12.1"
@@ -128,6 +129,7 @@ libc = "0.2.180"
 notify = "8.2.0"
 opentelemetry = { version = "0.32.0", features = ["logs", "trace"] }
 opentelemetry-appender-tracing = "0.32.0"
+opentelemetry-http = { version = "0.32.0", default-features = false, features = ["reqwest-blocking"] }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-json", "logs", "reqwest-blocking-client", "trace"] }
 opentelemetry_sdk = { version = "0.32.0", features = ["logs", "trace"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
