@@ -88,10 +88,11 @@ function AddModelFlow({ request, models, onAdded }: { request: AddDialogRequest;
 
 /**
  * The dialog's middle, between its header and footer. The dialog has one fixed height for every step and
- * state, so whatever loads in here scrolls instead of resizing it.
+ * state, so whatever loads in here scrolls instead of resizing it; its children keep their own height, so a
+ * long list overflows the body rather than being squeezed and clipped inside it.
  */
 export function DialogBody({ children }: { children: ReactNode }) {
-  return <div data-slot="dialog-body" className="-mx-4 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-px">{children}</div>
+  return <div data-slot="dialog-body" className="-mx-4 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-px [&>*]:shrink-0">{children}</div>
 }
 
 /** A step's footer: held at the bottom of the dialog body whether the content above is short or scrolls beneath it. */
