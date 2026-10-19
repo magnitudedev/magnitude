@@ -258,6 +258,7 @@ uint repack_grid_word(uint64_t gp, uint first, uint w) {
         value |= shift >= 0 ? entry << uint(shift) : entry >> uint(-shift);
     }
     return value;
+#endif
 }
 #endif
 
