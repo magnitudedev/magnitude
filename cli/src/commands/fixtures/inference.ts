@@ -354,6 +354,7 @@ export const makeSearchResponse = (overrides: Partial<HuggingFaceSearchResponse>
       architecture: Option.some("qwen35moe"),
       unsupported: Option.none(),
       gated: false,
+      versionCount: Option.none(),
     },
     {
       repository: HuggingFaceRepositoryIdSchema.make("huihui-ai/Qwen-Test-abliterated-GGUF"),
@@ -364,6 +365,7 @@ export const makeSearchResponse = (overrides: Partial<HuggingFaceSearchResponse>
       architecture: Option.some("qwen35moe"),
       unsupported: Option.none(),
       gated: false,
+      versionCount: Option.none(),
     },
   ],
   ...overrides,
@@ -378,6 +380,7 @@ export const makeUnsupportedSearchResult = (): HuggingFaceSearchResponse["result
   architecture: Option.some("deepseek4"),
   unsupported: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]),
   gated: false,
+  versionCount: Option.none(),
 })
 
 const version = (
