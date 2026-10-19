@@ -236,7 +236,7 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
     // Ensure: a worker loads exactly the previewed device.
     let started = Instant::now();
     let ready = main.instances.ensure_resident(&first).await?;
-    let ModelInstanceLifecycle::Ready { allocation } = &ready.lifecycle else {
+    let ModelInstanceLifecycle::Ready { allocation, .. } = &ready.lifecycle else {
         panic!("ensure returned {:?}", ready.lifecycle)
     };
     println!(

@@ -89,6 +89,16 @@ export const AcnHardwareSummarySchema = Schema.Struct({
 })
 export type AcnHardwareSummary = typeof AcnHardwareSummarySchema.Type
 
+/** Worker-confirmed execution device for a currently resident local model. */
+export const ActiveModelDeviceSchema = Schema.Struct({
+  instanceId: NonEmptyString,
+  modelId: NonEmptyString,
+  deviceId: NonEmptyString,
+  deviceName: Schema.optional(NonEmptyString),
+  backend: Schema.Literal("cpu", "metal", "cuda", "vulkan"),
+})
+export type ActiveModelDevice = typeof ActiveModelDeviceSchema.Type
+
 export class AcnReady extends Schema.TaggedClass<AcnReady>()("Ready", {
   hardware: Schema.optionalWith(AcnHardwareSummarySchema, { as: "Option", exact: true }),
 }) {}
@@ -136,5 +146,7 @@ export type AcnHealthResponse = typeof AcnHealthResponseSchema.Type;
 export const MagnitudeHealthResponseSchema = Schema.Struct({
   ...AcnHealthResponseSchema.fields,
   rpcVersion: PositiveSafeInteger,
+  /** Live model placement; absent while the service is starting or on older workers. */
+  activeModelDevices: Schema.optional(Schema.Array(ActiveModelDeviceSchema)),
 });
 export type MagnitudeHealthResponse = typeof MagnitudeHealthResponseSchema.Type;

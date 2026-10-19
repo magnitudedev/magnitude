@@ -724,11 +724,18 @@ impl EngineResidency {
             context_window_tokens,
             &ready.ready_info().census,
         );
+        // Preserve the worker's confirmed device/backend, not merely the startup default or
+        // the device that happened to be first in host topology discovery.
+        let device = ModelLoadDevice {
+            id: HardwareDeviceId::new(ready.ready_info().device.to_string()),
+            backend: crate::hardware::execution_backend(ready.ready_info().backend),
+        };
         let (host, client, _) = ready.into_parts();
         tracing::info!(device = %preview.device, "model ready");
         Ok(PreparedResidency {
             package_ids: resolved.package_ids.clone(),
             allocation,
+            device,
             worker,
             resident: ResidentEngine {
                 host,

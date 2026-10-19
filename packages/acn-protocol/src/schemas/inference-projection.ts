@@ -83,6 +83,13 @@ const usable = ({ device }: SnapshotDevice): boolean => Option.isNone(device.una
 const startupBackendName = (backend: StartupBackend): AcnHardwareSummary["backend"] =>
   backend._tag === "Cpu" ? "cpu" : backend._tag === "Metal" ? "metal" : backend._tag === "Cuda" ? "cuda" : "vulkan"
 
+const normalizedLabel = (value: string): string => value.trim().toLocaleLowerCase("en-US")
+const matchesHardwareLabel = (entry: SnapshotDevice, hardwareLabel: string): boolean => {
+  const label = normalizedLabel(hardwareLabel)
+  return label.length > 0 && [entry.device.name, entry.device.description]
+    .some(value => normalizedLabel(value) === label)
+}
+
 /** The machine as one record: the backend the engine runs on, the GPU it runs on if any, and why a present GPU is not used. */
 export const summarizeInferenceHardware = (
   loaded: Option.Option<StartupBackend>,
@@ -96,7 +103,15 @@ export const summarizeInferenceHardware = (
     onSome: startupBackendName,
     onNone: () => largestFirst.find(usable)?.device.backend ?? "cpu",
   })
-  const used = backend === "cpu" ? undefined : largestFirst.find(entry => entry.device.backend === backend && usable(entry))
+  const backendDevices = backend === "cpu"
+    ? []
+    : largestFirst.filter(entry => entry.device.backend === backend && usable(entry))
+  const loadedHardwareLabel = Option.getOrNull(Option.map(loaded, value => value.hardwareLabel))
+  // A backend can expose several physical devices. Prefer the exact device label reported by
+  // startup over a larger device on the same backend; use capacity only as a safe fallback.
+  const used = loadedHardwareLabel
+    ? backendDevices.find(entry => matchesHardwareLabel(entry, loadedHardwareLabel)) ?? backendDevices[0]
+    : backendDevices[0]
   const diagnostics = Option.getOrElse(hardware.backend_diagnostics, () => [])
   const unusedReason = (entry: SnapshotDevice): string => Option.getOrElse(entry.device.unavailable_reason, () => {
     const diagnostic = diagnostics.find(item => item.backend === entry.device.backend)
