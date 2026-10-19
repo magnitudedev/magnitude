@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures_util::{future::BoxFuture, stream::BoxStream};
 use magnitude_service_contracts::bootstrap_protocol::{
@@ -17,7 +17,8 @@ use magnitude_service_contracts::bootstrap_protocol::{
     IcnStartupRecordType,
 };
 use magnitude_service_contracts::models::{
-    CandidateInspection, CandidateInspectionRequest, CatalogComponent,
+    CandidateInspection, CandidateInspectionEvent, CandidateInspectionProgress,
+    CandidateInspectionProgressSink, CandidateInspectionRequest, CatalogComponent,
     CatalogInstallationAdmission, CatalogInstallationOperation, CatalogInstallationOperationId,
     CatalogInstallationRemoval, CatalogInstallations, CatalogInstallationsResponse, CatalogModel,
     CatalogModelState, CatalogModels, CatalogModelsResponse, CustomModel, CustomModelOrigin,
@@ -31,7 +32,8 @@ use magnitude_service_contracts::models::{
     StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use magnitude_service_contracts::{
-    ExecutionBackend, HardwareProvider, HardwareSnapshot, HuggingFaceModelCatalog,
+    ExecutionBackend, HardwareProvider, HardwareSnapshot, HuggingFaceCredential,
+    HuggingFaceModelCatalog,
     HuggingFaceModelSearchRequest, HuggingFaceModelSearchResults, HuggingFaceRepositoryRequest,
     HuggingFaceRepositorySnapshot, InventoryError,
 };
@@ -330,6 +332,10 @@ pub fn app(state: AppState, serving: magnitude_serving::Serving) -> Router {
             post(prune_local_drafters),
         )
         .route("/api/v1/candidates/inspect", post(inspect_model_candidate))
+        .route(
+            "/api/v1/candidates/inspect/stream",
+            post(stream_model_candidate_inspection),
+        )
         .route("/api/v1/candidates/drafters", post(drafter_candidates))
         .route("/api/v1/candidates/bundle", post(candidate_bundle))
         .route("/api/v1/model-assessments", get(model_assessments))
@@ -370,6 +376,10 @@ pub fn app(state: AppState, serving: magnitude_serving::Serving) -> Router {
         .route(
             "/api/v1/sources/hugging-face/resolve",
             post(resolve_hugging_face_repository),
+        )
+        .route(
+            "/api/v1/sources/hugging-face/credential",
+            put(configure_hugging_face_credential),
         )
         .route("/v1/models", get(standard_models))
         .route("/openapi.json", get(serve_openapi))
@@ -940,6 +950,37 @@ async fn resolve_hugging_face_repository(
         .map_err(ApiError::from_inventory)
 }
 
+#[utoipa::path(put, path = "/api/v1/sources/hugging-face/credential", operation_id = "configureHuggingFaceCredential", tag = "hugging-face",
+    request_body(content = HuggingFaceCredential, content_type = "application/json"),
+    responses(
+        (status = 204, description = "Later Hub requests present this token, or none when it is absent. The token is write-only: no response returns it"),
+        (status = 400, description = "Empty token", body = ErrorResponse),
+        (status = 500, description = "The credential could not be applied", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.hugging_face.configure_credential", skip_all, err(Debug))]
+async fn configure_hugging_face_credential(
+    State(state): State<AppState>,
+    Json(credential): Json<HuggingFaceCredential>,
+) -> Result<StatusCode, ApiError> {
+    let catalog = state
+        .hugging_face_catalog
+        .as_ref()
+        .ok_or_else(|| ApiError::server("Hugging Face discovery is not configured"))?;
+    if credential
+        .token
+        .as_deref()
+        .is_some_and(|token| token.trim().is_empty())
+    {
+        return Err(ApiError::invalid("a Hugging Face token must not be empty"));
+    }
+    catalog
+        .configure_credential(credential)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(ApiError::from_inventory)
+}
+
 #[utoipa::path(get, path = "/api/v1/catalog/models", operation_id = "listCatalogModels", tag = "catalog",
     responses(
         (status = 200, description = "Catalog declarations and current managed local state", body = CatalogModelsResponse),
@@ -1330,6 +1371,139 @@ async fn inspect_model_candidate(
         .map_err(ApiError::from_inventory)
 }
 
+#[utoipa::path(post, path = "/api/v1/candidates/inspect/stream", operation_id = "streamModelCandidateInspection", tag = "candidates",
+    request_body(content = CandidateInspectionRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "The inspection's progress in order, then the inspection; a failure after the first event is an `error` event", body = String, content_type = "text/event-stream"),
+        (status = 400, description = "Invalid candidate", body = ErrorResponse),
+        (status = 404, description = "Repository, revision or file not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
+        (status = 500, description = "Inspection failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.candidates.inspect_stream", skip_all, err(Debug))]
+async fn stream_model_candidate_inspection(
+    State(state): State<AppState>,
+    Json(request): Json<CandidateInspectionRequest>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let candidates = Arc::clone(model_candidates_domain(&state)?);
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let progress = CandidateInspectionProgressSink::new(move |progress| {
+        let _ = sender.send(progress);
+    });
+    let mut inspection: BoxFuture<'static, Result<CandidateInspection, InventoryError>> =
+        Box::pin(async move { candidates.inspect_with_progress(request, progress).await });
+    // A failure before the first progress (a repository or revision that can't be resolved) is
+    // the response's own status, as the request/response inspection reports it.
+    let stage = tokio::select! {
+        biased;
+        Some(progress) = receiver.recv() => InspectionStage::Running { first: Some(progress), receiver, inspection },
+        result = &mut inspection => match receiver.try_recv() {
+            Ok(progress) => InspectionStage::Draining { first: Some(progress), receiver, result },
+            Err(_) => match result {
+                Ok(inspection) => InspectionStage::Draining { first: None, receiver, result: Ok(inspection) },
+                Err(error) => return Err(ApiError::from_inventory(error)),
+            },
+        },
+    };
+    let events = futures_util::stream::unfold(stage, |stage| async move {
+        match stage {
+            InspectionStage::Running {
+                first: Some(progress),
+                receiver,
+                inspection,
+            } => Some((
+                progress_event(progress),
+                InspectionStage::Running {
+                    first: None,
+                    receiver,
+                    inspection,
+                },
+            )),
+            InspectionStage::Running {
+                first: None,
+                mut receiver,
+                mut inspection,
+            } => tokio::select! {
+                biased;
+                Some(progress) = receiver.recv() => Some((
+                    progress_event(progress),
+                    InspectionStage::Running { first: None, receiver, inspection },
+                )),
+                result = &mut inspection => {
+                    // Progress reported in the same poll that finished the inspection comes first.
+                    let first = receiver.try_recv().ok();
+                    match first {
+                        Some(progress) => Some((
+                            progress_event(progress),
+                            InspectionStage::Draining { first: None, receiver, result },
+                        )),
+                        None => Some((inspection_outcome_event(result), InspectionStage::Done)),
+                    }
+                },
+            },
+            InspectionStage::Draining {
+                first,
+                mut receiver,
+                result,
+            } => match first.or_else(|| receiver.try_recv().ok()) {
+                Some(progress) => Some((
+                    progress_event(progress),
+                    InspectionStage::Draining {
+                        first: None,
+                        receiver,
+                        result,
+                    },
+                )),
+                None => Some((inspection_outcome_event(result), InspectionStage::Done)),
+            },
+            InspectionStage::Done => None,
+        }
+    });
+    Ok(Sse::new(events).keep_alive(KeepAlive::default()))
+}
+
+/// The stream's progress through an inspection: running, then any progress still buffered once
+/// it finished, then its outcome.
+enum InspectionStage {
+    Running {
+        first: Option<CandidateInspectionProgress>,
+        receiver: tokio::sync::mpsc::UnboundedReceiver<CandidateInspectionProgress>,
+        inspection: BoxFuture<'static, Result<CandidateInspection, InventoryError>>,
+    },
+    Draining {
+        first: Option<CandidateInspectionProgress>,
+        receiver: tokio::sync::mpsc::UnboundedReceiver<CandidateInspectionProgress>,
+        result: Result<CandidateInspection, InventoryError>,
+    },
+    Done,
+}
+
+fn progress_event(progress: CandidateInspectionProgress) -> Result<Event, Infallible> {
+    Ok(Event::default().data(
+        serde_json::to_string(&CandidateInspectionEvent::Progress { progress })
+            .expect("inspection progress is serializable"),
+    ))
+}
+
+/// The inspection, or its failure as an `error` event carrying the error the request/response
+/// inspection would have returned.
+fn inspection_outcome_event(
+    result: Result<CandidateInspection, InventoryError>,
+) -> Result<Event, Infallible> {
+    Ok(match result {
+        Ok(inspection) => Event::default().data(
+            serde_json::to_string(&CandidateInspectionEvent::Inspected { inspection })
+                .expect("inspection is serializable"),
+        ),
+        Err(error) => Event::default().event("error").data(
+            serde_json::to_string(&ApiError::from_inventory(error).body)
+                .expect("error response is serializable"),
+        ),
+    })
+}
+
 #[utoipa::path(post, path = "/api/v1/candidates/drafters", operation_id = "listDrafterCandidates", tag = "candidates",
     request_body(content = DrafterCandidatesRequest, content_type = "application/json"),
     responses(
@@ -1706,6 +1880,7 @@ fn open_ai_model(
         remove_local_model_files,
         prune_local_drafters,
         inspect_model_candidate,
+        stream_model_candidate_inspection,
         drafter_candidates,
         candidate_bundle,
         model_assessments,
@@ -1717,6 +1892,7 @@ fn open_ai_model(
         standard_models,
         search_hugging_face_models,
         resolve_hugging_face_repository,
+        configure_hugging_face_credential,
         preview_model_load,
         ensure_model_instance,
         model_instances,
@@ -1763,6 +1939,7 @@ fn open_ai_model(
         HuggingFaceModelSearchResults,
         HuggingFaceRepositoryRequest,
         HuggingFaceRepositorySnapshot,
+        HuggingFaceCredential,
         ModelLoadPlan,
         ModelInstancesSnapshot,
         ModelInstancesInvalidation,
@@ -1928,6 +2105,29 @@ impl StreamContract for ResponsesStream {
     }
 }
 
+struct CandidateInspectionStream;
+
+impl StreamContract for CandidateInspectionStream {
+    type Event = CandidateInspectionEvent;
+    const RESPONSE_STATUS: u16 = 200;
+
+    fn metadata() -> StreamMetadata {
+        StreamMetadata {
+            version: 1,
+            response_status: Self::RESPONSE_STATUS,
+            framing: StreamFraming::Sse,
+            data: StreamData {
+                encoding: "json",
+                schema: StreamSchemaRef {
+                    reference: format!("#/components/schemas/{}", Self::Event::name()),
+                },
+            },
+            termination: StreamTermination::Eof,
+            reconnect: StreamReconnect::None,
+        }
+    }
+}
+
 struct InferenceEventsStream;
 
 impl StreamContract for InferenceEventsStream {
@@ -1986,6 +2186,11 @@ pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
     attach_stream_contract::<InferenceEventsStream>(
         &mut document,
         "watchInferenceEvents",
+        "text/event-stream",
+    )?;
+    attach_stream_contract::<CandidateInspectionStream>(
+        &mut document,
+        "streamModelCandidateInspection",
         "text/event-stream",
     )?;
     Ok(document)
@@ -2223,9 +2428,20 @@ mod tests {
         }
     }
 
-    struct StubHuggingFaceCatalog;
+    #[derive(Default)]
+    struct StubHuggingFaceCatalog {
+        credentials: std::sync::Mutex<Vec<Option<String>>>,
+    }
 
     impl HuggingFaceModelCatalog for StubHuggingFaceCatalog {
+        fn configure_credential(
+            &self,
+            credential: HuggingFaceCredential,
+        ) -> BoxFuture<'_, Result<(), InventoryError>> {
+            self.credentials.lock().unwrap().push(credential.token);
+            Box::pin(async { Ok(()) })
+        }
+
         fn search(
             &self,
             request: HuggingFaceModelSearchRequest,
@@ -2243,6 +2459,7 @@ mod tests {
                         tags: vec!["gguf".to_owned()],
                         architecture: Some("qwen35moe".to_owned()),
                         variant_of: Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()),
+                        version_count: Some(3),
                         unsupported: Vec::new(),
                     }],
                 })
@@ -2348,7 +2565,7 @@ mod tests {
 
     #[tokio::test]
     async fn hugging_face_endpoints_expose_live_search_and_immutable_resolution() {
-        let state = AppState::new().with_hugging_face_catalog(Arc::new(StubHuggingFaceCatalog));
+        let state = AppState::new().with_hugging_face_catalog(Arc::new(StubHuggingFaceCatalog::default()));
         let search = test_app(state.clone())
             .oneshot(
                 Request::post("/api/v1/sources/hugging-face/search")
@@ -2388,6 +2605,60 @@ mod tests {
                 .unwrap();
         assert_eq!(resolve_body["commit"], "b".repeat(40));
         assert_eq!(resolve_body["ggufFiles"][0]["sizeBytes"], 123);
+    }
+
+    #[tokio::test]
+    async fn the_hugging_face_credential_is_write_only_and_absent_means_anonymous() {
+        let catalog = Arc::new(StubHuggingFaceCatalog::default());
+        let state = AppState::new().with_hugging_face_catalog(catalog.clone());
+        for body in [json!({ "token": "hf_secret" }), json!({})] {
+            let response = test_app(state.clone())
+                .oneshot(json_request(
+                    "PUT",
+                    "/api/v1/sources/hugging-face/credential",
+                    body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(bytes.is_empty());
+        }
+        assert_eq!(
+            *catalog.credentials.lock().unwrap(),
+            vec![Some("hf_secret".to_owned()), None]
+        );
+        let document = serde_json::to_string(&openapi().unwrap()).unwrap();
+        assert!(!document.contains("hf_secret"));
+        let value: Value = serde_json::from_str(&document).unwrap();
+        let operation = &value["paths"]["/api/v1/sources/hugging-face/credential"]["put"];
+        assert_eq!(operation["operationId"], "configureHuggingFaceCredential");
+        assert!(operation["responses"]["204"]["content"].is_null());
+        let schema = &value["components"]["schemas"]["HuggingFaceCredential"];
+        assert_eq!(schema["properties"]["token"]["type"], "string");
+        assert!(schema.get("required").is_none_or(|required| required
+            .as_array()
+            .is_some_and(Vec::is_empty)));
+    }
+
+    #[tokio::test]
+    async fn an_empty_hugging_face_token_is_rejected() {
+        let catalog = Arc::new(StubHuggingFaceCatalog::default());
+        let state = AppState::new().with_hugging_face_catalog(catalog.clone());
+        for token in ["", "   "] {
+            let (status, body) = send(
+                test_app(state.clone()),
+                json_request(
+                    "PUT",
+                    "/api/v1/sources/hugging-face/credential",
+                    json!({ "token": token }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{token:?}");
+            assert_eq!(body["error"]["code"], "invalid_request");
+        }
+        assert!(catalog.credentials.lock().unwrap().is_empty());
     }
 
     struct StubModelInstanceController;
@@ -2842,14 +3113,37 @@ mod tests {
     struct StubModelCandidates;
 
     impl ModelCandidates for StubModelCandidates {
-        fn inspect(
+        fn inspect_with_progress(
             &self,
             request: CandidateInspectionRequest,
+            progress: CandidateInspectionProgressSink,
         ) -> BoxFuture<'_, Result<CandidateInspection, InventoryError>> {
             Box::pin(async move {
-                let CandidateInspectionRequest::HuggingFace { .. } = request else {
+                let CandidateInspectionRequest::HuggingFace { revision, .. } = request else {
                     return Err(InventoryError::NotFound("local candidate".to_owned()));
                 };
+                let row = |assessment| magnitude_service_contracts::models::CandidateVersionProgress {
+                    label: "Q4_K_M".to_owned(),
+                    size_bytes: 100,
+                    assessment,
+                };
+                progress.report(CandidateInspectionProgress {
+                    phase: magnitude_service_contracts::models::CandidateInspectionPhase::ReadingHeaders {
+                        completed: 1,
+                        total: 1,
+                    },
+                    versions: vec![row(None)],
+                });
+                if revision == "fails-late" {
+                    return Err(InventoryError::Internal("header reads failed".to_owned()));
+                }
+                progress.report(CandidateInspectionProgress {
+                    phase: magnitude_service_contracts::models::CandidateInspectionPhase::CheckingVersions {
+                        completed: 1,
+                        total: 1,
+                    },
+                    versions: vec![row(Some(fits_assessment()))],
+                });
                 Ok(CandidateInspection {
                     source: hugging_face_source(),
                     display_name: "Repo".to_owned(),
@@ -3269,6 +3563,77 @@ mod tests {
         assert_eq!(body["error"]["message"], "local models are not configured");
     }
 
+    async fn inspection_stream(
+        state: AppState,
+        request: serde_json::Value,
+    ) -> (StatusCode, Vec<(Option<String>, serde_json::Value)>) {
+        let response = test_app(state)
+            .oneshot(json_request("POST", "/api/v1/candidates/inspect/stream", request))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        if status != StatusCode::OK {
+            return (status, vec![(None, serde_json::from_str(&text).unwrap())]);
+        }
+        let events = text
+            .split("\n\n")
+            .filter(|frame| frame.contains("data:"))
+            .map(|frame| {
+                let name = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("event:"))
+                    .map(|name| name.trim().to_owned());
+                let data = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data:"))
+                    .unwrap()
+                    .trim();
+                (name, serde_json::from_str(data).unwrap())
+            })
+            .collect();
+        (status, events)
+    }
+
+    #[tokio::test]
+    async fn inspection_stream_reports_progress_in_order_then_the_inspection() {
+        let state = AppState::new().with_model_candidates(Arc::new(StubModelCandidates));
+        let (status, events) = inspection_stream(
+            state.clone(),
+            json!({ "_tag": "HuggingFace", "repository": "owner/repo", "revision": "main" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let tags = events
+            .iter()
+            .map(|(_, event)| event["_tag"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(tags, ["Progress", "Progress", "Inspected"]);
+        assert_eq!(events[0].1["progress"]["phase"]["_tag"], "ReadingHeaders");
+        assert!(events[0].1["progress"]["versions"][0].get("assessment").is_none());
+        assert_eq!(events[1].1["progress"]["phase"]["_tag"], "CheckingVersions");
+        assert_eq!(events[1].1["progress"]["phase"]["completed"], 1);
+        assert_eq!(events[1].1["progress"]["versions"][0]["assessment"]["_tag"], "Fits");
+        assert_eq!(events[2].1["inspection"]["versions"][0]["label"], "Q4_K_M");
+
+        // A failure before any progress is the response's status; one after it, an error event.
+        let (status, events) =
+            inspection_stream(state.clone(), json!({ "_tag": "Local", "path": "/missing.gguf" }))
+                .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(events[0].1["error"]["message"].is_string());
+        let (status, events) = inspection_stream(
+            state,
+            json!({ "_tag": "HuggingFace", "repository": "owner/repo", "revision": "fails-late" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].0.as_deref(), Some("error"));
+        assert_eq!(events[1].1["error"]["type"], "server_error");
+    }
+
     #[tokio::test]
     async fn candidate_routes_inspect_list_drafters_and_assess() {
         let state = AppState::new().with_model_candidates(Arc::new(StubModelCandidates));
@@ -3664,6 +4029,7 @@ mod tests {
             ("/api/v1/local-models/configuration", "put"),
             ("/api/v1/local-models", "get"),
             ("/api/v1/local-models/refresh", "post"),
+            ("/api/v1/sources/hugging-face/credential", "put"),
             ("/api/v1/candidates/inspect", "post"),
             ("/api/v1/candidates/drafters", "post"),
             ("/api/v1/candidates/bundle", "post"),
@@ -3689,6 +4055,8 @@ mod tests {
             "ModelFingerprint",
             "CustomModel",
             "LocalModelsConfiguration",
+            "HuggingFaceCredential",
+            "HuggingFaceAccess",
             "CandidateInspection",
             "DrafterCandidate",
         ] {

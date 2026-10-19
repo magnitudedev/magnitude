@@ -267,6 +267,23 @@ fn single_file_kind(directory: &Directory, prefix: &[u8], architecture: &str) ->
     }
 }
 
+/// How many versions a repository's GGUF paths offer: its complete GGUFs, split shards counted
+/// once, without projectors. Names alone cannot tell a drafter from a model, so this is
+/// approximate. `None` when it offers none.
+pub(crate) fn version_count<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<u32> {
+    let files = paths
+        .into_iter()
+        .filter(|path| !crate::catalog::is_projector_path(path))
+        .map(|path| CandidateGguf {
+            path: path.to_path_buf(),
+            size_bytes: 0,
+        })
+        .collect::<Vec<_>>();
+    u32::try_from(group_ggufs(&files).len())
+        .ok()
+        .filter(|count| *count > 0)
+}
+
 /// What `repository` at `commit` holds for search: cached, else found and read (see the module
 /// documentation). `None` is a failed or slow read (a refused gated file among them), which is
 /// tried again next time.
@@ -398,9 +415,10 @@ async fn read_repository_model(
                     })
                     .collect::<Vec<_>>();
                 let references = references.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let token = models.hub_token();
                 let mut remote = crate::preview::RemoteRanges::new(
                     &models.http,
-                    models.hub_token(),
+                    token.as_deref(),
                     models.client.endpoint(),
                     repository,
                     commit,
@@ -443,14 +461,11 @@ impl ManagedModelStore {
         let url = crate::preview::resolve_url(self.client.endpoint(), repository, commit, path)?;
         let range = format!("bytes=0-{}", SHAPE_PREFIX_BYTES - 1);
         let token = self.hub_token();
-        let mut response = crate::preview::send_hub_request(|| {
-            let request = self.http.get(url.clone()).header(RANGE, &range);
-            match token {
-                Some(token) => request.bearer_auth(token),
-                None => request,
-            }
-        })
-        .await?;
+        let (mut response, _) =
+            crate::preview::send_with_credential_fallback(token.as_deref(), || {
+                self.http.get(url.clone()).header(RANGE, &range)
+            })
+            .await?;
         if !response.status().is_success() {
             return Err(InventoryError::Upstream(format!(
                 "GGUF prefix request returned HTTP {}",
@@ -475,6 +490,22 @@ impl ManagedModelStore {
 mod tests {
     use super::*;
     use crate::test_gguf::fixture_header;
+
+    #[test]
+    fn version_count_groups_shards_and_excludes_projectors() {
+        let paths = [
+            "Model-Q4_K_M.gguf",
+            "Model-Q8_0.gguf",
+            "BF16/Model-BF16-00001-of-00003.gguf",
+            "BF16/Model-BF16-00002-of-00003.gguf",
+            "BF16/Model-BF16-00003-of-00003.gguf",
+            "mmproj-Model-F16.gguf",
+            "Model-mmproj-BF16.gguf",
+        ]
+        .map(Path::new);
+        assert_eq!(version_count(paths), Some(3));
+        assert_eq!(version_count([Path::new("mmproj-F16.gguf")]), None);
+    }
 
     #[test]
     fn a_prefix_ending_inside_the_token_list_has_the_whole_header_s_shape() {

@@ -76,7 +76,9 @@ First-party clients never drain native events or maintain a second inference que
 `WatchFile`, `WatchProjectFiles`, and `StreamDisplayView` carry a resource in their payload. Their
 relationship to client state is ordinary code in the owning client service: watches invalidate the
 queries they keep fresh and are open exactly while those queries are observed; the display view
-subscription is consumed by the display controller.
+subscription is consumed by the display controller. `StreamModelCandidateInspection` carries a
+candidate reference; client-common folds it into a query whose value is the latest progress and then
+the inspection, so an inspection already made shows at once while that query is cached.
 
 ## Guarantees
 

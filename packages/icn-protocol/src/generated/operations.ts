@@ -260,6 +260,32 @@ export const cancelModelDownloadOperation = {
   pathParameters: S.Struct({ download_id: S.String }),
 } as const
 
+export const configureHuggingFaceCredentialOperation = {
+  operationId: "configureHuggingFaceCredential",
+  transport: "http",
+  method: "PUT",
+  path: "/api/v1/sources/hugging-face/credential",
+  group: "hugging-face",
+  successes: [{ status: 204, schema: S.Void }],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend(
+    (): S.Schema<Schemas.HuggingFaceCredential, Schemas.HuggingFaceCredentialEncoded> => Schemas.HuggingFaceCredential,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
 export const configureLocalModelsOperation = {
   operationId: "configureLocalModels",
   transport: "http",
@@ -1521,6 +1547,52 @@ export const stopModelInstanceOperation = {
     },
   ],
   pathParameters: S.Struct({ instance_id: S.String }),
+} as const
+
+export const streamModelCandidateInspectionOperation = {
+  operationId: "streamModelCandidateInspection",
+  transport: "sse",
+  method: "POST",
+  path: "/api/v1/candidates/inspect/stream",
+  group: "candidates",
+  mediaType: "text/event-stream",
+  responseStatus: 200,
+  eventSchema: Schemas.CandidateInspectionEvent,
+  termination: { type: "eof" },
+  reconnect: { type: "none" },
+  payload: S.suspend(
+    (): S.Schema<Schemas.CandidateInspectionRequest, Schemas.CandidateInspectionRequestEncoded> =>
+      Schemas.CandidateInspectionRequest,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 422,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
 } as const
 
 export const watchInferenceEventsOperation = {

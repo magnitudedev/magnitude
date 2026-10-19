@@ -11,7 +11,8 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use magnitude_artifacts::gguf::Encoding;
 use magnitude_service_contracts::models::{
-    CandidateDrafter, CandidateFile, CandidateInspectionRequest, CandidateSource,
+    CandidateDrafter, CandidateFile, CandidateInspectionPhase, CandidateInspectionProgress,
+    CandidateInspectionProgressSink, CandidateInspectionRequest, CandidateSource,
     CatalogInstallationAdmission, CatalogInstallationRemoval, CatalogModels, CatalogModelsResponse,
     CatalogSupport, CustomModel, CustomModelOrigin, CustomModelState, DrafterCandidatesRequest,
     DrafterCategory, DrafterLineage, DrafterReference, DrafterVerdict, HuggingFaceRepositoryId,
@@ -1343,6 +1344,108 @@ async fn inspection_groups_versions_and_reports_each_engine_verdict() {
         version(&inspection, "llama-Q4_K_M.gguf").model_id.as_str(),
         format!("hf:{COMMUNITY}/llama-Q4_K_M.gguf")
     );
+}
+
+/// An inspection reports, in order: every header read, counted from none to all; each version
+/// check with the rows it returns; then the recommended version's drafter checks. Each version's
+/// verdict appears as soon as it is checked, and the rows end as the inspection's versions.
+#[tokio::test(flavor = "multi_thread")]
+async fn inspection_reports_its_progress_in_order_with_counts_and_each_verdict() {
+    let fixture = fixture(Vec::new()).await;
+    let reported = Arc::new(std::sync::Mutex::new(Vec::<CandidateInspectionProgress>::new()));
+    let sink = {
+        let reported = Arc::clone(&reported);
+        CandidateInspectionProgressSink::new(move |progress| {
+            reported.lock().unwrap().push(progress);
+        })
+    };
+    let inspection = fixture
+        .candidates
+        .inspect_with_progress(
+            CandidateInspectionRequest::HuggingFace {
+                repository: HuggingFaceRepositoryId::new(COMMUNITY.to_owned()).unwrap(),
+                revision: "main".to_owned(),
+            },
+            sink,
+        )
+        .await
+        .expect("inspection");
+    let reported = reported.lock().unwrap().clone();
+    let phase_rank = |progress: &CandidateInspectionProgress| match progress.phase {
+        CandidateInspectionPhase::ReadingHeaders { .. } => 0,
+        CandidateInspectionPhase::CheckingVersions { .. } => 1,
+        CandidateInspectionPhase::CheckingDrafters { .. } => 2,
+    };
+    assert!(
+        reported.windows(2).all(|pair| phase_rank(&pair[0]) <= phase_rank(&pair[1])),
+        "phases never go back: {reported:#?}"
+    );
+
+    let headers = reported
+        .iter()
+        .filter_map(|progress| match progress.phase {
+            CandidateInspectionPhase::ReadingHeaders { completed, total } => Some((completed, total)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let total = headers[0].1;
+    assert!(total >= 4, "every GGUF of the repository has a header: {headers:?}");
+    assert_eq!(
+        headers,
+        (0..=total).map(|completed| (completed, total)).collect::<Vec<_>>(),
+        "each header read counts once"
+    );
+    assert!(
+        reported[0].versions.iter().all(|row| row.assessment.is_none()),
+        "files are named before any is checked"
+    );
+
+    let versions = reported
+        .iter()
+        .filter(|progress| matches!(progress.phase, CandidateInspectionPhase::CheckingVersions { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(versions.len(), inspection.versions.len() + 1);
+    for (step, progress) in versions.iter().enumerate() {
+        assert_eq!(
+            progress.phase,
+            CandidateInspectionPhase::CheckingVersions {
+                completed: u32::try_from(step).unwrap(),
+                total: u32::try_from(inspection.versions.len()).unwrap(),
+            }
+        );
+        assert_eq!(
+            progress.versions.iter().filter(|row| row.assessment.is_some()).count(),
+            step,
+            "one more verdict with each check"
+        );
+        assert_eq!(
+            progress
+                .versions
+                .iter()
+                .map(|row| (row.label.as_str(), row.size_bytes))
+                .collect::<Vec<_>>(),
+            inspection
+                .versions
+                .iter()
+                .map(|version| (version.label.as_str(), version.size_bytes))
+                .collect::<Vec<_>>(),
+            "the rows are the versions the inspection returns"
+        );
+    }
+
+    let drafters = reported
+        .iter()
+        .filter_map(|progress| match &progress.phase {
+            CandidateInspectionPhase::CheckingDrafters { version, completed, total } => {
+                Some((version.as_str(), *completed, *total))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(drafters.iter().all(|(version, completed, total)| *version == "Q4_K_M" && completed <= total));
+    let (_, completed, total) = drafters.last().copied().expect("drafter checks are reported");
+    assert!(total >= 1);
+    assert_eq!(completed, total, "every planned drafter check finishes");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2707,7 +2810,10 @@ async fn a_flat_llama_cpp_root_offers_only_the_models_own_repository_drafters() 
         lineage: Default::default(),
         catalog: None,
     };
-    let offered = fixture.candidates.next_to_model(&target, None).await;
+    let offered = fixture
+        .candidates
+        .next_to_model(&target, None, &crate::assessment::inspection_progress::InspectionProgress::silent())
+        .await;
     assert_eq!(
         offered
             .iter()

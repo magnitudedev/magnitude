@@ -6,6 +6,9 @@ applies_to:
   - inference/service/server/src/main.rs
   - inference/service/contracts/src/inventory.rs
   - inference/service/contracts/src/models.rs
+  - inference/service/server/src/assessment/candidates.rs
+  - inference/service/server/src/assessment/inspection_progress.rs
+  - packages/icn/src/candidates/**
   - packages/icn/src/models/**
   - packages/icn/src/events/**
   - packages/acn/src/local-model*
@@ -131,6 +134,23 @@ also returns the exact servable bundle to download, with the same package identi
 scan computes; clients never construct bundles. These queries do not change the release catalog,
 managed inventory, or configuration, and catalog use does not depend on them.
 
+Inspection reports its progress as it goes, through the same work: reading headers (every GGUF of
+the repository counted, those already cached counted at once, rows named by their files until
+headers decide which are versions), then checking versions (the rows become exactly the versions
+the inspection returns, each with its plain verdict as soon as its own check finishes, whatever the
+order the checks were started in), then checking drafters for the recommended version (the target's
+own built-in heads, each drafter next to it and each catalog drafter, counted as each is about to
+run, so the drafter total counts the checks known so far and can grow). Counts never pass their
+totals and phases never go back. ICN serves this as `POST /api/v1/candidates/inspect/stream`, an
+SSE stream of progress events in order and then the inspection, which is exactly what the
+request/response inspection returns. A failure before the first progress event (a repository or
+revision that can't be resolved) is the response's own status; one after it is an `error` event
+carrying the same error body, which ACN classifies by its code and type as it does the status.
+Local candidates report version and drafter checks, not header reads. ACN relays it as the
+`StreamModelCandidateInspection` subscription (progress with each verdict projected, then the
+product inspection), which, like every ACN subscription, stays open after its last update until the
+subscriber leaves; `InspectModelCandidate` stays the request/response form the CLI uses.
+
 Catalog attribution across exact artifact or drafter changes follows
 [Intrinsic catalog target mapping](./intrinsic-target-mapping.md).
 
@@ -239,20 +259,39 @@ inputs, or ranking scores. Authentication, authorization, rate-limit, timeout, a
 failures preserve their original classification. A fallback is accepted only when every required
 path, size, and digest matches.
 
-Acquisition presents only an explicit `HF_TOKEN`; implicit Hugging Face credentials (the token
-file under `HF_HOME`) are never discovered. When the Hub rejects the presented credential itself
-(HTTP 401, as for an expired or revoked token, which Hugging Face rejects even on public
-repositories), the package is resolved and downloaded anonymously instead. A rejected credential
-therefore never makes public packages unavailable; content that still requires authorization fails
-with its anonymous classification. Header reads for inspection that the Hub refuses (401 or 403, a
-gated or private repository) fail with the model operation code `hugging_face_access_required`,
-whose message asks for accepting the repository's terms and setting `HF_TOKEN` (or, with a token,
-for granting that account access); clients present it as such, never as a connection failure.
-Repository metadata the Hub refuses (401 or 404) fails with the model operation code
-`hugging_face_repository_not_found`: the Hub answers an anonymous request for a repository that
-doesn't exist with 401, so the repository may be missing, private or gated. Clients present it as
-a typed not-found error whose message asks to check the name or set `HF_TOKEN`. A gated repository
-shows its metadata, so only its refused files get `hugging_face_access_required`.
+ICN presents only the Hugging Face token ACN pushes to it at runtime through the write-only
+`PUT /api/v1/sources/hugging-face/credential` (`{ "token"?: string }`; absent clears it, an empty
+token is rejected, no endpoint ever returns it). ACN owns sign-in and the credential (see
+`design/acn/hugging-face-sign-in.md`); ICN reads no `HF_TOKEN`, disables implicit Hugging Face
+credentials (environment variables and the token file under `HF_HOME`) at startup, and replaces the
+credential without restarting. The token is the Bearer credential on every Hub request (search,
+listings, metadata, header range reads, downloads) and is sent only to the Hub host: a header read
+continues on a redirected location without it, and the HTTP client drops `Authorization` on
+cross-host redirects. Replacing it clears cached search rows so the next search reads with the new
+access. When the Hub rejects the presented credential itself (HTTP 401, as for an expired or revoked
+token, which Hugging Face rejects even on public repositories), the request is repeated anonymously,
+and a package is resolved and downloaded anonymously instead. A rejected credential therefore never
+makes public packages unavailable; content that still requires authorization fails with its anonymous
+classification. ICN redacts tokens (`hf_…`) and Bearer credentials from every log line and every
+exported OTLP payload.
+
+Files of a gated or private repository the Hub refuses fail with one of two model operation codes,
+which clients present as such, never as a connection failure:
+
+- `hugging_face_sign_in_required` ("Sign in to Hugging Face to use this model."): refused with 401
+  (no token, or one the Hub rejected even after the anonymous retry), or with 403 without a token.
+- `hugging_face_terms_required` ("Accept this model's terms on Hugging Face, then try again. Some
+  models also need the author's approval."): refused with 403 to a presented token; Hugging Face
+  answers `X-Error-Code: GatedRepo` when the signed-in account hasn't accepted the terms or hasn't
+  been granted access.
+
+A download refused the same way fails with `DownloadFailure` `HuggingFaceAccessRequired` whose
+`access` is `SignIn` or `AcceptTerms`, by the same rule. Repository metadata the Hub refuses (401 or
+404) fails with the model operation code `hugging_face_repository_not_found`: the Hub answers an
+anonymous request for a repository that doesn't exist with 401, so the repository may be missing,
+private or gated. Clients present it as a typed not-found error whose message asks to check the name
+or to sign in to Hugging Face. A gated repository shows its metadata, so only its refused files get
+the sign-in or terms codes.
 
 ## Artifact stores and inventory
 
@@ -432,7 +471,7 @@ failure classification, publication, acknowledgement and post-download optimizat
 
 Update for an added model means its repository has a newer commit where its target is still present
 with other content; it never follows a mutable revision implicitly. ICN checks each added declaration
-in the background: it resolves the repository's `main` with the `HF_TOKEN` credential when one is set,
+in the background: it resolves the repository's `main` with the configured Hugging Face credential when there is one,
 compares the target files' LFS content at `main` and at the pinned commit, and reports the newer commit
 on the custom model (`updateCommit`) only when a target file differs and none is missing. A result is
 kept for about six hours; a check that cannot reach the Hub keeps the last result and reports nothing.

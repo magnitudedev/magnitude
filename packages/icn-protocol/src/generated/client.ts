@@ -20,6 +20,11 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         buildCandidateBundle: makeHttpOperation(http, options, Operations.buildCandidateBundleOperation),
         inspectModelCandidate: makeHttpOperation(http, options, Operations.inspectModelCandidateOperation),
         listDrafterCandidates: makeHttpOperation(http, options, Operations.listDrafterCandidatesOperation),
+        streamModelCandidateInspection: makeStreamOperation(
+          http,
+          options,
+          Operations.streamModelCandidateInspectionOperation,
+        ),
       },
       catalog: {
         acknowledgeCatalogInstallationFailure: makeHttpOperation(
@@ -56,6 +61,11 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         startModelDownload: makeHttpOperation(http, options, Operations.startModelDownloadOperation),
       },
       huggingFace: {
+        configureHuggingFaceCredential: makeHttpOperation(
+          http,
+          options,
+          Operations.configureHuggingFaceCredentialOperation,
+        ),
         resolveHuggingFaceRepository: makeHttpOperation(
           http,
           options,

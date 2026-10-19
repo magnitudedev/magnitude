@@ -188,6 +188,61 @@ export const CandidateInspection = S.Struct({
 export type CandidateInspection = S.Schema.Type<typeof CandidateInspection>
 export type CandidateInspectionEncoded = S.Schema.Encoded<typeof CandidateInspection>
 
+export const CandidateInspectionEvent = S.Union(
+  S.extend(
+    S.TaggedStruct("Progress", {
+      progress: S.suspend(
+        (): S.Schema<CandidateInspectionProgress, CandidateInspectionProgressEncoded> => CandidateInspectionProgress,
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Inspected", {
+      inspection: S.suspend((): S.Schema<CandidateInspection, CandidateInspectionEncoded> => CandidateInspection),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type CandidateInspectionEvent = S.Schema.Type<typeof CandidateInspectionEvent>
+export type CandidateInspectionEventEncoded = S.Schema.Encoded<typeof CandidateInspectionEvent>
+
+export const CandidateInspectionPhase = S.Union(
+  S.extend(
+    S.TaggedStruct("ReadingHeaders", {
+      completed: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      total: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("CheckingVersions", {
+      completed: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      total: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("CheckingDrafters", {
+      completed: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      total: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      version: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type CandidateInspectionPhase = S.Schema.Type<typeof CandidateInspectionPhase>
+export type CandidateInspectionPhaseEncoded = S.Schema.Encoded<typeof CandidateInspectionPhase>
+
+export const CandidateInspectionProgress = S.Struct({
+  phase: S.suspend((): S.Schema<CandidateInspectionPhase, CandidateInspectionPhaseEncoded> => CandidateInspectionPhase),
+  versions: S.Array(
+    S.suspend((): S.Schema<CandidateVersionProgress, CandidateVersionProgressEncoded> => CandidateVersionProgress),
+  ),
+})
+export type CandidateInspectionProgress = S.Schema.Type<typeof CandidateInspectionProgress>
+export type CandidateInspectionProgressEncoded = S.Schema.Encoded<typeof CandidateInspectionProgress>
+
 export const CandidateInspectionRequest = S.Union(
   S.extend(
     S.TaggedStruct("HuggingFace", {
@@ -250,6 +305,17 @@ export const CandidateVersion = S.Struct({
 })
 export type CandidateVersion = S.Schema.Type<typeof CandidateVersion>
 export type CandidateVersionEncoded = S.Schema.Encoded<typeof CandidateVersion>
+
+export const CandidateVersionProgress = S.Struct({
+  assessment: S.optionalWith(
+    S.suspend((): S.Schema<ModelAssessment, ModelAssessmentEncoded> => ModelAssessment),
+    { exact: true, as: "Option" },
+  ),
+  label: S.String,
+  sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type CandidateVersionProgress = S.Schema.Type<typeof CandidateVersionProgress>
+export type CandidateVersionProgressEncoded = S.Schema.Encoded<typeof CandidateVersionProgress>
 
 export const CatalogComponent = S.Union(S.Literal("Projector"), S.Literal("Drafter"))
 export type CatalogComponent = S.Schema.Type<typeof CatalogComponent>
@@ -1095,6 +1161,12 @@ export const DownloadFailure = S.Union(
   S.extend(S.TaggedStruct("LocalStorageFailure", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(S.TaggedStruct("CorruptDownload", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
+    S.TaggedStruct("HuggingFaceAccessRequired", {
+      access: S.suspend((): S.Schema<HuggingFaceAccess, HuggingFaceAccessEncoded> => HuggingFaceAccess),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
     S.TaggedStruct("Internal", {
       message: S.String,
     }),
@@ -1541,6 +1613,16 @@ export const HealthResponse = S.Struct({
 export type HealthResponse = S.Schema.Type<typeof HealthResponse>
 export type HealthResponseEncoded = S.Schema.Encoded<typeof HealthResponse>
 
+export const HuggingFaceAccess = S.Union(S.Literal("SignIn"), S.Literal("AcceptTerms"))
+export type HuggingFaceAccess = S.Schema.Type<typeof HuggingFaceAccess>
+export type HuggingFaceAccessEncoded = S.Schema.Encoded<typeof HuggingFaceAccess>
+
+export const HuggingFaceCredential = S.Struct({
+  token: S.optionalWith(S.String, { exact: true, as: "Option" }),
+})
+export type HuggingFaceCredential = S.Schema.Type<typeof HuggingFaceCredential>
+export type HuggingFaceCredentialEncoded = S.Schema.Encoded<typeof HuggingFaceCredential>
+
 export const HuggingFaceModelSearchRequest = S.Struct({
   limit: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   query: S.String,
@@ -1563,6 +1645,7 @@ export const HuggingFaceModelSearchResult = S.Struct({
     S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
     { exact: true, as: "Option" },
   ),
+  versionCount: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)), { exact: true, as: "Option" }),
 })
 export type HuggingFaceModelSearchResult = S.Schema.Type<typeof HuggingFaceModelSearchResult>
 export type HuggingFaceModelSearchResultEncoded = S.Schema.Encoded<typeof HuggingFaceModelSearchResult>

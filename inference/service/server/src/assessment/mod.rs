@@ -6,6 +6,7 @@ pub mod assessor;
 pub mod candidates;
 pub mod catalog_kernels;
 pub mod environment;
+mod inspection_progress;
 
 use std::sync::{Arc, Mutex, Weak};
 

@@ -410,6 +410,103 @@
         }
       }
     },
+    "/api/v1/candidates/inspect/stream": {
+      "post": {
+        "tags": [
+          "candidates"
+        ],
+        "operationId": "streamModelCandidateInspection",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateInspectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The inspection's progress in order, then the inspection; a failure after the first event is an `error` event",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid candidate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Repository, revision or file not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The operation conflicts with the model's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The repository's metadata or a file's header is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Inspection failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-magnitude-stream": {
+          "version": 1,
+          "responseStatus": 200,
+          "framing": "sse",
+          "data": {
+            "encoding": "json",
+            "schema": {
+              "$ref": "#/components/schemas/CandidateInspectionEvent"
+            }
+          },
+          "termination": {
+            "type": "eof"
+          },
+          "reconnect": {
+            "type": "none"
+          }
+        }
+      }
+    },
     "/api/v1/catalog/installations": {
       "get": {
         "tags": [
@@ -1925,6 +2022,49 @@
         }
       }
     },
+    "/api/v1/sources/hugging-face/credential": {
+      "put": {
+        "tags": [
+          "hugging-face"
+        ],
+        "operationId": "configureHuggingFaceCredential",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HuggingFaceCredential"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Later Hub requests present this token, or none when it is absent. The token is write-only: no response returns it"
+          },
+          "400": {
+            "description": "Empty token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The credential could not be applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sources/hugging-face/resolve": {
       "post": {
         "tags": [
@@ -2806,6 +2946,154 @@
         },
         "additionalProperties": false
       },
+      "CandidateInspectionEvent": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "progress",
+              "_tag"
+            ],
+            "properties": {
+              "progress": {
+                "$ref": "#/components/schemas/CandidateInspectionProgress"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Progress"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "inspection",
+              "_tag"
+            ],
+            "properties": {
+              "inspection": {
+                "$ref": "#/components/schemas/CandidateInspection"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Inspected"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "One event of an inspection's stream: progress, in order, then the inspection itself."
+      },
+      "CandidateInspectionPhase": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "completed",
+              "total",
+              "_tag"
+            ],
+            "properties": {
+              "completed": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "total": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "ReadingHeaders"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "completed",
+              "total",
+              "_tag"
+            ],
+            "properties": {
+              "completed": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "total": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "CheckingVersions"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "version",
+              "completed",
+              "total",
+              "_tag"
+            ],
+            "properties": {
+              "version": {
+                "type": "string"
+              },
+              "completed": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "total": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "CheckingDrafters"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What an inspection is doing, with how much of it is done: reading each file's GGUF header,\nchecking each version against this computer, then checking the drafters of the version it\nrecommends. A drafter total counts the drafter checks known so far, so it can grow."
+      },
+      "CandidateInspectionProgress": {
+        "type": "object",
+        "description": "How far an inspection has got, each version's verdict included as soon as it is known.",
+        "required": [
+          "phase",
+          "versions"
+        ],
+        "properties": {
+          "phase": {
+            "$ref": "#/components/schemas/CandidateInspectionPhase"
+          },
+          "versions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CandidateVersionProgress"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
       "CandidateInspectionRequest": {
         "oneOf": [
           {
@@ -2940,6 +3228,28 @@
           },
           "onThisComputer": {
             "$ref": "#/components/schemas/ModelId"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CandidateVersionProgress": {
+        "type": "object",
+        "description": "A version as an inspection in progress knows it: its label and size, and its plain verdict\nonce checked. While headers are read, the rows are the repository's GGUFs named by their files;\nfrom the version checks on, they are the versions the inspection returns.",
+        "required": [
+          "label",
+          "sizeBytes"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "assessment": {
+            "$ref": "#/components/schemas/ModelAssessment"
           }
         },
         "additionalProperties": false
@@ -4952,6 +5262,24 @@
           {
             "type": "object",
             "required": [
+              "access",
+              "_tag"
+            ],
+            "properties": {
+              "access": {
+                "$ref": "#/components/schemas/HuggingFaceAccess"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "HuggingFaceAccessRequired"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "message",
               "_tag"
             ],
@@ -6059,6 +6387,24 @@
         },
         "additionalProperties": false
       },
+      "HuggingFaceAccess": {
+        "type": "string",
+        "description": "What Hugging Face needs before it serves a refused repository's files: a signed-in account\n(no token, or one it rejected), or that the signed-in account accept the repository's terms.",
+        "enum": [
+          "SignIn",
+          "AcceptTerms"
+        ]
+      },
+      "HuggingFaceCredential": {
+        "type": "object",
+        "description": "The Hugging Face token presented on every later Hub request; without one, Hub requests are\nanonymous. It is write-only: no response carries it.",
+        "properties": {
+          "token": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "HuggingFaceModelSearchRequest": {
         "type": "object",
         "required": [
@@ -6079,7 +6425,7 @@
       },
       "HuggingFaceModelSearchResult": {
         "type": "object",
-        "description": "One repository. `unsupported` is empty for a repository whose architecture the engine runs,\nelse it names that architecture. `variant_of` is the catalog model whose shape fingerprint the\nrepository's GGUF has.",
+        "description": "One repository. `unsupported` is empty for a repository whose architecture the engine runs,\nelse it names that architecture. `variant_of` is the catalog model whose shape fingerprint the\nrepository's GGUF has. `version_count` is how many GGUFs the repository's file list offers\n(split shards counted once, projectors excluded), approximate since drafters are not told apart.",
         "required": [
           "repository",
           "commit",
@@ -6125,6 +6471,11 @@
           },
           "variantOf": {
             "$ref": "#/components/schemas/ModelId"
+          },
+          "versionCount": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
           },
           "unsupported": {
             "type": "array",

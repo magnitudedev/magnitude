@@ -651,7 +651,8 @@ pub struct HuggingFaceModelSearchRequest {
 
 /// One repository. `unsupported` is empty for a repository whose architecture the engine runs,
 /// else it names that architecture. `variant_of` is the catalog model whose shape fingerprint the
-/// repository's GGUF has.
+/// repository's GGUF has. `version_count` is how many GGUFs the repository's file list offers
+/// (split shards counted once, projectors excluded), approximate since drafters are not told apart.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -676,6 +677,9 @@ pub struct HuggingFaceModelSearchResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub variant_of: Option<crate::models::ModelId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, minimum = 1))]
+    pub version_count: Option<u32>,
     pub unsupported: Vec<crate::models::UnsupportedReason>,
 }
 
@@ -686,6 +690,26 @@ pub struct HuggingFaceModelSearchResult {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HuggingFaceModelSearchResults {
     pub results: Vec<HuggingFaceModelSearchResult>,
+}
+
+/// The Hugging Face token presented on every later Hub request; without one, Hub requests are
+/// anonymous. It is write-only: no response carries it.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HuggingFaceCredential {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for HuggingFaceCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HuggingFaceCredential")
+            .field("token", &self.token.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -842,9 +866,22 @@ pub enum DownloadFailure {
     LocalStorageFailure,
     CorruptDownload,
     #[serde(rename_all = "camelCase")]
+    HuggingFaceAccessRequired {
+        access: HuggingFaceAccess,
+    },
+    #[serde(rename_all = "camelCase")]
     Internal {
         message: String,
     },
+}
+
+/// What Hugging Face needs before it serves a refused repository's files: a signed-in account
+/// (no token, or one it rejected), or that the signed-in account accept the repository's terms.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HuggingFaceAccess {
+    SignIn,
+    AcceptTerms,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -901,6 +938,12 @@ pub trait HuggingFaceModelCatalog: Send + Sync + 'static {
         &self,
         request: HuggingFaceRepositoryRequest,
     ) -> BoxFuture<'_, Result<HuggingFaceRepositorySnapshot, InventoryError>>;
+
+    /// Replaces the token presented on every later Hub request. An empty token is invalid.
+    fn configure_credential(
+        &self,
+        credential: HuggingFaceCredential,
+    ) -> BoxFuture<'_, Result<(), InventoryError>>;
 }
 
 #[derive(Debug, thiserror::Error)]

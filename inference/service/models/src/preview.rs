@@ -11,7 +11,8 @@ use magnitude_service_contracts::models::{
     KnownUnsupportedReason, ModelFingerprint, ModelId, ModelPackage, UnsupportedReason,
 };
 use magnitude_service_contracts::{
-    ComponentRelationship, ComponentRole, ContentIdentity, HuggingFaceModelCatalog,
+    ComponentRelationship, ComponentRole, ContentIdentity, HuggingFaceCredential,
+    HuggingFaceModelCatalog,
     HuggingFaceModelSearchRequest, HuggingFaceModelSearchResult, HuggingFaceModelSearchResults,
     HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
     Integrity, InventoryEntryId, InventoryError, ModelComponent, ModelLocation, ModelPreviewSource,
@@ -99,7 +100,8 @@ impl HuggingFaceDiscovery {
         ] {
             url.query_pairs_mut().append_pair("expand", field);
         }
-        let response = send_hub_get(&self.models.http, self.models.hub_token(), url.clone()).await?;
+        let token = self.models.hub_token();
+        let response = send_hub_get(&self.models.http, token.as_deref(), url.clone()).await?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(hub_rate_limited(hub_pause(&url).unwrap_or(DEFAULT_RATE_LIMIT_PAUSE)));
         }
@@ -301,6 +303,18 @@ impl HuggingFaceModelCatalog for HuggingFaceDiscovery {
     ) -> BoxFuture<'_, Result<HuggingFaceRepositorySnapshot, InventoryError>> {
         Box::pin(refresh_hugging_face_repository(&self.models, request))
     }
+
+    fn configure_credential(
+        &self,
+        credential: HuggingFaceCredential,
+    ) -> BoxFuture<'_, Result<(), InventoryError>> {
+        Box::pin(async move {
+            self.models.configure_hub_credential(credential.token)?;
+            // Search rows hold what this credential could read; the next search reads again.
+            self.searches.lock().await.clear();
+            Ok(())
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -444,6 +458,14 @@ impl HubSearchModel {
             .and_then(|gguf| gguf.get("architecture"))
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
+        let version_count = self.siblings.as_ref().and_then(|siblings| {
+            crate::search_shape::version_count(
+                siblings
+                    .iter()
+                    .map(|sibling| Path::new(&sibling.rfilename))
+                    .filter(|path| valid_gguf_path(path)),
+            )
+        });
         Some(HuggingFaceModelSearchResult {
             repository: self.id,
             commit: immutable_commit(self.sha?)?,
@@ -455,6 +477,7 @@ impl HubSearchModel {
             tags: self.tags,
             architecture,
             variant_of: None,
+            version_count,
             unsupported: Vec::new(),
         })
     }
@@ -575,7 +598,7 @@ async fn refresh_hub_repository_snapshot(
 ) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
     let fetched = fetch_hub_model(
         http,
-        models.hub_token(),
+        models.hub_token().as_deref(),
         endpoint,
         &request.repository,
         request.revision.as_str(),
@@ -618,15 +641,12 @@ async fn fetch_hub_model(
 ) -> Result<HubModelFetch, InventoryError> {
     let url =
         revision_metadata_url(endpoint, repository, revision).map_err(InventoryError::Internal)?;
-    let response = send_hub_request(|| {
-        let mut request = http.get(url.clone()).query(&[("blobs", "true")]);
-        if let Some(token) = &token {
-            request = request.bearer_auth(token);
+    let (response, _) = send_with_credential_fallback(token, || {
+        let request = http.get(url.clone()).query(&[("blobs", "true")]);
+        match etag {
+            Some(etag) => request.header(IF_NONE_MATCH, etag),
+            None => request,
         }
-        if let Some(etag) = etag {
-            request = request.header(IF_NONE_MATCH, etag);
-        }
-        request
     })
     .await?;
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
@@ -702,7 +722,7 @@ pub(crate) fn hub_rate_limited(left: Duration) -> InventoryError {
     InventoryError::ModelOperation {
         code: "hugging_face_rate_limited".to_owned(),
         message: format!(
-            "Hugging Face is limiting requests from this computer. Try again in {} seconds, or set HF_TOKEN for a higher limit.",
+            "Hugging Face is limiting requests from this computer. Try again in {} seconds, or sign in to Hugging Face for a higher limit.",
             left.as_secs().max(1)
         ),
         retryable: true,
@@ -871,7 +891,7 @@ impl ManagedModelStore {
     ) -> Result<CachedArtifact, InventoryError> {
         let metadata = fetch_hub_model(
             &self.http,
-            self.hub_token(),
+            self.hub_token().as_deref(),
             self.client.endpoint(),
             &source.repository,
             &source.revision,
@@ -914,7 +934,7 @@ impl ManagedModelStore {
             };
             let header = fetch_header(
                 &self.http,
-                self.hub_token(),
+                self.hub_token().as_deref(),
                 self.client.endpoint(),
                 &source.repository,
                 &commit,
@@ -1569,19 +1589,15 @@ impl<'a> RemoteRanges<'a> {
             .token
             .filter(|_| self.url.host_str() == self.hub_host.as_deref());
         let url = self.url.clone();
-        let mut response = send_hub_request(|| {
-            let mut request = self.http.get(url.clone()).header(RANGE, &range);
-            if let Some(token) = &token {
-                request = request.bearer_auth(token);
-            }
-            request
+        let (mut response, credentialed) = send_with_credential_fallback(token, || {
+            self.http.get(url.clone()).header(RANGE, &range)
         })
         .await?;
-        if matches!(
-            response.status(),
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) {
-            return Err(hub_access_required(token.is_some()));
+        match response.status() {
+            reqwest::StatusCode::UNAUTHORIZED => return Err(hub_sign_in_required()),
+            reqwest::StatusCode::FORBIDDEN if credentialed => return Err(hub_terms_required()),
+            reqwest::StatusCode::FORBIDDEN => return Err(hub_sign_in_required()),
+            _ => {}
         }
         if !response.status().is_success() {
             return Err(InventoryError::Upstream(format!(
@@ -1737,17 +1753,23 @@ fn valid_content_range(
         && total.parse::<u64>().ok() == Some(logical_size)
 }
 
-/// A gated or private repository's files refused to this request: without `HF_TOKEN`, or with a
-/// token whose account hasn't been granted access.
-pub(crate) fn hub_access_required(with_token: bool) -> InventoryError {
+/// A gated or private repository's files refused with 401: no token was presented, or the Hub
+/// rejected it even after the anonymous retry. A 403 without a token means the same.
+pub(crate) fn hub_sign_in_required() -> InventoryError {
     InventoryError::ModelOperation {
-        code: "hugging_face_access_required".to_owned(),
-        message: if with_token {
-            "This repository requires accepting its terms on Hugging Face, and the account of your HF_TOKEN doesn't have access yet. Accept its terms on the repository's page with that account, then try again."
-        } else {
-            "This repository requires accepting its terms on Hugging Face and an access token. Set HF_TOKEN to a token from an account that has accepted them, then try again."
-        }
-        .to_owned(),
+        code: "hugging_face_sign_in_required".to_owned(),
+        message: "Sign in to Hugging Face to use this model.".to_owned(),
+        retryable: false,
+    }
+}
+
+/// A gated repository's files refused with 403 to a presented token: the account is signed in
+/// but hasn't accepted the repository's terms or hasn't been granted access (the Hub answers
+/// `X-Error-Code: GatedRepo`).
+pub(crate) fn hub_terms_required() -> InventoryError {
+    InventoryError::ModelOperation {
+        code: "hugging_face_terms_required".to_owned(),
+        message: "Accept this model's terms on Hugging Face, then try again. Some models also need the author's approval.".to_owned(),
         retryable: false,
     }
 }
@@ -1755,35 +1777,42 @@ pub(crate) fn hub_access_required(with_token: bool) -> InventoryError {
 /// A repository whose metadata the Hub refuses: it doesn't exist, or it's private or gated and this
 /// request has no access. The Hub answers an anonymous request for a missing repository with 401,
 /// so neither status tells them apart. A gated repository shows its metadata, and its refused files
-/// get [`hub_access_required`].
+/// get [`hub_sign_in_required`] or [`hub_terms_required`].
 pub(crate) fn hub_repository_not_found() -> InventoryError {
     InventoryError::ModelOperation {
         code: "hugging_face_repository_not_found".to_owned(),
-        message: "Repository not found, or it's private or gated. Check the name, or set HF_TOKEN if you have access.".to_owned(),
+        message: "Repository not found, or it's private or gated. Check the name, or sign in to Hugging Face if you have access.".to_owned(),
         retryable: false,
     }
 }
 
-/// A Hub metadata GET with the explicit `HF_TOKEN` when present, retried on rate limits and server
-/// failures. A rejected credential (401) falls back to an anonymous request, so an expired token
-/// never hides public repositories.
+/// One Hub request with the configured token as its Bearer credential when there is one, through
+/// [`send_hub_request`]. Hugging Face rejects an expired or revoked token outright (401), even for
+/// public repositories, so a rejected credential falls back to an anonymous request. Also returns
+/// whether the final response answered a request that presented the token.
+pub(crate) async fn send_with_credential_fallback(
+    token: Option<&str>,
+    request: impl Fn() -> reqwest::RequestBuilder,
+) -> Result<(reqwest::Response, bool), InventoryError> {
+    if let Some(token) = token {
+        let response = send_hub_request(|| request().bearer_auth(token)).await?;
+        if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok((response, true));
+        }
+        tracing::debug!("Hugging Face rejected the configured token; retrying anonymously");
+    }
+    Ok((send_hub_request(&request).await?, false))
+}
+
+/// A Hub metadata GET through [`send_with_credential_fallback`].
 pub(crate) async fn send_hub_get(
     http: &reqwest::Client,
     token: Option<&str>,
     url: reqwest::Url,
 ) -> Result<reqwest::Response, InventoryError> {
-    let response = send_hub_request(|| {
-        let request = http.get(url.clone());
-        match &token {
-            Some(token) => request.bearer_auth(token),
-            None => request,
-        }
-    })
-    .await?;
-    if token.is_some() && response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return send_hub_request(|| http.get(url.clone())).await;
-    }
-    Ok(response)
+    send_with_credential_fallback(token, || http.get(url.clone()))
+        .await
+        .map(|(response, _)| response)
 }
 
 impl ManagedModelStore {
@@ -1967,9 +1996,10 @@ impl ManagedModelStore {
             }
             None => {}
         }
+        let token = self.hub_token();
         let mut remote = RemoteRanges::new(
             &self.http,
-            self.hub_token(),
+            token.as_deref(),
             self.client.endpoint(),
             repository,
             commit,
@@ -3076,51 +3106,105 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_gated_repository_refusing_its_files_asks_for_access_and_a_token() {
+    /// A Hub that answers every request with `status` (and `extra` header lines), recording each
+    /// request's `Authorization` header.
+    fn serve_refusals(
+        status: &'static str,
+        extra: &'static str,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("gated listener");
         let endpoint = format!("http://{}", listener.local_addr().expect("gated address"));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
         std::thread::spawn(move || {
             for connection in listener.incoming() {
                 let Ok(mut connection) = connection else {
                     return;
                 };
                 let mut reader = BufReader::new(connection.try_clone().expect("stream"));
+                let mut authorization = None;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                         break;
                     }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("authorization")
+                    {
+                        authorization = Some(value.trim().to_owned());
+                    }
                 }
+                recorded.lock().unwrap().push(authorization);
                 let _ = write!(
                     connection,
-                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 {status}\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n"
                 );
             }
         });
-        let error = fetch_header(
-            &reqwest::Client::new(),
-            None,
-            &endpoint,
-            "google/gated-model-GGUF",
-            &"a".repeat(40),
-            Path::new("model.gguf"),
-            1024 * 1024 * 1024,
-        )
-        .await
-        .unwrap_err();
-        let InventoryError::ModelOperation {
-            code,
-            message,
-            retryable,
-        } = error
-        else {
-            panic!("a refused gated file is a model operation failure: {error:?}");
-        };
-        assert_eq!(code, "hugging_face_access_required");
-        assert!(message.contains("HF_TOKEN"), "{message}");
-        assert!(!retryable);
+        (endpoint, seen)
+    }
+
+    /// 401 means Hugging Face wants a signed-in account: no token was sent, or it rejected the
+    /// token even after the anonymous retry. 403 to a token (`X-Error-Code: GatedRepo`) means the
+    /// account must accept the repository's terms; 403 without one still means signing in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gated_repository_refusing_its_files_asks_to_sign_in_or_accept_its_terms() {
+        let bearer = Some("Bearer hf_test".to_owned());
+        for (status, extra, token, code, requests) in [
+            (
+                "401 Unauthorized",
+                "",
+                None,
+                "hugging_face_sign_in_required",
+                vec![None],
+            ),
+            (
+                "401 Unauthorized",
+                "",
+                Some("hf_test"),
+                "hugging_face_sign_in_required",
+                vec![bearer.clone(), None],
+            ),
+            (
+                "403 Forbidden",
+                "X-Error-Code: GatedRepo\r\n",
+                Some("hf_test"),
+                "hugging_face_terms_required",
+                vec![bearer.clone()],
+            ),
+            (
+                "403 Forbidden",
+                "X-Error-Code: GatedRepo\r\n",
+                None,
+                "hugging_face_sign_in_required",
+                vec![None],
+            ),
+        ] {
+            let (endpoint, seen) = serve_refusals(status, extra);
+            let error = fetch_header(
+                &reqwest::Client::new(),
+                token,
+                &endpoint,
+                "google/gated-model-GGUF",
+                &"a".repeat(40),
+                Path::new("model.gguf"),
+                1024 * 1024 * 1024,
+            )
+            .await
+            .unwrap_err();
+            let InventoryError::ModelOperation {
+                code: refused,
+                message: _,
+                retryable,
+            } = error
+            else {
+                panic!("a refused gated file is a model operation failure: {error:?}");
+            };
+            assert_eq!(refused, code, "{status} with {token:?}");
+            assert!(!retryable);
+            assert_eq!(*seen.lock().unwrap(), requests, "{status} with {token:?}");
+        }
     }
 
     /// The Hub answers an anonymous metadata request for a repository that doesn't exist with 401,
@@ -3174,7 +3258,7 @@ mod tests {
             assert_eq!(code, "hugging_face_repository_not_found", "{status}");
             assert_eq!(
                 message,
-                "Repository not found, or it's private or gated. Check the name, or set HF_TOKEN if you have access."
+                "Repository not found, or it's private or gated. Check the name, or sign in to Hugging Face if you have access."
             );
             assert!(!retryable);
         }
@@ -3276,10 +3360,10 @@ mod tests {
         );
     }
 
-    /// An explicit Hugging Face token is presented as a bearer credential on every Hub request:
-    /// search, repository resolution and header reads.
+    /// A configured Hugging Face token is presented as a bearer credential on every Hub request:
+    /// search, repository resolution and header reads. Clearing it makes them anonymous.
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_hf_token_is_sent_on_search_resolve_and_header_reads() {
+    async fn a_configured_token_is_sent_on_search_resolve_and_header_reads_until_cleared() {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("hub listener");
         let endpoint = format!("http://{}", listener.local_addr().expect("hub address"));
@@ -3342,7 +3426,6 @@ mod tests {
         .unwrap();
         config.local_models.roots.clear();
         config.hub_endpoint = Some(endpoint);
-        config.hub_token = Some("test-token".to_owned());
         let store = Arc::new(ManagedModelStore::open(config).await.unwrap());
 
         let discovery = HuggingFaceDiscovery::new(
@@ -3354,52 +3437,95 @@ mod tests {
             ),
             StubCatalog::empty(),
         );
-        discovery
-            .search(HuggingFaceModelSearchRequest {
-                query: "repo".to_owned(),
-                limit: 5,
-            })
-            .await
-            .expect("search");
-        let snapshot = refresh_hugging_face_repository(
-            &store,
-            HuggingFaceRepositoryRequest {
-                repository: "owner/Repo-GGUF".to_owned(),
-                revision: "main".to_owned(),
-            },
-        )
-        .await
-        .expect("resolve");
-        let _ = store
-            .hugging_face_gguf_header(
-                "owner/Repo-GGUF",
-                &snapshot.commit,
-                &snapshot.gguf_files[0],
-                &[],
+        let exercise = || async {
+            discovery
+                .search(HuggingFaceModelSearchRequest {
+                    query: "repo".to_owned(),
+                    limit: 5,
+                })
+                .await
+                .expect("search");
+            let snapshot = refresh_hugging_face_repository(
+                &store,
+                HuggingFaceRepositoryRequest {
+                    repository: "owner/Repo-GGUF".to_owned(),
+                    revision: "main".to_owned(),
+                },
             )
-            .await;
-
-        let seen = seen.lock().unwrap().clone();
-        let kinds = |predicate: fn(&str) -> bool| {
+            .await
+            .expect("resolve");
+            let _ = store
+                .hugging_face_gguf_header(
+                    "owner/Repo-GGUF",
+                    &snapshot.commit,
+                    &snapshot.gguf_files[0],
+                    &[],
+                )
+                .await;
+            std::mem::take(&mut *seen.lock().unwrap())
+        };
+        let kinds = |seen: &[(String, Option<String>)], predicate: fn(&str) -> bool| {
             seen.iter()
                 .filter(|(path, _)| predicate(path))
                 .map(|(_, authorization)| authorization.clone())
                 .collect::<Vec<_>>()
         };
-        let bearer = Some("Bearer test-token".to_owned());
+
+        discovery
+            .configure_credential(HuggingFaceCredential {
+                token: Some("hf_test-token".to_owned()),
+            })
+            .await
+            .expect("configure the token");
+        assert_eq!(store.hub_token().as_deref(), Some("hf_test-token"));
+        let credentialed = exercise().await;
+        let bearer = Some("Bearer hf_test-token".to_owned());
         for (kind, requests) in [
-            ("search", kinds(|path| path == "/api/models")),
-            ("resolve", kinds(|path| path.contains("/revision/"))),
-            ("header read", kinds(|path| path.contains("/resolve/"))),
+            ("search", kinds(&credentialed, |path| path == "/api/models")),
+            ("resolve", kinds(&credentialed, |path| path.contains("/revision/"))),
+            ("header read", kinds(&credentialed, |path| path.contains("/resolve/"))),
         ] {
-            assert!(!requests.is_empty(), "no {kind} request: {seen:?}");
+            assert!(!requests.is_empty(), "no {kind} request: {credentialed:?}");
             assert!(
                 requests
                     .iter()
                     .all(|authorization| *authorization == bearer),
-                "{kind}: {seen:?}"
+                "{kind}: {credentialed:?}"
             );
         }
+
+        discovery
+            .configure_credential(HuggingFaceCredential { token: None })
+            .await
+            .expect("clear the token");
+        assert_eq!(store.hub_token(), None);
+        let anonymous = exercise().await;
+        for (kind, requests) in [
+            ("search", kinds(&anonymous, |path| path == "/api/models")),
+            ("resolve", kinds(&anonymous, |path| path.contains("/revision/"))),
+        ] {
+            assert!(!requests.is_empty(), "no {kind} request: {anonymous:?}");
+        }
+        assert!(
+            anonymous.iter().all(|(_, authorization)| authorization.is_none()),
+            "{anonymous:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_token_is_refused_and_clones_share_the_credential() {
+        let (_temporary, store) = stub_store("http://127.0.0.1:9".to_owned()).await;
+        let clone = (*store).clone();
+        assert!(matches!(
+            store.configure_hub_credential(Some("  ".to_owned())),
+            Err(InventoryError::InvalidRequest(_))
+        ));
+        store
+            .configure_hub_credential(Some("hf_shared".to_owned()))
+            .unwrap();
+        assert_eq!(clone.hub_token().as_deref(), Some("hf_shared"));
+        clone.configure_hub_credential(None).unwrap();
+        assert_eq!(store.hub_token(), None);
     }
 
     async fn stub_store(endpoint: String) -> (tempfile::TempDir, Arc<ManagedModelStore>) {

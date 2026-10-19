@@ -20,8 +20,8 @@ use magnitude_engine::assessment::{
 use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
 use magnitude_engine::options::ModelMethod;
 use magnitude_service_contracts::models::{
-    CandidateDrafter, CandidateFile, CandidateInspection, CandidateInspectionRequest,
-    CandidateSource, CandidateVersion, CatalogModelState, CatalogModels, CustomModel,
+    CandidateDrafter, CandidateFile, CandidateInspection, CandidateInspectionProgressSink,
+    CandidateInspectionRequest, CandidateSource, CandidateVersion, CatalogModelState, CatalogModels, CustomModel,
     CustomModelOrigin, CustomModelState, DrafterCandidate, DrafterCandidatesRequest,
     DrafterCandidatesResponse, DrafterCategory, DrafterChoice, DrafterLineage, DrafterReference,
     DrafterVerdict, HuggingFaceRepositoryId, LocalModels, ModelAssessment, ModelAssessmentProfile,
@@ -50,6 +50,7 @@ use magnitude_service_models::{
 use sha2::{Digest, Sha256};
 
 use super::assessor::{ModelAssessor, model_assessment, performance_depths, preparation_error};
+use super::inspection_progress::InspectionProgress;
 
 /// Concurrent header requests while classifying a repository's files.
 const HEADER_CONCURRENCY: usize = 12;
@@ -920,6 +921,7 @@ impl ManagedModelCandidates {
     async fn classify_hugging_face(
         &self,
         snapshot: &HuggingFaceRepositorySnapshot,
+        progress: &InspectionProgress,
     ) -> Result<Vec<ClassifiedGroup>, InventoryError> {
         let files = snapshot
             .gguf_files
@@ -929,9 +931,21 @@ impl ManagedModelCandidates {
                 size_bytes: file.size_bytes,
             })
             .collect::<Vec<_>>();
+        let groups = group_ggufs(&files);
+        // Until their headers are read, the rows are the files that may be versions, named by
+        // their files; a name only orders and labels them here, and headers decide every role.
+        progress.reading_headers(
+            groups
+                .iter()
+                .filter(|group| !is_projector_name(&group.primary().path))
+                .map(|group| (version_label(&group.primary().path, None), group.size_bytes()))
+                .collect(),
+            0,
+            groups.len(),
+        );
         let mut cached = Vec::new();
         let mut uncached = Vec::new();
-        for group in group_ggufs(&files) {
+        for group in groups {
             let file = snapshot_file(snapshot, &group.primary().path)?;
             match self.models().cached_hugging_face_classification(
                 &snapshot.repository,
@@ -941,6 +955,7 @@ impl ManagedModelCandidates {
             ) {
                 Some((digest, classification)) => {
                     cached.push(classified_group(group, digest, classification));
+                    progress.header_read();
                 }
                 None => uncached.push(group),
             }
@@ -954,14 +969,8 @@ impl ManagedModelCandidates {
         // projector, an imatrix or a drafter may carry none). Names only order the requests;
         // headers decide every role. A probe whose header holds nothing to share (an imatrix)
         // or can't be read at all leaves the next largest file to be read whole.
-        let probe_order = |group: &GgufGroup| {
-            (
-                !path_string(&group.primary().path)
-                    .to_lowercase()
-                    .contains("mmproj"),
-                group.size_bytes(),
-            )
-        };
+        let probe_order =
+            |group: &GgufGroup| (!is_projector_name(&group.primary().path), group.size_bytes());
         let mut reference = classified
             .iter()
             .map(|classified| &classified.group)
@@ -986,6 +995,7 @@ impl ManagedModelCandidates {
                 self.classify_hugging_face_group(snapshot, probe, &[])
                     .await?,
             );
+            progress.header_read();
             reference = self.models().hugging_face_reference_header(
                 &snapshot.repository,
                 &snapshot.commit,
@@ -994,9 +1004,13 @@ impl ManagedModelCandidates {
         }
         let references = reference.as_deref().into_iter().collect::<Vec<_>>();
         let rest = futures_util::stream::iter(
-            uncached
-                .into_iter()
-                .map(|group| self.classify_hugging_face_group(snapshot, group, &references)),
+            uncached.into_iter().map(|group| async {
+                let classified = self
+                    .classify_hugging_face_group(snapshot, group, &references)
+                    .await;
+                progress.header_read();
+                classified
+            }),
         )
         .buffered(HEADER_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -1086,6 +1100,7 @@ impl ManagedModelCandidates {
         targets: &[&ClassifiedGroup],
         mut assessments: Vec<Option<CachedModelAssessment>>,
         projector: Option<CandidateFile>,
+        progress: &InspectionProgress,
     ) -> Vec<Option<CachedModelAssessment>> {
         let recommended = recommended_version(
             targets
@@ -1094,9 +1109,14 @@ impl ManagedModelCandidates {
                 .map(|(group, assessment)| (*group, assessment.as_ref())),
         );
         if let Some(index) = recommended {
+            progress.checking_drafters(index);
             let plain = assessments[index].take();
             assessments[index] = self
-                .with_preselected_drafter(version_candidate(source, targets[index], projector), plain)
+                .with_preselected_drafter(
+                    version_candidate(source, targets[index], projector),
+                    plain,
+                    progress,
+                )
                 .await;
         }
         assessments
@@ -1106,12 +1126,13 @@ impl ManagedModelCandidates {
         &self,
         candidate: ModelCandidate,
         plain: Option<CachedModelAssessment>,
+        progress: &InspectionProgress,
     ) -> Option<CachedModelAssessment> {
         let plain = plain?;
         if matches!(plain.profile, ModelAssessment::Unsupported { .. }) {
             return Some(plain);
         }
-        match self.preselected_assessment(&candidate).await {
+        match self.preselected_assessment(&candidate, progress).await {
             Ok(Some(assessed)) => Some(assessed),
             Ok(None) => Some(plain),
             Err(error) => {
@@ -1128,9 +1149,11 @@ impl ManagedModelCandidates {
     async fn preselected_assessment(
         &self,
         candidate: &ModelCandidate,
+        progress: &InspectionProgress,
     ) -> Result<Option<CachedModelAssessment>, InventoryError> {
         let target = self.candidate_target(candidate).await?;
-        let Some(chosen) = recommended(self.enumerate_drafters(&target, None, true).await?) else {
+        let drafters = self.drafter_list(&target, None, true, progress).await?;
+        let Some(chosen) = recommended(drafters.candidates) else {
             return Ok(Some(
                 self.assess(&target.material, None, ModelMethod::Plain)
                     .await?,
@@ -1188,9 +1211,10 @@ impl ManagedModelCandidates {
         &self,
         repository: HuggingFaceRepositoryId,
         revision: String,
+        progress: &InspectionProgress,
     ) -> Result<CandidateInspection, InventoryError> {
         let snapshot = self.snapshot(repository.as_str(), &revision).await?;
-        let classified = self.classify_hugging_face(&snapshot).await?;
+        let classified = self.classify_hugging_face(&snapshot, progress).await?;
         let projector = choose_projector(&classified);
         let targets = classified
             .iter()
@@ -1200,6 +1224,7 @@ impl ManagedModelCandidates {
         let custom = self.custom_models().await;
         let catalog_installed = self.installed_catalog_models().await;
         let projector_path = projector.map(|projector| projector.group.primary().path.clone());
+        progress.checking_versions(version_rows(&targets));
         let mut pending = Vec::new();
         for group in &targets {
             pending.push(self.version_assessment(
@@ -1216,17 +1241,14 @@ impl ManagedModelCandidates {
                 ),
             ));
         }
-        let assessments = futures_util::stream::iter(pending)
-            .buffered(assessment_concurrency())
-            .collect::<Vec<_>>()
-            .await;
+        let assessments = checked_versions(pending, progress).await;
         let source = CandidateSource::HuggingFace {
             repository: repository.clone(),
             commit: snapshot.commit.clone(),
         };
         let projector_file = projector.map(|projector| candidate_file(projector.group.primary()));
         let assessments = self
-            .compose_recommended(&source, &targets, assessments, projector_file.clone())
+            .compose_recommended(&source, &targets, assessments, projector_file.clone(), progress)
             .await;
         let versions = targets
             .iter()
@@ -1290,7 +1312,11 @@ impl ManagedModelCandidates {
         })
     }
 
-    async fn inspect_local(&self, path: PathBuf) -> Result<CandidateInspection, InventoryError> {
+    async fn inspect_local(
+        &self,
+        path: PathBuf,
+        progress: &InspectionProgress,
+    ) -> Result<CandidateInspection, InventoryError> {
         let metadata = std::fs::metadata(&path)
             .map_err(|error| InventoryError::NotFound(format!("{}: {error}", path.display())))?;
         let (root, selected) = if metadata.is_file() {
@@ -1336,6 +1362,7 @@ impl ManagedModelCandidates {
         let unsupported_architecture = self.unsupported_architecture(&targets);
         let custom = self.custom_models().await;
         let projector_path = projector.map(|projector| root.join(&projector.group.primary().path));
+        progress.checking_versions(version_rows(&targets));
         let mut pending = Vec::new();
         for group in &targets {
             let material = self.local_target(
@@ -1353,14 +1380,11 @@ impl ManagedModelCandidates {
                 }
             });
         }
-        let assessments = futures_util::stream::iter(pending)
-            .buffered(assessment_concurrency())
-            .collect::<Vec<_>>()
-            .await;
+        let assessments = checked_versions(pending, progress).await;
         let source = CandidateSource::Local { path: root.clone() };
         let projector_file = projector.map(|projector| candidate_file(projector.group.primary()));
         let assessments = self
-            .compose_recommended(&source, &targets, assessments, projector_file.clone())
+            .compose_recommended(&source, &targets, assessments, projector_file.clone(), progress)
             .await;
         let versions = targets
             .iter()
@@ -1810,19 +1834,27 @@ impl ManagedModelCandidates {
         other: Option<&str>,
         stop_at_first_automatic: bool,
     ) -> Result<Vec<DrafterCandidate>, InventoryError> {
-        self.drafter_list(target, other, stop_at_first_automatic)
-            .await
-            .map(|list| list.candidates)
+        self.drafter_list(
+            target,
+            other,
+            stop_at_first_automatic,
+            &InspectionProgress::silent(),
+        )
+        .await
+        .map(|list| list.candidates)
     }
 
     /// The drafter list of `enumerate_drafters`, with the listed reference a different drafter
     /// resolves to: a candidate already listed that is the same file (the catalog drafter's
     /// package, or the same repository, commit and path), else its own Other row.
+    /// `progress` counts the drafter checks: the target's own built-in heads, each drafter next to
+    /// it and each catalog drafter, as each is about to run.
     async fn drafter_list(
         &self,
         target: &DrafterTarget,
         other: Option<&str>,
         stop_at_first_automatic: bool,
+        progress: &InspectionProgress,
     ) -> Result<DrafterList, InventoryError> {
         let bare = self
             .assess(&target.material, None, ModelMethod::Plain)
@@ -1832,9 +1864,12 @@ impl ManagedModelCandidates {
         }
         let fit_decides = fits(&bare.profile);
         // The target as the engine takes it on its own: with its built-in heads when it has any.
+        progress.drafters_planned(1);
         let own = self
             .assess(&target.material, None, ModelMethod::Auto)
-            .await?;
+            .await;
+        progress.drafter_checked();
+        let own = own?;
         let regardless_of_fit = |mut candidate: DrafterCandidate| {
             candidate.automatic = candidate.category != DrafterCategory::Other
                 && is_bound(&candidate.verdict);
@@ -1902,7 +1937,7 @@ impl ManagedModelCandidates {
                 return Ok(DrafterList::default());
             };
             let catalog = self
-                .catalog_drafter(&target, matched, *lineage)
+                .catalog_drafter(&target, matched, *lineage, progress)
                 .await
                 .map(decide);
             return Ok(DrafterList {
@@ -1917,7 +1952,7 @@ impl ManagedModelCandidates {
             .as_ref()
             .and_then(|(matched, _)| catalog_draft_key(&matched.model));
         let mut candidates = self
-            .next_to_model(&target, catalog_file.as_deref())
+            .next_to_model(&target, catalog_file.as_deref(), progress)
             .await
             .into_iter()
             .map(decide)
@@ -1928,7 +1963,10 @@ impl ManagedModelCandidates {
             if done(&candidates) {
                 break;
             }
-            let Some(candidate) = self.catalog_drafter(&target, matched, *lineage).await else {
+            let Some(candidate) = self
+                .catalog_drafter(&target, matched, *lineage, progress)
+                .await
+            else {
                 continue;
             };
             let bound = is_bound(&candidate.verdict);
@@ -1984,6 +2022,7 @@ impl ManagedModelCandidates {
         target: &DrafterTarget,
         matched: &CatalogLineageMatch,
         lineage: DrafterLineage,
+        progress: &InspectionProgress,
     ) -> Option<DrafterCandidate> {
         let ServableModelBundle::SpeculativeDecoding {
             draft_source,
@@ -1993,6 +2032,22 @@ impl ManagedModelCandidates {
         else {
             return None;
         };
+        progress.drafters_planned(1);
+        let candidate = self
+            .catalog_drafter_candidate(target, matched, lineage, draft_source, method)
+            .await;
+        progress.drafter_checked();
+        candidate
+    }
+
+    async fn catalog_drafter_candidate(
+        &self,
+        target: &DrafterTarget,
+        matched: &CatalogLineageMatch,
+        lineage: DrafterLineage,
+        draft_source: &SpeculativeDraftSource,
+        method: &SpeculativeMethod,
+    ) -> Option<DrafterCandidate> {
         let (drafter, size_bytes, on_this_computer) = match draft_source {
             SpeculativeDraftSource::Embedded => (None, 0, true),
             SpeculativeDraftSource::Separate { draft } => {
@@ -2045,9 +2100,13 @@ impl ManagedModelCandidates {
         &self,
         target: &DrafterTarget,
         catalog_file: Option<&str>,
+        progress: &InspectionProgress,
     ) -> Vec<DrafterCandidate> {
         if let Some(snapshot) = &target.snapshot {
-            let Ok(classified) = self.classify_hugging_face(snapshot).await else {
+            let Ok(classified) = self
+                .classify_hugging_face(snapshot, &InspectionProgress::silent())
+                .await
+            else {
                 return Vec::new();
             };
             let pending = classified
@@ -2065,7 +2124,7 @@ impl ManagedModelCandidates {
                 })
                 .map(|path| self.hugging_face_drafter_candidate(target, snapshot, path))
                 .collect::<Vec<_>>();
-            return collect_candidates(pending).await;
+            return collect_candidates(pending, progress).await;
         }
         let mut pending = Vec::new();
         for folder in &target.folders {
@@ -2085,7 +2144,7 @@ impl ManagedModelCandidates {
                     }),
             );
         }
-        collect_candidates(pending).await
+        collect_candidates(pending, progress).await
     }
 
     /// A drafter file in the target's Hugging Face repository, with the engine's verdict.
@@ -2186,7 +2245,9 @@ impl ManagedModelCandidates {
         let path = match path {
             Some(path) => PathBuf::from(path),
             None => {
-                let classified = self.classify_hugging_face(&snapshot).await?;
+                let classified = self
+                    .classify_hugging_face(&snapshot, &InspectionProgress::silent())
+                    .await?;
                 classified
                     .into_iter()
                     .filter(|group| matches!(group.role, CandidateFileRole::Drafter { .. }))
@@ -2356,17 +2417,24 @@ impl CatalogFingerprints for ManagedModelCandidates {
 }
 
 impl ModelCandidates for ManagedModelCandidates {
-    fn inspect(
+    fn inspect_with_progress(
         &self,
         request: CandidateInspectionRequest,
+        progress: CandidateInspectionProgressSink,
     ) -> BoxFuture<'_, Result<CandidateInspection, InventoryError>> {
         Box::pin(async move {
+            let progress = InspectionProgress::new(progress);
             match request {
                 CandidateInspectionRequest::HuggingFace {
                     repository,
                     revision,
-                } => self.inspect_hugging_face(repository, revision).await,
-                CandidateInspectionRequest::Local { path } => self.inspect_local(path).await,
+                } => {
+                    self.inspect_hugging_face(repository, revision, &progress)
+                        .await
+                }
+                CandidateInspectionRequest::Local { path } => {
+                    self.inspect_local(path, &progress).await
+                }
             }
         })
     }
@@ -2384,7 +2452,9 @@ impl ModelCandidates for ManagedModelCandidates {
                     (self.model_target(&model_id).await?, other)
                 }
             };
-            let list = self.drafter_list(&target, other.as_deref(), false).await?;
+            let list = self
+                .drafter_list(&target, other.as_deref(), false, &InspectionProgress::silent())
+                .await?;
             Ok(DrafterCandidatesResponse {
                 candidates: list.candidates,
                 entered: list.entered,
@@ -2472,12 +2542,58 @@ impl ModelCandidates for ManagedModelCandidates {
 /// could not be assessed.
 async fn collect_candidates(
     pending: Vec<impl std::future::Future<Output = Option<DrafterCandidate>>>,
+    progress: &InspectionProgress,
 ) -> Vec<DrafterCandidate> {
-    futures_util::stream::iter(pending)
-        .buffered(assessment_concurrency())
+    progress.drafters_planned(pending.len());
+    futures_util::stream::iter(pending.into_iter().map(|check| async {
+        let candidate = check.await;
+        progress.drafter_checked();
+        candidate
+    }))
+    .buffered(assessment_concurrency())
         .filter_map(|candidate| async move { candidate })
         .collect()
         .await
+}
+
+/// Runs the versions' checks with bounded concurrency, keeping their order and reporting each
+/// version's verdict as soon as its own check finishes.
+async fn checked_versions(
+    pending: Vec<impl std::future::Future<Output = Option<CachedModelAssessment>>>,
+    progress: &InspectionProgress,
+) -> Vec<Option<CachedModelAssessment>> {
+    futures_util::stream::iter(pending.into_iter().enumerate().map(|(index, check)| async move {
+        let assessment = check.await;
+        progress.version_checked(
+            index,
+            assessment.as_ref().map(|assessment| assessment.profile.clone()),
+        );
+        assessment
+    }))
+    .buffered(assessment_concurrency())
+    .collect()
+    .await
+}
+
+/// The versions an inspection returns, by label and size, before any is checked.
+fn version_rows(targets: &[&ClassifiedGroup]) -> Vec<(String, u64)> {
+    let labels = distinct_labels(
+        &targets
+            .iter()
+            .map(|group| (&group.group, group.quantization.as_deref(), group.embedded_mtp))
+            .collect::<Vec<_>>(),
+    );
+    labels
+        .into_iter()
+        .zip(targets)
+        .map(|(label, group)| (label, group.group.size_bytes()))
+        .collect()
+}
+
+/// Whether a file's name calls it a projector, which only orders and hides it before its header
+/// is read.
+fn is_projector_name(path: &Path) -> bool {
+    path_string(path).to_lowercase().contains("mmproj")
 }
 
 fn assessment_concurrency() -> usize {

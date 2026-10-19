@@ -167,6 +167,26 @@ export const cancelModelDownload = HttpApiEndpoint.post("cancelModelDownload", "
     { status: 500 },
   )
 
+export const configureHuggingFaceCredential = HttpApiEndpoint.put(
+  "configureHuggingFaceCredential",
+  "/api/v1/sources/hugging-face/credential",
+)
+  .setPayload(
+    S.suspend(
+      (): S.Schema<Schemas.HuggingFaceCredential, Schemas.HuggingFaceCredentialEncoded> =>
+        Schemas.HuggingFaceCredential,
+    ),
+  )
+  .addSuccess(S.Void, { status: 204 })
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 400 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
 export const configureLocalModels = HttpApiEndpoint.put("configureLocalModels", "/api/v1/local-models/configuration")
   .setPayload(
     S.suspend(
@@ -845,6 +865,7 @@ export const DownloadsGroup = HttpApiGroup.make("downloads")
   .add(startModelDownload)
 
 export const HuggingFaceGroup = HttpApiGroup.make("huggingFace")
+  .add(configureHuggingFaceCredential)
   .add(resolveHuggingFaceRepository)
   .add(searchHuggingFaceModels)
 
