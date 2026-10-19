@@ -884,6 +884,23 @@ impl ManagedModelStore {
         Ok(())
     }
 
+    /// Who a saved read of a gated or private repository's files belongs to: the anonymous caller, or
+    /// the credential that read them. Public repositories share one scope (empty), so their reads are
+    /// cached for everyone; a restricted repository's reads are served again only to the same
+    /// credential, so signing out (or into another account) never shows files it can no longer read.
+    pub(crate) fn restricted_access_scope(&self, restricted: bool) -> String {
+        if !restricted {
+            return String::new();
+        }
+        self.hub_token().map_or_else(
+            || ":anonymous".to_owned(),
+            |token| {
+                use sha2::{Digest, Sha256};
+                format!(":credential-{:x}", Sha256::digest(token.as_bytes()))
+            },
+        )
+    }
+
     /// The Hugging Face token presented on Hub requests, when one is configured.
     #[must_use]
     pub fn hub_token(&self) -> Option<String> {

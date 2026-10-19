@@ -99,6 +99,14 @@ a Bearer on every Hub request (search, listings, header reads, downloads), only 
 hosts, retries anonymously when the Hub rejects it, and never reads a token from its environment or a
 token file. See [catalog and acquisition](../model-management/catalog-and-acquisition.md).
 
+What one credential read of a gated or private repository is never shown to another. ICN keys its
+saved reads of such a repository's files (an inspection's files and headers, a search row's model
+shape) by the credential that made them, anonymous included, so after a sign-out or a sign-in as
+another account the next read asks the Hub again and gets that account's answer; public repositories
+keep one shared cache. ICN also drops its in-memory search results on every credential change. Once
+ICN has a different account's token, or none, ACN pokes clients to refetch search results,
+inspections and drafter lists; a renewed token for the same account pokes nothing.
+
 ## Gated repositories
 
 A gated repository's refused files are told apart by the Hub's answer: 401 means sign-in is needed,

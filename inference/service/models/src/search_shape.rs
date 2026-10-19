@@ -286,17 +286,20 @@ pub(crate) fn version_count<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Op
 
 /// What `repository` at `commit` holds for search: cached, else found and read (see the module
 /// documentation). `None` is a failed or slow read (a refused gated file among them), which is
-/// tried again next time.
+/// tried again next time. A `restricted` (gated or private) repository's read is cached for the
+/// credential that made it only.
 pub(crate) async fn repository_model(
     models: &Arc<ManagedModelStore>,
     architectures: &RecognizedArchitectures,
     catalog: &[(ModelId, ModelFingerprint)],
     repository: &str,
     commit: &str,
+    restricted: bool,
 ) -> Option<RepositoryModel> {
     let key = format!(
-        "{CACHE_VERSION}:{}:{repository}@{commit}",
-        models.client.endpoint()
+        "{CACHE_VERSION}:{}:{repository}@{commit}{}",
+        models.client.endpoint(),
+        models.restricted_access_scope(restricted)
     );
     if let Some(cached) = models
         .cache

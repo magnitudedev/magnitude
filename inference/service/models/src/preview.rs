@@ -193,6 +193,7 @@ impl HuggingFaceDiscovery {
             catalog,
             &result.repository,
             &result.commit,
+            result.gated || result.private,
         )
         .await
         {
@@ -860,14 +861,20 @@ impl ManagedModelStore {
                 "repository snapshot does not match the preview source".to_owned(),
             ));
         }
+        // A gated or private repository's saved read is served only to the credential that made it.
         let evidence = serde_json::to_string(source)
-            .map_err(|error| InventoryError::Internal(error.to_string()))?;
-        let cached = self.cached_preview_artifact(source).filter(|artifact| {
-            artifact
-                .components
-                .iter()
-                .all(|component| self.cache.has_header(&component.header_digest))
-        });
+            .map_err(|error| InventoryError::Internal(error.to_string()))?
+            + &self.restricted_access_scope(snapshot.gated || snapshot.private);
+        let cached = self
+            .cache
+            .read_index::<CachedArtifact>(ModelIndexKind::Artifact, &evidence)
+            .filter(|artifact| artifact_matches_source(artifact, source))
+            .filter(|artifact| {
+                artifact
+                    .components
+                    .iter()
+                    .all(|component| self.cache.has_header(&component.header_digest))
+            });
         let artifact = match cached {
             Some(artifact) => artifact,
             None => {
@@ -3526,6 +3533,24 @@ mod tests {
         assert_eq!(clone.hub_token().as_deref(), Some("hf_shared"));
         clone.configure_hub_credential(None).unwrap();
         assert_eq!(store.hub_token(), None);
+    }
+
+    /// Signing out, or into another account, must not show a gated or private repository's files
+    /// from a read made with another credential, while a public repository's reads stay shared.
+    #[tokio::test]
+    async fn a_restricted_repository_is_read_again_for_each_credential() {
+        let (_temporary, store) = stub_store("http://127.0.0.1:9".to_owned()).await;
+        let anonymous = store.restricted_access_scope(true);
+        store.configure_hub_credential(Some("hf_first".to_owned())).unwrap();
+        let first = store.restricted_access_scope(true);
+        assert_eq!(store.restricted_access_scope(false), "");
+        store.configure_hub_credential(Some("hf_second".to_owned())).unwrap();
+        let second = store.restricted_access_scope(true);
+        store.configure_hub_credential(None).unwrap();
+        assert_eq!(store.restricted_access_scope(true), anonymous);
+        assert_ne!(anonymous, first);
+        assert_ne!(first, second);
+        assert!(!first.contains("hf_first") && !second.contains("hf_second"));
     }
 
     async fn stub_store(endpoint: String) -> (tempfile::TempDir, Arc<ManagedModelStore>) {
