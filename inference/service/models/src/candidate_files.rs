@@ -473,8 +473,9 @@ pub fn display_name(name: &str) -> String {
 /// How a model on this computer is named: its display name and the quantization label of the
 /// variant, the one its file names (`Q4_K_M`, `UD-Q4_K_XL`) or else its header's. The name is the repository's when
 /// the file has a Hub identity (`Qwen3.5 4B` for `lmstudio-community/Qwen3.5-4B-GGUF`), else the
-/// GGUF's `general.name`, else the file name, each without its quantization and with separators as
-/// spaces. Names are presentation only.
+/// GGUF's `general.name` unless that is only a digest (some converters write the source commit
+/// there), else the file name, each without its quantization and with separators as spaces. Names
+/// are presentation only.
 #[must_use]
 pub fn model_presentation(
     primary: &Path,
@@ -516,7 +517,11 @@ pub fn model_presentation(
     };
     let name = repository
         .map(display_name)
-        .or_else(|| header_name.map(without_label))
+        .or_else(|| {
+            header_name
+                .filter(|name| !is_digest(name))
+                .map(without_label)
+        })
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| without_label(stem));
     let name = if name.trim().is_empty() {
@@ -525,6 +530,14 @@ pub fn model_presentation(
         name
     };
     (name, label)
+}
+
+/// Whether a name is only a hexadecimal digest, such as a commit hash, rather than a model's name.
+fn is_digest(name: &str) -> bool {
+    let name = name.trim();
+    (7..=64).contains(&name.len())
+        && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && name.bytes().any(|byte| byte.is_ascii_digit())
 }
 
 /// Whether a version's quantization (the GGUF's `general.file_type` name) is in the Q4_K class,
@@ -1121,6 +1134,44 @@ mod tests {
             model_presentation(Path::new("renamed-q8.gguf"), None, None, None).1,
             Some("Q8".to_owned()),
             "without a header type, the name's"
+        );
+    }
+
+    /// QA (windows, round 4): `LFM2.5-230M-Q8_0.gguf` from LiquidAI/LFM2.5-230M-GGUF names a
+    /// source commit as its `general.name`, and was shown as that hash. A digest is no name, so the
+    /// file names the model.
+    #[test]
+    fn a_digest_header_name_gives_way_to_the_file_name() {
+        assert_eq!(
+            model_presentation(
+                Path::new("models/LFM2.5-230M-Q8_0.gguf"),
+                None,
+                Some("2639448dbae4a4cc657be3a5a8fcce8e531ee6c4"),
+                Some("Q8_0")
+            ),
+            ("LFM2.5 230M".to_owned(), Some("Q8_0".to_owned()))
+        );
+        assert_eq!(
+            model_presentation(Path::new("weights.gguf"), None, Some("4cd563d"), None).0,
+            "weights"
+        );
+        for name in [
+            "Qwen3-8B-abcdef",
+            "LFM2.5 230M",
+            "deadbeefcafe",
+            "Llama 3.1 8B",
+        ] {
+            assert!(!is_digest(name), "{name}");
+        }
+        assert_eq!(
+            model_presentation(
+                Path::new("weights.gguf"),
+                None,
+                Some("Qwen3-8B-abcdef"),
+                None
+            )
+            .0,
+            "Qwen3 8B abcdef"
         );
     }
 }

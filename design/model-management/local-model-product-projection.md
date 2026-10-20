@@ -47,8 +47,8 @@ instances separately, then publishes one `LocalModel` union:
 - `Custom` carries its `origin` (`Added`, `Imported`, or `Found` with its source), the catalog model
   it is a variant of, its attached and recommended drafters, serving
   state, and, for `Added` only, managed acquisition state. ICN names it: the repository's name when
-  the file has a Hub identity (as the repository step does), else the GGUF's `general.name`, else
-  the file name, each without the quantization and with separators as spaces, and as the variant
+  the file has a Hub identity (as the repository step does), else the GGUF's `general.name` unless
+  that is only a hexadecimal digest (a source commit some converters write there), else the file name, each without the quantization and with separators as spaces, and as the variant
   label its header's `general.file_type` label, kept as its file name spells it only when that names
   the same weight type more precisely (`UD-Q4_K_XL` for a Q4_K_M header), as a candidate version is
   labelled, so a renamed file is never labelled from its name; else the quantization its file name
