@@ -498,7 +498,7 @@
     },
     {
       "name": "deepseek4",
-      "description": "unsloth DeepSeek V4 Flash 0731 UD-Q2_K_XL, three shards: no deepseek4 family, I32 tensors and the joyai-llm pre-tokenizer.",
+      "description": "unsloth DeepSeek V4 Flash 0731 UD-Q2_K_XL, three shards: no deepseek4 family, I32 tensors, the joyai-llm pre-tokenizer, and a chat template whose enabled default renders neither its high nor its max effort.",
       "target": [
         {
           "header": "headers/DeepSeek-V4-Flash-0731-UD-Q2_K_XL-00001-of-00003.gguf.gz",
@@ -542,7 +542,8 @@
                 "model": "gpt2",
                 "pre": "joyai-llm"
               }
-            }
+            },
+            "ChatTemplate"
           ]
         }
       }

@@ -371,6 +371,12 @@ Template compilation failure, inability to render the required baseline, unstabl
 probe nonces, or inability to derive the declared public property is an assessment failure. It is
 not normalized to `none` and is not cached as a model capability.
 
+A template with no unique normalized default is such a failure: the engine refuses its chat
+template, so supported reasoning is never published without a default. The unsloth DeepSeek V4
+Flash GGUF is the current example; with thinking enabled and no effort it renders neither its high
+nor its max instruction. The OpenAI-compatible model listing leaves out an offered model whose
+capabilities still claim supported reasoning without a default rather than failing the listing.
+
 Fixed reasoning is also a successful result. It normalizes to `high`, not `none`, and does not
 advertise a disabling option.
 

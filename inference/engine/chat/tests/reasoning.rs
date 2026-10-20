@@ -2,6 +2,7 @@ use magnitude_chat::reasoning::{
     inspect_reasoning, normalize_effort, EffortDomain, EffortMapping, ReasoningError,
     ReasoningIntent, ReasoningProfile, DETECTOR,
 };
+use magnitude_chat::{TemplateBundle, TemplateVariant};
 use magnitude_templates::Template;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -345,4 +346,29 @@ fn an_omitted_effort_selects_the_enabled_side_of_a_toggle() {
     ] {
         assert_eq!(profile_of(name).default_effort.as_deref(), default, "{name}");
     }
+}
+
+/// A template whose omitted control renders as no single effort cannot be
+/// published with a default, so inspecting it is an assessment failure rather
+/// than a capability without one.
+#[test]
+fn a_template_without_a_unique_default_effort_fails_inspection() {
+    let inspect = |name: &str| {
+        TemplateBundle::new(
+            vec![TemplateVariant {
+                name: "default".into(),
+                source: fixtures()[name].clone(),
+                provenance: "fixture".into(),
+            }],
+            "default".into(),
+            Default::default(),
+        )
+        .unwrap()
+        .inspect()
+    };
+    assert!(inspect("UNNAMED_DEFAULT_EFFORT").is_err());
+    assert_eq!(
+        inspect("TOGGLE").unwrap().reasoning.default_effort.as_deref(),
+        Some("high")
+    );
 }

@@ -1710,14 +1710,14 @@ async fn standard_models(
         })?;
         let name = format!("{} ({})", model.display_name, model.variant_label);
         let id = model.id.to_string();
-        Some(open_ai_model(
+        open_ai_model(
             id,
             "magnitude",
             name,
             model.description,
             target.profile.context_length,
             capabilities.clone(),
-        ))
+        )
     });
     let custom_models = local.models.into_iter().filter_map(|model| {
         let CustomModelState::Ready { model: target, .. } = &model.state else {
@@ -1727,14 +1727,14 @@ async fn standard_models(
             model_id: model.model_id.clone(),
         })?;
         let (owned_by, description) = custom_model_source(&model);
-        Some(open_ai_model(
+        open_ai_model(
             model.model_id.to_string(),
             owned_by,
             model.display_name,
             description,
             target.profile.context_length,
             capabilities.clone(),
-        ))
+        )
     });
     let data = catalog_models.chain(custom_models).collect();
     Ok(Json(OpenAiModelsResponse {
@@ -1800,6 +1800,9 @@ fn offered_capabilities(
         .collect()
 }
 
+/// An offered model's OpenAI listing entry. A model that supports reasoning but has no default
+/// effort is an incomplete assessment: it is left out of the listing rather than taking down every
+/// other model's entry.
 fn open_ai_model(
     id: String,
     owned_by: &'static str,
@@ -1807,7 +1810,7 @@ fn open_ai_model(
     description: String,
     context_length: u32,
     capabilities: magnitude_service_contracts::models::ModelCapabilities,
-) -> OpenAiModel {
+) -> Option<OpenAiModel> {
     let mut supported_parameters = vec!["max_tokens"];
     if capabilities.tools {
         supported_parameters.extend(["tools", "tool_choice"]);
@@ -1815,29 +1818,31 @@ fn open_ai_model(
     if capabilities.structured_output {
         supported_parameters.extend(["structured_outputs", "response_format"]);
     }
-    let reasoning = capabilities.reasoning.supported.then(|| {
-        supported_parameters.push("reasoning");
-        let default_effort = capabilities
-            .reasoning
-            .default_effort
-            .clone()
-            .expect("assessed reasoning capabilities must include a default effort");
-        OpenAiModelReasoning {
-            default_enabled: default_effort != "none",
-            mandatory: !capabilities
-                .reasoning
-                .efforts
-                .iter()
-                .any(|effort| effort == "none"),
-            supported_efforts: capabilities.reasoning.efforts,
-            default_effort,
+    let reasoning = match (
+        capabilities.reasoning.supported,
+        capabilities.reasoning.default_effort,
+    ) {
+        (false, _) => None,
+        (true, Some(default_effort)) => {
+            supported_parameters.push("reasoning");
+            Some(OpenAiModelReasoning {
+                default_enabled: default_effort != "none",
+                mandatory: !capabilities
+                    .reasoning
+                    .efforts
+                    .iter()
+                    .any(|effort| effort == "none"),
+                supported_efforts: capabilities.reasoning.efforts,
+                default_effort,
+            })
         }
-    });
+        (true, None) => return None,
+    };
     let mut input_modalities = vec!["text"];
     if capabilities.vision {
         input_modalities.push("image");
     }
-    OpenAiModel {
+    Some(OpenAiModel {
         id,
         object: "model",
         created: 0,
@@ -1855,7 +1860,7 @@ fn open_ai_model(
             context_length,
             max_completion_tokens: context_length.min(CONNECTOR_MAX_OUTPUT_TOKENS),
         },
-    }
+    })
 }
 
 #[derive(OpenApi)]
@@ -2363,7 +2368,8 @@ mod tests {
                     default_effort: Some("high".to_owned()),
                 },
             },
-        );
+        )
+        .expect("listed model");
 
         let value = serde_json::to_value(model).expect("serializable model");
         assert_eq!(value["context_length"], 65_536);
@@ -3891,6 +3897,36 @@ mod tests {
         assert_eq!(body["data"][0]["name"], "Fine Tune");
         assert_eq!(body["data"][0]["description"], "Found in Ollama");
         assert_eq!(body["data"][0]["context_length"], 8192);
+    }
+
+    #[tokio::test]
+    async fn standard_models_omit_a_reasoning_model_without_a_default_effort() {
+        let mut entry = assessed_entry(
+            ModelAssessmentSubject::Custom {
+                model_id: local_model_id(),
+            },
+            fits_assessment(),
+        );
+        let ModelAssessmentEntryState::Assessed { capabilities, .. } = &mut entry.state else {
+            unreachable!("assessed entry");
+        };
+        capabilities.reasoning = magnitude_service_contracts::models::ModelReasoningCapabilities {
+            supported: true,
+            efforts: vec!["none".to_owned(), "high".to_owned()],
+            default_effort: None,
+        };
+        let assessments = Arc::new(StubModelAssessments(assessments_snapshot(
+            Vec::new(),
+            vec![entry],
+        )));
+        let state = local_models_state(StubLocalModels::new()).with_model_assessments(assessments);
+        let (status, body) = send(
+            test_app(state),
+            Request::get("/v1/models").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"], json!([]));
     }
 
     #[tokio::test]
