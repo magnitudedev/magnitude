@@ -2,7 +2,7 @@
 //!
 //! A result's model file is found by size, never by name: its GGUFs (shards counted together,
 //! projectors excluded) largest first, skipping files whose header names no architecture, a
-//! projector's or a separate drafter's, or declares fewer tensors than blocks (a piece of a
+//! projector's or a drafter's (see `RecognizedArchitectures::declares_drafter`), or declares fewer tensors than blocks (a piece of a
 //! layer-split model), up to [`MAX_MODEL_FILE_READS`] files. Each is read from its
 //! first [`SHAPE_PREFIX_BYTES`] with one ranged GET: the metadata up to the tokenizer's token list,
 //! whose element count is the vocabulary size. When the prefix holds no shape (its writer put the
@@ -37,7 +37,7 @@ pub const MAX_MODEL_FILE_READS: usize = 3;
 /// without what it would tell.
 const MODEL_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// Versions the cached outcome: a change to how the model file is found drops older entries.
-const CACHE_VERSION: &str = "model-file.v3";
+const CACHE_VERSION: &str = "model-file.v4";
 const TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 
 /// Each catalog model's shape fingerprint, as its first variant's model ID, in catalog order.
@@ -372,7 +372,10 @@ async fn read_repository_model(
         });
         let file = match (&architecture, &metadata) {
             (Some(architecture), _) if architecture == PROJECTOR_ARCHITECTURE => FileKind::Other,
-            (Some(architecture), _) if architectures.is_separate_drafter(architecture) => {
+            (Some(architecture), Some(directory))
+                if architectures
+                    .declares_drafter(architecture, &crate::gguf::header_tags(directory)) =>
+            {
                 FileKind::Drafter
             }
             (Some(_), _) if group.files.len() > 1 => FileKind::Model,

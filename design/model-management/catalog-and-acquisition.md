@@ -46,10 +46,13 @@ prefilter against the engine's recognized-architecture list. Repositories the ca
 never returned as new models, and drafter repositories (a drafter architecture, such as DFlash,
 EAGLE, a Gemma assistant or MTP-only heads, or the Hub's speculative-decoding tags) are never
 results: they are offered only in drafter lists. "Variant of" and the architecture shown come from
-the repository's model file, found by size and header: its GGUFs (a sharded set by its total size,
-read at its first shard; `mmproj` projector files excluded) largest first, skipping a file whose
-header names no architecture, a projector's or a separate drafter's (an importance matrix, an MTP
-or DFlash drafter), up to three reads. Each read is the file's first 64 KiB in one ranged GET: the
+the repository's model file, read for every result, one whose Hub architecture the engine doesn't
+run included, since the Hub names an architecture but never what a file is for. It is found by size
+and header: its GGUFs (a sharded set by its total size, read at its first shard; `mmproj` projector
+files excluded) largest first, skipping a file whose header names no architecture, a projector's or
+a drafter's (an importance matrix; an architecture the engine binds only as a drafter, such as
+DFlash; or an architecture the engine doesn't run as a target whose `general.tags` mark it for
+speculative decoding, as a community `dflash-draft` conversion's do), up to three reads. Each read is the file's first 64 KiB in one ranged GET: the
 metadata up to the tokenizer's token list and the list's element count, which give the engine's
 shape fingerprint without the token table digest. When the prefix holds no shape (a writer put the
 shape keys after the token list) or a near miss of a catalog model's (same architecture, width and
@@ -61,7 +64,7 @@ catalog model, in catalog order, whose fingerprint has that shape. The header's 
 replaces the Hub's; a repository the engine doesn't run is unsupported with that architecture, and
 one whose headers were read but hold no model file (no architecture, a projector's, or the pieces
 of a layer-split model, which repeat its metadata over fewer tensors than its blocks) is unsupported
-as unreadable; one whose files read are all drafters' (a separate drafter architecture, or a single
+as unreadable; one whose files read are all drafters' (a drafter by its header as above, or a single
 file declaring prediction layers over fewer tensors than blocks, as an MTP block) is a drafter
 repository and no result. A split set's shards are never judged by their tensor count: the listing
 groups them, and a first shard may hold only the metadata. A repository whose listing holds no GGUF at all (the Hub's

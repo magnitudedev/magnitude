@@ -62,6 +62,8 @@ pub(crate) struct PrimaryEvidence {
     pub(crate) license: Option<String>,
     #[serde(default)]
     pub(crate) quantization: Option<String>,
+    #[serde(default)]
+    pub(crate) tags: Vec<String>,
 }
 
 impl PrimaryEvidence {
@@ -74,7 +76,12 @@ impl PrimaryEvidence {
         &self,
         architectures: &crate::candidate_files::RecognizedArchitectures,
     ) -> crate::gguf::GgufRole {
-        crate::gguf::role(self.architecture.as_deref(), self.tensors, architectures)
+        crate::gguf::role(
+            self.architecture.as_deref(),
+            &self.tags,
+            self.tensors,
+            architectures,
+        )
     }
 
     fn from_inspection(inspection: &crate::gguf::GgufInspection) -> Self {
@@ -87,6 +94,7 @@ impl PrimaryEvidence {
             base_models: inspection.base_models.clone(),
             license: inspection.license.clone(),
             quantization: inspection.quantization.clone(),
+            tags: inspection.tags.clone(),
         }
     }
 }

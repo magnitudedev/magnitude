@@ -39,12 +39,15 @@ pub struct GgufInspection {
     pub tensors: GgufTensors,
     #[serde(default)]
     pub license: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
-/// What a GGUF file is, read from its architecture and tensors rather than its name. Which
-/// architectures are projectors and separate drafters is the engine's: a `Drafter` declares an
-/// architecture the engine binds only as a drafter, or its tensors are a prediction head. Whether
-/// the engine binds it is the engine's verdict.
+/// What a GGUF file is, read from its header rather than its name. Which architectures are
+/// projectors and separate drafters is the engine's: a `Drafter` declares an architecture the
+/// engine binds only as a drafter, or an architecture the engine doesn't run as a target with
+/// `general.tags` marking it for speculative decoding, or its tensors are a prediction head.
+/// Whether the engine binds it is the engine's verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgufRole {
     Model { embedded_mtp: bool },
@@ -117,16 +120,18 @@ impl GgufTensors {
     }
 }
 
-/// A GGUF's role, from its declared architecture, its tensors and the engine's architectures.
+/// A GGUF's role, from its declared architecture and `general.tags`, its tensors and the engine's
+/// architectures.
 #[must_use]
 pub fn role(
     architecture: Option<&str>,
+    tags: &[String],
     tensors: GgufTensors,
     architectures: &RecognizedArchitectures,
 ) -> GgufRole {
     match (architecture, tensors) {
         (Some(PROJECTOR_ARCHITECTURE), _) => GgufRole::Projector,
-        (Some(architecture), _) if architectures.is_separate_drafter(architecture) => {
+        (Some(architecture), _) if architectures.declares_drafter(architecture, tags) => {
             GgufRole::Drafter
         }
         (_, GgufTensors::PredictionHead) => GgufRole::Drafter,
@@ -137,7 +142,27 @@ pub fn role(
 impl GgufInspection {
     #[must_use]
     pub fn role(&self, architectures: &RecognizedArchitectures) -> GgufRole {
-        role(self.architecture.as_deref(), self.tensors, architectures)
+        role(
+            self.architecture.as_deref(),
+            &self.tags,
+            self.tensors,
+            architectures,
+        )
+    }
+}
+
+/// A header's `general.tags`.
+#[must_use]
+pub fn header_tags(directory: &Directory) -> Vec<String> {
+    match directory.value("general.tags") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(|value| match value {
+                Scalar::String(tag) => Some(tag.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -664,6 +689,7 @@ pub(crate) fn interpret(
         content_sample: None,
         fingerprint_material,
         tensors,
+        tags: header_tags(directory),
     })
 }
 
@@ -1279,6 +1305,25 @@ mod tests {
                 embedded_mtp: false
             },
             "an architecture the engine doesn't list is no drafter; the engine judges it"
+        );
+        let speculative = ("general.tags", Meta::Strs(&["dflash", "speculative-decoding"]));
+        assert_eq!(
+            role_of(&[arch("dflash-draft"), speculative], &["blk.0.attn_q.weight"]),
+            GgufRole::Drafter,
+            "an architecture the engine doesn't know, tagged for speculative decoding, is a drafter"
+        );
+        assert_eq!(
+            role_of(
+                &[
+                    arch("qwen35"),
+                    ("general.tags", Meta::Strs(&["speculative-decoding"]))
+                ],
+                &["blk.0.attn_q.weight"]
+            ),
+            GgufRole::Model {
+                embedded_mtp: false
+            },
+            "a target architecture is told apart by its tensors, whatever its tags"
         );
         assert_eq!(
             inspect_bytes(&crate::test_gguf::gguf_bytes(

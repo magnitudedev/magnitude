@@ -146,16 +146,18 @@ impl HuggingFaceDiscovery {
             }
             kept.push(result);
         }
-        let catalog = if kept.iter().any(|result| result.unsupported.is_empty()) {
-            self.catalog.catalog_fingerprints().await
-        } else {
+        let catalog = if kept.is_empty() {
             Vec::new()
+        } else {
+            self.catalog.catalog_fingerprints().await
         };
         let catalog = &catalog;
+        // Every result's model file is read, an unsupported Hub architecture's too: the Hub names
+        // an architecture, never what its files are for, and a drafter of an architecture the
+        // engine doesn't know is told by its header alone.
         let mut results = futures_util::stream::iter(kept)
             .map(|mut result| async move {
-                let model = !result.unsupported.is_empty()
-                    || self.read_model_file(&mut result, catalog).await;
+                let model = self.read_model_file(&mut result, catalog).await;
                 model.then_some(result)
             })
             .buffered(SEARCH_SHAPE_CONCURRENCY)
@@ -172,14 +174,15 @@ impl HuggingFaceDiscovery {
         Ok(HuggingFaceModelSearchResults { results })
     }
 
-    /// What `result`'s model file says: its header's architecture, which is unsupported when the
-    /// engine doesn't run it, and the first catalog model whose shape fingerprint it has. Names and
-    /// declared lineage never decide. A repository whose headers were read and hold no model file
+    /// What `result`'s model file says: its header's architecture, which replaces the Hub's and is
+    /// unsupported when the engine doesn't run it, and the first catalog model whose shape
+    /// fingerprint it has. Names and declared lineage never decide. A repository whose headers were read and hold no model file
     /// (no architecture, a projector's or a drafter's, or a layer-split piece) is unreadable,
     /// whatever the Hub's repository-level architecture says; a read that failed or timed out
     /// (a gated repository's refused files among them) leaves the result as the Hub describes it.
-    /// `false` for a repository whose files read are all drafters' (a prediction head alone, as an
-    /// MTP block): drafters are offered only in drafter lists, never as results.
+    /// `false` for a repository whose files read are all drafters' (a separate drafter
+    /// architecture, one the engine doesn't run tagged for speculative decoding, or a prediction
+    /// head alone, as an MTP block): drafters are offered only in drafter lists, never as results.
     async fn read_model_file(
         &self,
         result: &mut HuggingFaceModelSearchResult,
@@ -208,6 +211,7 @@ impl HuggingFaceDiscovery {
                     )];
                     return true;
                 }
+                result.unsupported.clear();
                 result.variant_of = shape.and_then(|shape| shape.variant_of(catalog));
             }
             Some(RepositoryModel::Unreadable) => {
@@ -4439,6 +4443,46 @@ mod tests {
              drafter repository, offered only in drafter lists"
         );
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drafter_of_an_architecture_the_engine_does_not_know_is_no_result() {
+        use crate::test_gguf::Meta;
+        let dflash = crate::test_gguf::gguf_bytes(
+            &[
+                ("general.architecture", Meta::Str("dflash-draft")),
+                ("general.tags", Meta::Strs(&["dflash", "speculative-decoding", "block-diffusion"])),
+                ("dflash-draft.block_count", Meta::U32(1)),
+            ],
+            &["blk.0.attn_q.weight"],
+        );
+        let (endpoint, _, _) = serve_repositories(vec![
+            StubRepository::new("psychopenguin/Qwen3.5-4B-DFlash-FP16-GGUF", Some("dflash-draft"))
+                .file("Qwen3.5-4B-DFlash-FP16.gguf", 1_080_000_000, Some(dflash.clone()))
+                .file("Qwen3.5-4B-DFlash-Q4_K_M.gguf", 300_000_000, Some(dflash)),
+            StubRepository::new("someone/DeepSeek-V4-GGUF", Some("deepseek4"))
+                .file("model.gguf", 2_000_000_000, Some(architecture_only("deepseek4"))),
+            StubRepository::new("someone/Mislabelled-GGUF", Some("qwen3moe"))
+                .file("model.gguf", 2_000_000_000, Some(architecture_only("llama"))),
+        ]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let results = search_all(&shape_discovery(&store, &["llama"], Vec::new())).await;
+        assert!(
+            !results.contains_key("psychopenguin/Qwen3.5-4B-DFlash-FP16-GGUF"),
+            "a drafter architecture the engine doesn't know is told by its header's tags, not \
+             listed as a model it can't run"
+        );
+        assert_eq!(
+            results["someone/DeepSeek-V4-GGUF"].unsupported,
+            [UnsupportedReason::Known(KnownUnsupportedReason::Architecture {
+                architecture: "deepseek4".to_owned()
+            })],
+            "a model of an architecture the engine doesn't run is still listed as unsupported"
+        );
+        assert!(
+            results["someone/Mislabelled-GGUF"].unsupported.is_empty(),
+            "the header's architecture replaces the Hub's"
+        );
     }
 
     /// A rate limit (HTTP 429) on a file listing or a header read is unknown, never a verdict: the

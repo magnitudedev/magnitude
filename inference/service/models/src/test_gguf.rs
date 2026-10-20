@@ -6,6 +6,7 @@ pub(crate) enum Meta<'a> {
     Str(&'a str),
     U32(u32),
     Bool(bool),
+    Strs(&'a [&'a str]),
 }
 
 const ALIGNMENT: usize = 32;
@@ -36,6 +37,14 @@ pub(crate) fn gguf_bytes(metadata: &[(&str, Meta<'_>)], tensors: &[&str]) -> Vec
             Meta::Bool(value) => {
                 bytes.extend_from_slice(&7_u32.to_le_bytes());
                 bytes.push(u8::from(*value));
+            }
+            Meta::Strs(values) => {
+                bytes.extend_from_slice(&9_u32.to_le_bytes());
+                bytes.extend_from_slice(&8_u32.to_le_bytes());
+                bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                for value in *values {
+                    push_string(&mut bytes, value);
+                }
             }
         }
     }

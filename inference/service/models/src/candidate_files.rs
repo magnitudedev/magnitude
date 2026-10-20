@@ -58,22 +58,37 @@ impl RecognizedArchitectures {
         self.drafters.contains(architecture) && !self.targets.contains(architecture)
     }
 
+    /// Whether a GGUF header declares a drafter: an architecture the engine binds only as a
+    /// drafter, or an architecture the engine doesn't run as a target whose `general.tags` mark
+    /// it for speculative decoding (a drafter architecture the engine doesn't know yet, such as
+    /// a community DFlash conversion). An architecture the engine runs as a target is told apart
+    /// by its tensors.
+    #[must_use]
+    pub fn declares_drafter(&self, architecture: &str, tags: &[String]) -> bool {
+        self.is_separate_drafter(architecture)
+            || (!self.targets.contains(architecture) && speculative_decoding_tags(tags))
+    }
+
     /// Whether a Hub repository holds a drafter rather than a model: it declares an architecture
     /// the engine binds only as a drafter, or the Hub tags it for speculative decoding. Names
     /// never decide. Drafters are offered in drafter lists, never as models.
     #[must_use]
     pub fn is_drafter_repository(&self, architecture: Option<&str>, tags: &[String]) -> bool {
-        let tagged = tags.iter().any(|tag| {
-            matches!(
-                tag.to_ascii_lowercase().as_str(),
-                "speculative-decoding"
-                    | "speculative-decoding-draft"
-                    | "draft-model"
-                    | "speculator"
-            )
-        });
-        tagged || architecture.is_some_and(|architecture| self.is_separate_drafter(architecture))
+        speculative_decoding_tags(tags)
+            || architecture.is_some_and(|architecture| self.is_separate_drafter(architecture))
     }
+}
+
+/// Whether tags (a Hub repository's, or a GGUF header's `general.tags`) mark a drafter for
+/// speculative decoding.
+#[must_use]
+pub fn speculative_decoding_tags(tags: &[String]) -> bool {
+    tags.iter().any(|tag| {
+        matches!(
+            tag.to_ascii_lowercase().as_str(),
+            "speculative-decoding" | "speculative-decoding-draft" | "draft-model" | "speculator"
+        )
+    })
 }
 
 /// What a GGUF is for, read from its header.
@@ -111,7 +126,8 @@ impl CandidateFileRole {
             .and_then(Value::string)
             .map(ToOwned::to_owned);
         let tensors = crate::gguf::GgufTensors::of(directory, architecture.as_deref());
-        match crate::gguf::role(architecture.as_deref(), tensors, architectures) {
+        let tags = crate::gguf::header_tags(directory);
+        match crate::gguf::role(architecture.as_deref(), &tags, tensors, architectures) {
             crate::gguf::GgufRole::Projector => Self::Projector,
             crate::gguf::GgufRole::Drafter => match architecture {
                 Some(architecture) => Self::Drafter { architecture },
