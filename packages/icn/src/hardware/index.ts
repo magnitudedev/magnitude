@@ -1,4 +1,5 @@
-import { Cause, Context, Duration, Effect, Layer, Schema, Stream } from "effect"
+import { Cause, Context, Duration, Effect, Layer, Stream } from "effect"
+import { dataEquivalence } from "@magnitudedev/utils/data-equivalence"
 import { IcnClient, type IcnClientService } from "../client.js"
 import { HardwareSnapshot as HardwareSnapshotSchema } from "@magnitudedev/icn-protocol/schemas"
 import {
@@ -35,7 +36,7 @@ export const makeIcnHardware = (
       const observed = yield* makeIcnObservedState(
         initial,
         read,
-        Schema.equivalence(HardwareSnapshotSchema),
+        dataEquivalence(),
         { initiallyInitialized: true },
       )
 

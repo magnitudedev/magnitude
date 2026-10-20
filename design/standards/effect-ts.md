@@ -51,6 +51,14 @@ Nest discriminated unions in other structures when needed, for example.
 
 Use Schema.brand when a field is of a meaningful semantic purpose that should be made explicit for the purpose of ensuring consumers use it correctly.
 
+### Schemas on hot paths
+
+Compile a validator or decoder once, at module level, wherever it runs per item or per refresh.
+`Schema.validateSync(schema)` and `Schema.is(schema)` derive the type side of the AST and build a new
+parser on each call when the schema has transformations, such as Option fields. Compare large
+decoded states for change with `dataEquivalence` from `@magnitudedev/utils/data-equivalence`, not
+`Schema.equivalence`, which builds a parser for each union member on every comparison.
+
 ## Errors
 
 ### Error anti-patterns

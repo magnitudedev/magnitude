@@ -162,6 +162,11 @@ hardware cycle still match the request. A superseded result cannot overwrite a n
 snapshot. Derived projections may be materialized for cost, but source revisions and native state
 remain authoritative.
 
+ACN rereads ICN state and reprojects the whole list on every relevant change, on the one event loop
+that also answers health and RPC. Those passes stay cheap: validators are compiled once, never per
+model, and ICN observed states and the projection detect change by value equality of the decoded
+data, not `Schema.equivalence`, which rebuilds parsers for every union member it compares.
+
 ## Conformance
 
 - Catalog and custom models share `ModelId` without sharing lifecycle semantics.

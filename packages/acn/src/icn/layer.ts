@@ -1,6 +1,6 @@
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups";
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native";
-import { FileSystem } from "@effect/platform";
+import { FetchHttpClient, FileSystem } from "@effect/platform";
 import { ModelAssessmentsSnapshot } from "@magnitudedev/icn-protocol/schemas";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -51,6 +51,13 @@ const artifactProgress = (
   attempt: Option.some(event.progress.attempt),
 });
 const defaultDataDir = () => join(homedir(), ".magnitude");
+// ICN bounds its own work (a stalled Hub transfer fails there), so its calls carry no client deadline.
+// Bun's fetch otherwise ends every request after five minutes, and a repository inspection that
+// outlasts that on a slow connection would be reported as ICN being unreachable.
+const icnFetchOptions: globalThis.RequestInit & { readonly timeout: false } = { timeout: false };
+export const icnHttpClient = FetchHttpClient.layer.pipe(
+  Layer.provide(Layer.succeed(FetchHttpClient.RequestInit, icnFetchOptions)),
+);
 const AcceptanceAssessmentDiagnostics = Schema.Struct({
   assessments: ModelAssessmentsSnapshot,
   inferenceDiagnosticTail: Schema.String,
@@ -295,7 +302,7 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
     )
   );
   const supervisedProcess = Layer.provideMerge(makeSupervision(), process);
-  const withClient = Layer.provideMerge(makeIcnClient(), supervisedProcess);
+  const withClient = Layer.provideMerge(makeIcnClient().pipe(Layer.provide(icnHttpClient)), supervisedProcess);
   const withHubCredential = Layer.provideMerge(
     HuggingFaceCredentialDeliveryLive.pipe(Layer.provideMerge(makeIcnHuggingFaceCredential())),
     withClient,

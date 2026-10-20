@@ -1,6 +1,6 @@
 import { Array, Context, Effect, Layer, Option, Schema, Stream } from "effect"
+import { dataEquivalence } from "@magnitudedev/utils/data-equivalence"
 import {
-  LocalModelsStateSchema,
   LocalModelAssessmentSchema,
   LocalModelDoesNotFitAssessmentSchema,
   CatalogLocalModelSchema,
@@ -80,6 +80,22 @@ import { materializeProjection } from "./materialized-projection"
 import { modelRankingScores } from "./local-model-ranking-policy"
 import { LocalModelRemovals, type LocalModelRemovalState } from "./local-model-removals"
 
+// Compiled once: `Schema.validateSync(schema)` rebuilds its parser on every call, which costs
+// seconds of event-loop time when the whole list is projected on each inference change.
+const decodeLocalModelAssessment = Schema.decodeUnknownSync(LocalModelAssessmentSchema)
+const decodeDrafterVerdict = Schema.decodeUnknownOption(DrafterVerdictSchema)
+const validateModelCapabilities = Schema.validateSync(ModelCapabilitiesSchema)
+const validateDoesNotFitAssessment = Schema.validateSync(LocalModelDoesNotFitAssessmentSchema)
+const validateCatalogLocalModel = Schema.validateSync(CatalogLocalModelSchema)
+const validateCustomLocalModel = Schema.validateSync(CustomLocalModelSchema)
+const validateUnsupportedLocalModel = Schema.validateOption(UnsupportedLocalModelSchema)
+const decodeUnsupportedLocalModel = Schema.decodeUnknownOption(UnsupportedLocalModelSchema)
+const decodeVariantLabel = Schema.decodeUnknownSync(ModelVariantLabelSchema)
+const decodeReleaseDate = Schema.decodeUnknownSync(ModelReleaseDateSchema)
+const decodeCustomFormModelId = Schema.decodeUnknownOption(CustomFormModelIdSchema)
+const decodeCatalogFormModelId = Schema.decodeUnknownOption(CatalogFormModelIdSchema)
+const decodeCustomModelOrigin = Schema.decodeUnknownSync(CustomModelOriginSchema)
+
 const failure = (code: string, message: string, retryable = false): ModelFailure => ({ code, message, retryable })
 
 const assessmentDomainProgress = (
@@ -141,7 +157,7 @@ export const projectAssessment = (environmentId: string, assessment: ModelAssess
     const totalRequiredBytes = assessment.memory.reduce((total, item) => total + item.requiredBytes, 0)
     const requiredSystemMemoryBytes = assessment.memory.filter((item) => item.memoryDomainId === "system")
       .reduce((total, item) => total + item.requiredBytes, 0)
-    return Schema.decodeUnknownSync(LocalModelAssessmentSchema)({
+    return decodeLocalModelAssessment({
       _tag: "Fits", assessmentId: assessment.assessmentId, environmentId,
       profile: assessment.profile,
       memory: {
@@ -151,7 +167,7 @@ export const projectAssessment = (environmentId: string, assessment: ModelAssess
     })
   }
   if (assessment._tag === "DoesNotFit") {
-    return Schema.decodeUnknownSync(LocalModelAssessmentSchema)({
+    return decodeLocalModelAssessment({
       _tag: "DoesNotFit", assessmentId: assessment.assessmentId, environmentId,
       profile: assessment.profile,
       memoryDomains: assessment.memory,
@@ -159,7 +175,7 @@ export const projectAssessment = (environmentId: string, assessment: ModelAssess
       deficitBytes: assessment.deficitBytes, limitingResource: assessment.limitingResource,
     })
   }
-  return Schema.decodeUnknownSync(LocalModelAssessmentSchema)({
+  return decodeLocalModelAssessment({
     _tag: "Unsupported", environmentId,
     ...Option.match(assessment.profile, { onNone: () => ({}), onSome: (profile) => ({ profile }) }),
     reasons: productUnsupportedReasons(assessment.reasons, assessment.detail), detail: assessment.detail,
@@ -189,7 +205,7 @@ export const coordinatedAssessment = (
 }
 
 export const productDrafterVerdict = (verdict: NativeDrafterVerdict): DrafterVerdict | undefined =>
-  Option.getOrUndefined(Schema.decodeUnknownOption(DrafterVerdictSchema)(
+  Option.getOrUndefined(decodeDrafterVerdict(
     verdict._tag === "Rejected" ? { ...verdict, reasons: productUnsupportedReasons(verdict.reasons, verdict.detail) } : verdict,
   ))
 
@@ -272,14 +288,14 @@ export const catalogModelServingState = (
   }
   const assessed = {
     metadata: ready.metadata,
-    capabilities: Schema.validateSync(ModelCapabilitiesSchema)(assessment.capabilities),
+    capabilities: validateModelCapabilities(assessment.capabilities),
     speculativeMethod: ready.speculativeMethod,
   }
   return assessment.assessment._tag === "Fits"
     ? { _tag: "Assessed", ...assessed, assessment: assessment.assessment, rankingScores }
     // The service never reports a catalog model as Unsupported; validation rejects that contract violation.
     : { _tag: "Assessed", ...assessed,
-        assessment: Schema.validateSync(LocalModelDoesNotFitAssessmentSchema)(assessment.assessment) }
+        assessment: validateDoesNotFitAssessment(assessment.assessment) }
 }
 
 const catalogSupport = (support: CatalogModel["support"]) => {
@@ -338,26 +354,26 @@ const catalogModel = (
         performance: assessment.assessment.performance,
       })
     : Option.none()
-  return Schema.validateSync(CatalogLocalModelSchema)({
+  return validateCatalogLocalModel({
     _tag: "Catalog",
     modelId: entry.id,
     storageBytes: source.desired.metadata.storageBytes,
     presentation: {
       displayName: source.displayName,
-      variantLabel: Schema.decodeUnknownSync(ModelVariantLabelSchema)(source.variantLabel),
+      variantLabel: decodeVariantLabel(source.variantLabel),
       description: source.description,
       license: Option.some(source.license),
       sourceUrls: source.sourceUrls,
     },
     catalogData: {
-      releaseDate: Schema.decodeUnknownSync(ModelReleaseDateSchema)(source.releaseDate),
+      releaseDate: decodeReleaseDate(source.releaseDate),
       parameterization: source.parameterization,
       intelligence: source.intelligence,
       support: catalogSupport(source.support),
       fidelityRank: source.fidelityRank,
       quantizationAware: source.quantizationAware,
       aliases: Option.getOrElse(source.aliases, () => []).filter((alias) => !hidden.includes(alias)).flatMap((alias) =>
-        Option.toArray(Schema.decodeUnknownOption(CustomFormModelIdSchema)(alias))),
+        Option.toArray(decodeCustomFormModelId(alias))),
     },
     acquisitionState,
     servingState: catalogModelServingState(ready, assessment, rankingScores, unavailableFailure),
@@ -385,7 +401,7 @@ export const customModelServingState = (
   return {
     _tag: "Assessed",
     metadata: state.model.metadata,
-    capabilities: Schema.validateSync(ModelCapabilitiesSchema)(assessment.capabilities),
+    capabilities: validateModelCapabilities(assessment.capabilities),
     speculativeMethod: state.model.speculativeMethod,
     assessment: assessment.assessment,
   }
@@ -514,7 +530,7 @@ const externalUnsupportedAssessment = (inputs: CustomModelInputs, origin: Custom
 /** One custom row, or none when it has nothing to show: absent external files, a failed assessment, or no support. */
 export const customModel = (inputs: CustomModelInputs): Option.Option<CustomLocalModel> => {
   const { entry, assessment, instances, related, catalog } = inputs
-  const origin = Schema.decodeUnknownSync(CustomModelOriginSchema)(entry.source.origin)
+  const origin = decodeCustomModelOrigin(entry.source.origin)
   if (assessment?._tag === "Dropped" && origin._tag !== "Added") return Option.none()
   if (Option.isSome(externalUnsupportedAssessment(inputs, origin))) return Option.none()
   const visible = assessment?._tag === "Dropped" ? undefined : assessment
@@ -525,7 +541,7 @@ export const customModel = (inputs: CustomModelInputs): Option.Option<CustomLoca
   const servingState: CustomLocalModelServingState = assessment?._tag === "Dropped"
     ? { _tag: "Failed", profile: entry.source.profile, failure: unavailableAssessment }
     : customModelServingState(entry.source, visible)
-  return Option.some(Schema.validateSync(CustomLocalModelSchema)({
+  return Option.some(validateCustomLocalModel({
     _tag: "Custom",
     modelId: entry.id,
     origin,
@@ -533,12 +549,12 @@ export const customModel = (inputs: CustomModelInputs): Option.Option<CustomLoca
       displayName: entry.source.displayName.trim().length > 0
         ? entry.source.displayName
         : fileStem(entry.source.files[0]?.path ?? entry.id),
-      variantLabel: Schema.decodeUnknownSync(ModelVariantLabelSchema)(Option.getOrElse(
+      variantLabel: decodeVariantLabel(Option.getOrElse(
         Option.filter(entry.source.variantLabel, (label) => label.length > 0),
         () => ready !== undefined && ready.metadata.quantizationName.length > 0 ? ready.metadata.quantizationName : "GGUF",
       )),
       sourceLabel: customModelSourceLabel(origin),
-      variantOf: Option.flatMap(entry.source.variantOf, Schema.decodeUnknownOption(CatalogFormModelIdSchema)),
+      variantOf: Option.flatMap(entry.source.variantOf, decodeCatalogFormModelId),
       license: Option.filter(Option.map(entry.source.license, (license) => license.trim()), (license) => license.length > 0),
       sourceUrls: sourceUrls(entry.id),
     },
@@ -557,10 +573,10 @@ export const customModel = (inputs: CustomModelInputs): Option.Option<CustomLoca
 /** A found or imported model whose assessment is `Unsupported`, listed with every engine reason. */
 export const unsupportedCustomModel = (inputs: CustomModelInputs): Option.Option<UnsupportedLocalModel> => {
   const { entry } = inputs
-  const origin = Schema.decodeUnknownSync(CustomModelOriginSchema)(entry.source.origin)
+  const origin = decodeCustomModelOrigin(entry.source.origin)
   return Option.flatMap(externalUnsupportedAssessment(inputs, origin), (unsupported) => {
     const path = entry.source.files[0]?.path ?? (origin._tag === "Imported" ? origin.path : entry.id)
-    return Schema.validateOption(UnsupportedLocalModelSchema)({
+    return validateUnsupportedLocalModel({
       modelId: Option.some(entry.id),
       displayName: entry.source.displayName.trim().length > 0 ? entry.source.displayName : fileStem(path),
       origin,
@@ -572,7 +588,7 @@ export const unsupportedCustomModel = (inputs: CustomModelInputs): Option.Option
 }
 
 export const unsupportedLocalModel = (model: NativeUnsupportedLocalModel): Option.Option<UnsupportedLocalModel> =>
-  Schema.decodeUnknownOption(UnsupportedLocalModelSchema)({
+  decodeUnsupportedLocalModel({
     ...model,
     displayName: model.displayName.trim().length > 0 ? model.displayName : fileStem(model.path),
     reasons: productUnsupportedReasons(model.reasons, model.detail),
@@ -622,7 +638,7 @@ export const LocalModelsLive: Layer.Layer<
       downloads.changes.pipe(Stream.map(() => undefined)), customModels.changes.pipe(Stream.map(() => undefined)),
       removalService.changes,
     ], { concurrency: "unbounded" }),
-    equivalent: Schema.equivalence(LocalModelsStateSchema),
+    equivalent: dataEquivalence(),
   })
   return LocalModels.of({
     state: projection.get,

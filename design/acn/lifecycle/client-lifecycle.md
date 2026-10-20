@@ -32,7 +32,9 @@ and any other answer is final. An already-starting service is observed without i
 starter. CLI and plugin clients are connect-only: they omit startup authority and report unavailable
 services without launching an application or subprocess. Malformed health and protocol mismatch
 remain distinguishable failures. The default absolute admission deadline is ten minutes, including
-starter execution and health waiting. Each health request has a two-second bound.
+starter execution and health waiting. Each health request has a two-second bound. A request the
+service accepted but left unanswered within it means a busy service, not an absent one: it is asked
+again, three times in all, before admission reports the service unavailable.
 
 Privileged first-party hosts can supply a direct starter backed by private daemon-management.
 That package owns native desktop discovery/control, exact child supervision,

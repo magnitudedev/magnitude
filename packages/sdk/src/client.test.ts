@@ -13,6 +13,8 @@ import {
   Layer,
   Scope,
   Stream,
+  TestClock,
+  TestContext,
 } from "effect";
 import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/acn-protocol";
 import { MagnitudeClient } from "./client";
@@ -119,6 +121,30 @@ const fixture = (options: { readonly starterUpgrades?: boolean } = {}) => {
     },
   };
 };
+
+/** Health requests the service accepts but leaves unanswered, `count` times, before answering again. */
+const unansweredHealth = (http: HttpClient.HttpClient, count: number) => {
+  let remaining = count;
+  const health: string[] = [];
+  return {
+    health,
+    http: HttpClient.make((request) => {
+      if (!request.url.endsWith("/health")) return http.execute(request);
+      health.push(request.url);
+      return remaining-- > 0 ? Effect.never : http.execute(request);
+    }),
+  };
+};
+
+/** Advances the test clock until the fiber is done. */
+const joinAdvancing = <A, E>(fiber: Fiber.Fiber<A, E>) =>
+  Effect.gen(function* () {
+    while ((yield* Fiber.poll(fiber))._tag === "None") {
+      yield* TestClock.adjust("500 millis");
+      yield* Effect.yieldNow();
+    }
+    return yield* Fiber.join(fiber);
+  });
 
 describe("MagnitudeClient", () => {
   it("scope closure cancels startup, terminalizes waiters, and prevents reuse", async () => {
@@ -401,6 +427,44 @@ describe("MagnitudeClient", () => {
         expect((yield* client.connection.state)._tag).toBe("Ready");
         yield* client.models.stop({});
       }).pipe(Effect.provide(live))
+    );
+  });
+
+  it("asks a busy service's health again instead of reporting it unavailable", async () => {
+    const f = fixture();
+    const busy = unansweredHealth(f.http, 2);
+    const live = MagnitudeClient.layer({ autoStart: false }).pipe(
+      Layer.provide(Layer.succeed(HttpClient.HttpClient, busy.http))
+    );
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* MagnitudeClient;
+        yield* joinAdvancing(yield* Effect.fork(client.models.stop({})));
+        expect((yield* client.connection.state)._tag).toBe("Ready");
+        expect(busy.health).toHaveLength(3);
+      }).pipe(Effect.provide(live), Effect.provide(TestContext.TestContext))
+    );
+  });
+
+  it("reports a service whose health stays unanswered as unavailable after a bounded number of asks", async () => {
+    const f = fixture();
+    const hung = unansweredHealth(f.http, Number.POSITIVE_INFINITY);
+    const live = MagnitudeClient.layer({ autoStart: false }).pipe(
+      Layer.provide(Layer.succeed(HttpClient.HttpClient, hung.http))
+    );
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const client = yield* MagnitudeClient;
+        const result = yield* joinAdvancing(
+          yield* Effect.fork(Effect.either(client.connection.connect))
+        );
+        expect(result._tag).toBe("Left");
+        if (result._tag === "Left") {
+          expect(result.left._tag).toBe("ServiceUnavailable");
+          expect(result.left).toMatchObject({ message: "Magnitude service health timed out" });
+        }
+        expect(hung.health).toHaveLength(3);
+      }).pipe(Effect.provide(live), Effect.provide(TestContext.TestContext))
     );
   });
 

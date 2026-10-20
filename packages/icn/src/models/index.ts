@@ -1,4 +1,5 @@
-import { Cause, Context, Duration, Effect, Layer, Schema } from "effect"
+import { Cause, Context, Duration, Effect, Layer } from "effect"
+import { dataEquivalence } from "@magnitudedev/utils/data-equivalence"
 import {
   CatalogInstallationsResponse,
   CatalogModelsResponse,
@@ -69,7 +70,7 @@ export const makeIcnCatalog = (
   const read = client.catalog.listCatalogModels({})
   const retryInterval = options.retryInterval ?? "1 second"
   const initial = yield* read
-  const observed = yield* makeIcnObservedState(initial, read, Schema.equivalence(CatalogModelsResponse), {
+  const observed = yield* makeIcnObservedState(initial, read, dataEquivalence(), {
     initiallyInitialized: true,
   })
   yield* refreshOnIcnEvents(invalidations, new Set(["catalog"]), observed.refresh, "ICN catalog", retryInterval)
@@ -85,7 +86,7 @@ export const makeIcnLocalModels = (
   const read = client.localModels.listLocalModels({})
   const retryInterval = options.retryInterval ?? "1 second"
   const initial = yield* read
-  const observed = yield* makeIcnObservedState(initial, read, Schema.equivalence(LocalModelsResponse), {
+  const observed = yield* makeIcnObservedState(initial, read, dataEquivalence(), {
     initiallyInitialized: true,
   })
   yield* refreshOnIcnEvents(invalidations, new Set(["local-models"]), observed.refresh, "ICN local models", retryInterval)
@@ -121,7 +122,7 @@ export const makeIcnModelAssessments = (
     const observed = yield* makeIcnObservedState(
       initial,
       read,
-      Schema.equivalence(ModelAssessmentsSnapshot),
+      dataEquivalence(),
       { initiallyInitialized: true },
     )
     yield* refreshOnIcnEvents(
@@ -146,7 +147,7 @@ export const makeIcnCatalogInstallations = (
     const observed = yield* makeIcnObservedState(
       initial,
       read,
-      Schema.equivalence(CatalogInstallationsResponse),
+      dataEquivalence(),
       { initiallyInitialized: true },
     )
     yield* refreshOnIcnEvents(

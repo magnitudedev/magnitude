@@ -167,6 +167,10 @@ execution, response decoding, SSE and NDJSON framing, declared stream terminatio
 policy, response-body cleanup, cancellation, and the common transport/protocol error model. That
 runtime is part of `@magnitudedev/openapi-effect`; none of it is recreated in `@magnitudedev/icn`.
 
+ACN's ICN client sets no client-side request deadline, so Bun's default five-minute fetch timeout
+never ends a long repository inspection or event stream; ICN bounds its own work, such as stalled
+Hugging Face transfers.
+
 The generated client preserves per-operation success and declared error types and groups methods by
 the OpenAPI operation groups. It captures `HttpClient` and connection configuration when
 constructed so methods require no platform services. Streaming admission failures remain in the

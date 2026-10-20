@@ -1,4 +1,5 @@
-import { Context, Duration, Effect, Layer, Option, Schema } from "effect"
+import { Context, Duration, Effect, Layer, Option } from "effect"
+import { dataEquivalence } from "@magnitudedev/utils/data-equivalence"
 import {
   ModelDownloadsResponse,
   type ModelDownload,
@@ -41,7 +42,7 @@ export const makeIcnDownloads = (
   const invalidations = yield* (yield* IcnEvents).subscribe
   const read = client.downloads.listModelDownloads({})
   const initial = yield* read
-  const observed = yield* makeIcnObservedState(initial, read, Schema.equivalence(ModelDownloadsResponse), {
+  const observed = yield* makeIcnObservedState(initial, read, dataEquivalence(), {
     initiallyInitialized: true,
   })
   yield* refreshOnIcnEvents(
