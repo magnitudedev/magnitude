@@ -24,6 +24,7 @@ the job, like the source tree; a local run uses them in place.
 """
 
 import getpass
+import hashlib
 import json
 import os
 import secrets
@@ -127,18 +128,29 @@ def _collect(step: str, sink: OutputSink, captured: list[str]) -> Callable[[str,
     return receive
 
 
+def local_target(root: Path, source: Path) -> Path:
+    """A local checkout's cargo target directory: under the cache root, never inside the source
+    root. Provenance accepts an uninstrumented (registry) crate only when all its sources lie
+    outside the synchronized sources, and build-script output is among them, so a target inside
+    the checkout refuses every such crate. Keyed by checkout, so local checkouts never share
+    one."""
+    key = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:12]
+    return root / "targets" / f"local-{source.parent.name}-{key}"
+
+
 class LocalExecutor:
     alias = None
 
     def __init__(self, config: HostConfig, sink: OutputSink):
         source = sync.INFERENCE
+        root = Path(config.root).expanduser()
         self.layout = Layout(
             str(source),
-            str(source / "target"),
+            str(local_target(root, source)),
             str(RESULTS),
             str(Path(config.models).expanduser()),
             sys.executable,
-            str(Path(config.root).expanduser()),
+            str(root),
         )
         self._sink = sink
         self._env = {name: os.path.expanduser(value) for name, value in config.env}
@@ -152,7 +164,7 @@ class LocalExecutor:
         process = subprocess.Popen(
             argv,
             cwd=self.layout.src,
-            env={**os.environ, **self._env, **env},
+            env={**os.environ, "CARGO_TARGET_DIR": self.layout.target, **self._env, **env},
             stdin=subprocess.DEVNULL if input is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -2,6 +2,7 @@
 
 import json
 import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -93,6 +94,17 @@ def test_remote_steps_keep_caches_under_the_cache_root():
         "T": "/home/u/t",
         "X": "1",
     })
+
+
+def test_local_cargo_target_lies_outside_the_source_root(tmp_path):
+    config = HostConfig("", str(tmp_path / "root"), str(tmp_path / "models"))
+    executor = flow.LocalExecutor(config, lambda *a: None)
+    target = Path(executor.layout.target)
+    assert target.is_relative_to(tmp_path / "root")
+    assert not target.resolve().is_relative_to(sync.INFERENCE.resolve())
+    script = "import os; print(os.environ['CARGO_TARGET_DIR'])"
+    code, output = executor.run("job", [sys.executable, "-c", script], env={}, input=None)
+    assert (code, output) == (0, f"{target}\n")
 
 
 def test_host_env_from_the_hosts_file(tmp_path):
