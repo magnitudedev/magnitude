@@ -704,6 +704,7 @@ describe("adding models", () => {
           memory: [{ memoryDomainId: "system", capacityBytes: 8, compatibilityReserveBytes: 0, remainingBytes: -4, requiredBytes: 12 }],
           limitingResource: "system",
           deficitBytes: 4,
+          projector: { _tag: "None" },
           drafter: { _tag: "None" },
         },
       }],
