@@ -16,10 +16,12 @@ printf 'APPLE_RELEASE_KEYCHAIN=%s\n' "$keychain" >> "$GITHUB_ENV"
 /usr/bin/security set-keychain-settings -lut 21600 "$keychain"
 /usr/bin/security unlock-keychain -p "$keychain_password" "$keychain"
 /usr/bin/security import "$credential_dir/certificate.p12" -k "$keychain" -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security > /dev/null
-/usr/bin/curl --fail --silent --show-error --location https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer -o "$credential_dir/DeveloperIDG2CA.cer"
+/usr/bin/curl --fail --silent --show-error --location --retry 5 --retry-all-errors https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer -o "$credential_dir/DeveloperIDG2CA.cer"
 /usr/bin/security import "$credential_dir/DeveloperIDG2CA.cer" -k "$keychain" > /dev/null
 /usr/bin/security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
 /usr/bin/security list-keychains -d user -s "$keychain"
-/usr/bin/xcrun notarytool store-credentials magnitude-release --keychain "$keychain" \
+# Not validated here, where a dropped connection would fail the job: Apple commands that use the profile retry
+# dropped connections, and the release build checks it before compiling.
+/usr/bin/xcrun notarytool store-credentials magnitude-release --keychain "$keychain" --no-validate \
   --key "$credential_dir/notary.p8" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" > /dev/null
 printf 'APPLE_TEAM_ID=%s\nAPPLE_SIGNING_IDENTITY=%s\n' "$APPLE_TEAM_ID" "$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"

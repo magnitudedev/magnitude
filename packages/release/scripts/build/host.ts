@@ -7,7 +7,7 @@ import { buildWindowsDesktopInstaller } from "./desktop-windows"
 import { signWindowsCode } from "./windows-signing"
 import { BunContext } from "@effect/platform-bun"
 import { buildDesktopDmg, validateDesktopDistribution } from "../apple/desktop"
-import { appleSigning, signAppleCode, appleCommand } from "../apple/signing"
+import { appleSigning, signAppleCode, appleCommand, verifyNotaryCredentials } from "../apple/signing"
 import { runAppleBuild } from "../apple/compile-bun"
 import { notarizeAppleUnit, regularAppleFiles, writeAppleReceipt } from "../apple/distribution"
 import {
@@ -129,7 +129,7 @@ export const smokeHostArchives = async (
       const signing = await runAppleBuild(appleSigning)
       await run(["/usr/bin/codesign", "--verify", "--deep", "--strict", "-R", `=${appleRequirement("dev.magnitude.service", signing.team)}`, app])
       await run(["/usr/bin/codesign", "--verify", "--strict", "-R", `=${appleRequirement("dev.magnitude.cli", signing.team)}`, resolve(cliRoot, "bin/magnitude-cli")])
-      if (signing.mode === "developer-id") await run(["/usr/bin/xcrun", "stapler", "validate", app])
+      if (signing.mode === "developer-id") await runAppleBuild(appleCommand("/usr/bin/xcrun", "stapler", "validate", app))
     }
   } finally {
     await Effect.runPromise(Effect.tryPromise(() => rm(root, { recursive: true, force: true })).pipe(
@@ -166,6 +166,7 @@ export const buildHostArtifacts = async (
   const host = hostById(hostId)
   // Resolved before compiling so a missing or malformed publisher identity fails immediately.
   const desktopEnvironment = await Effect.runPromise(desktopBuildEnvironment(host.id))
+  if (host.id.startsWith("darwin-")) await runAppleBuild(verifyNotaryCredentials)
   const output = resolve(outputRoot)
   await rm(output, { recursive: true, force: true })
   await mkdir(output, { recursive: true, mode: 0o700 })

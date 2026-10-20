@@ -30,7 +30,7 @@ Dump of file C:\\build\\ggml-base.dll
   })
 
   it("requires app-local compiler runtimes and never treats arbitrary paths as OS libraries", () => {
-    for (const name of ["KERNEL32.dll", "api-ms-win-crt-heap-l1-1-0.dll"]) expect(windowsSystemLibrary(name)).toBe(true)
+    for (const name of ["KERNEL32.dll", "DXGI.dll", "api-ms-win-crt-heap-l1-1-0.dll"]) expect(windowsSystemLibrary(name)).toBe(true)
     for (const name of ["MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "ggml-base.dll", "C:\\Windows\\KERNEL32.dll", "api-ms-win-../vendor.dll"]) {
       expect(windowsSystemLibrary(name)).toBe(false)
     }
