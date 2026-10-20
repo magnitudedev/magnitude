@@ -20,14 +20,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         });
     }
 
-    /// The host's turn starts again now: what it waited for since it began
-    /// prepared no launch.
-    pub(super) fn restart_host_turn(&mut self) {
-        if let Some(turn) = &mut self.host_turn {
-            turn.since = Instant::now();
-        }
-    }
-
     /// When the service of a launch of `requests` submitted at `submitted`
     /// starts: where the flight before it finished, when that flight
     /// carried one of its requests and the owner did not idle since, so a

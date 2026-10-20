@@ -15,7 +15,7 @@
 //!
 //! Requests verified in one launch share its rows ([`share_rows`]).
 
-use magnitude_executor::{TokenId, draft_ladder};
+use magnitude_executor::{draft_ladder, TokenId};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -42,10 +42,24 @@ const LOOK_SHARE: f64 = 0.01;
 /// Which launch of a round a duration belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimedLaunch {
-    /// The drafter's launch.
+    /// The drafter's launch that proposes.
     Draft,
+    /// A drafter launch that only enters pairs: the catch-up of a round
+    /// drafting after rounds that did not, or the entry of held pairs past
+    /// their bound. It is part of the round it serves.
+    Entry,
     /// The target's launch.
     Target,
+}
+
+/// A round that changes between drafting and not: one that drafts after a
+/// round that did not discards the decode queued behind that round and
+/// first enters the pairs held since, and one that does not draft after a
+/// round that did starts the decode pipeline again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Switch {
+    Enter,
+    Leave,
 }
 
 /// A launch's latest durations in seconds, oldest first, each with the
@@ -74,6 +88,10 @@ impl Durations {
         sorted[(sorted.len() - 1) / 2]
     }
 
+    fn measured(&self) -> bool {
+        !self.0.is_empty()
+    }
+
     /// Whether the cost rests on its full share of durations.
     fn proven(&self) -> bool {
         self.0.len() == COST_SAMPLES
@@ -97,6 +115,8 @@ pub struct LaunchCosts {
     draft: BTreeMap<usize, Durations>,
     /// By target rows.
     verify: BTreeMap<usize, Durations>,
+    enter: Durations,
+    leave: Durations,
 }
 
 impl LaunchCosts {
@@ -122,6 +142,22 @@ impl LaunchCosts {
         }
         for durations in self.draft.values_mut() {
             durations.scale(factor);
+        }
+        self.enter.scale(factor);
+        self.leave.scale(factor);
+    }
+
+    fn switch(&self, switch: Switch) -> &Durations {
+        match switch {
+            Switch::Enter => &self.enter,
+            Switch::Leave => &self.leave,
+        }
+    }
+
+    fn switch_mut(&mut self, switch: Switch) -> &mut Durations {
+        match switch {
+            Switch::Enter => &mut self.enter,
+            Switch::Leave => &mut self.leave,
         }
     }
 
@@ -157,10 +193,16 @@ struct RoundCosts {
     shorter: Vec<(f64, LaunchCosts)>,
     /// Requests sharing each launch.
     sequences: usize,
+    after_drafting: Option<bool>,
 }
 
 impl RoundCosts {
-    fn of(load: &DraftLoad, context_class: usize, sequences: usize) -> Self {
+    fn of(
+        load: &DraftLoad,
+        context_class: usize,
+        sequences: usize,
+        after_drafting: Option<bool>,
+    ) -> Self {
         let costs = load.costs.lock().expect("draft load costs");
         Self {
             own: costs
@@ -182,6 +224,7 @@ impl RoundCosts {
                 .map(|((context, _), costs)| (context_class as f64 / *context as f64, costs.clone()))
                 .collect(),
             sequences,
+            after_drafting,
         }
     }
 
@@ -221,11 +264,52 @@ impl RoundCosts {
         self.seconds(|costs| &costs.verify, rows)
     }
 
+    /// What changing between drafting and not costs a round beyond its
+    /// launches: measured here, or else the most it measured at no longer a
+    /// context (it enters pairs and restarts a pipeline, not attention).
+    fn switch(&self, switch: Switch) -> Option<f64> {
+        let own = self.own.switch(switch);
+        if own.measured() {
+            return Some(own.cost());
+        }
+        self.lesser
+            .iter()
+            .map(|costs| costs.switch(switch))
+            .filter(|durations| durations.measured())
+            .map(Durations::cost)
+            .reduce(f64::max)
+    }
+
+    /// The switch a round generating `generated` makes from the request's
+    /// previous round.
+    fn switching(&self, generated: usize) -> Option<Switch> {
+        match (self.after_drafting, generated > 0) {
+            (Some(false), true) => Some(Switch::Enter),
+            (Some(true), false) => Some(Switch::Leave),
+            _ => None,
+        }
+    }
+
     /// Seconds of a round generating `generated` and verifying `verified`,
-    /// in launches whose other requests take the same rows. Launches nothing
+    /// in launches whose other requests take the same rows, with its share
+    /// of what changing between drafting and not costs. A switch serves the
+    /// rounds after it too: a text the depth means follow lasts at least as
+    /// many rounds as they take to move, so a round that would switch pays
+    /// that share of it, and nothing until it is measured. Launches nothing
     /// has measured cost the same, so a load's first round is its widest.
     fn round(&self, generated: usize, verified: usize) -> f64 {
-        (self.draft(generated) + self.verify(self.sequences * (verified + 1))).max(1e-9)
+        let switch = self
+            .switching(generated)
+            .and_then(|switch| self.switch(switch))
+            .map_or(0.0, |switch| MEMORY * switch);
+        (self.draft(generated) + self.verify(self.sequences * (verified + 1)) + switch).max(1e-9)
+    }
+
+    /// The price of a round's launches when both are measured here.
+    fn steady(&self, generated: usize, rows: usize) -> Option<f64> {
+        let drafted = generated == 0 || self.own.draft.contains_key(&generated);
+        (drafted && self.own.verify.contains_key(&rows))
+            .then(|| self.draft(generated) + self.verify(rows))
     }
 }
 
@@ -253,7 +337,7 @@ pub fn share_rows(outlooks: &[DraftOutlook], rows: usize) -> Option<Vec<usize>> 
         return None;
     }
     let context_class = outlooks.iter().map(|outlook| outlook.context_class).max()?;
-    let costs = RoundCosts::of(&outlooks[0].load, context_class, requests);
+    let costs = RoundCosts::of(&outlooks[0].load, context_class, requests, None);
     let drafted: f64 = outlooks.iter().map(|outlook| outlook.draft_seconds).sum();
     // A request's proposals are no more often right the deeper they are, so
     // taking proposals in this order takes each request's in depth order.
@@ -360,6 +444,10 @@ pub struct DraftController {
     /// The launches this round's durations belong to.
     timing_draft: Option<usize>,
     timing_target: bool,
+    entered: f64,
+    drafter: Option<f64>,
+    after_drafting: Option<bool>,
+    chosen: Option<bool>,
     /// The length of this round's drafted block, until it is verified.
     drafted: Option<usize>,
     context_class: usize,
@@ -391,6 +479,10 @@ impl DraftController {
             kept: None,
             timing_draft: None,
             timing_target: false,
+            entered: 0.0,
+            drafter: None,
+            after_drafting: None,
+            chosen: None,
             drafted: None,
             context_class: 1,
             sequences: 1,
@@ -421,8 +513,11 @@ impl DraftController {
         self.costs().own
     }
 
+    /// The costs this round chooses by. A plain decode taken to measure it
+    /// changes no choice: a load drafting goes on drafting after it, so the
+    /// round coming back from it is priced as one continuing to draft.
     fn costs(&self) -> RoundCosts {
-        RoundCosts::of(&self.load, self.context_class, self.sequences)
+        RoundCosts::of(&self.load, self.context_class, self.sequences, self.chosen)
     }
 
     /// This round's drafted block, while it awaits verification.
@@ -475,6 +570,9 @@ impl DraftController {
     /// anchored at target position `position`.
     pub fn generate(&mut self, limit: usize, position: usize) -> usize {
         self.context_class = position.max(1).next_power_of_two();
+        // Entries before a round chooses are no round's: the prompt's, or
+        // pairs held past their bound by rounds that drafted nothing.
+        self.entered = 0.0;
         let costs = self.costs();
         let right = self.right();
         // The fastest pair. Of equal rates the narrowest.
@@ -583,6 +681,9 @@ impl DraftController {
             }
         };
         let generated = if plain_unsettled { 0 } else { generated };
+        if !plain_unsettled {
+            self.chosen = Some(generated > 0);
+        }
         *self.load.look_seconds.lock().expect("draft load look time") = self.look_seconds;
         self.choice = RoundChoice {
             generated,
@@ -672,7 +773,14 @@ impl DraftController {
 
     /// A launch of this request finished in `duration`: `rows` rows of
     /// `sequences` requests. A drafter launch is measured by the proposals
-    /// it generated, a target launch by its rows.
+    /// it generated, a target launch by its rows. The drafter's entries for
+    /// a round are part of its proposing launch, or of the target's when the
+    /// round proposed nothing. A switch between drafting and not (see
+    /// [`Switch`]) is paid in the launch that follows it: the discarded
+    /// decode and the catch-up before the drafter proposes, the decode
+    /// started again in the target's launch. That launch is measured without
+    /// the switch's price, and the switch by what its round took beyond the
+    /// price of its launches.
     pub fn timed(
         &mut self,
         launch: TimedLaunch,
@@ -680,7 +788,12 @@ impl DraftController {
         sequences: usize,
         rows: usize,
     ) {
+        let seconds = duration.as_secs_f64();
         let size = match launch {
+            TimedLaunch::Entry => {
+                self.entered += seconds;
+                return;
+            }
             TimedLaunch::Draft => self.timing_draft.take(),
             TimedLaunch::Target => std::mem::take(&mut self.timing_target).then_some(rows),
         };
@@ -688,6 +801,26 @@ impl DraftController {
             return;
         };
         self.sequences = sequences.max(1);
+        let costs = RoundCosts::of(
+            &self.load,
+            self.context_class,
+            self.sequences,
+            self.after_drafting,
+        );
+        let switch = costs.switching(self.choice.generated);
+        // The switch's price, when this launch paid one: none while the
+        // switch is unmeasured, and then the launch is measured only if it
+        // has no other measurement.
+        let paid = |paying: Switch, launches: &BTreeMap<usize, Durations>, size: usize| {
+            if switch != Some(paying) {
+                Some(0.0)
+            } else {
+                costs
+                    .switch(paying)
+                    .or_else(|| (!launches.contains_key(&size)).then_some(0.0))
+            }
+        };
+        let took = seconds + std::mem::take(&mut self.entered);
         let round = {
             let mut rounds = self.load.rounds.lock().expect("draft load rounds");
             if launch == TimedLaunch::Target {
@@ -695,15 +828,40 @@ impl DraftController {
             }
             *rounds
         };
-        let mut costs = self.load.costs.lock().expect("draft load costs");
-        let costs = costs
+        let mut measured = self.load.costs.lock().expect("draft load costs");
+        let launches = measured
             .entry((self.context_class, self.sequences))
             .or_default();
-        let seconds = duration.as_secs_f64();
-        match launch {
-            TimedLaunch::Draft => LaunchCosts::record(&mut costs.draft, round, size, seconds),
-            TimedLaunch::Target if size == 1 => costs.record_plain(round, seconds),
-            TimedLaunch::Target => LaunchCosts::record(&mut costs.verify, round, size, seconds),
+        if launch == TimedLaunch::Draft {
+            self.drafter = Some(took);
+            if let Some(paid) = paid(Switch::Enter, &launches.draft, size) {
+                LaunchCosts::record(&mut launches.draft, round, size, (took - paid).max(0.0));
+            }
+            return;
+        }
+        let drafter = self.drafter.take();
+        self.after_drafting = Some(self.choice.generated > 0);
+        let generated = if drafter.is_some() {
+            self.choice.generated
+        } else {
+            0
+        };
+        if let (Some(switch), Some(steady)) = (switch, costs.steady(generated, size)) {
+            let round_took = took + drafter.unwrap_or(0.0);
+            launches
+                .switch_mut(switch)
+                .record(round, (round_took - steady).max(0.0));
+        }
+        let Some(paid) = paid(Switch::Leave, &launches.verify, size) else {
+            return;
+        };
+        let seconds = (took - paid).max(0.0);
+        match (size, self.choice.generated) {
+            (1, 0) => launches.record_plain(round, seconds),
+            // A drafting round that verified nothing decoded one row behind
+            // its drafter's launch, not in a decode pipeline.
+            (1, _) => {}
+            (rows, _) => LaunchCosts::record(&mut launches.verify, round, rows, seconds),
         }
     }
 }

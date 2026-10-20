@@ -245,7 +245,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Wait for a queued step nobody will claim and drop it: its successors
     /// release their rows and banks, its leases return to their pools.
     pub(super) fn orphan_lookahead(
-        &mut self,
+        &self,
         bindings: &mut StateBindings<F>,
     ) -> Result<(), DomainError> {
         let Some(lookahead) = bindings.lookahead.take() else {
@@ -264,13 +264,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .flight
             .priming
             .map(|priming| priming.submission.finish().map(drop));
-        let finished = match (lookahead.flight.submission.finish().map(drop), priming) {
+        // The wait stays in the host's turn: a request that stops decoding
+        // plainly pays for the step it discarded in its next launch.
+        match (lookahead.flight.submission.finish().map(drop), priming) {
             (Ok(()), None | Some(Ok(()))) => Ok(()),
             (Err(error), _) | (_, Some(Err(error))) => Err(DomainError::Device(error)),
-        };
-        // Waiting for discarded work prepares no launch.
-        self.restart_host_turn();
-        finished
+        }
     }
 
     /// Queue the successor of `flight` (just submitted or claimed for

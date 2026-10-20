@@ -644,6 +644,31 @@ fn a_launch_is_charged_its_requests_host_turn_but_not_idle_time() {
     assert!(idle < gap, "after the owner idled: {idle:?}");
 }
 
+/// A request that stops continuing its queued step discards it, and waiting
+/// for that step is part of its next launch: the switch away from plain
+/// decoding costs the round that makes it.
+#[test]
+fn a_launch_that_discards_its_requests_lookahead_is_charged_the_wait() {
+    let Some((mut domain, mut bindings)) = fixture_with(None, true, true) else {
+        return;
+    };
+    let gap = std::time::Duration::from_millis(60);
+    let request = RequestId(72);
+    open(&mut domain, &mut bindings, request);
+    let bindings = queue_lookahead(&mut domain, bindings, request);
+    std::thread::sleep(gap);
+    // A replay row is not the queued prefill step: submitting it discards
+    // that step first.
+    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 1)]);
+    let (pending, bindings) = finish_one(&mut domain, flight);
+    assert!(bindings.lookahead.is_none(), "the queued step was discarded");
+    assert!(
+        pending.physical_duration() >= gap,
+        "the wait and the host turn before it: {:?}",
+        pending.physical_duration()
+    );
+}
+
 /// Growth changes bindings: every entry that can grow resolves a queued
 /// lookahead first, then commits the slab.
 #[test]

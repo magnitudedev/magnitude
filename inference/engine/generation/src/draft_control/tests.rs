@@ -71,6 +71,7 @@ const EVEN: Costs = Costs {
     },
 };
 
+#[derive(Clone)]
 struct Stream {
     /// Segment lengths in tokens with their curves.
     segments: Vec<(usize, [f64; WIDEST])>,
@@ -701,5 +702,286 @@ fn a_width_held_up_on_its_first_launch_is_taken_again() {
             if round.get() == held + 1 { 15.0 } else { 1.0 }
         });
         within_of_fixed(&run, &stream, SHORT, 7, 0.05);
+    }
+}
+
+/// A GPU on which a round that drafts nothing is a decode pipelined behind
+/// its predecessor, so changing between drafting and not costs time beyond
+/// either round's launches.
+#[derive(Clone, Copy)]
+struct Pipelined {
+    costs: Costs,
+    resume: f64,
+    discard: f64,
+    catch_up: fn(usize) -> f64,
+}
+
+/// How the controller sees a round that changes between drafting and not:
+/// whole (the decode it discarded in its drafter's launch, the drafter's
+/// catch-up as an entry of the round, the restarted decode in its target's
+/// launch), or as round 4e's controller saw it, with no switch in any
+/// launch (its executor charged the discarded decode and the catch-up to no
+/// launch, and the restarted decode to a plain decode the median dropped).
+#[derive(Clone, Copy, PartialEq)]
+enum Reported {
+    Whole,
+    WithoutSwitch,
+}
+
+/// One request over `stream` on `machine`, drafting at most `widest`, under
+/// the controller. The run's time is what the rounds took: a one-row target
+/// launch is a decode pipelined behind its predecessor, a plain round after
+/// a drafting one adds `resume` (nothing was queued behind it), and a
+/// drafting round after a plain one adds `discard` (the decode queued behind
+/// that round finishes before its drafter runs) and the drafter's catch-up
+/// of the pairs held since.
+fn pipelined(
+    stream: &Stream,
+    machine: Pipelined,
+    widest: usize,
+    load: &Arc<DraftLoad>,
+    reported: Reported,
+) -> Run {
+    let mut controller = DraftController::new(widest, load.clone());
+    let mut run = Run::default();
+    let mut position = 0;
+    let mut drafted_before = None;
+    let mut held = 0;
+    let ms = |milliseconds: f64| Duration::from_secs_f64(milliseconds / 1000.0);
+    while position < stream.len() {
+        let limit = (stream.len() - position - 1).min(widest);
+        let generated = controller.generate(limit, CONTEXT + position);
+        let mut verified = 0;
+        if generated > 0 {
+            let mut draft = (machine.costs.draft)(generated);
+            let mut entry = 0.0;
+            if drafted_before == Some(false) {
+                draft += machine.discard;
+                entry = (machine.catch_up)(held);
+            }
+            run.milliseconds += draft + entry;
+            match reported {
+                Reported::Whole => {
+                    if entry > 0.0 {
+                        controller.timed(TimedLaunch::Entry, ms(entry), 1, held);
+                    }
+                    controller.timed(TimedLaunch::Draft, ms(draft), 1, generated + 1);
+                }
+                Reported::WithoutSwitch => {
+                    let launch = (machine.costs.draft)(generated);
+                    controller.timed(TimedLaunch::Draft, ms(launch), 1, generated + 1);
+                }
+            }
+            held = 0;
+            let block = stream.block(position, generated);
+            controller.drafted(generated, &block);
+            verified = controller.verify(block.len(), limit);
+        } else {
+            held = (held + 1).min(64);
+        }
+        let mut target = (machine.costs.verify)(verified + 1);
+        if generated == 0 && drafted_before == Some(true) {
+            target += machine.resume;
+        }
+        run.milliseconds += target;
+        if reported == Reported::WithoutSwitch {
+            target = (machine.costs.verify)(verified + 1);
+        }
+        controller.timed(TimedLaunch::Target, ms(target), 1, verified + 1);
+        drafted_before = Some(generated > 0);
+        let accepted = stream.right(position).min(verified);
+        let committed = (position + 1..=position + accepted + 1)
+            .map(Stream::token)
+            .collect::<Vec<_>>();
+        controller.committed(&committed);
+        run.rounds.push((controller.choice(), accepted + 1));
+        position += accepted + 1;
+    }
+    run
+}
+
+/// One request over `stream` on `machine` at a fixed width, drafting its
+/// whole width or nothing as a fixed budget does. It switches only at the
+/// request's last tokens, which this leaves out.
+fn pipelined_fixed(stream: &Stream, machine: Pipelined, width: usize) -> f64 {
+    let mut milliseconds = 0.0;
+    let mut position = 0;
+    while position < stream.len() {
+        let limit = stream.len() - position - 1;
+        let width = if width <= limit { width } else { 0 };
+        milliseconds += (machine.costs.draft)(width) + (machine.costs.verify)(width + 1);
+        position += stream.right(position).min(width) + 1;
+    }
+    milliseconds
+}
+
+/// Qwen3.5 2B's chained heads on a Radeon PRO V710 under Vulkan (round 4e,
+/// traced): each proposal is another head pass, a verification costs a
+/// third more than the plain decode it replaces, and that decode is
+/// pipelined. Switching costs as an M4 Max traced them.
+const V710_HEADS: Pipelined = Pipelined {
+    costs: Costs {
+        draft: |generated| match generated {
+            0 => 0.0,
+            1 => 1.8,
+            2..=3 => 4.7,
+            4..=7 => 10.9,
+            _ => 12.4,
+        },
+        verify: |rows| match rows {
+            1 => 6.1,
+            2 => 8.4,
+            3..=4 => 10.9,
+            5..=8 => 11.2,
+            _ => 16.0,
+        },
+    },
+    resume: 1.7,
+    discard: 4.5,
+    catch_up: |held| {
+        if held > 1 {
+            0.6 + 0.02 * held as f64
+        } else {
+            0.0
+        }
+    },
+};
+
+/// The heads' acceptance on prose and on code (measured at width 1 on an M4
+/// Max, deeper depths from the controller's scores there).
+const HEADS_PROSE: [f64; WIDEST] = [
+    0.64, 0.40, 0.24, 0.15, 0.09, 0.05, 0.03, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+];
+const HEADS_CODE: [f64; WIDEST] = [
+    0.82, 0.64, 0.48, 0.36, 0.27, 0.20, 0.15, 0.11, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+];
+const HEADS: usize = 8;
+
+/// QA (linux-vulkan-13): with Qwen3.5 2B's heads on Vulkan, decoding with
+/// them came out 3-5 % slower than plain on prose. The heads barely pay
+/// there (a verification costs a third more than the pipelined decode it
+/// replaces), and every change between drafting and not cost a discarded
+/// decode and the drafter's catch-up, which no launch was charged with: a
+/// round entering drafting looked as cheap as one continuing it, so the
+/// controller kept changing on noise in its acceptance and paid for every
+/// change. Charged to the round that switches, and priced into a round that
+/// would, a switch is taken only where it pays.
+#[test]
+fn switching_between_drafting_and_plain_decoding_is_priced() {
+    // Many texts, each a short request after a warming one, as a benchmark
+    // sends them.
+    let texts = |segments: Vec<(usize, [f64; WIDEST])>| {
+        (0..24u64)
+            .map(|seed| Stream {
+                segments: segments.clone(),
+                seed: seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x51,
+            })
+            .collect::<Vec<_>>()
+    };
+    let total = |streams: &[Stream], reported: Option<Reported>, width: usize| {
+        streams
+            .iter()
+            .map(|stream| match reported {
+                None => pipelined_fixed(stream, V710_HEADS, width),
+                Some(reported) => {
+                    let load = Arc::new(DraftLoad::default());
+                    let warming = Stream {
+                        seed: !stream.seed,
+                        ..stream.clone()
+                    };
+                    pipelined(&warming, V710_HEADS, HEADS, &load, reported);
+                    pipelined(stream, V710_HEADS, HEADS, &load, reported).milliseconds
+                }
+            })
+            .sum::<f64>()
+    };
+    let mixed = vec![
+        (100, HEADS_CODE),
+        (100, HEADS_PROSE),
+        (100, HEADS_CODE),
+        (100, HEADS_PROSE),
+    ];
+    for (segments, name, width) in [
+        (vec![(400, HEADS_PROSE)], "prose", 0),
+        (vec![(400, HEADS_CODE)], "code", 3),
+        (mixed, "mixed", 1),
+    ] {
+        let streams = texts(segments);
+        let (fastest, best) = [0, 1, 3, 7, 8]
+            .into_iter()
+            .map(|width| (width, total(&streams, None, width)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap();
+        assert_eq!(fastest, width, "the fastest fixed width on {name}");
+        let plain = total(&streams, None, 0);
+        let priced = total(&streams, Some(Reported::Whole), HEADS);
+        let unpriced = total(&streams, Some(Reported::WithoutSwitch), HEADS);
+        let report = format!(
+            "{name}: fixed {width} {best:.0} ms, plain {plain:.0} ms, priced {priced:.0} ms ({:+.1}%), as round 4e saw it {unpriced:.0} ms ({:+.1}%)",
+            (priced / best - 1.0) * 100.0,
+            (unpriced / best - 1.0) * 100.0,
+        );
+        eprintln!("{report}");
+        assert!(priced < unpriced, "{report}");
+        assert!(
+            name != "code" || priced < plain,
+            "drafting that pays goes on: {report}"
+        );
+        assert!(
+            width != 0 || priced <= best * 1.015,
+            "within the looks of plain decoding: {report}"
+        );
+    }
+}
+
+/// A switch is measured apart from the launches of the round that makes it:
+/// what entering drafting costs (the discarded decode and the catch-up) and
+/// what leaving it costs (the restarted decode), while the launches keep
+/// the prices of rounds that do not switch.
+#[test]
+fn a_switch_is_measured_apart_from_its_rounds_launches() {
+    let load = Arc::new(DraftLoad::default());
+    let segments = (0..6)
+        .flat_map(|_| [(150, HEADS_CODE), (150, HEADS_PROSE)])
+        .collect::<Vec<_>>();
+    let run = pipelined(
+        &Stream::of(&segments),
+        V710_HEADS,
+        HEADS,
+        &load,
+        Reported::Whole,
+    );
+    let switches = run
+        .rounds
+        .windows(2)
+        .filter(|pair| (pair[0].0.generated > 0) != (pair[1].0.generated > 0))
+        .count();
+    assert!(switches >= 4, "the run switches: {}", run.rounds());
+    let costs = load.costs.lock().unwrap();
+    let measured = &costs[&((CONTEXT + 1).next_power_of_two(), 1)];
+    let ms = |durations: &super::Durations| durations.cost() * 1000.0;
+    let enter = ms(&measured.enter);
+    let catch_up = (V710_HEADS.catch_up)(64);
+    assert!(
+        enter >= V710_HEADS.discard * 0.99 && enter <= (V710_HEADS.discard + catch_up) * 1.01,
+        "entering costs the discarded decode and the catch-up: {enter} ms"
+    );
+    assert!((ms(&measured.leave) - V710_HEADS.resume).abs() < 0.01);
+    assert!((ms(&measured.verify[&1]) - (V710_HEADS.costs.verify)(1)).abs() < 0.01);
+    // A catch-up's length varies with the pairs held, so a drafter launch
+    // that pays for one is off by at most that variation. A launch first
+    // measured in a switching round, before the switch had a price, keeps
+    // that duration until it is measured again, so only launches measured
+    // their full share of times are checked.
+    for (generated, durations) in measured
+        .draft
+        .iter()
+        .filter(|(_, durations)| durations.proven())
+    {
+        assert!(
+            (ms(durations) - (V710_HEADS.costs.draft)(*generated)).abs() <= catch_up,
+            "{generated} proposals: {} ms",
+            ms(durations)
+        );
     }
 }

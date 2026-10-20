@@ -342,9 +342,18 @@ generated count and each target launch by rows, per context class and per number
 of requests sharing the launch. A launch's duration includes the host work that
 prepared it: it runs from the end of the flight before it when that flight carried
 one of its requests and the owner did not idle between, and from its submission
-otherwise, so idle time and other requests' work are charged to no launch. A
+otherwise, so idle time and other requests' work are charged to no launch;
+waiting for a queued decode its request discards is part of that host work. A
 pipelined decode's runs from its predecessor's completion, so a round that drafts
-and one that does not are both priced at what they take end to end. Nothing is
+and one that does not are both priced at what they take end to end. A drafter
+launch that only enters pairs is part of the round it serves. A round that
+changes between drafting and not takes longer than its launches: one that drafts
+after one that did not waits for the decode queued behind it, discards it, and
+first has the drafter enter the pairs held since; one that does not draft after
+one that did starts the decode pipeline again. The load measures each switch
+apart, by what its round took beyond the price of its launches, and measures the
+launch that paid it (the drafter's, or the target's) without the switch's price,
+so a launch is priced as in rounds that do not switch. Nothing is
 forecast. A launch costs the median of
 its latest few durations, so a launch another process held up once prices
 nothing; durations older than a fixed number of the load's rounds are dropped when
@@ -365,10 +374,15 @@ decode is the one launch no look takes, so once measured in a context class it i
 taken in place of drafting while its cost rests on fewer than its full share of
 durations, or on durations as old as that fixed number of rounds: a plain cost
 left high by one held-up decode or a since-freed machine would otherwise make
-drafting that loses look faster for good.
+drafting that loses look faster for good. Such a decode changes no choice: the
+round returning from it to drafting is priced as one that goes on drafting.
 
 **Choice.** Expected tokens are one plus the acceptance of each verified depth;
-a round's time is its two launches. Three rules:
+a round's time is its two launches, and a round that would switch between
+drafting and not adds a share of the switch's measured cost: a switch serves the
+rounds after it, and a text the depth means follow lasts at least as many rounds
+as they take to move, so it pays the means' weight of it. A switch nothing has
+measured costs nothing. Three rules:
 
 1. The round takes the budget committing the most tokens per second. Once its
    block is drafted, it verifies the prefix that does so with the drafter's
@@ -418,3 +432,6 @@ separate launches.
 - The means, the kept rounds and the looks' share are fixed constants, not
   statistical guarantees. Acceptance that alternates faster than the means move
   is not followed.
+- Acceptance is observed only on drafted blocks. Drafting that stopped on a run
+  of wrong blocks keeps that run's means until a look scores again, so where
+  drafting barely pays a load can stay plain where a fixed width gains a little.

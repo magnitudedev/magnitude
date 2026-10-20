@@ -2538,8 +2538,13 @@ impl<F: ProgramFamily> Service<F> {
                 );
                 continue;
             }
-            if matches!(operation, Operation::Head { proposals, .. } if !proposals.is_empty()) {
-                generation.timed(TimedLaunch::Draft, item.physical_duration(), sequences, rows);
+            if let Operation::Head { proposals, .. } = operation {
+                let launch = if proposals.is_empty() {
+                    TimedLaunch::Entry
+                } else {
+                    TimedLaunch::Draft
+                };
+                generation.timed(launch, item.physical_duration(), sequences, rows);
             }
             let transition = match generation.prepare_method_transition(operation, item.outcome()) {
                 Ok(transition) => transition,
