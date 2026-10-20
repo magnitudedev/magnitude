@@ -783,6 +783,19 @@ mod packed_x86 {
         }
     }
 
+    /// The 32 codes of a 16-entry codebook `table` (broadcast to both
+    /// halves) at the nibble codes `codes`.
+    #[inline(always)]
+    pub(super) unsafe fn lookup(table: __m256i, codes: __m256i) -> __m256i {
+        unsafe { _mm256_shuffle_epi8(table, codes) }
+    }
+
+    /// A 16-entry byte table in both halves of a vector.
+    #[inline(always)]
+    pub(super) unsafe fn table(values: &[i8; 16]) -> __m256i {
+        unsafe { _mm256_broadcastsi128_si256(_mm_loadu_si128(values.as_ptr().cast())) }
+    }
+
     /// Eight f16 values widened exactly as `element::f16_to_f32` widens
     /// each: the same integer steps and the same one subtraction for
     /// subnormals, lane by lane.
@@ -1913,6 +1926,8 @@ pub trait Codebook4: Copy + Send + Sync + 'static {
     /// Bytes of one stored scale field.
     const SCALE_BYTES: usize;
     const VALUES: [i8; 16];
+    /// Whether [`Codebook4::scale`] is the f16 widening of its two bytes.
+    const F16_SCALE: bool = false;
 
     /// The scale of one stored field (`SCALE_BYTES` bytes).
     fn scale(field: &[u8]) -> f32;
@@ -1954,6 +1969,7 @@ impl Codebook4 for Iq4SBook {
     const GROUP: usize = 32;
     const SCALE_BYTES: usize = 2;
     const VALUES: [i8; 16] = Iq4Book::VALUES;
+    const F16_SCALE: bool = true;
 
     #[inline(always)]
     fn scale(field: &[u8]) -> f32 {
@@ -1972,6 +1988,7 @@ impl Codebook4 for Q4Book {
     const GROUP: usize = 32;
     const SCALE_BYTES: usize = 2;
     const VALUES: [i8; 16] = [-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7];
+    const F16_SCALE: bool = true;
 
     #[inline(always)]
     fn scale(field: &[u8]) -> f32 {
@@ -2046,13 +2063,62 @@ impl<B: Codebook4> Coded4<B> {
     /// Scales per packet (1 or 2).
     const SCALES: usize = PACKET / B::GROUP;
 
+    /// Packets per storage group.
+    const PACKETS: usize = B::STORAGE / PACKET;
+    /// Bytes of one packet's scale fields.
+    const FIELD_BYTES: usize = Self::SCALES * B::SCALE_BYTES;
+    /// The smallest codebook value and the span to the largest.
+    #[cfg(target_arch = "x86_64")]
+    const LOWEST: i8 = {
+        let mut lowest = B::VALUES[0];
+        let mut i = 1;
+        while i < 16 {
+            if B::VALUES[i] < lowest {
+                lowest = B::VALUES[i];
+            }
+            i += 1;
+        }
+        lowest
+    };
+    #[cfg(target_arch = "x86_64")]
+    const SPAN: i32 = {
+        let mut highest = B::VALUES[0];
+        let mut i = 1;
+        while i < 16 {
+            if B::VALUES[i] > highest {
+                highest = B::VALUES[i];
+            }
+            i += 1;
+        }
+        highest as i32 - Self::LOWEST as i32
+    };
+    /// The codebook shifted to start at zero, as unsigned bytes.
+    #[cfg(target_arch = "x86_64")]
+    const SHIFTED: [i8; 16] = {
+        let mut shifted = [0i8; 16];
+        let mut i = 0;
+        while i < 16 {
+            shifted[i] = (B::VALUES[i] as i32 - Self::LOWEST as i32) as u8 as i8;
+            i += 1;
+        }
+        shifted
+    };
+
+    /// The 16 code bytes of packet `p`.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn packet_codes(row: *const u8, geometry: &RowGeometry, p: usize) -> *const u8 {
+        let group = unsafe { geometry.group(row, Plane::Codes, p / Self::PACKETS) };
+        unsafe { group.add(16 * (p % Self::PACKETS)) }
+    }
+
     /// The (up to two) scales of packet `p`, in value order.
     #[inline(always)]
     unsafe fn scales(row: *const u8, geometry: &RowGeometry, p: usize) -> [f32; 2] {
-        let bytes = Self::SCALES * B::SCALE_BYTES;
         // A packet's fields are contiguous within one storage group.
-        let at = unsafe { geometry.address(row, Plane::Supers, p * bytes) };
-        let fields = unsafe { std::slice::from_raw_parts(at, bytes) };
+        let group = unsafe { geometry.group(row, Plane::Supers, p / Self::PACKETS) };
+        let at = unsafe { group.add(Self::FIELD_BYTES * (p % Self::PACKETS)) };
+        let fields = unsafe { std::slice::from_raw_parts(at, Self::FIELD_BYTES) };
         let mut scales = [0.0f32; 2];
         for (scale, field) in scales.iter_mut().zip(fields.chunks_exact(B::SCALE_BYTES)) {
             *scale = B::scale(field);
@@ -2105,6 +2171,44 @@ impl<B: Codebook4> Format for Coded4<B> {
         k: usize,
         x: &Q8Block,
     ) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if MODE >= 1 {
+            // Codebook lookups and exact integer dots in registers: the
+            // packet sums (or, for 16-value groups, the half sums), then the
+            // same per-group f32 combine as below.
+            let (mut low, mut high) = ([0i32; 8], [0i32; 8]);
+            unsafe {
+                use std::arch::x86_64::*;
+                let table = packed_x86::table(&B::VALUES);
+                let mut products = [_mm256_setzero_si256(); 8];
+                for (local, p) in block_packets(b, k).enumerate() {
+                    let codes = packed_x86::nibbles(Self::packet_codes(row, geometry, p));
+                    let weights = packed_x86::lookup(table, codes);
+                    let activations = packed_x86::load(x.codes.as_ptr().add(32 * local));
+                    products[local] = packed_x86::dot_signed::<MODE>(
+                        _mm256_setzero_si256(),
+                        weights,
+                        activations,
+                    );
+                }
+                if Self::SCALES == 1 {
+                    _mm256_storeu_si256(low.as_mut_ptr().cast(), packed_x86::sums8(products));
+                } else {
+                    let (first, second) = packed_x86::halves8(products);
+                    _mm256_storeu_si256(low.as_mut_ptr().cast(), first);
+                    _mm256_storeu_si256(high.as_mut_ptr().cast(), second);
+                }
+            }
+            let mut sum = 0.0f32;
+            for (local, p) in block_packets(b, k).enumerate() {
+                let scales = unsafe { Self::scales(row, geometry, p) };
+                sum = scales[0].mul_add(low[local] as f32, sum);
+                if Self::SCALES == 2 {
+                    sum = scales[1].mul_add(high[local] as f32, sum);
+                }
+            }
+            return x.d * sum;
+        }
         let mut sum = 0.0f32;
         for p in block_packets(b, k) {
             let codes = unsafe { nibbles(row, geometry, p) };
@@ -2128,6 +2232,58 @@ impl<B: Codebook4> Format for Coded4<B> {
             }
         }
         x.d * sum
+    }
+
+    /// Each packet's codes unpack and look up once for the four activation
+    /// rows; each row keeps its own f32 combine in group order, one row per
+    /// lane.
+    #[inline(always)]
+    unsafe fn dot_q8_four<const MODE: u8>(
+        row: *const u8,
+        geometry: &RowGeometry,
+        b: usize,
+        k: usize,
+        x: [&Q8Block; 4],
+    ) -> [f32; 4] {
+        #[cfg(target_arch = "x86_64")]
+        if MODE >= 1 {
+            return unsafe {
+                use std::arch::x86_64::*;
+                let table = packed_x86::table(&B::VALUES);
+                let mut sums = _mm_setzero_ps();
+                for (local, p) in block_packets(b, k).enumerate() {
+                    let codes = packed_x86::nibbles(Self::packet_codes(row, geometry, p));
+                    let weights = packed_x86::lookup(table, codes);
+                    let magnitudes = _mm256_abs_epi8(weights);
+                    let mut products = [_mm256_setzero_si256(); 4];
+                    for (m, products) in products.iter_mut().enumerate() {
+                        let activations = packed_x86::load(x[m].codes.as_ptr().add(32 * local));
+                        *products = packed_x86::dot::<MODE>(
+                            *products,
+                            magnitudes,
+                            _mm256_sign_epi8(activations, weights),
+                        );
+                    }
+                    let halves = packed_x86::halves4(products);
+                    let (first, second) = (
+                        _mm256_castsi256_si128(halves),
+                        _mm256_extracti128_si256::<1>(halves),
+                    );
+                    let scales = Self::scales(row, geometry, p);
+                    if Self::SCALES == 1 {
+                        let exact = _mm_cvtepi32_ps(_mm_add_epi32(first, second));
+                        sums = _mm_fmadd_ps(_mm_set1_ps(scales[0]), exact, sums);
+                    } else {
+                        sums = _mm_fmadd_ps(_mm_set1_ps(scales[0]), _mm_cvtepi32_ps(first), sums);
+                        sums = _mm_fmadd_ps(_mm_set1_ps(scales[1]), _mm_cvtepi32_ps(second), sums);
+                    }
+                }
+                let mut out = [0.0f32; 4];
+                _mm_storeu_ps(out.as_mut_ptr(), sums);
+                std::array::from_fn(|m| x[m].d * out[m])
+            };
+        }
+        unsafe { dot_q8_each::<Self, MODE>(row, geometry, b, k, x) }
     }
 }
 
@@ -2533,6 +2689,85 @@ impl Rows8Format for Q8 {
 
 impl<B: Codebook4> Rows8Format for Coded4<B> {
     const ROWS8_NAME: &'static str = B::ROWS8_NAME;
+
+    /// Per packet, the eight rows' codes look up their codebook values and
+    /// their exact integer dots reduce into one vector per scale group, one
+    /// row per lane; each lane keeps its row's f32 combine in group order.
+    /// Where the shifted codebook fits the unsigned products (always with
+    /// VNNI), the rows dot the shifted codes and add back the lowest value
+    /// times the activation sums, which are exact and shared by the rows.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn tile_dot_q8<const MODE: u8>(
+        geometry: &RowGeometry,
+        tile: *const u8,
+        b: usize,
+        k: usize,
+        x: &Q8Block,
+    ) -> Option<[f32; 8]> {
+        if !tiles::<MODE>() {
+            return None;
+        }
+        let shifted = MODE == 2 || Self::SPAN <= 128;
+        let (code_bytes, field_bytes) = (geometry.groups[0], geometry.groups[3]);
+        Some(unsafe {
+            use std::arch::x86_64::*;
+            let table = packed_x86::table(if shifted { &Self::SHIFTED } else { &B::VALUES });
+            let mut sums = _mm256_setzero_ps();
+            for (local, p) in block_packets(b, k).enumerate() {
+                let (group, packet) = (p / Self::PACKETS, p % Self::PACKETS);
+                let codes = geometry.tile_group(tile, Plane::Codes, group).add(16 * packet);
+                let fields = geometry
+                    .tile_group(tile, Plane::Supers, group)
+                    .add(Self::FIELD_BYTES * packet);
+                let activations = packed_x86::load(x.codes.as_ptr().add(32 * local));
+                let mut products = [_mm256_setzero_si256(); 8];
+                for (row, products) in products.iter_mut().enumerate() {
+                    let weights = packed_x86::lookup(
+                        table,
+                        packed_x86::nibbles(codes.add(code_bytes * row)),
+                    );
+                    *products = if shifted {
+                        packed_x86::dot::<MODE>(*products, weights, activations)
+                    } else {
+                        packed_x86::dot_signed::<MODE>(*products, weights, activations)
+                    };
+                }
+                let exact = if Self::SCALES == 1 {
+                    [packed_x86::sums8(products), _mm256_setzero_si256()]
+                } else {
+                    let (first, second) = packed_x86::halves8(products);
+                    [first, second]
+                };
+                let half_sums = [i32::from(x.sums[2 * local]), i32::from(x.sums[2 * local + 1])];
+                for (half, mut exact) in exact.into_iter().take(Self::SCALES).enumerate() {
+                    if shifted {
+                        let sum = if Self::SCALES == 1 {
+                            half_sums[0] + half_sums[1]
+                        } else {
+                            half_sums[half]
+                        };
+                        let shift = _mm256_set1_epi32(i32::from(Self::LOWEST) * sum);
+                        exact = _mm256_add_epi32(exact, shift);
+                    }
+                    let scales = if B::F16_SCALE && field_bytes == 2 {
+                        packed_x86::f16x8(fields)
+                    } else {
+                        let mut scales = [0.0f32; 8];
+                        for (row, scale) in scales.iter_mut().enumerate() {
+                            let at = fields.add(field_bytes * row + B::SCALE_BYTES * half);
+                            *scale = B::scale(std::slice::from_raw_parts(at, B::SCALE_BYTES));
+                        }
+                        _mm256_loadu_ps(scales.as_ptr())
+                    };
+                    sums = _mm256_fmadd_ps(scales, _mm256_cvtepi32_ps(exact), sums);
+                }
+            }
+            let mut out = [0.0f32; 8];
+            _mm256_storeu_ps(out.as_mut_ptr(), sums);
+            out.map(|sum| x.d * sum)
+        })
+    }
 }
 impl Rows8Format for Q5G32S {
     const ROWS8_NAME: &'static str = "q5g32s@rows8";
