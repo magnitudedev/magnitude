@@ -23,6 +23,7 @@ describe("catalog removal outcomes", () => {
       const failure = Option.getOrThrow(Cause.failureOption(exit.cause))
       expect(failure.code).toBe(code)
       if (reason === "ExternalOwnership") expect(failure.message).toContain(`magnitude models hide ${modelId}`)
+      else expect(failure.message).not.toContain("magnitude models hide")
     }
   })
 })

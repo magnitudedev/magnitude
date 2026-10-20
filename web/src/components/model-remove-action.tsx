@@ -22,6 +22,11 @@ export const removalConfirmation = (model: LocalModel, running: boolean): { read
   }
   if (model._tag === "Catalog" && removalKind(model) === "parts") {
     const parts = model.storedComponents.map(component => catalogComponentName(component).toLowerCase()).join(" and ")
+    if (parts.length === 0) return {
+      title: `Cancel the download Magnitude has in progress for ${name}?`,
+      description: "The model file is in another app's location, which Magnitude never deletes, so the model stays in My Models and runs from there. Hide it to stop listing it.",
+      confirmLabel: running ? "Stop and cancel" : "Cancel download",
+    }
     return {
       title: running ? `Stop ${name} and remove the ${parts} Magnitude downloaded?` : `Remove the ${parts} Magnitude downloaded for ${name}?`,
       description: "The model file is in another app's location, which Magnitude never deletes, so the model stays in My Models and runs from there. Hide it to stop listing it.",

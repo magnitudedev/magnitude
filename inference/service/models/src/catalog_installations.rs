@@ -325,14 +325,14 @@ impl ManagedCatalogInstallations {
                 retryable: false,
             });
         }
-        if plan.externally_owned && plan.package_ids.is_empty() {
-            return Ok(CatalogInstallationRemoval::Retained {
-                reason: CatalogInstallationRetentionReason::ExternalOwnership,
-            });
-        }
         if plan.shared {
             return Ok(CatalogInstallationRemoval::Retained {
                 reason: CatalogInstallationRetentionReason::SharedMaterial,
+            });
+        }
+        if plan.externally_owned && plan.package_ids.is_empty() {
+            return Ok(CatalogInstallationRemoval::Retained {
+                reason: CatalogInstallationRetentionReason::ExternalOwnership,
             });
         }
         let reclaimed_bytes = self

@@ -70,6 +70,11 @@ describe("removing by origin", () => {
       confirmLabel: "Remove",
     })
   })
+  it("cancels the parts Magnitude is still fetching for a found catalog model rather than hiding it", () => {
+    const fetching = { ...catalogModel(), storedComponents: [] as const, acquisitionState: { _tag: "Updating" as const, installation: { _tag: "Resolved" as const, installedBytes: 1, primaryPath: "/Users/me/.cache/huggingface/hub/qwen.gguf", ownership: "External" as const }, residencyState: { _tag: "Unloaded" as const }, progress: { stage: "queued" as const, completedBytes: 0, totalBytes: 685_000_000, bytesPerSecond: Option.none() } } }
+    expect(removalKind(fetching)).toBe("parts")
+    expect(removalConfirmation(fetching, false).title).toBe("Cancel the download Magnitude has in progress for Qwen3.6 35B-A3B (Q4)?")
+  })
   it("says removing an added model with the same bytes elsewhere deletes only Magnitude's copy and keeps it listed", () => {
     const addedModel = customModel(added)
     const alsoFound = customModel(added, { acquisitionState: { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 23_000_000_000, primaryPath: "/models/qwen.gguf", ownership: "Mixed" }, residencyState: { _tag: "Unloaded" } } })

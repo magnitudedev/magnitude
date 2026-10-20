@@ -308,31 +308,27 @@ impl ModelDomainResolver {
         revisions
     }
 
-    /// The separate drafter packages custom models use: the drafter each serves with, or downloads
-    /// with its target. `None` while a model's automatic drafter isn't worked out yet, when it may
-    /// be about to use any catalog drafter.
-    pub(crate) fn custom_drafter_packages(
-        &self,
-    ) -> Result<Option<BTreeSet<ModelPackageId>>, InventoryError> {
+    /// The separate drafter packages custom models use (the drafter each serves with, or downloads
+    /// with its target), and whether some model's automatic drafter isn't worked out yet, when it
+    /// may be about to use any catalog drafter.
+    pub(crate) fn custom_drafter_use(&self) -> Result<CustomDrafterUse, InventoryError> {
         let projection = self.local_projection()?;
         let projected = || projection.models.iter().chain(&projection.hidden);
-        if projected().any(|projected| projected.drafter_pending) {
-            return Ok(None);
-        }
-        Ok(Some(
-            projected()
+        Ok(CustomDrafterUse {
+            used: projected()
                 .filter_map(|projected| match &projected.configuration {
                     Ok(configuration) => separate_draft(&configuration.bundle),
                     Err(_) => projected.awaited_drafter.clone(),
                 })
                 .collect(),
-        ))
+            pending: projected().any(|projected| projected.drafter_pending),
+        })
     }
 
     /// The Magnitude-owned drafter packages no model uses: not the drafter of an installed
     /// catalog model, and not the drafter any custom model serves with.
     fn unused_drafter_packages(&self) -> Result<Vec<ModelPackageId>, InventoryError> {
-        let custom = self.custom_drafter_packages()?;
+        let custom = self.custom_drafter_use()?;
         let installed = self.inventory.catalog_packages_response()?;
         let present = installed
             .packages
@@ -344,11 +340,11 @@ impl ModelDomainResolver {
             .models
             .iter()
             .filter(|definition| {
-                custom.is_none() || present.contains(&crate::lineage::catalog_target(definition).id)
+                custom.pending || present.contains(&crate::lineage::catalog_target(definition).id)
             })
             .filter_map(|definition| separate_draft(&definition.configuration.bundle))
             .collect::<BTreeSet<_>>();
-        used.extend(custom.into_iter().flatten());
+        used.extend(custom.used);
         // A drafter stays while any model here would use it: as its recommended drafter or its
         // catalog model's drafter (even with its drafter turned off), or as a drafter from its own
         // repository.
@@ -556,6 +552,11 @@ impl LocalProjection {
             unsupported: self.unsupported,
         }
     }
+}
+
+pub(crate) struct CustomDrafterUse {
+    pub(crate) used: BTreeSet<ModelPackageId>,
+    pub(crate) pending: bool,
 }
 
 struct ProjectedModel {
@@ -1349,7 +1350,10 @@ impl ModelContext<'_> {
                 .collect(),
             lineage_repository: group.lineage_repository(),
             candidate_drafters,
-            drafter_pending: matches!(choice, DrafterChoice::Auto) && !enrichment_known,
+            // Only a model that serves is enriched; one that can't serve has no drafter to await.
+            drafter_pending: matches!(choice, DrafterChoice::Auto)
+                && !enrichment_known
+                && configuration.is_ok(),
             awaited_drafter: None,
             managed_packages: group
                 .occurrences
@@ -4262,6 +4266,206 @@ mod tests {
             .find(|installed| installed.package.id == target.id)
             .map(|installed| installed.origin);
         assert_eq!(target_owner, Some(ModelPackageInstallationOrigin::Magnitude));
+    }
+
+    /// Enrichment that hasn't worked out any model's drafters yet, as for a model whose enrichment
+    /// keeps failing or hasn't run.
+    struct NotWorkedOut;
+
+    impl CustomModelEnrichment for NotWorkedOut {
+        fn enrich(&self, _model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult {
+            CustomModelEnrichmentResult::default()
+        }
+
+        fn knows(&self, _model: &CustomModelFacts<'_>) -> bool {
+            false
+        }
+    }
+
+    /// The Fedora round 4 sequence: `hf download` puts the catalog's exact target weights in the
+    /// Hugging Face cache, beside another found model whose automatic drafter isn't worked out, and
+    /// `catalog pull --only drafter` stores the catalog drafter. Removing the catalog model removes
+    /// that drafter, the only part Magnitude stores for it, rather than keeping it in case the other
+    /// model may use it and reporting the model as another app's; the found weights stay and keep
+    /// serving the catalog model. A drafter another model does serve with is kept, reported as
+    /// shared rather than as another app's files.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_found_catalog_target_removes_its_stored_drafter() {
+        use magnitude_service_contracts::models::{
+            CatalogComponent, CatalogInstallationRemoval, CatalogInstallationRetentionReason,
+            CatalogModelState, InstalledModelPackages as _, ModelFileRole, ModelInstallation,
+            ModelInstallationOwnership,
+        };
+
+        let fixture = Fixture::new().await;
+        let cache = fixture.root.join("hf");
+        let commit = "a".repeat(40);
+        let draft_commit = "b".repeat(40);
+        let weights = model_bytes("model");
+        let projector = gguf_bytes(
+            &[
+                ("general.architecture", Meta::Str("clip")),
+                ("general.name", Meta::Str("projector")),
+            ],
+            &["v.patch_embd.weight"],
+        );
+        let drafter = drafter_bytes("drafter");
+        let snapshot = publish_hf_cache(
+            &cache,
+            "owner/Model-GGUF",
+            &commit,
+            &[
+                ("Model-Q4_K_XL.gguf", weights.clone()),
+                ("mmproj-F16.gguf", projector.clone()),
+            ],
+        );
+        publish_hf_cache(
+            &cache,
+            "owner/Model-MTP-GGUF",
+            &draft_commit,
+            &[("Model-MTP.gguf", drafter.clone())],
+        );
+        publish_hf_cache(
+            &cache,
+            "someone/Other-GGUF",
+            &"c".repeat(40),
+            &[("Other-Q4_K_M.gguf", model_bytes("other"))],
+        );
+        let shown = roots(vec![root(ModelRootKind::HuggingFaceCache, &cache)]);
+        fixture.apply(shown.clone()).await;
+        let packages = fixture.inventory().list_installed().await.unwrap().packages;
+        let target = packages
+            .iter()
+            .map(|installed| installed.package.clone())
+            .find(|package| package.files.iter().any(|file| file.role == ModelFileRole::Projector))
+            .expect("the catalog target pairs its projector");
+        let draft = packages
+            .iter()
+            .map(|installed| installed.package.clone())
+            .find(|package| package.files.iter().any(|file| file.path.ends_with("Model-MTP.gguf")))
+            .expect("the drafter package");
+        // The cache then holds only the target's weights, as `hf download` of the one GGUF leaves it.
+        fs::remove_file(snapshot.join("mmproj-F16.gguf")).unwrap();
+        fs::remove_dir_all(cache.join(hf_repo_dir("owner/Model-MTP-GGUF"))).unwrap();
+        let mut definition = catalog_definition(target.clone());
+        definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+            target: target.clone(),
+            draft_source: SpeculativeDraftSource::Separate {
+                draft: draft.clone(),
+            },
+            method: SpeculativeMethod::Mtp,
+        };
+        let model_id = catalog_id(&definition);
+        let (endpoint, _) = serve_files(vec![
+            (
+                "owner/Model-GGUF",
+                commit.clone(),
+                vec![
+                    ("Model-Q4_K_XL.gguf", weights.clone()),
+                    ("mmproj-F16.gguf", projector.clone()),
+                ],
+            ),
+            (
+                "owner/Model-MTP-GGUF",
+                draft_commit,
+                vec![("Model-MTP.gguf", drafter.clone())],
+            ),
+        ]);
+        let fixture = fixture.restart_with_hub(endpoint, vec![definition]).await;
+        fixture
+            .resolver
+            .set_custom_model_enrichment(Arc::new(NotWorkedOut));
+        fixture.apply(shown.clone()).await;
+        let other = fixture.local.list_local().await.unwrap().models;
+        let [other] = other.as_slice() else {
+            panic!("only the other file lists as a found model: {other:?}");
+        };
+        let other = other.model_id.clone();
+        let downloads = crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
+            .await
+            .unwrap();
+        let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
+            fixture.resolver.clone(),
+            Arc::new(downloads),
+            Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
+            Arc::new(NoOptimizer),
+        );
+        let installed = || match fixture.resolver.catalog_snapshot().unwrap().models[0]
+            .local_state
+            .clone()
+        {
+            CatalogModelState::Installed {
+                installation,
+                stored_components,
+                ..
+            } => (installation, stored_components),
+            CatalogModelState::NotInstalled => panic!("the found target installs the catalog model"),
+        };
+        let pull_drafter = || async {
+            installations
+                .install_component(&model_id, CatalogComponent::Drafter)
+                .await
+                .unwrap();
+            for _ in 0..200 {
+                if installed().1 == vec![CatalogComponent::Drafter] {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(installed().1, vec![CatalogComponent::Drafter]);
+            assert_eq!(
+                stored_files(&fixture.store).iter().map(|(_, size)| size).sum::<u64>(),
+                drafter.len() as u64
+            );
+        };
+        assert!(installed().1.is_empty());
+
+        pull_drafter().await;
+        let removed = installations.remove(&model_id).await.unwrap();
+        assert!(
+            matches!(removed, CatalogInstallationRemoval::Removed { .. }),
+            "a model whose drafter isn't worked out never keeps a found target's drafter: {removed:?}"
+        );
+        fixture.inventory().ensure_installed_model_inventory().await.unwrap();
+        assert!(stored_files(&fixture.store).is_empty());
+        assert_eq!(fs::read(snapshot.join("Model-Q4_K_XL.gguf")).unwrap(), weights);
+        let (installation, stored_components) = installed();
+        assert!(stored_components.is_empty());
+        assert!(
+            matches!(
+                &installation,
+                ModelInstallation::Resolved {
+                    ownership: ModelInstallationOwnership::External,
+                    primary_path,
+                    ..
+                } if primary_path.starts_with(&cache)
+            ),
+            "the catalog model still runs from the found file: {installation:?}"
+        );
+
+        // Another model serving with the drafter keeps it: shared, never another app's files.
+        pull_drafter().await;
+        fixture
+            .apply(LocalModelsConfiguration {
+                drafters: vec![DrafterAttachment {
+                    model_id: other,
+                    drafter: DrafterChoice::Reference {
+                        reference: DrafterReference::Catalog {
+                            model_id: model_id.clone(),
+                        },
+                        method: SpeculativeMethod::Mtp,
+                    },
+                }],
+                ..shown.clone()
+            })
+            .await;
+        assert!(matches!(
+            installations.remove(&model_id).await.unwrap(),
+            CatalogInstallationRemoval::Retained {
+                reason: CatalogInstallationRetentionReason::SharedMaterial
+            }
+        ));
+        assert_eq!(installed().1, vec![CatalogComponent::Drafter]);
     }
 
     /// Hiding changes only what is shown: installing a catalog model whose target is exactly a

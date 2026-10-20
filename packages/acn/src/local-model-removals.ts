@@ -37,7 +37,7 @@ export const catalogRemovalOutcome = (modelId: CatalogFormModelId) => (
         : "model_removal_retained_shared",
       message: result.reason === "ExternalOwnership"
         ? `${modelId} uses files another app manages, which Magnitude never deletes. Hide it with \`magnitude models hide ${modelId}\` instead.`
-        : "This model uses files shared by another catalog model and was not removed.",
+        : `${modelId} uses files another model on this computer also uses, so they were not removed.`,
       retryable: false,
     }))
 

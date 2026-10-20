@@ -40,7 +40,8 @@ pub struct CatalogRemovalPlan {
 /// Removal deletes Magnitude's own copies of the model's packages and never another app's files.
 /// A target with no copy of Magnitude's own is externally owned: only Magnitude's own components
 /// of it (its projector package and drafter) are removed, and the found target stays. A target
-/// that another catalog model shares is retained as shared. When an external copy of the target
+/// that another catalog model shares, or a found target whose stored parts other models all use,
+/// is retained as shared. When an external copy of the target
 /// remains after Magnitude's is removed, it serves the catalog model from where it is.
 fn removal_plan(
     ids: &BTreeSet<ModelPackageId>,
@@ -465,14 +466,21 @@ impl ModelDomainResolver {
         drop(occurrences);
         let mut plan = removal_plan(&ids, &target_ids, &managed_ids, &shared_ids);
         // A drafter another model uses stays; pruning removes it once no model does. While a
-        // model's automatic drafter is still being worked out, this model's drafter stays too.
-        let in_use = match self.custom_drafter_packages()? {
-            Some(used) => used,
-            None => crate::custom_models::separate_draft(&definition.configuration.bundle)
-                .into_iter()
-                .collect(),
-        };
+        // model's automatic drafter is still being worked out, this model's drafter stays too when
+        // Remove deletes the target anyway. A found target's stored parts are all that Remove
+        // deletes, so only a drafter another model serves with keeps one of them.
+        let custom = self.custom_drafter_use()?;
+        let mut in_use = custom.used;
+        if custom.pending && !plan.externally_owned {
+            in_use.extend(crate::custom_models::separate_draft(
+                &definition.configuration.bundle,
+            ));
+        }
         plan.package_ids.retain(|package_id| !in_use.contains(package_id));
+        // Magnitude stores parts of a found target, but another model uses each of them.
+        if plan.externally_owned && plan.package_ids.is_empty() && !managed_ids.is_empty() {
+            plan.shared = true;
+        }
         Ok(plan)
     }
 

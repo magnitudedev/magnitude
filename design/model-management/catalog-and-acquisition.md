@@ -696,14 +696,18 @@ hidden, never deleted; so is a catalog model whose files are all in external loc
 found copy. After a model is removed, and after catalog removal, the Magnitude-owned drafter
 packages that no installed catalog model and no custom model uses are removed; changing or turning
 off a drafter never prunes. While any custom model's automatic drafter is not yet worked out, catalog
-drafters are kept. ICN checks each package again at the deletion itself, whatever the reference
+drafters are kept; only a model that serves awaits one, since a model that can't serve is never
+worked out. ICN checks each package again at the deletion itself, whatever the reference
 accounting decided: it deletes only a package of Magnitude's holding drafter files alone (never a
 target's weights, a model with built-in heads included), that no installed catalog model's bundle
 and no custom model uses, that shares no snapshot file with another package, and that the residency
 admits for removal (a package a resident model has loaded is kept).
 Catalog removal itself keeps the catalog model's drafter while a custom model uses it (or may, while
 an automatic drafter is being worked out) and removes the target; pruning removes the drafter once no
-model uses it. An added model whose target is still downloading uses the drafter it downloads with
+model uses it. A catalog model whose target is found elsewhere has nothing of Magnitude's but its
+stored projector and drafter, so only a custom model actually serving with that drafter keeps it, and
+when every stored part is kept that way the removal is retained as shared (another model uses the
+files), never as another app's files. An added model whose target is still downloading uses the drafter it downloads with
 it, so a drafter that finished first is never pruned before its target lands.
 
 Removing a catalog model that is not installed changes nothing: it is reported as not installed,

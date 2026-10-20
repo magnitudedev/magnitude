@@ -166,7 +166,7 @@ it("stops a running model before removing it, and removes an idle model without 
     Effect.provideService(LocalModelRemovals, { remove: (modelId: string) => Effect.sync(() => { calls.push(`remove ${modelId}`); return {} }) } as never),
     Effect.provideService(ModelSlotController, {} as never),
     Effect.provideService(IcnCatalog, {} as never),
-    Effect.provideService(IcnCatalogInstallations, {} as never),
+    Effect.provideService(IcnCatalogInstallations, { get: Effect.succeed({ state: { operations: [] } }) } as never),
   )
   await Effect.runPromise(remove("model-a:gguf:test"))
   await Effect.runPromise(remove("model-b:gguf:test"))
@@ -177,7 +177,7 @@ it("stops a running model before removing it, and removes an idle model without 
   expect(customCalls).toContain("custom hide model-c:gguf:test")
 })
 
-it("removes only the parts Magnitude stores for a catalog model whose weights are found elsewhere, and hides one without any", async () => {
+it("removes only the parts Magnitude stores or is fetching for a catalog model whose weights are found elsewhere, and hides one without any", async () => {
   const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations, IcnLocalModels } = await import("@magnitudedev/icn")
   const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
   const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
@@ -197,7 +197,7 @@ it("removes only the parts Magnitude stores for a catalog model whose weights ar
     missingComponents: [],
     storedComponents,
   })
-  const remove = (storedComponents: readonly string[], removal: unknown) => Effect.gen(function* () {
+  const remove = (storedComponents: readonly string[], removal: unknown, operationState = "Completed") => Effect.gen(function* () {
     const commands = yield* ModelCommands
     return yield* commands.remove(Schema.decodeUnknownSync(ModelIdSchema)("qwen3.5-4b:gguf:q4"))
   }).pipe(
@@ -213,9 +213,16 @@ it("removes only the parts Magnitude stores for a catalog model whose weights ar
         calls.push(`remove ${path.model_id}`)
         return removal
       }),
+      cancelCatalogInstallation: ({ path }: { path: { operation_id: string } }) => Effect.sync(() => {
+        calls.push(`cancel ${path.operation_id}`)
+        return {}
+      }),
     } } as never),
     Effect.provideService(IcnCatalog, { refresh: Effect.void } as never),
-    Effect.provideService(IcnCatalogInstallations, {} as never),
+    Effect.provideService(IcnCatalogInstallations, {
+      get: Effect.succeed({ state: { operations: [{ operationId: "op-drafter", modelId: "qwen3.5-4b:gguf:q4", state: { _tag: operationState } }] } }),
+      refresh: Effect.void,
+    } as never),
     Effect.provideService(IcnLocalModels, { pruneDrafters: Effect.void } as never),
     Effect.provideService(ModelSlotController, {} as never),
   )
@@ -230,10 +237,23 @@ it("removes only the parts Magnitude stores for a catalog model whose weights ar
   expect(customCalls).toEqual(["custom hide qwen3.5-4b:gguf:q4"])
   expect(calls).toHaveLength(1)
 
-  // Parts another model still uses stay; ICN retains them and the guidance is Hide, never Remove again.
-  const retained = await Effect.runPromise(remove(["Drafter"], { _tag: "Retained", reason: "ExternalOwnership" }).pipe(Effect.flip))
-  expect(retained.message).toContain("magnitude models hide qwen3.5-4b:gguf:q4")
-  expect(retained.message).not.toContain("catalog remove")
+  // Parts another model still uses stay; ICN retains them as shared, never as another app's files to hide.
+  const retained = await Effect.runPromise(remove(["Drafter"], { _tag: "Retained", reason: "SharedMaterial" }).pipe(Effect.flip))
+  expect(retained._tag === "LocalModelMutationFailed" && retained.code).toBe("model_removal_retained_shared")
+  expect(retained.message).not.toContain("magnitude models hide")
+
+  // A drafter still queued is Magnitude's own part too: Remove cancels its installation and never hides the model,
+  // which keeps running from the found file (QA mac round 4).
+  calls.length = 0
+  customCalls.length = 0
+  expect(await Effect.runPromise(remove([], { _tag: "Removed", reclaimedBytes: 0 }, "Pending"))).toEqual({})
+  expect(calls).toEqual(["cancel op-drafter"])
+  expect(customCalls).toEqual([])
+
+  // With a stored projector beside the queued drafter, the drafter is cancelled and the projector removed.
+  calls.length = 0
+  expect(await Effect.runPromise(remove(["Projector"], { _tag: "Removed", reclaimedBytes: 1 }, "Running"))).toEqual({})
+  expect(calls).toEqual(["cancel op-drafter", "remove qwen3.5-4b:gguf:q4"])
 })
 
 it("reports whether a catalog sync installs, updates, or finds the model current", async () => {

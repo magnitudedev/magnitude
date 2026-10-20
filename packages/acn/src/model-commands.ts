@@ -152,13 +152,23 @@ export const ModelCommandsLive: Layer.Layer<
   /** Whether Magnitude stores parts (a projector or drafter) of a catalog model whose weights are found elsewhere. */
   const storesComponents = (modelId: CatalogFormModelId) => localModels.state.pipe(Effect.map(({ models, hidden }) =>
     [...models, ...hidden].some((model) => model._tag === "Catalog" && model.modelId === modelId && model.storedComponents.length > 0)))
+  const installing = (modelId: CatalogFormModelId) => operationFor(modelId).pipe(
+    Effect.map((operation) => operation !== undefined && (operation.state._tag === "Pending"
+      || operation.state._tag === "Running" || operation.state._tag === "Optimizing")),
+    Effect.mapError((cause) => modelCommandFailure("remove", cause)),
+  )
   // Remove never deletes files Magnitude doesn't own. A catalog model whose weights are found elsewhere loses only
-  // the parts Magnitude stores for it and keeps running from the found file; with none, it is hidden instead, as
-  // Remove hides any found model.
+  // Magnitude's own parts, the ones it stores and any it is still fetching (that installation is cancelled), and
+  // keeps running from the found file; with none, it is hidden instead, as Remove hides any found model.
   const catalogRemove = (modelId: CatalogFormModelId) => Effect.all([custom.externalCatalogFiles(modelId), storesComponents(modelId)]).pipe(
-    Effect.flatMap(([external, stored]) => stopModel(modelId).pipe(Effect.zipRight(Option.isSome(external) && !stored
-      ? custom.hide(modelId).pipe(Effect.as({}))
-      : removals.remove(modelId)))),
+    Effect.flatMap(([external, stored]) => Option.isNone(external)
+      ? stopModel(modelId).pipe(Effect.zipRight(removals.remove(modelId)))
+      : installing(modelId).pipe(Effect.flatMap((fetching) => stopModel(modelId).pipe(
+          Effect.zipRight(fetching ? catalogCancel(modelId) : Effect.succeed({})),
+          Effect.zipRight(stored
+            ? removals.remove(modelId)
+            : fetching ? Effect.succeed({}) : custom.hide(modelId).pipe(Effect.as({}))),
+        )))),
   )
   return ModelCommands.of({
     sync: (modelId) => byForm(modelId, catalogSync.sync, custom.sync),

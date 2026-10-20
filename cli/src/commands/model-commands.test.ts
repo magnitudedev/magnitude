@@ -202,6 +202,28 @@ describe("model mutations accept hf: and local: IDs", () => {
       `Unhide it: magnitude models unhide ${withParts.modelId}`,
       "",
     ].join("\n"))
+
+    // A drafter still queued is Magnitude's own part too: Remove cancels it rather than hiding the model
+    // (QA mac round 4: it hid the model, which then looked like a catalog download).
+    const fetching = makeInstalledCatalogModel({
+      acquisitionState: {
+        _tag: "Updating",
+        installation: { _tag: "Resolved", installedBytes: 1, primaryPath: weightsPath, ownership: "External" },
+        residencyState: { _tag: "Unloaded" },
+        progress: { stage: "queued", completedBytes: 0, totalBytes: 685_000_000, bytesPerSecond: Option.none() },
+      },
+      storedComponents: [],
+    })
+    const cancelled = await runBoth({
+      getCatalog: succeed(catalogState([fetching])),
+      removeLocalModel: succeed(),
+    }, (options) => removeModel(fetching.modelId, options))
+    expect(cancelled.text).toBe([
+      `Cancelled the download Magnitude had in progress for ${fetching.modelId}.`,
+      `It still runs from ${weightsPath}, which Magnitude never deletes.`,
+      `To stop listing it: magnitude models hide ${fetching.modelId}`,
+      "",
+    ].join("\n"))
   })
 
   it("models hide fails with the service's error for an ID that isn't on this computer", async () => {

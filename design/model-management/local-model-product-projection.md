@@ -144,8 +144,11 @@ A catalog drafter or projector in Magnitude's store beside external weights leav
 for a `Mixed` model its copy of the weights (it stays listed from its external copy), for an
 `External` model with stored components only those components (it keeps running from the found
 file), and an `External` model with none is hidden instead, as Remove hides any found model, and
-says so ("Hid … from Magnitude"). The removal gate checks for stored components, not ownership alone,
-and Hide applies to every `External` model.
+says so ("Hid … from Magnitude"). A component Magnitude is still fetching for an `External` model (a
+queued or running installation) is Magnitude's own part too: Remove cancels that installation,
+deletes any stored components, and never hides the model, which keeps running from the found file.
+The removal gate checks for stored or in-flight components, not ownership alone, and Hide applies to
+every `External` model.
 An installation's optimization projects as `Optimizing`, an installed-family state that carries
 residency and optimization progress (stage, completed and total units, and the device once known).
 Installing or Updating moves to `Optimizing` and then to `Installed`; cancellation, a load, or a

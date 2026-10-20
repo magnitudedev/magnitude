@@ -13,6 +13,7 @@ import {
   localModelServingState,
   preselectedDrafterCandidate,
   removalKind,
+  acquiringCatalogParts,
   unsupportedLocalModelSourceTag,
   unsupportedReasonMessages,
   type RemovalKind,
@@ -92,18 +93,19 @@ export const cancelDownload = (modelInput: string, options: JsonOption = {}) => 
   options,
 )
 
-/** The parts Magnitude stores for a catalog model whose weights are found elsewhere, and where those weights are. */
+/** Magnitude's own parts of a catalog model whose weights are found elsewhere: those it stores, whether it is still fetching more, and where the weights are. */
 export interface StoredCatalogParts {
   readonly components: readonly CatalogComponent[]
+  readonly fetching: boolean
   readonly weightsPath: string
 }
 
-/** A catalog model's stored parts when its weights are only in another app's location: what Remove deletes. */
+/** A catalog model's own parts when its weights are only in another app's location: what Remove deletes or cancels. */
 export const storedCatalogParts = (model: LocalModel): Option.Option<StoredCatalogParts> => {
-  if (model._tag !== "Catalog" || model.storedComponents.length === 0) return Option.none()
+  if (model._tag !== "Catalog" || removalKind(model) !== "parts") return Option.none()
   const installation = installedAcquisition(model.acquisitionState)?.installation
   return installation?._tag === "Resolved"
-    ? Option.some({ components: model.storedComponents, weightsPath: installation.primaryPath })
+    ? Option.some({ components: model.storedComponents, fetching: acquiringCatalogParts(model), weightsPath: installation.primaryPath })
     : Option.none()
 }
 
@@ -115,7 +117,8 @@ export const renderRemoval = (
 ): string => {
   if (Option.isSome(parts)) {
     const names = parts.value.components.map((component) => catalogComponentName(component).toLowerCase()).join(" and ")
-    return `Removed the ${names} Magnitude downloaded for ${modelId}.\n`
+    return (parts.value.fetching ? `Cancelled the download Magnitude had in progress for ${modelId}.\n` : "")
+      + (names.length > 0 ? `Removed the ${names} Magnitude downloaded for ${modelId}.\n` : "")
       + `It still runs from ${parts.value.weightsPath}, which Magnitude never deletes.\n`
       + `To stop listing it: magnitude models hide ${modelId}\n`
   }
