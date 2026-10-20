@@ -705,7 +705,8 @@ Removing an added custom model deletes its Magnitude-owned files under the same 
 files that are also present in an external location stay there, and the model remains as found.
 Removing an imported model forgets its declaration and never touches the file. A found model is
 hidden, never deleted; so is a catalog model whose files are all in external locations, which is a
-found copy. After a model is removed, and after catalog removal, the Magnitude-owned drafter
+found copy. Adding a version that is already a found model declares nothing (it records only the
+drafter choice), so that model stays found and Remove hides it. After a model is removed, and after catalog removal, the Magnitude-owned drafter
 packages that no installed catalog model and no custom model uses are removed; changing or turning
 off a drafter never prunes. While any custom model's automatic drafter is not yet worked out, catalog
 drafters are kept; only a model that serves awaits one, since a model that can't serve is never

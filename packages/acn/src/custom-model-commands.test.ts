@@ -739,6 +739,20 @@ describe("adding models", () => {
     expect(recorded.bundles[0]).toMatchObject({ source: { _tag: "Local", path: "/models" }, target: ["found-Q8_0.gguf"] })
   })
 
+  // QA linux-cuda round 3c: pulling a version that is already a found model ("already on this computer") declares
+  // nothing, so the model stays found and Remove hides it, as it hides any found model.
+  it("hides a found model on Remove after adding it reported it as already on this computer", async () => {
+    const { run, recorded } = harness({ inspect: inspection(foundId) })
+    const config = await run((commands, models) => Effect.gen(function* () {
+      yield* commands.addHuggingFaceModel({ repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false })
+      yield* commands.remove(foundId)
+      return yield* models.get
+    }))
+    expect(config.declarations[foundId]).toBeUndefined()
+    expect(config.hidden).toEqual([foundId])
+    expect(recorded.removedFiles).toEqual([])
+  })
+
 })
 
 describe("a declaration left by a link", () => {
