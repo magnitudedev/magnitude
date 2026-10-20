@@ -1,4 +1,4 @@
-use seismic::{BackendName, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor};
+use seismic::{BackendName, Devices, Element, NativeSpecialization, SlabRegion, SlabTensor};
 use seismic_native_tests::{scale_rows, slab_probe, slab_scale};
 
 #[test]
@@ -38,7 +38,7 @@ fn native_reads_rows_across_slab_boundary(backend: BackendName) {
 }
 
 fn native_reads_rows_with_slab_size(backend: BackendName, slab_rows: u64) {
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(backend)
         .unwrap();
@@ -112,7 +112,7 @@ fn native_vulkan_reads_reused_interior_slab_index() {
 }
 
 fn native_reads_reused_interior_slab_index(backend: BackendName) {
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(backend)
         .unwrap();
@@ -244,7 +244,7 @@ fn metal_submission_cost_with_one_and_one_hundred_slabs() {
         )
     }
 
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Metal)
         .unwrap();
@@ -268,7 +268,7 @@ fn metal_frees_slab_after_submitted_read() {
 }
 
 fn free_after_submitted_read(backend: BackendName) {
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(backend)
         .unwrap();
@@ -336,7 +336,7 @@ fn free_after_submitted_read(backend: BackendName) {
 
 #[test]
 fn queued_graph_keeps_slab_placement_fixed_until_submission_or_drop() {
-    let device = DeviceCatalog::discover()
+    let device = Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();

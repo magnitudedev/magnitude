@@ -9,6 +9,7 @@
 // Every case checks the outputs, the published windows (copies), and that
 // no bank other than each slot's successor changes.
 
+mod timing_common;
 mod versions_common;
 
 use magnitude_kernels::short_conv_rows;
@@ -447,10 +448,11 @@ fn tape_versions_equal_runs_that_stopped_there() {
 #[test]
 #[ignore = "timing; run explicitly on the measurement host"]
 fn short_conv_timings() {
-    let options = seismic::MeasureOptions {
-        samples: 11,
+    let options = seismic::measure::Measure {
+        samples: std::num::NonZeroUsize::new(11).unwrap(),
         min_sample_seconds: 0.01,
     };
+    let measure = |point| timing_common::measured(point, &options);
     let geometry = Geometry {
         channels: 2048,
         taps: 3,
@@ -471,7 +473,7 @@ fn short_conv_timings() {
             let case = Case::new(Geometry { banks, ..geometry }, rows, slots.clone(), 3);
             let mut rotation = (0..8).map(|_| case.bind(&device, false)).collect::<Vec<_>>();
             let args = rotation.iter_mut().map(|bound| bound.args(case.slab_banks)).collect();
-            let seconds = kernel(&device, Element::bf16()).measure(args, &options).unwrap().median;
+            let seconds = measure(kernel(&device, Element::bf16()).point(args).unwrap()).median;
             let bytes = rows * 2048 * (8 + 2) + slots.len() * 2 * 2 * 2048 * 4;
             println!(
                 "{backend} short conv {label}: {:.1} us ({:.0} GB/s effective)",

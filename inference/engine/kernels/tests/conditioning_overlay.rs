@@ -2,7 +2,7 @@ use magnitude_kernels::conditioning_overlay;
 
 /// The host's GPU (Metal on macOS, else Vulkan when present), then the CPU.
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let gpu = if cfg!(target_os = "macos") {
         Some(catalog.open_backend(seismic::BackendName::Metal).unwrap())
     } else {

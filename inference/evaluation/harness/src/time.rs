@@ -104,7 +104,7 @@ pub fn run(
         "wall_ms": (host_seconds() - opening.0) * MS,
         "process_cpu_ms": (process_cpu_seconds() - opening.1) * MS,
     });
-    let devices = vec![engine.device().info().name.clone()];
+    let devices = vec![engine.device().info().name().to_owned()];
     let mut speed = Vec::new();
     for (context, rendered) in &by_context {
         for &concurrency in &time.concurrency {

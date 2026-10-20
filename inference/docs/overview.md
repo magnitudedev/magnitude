@@ -57,6 +57,7 @@ flowchart TD
 | [Precision](precision.md) | Error model, composition assumptions, storage-resolution yardsticks and numerical admission |
 | [Native tuning](tuning.md) | First-load search, time allocation, numerical coverage, selection and reuse |
 | [Distribution](distribution.md) | Products, platform composition, and runtime dependencies |
+| [Device topology](device-topology.md) | The machine model: graph, discovery, reported values, status samples and how work on it is measured |
 
 These documents describe intended architecture and own their respective contracts.
 Implementation specs describe changes and sequencing; validation records describe

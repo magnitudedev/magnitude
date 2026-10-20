@@ -43,6 +43,9 @@ pub trait ProgramFamily: 'static {
         Ok(0)
     }
 
+    /// Physical allocations classified as model storage, including constants.
+    fn visit_model_storage(&self, _visit: &mut dyn FnMut(&seismic::Tensor)) {}
+
     fn prepared_program_bytes(&self) -> Result<u64, &'static str> {
         Ok(0)
     }
@@ -179,6 +182,18 @@ impl ProgramFamily for NativeFamily {
 
     fn target_weight_bytes(&self) -> Result<u64, &'static str> {
         self.resident.storage_bytes()
+    }
+
+    fn visit_model_storage(&self, visit: &mut dyn FnMut(&seismic::Tensor)) {
+        self.resident
+            .visit_weights(|weight| weight.visit_storage(visit));
+        self.target.visit_constants(visit);
+        if let Some(head) = &self.head {
+            head.visit_constants(visit);
+        }
+        if let Some(vision) = &self.vision {
+            vision.visit_constants(visit);
+        }
     }
 
     fn prepared_program_bytes(&self) -> Result<u64, &'static str> {

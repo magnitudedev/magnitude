@@ -295,7 +295,7 @@ fn reference(
 
 #[test]
 fn draft_rows_match_the_host_model_over_resident_weights() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [
         seismic::BackendName::Metal,
         seismic::BackendName::Cuda,
@@ -525,7 +525,7 @@ fn draft_rows_match_on(device: &Device) {
 
 #[test]
 fn draft_rows_preserve_distinct_f32_streams() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [
         seismic::BackendName::Cuda,
         seismic::BackendName::Metal,
@@ -642,7 +642,7 @@ fn draft_rows_preserve_distinct_f32_streams() {
 /// table whose rows are not a whole number of any tile.
 #[test]
 fn draft_rows_match_the_host_model_over_every_table_form() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [
         seismic::BackendName::Metal,
         seismic::BackendName::Cuda,

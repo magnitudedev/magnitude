@@ -783,8 +783,8 @@ impl ModelLoadPlan {
 
     /// The host-shared bytes of the target's stored tables
     /// (`TableFill::Stored`): their slots and directories, part of the
-    /// target's weights, in the domain the device's host-shared storage
-    /// consumes (`platform::shared_role`).
+    /// target's weights, and upload storage, held where the executor's upload
+    /// placement lands.
     pub fn shared_table_bytes(&self) -> Result<u64, String> {
         self.target
             .iter()

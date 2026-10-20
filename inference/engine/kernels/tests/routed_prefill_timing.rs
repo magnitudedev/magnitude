@@ -28,7 +28,7 @@ fn shape() -> (u64, u64, u64, u64) {
 }
 
 fn native_device() -> seismic::Device {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     [seismic::BackendName::Cuda, seismic::BackendName::Metal]
         .into_iter()
         .find_map(|backend| catalog.open_backend(backend).ok())

@@ -6,15 +6,17 @@ import { deriveHardwareMemoryView } from "./hardware-memory"
 const GiB = 1024 ** 3
 const hardware = (available: number | null = 8 * GiB, discrete = false, bothBackends = false) => Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
   platform: discrete ? "Linux" : "MacOS", architecture: discrete ? "X64" : "Arm64",
-  logicalCores: 8, totalSystemMemoryBytes: 16 * GiB, availableSystemMemoryBytes: 8 * GiB,
-  systemAllocationCapacityBytes: 14 * GiB, systemAllocationHeadroomBytes: 6 * GiB, abortReserveBytes: GiB,
+  logicalCores: 8, totalSystemMemoryBytes: 16 * GiB,
   accelerators: [
-    { acceleratorId: "gpu", name: "Test GPU", backend: discrete ? "cuda" : "metal", memoryDomainId: discrete ? "gpu" : "system" },
-    ...(bothBackends ? [{ acceleratorId: "gpu-vulkan", name: "Test GPU", backend: "vulkan", memoryDomainId: "gpu" }] : []),
+    { acceleratorId: "gpu", name: "Test GPU", executors: [
+      { deviceId: "primary", backend: discrete ? "cuda" : "metal", memoryDomainIds: [discrete ? "gpu" : "system"] },
+      ...(bothBackends ? [{ deviceId: "vulkan", backend: "vulkan", memoryDomainIds: ["gpu"] }] : []),
+    ] },
   ],
+  selectedDeviceId: "primary",
   memoryDomains: [
-    { memoryDomainId: "system", kind: discrete ? "System" : "UnifiedMemory", totalBytes: 16 * GiB, stableCapacityBytes: 14 * GiB, sharesSystemMemory: true, ...(available === null ? {} : { availableBytes: available }) },
-    ...(discrete ? [{ memoryDomainId: "gpu", kind: "PhysicalDevice", totalBytes: 16 * GiB, stableCapacityBytes: 16 * GiB, availableBytes: 8 * GiB, sharesSystemMemory: false }] : []),
+    { memoryDomainId: "system", kind: discrete ? "System" : "UnifiedMemory", totalBytes: 16 * GiB, ...(available === null ? {} : { availableBytes: available }) },
+    ...(discrete ? [{ memoryDomainId: "gpu", kind: "PhysicalDevice", totalBytes: 16 * GiB, availableBytes: 8 * GiB }] : []),
   ],
 })
 const allocation = (domain = "system", modelBytes = 3 * GiB) => Option.some(Schema.decodeUnknownSync(ModelInstanceAllocationSchema)({

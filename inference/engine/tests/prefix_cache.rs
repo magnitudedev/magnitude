@@ -628,7 +628,10 @@ fn vision_claims_its_slots_on_an_image_and_releases_them_at_idle() {
     let input = image_prompt(&resolved.host);
     let (mut domain, mut bindings, _) =
         build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
-    let charged = |domain: &ExecutorDomain| domain.resources().device().memory_usage().charged;
+    let charged = |domain: &ExecutorDomain| {
+        let device = domain.resources().device();
+        device.storage_usage(seismic::StorageKind::Device).charged
+    };
     let mut cycles = Vec::new();
     for request in [RequestId(1), RequestId(2)] {
         domain.install_input(request, input.clone()).unwrap();

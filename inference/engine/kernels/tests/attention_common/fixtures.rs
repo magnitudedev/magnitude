@@ -283,7 +283,7 @@ impl Case {
 /// decode/prefill contract with the same decode parameters), and the CPU
 /// device.
 fn devices() -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let gpu = if cfg!(target_os = "macos") {
         Some(catalog.open_backend(BackendName::Metal).unwrap())
     } else {
@@ -459,7 +459,12 @@ fn speculative_rows(rows: usize, context: i32) -> Vec<Row> {
         .collect()
 }
 
-const TIMING: seismic::MeasureOptions = seismic::MeasureOptions {
-    samples: 15,
+/// How the attention timing tests measure a kernel's rotation
+/// (`timing_common::Timed`); the includers without a timing test leave it
+/// unused.
+#[allow(dead_code)]
+const TIMING: seismic::measure::Measure = seismic::measure::Measure {
+    samples: std::num::NonZeroUsize::new(15).unwrap(),
     min_sample_seconds: 0.005,
 };
+

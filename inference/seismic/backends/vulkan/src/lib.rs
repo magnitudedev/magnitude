@@ -16,20 +16,19 @@ mod probe;
 pub mod seal;
 pub mod toolchain;
 
-pub use device::{Device, MemoryBudget, OpenError, Rounded};
+pub use device::{Device, HeapBudget, MemoryBudget, OpenError, Rounded};
 pub use facts::{
-    Calibration, Description, DeviceType, Facts, FormationFacts, Limits, SubgroupWidth,
-    SUBGROUP_WIDTH,
+    Allocation, Calibration, Description, DeviceType, Facts, FormationFacts, Limits, MemoryHeap,
+    MemoryLayout, MemoryType, SubgroupWidth, SUBGROUP_WIDTH,
 };
 pub use instance::LoaderError;
-pub use memory::Buffer;
+pub use memory::{AllocationAccount, Buffer, PlacedStorage};
 
 /// Enumerate the physical devices against the whole floor, so a device
 /// discovery reports available opens: one meeting the static floor whose
 /// numerics only a probe establishes is opened briefly, once per process,
-/// to run it (`device::numerical_floor`). A device meeting the static floor
-/// reports its heap budget. GPUs come first, so the first device of the
-/// backend is a GPU when there is one.
+/// to run it (`device::numerical_floor`). GPUs come first, so the first
+/// device of the backend is a GPU when there is one.
 pub fn discover() -> Result<Vec<Description>, LoaderError> {
     let instance = instance::instance()?;
     let mut descriptions = instance
@@ -38,8 +37,6 @@ pub fn discover() -> Result<Vec<Description>, LoaderError> {
         .map(|physical| {
             let mut description = facts::describe(instance, physical);
             if description.floor.is_ok() {
-                description.heap_budget_bytes =
-                    Some(device::memory_budget(instance, physical).heap_budget_bytes);
                 description.floor = device::numerical_floor(instance, physical, &description.facts)
                     .map_err(|error| {
                         error.floor_reason().unwrap_or_else(|| {
@@ -52,6 +49,27 @@ pub fn discover() -> Result<Vec<Description>, LoaderError> {
         .collect::<Vec<_>>();
     descriptions.sort_by_key(|description| !description.facts.is_gpu());
     Ok(descriptions)
+}
+
+/// Every heap's `VK_EXT_memory_budget` budget and usage of the device of
+/// `uuid`, in heap order, read from the physical device without a logical
+/// one; `None` when no device has that UUID. The extension is in the floor,
+/// so every device meeting it reports budgets.
+pub fn heap_budgets(uuid: [u8; 16]) -> Result<Option<Vec<HeapBudget>>, LoaderError> {
+    let instance = instance::instance()?;
+    for physical in instance.physical_devices()? {
+        let mut id = ash::vk::PhysicalDeviceIDProperties::default();
+        let mut properties = ash::vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+        unsafe {
+            instance
+                .raw()
+                .get_physical_device_properties2(physical, &mut properties)
+        };
+        if id.device_uuid == uuid {
+            return Ok(Some(device::heap_budgets(instance, physical)));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

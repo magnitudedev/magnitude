@@ -34,7 +34,7 @@ use magnitude_service_models::{
     ManagedModelStore, ModelDomainResolver, serving_configuration_fingerprint,
     servable_model_bundle_key_for_bundle,
 };
-use seismic::DeviceCatalog;
+use seismic::Devices;
 
 use super::optimization::{self, PreparationJobs};
 use super::supervisor::{HostMemoryObserver, MemorySupervisor};
@@ -74,7 +74,7 @@ pub struct ResidencyEnvironment {
     pub model_variants: Arc<ModelDomainResolver>,
     pub configurations: Arc<ResolvedConfigurations>,
     /// The service process's device catalog: previews read it.
-    pub catalog: Arc<DeviceCatalog>,
+    pub catalog: Arc<Devices>,
     pub reserves: MemoryReserves,
     /// System-RAM headroom for the memory guard ([`SeismicHostMemory`] on the service catalog).
     pub host_memory: Arc<dyn HostMemoryObserver>,
@@ -111,12 +111,12 @@ impl ModelInstances {
     pub fn start(environment: ResidencyEnvironment) -> Self {
         let environment = Arc::new(environment);
         let (client, inbox) = ResidencyClient::channel();
-        let host_capacity = environment.catalog.topology().host_pool().capacity_bytes;
+        let host_capacity = environment.catalog.topology().host_ram().capacity().value;
         let supervisor = MemorySupervisor::start(
             Arc::clone(&environment.host_memory),
             environment
                 .reserves
-                .for_domain(seismic::MemoryPoolKind::HostRam, host_capacity),
+                .for_domain(&seismic::StoreKind::HostRam, host_capacity),
             client.notifier(),
         );
         let preparations = PreparationJobs::default();
@@ -406,7 +406,7 @@ fn residency_target(
 }
 
 pub(super) async fn preview(
-    catalog: &Arc<DeviceCatalog>,
+    catalog: &Arc<Devices>,
     resolved: &Arc<ResolvedConfiguration>,
 ) -> Result<LoadPreview, ModelOperationFailure> {
     let catalog = Arc::clone(catalog);
@@ -731,11 +731,7 @@ impl EngineResidency {
             ));
         }
         let context_window_tokens = plan.context_window_tokens;
-        let allocation = instance_allocation(
-            &environment.catalog.topology(),
-            context_window_tokens,
-            &ready.ready_info().census,
-        );
+        let allocation = instance_allocation(context_window_tokens, &ready.ready_info().census);
         let (host, client, _) = ready.into_parts();
         tracing::info!(device = %preview.device, "model ready");
         Ok(PreparedResidency {
@@ -857,7 +853,6 @@ impl ModelResidencyDriver for EngineResidency {
             worker,
             Arc::new(resident.client),
             resident.context_window_tokens,
-            self.environment.catalog.topology(),
         );
     }
 

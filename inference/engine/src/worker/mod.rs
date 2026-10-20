@@ -28,7 +28,7 @@ pub use preparation::{
     WorkerReport,
 };
 
-use crate::census::{AllocationCensus, HostModelBytes, MemoryDomain};
+use crate::census::AllocationCensus;
 use crate::execution::LoadAttempt;
 use magnitude_executor::UnpreparedUnits;
 use crate::error::{ArtifactError, LoadError, UnloadCause};
@@ -45,7 +45,6 @@ use magnitude_scheduler::{
     worker::{Driven, SpawnError, Wakes, Worker, WorkerWakeHandle},
 };
 use protocol::{EngineBuild, HostMessage, WorkerMessage};
-use seismic::DeviceCatalog;
 use session::{Loaded, Outbound, Session, Signal};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -164,7 +163,8 @@ fn prepare_only(
             ))
         })
         .and_then(|package| {
-            let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
+            let catalog =
+                seismic::Devices::discover(&[]).map_err(|error| internal(error.to_string()))?;
             crate::execution::search(
                 Rc::new(catalog),
                 &manifest,
@@ -238,7 +238,7 @@ fn serve(
 /// Readiness facts of the constructed execution domain.
 struct ExecutionReady {
     resources: ResourcePlanSummary,
-    device: seismic::DeviceSelector,
+    device: seismic::ExecutorSelector,
     backend: seismic::BackendName,
     census: AllocationCensus,
 }
@@ -288,13 +288,13 @@ fn load(
     let ready_path = manifest.path;
     let host_package = package.clone();
     let progress_outbound = outbound.clone();
-    // Readiness, the host-table bytes and the allocation domain.
-    type Built = (ExecutionReady, HostModelBytes, MemoryDomain);
+    // Readiness and the host-resident tables' bytes.
+    type Built = (ExecutionReady, u64);
     let factory = move |wakes: WorkerWakeHandle<UnloadCause>| -> Result<
         (Box<dyn Driven<Stopped = UnloadCause>>, Built),
         Stopped,
     > {
-        let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
+        let catalog = seismic::Devices::discover(&[]).map_err(|error| internal(error.to_string()))?;
         let built = match crate::execution::build(
             catalog,
             &manifest,
@@ -321,11 +321,7 @@ fn load(
             );
         }
         let backend = built.domain.execution_backend();
-        let host_model = HostModelBytes {
-            tables: built.domain.host_table_bytes(),
-            stored_tables: built.domain.host_stored_table_bytes().map_err(internal)?,
-        };
-        let domain = MemoryDomain::of(built.device, built.pool);
+        let host_table_bytes = built.domain.host_table_bytes();
         let resources = ResourcePlanSummary::from_plan(&built.plan).map_err(internal)?;
         let owner = Owner::with_resource_plan(
             built.domain,
@@ -337,7 +333,7 @@ fn load(
         .map_err(internal)?;
         let census = owner
             .reconcile_memory_charge()
-            .and_then(|charge| AllocationCensus::classify(&charge, host_model, domain))
+            .and_then(|charge| AllocationCensus::classify(&charge, host_table_bytes))
             .map_err(internal)?;
         let ready = ExecutionReady {
             resources,
@@ -347,7 +343,7 @@ fn load(
         };
         Ok((
             Box::new(ExecutionOwner::new(owner, method)) as Box<dyn Driven<Stopped = UnloadCause>>,
-            (ready, host_model, domain),
+            (ready, host_table_bytes),
         ))
     };
     let host = move || -> Result<(GenerationBinding, ChatIdentity), Stopped> {
@@ -385,7 +381,7 @@ fn load(
     };
     let (
         execution,
-        (execution_ready, host_model, domain),
+        (execution_ready, host_table_bytes),
         (binding, chat),
     ) = match Worker::spawn_ready_with(factory, usize::MAX, host) {
         Ok(spawned) => spawned,
@@ -416,8 +412,7 @@ fn load(
             execution,
             binding,
             definition: session_definition,
-            host_model,
-            domain,
+            host_table_bytes,
         },
         ready,
     )))

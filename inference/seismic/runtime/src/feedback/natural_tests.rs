@@ -6,8 +6,8 @@ use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 use seismic_lang::entry::ElementBindings;
 
 fn wide_scalar_publications(backend: registry::BackendName) {
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(backend).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(backend).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "wide-scalar-publication.seismic".into(),
         text: r#"fn identity(i: index[1152921504606846976]) -> index[1152921504606846976]:

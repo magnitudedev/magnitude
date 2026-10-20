@@ -41,7 +41,7 @@ use magnitude_executor::{
 };
 use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily};
 use magnitude_scheduler::ServiceLimits;
-use seismic::{DType, DeviceCatalog, DeviceTopology, HostMemoryStatus, Layout};
+use seismic::{DType, DeviceTopology, Devices, Layout, Status};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -63,11 +63,11 @@ pub struct ModelPackagePaths {
 }
 
 /// The execution configuration every model is assessed on: the device a
-/// native load selects, its memory bandwidth, the host and the serving
-/// policy.
+/// native load selects, its memory bandwidth, one status sample and the
+/// serving policy.
 pub struct AssessmentSetup {
     pub topology: Arc<DeviceTopology>,
-    pub host: HostMemoryStatus,
+    pub status: Status,
     pub device: DeviceRequest,
     pub selected: SelectedDevice,
     pub bandwidth: DeviceBandwidth,
@@ -78,9 +78,9 @@ pub struct AssessmentSetup {
 
 impl AssessmentSetup {
     /// Select the device a native load would select, resolve its bandwidth
-    /// and observe the host.
+    /// and take one status sample. Opens no device.
     pub fn discover(
-        catalog: &DeviceCatalog,
+        catalog: &Devices,
         device: DeviceRequest,
         reserves: MemoryReserves,
         policy: ModelPolicy,
@@ -88,9 +88,6 @@ impl AssessmentSetup {
     ) -> Result<Self, ModelAssessmentError> {
         let selected = platform::select_device(catalog, ExecutionPath::Native, device, &reserves)
             .map_err(ModelAssessmentError::Platform)?;
-        let host = catalog
-            .host_memory_status()
-            .map_err(|error| ModelAssessmentError::Platform(PlatformError::Observation(error)))?;
         let topology = catalog.topology();
         // Apple silicon, the only chips whose bins the core count selects,
         // has no simultaneous multithreading.
@@ -99,7 +96,7 @@ impl AssessmentSetup {
         let bandwidth = resolve_bandwidth(&topology, &selected.info, cpu_cores);
         Ok(Self {
             topology,
-            host,
+            status: catalog.status(),
             device,
             selected,
             bandwidth,
@@ -274,7 +271,7 @@ pub fn finish_model_assessment(
         preparation,
         draft,
         &setup.topology,
-        &setup.host,
+        &setup.status,
         setup.bandwidth,
         &AssessmentRequest {
             context_limit: facts.context_limit,
@@ -323,7 +320,7 @@ pub fn prepare_model_assessment_from(
     headers: &dyn HeaderSource,
     setup: &AssessmentSetup,
 ) -> Result<PreparedModelAssessment, ModelAssessmentError> {
-    let layout = resident_layout(ExecutionPath::Native, setup.selected.info.backend);
+    let layout = resident_layout(ExecutionPath::Native, setup.selected.info.backend());
     let admitted = match admit(package, headers, layout)? {
         Admission::Unsupported {
             unsupported,
@@ -506,7 +503,7 @@ fn prepare_plan(
     let draft = match plan_execution(manifest, selected) {
         Ok(draft) => draft,
         Err(ExecutionPlanningError::Plan(error)) => {
-            return Err(refused(classify_plan(error, selected.info.backend)));
+            return Err(refused(classify_plan(error, selected.info.backend())));
         }
         Err(error) => {
             return Err(Refusal::Failed(ModelAssessmentError::Planning(

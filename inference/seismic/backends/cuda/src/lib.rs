@@ -26,8 +26,9 @@ pub use compile::NativeCandidate;
 pub use executor::{Device, Executor, MemoryInfo};
 pub use open::{open, open_analytical, usable_memory_bytes, OpenedCuda};
 pub use profile::{
-    describe, device_count, max_allocation_bytes, ComputeCapability, CudaFacts, CudaKernelAbi,
-    DeviceDescriptor, DriverApiVersion, PtxFeatureSet, PtxTarget, TensorMemory, BACKEND_REVISION,
+    can_access_peer, describe, device_count, max_allocation_bytes, ComputeCapability, CudaFacts,
+    CudaKernelAbi, DeviceDescriptor, DriverApiVersion, PtxFeatureSet, PtxTarget, TensorMemory,
+    BACKEND_REVISION,
 };
 pub use registry::registry;
 

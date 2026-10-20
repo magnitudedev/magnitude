@@ -7,7 +7,7 @@
 //! -- --ignored --nocapture`.
 
 use seismic::{
-    Availability, BackendName, Device, DeviceCatalog, Element, HostHeap, NativeGraphFamily,
+    Availability, BackendName, Device, Devices, Element, HostHeap, NativeGraphFamily,
     NativeGraphMetadata, NativeSpecialization, Tensor,
 };
 use seismic_native_tests::{accumulate, scale_rows};
@@ -18,8 +18,8 @@ const WARM: usize = 20;
 const RUNS: usize = 200;
 
 fn devices() -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().expect("device discovery");
-    let topology = catalog.topology();
+    let devices = Devices::discover(&[]).expect("device discovery");
+    let topology = devices.topology();
     [
         BackendName::Cpu,
         BackendName::Metal,
@@ -28,12 +28,12 @@ fn devices() -> Vec<Device> {
     ]
     .into_iter()
     .filter(|backend| {
-        topology.devices().iter().any(|device| {
-            device.backend == *backend && matches!(device.availability, Availability::Available)
+        topology.executors().iter().any(|device| {
+            device.backend() == *backend && matches!(device.availability(), Availability::Available)
         })
     })
     .map(|backend| {
-        catalog
+        devices
             .open_backend(backend)
             .expect("available device opens")
     })

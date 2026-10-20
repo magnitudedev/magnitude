@@ -158,8 +158,11 @@ export const CustomLocalModelJsonSchema = Schema.Struct({
 export const LocalModelJsonSchema = Schema.Union(CatalogLocalModelJsonSchema, CustomLocalModelJsonSchema)
 
 export const LocalInferenceHardwareJsonSchema = Schema.Struct({
-  ...LocalInferenceHardwareSchema.from.fields,
-  accelerators: Schema.Array(Schema.Struct(Struct.omit(LocalInferenceAcceleratorSchema.fields, "acceleratorId", "memoryDomainId"))),
+  ...Struct.omit(LocalInferenceHardwareSchema.from.fields, "selectedDeviceId"),
+  accelerators: Schema.Array(Schema.Struct({
+    ...Struct.omit(LocalInferenceAcceleratorSchema.fields, "acceleratorId", "executors"),
+    executors: Schema.Array(Schema.Struct(Struct.omit(LocalInferenceAcceleratorSchema.fields.executors.value.fields, "deviceId", "memoryDomainIds"))),
+  })),
   memoryDomains: Schema.Array(Schema.Struct(Struct.omit(LocalInferenceMemoryDomainSchema.fields, "memoryDomainId"))),
 })
 

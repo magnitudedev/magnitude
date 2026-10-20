@@ -1023,7 +1023,7 @@ impl AttestedPrograms {
                 outcome: format!("the native program factory cannot serve the {path} path"),
             });
         }
-        if planned_device.selector() != device.info().selector {
+        if planned_device.selector() != device.info().selector() {
             return Err(CatalogFailure::Preparation {
                 entry: "program_factory",
                 bindings: "selected device".into(),

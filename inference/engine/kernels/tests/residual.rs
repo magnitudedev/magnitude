@@ -119,7 +119,7 @@ fn read_f32(tensor: &seismic::Tensor) -> Vec<f32> {
 /// CUDA, else Metal; `SEISMIC_TEST_BACKEND=vulkan` selects Vulkan (a CUDA
 /// host also has a Vulkan device). Then the CPU.
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let gpu = match std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() {
         Some("vulkan") => Some(catalog.open_backend(seismic::BackendName::Vulkan).expect("the Vulkan device opens")),
         Some(other) => panic!("SEISMIC_TEST_BACKEND={other}: only vulkan is selectable"),

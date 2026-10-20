@@ -14,10 +14,10 @@ fn occupied(store: &StateStore) -> usize {
         .map(|domain| store.occupied_rows(domain))
         .sum()
 }
-use seismic::{BackendName, DType, Device, DeviceCatalog, Tensor};
+use seismic::{BackendName, DType, Device, Tensor};
 use std::rc::Rc;
 fn device() -> Device {
-    DeviceCatalog::discover()
+    seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Metal)
         .unwrap()

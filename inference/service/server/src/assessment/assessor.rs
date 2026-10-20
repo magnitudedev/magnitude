@@ -710,8 +710,8 @@ fn capabilities(capabilities: EngineCapabilities) -> ModelCapabilities {
     }
 }
 
-fn domain_id(domain: seismic::MemoryPoolId, environment: &AssessmentEnvironment) -> MemoryDomainId {
-    crate::memory_domains::pool_domain_id(&environment.setup.topology, domain)
+fn domain_id(domain: seismic::StoreId, environment: &AssessmentEnvironment) -> MemoryDomainId {
+    crate::memory_domains::store_domain_id(&environment.setup.topology, domain)
 }
 
 fn memory_assessments(

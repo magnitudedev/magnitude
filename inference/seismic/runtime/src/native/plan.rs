@@ -21,7 +21,7 @@
 //! group over the whole program ([`whole`]), since its source receives
 //! every entry parameter and none can be shown to belong to one launch.
 
-use super::search::PointKey;
+use super::search::LaunchKey;
 use seismic_lang::checked::{
     NativeCondition, NativeEvalError, NativeImplementation, NativeParameter, NativeSpecialization,
     NativeSpecializationError,
@@ -59,9 +59,9 @@ pub trait Domain {
     fn forecast(
         &self,
         point: usize,
-        baseline: &PointKey,
+        baseline: &LaunchKey,
         specialization: &NativeSpecialization,
-    ) -> PointKey;
+    ) -> LaunchKey;
 }
 
 /// How far `candidate` is from `base`: how many of `parameters` differ, and

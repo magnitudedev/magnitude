@@ -620,8 +620,8 @@ describe("--json never leaks internals", () => {
     const { catalogs, tooLarge, catalog } = leakyModels()
     const hardware = encode(hardwareJson, { hardware: makeHardware(), models: [catalogs[1]!] })
     expect(hardware.hardware).toMatchObject({
-      accelerators: [{ name: "Test GPU", backend: "cuda" }],
-      memoryDomains: [{ kind: "PhysicalDevice", totalBytes: 24 * 1024 ** 3, sharesSystemMemory: false }],
+      accelerators: [{ name: "Test GPU", executors: [{ backend: "cuda" }] }],
+      memoryDomains: [{ kind: "PhysicalDevice", totalBytes: 24 * 1024 ** 3 }],
     })
     expect(hardware.currentModel).toMatchObject({
       acquisitionState: {

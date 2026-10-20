@@ -2,13 +2,13 @@
 //! engine configuration every model is assessed with, and the identity that keys every cached
 //! assessment made in it. Established once, during service start.
 
-use magnitude_engine::assessment::{AssessmentSetup, ModelAssessmentError};
+use magnitude_engine::assessment::AssessmentSetup;
 use magnitude_engine::options::{ModelPolicy, standard_service_limits};
 use magnitude_engine::worker::protocol::EngineBuild;
 use magnitude_executor::assessment::{BandwidthSource, DeviceClass};
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use magnitude_service_contracts::models::AssessmentEnvironmentId;
-use seismic::{DeviceCatalog, DeviceMemory, DeviceTopology, HostMemoryStatus};
+use seismic::Devices;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -17,33 +17,37 @@ pub fn serving_policy() -> ModelPolicy {
     ModelPolicy::default()
 }
 
+/// The device the service loads, assesses and reports every model on: the engine's automatic
+/// selection.
+pub const SERVING_DEVICE: DeviceRequest = DeviceRequest::Automatic;
+
 pub struct AssessmentEnvironment {
     pub id: AssessmentEnvironmentId,
     pub setup: AssessmentSetup,
 }
 
 impl AssessmentEnvironment {
-    /// Select the device a native load selects, resolve its bandwidth, observe the host and
-    /// derive the environment's identity. Opens no device.
-    pub fn establish(catalog: &DeviceCatalog) -> Result<Self, ModelAssessmentError> {
+    /// Select the device a native load selects, resolve its bandwidth, take one status sample
+    /// and derive the environment's identity. Opens no device.
+    pub fn establish(catalog: &Devices) -> anyhow::Result<Self> {
         let setup = AssessmentSetup::discover(
             catalog,
-            DeviceRequest::Automatic,
+            SERVING_DEVICE,
             MemoryReserves::standard(),
             serving_policy(),
             standard_service_limits(),
         )?;
         let bandwidth = setup.bandwidth;
         tracing::info!(
-            device = %setup.selected.info.selector,
-            device.name = %setup.selected.info.name,
-            backend = setup.selected.info.backend.as_str(),
+            device = %setup.selected.info.selector(),
+            device.name = %setup.selected.info.name(),
+            backend = setup.selected.info.backend().as_str(),
             bandwidth.bytes_per_second = bandwidth.bytes_per_second,
             bandwidth.source = bandwidth_source(bandwidth.source),
             "assessment environment established"
         );
         Ok(Self {
-            id: environment_id(&setup),
+            id: environment_id(&setup)?,
             setup,
         })
     }
@@ -61,68 +65,40 @@ fn bandwidth_source(source: BandwidthSource) -> &'static str {
 
 /// The identity of everything an assessment result depends on besides the model: engine build
 /// (covering model families, the fit workload, decode costs and the bandwidth table), device and
-/// its resolved bandwidth, the stable topology and process limits that bound fit capacity, the
-/// reserve policy and the serving configuration. Live free memory is not an input.
-fn environment_id(setup: &AssessmentSetup) -> AssessmentEnvironmentId {
+/// its resolved bandwidth, the topology's normalized structure and the process limits that bound
+/// fit capacity, the reserve policy and the serving configuration. Live free memory is not an
+/// input. Fails only when the host sample did: its process limits enter the identity.
+fn environment_id(setup: &AssessmentSetup) -> anyhow::Result<AssessmentEnvironmentId> {
+    let host = setup
+        .status
+        .sample
+        .host_ram
+        .as_ref()
+        .map_err(Clone::clone)?;
+    let process_limits = host
+        .limits
+        .iter()
+        .map(|limit| json!({ "kind": format!("{:?}", limit.kind), "bytes": limit.limit_bytes }))
+        .collect::<Vec<_>>();
     let material = json!({
         "engine_build": EngineBuild::current().0,
-        "backend": setup.selected.info.backend.as_str(),
-        "device": setup.selected.info.selector,
-        "device_name": setup.selected.info.name,
+        "device": setup.selected.info.selector().to_string(),
+        "device_name": setup.selected.info.name(),
         "bandwidth": {
             "bytes_per_second": setup.bandwidth.bytes_per_second,
             "source": bandwidth_source(setup.bandwidth.source),
         },
-        "topology": normalized_topology(&setup.topology),
-        "process_limits": process_limits(&setup.host),
-        "reserves": format!("{:?}", setup.reserves),
+        "topology": setup.topology.normalized(),
+        "process_limits": process_limits,
+        "limit_visibility": format!("{:?}", host.limit_visibility),
+        "reserves": setup.reserves.identity(),
         "policy": format!("{:?}", setup.policy),
         "service": format!("{:?}", setup.service),
     });
-    AssessmentEnvironmentId(format!(
+    Ok(AssessmentEnvironmentId(format!(
         "environment_{:x}",
         Sha256::digest(material.to_string().as_bytes())
-    ))
-}
-
-/// Devices and memory pools without the per-process revision: identity, kind, backend,
-/// availability, memory relationships and capacities.
-fn normalized_topology(topology: &DeviceTopology) -> serde_json::Value {
-    let pools = topology.pools();
-    let pool_index = |id| pools.iter().position(|pool| pool.id == id);
-    json!({
-        "devices": topology.devices().iter().map(|device| json!({
-            "selector": device.selector,
-            "name": device.name,
-            "kind": format!("{:?}", device.kind),
-            "backend": device.backend.as_str(),
-            "availability": format!("{:?}", device.availability),
-            "memory": match &device.memory {
-                DeviceMemory::Established(memory) => json!({
-                    "allocation_pool": pool_index(memory.allocation_pool),
-                    "host_pool": pool_index(memory.host_pool),
-                    "max_allocation_bytes": memory.max_allocation_bytes,
-                }),
-                DeviceMemory::Unsupported { reason } => json!({ "unsupported": reason }),
-            },
-            "recommended_working_set_bytes": device.recommended_working_set_bytes(),
-        })).collect::<Vec<_>>(),
-        "pools": pools.iter().map(|pool| json!({
-            "kind": format!("{:?}", pool.kind),
-            "capacity_bytes": pool.capacity_bytes,
-            "basis": format!("{:?}", pool.basis),
-        })).collect::<Vec<_>>(),
-    })
-}
-
-fn process_limits(host: &HostMemoryStatus) -> serde_json::Value {
-    json!({
-        "limits": host.limits.iter().map(|limit| json!({
-            "kind": format!("{:?}", limit.kind),
-            "limit_bytes": limit.limit_bytes,
-        })).collect::<Vec<_>>(),
-        "visibility": format!("{:?}", host.limit_visibility),
-    })
+    )))
 }
 
 #[cfg(test)]
@@ -132,7 +108,7 @@ mod tests {
 
     fn cpu_setup() -> AssessmentSetup {
         AssessmentSetup::discover(
-            &DeviceCatalog::discover().expect("device catalog"),
+            &seismic::Devices::discover(&[]).expect("device catalog"),
             DeviceRequest::Backend(BackendName::Cpu),
             MemoryReserves::standard(),
             serving_policy(),
@@ -143,20 +119,29 @@ mod tests {
 
     #[test]
     fn a_different_backend_or_hardware_is_a_different_environment() {
-        let mut setup = cpu_setup();
-        let id = environment_id(&setup);
-        assert_eq!(environment_id(&setup), id, "the identity is stable");
+        let setup = cpu_setup();
+        let id = environment_id(&setup).unwrap();
+        assert_eq!(
+            environment_id(&setup).unwrap(),
+            id,
+            "the identity is stable"
+        );
 
-        setup.selected.info.backend = BackendName::Metal;
-        let other_backend = environment_id(&setup);
-        assert_ne!(other_backend, id);
-
-        let mut setup = cpu_setup();
-        setup.selected.info.name = format!("{} (other)", setup.selected.info.name);
-        assert_ne!(environment_id(&setup), id);
+        // Any other executor of the machine (another backend, another device).
+        let mut other = cpu_setup();
+        if let Some(executor) = other
+            .topology
+            .executors()
+            .iter()
+            .find(|executor| executor.backend() != BackendName::Cpu)
+            .cloned()
+        {
+            other.selected.info = executor;
+            assert_ne!(environment_id(&other).unwrap(), id);
+        }
 
         let mut setup = cpu_setup();
         setup.bandwidth.bytes_per_second += 1;
-        assert_ne!(environment_id(&setup), id);
+        assert_ne!(environment_id(&setup).unwrap(), id);
     }
 }

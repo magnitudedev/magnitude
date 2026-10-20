@@ -8,6 +8,7 @@
 //! without it or without CUDA.
 
 mod cuda_common;
+mod timing_common;
 
 use cuda_common::*;
 use magnitude_kernels::{dense_expand, project_rows};
@@ -15,6 +16,12 @@ use seismic::{Element, NativeSpecialization, Tensor};
 use seismic_lang::registry::bf16_round;
 use std::collections::HashMap;
 use std::fs;
+
+/// How the paired rounds time each projection.
+const TIMING: seismic::measure::Measure = seismic::measure::Measure {
+    samples: std::num::NonZeroUsize::new(13).unwrap(),
+    min_sample_seconds: 0.02,
+};
 
 /// The tensors of a GGUF file: name -> (GGUF type id, dims, bytes).
 struct Gguf {
@@ -519,10 +526,7 @@ fn real_12b_physical_f16_projection_operands() {
         rms <= 0.005 && peak <= 0.25,
         "empirical kernel class envelope"
     );
-    let measure = seismic::MeasureOptions {
-        samples: 13,
-        min_sample_seconds: 0.02,
-    };
+    let measure = |point| timing_common::measured(point, &TIMING);
     for round in 0..3 {
         let order = if round % 2 == 0 {
             [("semantic", &baseline), ("physical-F16", &physical)]
@@ -530,7 +534,7 @@ fn real_12b_physical_f16_projection_operands() {
             [("physical-F16", &physical), ("semantic", &baseline)]
         };
         for (name, kernel) in order {
-            let seconds = kernel.measure(vec![args()], &measure).unwrap().median;
+            let seconds = measure(kernel.point(vec![args()]).unwrap()).median;
             eprintln!("paired round{round} {name}: {:.6} ms", seconds * 1e3);
         }
     }
@@ -601,7 +605,7 @@ fn real_12b_physical_f16_projection_operands() {
             [("physical-F16", &physical_down), ("semantic", &exact_down)]
         };
         for (name, kernel) in order {
-            let seconds = kernel.measure(vec![down_args()], &measure).unwrap().median;
+            let seconds = measure(kernel.point(vec![down_args()]).unwrap()).median;
             eprintln!("down paired round{round} {name}: {:.6} ms", seconds * 1e3);
         }
     }
@@ -764,10 +768,7 @@ fn real_26b_grouped_physical_f16_operands() {
     );
     // Raw peak includes output rounding. Whole-model admission remains separate.
     assert!(rms <= 0.005, "empirical operand RMS envelope");
-    let measure = seismic::MeasureOptions {
-        samples: 13,
-        min_sample_seconds: 0.02,
-    };
+    let measure = |point| timing_common::measured(point, &TIMING);
     for round in 0..3 {
         let order = if round % 2 == 0 {
             [("semantic", &baseline), ("physical-F16", &physical)]
@@ -775,7 +776,7 @@ fn real_26b_grouped_physical_f16_operands() {
             [("physical-F16", &physical), ("semantic", &baseline)]
         };
         for (name, kernel) in order {
-            let seconds = kernel.measure(vec![args()], &measure).unwrap().median;
+            let seconds = measure(kernel.point(vec![args()]).unwrap()).median;
             eprintln!(
                 "26B grouped paired round{round} {name}: {:.6} ms",
                 seconds * 1e3

@@ -1,14 +1,18 @@
-//! The consumer's cutoff for optional tuning work. Expiry is incomplete
+//! The consumer's cutoff for optional measuring work. Expiry is incomplete
 //! work, never an execution or numerical rejection.
 
 use std::time::{Duration, Instant};
 
+/// When optional work must end; none for work without a cutoff.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Deadline(Option<Instant>);
+pub struct Deadline(Option<Instant>);
 
+/// Work that ended at its deadline, or failed.
 #[derive(Debug)]
-pub(crate) enum WorkError<E> {
+pub enum WorkError<E> {
+    /// The deadline passed before the work was done.
     Expired,
+    /// The work failed with this error.
     Failed(E),
 }
 
@@ -19,7 +23,8 @@ impl<E> From<E> for WorkError<E> {
 }
 
 impl<E> WorkError<E> {
-    pub(super) fn map<F>(self, map: impl FnOnce(E) -> F) -> WorkError<F> {
+    /// The same outcome with the failure mapped by `map`.
+    pub fn map<F>(self, map: impl FnOnce(E) -> F) -> WorkError<F> {
         match self {
             Self::Expired => WorkError::Expired,
             Self::Failed(error) => WorkError::Failed(map(error)),
@@ -28,17 +33,19 @@ impl<E> WorkError<E> {
 }
 
 impl Deadline {
-    pub(super) fn new(before: Option<Instant>) -> Self {
+    /// A cutoff at `before`; none when `before` is none.
+    pub fn new(before: Option<Instant>) -> Self {
         Self(before)
     }
 
-    pub(super) fn expired(self) -> bool {
+    /// Whether the cutoff has passed.
+    pub fn expired(self) -> bool {
         self.0.is_some_and(|before| Instant::now() >= before)
     }
 
     /// A known submission must fit as well as start before the cutoff.
     /// Its price remains a forecast; work already submitted is drained.
-    pub(super) fn check<E>(self, forecast: Duration) -> Result<(), WorkError<E>> {
+    pub fn check<E>(self, forecast: Duration) -> Result<(), WorkError<E>> {
         if self.0.is_some_and(|before| {
             let now = Instant::now();
             now >= before || forecast > before.saturating_duration_since(now)

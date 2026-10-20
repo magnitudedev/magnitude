@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn prepared_graph_copies_within_held_slabs() {
-        let catalog = seismic::DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Devices::discover(&[]).unwrap();
         let Ok(device) = catalog.open_backend(BackendName::Cpu) else {
             return;
         };

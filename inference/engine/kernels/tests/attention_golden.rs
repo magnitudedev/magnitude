@@ -22,7 +22,7 @@ use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_prefill, attention_prefill_k8v4,
 };
 use seismic::{
-    BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor,
+    BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
     Tensor,
 };
 use seismic_lang::registry::{f16_bits, f16_to_f32};
@@ -586,7 +586,7 @@ fn open(backend: &str) -> Device {
         "cpu" => BackendName::Cpu,
         other => panic!("ATTENTION_GOLDEN_BACKEND={other}: expected metal, cuda, vulkan or cpu"),
     };
-    DeviceCatalog::discover()
+    seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(backend)
         .unwrap()

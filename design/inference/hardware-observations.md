@@ -1,50 +1,76 @@
 ---
 applies_to:
+  - inference/seismic/topology/**
   - inference/service/server/src/hardware.rs
-  - inference/seismic/runtime/src/backends.rs
   - inference/service/server/src/memory_domains.rs
   - inference/service/contracts/src/inventory.rs
   - packages/acn-protocol/src/schemas/inference-projection.ts
   - packages/acn-protocol/src/schemas/model-state.ts
+  - packages/client-common/src/utils/hardware-memory.ts
+  - cli/src/commands/inference-format.ts
   - web/src/components/hardware-details.ts
 ---
 
 # Descriptive hardware observations
 
-ICN owns observations of the inference host. ACN projects them into the client contract; renderers do not query operating systems, initialize GPU drivers, or benchmark hardware to populate a hardware card. Native desktop enclosure identity identifies the client machine independently and never supplies inference capacity or ranking inputs.
+ICN projects the Seismic topology and the engine's fit calculation. ACN projects that wire graph
+into product hardware observations. Renderers do not query operating systems, initialize drivers,
+measure hardware, or compute allocation capacity. Native desktop enclosure identity describes the
+client machine independently and supplies no inference capacity or ranking input.
 
-Physical CPU topology is optional descriptive metadata. It is cached per ICN process and does not affect scheduling, placement, capacity, ranking, or topology fingerprints. Machine-wide physical cores and scheduler-available CPU threads are distinct quantities. A scheduling quota or affinity limit must not be presented as an installed core count. Missing or incomplete physical topology remains unknown; counting logical processor records is not an acceptable substitute. Virtual machines expose guest topology and cannot establish the host's physical configuration.
+The graph distinguishes physical devices, backend executors, stores, access paths and transfer
+paths. Executors retain their native selectors, which load plans also use. Physical identity is
+independent of those selectors: CUDA and Vulkan views of one GPU remain one physical device. Device
+and upload placements may each name several access paths. Shared host RAM is one store even when
+several executors access it; physical identity must never be inferred by grouping memory domains.
 
-Each execution device is identified by its serialized Seismic device selector (`metal:<registry-id>`, `cuda:<uuid>`, `vulkan:<uuid>`, `host-cpu`), the same identity a load plan names as its device; there is no native index or separate physical identity. Its backend is one of `cpu`, `metal`, `cuda`, or `vulkan`, and clients choose the display label. A device that discovery found but that is below its backend's floor carries its unavailability reason, so an old driver is reported instead of silently falling back to CPU; absence of a reason means the device is usable. The floor includes what only a probe can establish (a Vulkan device's fused `fma` and fp32 rounding), so discovery runs those probes once per process and a device it reports usable does not later fail to open for a compatibility reason. ACN's accelerators are the usable devices only: a GPU below its floor never runs a model, so a machine whose only GPU is below its floor is presented, assessed and loaded as CPU-only.
+Every executor carries either available stable placement capacity or an explicit unavailability
+reason. Compatibility admission remains Seismic's responsibility, including numerical qualification
+where API reports cannot establish it. Performance measurements are explicit operations and are not
+invoked by a hardware snapshot. Unavailable executors remain in the wire graph; only usable GPU
+executors enter product accelerator cards. Backend and OS-adapter discovery diagnostics retain
+their source.
 
-CPU discovery also enforces the native instruction-set floor: x86 requires SSE3, SSSE3,
-SSE4.1, SSE4.2 and POPCNT (the x86v2 tier); AVX is not required. A virtual CPU
-missing that floor remains visible with its unavailability reason and is refused by
-assessment and selection before kernel preparation.
+The snapshot names the executor the engine's device selection takes for the service's request, the
+one every load runs on, from the engine's own selection rule, or no executor when none can run.
+Clients read the backend that runs from it and never restate or approximate the selection rule.
 
-The snapshot is the service process's own Seismic topology and host memory status; the service
-holds no device for it. Discovery measures the memory each dedicated GPU's driver lets one process
-use, once per process and before anything is allocated ([engine memory](engine/memory.md)): a CUDA
-device's primary context is created and released to read it (on Linux with NVML's device accounting across that creation), a Vulkan device's heap and budget
-are physical-device queries. The figure excludes the driver's reserve and the process's context and
-does not depend on other programs. Assessment, recommendations and the catalog's fit verdict therefore plan
-against the same capacity a loaded worker's claims are bounded by, measured the same way in the
-worker before its load. A CUDA device whose context cannot be created is reported with that
-reason and never runs a model. Host RAM is the `system` memory domain (`unified_memory` when a
-usable GPU allocates from it); a dedicated device's memory is a domain named by that device's
-selector, the same names assessments and instance allocations use. A dedicated domain's total is
-the memory its device reports (the largest any backend view reports), a descriptive figure; its
-stable capacity is that measured capacity less the device's planning reserve. The system domain's
-stable capacity is its capacity, bounded by process limits and, on Metal, the recommended working
-set, less the host planning reserve; `assessReserve` and `abortReserve` are the system-RAM planning
-and emergency reserves. System-RAM free bytes are the limit-bounded headroom. Only a process with the device
-open observes a dedicated domain's live free bytes, so while a model is loaded the snapshot merges
-the resident worker's fresh reading of its device's domain; otherwise a dedicated domain reports no
-live free bytes. System RAM always keeps the service's own sample. Domain names come from the
-topology's pools, so a GPU visible through two backends is one domain whichever backend loaded it.
-The desktop hardware card shows one GPU per dedicated domain and lists the available backends
-under that GPU; backend views do not become additional physical GPU cards.
+Stores expose reported physical capacity, its typed basis (the interface that reported it), and
+capacities and reserves from the engine's single fit owner. The snapshot holds host RAM, device
+memory and volumes as distinct fields, so every snapshot has exactly one host RAM store, and host
+RAM and volumes always carry the OS's free reading. Host RAM carries both what the OS reports
+available to every program and what this process may still take within its limits. Access grants
+remain distinct from store capacity. Host RAM has the product memory-domain name `system`; other
+domains use the topology's stable store identity. The same identity joins assessment results,
+resident allocations and hardware observations across processes. No native ordinal or
+process-local graph identifier becomes a persistent identity.
 
-An unavailable descriptive field must not make the rest of the hardware observation unavailable. Published chip facts are separate from observations and cannot override observed RAM or VRAM. Configurable chip facts require sufficient evidence to select a unique published variant; an enclosure name, product photograph, or scheduling parallelism is insufficient.
+ACN resolves every executor's device placement once, and both the product hardware and the
+startup hardware summary read that resolution. Device storage is placed only in a memory domain,
+so a placement naming a missing path, another executor's path, or a path to a volume is a
+contract violation, never skipped. A product memory domain is host RAM (`System`, or
+`UnifiedMemory` when a usable accelerator places on it) or a device's own memory
+(`PhysicalDevice`); whether a domain is host RAM is its kind, not a separate flag. The memory
+domains an accelerator places on are every domain any of its executors places on, a rule clients
+share rather than restate.
 
-Conformance includes SMT and multiple-socket topology, incomplete topology, missing observations through the wire projection, and a machine whose physical core count exceeds its process parallelism. GPU descriptions represent inference-visible devices and do not guarantee enumeration of every installed graphics adapter.
+The hardware provider samples unopened observations from its shared inventory. Only an opened
+worker observes dedicated device memory's live headroom, so a resident worker's fresh reading is
+merged by stable store identity. Host RAM always keeps the service's own sample. A dedicated store
+without a resident observation has unknown free bytes, not zero. Observational failure is explicit.
+
+Physical CPU topology is optional descriptive metadata, cached per ICN process. Machine-wide
+physical cores and scheduler-available threads are distinct quantities. Quotas and affinity limits
+are not installed core counts. Missing or incomplete physical topology stays unknown; logical
+processor records cannot substitute for it. Virtual machines describe guest topology only.
+
+The desktop shows one card per physical GPU. Only the GPU holding the selected executor names a
+backend, and it names that executor's backend alone. A placement spanning dedicated memory and host
+RAM shows both. Published chip facts remain presentation
+metadata and cannot override observed RAM, VRAM or fit. Configurable chip facts
+require evidence for a unique published variant; enclosure names, photographs and scheduling
+parallelism are insufficient.
+
+Conformance covers multiple backend views of one GPU, distinct GPUs sharing host RAM, placements
+spanning stores, unavailable executors, absent free-memory observations, and physical core counts
+larger than process parallelism.

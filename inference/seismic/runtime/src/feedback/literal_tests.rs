@@ -6,8 +6,8 @@ use seismic_lang::entry::ElementBindings;
 use seismic_lang::reference_math::ReferenceScalar;
 
 fn literal_publications(backend: registry::BackendName) {
-    let catalog = crate::devices::Catalog::discover().unwrap();
-    let device = catalog.open_backend(backend).unwrap();
+    let devices = crate::devices::Devices::discover(&[]).unwrap();
+    let device = devices.open_backend(backend).unwrap();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "literal-publication.seismic".into(),
         text: "fn probe() -> (f16, bf16, f32, f32, f16, bf16, f32, f16):\n    return (1.0004882812500002, 1.0039062500000002, 9007199791611905, 18446744073709551615, -0.0, -0.0, -0.0, -inf)\n".into(),

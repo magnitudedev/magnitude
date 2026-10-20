@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+seismic-topology.workspace = true
+seismic-measure.workspace = true
 seismic-ir.workspace = true
 seismic-lang.workspace = true
 seismic-compiler.workspace = true
@@ -40,9 +42,5 @@ seismic-vulkan.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
-  "Win32_System_JobObjects",
   "Win32_System_Memory",
-  "Win32_System_ProcessStatus",
-  "Win32_System_SystemInformation",
-  "Win32_System_Threading",
 ] }

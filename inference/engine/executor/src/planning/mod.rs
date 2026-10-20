@@ -305,7 +305,7 @@ pub(crate) mod tests {
     /// kernels a load prepares on the selected device.
     #[test]
     fn kernel_inventory_names_every_kernel_a_load_prepares() {
-        let Ok(catalog) = seismic::DeviceCatalog::discover() else {
+        let Ok(catalog) = seismic::Devices::discover(&[]) else {
             return;
         };
         let Ok(selected) = crate::platform::select_device(
@@ -317,7 +317,7 @@ pub(crate) mod tests {
             return;
         };
         let device = catalog
-            .open(catalog.resolve(selected.info.selector).unwrap())
+            .open(catalog.resolve(selected.info.selector()).unwrap())
             .unwrap();
         let definition = fixture_definition();
         let manifest = fixture_manifest(&definition);
@@ -407,7 +407,7 @@ pub(crate) mod tests {
                 }
             }
         }
-        let Ok(catalog) = seismic::DeviceCatalog::discover() else {
+        let Ok(catalog) = seismic::Devices::discover(&[]) else {
             return;
         };
         let Ok(selected) = crate::platform::select_device(
@@ -419,7 +419,7 @@ pub(crate) mod tests {
             return;
         };
         let device = catalog
-            .open(catalog.resolve(selected.info.selector).unwrap())
+            .open(catalog.resolve(selected.info.selector()).unwrap())
             .unwrap();
         let definition = fixture_definition();
         let manifest = fixture_manifest(&definition);
@@ -449,7 +449,8 @@ pub(crate) mod tests {
         let observer = Ceiling(std::cell::Cell::new(None));
         let room = crate::TuningRoom {
             device_bytes: 1 << 40,
-            host_bytes: None,
+            host_bytes: u64::MAX,
+            host_shared: true,
         };
         crate::AttestedPrograms::search_draft(
             &draft,
@@ -480,7 +481,7 @@ pub(crate) mod tests {
     /// Build actual checked Seismic graph families. The engine may choose how
     /// many slots to reserve, but no test supplies intermediate tensor shapes.
     fn prepared_resource_plan() -> Option<ResourcePlan> {
-        let catalog = seismic::DeviceCatalog::discover().ok()?;
+        let catalog = seismic::Devices::discover(&[]).ok()?;
         let selected = crate::platform::select_device(
             &catalog,
             crate::ExecutionPath::Native,
@@ -489,7 +490,7 @@ pub(crate) mod tests {
         )
         .ok()?;
         let device = catalog
-            .open(catalog.resolve(selected.info.selector).unwrap())
+            .open(catalog.resolve(selected.info.selector()).unwrap())
             .unwrap();
         let definition = fixture_definition();
         let manifest = fixture_manifest(&definition);
@@ -505,7 +506,7 @@ pub(crate) mod tests {
         };
         let capacity_bytes = ResourceCapacity {
             domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
-            tensor_operations: TensorOperations::of(selected.tensor_operations),
+            tensor_operations: TensorOperations::of(selected.info.forms_tensor_operations()),
         };
         let draft = ExecutionPlanner::prepare(
             &selected,
@@ -892,7 +893,7 @@ pub(crate) mod tests {
     /// at the storage their certification charges.
     #[test]
     fn a_streams_decoder_prepares_and_certifies_on_the_device() {
-        let Ok(catalog) = seismic::DeviceCatalog::discover() else {
+        let Ok(catalog) = seismic::Devices::discover(&[]) else {
             return;
         };
         let attention = hyper_connection_fixture_definition();
@@ -906,7 +907,7 @@ pub(crate) mod tests {
     }
 
     fn prepares_on_the_device(
-        catalog: &seismic::DeviceCatalog,
+        catalog: &seismic::Devices,
         definition: &ModelDefinition,
         manifest: &PackageManifest,
     ) {
@@ -930,7 +931,7 @@ pub(crate) mod tests {
                 continue;
             };
             let device = catalog
-                .open(catalog.resolve(selected.info.selector).unwrap())
+                .open(catalog.resolve(selected.info.selector()).unwrap())
                 .unwrap();
             let draft = ExecutionPlanner::prepare(
                 &selected,
@@ -954,7 +955,9 @@ pub(crate) mod tests {
                 limits,
                 ResourceCapacity {
                     domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
-                    tensor_operations: TensorOperations::of(selected.tensor_operations),
+                    tensor_operations: TensorOperations::of(
+                        selected.info.forms_tensor_operations(),
+                    ),
                 },
             )
             .unwrap();

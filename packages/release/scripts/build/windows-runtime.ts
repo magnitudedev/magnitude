@@ -12,7 +12,7 @@ class WindowsRuntimeInvalid extends Schema.TaggedError<WindowsRuntimeInvalid>()(
 // absent: it must be carried by the installation, even when installed on the builder.
 const systemLibraries = new Set([
   "advapi32.dll", "avrt.dll", "bcrypt.dll", "bcryptprimitives.dll", "cfgmgr32.dll",
-  "combase.dll", "comctl32.dll", "comdlg32.dll", "crypt32.dll", "dbghelp.dll", "dnsapi.dll",
+  "combase.dll", "comctl32.dll", "comdlg32.dll", "crypt32.dll", "dbghelp.dll", "dnsapi.dll", "dxgi.dll",
   "gdi32.dll", "imm32.dll", "iphlpapi.dll", "kernel32.dll", "mswsock.dll",
   "ncrypt.dll", "netapi32.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll",
   "pdh.dll", "powrprof.dll", "propsys.dll", "psapi.dll", "rpcrt4.dll", "secur32.dll",

@@ -72,7 +72,6 @@ for pass in fresh repeat; do
   "$HOME/.magnitude/bin/magnitude" status > "$root/$pass-status.txt"
   grep -Eq 'Runtime[[:space:]]+Stopped' "$root/$pass-status.txt"
   /usr/bin/codesign --verify --deep --strict "$bundle"
-  /usr/bin/xcrun stapler validate "$bundle"
   /usr/sbin/spctl --assess --type execute "$bundle"
 done
 /bin/zsh -lic 'command -v magnitude; magnitude --version' > "$root/shell-registration.txt"

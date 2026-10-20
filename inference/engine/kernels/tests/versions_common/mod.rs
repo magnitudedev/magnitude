@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use seismic::{BackendName, Device, DeviceCatalog, Element, SlabRegion, SlabTensor, Tensor};
+use seismic::{BackendName, Device, Element, SlabRegion, SlabTensor, Tensor};
 
 pub const SENTINEL: f32 = 7.25;
 
@@ -87,7 +87,7 @@ pub fn bf16_round(value: f32) -> f32 {
 
 /// Every backend this host can open, the CPU always.
 pub fn devices() -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let devices = [
         BackendName::Metal,
         BackendName::Cuda,

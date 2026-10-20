@@ -2001,7 +2001,7 @@ mod tests {
             config.catalog_models = catalog.clone();
             config.catalog_header_digests = header_digests;
             config.architectures = crate::test_gguf::engine_architectures();
-            let inventory = Arc::new(ManagedModelStore::open(config).await.unwrap());
+            let inventory = Arc::new(ManagedModelStore::open_unbounded(config).await.unwrap());
             inventory.ensure_installed_model_inventory().await.unwrap();
             let resolver = ModelDomainResolver::new(
                 inventory,

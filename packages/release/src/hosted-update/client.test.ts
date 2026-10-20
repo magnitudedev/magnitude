@@ -49,7 +49,7 @@ describe("hosted update client", () => {
       expect(Option.isSome(await Effect.runPromise(Effect.option(decodeUpdateRequest(url, Math.floor(Date.now() / 1000)))))).toBe(true)
       return new Response(null, { status: 204 })
     }
-    const hardware = { backend: "cuda" as const, gpu_name: Option.some("NVIDIA A10-8Q"), gpu_kind: Option.some("discrete" as const), gpu_memory_gb: Option.some(8), gpu_count: Option.some(1),
+    const hardware = { backend: Option.some("cuda" as const), gpu_name: Option.some("NVIDIA A10-8Q"), gpu_kind: Option.some("discrete" as const), gpu_memory_gb: Option.some(8), gpu_count: Option.some(1),
       gpu_unused_reason: Option.none(), cpu_model: Option.some("AMD EPYC 7V13 64-Core Processor"), cpu_cores: Option.some(12), memory_gb: Option.some(110) }
     await Effect.runPromise(check(fetch, { reason: "launch", outcome: Option.some({ outcome: "failed", version: "1.0.1", from: Option.some("1.0.0"), reason: Option.some("verify") }), hardware: Option.none() }))
     await Effect.runPromise(check(fetch, { reason: "scheduled", outcome: Option.some({ outcome: "applied", version: "1.0.0", from: Option.some("0.9.0"), reason: Option.none() }), hardware: Option.some(hardware) }))

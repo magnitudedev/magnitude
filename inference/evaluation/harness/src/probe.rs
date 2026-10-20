@@ -672,7 +672,7 @@ mod tests {
             // two rounding steps from the default's.
             observations: vec![seismic::NumericalObservation {
                 point: "m1".into(),
-                key: seismic::PointKey {
+                key: seismic::LaunchKey {
                     launches: vec![0],
                     values: BTreeMap::from([("SIMDS".into(), 8)]),
                 },

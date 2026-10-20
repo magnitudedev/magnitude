@@ -2518,31 +2518,38 @@ mod tests {
                     "architecture": "test64",
                     "cpu_model": "Test CPU",
                     "logical_cores": 8,
-                    "system_memory": {
-                        "physical_capacity_bytes": 1024,
-                        "physical_available_bytes": 512,
-                        "allocation_capacity_bytes": 1024,
-                        "allocation_headroom_bytes": 512,
-                        "assess_reserve_bytes": 128,
-                        "abort_reserve_bytes": 64
-                    },
                     "native_build": "test-build",
                     "enabled_backends": ["cpu"],
                     "topology_fingerprint": "topology",
-                    "memory_domains": [{
-                        "id": "system",
-                        "kind": "system",
-                        "total_capacity_bytes": 1024,
-                        "stable_capacity_bytes": 768,
-                        "current_free_bytes": 512,
-                        "shares_system_memory": true,
-                        "devices": [{
+                    "host_ram": {
+                        "store": {
+                            "id": "system",
+                            "total_capacity_bytes": 1024,
+                            "stable_capacity_bytes": 768,
+                            "allocation_capacity_bytes": 1024,
+                            "planning_reserve_bytes": 256,
+                            "emergency_reserve_bytes": 64,
+                            "capacity_basis": "linux_mem_total"
+                        },
+                        "available_bytes": 640,
+                        "current_free_bytes": 512
+                    },
+                    "device_memory": [],
+                    "volumes": [],
+                    "access_paths": [{
+                        "id": 0, "executor": "cpu", "store": "system", "grant": null
+                    }],
+                    "transfer_paths": [],
+                    "selected_executor": "cpu",
+                    "physical_devices": [{
+                        "id": "host", "kind": "cpu",
+                        "executors": [{
                             "id": "cpu",
                             "backend": "cpu",
                             "name": "CPU",
                             "description": "Test CPU",
-                            "kind": "cpu",
-                            "memory_limit": null
+                            "device_placement": [0], "upload_placement": [0],
+                            "availability": { "type": "available", "stable_capacity_bytes": 768 }
                         }]
                     }]
                 }))
@@ -2566,7 +2573,7 @@ mod tests {
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         assert_eq!(body["topology_fingerprint"], "topology");
-        assert_eq!(body["memory_domains"][0]["stable_capacity_bytes"], 768);
+        assert_eq!(body["host_ram"]["store"]["stable_capacity_bytes"], 768);
     }
 
     #[tokio::test]

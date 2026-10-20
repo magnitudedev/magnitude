@@ -216,7 +216,7 @@ fn worker_process(arguments: &Arguments) -> Result<(Vec<TokenId>, FinishReason),
     let resolved = configuration(arguments)
         .resolve()
         .map_err(|error| error.to_string())?;
-    let catalog = seismic::DeviceCatalog::discover().map_err(|error| error.to_string())?;
+    let catalog = seismic::Devices::discover(&[]).map_err(|error| error.to_string())?;
     let preview = resolved
         .manifest
         .preview(&catalog)

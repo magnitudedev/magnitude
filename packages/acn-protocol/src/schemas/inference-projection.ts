@@ -1,11 +1,12 @@
-import { Data, Effect, Match, Option } from "effect"
+import { Data, Effect, Option } from "effect"
 import type * as InferenceSchema from "@magnitudedev/icn-protocol/schemas"
 import {
   LocalInferenceAcceleratorIdSchema,
+  LocalInferenceDeviceIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   type LocalInferenceHardware,
 } from "./model-state"
-import type { AcnHardwareSummary, StartupBackend } from "./acn-health"
+import type { AcnHardwareSummary } from "./acn-health"
 
 export class InferenceHardwareProjectionError extends Data.TaggedError(
   "InferenceHardwareProjectionError",
@@ -14,37 +15,87 @@ export class InferenceHardwareProjectionError extends Data.TaggedError(
 const genericBackendOrdinal = /^(?:CUDA|MTL|Vulkan|ROCm|SYCL|OpenCL)\d+$/i
 
 export const inferenceAcceleratorDisplayName = (
-  device: Pick<InferenceSchema.HardwareDevice, "name" | "description">,
+  device: Pick<InferenceSchema.HardwareExecutor, "name" | "description">,
 ): string => genericBackendOrdinal.test(device.name.trim()) && device.description.trim().length > 0
   ? device.description.trim()
   : device.name
 
+type AccessPath = InferenceSchema.HardwareAccessPath
+
+/**
+ * Every executor's device placement, each index resolved to its access path. Device storage is
+ * placed only in a memory domain (host RAM or a device's own memory), so a placement fails on an
+ * index that names no path, a path of another executor, or a path to any other store.
+ */
+const resolvePlacements = (
+  hardware: InferenceSchema.HardwareSnapshot,
+): Effect.Effect<ReadonlyMap<string, readonly AccessPath[]>, InferenceHardwareProjectionError> => {
+  const paths = new Map(hardware.access_paths.map(path => [path.id, path]))
+  const memoryDomains = new Set([hardware.host_ram.store, ...hardware.device_memory.map(memory => memory.store)]
+    .map(store => store.id))
+  const executors = hardware.physical_devices.flatMap(physical => physical.executors)
+  return Effect.forEach(executors, executor => Effect.forEach(executor.device_placement, index => {
+    const path = paths.get(index)
+    return path && path.executor === executor.id && memoryDomains.has(path.store)
+      ? Effect.succeed(path)
+      : Effect.fail(new InferenceHardwareProjectionError({
+          message: `Executor ${executor.id} references invalid placement path ${index}`,
+        }))
+  }).pipe(Effect.map(placement => [executor.id, placement] as const))).pipe(Effect.map(entries => new Map(entries)))
+}
+
+type SnapshotExecutor = { readonly executor: InferenceSchema.HardwareExecutor; readonly physical: InferenceSchema.HardwarePhysicalDevice }
+
+const snapshotExecutors = (hardware: InferenceSchema.HardwareSnapshot): readonly SnapshotExecutor[] =>
+  hardware.physical_devices.flatMap(physical => physical.executors.map(executor => ({ executor, physical })))
+
+/** The executor the engine selects, if any can run; a selection naming no reported executor breaks ICN's contract. */
+const resolveSelected = (
+  hardware: InferenceSchema.HardwareSnapshot,
+): Effect.Effect<Option.Option<SnapshotExecutor>, InferenceHardwareProjectionError> => Option.match(
+  Option.flatMap(hardware.selected_executor, Option.fromNullable), {
+    onNone: () => Effect.succeed(Option.none()),
+    onSome: id => Option.match(Option.fromNullable(snapshotExecutors(hardware).find(({ executor }) => executor.id === id)), {
+      onNone: () => Effect.fail(new InferenceHardwareProjectionError({ message: `Selected executor ${id} is not a reported executor` })),
+      onSome: selected => Effect.succeed(Option.some(selected)),
+    }),
+  })
+
 export const projectInferenceHardware = (
   hardware: InferenceSchema.HardwareSnapshot,
 ): Effect.Effect<LocalInferenceHardware, InferenceHardwareProjectionError> => Effect.gen(function* () {
-  const memoryDomains = hardware.memory_domains.map((domain) => ({
-    memoryDomainId: LocalInferenceMemoryDomainIdSchema.make(domain.id),
-    kind: Match.value(domain.kind).pipe(
-      Match.when("unified_memory", () => "UnifiedMemory" as const),
-      Match.when("physical_device", () => "PhysicalDevice" as const),
-      Match.when("system", () => "System" as const),
-      Match.exhaustive,
-    ),
-    totalBytes: domain.total_capacity_bytes,
-    stableCapacityBytes: domain.stable_capacity_bytes,
-    availableBytes: Option.flatMap(domain.current_free_bytes, Option.fromNullable),
-    sharesSystemMemory: domain.shares_system_memory,
-  }))
-  // Accelerators are the GPUs a model can run on: a device below its backend's floor carries an
-  // unavailable reason and never runs one, so it is not an accelerator.
-  const accelerators = hardware.memory_domains.flatMap((domain) => domain.devices
-    .filter((device) => device.kind !== "cpu" && Option.isNone(device.unavailable_reason))
-    .map((device) => ({
-      acceleratorId: LocalInferenceAcceleratorIdSchema.make(device.id),
-      name: inferenceAcceleratorDisplayName(device),
-      backend: device.backend,
-      memoryDomainId: LocalInferenceMemoryDomainIdSchema.make(domain.id),
-    })))
+  const host = hardware.host_ram
+  const placements = yield* resolvePlacements(hardware)
+  const accelerators = hardware.physical_devices.flatMap(physical => {
+    const executors = physical.executors.filter(executor => executor.availability.type === "available")
+    const [first] = executors
+    return physical.kind === "cpu" || first === undefined ? [] : [{
+      acceleratorId: LocalInferenceAcceleratorIdSchema.make(physical.id),
+      name: inferenceAcceleratorDisplayName(first),
+      executors: executors.map(executor => ({
+        deviceId: LocalInferenceDeviceIdSchema.make(executor.id),
+        backend: executor.backend,
+        memoryDomainIds: [...new Set(placements.get(executor.id)!.map(path =>
+          LocalInferenceMemoryDomainIdSchema.make(path.store)))],
+      })),
+    }]
+  })
+  const shared = accelerators.some(physical => physical.executors.some(executor =>
+    executor.memoryDomainIds.some(id => id === host.store.id)))
+  const memoryDomains = [
+    {
+      memoryDomainId: LocalInferenceMemoryDomainIdSchema.make(host.store.id),
+      kind: shared ? "UnifiedMemory" as const : "System" as const,
+      totalBytes: host.store.total_capacity_bytes,
+      availableBytes: Option.some(host.current_free_bytes),
+    },
+    ...hardware.device_memory.map(memory => ({
+      memoryDomainId: LocalInferenceMemoryDomainIdSchema.make(memory.store.id),
+      kind: "PhysicalDevice" as const,
+      totalBytes: memory.store.total_capacity_bytes,
+      availableBytes: Option.flatMap(memory.current_free_bytes, Option.fromNullable),
+    })),
+  ]
   const platform = hardware.platform === "macos"
     ? "MacOS"
     : hardware.platform === "windows"
@@ -64,59 +115,72 @@ export const projectInferenceHardware = (
     processor: Option.flatMap(hardware.cpu_model, Option.fromNullable),
     physicalCores: Option.filter(Option.flatMap(hardware.physical_cores, Option.fromNullable), count => count > 0),
     logicalCores: Math.max(1, hardware.logical_cores),
-    totalSystemMemoryBytes: hardware.system_memory.physical_capacity_bytes,
-    availableSystemMemoryBytes: hardware.system_memory.physical_available_bytes,
-    systemAllocationCapacityBytes: hardware.system_memory.allocation_capacity_bytes,
-    systemAllocationHeadroomBytes: hardware.system_memory.allocation_headroom_bytes,
-    abortReserveBytes: hardware.system_memory.abort_reserve_bytes,
+    totalSystemMemoryBytes: host.store.total_capacity_bytes,
     accelerators,
+    selectedDeviceId: Option.map(yield* resolveSelected(hardware), ({ executor }) =>
+      LocalInferenceDeviceIdSchema.make(executor.id)),
     memoryDomains,
   }
 })
 
-type SnapshotDevice = { readonly device: InferenceSchema.HardwareDevice; readonly domain: InferenceSchema.HardwareMemoryDomain }
-const deviceBytes = ({ device, domain }: SnapshotDevice): number => Option.match(Option.flatMap(device.memory_limit, Option.fromNullable), {
-  onNone: () => domain.total_capacity_bytes,
-  onSome: limit => limit.total_bytes,
-})
-const usable = ({ device }: SnapshotDevice): boolean => Option.isNone(device.unavailable_reason)
-const startupBackendName = (backend: StartupBackend): AcnHardwareSummary["backend"] =>
-  backend._tag === "Cpu" ? "cpu" : backend._tag === "Metal" ? "metal" : backend._tag === "Cuda" ? "cuda" : "vulkan"
+
+/**
+ * The memory a GPU has, as its driver states it: its own memory store's total, and for host RAM
+ * its placement reaches, what the paths' grants let it place there (host RAM's total where a path
+ * is ungranted). An executor without a placement (unavailable) has its physical device's own
+ * memory, or host RAM's total for a GPU whose memory is the host's.
+ */
+const deviceBytes = (
+  hardware: InferenceSchema.HardwareSnapshot,
+  placements: ReadonlyMap<string, readonly AccessPath[]>,
+) => {
+  const host = hardware.host_ram.store
+  return ({ executor, physical }: SnapshotExecutor): number => {
+    const placed = placements.get(executor.id)!
+    if (placed.length === 0) {
+      return hardware.device_memory.find(memory => memory.physical_device_id === physical.id)?.store.total_capacity_bytes
+        ?? host.total_capacity_bytes
+    }
+    const stores = new Set(placed.map(path => path.store))
+    const own = hardware.device_memory.filter(memory => stores.has(memory.store.id))
+      .reduce((total, memory) => total + memory.store.total_capacity_bytes, 0)
+    const onHost = placed.filter(path => path.store === host.id).reduce((total, path) =>
+      total + Option.match(Option.flatMap(path.grant, Option.fromNullable), {
+        onNone: () => host.total_capacity_bytes,
+        onSome: grant => grant.bytes,
+      }), 0)
+    return own + Math.min(onHost, host.total_capacity_bytes)
+  }
+}
 
 /** The machine as one record: the backend the engine runs on, the GPU it runs on if any, and why a present GPU is not used. */
 export const summarizeInferenceHardware = (
-  loaded: Option.Option<StartupBackend>,
   hardware: InferenceSchema.HardwareSnapshot,
-): AcnHardwareSummary => {
-  const devices: SnapshotDevice[] = hardware.memory_domains.flatMap(domain => domain.devices
-    .filter(device => device.kind !== "cpu")
-    .map(device => ({ device, domain })))
-  const largestFirst = [...devices].sort((a, b) => deviceBytes(b) - deviceBytes(a))
-  const backend = Option.match(loaded, {
-    onSome: startupBackendName,
-    onNone: () => largestFirst.find(usable)?.device.backend ?? "cpu",
-  })
-  const used = backend === "cpu" ? undefined : largestFirst.find(entry => entry.device.backend === backend && usable(entry))
+): Effect.Effect<AcnHardwareSummary, InferenceHardwareProjectionError> => Effect.gen(function* () {
+  const bytes = deviceBytes(hardware, yield* resolvePlacements(hardware))
+  const selected = yield* resolveSelected(hardware)
+  const used = Option.getOrUndefined(Option.filter(selected, ({ physical }) => physical.kind !== "cpu"))
+  const largestFirst = snapshotExecutors(hardware).filter(({ physical }) => physical.kind !== "cpu")
+    .sort((a, b) => bytes(b) - bytes(a))
   const diagnostics = Option.getOrElse(hardware.backend_diagnostics, () => [])
-  const unusedReason = (entry: SnapshotDevice): string => Option.getOrElse(entry.device.unavailable_reason, () => {
-    const diagnostic = diagnostics.find(item => item.backend === entry.device.backend)
-    if (diagnostic) return `${entry.device.backend}: ${diagnostic.message}`
-    if (!hardware.enabled_backends.includes(entry.device.backend)) return `${entry.device.backend}: not available in this build`
-    if (entry.device.backend === "vulkan" && entry.device.kind === "integrated_gpu") return "vulkan: integrated GPU is not selected automatically"
-    return `${entry.device.backend}: not selected`
-  })
+  const unusedReason = ({ executor }: SnapshotExecutor): string => {
+    if (executor.availability.type === "unavailable") return executor.availability.reason
+    const diagnostic = diagnostics.find(item => item.source.type === "backend" && item.source.backend === executor.backend)
+    if (diagnostic) return `${executor.backend}: ${diagnostic.message}`
+    if (!hardware.enabled_backends.includes(executor.backend)) return `${executor.backend}: not available in this build`
+    return `${executor.backend}: not selected`
+  }
   const unused = used ? undefined : largestFirst[0]
-  const physical = new Set(devices.map(entry => `${entry.domain.id}|${entry.device.name}`))
   return {
-    backend,
-    gpuName: Option.fromNullable(used?.device.name).pipe(Option.filter(name => name.length > 0)),
-    gpuKind: used ? Option.some(used.device.kind === "integrated_gpu" ? "integrated" : "discrete") : Option.none(),
-    gpuMemoryBytes: used ? Option.some(deviceBytes(used)) : Option.none(),
-    gpuCount: physical.size,
+    backend: Option.map(selected, ({ executor }) => executor.backend),
+    gpuName: Option.fromNullable(used?.executor.name).pipe(Option.filter(name => name.length > 0)),
+    gpuKind: used ? Option.some(used.physical.kind === "integrated_gpu" ? "integrated" : "discrete") : Option.none(),
+    gpuMemoryBytes: used ? Option.some(bytes(used)) : Option.none(),
+    gpuCount: hardware.physical_devices.filter(physical => physical.kind !== "cpu").length,
     gpuUnusedReason: unused ? Option.some(unusedReason(unused)) : Option.none(),
     cpuModel: Option.flatMap(hardware.cpu_model, Option.fromNullable).pipe(Option.filter(model => model.trim().length > 0)),
     cpuCores: Option.flatMap(hardware.physical_cores, Option.fromNullable).pipe(Option.filter(count => count > 0),
       Option.orElse(() => hardware.logical_cores > 0 ? Option.some(hardware.logical_cores) : Option.none())),
-    memoryBytes: hardware.system_memory.physical_capacity_bytes,
-  }
-}
+    memoryBytes: hardware.host_ram.store.total_capacity_bytes,
+  } satisfies AcnHardwareSummary
+})

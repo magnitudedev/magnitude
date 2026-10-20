@@ -284,10 +284,8 @@ impl DirectGraphBuilder {
         let mut graph = self.graph.take().expect("a live builder holds its graph");
         graph.arguments = std::mem::take(&mut self.arguments.chunks);
         let device_bytes = self.device.inner.unheld_since(self.mark);
-        self.device
-            .inner
-            .graphs
-            .fetch_add(device_bytes, Ordering::Relaxed);
+        let inner = &self.device.inner;
+        inner.record_driver_memory(&inner.graphs, device_bytes);
         Ok(DirectGraph {
             inner: std::sync::Arc::new(graph),
             device_bytes,

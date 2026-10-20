@@ -102,13 +102,13 @@ fn fixture_of(
     head: bool,
     device_request: platform::DeviceRequest,
 ) -> Option<Fixture> {
-    let catalog = seismic::DeviceCatalog::discover().ok()?;
+    let catalog = seismic::Devices::discover(&[]).ok()?;
     let reserves = platform::MemoryReserves::standard();
     let selected =
         platform::select_device(&catalog, ExecutionPath::Native, device_request, &reserves).ok()?;
     let device = Rc::new(
         catalog
-            .open(catalog.resolve(selected.info.selector).unwrap())
+            .open(catalog.resolve(selected.info.selector()).unwrap())
             .unwrap(),
     );
     let definition = Rc::new(definition);
@@ -125,7 +125,7 @@ fn fixture_of(
     };
     let capacity_bytes = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
-        tensor_operations: crate::TensorOperations::of(selected.tensor_operations),
+        tensor_operations: crate::TensorOperations::of(selected.info.forms_tensor_operations()),
     };
     let draft = ExecutionPlanner::prepare(
         &selected,
@@ -1775,7 +1775,7 @@ fn a_forward_replaces_the_tokens_at_and_after_its_position() {
 fn host_rows_from_the_token_history_equal_the_device_rows() {
     use magnitude_family_contracts::NGramHash;
     use magnitude_kernels::ngram_rows;
-    use seismic::{BackendName, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
+    use seismic::{BackendName, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
     let hash = NGramHash {
         context: 2,
         heads_per_order: 8,
@@ -1787,7 +1787,7 @@ fn host_rows_from_the_token_history_equal_the_device_rows() {
     let (context, heads) = (2u64, 16usize);
     let tape = 3u64;
     let (banks, slab_banks) = (4u64, 2u64);
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let devices = [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan, BackendName::Cpu]
         .into_iter()
         .filter_map(|backend| catalog.open_backend(backend).ok())
@@ -1917,7 +1917,7 @@ fn failed_table_read(name: &str) -> (std::path::PathBuf, crate::programs::Stored
         std::process::id()
     ));
     std::fs::write(&path, vec![0x11u8; (ROWS * ROW_BYTES) as usize]).unwrap();
-    let device = seismic::DeviceCatalog::discover()
+    let device = seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(seismic::BackendName::Cpu)
         .unwrap();

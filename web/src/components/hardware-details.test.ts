@@ -54,7 +54,7 @@ it.each([
 it("uses dedicated physical capacity, allowing small reservations but not budgets or shared memory", () => {
   const base = hardware("Unknown", 64, 8, [{ name: "RTX 3060", memory: 12 }])
   const value = { ...base, memoryDomains: base.memoryDomains.map(domain => domain.kind === "PhysicalDevice"
-    ? { ...domain, totalBytes: 12 * 1024 ** 3 - 64 * 1024 ** 2, stableCapacityBytes: 8 * 1024 ** 3 } : domain) }
+    ? { ...domain, totalBytes: 12 * 1024 ** 3 - 64 * 1024 ** 2 } : domain) }
   expect(hardwareDetails(null, value).accelerators[0]?.facts).toContainEqual({ label: "Memory bandwidth (spec)", value: "360 GB/s" })
   for (const gpu of [{ memory: 0 }, { memory: 10 }, { memory: 11.5 }, { memory: 12, shared: true }]) {
     expect(hardwareDetails(null, hardware("Unknown", 64, 8, [{ name: "RTX 3060", ...gpu }])).accelerators[0]?.facts.some(f => f.label === "Memory bandwidth (spec)")).toBe(false)
@@ -155,21 +155,23 @@ it("requires exact fact identities and retains primary source URLs", () => {
 it("counts dedicated memory once when two backends expose one physical domain", () => {
   const value = hardware("AMD", 64, 16, [{ name: "RTX 4090", memory: 24 }])
   const accelerator = value.accelerators[0]!
-  const result = hardwareDetails(null, { ...value, accelerators: [accelerator, { ...accelerator, acceleratorId: "vulkan-alias" as typeof accelerator.acceleratorId, backend: "vulkan" }] })
+  const executor = accelerator.executors[0]!
+  const result = hardwareDetails(null, { ...value, accelerators: [{ ...accelerator, executors: [executor, { ...executor, deviceId: "vulkan-alias" as typeof executor.deviceId, backend: "vulkan" }] }] })
   expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["24 GB VRAM"])
-  expect(result.groups.at(-1)?.details).toContain("CUDA + Vulkan acceleration")
+  expect(result.groups.at(-1)?.details).toContain("CUDA acceleration")
+  expect(result.groups.at(-1)?.details).not.toContain("Vulkan acceleration")
 })
-it("shows two physical GPU cards when each has CUDA and Vulkan views", () => {
+it("shows the selected backend on the GPU the engine selects, and none on the others", () => {
   const value = hardware("AMD", 64, 16, [{ name: "RTX 3090", memory: 24 }, { name: "RTX 3090", memory: 24 }])
-  const views = value.accelerators.flatMap(accelerator => [
-    accelerator,
-    { ...accelerator, acceleratorId: `${accelerator.acceleratorId}-vulkan` as typeof accelerator.acceleratorId, backend: "vulkan" as const },
-  ])
+  const views = value.accelerators.map(accelerator => ({ ...accelerator, executors: [
+    ...accelerator.executors,
+    { ...accelerator.executors[0]!, deviceId: `${accelerator.acceleratorId}-vulkan` as typeof accelerator.executors[0]["deviceId"], backend: "vulkan" as const },
+  ] }))
   const result = hardwareDetails(null, { ...value, accelerators: views })
   expect(result.groups.map(group => group.label)).toEqual(["CPU", "Memory", "GPU 1", "GPU 2"])
-  expect(result.groups.slice(2).map(group => group.details.slice(0, 2))).toEqual([
-    ["24 GB VRAM", "CUDA + Vulkan acceleration"],
-    ["24 GB VRAM", "CUDA + Vulkan acceleration"],
+  expect(result.groups.slice(2).map(group => group.details.filter(detail => detail.endsWith("acceleration")))).toEqual([
+    ["CUDA acceleration"],
+    [],
   ])
 })
 it("keeps ordinary shared system RAM distinct from unified memory in mixed systems", () => {
@@ -199,7 +201,7 @@ it("labels PC components consistently and numbers separate GPUs", () => {
   expect(result.groups[0]?.name).toBe("AMD Ryzen 9 9950X")
   expect(result.groups[1]?.details).toEqual(["System RAM"])
   expect(result.groups[2]?.details[0]).toBe("32 GB VRAM")
-  expect(result.groups[2]?.details).toEqual(["32 GB VRAM", "1,792 GB/s Memory bandwidth (spec)"])
+  expect(result.groups[2]?.details).toEqual(["32 GB VRAM", "CUDA acceleration", "1,792 GB/s Memory bandwidth (spec)"])
 })
 
 it.each(["RTX 5090", "Radeon 8060S Graphics", "Arc B580", "RX 580"])("omits implementation-specific GPU unit counts from the %s card", name => {

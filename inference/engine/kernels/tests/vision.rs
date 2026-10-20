@@ -27,6 +27,8 @@ use seismic_lang::{
     types::DType,
 };
 
+mod timing_common;
+
 // ---------------------------------------------------------------------------
 // Host values.
 
@@ -262,7 +264,7 @@ fn relative_error(label: &str, actual: &[f32], expected: &[f32], maximum: f32, m
 
 /// The host's accelerator (Metal on macOS, else CUDA;
 /// `SEISMIC_TEST_BACKEND=vulkan` selects Vulkan; `cpu` runs the CPU only).
-fn accelerator(catalog: &seismic::DeviceCatalog) -> Option<Device> {
+fn accelerator(catalog: &seismic::Devices) -> Option<Device> {
     let backend = match std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() {
         Some("vulkan") => seismic::BackendName::Vulkan,
         Some("cpu") => return None,
@@ -275,7 +277,7 @@ fn accelerator(catalog: &seismic::DeviceCatalog) -> Option<Device> {
 
 /// The accelerator and the CPU.
 fn devices() -> Vec<Device> {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     accelerator(&catalog)
         .into_iter()
         .chain([catalog.open_backend(seismic::BackendName::Cpu).unwrap()])
@@ -811,27 +813,28 @@ fn attention_timing() {
                 t(&coordinates),
                 t(&spans),
             );
-            let measurement = kernel
-                .measure(
-                    vec![vision_attention::Args {
-                        query: &q,
-                        key: &k,
-                        value: &v,
-                        query_norm: &qn,
-                        key_norm: &kn,
-                        value_norm: &vn,
-                        coordinates: &c,
-                        spans: &sp,
-                        log_base: 100f32.ln(),
-                        epsilon: EPSILON,
-                        unit_scale: 0,
-                    }],
-                    &seismic::MeasureOptions {
-                        samples: 15,
-                        min_sample_seconds: 0.005,
-                    },
-                )
+            let point = kernel
+                .point(vec![vision_attention::Args {
+                    query: &q,
+                    key: &k,
+                    value: &v,
+                    query_norm: &qn,
+                    key_norm: &kn,
+                    value_norm: &vn,
+                    coordinates: &c,
+                    spans: &sp,
+                    log_base: 100f32.ln(),
+                    epsilon: EPSILON,
+                    unit_scale: 0,
+                }])
                 .unwrap();
+            let measurement = timing_common::measured(
+                point,
+                &seismic::measure::Measure {
+                    samples: std::num::NonZeroUsize::new(15).unwrap(),
+                    min_sample_seconds: 0.005,
+                },
+            );
             let keys = if ws == 1 { 1024 } else { rows };
             let flop = (rows * keys * heads * width * 4) as f64;
             eprintln!(

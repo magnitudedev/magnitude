@@ -10,7 +10,7 @@ include!("recurrent_stages.rs");
 
 fn vulkan() -> Option<Device> {
     let selected = std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() == Some("vulkan");
-    let catalog = match DeviceCatalog::discover() {
+    let catalog = match seismic::Devices::discover(&[]) {
         Ok(catalog) => catalog,
         Err(error) if selected => panic!("selected Vulkan backend discovery failed: {error}"),
         Err(_) => return None,

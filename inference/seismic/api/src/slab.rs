@@ -368,11 +368,11 @@ impl SlabTensor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Availability, BackendName, DeviceCatalog};
+    use crate::{Availability, BackendName, Devices};
 
     #[test]
     fn slab_regions_share_one_charge_and_reuse_the_lowest_slot() {
-        let device = DeviceCatalog::discover()
+        let device = Devices::discover(&[])
             .unwrap()
             .open_backend(BackendName::Cpu)
             .unwrap();
@@ -481,12 +481,12 @@ mod tests {
 
     #[test]
     fn typed_regions_work_on_every_available_backend() {
-        let catalog = DeviceCatalog::discover().unwrap();
-        for info in catalog.topology().devices() {
-            if !matches!(info.availability, Availability::Available) {
+        let catalog = Devices::discover(&[]).unwrap();
+        for info in catalog.topology().executors() {
+            if !matches!(info.availability(), Availability::Available) {
                 continue;
             }
-            let device = catalog.open(info.id).unwrap();
+            let device = catalog.open(info.id()).unwrap();
             let mut tensor = SlabTensor::new(
                 &device,
                 256,
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn final_slab_can_exceed_the_logical_extent() {
-        let device = DeviceCatalog::discover()
+        let device = Devices::discover(&[])
             .unwrap()
             .open_backend(BackendName::Cpu)
             .unwrap();

@@ -51,7 +51,7 @@ pub fn plan_execution(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
 ) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
-    let (selection, method, limits) = planner_inputs(manifest, selected.info.backend)?;
+    let (selection, method, limits) = planner_inputs(manifest, selected.info.backend())?;
     ExecutionPlanner::prepare(
         selected,
         &manifest.package,

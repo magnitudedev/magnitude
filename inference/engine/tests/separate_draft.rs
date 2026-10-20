@@ -363,7 +363,7 @@ fn draft_state_copies_and_restores_reproduce_its_proposals() {
 #[test]
 #[ignore = "requires a device, MAGNITUDE_TEST_TARGET_GGUF and MAGNITUDE_TEST_DRAFT_GGUF"]
 fn header_only_assessment_charges_what_a_load_commits() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let setup = AssessmentSetup::discover(
         &catalog,
         DeviceRequest::Automatic,

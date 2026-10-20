@@ -2,7 +2,7 @@
 //! driver's report, a published specification matched by device name, or
 //! the device's class. Nothing runs on the device.
 
-use seismic::{DeviceInfo, DeviceKind, DeviceMemory, DeviceTopology};
+use seismic::{DeviceMemory, DeviceTopology, Executor, ExecutorKind, StorageKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceBandwidth {
@@ -30,17 +30,16 @@ pub enum DeviceClass {
 }
 
 impl DeviceClass {
-    /// A GPU whose memory backing is not established takes the lower GPU
-    /// class.
-    fn of(device: &DeviceInfo) -> Self {
-        match (device.kind, &device.memory) {
-            (DeviceKind::Cpu, _) => Self::Cpu,
-            (DeviceKind::Gpu, DeviceMemory::Established(memory))
-                if !memory.allocates_host_memory() =>
-            {
-                Self::DedicatedGpu
-            }
-            (DeviceKind::Gpu, _) => Self::IntegratedGpu,
+    /// A GPU whose memory is undecided takes the lower GPU class.
+    fn of(topology: &DeviceTopology, device: &Executor) -> Self {
+        let memory = topology
+            .physical_device(device.physical())
+            .expect("an executor's device is of its revision")
+            .memory();
+        match (device.kind(), memory) {
+            (ExecutorKind::Cpu, _) => Self::Cpu,
+            (_, DeviceMemory::Own) => Self::DedicatedGpu,
+            (_, DeviceMemory::Host | DeviceMemory::Undecided) => Self::IntegratedGpu,
         }
     }
 
@@ -63,30 +62,35 @@ const MB: u64 = 1_000_000;
 /// selects between an Apple chip's bins, which share one name.
 pub fn resolve_bandwidth(
     topology: &DeviceTopology,
-    device: &DeviceInfo,
+    device: &Executor,
     cpu_cores: u32,
 ) -> DeviceBandwidth {
-    if let Some(bytes_per_second) = device.memory_bandwidth {
+    if let Some(reported) = device.limits().memory_bandwidth {
         return DeviceBandwidth {
-            bytes_per_second,
+            bytes_per_second: reported.value,
             source: BandwidthSource::Reported,
         };
     }
     // The memory the device allocates from: its own for a discrete GPU, host RAM for a unified
-    // one.
-    let memory_bytes = match &device.memory {
-        DeviceMemory::Established(memory) => topology
-            .pool(memory.allocation_pool)
-            .map(|pool| pool.capacity_bytes),
-        DeviceMemory::Unsupported { .. } => None,
-    };
-    if let Some(bytes_per_second) = published(&device.name, cpu_cores, memory_bytes) {
+    // one. None for an executor that places nothing.
+    let memory_bytes = device.placement(StorageKind::Device).first().map(|&path| {
+        let store = topology
+            .access_path(path)
+            .expect("a placement names paths of its revision")
+            .store();
+        topology
+            .store(store)
+            .expect("a path's store is of its revision")
+            .capacity()
+            .value
+    });
+    if let Some(bytes_per_second) = published(device.name(), cpu_cores, memory_bytes) {
         return DeviceBandwidth {
             bytes_per_second,
             source: BandwidthSource::Published,
         };
     }
-    let class = DeviceClass::of(device);
+    let class = DeviceClass::of(topology, device);
     DeviceBandwidth {
         bytes_per_second: class.assumed_bytes_per_second(),
         source: BandwidthSource::Assumed(class),

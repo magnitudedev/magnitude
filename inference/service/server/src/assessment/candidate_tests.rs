@@ -1057,7 +1057,7 @@ async fn hugging_face_package(
 }
 
 fn cpu_environment() -> Arc<AssessmentEnvironment> {
-    let catalog = seismic::DeviceCatalog::discover().expect("device catalog");
+    let catalog = seismic::Devices::discover(&[]).expect("device catalog");
     let setup = magnitude_engine::assessment::AssessmentSetup::discover(
         &catalog,
         magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
@@ -1180,7 +1180,7 @@ async fn fixture_from(
     config.hub_endpoint = Some(endpoint);
     config.local_models = local_models;
     config.architectures = super::engine_architectures();
-    let models = Arc::new(ManagedModelStore::open(config).await.expect("model store"));
+    let models = Arc::new(ManagedModelStore::open(config, std::sync::Arc::new(|| Ok::<u64, std::convert::Infallible>(u64::MAX))).await.expect("model store"));
     models
         .ensure_model_inventory()
         .await
@@ -1239,7 +1239,7 @@ pub(super) async fn bare_store() -> (tempfile::TempDir, Arc<ManagedModelStore>) 
         directory.path().join("cache"),
     )
     .expect("inventory config");
-    let store = Arc::new(ManagedModelStore::open(config).await.expect("model store"));
+    let store = Arc::new(ManagedModelStore::open(config, std::sync::Arc::new(|| Ok::<u64, std::convert::Infallible>(u64::MAX))).await.expect("model store"));
     (directory, store)
 }
 
@@ -3813,7 +3813,7 @@ async fn live_fixture_reaching(
     config.hub_endpoint = Some(endpoint);
     config.local_models = local_models;
     config.architectures = super::engine_architectures();
-    let models = Arc::new(ManagedModelStore::open(config).await.expect("model store"));
+    let models = Arc::new(ManagedModelStore::open(config, std::sync::Arc::new(|| Ok::<u64, std::convert::Infallible>(u64::MAX))).await.expect("model store"));
     models
         .ensure_model_inventory()
         .await
@@ -4696,9 +4696,10 @@ impl Requirements {
             serde_json::from_value(serde_json::json!({
                 "host": { "planning": reserve(self.capacity - budget), "emergency": reserve(0) },
                 "device": { "planning": reserve(0), "emergency": reserve(0) },
+                "volume_bytes": 0,
             }))
             .expect("memory reserves");
-        let catalog = seismic::DeviceCatalog::discover().expect("device catalog");
+        let catalog = seismic::Devices::discover(&[]).expect("device catalog");
         let setup = magnitude_engine::assessment::AssessmentSetup::discover(
             &catalog,
             magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
@@ -5323,7 +5324,7 @@ async fn search_disables_a_result_whose_header_the_engine_refuses() {
     .expect("inventory config");
     config.hub_endpoint = Some(endpoint);
     config.architectures = super::engine_architectures();
-    let models = Arc::new(ManagedModelStore::open(config).await.expect("model store"));
+    let models = Arc::new(ManagedModelStore::open(config, std::sync::Arc::new(|| Ok::<u64, std::convert::Infallible>(u64::MAX))).await.expect("model store"));
     let (catalog, _) = llama_test_catalog(&models).await;
     let discovery = magnitude_service_models::HuggingFaceDiscovery::new(
         Arc::clone(&models),

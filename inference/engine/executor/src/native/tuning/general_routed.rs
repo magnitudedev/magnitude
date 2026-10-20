@@ -17,7 +17,7 @@ use magnitude_kernels::{
     routed_down, routed_experts, routed_experts_up, routed_gate_up, routed_scatter, routed_select,
     routed_up,
 };
-use seismic::{Element, Tensor};
+use seismic::{BuildError, Element, Tensor};
 
 /// The fused cases' routing shape for the synthetic tables.
 pub(crate) fn routing_shape(binding: &GeneralRoutedBinding) -> RoutedShape {
@@ -92,7 +92,7 @@ impl EntryTuning for RoutedSelectTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let (shape, rows) = (self.binding.shape, point.rows);
         let experts = usize::try_from(shape.experts).map_err(|_| "expert count exceeds host")?;
         TuningInputs::rotation_scopes(&self.scopes, point)
@@ -182,7 +182,7 @@ pub(crate) struct RoutedExpandDecodeCase {
 
 /// Unit accumulator scales for up-only experts (`routed_up` /
 /// `routed_experts_up`; NVFP4's stored scales are refused at plan time).
-fn unit_up_scales(inputs: &mut TuningInputs<'_, '_>, experts: u64) -> Result<Tensor, String> {
+fn unit_up_scales(inputs: &mut TuningInputs<'_, '_>, experts: u64) -> Result<Tensor, BuildError> {
     let count = usize::try_from(experts).map_err(|_| "expert count exceeds host")?;
     inputs.f32s(&[experts], &vec![1.0; count])
 }
@@ -192,7 +192,7 @@ impl RoutedExpandDecodeTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<RoutedExpandDecodeCase>, String> {
+    ) -> Result<Vec<RoutedExpandDecodeCase>, BuildError> {
         let (shape, rows) = (self.binding.shape, point.rows);
         let table = routes(rows, routing_shape(&self.binding));
         TuningInputs::rotation_scopes(&self.scopes, point)
@@ -263,7 +263,7 @@ impl EntryTuning for RoutedGateUpTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         self.0.cases(inputs, point)
     }
 
@@ -312,7 +312,7 @@ impl EntryTuning for RoutedUpTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         self.0.cases(inputs, point)
     }
 
@@ -379,7 +379,7 @@ impl EntryTuning for RoutedDownTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let (shape, rows) = (self.binding.shape, point.rows);
         let table = routes(rows, routing_shape(&self.binding));
         TuningInputs::rotation_scopes(&self.scopes, point)
@@ -451,7 +451,7 @@ impl RoutedExpertTilesTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<RoutedExpertTilesCase>, String> {
+    ) -> Result<Vec<RoutedExpertTilesCase>, BuildError> {
         let (shape, rows) = (self.binding.shape, point.rows);
         let routing = routing_shape(&self.binding);
         let (order, _, table) = group(&routes(rows, routing), rows, routing)?;
@@ -531,7 +531,7 @@ impl EntryTuning for RoutedGatedTilesTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         self.0.cases(inputs, point)
     }
 
@@ -588,7 +588,7 @@ impl EntryTuning for RoutedUpTilesTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         self.0.cases(inputs, point)
     }
 
@@ -657,7 +657,7 @@ impl EntryTuning for RoutedScatterTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let (shape, rows) = (self.binding.shape, point.rows);
         let routing = routing_shape(&self.binding);
         let (_, inverse, table) = group(&routes(rows, routing), rows, routing)?;

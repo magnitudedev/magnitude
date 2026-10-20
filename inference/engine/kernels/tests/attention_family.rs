@@ -15,7 +15,7 @@
 
 use magnitude_kernels::{attention_decode, attention_prefill};
 use seismic::{
-    BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor,
+    BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
     Tensor,
 };
 
@@ -509,7 +509,7 @@ fn check_host_model(entry: &str, case: &Case) {
 // Devices.
 
 fn devices() -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let names =
         std::env::var("ATTENTION_BACKENDS").unwrap_or_else(|_| "metal,cuda,vulkan,cpu".into());
     names
@@ -1705,36 +1705,35 @@ fn time_decode(
         specialization,
     )
     .map_err(|error| error.to_string())?;
-    let options = seismic::MeasureOptions {
-        samples: 15,
+    let options = seismic::measure::Measure {
+        samples: std::num::NonZeroUsize::new(15).unwrap(),
         min_sample_seconds: 0.005,
     };
-    let seconds = kernel
-        .measure(
-            vec![attention_decode::Args {
-                query: &bound.query,
-                gate: &bound.gate,
-                key: &bound.key,
-                value: &bound.value,
-                query_norm: &bound.query_norm,
-                key_norm: &bound.key_norm,
-                value_norm: &bound.value_norm,
-                rotary_components: &bound.components,
-                rotary_frequencies: &bound.frequencies,
-                rotary_amplitudes: &bound.amplitudes,
-                coordinates: &bound.coordinates,
-                visible: &bound.visible,
-                fresh: &bound.fresh,
-                destinations: &bound.destinations,
-                history_key: &mut bound.history_key,
-                history_value: &mut bound.history_value,
-                epsilon: case.epsilon,
-                scale: case.scale,
-                gate_function: 0,
-                slab_rows: case.slab_rows as u32,
-            }],
-            &options,
-        )
+    let point = kernel
+        .point(vec![attention_decode::Args {
+            query: &bound.query,
+            gate: &bound.gate,
+            key: &bound.key,
+            value: &bound.value,
+            query_norm: &bound.query_norm,
+            key_norm: &bound.key_norm,
+            value_norm: &bound.value_norm,
+            rotary_components: &bound.components,
+            rotary_frequencies: &bound.frequencies,
+            rotary_amplitudes: &bound.amplitudes,
+            coordinates: &bound.coordinates,
+            visible: &bound.visible,
+            fresh: &bound.fresh,
+            destinations: &bound.destinations,
+            history_key: &mut bound.history_key,
+            history_value: &mut bound.history_value,
+            epsilon: case.epsilon,
+            scale: case.scale,
+            gate_function: 0,
+            slab_rows: case.slab_rows as u32,
+        }])
+        .map_err(|error| format!("{error:?}"))?;
+    let seconds = seismic::measure::measure(point, &options)
         .map_err(|error| format!("{error:?}"))?
         .median;
     Ok(seconds * 1.0e6)

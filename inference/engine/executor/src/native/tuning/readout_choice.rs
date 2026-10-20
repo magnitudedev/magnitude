@@ -36,9 +36,9 @@ use magnitude_kernels::{
     readout_exact_rows, readout_features_rows, readout_head_rows, readout_planes_rows,
     readout_project_rows, readout_refine_rows, readout_top_rows,
 };
+use seismic::measure::{Shuffle, SustainedClock, Tally, Verdict};
 use seismic::{
-    Element, Entry, NativeKernel, NativeSpecialization, NativeTensorBatch, Shuffle, SustainedClock,
-    Tally, Tensor, Verdict,
+    BuildError, Element, Entry, NativeKernel, NativeSpecialization, NativeTensorBatch, Tensor,
 };
 use std::{cell::RefCell, rc::Rc, time::Instant};
 
@@ -392,7 +392,7 @@ impl RecipeCase {
         recipe: ReadoutRecipe,
         rows: u64,
         seed: u64,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, BuildError> {
         let hidden =
             inputs.activation(Element::f32(), &[rows, recipe.parts * recipe.hidden], seed)?;
         let norm = if recipe.norm_extent == 0 {
@@ -402,15 +402,13 @@ impl RecipeCase {
         };
         let weight = inputs
             .shared_weight(recipe.scope, WeightKind::Output)?
-            .slice_leading(0, recipe.vocabulary)
-            .map_err(|error| error.to_string())?;
+            .slice_leading(0, recipe.vocabulary)?;
         let mut views = Vec::new();
         for plane in ProgressivePlane::ALL {
             views.push(
                 inputs
                     .shared_weight(recipe.scope, WeightKind::OutputPlane(plane))?
-                    .slice_leading(0, recipe.vocabulary)
-                    .map_err(|error| error.to_string())?,
+                    .slice_leading(0, recipe.vocabulary)?,
             );
         }
         let planes = views
@@ -427,7 +425,7 @@ impl RecipeCase {
             .collect::<Vec<_>>();
         let words = recipe.vocabulary.div_ceil(32);
         let zeros = |element, shape: &[u64]| {
-            Tensor::zeros(inputs.device, element, shape).map_err(|e| e.to_string())
+            Tensor::zeros(inputs.device, element, shape).map_err(BuildError::from)
         };
         Ok(Self {
             hidden,
@@ -462,14 +460,10 @@ impl RecipeCase {
         recipe: ReadoutRecipe,
         rows: u64,
         seed: u64,
-    ) -> Result<Tensor, String> {
+    ) -> Result<Tensor, BuildError> {
         let [top, next, rest, scales, _] = &self.planes;
-        let stored = |plane: &Tensor, token: u64| {
-            plane
-                .slice_leading(token, token + 1)
-                .map_err(|error| error.to_string())?
-                .read_to_host()
-                .map_err(|error| error.to_string())
+        let stored = |plane: &Tensor, token: u64| -> Result<Vec<u8>, BuildError> {
+            Ok(plane.slice_leading(token, token + 1)?.read_to_host()?)
         };
         let columns = usize::try_from(recipe.hidden).map_err(|_| "hidden width exceeds usize")?;
         let bits = u8::try_from(2 * (recipe.low_planes + 1))
@@ -835,7 +829,7 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         let rounds = Tally::default().fewest(super::SEARCH_SETTINGS.error_rate);
         // The comparison's clock is established by its first raise: twice
         // over, readings of the packed run in doubling lengths from a
-        // sample's, none shorter than one run (`seismic::SustainedClock`).
+        // sample's, none shorter than one run (`seismic::measure::SustainedClock`).
         let establishment = 2.
             * (0..rounds)
                 .map(|stage| {
@@ -934,7 +928,7 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             }
             cases.push(case);
         }
-        // The search's comparison (`seismic::Tally`), on whole
+        // The search's comparison (`seismic::measure::Tally`), on whole
         // recipe runs: a round raises the device to a sustained clock, then
         // runs both recipes at every seed in random order, each behind a lead
         // of its own work, and is ahead when the
@@ -1026,7 +1020,7 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
 mod tests {
     use super::*;
     use crate::{ExecutionPath, resident_layout};
-    use seismic::{BackendName, DeviceCatalog};
+    use seismic::BackendName;
 
     /// Every program of the recipe digests and forms on each backend with
     /// its kernels, in both input forms: a normed exit's one row, and a
@@ -1035,7 +1029,7 @@ mod tests {
     /// not reaches only the one.
     #[test]
     fn every_recipe_program_takes_its_own_statics() {
-        let catalog = DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Devices::discover(&[]).unwrap();
         for backend in [BackendName::Metal, BackendName::Cuda] {
             let Ok(device) = catalog.open_backend(backend) else {
                 continue;

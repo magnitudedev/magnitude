@@ -8,10 +8,10 @@ use magnitude_executor::platform::{
     DeviceRequest, MemoryPolicyError, PlatformError, SelectionError,
 };
 use magnitude_executor::{CatalogError, CatalogFailure, GraphError, PlanError};
-use crate::census::MemoryDomain;
 pub use magnitude_artifacts::{UnsupportedReason, WeightTypeCount};
 use magnitude_family_contracts::FamilyError;
-use seismic::{DeviceSelector, ResolveError as SeismicResolveError};
+use seismic::ResolveError as SeismicResolveError;
+use seismic::StoreIdentity;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -168,12 +168,6 @@ pub enum DeviceSelectionError {
         request: DeviceRequest,
         evidence: Vec<String>,
     },
-    /// The exact selector resolved to several devices in this process's
-    /// catalog: the identity is stale and must be refreshed by the host.
-    Stale {
-        selector: DeviceSelector,
-        matches: usize,
-    },
 }
 
 impl fmt::Display for DeviceSelectionError {
@@ -183,10 +177,6 @@ impl fmt::Display for DeviceSelectionError {
                 formatter,
                 "no usable device matches `{request}`: {}",
                 evidence.join("; ")
-            ),
-            Self::Stale { selector, matches } => write!(
-                formatter,
-                "device {selector} resolves to {matches} devices; the selector is stale"
             ),
         }
     }
@@ -198,7 +188,6 @@ impl From<SelectionError> for DeviceSelectionError {
             SelectionError::NoCandidate { request, evidence, .. } => {
                 Self::Unavailable { request, evidence }
             }
-            SelectionError::Stale { selector, matches } => Self::Stale { selector, matches },
         }
     }
 }
@@ -210,9 +199,6 @@ impl From<SeismicResolveError> for DeviceSelectionError {
                 request: DeviceRequest::Selector(selector),
                 evidence: vec![format!("device {selector} is not present")],
             },
-            SeismicResolveError::Ambiguous { selector, matches } => {
-                Self::Stale { selector, matches }
-            }
         }
     }
 }
@@ -290,21 +276,20 @@ pub enum LoadError {
     Artifact(ArtifactError),
     Unsupported(UnsupportedModel),
     Device(DeviceSelectionError),
-    /// A startup claim could not be satisfied in `domain` (the device's
-    /// allocation domain, or host RAM for a dedicated device's staged
-    /// uploads). Retryable once memory frees.
+    /// A startup claim could not be satisfied in `store`, one of the stores
+    /// the executor's placement charges. Retryable once memory frees.
     InsufficientMemory {
         purpose: String,
-        domain: MemoryDomain,
+        store: StoreIdentity,
         memory: InsufficientMemory,
     },
-    /// `domain` was in the Reclaim band when the load claimed from it or
+    /// `store` was in the Reclaim band when the load claimed from it or
     /// while it imported weights: its headroom was at or below the planning
     /// reserve, or its host was in distress. No byte count describes it.
-    /// Retryable once the domain recovers.
+    /// Retryable once the store recovers.
     MemoryPressure {
         purpose: String,
-        domain: MemoryDomain,
+        store: StoreIdentity,
     },
     MemoryObservationUnavailable { reason: String },
     DeviceLost { reason: String },
@@ -334,11 +319,11 @@ impl fmt::Display for LoadError {
             Self::Device(error) => error.fmt(formatter),
             Self::InsufficientMemory {
                 purpose,
-                domain,
+                store,
                 memory,
-            } => write!(formatter, "{purpose} in {domain}: {memory}"),
-            Self::MemoryPressure { purpose, domain } => {
-                write!(formatter, "{purpose} in {domain}: memory pressure")
+            } => write!(formatter, "{purpose} in {store}: {memory}"),
+            Self::MemoryPressure { purpose, store } => {
+                write!(formatter, "{purpose} in {store}: memory pressure")
             }
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
@@ -630,8 +615,7 @@ pub(crate) fn classify_platform(error: PlatformError) -> PlatformOutcome {
     match error {
         PlatformError::Selection(error) => PlatformOutcome::Device(error.into()),
         PlatformError::Resolve(error) => PlatformOutcome::Device(error.into()),
-        PlatformError::Observation(error)
-        | PlatformError::Memory(MemoryPolicyError::Observation(error)) => {
+        PlatformError::Memory(MemoryPolicyError::Observation(error)) => {
             PlatformOutcome::MemoryObservationUnavailable(error.to_string())
         }
         PlatformError::Policy { path, outcome } => {

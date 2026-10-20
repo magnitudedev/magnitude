@@ -7,7 +7,7 @@ use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, ro
 use crate::operators::streams::{StreamsBinding, StreamsGeometry};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{stream_mix_down, stream_mix_up};
-use seismic::{Element, Tensor};
+use seismic::{BuildError, Element, Tensor};
 
 /// The streams' geometry of the tuned model.
 fn geometry(inputs: &ModelInputs<'_>) -> Result<StreamsGeometry, String> {
@@ -23,13 +23,12 @@ fn streams_and_norm(
     geometry: StreamsGeometry,
     rows: u64,
     seed: u64,
-) -> Result<(Tensor, Tensor), String> {
+) -> Result<(Tensor, Tensor), BuildError> {
     let (s, h) = (geometry.streams, geometry.hidden);
     let streams = inputs.activation(Element::f32(), &[rows, s, h], seed)?;
     let norm = inputs
         .weight(scope, WeightKind::HyperConnectionNorm)?
-        .reshape(&[s, h])
-        .map_err(|error| error.to_string())?;
+        .reshape(&[s, h])?;
     Ok((streams, norm))
 }
 
@@ -107,7 +106,7 @@ impl EntryTuning for StreamMixDownTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let geometry = geometry(inputs)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
@@ -208,7 +207,7 @@ impl EntryTuning for StreamMixUpTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let geometry = geometry(inputs)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()

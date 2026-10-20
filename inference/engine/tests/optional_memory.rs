@@ -12,8 +12,7 @@ use magnitude_engine::{
 };
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
-    ExecutionPath, FeatureRows, Operation, PhysicalDecision, RequestId, ReservedResources,
-    TokenId,
+    ExecutionPath, FeatureRows, Operation, PhysicalDecision, RequestId, ReservedResources, TokenId,
 };
 use magnitude_family_contracts::{PreparedModelInput, TokenPlan};
 use magnitude_generation::{
@@ -200,13 +199,7 @@ fn stopped_turn(
     tokens: &[TokenId],
     count: usize,
 ) -> (Vec<TokenId>, usize) {
-    let mut stream = admit(
-        host,
-        greedy(tokens, vocabulary, 4 * count),
-        true,
-        4 * count,
-    )
-    .unwrap();
+    let mut stream = admit(host, greedy(tokens, vocabulary, 4 * count), true, 4 * count).unwrap();
     host.step_until(&mut [&mut stream], Duration::from_secs(60), |_, streams| {
         streams[0].output.len() >= count
     });
@@ -273,7 +266,10 @@ fn concurrent_cohort_memory_growth_and_idle_release() {
                 stream.failure()
             );
             assert_eq!(stream.usage().completion_tokens, 24);
-            assert!(host.snapshot(stream.id).is_none(), "a completed request is retired");
+            assert!(
+                host.snapshot(stream.id).is_none(),
+                "a completed request is retired"
+            );
         }
         host.settle();
         let idle = host.owner().reconcile_memory_charge().unwrap();
@@ -336,7 +332,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
     let package = resolved.host.shared_package();
     let (mut domain, mut bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let charge = |domain: &magnitude_executor::ExecutorDomain| {
-        domain.resources().device().memory_usage().charged
+        domain.resources().device().storage_usage(seismic::StorageKind::Device).charged
     };
     // Startup warms the optional head. Measure the unloaded baseline so both
     // cycles exercise the same lazy rebind and release lifecycle.
@@ -510,7 +506,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
 #[ignore = "requires Sparky's unified CUDA device and MAGNITUDE_TEST_MTP_GGUF"]
 fn admission_reclaims_under_a_real_process_limit() {
     use magnitude_executor::platform::{self, DomainReading, MemoryBand, MemoryConstraint};
-    use seismic::DeviceCatalog;
+    use seismic::Devices;
 
     struct AddressSpaceLimit(libc::rlimit);
     impl Drop for AddressSpaceLimit {
@@ -555,12 +551,12 @@ fn admission_reclaims_under_a_real_process_limit() {
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let package = resolved.host.shared_package();
     let (domain, bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = Devices::discover(&[]).unwrap();
     let reserves = MemoryReserves::standard();
     let allocation = |device: &seismic::Device| -> Result<DomainReading, String> {
         let readings = platform::observe_domains(&catalog, device, &reserves)
             .map_err(|error| error.to_string())?;
-        Ok(readings[0])
+        Ok(readings[0].clone())
     };
     let available = allocation(domain.resources().device()).unwrap();
     assert_eq!(available.constraint, MemoryConstraint::HostRam);
@@ -681,7 +677,10 @@ fn admission_reclaims_under_a_real_process_limit() {
     let mut incoming = admit(&mut host, generation(prompt_tokens), false, 16).unwrap();
     let charged = |host: &Host| {
         host.owner()
-            .inspect_domain(|domain| Ok(domain.resources().device().memory_usage().charged))
+            .inspect_domain(|domain| {
+                let device = domain.resources().device();
+                Ok(device.storage_usage(seismic::StorageKind::Device).charged)
+            })
             .unwrap()
     };
     let mut saw_preemption = false;
@@ -760,7 +759,7 @@ fn admission_reclaims_under_a_real_process_limit() {
 fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
     use magnitude_executor::platform::{self, MemoryBand};
     use magnitude_scheduler::publication::{ModelUnloadCause, RequestError};
-    use seismic::DeviceCatalog;
+    use seismic::Devices;
 
     struct AddressSpaceLimit(libc::rlimit);
     impl Drop for AddressSpaceLimit {
@@ -805,7 +804,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
     let package = resolved.host.shared_package();
     let (domain, bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = Devices::discover(&[]).unwrap();
     let reserves = MemoryReserves::standard();
     let planning = platform::observe_domains(&catalog, domain.resources().device(), &reserves)
         .unwrap()[0]
@@ -1012,7 +1011,10 @@ fn idle_shrink_preserves_a_retained_session() {
         "the retained session still serves the turn"
     );
     assert_eq!(replayed, reference);
-    assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
+    assert_eq!(
+        host.owner().reconcile_memory_charge().unwrap().unattributed,
+        0
+    );
 }
 
 /// Retained-state release in the Reclaim band, with replay. A session's
@@ -1027,7 +1029,7 @@ fn idle_shrink_preserves_a_retained_session() {
 #[ignore = "requires Sparky's unified CUDA device and MAGNITUDE_TEST_MTP_GGUF"]
 fn reclaim_releases_retained_sessions_and_replays_them() {
     use magnitude_executor::platform::{self, MemoryBand};
-    use seismic::DeviceCatalog;
+    use seismic::Devices;
 
     struct AddressSpaceLimit(libc::rlimit);
     impl Drop for AddressSpaceLimit {
@@ -1065,7 +1067,7 @@ fn reclaim_releases_retained_sessions_and_replays_them() {
     assert!(retained >= 2 && before.target_state.retained > 0);
     assert_eq!(before.unattributed, 0);
 
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = Devices::discover(&[]).unwrap();
     let reserves = MemoryReserves::standard();
     let band = |host: &Host| {
         host.owner()
@@ -1074,6 +1076,7 @@ fn reclaim_releases_retained_sessions_and_replays_them() {
                     .map_err(|error| error.to_string())
             })
             .unwrap()[0]
+            .clone()
     };
     let planning = band(&host).thresholds.planning_bytes;
     let vm_bytes = std::fs::read_to_string("/proc/self/status")
@@ -1131,5 +1134,8 @@ fn reclaim_releases_retained_sessions_and_replays_them() {
     );
     assert_eq!(cached, 0, "nothing retained survived the Reclaim release");
     assert_eq!(replayed, cold);
-    assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
+    assert_eq!(
+        host.owner().reconcile_memory_charge().unwrap().unattributed,
+        0
+    );
 }

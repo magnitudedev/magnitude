@@ -101,7 +101,7 @@ fn generated_surface_exposes_native_and_planned_dense_plane_bindings() {
 
 #[test]
 fn native_copies_indexed_word_plane_rows_bit_exactly_on_every_device() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [
         seismic::BackendName::Metal,
         seismic::BackendName::Cuda,
@@ -162,7 +162,7 @@ fn copy_word_plane_rows(device: &seismic::Device) {
 
 /// The host's GPU (Metal on macOS, else Vulkan when present), then the CPU.
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let gpu = if cfg!(target_os = "macos") {
         Some(catalog.open_backend(seismic::BackendName::Metal).unwrap())
     } else {

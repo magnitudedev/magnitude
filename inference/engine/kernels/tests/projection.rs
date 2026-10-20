@@ -20,6 +20,9 @@ use seismic_lang::{
     registry::{self, RepresentationKind},
     types::DType,
 };
+use timing_common::{Timed, measured};
+
+mod timing_common;
 
 // ---------------------------------------------------------------------------
 // Host values.
@@ -658,7 +661,7 @@ fn assert_within(label: &str, actual: &[f32], expected: &[f32], bound: &[f32]) {
 /// Metal on macOS, elsewhere Vulkan when present (rows16 is the resident
 /// layout of both), and the CPU device.
 fn devices() -> Vec<Device> {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let gpu = if cfg!(target_os = "macos") {
         Some(catalog.open_backend(seismic::BackendName::Metal).unwrap())
     } else {
@@ -3278,7 +3281,7 @@ fn packed_timing() {
                     weight_bound: &bound,
                 })
                 .collect();
-            kernel.measure(rotation, &TIMING_OPTIONS).unwrap().median
+            kernel.time(rotation, &TIMING_OPTIONS).unwrap().median
         };
         run(
             &label,
@@ -3353,7 +3356,7 @@ fn packed_timing() {
                     down_bound: &bound,
                 })
                 .collect();
-            kernel.measure(rotation, &TIMING_OPTIONS).unwrap().median
+            kernel.time(rotation, &TIMING_OPTIONS).unwrap().median
         };
         run(
             &label,
@@ -3409,7 +3412,7 @@ fn packed_timing() {
                     up_bound: &bound,
                 })
                 .collect();
-            kernel.measure(rotation, &TIMING_OPTIONS).unwrap().median
+            kernel.time(rotation, &TIMING_OPTIONS).unwrap().median
         };
         run(
             &label,
@@ -3466,7 +3469,7 @@ fn packed_timing() {
                     gate_bound: &absent_scale,
                 })
                 .collect();
-            kernel.measure(rotation, &TIMING_OPTIONS).unwrap().median
+            kernel.time(rotation, &TIMING_OPTIONS).unwrap().median
         };
         run(
             label,
@@ -3543,7 +3546,7 @@ fn packed_timing() {
                     value_bound: &absent_scale,
                 })
                 .collect();
-            kernel.measure(rotation, &TIMING_OPTIONS).unwrap().median
+            kernel.time(rotation, &TIMING_OPTIONS).unwrap().median
         };
         run(
             &label,
@@ -3598,7 +3601,7 @@ fn packed_timing() {
                     output_bound: &bound,
                 })
                 .collect();
-            kernel.measure(rotation, &TIMING_OPTIONS).unwrap().median
+            kernel.time(rotation, &TIMING_OPTIONS).unwrap().median
         };
         run(
             &label,
@@ -5382,8 +5385,8 @@ fn report(label: &str, m: usize, mapping: Mapping, seconds: f64, bytes: usize, m
     );
 }
 
-const TIMING_OPTIONS: seismic::MeasureOptions = seismic::MeasureOptions {
-    samples: 9,
+const TIMING_OPTIONS: seismic::measure::Measure = seismic::measure::Measure {
+    samples: std::num::NonZeroUsize::new(9).unwrap(),
     min_sample_seconds: 0.02,
 };
 
@@ -5639,7 +5642,7 @@ fn timing_on(device: &Device) {
                         down_bound: &absent_scale,
                     })
                     .collect();
-                let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
+                let measured = kernel.time(rotation, &TIMING_OPTIONS).unwrap();
                 report(label, m, mapping, measured.median, bytes, m * h * f);
             }
         }
@@ -5729,7 +5732,7 @@ fn timing_on(device: &Device) {
                         up_bound: &absent_scale,
                     })
                     .collect();
-                let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
+                let measured = kernel.time(rotation, &TIMING_OPTIONS).unwrap();
                 report(label, m, mapping, measured.median, bytes, m * 2 * f * h);
             }
         }
@@ -5811,7 +5814,7 @@ fn timing_on(device: &Device) {
                         gate_bound: &no_bound,
                     })
                     .collect();
-                let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
+                let measured = kernel.time(rotation, &TIMING_OPTIONS).unwrap();
                 report(label, m, mapping, measured.median, bytes, m * total * h);
             }
         }
@@ -5868,7 +5871,7 @@ fn timing_on(device: &Device) {
                         output_bound: &no_bound,
                     })
                     .collect();
-                let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
+                let measured = kernel.time(rotation, &TIMING_OPTIONS).unwrap();
                 report(label, m, mapping, measured.median, bytes, m * h * k);
             }
         }
@@ -5959,7 +5962,7 @@ fn timing_on(device: &Device) {
                         value_bound: &no_bound,
                     })
                     .collect();
-                let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
+                let measured = kernel.time(rotation, &TIMING_OPTIONS).unwrap();
                 report(label, m, mapping, measured.median, bytes, m * total * d);
             }
         }
@@ -6016,7 +6019,7 @@ fn timing_on(device: &Device) {
                         output_bound: &no_bound,
                     })
                     .collect();
-                let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
+                let measured = kernel.time(rotation, &TIMING_OPTIONS).unwrap();
                 report(label, m, mapping, measured.median, bytes, m * d * k);
             }
         }
@@ -6045,7 +6048,7 @@ fn timing_on(device: &Device) {
             out_rows: &out_rows,
             epsilon: 1e-6,
         }];
-        let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
+        let measured = kernel.time(rotation, &TIMING_OPTIONS).unwrap();
         eprintln!(
             "timing launch_floor features_rows 1x2560: {:.1} us",
             measured.median * 1e6
@@ -6096,7 +6099,7 @@ fn timing_on(device: &Device) {
                     softcap: 0.0,
                     weight_scale: &absent_scale,
                 }];
-                let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
+                let measured = kernel.time(rotation, &TIMING_OPTIONS).unwrap();
                 report(label, m, mapping, measured.median, bytes, m * v * d);
             }
         }
@@ -6110,7 +6113,7 @@ fn timing_on(device: &Device) {
 /// rows. (CUDA's mma16 tables: `cuda_projection.rs`.)
 #[test]
 fn embedding_rows_read_the_slots_their_directory_names() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let module = module();
     let act = Act::Bf16;
     let (v, d) = (300usize, 512usize);
@@ -6714,7 +6717,7 @@ fn metal_attention_output_matrix_matches_host() {
 #[test]
 #[ignore = "one measured trial per readout shape on the measurement host"]
 fn time_draft_full_vocabulary_readout() {
-    let device = seismic::DeviceCatalog::discover()
+    let device = seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Metal)
         .unwrap();
@@ -6746,26 +6749,27 @@ fn time_draft_full_vocabulary_readout() {
                 ),
             )
             .unwrap();
-            let measured = kernel
-                .measure(
-                    vec![readout_head_rows::Args {
-                        hidden: &hidden,
-                        norm: &norm,
-                        weight: &weight,
-                        out_rows: &out_rows,
-                        epsilon: 1e-6,
-                        softcap: 0.0,
-                        weight_scale: &absent_scale,
-                    }],
-                    &seismic::MeasureOptions {
-                        samples: 1,
-                        min_sample_seconds: 0.0,
-                    },
-                )
+            let point = kernel
+                .point(vec![readout_head_rows::Args {
+                    hidden: &hidden,
+                    norm: &norm,
+                    weight: &weight,
+                    out_rows: &out_rows,
+                    epsilon: 1e-6,
+                    softcap: 0.0,
+                    weight_scale: &absent_scale,
+                }])
                 .unwrap();
+            let measurement = measured(
+                point,
+                &seismic::measure::Measure {
+                    samples: std::num::NonZeroUsize::MIN,
+                    min_sample_seconds: 0.0,
+                },
+            );
             eprintln!(
                 "draft_readout Q6K V={vocabulary} D={d} O={m} seconds={:.9}",
-                measured.median
+                measurement.median
             );
         }
     }
@@ -6900,7 +6904,7 @@ fn gemma_q4_verify_timing() {
                         weight_bound: &absent_scale,
                     })
                     .collect();
-                let measured = kernel.measure(rotation, &TIMING_OPTIONS).unwrap();
+                let measured = kernel.time(rotation, &TIMING_OPTIONS).unwrap();
                 report(
                     "Gemma12B project_rows q4g32s 15360x3840",
                     m,

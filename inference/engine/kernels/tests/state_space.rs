@@ -9,6 +9,7 @@
 // successor changes: accepted banks, the zero seed, and unrelated banks keep
 // their exact bytes.
 
+mod timing_common;
 mod versions_common;
 
 use magnitude_kernels::{state_space_chunk, state_space_gate, state_space_step};
@@ -1041,10 +1042,11 @@ fn launch_medians(device: &Device, run: impl FnOnce()) -> String {
 #[test]
 #[ignore = "timing; run explicitly on the measurement host"]
 fn state_space_timings() {
-    let options = seismic::MeasureOptions {
-        samples: 11,
+    let options = seismic::measure::Measure {
+        samples: std::num::NonZeroUsize::new(11).unwrap(),
         min_sample_seconds: 0.01,
     };
+    let measure = |point| timing_common::measured(point, &options);
     for device in devices() {
         let backend = device.backend().as_str();
         for (name, geometry) in &nemotron()[..2] {
@@ -1074,7 +1076,7 @@ fn state_space_timings() {
                         )
                         .unwrap();
                         let args = rotation.iter_mut().map(|bound| bound.chunk_args(case.slab_banks)).collect();
-                        let seconds = kernel.measure(args, &options).unwrap().median;
+                        let seconds = measure(kernel.point(args).unwrap()).median;
                         let launches = launch_medians(&device, || {
                             for bound in rotation.iter_mut() {
                                 kernel.call(bound.chunk_args(case.slab_banks)).unwrap();
@@ -1089,7 +1091,7 @@ fn state_space_timings() {
                         )
                         .unwrap();
                         let args = rotation.iter_mut().map(|bound| bound.step_args(case.slab_banks)).collect();
-                        (kernel.measure(args, &options).unwrap().median, String::new())
+                        (measure(kernel.point(args).unwrap()).median, String::new())
                     };
                     let traffic = 2.0 * (slots.len() * bank_bytes) as f64;
                     println!(

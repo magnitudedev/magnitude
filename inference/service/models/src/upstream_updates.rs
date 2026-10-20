@@ -417,7 +417,7 @@ mod tests {
         )
         .expect("config");
         config.hub_endpoint = Some(endpoint);
-        let store = ManagedModelStore::open(config).await.expect("store");
+        let store = ManagedModelStore::open_unbounded(config).await.expect("store");
         (temporary, Arc::new(store))
     }
 

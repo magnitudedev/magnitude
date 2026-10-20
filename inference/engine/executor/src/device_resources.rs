@@ -518,6 +518,15 @@ impl ResourceDomain {
                 .ok_or(ResourceError::InvalidFeatureShape)
         })
     }
+
+    /// Visit the storage of every feature tensor the domain owns.
+    pub(crate) fn visit_owned_feature_storage(
+        &self,
+        visit: &mut dyn FnMut(&seismic::TensorStorageObserver),
+    ) {
+        self.owned_features.borrow().iter().for_each(visit);
+    }
+
     pub fn publish_features(&self, tensor: Tensor) -> Result<FeatureRef, ResourceError> {
         let observation = tensor.observe_storage();
         let feature = self.publish_feature_backing(TensorBacking::Owned(tensor))?;
@@ -689,7 +698,7 @@ mod tests {
     use super::*;
     #[test]
     fn standalone_feature_census_is_shared_and_does_not_retain_allocations() {
-        let Ok(catalog) = seismic::DeviceCatalog::discover() else {
+        let Ok(catalog) = seismic::Devices::discover(&[]) else {
             return;
         };
         let Ok(device) = catalog.open_backend(seismic::BackendName::Cpu) else {

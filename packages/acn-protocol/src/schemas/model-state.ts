@@ -1581,16 +1581,17 @@ export type ModelSlotsState = typeof ModelSlotsStateSchema.Type
 export const LocalInferenceAcceleratorSchema = Schema.Struct({
   acceleratorId: LocalInferenceAcceleratorIdSchema,
   name: Schema.String,
-  backend: LocalInferenceBackendSchema,
-  memoryDomainId: LocalInferenceMemoryDomainIdSchema,
+  executors: Schema.Array(Schema.Struct({
+    deviceId: LocalInferenceDeviceIdSchema,
+    backend: LocalInferenceBackendSchema,
+    memoryDomainIds: Schema.Array(LocalInferenceMemoryDomainIdSchema),
+  })),
 })
 export const LocalInferenceMemoryDomainSchema = Schema.Struct({
   memoryDomainId: LocalInferenceMemoryDomainIdSchema,
   kind: Schema.Literal("System", "PhysicalDevice", "UnifiedMemory"),
   totalBytes: NonNegativeSafeInteger,
-  stableCapacityBytes: NonNegativeSafeInteger,
   availableBytes: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
-  sharesSystemMemory: Schema.Boolean,
 })
 export const LocalInferenceHardwareSchema = Schema.Struct({
   platform: Schema.Literal("MacOS", "Linux", "Windows"),
@@ -1600,11 +1601,9 @@ export const LocalInferenceHardwareSchema = Schema.Struct({
   physicalCores: Schema.optionalWith(PositiveSafeInteger, { as: "Option", exact: true }),
   logicalCores: PositiveSafeInteger,
   totalSystemMemoryBytes: NonNegativeSafeInteger,
-  availableSystemMemoryBytes: NonNegativeSafeInteger,
-  systemAllocationCapacityBytes: NonNegativeSafeInteger,
-  systemAllocationHeadroomBytes: NonNegativeSafeInteger,
-  abortReserveBytes: NonNegativeSafeInteger,
   accelerators: Schema.Array(LocalInferenceAcceleratorSchema),
+  /** The executor the engine selects: the one every load runs on. None when no executor can run. */
+  selectedDeviceId: Schema.optionalWith(LocalInferenceDeviceIdSchema, { as: "Option", exact: true }),
   memoryDomains: Schema.Array(LocalInferenceMemoryDomainSchema),
 }).pipe(Schema.filter((hardware) => {
   const memoryDomainIds = hardware.memoryDomains.map(({ memoryDomainId }) => memoryDomainId)
@@ -1612,6 +1611,7 @@ export const LocalInferenceHardwareSchema = Schema.Struct({
   const domains = new Set(memoryDomainIds)
   return domains.size === memoryDomainIds.length
     && new Set(acceleratorIds).size === acceleratorIds.length
-    && hardware.accelerators.every(({ memoryDomainId }) => domains.has(memoryDomainId))
+    && hardware.accelerators.every(({ executors }) => executors.every(({ memoryDomainIds }) =>
+      memoryDomainIds.every(id => domains.has(id))))
 }, { message: () => "hardware identities must be unique and accelerator memory-domain references must resolve" }))
 export type LocalInferenceHardware = typeof LocalInferenceHardwareSchema.Type

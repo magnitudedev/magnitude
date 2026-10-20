@@ -2605,7 +2605,7 @@ mod tests {
             crate::inventory::InventoryConfig::with_roots(store.clone(), cache_root.clone())
                 .unwrap();
         config.local_models.roots.clear();
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
         let _ = fs::remove_dir_all(&cache_root);
         fs::write(&cache_root, b"not a directory").unwrap();
 
@@ -2788,7 +2788,7 @@ mod tests {
         )
         .unwrap();
         config.local_models.roots.clear();
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
 
         for (index, fixture) in fixtures.into_iter().enumerate() {
             let inspection = crate::gguf::inspect(&fixture).unwrap();
@@ -3569,7 +3569,7 @@ mod tests {
         .unwrap();
         config.local_models.roots.clear();
         config.hub_endpoint = Some(endpoint);
-        let store = Arc::new(ManagedModelStore::open(config).await.unwrap());
+        let store = Arc::new(ManagedModelStore::open_unbounded(config).await.unwrap());
 
         let discovery = HuggingFaceDiscovery::new(
             Arc::clone(&store),
@@ -3699,7 +3699,7 @@ mod tests {
         .unwrap();
         config.local_models.roots.clear();
         config.hub_endpoint = Some(endpoint);
-        let store = Arc::new(ManagedModelStore::open(config).await.unwrap());
+        let store = Arc::new(ManagedModelStore::open_unbounded(config).await.unwrap());
         (temporary, store)
     }
 
@@ -4902,7 +4902,7 @@ mod tests {
         )
         .unwrap();
         config.local_models.roots.clear();
-        let store = ManagedModelStore::open(config).await.unwrap();
+        let store = ManagedModelStore::open_unbounded(config).await.unwrap();
         store.cache.write_index(
             ModelIndexKind::ModelAssessment,
             "old evidence",

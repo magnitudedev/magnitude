@@ -107,28 +107,24 @@ pub mod coverage {
 }
 /// Replay of the tuning search against recorded surveys (development).
 pub use seismic_runtime::native::replay;
-/// The search's timed comparison of two alternatives, for a comparison whose
-/// rounds its caller runs.
-pub use seismic_runtime::native::sampling::{Shuffle, Tally, Verdict};
 pub use seismic_runtime::native::search::{
-    Cost, ParameterValues, PointKey, SearchSettings, SearchStop,
+    Cost, LaunchKey, ParameterValues, SearchSettings, SearchStop,
 };
 pub use seismic_runtime::native::trace::{
     SubmissionTrace, TraceDetail, TraceError, TracedLaunch, TracedLaunchGeometry, TracedSubmission,
     host_seconds,
 };
 pub use seismic_runtime::native::tune::{
-    COMPARISON_VERSION, Configuration, ConfigurationRecord, Constraint, CoverageCheck,
-    CoverageOutcome, DeclaredParameter, Difference, Exclusion, Footprint, FormationRecord, Formed,
+    BuildError, COMPARISON_VERSION, Configuration, ConfigurationRecord, Constraint, CoverageCheck,
+    CoverageOutcome, DeclaredParameter, Difference, Exclusion, FormationRecord, Formed,
     GOVERNING_STEP, GoverningStep, Grounded, Narrowed, NumericalObservation, NumericalRequirement,
-    Observed, Outcome, Performed, PieceMemory, PointInputs, PointMeasurement, PointRecord,
-    PointSpec, ProcessMemory, Publication, Quote, Raise, RaiseOutcome, Reselection, SearchPlan,
-    Spent, Stage, Standing, StepPower, Strategy, SubjectComparison, SubjectMeasurement, SurveyPlan,
-    SustainedClock, TuneError, TuningDisposition, TuningInitializer, TuningMethod, TuningResult,
-    TuningTime, UnitPlan, Violation, Work, Workers, WorkloadRotation, WrittenRows, admit,
-    governing_ratio, reselect, return_freed_pages,
+    Outcome, Performed, PieceMemory, PointInputs, PointMeasurement, PointRecord, PointSpec,
+    ProcessMemory, Publication, Reselection, SearchPlan, Spent, Stage, Standing, StepPower,
+    Strategy, SubjectComparison, SubjectMeasurement, SurveyPlan, TuneError, TuningDisposition,
+    TuningInitializer, TuningMethod, TuningResult, TuningTime, UnitPlan, Violation, Work, Workers,
+    WorkloadRotation, WrittenRows, admit, governing_ratio, reselect, return_freed_pages,
 };
-pub use seismic_runtime::native::{MeasureOptions, Measurement, NativeArtifactIdentity};
+pub use seismic_runtime::native::{Footprint, NativeArtifactIdentity, Observed, Quote};
 
 /// Result of checking one native entry's element bindings without device
 /// formation. Acceptance proves only checked source semantics.
@@ -176,20 +172,32 @@ pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
 pub use seismic_native_cpu as cpu;
 pub use seismic_runtime::api::HostRegion;
-pub use seismic_runtime::api::{CallError, OutputError, TensorError, WorkflowError};
+pub use seismic_runtime::api::{
+    CallError, OutputError, TensorError, ViewChargeError, WorkflowError,
+};
 pub use seismic_runtime::native::recorded_graph_device_bytes;
 /// The largest block a dedicated device's allocator takes from its driver
 /// for an ordinary allocation (blocks grow from 64 MiB to it).
 pub use seismic_compiler::blocks::BLOCK_CAP_BYTES as DEVICE_BLOCK_CAP_BYTES;
 mod slab;
-pub use seismic_runtime::devices::{
-    Availability, CapacityBasis, DISPLACEMENT_HISTORY, DeviceId, DeviceInfo, DeviceKind, DeviceMeasurements,
-    DeviceMemory, DeviceMemoryInfo, DeviceMemoryStatus, DeviceSelector, DeviceTopology,
-    DiscoveryDiagnostic, DiscoveryError, DisplacementWindow, HeadroomBasis, HeadroomEstimate,
-    HostDisplacement, HostMeasurements, HostMemoryStatus, KernelPressure, LimitVisibility,
-    MemoryPoolId, MemoryPoolInfo, MemoryPoolKind, MemoryUsage, ObservationError, OpenError,
-    ProcessLimitKind, ProcessMemoryLimit, ResolveError, SelectorParseError,
+/// Measuring work on a device (`seismic-measure`): the timing session, the
+/// sustained clock and the statistics. The runtime's measurable work is
+/// [`KernelPoint`].
+pub use seismic_measure as measure;
+pub use seismic_runtime::devices::{LimitError, MemoryUsage, OpenError, ResolveError};
+pub use seismic_runtime::native::KernelPoint;
+pub use seismic_topology::{
+    volume_available, AccessPath, AccessPathId, AccessRoute, Availability, DeviceMemory,
+    DeviceTopology, Diagnostic, DiagnosticSource, DiscoveryError, DisplacementWindow, Executor,
+    ExecutorId, ExecutorKind, ExecutorSelector, HostDisplacement, HostStatus, Inventory,
+    KernelPressure, LimitVisibility, Limits, ObservationError, PhysicalDevice, PhysicalDeviceId,
+    PhysicalIdentity, ProcessLimitKind, ProcessMemoryLimit, Reported, ReportedBy, Revision,
+    RuntimeStatus, Sample, Status, StorageKind, Store, StoreId, StoreIdentity, StoreKind,
+    TransferPath, TransferPathId, VolumeId, DISPLACEMENT_HISTORY,
 };
+/// The recorded machines (`fixtures::recorded`), for other crates' tests.
+#[cfg(feature = "fixtures")]
+pub use seismic_topology::fixtures;
 pub use slab::{Slab, SlabLayout, SlabRegion, SlabTensor};
 
 use seismic_compiler::prepared::ArgumentValue;
@@ -201,54 +209,73 @@ use std::sync::Arc;
 // Devices
 // ---------------------------------------------------------------------------
 
-/// The one device inventory: host RAM and backend devices, their memory
-/// pools and identities, scoped observations, and device opening.
-pub struct DeviceCatalog {
-    inner: seismic_runtime::devices::Catalog,
+/// Execution resources over the machine's inventory: opening executors by
+/// identity, and the status of what this process holds.
+pub struct Devices {
+    inner: seismic_runtime::devices::Devices,
 }
 
-impl DeviceCatalog {
-    pub fn discover() -> Result<Self, DiscoveryError> {
-        seismic_runtime::devices::Catalog::discover().map(|inner| Self { inner })
+impl Devices {
+    /// Devices over `inventory`, which owns discovery and its revisions.
+    pub fn new(inventory: Arc<Inventory>) -> Self {
+        Self {
+            inner: seismic_runtime::devices::Devices::new(inventory),
+        }
     }
-    /// The current immutable inventory snapshot.
+
+    /// Devices over a newly discovered inventory serving `paths`.
+    pub fn discover(paths: &[std::path::PathBuf]) -> Result<Self, DiscoveryError> {
+        seismic_runtime::devices::Devices::discover(paths).map(|inner| Self { inner })
+    }
+
+    /// The inventory the devices are opened over.
+    pub fn inventory(&self) -> &Arc<Inventory> {
+        self.inner.inventory()
+    }
+
+    /// The current immutable topology revision.
     pub fn topology(&self) -> Arc<DeviceTopology> {
         self.inner.topology()
     }
-    /// Re-enumerates; identifiers stay valid unless the inventory changed.
-    pub fn refresh(&self) -> Result<Arc<DeviceTopology>, DiscoveryError> {
-        self.inner.refresh()
-    }
-    /// Resolves a same-machine selector, rejecting missing or ambiguous
-    /// matches. Never substitutes another device.
-    pub fn resolve(&self, selector: DeviceSelector) -> Result<DeviceId, ResolveError> {
+
+    /// Resolves a same-machine selector, rejecting a missing executor.
+    /// Never substitutes another executor.
+    pub fn resolve(&self, selector: ExecutorSelector) -> Result<ExecutorId, ResolveError> {
         self.inner.resolve(selector)
     }
-    pub fn open(&self, id: DeviceId) -> Result<Device, OpenError> {
+
+    /// Open executor `id` of the current revision without an artifact
+    /// store. An executor already open is shared.
+    pub fn open(&self, id: ExecutorId) -> Result<Device, OpenError> {
         self.inner.open(id).map(|inner| Device { inner })
     }
-    /// Open with `options` (for example an artifact store). A device already
-    /// open is shared; asking it for a different store is an error.
-    pub fn open_with(&self, id: DeviceId, options: DeviceOptions) -> Result<Device, OpenError> {
+
+    /// Open with `options` (for example an artifact store). An executor
+    /// already open is shared; asking it for a different store is an error.
+    pub fn open_with(&self, id: ExecutorId, options: DeviceOptions) -> Result<Device, OpenError> {
         self.inner
             .open_with(id, options)
             .map(|inner| Device { inner })
     }
-    /// Low-level control: opens the first discovered device of a backend.
+
+    /// Low-level control: opens the first discovered executor of a backend.
     /// Managed callers select by requirements and open by identity.
     pub fn open_backend(&self, backend: BackendName) -> Result<Device, OpenError> {
         self.inner
             .open_backend(backend)
             .map(|inner| Device { inner })
     }
-    pub fn host_memory_status(&self) -> Result<HostMemoryStatus, ObservationError> {
-        self.inner.host_memory_status()
+
+    /// A status sample of the current topology with what this process's
+    /// opened executors hold.
+    pub fn status(&self) -> Status {
+        self.inner.status()
     }
 }
 
-impl fmt::Debug for DeviceCatalog {
+impl fmt::Debug for Devices {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DeviceCatalog")
+        f.debug_struct("Devices")
             .field("topology", &self.topology())
             .finish()
     }
@@ -264,7 +291,7 @@ impl Device {
     pub fn same_device(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
-    pub fn info(&self) -> &DeviceInfo {
+    pub fn info(&self) -> &Executor {
         self.inner.info()
     }
     /// Complete capability summary acquired from this opened device.
@@ -272,7 +299,7 @@ impl Device {
         self.inner.capabilities()
     }
     pub fn backend(&self) -> BackendName {
-        self.inner.info().backend
+        self.inner.info().backend()
     }
     /// Stable key of this device's model and configuration for native
     /// tuning records.
@@ -287,8 +314,7 @@ impl Device {
         self.inner.staff(workers)
     }
     /// Whether this opened device forms Metal tensor operations (false on
-    /// every other backend): what `DeviceInfo::forms_tensor_operations`
-    /// answers before the device is opened.
+    /// every other backend).
     pub fn forms_tensor_operations(&self) -> bool {
         self.inner.forms_tensor_operations()
     }
@@ -329,22 +355,53 @@ impl Device {
     pub fn programs_formed(&self) -> usize {
         self.inner.programs_formed()
     }
-    /// Seismic-owned charges and limits for this device and its pool.
-    pub fn memory_usage(&self) -> MemoryUsage {
-        self.inner.memory_usage()
-    }
-    /// Enforce a requested allocation budget on this device's allocations.
-    pub fn set_memory_limit(&self, limit: Option<u64>) {
-        self.inner.set_memory_limit(limit)
-    }
-    /// Start [`MemoryUsage::high_water`] again from the current charge: the
-    /// next reading is the most charged since this call.
+    /// Start device storage's [`MemoryUsage::high_water`] again from its
+    /// current charge: the next reading is the most charged since this call.
     pub fn restart_memory_high_water(&self) {
         self.inner.restart_memory_high_water()
     }
-    /// Samples this device's backend memory observation.
-    pub fn memory_status(&self) -> Result<DeviceMemoryStatus, ObservationError> {
-        self.inner.memory_status()
+    /// The topology revision this device was opened in.
+    pub fn topology(&self) -> &Arc<DeviceTopology> {
+        self.inner.topology()
+    }
+    /// What this process has charged to each store this device reaches.
+    pub fn store_charges(&self) -> Vec<(StoreId, u64)> {
+        self.inner.store_charges()
+    }
+    /// What this device has charged along each of its access paths.
+    pub fn path_charges(&self) -> Vec<(AccessPathId, u64)> {
+        self.inner.path_charges()
+    }
+    /// Whether this device's allocations count in the process's footprint
+    /// (CPU, Metal) rather than being held by a driver beside it.
+    pub fn allocations_in_process_footprint(&self) -> bool {
+        self.inner.allocations_in_process_footprint()
+    }
+    /// Seismic-owned charges and limits of `kind` storage on this device:
+    /// its allocations' charges, what its backend holds for it beyond them,
+    /// and the charges to the stores its placement reaches.
+    pub fn storage_usage(&self, kind: StorageKind) -> MemoryUsage {
+        self.inner.storage_usage(kind)
+    }
+    /// The native memory `kind` storage can still take on this device: an
+    /// allocation needing more is refused as a capacity shortfall.
+    pub fn storage_available(&self, kind: StorageKind) -> u64 {
+        self.inner.storage_available(kind)
+    }
+    /// Bounds `kind` storage allocated through this device. Charges already
+    /// made count against the limit; they are never charged twice.
+    pub fn set_storage_limit(&self, kind: StorageKind, limit: Option<u64>) {
+        self.inner.set_storage_limit(kind, limit)
+    }
+    /// Holds the charges to `store`, from every executor of the process
+    /// that reaches it, to `limit` on top of its capacity.
+    pub fn set_store_limit(&self, store: StoreId, limit: Option<u64>) -> Result<(), LimitError> {
+        self.inner.set_store_limit(store, limit)
+    }
+    /// Holds this device's claim along its access path `path` to `limit`
+    /// on top of the path's grant.
+    pub fn set_path_limit(&self, path: AccessPathId, limit: Option<u64>) -> Result<(), LimitError> {
+        self.inner.set_path_limit(path, limit)
     }
     /// A planned workflow on this device; refused on a native-only backend.
     pub fn workflow(&self) -> Result<WorkflowDraft, WorkflowError> {
@@ -674,6 +731,10 @@ pub struct TensorStorageObserver {
 }
 
 impl TensorStorageObserver {
+    /// The observed allocation's charge to each store; `None` once released.
+    pub fn store_charges(&self) -> Option<Vec<(StoreId, u64)>> {
+        self.inner.store_charges()
+    }
     pub fn identity(&self) -> u64 {
         self.inner.identity()
     }
@@ -960,6 +1021,11 @@ impl Tensor {
     }
     pub fn storage_bytes(&self) -> u64 {
         self.inner.storage_bytes()
+    }
+    /// The bytes of this contiguous view charged to each store: the share
+    /// of its allocation's path charges its byte range covers.
+    pub fn view_store_charges(&self) -> Result<Vec<(StoreId, u64)>, TensorError> {
+        self.inner.view_store_charges()
     }
     pub fn observe_storage(&self) -> TensorStorageObserver {
         TensorStorageObserver {
@@ -1365,8 +1431,11 @@ pub trait PointSource<'a, E: Entry> {
     fn served(&self) -> Vec<std::collections::BTreeMap<String, u64>> {
         Vec::new()
     }
-    /// Build point `point`'s inputs, or say why they cannot be built.
-    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, String>;
+    /// Build point `point`'s inputs, or say why they cannot be built: an
+    /// allocation the device refused is [`BuildError::Refused`] (what a
+    /// [`TensorError`] or [`CallError`] of allocation capacity converts to),
+    /// which the tuner prices and offers again rather than failing the unit.
+    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, BuildError>;
 }
 
 impl<'a, E: Entry, S: PointSource<'a, E> + ?Sized> PointSource<'a, E> for &mut S {
@@ -1381,7 +1450,7 @@ impl<'a, E: Entry, S: PointSource<'a, E> + ?Sized> PointSource<'a, E> for &mut S
         (**self).served()
     }
 
-    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, String> {
+    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, BuildError> {
         (**self).build(point)
     }
 }
@@ -1401,7 +1470,7 @@ impl<'a, E: Entry> seismic_runtime::native::tune::PointSource<'a> for TypedPoint
         self.0.served()
     }
 
-    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, String> {
+    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, BuildError> {
         self.0.build(point)
     }
 }
@@ -1657,13 +1726,13 @@ impl<'a, E: Entry> PointSource<'a, E> for Vec<TuningPoint<'a, E>> {
             .collect()
     }
 
-    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, String> {
+    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, BuildError> {
         let point = &mut self[point];
         if point.rotation.is_empty() {
-            return Err(format!(
+            return Err(BuildError::Failed(format!(
                 "the inputs of `{}` were built up front and handed over already",
                 point.label
-            ));
+            )));
         }
         Ok(point_inputs::<E>(
             std::mem::take(&mut point.rotation),
@@ -3233,14 +3302,12 @@ impl<E: Entry> NativeKernel<E> {
         self.inner.artifact()
     }
 
-    /// Device time of calls cycling through `rotation`.
-    pub fn measure(
-        &self,
-        rotation: Vec<E::Args<'_>>,
-        options: &MeasureOptions,
-    ) -> Result<Measurement, CallError> {
+    /// Calls cycling through `rotation`, each argument set validated and
+    /// placed once with results of its own, as [`measure::measure`] times
+    /// them.
+    pub fn point(&self, rotation: Vec<E::Args<'_>>) -> Result<KernelPoint, CallError> {
         self.inner
-            .measure(rotation.into_iter().map(E::encode).collect(), options)
+            .point(rotation.into_iter().map(E::encode).collect())
     }
 
     pub fn call(&self, args: E::Args<'_>) -> Result<E::Results, CallError> {

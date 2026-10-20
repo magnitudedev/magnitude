@@ -1,5 +1,10 @@
 import { Option } from "effect"
-import { formatLocalInferenceBackend, formatMemorySize } from "@magnitudedev/client-common"
+import {
+  acceleratorBackend,
+  acceleratorMemoryDomainIds,
+  formatLocalInferenceBackend,
+  formatMemorySize,
+} from "@magnitudedev/client-common"
 import type { LocalInferenceHardware, LocalInferenceMemoryDomainId } from "@magnitudedev/sdk"
 
 export const formatContext = (tokens: number): string => tokens < 1_000
@@ -17,16 +22,16 @@ const unique = (values: readonly string[]): string[] =>
   [...new Set(values.map((value) => value.trim()).filter(Boolean))]
 
 const localHardwareTopology = (hardware: LocalInferenceHardware) => {
-  const unified = hardware.memoryDomains.filter((domain) =>
-    domain.kind === "UnifiedMemory" && domain.sharesSystemMemory)
+  const unified = hardware.memoryDomains.filter((domain) => domain.kind === "UnifiedMemory")
   const discrete = hardware.memoryDomains.filter((domain) => domain.kind === "PhysicalDevice")
-  const backendsFor = (memoryDomainId: LocalInferenceMemoryDomainId) => unique(hardware.accelerators
-    .filter((accelerator) => accelerator.memoryDomainId === memoryDomainId)
-    .map((accelerator) => formatLocalInferenceBackend(accelerator.backend)))
+  // The backend the engine runs on, when its selected executor places in the domain.
+  const backendFor = (memoryDomainId: LocalInferenceMemoryDomainId) => Option.firstSomeOf(hardware.accelerators
+    .filter(accelerator => acceleratorMemoryDomainIds(accelerator).has(memoryDomainId))
+    .map(accelerator => Option.map(acceleratorBackend(hardware, accelerator), formatLocalInferenceBackend)))
   const namesFor = (memoryDomainId: LocalInferenceMemoryDomainId) => unique(hardware.accelerators
-    .filter((accelerator) => accelerator.memoryDomainId === memoryDomainId)
+    .filter(accelerator => acceleratorMemoryDomainIds(accelerator).has(memoryDomainId))
     .map((accelerator) => accelerator.name))
-  const unifiedBackends = unique(unified.flatMap((domain) => backendsFor(domain.memoryDomainId)))
+  const unifiedBackend = Option.firstSomeOf(unified.map((domain) => backendFor(domain.memoryDomainId)))
   const unifiedAcceleratorNames = unique(unified.flatMap((domain) =>
     namesFor(domain.memoryDomainId)))
   const isAppleSilicon = hardware.platform === "MacOS" && hardware.architecture === "Arm64"
@@ -36,7 +41,7 @@ const localHardwareTopology = (hardware: LocalInferenceHardware) => {
   const systemName = isAppleSilicon
     ? processorName
     : unique([productName, unifiedAcceleratorNames.join(" + ")]).join(" · ") || processorName
-  return { unified, discrete, backendsFor, namesFor, unifiedBackends, systemName }
+  return { unified, discrete, backendFor, namesFor, unifiedBackend, systemName }
 }
 
 export const describeLocalHardware = (
@@ -45,9 +50,9 @@ export const describeLocalHardware = (
   const {
     unified,
     discrete,
-    backendsFor,
+    backendFor,
     namesFor,
-    unifiedBackends,
+    unifiedBackend,
     systemName,
   } = localHardwareTopology(hardware)
   return {
@@ -55,15 +60,15 @@ export const describeLocalHardware = (
       name: systemName,
       details: [
         `${hardware.platform === "MacOS" ? "macOS" : hardware.platform} · ${hardware.architecture === "Arm64" ? "ARM64" : "x86-64"} · ${hardware.logicalCores} logical CPU core${hardware.logicalCores === 1 ? "" : "s"}`,
-        `${formatMemorySize(hardware.totalSystemMemoryBytes)} ${unified.length > 0 ? "unified" : "system"} memory${unifiedBackends.length > 0 ? ` · ${unifiedBackends.join(" + ")} GPU acceleration` : ""}`,
+        `${formatMemorySize(hardware.totalSystemMemoryBytes)} ${unified.length > 0 ? "unified" : "system"} memory${Option.match(unifiedBackend, { onNone: () => "", onSome: backend => ` · ${backend} GPU acceleration` })}`,
       ],
     },
     accelerators: discrete.map((domain) => {
       const names = namesFor(domain.memoryDomainId)
-      const backends = backendsFor(domain.memoryDomainId)
+      const backend = backendFor(domain.memoryDomainId)
       return {
-        name: names.join(" + ") || `${backends[0] ?? "Local"} GPU`,
-        details: `${formatMemorySize(domain.totalBytes)} VRAM · ${backends.join(" + ") || "GPU"} acceleration`,
+        name: names.join(" + ") || `${Option.getOrElse(backend, () => "Local")} GPU`,
+        details: `${formatMemorySize(domain.totalBytes)} VRAM${Option.match(backend, { onNone: () => "", onSome: backend => ` · ${backend} acceleration` })}`,
       }
     }),
   }

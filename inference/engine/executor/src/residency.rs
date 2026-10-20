@@ -235,6 +235,19 @@ pub struct ResidentWeight {
 }
 
 impl ResidentWeight {
+    /// Visit every tensor the weight holds: its own, its scale and bound,
+    /// and its table's beside them.
+    pub(crate) fn visit_storage(&self, visit: &mut dyn FnMut(&Tensor)) {
+        visit(&self.tensor);
+        if let Some(tensor) = &self.scale {
+            visit(tensor);
+        }
+        if let Some(tensor) = &self.bound {
+            visit(tensor);
+        }
+        self.table.visit_extra_storage(visit);
+    }
+
     /// The weight as its row-gathering readers find it.
     pub fn table(&self) -> &ResidentTable {
         &self.table
@@ -438,7 +451,7 @@ impl ResidencyStore {
     ) -> Result<Self, WeightImportError> {
         if !programs.belongs_to(&device)
             || execution.device().backend() != device.backend()
-            || execution.device().name() != device.info().name
+            || execution.device().name() != device.info().name()
         {
             return Err(invalid(
                 "attested programs, selected plan, and residency device differ",
@@ -482,7 +495,7 @@ impl ResidencyStore {
         &self.device
     }
     pub fn belongs_to(&self, device: &Device) -> bool {
-        self.device.info().id == device.info().id
+        self.device.info().id() == device.info().id()
     }
     pub fn len(&self) -> usize {
         self.resident.len()
@@ -500,6 +513,13 @@ impl ResidencyStore {
                 .checked_add(weight.storage_bytes())
                 .ok_or("resident cache charge overflows")
         })
+    }
+
+    /// Visit every tensor of the completed resident imports.
+    pub(crate) fn visit_storage(&self, visit: &mut dyn FnMut(&Tensor)) {
+        for weight in self.resident.values() {
+            weight.visit_storage(visit);
+        }
     }
 
     pub fn mapped_import_report(&self) -> MappedImportReport {
@@ -1302,6 +1322,11 @@ pub struct ComponentLoader<T: Clone> {
 }
 
 impl<T: Clone> ComponentLoader<T> {
+    /// Visit every tensor the component's resident imports hold.
+    pub(crate) fn visit_storage(&self, visit: &mut dyn FnMut(&Tensor)) {
+        self.store.borrow().visit_storage(visit);
+    }
+
     pub fn resident_bytes(&self) -> Result<u64, &'static str> {
         self.store.borrow().resident_bytes()
     }

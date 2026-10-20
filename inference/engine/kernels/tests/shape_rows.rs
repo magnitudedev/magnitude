@@ -206,7 +206,7 @@ const CPU_PARTITIONS: [u64; 4] = [32, 8, 64, 1];
 
 /// Every accelerator this host opens, then the CPU.
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     [
         seismic::BackendName::Metal,
         seismic::BackendName::Cuda,

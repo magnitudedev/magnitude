@@ -1,29 +1,34 @@
 //! `GET /api/v1/hardware` (integration spec §5.4, §9.4; memory-reserves spec §5.5): the service
-//! process's own Seismic topology and host memory status under the service's reserve policy,
-//! merged with the resident worker's observations. The service opens no device, so only a loaded
-//! worker observes a dedicated device's live free bytes.
+//! process's own Seismic topology (its physical devices with their executors and the one the
+//! engine's selection takes, the stores, and the access and transfer paths with their grants)
+//! and its status under the service's reserve
+//! policy, as the engine's fit reads them, merged with the resident worker's readings. The
+//! service opens no executor, so only a loaded worker reads a device store's live free bytes.
+//! No capacity, placement or backend rule is recreated here.
 
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use futures_util::future::BoxFuture;
-use magnitude_engine::census::MemoryDomain;
 use magnitude_engine::worker::protocol::MemoryObservation;
-use magnitude_executor::platform::{MemoryReserves, unusable_reason};
+use magnitude_executor::ExecutionPath;
+use magnitude_executor::platform::{Fit, MemoryReserves, select};
 use magnitude_service_contracts::{
-    ExecutionBackend, HardwareBackendDiagnostic, HardwareDevice, HardwareDeviceId, HardwareDeviceKind,
-    HardwareDeviceMemoryLimit, HardwareDeviceMemoryLimitKind, HardwareMemoryDomain,
-    HardwareMemoryDomainKind, HardwareProvider, HardwareSnapshot, HardwareSystemMemory,
-    InventoryError,
+    ExecutionBackend, HardwareAccessPath, HardwareBackendDiagnostic, HardwareDeviceId,
+    HardwareDeviceKind, HardwareDeviceMemory, HardwareDiagnosticSource, HardwareExecutor,
+    HardwareExecutorAvailability, HardwareGrant, HardwareHostRam, HardwareObservedStore,
+    HardwarePhysicalDevice, HardwarePhysicalDeviceId, HardwareProvider, HardwareReportedBy,
+    HardwareSnapshot, HardwareStore, HardwareTransferPath, InventoryError,
 };
 use seismic::{
-    BackendName, DeviceCatalog, DeviceInfo, DeviceKind, DeviceMemory, DeviceTopology,
-    HostMemoryStatus, MemoryPoolKind,
+    Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, Inventory,
+    PhysicalIdentity, ReportedBy, RuntimeStatus, Status, StorageKind, StoreKind,
 };
 use sha2::{Digest, Sha256};
 
+use crate::assessment::environment::SERVING_DEVICE;
 use crate::build_identity;
-use crate::memory_domains::{census_domain_id, pool_domain_id};
+use crate::memory_domains::{store_domain_id, store_identity_id};
 use crate::residency::controller::ModelInstances;
 
 /// The engine backend a Seismic backend names.
@@ -75,272 +80,321 @@ impl ResidentMemory for ModelInstances {
 
 /// The hardware endpoint's provider.
 pub struct HardwareInventory {
-    catalog: Arc<DeviceCatalog>,
+    inventory: Arc<Inventory>,
     reserves: MemoryReserves,
     machine: Arc<MachineDescription>,
     resident: Arc<dyn ResidentMemory>,
 }
 
 impl HardwareInventory {
-    /// Describe the machine once; every snapshot then reads the catalog's topology, a fresh host
-    /// memory status and the resident worker's fresh observations.
+    /// Describe the machine once; every snapshot then reads `inventory`'s current topology, a
+    /// fresh status sample and the resident worker's fresh observations.
     pub fn new(
-        catalog: Arc<DeviceCatalog>,
+        inventory: Arc<Inventory>,
         reserves: MemoryReserves,
         resident: Arc<dyn ResidentMemory>,
     ) -> Self {
         Self {
-            catalog,
+            inventory,
             reserves,
             machine: Arc::new(MachineDescription::discover()),
             resident,
         }
     }
 
+    /// The snapshot of `inventory`'s current topology from one sample, which
+    /// needs no opened executor, with a resident worker's device memory
+    /// readings.
     fn snapshot_with(
-        catalog: &DeviceCatalog,
+        inventory: &Inventory,
         reserves: &MemoryReserves,
         machine: &MachineDescription,
         resident: Option<&MemoryObservation>,
     ) -> Result<HardwareSnapshot, InventoryError> {
-        let host = catalog.host_memory_status().map_err(|error| {
-            InventoryError::ModelOperation {
-                code: "memory_observation_unavailable".to_owned(),
-                message: format!("system memory observation failed: {error}"),
-                retryable: true,
-            }
-        })?;
-        let topology = catalog.topology();
-        let mut snapshot = snapshot(&topology, &host, reserves, machine);
+        let topology = inventory.topology();
+        let status = Status {
+            sample: inventory.sample(&topology),
+            runtime: RuntimeStatus::default(),
+        };
+        let mut snapshot = snapshot(&topology, &status, reserves, machine)?;
         if let Some(resident) = resident {
-            merge_resident(&mut snapshot, &topology, resident);
+            merge_resident(&mut snapshot.device_memory, resident);
         }
         Ok(snapshot)
     }
 }
 
+/// A resident worker's readings of device memory, which only an opened
+/// executor knows; the OS reports host RAM and volumes to the sample.
+fn merge_resident(device_memory: &mut [HardwareDeviceMemory], resident: &MemoryObservation) {
+    for reading in &resident.stores {
+        let id = store_identity_id(&reading.store);
+        if let Some(memory) = device_memory
+            .iter_mut()
+            .find(|memory| memory.store.id == id)
+        {
+            memory.current_free_bytes = Some(reading.headroom_bytes);
+        }
+    }
+}
+
+/// The wire name of the interface a value was reported by.
+pub fn reported_by(by: ReportedBy) -> HardwareReportedBy {
+    match by {
+        ReportedBy::LinuxMemTotal => HardwareReportedBy::LinuxMemTotal,
+        ReportedBy::MacOsMemsize => HardwareReportedBy::MacOsMemsize,
+        ReportedBy::WindowsTotalPhys => HardwareReportedBy::WindowsTotalPhys,
+        ReportedBy::LinuxMemAvailable => HardwareReportedBy::LinuxMemAvailable,
+        ReportedBy::MachMovablePages => HardwareReportedBy::MachMovablePages,
+        ReportedBy::WindowsPhysicalAndCommit => HardwareReportedBy::WindowsPhysicalAndCommit,
+        ReportedBy::CpuAddressSpace => HardwareReportedBy::CpuAddressSpace,
+        ReportedBy::MetalMaxBufferLength => HardwareReportedBy::MetalMaxBufferLength,
+        ReportedBy::MetalRecommendedWorkingSet => HardwareReportedBy::MetalRecommendedWorkingSet,
+        ReportedBy::MetalWorkingSetUnallocated => HardwareReportedBy::MetalWorkingSetUnallocated,
+        ReportedBy::CudaTotalMemory => HardwareReportedBy::CudaTotalMemory,
+        ReportedBy::CudaUsableMemory => HardwareReportedBy::CudaUsableMemory,
+        ReportedBy::CudaFree => HardwareReportedBy::CudaFree,
+        ReportedBy::VulkanHeap => HardwareReportedBy::VulkanHeap,
+        ReportedBy::VulkanHeapBudget => HardwareReportedBy::VulkanHeapBudget,
+        ReportedBy::VulkanHeaps => HardwareReportedBy::VulkanHeaps,
+        ReportedBy::VulkanHeapsBeyondDedicated => HardwareReportedBy::VulkanHeapsBeyondDedicated,
+        ReportedBy::VulkanMaxAllocation => HardwareReportedBy::VulkanMaxAllocation,
+        ReportedBy::CudaTotalBeyondDedicated => HardwareReportedBy::CudaTotalBeyondDedicated,
+        ReportedBy::MetalWorkingSetBeyondDedicated => {
+            HardwareReportedBy::MetalWorkingSetBeyondDedicated
+        }
+        ReportedBy::DxgiDedicatedMemory => HardwareReportedBy::DxgiDedicatedMemory,
+        ReportedBy::CudaMemoryClockBusWidth => HardwareReportedBy::CudaMemoryClockBusWidth,
+        ReportedBy::FilesystemSize => HardwareReportedBy::FilesystemSize,
+        ReportedBy::FilesystemAvailable => HardwareReportedBy::FilesystemAvailable,
+    }
+}
+
 impl HardwareProvider for HardwareInventory {
     fn snapshot(&self) -> BoxFuture<'_, Result<HardwareSnapshot, InventoryError>> {
-        let catalog = Arc::clone(&self.catalog);
+        let inventory = Arc::clone(&self.inventory);
         let reserves = self.reserves;
         let machine = Arc::clone(&self.machine);
         Box::pin(async move {
             let resident = self.resident.observe().await;
             crate::spawn_blocking_traced(move || {
-                Self::snapshot_with(&catalog, &reserves, &machine, resident.as_ref())
+                Self::snapshot_with(&inventory, &reserves, &machine, resident.as_ref())
             })
             .await
-            .map_err(|error| InventoryError::Internal(format!("hardware snapshot task failed: {error}")))?
+            .map_err(|error| {
+                InventoryError::Internal(format!("hardware snapshot task failed: {error}"))
+            })?
         })
     }
 }
 
-/// Merge the resident worker's readings: a dedicated domain's live free bytes are observable
-/// only by the process that has the device open. Host RAM keeps the service's own sample, taken
-/// from the same Seismic source.
-fn merge_resident(
-    snapshot: &mut HardwareSnapshot,
-    topology: &DeviceTopology,
-    resident: &MemoryObservation,
-) {
-    for reading in &resident.domains {
-        let MemoryDomain::DeviceLocal { .. } = reading.domain else {
-            continue;
-        };
-        let id = census_domain_id(topology, &reading.domain);
-        let domain = snapshot
-            .memory_domains
-            .iter_mut()
-            .find(|domain| domain.id == id)
-            .expect("the snapshot lists every dedicated pool of its topology");
-        domain.current_free_bytes = Some(reading.headroom_bytes);
+fn observation_error(error: impl std::fmt::Display) -> InventoryError {
+    InventoryError::ModelOperation {
+        code: "memory_observation_unavailable".to_owned(),
+        message: error.to_string(),
+        retryable: true,
     }
 }
 
 fn snapshot(
     topology: &DeviceTopology,
-    host: &HostMemoryStatus,
+    status: &Status,
     reserves: &MemoryReserves,
     machine: &MachineDescription,
-) -> HardwareSnapshot {
-    let host_pool = topology.host_pool();
-    let host_thresholds = reserves.for_domain(MemoryPoolKind::HostRam, host_pool.capacity_bytes);
-    let allocation_capacity_bytes = host
-        .limits
-        .iter()
-        .map(|limit| limit.limit_bytes)
-        .fold(host_pool.capacity_bytes, u64::min);
-    let allocation_headroom_bytes = host
-        .limits
-        .iter()
-        .map(|limit| limit.remaining_bytes())
-        .fold(host.headroom.bytes, u64::min);
-    let host_backed = |device: &DeviceInfo| match &device.memory {
-        DeviceMemory::Established(memory) => memory.allocates_host_memory(),
-        DeviceMemory::Unsupported { .. } => device.kind == DeviceKind::Cpu,
+) -> Result<HardwareSnapshot, InventoryError> {
+    let fit = Fit::new(topology, status, reserves);
+    let path_index = |id| {
+        let index = topology
+            .access_paths()
+            .iter()
+            .position(|path| path.id() == id)
+            .expect("placement names a topology path");
+        u32::try_from(index).expect("topology path index fits u32")
     };
-    let working_set = topology
-        .devices()
-        .iter()
-        .filter_map(DeviceInfo::recommended_working_set_bytes)
-        .min();
-    let system_stable_capacity = working_set
-        .map_or(allocation_capacity_bytes, |working_set| {
-            allocation_capacity_bytes.min(working_set)
-        })
-        .saturating_sub(host_thresholds.planning_bytes);
-    let system_devices = topology
-        .devices()
-        .iter()
-        .filter(|device| host_backed(device))
-        .map(|device| {
-            public_device(
-                device,
-                device
-                    .recommended_working_set_bytes()
-                    .map(|total| HardwareDeviceMemoryLimit {
-                        kind: HardwareDeviceMemoryLimitKind::RecommendedWorkingSet,
-                        total_bytes: total,
-                        stable_bytes: total
-                            .min(allocation_capacity_bytes)
-                            .saturating_sub(host_thresholds.planning_bytes),
-                        current_free_bytes: None,
-                    }),
-            )
-        })
-        .collect::<Vec<_>>();
-    // Host RAM is unified memory only when a usable GPU allocates from it: an integrated GPU below
-    // its backend's floor never runs a model, so the machine is CPU-only.
-    let unified = topology.devices().iter().any(|device| {
-        device.kind == DeviceKind::Gpu && host_backed(device) && unusable_reason(device).is_none()
-    });
-    let mut memory_domains = vec![HardwareMemoryDomain {
-        id: pool_domain_id(topology, host_pool.id),
-        kind: if unified {
-            HardwareMemoryDomainKind::UnifiedMemory
-        } else {
-            HardwareMemoryDomainKind::System
-        },
-        total_capacity_bytes: host_pool.capacity_bytes,
-        stable_capacity_bytes: system_stable_capacity,
-        current_free_bytes: Some(allocation_headroom_bytes),
-        shares_system_memory: true,
-        devices: system_devices,
-    }];
-    for device in topology.devices().iter().filter(|device| !host_backed(device)) {
-        // The domain's total is the memory the device has; its stable capacity is what the
-        // driver grants this process, less the device's planning reserve.
-        let (id, total_capacity_bytes, stable_capacity_bytes) = match &device.memory {
-            DeviceMemory::Established(memory) => {
-                let pool = topology
-                    .pool(memory.allocation_pool)
-                    .expect("a device's pools belong to its topology");
-                (
-                    pool_domain_id(topology, pool.id),
-                    pool.total_bytes,
-                    pool.capacity_bytes.saturating_sub(
-                        reserves
-                            .for_domain(pool.kind, pool.capacity_bytes)
-                            .planning_bytes,
-                    ),
-                )
-            }
-            // A device whose memory Seismic cannot normalize has no assessable capacity; its
-            // unavailable reason says why.
-            DeviceMemory::Unsupported { .. } => (
-                magnitude_service_contracts::MemoryDomainId::new(device.selector.to_string()),
-                0,
-                0,
-            ),
+    let executor_id = |id| {
+        let executor = topology
+            .executor(id)
+            .expect("path names a topology executor");
+        HardwareDeviceId::new(executor.selector().to_string())
+    };
+    let placement = |executor: &seismic::Executor, kind| -> Vec<u32> {
+        executor
+            .placement(kind)
+            .iter()
+            .copied()
+            .map(path_index)
+            .collect()
+    };
+    let hardware_executor = |executor: &seismic::Executor| -> Result<_, InventoryError> {
+        let availability = match executor.availability() {
+            Availability::Available => HardwareExecutorAvailability::Available {
+                stable_capacity_bytes: fit
+                    .placement(executor, StorageKind::Device)
+                    .map_err(observation_error)?
+                    .stable_bytes,
+            },
+            Availability::Unavailable { reason } => HardwareExecutorAvailability::Unavailable {
+                reason: reason.clone(),
+            },
         };
-        if let Some(domain) = memory_domains.iter_mut().find(|domain| domain.id == id) {
-            domain.devices.push(public_device(device, None));
-            continue;
+        Ok(HardwareExecutor {
+            id: executor_id(executor.id()),
+            backend: execution_backend(executor.backend()),
+            name: executor.name().to_owned(),
+            description: format!("{} ({})", executor.name(), executor.backend().as_str()),
+            device_placement: placement(executor, StorageKind::Device),
+            upload_placement: placement(executor, StorageKind::Upload),
+            availability,
+        })
+    };
+    let physical_devices = topology
+        .physical_devices()
+        .iter()
+        .map(|physical| {
+            let executors = topology
+                .executors()
+                .iter()
+                .filter(|executor| executor.physical() == physical.id())
+                .collect::<Vec<_>>();
+            // The device's kind is what discovery decided of it once, from all its backends'
+            // reports: the host is the CPU, and a GPU is integrated when its memory is the
+            // host's.
+            let kind = match (physical.identity(), physical.memory()) {
+                (PhysicalIdentity::Host { .. }, _) => HardwareDeviceKind::Cpu,
+                (_, DeviceMemory::Host) => HardwareDeviceKind::IntegratedGpu,
+                (_, DeviceMemory::Own) => HardwareDeviceKind::Gpu,
+                (_, DeviceMemory::Undecided) => HardwareDeviceKind::Unknown,
+            };
+            Ok(HardwarePhysicalDevice {
+                id: HardwarePhysicalDeviceId::new(physical.identity().to_string()),
+                kind,
+                executors: executors
+                    .into_iter()
+                    .map(&hardware_executor)
+                    .collect::<Result<Vec<_>, InventoryError>>()?,
+            })
+        })
+        .collect::<Result<Vec<_>, InventoryError>>()?;
+    let store = |store: &seismic::Store| -> Result<(HardwareStore, u64), InventoryError> {
+        let reading = fit.store(store.id()).map_err(observation_error)?;
+        let hardware = HardwareStore {
+            id: store_domain_id(topology, store.id()),
+            total_capacity_bytes: store.capacity().value,
+            capacity_basis: reported_by(store.capacity().by),
+            stable_capacity_bytes: reading.stable_bytes,
+            allocation_capacity_bytes: reading.capacity_bytes,
+            planning_reserve_bytes: reading.thresholds.planning_bytes,
+            emergency_reserve_bytes: reading.thresholds.emergency_bytes,
+        };
+        Ok((hardware, reading.headroom_bytes))
+    };
+    let host_ram = {
+        let (store, current_free_bytes) = store(topology.host_ram())?;
+        let host = status.sample.host_ram.as_ref().map_err(observation_error)?;
+        HardwareHostRam {
+            store,
+            available_bytes: host.headroom.value,
+            current_free_bytes,
         }
-        memory_domains.push(HardwareMemoryDomain {
-            id,
-            kind: HardwareMemoryDomainKind::PhysicalDevice,
-            total_capacity_bytes,
-            stable_capacity_bytes,
-            current_free_bytes: None,
-            shares_system_memory: false,
-            devices: vec![public_device(device, None)],
-        });
+    };
+    let mut device_memory = Vec::new();
+    let mut volumes = Vec::new();
+    for each in topology.stores() {
+        match each.kind() {
+            StoreKind::HostRam => {}
+            // Its headroom is what opened executors leave, which only a
+            // resident worker reads (`merge_resident`).
+            StoreKind::DeviceMemory(device) => device_memory.push(HardwareDeviceMemory {
+                physical_device_id: HardwarePhysicalDeviceId::new(
+                    topology
+                        .physical_device(*device)
+                        .expect("a device memory store's owner belongs to its topology")
+                        .identity()
+                        .to_string(),
+                ),
+                store: store(each)?.0,
+                current_free_bytes: None,
+            }),
+            StoreKind::Volume(_) => {
+                let (store, current_free_bytes) = store(each)?;
+                volumes.push(HardwareObservedStore {
+                    store,
+                    current_free_bytes,
+                });
+            }
+        }
     }
-    HardwareSnapshot {
-        captured_at: host
-            .sampled_at
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
+    let access_paths = topology
+        .access_paths()
+        .iter()
+        .map(|path| {
+            let remaining = status
+                .grant_left(path.id())
+                .transpose()
+                .map_err(observation_error)?;
+            Ok(HardwareAccessPath {
+                id: path_index(path.id()),
+                executor: executor_id(path.executor()),
+                store: store_domain_id(topology, path.store()),
+                grant: path.grant().map(|grant| HardwareGrant {
+                    bytes: grant.value,
+                    basis: reported_by(grant.by),
+                    remaining_bytes: remaining.map(|left| left.value),
+                }),
+            })
+        })
+        .collect::<Result<Vec<_>, InventoryError>>()?;
+    let transfer_paths = topology
+        .transfer_paths()
+        .iter()
+        .map(|path| HardwareTransferPath {
+            from: store_domain_id(topology, path.from()),
+            to: store_domain_id(topology, path.to()),
+            executor: executor_id(path.by()),
+        })
+        .collect();
+    let backend_diagnostics = topology
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| HardwareBackendDiagnostic {
+            source: match diagnostic.source {
+                DiagnosticSource::Backend(backend) => HardwareDiagnosticSource::Backend {
+                    backend: execution_backend(backend),
+                },
+                DiagnosticSource::Adapters => HardwareDiagnosticSource::Adapters,
+            },
+            message: diagnostic.message.clone(),
+        })
+        .collect();
+    let internal = |error: &dyn std::fmt::Display| InventoryError::Internal(error.to_string());
+    // Selection's only failure is that no executor can run the request.
+    let selected_executor = select(topology, ExecutionPath::Native, SERVING_DEVICE).ok();
+    let captured_at = status
+        .sample
+        .taken
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| internal(&error))?
+        .as_millis();
+    Ok(HardwareSnapshot {
+        captured_at: u64::try_from(captured_at).map_err(|error| internal(&error))?,
         platform: std::env::consts::OS.to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
         system_product_name: machine.system_product_name.clone(),
         cpu_model: machine.cpu_model.clone(),
         physical_cores: machine.physical_cores,
         logical_cores: machine.logical_cores,
-        system_memory: HardwareSystemMemory {
-            physical_capacity_bytes: host_pool.capacity_bytes,
-            physical_available_bytes: host.headroom.bytes,
-            allocation_capacity_bytes,
-            allocation_headroom_bytes,
-            assess_reserve_bytes: host_thresholds.planning_bytes,
-            abort_reserve_bytes: host_thresholds.emergency_bytes,
-        },
         native_build: build_identity::native_build(),
         enabled_backends: build_identity::compiled_backends(),
-        backend_diagnostics: topology
-            .diagnostics()
-            .iter()
-            .map(|diagnostic| HardwareBackendDiagnostic {
-                backend: execution_backend(diagnostic.backend),
-                message: diagnostic.message.clone(),
-            })
-            .collect(),
-        topology_fingerprint: topology_fingerprint(&memory_domains),
-        memory_domains,
-    }
-}
-
-fn public_device(device: &DeviceInfo, memory_limit: Option<HardwareDeviceMemoryLimit>) -> HardwareDevice {
-    let backend = execution_backend(device.backend);
-    HardwareDevice {
-        id: HardwareDeviceId::new(device.selector.to_string()),
-        backend,
-        name: device.name.clone(),
-        description: format!("{} ({})", device.name, device.backend.as_str()),
-        kind: match (&device.kind, &device.memory) {
-            (DeviceKind::Cpu, _) => HardwareDeviceKind::Cpu,
-            (DeviceKind::Gpu, DeviceMemory::Established(memory))
-                if memory.allocates_host_memory() =>
-            {
-                HardwareDeviceKind::IntegratedGpu
-            }
-            (DeviceKind::Gpu, _) => HardwareDeviceKind::Gpu,
-        },
-        memory_limit,
-        unavailable_reason: unusable_reason(device).map(str::to_owned),
-    }
-}
-
-/// The identity of the stable topology: domains, capacities and devices, without live values.
-fn topology_fingerprint(domains: &[HardwareMemoryDomain]) -> String {
-    let mut digest = Sha256::new();
-    for domain in domains {
-        digest.update(domain.id.as_str().as_bytes());
-        digest.update(format!("{:?}", domain.kind).as_bytes());
-        digest.update(domain.total_capacity_bytes.to_le_bytes());
-        digest.update(domain.stable_capacity_bytes.to_le_bytes());
-        for device in &domain.devices {
-            digest.update(device.id.as_str().as_bytes());
-            digest.update(format!("{:?}{:?}", device.backend, device.kind).as_bytes());
-            if let Some(limit) = &device.memory_limit {
-                digest.update(limit.total_bytes.to_le_bytes());
-                digest.update(limit.stable_bytes.to_le_bytes());
-            }
-            digest.update(device.unavailable_reason.as_deref().unwrap_or("").as_bytes());
-        }
-    }
-    format!("{:x}", digest.finalize())
+        backend_diagnostics,
+        topology_fingerprint: format!("{:x}", Sha256::digest(topology.normalized().as_bytes())),
+        physical_devices,
+        selected_executor: selected_executor.map(|executor| executor_id(executor.id())),
+        host_ram,
+        device_memory,
+        volumes,
+        access_paths,
+        transfer_paths,
+    })
 }
 
 fn system_product_name() -> Option<String> {
@@ -466,96 +520,90 @@ mod tests {
         );
     }
 
-    /// The live snapshot on this machine: one `system` domain, every device named by its
-    /// selector, reserves from the standard policy.
     #[test]
-    fn live_snapshot_names_domains_and_devices_by_selector() {
-        let catalog = DeviceCatalog::discover().expect("device discovery");
-        let snapshot = HardwareInventory::snapshot_with(
-            &catalog,
-            &MemoryReserves::standard(),
-            &MachineDescription::discover(),
-            None,
-        )
-        .expect("hardware snapshot");
-        let system = &snapshot.memory_domains[0];
-        assert!(system.id.is_system());
-        let thresholds =
-            MemoryReserves::standard().for_domain(MemoryPoolKind::HostRam, system.total_capacity_bytes);
-        assert_eq!(snapshot.system_memory.assess_reserve_bytes, thresholds.planning_bytes);
-        assert_eq!(snapshot.system_memory.abort_reserve_bytes, thresholds.emergency_bytes);
-        assert!(system.stable_capacity_bytes <= system.total_capacity_bytes - thresholds.planning_bytes);
-        let topology = catalog.topology();
-        let listed = snapshot
-            .memory_domains
-            .iter()
-            .flat_map(|domain| &domain.devices)
-            .count();
-        assert_eq!(listed, topology.devices().len());
-        // Host RAM is unified memory only beside a usable integrated GPU.
-        let usable_integrated = topology.devices().iter().any(|device| {
-            device.kind == DeviceKind::Gpu
-                && unusable_reason(device).is_none()
-                && matches!(&device.memory, DeviceMemory::Established(memory) if memory.allocates_host_memory())
-        });
-        assert_eq!(system.kind == HardwareMemoryDomainKind::UnifiedMemory, usable_integrated);
-        for device in topology.devices() {
-            assert!(snapshot.memory_domains.iter().flat_map(|domain| &domain.devices).any(
-                |public| public.id.as_str() == device.selector.to_string()
-                    && public.unavailable_reason.as_deref() == unusable_reason(device)
-            ));
-        }
-        assert!(serde_json::to_string(&snapshot).is_ok());
+    fn resident_readings_update_only_their_physical_store() {
+        use magnitude_engine::census::AllocationCensus;
+        use magnitude_engine::worker::protocol::StoreHeadroom;
+        use seismic::StoreIdentity;
+        let gpu = StoreIdentity::DeviceMemory(PhysicalIdentity::Uuid([1; 16]));
+        let other = StoreIdentity::DeviceMemory(PhysicalIdentity::Uuid([2; 16]));
+        let memory = |identity: &StoreIdentity| HardwareDeviceMemory {
+            physical_device_id: HardwarePhysicalDeviceId::new(identity.to_string()),
+            store: HardwareStore {
+                id: store_identity_id(identity),
+                total_capacity_bytes: 1024,
+                capacity_basis: HardwareReportedBy::CudaTotalMemory,
+                stable_capacity_bytes: 768,
+                allocation_capacity_bytes: 1024,
+                planning_reserve_bytes: 256,
+                emergency_reserve_bytes: 64,
+            },
+            current_free_bytes: None,
+        };
+        let mut device_memory = vec![memory(&gpu), memory(&other)];
+        let observation = MemoryObservation {
+            census: AllocationCensus { stores: Vec::new() },
+            stores: vec![
+                StoreHeadroom {
+                    store: StoreIdentity::HostRam,
+                    headroom_bytes: 3,
+                },
+                StoreHeadroom {
+                    store: gpu,
+                    headroom_bytes: 7,
+                },
+            ],
+        };
+        merge_resident(&mut device_memory, &observation);
+        assert_eq!(device_memory[0].current_free_bytes, Some(7));
+        assert_eq!(device_memory[1].current_free_bytes, None);
     }
 
-    /// A resident worker's readings give every dedicated domain it observes live free bytes;
-    /// the system domain keeps the service's own sample.
     #[test]
-    fn resident_readings_merge_into_dedicated_domains() {
-        use magnitude_engine::census::AllocationCensus;
-        use magnitude_engine::worker::protocol::DomainHeadroom;
-        let catalog = DeviceCatalog::discover().expect("device discovery");
-        let topology = catalog.topology();
-        let mut snapshot = HardwareInventory::snapshot_with(
-            &catalog,
+    fn snapshot_keeps_physical_identity_and_all_placement_references() {
+        let inventory = Inventory::discover(&[]).unwrap();
+        let topology = inventory.topology();
+        let observed = HardwareInventory::snapshot_with(
+            &inventory,
             &MemoryReserves::standard(),
             &MachineDescription::discover(),
             None,
         )
-        .expect("hardware snapshot");
-        let system_free = snapshot.memory_domains[0].current_free_bytes;
-        let dedicated = topology
-            .devices()
-            .iter()
-            .filter(|device| {
-                matches!(&device.memory, DeviceMemory::Established(memory) if !memory.allocates_host_memory())
-            })
-            .map(|device| MemoryDomain::DeviceLocal {
-                device: device.selector,
-            })
+        .unwrap();
+        assert_eq!(
+            observed.physical_devices.len(),
+            topology.physical_devices().len()
+        );
+        assert_eq!(
+            observed.device_memory.len() + observed.volumes.len() + 1,
+            topology.stores().len()
+        );
+        assert!(observed.host_ram.current_free_bytes <= observed.host_ram.available_bytes);
+        let stores = std::iter::once(&observed.host_ram.store)
+            .chain(observed.device_memory.iter().map(|memory| &memory.store))
+            .chain(observed.volumes.iter().map(|volume| &volume.store))
             .collect::<Vec<_>>();
-        let resident = MemoryObservation {
-            census: AllocationCensus { domains: Vec::new() },
-            domains: dedicated
-                .iter()
-                .copied()
-                .chain([MemoryDomain::HostRam])
-                .map(|domain| DomainHeadroom {
-                    domain,
-                    headroom_bytes: 7,
-                })
-                .collect(),
-        };
-        merge_resident(&mut snapshot, &topology, &resident);
-        assert_eq!(snapshot.memory_domains[0].current_free_bytes, system_free);
-        for domain in &dedicated {
-            let id = census_domain_id(&topology, domain);
-            let public = snapshot
-                .memory_domains
-                .iter()
-                .find(|public| public.id == id)
-                .expect("dedicated domain");
-            assert_eq!(public.current_free_bytes, Some(7));
+        for physical in &observed.physical_devices {
+            for executor in &physical.executors {
+                for path in executor
+                    .device_placement
+                    .iter()
+                    .chain(&executor.upload_placement)
+                {
+                    let path = &observed.access_paths[*path as usize];
+                    assert_eq!(path.executor, executor.id);
+                    assert!(stores.iter().any(|s| s.id == path.store));
+                }
+            }
+        }
+        if let Some(selected) = &observed.selected_executor {
+            assert!(
+                observed
+                    .physical_devices
+                    .iter()
+                    .flat_map(|physical| &physical.executors)
+                    .any(|executor| &executor.id == selected)
+            );
         }
     }
 }

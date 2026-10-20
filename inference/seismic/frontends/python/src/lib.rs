@@ -13,15 +13,24 @@ fn element(name: &str) -> PyResult<seismic::Element> {
     seismic::Element::named(name)
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("unknown element {name}")))
 }
-fn catalog() -> PyResult<&'static Mutex<seismic::DeviceCatalog>> {
-    static CATALOG: OnceLock<Mutex<seismic::DeviceCatalog>> = OnceLock::new();
-    if let Some(c) = CATALOG.get() {
+fn storage_kind(name: &str) -> PyResult<seismic::StorageKind> {
+    match name {
+        "device" => Ok(seismic::StorageKind::Device),
+        "upload" => Ok(seismic::StorageKind::Upload),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown storage kind {name}"
+        ))),
+    }
+}
+/// The process's devices, over the inventory discovered on first use.
+fn discovered() -> PyResult<&'static Mutex<seismic::Devices>> {
+    static DISCOVERED: OnceLock<Mutex<seismic::Devices>> = OnceLock::new();
+    if let Some(c) = DISCOVERED.get() {
         return Ok(c);
     }
-    let c =
-        seismic::DeviceCatalog::discover().map_err(|e| error(d::Error::new("TargetError", e)))?;
-    let _ = CATALOG.set(Mutex::new(c));
-    Ok(CATALOG.get().expect("catalog initialized"))
+    let c = seismic::Devices::discover(&[]).map_err(|e| error(d::Error::new("TargetError", e)))?;
+    let _ = DISCOVERED.set(Mutex::new(c));
+    Ok(DISCOVERED.get().expect("devices discovered"))
 }
 
 #[pyclass(name = "Device", frozen)]
@@ -33,7 +42,7 @@ struct Device {
 impl Device {
     #[getter]
     fn name(&self) -> String {
-        self.inner.info().name.clone()
+        self.inner.info().name().to_owned()
     }
     #[getter]
     fn backend(&self) -> String {
@@ -43,12 +52,12 @@ impl Device {
     fn capabilities(&self) -> Vec<String> {
         self.inner.capabilities().to_vec()
     }
-    fn memory_usage(&self) -> (u64, Option<u64>, u64) {
-        let m = self.inner.memory_usage();
-        (m.charged, m.limit, m.pool_charged)
+    fn storage_usage(&self, kind: &str) -> PyResult<(u64, Option<u64>, u64)> {
+        let m = self.inner.storage_usage(storage_kind(kind)?);
+        Ok((m.charged, m.limit, m.store_charged))
     }
-    fn set_memory_limit(&self, bytes: Option<u64>) -> PyResult<()> {
-        self.inner.set_memory_limit(bytes);
+    fn set_storage_limit(&self, kind: &str, bytes: Option<u64>) -> PyResult<()> {
+        self.inner.set_storage_limit(storage_kind(kind)?, bytes);
         Ok(())
     }
     fn __repr__(&self) -> String {
@@ -57,15 +66,15 @@ impl Device {
 }
 #[pyfunction]
 fn devices() -> PyResult<Vec<(String, String, String)>> {
-    let c = catalog()?.lock().unwrap();
+    let c = discovered()?.lock().unwrap();
     Ok(c.topology()
-        .devices()
+        .executors()
         .iter()
         .map(|i| {
             (
-                i.selector.to_string(),
-                i.name.clone(),
-                i.backend.as_str().to_owned(),
+                i.selector().to_string(),
+                i.name().to_owned(),
+                i.backend().as_str().to_owned(),
             )
         })
         .collect())
@@ -76,17 +85,17 @@ fn devices() -> PyResult<Vec<(String, String, String)>> {
 fn device(py: Python<'_>, selector: &str) -> PyResult<Device> {
     let selector = selector.to_owned();
     py.detach(move || {
-        let c = catalog()?.lock().unwrap();
-        let id = match selector.parse::<seismic::DeviceSelector>() {
+        let c = discovered()?.lock().unwrap();
+        let id = match selector.parse::<seismic::ExecutorSelector>() {
             Ok(exact) => c
                 .resolve(exact)
                 .map_err(|e| error(d::Error::new("TargetError", e)))?,
             Err(_) => c
                 .topology()
-                .devices()
+                .executors()
                 .iter()
-                .find(|i| i.backend.as_str() == selector)
-                .map(|i| i.id)
+                .find(|i| i.backend().as_str() == selector)
+                .map(|i| i.id())
                 .ok_or_else(|| {
                     error(d::Error::new(
                         "TargetError",

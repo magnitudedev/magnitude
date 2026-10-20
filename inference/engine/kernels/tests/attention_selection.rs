@@ -5,7 +5,7 @@
 // with split and unsplit key partitions.
 
 use magnitude_kernels::attention_prefill;
-use seismic::{BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
+use seismic::{BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
 
 include!("attention_common/fixtures.rs");
 

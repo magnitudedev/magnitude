@@ -283,7 +283,30 @@ pub enum TensorError {
         rows: u64,
         committed: u64,
     },
+    /// A view's store charges cannot be read.
+    ViewCharge(ViewChargeError),
     Execution(ExecutionError),
+}
+
+/// Why a view's store charges cannot be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewChargeError {
+    /// The view is not contiguous, so it covers no one byte range.
+    NotContiguous,
+    /// Its allocation is charged to no store (a mapped host region).
+    Uncharged,
+    /// The view reaches past what its allocation is charged for.
+    BeyondCharge,
+}
+
+impl fmt::Display for ViewChargeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotContiguous => "store charges require a contiguous tensor view",
+            Self::Uncharged => "tensor has no owned allocation charge",
+            Self::BeyondCharge => "tensor view exceeds its allocation charge",
+        })
+    }
 }
 impl fmt::Display for TensorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -339,6 +362,7 @@ impl fmt::Display for TensorError {
                 f,
                 "access to {rows} leading rows of a reserved tensor with {committed} committed rows"
             ),
+            Self::ViewCharge(error) => write!(f, "{error}"),
             Self::Execution(error) => write!(f, "{error}"),
         }
     }
@@ -352,15 +376,18 @@ impl From<ExecutionError> for TensorError {
 
 pub mod device {
     use crate::backends::OpenedKind;
-    use crate::devices::{DeviceInfo, DeviceMemoryStatus, MemoryUsage, ObservationError};
+    use crate::devices::{LimitError, MemoryUsage};
     use crate::driver::Allocation;
     use seismic_compiler::errors::ExecutionError;
+    use seismic_topology::{AccessPathId, DeviceTopology, Executor, StorageKind, StoreId};
     use std::sync::Arc;
 
-    /// One opened catalog device: its immutable description, execution
-    /// resources and accounting scope.
+    /// One opened executor: its immutable description, execution resources
+    /// and accounting scopes.
     pub struct DeviceInner {
-        pub(crate) info: DeviceInfo,
+        pub(crate) info: Executor,
+        pub(crate) topology: Arc<DeviceTopology>,
+        pub(crate) memory: Arc<crate::memory::ExecutorMemory>,
         pub(crate) capabilities: std::sync::OnceLock<Vec<String>>,
         pub(crate) kind: OpenedKind,
         /// Forms this device's native programs.
@@ -390,8 +417,13 @@ pub mod device {
                 .expect("trace slot lock is never poisoned")
                 .clone()
         }
-        pub fn info(&self) -> &DeviceInfo {
+        pub fn info(&self) -> &Executor {
             &self.info
+        }
+        /// The topology revision this device was opened in; its identifiers
+        /// are the ones this device's charges and limits name.
+        pub fn topology(&self) -> &Arc<DeviceTopology> {
+            &self.topology
         }
         /// How many native programs this device has formed.
         pub fn programs_formed(&self) -> usize {
@@ -460,7 +492,7 @@ pub mod device {
         /// tuning records: its name and the backend facts that shape
         /// performance.
         pub fn tuning_identity(&self) -> String {
-            format!("{};{}", self.info.name, self.kind.tuning_identity())
+            format!("{};{}", self.info.name(), self.kind.tuning_identity())
         }
         /// Lend the device `workers` for the programs it forms off the
         /// calling thread, or take them back (none). The device starts no
@@ -469,16 +501,11 @@ pub mod device {
         pub fn staff(&self, workers: Option<Arc<seismic_native_target::workers::Workers>>) {
             self.programs.staff(workers);
         }
-        /// Whether this opened device forms Metal tensor operations (the
-        /// fact its native sources are formed under); false on every other
-        /// backend. `DeviceInfo::forms_tensor_operations` answers the same
-        /// before the device is opened.
+        /// Whether this device forms Metal tensor operations: what its
+        /// executor reports ([`seismic_topology::Executor::forms_tensor_operations`]),
+        /// false on every other backend.
         pub fn forms_tensor_operations(&self) -> bool {
-            match &self.kind {
-                #[cfg(target_os = "macos")]
-                OpenedKind::Metal(opened) => opened.device_description().facts().tensor_ops(),
-                _ => false,
-            }
+            self.info().forms_tensor_operations()
         }
         pub(crate) fn supports_representation(
             &self,
@@ -486,26 +513,96 @@ pub mod device {
         ) -> bool {
             self.kind.supports_representation(representation)
         }
-        pub fn memory_usage(&self) -> MemoryUsage {
-            self.kind.memory_usage()
+        /// The bytes this device charges to each store it reaches: its
+        /// paths' claims, and its staging on host RAM.
+        pub fn store_charges(&self) -> Vec<(StoreId, u64)> {
+            let mut charges = crate::memory::store_charges(&self.topology, self.path_charges());
+            *charges.entry(self.topology.host_ram().id()).or_default() +=
+                self.memory.staging.scope_charge();
+            charges.into_iter().collect()
         }
-        /// Bounds allocations made through this device. Charges already made
-        /// count against the limit; they are never charged twice.
-        pub fn set_memory_limit(&self, limit: Option<u64>) {
-            self.kind.set_memory_limit(limit)
+        /// The claim this device holds along each of its access paths.
+        pub fn path_charges(&self) -> Vec<(AccessPathId, u64)> {
+            self.memory
+                .paths
+                .iter()
+                .map(|path| (path.id, path.scope.charged()))
+                .collect()
         }
-        /// Start [`MemoryUsage::high_water`] again from the current charge.
+        /// CPU allocations are ordinary process memory; Metal resources enter
+        /// the task's physical-footprint ledger. CUDA and Vulkan driver allocations
+        /// are accounted separately from the process's anonymous footprint.
+        pub fn allocations_in_process_footprint(&self) -> bool {
+            match &self.kind {
+                OpenedKind::Cpu(_) => true,
+                #[cfg(target_os = "macos")]
+                OpenedKind::Metal(_) => true,
+                OpenedKind::Cuda(_) => false,
+                #[cfg(not(target_os = "macos"))]
+                OpenedKind::Vulkan(_) => false,
+            }
+        }
+        /// Seismic-owned charges and limits of `kind` storage on this
+        /// device: its allocations' charges, what its backend holds for it
+        /// beyond them, and the charges to the stores its placement reaches.
+        pub fn storage_usage(&self, kind: StorageKind) -> MemoryUsage {
+            self.kind.usage(kind)
+        }
+        /// What `kind` storage can still take on this device: what its
+        /// placement's paths, their grants and stores, and the device's
+        /// limit leave to both its allocations' charges and what the backend
+        /// holds natively. An allocation needing more is refused as a
+        /// capacity shortfall.
+        pub fn storage_available(&self, kind: StorageKind) -> u64 {
+            let domain = match kind {
+                StorageKind::Device => &self.memory.device,
+                StorageKind::Upload => &self.memory.upload,
+            };
+            domain.available().min(domain.physical().available())
+        }
+        /// Holds the charges to `store`, from every executor of the process
+        /// that reaches it, to `limit` on top of its capacity.
+        pub fn set_store_limit(
+            &self,
+            store: StoreId,
+            limit: Option<u64>,
+        ) -> Result<(), LimitError> {
+            self.topology
+                .store(store)
+                .ok_or(LimitError::StaleStore(store))?;
+            crate::memory::store_ledger(&self.topology, store).set_limit(limit);
+            Ok(())
+        }
+        /// Holds this device's claim along its access path `path` to `limit`
+        /// on top of the path's grant.
+        pub fn set_path_limit(
+            &self,
+            path: AccessPathId,
+            limit: Option<u64>,
+        ) -> Result<(), LimitError> {
+            let path = self
+                .memory
+                .path(path)
+                .ok_or(LimitError::ForeignPath(path))?;
+            path.scope.set_limit(limit);
+            Ok(())
+        }
+        /// Bounds `kind` storage allocated through this device. Charges
+        /// already made count against the limit; they are never charged
+        /// twice.
+        pub fn set_storage_limit(&self, kind: StorageKind, limit: Option<u64>) {
+            self.kind.set_limit(kind, limit)
+        }
+        /// Start device storage's [`MemoryUsage::high_water`] again from its
+        /// current charge.
         pub fn restart_memory_high_water(&self) {
             self.kind.restart_memory_high_water()
-        }
-        pub fn memory_status(&self) -> Result<DeviceMemoryStatus, ObservationError> {
-            self.kind.memory_status()
         }
     }
 }
 
 pub mod tensor {
-    use super::{device::DeviceInner, HostRegion, TensorError};
+    use super::{device::DeviceInner, HostRegion, TensorError, ViewChargeError};
     use crate::driver::{write_zeros, Allocation};
     use crate::layout;
     use seismic_compiler::errors::ExecutionError;
@@ -523,9 +620,27 @@ pub mod tensor {
     pub struct TensorStorageObserver {
         allocation: Weak<Allocation>,
         identity: u64,
+        topology: Arc<seismic_topology::DeviceTopology>,
+        /// The accounting of the executor the allocation was made through.
+        memory: Arc<crate::memory::ExecutorMemory>,
     }
 
     impl TensorStorageObserver {
+        /// The bytes the allocation charges to each store, while it lives
+        /// and is charged.
+        pub fn store_charges(&self) -> Option<Vec<(seismic_topology::StoreId, u64)>> {
+            let paths = self.path_charges()?;
+            Some(
+                crate::memory::store_charges(&self.topology, paths)
+                    .into_iter()
+                    .collect(),
+            )
+        }
+        /// The bytes the allocation charges along each access path, while
+        /// it lives and is charged.
+        pub fn path_charges(&self) -> Option<Vec<(seismic_topology::AccessPathId, u64)>> {
+            self.allocation.upgrade()?.path_charges(&self.memory)
+        }
         pub fn identity(&self) -> u64 {
             self.identity
         }
@@ -561,7 +676,7 @@ pub mod tensor {
         ) -> Result<TensorInner, TensorError> {
             if !self.device.supports_representation(representation) {
                 return Err(TensorError::UnsupportedRepresentation {
-                    backend: self.device.info().backend,
+                    backend: self.device.info().backend(),
                     representation: representation_info(representation).name,
                 });
             }
@@ -737,7 +852,7 @@ pub mod tensor {
         ) -> Result<Self, TensorError> {
             if !self.device.supports_representation(representation) {
                 return Err(TensorError::UnsupportedRepresentation {
-                    backend: self.device.info().backend,
+                    backend: self.device.info().backend(),
                     representation: representation_info(representation).name,
                 });
             }
@@ -790,7 +905,7 @@ pub mod tensor {
         ) -> Result<Self, TensorError> {
             if !device.supports_representation(representation) {
                 return Err(TensorError::UnsupportedRepresentation {
-                    backend: device.info().backend,
+                    backend: device.info().backend(),
                     representation: representation_info(representation).name,
                 });
             }
@@ -1017,7 +1132,7 @@ pub mod tensor {
         ) -> Result<Self, TensorError> {
             if !device.supports_representation(representation) {
                 return Err(TensorError::UnsupportedRepresentation {
-                    backend: device.info().backend,
+                    backend: device.info().backend(),
                     representation: representation_info(representation).name,
                 });
             }
@@ -1096,7 +1211,7 @@ pub mod tensor {
         ) -> Result<Self, TensorError> {
             if !device.supports_representation(representation) {
                 return Err(TensorError::UnsupportedRepresentation {
-                    backend: device.info().backend,
+                    backend: device.info().backend(),
                     representation: representation_info(representation).name,
                 });
             }
@@ -1120,7 +1235,7 @@ pub mod tensor {
         ) -> Result<Self, TensorError> {
             if !device.supports_representation(representation) {
                 return Err(TensorError::UnsupportedRepresentation {
-                    backend: device.info().backend,
+                    backend: device.info().backend(),
                     representation: representation_info(representation).name,
                 });
             }
@@ -1371,11 +1486,45 @@ pub mod tensor {
         pub fn storage_bytes(&self) -> u64 {
             self.allocation.bytes()
         }
+        /// A non-owning observation of this tensor's allocation.
         pub fn observe_storage(&self) -> TensorStorageObserver {
             TensorStorageObserver {
                 allocation: Arc::downgrade(&self.allocation),
                 identity: self.allocation.identity(),
+                topology: self.device.topology.clone(),
+                memory: self.device.memory.clone(),
             }
+        }
+        /// The bytes of this contiguous view charged to each store: the
+        /// share of its allocation's path charges its byte range covers.
+        pub fn view_store_charges(
+            &self,
+        ) -> Result<Vec<(seismic_topology::StoreId, u64)>, TensorError> {
+            if layout::canonical(self.representation, &self.extents)?.strides != self.strides {
+                return Err(TensorError::ViewCharge(ViewChargeError::NotContiguous));
+            }
+            let paths = self
+                .allocation
+                .path_charges(&self.device.memory)
+                .ok_or(TensorError::ViewCharge(ViewChargeError::Uncharged))?;
+            let mut skip = self.byte_offset;
+            let mut remaining = self.byte_len;
+            let mut held = Vec::new();
+            for (path, bytes) in paths {
+                let ignored = skip.min(bytes);
+                skip -= ignored;
+                let covered = remaining.min(bytes - ignored);
+                remaining -= covered;
+                if covered != 0 {
+                    held.push((path, covered));
+                }
+            }
+            if remaining != 0 {
+                return Err(TensorError::ViewCharge(ViewChargeError::BeyondCharge));
+            }
+            Ok(crate::memory::store_charges(&self.device.topology, held)
+                .into_iter()
+                .collect())
         }
         #[doc(hidden)]
         pub fn reclaimable_bytes<'a>(
@@ -1569,8 +1718,8 @@ pub mod tensor {
             std::thread::Builder::new()
                 .stack_size(256 * 1024)
                 .spawn(|| {
-                    let catalog = crate::devices::Catalog::discover().unwrap();
-                    let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+                    let devices = crate::devices::Devices::discover(&[]).unwrap();
+                    let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
                     let count = 3 * 1024 * 1024 / 4 + 5;
                     let tensor = TensorInner::from_host(
                         &device,
@@ -1586,6 +1735,21 @@ pub mod tensor {
                 .unwrap()
                 .join()
                 .unwrap();
+        }
+
+        #[test]
+        fn a_view_reports_only_its_owned_byte_interval() {
+            let device = crate::devices::Devices::discover(&[])
+                .unwrap()
+                .open_backend(registry::BackendName::Cpu)
+                .unwrap();
+            let tensor = TensorInner::zeros(&device, registry::dense(DType::U32), &[4, 8]).unwrap();
+            let view = tensor.slice_leading(1, 3).unwrap();
+            assert_eq!(
+                view.view_store_charges().unwrap(),
+                vec![(device.topology().host_ram().id(), 64)]
+            );
+            assert_eq!(view.observe_storage().charged_bytes(), Some(128));
         }
     }
 }
@@ -1632,13 +1796,13 @@ pub mod kernel {
         ) -> Result<(), super::CallError> {
             self.inner.admits(dimensions)
         }
-        /// Time calls cycling through `rotation` on the device.
-        pub fn measure(
+        /// Calls cycling through `rotation`, each argument set validated
+        /// and placed once, as `seismic-measure` times them.
+        pub fn point(
             &self,
             rotation: Vec<EncodedArgs>,
-            options: &crate::native::MeasureOptions,
-        ) -> Result<crate::native::Measurement, super::CallError> {
-            self.inner.measure(rotation, options)
+        ) -> Result<crate::native::KernelPoint, super::CallError> {
+            crate::native::KernelPoint::place(&self.inner, rotation, None)
         }
     }
 

@@ -28,11 +28,12 @@ use magnitude_service_contracts::models::{
     ModelReleaseReason,
 };
 use magnitude_service_models::{
-    InventoryConfig, ManagedModelDownloads, ManagedModelStore, ModelDomainResolver,
-    load_release_catalog, managed_model_services,
+    InventoryConfig, ManagedModelDownloads, ModelDomainResolver, load_release_catalog,
+    managed_model_services,
 };
 use magnitude_service_server::configurations::ResolvedConfigurations;
 use magnitude_service_server::hardware::HardwareInventory;
+use magnitude_service_server::model_store::{ServedStore, open_served_store};
 use magnitude_service_server::residency::controller::{ModelInstances, ResidencyEnvironment};
 use magnitude_service_server::residency::supervisor::{
     HostMemoryObserver, HostMemorySample, SeismicHostMemory,
@@ -101,13 +102,15 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
     config.add_hugging_face_caches([PathBuf::from(flag(&arguments, "--hf-cache"))]);
     config.catalog_models = release.catalog().models.clone();
     config.architectures = magnitude_service_server::assessment::candidates::engine_architectures();
-    let inventory = Arc::new(ManagedModelStore::open(config).await?);
+    let reserves = MemoryReserves::standard();
+    let ServedStore {
+        store: inventory,
+        devices: catalog,
+    } = open_served_store(config, reserves).await?;
     let resolver = ModelDomainResolver::new(inventory.clone(), release.catalog().clone());
     let downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()).await?);
-    let catalog = Arc::new(seismic::DeviceCatalog::discover()?);
-    let reserves = MemoryReserves::standard();
     let host_memory = Arc::new(ScriptedHostMemory {
-        seismic: SeismicHostMemory::new(catalog.clone()),
+        seismic: SeismicHostMemory::new(catalog.clone(), reserves),
         headroom: AtomicU64::new(NO_OVERRIDE),
     });
     let configurations = Arc::new(ResolvedConfigurations::new(
@@ -264,21 +267,27 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         .resident_memory()
         .await
         .expect("a resident worker answers an observation");
-    let hardware =
-        HardwareInventory::new(catalog.clone(), reserves, Arc::new(main.instances.clone()));
+    let hardware = HardwareInventory::new(
+        catalog.inventory().clone(),
+        reserves,
+        Arc::new(main.instances.clone()),
+    );
     let snapshot = HardwareProvider::snapshot(&hardware).await?;
     println!(
-        "hardware     {:>7.3} s  worker domains {:?}; snapshot domains {:?}",
+        "hardware     {:>7.3} s  worker stores {:?}; snapshot device memory {:?}",
         started.elapsed().as_secs_f64(),
         resident
-            .domains
+            .stores
             .iter()
-            .map(|domain| (domain.domain.to_string(), domain.headroom_bytes))
+            .map(|reading| (reading.store.to_string(), reading.headroom_bytes))
             .collect::<Vec<_>>(),
         snapshot
-            .memory_domains
+            .device_memory
             .iter()
-            .map(|domain| (domain.id.as_str().to_owned(), domain.current_free_bytes))
+            .map(|memory| (
+                memory.store.id.as_str().to_owned(),
+                memory.current_free_bytes
+            ))
             .collect::<Vec<_>>()
     );
 

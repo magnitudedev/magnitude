@@ -2,14 +2,13 @@
 //! startup allocation to unload.
 
 use crate::memory::{
-    ClaimId, HoldingClass, MemoryAction, MemoryBand, MemoryError, MemoryHeap, MemoryNeed,
-    MemoryObservation,
+    ClaimDemand, ClaimId, HoldingClass, MemoryError, MemoryHeap, MemoryObservation,
 };
 use crate::platform::{
-    DomainReading, DomainRole, HostDistress, MemoryBand as ReadingBand, MemoryConstraint,
-    MemoryPolicyError, MemoryReserves,
+    DomainReading, DomainRole, Fit, FitMode, HostDistress, MemoryBand, MemoryConstraint,
+    MemoryPolicyError, MemoryReserves, StorageDemand,
 };
-use seismic::{Device, DeviceCatalog};
+use seismic::{Device, Devices, StorageKind};
 use std::fmt;
 use std::rc::Rc;
 
@@ -20,16 +19,17 @@ pub enum ClaimRefusal {
     /// an allocation.
     Blind(MemoryPolicyError),
     /// A domain is in the Reclaim band: growth waits while reclaimable
-    /// holdings are released. `role` is the first such domain; `distress` is
-    /// its host's, absent when headroom at or below the planning reserve is
-    /// the cause.
+    /// holdings are released. `store` is the first such domain; `distress`
+    /// is its host's, absent when headroom at or below the planning reserve
+    /// is the cause.
     Reclaim {
-        role: DomainRole,
+        store: seismic::StoreId,
         distress: Option<HostDistress>,
     },
     /// The claim exceeds a domain's ceiling above its planning reserve.
     Deficit {
         role: DomainRole,
+        store: seismic::StoreId,
         constraint: MemoryConstraint,
         required: u64,
         available: u64,
@@ -42,13 +42,9 @@ impl fmt::Display for ClaimRefusal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Blind(error) => write!(formatter, "memory observation unavailable: {error}"),
-            Self::Reclaim {
-                role,
-                distress: None,
-            } => write!(
-                formatter,
-                "{role:?} memory headroom is at or below the planning reserve"
-            ),
+            Self::Reclaim { distress: None, .. } => {
+                formatter.write_str("memory headroom is at or below the planning reserve")
+            }
             Self::Reclaim {
                 distress: Some(distress),
                 ..
@@ -74,9 +70,9 @@ impl std::error::Error for ClaimRefusal {}
 fn reclaiming(readings: &[DomainReading]) -> Option<ClaimRefusal> {
     readings
         .iter()
-        .find(|reading| reading.band == ReadingBand::Reclaim)
+        .find(|reading| reading.band == MemoryBand::Reclaim)
         .map(|reading| ClaimRefusal::Reclaim {
-            role: reading.role,
+            store: reading.domain,
             distress: reading.distress,
         })
 }
@@ -86,7 +82,7 @@ fn reclaiming(readings: &[DomainReading]) -> Option<ClaimRefusal> {
 /// it proceeds: its own allocations can put the host in distress after the
 /// claim was granted, and other programs can take the headroom.
 pub fn require_normal(
-    catalog: &DeviceCatalog,
+    catalog: &Devices,
     device: &Device,
     reserves: &MemoryReserves,
 ) -> Result<(), ClaimRefusal> {
@@ -95,13 +91,33 @@ pub fn require_normal(
     reclaiming(&readings).map_or(Ok(()), Err)
 }
 
+/// The new storage `total` asks of `executor`'s placements: each kind's
+/// bytes beyond `held_free`, the free space of the blocks the device already
+/// holds for it ([`DeviceHeap::held_free`]), which a claim takes without the
+/// device holding more.
+fn new_storage(
+    executor: seismic::ExecutorId,
+    total: ClaimDemand,
+    held_free: impl Fn(StorageKind) -> u64,
+) -> [StorageDemand; 2] {
+    [
+        (StorageKind::Device, total.device),
+        (StorageKind::Upload, total.upload),
+    ]
+    .map(|(kind, bytes)| StorageDemand {
+        executor,
+        kind,
+        bytes: bytes.saturating_sub(held_free(kind)),
+    })
+}
+
 /// The heap of one opened device together with the host's threshold policy
 /// and the catalog that observes the domains the device uses. It exists
 /// before the first startup allocation, so loading and serving claim through
 /// one authority: every allocation's peak is claimed from a fresh reading,
 /// and Seismic's enforced limit is refreshed from the same reading.
 pub struct DeviceHeap {
-    catalog: Rc<DeviceCatalog>,
+    catalog: Rc<Devices>,
     reserves: MemoryReserves,
     device: Rc<Device>,
     capacity_bytes: u64,
@@ -113,23 +129,18 @@ pub struct DeviceHeap {
 }
 
 impl DeviceHeap {
-    /// The heap of `device`, observed once. The allocation domain's stable
-    /// capacity is fixed here.
+    /// The heap of `device`, observed once. Its capacity, the stable fit of
+    /// the device's storage ([`MemoryObservation::capacity_bytes`]), is fixed
+    /// here.
     pub fn open(
-        catalog: Rc<DeviceCatalog>,
+        catalog: Rc<Devices>,
         reserves: MemoryReserves,
         device: Rc<Device>,
     ) -> Result<Self, MemoryPolicyError> {
-        let host = catalog
-            .host_memory_status()
-            .map_err(MemoryPolicyError::Observation)?;
-        let capacity_bytes =
-            crate::platform::fit_capacities(&catalog.topology(), device.info(), &host, &reserves)?
-                .into_iter()
-                .find(|(role, _)| *role == DomainRole::Allocation)
-                .expect("fit capacities include the allocation domain")
-                .1
-                .capacity_bytes;
+        let status = catalog.status();
+        let capacity_bytes = Fit::new(device.topology(), &status, &reserves)
+            .storage_beside(device.info(), &StorageKind::ALL, &[])?
+            .stable_bytes;
         let mut heap = Self {
             catalog,
             reserves,
@@ -138,7 +149,7 @@ impl DeviceHeap {
             heap: MemoryHeap::new(),
             host_table_bytes: 0,
         };
-        heap.refresh()?;
+        heap.observe(&status)?;
         Ok(heap)
     }
 
@@ -160,145 +171,105 @@ impl DeviceHeap {
     /// ceiling from the readings, and refresh the heap's view from them.
     /// A failed observation revokes unspent grants and leaves the heap Blind.
     pub fn refresh(&mut self) -> Result<Vec<DomainReading>, MemoryPolicyError> {
+        let status = self.catalog.status();
+        self.observe(&status)
+    }
+
+    /// [`Self::refresh`] from the status sample `status`.
+    fn observe(
+        &mut self,
+        status: &seismic::Status,
+    ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
         let readings =
-            crate::platform::refresh_device_ceiling(&self.catalog, &self.device, &self.reserves);
-        let (available_bytes, band) = match &readings {
-            Ok(readings) => (
-                self.ceiling(readings, DomainRole::Allocation),
-                MemoryBand::from(crate::platform::band_of(readings)),
-            ),
-            Err(_) => (0, MemoryBand::Blind),
-        };
+            crate::platform::refresh_device_ceiling(&self.device, status, &self.reserves);
+        let charged_bytes = StorageKind::ALL
+            .into_iter()
+            .map(|kind| self.device.storage_usage(kind).charged)
+            .sum();
         self.heap
             .observe(MemoryObservation {
                 capacity_bytes: self.capacity_bytes,
-                available_bytes,
-                charged_bytes: self.device.memory_usage().charged,
-                band,
+                charged_bytes,
             })
-            .expect("a Seismic reading of the allocation domain is a valid observation");
+            .expect("a Seismic reading of the device's storage is a valid observation");
         readings
     }
 
-    /// Whether a peak of `required` device bytes, of which a dedicated device
-    /// stages `staged` through host RAM, fits now: from a fresh reading, in
+    /// The free space of the blocks the device holds for `kind` storage
+    /// ([`seismic::MemoryUsage::unallocated`]): memory its stores already
+    /// lost to the device, so absent from their headroom, that a claim
+    /// takes without the device holding more. A claim within it needs no
+    /// new room in any store.
+    fn held_free(&self, kind: StorageKind) -> u64 {
+        self.device.storage_usage(kind).unallocated
+    }
+
+    /// Whether a peak of `required` device bytes, `staged` of which the
+    /// backend stages through host RAM, fits now: from a fresh reading, in
     /// the Normal band, within every domain's ceiling beyond outstanding
     /// claims. The readings exclude existing charges, so only the added peak
     /// is compared.
     pub fn check(&mut self, required: u64, staged: u64) -> Result<(), ClaimRefusal> {
-        let readings = self.refresh().map_err(ClaimRefusal::Blind)?;
-        let allocation = readings
-            .iter()
-            .find(|reading| reading.role == DomainRole::Allocation)
-            .expect("readings include the allocation domain");
-        let action = self
-            .heap
-            .decide(MemoryNeed {
-                minimum_bytes: required,
-                preferred_bytes: required,
-                class: HoldingClass::Surplus,
-            })
-            .map_err(ClaimRefusal::Accounting)?;
-        match action {
-            // The heap's band is the readings' band, so some reading is in
-            // Reclaim.
-            MemoryAction::Wait => {
-                return Err(
-                    reclaiming(&readings).expect("a Reclaim band has a domain in the Reclaim band")
-                );
-            }
-            MemoryAction::Grant { bytes } if bytes >= required => {}
-            MemoryAction::Grant { bytes: available } | MemoryAction::Reject { available, .. } => {
-                return Err(ClaimRefusal::Deficit {
-                    role: DomainRole::Allocation,
-                    constraint: allocation.constraint,
-                    required,
-                    available,
-                });
-            }
+        self.check_storage(
+            ClaimDemand {
+                device: required,
+                upload: 0,
+                staged,
+            },
+            0,
+        )
+    }
+
+    /// Whether `claim` and `table` new bytes of host tables fit beside every
+    /// outstanding claim and the held host tables, from one fresh status
+    /// sample. Fit decides where the claims' staged bytes are charged
+    /// ([`Fit::host_staging`]).
+    fn check_storage(&mut self, claim: ClaimDemand, table: u64) -> Result<(), ClaimRefusal> {
+        let status = self.catalog.status();
+        let readings = self.observe(&status).map_err(ClaimRefusal::Blind)?;
+        if let Some(refusal) = reclaiming(&readings) {
+            return Err(refusal);
         }
-        // A host-backed device has no staging domain: its staged bytes are
-        // part of `required` on the same host domain.
-        if let Some(staging) = readings
-            .iter()
-            .find(|reading| reading.role == DomainRole::Staging)
-        {
-            let available = self.ceiling(&readings, DomainRole::Staging);
-            if staged > available {
-                return Err(ClaimRefusal::Deficit {
-                    role: DomainRole::Staging,
-                    constraint: staging.constraint,
-                    required: staged,
-                    available,
-                });
-            }
+        let total = self.heap.claimed().plus(claim);
+        let topology = self.device.topology();
+        let info = self.device.info();
+        let executor = info.id();
+        let fit = Fit::new(topology, &status, &self.reserves);
+        let host = fit
+            .host_staging(info, total.staged)
+            .saturating_add(self.host_table_bytes)
+            .saturating_add(table);
+        let demand = fit
+            .demand(
+                &new_storage(executor, total, |kind| self.held_free(kind)),
+                &[(topology.host_ram().id(), host)],
+                FitMode::Live,
+            )
+            .map_err(ClaimRefusal::Blind)?;
+        if let Some(refusal) = demand.refused.first() {
+            let role = readings
+                .iter()
+                .find(|reading| reading.domain == refusal.store)
+                .expect("demand stores are observed")
+                .role;
+            return Err(ClaimRefusal::Deficit {
+                role,
+                store: refusal.store,
+                constraint: refusal.constraint,
+                required: refusal.required_bytes,
+                available: refusal.required_bytes.saturating_sub(refusal.missing_bytes),
+            });
         }
         Ok(())
     }
 
-    /// The host-RAM domain's role: the staging domain of a dedicated device,
-    /// the allocation domain of a host-backed one.
-    fn host_role(readings: &[DomainReading]) -> DomainRole {
-        if readings
-            .iter()
-            .any(|reading| reading.role == DomainRole::Staging)
-        {
-            DomainRole::Staging
-        } else {
-            DomainRole::Allocation
-        }
-    }
-
-    /// A domain's ceiling above its planning reserve, less the host tables
-    /// held in it.
-    fn ceiling(&self, readings: &[DomainReading], role: DomainRole) -> u64 {
-        let ceiling = readings
-            .iter()
-            .find(|reading| reading.role == role)
-            .expect("readings include the domain")
-            .ceiling_bytes;
-        if Self::host_role(readings) == role {
-            ceiling.saturating_sub(self.host_table_bytes)
-        } else {
-            ceiling
-        }
-    }
-
-    /// Hold a host-resident table's `bytes` in the host-RAM domain for the
-    /// model's lifetime, from a fresh reading within the domain's ceiling
-    /// above its planning reserve. Its mapped pages then count against every
-    /// later decision in that domain.
+    /// Hold a host-resident table's `bytes` in host RAM for the model's
+    /// lifetime, from a fresh reading within host RAM's ceiling above its
+    /// planning reserve, beside every outstanding claim and every storage
+    /// placement into host RAM. Its mapped pages then count against every
+    /// later decision there.
     pub fn hold_host_table(&mut self, bytes: u64) -> Result<(), ClaimRefusal> {
-        let readings = self.refresh().map_err(ClaimRefusal::Blind)?;
-        let role = Self::host_role(&readings);
-        let reading = readings
-            .iter()
-            .find(|reading| reading.role == role)
-            .expect("readings include the host domain");
-        if reading.band == ReadingBand::Reclaim {
-            return Err(ClaimRefusal::Reclaim {
-                role,
-                distress: reading.distress,
-            });
-        }
-        // Outstanding claims on a host-backed device hold host bytes too.
-        let claimed = match role {
-            DomainRole::Allocation => self
-                .heap
-                .claims()
-                .try_fold(0u64, |total, claim| total.checked_add(claim.bytes))
-                .ok_or(ClaimRefusal::Accounting(MemoryError::HoldingOverflow))?,
-            DomainRole::Staging => 0,
-        };
-        let available = self.ceiling(&readings, role).saturating_sub(claimed);
-        if bytes > available {
-            return Err(ClaimRefusal::Deficit {
-                role,
-                constraint: reading.constraint,
-                required: bytes,
-                available,
-            });
-        }
+        self.check_storage(ClaimDemand::default(), bytes)?;
         self.host_table_bytes = self
             .host_table_bytes
             .checked_add(bytes)
@@ -321,17 +292,31 @@ impl DeviceHeap {
         staged: u64,
         class: HoldingClass,
     ) -> Result<ClaimId, ClaimRefusal> {
-        self.check(required, staged)?;
+        self.claim_storage(required, 0, staged, class)
+    }
+
+    /// [`Self::claim`] with `upload` bytes of upload storage beside the
+    /// `required` device bytes.
+    pub fn claim_storage(
+        &mut self,
+        required: u64,
+        upload: u64,
+        staged: u64,
+        class: HoldingClass,
+    ) -> Result<ClaimId, ClaimRefusal> {
+        let demand = ClaimDemand {
+            device: required,
+            upload,
+            staged,
+        };
+        self.check_storage(demand, 0)?;
         self.heap
-            .claim(MemoryNeed {
-                minimum_bytes: required,
-                preferred_bytes: required,
-                class,
-            })
+            .claim(demand, class)
             .map(|claim| claim.id)
             .map_err(ClaimRefusal::Accounting)
     }
 
+    /// Release `claim`: its physical operation's charge is now Seismic's.
     pub fn release(&mut self, claim: ClaimId) {
         self.heap
             .cancel_claim(claim)
@@ -344,15 +329,86 @@ mod tests {
     use super::*;
     use seismic::BackendName;
 
+    /// On the RTX 3090, a claim beyond what the device store's headroom
+    /// leaves above its reserve fits when the blocks the device holds have
+    /// the rest free, and is refused by the store when they do not.
+    #[test]
+    fn held_free_block_space_admits_a_claim_beyond_the_store_headroom() {
+        const GIB: u64 = 1 << 30;
+        let topology = seismic::fixtures::recorded::rtx3090();
+        let cuda = topology
+            .executors()
+            .iter()
+            .find(|executor| executor.backend() == BackendName::Cuda)
+            .unwrap();
+        let path = topology
+            .access_path(cuda.placement(StorageKind::Device)[0])
+            .unwrap();
+        let gpu = topology.store(path.store()).unwrap();
+        let mut status = seismic::Status {
+            sample: seismic::Sample {
+                taken: std::time::SystemTime::now(),
+                host_ram: Ok(seismic::HostStatus {
+                    headroom: seismic::Reported::new(
+                        16 * GIB,
+                        seismic::ReportedBy::LinuxMemAvailable,
+                    ),
+                    limits: Vec::new(),
+                    limit_visibility: seismic::LimitVisibility::Complete,
+                    displacement: None,
+                    kernel_pressure: None,
+                }),
+                volumes: Vec::new(),
+                grants: Vec::new(),
+            },
+            runtime: seismic::RuntimeStatus::default(),
+        };
+        // The device's blocks leave 4 GiB of its memory as headroom.
+        status.runtime.charges = vec![(gpu.id(), gpu.capacity().value - 4 * GIB)];
+        let reserves = MemoryReserves::standard();
+        let fit = Fit::new(&topology, &status, &reserves);
+        let ceiling = fit.store(gpu.id()).unwrap().ceiling_bytes;
+        let claim = ClaimDemand {
+            device: ceiling + GIB,
+            upload: 0,
+            staged: 0,
+        };
+        let demand = |held: u64| {
+            let storage = new_storage(cuda.id(), claim, |kind| match kind {
+                StorageKind::Device => held,
+                StorageKind::Upload => 0,
+            });
+            fit.demand(&storage, &[], FitMode::Live).unwrap()
+        };
+        let refused = demand(0);
+        assert_eq!(refused.refused.len(), 1);
+        assert_eq!(refused.refused[0].store, gpu.id());
+        assert!(demand(2 * GIB).fits());
+    }
+
+    /// The live ceiling of `heap`'s device storage beside its held host
+    /// tables, from a fresh status sample.
+    fn live_ceiling(heap: &DeviceHeap) -> u64 {
+        let topology = heap.device.topology();
+        Fit::new(topology, &heap.catalog.status(), &heap.reserves)
+            .storage_beside(
+                heap.device.info(),
+                &StorageKind::ALL,
+                &[(topology.host_ram().id(), heap.host_table_bytes)],
+            )
+            .unwrap()
+            .ceiling_bytes
+    }
+
     fn cpu_heap() -> DeviceHeap {
-        let catalog = Rc::new(DeviceCatalog::discover().unwrap());
+        let catalog = Rc::new(Devices::discover(&[]).unwrap());
         let device = Rc::new(catalog.open_backend(BackendName::Cpu).unwrap());
         DeviceHeap::open(catalog, MemoryReserves::standard(), device).unwrap()
     }
 
     #[test]
     fn a_host_in_the_normal_band_lets_a_running_operation_continue() {
-        let catalog = DeviceCatalog::discover().unwrap();
+        let catalog = Devices::discover(&[]).unwrap();
         let device = catalog.open_backend(BackendName::Cpu).unwrap();
         assert_eq!(
             require_normal(&catalog, &device, &MemoryReserves::standard()),
@@ -363,7 +419,7 @@ mod tests {
     #[test]
     fn claims_hold_their_peak_against_later_decisions_until_released() {
         let mut heap = cpu_heap();
-        let ceiling = heap.heap().standing().unwrap().observation.available_bytes;
+        let ceiling = live_ceiling(&heap);
         assert!(
             ceiling > 1024,
             "the test host has headroom above its reserve"
@@ -396,7 +452,7 @@ mod tests {
     #[test]
     fn host_tables_hold_their_bytes_in_the_host_domain() {
         let mut heap = cpu_heap();
-        let ceiling = heap.heap().standing().unwrap().observation.available_bytes;
+        let ceiling = live_ceiling(&heap);
         assert!(matches!(
             heap.hold_host_table(u64::MAX / 2),
             Err(ClaimRefusal::Deficit {
@@ -407,10 +463,7 @@ mod tests {
         assert_eq!(heap.host_table_bytes(), 0);
         heap.hold_host_table(ceiling / 2).unwrap();
         assert_eq!(heap.host_table_bytes(), ceiling / 2);
-        assert!(
-            heap.heap().standing().unwrap().observation.available_bytes
-                <= ceiling - ceiling / 2 + ceiling / 8
-        );
+        assert!(live_ceiling(&heap) <= ceiling - ceiling / 2 + ceiling / 8);
         assert!(matches!(
             heap.check(ceiling / 4 * 3, 0),
             Err(ClaimRefusal::Deficit {

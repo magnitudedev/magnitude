@@ -1,12 +1,10 @@
-use seismic::{
-    BackendName, DeviceCatalog, Element, NativeSpecialization, NativeTensorBatch, Tensor,
-};
+use seismic::{BackendName, Devices, Element, NativeSpecialization, NativeTensorBatch, Tensor};
 use seismic_native_tests::{scale_rows, scoped_scale};
 
 #[test]
 fn different_native_entries_complete_in_one_metal_batch() {
-    let catalog = DeviceCatalog::discover().unwrap();
-    let Ok(device) = catalog.open_backend(BackendName::Metal) else {
+    let devices = Devices::discover(&[]).unwrap();
+    let Ok(device) = devices.open_backend(BackendName::Metal) else {
         return;
     };
     let rows =
@@ -86,13 +84,13 @@ fn canonical_formation_alone_serves_a_legal_choice_without_building_observations
                 census: true,
             }]
         }
-        fn build(&mut self, _: usize) -> Result<PointInputs<'static>, String> {
+        fn build(&mut self, _: usize) -> Result<PointInputs<'static>, seismic::BuildError> {
             panic!("the mandatory work and its record must not build observations")
         }
     }
 
-    let catalog = DeviceCatalog::discover().unwrap();
-    let Ok(device) = catalog.open_backend(BackendName::Metal) else {
+    let devices = Devices::discover(&[]).unwrap();
+    let Ok(device) = devices.open_backend(BackendName::Metal) else {
         return;
     };
     // Both a demanded case and a zero-demand required witness have no evidence

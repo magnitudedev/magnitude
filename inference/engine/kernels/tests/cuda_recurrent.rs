@@ -6,7 +6,7 @@ include!("recurrent_stages.rs");
 
 fn cuda() -> Option<Device> {
     let selected = std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() == Some("cuda");
-    let catalog = match DeviceCatalog::discover() {
+    let catalog = match seismic::Devices::discover(&[]) {
         Ok(catalog) => catalog,
         Err(error) if selected => panic!("selected CUDA backend discovery failed: {error}"),
         Err(_) => return None,
@@ -518,10 +518,11 @@ fn cuda_chunk_every_catalog_value_head_count_matches_the_host_model() {
 #[ignore = "timing; run explicitly on the measurement host"]
 fn cuda_recurrent_timings() {
     let Some(device) = cuda() else { return };
-    let options = seismic::MeasureOptions {
-        samples: 15,
+    let options = seismic::measure::Measure {
+        samples: std::num::NonZeroUsize::new(15).unwrap(),
         min_sample_seconds: 0.002,
     };
+    let measure = |point| timing_common::measured(point, &options);
     // Slots of `per_slot` rows each: decode (1 row), MTP verify (2-16 rows
     // per request, alone and 8 requests batched) and prefill.
     for (slots, per_slot) in [
@@ -552,7 +553,7 @@ fn cuda_recurrent_timings() {
             for mapping in STEPS {
                 let kernel = case.cuda_step(&device, Element::bf16(), mapping);
                 let args = rotation.iter_mut().map(|t| t.step_args(&case)).collect();
-                let measured = kernel.measure(args, &options).unwrap();
+                let measured = measure(kernel.point(args).unwrap());
                 println!("{label}: step {mapping:?} {:.1} us", measured.median * 1e6);
             }
         }
@@ -560,7 +561,7 @@ fn cuda_recurrent_timings() {
             for mapping in CHUNK_ROWS {
                 let kernel = case.cuda_chunk(&device, Element::bf16(), mapping);
                 let args = rotation.iter_mut().map(|t| t.chunk_args(&case)).collect();
-                let measured = kernel.measure(args, &options).unwrap();
+                let measured = measure(kernel.point(args).unwrap());
                 println!(
                     "{label}: chunk ROWS {mapping} {:.1} us",
                     measured.median * 1e6

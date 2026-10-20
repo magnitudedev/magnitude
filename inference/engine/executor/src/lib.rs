@@ -45,8 +45,8 @@ pub use domain::{
     ClaimRefusal, DeviceHeap, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
     HeadFlight, MemoryChargeReconciliation, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
-    ReservedResources, ResumeState, StateBindings, SubmitFailure, TargetContinuation, TargetFlight,
-    TargetHostTiming, VisionFlight, require_normal,
+    ReservedResources, ResumeState, StateBindings, StoreAllocation, SubmitFailure,
+    TargetContinuation, TargetFlight, TargetHostTiming, VisionFlight, require_normal,
 };
 pub use error::{
     CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError,
@@ -75,12 +75,13 @@ pub use native::pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use native::tuning_survey;
 pub use native::{
-    AttestedPrograms, CatalogError, CatalogFailure, NumericalProfile, PinnedChoice, PointShape,
-    QualificationCase, QualificationReport, ROTATION_LAYERS, Receipt, ResolvedNumericalProfile,
-    SEARCH_VERSION, STANDARD_TUNING_BUDGET, SearchProgress, TRACE_SCHEMA, TUNING_CONTEXTS,
-    TUNING_ROWS, TracedWork, TunedEntry, TuningContext, TuningEvent, TuningLimits, TuningObserver,
-    TuningOrigin, TuningRoom, TuningSettings, TuningTrace, TuningWeightSource, UnpreparedUnits,
-    UnreportedTuning, ZeroTuningWeights, attention_points, row_points,
+    AttestedPrograms, CatalogError, CatalogFailure, MIN_SAMPLE_SECONDS, NumericalProfile,
+    PinnedChoice, PointShape, QualificationCase, QualificationReport, ROTATION_LAYERS, Receipt,
+    ResolvedNumericalProfile, SEARCH_SETTINGS, SEARCH_VERSION, STANDARD_TUNING_BUDGET,
+    SearchProgress, TRACE_SCHEMA, TUNING_CONTEXTS, TUNING_ROWS, TracedWork, TunedEntry,
+    TuningContext, TuningEvent, TuningLimits, TuningObserver, TuningOrigin, TuningRoom,
+    TuningSettings, TuningTrace, TuningWeightSource, UnpreparedUnits, UnreportedTuning,
+    ZeroTuningWeights, attention_points, row_points,
 };
 pub use operation::{
     CommittedClass, DraftForm, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, GroupKey,

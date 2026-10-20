@@ -3,11 +3,11 @@
 //! RMS/projection host models, mappings and tolerance checks.
 #![allow(dead_code)]
 
-use seismic::{BackendName, Device, DeviceCatalog, Element, Layout, Tensor};
+use seismic::{BackendName, Device, Element, Layout, Tensor};
 use seismic_lang::registry::{bf16_round, f16_bits};
 
 pub fn cuda() -> Option<Device> {
-    DeviceCatalog::discover()
+    seismic::Devices::discover(&[])
         .ok()?
         .open_backend(BackendName::Cuda)
         .ok()

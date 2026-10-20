@@ -148,16 +148,16 @@ class Device:
     def capabilities(self):
         return tuple(self._inner.capabilities)
 
-    def memory_usage(self):
-        charged, limit, pool_charged = self._inner.memory_usage()
+    def storage_usage(self, kind):
+        charged, limit, store_charged = _invoke(self._inner.storage_usage, kind)
         return MappingProxyType(
-            {"charged": charged, "limit": limit, "pool_charged": pool_charged}
+            {"charged": charged, "limit": limit, "store_charged": store_charged}
         )
 
-    def set_memory_limit(self, value):
+    def set_storage_limit(self, kind, value):
         if value is not None:
             value = _natural(value)
-        _invoke(self._inner.set_memory_limit, value)
+        _invoke(self._inner.set_storage_limit, kind, value)
 
     def __repr__(self):
         return repr(self._inner)

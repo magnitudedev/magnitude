@@ -77,7 +77,7 @@ export class AcnStarting extends Schema.TaggedClass<AcnStarting>()("Starting", {
 }) {}
 
 export const AcnHardwareSummarySchema = Schema.Struct({
-  backend: Schema.Literal("cpu", "metal", "cuda", "vulkan"),
+  backend: Schema.optionalWith(Schema.Literal("cpu", "metal", "cuda", "vulkan"), { as: "Option", exact: true }),
   gpuName: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
   gpuKind: Schema.optionalWith(Schema.Literal("discrete", "integrated"), { as: "Option", exact: true }),
   gpuMemoryBytes: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),

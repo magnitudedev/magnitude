@@ -5,7 +5,7 @@ use crate::planning::tests::{fixture_definition, fixture_manifest};
 use crate::{ComponentSelection, ModelLoadPlan};
 use magnitude_kernels::{dense_output, shape_rows};
 use seismic::TuningMethod;
-use seismic::{BackendName, ConfigurationRecord, DeviceCatalog, Outcome};
+use seismic::{BackendName, ConfigurationRecord, Outcome};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -184,7 +184,7 @@ fn steps(alpha: f64) -> seismic::NumericalRequirement {
 fn observation(point: &str, variant: u64, ratio: f64) -> seismic::NumericalObservation {
     seismic::NumericalObservation {
         point: point.into(),
-        key: seismic::PointKey {
+        key: seismic::LaunchKey {
             launches: vec![0],
             values: BTreeMap::from([("ROWS".into(), variant)]),
         },
@@ -367,7 +367,7 @@ fn persisted_point_weights_preserve_cache_identity() {
 
 #[test]
 fn stored_cpu_choice_accepts_device_owned_parameters() {
-    let device = DeviceCatalog::discover()
+    let device = seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -392,7 +392,7 @@ fn stored_cpu_choice_accepts_device_owned_parameters() {
 /// reports them, so the load after the search forms none of them itself.
 #[test]
 fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
-    let device = DeviceCatalog::discover()
+    let device = seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -440,7 +440,7 @@ fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
 
 #[test]
 fn the_tuning_cache_key_is_what_a_result_is_valid_for() {
-    let device = DeviceCatalog::discover()
+    let device = seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
@@ -692,7 +692,7 @@ fn rotations_take_distinct_layers_spread_over_depth() {
 }
 
 fn metal() -> Option<Device> {
-    DeviceCatalog::discover()
+    seismic::Devices::discover(&[])
         .ok()?
         .open_backend(BackendName::Metal)
         .ok()
@@ -825,7 +825,7 @@ impl EntryTuning for FakeCase {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<FakeArgs>, String> {
+    ) -> Result<Vec<FakeArgs>, BuildError> {
         (0..ROTATION_LAYERS)
             .map(|layer| {
                 Ok(FakeArgs {
@@ -925,7 +925,7 @@ impl FakeSearch {
             .take(count)
             .map(|spec| seismic::PointMeasurement {
                 point: spec.label.clone(),
-                key: seismic::PointKey {
+                key: seismic::LaunchKey {
                     launches: vec![0],
                     values: Default::default(),
                 },
@@ -3548,7 +3548,7 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
 /// the bare declaration's, or every later Prepare refuses to reopen it.
 #[test]
 fn stored_cpu_fallback_matches_the_device_default() {
-    let device = DeviceCatalog::discover()
+    let device = seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();

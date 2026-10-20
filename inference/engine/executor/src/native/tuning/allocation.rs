@@ -356,6 +356,19 @@ pub(crate) trait Unit {
     {
         HostRoom::Unbounded
     }
+    /// What host work adding `host` bytes, beside device work charging
+    /// `device` bytes, takes of [`Unit::free`] beyond those device bytes:
+    /// nothing where host RAM is a domain apart ([`Unit::host_free`]), and
+    /// where the device's room and host RAM share one ceiling, the host
+    /// bytes that ceiling does not already count among the device's (the
+    /// tuner's rule, `TuningMemory::shared_host_bytes`). A piece fits when
+    /// its device bytes and this together fit [`Unit::free`].
+    fn shared_host_extra(_context: &Self::Context, _host: u64, _device: u64) -> u64
+    where
+        Self: Sized,
+    {
+        0
+    }
     /// What a piece of the unit's work is taken to add to that host domain:
     /// the most one has added. None before a piece of the unit has run:
     /// its price is then not known, and a piece without a price runs with
@@ -1042,9 +1055,6 @@ pub(crate) fn allocate<U: Unit>(
         }
         if let Some((unit, work)) = choice {
             let largest = units[unit].largest_footprint();
-            let free = |context: &U::Context| {
-                U::free(context).map(|free| free.saturating_sub(flying_bytes))
-            };
             // Where host RAM is a domain of its own, the piece's host
             // bytes fit what is free of it beside the pieces in flight:
             // what is held now, as measured, with the whole price of every
@@ -1060,6 +1070,15 @@ pub(crate) fn allocate<U: Unit>(
                         0
                     })
             });
+            let free = |context: &U::Context| {
+                let device = work.footprint.forecast(largest);
+                let extra = U::shared_host_extra(
+                    context,
+                    host.saturating_add(flying_host),
+                    device.saturating_add(flying_bytes),
+                );
+                U::free(context).map(|free| free.saturating_sub(flying_bytes).saturating_sub(extra))
+            };
             let host_fits = |context: &U::Context| U::host_free(context).admits(host, flying_host);
             // Before any unit gives up inputs it would build again, the
             // load gives back what it holds for nothing.
@@ -1152,7 +1171,7 @@ pub(crate) fn allocate<U: Unit>(
                 .max(workers.compile_host())
                 .saturating_mul(workers.needs(forming) as u64)
         });
-        if let Some((unit, _, _)) = &forming {
+        if let Some((unit, work, _)) = &forming {
             let piece = units[*unit]
                 .host_footprint(context)
                 .unwrap_or(0)
@@ -1165,13 +1184,22 @@ pub(crate) fn allocate<U: Unit>(
                         0
                     })
             });
-            if !U::host_free(context).admits(piece, flying) {
+            let fits = |context: &U::Context| {
+                let device = work
+                    .footprint
+                    .forecast(units[*unit].largest_footprint())
+                    .saturating_add(flying_bytes);
+                let extra = U::shared_host_extra(context, piece.saturating_add(flying), device);
+                U::host_free(context).admits(piece, flying)
+                    && U::free(context).is_none_or(|free| device.saturating_add(extra) <= free)
+            };
+            if !fits(context) {
                 if !flights.is_empty() {
                     crowded[*unit] = true;
                     continue;
                 }
                 U::reclaim(context);
-                if !U::host_free(context).admits(piece, flying) {
+                if !fits(context) {
                     starved[*unit] = true;
                     continue;
                 }
@@ -1694,6 +1722,7 @@ mod tests {
         host: u64,
         host_peak: u64,
         host_ceiling: Option<u64>,
+        shared_host: bool,
     }
 
     thread_local! {
@@ -1709,6 +1738,7 @@ mod tests {
                 host: 0,
                 host_peak: 0,
                 host_ceiling: None,
+                shared_host: false,
             })
         };
     }
@@ -1904,6 +1934,14 @@ mod tests {
             Some(if self.resident { 0 } else { self.host })
         }
 
+        fn shared_host_extra(_: &Log, host: u64, _: u64) -> u64 {
+            if MEMORY.with(Cell::get).shared_host {
+                host
+            } else {
+                0
+            }
+        }
+
         fn programs(&self) -> u64 {
             self.programs_held
         }
@@ -1924,9 +1962,11 @@ mod tests {
 
         fn free(_: &Log) -> Option<u64> {
             let memory = MEMORY.with(Cell::get);
-            memory
-                .ceiling
-                .map(|ceiling| ceiling.saturating_sub(memory.held))
+            memory.ceiling.map(|ceiling| {
+                ceiling
+                    .saturating_sub(memory.held)
+                    .saturating_sub(if memory.shared_host { memory.host } else { 0 })
+            })
         }
 
         fn capacity(_: &Log) -> Option<u64> {
@@ -3307,6 +3347,29 @@ mod tests {
         assert!(!HostRoom::Free(300).admits(200, 101));
         assert!(HostRoom::Free(0).admits(0, 0));
         assert!(!HostRoom::Exceeded.admits(0, 0));
+    }
+
+    #[test]
+    fn shared_store_rejects_a_piece_whose_separate_prices_each_fit() {
+        let clock = Fake::default();
+        let mut units = [Synthetic {
+            inputs: 200,
+            host: 200,
+            ..Synthetic::new(0, &clock, 0.5, &[0.5])
+        }];
+        MEMORY.with(|memory| {
+            memory.set(Memory {
+                ceiling: Some(300),
+                host_ceiling: Some(300),
+                shared_host: true,
+                ..Memory::default()
+            })
+        });
+        let (_, report) = run(&mut units, &clock, 600);
+        let memory = MEMORY.with(Cell::take);
+        assert_eq!(units[0].built, 0);
+        assert_eq!(memory.peak, 0);
+        assert_eq!(report.refused[0].refusal, Refusal::Bytes);
     }
 
     /// A piece whose bytes have no observed price is admitted on nothing

@@ -24,19 +24,20 @@ applies_to:
 
 # Engine memory
 
-One loaded engine owns one heap in the physical memory domain of its selected device. The
-domain is host RAM for a CPU or unified-memory device and device-local memory for a dedicated
-GPU. Seismic identifies the domain, measures its capacity and live availability, charges every
-allocation to it, and enforces the latest limit the heap grants. The heap owns the engine's
-holdings and memory decisions; the request owner chooses release victims and runs one release
-order. The hosting service supplies one threshold policy (the planning and emergency reserves);
+One loaded engine owns one heap over the stores used by its selected executor. Device and
+Upload storage each have an ordered placement through access paths to physical stores.
+Several paths may share one store, and one placement may span stores. Seismic identifies
+those stores, reports their capacity and live availability, charges every allocation to
+its actual paths and stores, and enforces the latest limits the heap grants. The heap owns
+the engine's holdings and memory decisions; the request owner chooses release victims and
+runs one release order. The hosting service supplies one threshold policy (the planning and emergency reserves);
 no caller supplies a memory budget or retention percentage.
 
 A dedicated device's capacity is its usable memory: the device's total less the driver and runtime
 overhead the process cannot use for its own allocations, namely the driver's reserve, what the
 operating system withholds from a process (WDDM), and the process's own context. One function per
 device computes it, once per process and physical device, before the process allocates anything;
-the topology's pool carries it, and stable fit, assessment, the catalog's fit verdict,
+the topology's store carries it, and stable fit, assessment, the catalog's fit verdict,
 recommendations and the engine's claim ceiling all read that one figure:
 
 | Device | Usable capacity |
@@ -75,6 +76,7 @@ emergency reserve `E`:
 |---|---|---|
 | Host RAM, unified memory included | `max(capacity / 10, 2 GiB)` | `max(capacity / 20, 1 GiB)` |
 | A dedicated device's own memory | `max(capacity / 20, 512 MiB)` | `max(capacity / 40, 256 MiB)` |
+| A volume (downloads) | 2 GiB | none: no worker grows on a volume |
 
 Host RAM keeps room for the operating system and other programs whatever the machine's size. A
 dedicated device's capacity already excludes the driver's reserve, the operating system's share and
@@ -110,18 +112,25 @@ separate preclaim check or capacity table decides beside it. A refused startup c
 load, naming the domain that refused it (the allocation domain, or host RAM for a dedicated
 device's staging): with `InsufficientMemory` and the bytes required and available when the claim
 exceeds the domain's ceiling, or with `MemoryPressure` and no byte count when the domain is in
-Reclaim. A weight import runs under one claim for as long as its weights take to become resident,
-so it observes its domains every 100 ms as weights are published and fails the load with
-`MemoryPressure` if one enters Reclaim. A claim is held until Seismic's
+Reclaim. A claim's staged bytes are part of its device bytes; fit charges them to host RAM as well
+only where host RAM is not a store of the executor's device placement, so a device whose memory is
+the host's never counts them twice. A weight import runs under one claim for as long as its
+weights take to become resident, so it observes its domains every 100 ms as weights are
+published and fails the load with `MemoryPressure` if one enters Reclaim. A claim is held until Seismic's
 charge reflects its physical operation (an import and binding, or an added state slab)
 and is then released; the charged bytes join a classified holding. A claim
 names its holding class, its minimum physical peak charge and any preferred charge for useful
 headroom. Seismic's
 charge ledger remains the byte authority: the sum of classified holdings equals its charge.
 
-Beside the charge, Seismic reports what each opened device holds of its memory domain (`held`): the
-charge plus the device memory its backend holds beyond its allocations, so nothing the engine's
-work takes from the device grows outside it. CUDA and Vulkan take device memory from the driver in
+The store ledger includes native holdings as well as logical allocation reservations. Within
+one access path these overlap: the native block owns the tensor ranges suballocated from it,
+so its claim is the maximum of logical reservations and native holdings, not their sum. Native
+blocks, committed virtual-memory granules, mapped host buffers and retained staging own their
+charges until native release. Driver memory whose size is observable only after an operation
+is recorded against the same ledger and reduces subsequent admission headroom. The per-device
+allocation view still reports logical `charged`, native `held`, and reusable `unallocated` bytes.
+CUDA and Vulkan take device memory from the driver in
 blocks (64 MiB, doubling to 1 GiB, a larger request in a dedicated block of whole driver granules)
 and sub-allocate every allocation from them, so a model's many tensors cost no per-allocation driver
 rounding (under WDDM every `cuMemAlloc` takes whole 2 MiB pages); a block is freed once it holds no
@@ -135,31 +144,27 @@ recently replayed dropped beyond it, and assessment plans that bound as a term o
 Vulkan load. A new block is sized within the room the limit grants less the free space blocks
 already hold, and holds only its allocation when a doubled block does not fit that room.
 
-Stable fit capacity bounds metadata-only model fit. It is
-the allocation domain's capacity under applicable process limits and, on Metal, the device's
-recommended working set, less the planning reserve. A live claim uses fresh headroom for that same
-domain, bounded by process limits, and must leave headroom above the planning reserve; on Metal it
-must also leave the working set's remaining bytes above the same reserve, and on a dedicated device
-the capacity less what the device holds (`held`) above it, so what the engine holds never exceeds
-stable fit capacity: fit and the live ceiling share one capacity basis, and a live figure that later
-grows never lets a load outgrow what assessment promised. A claim may also take the device's
-`unallocated` block space, which it fills without the device holding more. The driver's submission memory lies outside the engine's charge,
-and a working set filled to its end fails a submission as a lost device instead of refusing a claim.
-The observation already excludes the engine's own charges and other processes' use, so an existing
-charge is never subtracted again. Released storage returns to its domain: a backend that
-sub-allocates device memory frees each underlying allocation once it holds no storage, so a
-released charge reappears in observed headroom and the release order can satisfy a deficit. A load onto a
-dedicated device also claims its staged uploads against host RAM under the host's reserve.
-A stored table's slots and directory ([residency](residency.md)) are host-shared storage (Seismic's
-upload allocation), charged to the domain it is physically allocated in, which the device reports
-(`DeviceMemoryInfo::shared_pool`): the allocation domain of a unified-memory device (Apple, DGX
-Spark, the CPU) and of a Vulkan device whose upload memory is a large host-visible device-local
-heap (ReBAR/SAM); host RAM, the staging domain, of a dedicated CUDA device (mapped pinned memory)
-and of a Vulkan device without one. Assessment charges them there
-(`AssessmentMemoryCharge::assess_fit`), so a load that does not fit host RAM is refused although
-the device holds the rest; the target import's claim stages them through host RAM; and the census
-reports them in host RAM. Seismic charges every allocation of a device, these included, to its
-ledger, so its enforced limit, charges plus the device's ceiling, is unchanged by them.
+Stable fit bounds metadata-only model fit. The engine's Fit policy subtracts each store's
+planning reserve from its capacity, and bounds each access path by its grant less the same
+reserve: a grant bounds its store as its headroom does, and the device's own work lies inside it
+beside the charges, so a grant filled to its end fails that work (Metal's submission memory
+beyond its recommended working set loses the device) instead of refusing a claim. A path takes
+the smaller of its store's room and its grant's, so no reserve is counted twice. Host process
+limits constrain host capacity and headroom. Live fit uses fresh store headroom and what is left
+of each grant; existing charges are never subtracted twice. A claim may also take the free space
+of the blocks the device already holds (Seismic's `unallocated`), which it fills without the
+device holding more. Direct host demands, Device storage and Upload storage
+consume the same per-store budgets, and storage sharing an access path consumes its grant once.
+The runtime owns driver-granule and retained-block accounting; engine policy never infers a
+memory placement from a backend name. Released storage returns to its actual stores.
+
+A stored table's slots and directory ([residency](residency.md)) use Upload storage. Assessment
+and admission resolve that storage through the executor's Upload placement, while the census
+uses allocation observers to report the physical store charges. Host import buffers are direct
+host demands. The census deduplicates allocations by identity across resident weights, bound
+constants, state slabs, retired in-flight storage and request media; it never assigns allocations
+to a first path or distributes bytes proportionally. Stable store identities cross the worker
+boundary, while revision-local store IDs stay inside their topology.
 
 State is stored in fixed-size history and bank slabs on every backend: one history slab tensor per
 history domain of a store, and one bank slab tensor. The 64 MiB slab target is fixed for an engine
@@ -171,13 +176,16 @@ receives credit only for a decrease in Seismic's measured charge, never for the 
 or prefix cache entry. A failed allocation or copy preserves the published placement and charge.
 
 The heap grants a claim only while every domain the load uses is in the Normal band. It tries the
-preferred charge first, then the minimum. It sets Seismic's enforced limit to current charges plus
-the allocation domain's ceiling (headroom less the planning reserve).
-A limit may fall below retained charges: that forbids further allocation until releases reduce
-the charge. An unclaimed allocation therefore fails within Seismic. Beside its high-water mark, Seismic's
-usage reports the largest demand its limit refused since the mark was restarted (what was charged
-with what was asked for), so a consumer such as kernel tuning tells a refusal by the limit from any
-other failure and learns what the refused work needed. A refused minimum leaves
+preferred charge first, then the minimum. It sets Seismic's enforced store, access-path and storage
+limits to current charges plus their available room. Device and Upload storage share store and
+path ledgers, so neither can spend room already granted to the other.
+A limit may fall below retained charges: that forbids growth of the physical claim until releases
+reduce it; reusing storage already held does not grow the claim. An unclaimed allocation therefore
+fails within Seismic, as a capacity refusal carrying the bytes required and what could be taken,
+which a consumer such as kernel tuning tells from any other failure and prices the refused work
+by. Beside its high-water mark, Seismic's usage reports the largest demand its limit refused since
+the mark was restarted (what was charged with what was asked for), for diagnostics. A refused
+minimum leaves
 accepted request state unchanged and returns the required and available bytes as a demand
 deficit for the request owner to resolve.
 

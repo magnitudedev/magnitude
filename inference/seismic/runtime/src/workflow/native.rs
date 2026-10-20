@@ -1146,8 +1146,8 @@ mod preclaim_tests {
 
     #[test]
     fn opposite_graph_key_orders_preclaim_without_deadlock_or_unused_capacity() {
-        let catalog = crate::devices::Catalog::discover().unwrap();
-        let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+        let devices = crate::devices::Devices::discover(&[]).unwrap();
+        let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
         let crate::backends::OpenedKind::Cpu(opened) = &device.kind else {
             unreachable!()
         };

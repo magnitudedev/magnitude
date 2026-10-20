@@ -162,6 +162,8 @@ pub(crate) struct Inner {
     /// Device memory the driver took for this device outside every block:
     /// the logical device itself, pipelines, shader scratch.
     driver: std::sync::atomic::AtomicU64,
+    driver_account: Mutex<Option<std::sync::Arc<dyn seismic_compiler::executable::MemoryAccount>>>,
+    driver_holds: Mutex<Vec<Box<dyn seismic_compiler::executable::MemoryHold>>>,
     /// Device memory recorded graphs took (their command memory), measured
     /// while each is recorded; the device keeps it for the command buffers
     /// it reuses.
@@ -272,9 +274,9 @@ pub(crate) fn numerical_floor(
 }
 
 impl Inner {
-    /// This process's usage of the device-local heap.
+    /// This process's usage of the heaps device storage is allocated from.
     fn heap_usage(&self) -> u64 {
-        memory_budget(self.instance, self.physical).heap_usage_bytes
+        memory_budget(self.instance, self.physical, &self.facts).heap_usage_bytes
     }
 
     /// Run a driver operation that may take device memory no allocation
@@ -292,12 +294,33 @@ impl Inner {
         }
         let start = self.unheld_mark();
         let result = operation();
-        self.driver.fetch_add(
-            self.unheld_since(start),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.record_driver_memory(&self.driver, self.unheld_since(start));
         MEASURING.with(|measuring| measuring.set(false));
         result
+    }
+
+    /// Count `bytes` the driver took for this device in `counter` (`driver`,
+    /// or `graphs` for a recorded graph) and charge them to the driver
+    /// memory account, held until the device is destroyed. The driver has
+    /// already taken them, so they are recorded, never refused; before an
+    /// account is set they are only counted, and the account takes them
+    /// when it is set. Both happen under the account's lock, so an account
+    /// set meanwhile takes them once.
+    pub(crate) fn record_driver_memory(&self, counter: &std::sync::atomic::AtomicU64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let account = self
+            .driver_account
+            .lock()
+            .expect("driver account lock poisoned");
+        counter.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        if let Some(account) = account.as_ref() {
+            self.driver_holds
+                .lock()
+                .expect("driver accounting lock poisoned")
+                .push(account.record(bytes));
+        }
     }
 
     /// The process's heap usage with the blocks and recorded graphs this
@@ -305,7 +328,7 @@ impl Inner {
     pub(crate) fn unheld_mark(&self) -> (u64, u64) {
         (
             self.heap_usage(),
-            self.memory.device_local_block_bytes()
+            self.memory.device_heap_block_bytes()
                 + self.graphs.load(std::sync::atomic::Ordering::Relaxed),
         )
     }
@@ -314,7 +337,7 @@ impl Inner {
     /// recorded graph accounts for.
     pub(crate) fn unheld_since(&self, (usage, held): (u64, u64)) -> u64 {
         let grown = self.heap_usage().saturating_sub(usage);
-        let held = (self.memory.device_local_block_bytes()
+        let held = (self.memory.device_heap_block_bytes()
             + self.graphs.load(std::sync::atomic::Ordering::Relaxed))
         .saturating_sub(held);
         grown.saturating_sub(held)
@@ -322,6 +345,15 @@ impl Inner {
 }
 
 impl Device {
+    /// The account the device's staging blocks are charged to: host RAM's.
+    /// The logical device is the process's, so a later open replaces the
+    /// account for later blocks; existing blocks keep their charges.
+    pub fn set_host_memory_account(
+        &self,
+        account: Arc<dyn seismic_compiler::executable::MemoryAccount>,
+    ) {
+        self.inner.memory.set_host_memory_account(account);
+    }
     /// Open the physical device with this UUID, revalidating it against
     /// the floor, including its numerical part: without `RoundingModeRTE 32`
     /// its default fp32 rounding must pass the rounding probe, and without
@@ -400,6 +432,40 @@ impl Device {
             .memory
             .allocate(&self.inner.device, kind, bytes, alignment, room)?;
         Ok(Buffer::new(self.inner.clone(), range))
+    }
+
+    /// The accounts new device and upload blocks are charged to, by storage
+    /// kind and heap (the topology's access paths). Replaces the accounts
+    /// for later blocks; existing blocks keep their charges.
+    pub fn set_allocation_accounts(&self, accounts: Vec<crate::AllocationAccount>) {
+        self.inner.memory.set_allocation_accounts(accounts);
+    }
+
+    /// The account the driver's memory for this device is recorded to. The
+    /// first account set also takes what the driver and recorded graphs took
+    /// before it.
+    pub fn set_driver_memory_account(
+        &self,
+        account: Arc<dyn seismic_compiler::executable::MemoryAccount>,
+    ) {
+        let mut slot = self
+            .inner
+            .driver_account
+            .lock()
+            .expect("driver account lock poisoned");
+        let first = slot.is_none();
+        let account = slot.insert(account);
+        // What was counted before, read under the lock every count is made
+        // under, so nothing is taken twice.
+        let counted = self.inner.driver.load(std::sync::atomic::Ordering::Relaxed)
+            + self.inner.graphs.load(std::sync::atomic::Ordering::Relaxed);
+        if first && counted != 0 {
+            self.inner
+                .driver_holds
+                .lock()
+                .expect("driver accounting lock poisoned")
+                .push(account.record(counted));
+        }
     }
 
     /// Host write: through the mapping when the storage is host-visible,
@@ -735,34 +801,76 @@ impl Device {
         self.inner.measured(operation)
     }
 
-    /// Device-local memory the device's blocks hold beyond their ranges:
-    /// held by this process, charged to no allocation, and free for later
-    /// allocations.
-    pub fn unallocated_bytes(&self) -> u64 {
-        self.inner.memory.device_local_slack()
+    /// What the blocks of `storage` hold beyond their ranges: held by this
+    /// process, charged to no allocation, and free for later allocations.
+    pub fn unallocated_bytes(&self, storage: crate::PlacedStorage) -> u64 {
+        self.inner.memory.free_bytes(storage.into())
     }
 
-    /// Device-local memory the device holds beyond its allocations: its
-    /// blocks' free space, its own ranges (argument chunks, staging) and
-    /// the driver's memory for the device (measured; see `Inner::measured`).
-    pub fn held_beyond_allocations(&self) -> u64 {
-        self.inner.memory.device_local_slack()
-            + self.inner.memory.internal_device_local()
-            + self.inner.driver.load(std::sync::atomic::Ordering::Relaxed)
-            + self.inner.graphs.load(std::sync::atomic::Ordering::Relaxed)
+    /// What the device holds for `storage` beyond its allocations: its
+    /// blocks' free space and the device's own ranges in them (argument
+    /// chunks, in upload storage) and, for device storage, the driver's
+    /// memory for the device and its recorded graphs (measured; see
+    /// `Inner::measured`), which the driver memory account charges there.
+    pub fn held_beyond_allocations(&self, storage: crate::PlacedStorage) -> u64 {
+        let memory = &self.inner.memory;
+        let kind: StorageKind = storage.into();
+        let driver = match storage {
+            crate::PlacedStorage::Device => {
+                self.inner.driver.load(std::sync::atomic::Ordering::Relaxed)
+                    + self.inner.graphs.load(std::sync::atomic::Ordering::Relaxed)
+            }
+            crate::PlacedStorage::Upload => 0,
+        };
+        memory.free_bytes(kind) + memory.internal_bytes(kind) + driver
     }
 
-    /// `VK_EXT_memory_budget` of the device-local heap.
+    /// `VK_EXT_memory_budget` of the heaps device storage is allocated
+    /// from.
     pub fn memory_budget(&self) -> MemoryBudget {
-        memory_budget(self.inner.instance, self.inner.physical)
+        memory_budget(self.inner.instance, self.inner.physical, &self.inner.facts)
     }
 }
 
-/// `VK_EXT_memory_budget` of the largest device-local heap of `physical`, a
-/// device meeting the floor (which requires the extension and the heap). The
-/// budget is what the driver grants this process of the heap, its own usage
-/// included; a physical-device query needs no logical device.
-pub(crate) fn memory_budget(instance: &Instance, physical: vk::PhysicalDevice) -> MemoryBudget {
+/// `VK_EXT_memory_budget` of the heaps `facts`' device storage is allocated
+/// from, together. The budget is what the driver grants this process of the
+/// heaps, its own usage included.
+pub(crate) fn memory_budget(
+    instance: &Instance,
+    physical: vk::PhysicalDevice,
+    facts: &Facts,
+) -> MemoryBudget {
+    let budgets = heap_budgets(instance, physical);
+    crate::Allocation::heaps(&facts.memory, &facts.allocation.device)
+        .iter()
+        .map(|&heap| budgets[heap as usize])
+        .fold(
+            MemoryBudget {
+                heap_budget_bytes: 0,
+                heap_usage_bytes: 0,
+            },
+            |sum, heap| MemoryBudget {
+                heap_budget_bytes: sum.heap_budget_bytes + heap.budget,
+                heap_usage_bytes: sum.heap_usage_bytes + heap.usage,
+            },
+        )
+}
+
+/// One heap's `VK_EXT_memory_budget`: what the driver grants this process
+/// of the heap, and what the process uses of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapBudget {
+    /// `heapBudget`: what the driver grants this process of the heap, its
+    /// own usage included.
+    pub budget: u64,
+    /// `heapUsage`: what this process uses of the heap.
+    pub usage: u64,
+}
+
+/// Every heap's budget of `physical`, a device meeting the floor (which
+/// requires the extension); a physical-device query needs no logical
+/// device.
+pub(crate) fn heap_budgets(instance: &Instance, physical: vk::PhysicalDevice) -> Vec<HeapBudget> {
     let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
     let mut properties = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
     unsafe {
@@ -770,19 +878,12 @@ pub(crate) fn memory_budget(instance: &Instance, physical: vk::PhysicalDevice) -
             .raw()
             .get_physical_device_memory_properties2(physical, &mut properties)
     };
-    let memory = properties.memory_properties;
-    let heap = (0..memory.memory_heap_count as usize)
-        .filter(|index| {
-            memory.memory_heaps[*index]
-                .flags
-                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+    (0..properties.memory_properties.memory_heap_count as usize)
+        .map(|heap| HeapBudget {
+            budget: budget.heap_budget[heap],
+            usage: budget.heap_usage[heap],
         })
-        .max_by_key(|index| memory.memory_heaps[*index].size)
-        .expect("the floor requires a device-local heap");
-    MemoryBudget {
-        heap_budget_bytes: budget.heap_budget[heap],
-        heap_usage_bytes: budget.heap_usage[heap],
-    }
+        .collect()
 }
 
 /// One global memory barrier.
@@ -815,7 +916,7 @@ impl Inner {
         physical: vk::PhysicalDevice,
         facts: Facts,
     ) -> Result<Self, OpenError> {
-        let usage_before = memory_budget(instance, physical).heap_usage_bytes;
+        let usage_before = memory_budget(instance, physical, &facts).heap_usage_bytes;
         let raw = instance.raw();
         let mut extensions: Vec<&CStr> = facts::FLOOR_EXTENSIONS.to_vec();
         if facts.matrix {
@@ -899,8 +1000,7 @@ impl Inner {
         // From here every created object is destroyed by `Drop` (null
         // handles are ignored), so partial construction cleans up.
         let queue = unsafe { device.get_device_queue(facts.queue_family, 0) };
-        let memory_properties = unsafe { raw.get_physical_device_memory_properties(physical) };
-        let memory = match Memory::new(&memory_properties, &facts) {
+        let memory = match Memory::new(&facts, instance, physical) {
             Ok(memory) => memory,
             Err(reason) => {
                 unsafe { device.destroy_device(None) };
@@ -927,6 +1027,8 @@ impl Inner {
             }),
             staging: Mutex::new(None),
             driver: std::sync::atomic::AtomicU64::new(0),
+            driver_account: Mutex::new(None),
+            driver_holds: Mutex::new(Vec::new()),
             graphs: std::sync::atomic::AtomicU64::new(0),
             physical,
             instance,

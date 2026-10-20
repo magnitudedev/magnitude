@@ -621,7 +621,7 @@ impl ConstantTensors {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic::{BackendName, DeviceCatalog};
+    use seismic::BackendName;
 
     #[test]
     fn zero_constants_keep_metadata_symbolic_and_bind_exact_bytes() {
@@ -640,40 +640,42 @@ mod tests {
         #[cfg(target_os = "macos")]
         backends.push(BackendName::Metal);
         for backend in backends {
-            let device = DeviceCatalog::discover()
+            let device = seismic::Devices::discover(&[])
                 .unwrap()
                 .open_backend(backend)
                 .unwrap();
-            let before = device.memory_usage().charged;
+            let charged = || device.storage_usage(seismic::StorageKind::Device).charged;
+            let before = charged();
             let mut uploaded = ConstantTensors::new(device.clone());
             let tensor = uploaded.tensor(&zero).unwrap();
             assert_eq!(tensor.read_to_host().unwrap(), vec![0; 24]);
             let tied = uploaded.tensor(&explicit).unwrap();
             assert_eq!(tied.read_to_host().unwrap(), vec![0; 24]);
-            assert_eq!(device.memory_usage().charged - before, 24);
+            assert_eq!(charged() - before, 24);
             drop(tensor);
             drop(tied);
             drop(uploaded);
-            assert_eq!(device.memory_usage().charged, before);
+            assert_eq!(charged(), before);
         }
     }
 
     #[test]
     fn binding_claim_matches_distinct_physical_constant_charge() {
-        let catalog = DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Devices::discover(&[]).unwrap();
         let device = catalog.open_backend(BackendName::Cpu).unwrap();
         let mut graph = device.native_graph();
         let first = GraphConstant::i32(&mut graph, &[1, 2, 3]).unwrap();
         let tied = GraphConstant::i32(&mut graph, &[1, 2, 3]).unwrap();
         let other = GraphConstant::f32(&mut graph, &[1.0, 2.0]).unwrap();
         let claim = distinct_storage_bytes([&first, &tied, &other]).unwrap();
-        let before = device.memory_usage().charged;
+        let charged = || device.storage_usage(seismic::StorageKind::Device).charged;
+        let before = charged();
         let mut uploaded = ConstantTensors::new(device.clone());
         uploaded.tensor(&first).unwrap();
         uploaded.tensor(&tied).unwrap();
         uploaded.tensor(&other).unwrap();
-        assert_eq!(device.memory_usage().charged - before, claim);
+        assert_eq!(charged() - before, claim);
         drop(uploaded);
-        assert_eq!(device.memory_usage().charged, before);
+        assert_eq!(charged(), before);
     }
 }

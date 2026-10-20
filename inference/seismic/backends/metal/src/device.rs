@@ -360,8 +360,12 @@ impl MetalDevice {
                 .raw()
                 .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
         })
-        .ok_or_else(|| {
-            ExecutionError::AllocationFailed(format!("Metal refused a {bytes}-byte buffer"))
+        // Metal states no reason for a buffer it does not create; within
+        // `maxBufferLength` it is the device's memory that refused it, a
+        // capacity refusal as every backend reports one.
+        .ok_or(ExecutionError::AllocationCapacity {
+            required: bytes.into(),
+            available: 0,
         })?;
         let wired = WiredAllocation::wire(&self.residency, &buffer);
         Ok(MetalBuffer {

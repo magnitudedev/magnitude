@@ -543,7 +543,7 @@ fn generated_surface_is_one_dense_import_and_one_exact_repack() {
 
 /// The opened device of `backend`, when this host has one.
 fn device(backend: seismic::BackendName) -> Option<seismic::Device> {
-    seismic::DeviceCatalog::discover()
+    seismic::Devices::discover(&[])
         .ok()?
         .open_backend(backend)
         .ok()

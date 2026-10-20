@@ -79,7 +79,7 @@ impl EntryTuning for ProjectRowsTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, seismic::BuildError> {
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()

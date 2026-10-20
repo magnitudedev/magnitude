@@ -386,6 +386,11 @@ impl RowState<'_> {
 }
 
 impl NativeTargetProgram {
+    /// Visit the graph constants the program binds.
+    pub(crate) fn visit_constants(&self, visit: &mut dyn FnMut(&seismic::Tensor)) {
+        self.graphs.visit_constants(visit);
+    }
+
     pub(crate) fn constant_bytes(&self) -> Result<u64, &'static str> {
         self.graphs.constant_bytes()
     }

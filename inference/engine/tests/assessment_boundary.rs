@@ -683,7 +683,7 @@ fn the_fingerprint_reads_the_header_shape_and_the_token_table() {
 }
 
 fn cpu_setup() -> AssessmentSetup {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     AssessmentSetup::discover(
         &catalog,
         DeviceRequest::Backend(BackendName::Cpu),
@@ -855,7 +855,7 @@ fn cpu_refusal(package: &ModelPackagePaths, policy: ModelPolicy) -> UnsupportedM
     else {
         panic!("the package is admitted");
     };
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let setup = AssessmentSetup::discover(
         &catalog,
         DeviceRequest::Backend(BackendName::Cpu),

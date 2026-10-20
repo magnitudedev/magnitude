@@ -729,16 +729,17 @@ impl ManagedModelStore {
 
         let completed_bytes = resumable_bytes(&repo_root, &components).await;
         let missing_bytes = total_bytes.saturating_sub(completed_bytes);
-        let required_bytes = missing_bytes
-            .saturating_add(companion_bytes)
-            .saturating_add(self.config.disk_reserve_bytes);
+        let required_bytes = missing_bytes.saturating_add(companion_bytes);
+        // What the volume has above its reserve, which fit owns.
         let available_bytes =
-            fs2::available_space(&self.config.root).map_err(|error| DownloadError {
-                kind: DownloadErrorKind::FileSystem,
-                message: error.to_string(),
-                retryable: true,
-                resumable: true,
-            })?;
+            self.download_space
+                .available_bytes()
+                .map_err(|error| DownloadError {
+                    kind: DownloadErrorKind::FileSystem,
+                    message: error.to_string(),
+                    retryable: true,
+                    resumable: true,
+                })?;
         operation
             .sender
             .send_replace(ModelDownloadEvent::CheckingSpace {
@@ -2537,7 +2538,7 @@ mod tests {
             .expect("installed model");
         let mut config = InventoryConfig::with_roots(root, cache_root).expect("inventory config");
         config.add_hugging_face_caches([hf_cache]);
-        let manager = ManagedModelStore::open(config)
+        let manager = ManagedModelStore::open_unbounded(config)
             .await
             .expect("model manager");
         manager
@@ -2619,7 +2620,7 @@ mod tests {
         .expect("inventory config");
         config.add_hugging_face_caches([hf_cache]);
         let manager = Arc::new(
-            ManagedModelStore::open(config)
+            ManagedModelStore::open_unbounded(config)
                 .await
                 .expect("model manager"),
         );
@@ -2707,7 +2708,7 @@ mod tests {
         )
         .expect("inventory config");
         let manager = Arc::new(
-            ManagedModelStore::open(config)
+            ManagedModelStore::open_unbounded(config)
                 .await
                 .expect("model manager"),
         );
@@ -2800,7 +2801,7 @@ mod tests {
                 directory.path().join("cache"),
             )
             .expect("inventory config");
-            let manager = ManagedModelStore::open(config)
+            let manager = ManagedModelStore::open_unbounded(config)
                 .await
                 .expect("model manager");
             let package = exact_package("model.gguf", b"model");
@@ -2855,7 +2856,7 @@ mod tests {
             directory.path().join("cache"),
         )
         .expect("inventory config");
-        let manager = ManagedModelStore::open(config)
+        let manager = ManagedModelStore::open_unbounded(config)
             .await
             .expect("model manager");
         let package = exact_package("model.gguf", b"model");
@@ -3167,7 +3168,7 @@ mod tests {
         )
         .unwrap();
         config.add_hugging_face_caches([temporary.path().join("hf-cache")]);
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
 
         let present = model_component(&contents);

@@ -1,5 +1,6 @@
-//! The one host platform implementation: host RAM capacity and scoped host
-//! memory observations. Host modules never load GPU drivers.
+//! The host: RAM capacity, the OS build, and host RAM status with the
+//! process limits that bound every path into host RAM (spec §2.4). Host
+//! modules never load GPU drivers.
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -15,35 +16,41 @@ use macos as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
 
-use super::{CapacityBasis, ObservationError};
-use std::time::{Duration, Instant, SystemTime};
+use crate::model::Reported;
+use std::fmt;
+use std::time::{Duration, Instant};
 
-/// Established host RAM capacity and the definition of that figure.
-pub(crate) struct HostCapacity {
-    pub(crate) bytes: u64,
-    pub(crate) basis: CapacityBasis,
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub(crate) fn capacity() -> Result<HostCapacity, String> {
+/// Host RAM capacity: RAM the OS can use.
+pub(crate) fn capacity() -> Result<Reported<u64>, String> {
     platform::capacity()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub(crate) fn capacity() -> Result<HostCapacity, String> {
-    Err("host memory discovery is not implemented for this operating system".into())
+/// The OS version and build, as the OS reports it: the driver of the CPU
+/// executor and of Metal.
+pub(crate) fn os_build() -> Result<String, String> {
+    platform::os_build()
 }
 
-/// One host memory observation. `history` holds the displacement windows of
-/// the samples taken through it; the sample closes a window when it is due.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub(crate) fn status(
-    history: &mut DisplacementHistory,
-) -> Result<HostMemoryStatus, ObservationError> {
+/// The CPU as the OS reports it: the platform's identifying CPU fields
+/// (Linux `/proc/cpuinfo`'s model, feature and revision fields for every
+/// processor; macOS `sysctl`'s brand string, model and CPU counts;
+/// Windows' processor architecture, count, level and revision with its
+/// CPUID vendor, signature and feature, and brand leaves), then
+/// `;isa=<tier>` for the highest native tier it supports, where it supports
+/// one.
+pub(crate) fn cpu_identity() -> Result<String, String> {
+    let mut identity = platform::cpu_identity()?;
+    if let Some(tier) = seismic_native_cpu::Tier::detected() {
+        identity.push_str(&format!(";isa={}", tier.name()));
+    }
+    Ok(identity)
+}
+
+/// One host RAM status. `history` holds the displacement windows of the
+/// samples taken through it; the sample closes a window when it is due.
+pub(crate) fn status(history: &mut DisplacementHistory) -> Result<HostStatus, ObservationError> {
     let sample = platform::sample()?;
-    Ok(HostMemoryStatus {
-        sampled_at: sample.sampled_at,
-        measurements: sample.measurements,
+    Ok(HostStatus {
         headroom: sample.headroom,
         limits: sample.limits,
         limit_visibility: sample.limit_visibility,
@@ -54,25 +61,10 @@ pub(crate) fn status(
     })
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub(crate) fn status(
-    _history: &mut DisplacementHistory,
-) -> Result<HostMemoryStatus, ObservationError> {
-    Err(ObservationError::Unsupported(
-        "host memory observation is not implemented for this operating system".into(),
-    ))
-}
-
-/// One platform sample, before the displacement history of the catalog that
-/// took it is applied.
-#[cfg_attr(
-    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
-    allow(dead_code)
-)]
+/// One platform sample, before the displacement history of the inventory
+/// that took it is applied.
 pub(crate) struct HostSample {
-    pub(crate) sampled_at: SystemTime,
-    pub(crate) measurements: HostMeasurements,
-    pub(crate) headroom: HeadroomEstimate,
+    pub(crate) headroom: Reported<u64>,
     pub(crate) limits: Vec<ProcessMemoryLimit>,
     pub(crate) limit_visibility: LimitVisibility,
     /// Cumulative displacement, on a platform that counts it.
@@ -80,27 +72,58 @@ pub(crate) struct HostSample {
     pub(crate) kernel_pressure: Option<KernelPressure>,
 }
 
-/// One sampled host memory observation. Its fields share one sample time;
-/// device observations are separate samples, not one atomic snapshot.
+/// Host RAM's status in one sample.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostMemoryStatus {
-    pub sampled_at: SystemTime,
-    /// Native counters exactly as the platform names them.
-    pub measurements: HostMeasurements,
-    /// The platform's defined headroom estimate. It is an estimate of
+pub struct HostStatus {
+    /// The OS's estimate of RAM this process can still take. An estimate of
     /// allocatable RAM, never exact physical availability.
-    pub headroom: HeadroomEstimate,
-    /// Process and environment limits that apply to this process.
+    pub headroom: Reported<u64>,
+    /// The OS limits on this process: grants on host RAM that every path
+    /// into it shares.
     pub limits: Vec<ProcessMemoryLimit>,
     /// Whether every applicable limit could be observed.
     pub limit_visibility: LimitVisibility,
     /// Displacement of programs' memory over the recent windows of the
-    /// catalog that took this sample. `None` on a platform that counts none.
+    /// inventory that took this sample. `None` on a platform that counts
+    /// none.
     pub displacement: Option<HostDisplacement>,
     /// The kernel's own pressure classification. `None` on a platform
     /// without one.
     pub kernel_pressure: Option<KernelPressure>,
 }
+
+impl HostStatus {
+    /// What host RAM has left for this process: the OS's availability
+    /// within every process limit.
+    pub fn available(&self) -> u64 {
+        self.limits
+            .iter()
+            .fold(self.headroom.value, |bytes, limit| {
+                bytes.min(limit.remaining_bytes())
+            })
+    }
+}
+
+/// Why a status reading could not be taken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObservationError {
+    /// This platform or configuration offers no qualified facility for the
+    /// observation.
+    Unsupported(String),
+    /// The native query failed.
+    Failed(String),
+}
+
+impl fmt::Display for ObservationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported(message) => write!(f, "observation unsupported: {message}"),
+            Self::Failed(message) => write!(f, "observation failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ObservationError {}
 
 /// A program's pages leaving RAM under memory demand, counted in pages
 /// since boot: compressed in memory, faulted back from compression, written
@@ -118,10 +141,15 @@ pub(crate) struct DisplacementCounters {
 /// at least 500 ms apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DisplacementWindow {
+    /// The span between the window's two samples.
     pub duration: Duration,
+    /// Pages compressed in memory within the window.
     pub compressed_pages: u64,
+    /// Pages faulted back from compression within the window.
     pub decompressed_pages: u64,
+    /// Pages written to swap within the window.
     pub swapped_out_pages: u64,
+    /// Pages read back from swap within the window.
     pub swapped_in_pages: u64,
 }
 
@@ -130,6 +158,7 @@ pub struct DisplacementWindow {
 /// in the list begins.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HostDisplacement {
+    /// The windows, most recent first.
     pub windows: Vec<DisplacementWindow>,
 }
 
@@ -141,10 +170,10 @@ const MIN_DISPLACEMENT_WINDOW: Duration = Duration::from_millis(500);
 /// memory policy judges displacement over.
 pub const DISPLACEMENT_HISTORY: Duration = Duration::from_secs(60);
 
-/// The completed displacement windows of one catalog's host samples. Windows
-/// tumble: the first sample at least [`MIN_DISPLACEMENT_WINDOW`] after a
-/// window opened completes it and opens the next. A window that ended more
-/// than [`DISPLACEMENT_HISTORY`] ago is dropped.
+/// The completed displacement windows of one inventory's host samples.
+/// Windows tumble: the first sample at least [`MIN_DISPLACEMENT_WINDOW`]
+/// after a window opened completes it and opens the next. A window that
+/// ended more than [`DISPLACEMENT_HISTORY`] ago is dropped.
 #[derive(Debug, Default)]
 pub(crate) struct DisplacementHistory {
     open: Option<(Instant, DisplacementCounters)>,
@@ -152,7 +181,11 @@ pub(crate) struct DisplacementHistory {
 }
 
 impl DisplacementHistory {
-    pub(crate) fn record(&mut self, at: Instant, counters: DisplacementCounters) -> HostDisplacement {
+    pub(crate) fn record(
+        &mut self,
+        at: Instant,
+        counters: DisplacementCounters,
+    ) -> HostDisplacement {
         let Some((opened_at, opening)) = self.open else {
             self.open = Some((at, counters));
             return self.completed.clone();
@@ -200,71 +233,22 @@ impl DisplacementHistory {
 /// A kernel's classification of system memory pressure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelPressure {
+    /// The kernel reports no memory pressure.
     Normal,
+    /// The kernel warns of memory pressure.
     Warning,
+    /// The kernel reports critical memory pressure.
     Critical,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HostMeasurements {
-    /// Mach `HOST_VM_INFO64` page counters and the page size they use.
-    MacOs {
-        page_size_bytes: u64,
-        /// Free pages, including speculative pages.
-        free_pages: u64,
-        speculative_pages: u64,
-        active_pages: u64,
-        inactive_pages: u64,
-        wired_pages: u64,
-        purgeable_pages: u64,
-        /// Pages occupied by the compressor (compressed storage, not the
-        /// uncompressed size it holds).
-        compressor_pages: u64,
-        /// File-backed pages.
-        external_pages: u64,
-        /// Anonymous pages.
-        internal_pages: u64,
-    },
-    /// `/proc/meminfo`.
-    Linux {
-        mem_free_bytes: u64,
-        /// The kernel's estimate of memory available for new workloads.
-        mem_available_bytes: u64,
-    },
-    /// `GlobalMemoryStatusEx`.
-    Windows {
-        available_physical_bytes: u64,
-        /// Commit limit (physical RAM plus page files) for this process.
-        commit_limit_bytes: u64,
-        /// Commit this process can still make.
-        available_commit_bytes: u64,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HeadroomEstimate {
-    pub bytes: u64,
-    pub basis: HeadroomBasis,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeadroomBasis {
-    /// macOS: (free + active + inactive pages) × page size, the kernel's
-    /// own definition of available memory: every page that is neither wired
-    /// nor occupied by the compressor. Taking a page another program holds
-    /// displaces it; the displacement windows report that cost.
-    MachMovablePages,
-    /// Linux `MemAvailable`.
-    LinuxMemAvailable,
-    /// Windows: the lesser of available physical memory and available commit.
-    WindowsPhysicalAndCommit,
 }
 
 /// One applicable limit with the usage it is enforced against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessMemoryLimit {
+    /// Which limit it is.
     pub kind: ProcessLimitKind,
+    /// The limit.
     pub limit_bytes: u64,
+    /// The usage the limit is enforced against.
     pub used_bytes: u64,
     /// Clean inactive file cache the OS can reclaim within this limit. Zero
     /// for address-space, data-segment and committed-memory limits, where
@@ -273,12 +257,15 @@ pub struct ProcessMemoryLimit {
 }
 
 impl ProcessMemoryLimit {
+    /// What the limit has left: the limit less the usage the OS cannot
+    /// reclaim within it.
     pub fn remaining_bytes(&self) -> u64 {
         self.limit_bytes
             .saturating_sub(self.used_bytes.saturating_sub(self.reclaimable_bytes))
     }
 }
 
+/// An OS limit on this process's memory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcessLimitKind {
     /// cgroup v1 `memory.limit_in_bytes` of this process's cgroup or a
@@ -297,6 +284,7 @@ pub enum ProcessLimitKind {
     WindowsJobProcess,
 }
 
+/// Whether a sample's process limits are all the limits that apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LimitVisibility {
     /// Every limit applicable to this process was observed.
@@ -322,7 +310,10 @@ mod tests {
     fn a_window_completes_at_the_first_sample_past_the_minimum_span() {
         let start = Instant::now();
         let mut history = DisplacementHistory::default();
-        assert_eq!(history.record(start, counters(10, 0)), HostDisplacement::default());
+        assert_eq!(
+            history.record(start, counters(10, 0)),
+            HostDisplacement::default()
+        );
         // Samples inside the open window complete nothing.
         let early = history.record(start + Duration::from_millis(499), counters(40, 0));
         assert_eq!(early, HostDisplacement::default());
@@ -374,23 +365,20 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_headroom_is_movable_memory_and_its_samples_form_displacement_windows() {
+        let reading = macos::vm_reading().unwrap();
+        let pages = &reading.statistics;
+        let movable = u64::from(pages.free_count)
+            + u64::from(pages.active_count)
+            + u64::from(pages.inactive_count);
+        assert_eq!(
+            macos::sample_of(&reading).unwrap().headroom,
+            Reported::new(
+                movable * reading.page_size,
+                crate::model::ReportedBy::MachMovablePages
+            )
+        );
         let mut history = DisplacementHistory::default();
         let first = status(&mut history).unwrap();
-        let HostMeasurements::MacOs {
-            page_size_bytes,
-            free_pages,
-            active_pages,
-            inactive_pages,
-            ..
-        } = first.measurements
-        else {
-            panic!("macOS reports Mach measurements");
-        };
-        assert_eq!(first.headroom.basis, HeadroomBasis::MachMovablePages);
-        assert_eq!(
-            first.headroom.bytes,
-            (free_pages + active_pages + inactive_pages) * page_size_bytes
-        );
         assert!(first.kernel_pressure.is_some());
         assert_eq!(first.displacement, Some(HostDisplacement::default()));
         std::thread::sleep(MIN_DISPLACEMENT_WINDOW);

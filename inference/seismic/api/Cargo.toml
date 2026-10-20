@@ -8,6 +8,8 @@ license.workspace = true
 seismic-lang.workspace = true
 seismic-compiler.workspace = true
 seismic-runtime.workspace = true
+seismic-topology.workspace = true
+seismic-measure.workspace = true
 seismic-native-cpu.workspace = true
 seismic-std.workspace = true
 sha2 = "0.10"
@@ -16,3 +18,5 @@ self_cell = "1"
 [features]
 # Offline formation coverage of native implementations (`seismic::coverage`).
 coverage = ["seismic-runtime/coverage"]
+# The recorded machines (`seismic::fixtures::recorded`), for other crates' tests.
+fixtures = ["seismic-topology/fixtures"]

@@ -11,7 +11,7 @@ use crate::{
 };
 use magnitude_artifacts::{Package, gguf::GgufArtifact};
 use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
-use seismic::{Device, Element, Tensor};
+use seismic::{BuildError, Device, Element, Tensor};
 use std::collections::HashMap;
 
 /// Where tuning reads weights from.
@@ -22,7 +22,7 @@ pub trait TuningWeightSource {
 
     /// The tensor an import entry reads `weight` from on `device`: its
     /// source in its upload representation, one row of every element.
-    fn import_source(&self, device: &Device, weight: &WeightPlan) -> Result<Tensor, String>;
+    fn import_source(&self, device: &Device, weight: &WeightPlan) -> Result<Tensor, BuildError>;
 }
 
 impl TuningWeightSource for Package {
@@ -50,16 +50,14 @@ impl TuningWeightSource for Package {
     /// written from the stored range a block at a time. Tuning's import of
     /// a weight therefore holds on the host what the load's import of it
     /// holds, and no copy of the source besides.
-    fn import_source(&self, device: &Device, weight: &WeightPlan) -> Result<Tensor, String> {
+    fn import_source(&self, device: &Device, weight: &WeightPlan) -> Result<Tensor, BuildError> {
         let artifact = artifact(self, weight.component)?;
         let stored =
             Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
         let window = (ImportWindow::serves(device) && !weight.host_prepared())
             .then(|| ImportWindow::of(device, &stored))
-            .transpose()
-            .map_err(|error| error.to_string())?;
-        let mut source = ImportSource::acquire(weight, &stored, window.as_ref(), device)
-            .map_err(|error| error.to_string())?;
+            .transpose()?;
+        let mut source = ImportSource::acquire(weight, &stored, window.as_ref(), device)?;
         if let Some(upload) = source.staged_mut() {
             crate::programs::native_import::fill_staged_source(&stored, weight, upload)
                 .map_err(|error| error.to_string())?;
@@ -103,9 +101,8 @@ impl TuningWeightSource for ZeroTuningWeights {
         ])
     }
 
-    fn import_source(&self, device: &Device, weight: &WeightPlan) -> Result<Tensor, String> {
-        Tensor::zeros(device, weight.upload, &[logical_count(&weight.shape)?])
-            .map_err(|error| error.to_string())
+    fn import_source(&self, device: &Device, weight: &WeightPlan) -> Result<Tensor, BuildError> {
+        Ok(Tensor::zeros(device, weight.upload, &[logical_count(&weight.shape)?])?)
     }
 }
 
@@ -182,7 +179,11 @@ impl<'a> TuningWeights<'a> {
 
     /// The packing bound of a weight, as its import makes it; `None` for a
     /// weight without one.
-    pub fn bound(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Option<Tensor>, String> {
+    pub fn bound(
+        &mut self,
+        scope: WeightScope,
+        kind: WeightKind,
+    ) -> Result<Option<Tensor>, BuildError> {
         let role = WeightRole { scope, kind };
         if self.plan(scope, kind)?.bound == 0 {
             return Ok(None);
@@ -193,7 +194,10 @@ impl<'a> TuningWeights<'a> {
         Ok(self.bounds.get(&role).cloned())
     }
 
-    pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, String> {
+    /// The resident weight of one role, imported once and shared while any
+    /// built input holds it. An allocation the device refuses is
+    /// [`BuildError::Refused`].
+    pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, BuildError> {
         let role = WeightRole { scope, kind };
         if let Some(tensor) = self.resident.get(&role) {
             return Ok(tensor.clone());
@@ -203,18 +207,15 @@ impl<'a> TuningWeights<'a> {
         // uploads it.
         if plan.placed_on_host() {
             let bytes = self.source.source_bytes(plan)?;
-            let tensor = Tensor::from_host(self.device, plan.resident, &plan.shape, &bytes)
-                .map_err(|error| error.to_string())?;
+            let tensor = Tensor::from_host(self.device, plan.resident, &plan.shape, &bytes)?;
             self.resident.insert(role, tensor.clone());
             return Ok(tensor);
         }
         let source = self.source.import_source(self.device, plan)?;
-        let destination = Tensor::zeros(self.device, plan.resident, &plan.shape)
-            .map_err(|error| error.to_string())?;
+        let destination = Tensor::zeros(self.device, plan.resident, &plan.shape)?;
         let mut bound = (plan.bound != 0)
             .then(|| Tensor::zeros(self.device, Element::f32(), &[plan.bound]))
-            .transpose()
-            .map_err(|error| error.to_string())?;
+            .transpose()?;
         let handle = self
             .import
             .attested(ImportProgramSlot::of(plan))

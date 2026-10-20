@@ -106,7 +106,11 @@ async fn open_catalog_models(
     let mut config = InventoryConfig::with_roots(model_store, cache_root)
         .context("invalid catalog-build inventory configuration")?;
     config.add_hugging_face_caches(hf_caches);
-    Ok(Arc::new(ManagedModelStore::open(config).await?))
+    let space = Arc::new(magnitude_executor::platform::volume_space(
+        config.root.clone(),
+        magnitude_executor::platform::MemoryReserves::standard(),
+    ));
+    Ok(Arc::new(ManagedModelStore::open(config, space).await?))
 }
 
 fn ensure_catalog_resolved(

@@ -26,32 +26,35 @@ pub use super::admission::{
     Constraint, GOVERNING_STEP, GoverningStep, NumericalObservation, NumericalRequirement,
     Reselection, Violation, admit, governing_ratio, reselect,
 };
+use super::budget::{Footprint, Linear, Observed, PointPrices, Quote};
 pub use super::comparison::{
     COMPARISON_VERSION, Difference, StepPower, SubjectComparison, SubjectMeasurement,
 };
-use super::deadline::{Deadline, WorkError};
 use super::plan::{self, PointShape};
-use super::sampling::{Rates, Sequence, Shuffle, Tally, Verdict};
-use super::search::{Cost, ParameterValues, PointKey, SearchSettings};
-use super::timing::{self, OutputPool, PointPrices, PointTiming};
-pub use super::timing::{Footprint, Linear, Observed, Quote, Raise, RaiseOutcome, SustainedClock};
+use super::sampling::{Rates, Sequence};
+use super::search::{Cost, LaunchKey, ParameterValues, SearchSettings};
+use super::timing::{OutputPool, PointTiming};
 use super::validation::{PreparedPoint, Validator};
-use super::{
-    FormationClass, HeldPrograms, MeasureOptions, NativePrepared, Rendered, median, median_of,
-};
+use super::{FormationClass, HeldPrograms, NativePrepared, Rendered};
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{EncodedArgs, PrepareError};
 use crate::api::{CallError, TensorError};
+use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::prepared::{InvocationContract, validate_invocation};
 use seismic_lang::checked::{CheckedModule, NativeImplementation, NativeSpecialization};
 use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::EntryId;
+use seismic_measure::{
+    Clock, Counted, Deadline, Raise, Rounds, Shuffle, Slotted, Tally, Verdict, WorkError, median,
+    median_of, sample, warm,
+};
 pub use seismic_native_target::process::{ProcessMemory, return_freed_pages};
 pub use seismic_native_target::workers::{Narrowed, Workers};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -166,7 +169,78 @@ pub trait PointSource<'a> {
         Vec::new()
     }
     /// Build point `point`'s inputs, or say why they cannot be built.
-    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, String>;
+    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, BuildError>;
+}
+
+/// Why a point's inputs were not built.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BuildError {
+    /// The device refused an allocation the inputs need: `required` bytes
+    /// where it could take `available`. Not the unit's failure: the point
+    /// is priced at what its build demanded and offered again once that is
+    /// free ([`build_point`]).
+    Refused { required: u64, available: u64 },
+    /// The inputs cannot be built; the unit fails.
+    Failed(String),
+}
+
+impl fmt::Display for BuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused {
+                required,
+                available,
+            } => write!(
+                f,
+                "the device refused {required} bytes of inputs with {available} available"
+            ),
+            Self::Failed(detail) => f.write_str(detail),
+        }
+    }
+}
+
+impl From<String> for BuildError {
+    fn from(detail: String) -> Self {
+        Self::Failed(detail)
+    }
+}
+
+impl From<&str> for BuildError {
+    fn from(detail: &str) -> Self {
+        Self::Failed(detail.to_owned())
+    }
+}
+
+impl BuildError {
+    /// A build that failed with `error`: a refusal where the device refused
+    /// an allocation, else a failure.
+    fn of(error: impl Refusal + fmt::Display) -> Self {
+        match error.refusal() {
+            Some((required, available)) => Self::Refused {
+                required,
+                available,
+            },
+            None => Self::Failed(error.to_string()),
+        }
+    }
+}
+
+impl From<ExecutionError> for BuildError {
+    fn from(error: ExecutionError) -> Self {
+        Self::of(error)
+    }
+}
+
+impl From<TensorError> for BuildError {
+    fn from(error: TensorError) -> Self {
+        Self::of(error)
+    }
+}
+
+impl From<CallError> for BuildError {
+    fn from(error: CallError) -> Self {
+        Self::of(error)
+    }
 }
 
 /// A point with its inputs built.
@@ -258,6 +332,90 @@ pub enum Exclusion {
     Validation { point: String, detail: String },
     /// Measuring the configuration at a point failed.
     Measurement { point: String, detail: String },
+    /// The device refused an allocation the configuration's work needs:
+    /// `required` bytes where it could take `available`. Not the
+    /// configuration's failure: the work did not fit the room it was given.
+    Refused { required: u64, available: u64 },
+}
+
+/// The capacity refusal an error carries, as the bytes required and
+/// available: the one reading of a refusal both builds ([`BuildError`]) and
+/// measurements ([`Exclusion`]) classify by.
+pub(crate) trait Refusal {
+    fn refusal(&self) -> Option<(u64, u64)>;
+}
+
+impl Refusal for ExecutionError {
+    fn refusal(&self) -> Option<(u64, u64)> {
+        match self {
+            // A demand beyond u64 is never free.
+            ExecutionError::AllocationCapacity {
+                required,
+                available,
+            } => Some((u64::try_from(required).unwrap_or(u64::MAX), *available)),
+            _ => None,
+        }
+    }
+}
+
+impl Refusal for CallError {
+    fn refusal(&self) -> Option<(u64, u64)> {
+        match self {
+            CallError::Execution(error) => error.refusal(),
+            _ => None,
+        }
+    }
+}
+
+impl Refusal for TensorError {
+    fn refusal(&self) -> Option<(u64, u64)> {
+        match self {
+            TensorError::Execution(error) => error.refusal(),
+            _ => None,
+        }
+    }
+}
+
+impl Exclusion {
+    /// The exclusion of `error`: a refusal where the device refused an
+    /// allocation ([`BuildError::of`]), else what `failed` makes of its
+    /// text.
+    fn of(error: BuildError, failed: impl FnOnce(String) -> Self) -> Self {
+        match error {
+            BuildError::Refused {
+                required,
+                available,
+            } => Self::Refused {
+                required,
+                available,
+            },
+            BuildError::Failed(detail) => failed(detail),
+        }
+    }
+
+    /// The exclusion of a call that failed with `error`: a refusal where the
+    /// device refused an allocation, else an execution failure.
+    pub(crate) fn execution(error: impl Refusal + fmt::Display) -> Self {
+        Self::from(BuildError::of(error))
+    }
+
+    /// The exclusion of measuring at `point` failing with `error`: a
+    /// refusal where the device refused an allocation, else a measurement
+    /// failure.
+    pub(crate) fn measuring(point: String, error: impl Refusal + fmt::Display) -> Self {
+        Self::of(BuildError::of(error), |detail| Self::Measurement {
+            point,
+            detail,
+        })
+    }
+}
+
+impl From<BuildError> for Exclusion {
+    /// A build's refusal is the point's; a failed build is an execution
+    /// failure.
+    fn from(error: BuildError) -> Self {
+        Self::of(error, Self::Execution)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -265,7 +423,7 @@ pub struct PointMeasurement {
     pub point: String,
     /// What the measurement depends on; configurations with the same key at
     /// a point share it.
-    pub key: PointKey,
+    pub key: LaunchKey,
     /// The time of one call there. For the defaults, the median of their
     /// samples. For a challenger of a search, its time in the unit's
     /// canonical units: the median over its rounds of its sample's ratio
@@ -678,15 +836,16 @@ fn held_bytes(device: &DeviceInner, charged: u64, retained: u64, footprint: Opti
     }
 }
 
-/// Build point `index`'s inputs on `device`. A build the device's enforced
-/// memory limit refused is not the unit's failure: its piece was admitted
-/// on a footprint below what the build demands, which an unbuilt point's
-/// price only forecasts. The point's price (`resident`) is raised to what
-/// the build demanded of the ledger, what it had charged when refused with
-/// what it asked for, and `None` ends the piece. Offered again at that
-/// price, it is admitted as any priced piece: once enough is free, so the
-/// same allocation is not refused again, or never, its unit then stopped
-/// for want of room.
+/// Build point `index`'s inputs on `device`. A build the device refused
+/// ([`BuildError::Refused`]) is not the unit's failure: its piece was
+/// admitted on a footprint below what the build demands, which an unbuilt
+/// point's price only forecasts. The point's price (`resident`) is raised to
+/// what the build demanded: what it took of what the device's storage could
+/// take before it ([`DeviceInner::storage_available`]) until the refusal
+/// left `available`, and the `required` bytes refused. `None` ends the
+/// piece. Offered again at that price, it is admitted as any priced piece:
+/// once enough is free, so the same allocation is not refused again, or
+/// never, its unit then stopped for want of room.
 fn build_point<'a>(
     device: &DeviceInner,
     source: &mut dyn PointSource<'a>,
@@ -694,19 +853,21 @@ fn build_point<'a>(
     index: usize,
     resident: &mut Observed,
 ) -> Result<Option<PointInputs<'a>>, TuneError> {
-    let before = device.memory_usage();
+    let before = device.storage_available(seismic_topology::StorageKind::Device);
     match source.build(index) {
         Ok(inputs) => Ok(Some(inputs)),
-        Err(detail) => match device.memory_usage().refused_demand {
-            Some(demand) if Some(demand) > before.refused_demand => {
-                resident.observe(demand.saturating_sub(before.charged) as f64);
-                Ok(None)
-            }
-            _ => Err(TuneError::Inputs {
-                point: spec.label.clone(),
-                detail,
-            }),
-        },
+        Err(BuildError::Refused {
+            required,
+            available,
+        }) => {
+            let taken = before.saturating_sub(available);
+            resident.observe(taken.saturating_add(required) as f64);
+            Ok(None)
+        }
+        Err(BuildError::Failed(detail)) => Err(TuneError::Inputs {
+            point: spec.label.clone(),
+            detail,
+        }),
     }
 }
 
@@ -836,7 +997,7 @@ pub struct Performed {
     /// between operations.
     pub spent: Spent,
     /// What each raise of the device's clock did within the piece, and
-    /// each establishment of its gauge, in order ([`timing::Clock`]).
+    /// each establishment of its gauge, in order ([`Clock`]).
     pub raises: Vec<Raise>,
     /// The served choice changed. The unit's record changed either way: a
     /// measurement, a verdict or the choice.
@@ -1130,7 +1291,7 @@ impl Forming<'_> {
         let held = |device: &DeviceInner| {
             held_bytes(
                 device,
-                device.memory_usage().charged,
+                device.storage_usage(seismic_topology::StorageKind::Device).charged,
                 0,
                 ProcessMemory::footprint_now(),
             )
@@ -1641,7 +1802,7 @@ fn launch_key(
     boundary: &[plan::ParameterAddress],
     working: Vec<usize>,
     specialization: &NativeSpecialization,
-) -> PointKey {
+) -> LaunchKey {
     let mut values = BTreeMap::new();
     for parameter in &implementation.params {
         let owners = implementation
@@ -1676,7 +1837,7 @@ fn launch_key(
             values.insert(format!("@{launch}:{name}"), *value);
         }
     }
-    PointKey {
+    LaunchKey {
         launches: working,
         values,
     }
@@ -1684,7 +1845,7 @@ fn launch_key(
 
 /// The key of a point as the unit's programs are formed: what a
 /// configuration's measurement there depends on.
-type Key<'k> = &'k dyn Fn(Vec<usize>, &NativeSpecialization) -> PointKey;
+type Key<'k> = &'k dyn Fn(Vec<usize>, &NativeSpecialization) -> LaunchKey;
 
 /// A challenger formed, with what its comparison with the served choice
 /// has shown before this session.
@@ -1713,8 +1874,8 @@ struct Matching<'s> {
     rates: &'s mut Rates,
     shuffle: &'s mut Shuffle,
     /// The device's sustained clock, held by the unit from its first
-    /// session ([`timing::Clock`]).
-    clock: &'s mut Option<Arc<timing::Clock>>,
+    /// session ([`Clock`]).
+    clock: &'s mut Option<Arc<Clock<CallError>>>,
     /// What the unit's witnesses and rounds have cost and how often each
     /// ended a challenger: the order its challengers' tests are taken in.
     sequence: &'s mut Sequence,
@@ -1723,9 +1884,9 @@ struct Matching<'s> {
 /// Bring the device of `placed`'s slots to its sustained clock for the
 /// session that follows at once, with the clock its unit holds in `held`:
 /// the unit's own work, which is `placed`'s first slot's when the unit
-/// holds none yet ([`timing::Clock::hold`]).
+/// holds none yet ([`Clock::hold`]).
 fn raise(
-    held: &mut Option<Arc<timing::Clock>>,
+    held: &mut Option<Arc<Clock<CallError>>>,
     placed: &[PointTiming],
     settings: &SearchSettings,
     min_sample_seconds: f64,
@@ -1735,9 +1896,8 @@ fn raise(
         return Ok(());
     };
     // The device's state is asked the evidence a lead is.
-    let stages = Tally::default().fewest(settings.error_rate);
-    let clock = timing::Clock::hold(held, first, min_sample_seconds, stages)?;
-    timing::warm(&clock, placed, deadline)
+    let clock = Clock::hold(held, first.slot(), min_sample_seconds, settings.error_rate)?;
+    warm(&clock, placed, deadline)
 }
 
 /// What a challenger new to the unit takes at the timed points besides its
@@ -1867,7 +2027,7 @@ struct Pairing {
 /// challenger measured beside the third choice served is `ratio₃ × ratio₂ ×
 /// ratio₁ × default`. Each link carries the spread of one median of
 /// ratios, and holds only between sessions read at one device state: every
-/// session is read at the device's sustained clock ([`timing::Clock`]),
+/// session is read at the device's sustained clock ([`Clock`]),
 /// where the same point and key read in two sessions of one load agreed to
 /// 1.3% at the median and 9.5% at the 90th percentile (Qwen3.5-4B on an M4
 /// Pro, 2026-10-10; 4.3% and 49% before sessions were raised), so costs measured beside different choices compare within the links
@@ -1914,7 +2074,7 @@ impl Matched<'_> {
     }
 }
 
-impl timing::Rounds for Matched<'_> {
+impl Rounds for Matched<'_> {
     /// By point: the incumbent's slot there and the slots of the
     /// challengers still in the session that are sampled beside it.
     fn next(&mut self) -> Vec<Vec<usize>> {
@@ -2012,7 +2172,7 @@ fn measure_matched(
     matching: Matching<'_>,
     affected_launches: Option<&[usize]>,
     baseline: &[PointMeasurement],
-    cache: Option<&mut BTreeMap<(usize, PointKey), PointMeasurement>>,
+    cache: Option<&mut BTreeMap<(usize, LaunchKey), PointMeasurement>>,
     outputs: &mut OutputPool,
     // The classes a challenger new to the unit is observed in at the timed
     // points; none for one measured before, placed again.
@@ -2029,8 +2189,8 @@ fn measure_matched(
     // candidates it measures. Candidates that run the same launches with
     // the same values at a point run the same work there: one slot serves
     // all of them.
-    let mut slots: Vec<(usize, PointKey, Vec<usize>)> = Vec::new();
-    let mut slot_by_key: BTreeMap<(usize, PointKey), usize> = BTreeMap::new();
+    let mut slots: Vec<(usize, LaunchKey, Vec<usize>)> = Vec::new();
+    let mut slot_by_key: BTreeMap<(usize, LaunchKey), usize> = BTreeMap::new();
     let mut sampled = vec![Vec::new(); candidates.len()];
     let timed_first = admission.is_some() && matching.sequence.timed_first();
     for (candidate, formed) in candidates.iter().enumerate() {
@@ -2235,17 +2395,14 @@ fn measure_matched(
         matching.deadline,
     ) {
         if let WorkError::Failed(error) = error {
-            let exclusion = Exclusion::Measurement {
-                point: "device clock".into(),
-                detail: error.to_string(),
-            };
+            let exclusion = Exclusion::measuring("device clock".into(), error);
             for (failure, pairing) in failures.iter_mut().zip(&mut rounds.pairings) {
                 failure.get_or_insert(exclusion.clone());
                 pairing.admitted = 0;
             }
         }
     }
-    while let Err(failure) = timing::sample(
+    while let Err(failure) = sample(
         &mut placed,
         minimum,
         &mut rounds,
@@ -2259,13 +2416,13 @@ fn measure_matched(
         };
         let exclusion = measurement_failure(
             points,
-            slots.get(failure.point).map_or_else(
-                || incumbent_point(&incumbent_slots, failure.point),
+            slots.get(failure.slot).map_or_else(
+                || incumbent_point(&incumbent_slots, failure.slot),
                 |slot| slot.0,
             ),
             error,
         );
-        for candidate in rounds.fail(failure.point) {
+        for candidate in rounds.fail(failure.slot) {
             failures[candidate] = Some(exclusion.clone());
         }
     }
@@ -2371,10 +2528,7 @@ fn incumbent_point(incumbent_slots: &BTreeMap<usize, usize>, slot: usize) -> usi
 }
 
 fn measurement_failure(points: &[PreparedPoint<'_>], point: usize, error: CallError) -> Exclusion {
-    Exclusion::Measurement {
-        point: points[point].label.clone(),
-        detail: error.to_string(),
-    }
+    Exclusion::measuring(points[point].label.clone(), error)
 }
 
 /// Which parameters each launch reads, as the declaration names them: those
@@ -2406,7 +2560,7 @@ impl Influence {
 
     /// The key of a point where the launches `working` do work, for a
     /// configuration with parameter `values`.
-    fn key(&self, working: Vec<usize>, values: &ParameterValues) -> PointKey {
+    fn key(&self, working: Vec<usize>, values: &ParameterValues) -> LaunchKey {
         let values = values
             .iter()
             .filter(|(name, _)| {
@@ -2417,7 +2571,7 @@ impl Influence {
             })
             .map(|(name, value)| (name.clone(), *value))
             .collect();
-        PointKey {
+        LaunchKey {
             launches: working,
             values,
         }
@@ -2445,7 +2599,7 @@ impl Keying {
         implementation: &NativeImplementation,
         working: Vec<usize>,
         specialization: &NativeSpecialization,
-    ) -> PointKey {
+    ) -> LaunchKey {
         match self {
             Self::Launches(boundary) => {
                 launch_key(implementation, boundary, working, specialization)
@@ -2485,9 +2639,9 @@ impl plan::Domain for Declared<'_> {
     fn forecast(
         &self,
         _point: usize,
-        baseline: &PointKey,
+        baseline: &LaunchKey,
         specialization: &NativeSpecialization,
-    ) -> PointKey {
+    ) -> LaunchKey {
         self.keying.key(
             self.implementation,
             baseline.launches.clone(),
@@ -2499,7 +2653,7 @@ impl plan::Domain for Declared<'_> {
 /// A configuration placed at every point, keyed.
 struct Placed<'a> {
     timings: Vec<PointTiming<'a>>,
-    keys: Vec<PointKey>,
+    keys: Vec<LaunchKey>,
 }
 
 /// Place `kernel`'s calls at every point and key them.
@@ -2563,11 +2717,18 @@ fn place<'a>(
     Ok(Placed { timings, keys })
 }
 
+/// How each point of a measurement is sampled: `samples` times, each sample
+/// at least `min_sample_seconds` of device time.
+struct Sampling {
+    samples: usize,
+    min_sample_seconds: f64,
+}
+
 /// Measures configurations at the tuning points, once per point and key.
-struct Measurer {
+struct PointSurveyor {
     influence: Influence,
     /// Every point measured so far, by point label and key.
-    measured: HashMap<(String, PointKey), PointMeasurement>,
+    measured: HashMap<(String, LaunchKey), PointMeasurement>,
     outputs: OutputPool,
     /// Whether a challenger its unit's requirement does not admit is
     /// excluded before it is timed: always, but in a survey, which records
@@ -2575,11 +2736,11 @@ struct Measurer {
     gated: bool,
     shuffle: Shuffle,
     /// The device's sustained clock, held from the first session
-    /// ([`timing::Clock`]).
-    clock: Option<Arc<timing::Clock>>,
+    /// ([`Clock`]).
+    clock: Option<Arc<Clock<CallError>>>,
 }
 
-impl Measurer {
+impl PointSurveyor {
     fn new(implementation: &NativeImplementation, gated: bool) -> Self {
         Self {
             influence: Influence::of(implementation),
@@ -2599,7 +2760,7 @@ impl Measurer {
         kernel: &Arc<NativePrepared>,
         points: &[PreparedPoint<'_>],
         values: &ParameterValues,
-        options: &MeasureOptions,
+        options: &Sampling,
         settings: &SearchSettings,
         admission: Option<&mut Observed>,
         deadline: Deadline,
@@ -2625,10 +2786,7 @@ impl Measurer {
             .unzip();
         // Each point's own time, the count its caller named, at the
         // device's sustained clock.
-        let clock = |error: CallError| Exclusion::Measurement {
-            point: "device clock".into(),
-            detail: error.to_string(),
-        };
+        let clock = |error: CallError| Exclusion::measuring("device clock".into(), error);
         raise(
             &mut self.clock,
             &timings,
@@ -2637,10 +2795,10 @@ impl Measurer {
             deadline,
         )
         .map_err(|error| error.map(clock))?;
-        timing::sample(
+        sample(
             &mut timings,
             options.min_sample_seconds,
-            &mut timing::Counted::new(fresh.len(), options.samples),
+            &mut Counted::new(fresh.len(), options.samples),
             &mut self.shuffle,
             self.clock.as_deref(),
             deadline,
@@ -2648,7 +2806,7 @@ impl Measurer {
         .map_err(|failure| {
             failure
                 .error
-                .map(|error| measurement_failure(points, fresh[failure.point], error))
+                .map(|error| measurement_failure(points, fresh[failure.slot], error))
         })?;
         for (point, timing) in fresh.into_iter().zip(&timings) {
             let key = keys[point].clone();
@@ -3083,7 +3241,7 @@ struct ScopeQualification<'s, 'a> {
     default: &'s str,
     /// The key of the checked configuration at a point where the given
     /// launches work.
-    key: &'s dyn Fn(Vec<usize>) -> PointKey,
+    key: &'s dyn Fn(Vec<usize>) -> LaunchKey,
     /// The whole check of each untimed point, by point: its class.
     checks: &'s mut [Observed],
     building_seconds: f64,
@@ -3110,7 +3268,7 @@ impl ScopeQualification<'_, '_> {
             let built = self.source.build(index);
             self.building_seconds += began.elapsed().as_secs_f64();
             let result = (|| {
-                let inputs = built.map_err(Exclusion::Execution)?;
+                let inputs = built.map_err(Exclusion::from)?;
                 let mut point = TuningPoint::new(spec, inputs)
                     .and_then(|point| self.validator.point(point))
                     .map_err(|error| Exclusion::Execution(error.to_string()))?;
@@ -3332,12 +3490,12 @@ struct Run {
     /// Measurements by point and key, in the unit's canonical units: a
     /// point with the same active launches and parameters runs the same
     /// work under every candidate and boundary.
-    samples: BTreeMap<(usize, PointKey), PointMeasurement>,
+    samples: BTreeMap<(usize, LaunchKey), PointMeasurement>,
     /// The order of every round's samples, from session to session.
     shuffle: Shuffle,
     /// The device's sustained clock, held as the unit's census held it
-    /// ([`timing::Clock`]).
-    clock: Option<Arc<timing::Clock>>,
+    /// ([`Clock`]).
+    clock: Option<Arc<Clock<CallError>>>,
     /// The order the unit's challengers take their two tests in.
     sequence: Sequence,
 }
@@ -3390,7 +3548,7 @@ pub struct UnitSearch<'m, 'a> {
     grounded: usize,
     /// Measures the defaults as points are discovered; none once the
     /// search is open, which places into its own result storage.
-    measurer: Option<Measurer>,
+    surveyor: Option<PointSurveyor>,
     plan: Option<UnitPlan>,
     progress: Progress<'a>,
     /// Building each point's inputs, by point: its class.
@@ -3487,7 +3645,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             statics,
             cpu,
             backend,
-            measurer: Some(Measurer::new(&implementation, true)),
+            surveyor: Some(PointSurveyor::new(&implementation, true)),
             implementation,
             logical,
             mutable,
@@ -3691,7 +3849,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     }
 
     /// What the unit's clock did since this was last asked: its raises and
-    /// its establishment ([`timing::Clock::raises`]). The clock is the
+    /// its establishment ([`Clock::raises`]). The clock is the
     /// census's until a search takes it.
     fn raises(&self) -> Vec<Raise> {
         let searching = match &self.progress {
@@ -3700,9 +3858,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         };
         searching
             .or_else(|| {
-                self.measurer
+                self.surveyor
                     .as_ref()
-                    .and_then(|measurer| measurer.clock.as_ref())
+                    .and_then(|surveyor| surveyor.clock.as_ref())
             })
             .map_or_else(Vec::new, |clock| clock.raises())
     }
@@ -3750,8 +3908,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let exhausted = self.next().is_none();
         // A piece that follows builds the inputs again.
         self.offered.set(None);
-        if let Some(measurer) = &mut self.measurer {
-            measurer.outputs = OutputPool::default();
+        if let Some(surveyor) = &mut self.surveyor {
+            surveyor.outputs = OutputPool::default();
         }
         match &mut self.progress {
             Progress::Discovering(slots) => {
@@ -3884,7 +4042,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     fn held(&self) -> u64 {
         held_bytes(
             &self.device,
-            self.device.memory_usage().charged,
+            self.device.storage_usage(seismic_topology::StorageKind::Device).charged,
             self.ground
                 .as_ref()
                 .map_or(0, |ground| ground.validator.retained_bytes()),
@@ -3928,7 +4086,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let held = || {
             held_bytes(
                 device,
-                device.memory_usage().charged,
+                device.storage_usage(seismic_topology::StorageKind::Device).charged,
                 validator.retained_bytes(),
                 ProcessMemory::footprint_now(),
             )
@@ -4216,7 +4374,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let mut admissions = 0;
         let mut sampled = BTreeMap::<usize, (usize, f64)>::new();
         // `keys`: the challenger's forecast key at each timed point.
-        let mut admit = |keys: &dyn Fn(usize) -> PointKey| {
+        let mut admit = |keys: &dyn Fn(usize) -> LaunchKey| {
             admissions += 1;
             let apart = (0..searching.points.len())
                 .map(|point| (point, keys(point)))
@@ -4406,7 +4564,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // within it is over this.
         let ledgers = |unit: &Self| {
             (
-                unit.device.memory_usage(),
+                unit.device.storage_usage(seismic_topology::StorageKind::Device),
                 unit.ground.as_ref().map_or((0, 0), |ground| {
                     (
                         ground.validator.retained_bytes(),
@@ -4485,7 +4643,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             began_bytes,
             peak_bytes: held_bytes(
                 &self.device,
-                self.device.memory_usage().high_water,
+                self.device.storage_usage(seismic_topology::StorageKind::Device).high_water,
                 self.ground
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_high_water()),
@@ -4493,13 +4651,16 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             ),
             ended_bytes: held_bytes(
                 &self.device,
-                self.device.memory_usage().charged,
+                self.device.storage_usage(seismic_topology::StorageKind::Device).charged,
                 self.ground
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_bytes()),
                 ended,
             ),
-            ledger_peak_bytes: self.device.memory_usage().high_water
+            ledger_peak_bytes: self
+                .device
+                .storage_usage(seismic_topology::StorageKind::Device)
+                .high_water
                 + self
                     .ground
                     .as_ref()
@@ -4534,10 +4695,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     }
 
     /// Build the next discovery point and measure the defaults there; with
-    /// the last, plan the search. False when the device's memory limit
-    /// refused the point's build ([`build_point`]) or the measurement of its
-    /// defaults: nothing was measured, and the point is priced at what the
-    /// piece demanded.
+    /// the last, plan the search. False when the device refused the point's
+    /// build ([`build_point`]) or the measurement of its defaults
+    /// ([`Exclusion::Refused`]): nothing was measured, and the point is
+    /// priced at what the piece demanded.
     fn discover(
         &mut self,
         source: &mut dyn PointSource<'a>,
@@ -4546,7 +4707,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let index = self
             .undiscovered()
             .expect("discovery has an unmeasured point");
-        let before = self.device.memory_usage();
+        // What the device's storage can take as the piece begins: a refusal
+        // within it is priced from what the piece took of it.
+        let before = self
+            .device
+            .storage_available(seismic_topology::StorageKind::Device);
         let building = Instant::now();
         let Some(inputs) = build_point(
             &self.device,
@@ -4582,16 +4747,16 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // records and the point's weight in what it optimises: the median
         // of three samples, the fewest whose median one sample cannot
         // move, whatever that sample read.
-        let options = MeasureOptions {
+        let options = Sampling {
             samples: 3,
             min_sample_seconds: self.planned().min_sample_seconds,
         };
         let settings = self.planned().settings.clone();
         let measuring = Instant::now();
         let measured = self
-            .measurer
+            .surveyor
             .as_mut()
-            .expect("the measurer serves discovery until a search takes it")
+            .expect("the surveyor serves discovery until a search takes it")
             .measure(
                 &ground.kernel,
                 std::slice::from_ref(&point),
@@ -4611,14 +4776,17 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 source.release(index);
                 return Err(WorkError::Expired);
             }
-            Err(WorkError::Failed(exclusion)) => match self.device.memory_usage().refused_demand {
-                Some(demand) if Some(demand) > before.refused_demand => {
-                    self.resident_bytes[index]
-                        .observe(demand.saturating_sub(before.charged) as f64);
-                    return Ok(false);
-                }
-                _ => return Err(TuneError::DefaultUnusable(exclusion).into()),
-            },
+            Err(WorkError::Failed(Exclusion::Refused {
+                required,
+                available,
+            })) => {
+                let taken = before.saturating_sub(available);
+                self.resident_bytes[index].observe(taken.saturating_add(required) as f64);
+                return Ok(false);
+            }
+            Err(WorkError::Failed(exclusion)) => {
+                return Err(TuneError::DefaultUnusable(exclusion).into());
+            }
         };
         let measured = measuring.elapsed().as_secs_f64();
         self.longest = self.longest.max(measured);
@@ -5222,7 +5390,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .collect();
         // The run places into its own result storage, and holds the clock
         // the census held.
-        let clock = self.measurer.take().and_then(|measurer| measurer.clock);
+        let clock = self.surveyor.take().and_then(|surveyor| surveyor.clock);
         Ok((
             Run {
                 search: GroupSearch::new(
@@ -5284,9 +5452,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let mut points = Vec::with_capacity(self.specs.len());
         for (index, spec) in self.specs.iter().enumerate() {
             let began = Instant::now();
-            let inputs = source.build(index).map_err(|detail| TuneError::Inputs {
+            let inputs = source.build(index).map_err(|error| TuneError::Inputs {
                 point: spec.label.clone(),
-                detail,
+                detail: error.to_string(),
             })?;
             self.time.building_seconds += began.elapsed().as_secs_f64();
             points.push(ground.validator.point(TuningPoint::new(spec, inputs)?)?);
@@ -7168,14 +7336,14 @@ type Tuning = (Records, NativeSpecialization, TuningMethod, TuningTime);
 
 impl Tuned<'_> {
     fn survey(&self, points: &[PreparedPoint<'_>], plan: SurveyPlan) -> Result<Tuning, TuneError> {
-        let options = MeasureOptions {
+        let options = Sampling {
             samples: plan.samples,
             min_sample_seconds: plan.min_sample_seconds,
         };
         let mut time = TuningTime::default();
         // A survey measures and times every configuration whatever its
         // verdict, and prices nothing.
-        let mut measurer = Measurer::new(self.formation.implementation, false);
+        let mut surveyor = PointSurveyor::new(self.formation.implementation, false);
         // A survey resolves no comparison and names no error rate. Its
         // device is raised at the rate one of its samples stands for: what
         // the samples of a point can tell apart at all.
@@ -7205,7 +7373,7 @@ impl Tuned<'_> {
                     Err(exclusion) => (None, Outcome::Excluded(exclusion)),
                     Ok(kernel) => (
                         Some(kernel.artifact().0.clone()),
-                        match measurer.measure(
+                        match surveyor.measure(
                             &kernel,
                             points,
                             specialization.params(),
@@ -7396,7 +7564,7 @@ pub(super) fn prepare_message(error: PrepareError) -> String {
     }
 }
 
-fn point_measurement(label: &str, key: PointKey, timing: &PointTiming<'_>) -> PointMeasurement {
+fn point_measurement(label: &str, key: LaunchKey, timing: &PointTiming<'_>) -> PointMeasurement {
     let measurement = timing.measurement();
     PointMeasurement {
         point: label.to_owned(),
@@ -7405,12 +7573,37 @@ fn point_measurement(label: &str, key: PointKey, timing: &PointTiming<'_>) -> Po
         deviation_seconds: measurement.deviation,
         samples: measurement.samples,
         repetitions: measurement.repetitions,
-        rotation_bytes: measurement.rotation_bytes,
+        rotation_bytes: timing.rotation_bytes(),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// A capacity refusal is a typed refusal however it reaches the source;
+    /// every other error fails the build.
+    #[test]
+    fn allocation_capacity_is_a_refused_build_and_other_errors_fail_it() {
+        use super::{BuildError, CallError, ExecutionError, TensorError};
+        let capacity = || ExecutionError::AllocationCapacity {
+            required: 96u64.into(),
+            available: 32,
+        };
+        let refused = BuildError::Refused {
+            required: 96,
+            available: 32,
+        };
+        assert_eq!(BuildError::from(capacity()), refused);
+        assert_eq!(
+            BuildError::from(TensorError::Execution(capacity())),
+            refused
+        );
+        assert_eq!(BuildError::from(CallError::Execution(capacity())), refused);
+        assert!(matches!(
+            BuildError::from(ExecutionError::AllocationFailed("driver".into())),
+            BuildError::Failed(_)
+        ));
+    }
+
     #[test]
     fn workload_rotation_requires_distinct_present_witnesses() {
         assert_eq!(WorkloadRotation::All.indices(4).unwrap(), vec![0, 1, 2, 3]);
@@ -7483,7 +7676,6 @@ mod tests {
     /// since replaced resolve nothing about the one that replaced it.
     #[test]
     fn a_round_groups_each_point_with_the_served_choice_there() {
-        use timing::Rounds;
         let settings = SearchSettings { error_rate: 0.05 };
         let pairing = |terms: Vec<(usize, f64)>| Pairing {
             incumbent: terms.iter().map(|(_, weight)| weight).sum(),
@@ -7583,7 +7775,7 @@ mod tests {
     fn only_the_winner_is_covered_and_a_failure_gives_way_to_the_next() {
         let cost = |form: u64, total: f64| {
             Cost::new(vec![(
-                PointKey {
+                LaunchKey {
                     launches: vec![0],
                     values: [("FORM".to_owned(), form)].into(),
                 },
@@ -7628,7 +7820,6 @@ mod tests {
     /// promotes it.
     #[test]
     fn a_challenger_faster_by_less_than_two_percent_in_every_round_is_promoted() {
-        use timing::Rounds;
         let settings = SearchSettings { error_rate: 0.05 };
         let fewest = Tally::default().fewest(settings.error_rate);
         assert_eq!(fewest, 7);
@@ -8549,7 +8740,7 @@ mod tests {
         (0..points)
             .map(|point| PointMeasurement {
                 point: format!("m{point}"),
-                key: PointKey {
+                key: LaunchKey {
                     launches: vec![0, 1],
                     values: (0..8)
                         .map(|value| (format!("@0:PARAMETER_{value}"), key(point)))
@@ -8654,7 +8845,7 @@ mod tests {
             text: "fn project[N](x: &tensor[N] f32) -> tensor[N] f32:\n    let mut y = tensor[N] f32\n    for i in 0..N:\n        y[i] = x[i]\n    return y\n\nnative project for cpu from \"project.rs\":\n    static (N)\n    launch project:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n".into(),
         }]))
         .unwrap();
-        let device = crate::devices::Catalog::discover()
+        let device = crate::devices::Devices::discover(&[])
             .unwrap()
             .open_backend(BackendName::Cpu)
             .unwrap();
@@ -9016,7 +9207,7 @@ mod tests {
     fn measured(median: f64, deviation: f64) -> PointMeasurement {
         PointMeasurement {
             point: "m1".into(),
-            key: PointKey {
+            key: LaunchKey {
                 launches: vec![0],
                 values: ParameterValues::new(),
             },
@@ -9277,7 +9468,7 @@ mod tests {
     fn no_formation_starts_that_cannot_end_before_the_deadline() {
         use seismic_lang::checked::{SourceFile, SourceSet, check_source};
         use seismic_lang::registry::BackendName;
-        let Ok(device) = crate::devices::Catalog::discover()
+        let Ok(device) = crate::devices::Devices::discover(&[])
             .expect("device discovery")
             .open_backend(BackendName::Metal)
         else {
@@ -9652,6 +9843,168 @@ mod tests {
         assert!(
             ended > budget,
             "one mean over both classes overruns: {ended}"
+        );
+    }
+}
+
+/// The session tuning's comparisons run, pinned on scripted work: the order
+/// and size of every submission, and what each raise of the clock recorded,
+/// for matched rounds (a counted session is pinned in `seismic-measure`). A
+/// change to either is a change to what tuning measures.
+#[cfg(test)]
+mod session_golden {
+    use super::*;
+    use seismic_measure::{Gauge, Pending, Slot, Work};
+    use std::cell::RefCell;
+
+    /// Every submission of the scripted works, as (work, passes); a gauge is
+    /// its work's number plus 100.
+    type Log = Rc<RefCell<Vec<(usize, usize)>>>;
+
+    /// Work whose pass takes `pass` seconds on a device with one clock.
+    struct Scripted {
+        id: usize,
+        pass: f64,
+        log: Log,
+    }
+
+    struct Read(f64);
+
+    impl Pending<CallError> for Read {
+        fn seconds(&self) -> Result<f64, CallError> {
+            Ok(self.0)
+        }
+        fn wait(&self) -> Result<(), CallError> {
+            Ok(())
+        }
+    }
+
+    impl Gauge<CallError> for Scripted {
+        fn submit(&self, passes: usize) -> Result<Box<dyn Pending<CallError>>, CallError> {
+            Ok(Box::new(Work::submit(self, passes)?))
+        }
+    }
+
+    impl Work for Scripted {
+        type Error = CallError;
+        type Pending = Read;
+        fn submit(&self, passes: usize) -> Result<Read, CallError> {
+            self.log.borrow_mut().push((self.id, passes));
+            Ok(Read(self.pass * passes as f64))
+        }
+        fn calls_per_pass(&self) -> usize {
+            1
+        }
+        fn gauge(&self) -> Result<Box<dyn Gauge<CallError>>, CallError> {
+            Ok(Box::new(Scripted {
+                id: self.id + 100,
+                pass: self.pass,
+                log: self.log.clone(),
+            }))
+        }
+    }
+
+    /// What a raise recorded, without its host seconds.
+    fn raises(clock: &Clock<CallError>) -> Vec<String> {
+        clock
+            .raises()
+            .iter()
+            .map(|raise| {
+                format!(
+                    "{:?} {} {:e} {:?} {:e} {:?}",
+                    raise.outcome,
+                    raise.readings,
+                    raise.level,
+                    raise.bound,
+                    raise.first,
+                    raise.sample
+                )
+            })
+            .collect()
+    }
+
+    /// The slots of `passes`' works, a raised clock held for them, and the
+    /// log of their submissions.
+    fn session(passes: &[f64]) -> (Vec<Slot<Scripted>>, Arc<Clock<CallError>>, Log) {
+        let log = Log::default();
+        let slots = passes
+            .iter()
+            .enumerate()
+            .map(|(id, &pass)| {
+                Slot::new(Scripted {
+                    id,
+                    pass,
+                    log: log.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let clock = Arc::new(Clock::new(slots[0].work(), 2e-3, 0.05).unwrap());
+        warm(&clock, &slots, Deadline::default()).unwrap();
+        (slots, clock, log)
+    }
+
+    /// The establishment of the gauge of work whose pass is 0.1 ms: a pass
+    /// behind a lead, then stages doubling from a 2 ms reading over the
+    /// seven stages a lead takes at one in twenty, then the level's
+    /// readings.
+    fn establishment() -> Vec<(usize, usize)> {
+        let mut expected = vec![(100, 1), (100, 1)];
+        for passes in [20, 40, 80, 160, 320, 640, 1280] {
+            expected.extend([(100, passes); 3]);
+        }
+        expected.extend([(100, 20); 4]);
+        expected
+    }
+
+    #[test]
+    fn a_matched_session_submits_and_raises_as_recorded() {
+        let (mut slots, clock, log) = session(&[1e-4, 0.99e-4]);
+        let settings = SearchSettings { error_rate: 0.05 };
+        let fewest = Tally::default().fewest(settings.error_rate);
+        // The challenger in slot 1, beside the served choice in slot 0.
+        let mut rounds = Matched {
+            settings: &settings,
+            partner: vec![None, Some(0)],
+            ratios: vec![Vec::new(); 2],
+            pairings: vec![Pairing {
+                terms: vec![(1, 1.)],
+                reused: 0.,
+                incumbent: 1.,
+                complete: true,
+                evidence: Tally::default(),
+                admitted: fewest,
+                taken: 0,
+                ahead: true,
+            }],
+        };
+        sample(
+            &mut slots,
+            2e-3,
+            &mut rounds,
+            &mut Shuffle::default(),
+            Some(&clock),
+            Deadline::default(),
+        )
+        .unwrap_or_else(|_| panic!("scripted work does not fail"));
+        let mut expected = establishment();
+        // The served choice is calibrated first (a lead and a pass), and
+        // the challenger inherits its repetitions, priced by its own lead.
+        expected.extend([(0, 1), (0, 1), (0, 1), (0, 20), (1, 1), (1, 20)]);
+        // Seven rounds in the shuffle's order, every one ahead.
+        for order in [[1, 0], [0, 1], [0, 1], [1, 0], [0, 1], [1, 0]] {
+            for slot in order {
+                expected.extend([(slot, 1), (slot, 20)]);
+            }
+        }
+        assert_eq!(*log.borrow(), expected);
+        assert_eq!(
+            raises(&clock),
+            ["Established 18 2e-3 None 2e-3 Some(0.0001)"]
+        );
+        assert_eq!(rounds.ratios[1], [0.99e-4 / 1e-4; 7]);
+        assert_eq!(
+            rounds.pairings[0].evidence.verdict(0.05),
+            Some(Verdict::Leads)
         );
     }
 }

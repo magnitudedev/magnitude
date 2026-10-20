@@ -8,13 +8,12 @@
 
 use super::binding::GenerationBinding;
 use super::protocol::{
-    Admission, DomainHeadroom, ExecutionTimings, HostMessage, HostRequestId, MemoryObservation,
-    RequestProgress, RequestState, WorkerMessage,
+    Admission, ExecutionTimings, HostMessage, HostRequestId, MemoryObservation, RequestProgress,
+    RequestState, StoreHeadroom, WorkerMessage,
 };
-use magnitude_executor::platform::DomainRole;
 use super::transport::{MessageReceiver, MessageSender, TransportError};
 use super::WorkerExit;
-use crate::census::{AllocationCensus, MemoryDomain};
+use crate::census::AllocationCensus;
 use crate::error::{RequestError, UnloadCause};
 use magnitude_executor::RequestId;
 use magnitude_family_contracts::ModelDefinition;
@@ -125,9 +124,9 @@ pub(crate) struct Loaded {
     pub execution: Worker<UnloadCause>,
     pub binding: GenerationBinding,
     pub definition: ModelDefinition,
-    /// The model's bytes in host RAM beside the device's allocation domain.
-    pub host_model: crate::census::HostModelBytes,
-    pub domain: MemoryDomain,
+    /// The model's host-resident tables' bytes, which the census reports in
+    /// host RAM (`AllocationCensus::classify`).
+    pub host_table_bytes: u64,
 }
 
 pub(crate) struct Session {
@@ -431,22 +430,18 @@ impl Session {
                     readings,
                 }) => match AllocationCensus::classify(
                     &reconciliation,
-                    self.loaded.host_model,
-                    self.loaded.domain,
+                    self.loaded.host_table_bytes,
                 ) {
                     Ok(census) => {
-                        let domains = readings
+                        let stores = readings
                             .iter()
-                            .map(|reading| DomainHeadroom {
-                                domain: match reading.role {
-                                    DomainRole::Allocation => self.loaded.domain,
-                                    DomainRole::Staging => MemoryDomain::HostRam,
-                                },
+                            .map(|reading| StoreHeadroom {
+                                store: reading.identity.clone(),
                                 headroom_bytes: reading.headroom_bytes,
                             })
                             .collect();
                         self.send(WorkerMessage::Observed {
-                            observation: Ok(MemoryObservation { census, domains }),
+                            observation: Ok(MemoryObservation { census, stores }),
                         })?
                     }
                     Err(reason) => {

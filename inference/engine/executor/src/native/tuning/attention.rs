@@ -33,7 +33,7 @@ use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
     attention_prefill_k8v4, attention_project,
 };
-use seismic::{Device, Element, Tensor};
+use seismic::{BuildError, Device, Element, Tensor};
 use std::collections::BTreeMap;
 use std::ops::Range;
 
@@ -384,7 +384,7 @@ impl EntryTuning for AttentionProjectTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let shape = self.binding.shape;
         let query_kind = operators::attention::query_kind(operator(inputs, &self.scopes)?);
         let (parts, norm) = inputs.input_form(&self.scopes, shape.hidden)?;
@@ -398,7 +398,7 @@ impl EntryTuning for AttentionProjectTuning {
                     if rows > 0 {
                         inputs.weight(scope, kind)
                     } else {
-                        query.slice_leading(0, 0).map_err(|error| error.to_string())
+                        query.slice_leading(0, 0).map_err(BuildError::from)
                     }
                 };
                 Ok(AttentionProjectCase {
@@ -544,7 +544,7 @@ impl EntryTuning for IndexerProjectTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let hidden = self.binding.shape.hidden;
         let (parts, norm) = inputs.input_form(&self.scopes, hidden)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
@@ -655,7 +655,7 @@ impl EntryTuning for AttentionOutputTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, BuildError> {
         let shape = self.shape;
         let (streams, inject) = inputs.join(&self.scopes)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
@@ -886,7 +886,7 @@ pub(crate) trait MixHistory: Sized {
         rows: u64,
         view: u64,
         appended: Range<u64>,
-    ) -> Result<Self, String>;
+    ) -> Result<Self, BuildError>;
     fn share(&self) -> Self;
     /// The planes, by the entry parameter each binds.
     fn states(&self) -> Vec<(&'static str, &CaseState)>;
@@ -907,7 +907,7 @@ impl MixHistory for DenseMixHistory {
         rows: u64,
         view: u64,
         appended: Range<u64>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, BuildError> {
         let shape = mix.shape;
         let mut plane = |name: &str, seed: u64| {
             let extents = [rows, shape.kv_heads, shape.width];
@@ -946,7 +946,11 @@ pub(crate) struct AffineMixHistory {
 }
 
 impl AffineMixHistory {
-    fn codes(inputs: &TuningInputs<'_, '_>, extents: &[u64], seed: u64) -> Result<Tensor, String> {
+    fn codes(
+        inputs: &TuningInputs<'_, '_>,
+        extents: &[u64],
+        seed: u64,
+    ) -> Result<Tensor, BuildError> {
         inputs.generated(Element::u32(), extents, |count| {
             let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
             Ok((0..count)
@@ -965,7 +969,7 @@ impl AffineMixHistory {
         inputs: &TuningInputs<'_, '_>,
         extents: &[u64],
         levels: u32,
-    ) -> Result<Tensor, String> {
+    ) -> Result<Tensor, BuildError> {
         inputs.generated(Element::f16(), extents, |count| {
             Ok((0..count / 2)
                 .flat_map(|index| {
@@ -991,10 +995,10 @@ impl MixHistory for AffineMixHistory {
         rows: u64,
         view: u64,
         appended: Range<u64>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, BuildError> {
         let shape = mix.shape;
         let mut plane =
-            |name: &str, build: &dyn Fn(&TuningInputs<'_, '_>) -> Result<Tensor, String>| {
+            |name: &str, build: &dyn Fn(&TuningInputs<'_, '_>) -> Result<Tensor, BuildError>| {
                 let plane = inputs.shared(
                     format!(
                         "{name}-affine-{rows}x{}x{}-{:?}",
@@ -1161,7 +1165,7 @@ impl AttentionMix {
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
         points: Vec<PointShape>,
-    ) -> Result<Vec<AttentionMixCase<H>>, String> {
+    ) -> Result<Vec<AttentionMixCase<H>>, BuildError> {
         let shape = self.shape;
         let rows = point.rows;
         let context = point
@@ -1226,7 +1230,7 @@ impl AttentionMix {
                         inputs
                             .weight(scope, kind)?
                             .reshape(&[1, width])
-                            .map_err(|error| error.to_string())
+                            .map_err(BuildError::from)
                     } else {
                         inputs.f32s(&[0, width], &[])
                     }
@@ -1411,7 +1415,7 @@ macro_rules! mix_entry {
                 &self,
                 inputs: &mut TuningInputs<'_, '_>,
                 point: &PointShape,
-            ) -> Result<Vec<Self::Case>, String> {
+            ) -> Result<Vec<Self::Case>, BuildError> {
                 let points = self.served(inputs.limits);
                 self.0.rotation(inputs, point, points)
             }

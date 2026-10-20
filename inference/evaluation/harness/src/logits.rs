@@ -160,7 +160,7 @@ pub fn run(
         serde_json::to_vec(&metadata).expect("logits metadata serializes"),
     )
     .map_err(|error| format!("writing {}: {error}", path.display()))?;
-    Ok(engine.device().info().name.clone())
+    Ok(engine.device().info().name().to_owned())
 }
 
 /// Advance every walk through its predicting positions: a packed prefill

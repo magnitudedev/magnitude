@@ -388,7 +388,7 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let catalog = seismic::DeviceCatalog::discover()?;
+    let catalog = seismic::Devices::discover(&[])?;
     let device = catalog.open_backend(seismic::BackendName::Metal)?;
     let x = seismic::Tensor::from_host(
         &device,
@@ -445,7 +445,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     verify_native_graph(&device)?;
     println!(
         "native dense and polymorphic fixtures executed successfully on {}",
-        device.info().name
+        device.info().name()
     );
     Ok(())
 }

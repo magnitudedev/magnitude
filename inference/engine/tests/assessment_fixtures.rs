@@ -171,7 +171,7 @@ impl Drop for Scratch {
 }
 
 fn cpu_setup() -> AssessmentSetup {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     AssessmentSetup::discover(
         &catalog,
         DeviceRequest::Backend(BackendName::Cpu),

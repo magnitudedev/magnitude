@@ -6,7 +6,7 @@
 use magnitude_kernels::{
     readout_exact_rows, readout_planes_rows, readout_refine_rows, readout_top_rows,
 };
-use seismic::{BackendName, Device, DeviceCatalog, Element, NativeSpecialization, Tensor};
+use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
     checked::{CheckedModule, SourceFile, check_source},
     entry::ElementBindings,
@@ -17,6 +17,8 @@ use seismic_lang::{
     types::DType,
 };
 
+mod timing_common;
+
 const EPSILON: f32 = 1e-6;
 
 fn device() -> Option<Device> {
@@ -25,7 +27,7 @@ fn device() -> Option<Device> {
     } else {
         BackendName::Cuda
     };
-    DeviceCatalog::discover().ok()?.open_backend(backend).ok()
+    seismic::Devices::discover(&[]).ok()?.open_backend(backend).ok()
 }
 
 /// The launch of the top level's and the full pass's vocabulary projection
@@ -1148,10 +1150,17 @@ fn progressive_portable_bodies_match_the_natives() {
 // ---------------------------------------------------------------------------
 // Timing.
 
-const TIMING_OPTIONS: seismic::MeasureOptions = seismic::MeasureOptions {
-    samples: 9,
+const TIMING_OPTIONS: seismic::measure::Measure = seismic::measure::Measure {
+    samples: std::num::NonZeroUsize::new(9).unwrap(),
     min_sample_seconds: 0.02,
 };
+
+/// The device time of `point`'s calls.
+fn timed(
+    point: Result<seismic::KernelPoint, seismic::CallError>,
+) -> seismic::measure::Measurement {
+    timing_common::measured(point.unwrap(), &TIMING_OPTIONS)
+}
 
 /// Device time of every level at the 35B-A3B head (V = 248320, D = 2048) over
 /// random planes: `cargo test --release -p magnitude-kernels --test
@@ -1220,7 +1229,7 @@ fn progressive_timings() {
                 constrained: &t.constrained,
                 epsilon: EPSILON,
             };
-            let measured = top.measure(vec![args], &TIMING_OPTIONS).unwrap();
+            let measured = timed(top.point(vec![args]));
             report(
                 &format!("top O {o} {width} {scan} ROWS {rows}"),
                 measured.median,
@@ -1246,7 +1255,7 @@ fn progressive_timings() {
                 out_rows: &t.out_rows,
                 epsilon: EPSILON,
             };
-            let measured = planes.measure(vec![args], &TIMING_OPTIONS).unwrap();
+            let measured = timed(planes.point(vec![args]));
             report(
                 &format!("planes O {o} {width} {scan} ROWS {rows}"),
                 measured.median,
@@ -1304,7 +1313,7 @@ fn progressive_timings() {
                     mask: &t.mask,
                     constrained: &t.constrained,
                 };
-                let measured = refine.measure(vec![args], &TIMING_OPTIONS).unwrap();
+                let measured = timed(refine.point(vec![args]));
                 report(
                     &format!("refine O {o} share {share} {width} {gather}"),
                     measured.median,
@@ -1332,7 +1341,7 @@ fn progressive_timings() {
                     mask: &t.mask,
                     constrained: &t.constrained,
                 };
-                let measured = exact.measure(vec![args], &TIMING_OPTIONS).unwrap();
+                let measured = timed(exact.point(vec![args]));
                 report(
                     &format!("exact O {o} share {share} {width} {gather}"),
                     measured.median,

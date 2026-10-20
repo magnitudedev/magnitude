@@ -8,7 +8,7 @@ use crate::api::kernel::{
 };
 use crate::api::tensor::TensorInner;
 use crate::api::CallError;
-use crate::memory::{MemoryCharge, MemoryDomain, MemoryReservation, MemoryUsage};
+use crate::memory::{ExecutorMemory, MemoryCharge, MemoryDomain, MemoryReservation, MemoryUsage};
 use crate::resources::{AdmissionDomain, AdmittedResources, PersistentTable};
 use crate::telemetry::{self, hex, key_bool, key_str, key_u64, Timed};
 use opentelemetry::KeyValue;
@@ -85,6 +85,7 @@ where
             -> Result<AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError>,
     cache: Mutex<HashMap<PreparationKey, Weak<Prepared<T, E>>>>,
     memory: Arc<MemoryDomain>,
+    upload: Arc<MemoryDomain>,
     admission: AdmissionDomain,
 }
 
@@ -115,7 +116,7 @@ where
             AnalyticalEvaluationContext<T>,
             seismic_compiler::errors::TargetError,
         >,
-        memory: Arc<MemoryDomain>,
+        memory: Arc<ExecutorMemory>,
     ) -> Self {
         Self {
             identity: fresh_device_identity(),
@@ -126,7 +127,8 @@ where
             analytical: std::sync::OnceLock::new(),
             analytical_loader,
             cache: Mutex::new(HashMap::new()),
-            memory,
+            upload: memory.upload.clone(),
+            memory: memory.device.clone(),
             admission: AdmissionDomain::new(),
         }
     }
@@ -175,8 +177,17 @@ where
         usage.unallocated = self.service.unallocated();
         usage
     }
-    pub(crate) fn set_memory_limit(&self, limit: Option<u64>) {
-        self.memory.set_limit(limit)
+    /// Upload storage's usage. These backends allocate it whole, one native
+    /// allocation per tensor, so they hold nothing for it beyond its
+    /// charges.
+    pub(crate) fn upload_usage(&self) -> MemoryUsage {
+        self.upload.usage()
+    }
+    pub(crate) fn set_limit(&self, kind: seismic_topology::StorageKind, limit: Option<u64>) {
+        match kind {
+            seismic_topology::StorageKind::Device => self.memory.set_limit(limit),
+            seismic_topology::StorageKind::Upload => self.upload.set_limit(limit),
+        }
     }
     pub(crate) fn restart_memory_high_water(&self) {
         self.memory.restart_high_water()
@@ -204,6 +215,16 @@ where
         make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
         let mut reservation = reserve(&self.memory, bytes)?;
+        self.allocate_reserved_with(bytes, alignment, &mut reservation, false, make)
+    }
+
+    pub(crate) fn allocate_upload_with(
+        self: &Arc<Self>,
+        bytes: u64,
+        alignment: u64,
+        make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
+    ) -> Result<Arc<Allocation>, ExecutionError> {
+        let mut reservation = reserve(&self.upload, bytes)?;
         self.allocate_reserved_with(bytes, alignment, &mut reservation, false, make)
     }
 
@@ -523,6 +544,18 @@ impl AllocationAccess {
 }
 
 impl Allocation {
+    /// The bytes the allocation, one of `memory`'s executor, charges along
+    /// each of its access paths, if charged.
+    pub(crate) fn path_charges(
+        &self,
+        memory: &ExecutorMemory,
+    ) -> Option<Vec<(seismic_topology::AccessPathId, u64)>> {
+        self.charge
+            .lock()
+            .expect("allocation charge lock poisoned")
+            .as_ref()
+            .map(|charge| memory.path_charges(charge))
+    }
     fn new(
         identity: u64,
         bytes: u64,
@@ -1467,7 +1500,7 @@ mod physical_slot_tests {
 
     #[test]
     fn slab_and_table_share_one_hazard_group() {
-        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
+        let memory = MemoryDomain::new(crate::memory::StoreLedger::new());
         let mut reservation = memory.reserve(16).unwrap();
         let table = Allocation::new(1, 8, reservation.take(8), Box::new(EmptyStorage));
         let slab = Allocation::new(2, 8, reservation.take(8), Box::new(EmptyStorage));
@@ -1490,7 +1523,7 @@ mod physical_slot_tests {
 
     #[test]
     fn discarded_in_place_growth_restores_predecessor_charge() {
-        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
+        let memory = MemoryDomain::new(crate::memory::StoreLedger::new());
         let mut initial = memory.reserve(8).unwrap();
         let old = Allocation::new(1, 8, initial.take(8), Box::new(EmptyStorage));
         drop(initial);
@@ -1547,7 +1580,7 @@ mod physical_slot_tests {
     /// released bytes were spent meanwhile; publishing it restores nothing.
     #[test]
     fn discarded_in_place_shrink_restores_predecessor_backing_and_charge() {
-        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
+        let memory = MemoryDomain::new(crate::memory::StoreLedger::new());
         memory.set_limit(Some(16));
         let shrink = |identity: u64, old: &Arc<Allocation>, backed: &Arc<AtomicUsize>| {
             let mut charge = old.charge.lock().unwrap().take().unwrap();
@@ -1621,7 +1654,7 @@ mod physical_slot_tests {
 
     #[test]
     fn admitted_slot_owns_backing_charge_and_exclusive_access() {
-        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
+        let memory = MemoryDomain::new(crate::memory::StoreLedger::new());
         let mut reservation = memory.reserve(16).unwrap();
         let allocation = Allocation::new(1, 16, reservation.take(16), Box::new(EmptyStorage));
         let weak = Arc::downgrade(&allocation);
@@ -1640,20 +1673,29 @@ mod physical_slot_tests {
 
     #[test]
     fn native_allocation_owner_enforces_target_limits_without_leaking_reservation() {
-        let catalog = crate::devices::Catalog::discover().unwrap();
-        let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+        let devices = crate::devices::Devices::discover(&[]).unwrap();
+        let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
         let crate::backends::OpenedKind::Cpu(opened) = &device.kind else {
             unreachable!()
         };
         let baseline = opened.memory_usage().charged;
         let maximum = opened.device_description().limits().max_allocation_bytes;
+        let host_ram = device.topology().host_ram().capacity().value;
+        // The CPU's largest allocation is its address space, beyond host
+        // RAM, so host RAM's ledger refuses the request before the target
+        // limit is reached: what it could take is within host RAM. (Its
+        // exact room moves with the other tests charging host RAM in this
+        // process.) Nothing is allocated or kept.
+        assert!(host_ram < maximum);
         let error = opened
             .allocate_storage(maximum.checked_add(1).unwrap(), 4)
             .err()
-            .expect("target limit is enforced before allocating");
-        assert!(
-            matches!(error, ExecutionError::AllocationCapacity { required, available } if required == (maximum + 1).into() && available == maximum)
-        );
+            .expect("an allocation beyond every bound is refused before allocating");
+        assert!(matches!(
+            error,
+            ExecutionError::AllocationCapacity { required, available }
+                if required == (maximum + 1).into() && available <= host_ram
+        ));
         assert_eq!(opened.memory_usage().charged, baseline);
         assert!(matches!(
             opened.allocate_storage(4, 0),
@@ -1664,7 +1706,7 @@ mod physical_slot_tests {
 
     #[test]
     fn reached_slots_release_dead_capacity_and_preserve_live_permits_on_refusal() {
-        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
+        let memory = MemoryDomain::new(crate::memory::StoreLedger::new());
         let mut resources = AdmittedResources::new(memory.reserve(0).unwrap(), vec![]);
         resources.set_reached_budget(24);
         resources.declare_private(100);
@@ -1703,7 +1745,7 @@ mod physical_slot_tests {
 
     #[test]
     fn completed_dead_bank_releases_device_capacity_without_releasing_live_bank() {
-        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
+        let memory = MemoryDomain::new(crate::memory::StoreLedger::new());
         memory.set_limit(Some(24));
         let mut resources = AdmittedResources::new(memory.reserve(0).unwrap(), vec![]);
         resources.set_reached_budget(24);
@@ -1746,7 +1788,7 @@ mod physical_slot_tests {
 
     #[test]
     fn published_backing_survives_slot_release_without_retaining_its_permit() {
-        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
+        let memory = MemoryDomain::new(crate::memory::StoreLedger::new());
         let mut reservation = memory.reserve(16).unwrap();
         let allocation = Allocation::new(1, 16, reservation.take(16), Box::new(EmptyStorage));
         let resources = AdmittedResources::new(reservation, vec![allocation.acquire(true)]);

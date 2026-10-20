@@ -51,7 +51,7 @@ pub use custom_models::{
     DrafterContent, ManagedLocalModels,
 };
 pub use download_service::ManagedModelDownloads;
-pub use inventory::{InventoryConfig, ManagedModelStore};
+pub use inventory::{DownloadSpace, InventoryConfig, ManagedModelStore};
 pub use local_roots::llama_cpp_flat_prefix;
 pub use model_domains::{ManagedModelServices, ModelDomainResolver, managed_model_services};
 pub use package_service::{

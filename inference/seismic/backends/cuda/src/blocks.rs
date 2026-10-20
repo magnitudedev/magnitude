@@ -17,6 +17,7 @@ struct Block {
     allocation: Allocation,
     dedicated: bool,
     free: Mutex<FreeRanges>,
+    _charge: Option<Box<dyn seismic_compiler::executable::MemoryHold>>,
 }
 
 impl Block {
@@ -87,7 +88,13 @@ impl Blocks {
                     .filter(|block| !block.dedicated)
                     .map(|block| block.allocation.bytes as u64)
                     .max();
+                let account = self.context.device_account.get();
+                let room = account.map_or(room, |account| {
+                    let available = account.available();
+                    Some(room.map_or(available, |room| room.min(available)))
+                });
                 let size = block_bytes(largest, BLOCK_CAP_BYTES, bytes, room, self.granularity)?;
+                let charge = account.map(|account| account.reserve(size)).transpose()?;
                 let allocation = Allocation::new(
                     &self.context,
                     usize::try_from(size).map_err(|_| {
@@ -96,8 +103,9 @@ impl Blocks {
                         )
                     })?,
                 )
-                .map_err(crate::executor::allocation_error)?;
+                .map_err(crate::executor::allocation_error(size))?;
                 let block = Arc::new(Block {
+                    _charge: charge,
                     allocation,
                     dedicated: bytes > BLOCK_CAP_BYTES,
                     free: Mutex::new(FreeRanges::new(size)),

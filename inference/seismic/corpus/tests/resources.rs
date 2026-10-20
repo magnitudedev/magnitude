@@ -172,9 +172,9 @@ fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget:
             Input::I32(value) => Value::Scalar(Scalar::I32(*value)),
         })
         .collect();
-    let usage = device.memory_usage();
+    let usage = device.storage_usage(seismic::StorageKind::Device);
     let base = usage.charged;
-    device.set_memory_limit(Some(base + budget));
+    device.set_storage_limit(seismic::StorageKind::Device, Some(base + budget));
     let function = module.function(entry).expect("declared entry");
     let (kernel, _) = prepare(
         &function,
@@ -231,11 +231,11 @@ fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget:
         );
     }
     assert_eq!(
-        device.memory_usage().charged,
+        device.storage_usage(seismic::StorageKind::Device).charged,
         base,
         "{entry}: the run did not release every backing it acquired"
     );
-    device.set_memory_limit(usage.limit);
+    device.set_storage_limit(seismic::StorageKind::Device,usage.limit);
     Run { failed, tensors }
 }
 

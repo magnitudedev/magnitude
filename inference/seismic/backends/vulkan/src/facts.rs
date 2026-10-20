@@ -188,13 +188,24 @@ impl Default for ShaderFmaFeatures {
 unsafe impl vk::ExtendsPhysicalDeviceFeatures2 for ShaderFmaFeatures {}
 unsafe impl vk::ExtendsDeviceCreateInfo for ShaderFmaFeatures {}
 
+/// `VkPhysicalDeviceType`, as the backend reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceType {
     Discrete,
     Integrated,
     /// A software device (lavapipe).
     Cpu,
+    /// A virtual GPU or a type the backend does not know; the floor
+    /// refuses it.
     Other,
+}
+
+impl DeviceType {
+    /// Whether the device's memory is the host's, as its type reports it:
+    /// an integrated GPU's or a CPU device's is.
+    pub fn memory_is_host(self) -> bool {
+        matches!(self, Self::Integrated | Self::Cpu)
+    }
 }
 
 /// Limits the runtime checks launches and allocations against.
@@ -280,26 +291,164 @@ pub struct Facts {
     pub f32_atomic_add: bool,
     pub shared_int64_atomics: bool,
     pub calibration: Option<Calibration>,
-    /// Largest device-local heap.
-    pub device_local_bytes: u64,
-    /// Largest device-local heap that also has host-visible coherent memory
-    /// (ReBAR/SAM, or unified memory); 0 when there is none.
-    pub host_visible_device_local_bytes: u64,
+    /// `VkPhysicalDeviceIDProperties::deviceLUID`, when `deviceLUIDValid`:
+    /// the OS adapter's identity, in `LUID` memory layout.
+    pub luid: Option<[u8; 8]>,
+    /// The device's memory heaps and types.
+    pub memory: MemoryLayout,
+    /// The memory types the backend allocates each storage kind from.
+    pub allocation: Allocation,
+}
+
+/// `VkPhysicalDeviceMemoryProperties`: the heaps and the memory types, in
+/// the driver's order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryLayout {
+    /// The heaps, indexed by heap number.
+    pub heaps: Vec<MemoryHeap>,
+    /// The memory types, indexed by memory type number.
+    pub types: Vec<MemoryType>,
+}
+
+/// One `VkMemoryHeap`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryHeap {
+    pub bytes: u64,
+    /// `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT`.
+    pub device_local: bool,
+}
+
+/// One `VkMemoryType`: its heap and the property flags the backend reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryType {
+    /// The heap the type allocates from (`heapIndex`).
+    pub heap: u32,
+    /// `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT`.
+    pub device_local: bool,
+    /// `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT`.
+    pub host_visible: bool,
+    /// `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`.
+    pub host_coherent: bool,
+    /// `VK_MEMORY_PROPERTY_HOST_CACHED_BIT`.
+    pub host_cached: bool,
+}
+
+impl MemoryType {
+    /// Host-visible and coherent: the host maps it and its writes need no
+    /// flush.
+    pub fn mappable(&self) -> bool {
+        self.host_visible && self.host_coherent
+    }
 }
 
 /// The largest host-visible device-local heap that is a small BAR window,
 /// which upload storage is not spent on.
 const SMALL_BAR_BYTES: u64 = 256 << 20;
 
-impl Facts {
-    /// Whether upload storage (host-written storage the device reads:
-    /// upload regions, host-shared tensors) is device-local memory: a
-    /// host-visible device-local heap larger than a small BAR window
-    /// (ReBAR/SAM, or unified memory). Else it is host RAM.
-    pub fn uploads_device_local(&self) -> bool {
-        self.host_visible_device_local_bytes > SMALL_BAR_BYTES
+/// The memory types the backend allocates each storage kind from, in order:
+/// an allocation that finds no room on one type's heap moves to the next.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Allocation {
+    /// Storage device work reads and writes.
+    pub device: Vec<u32>,
+    /// Storage the host writes in place while device work reads it; every
+    /// type is mappable.
+    pub upload: Vec<u32>,
+    /// The backend's transfer staging, which is host RAM's: a mappable type
+    /// that is not device-local (any mappable type, on a device whose memory
+    /// is the host's), host-cached where one is; none when no type is.
+    pub staging: Option<u32>,
+}
+
+impl Allocation {
+    /// The types of `layout` the backend allocates from. A device whose
+    /// memory is not the host's keeps device storage on its first
+    /// device-local type, and upload storage on the device-local mappable
+    /// type of the largest such heap when that heap is larger than a small
+    /// BAR window (ReBAR/SAM; 256 MiB, `SMALL_BAR_BYTES`), else on its first
+    /// non-device-local mappable type (host RAM). A device whose memory is
+    /// the host's (`memory_is_host`) has one total presented across heaps,
+    /// so both kinds take its device-local heaps and then its other heaps,
+    /// on each heap the first mappable type (device storage, else the
+    /// heap's first type). Staging is as its field says.
+    pub fn of(layout: &MemoryLayout, memory_is_host: bool) -> Self {
+        let types = || {
+            layout
+                .types
+                .iter()
+                .enumerate()
+                .map(|(index, kind)| (index as u32, kind))
+        };
+        let host_mappable = || {
+            types().filter(|(_, kind)| kind.mappable() && (memory_is_host || !kind.device_local))
+        };
+        let staging = host_mappable()
+            .find(|(_, kind)| kind.host_cached)
+            .or_else(|| host_mappable().next())
+            .map(|(index, _)| index);
+        if memory_is_host {
+            let mut heaps = (0..layout.heaps.len() as u32).collect::<Vec<_>>();
+            heaps.sort_by_key(|&heap| !layout.heaps[heap as usize].device_local);
+            let on = |heap: u32| types().filter(move |(_, kind)| kind.heap == heap);
+            return Self {
+                device: heaps
+                    .iter()
+                    .filter_map(|&heap| {
+                        on(heap)
+                            .find(|(_, kind)| kind.mappable())
+                            .or_else(|| on(heap).next())
+                            .map(|(index, _)| index)
+                    })
+                    .collect(),
+                upload: heaps
+                    .iter()
+                    .filter_map(|&heap| {
+                        on(heap)
+                            .find(|(_, kind)| kind.mappable())
+                            .map(|(index, _)| index)
+                    })
+                    .collect(),
+                staging,
+            };
+        }
+        let device = types()
+            .find(|(_, kind)| kind.device_local)
+            .map(|(index, _)| index);
+        // The device-local mappable type on the largest heap, the first of
+        // them on it, when that heap is larger than a small BAR window.
+        let bar = types()
+            .filter(|(_, kind)| kind.device_local && kind.mappable())
+            .max_by_key(|(index, kind)| {
+                (
+                    layout.heaps[kind.heap as usize].bytes,
+                    std::cmp::Reverse(*index),
+                )
+            })
+            .filter(|(_, kind)| layout.heaps[kind.heap as usize].bytes > SMALL_BAR_BYTES);
+        let upload = bar
+            .or_else(|| types().find(|(_, kind)| !kind.device_local && kind.mappable()))
+            .map(|(index, _)| index);
+        Self {
+            device: device.into_iter().collect(),
+            upload: upload.into_iter().collect(),
+            staging,
+        }
     }
 
+    /// The heaps of `types` in `layout`, each once, in order.
+    pub fn heaps(layout: &MemoryLayout, types: &[u32]) -> Vec<u32> {
+        let mut heaps = Vec::new();
+        for &index in types {
+            let heap = layout.types[index as usize].heap;
+            if !heaps.contains(&heap) {
+                heaps.push(heap);
+            }
+        }
+        heaps
+    }
+}
+
+impl Facts {
     pub fn is_gpu(&self) -> bool {
         matches!(
             self.device_type,
@@ -386,14 +535,12 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// One enumerated physical device: its facts, whether it meets the floor
-/// (`Err` names the first missing item), and for a device meeting it, the
-/// budget of its device-local heap when discovered (`VK_EXT_memory_budget`).
+/// One enumerated physical device: its facts, and whether it meets the
+/// floor (`Err` names the first missing item).
 #[derive(Clone, Debug)]
 pub struct Description {
     pub facts: Facts,
     pub floor: Result<(), String>,
-    pub heap_budget_bytes: Option<u64>,
 }
 
 /// Device extensions of the floor.
@@ -470,28 +617,14 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
     });
     let queue_family = compute_only.or(universal);
 
-    let memory = unsafe { raw.get_physical_device_memory_properties(physical) };
-    let heaps = &memory.memory_heaps[..memory.memory_heap_count as usize];
-    let types = &memory.memory_types[..memory.memory_type_count as usize];
-    let device_local_bytes = heaps
-        .iter()
-        .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-        .map(|heap| heap.size)
-        .max()
-        .unwrap_or(0);
-    let host_visible_device_local_bytes = types
-        .iter()
-        .filter(|kind| {
-            kind.property_flags.contains(
-                vk::MemoryPropertyFlags::DEVICE_LOCAL
-                    | vk::MemoryPropertyFlags::HOST_VISIBLE
-                    | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
-        })
-        .map(|kind| heaps[kind.heap_index as usize].size)
-        .max()
-        .unwrap_or(0);
-
+    let memory = memory_layout(&unsafe { raw.get_physical_device_memory_properties(physical) });
+    let device_type = match base.device_type {
+        vk::PhysicalDeviceType::DISCRETE_GPU => DeviceType::Discrete,
+        vk::PhysicalDeviceType::INTEGRATED_GPU => DeviceType::Integrated,
+        vk::PhysicalDeviceType::CPU => DeviceType::Cpu,
+        _ => DeviceType::Other,
+    };
+    let allocation = Allocation::of(&memory, device_type.memory_is_host());
     let mixed_dot_accelerated =
         v13.integer_dot_product4x8_bit_packed_mixed_signedness_accelerated == vk::TRUE;
     let subgroup_width = SubgroupWidth::of(
@@ -527,12 +660,7 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
         uuid: v11.device_uuid,
         vendor_id: base.vendor_id,
         device_id: base.device_id,
-        device_type: match base.device_type {
-            vk::PhysicalDeviceType::DISCRETE_GPU => DeviceType::Discrete,
-            vk::PhysicalDeviceType::INTEGRATED_GPU => DeviceType::Integrated,
-            vk::PhysicalDeviceType::CPU => DeviceType::Cpu,
-            _ => DeviceType::Other,
-        },
+        device_type,
         driver_id: v12.driver_id.as_raw(),
         driver_name: text(&v12.driver_name),
         driver_info: text(&v12.driver_info),
@@ -566,8 +694,9 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
         f32_atomic_add: atomic_float.shader_buffer_float32_atomic_add == vk::TRUE,
         shared_int64_atomics: f12.shader_shared_int64_atomics == vk::TRUE,
         calibration,
-        device_local_bytes,
-        host_visible_device_local_bytes,
+        luid: (v11.device_luid_valid == vk::TRUE).then_some(v11.device_luid),
+        memory,
+        allocation,
     };
 
     let on = |value: vk::Bool32| value == vk::TRUE;
@@ -579,7 +708,7 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
         | vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE
         | vk::SubgroupFeatureFlags::CLUSTERED
         | vk::SubgroupFeatureFlags::QUAD;
-    let requirements: [(&str, bool); 36] = [
+    let requirements = [
         ("Vulkan 1.3", vk::api_version_major(base.api_version) > 1 || vk::api_version_minor(base.api_version) >= 3),
         ("a compute queue with timestamps", queue_family.is_some()),
         ("bufferDeviceAddress", on(f12.buffer_device_address)),
@@ -613,18 +742,48 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
         ("workgroup size (1024, 1024, 64)", limits.max_compute_work_group_size.iter().zip(FLOOR_GROUP_SIZE).all(|(size, floor)| *size >= floor)),
         ("128 bytes of push constants", limits.max_push_constants_size >= FLOOR_PUSH_CONSTANT_BYTES),
         ("a GPU or CPU device type", !matches!(facts.device_type, DeviceType::Other)),
-        ("a device-local heap", device_local_bytes > 0),
-        ("host-visible coherent memory", types.iter().any(|kind| kind.property_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT))),
+        (
+            "a device-local heap",
+            facts.memory.heaps.iter().any(|heap| heap.device_local && heap.bytes > 0),
+        ),
+        ("host-visible coherent memory", facts.memory.types.iter().any(MemoryType::mappable)),
+        ("device storage placement", !facts.allocation.device.is_empty()),
+        ("upload storage placement", !facts.allocation.upload.is_empty()),
+        ("host staging memory", facts.allocation.staging.is_some()),
         ("a nonzero allocation limit", facts.limits.max_allocation_bytes > 0),
     ];
     let floor = match requirements.iter().find(|(_, met)| !met) {
         Some((missing, _)) => Err(format!("missing {missing}")),
         None => Ok(()),
     };
-    Description {
-        facts,
-        floor,
-        heap_budget_bytes: None,
+    Description { facts, floor }
+}
+
+/// The heaps and types of `properties`, in the driver's order.
+pub(crate) fn memory_layout(properties: &vk::PhysicalDeviceMemoryProperties) -> MemoryLayout {
+    let heaps = &properties.memory_heaps[..properties.memory_heap_count as usize];
+    let types = &properties.memory_types[..properties.memory_type_count as usize];
+    MemoryLayout {
+        heaps: heaps
+            .iter()
+            .map(|heap| MemoryHeap {
+                bytes: heap.size,
+                device_local: heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL),
+            })
+            .collect(),
+        types: types
+            .iter()
+            .map(|kind| {
+                let has = |flag| kind.property_flags.contains(flag);
+                MemoryType {
+                    heap: kind.heap_index,
+                    device_local: has(vk::MemoryPropertyFlags::DEVICE_LOCAL),
+                    host_visible: has(vk::MemoryPropertyFlags::HOST_VISIBLE),
+                    host_coherent: has(vk::MemoryPropertyFlags::HOST_COHERENT),
+                    host_cached: has(vk::MemoryPropertyFlags::HOST_CACHED),
+                }
+            })
+            .collect(),
     }
 }
 
@@ -647,4 +806,55 @@ fn matrix_shapes(instance: &Instance, physical: vk::PhysicalDevice) -> bool {
             && shape.c_type == vk::ComponentTypeKHR::FLOAT32
             && shape.result_type == vk::ComponentTypeKHR::FLOAT32
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory_type(heap: u32, device_local: bool, mappable: bool) -> MemoryType {
+        MemoryType {
+            heap,
+            device_local,
+            host_visible: mappable,
+            host_coherent: mappable,
+            host_cached: false,
+        }
+    }
+
+    /// A discrete device's layout: its device-local heap, a host heap, and
+    /// a device-local mappable heap of `bar` bytes.
+    fn discrete(bar: u64) -> MemoryLayout {
+        MemoryLayout {
+            heaps: vec![
+                MemoryHeap {
+                    bytes: 24 << 30,
+                    device_local: true,
+                },
+                MemoryHeap {
+                    bytes: 64 << 30,
+                    device_local: false,
+                },
+                MemoryHeap {
+                    bytes: bar,
+                    device_local: true,
+                },
+            ],
+            types: vec![
+                memory_type(0, true, false),
+                memory_type(1, false, true),
+                memory_type(2, true, true),
+            ],
+        }
+    }
+
+    /// Upload storage is spent on a device-local mappable heap only beyond
+    /// a small BAR window; within one it is host RAM.
+    #[test]
+    fn upload_storage_takes_a_bar_heap_only_beyond_a_small_window() {
+        let small = Allocation::of(&discrete(SMALL_BAR_BYTES), false);
+        assert_eq!((small.device, small.upload), (vec![0], vec![1]));
+        let large = Allocation::of(&discrete(SMALL_BAR_BYTES + 1), false);
+        assert_eq!((large.device, large.upload), (vec![0], vec![2]));
+    }
 }

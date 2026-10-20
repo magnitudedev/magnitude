@@ -5,11 +5,14 @@
 
 use magnitude_kernels::{attention_append_dense, attention_decode, attention_prefill};
 use seismic::{
-    BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor,
+    BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
     Tensor,
 };
 
 include!("attention_common/fixtures.rs");
+
+mod timing_common;
+use timing_common::Timed;
 
 /// Device tensors of one case, in the family's Qwen form (see
 /// `attention_k8v4.rs`).
@@ -753,7 +756,7 @@ fn attention_reads_and_writes_after_reusing_an_interior_slab() {
 
 fn check_attention_slab_case(case: &Case, reused: bool) {
     let expected = case.expected();
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [
         BackendName::Cpu,
         BackendName::Metal,
@@ -923,7 +926,7 @@ fn decode_timing_on(device: &Device) {
             let kernel = decode_kernel(device, &specialization);
             let mut bound = Bound::new(device, &case);
             let measurement = kernel
-                .measure(vec![args!(attention_decode, bound, case)], &TIMING)
+                .time(vec![args!(attention_decode, bound, case)], &TIMING)
                 .unwrap();
             let kv_bytes = (context * QWEN.kv * QWEN.w() * 2 * 2) as f64;
             eprintln!(
@@ -984,7 +987,7 @@ fn prefill_timing_on(device: &Device) {
             let kernel = prefill_kernel(device, &specialization);
             let mut bound = Bound::new(device, &case);
             let measurement = kernel
-                .measure(vec![args!(attention_prefill, bound, case)], &TIMING)
+                .time(vec![args!(attention_prefill, bound, case)], &TIMING)
                 .unwrap();
             eprintln!(
                 "prefill {} rows after {history} history {config}: {:.1} us ({:.2} TFLOP/s)",
@@ -1009,7 +1012,7 @@ fn qwen_geometry_speculative_decode_matches_host_model() {
 #[test]
 #[ignore = "bounded CUDA register-query decode qualification"]
 fn cuda_register_query_decode_matches_host_model() {
-    let device = DeviceCatalog::discover()
+    let device = seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(BackendName::Cuda)
         .expect("CUDA qualification requires CUDA");
@@ -1166,7 +1169,7 @@ fn dense_append_publishes_only_the_same_history_as_prefill() {
     ];
     let case = Case::new(SMALL, 64, 1, &rows, 97);
     let expected = case.expected();
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [BackendName::Cpu, BackendName::Metal] {
         let Ok(device) = catalog.open_backend(backend) else {
             continue;

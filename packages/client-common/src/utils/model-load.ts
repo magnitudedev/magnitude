@@ -76,11 +76,9 @@ const describeOptimizing = (
   device: Option.Option<ModelLoadDevice>,
   hardware: Option.Option<LocalInferenceHardware>,
 ): string => Option.match(
-  Option.flatMap(device, (selected) => Option.flatMap(hardware, (snapshot) => {
-    // Accelerators and load devices are both identified by the service's hardware device id.
-    const deviceId: string = selected.deviceId
-    return Option.fromNullable(snapshot.accelerators.find((accelerator) => accelerator.acceleratorId === deviceId))
-  })),
+  Option.flatMap(device, (selected) => Option.flatMap(hardware, (snapshot) =>
+    Option.fromNullable(snapshot.accelerators.find((accelerator) =>
+      accelerator.executors.some(executor => executor.deviceId === selected.deviceId))))),
   {
     onNone: () => "Optimizing…",
     onSome: (accelerator) => `Optimizing for ${accelerator.name}…`,
