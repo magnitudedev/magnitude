@@ -33,6 +33,7 @@ export const unsupportedReasonMessage = (reason: UnsupportedReason): string => {
     case "Tokenizer": return "Uses a tokenizer Magnitude doesn't support"
     case "ChatTemplate": return "Its chat template can't be read"
     case "TiedOutputHead": return "Uses a tied output layer, which Magnitude doesn't support yet"
+    case "DraftArchitecture": return `Drafting with a separate ${reason.architecture} file isn't supported yet`
     case "TargetMismatch": return "Its drafter wasn't built for this model"
     case "KernelDomain":
     case "Backend": return `Its layer sizes aren't supported on this ${backendDevice(reason.backend)}`

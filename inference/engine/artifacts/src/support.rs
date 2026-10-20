@@ -11,7 +11,10 @@ use std::fmt;
 /// or projector that does not fit its target; `MissingMetadata` is a
 /// well-formed file that omits a declaration the engine requires and never
 /// infers (a block drafter's attention causality); `Unreadable` is a
-/// truncated or invalid GGUF, or a header missing what its family needs.
+/// truncated or invalid GGUF, or a header missing what its family needs;
+/// `DraftArchitecture` is a separate drafter whose `general.architecture`
+/// no drafter family binds (a model architecture's prediction head the
+/// engine drafts with only when it is built in, or not at all).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnsupportedReason {
     Architecture {
@@ -50,6 +53,9 @@ pub enum UnsupportedReason {
         detail: String,
     },
     TiedOutputHead,
+    DraftArchitecture {
+        architecture: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -107,6 +113,9 @@ impl fmt::Display for UnsupportedReason {
             Self::Unreadable => formatter.write_str("unreadable GGUF"),
             Self::TargetMismatch { detail } => write!(formatter, "target mismatch: {detail}"),
             Self::TiedOutputHead => formatter.write_str("tied output head"),
+            Self::DraftArchitecture { architecture } => {
+                write!(formatter, "separate drafter of architecture {architecture:?}")
+            }
         }
     }
 }

@@ -454,3 +454,50 @@ fn a_qwen4exp_target_with_its_prediction_block_is_assessed_with_built_in_heads()
             .map(|fingerprint| fingerprint.block_count)
     );
 }
+
+/// A separate Nemotron-H prediction-head file (as `mtp-*.gguf` beside a
+/// Nemotron 3.5 repository's versions): a `nemotron_h_moe` file holding only
+/// its last block. The engine runs the architecture but binds no separate
+/// drafter of it, which is the reason, never the architecture itself.
+#[test]
+fn a_separate_nemotron_head_names_its_drafter_architecture() {
+    let manifest = manifest();
+    let fixture = manifest
+        .fixtures
+        .iter()
+        .find(|fixture| fixture.name == "nemotron-h-supported")
+        .expect("the Nemotron fixture");
+    let scratch = Scratch::new("nemotron-separate-head");
+    let target = scratch.materialize(&fixture.target[0]);
+    let mut head = inspect_header(&target).unwrap();
+    let blocks = head
+        .value("nemotron_h_moe.block_count")
+        .and_then(Value::unsigned)
+        .unwrap();
+    let last = format!("blk.{}.", blocks - 1);
+    head.tensors.retain(|tensor| tensor.name.starts_with(&last));
+    let draft = scratch.0.join("mtp-nemotron.gguf");
+    std::fs::write(&draft, gguf_header(&head)).unwrap();
+    let ModelAssessment::Assessed { facts, .. } = assess_model(
+        &ModelPackagePaths {
+            target,
+            projector: None,
+            draft: Some(draft),
+            method: ModelMethod::Auto,
+        },
+        &cpu_setup(),
+        &[],
+    )
+    .unwrap_or_else(|error| panic!("operational failure: {error}")) else {
+        panic!("the Nemotron target is assessed");
+    };
+    let DrafterVerdict::Rejected(rejection) = facts.drafter else {
+        panic!("a separate Nemotron head is rejected: {:?}", facts.drafter);
+    };
+    assert_eq!(
+        rejection.reasons,
+        [UnsupportedReason::DraftArchitecture {
+            architecture: "nemotron_h_moe".into()
+        }]
+    );
+}

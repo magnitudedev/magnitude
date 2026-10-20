@@ -729,6 +729,7 @@ const KnownUnsupportedReasonSchema = Schema.Union(
   }),
   Schema.TaggedStruct("ChatTemplate", {}),
   Schema.TaggedStruct("TiedOutputHead", {}),
+  Schema.TaggedStruct("DraftArchitecture", { architecture: NonEmptyString }),
   Schema.TaggedStruct("TargetMismatch", { detail: Schema.String }),
   Schema.TaggedStruct("KernelDomain", {
     backend: NonEmptyString,
@@ -743,7 +744,7 @@ const KnownUnsupportedReasonSchema = Schema.Union(
 
 const knownUnsupportedReasonTags: ReadonlySet<string> = new Set<UnsupportedReason["_tag"]>([
   "Architecture", "WeightTypes", "RopeScaling", "UnrecognizedTensor", "UnrecognizedMetadata", "MissingMetadata", "Tokenizer",
-  "ChatTemplate", "TiedOutputHead", "TargetMismatch", "KernelDomain", "Backend", "Unreadable", "UnsupportedFormat",
+  "ChatTemplate", "TiedOutputHead", "DraftArchitecture", "TargetMismatch", "KernelDomain", "Backend", "Unreadable", "UnsupportedFormat",
   "Unknown",
 ])
 

@@ -62,7 +62,15 @@ vocabulary, where a later key such as an appended MTP head count may settle it),
 is read by the remote header reader. The shape comes from metadata alone: tensor types never
 affect it (weight support is decided at inspection, where a tensor type id the engine doesn't know
 is an unsupported weight type named `type <id>`, never a damaged file). The result is a variant of the first
-catalog model, in catalog order, whose fingerprint has that shape. The header's architecture
+catalog model, in catalog order, whose fingerprint has that shape. The engine also judges the
+header search holds, with no read of its own: the whole header when it was read (it ended inside
+the prefix, or the shape needed it), else the prefix's leading metadata. Its refusal (see
+[assessment](./assessment-and-ranking.md)) holds for every version and on every machine, so the
+result is unsupported with those reasons: a tokenizer the metadata declares (a SentencePiece
+Mistral), and, from a whole header, tensors or a head the family doesn't admit. A prefix ends
+before the tensor directory, so tensor-level refusals (an unrecognized `rope_freqs.weight`, a tied
+output layer) show only where the whole header was read, and otherwise at inspection. Weight
+types never make a result unsupported. The header's architecture
 replaces the Hub's; a repository the engine doesn't run is unsupported with that architecture, and
 one whose headers were read but hold no model file (no architecture, a projector's, or the pieces
 of a layer-split model, which repeat its metadata over fewer tensors than its blocks) is unsupported
@@ -75,7 +83,7 @@ gguf filter also matches a tag) is no result. A query that is a pasted Hugging F
 searches for its repository, read the way a model is added: a link (`https://huggingface.co/owner/repo/…`,
 `hf.co/owner/repo`), or `owner/repo` naming a version (`:QUANT`), a revision (`@revision`) or a
 file (`/path.gguf`), with or without `hf:`; any other query, `owner/repo` alone among them, is
-searched as typed. What a repository's commit holds is cached, so it is read once; reads
+searched as typed. What a repository's commit holds is cached per engine build, so it is read once; reads
 run with bounded concurrency. A failed or slow read (any status but success, a timeout, a listing
 that can't be resolved, a gated repository's refused files) is unknown: it is retried next time,
 never cached, never fails the search, and leaves the row as the Hub's search describes it (without a

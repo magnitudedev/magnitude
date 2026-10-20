@@ -1412,8 +1412,10 @@ impl From<KnownUnsupportedReason> for UnsupportedReason {
     }
 }
 
-/// A reason the engine raises, typed where it raises it. `UnsupportedFormat` is the service's own:
-/// a found model whose files are not GGUF, such as an Ollama model stored for its MLX runner.
+/// A reason the engine raises, typed where it raises it. `DraftArchitecture` is a separate drafter
+/// whose architecture no drafter family binds, such as a Nemotron-H MTP file. `UnsupportedFormat`
+/// is the service's own: a found model whose files are not GGUF, such as an Ollama model stored for
+/// its MLX runner.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
@@ -1455,6 +1457,9 @@ pub enum KnownUnsupportedReason {
         detail: String,
     },
     TiedOutputHead,
+    DraftArchitecture {
+        architecture: String,
+    },
     Unreadable,
     UnsupportedFormat,
 }
@@ -2636,6 +2641,9 @@ mod custom_model_wire_tests {
                 detail: "hidden size".to_owned(),
             }),
             UnsupportedReason::Known(KnownUnsupportedReason::TiedOutputHead),
+            UnsupportedReason::Known(KnownUnsupportedReason::DraftArchitecture {
+                architecture: "nemotron_h_moe".to_owned(),
+            }),
             UnsupportedReason::Known(KnownUnsupportedReason::Unreadable),
             UnsupportedReason::Known(KnownUnsupportedReason::UnsupportedFormat),
         ];
@@ -2655,6 +2663,7 @@ mod custom_model_wire_tests {
                 { "_tag": "MissingMetadata", "key": "dflash.attention.causal" },
                 { "_tag": "TargetMismatch", "detail": "hidden size" },
                 { "_tag": "TiedOutputHead" },
+                { "_tag": "DraftArchitecture", "architecture": "nemotron_h_moe" },
                 { "_tag": "Unreadable" },
                 { "_tag": "UnsupportedFormat" }
             ])

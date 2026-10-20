@@ -9,9 +9,9 @@
 use magnitude_artifacts::gguf::Encoding;
 use magnitude_engine::{
     assessment::{
-        assess_model, kernel_inventory, prepare_model_assessment, AssessmentSetup,
-        DrafterVerdict, KernelInventory, ModelAssessment, ModelPackagePaths,
-        PreparedModelAssessment, SpeculativeMethod,
+        assess_model, header_refusal, kernel_inventory, prepare_model_assessment,
+        AssessmentSetup, DrafterVerdict, HeaderExtent, KernelInventory, ModelAssessment,
+        ModelPackagePaths, PreparedModelAssessment, SpeculativeMethod,
     },
     error::{UnsupportedModel, UnsupportedReason, WeightTypeCount},
     fingerprint::ModelFingerprint,
@@ -509,6 +509,65 @@ fn independent_checks_report_every_reason_together() {
         ]
     );
     assert!(refusal.detail.contains("Q2_K"), "{}", refusal.detail);
+}
+
+/// A header's own refusal is admission's without the weight types: with the
+/// whole header, the family, tokenizer and template reasons; with leading
+/// metadata only, what those entries settle, and nothing the entries a prefix
+/// doesn't reach would decide.
+#[test]
+fn a_header_refuses_what_admission_does_without_its_weight_types() {
+    let directory =
+        |gguf: &Gguf| magnitude_artifacts::gguf::read_header(&gguf.bytes()).expect("header");
+    let reasons = |gguf: &Gguf, extent| {
+        header_refusal(&directory(gguf), extent).map(|refusal| refusal.reasons)
+    };
+    let mut quantized = llama();
+    quantized.encode("blk.0.ffn_down.weight", Encoding::Q2K);
+    assert_eq!(reasons(&quantized, HeaderExtent::Whole), None);
+    let mut refused = quantized;
+    refused.tensor("blk.0.attn_q.bias", &[HEADS * WIDTH], Encoding::F32);
+    refused.set("tokenizer.ggml.pre", Meta::Str("deepseek-v3".into()));
+    assert_eq!(
+        reasons(&refused, HeaderExtent::Whole),
+        Some(vec![
+            UnsupportedReason::UnrecognizedTensor {
+                name: "blk.0.attn_q.bias".into()
+            },
+            UnsupportedReason::Tokenizer {
+                model: "gpt2".into(),
+                pre: Some("deepseek-v3".into())
+            },
+        ])
+    );
+    // A prefix: the metadata before the token list, no tensor directory.
+    let leading = |model: &str| {
+        let mut gguf = Gguf::default();
+        for (key, value) in llama().metadata {
+            if key == "tokenizer.ggml.tokens" {
+                break;
+            }
+            gguf.set(&key, value);
+        }
+        gguf.set("tokenizer.ggml.model", Meta::Str(model.into()));
+        gguf
+    };
+    assert_eq!(reasons(&leading("gpt2"), HeaderExtent::Leading), None);
+    assert_eq!(
+        reasons(&leading("llama"), HeaderExtent::Leading),
+        Some(vec![UnsupportedReason::Tokenizer {
+            model: "llama".into(),
+            pre: Some("llama-bpe".into())
+        }])
+    );
+    let mut unknown = leading("gpt2");
+    unknown.set("general.architecture", Meta::Str("deepseek4".into()));
+    assert_eq!(
+        reasons(&unknown, HeaderExtent::Leading),
+        Some(vec![UnsupportedReason::Architecture {
+            architecture: "deepseek4".into()
+        }])
+    );
 }
 
 #[test]

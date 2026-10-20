@@ -1935,6 +1935,12 @@ export const KnownUnsupportedReason = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(S.TaggedStruct("TiedOutputHead", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("DraftArchitecture", {
+      architecture: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
   S.extend(S.TaggedStruct("Unreadable", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(S.TaggedStruct("UnsupportedFormat", {}), S.Record({ key: S.String, value: JsonValue })),
 )

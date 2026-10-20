@@ -28,7 +28,7 @@ use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::content_id;
 use crate::inventory::{ManagedModelStore, build_model, now};
 use crate::lineage::CatalogLineage;
-use crate::search_shape::{CatalogFingerprints, RepositoryModel};
+use crate::search_shape::{CatalogFingerprints, HeaderVerdicts, RepositoryModel};
 
 const MAX_HUB_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HUB_SIBLINGS: usize = 100_000;
@@ -47,6 +47,7 @@ const SEARCH_SHAPE_CONCURRENCY: usize = 8;
 pub struct HuggingFaceDiscovery {
     models: Arc<ManagedModelStore>,
     architectures: RecognizedArchitectures,
+    verdicts: Arc<dyn HeaderVerdicts>,
     lineage: Arc<CatalogLineage>,
     catalog: Arc<dyn CatalogFingerprints>,
     searches: tokio::sync::Mutex<BTreeMap<String, (Instant, HuggingFaceModelSearchResults)>>,
@@ -57,12 +58,14 @@ impl HuggingFaceDiscovery {
     pub fn new(
         models: Arc<ManagedModelStore>,
         architectures: RecognizedArchitectures,
+        verdicts: Arc<dyn HeaderVerdicts>,
         lineage: Arc<CatalogLineage>,
         catalog: Arc<dyn CatalogFingerprints>,
     ) -> Self {
         Self {
             models,
             architectures,
+            verdicts,
             lineage,
             catalog,
             searches: tokio::sync::Mutex::new(BTreeMap::new()),
@@ -180,8 +183,9 @@ impl HuggingFaceDiscovery {
     }
 
     /// What `result`'s model file says: its header's architecture, which replaces the Hub's and is
-    /// unsupported when the engine doesn't run it, and the first catalog model whose shape
-    /// fingerprint it has. Names and declared lineage never decide. A repository whose headers were read and hold no model file
+    /// unsupported when the engine doesn't run it, the engine's refusal of the header itself
+    /// (reasons that hold for every version, never weight types or this machine's), and the first
+    /// catalog model whose shape fingerprint it has. Names and declared lineage never decide. A repository whose headers were read and hold no model file
     /// (no architecture, a projector's or a drafter's, or a layer-split piece) is unreadable,
     /// whatever the Hub's repository-level architecture says; a read that failed or timed out
     /// (a gated repository's refused files among them) leaves the result as the Hub describes it,
@@ -198,6 +202,7 @@ impl HuggingFaceDiscovery {
         match crate::search_shape::repository_model(
             &self.models,
             &self.architectures,
+            self.verdicts.as_ref(),
             catalog,
             &result.repository,
             &result.commit,
@@ -208,6 +213,7 @@ impl HuggingFaceDiscovery {
             Some(RepositoryModel::Model {
                 architecture,
                 shape,
+                unsupported,
             }) => {
                 result.architecture = Some(architecture.clone());
                 if !self.architectures.targets.contains(&architecture) {
@@ -216,7 +222,7 @@ impl HuggingFaceDiscovery {
                     )];
                     return true;
                 }
-                result.unsupported.clear();
+                result.unsupported = unsupported;
                 result.variant_of = shape.and_then(|shape| shape.variant_of(catalog));
             }
             Some(RepositoryModel::Unreadable) => {
@@ -3554,6 +3560,7 @@ mod tests {
         let discovery = HuggingFaceDiscovery::new(
             Arc::clone(&store),
             RecognizedArchitectures::new(["llama"], ["dflash"]),
+            NoRefusals::new(),
             CatalogLineage::new(
                 Arc::clone(&store),
                 catalog_with_target("catalog/Llama-GGUF", &commit),
@@ -3810,6 +3817,7 @@ mod tests {
         let discovery = HuggingFaceDiscovery::new(
             Arc::clone(&store),
             RecognizedArchitectures::new(["llama"], ["dflash"]),
+            NoRefusals::new(),
             CatalogLineage::new(Arc::clone(&store), catalog),
             StubCatalog::empty(),
         );
@@ -3870,6 +3878,29 @@ mod tests {
     impl CatalogFingerprints for StubCatalog {
         fn catalog_fingerprints(&self) -> BoxFuture<'_, Vec<(ModelId, ModelFingerprint)>> {
             Box::pin(async move { self.0.clone() })
+        }
+    }
+
+    /// Header verdicts that refuse nothing; the engine's are the server's, tested there.
+    struct NoRefusals;
+
+    impl NoRefusals {
+        fn new() -> Arc<dyn HeaderVerdicts> {
+            Arc::new(Self)
+        }
+    }
+
+    impl HeaderVerdicts for NoRefusals {
+        fn identity(&self) -> String {
+            "no-refusals".to_owned()
+        }
+
+        fn refusal(
+            &self,
+            _: &magnitude_artifacts::gguf::Directory,
+            _: crate::search_shape::HeaderExtent,
+        ) -> Vec<UnsupportedReason> {
+            Vec::new()
         }
     }
 
@@ -4106,6 +4137,7 @@ mod tests {
         HuggingFaceDiscovery::new(
             Arc::clone(store),
             RecognizedArchitectures::new(targets.iter().copied(), ["dflash"]),
+            NoRefusals::new(),
             CatalogLineage::new(
                 Arc::clone(store),
                 catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40)),
@@ -4783,6 +4815,7 @@ mod tests {
         let discovery = HuggingFaceDiscovery::new(
             Arc::clone(&store),
             RecognizedArchitectures::new(["llama"], ["dflash"]),
+            NoRefusals::new(),
             CatalogLineage::new(
                 Arc::clone(&store),
                 catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40)),

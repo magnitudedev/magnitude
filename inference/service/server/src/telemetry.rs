@@ -511,6 +511,7 @@ mod tests {
         let discovery = magnitude_service_models::HuggingFaceDiscovery::new(
             store.clone(),
             magnitude_service_models::candidate_files::RecognizedArchitectures::default(),
+            std::sync::Arc::new(magnitude_service_server::assessment::assessor::EngineHeaderVerdicts),
             magnitude_service_models::lineage::CatalogLineage::new(
                 store.clone(),
                 magnitude_service_contracts::models::RecommendableModelCatalog {

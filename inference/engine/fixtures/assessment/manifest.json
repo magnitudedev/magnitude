@@ -528,7 +528,7 @@
               }
             },
             {
-              "Architecture": {
+              "DraftArchitecture": {
                 "architecture": "qwen35"
               }
             }
@@ -558,7 +558,7 @@
         "drafter": {
           "rejected": [
             {
-              "Architecture": {
+              "DraftArchitecture": {
                 "architecture": "qwen35"
               }
             }
@@ -588,7 +588,7 @@
         "drafter": {
           "rejected": [
             {
-              "Architecture": {
+              "DraftArchitecture": {
                 "architecture": "qwen35"
               }
             }

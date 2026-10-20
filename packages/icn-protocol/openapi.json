@@ -7234,6 +7234,24 @@
           {
             "type": "object",
             "required": [
+              "architecture",
+              "_tag"
+            ],
+            "properties": {
+              "architecture": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "DraftArchitecture"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "_tag"
             ],
             "properties": {
@@ -7260,7 +7278,7 @@
             }
           }
         ],
-        "description": "A reason the engine raises, typed where it raises it. `UnsupportedFormat` is the service's own:\na found model whose files are not GGUF, such as an Ollama model stored for its MLX runner."
+        "description": "A reason the engine raises, typed where it raises it. `DraftArchitecture` is a separate drafter\nwhose architecture no drafter family binds, such as a Nemotron-H MTP file. `UnsupportedFormat`\nis the service's own: a found model whose files are not GGUF, such as an Ollama model stored for\nits MLX runner."
       },
       "LocalModelRemoval": {
         "type": "object",

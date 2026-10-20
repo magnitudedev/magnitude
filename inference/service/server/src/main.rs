@@ -13,7 +13,7 @@ use magnitude_service_models::{
     ModelDomainResolver, managed_model_services,
 };
 use magnitude_service_server::assessment::ManagedModelAssessments;
-use magnitude_service_server::assessment::assessor::ModelAssessor;
+use magnitude_service_server::assessment::assessor::{EngineHeaderVerdicts, ModelAssessor};
 use magnitude_service_server::assessment::candidates::{
     ManagedModelCandidates, engine_architectures,
 };
@@ -242,6 +242,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 .with_hugging_face_catalog(Arc::new(HuggingFaceDiscovery::new(
                     inventory.clone(),
                     architectures,
+                    Arc::new(EngineHeaderVerdicts),
                     lineage,
                     candidates.clone(),
                 )))

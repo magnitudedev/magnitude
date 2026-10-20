@@ -10,10 +10,11 @@ use std::sync::{Arc, Weak};
 
 use magnitude_engine::assessment::{
     DrafterVerdict as EngineDrafterVerdict, ModelAssessment as EngineAssessment,
-    ModelAssessmentError, ModelCapabilities as EngineCapabilities, ModelPackagePaths,
-    PreparedModelAssessment, SpeculativeMethod as EngineSpeculativeMethod, finish_model_assessment,
-    prepare_model_assessment,
+    HeaderExtent as EngineHeaderExtent, ModelAssessmentError, ModelCapabilities as EngineCapabilities,
+    ModelPackagePaths, PreparedModelAssessment, SpeculativeMethod as EngineSpeculativeMethod,
+    finish_model_assessment, header_refusal, prepare_model_assessment,
 };
+use magnitude_artifacts::gguf::Directory;
 use magnitude_engine::error::{UnsupportedModel, UnsupportedReason as EngineUnsupportedReason};
 use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
 use magnitude_engine::options::ModelMethod;
@@ -28,8 +29,8 @@ use magnitude_service_contracts::models::{
 };
 use magnitude_service_contracts::{ComponentRole, InventoryError, MemoryDomainId, ResolvedModel};
 use magnitude_service_models::{
-    CachedModelAssessment, ManagedModelStore, ModelDomainResolver, ReleaseCatalog,
-    ServableModelBundleKey, servable_model_bundle_key_for_bundle,
+    CachedModelAssessment, HeaderExtent, HeaderVerdicts, ManagedModelStore, ModelDomainResolver,
+    ReleaseCatalog, ServableModelBundleKey, servable_model_bundle_key_for_bundle,
 };
 use sha2::{Digest, Sha256};
 
@@ -558,7 +559,30 @@ fn unsupported_reason(reason: EngineUnsupportedReason) -> UnsupportedReason {
             KnownUnsupportedReason::TargetMismatch { detail }
         }
         EngineUnsupportedReason::TiedOutputHead => KnownUnsupportedReason::TiedOutputHead,
+        EngineUnsupportedReason::DraftArchitecture { architecture } => {
+            KnownUnsupportedReason::DraftArchitecture { architecture }
+        }
     })
+}
+
+/// The engine's refusal of a model file's header alone, which search shows on a result: the
+/// header interpretation assessment admits a target by, without weight types or this machine.
+pub struct EngineHeaderVerdicts;
+
+impl HeaderVerdicts for EngineHeaderVerdicts {
+    fn identity(&self) -> String {
+        crate::build_identity::native_build()
+    }
+
+    fn refusal(&self, header: &Directory, extent: HeaderExtent) -> Vec<UnsupportedReason> {
+        let extent = match extent {
+            HeaderExtent::Whole => EngineHeaderExtent::Whole,
+            HeaderExtent::Leading => EngineHeaderExtent::Leading,
+        };
+        header_refusal(header, extent)
+            .map(|unsupported| unsupported_reasons(unsupported).0)
+            .unwrap_or_default()
+    }
 }
 
 fn unsupported_reasons(unsupported: UnsupportedModel) -> (Vec<UnsupportedReason>, String) {

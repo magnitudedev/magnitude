@@ -321,6 +321,7 @@ describe("UnsupportedReasonSchema", () => {
       { _tag: "MissingMetadata", key: "dflash.attention.causal" },
       { _tag: "TargetMismatch", detail: "drafter hidden size 2048 does not match 4096" },
       { _tag: "TiedOutputHead" },
+      { _tag: "DraftArchitecture", architecture: "nemotron_h_moe" },
       { _tag: "Unreadable" },
       { _tag: "UnsupportedFormat" },
     ]) {

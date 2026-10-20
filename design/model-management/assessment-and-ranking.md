@@ -92,8 +92,12 @@ verdicts.
 
 `UnsupportedReason` is a closed, structured set: architecture, weight types (each type with its
 tensor count), rope scaling, unrecognized tensor, unrecognized metadata, missing metadata,
-tokenizer, chat template, kernel domain, backend, unreadable, target mismatch, and tied output
-head. Target mismatch is a drafter (or projector) that does not fit the target it is bound to;
+tokenizer, chat template, kernel domain, backend, unreadable, target mismatch, tied output head,
+and drafter architecture. Target mismatch is a drafter (or projector) that does not fit the target it is bound to;
+drafter architecture is a separate drafter whose `general.architecture` no drafter family binds,
+which names what the engine lacks rather than the target's architecture: a Nemotron-H MTP file
+(`nemotron_h_moe`, an architecture the engine runs as a target) is refused this way, because the
+engine drafts with no Nemotron-H prediction head, separate or built in;
 missing metadata is a well-formed file that omits a declaration the engine requires and never
 infers (a block drafter's attention causality, which some published drafters predate); tied output
 head is a target whose output projection is its embedding where the family needs a separate one. Every refusal names
@@ -122,7 +126,12 @@ An assessed entry also carries the target's `ModelFingerprint`: architecture, de
 MTP prediction layers, so a conversion that dropped the heads keeps it), embedding
 length, head and KV-head counts, key length, vocabulary size, expert count, and a digest of the
 tokenizer's token table. The engine also publishes the architecture strings it recognizes, which
-Hugging Face search uses as its prefilter. The product side never parses headers, reads file names
+Hugging Face search uses as its prefilter, and judges a model file's header alone
+(`header_refusal`): the header interpretation admission runs (family, tokenizer, chat templates)
+without weight types, a drafter or a device, or, from leading metadata only (a prefix), what those
+entries settle by themselves (the architecture and the tokenizer scheme and flags they declare).
+Search shows a result whose model file header is refused this way disabled with those reasons;
+weight types never disable a search result, since another version may have supported ones. The product side never parses headers, reads file names
 for quantization, or keeps its own list of supported architectures.
 
 Engine guarantees:

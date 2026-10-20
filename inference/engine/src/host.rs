@@ -99,7 +99,9 @@ pub enum DraftUnavailable {
     /// this target.
     Assistant(magnitude_family_gemma4::Error),
     PredictionHead(magnitude_family_qwen4exp::Error),
-    /// An architecture no drafter family interprets.
+    /// An architecture no drafter family interprets: an unknown one, or a
+    /// model architecture whose prediction heads the engine binds only
+    /// built into their target, if at all (a separate Nemotron-H MTP file).
     Architecture(Option<String>),
 }
 
@@ -109,7 +111,7 @@ impl DraftUnavailable {
         let reasons = match self {
             Self::Block(error) => error.reasons(),
             Self::Assistant(error) | Self::PredictionHead(error) => error.reasons.clone(),
-            Self::Architecture(Some(architecture)) => vec![UnsupportedReason::Architecture {
+            Self::Architecture(Some(architecture)) => vec![UnsupportedReason::DraftArchitecture {
                 architecture: architecture.clone(),
             }],
             Self::Architecture(None) => vec![UnsupportedReason::Unreadable],
@@ -567,7 +569,7 @@ mod tests {
         let reasons = |unavailable: DraftUnavailable| unavailable.unsupported().reasons;
         assert_eq!(
             reasons(DraftUnavailable::Architecture(Some("eagle3".into()))),
-            [UnsupportedReason::Architecture {
+            [UnsupportedReason::DraftArchitecture {
                 architecture: "eagle3".into()
             }]
         );

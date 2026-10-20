@@ -20,12 +20,13 @@ use crate::host::{bind_draft, vocabulary_mismatch};
 use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy, ResolvedMethod};
 use crate::planning::{plan_backend, plan_execution, ExecutionPlanningError};
 use magnitude_artifacts::{
-    gguf::{FileHeaders, HeaderSource, TensorDescriptor},
-    PackageHeaders, PackageManifest, TemplatePayload, TokenizerPayload,
+    gguf::{Directory, FileHeaders, HeaderSource, TensorDescriptor},
+    ArtifactIdentity, PackageHeaders, PackageIdentity, PackageManifest, TemplatePayload,
+    TokenizerPayload,
 };
 use magnitude_chat::{
     artifacts::{gguf_templates, gguf_tokenizer_vocabulary},
-    TemplateInspection,
+    TemplateInspection, TokenizerError,
 };
 use magnitude_executor::{
     assessment::{
@@ -703,31 +704,16 @@ fn admit(
                 .map(|tensor| (tensor, Residency::Dequantized)),
         );
     refusals.extend(unsupported_weights(weights, layout));
-    let interpreted = crate::families::recognize(target).and_then(|family| {
-        family
-            .inspect(target, headers.projector(), headers.identity())
-            .map(|definition| (family, definition))
-            .map_err(UnsupportedModel::from)
-    });
-    let tokenizer = TokenizerPayload::from_directory(target);
-    // Support and vocabulary are header facts; a load builds the tokenizer.
-    let vocabulary = gguf_tokenizer_vocabulary(&tokenizer).map_err(UnsupportedModel::from);
-    let chat = TemplatePayload::from_directory(target, &package.target.display().to_string())
-        .map_err(|error| error.to_string())
-        .and_then(|templates| gguf_templates(&templates, &tokenizer))
-        .and_then(|bundle| bundle.inspect_cached())
-        .map_err(UnsupportedModel::chat_template);
-    if let (Ok((_, definition)), Ok(vocabulary)) = (&interpreted, &vocabulary) {
-        if u64::try_from(*vocabulary).ok() != Some(definition.decoder.vocabulary) {
-            refusals.push(vocabulary_mismatch(&tokenizer));
-        }
-    }
-    let (interpreted, chat) = match (interpreted, vocabulary, chat) {
-        (Ok(interpreted), Ok(_), Ok(chat)) if refusals.is_empty() => (interpreted, chat),
-        (interpreted, vocabulary, chat) => {
-            refusals.extend(interpreted.err());
-            refusals.extend(vocabulary.err());
-            refusals.extend(chat.err());
+    let interpreted = interpret_header(
+        target,
+        headers.projector(),
+        headers.identity(),
+        &package.target.display().to_string(),
+    );
+    let (family, definition, chat) = match interpreted {
+        Ok(interpreted) if refusals.is_empty() => interpreted,
+        interpreted => {
+            refusals.extend(interpreted.err().into_iter().flatten());
             return Ok(Admission::Unsupported {
                 unsupported: UnsupportedModel::union(refusals)
                     .expect("a refused admission has a refusal"),
@@ -735,7 +721,6 @@ fn admit(
             });
         }
     };
-    let (family, definition) = interpreted;
     let context_limit = u32::try_from(definition.decoder.context_limit)
         .map_err(|_| ModelAssessmentError::ContextLimit(definition.decoder.context_limit))?;
     let drafter = admit_drafter(package, source, &mut headers, family, &definition, layout)?;
@@ -747,6 +732,92 @@ fn admit(
         fingerprint,
         drafter,
     })))
+}
+
+/// A target header's interpretation: its family's definition, the tokenizer
+/// it declares (checked against the definition's vocabulary) and its chat
+/// templates, as independent checks whose refusals are reported together.
+/// It never reads weight encodings, a drafter or a device.
+fn interpret_header(
+    target: &Directory,
+    projector: Option<&Directory>,
+    identity: PackageIdentity,
+    name: &str,
+) -> Result<(&'static dyn ModelFamily, ModelDefinition, TemplateInspection), Vec<UnsupportedModel>>
+{
+    let interpreted = crate::families::recognize(target).and_then(|family| {
+        family
+            .inspect(target, projector, identity)
+            .map(|definition| (family, definition))
+            .map_err(UnsupportedModel::from)
+    });
+    let tokenizer = TokenizerPayload::from_directory(target);
+    // Support and vocabulary are header facts; a load builds the tokenizer.
+    let vocabulary = gguf_tokenizer_vocabulary(&tokenizer).map_err(UnsupportedModel::from);
+    let chat = TemplatePayload::from_directory(target, name)
+        .map_err(|error| error.to_string())
+        .and_then(|templates| gguf_templates(&templates, &tokenizer))
+        .and_then(|bundle| bundle.inspect_cached())
+        .map_err(UnsupportedModel::chat_template);
+    let mut refusals = Vec::new();
+    if let (Ok((_, definition)), Ok(vocabulary)) = (&interpreted, &vocabulary) {
+        if u64::try_from(*vocabulary).ok() != Some(definition.decoder.vocabulary) {
+            refusals.push(vocabulary_mismatch(&tokenizer));
+        }
+    }
+    match (interpreted, vocabulary, chat) {
+        (Ok((family, definition)), Ok(_), Ok(chat)) if refusals.is_empty() => {
+            Ok((family, definition, chat))
+        }
+        (interpreted, vocabulary, chat) => {
+            refusals.extend(interpreted.err());
+            refusals.extend(vocabulary.err());
+            refusals.extend(chat.err());
+            Err(refusals)
+        }
+    }
+}
+
+/// How much of a GGUF header a judgment has: all of it through its tensor
+/// directory, or only its leading metadata entries (a prefix that ends
+/// before the tokenizer's arrays, say).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderExtent {
+    Whole,
+    Leading,
+}
+
+/// Why no file with `target`'s header can run, whatever its weight types
+/// and wherever it runs: the refusals of the header interpretation an
+/// assessment admits a target by, without its weight encodings, a projector,
+/// a drafter or a device. With the `Whole` header that is the family's
+/// interpretation, the tokenizer and the chat templates. With `Leading`
+/// metadata only, it is what those entries settle by themselves: the
+/// architecture and the tokenizer scheme and flags they declare. Entries a
+/// prefix doesn't reach refuse nothing, so it never refuses what the whole
+/// header would admit. `None` when nothing is refused.
+pub fn header_refusal(target: &Directory, extent: HeaderExtent) -> Option<UnsupportedModel> {
+    let refusals = match extent {
+        HeaderExtent::Whole => {
+            let identity = PackageIdentity {
+                target: ArtifactIdentity([0; 32]),
+                projector: None,
+            };
+            interpret_header(target, None, identity, "header").err()?
+        }
+        HeaderExtent::Leading => {
+            let tokenizer = match gguf_tokenizer_vocabulary(&TokenizerPayload::from_directory(target)) {
+                Err(error @ TokenizerError::Unsupported(_)) => Some(UnsupportedModel::from(error)),
+                Ok(_) | Err(TokenizerError::Invalid(_)) => None,
+            };
+            crate::families::recognize(target)
+                .err()
+                .into_iter()
+                .chain(tokenizer)
+                .collect()
+        }
+    };
+    UnsupportedModel::union(refusals)
 }
 
 /// The package's drafter: its separate draft bound against the target

@@ -58,7 +58,9 @@ pub use package_service::{
     servable_model_bundle_key_for_bundle, serving_configuration_fingerprint,
     speculative_servable_model_bundle_key,
 };
-pub use search_shape::{CatalogFingerprints, ModelShape, SHAPE_PREFIX_BYTES};
+pub use search_shape::{
+    CatalogFingerprints, HeaderExtent, HeaderVerdicts, ModelShape, SHAPE_PREFIX_BYTES,
+};
 pub use preview::{
     HuggingFaceDiscovery, PreparedPreview, PreparedPreviewHeader, RemoteGgufHeader,
     pinned_hugging_face_repository, refresh_hugging_face_repository,

@@ -3513,7 +3513,7 @@ async fn a_fastmtp_file_is_a_rejected_drafter_never_a_version() {
             reasons,
             &[
                 serde_json::json!({ "WeightTypes": { "types": [{ "ggml_type": "I32", "tensor_count": 1 }] } }),
-                serde_json::json!({ "Architecture": { "architecture": "qwen35" } }),
+                serde_json::json!({ "DraftArchitecture": { "architecture": "qwen35" } }),
             ]
         ),
         "{reasons:?}"
@@ -3548,7 +3548,7 @@ async fn a_head_file_without_blocks_is_a_rejected_drafter_never_a_version() {
         )]),
     )
     .await;
-    let rejected_qwen35 = [serde_json::json!({ "Architecture": { "architecture": "qwen35" } })];
+    let rejected_qwen35 = [serde_json::json!({ "DraftArchitecture": { "architecture": "qwen35" } })];
     let assert_heads_rejected =
         |candidates: &[magnitude_service_contracts::models::DrafterCandidate],
          is_head: &dyn Fn(&DrafterReference, &str) -> bool| {
@@ -4874,4 +4874,118 @@ async fn a_different_drafter_that_is_the_catalog_drafters_file_resolves_to_the_c
         .expect("the different drafter is listed");
     assert_eq!(other.category, DrafterCategory::Other);
     assert_eq!(third_party.entered, Some(other.reference.clone()));
+}
+
+struct NoCatalogFingerprints;
+
+impl magnitude_service_models::CatalogFingerprints for NoCatalogFingerprints {
+    fn catalog_fingerprints(
+        &self,
+    ) -> BoxFuture<'_, Vec<(ModelId, magnitude_service_contracts::models::ModelFingerprint)>> {
+        Box::pin(async { Vec::new() })
+    }
+}
+
+/// Search applies the engine's interpretation to the model file header it reads, so a repository
+/// whose header the engine refuses is shown disabled with the engine's reasons: a tokenizer the
+/// leading metadata declares, read from the first bytes alone, and a tensor no admitted role binds,
+/// seen when the whole header is read (here because the writer put the block count after the token
+/// list). Weight types never disable a row, since another version may have supported ones.
+#[tokio::test(flavor = "multi_thread")]
+async fn search_disables_a_result_whose_header_the_engine_refuses() {
+    // The tokenizer scheme where writers put it, before the token list.
+    let mut sentencepiece = llama(7, Encoding::Q8_0);
+    for (key, value) in &mut sentencepiece.metadata {
+        if key == "tokenizer.ggml.model" {
+            *value = Meta::Str("llama".into());
+        }
+    }
+    let mut biased = llama(7, Encoding::Q8_0);
+    let block_count = biased
+        .metadata
+        .iter()
+        .position(|(key, _)| key == "llama.block_count")
+        .expect("a block count");
+    let block_count = biased.metadata.remove(block_count);
+    biased.metadata.push(block_count);
+    biased.tensor("blk.0.attn_q.bias", &[HEADS * WIDTH], Encoding::F32);
+    let mut q2 = llama(10, Encoding::Q8_0);
+    q2.encode_all(Encoding::Q8_0, Encoding::Q2K);
+    let mut stub = hub();
+    let mut search = Vec::new();
+    for (id, seed, gguf) in [
+        ("someone/Sentencepiece-GGUF", '7', &sentencepiece),
+        ("someone/Biased-GGUF", '8', &biased),
+        ("someone/Q2-GGUF", '0', &q2),
+    ] {
+        stub.repositories.insert(
+            id.to_owned(),
+            repository(seed, vec![StubFile::new("model-Q8_0.gguf", gguf)], &[]),
+        );
+        search.push(serde_json::json!({
+            "id": id,
+            "sha": commit(seed),
+            "downloads": 10,
+            "tags": ["gguf"],
+            "gguf": { "architecture": "llama" },
+        }));
+    }
+    stub.search = search;
+    let (endpoint, _hub) = stub.serve();
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut config = InventoryConfig::with_roots(
+        directory.path().join("models"),
+        directory.path().join("cache"),
+    )
+    .expect("inventory config");
+    config.hub_endpoint = Some(endpoint);
+    config.architectures = super::engine_architectures();
+    let models = Arc::new(ManagedModelStore::open(config).await.expect("model store"));
+    let (catalog, _) = llama_test_catalog(&models).await;
+    let discovery = magnitude_service_models::HuggingFaceDiscovery::new(
+        Arc::clone(&models),
+        super::engine_architectures(),
+        Arc::new(crate::assessment::assessor::EngineHeaderVerdicts),
+        CatalogLineage::new(Arc::clone(&models), catalog),
+        Arc::new(NoCatalogFingerprints),
+    );
+    let results = magnitude_service_contracts::HuggingFaceModelCatalog::search(
+        &discovery,
+        magnitude_service_contracts::HuggingFaceModelSearchRequest {
+            query: "llama".to_owned(),
+            limit: 10,
+        },
+    )
+    .await
+    .expect("search");
+    let unsupported = |id: &str| {
+        results
+            .results
+            .iter()
+            .find(|result| result.repository == id)
+            .unwrap_or_else(|| panic!("{id} is a result"))
+            .unsupported
+            .clone()
+    };
+    assert_eq!(
+        unsupported("someone/Sentencepiece-GGUF"),
+        [UnsupportedReason::Known(KnownUnsupportedReason::Tokenizer {
+            model: "llama".to_owned(),
+            pre: Some("llama-bpe".to_owned()),
+        })]
+    );
+    assert_eq!(
+        unsupported("someone/Biased-GGUF"),
+        [UnsupportedReason::Known(
+            KnownUnsupportedReason::UnrecognizedTensor {
+                name: "blk.0.attn_q.bias".to_owned()
+            }
+        )]
+    );
+    assert_eq!(unsupported("someone/Q2-GGUF"), []);
+    assert_eq!(
+        results.results.last().map(|result| result.repository.as_str()),
+        Some("someone/Biased-GGUF"),
+        "refused results are listed last"
+    );
 }

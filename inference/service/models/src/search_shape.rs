@@ -1,4 +1,5 @@
-//! What Hugging Face search learns from a repository's model file: its architecture and shape.
+//! What Hugging Face search learns from a repository's model file: its architecture, its shape and
+//! the engine's verdict on its header.
 //!
 //! A result's model file is found by size, never by name: its GGUFs (shards counted together,
 //! projectors excluded) largest first, skipping files whose header names no architecture, a
@@ -10,8 +11,11 @@
 //! list, such as an appended MTP head count, may settle it), the whole header is read by the remote
 //! header reader, header bytes only. The shape comes from metadata alone, never tensor types. It is
 //! the engine's `ModelFingerprint` without the token table digest, and a result is a variant of the first
-//! catalog model (in catalog order) whose fingerprint has the same shape. What a repository's
-//! commit holds is cached, so it is read once.
+//! catalog model (in catalog order) whose fingerprint has the same shape. The engine judges the
+//! header search holds ([`HeaderVerdicts`]): the whole header when it was read, else the prefix's
+//! leading metadata, which settles the architecture and the tokenizer it declares but nothing the
+//! tensor directory decides. What a repository's commit holds is cached, so it is read once per
+//! engine build.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,7 +23,7 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value, read_header};
-use magnitude_service_contracts::models::{ModelFingerprint, ModelId};
+use magnitude_service_contracts::models::{ModelFingerprint, ModelId, UnsupportedReason};
 use magnitude_service_contracts::{HuggingFaceRepositoryRequest, InventoryError};
 use reqwest::header::RANGE;
 use serde::{Deserialize, Serialize};
@@ -36,13 +40,34 @@ pub const MAX_MODEL_FILE_READS: usize = 3;
 /// How long finding and reading a repository's model file may take before its result is shown
 /// without what it would tell.
 const MODEL_READ_TIMEOUT: Duration = Duration::from_secs(15);
-/// Versions the cached outcome: a change to how the model file is found drops older entries.
-const CACHE_VERSION: &str = "model-file.v5";
+/// Versions the cached outcome: a change to how the model file is found or what is kept of it
+/// drops older entries.
+const CACHE_VERSION: &str = "model-file.v6";
 const TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 
 /// Each catalog model's shape fingerprint, as its first variant's model ID, in catalog order.
 pub trait CatalogFingerprints: Send + Sync {
     fn catalog_fingerprints(&self) -> BoxFuture<'_, Vec<(ModelId, ModelFingerprint)>>;
+}
+
+/// How much of a model file's header search holds: all of it through its tensor directory, or
+/// only its leading metadata entries (a prefix ending in the tokenizer's arrays).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderExtent {
+    Whole,
+    Leading,
+}
+
+/// The engine's verdict on a model file's header alone: why no version with this header can run,
+/// whatever its weight types and wherever it runs. The service holds no rules of its own; the
+/// server supplies the engine's.
+pub trait HeaderVerdicts: Send + Sync {
+    /// What the verdicts depend on besides the header (the engine build), which keys their cache.
+    fn identity(&self) -> String;
+
+    /// Why `header` can't run, empty when it refuses nothing. Of `Leading` metadata only what
+    /// those entries settle refuses; entries it doesn't reach never do.
+    fn refusal(&self, header: &Directory, extent: HeaderExtent) -> Vec<UnsupportedReason>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,15 +82,17 @@ pub struct ModelShape {
     expert_count: Option<u32>,
 }
 
-/// What a repository's commit holds for search: the model file's architecture and shape (absent
-/// when its header doesn't state one), headers read that hold no model file, headers read that
-/// are all drafters' (a drafter repository, never a model result), or headers read that are all
-/// projectors' (no GGUF model at all, never a result).
+/// What a repository's commit holds for search: the model file's architecture, shape (absent
+/// when its header doesn't state one) and the engine's refusal of its header (empty when it
+/// refuses nothing), headers read that hold no model file, headers read that are all drafters'
+/// (a drafter repository, never a model result), or headers read that are all projectors' (no GGUF
+/// model at all, never a result).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RepositoryModel {
     Model {
         architecture: String,
         shape: Option<ModelShape>,
+        unsupported: Vec<UnsupportedReason>,
     },
     Unreadable,
     Drafter,
@@ -290,17 +317,19 @@ pub(crate) fn version_count<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Op
 /// What `repository` at `commit` holds for search: cached, else found and read (see the module
 /// documentation). `None` is a failed or slow read (a refused gated file among them), which is
 /// tried again next time. A `restricted` (gated or private) repository's read is cached for the
-/// credential that made it only.
+/// credential that made it only, and every read for the engine build that judged it only.
 pub(crate) async fn repository_model(
     models: &Arc<ManagedModelStore>,
     architectures: &RecognizedArchitectures,
+    verdicts: &dyn HeaderVerdicts,
     catalog: &[(ModelId, ModelFingerprint)],
     repository: &str,
     commit: &str,
     restricted: bool,
 ) -> Option<RepositoryModel> {
     let key = format!(
-        "{CACHE_VERSION}:{}:{repository}@{commit}{}",
+        "{CACHE_VERSION}:{}:{}:{repository}@{commit}{}",
+        verdicts.identity(),
         models.client.endpoint(),
         models.restricted_access_scope(restricted)
     );
@@ -310,7 +339,7 @@ pub(crate) async fn repository_model(
     {
         return Some(cached);
     }
-    let read = read_repository_model(models, architectures, catalog, repository, commit);
+    let read = read_repository_model(models, architectures, verdicts, catalog, repository, commit);
     let model = match tokio::time::timeout(MODEL_READ_TIMEOUT, read).await {
         Ok(Ok(model)) => model,
         Ok(Err(error)) => {
@@ -331,6 +360,7 @@ pub(crate) async fn repository_model(
 async fn read_repository_model(
     models: &Arc<ManagedModelStore>,
     architectures: &RecognizedArchitectures,
+    verdicts: &dyn HeaderVerdicts,
     catalog: &[(ModelId, ModelFingerprint)],
     repository: &str,
     commit: &str,
@@ -406,6 +436,7 @@ async fn read_repository_model(
         // architecture, width and vocabulary; otherwise (no shape yet, or a near miss) the whole
         // header is read.
         let prefix_shape = ModelShape::from_header_prefix(&prefix);
+        let complete = matches!(walk(&prefix), Ok(Layout::Complete { .. }));
         let settled = match walk(&prefix) {
             Ok(Layout::Incomplete { .. }) => prefix_shape.as_ref().is_some_and(|shape| {
                 catalog
@@ -417,8 +448,8 @@ async fn read_repository_model(
             }),
             _ => true,
         };
-        let shape = match settled {
-            true => prefix_shape,
+        let (shape, whole) = match settled {
+            true => (prefix_shape, complete.then_some(prefix.as_slice())),
             false => {
                 // The header's metadata only: the remote reader walks the tensor directory's
                 // layout but never judges its tensor types, which inspection decides. The
@@ -443,13 +474,20 @@ async fn read_repository_model(
                     primary.size_bytes,
                 )?;
                 match crate::remote_header::read_header(&mut remote, &references).await {
-                    Ok(header) => ModelShape::from_header_prefix(&header),
-                    Err(InventoryError::Integrity(_)) => prefix_shape,
+                    Ok(header) => {
+                        return Ok(RepositoryModel::Model {
+                            shape: ModelShape::from_header_prefix(&header),
+                            unsupported: header_refusal(verdicts, &header, Some(&header)),
+                            architecture,
+                        });
+                    }
+                    Err(InventoryError::Integrity(_)) => (prefix_shape, None),
                     Err(error) => return Err(error),
                 }
             }
         };
         return Ok(RepositoryModel::Model {
+            unsupported: header_refusal(verdicts, &prefix, whole),
             architecture,
             shape,
         });
@@ -467,6 +505,21 @@ async fn read_repository_model(
             "{repository} lists no model GGUF"
         )))
     }
+}
+
+/// The engine's refusal of the header search holds: the `whole` header when it was read (and parses
+/// through its tensor directory), else the leading metadata entries of `prefix`.
+fn header_refusal(
+    verdicts: &dyn HeaderVerdicts,
+    prefix: &[u8],
+    whole: Option<&[u8]>,
+) -> Vec<UnsupportedReason> {
+    if let Some(directory) = whole.and_then(|header| read_header(header).ok()) {
+        return verdicts.refusal(&directory, HeaderExtent::Whole);
+    }
+    prefix_metadata(prefix)
+        .map(|(directory, _)| verdicts.refusal(&directory, HeaderExtent::Leading))
+        .unwrap_or_default()
 }
 
 impl ManagedModelStore {
