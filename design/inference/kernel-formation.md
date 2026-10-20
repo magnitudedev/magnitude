@@ -20,12 +20,19 @@ For one backend, a run:
 - forms every native implementation under configurations chosen so that every preprocessor group
   of its sources (the asset, its includes and Seismic's native library) is compiled at least once,
   and every value of every `form` tuning parameter is formed under each device configuration;
+- checks that every weight slot takes every resident representation: planning gives any weight any
+  representation of the backend's resident row layout, and each weight its own, so an element
+  parameter the entry reads (other than a conversion target, which its source chooses) that is
+  implemented at one of them must be implemented at each, with only that parameter changed from
+  the entry's base configuration. Preprocessing alone decides, so the check also runs as a test on
+  every host;
 - forms every distinct kernel request of every supported catalog model at its default
   specialization on the backend's base configuration.
 
 A run succeeds only if every formation succeeded, every group was reached, every form value was
-formed, no entry lacks an implemented configuration, this host could form every configuration the
-search kept, and every catalog request formed. A backend whose toolchain the host lacks is an
+formed, no entry lacks an implemented configuration, no weight slot leaves a resident
+representation untaken, this host could form every configuration the search kept, and every
+catalog request formed. A backend whose toolchain the host lacks is an
 error when named, never a skip.
 
 Formation produces the real artifact preparation produces (a CUBIN through ptxas, sealed SPIR-V,
@@ -104,3 +111,6 @@ so entry progress is not proportional to time.
 - An engine or service change alone does not invalidate the coverage completion.
 - A run after a change to one kernel family forms only that family's changed programs.
 - A run that is killed keeps every verdict it recorded.
+- A weight slot that rejects one resident representation of its backend's layout while it takes
+  another fails the run, so no model whose weights need it can pass assessment and then fail to
+  form.

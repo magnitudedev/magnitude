@@ -18,6 +18,13 @@
 //! reported: it is dead code, or reachable only through more than one change
 //! from every kept configuration.
 //!
+//! Planning gives a weight any representation of its backend's resident row
+//! layout, and gives each weight its own. So a weight slot (an element
+//! parameter the entry reads, other than a conversion target, which its
+//! source chooses) that takes one of them must take every one: the base
+//! configuration with only that slot changed to it must be implemented. A
+//! representation it is not implemented at is reported as untaken.
+//!
 //! A `form` tuning parameter selects a structurally different algorithm,
 //! which a kernel may take without a preprocessor group (a template chosen
 //! by a constant, say) and which its declaration may admit only at some
@@ -42,7 +49,10 @@ pub use seismic_native_target::{ProgramEntry, ProgramSource};
 
 use super::abi::{self, Dialect, render_source};
 use super::plan::{self, LaunchVariant};
-use seismic_lang::checked::{CheckedModule, EntryInfo, NativeImplementation, NativeParameter, NativeSpecialization};
+use seismic_lang::checked::{
+    CheckedModule, ElementDomain, ElementTarget, EntryInfo, NativeImplementation, NativeParameter,
+    NativeSpecialization,
+};
 use seismic_lang::entry::ElementBindings;
 use seismic_lang::ids::{EntryId, RepresentationId};
 use seismic_lang::registry::{self, BackendName};
@@ -103,6 +113,26 @@ impl fmt::Display for FormationFailure {
     }
 }
 
+/// A resident representation a weight slot of an entry does not take,
+/// though the slot takes other representations of the backend's resident
+/// layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Untaken {
+    pub entry: String,
+    pub parameter: String,
+    pub representation: &'static str,
+}
+
+impl fmt::Display for Untaken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "`{}` {}={}",
+            self.entry, self.parameter, self.representation
+        )
+    }
+}
+
 /// What forming one backend's implementations established.
 #[derive(Debug, Default)]
 pub struct Coverage {
@@ -123,6 +153,9 @@ pub struct Coverage {
     pub unformed: Vec<String>,
     /// Entries with no implemented configuration at all.
     pub unimplemented: Vec<String>,
+    /// Resident representations a weight slot does not take, though it
+    /// takes others ([`untaken`]).
+    pub untaken: Vec<Untaken>,
     /// Configurations this host's toolchain cannot form (Metal tensor
     /// operations on a compiler without Metal 4), with the entries whose
     /// kept configurations needed them.
@@ -137,6 +170,7 @@ impl Coverage {
             && self.unreached.is_empty()
             && self.unformed.is_empty()
             && self.unimplemented.is_empty()
+            && self.untaken.is_empty()
     }
 }
 
@@ -155,6 +189,9 @@ impl fmt::Display for Coverage {
         }
         for site in &self.unreached {
             writeln!(f, "unreached group: {site}")?;
+        }
+        for untaken in &self.untaken {
+            writeln!(f, "untaken representation: {untaken}")?;
         }
         for form in &self.unformed {
             writeln!(f, "unformed form: {form}")?;
@@ -338,6 +375,16 @@ impl Former {
                 *tensor_ops || !needed
             }
             _ => true,
+        }
+    }
+
+    /// The row layout weights are resident in on this backend.
+    fn resident_layout(&self) -> registry::Layout {
+        match self {
+            Self::Vulkan => registry::Layout::Rows16,
+            Self::Cuda { .. } => registry::Layout::Mma16,
+            #[cfg(target_os = "macos")]
+            Self::Metal { .. } => registry::Layout::Rows32,
         }
     }
 
@@ -1613,6 +1660,7 @@ struct Search {
     reached: BTreeSet<GroupSite>,
     universe: BTreeSet<GroupSite>,
     rejecting: BTreeSet<GroupSite>,
+    untaken: Vec<Untaken>,
 }
 
 impl Search {
@@ -1645,61 +1693,36 @@ fn search(subject: &Subject<'_>, forms: Forms<'_>) -> Result<Option<Search>, Cov
     let specialization = implementation
         .default_specialization(&statics)
         .expect("searched statics admit a configuration");
-    let configuration = forms.former.base();
     let mut search = Search::default();
     // The base: the first binding in candidate order that is admitted,
     // implemented and not rejected by the toolchain.
-    let mut base = None;
-    let mut choice = vec![0usize; subject.candidates.len()];
-    if subject
-        .candidates
-        .iter()
-        .all(|(_, candidates)| !candidates.is_empty())
-    {
-        loop {
-            let bindings = subject.candidates.iter().zip(&choice).fold(
-                ElementBindings::new(),
-                |bindings, ((parameter, candidates), index)| {
-                    bindings.bind(parameter, candidates[*index])
-                },
-            );
-            if subject.admits(&bindings) {
-                let row = Row {
-                    bindings,
-                    specialization: specialization.clone(),
-                    configuration,
-                };
-                let mut evaluated = evaluate(subject, std::slice::from_ref(&row))?;
-                search.universe.extend(evaluated.universe);
-                search.rejecting.extend(evaluated.rejecting);
-                if let Some(reached) = evaluated.reached.pop().expect("one row evaluated") {
-                    if search.record(subject, &row, form_row(subject, forms, &row)) {
-                        search.reached.extend(reached);
-                        base = Some(row);
-                        break;
-                    }
+    let base = base_row(
+        subject,
+        Row {
+            bindings: ElementBindings::new(),
+            specialization,
+            configuration: forms.former.base(),
+        },
+        |row, mut evaluated| {
+            search
+                .universe
+                .extend(std::mem::take(&mut evaluated.universe));
+            search
+                .rejecting
+                .extend(std::mem::take(&mut evaluated.rejecting));
+            match evaluated.reached.pop().expect("one row evaluated") {
+                Some(reached) if search.record(subject, row, form_row(subject, forms, row)) => {
+                    search.reached.extend(reached);
+                    true
                 }
+                _ => false,
             }
-            let mut position = choice.len();
-            let advanced = loop {
-                if position == 0 {
-                    break false;
-                }
-                position -= 1;
-                choice[position] += 1;
-                if choice[position] < subject.candidates[position].1.len() {
-                    break true;
-                }
-                choice[position] = 0;
-            };
-            if !advanced {
-                break;
-            }
-        }
-    }
+        },
+    )?;
     let Some(base) = base else {
         return Ok(None);
     };
+    search.untaken = untaken_at(subject, forms.former.resident_layout(), &base)?;
     let mut seen = BTreeSet::from([base.key()]);
     let mut frontier = vec![base.clone()];
     let mut paired = false;
@@ -1727,6 +1750,159 @@ fn search(subject: &Subject<'_>, forms: Forms<'_>) -> Result<Option<Search>, Cov
     let rejecting = std::mem::take(&mut search.rejecting);
     search.universe.retain(|site| !rejecting.contains(site));
     Ok(Some(search))
+}
+
+/// The first binding in candidate order that is admitted and that `accept`
+/// takes, given its evaluation, as a row like `template`.
+fn base_row(
+    subject: &Subject<'_>,
+    template: Row,
+    mut accept: impl FnMut(&Row, Evaluation) -> bool,
+) -> Result<Option<Row>, CoverageError> {
+    if subject
+        .candidates
+        .iter()
+        .any(|(_, candidates)| candidates.is_empty())
+    {
+        return Ok(None);
+    }
+    let mut choice = vec![0usize; subject.candidates.len()];
+    loop {
+        let bindings = subject.candidates.iter().zip(&choice).fold(
+            ElementBindings::new(),
+            |bindings, ((parameter, candidates), index)| {
+                bindings.bind(parameter, candidates[*index])
+            },
+        );
+        if subject.admits(&bindings) {
+            let row = Row {
+                bindings,
+                ..template.clone()
+            };
+            let evaluated = evaluate(subject, std::slice::from_ref(&row))?;
+            if accept(&row, evaluated) {
+                return Ok(Some(row));
+            }
+        }
+        let mut position = choice.len();
+        let advanced = loop {
+            if position == 0 {
+                break false;
+            }
+            position -= 1;
+            choice[position] += 1;
+            if choice[position] < subject.candidates[position].1.len() {
+                break true;
+            }
+            choice[position] = 0;
+        };
+        if !advanced {
+            return Ok(None);
+        }
+    }
+}
+
+/// The representations of `layout` that a weight slot of `base`'s entry is
+/// not implemented at while it is at another of them, each with only that
+/// slot of `base` changed. Only preprocessing decides; nothing is formed.
+fn untaken_at(
+    subject: &Subject<'_>,
+    layout: registry::Layout,
+    base: &Row,
+) -> Result<Vec<Untaken>, CoverageError> {
+    let domain = &subject.info.element_domain;
+    let mut untaken = Vec::new();
+    for (parameter, candidates) in &subject.candidates {
+        if !weight_slot(domain, parameter) {
+            continue;
+        }
+        let rows = candidates
+            .iter()
+            .filter(|representation| {
+                registry::representation_info(**representation).layout == layout
+            })
+            .map(|representation| Row {
+                bindings: base.bindings.clone().bind(parameter, *representation),
+                ..base.clone()
+            })
+            .filter(|row| subject.admits(&row.bindings))
+            .collect::<Vec<_>>();
+        let reached = evaluate(subject, &rows)?.reached;
+        if reached.iter().all(Option::is_none) {
+            continue;
+        }
+        for (row, _) in rows
+            .iter()
+            .zip(reached)
+            .filter(|(_, reached)| reached.is_none())
+        {
+            let representation = row.bindings.get(parameter).expect("the slot is bound");
+            untaken.push(Untaken {
+                entry: subject.info.name.clone(),
+                parameter: parameter.clone(),
+                representation: registry::representation_info(representation).name,
+            });
+        }
+    }
+    Ok(untaken)
+}
+
+/// Whether `parameter` is a weight slot: the entry reads its elements, and no
+/// conversion's source chooses it (`repack[U = U]`).
+fn weight_slot(domain: &ElementDomain, parameter: &str) -> bool {
+    let read = domain.parameters().iter().any(|element| {
+        element.name == parameter && (element.uses.decoded_read || element.uses.component_read)
+    });
+    let converted = domain.conversions().iter().any(|conversion| {
+        matches!(&conversion.target, ElementTarget::Parameter(target) if target == parameter)
+    });
+    read && !converted
+}
+
+/// Every resident representation a weight slot of a native implementation
+/// of `module` does not take while it takes another, on `toolchain`'s
+/// backend: the check [`cover`] makes, by preprocessing alone. Each entry's
+/// base is its first binding in candidate order that is admitted and
+/// implemented.
+pub fn untaken(
+    module: &CheckedModule,
+    toolchain: &Toolchain,
+) -> Result<Vec<Untaken>, CoverageError> {
+    let former = &toolchain.former;
+    let subjects = subjects(module, former.backend());
+    let found = in_parallel(&subjects, |subject| {
+        let Some(statics) = subject.statics(&[]) else {
+            return Ok(Vec::new());
+        };
+        let specialization = subject
+            .implementation
+            .default_specialization(&statics)
+            .expect("searched statics admit a configuration");
+        let base = base_row(
+            subject,
+            Row {
+                bindings: ElementBindings::new(),
+                specialization,
+                configuration: former.base(),
+            },
+            |_, mut evaluated| {
+                evaluated
+                    .reached
+                    .pop()
+                    .expect("one row evaluated")
+                    .is_some()
+            },
+        )?;
+        match base {
+            Some(base) => untaken_at(subject, former.resident_layout(), &base),
+            None => Ok(Vec::new()),
+        }
+    });
+    let mut untaken = Vec::new();
+    for found in found {
+        untaken.extend(found?);
+    }
+    Ok(untaken)
 }
 
 /// One value of a `form` tuning parameter: the launch that declares it (none
@@ -1952,19 +2128,7 @@ pub fn cover(
         former: &toolchain.former,
         forming,
     };
-    let backend = toolchain.backend();
-    let subjects = module
-        .entries()
-        .iter()
-        .filter_map(|info| {
-            let candidates = info
-                .element_parameters
-                .iter()
-                .map(|parameter| (parameter.clone(), representations()))
-                .collect();
-            Subject::new(module, info, backend, candidates)
-        })
-        .collect::<Vec<_>>();
+    let subjects = subjects(module, toolchain.backend());
     progress.begin(subjects.len());
     let searches = in_parallel(&subjects, |subject| {
         let searched = search(subject, forms);
@@ -1984,6 +2148,7 @@ pub fn cover(
         coverage.forms_formed += searched.forms_formed;
         coverage.forms += searched.forms;
         coverage.unformed.extend(searched.unformed);
+        coverage.untaken.extend(searched.untaken);
         coverage.failures.extend(searched.failures);
         coverage.unformable.extend(
             searched
@@ -1998,6 +2163,23 @@ pub fn cover(
     coverage.reached = reached.len();
     coverage.unreached = universe.difference(&reached).cloned().collect();
     Ok(coverage)
+}
+
+/// Every entry of `module` with a native implementation on `backend`, each
+/// element parameter's candidates every registry representation.
+fn subjects(module: &CheckedModule, backend: BackendName) -> Vec<Subject<'_>> {
+    module
+        .entries()
+        .iter()
+        .filter_map(|info| {
+            let candidates = info
+                .element_parameters
+                .iter()
+                .map(|parameter| (parameter.clone(), representations()))
+                .collect();
+            Subject::new(module, info, backend, candidates)
+        })
+        .collect()
 }
 
 /// `work` over every item on every core, results in item order.

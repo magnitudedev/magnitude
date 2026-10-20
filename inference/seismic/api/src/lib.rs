@@ -37,8 +37,15 @@ pub mod coverage {
     pub use seismic_runtime::native::coverage::{
         Configuration, Coverage, CoverageError, Formation, FormationFailure, Forming, GroupSite,
         InProcess, ProgramEntry, ProgramSource, Progress, RequestFailure, Target, Toolchain,
-        Verdict, form,
+        Untaken, Verdict, form,
     };
+
+    /// Every resident weight representation a weight slot of `module`'s
+    /// native implementations does not take while it takes another, on
+    /// `toolchain`'s backend, by preprocessing alone.
+    pub fn untaken(module: &Module, toolchain: &Toolchain) -> Result<Vec<Untaken>, CoverageError> {
+        seismic_runtime::native::coverage::untaken(module.checked(), toolchain)
+    }
 
     /// Form every native implementation of `module` with `toolchain`,
     /// through `forming`, until every preprocessor group of its sources has

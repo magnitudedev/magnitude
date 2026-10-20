@@ -839,12 +839,7 @@ void projection_gemm_store_b_of(const int kind, const uint threads, projection_g
 // The weight staging of a kind chosen per workgroup (a segmented launch, see
 // the file header): one preprocessor group per kind of PROJECTION_GEMM_KINDS,
 // each a constant-kind staging. Without PROJECTION_GEMM_KINDS the kind is a
-// constant and is staged directly. No segmented entry takes iq4g32s.
-#if defined(PROJECTION_GEMM_KINDS)
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ4S)) != 0
-#error "a segmented projection does not stage iq4g32s"
-#endif
-#endif
+// constant and is staged directly.
 #define PROJECTION_GEMM_LOAD_B(KIND) \
     if (kind == KIND) { \
         projection_gemm_load_b_of(KIND, threads, w, first, count, rows, k0, k, regs); \
@@ -876,6 +871,9 @@ void projection_gemm_load_b(int kind, const uint threads, projection_weights w, 
 #endif
 #if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q4G32S)) != 0
     PROJECTION_GEMM_LOAD_B(PACKETS_Q4G32S)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ4S)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_IQ4S)
 #endif
 #if (PROJECTION_GEMM_KINDS & (1 << PACKETS_MXFP4)) != 0
     PROJECTION_GEMM_LOAD_B(PACKETS_MXFP4)
@@ -932,6 +930,9 @@ void projection_gemm_store_b(int kind, const uint threads, projection_gemm_b reg
 #endif
 #if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q4G32S)) != 0
     PROJECTION_GEMM_STORE_B(PACKETS_Q4G32S)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ4S)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_IQ4S)
 #endif
 #if (PROJECTION_GEMM_KINDS & (1 << PACKETS_MXFP4)) != 0
     PROJECTION_GEMM_STORE_B(PACKETS_MXFP4)

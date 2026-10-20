@@ -154,8 +154,9 @@ enum Repr {
 const GRID_REPRS: [Repr; 3] = [Repr::Iq2xs, Repr::Iq3xxs, Repr::Iq2xxs];
 
 /// The formats with a representation of their own, imported from GGUF.
-const GGUF_REPRS: [Repr; 5] = [
+const GGUF_REPRS: [Repr; 6] = [
     Repr::Q4g32s,
+    Repr::Iq4g32s,
     Repr::Q5g32s,
     Repr::Q5g32,
     Repr::Mxfp4,
@@ -3800,6 +3801,7 @@ fn dense_expand_gguf_formats_match_their_portable_body() {
             &device,
             &[
                 (Repr::Q4g32s, Repr::Q4g32s),
+                (Repr::Iq4g32s, Repr::Q4g32s),
                 (Repr::Mxfp4, Repr::Nvfp4),
                 (Repr::Q5g32s, Repr::Q5g32),
             ],
@@ -4187,10 +4189,29 @@ fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(devi
     }
 }
 
+/// Which cases a segmented projection check runs: the small and 4B
+/// geometries over every mapping, the scoped launches, or the IQ4_NL
+/// single-block weights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cases {
+    Checked,
+    Scoped,
+    Iq4Blocks,
+}
+
 #[test]
 fn recurrent_project_matches_its_portable_body_and_the_host_reference() {
     for device in devices() {
         recurrent_project_matches_its_portable_body_and_the_host_reference_on(&device);
+    }
+}
+
+/// QKV and alpha weights in the IQ4_NL single-block form (iq4g32s) beside
+/// weights of other kinds in one segmented launch.
+#[test]
+fn recurrent_project_over_iq4_blocks_matches_its_portable_body_and_the_host_reference() {
+    for device in devices() {
+        recurrent_project_cases_on(&device, Cases::Iq4Blocks);
     }
 }
 
@@ -4202,30 +4223,33 @@ fn metal_gated_delta_project_scoped_launches_match_the_host() {
     else {
         return;
     };
-    recurrent_project_cases_on(&device, true);
+    recurrent_project_cases_on(&device, Cases::Scoped);
 }
 
 fn recurrent_project_matches_its_portable_body_and_the_host_reference_on(device: &Device) {
-    recurrent_project_cases_on(device, false);
+    recurrent_project_cases_on(device, Cases::Checked);
 }
 
-fn recurrent_project_cases_on(device: &Device, scoped: bool) {
+fn recurrent_project_cases_on(device: &Device, cases: Cases) {
     let module = module();
     let act = Act::Bf16;
+    let scoped = cases == Cases::Scoped;
     // A small geometry over every mapping, then the pinned 4B geometry over
-    // the decode and verify rows with the decode mapping.
-    let geometries = if scoped {
-        vec![(256usize, 1usize, 1usize, 64usize, false)]
-    } else {
-        vec![
-            (512usize, 2usize, 4usize, 32usize, false),
-            (2560, 16, 32, 128, true),
-        ]
+    // the decode and verify rows with the decode mapping; each with its qkv,
+    // gate, alpha and beta representations.
+    let k_quants = [Repr::Q5k, Repr::Q4k, Repr::Q8, Repr::Q8];
+    let iq4_blocks = [Repr::Iq4g32s, Repr::Q4g32s, Repr::Iq4g32s, Repr::Q8];
+    let geometries = match cases {
+        Cases::Scoped => vec![(256usize, 1usize, 1usize, 64usize, false, k_quants)],
+        Cases::Checked => vec![
+            (512, 2, 4, 32, false, k_quants),
+            (2560, 16, 32, 128, true, k_quants),
+        ],
+        Cases::Iq4Blocks => vec![(640, 2, 4, 32, false, iq4_blocks)],
     };
-    for (h, nk, nv, w, four_b) in geometries {
+    for (h, nk, nv, w, four_b, reprs) in geometries {
         let rows_of = [(2 * nk + nv) * w, nv * w, nv, nv];
         let total: usize = rows_of.iter().sum();
-        let reprs = [Repr::Q5k, Repr::Q4k, Repr::Q8, Repr::Q8];
         let weights = (0..4)
             .map(|i| weight(reprs[i], rows_of[i], h, 40 + i as u64, 1.0))
             .collect::<Vec<_>>();
@@ -4487,7 +4511,23 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
 #[test]
 fn attention_projections_match_their_portable_bodies_and_the_host_reference() {
     for device in devices() {
-        attention_projections_match_their_portable_bodies_and_the_host_reference_on(&device, false);
+        attention_projections_match_their_portable_bodies_and_the_host_reference_on(
+            &device,
+            Cases::Checked,
+        );
+    }
+}
+
+/// Query and value weights in the IQ4_NL single-block form (iq4g32s, rows
+/// whose width is not a multiple of 256) beside a key weight of another
+/// kind in one segmented launch, and an iq4g32s output projection.
+#[test]
+fn attention_projections_over_iq4_blocks_match_their_portable_bodies_and_the_host_reference() {
+    for device in devices() {
+        attention_projections_match_their_portable_bodies_and_the_host_reference_on(
+            &device,
+            Cases::Iq4Blocks,
+        );
     }
 }
 
@@ -4499,7 +4539,10 @@ fn metal_attention_scoped_launches_match_the_host() {
     else {
         return;
     };
-    attention_projections_match_their_portable_bodies_and_the_host_reference_on(&device, true);
+    attention_projections_match_their_portable_bodies_and_the_host_reference_on(
+        &device,
+        Cases::Scoped,
+    );
 }
 
 #[test]
@@ -4510,7 +4553,10 @@ fn cuda_attention_scoped_launches_match_the_host() {
     else {
         return;
     };
-    attention_projections_match_their_portable_bodies_and_the_host_reference_on(&device, true);
+    attention_projections_match_their_portable_bodies_and_the_host_reference_on(
+        &device,
+        Cases::Scoped,
+    );
 }
 
 #[test]
@@ -4521,7 +4567,10 @@ fn vulkan_attention_scoped_launches_match_the_host() {
     else {
         return;
     };
-    attention_projections_match_their_portable_bodies_and_the_host_reference_on(&device, true);
+    attention_projections_match_their_portable_bodies_and_the_host_reference_on(
+        &device,
+        Cases::Scoped,
+    );
 }
 
 #[test]
@@ -4532,33 +4581,39 @@ fn cpu_attention_scoped_launches_match_the_host() {
     else {
         return;
     };
-    attention_projections_match_their_portable_bodies_and_the_host_reference_on(&device, true);
+    attention_projections_match_their_portable_bodies_and_the_host_reference_on(
+        &device,
+        Cases::Scoped,
+    );
 }
 
 fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
     device: &Device,
-    scoped: bool,
+    cases: Cases,
 ) {
     let module = module();
     let act = Act::Bf16;
+    let scoped = cases == Cases::Scoped;
     // A small geometry over every mapping, then the pinned 4B geometry over
-    // the decode and verify rows with the decode mapping.
-    let geometries = if scoped {
-        vec![(256usize, 1usize, 4usize, 64usize, false)]
-    } else {
-        vec![
-            (512usize, 2usize, 2usize, 64usize, false),
-            (2560, 4, 4, 256, true),
-        ]
+    // the decode and verify rows with the decode mapping; each with its
+    // query, key and value representations.
+    let k_quants = [Repr::Q4k, Repr::Q4k, Repr::Q6k];
+    let iq4_blocks = [Repr::Iq4g32s, Repr::Q8, Repr::Iq4g32s];
+    let geometries = match cases {
+        Cases::Scoped => vec![(256usize, 1usize, 4usize, 64usize, false, k_quants)],
+        Cases::Checked => vec![
+            (512, 2, 2, 64, false, k_quants),
+            (2560, 4, 4, 256, true, k_quants),
+        ],
+        Cases::Iq4Blocks => vec![(640, 2, 2, 64, false, iq4_blocks)],
     };
-    for (d, kv, g, w, four_b) in geometries {
+    for (d, kv, g, w, four_b, reprs) in geometries {
         let (row_classes, mappings) = if scoped {
             (vec![1, 8, 32, 128], vec![MAPPINGS[0], MAPPINGS[2]])
         } else {
             checked_classes(four_b)
         };
         let rows_of = [kv * g * 2 * w, kv * w, kv * w];
-        let reprs = [Repr::Q4k, Repr::Q4k, Repr::Q6k];
         let weights = (0..3)
             .map(|i| weight(reprs[i], rows_of[i], d, 60 + i as u64, 1.0))
             .collect::<Vec<_>>();
@@ -4711,6 +4766,8 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
         let q = kv * g;
         let reprs: &[Repr] = if four_b || scoped {
             &[Repr::Q4k]
+        } else if cases == Cases::Iq4Blocks {
+            &[Repr::Iq4g32s]
         } else {
             &[Repr::Q4k, Repr::Q8, Repr::Bf16]
         };

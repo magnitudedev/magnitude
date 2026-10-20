@@ -434,7 +434,9 @@ Metal compilation or execution errors are reported directly.
   toolchain forms, at statics searched for it where only some admit it (a form may be a template a
   constant selects, with no group of its own); a form value no configuration forms fails the check.
   Every kernel request of every supported catalog model on every GPU backend its assessment
-  accepts is admissible, implemented and forms at its default specialization. For a backend whose
+  accepts is admissible, implemented and forms at its default specialization. A weight slot that
+  is implemented at one representation of its backend's resident layout is implemented at every
+  one, since planning gives any weight any of them. For a backend whose
   toolchain the operating system supplies, this holds for the verifying host's toolchain.
 - Ownership and bounded iteration determine legal reads, writes, moves, and parallel effects.
 - Every accepted write to storage shared across parallel participants carries
