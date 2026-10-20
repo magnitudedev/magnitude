@@ -330,8 +330,19 @@ logits. So the proposals a full verification would have accepted are those that
 agree with the tokens the request goes on to commit. Every drafted proposal is
 scored against them, verified or not, at no device cost, under sampling as under
 greedy selection. The controller keeps, per request, how often a block is right
-through each depth: the mean of the depth's recent blocks, never above a
-shallower depth's. A request starts from the load's latest values.
+through each depth, as two means of the depth's blocks: over the current text
+(its last few blocks) and over the load's text (many more of them, its usual
+acceptance). The current mean also moves with the binomial noise of so few
+blocks, so its departure from the usual one counts only by the share of the
+departures' measured mean square beyond that noise: on text whose acceptance
+does not change, a run of wrong blocks moves no estimate; on text that changes,
+the estimate follows the current mean. Acceptance is observed only on drafted
+blocks, so a depth no round scores (as while the load does not draft) has its
+current mean return to the usual one as fast as the usual mean forgets a block:
+a stretch of wrong blocks that stopped drafting stops counting once it is that
+old, and drafting that pays on the load's usual text comes back without waiting
+for a look. The estimate is never above a shallower depth's. A request starts
+from the load's latest means.
 
 A block's proposals depend on how many were generated, because bidirectional
 drafter layers see the whole block. Acceptance is nevertheless kept by depth
@@ -353,7 +364,13 @@ first has the drafter enter the pairs held since; one that does not draft after
 one that did starts the decode pipeline again. The load measures each switch
 apart, by what its round took beyond the price of its launches, and measures the
 launch that paid it (the drafter's, or the target's) without the switch's price,
-so a launch is priced as in rounds that do not switch. Nothing is
+so a launch is priced as in rounds that do not switch. While a switch is
+unmeasured, a drafter launch that paid it is not measured at all: its duration
+would carry the discarded decode, the switch measured against it would come out
+as nothing, and drafting measured only as it enters (as looks from plain
+decoding are) would keep the discarded decode in its price for good. A target
+launch that paid it is measured only if it has no other measurement; the plain
+decode is taken again until its median leaves that duration out. Nothing is
 forecast. A launch costs the median of
 its latest few durations, so a launch another process held up once prices
 nothing; durations older than a fixed number of the load's rounds are dropped when
@@ -380,9 +397,10 @@ round returning from it to drafting is priced as one that goes on drafting.
 **Choice.** Expected tokens are one plus the acceptance of each verified depth;
 a round's time is its two launches, and a round that would switch between
 drafting and not adds a share of the switch's measured cost: a switch serves the
-rounds after it, and a text the depth means follow lasts at least as many rounds
-as they take to move, so it pays the means' weight of it. A switch nothing has
-measured costs nothing. Three rules:
+rounds after it, and the choice it follows lasts at least as many rounds as the
+first depth's estimate takes to move, so it pays the weight a block has in that
+estimate (the current mean's on text that changes, the usual mean's on text that
+does not). A switch nothing has measured costs nothing. Three rules:
 
 1. The round takes the budget committing the most tokens per second. Once its
    block is drafted, it verifies the prefix that does so with the drafter's
@@ -393,7 +411,9 @@ measured costs nothing. Three rules:
    one such round, up to the rounds a look would take to return, and a kept round
    spends more of them the less of the rate is at stake.
 3. A look is a round generating wider than rules 1 and 2 would. It is an ordinary
-   round that loses a known time to the fastest budget. It goes to the wider
+   round that loses a known time to the fastest budget; a look after a round that
+   drafted nothing drafts for that round alone, so it loses the whole of
+   entering drafting and leaving it again. It goes to the wider
    width with the most to gain for that time, where the gain is that width's rate
    if every proposal were right. Looks take a fixed share of decode time, scaled
    down where little can be gained. The time set aside for looks belongs to the
@@ -429,9 +449,16 @@ separate launches.
   being drafted, to its wider widths.
 - Measuring a load's launches costs one round per width per context class, and the
   plain decode up to its share of rounds per context class and per stale period.
+- On text whose acceptance does not change, runs of wrong blocks do not stop
+  drafting that pays; after a stretch of wrong blocks, drafting that pays on the
+  load's usual text returns within the rounds the usual mean takes to forget a
+  block, and a genuinely unpredictable stretch is drafted again only as that
+  return or a look brings it, each scoring it afresh.
 - The means, the kept rounds and the looks' share are fixed constants, not
   statistical guarantees. Acceptance that alternates faster than the means move
   is not followed.
-- Acceptance is observed only on drafted blocks. Drafting that stopped on a run
-  of wrong blocks keeps that run's means until a look scores again, so where
-  drafting barely pays a load can stay plain where a fixed width gains a little.
+- Acceptance is observed only on drafted blocks. While a load does not draft its
+  usual acceptance does not move, so a usual mean that a long stretch of wrong
+  blocks pulled below what drafting needs stays there until a look scores again;
+  where drafting barely pays a load can then stay plain where a fixed width
+  gains a little.

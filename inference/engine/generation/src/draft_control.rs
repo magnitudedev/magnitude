@@ -11,7 +11,10 @@
 //! the text stops supporting is still drafted for a while, so its return is
 //! seen at once. And a look drafts wider than the fastest pair does: an
 //! ordinary round that is slower by a known amount, taken as often as a
-//! fixed share of the decode time pays for that amount.
+//! fixed share of the decode time pays for that amount. A depth no round
+//! scores, as while no round drafts, is expected to be right as often as the
+//! load's blocks usually are once what it last scored is old
+//! ([`DepthMeans`]).
 //!
 //! Requests verified in one launch share its rows ([`share_rows`]).
 
@@ -22,10 +25,14 @@ use std::{
     time::Duration,
 };
 
-/// The weight of a new block in a depth's estimate once the depth has had
-/// its share of blocks. A depth scored every round follows the text within a
-/// few rounds; one scored only by looks moves as slowly as they come.
+/// The weight of a new block in a depth's mean over the current text once
+/// the depth has had its share of blocks. A depth scored every round follows
+/// the text within a few rounds; one scored only by looks moves as slowly as
+/// they come.
 const MEMORY: f64 = 0.25;
+/// The weight of a new block in a depth's usual acceptance, the mean over
+/// the load's text, once the depth has had its share of blocks.
+const USUAL: f64 = 1.0 / 32.0;
 /// The latest durations a launch's cost is the median of. A launch another
 /// process held up once does not move the median, so it reprices nothing:
 /// a launch priced by such a duration and then no longer taken would keep
@@ -105,6 +112,77 @@ impl Durations {
         for (_, seconds) in &mut self.0 {
             *seconds *= factor;
         }
+    }
+}
+
+/// How often a block is right through one depth, as two means of its scored
+/// blocks: over the current text, which follows a change within a few
+/// blocks, and over the load's text, which the current text departs from and
+/// returns to. The current mean also moves with the noise of its few blocks,
+/// so how far it departs from the usual one counts only as far as the
+/// departures measured over the load exceed that noise: on text that does not
+/// change, a run of wrong blocks moves no estimate, and the estimate stands
+/// on the many blocks of the usual mean.
+#[derive(Clone, Debug, PartialEq)]
+struct DepthMeans {
+    current: f64,
+    usual: f64,
+    spread: f64,
+    blocks: u32,
+}
+
+impl DepthMeans {
+    /// A depth no block has scored: every proposal taken as right.
+    const UNSCORED: Self = Self {
+        current: 1.0,
+        usual: 1.0,
+        spread: 0.0,
+        blocks: 0,
+    };
+
+    /// Both means are plain until the depth has had their share of blocks,
+    /// so a load's first block replaces what it assumed.
+    fn score(&mut self, right: bool) {
+        self.blocks = self.blocks.saturating_add(1);
+        let weight = |memory: f64| (1.0 / f64::from(self.blocks)).max(memory);
+        let right = f64::from(u8::from(right));
+        self.current += weight(MEMORY) * (right - self.current);
+        self.usual += weight(USUAL) * (right - self.usual);
+        let departure = self.current - self.usual;
+        self.spread += weight(USUAL) * (departure * departure - self.spread);
+    }
+
+    /// A round that scored no block of the depth. The current text's mean
+    /// returns to the usual one as the usual mean forgets a block: a text
+    /// the depth has not seen for as many rounds as the usual mean holds
+    /// blocks is no better described by what it last scored than by the
+    /// usual. A load that stopped drafting on a stretch of wrong blocks thus
+    /// expects the load's acceptance again once the stretch is that old,
+    /// whether or not a look has come since.
+    fn unscored(&mut self) {
+        self.current += USUAL * (self.usual - self.current);
+    }
+
+    /// The share of the current mean's departure from the usual one that is
+    /// the text's: the departures' measured mean square beyond what the
+    /// binomial noise of the current mean's blocks alone gives.
+    fn text(&self) -> f64 {
+        let noise = self.usual * (1.0 - self.usual) * MEMORY / (2.0 - MEMORY);
+        if self.spread > noise {
+            1.0 - noise / self.spread
+        } else {
+            0.0
+        }
+    }
+
+    fn estimate(&self) -> f64 {
+        self.usual + self.text() * (self.current - self.usual)
+    }
+
+    /// The weight a new block has in the estimate.
+    fn weight(&self) -> f64 {
+        let text = self.text();
+        text * MEMORY + (1.0 - text) * USUAL
     }
 }
 
@@ -194,6 +272,7 @@ struct RoundCosts {
     /// Requests sharing each launch.
     sequences: usize,
     after_drafting: Option<bool>,
+    switch_weight: f64,
 }
 
 impl RoundCosts {
@@ -225,6 +304,16 @@ impl RoundCosts {
                 .collect(),
             sequences,
             after_drafting,
+            switch_weight: 0.0,
+        }
+    }
+
+    /// These costs with a round that would switch paying `weight` of the
+    /// switch (see [`Self::round`]).
+    fn sharing_switches(self, weight: f64) -> Self {
+        Self {
+            switch_weight: weight,
+            ..self
         }
     }
 
@@ -293,16 +382,29 @@ impl RoundCosts {
     /// Seconds of a round generating `generated` and verifying `verified`,
     /// in launches whose other requests take the same rows, with its share
     /// of what changing between drafting and not costs. A switch serves the
-    /// rounds after it too: a text the depth means follow lasts at least as
-    /// many rounds as they take to move, so a round that would switch pays
-    /// that share of it, and nothing until it is measured. Launches nothing
-    /// has measured cost the same, so a load's first round is its widest.
+    /// rounds after it too: the choice it follows lasts at least as many
+    /// rounds as the estimates take to move, so a round that would switch
+    /// pays the weight a block has in them of it, and nothing until it is
+    /// measured. Launches nothing has measured cost the same, so a load's
+    /// first round is its widest.
     fn round(&self, generated: usize, verified: usize) -> f64 {
         let switch = self
             .switching(generated)
             .and_then(|switch| self.switch(switch))
-            .map_or(0.0, |switch| MEMORY * switch);
+            .map_or(0.0, |switch| self.switch_weight * switch);
         (self.draft(generated) + self.verify(self.sequences * (verified + 1)) + switch).max(1e-9)
+    }
+
+    /// What a round generating `generated` that is a look pays for its
+    /// switches beyond its share: a look after a round that drafted nothing
+    /// drafts for that round alone, so it enters and leaves again whole.
+    fn excursion(&self, generated: usize) -> f64 {
+        if self.switching(generated) != Some(Switch::Enter) {
+            return 0.0;
+        }
+        let enter = self.switch(Switch::Enter).unwrap_or(0.0);
+        let leave = self.switch(Switch::Leave).unwrap_or(0.0);
+        (1.0 - self.switch_weight) * enter + leave
     }
 
     /// The price of a round's launches when both are measured here.
@@ -382,16 +484,16 @@ pub fn share_rows(outlooks: &[DraftOutlook], rows: usize) -> Option<Vec<usize>> 
 }
 
 /// What a load's requests share: launch costs by context class and sequence
-/// count, the acceptance its latest request reached, and the decode time set
-/// aside for the next look. That time carries from request to request, so a
-/// load of requests each too short to earn a look by itself still takes them
-/// at their share of the decode time, and drafting that stopped paying is
-/// tried again.
+/// count, the acceptance means its latest request reached, and the decode
+/// time set aside for the next look. That time carries from request to
+/// request, so a load of requests each too short to earn a look by itself
+/// still takes them at their share of the decode time, and drafting that
+/// stopped paying is tried again.
 #[derive(Debug, Default)]
 pub struct DraftLoad {
     costs: Mutex<BTreeMap<(usize, usize), LaunchCosts>>,
     rounds: Mutex<u64>,
-    right: Mutex<Option<Vec<f64>>>,
+    depths: Mutex<Option<Vec<DepthMeans>>>,
     /// The run of accepted rounds that earned its latest request a look.
     look_run: Mutex<Option<u32>>,
     look_seconds: Mutex<f64>,
@@ -422,10 +524,8 @@ pub struct DraftController {
     /// Candidate widths, increasing, without 0.
     ladder: Vec<usize>,
     load: Arc<DraftLoad>,
-    /// `right[k - 1]`: how often a block is right through depth `k`.
-    right: Vec<f64>,
-    /// Blocks behind each depth's estimate, counted up to its share.
-    blocks_scored: Vec<u32>,
+    depths: Vec<DepthMeans>,
+    scored: Vec<bool>,
     blocks: Vec<Block>,
     /// Seconds of decode time set aside for the next look (see
     /// [`DraftLoad`]).
@@ -456,21 +556,21 @@ pub struct DraftController {
 }
 
 impl DraftController {
-    /// A controller choosing among widths up to `widest`. A load that has
-    /// scored nothing takes every proposal as right.
+    /// A controller choosing among widths up to `widest`, from the load's
+    /// latest acceptance means. A load that has scored nothing takes every
+    /// proposal as right.
     pub fn new(widest: usize, load: Arc<DraftLoad>) -> Self {
-        let seed = load.right.lock().expect("draft load acceptance").clone();
+        let seed = load.depths.lock().expect("draft load acceptance").clone();
         let look_run = load.look_run.lock().expect("draft load looks").unwrap_or(1);
         let look_seconds = *load.look_seconds.lock().expect("draft load look time");
-        let (right, scored) = match seed {
-            Some(right) if right.len() == widest => (right, u32::MAX),
-            _ => (vec![1.0; widest], 0),
-        };
+        let depths = seed
+            .filter(|depths| depths.len() == widest)
+            .unwrap_or_else(|| vec![DepthMeans::UNSCORED; widest]);
         Self {
             ladder: draft_ladder(widest),
             load,
-            right,
-            blocks_scored: vec![scored; widest],
+            depths,
+            scored: vec![false; widest],
             blocks: Vec::new(),
             look_seconds,
             accepted_run: 0,
@@ -494,15 +594,16 @@ impl DraftController {
         self.choice
     }
 
-    /// How often a block is right through each depth, from depth 1. A block
-    /// right through a depth is right through every shallower one, so no
-    /// depth is rated above a shallower one.
+    /// How often a block is expected to be right through each depth, from
+    /// depth 1 (see [`DepthMeans`]). A block right through a depth is right
+    /// through every shallower one, so no depth is rated above a shallower
+    /// one.
     pub fn right(&self) -> Vec<f64> {
         let mut bound = 1.0f64;
-        self.right
+        self.depths
             .iter()
-            .map(|right| {
-                bound = bound.min(*right);
+            .map(|depth| {
+                bound = bound.min(depth.estimate());
                 bound
             })
             .collect()
@@ -515,9 +616,12 @@ impl DraftController {
 
     /// The costs this round chooses by. A plain decode taken to measure it
     /// changes no choice: a load drafting goes on drafting after it, so the
-    /// round coming back from it is priced as one continuing to draft.
+    /// round coming back from it is priced as one continuing to draft. A
+    /// switch is shared by the weight a block has in the first depth's
+    /// estimate, which every drafting round depends on.
     fn costs(&self) -> RoundCosts {
         RoundCosts::of(&self.load, self.context_class, self.sequences, self.chosen)
+            .sharing_switches(self.depths.first().map_or(MEMORY, DepthMeans::weight))
     }
 
     /// This round's drafted block, while it awaits verification.
@@ -598,7 +702,8 @@ impl DraftController {
         // its rate if every proposal it drafts were right, over the fastest
         // pair's, less one.
         // And what a round generating it loses to the fastest pair: its
-        // time beyond what its tokens take at the fastest pair's rate.
+        // time beyond what its tokens take at the fastest pair's rate, with
+        // the whole of the switches it makes as a look.
         let all_right = vec![1.0; right.len()];
         let wider = self
             .widths(limit)
@@ -606,7 +711,8 @@ impl DraftController {
             .map(|generated| {
                 let (_, best) = self.verified(&all_right, &costs, generated, limit);
                 let (verified, _) = self.verified(&right, &costs, generated, limit);
-                let lost = costs.round(generated, verified) - Self::tokens(&right, verified) / rate;
+                let lost = costs.round(generated, verified) + costs.excursion(generated)
+                    - Self::tokens(&right, verified) / rate;
                 (generated, (best / rate - 1.0).max(0.0), lost.max(0.0))
             })
             .collect::<Vec<_>>();
@@ -727,16 +833,12 @@ impl DraftController {
     }
 
     fn score(&mut self, depth: usize, right: bool) {
-        // The mean is plain until a depth has its share of blocks, so a
-        // load's first block replaces what it assumed.
-        let scored = &mut self.blocks_scored[depth - 1];
-        *scored = scored.saturating_add(1);
-        let weight = (1.0 / f64::from(*scored)).max(MEMORY);
-        let estimate = &mut self.right[depth - 1];
-        *estimate += weight * (f64::from(u8::from(right)) - *estimate);
+        self.depths[depth - 1].score(right);
+        self.scored[depth - 1] = true;
     }
 
-    /// Score every open block against the tokens just committed.
+    /// Score every open block against the tokens just committed, which end
+    /// the round: a depth no block scored in it goes unscored for a round.
     pub fn committed(&mut self, tokens: &[TokenId]) {
         // A round that verified proposals and committed them all extends
         // the run; any other ends it.
@@ -767,7 +869,12 @@ impl DraftController {
             });
         }
         self.blocks = blocks;
-        *self.load.right.lock().expect("draft load acceptance") = Some(self.right.clone());
+        for (depth, scored) in self.depths.iter_mut().zip(&mut self.scored) {
+            if !std::mem::take(scored) {
+                depth.unscored();
+            }
+        }
+        *self.load.depths.lock().expect("draft load acceptance") = Some(self.depths.clone());
         *self.load.look_run.lock().expect("draft load looks") = Some(self.look_run);
     }
 
@@ -808,17 +915,22 @@ impl DraftController {
             self.after_drafting,
         );
         let switch = costs.switching(self.choice.generated);
-        // The switch's price, when this launch paid one: none while the
-        // switch is unmeasured, and then the launch is measured only if it
-        // has no other measurement.
-        let paid = |paying: Switch, launches: &BTreeMap<usize, Durations>, size: usize| {
+        // The switch's price, when this launch paid one. While the switch is
+        // unmeasured, a drafter launch that paid it is not measured: its
+        // duration would carry the discarded decode, a switch measured
+        // against it would come out as nothing, and drafting measured only
+        // as it enters (as looks from plain decoding are) would keep that
+        // price for good. A target launch that paid it is measured if it
+        // has no other measurement: it carries only the restarted pipeline,
+        // and the plain decode is taken again until the median of its
+        // durations leaves that one out.
+        let paid = |paying: Switch, launches: &LaunchCosts, size: usize| {
             if switch != Some(paying) {
-                Some(0.0)
-            } else {
-                costs
-                    .switch(paying)
-                    .or_else(|| (!launches.contains_key(&size)).then_some(0.0))
+                return Some(0.0);
             }
+            costs.switch(paying).or_else(|| {
+                (paying == Switch::Leave && !launches.verify.contains_key(&size)).then_some(0.0)
+            })
         };
         let took = seconds + std::mem::take(&mut self.entered);
         let round = {
@@ -834,7 +946,7 @@ impl DraftController {
             .or_default();
         if launch == TimedLaunch::Draft {
             self.drafter = Some(took);
-            if let Some(paid) = paid(Switch::Enter, &launches.draft, size) {
+            if let Some(paid) = paid(Switch::Enter, launches, size) {
                 LaunchCosts::record(&mut launches.draft, round, size, (took - paid).max(0.0));
             }
             return;
@@ -852,7 +964,7 @@ impl DraftController {
                 .switch_mut(switch)
                 .record(round, (round_took - steady).max(0.0));
         }
-        let Some(paid) = paid(Switch::Leave, &launches.verify, size) else {
+        let Some(paid) = paid(Switch::Leave, launches, size) else {
             return;
         };
         let seconds = (took - paid).max(0.0);

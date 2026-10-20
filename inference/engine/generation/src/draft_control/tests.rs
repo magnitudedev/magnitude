@@ -689,7 +689,7 @@ fn a_width_held_up_on_its_first_launch_is_taken_again() {
         let load = Arc::new(DraftLoad {
             costs: std::sync::Mutex::new(warm.costs.lock().unwrap().clone()),
             rounds: std::sync::Mutex::new(*warm.rounds.lock().unwrap()),
-            right: std::sync::Mutex::new(warm.right.lock().unwrap().clone()),
+            depths: std::sync::Mutex::new(warm.depths.lock().unwrap().clone()),
             look_run: std::sync::Mutex::new(*warm.look_run.lock().unwrap()),
             look_seconds: std::sync::Mutex::new(*warm.look_seconds.lock().unwrap()),
         });
@@ -857,6 +857,46 @@ const HEADS_CODE: [f64; WIDEST] = [
 ];
 const HEADS: usize = 8;
 
+/// Many texts of `segments`, as a benchmark sends them.
+fn texts(segments: &[(usize, [f64; WIDEST])]) -> Vec<Stream> {
+    (0..24u64)
+        .map(|seed| Stream {
+            segments: segments.to_vec(),
+            seed: seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x51,
+        })
+        .collect()
+}
+
+/// The milliseconds of `streams` on `machine`: each a request on a load of
+/// its own after a warming request over the same kind of text under the
+/// controller (`Some`), or at a fixed `width` (`None`).
+fn served(streams: &[Stream], machine: Pipelined, reported: Option<Reported>, width: usize) -> f64 {
+    streams
+        .iter()
+        .map(|stream| match reported {
+            None => pipelined_fixed(stream, machine, width),
+            Some(reported) => {
+                let load = Arc::new(DraftLoad::default());
+                let warming = Stream {
+                    seed: !stream.seed,
+                    ..stream.clone()
+                };
+                pipelined(&warming, machine, HEADS, &load, reported);
+                pipelined(stream, machine, HEADS, &load, reported).milliseconds
+            }
+        })
+        .sum::<f64>()
+}
+
+/// The fastest fixed width over `streams` on `machine`, with its time.
+fn fastest_served(streams: &[Stream], machine: Pipelined) -> (usize, f64) {
+    [0, 1, 3, 7, 8]
+        .into_iter()
+        .map(|width| (width, served(streams, machine, None, width)))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap()
+}
+
 /// QA (linux-vulkan-13): with Qwen3.5 2B's heads on Vulkan, decoding with
 /// them came out 3-5 % slower than plain on prose. The heads barely pay
 /// there (a verification costs a third more than the pipelined decode it
@@ -870,31 +910,10 @@ const HEADS: usize = 8;
 fn switching_between_drafting_and_plain_decoding_is_priced() {
     // Many texts, each a short request after a warming one, as a benchmark
     // sends them.
-    let texts = |segments: Vec<(usize, [f64; WIDEST])>| {
-        (0..24u64)
-            .map(|seed| Stream {
-                segments: segments.clone(),
-                seed: seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x51,
-            })
-            .collect::<Vec<_>>()
-    };
     let total = |streams: &[Stream], reported: Option<Reported>, width: usize| {
-        streams
-            .iter()
-            .map(|stream| match reported {
-                None => pipelined_fixed(stream, V710_HEADS, width),
-                Some(reported) => {
-                    let load = Arc::new(DraftLoad::default());
-                    let warming = Stream {
-                        seed: !stream.seed,
-                        ..stream.clone()
-                    };
-                    pipelined(&warming, V710_HEADS, HEADS, &load, reported);
-                    pipelined(stream, V710_HEADS, HEADS, &load, reported).milliseconds
-                }
-            })
-            .sum::<f64>()
+        served(streams, V710_HEADS, reported, width)
     };
+    let texts = |segments: Vec<(usize, [f64; WIDEST])>| texts(&segments);
     let mixed = vec![
         (100, HEADS_CODE),
         (100, HEADS_PROSE),
@@ -907,11 +926,7 @@ fn switching_between_drafting_and_plain_decoding_is_priced() {
         (mixed, "mixed", 1),
     ] {
         let streams = texts(segments);
-        let (fastest, best) = [0, 1, 3, 7, 8]
-            .into_iter()
-            .map(|width| (width, total(&streams, None, width)))
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .unwrap();
+        let (fastest, best) = fastest_served(&streams, V710_HEADS);
         assert_eq!(fastest, width, "the fastest fixed width on {name}");
         let plain = total(&streams, None, 0);
         let priced = total(&streams, Some(Reported::Whole), HEADS);
@@ -983,5 +998,75 @@ fn a_switch_is_measured_apart_from_its_rounds_launches() {
             "{generated} proposals: {} ms",
             ms(durations)
         );
+    }
+}
+
+/// Qwen3.5 2B's chained heads on an M4 under Metal at 4k context (QA r4,
+/// traced): each proposal is another head pass of 4.5 ms, a verification
+/// costs little more than the plain decode it replaces, and entering
+/// drafting waits for the queued decode it discards, about a plain decode.
+const M4_HEADS: Pipelined = Pipelined {
+    costs: Costs {
+        draft: |generated| 4.5 * generated as f64,
+        verify: |rows| match rows {
+            1 => 14.6,
+            2 => 15.5,
+            3..=4 => 17.8,
+            5..=8 => 18.0,
+            _ => 29.7,
+        },
+    },
+    resume: 0.8,
+    discard: 13.5,
+    catch_up: V710_HEADS.catch_up,
+};
+
+/// A stretch the heads get wrong: a quoted table of numbers, say.
+const HEADS_WRONG: [f64; WIDEST] = [
+    0.15, 0.03, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+];
+
+/// QA r4 (Qwen3.5 2B with its heads on an M4 under Metal): decoding under
+/// the controller was 5-15 % slower than at a fixed width of 1. Acceptance is
+/// observed only while drafting, so after a stretch of wrong blocks stopped
+/// drafting its estimates stayed where the stretch left them (0.14-0.7, the
+/// first depth's real acceptance 0.82: rounds right after the plain stretches
+/// accepted 0.90), and the load stayed plain until a look, which on this
+/// machine costs a discarded decode, came. Every drafting round measured
+/// only as it entered drafting also kept the discarded decode in its price.
+/// An estimate not scored returns to the load's usual acceptance, so drafting
+/// comes back once the stretch has passed.
+#[test]
+fn drafting_that_pays_comes_back_after_a_stretch_of_wrong_blocks() {
+    let streams = texts(&[(100, HEADS_CODE), (30, HEADS_WRONG), (126, HEADS_CODE)]);
+    let (width, best) = fastest_served(&streams, M4_HEADS);
+    assert!(width > 0, "drafting pays");
+    let plain = served(&streams, M4_HEADS, None, 0);
+    let adaptive = served(&streams, M4_HEADS, Some(Reported::Whole), HEADS);
+    let report = format!(
+        "fixed {width} {best:.0} ms, plain {plain:.0} ms, adaptive {adaptive:.0} ms ({:+.1}%)",
+        (adaptive / best - 1.0) * 100.0
+    );
+    eprintln!("{report}");
+    assert!(adaptive <= best * 1.05, "{report}");
+}
+
+/// Text whose acceptance does not change still brings runs of wrong blocks:
+/// two in a row at 0.82 come every thirty rounds. Over a few blocks the
+/// current text's mean falls below what drafting needs, but those departures
+/// are what the binomial noise of so few blocks gives, so the estimate stays
+/// with the load's usual acceptance and drafting that pays goes on.
+#[test]
+fn runs_of_wrong_blocks_on_steady_text_do_not_stop_drafting() {
+    for machine in [V710_HEADS, M4_HEADS] {
+        let streams = texts(&[(400, HEADS_CODE)]);
+        let (width, best) = fastest_served(&streams, machine);
+        let adaptive = served(&streams, machine, Some(Reported::Whole), HEADS);
+        let report = format!(
+            "fixed {width} {best:.0} ms, adaptive {adaptive:.0} ms ({:+.1}%)",
+            (adaptive / best - 1.0) * 100.0
+        );
+        eprintln!("{report}");
+        assert!(adaptive <= best * 1.03, "{report}");
     }
 }
