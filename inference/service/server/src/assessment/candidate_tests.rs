@@ -4965,8 +4965,8 @@ async fn a_found_model_falls_back_to_its_built_in_heads_while_the_catalog_drafte
 /// with no "Variant of" and no drafter for minutes, and a model with built-in MTP heads loaded in
 /// that window served plain: every enrichment waited for the Hub (catalog lineage, the catalog
 /// drafter's header) before publishing anything. What the files here say is published first: the
-/// heads attach and a load uses them while the Hub never answers, and the catalog drafter it
-/// matches stays recommended, to be added.
+/// heads attach and a load uses them while the Hub never answers, and stay recommended: the catalog
+/// drafter it matches by shape alone is never automatic.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_found_models_built_in_heads_serve_while_the_hub_is_unreachable() {
     let locations = tempfile::tempdir().expect("locations");
@@ -5020,10 +5020,9 @@ async fn a_found_models_built_in_heads_serve_while_the_hub_is_unreachable() {
             .recommended_drafter
             .as_ref()
             .map(|candidate| &candidate.reference),
-        Some(&DrafterReference::Catalog {
-            model_id: qwen_catalog_id(),
-        }),
-        "the catalog drafter it matches by shape stays recommended, to be added"
+        Some(&DrafterReference::Embedded),
+        "without the Hub's lineage the catalog drafter matches by shape alone, offered but never \
+         automatic, so the built-in heads are recommended"
     );
     assert!(
         matches!(
