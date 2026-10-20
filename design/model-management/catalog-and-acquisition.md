@@ -428,7 +428,14 @@ by their local digest and never hashed in full; a package file whose SHA-256
 is not known from a blob name takes its identity from that digest and its size, unless it is a
 catalog file's exact copy in a Hugging Face cache (same repository, commit, path, size and header
 digest), which takes the catalog file's SHA-256 and so is that catalog file. A location that
-cannot be read is skipped for that reconciliation and never hides another location's models.
+cannot be read is skipped for that reconciliation and never hides another location's models. A
+directory inside a location that cannot be read (a disk's root-owned `lost+found`, another user's
+private folder, an unreadable Hugging Face repository or Ollama manifest folder) is skipped the same
+way and never hides the rest of its location: every readable model stays listed, and the directory
+is published as an unsupported local model with the `Unreadable` reason and its location, named by
+its path within the location, until a rescan finds it readable. Where the platform's watch cannot
+cover such a directory (inotify refuses one it cannot read), the location is rescanned periodically
+instead.
 
 Each complete independently callable GGUF group is a custom-model candidate. A standalone file is its
 own selector; a complete shard set uses its lexical first shard. Projectors and drafters are

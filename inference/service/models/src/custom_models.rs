@@ -36,7 +36,7 @@ use crate::catalog_models::catalog_id;
 use crate::gguf::{GgufBaseModel, GgufRole};
 use crate::inventory::{
     InstalledPackageRecord, InstalledPackageSnapshot, ManagedModelStore, UNSUPPORTED_FORMAT_CODE,
-    hf_repo_dir, origin_precedence,
+    UnreadableDirectory, hf_repo_dir, origin_precedence,
 };
 use crate::local_watch::{RootWatcher, watch_targets};
 use crate::model_domains::{ModelDomainResolver, domain_changes};
@@ -964,6 +964,11 @@ fn project(
             }
         }
     }
+    for directory in &snapshot.unreadable_directories {
+        if unsupported_paths.insert(directory.path.clone()) {
+            projection.unsupported.push(unreadable_directory(directory));
+        }
+    }
 
     // One model per identity: the declared one, else the best-represented content.
     let mut identified =
@@ -1077,6 +1082,26 @@ fn unsupported_model(
         reasons: vec![UnsupportedReason::Known(unreadable_reason(occurrence))],
         detail,
     })
+}
+
+/// A directory inside a location that Magnitude can't read, listed by its path within the location
+/// so the person sees which part of it is missing.
+fn unreadable_directory(directory: &UnreadableDirectory) -> UnsupportedLocalModel {
+    let within = directory
+        .path
+        .strip_prefix(&directory.root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .unwrap_or(&directory.path);
+    UnsupportedLocalModel {
+        display_name: within.display().to_string(),
+        origin: CustomModelOrigin::Found {
+            source: directory.source.clone(),
+        },
+        path: directory.path.clone(),
+        reasons: vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)],
+        detail: directory.detail.clone(),
+    }
 }
 
 fn unreadable_reason(occurrence: &Occurrence<'_>) -> KnownUnsupportedReason {
@@ -4452,6 +4477,78 @@ mod tests {
         assert_eq!(
             listed.unsupported[0].reasons,
             [UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)]
+        );
+    }
+
+    /// A subfolder Magnitude can't read hides nothing else in its folder: the folder's models, and
+    /// its can't-read file, stay listed, and the subfolder is listed as can't read by its path in
+    /// the folder until it becomes readable.
+    #[tokio::test]
+    async fn an_unreadable_subfolder_is_listed_as_unreadable_beside_the_rest_of_its_folder() {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("nested/kept.gguf"), "kept");
+        fs::write(folder.join("broken.gguf"), b"GGUF but not really").unwrap();
+        write_model(&folder.join("locked/inside.gguf"), "inside");
+        let Some(locked) = crate::test_gguf::LockedDirectory::lock(&folder.join("locked")) else {
+            return;
+        };
+        let Some(_empty) = crate::test_gguf::LockedDirectory::lock(&folder.join("empty-locked"))
+        else {
+            return;
+        };
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &folder)]))
+            .await;
+
+        assert_eq!(
+            ids(&listed.models),
+            [local_id(&folder.join("nested/kept.gguf")).to_string()]
+        );
+        let unsupported = listed
+            .unsupported
+            .iter()
+            .map(|model| (model.display_name.as_str(), model.path.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unsupported,
+            [
+                ("broken", folder.join("broken.gguf")),
+                ("empty-locked", folder.join("empty-locked")),
+                ("locked", folder.join("locked")),
+            ]
+        );
+        for model in &listed.unsupported {
+            assert_eq!(
+                model.reasons,
+                [UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)]
+            );
+            assert_eq!(
+                model.origin,
+                CustomModelOrigin::Found {
+                    source: FoundSource::Folder {
+                        path: folder.clone()
+                    }
+                }
+            );
+        }
+
+        drop(locked);
+        fixture
+            .inventory()
+            .rescan_model_roots(BTreeSet::from([folder.clone()]))
+            .await
+            .unwrap();
+        let listed = fixture.local.list_local().await.unwrap();
+        assert_eq!(listed.models.len(), 2);
+        assert_eq!(
+            listed
+                .unsupported
+                .iter()
+                .map(|model| model.display_name.as_str())
+                .collect::<Vec<_>>(),
+            ["broken", "empty-locked"]
         );
     }
 

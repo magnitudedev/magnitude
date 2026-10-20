@@ -7342,7 +7342,7 @@
       },
       "LocalModelsResponse": {
         "type": "object",
-        "description": "`models` are the custom models to offer and assess; `hidden` are the ones the configuration\nhides, listed so a client can unhide them, and never assessed. `unsupported` are GGUF groups\nthat cannot be read at all; a readable model the engine rejects stays in `models` with an\n`Unsupported` assessment.",
+        "description": "`models` are the custom models to offer and assess; `hidden` are the ones the configuration\nhides, listed so a client can unhide them, and never assessed. `unsupported` are GGUF groups\nthat cannot be read at all, and directories inside a location that cannot be read (the rest of\nthe location is still listed); a readable model the engine rejects stays in `models` with an\n`Unsupported` assessment.",
         "required": [
           "revision",
           "reconciliationComplete",
@@ -11294,7 +11294,7 @@
       },
       "UnsupportedLocalModel": {
         "type": "object",
-        "description": "A GGUF found on this computer that the engine cannot execute.",
+        "description": "A GGUF found on this computer that the engine cannot execute, or a directory inside a model\nlocation that Magnitude can't read, which may hold more models.",
         "required": [
           "displayName",
           "origin",

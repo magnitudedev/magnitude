@@ -19,10 +19,10 @@ use crate::cache::{ModelCache, ModelIndexKind};
 use crate::candidate_files::RecognizedArchitectures;
 use crate::identity::{content_id, inventory_entry_id};
 use crate::inventory::{
-    ArtifactCandidate, DeclaredProjectors, DiscoveryCandidate, LinkedFiles, ModelGroup,
-    canonical_or_self,
-    components_for_group, discover_groups, inspect_cached, modified_seconds, now, primary_path,
-    read_dir_sorted, scan_hf_cache, split_shard_name,
+    ArtifactCandidate, DeclaredProjectors, DiscoveryCandidate, LinkedFiles, LocationScan,
+    ModelGroup, UnreadableDirectories, canonical_or_self, components_for_group, discover_groups,
+    inspect_cached, io_error, modified_seconds, now, primary_path, read_dir_sorted,
+    readable_entries, scan_hf_cache, split_shard_name,
 };
 
 const OLLAMA_MODEL_MEDIA_TYPE: &str = "application/vnd.ollama.image.model";
@@ -56,16 +56,20 @@ pub(crate) fn is_partial_download(path: &Path) -> bool {
         || lower.contains("-partial")
 }
 
+/// One location's models. A location that can't be read at all fails, and is reported by its own
+/// state; a directory inside it that can't be read is skipped and recorded in the scan, so the rest
+/// of the location is still listed.
 pub(crate) fn scan_root(
     root: &ModelRoot,
     declared: &DeclaredProjectors,
     cache: &ModelCache,
     architectures: &RecognizedArchitectures,
-    output: &mut Vec<DiscoveryCandidate>,
-) -> Result<(), InventoryError> {
+) -> Result<LocationScan, InventoryError> {
+    let mut output = LocationScan::default();
     if !root.path.is_dir() {
-        return Ok(());
+        return Ok(output);
     }
+    fs::read_dir(&root.path).map_err(io_error)?;
     match root.kind {
         ModelRootKind::HuggingFaceCache => scan_hf_cache(
             HubCacheOwner::HuggingFace,
@@ -73,15 +77,16 @@ pub(crate) fn scan_root(
             declared,
             cache,
             architectures,
-            output,
+            &mut output,
         ),
-        ModelRootKind::LmStudio => scan_lm_studio(&root.path, cache, architectures, output),
+        ModelRootKind::LmStudio => scan_lm_studio(&root.path, cache, architectures, &mut output),
         ModelRootKind::LlamaCpp => {
-            scan_llama_cpp(&root.path, declared, cache, architectures, output)
+            scan_llama_cpp(&root.path, declared, cache, architectures, &mut output)
         }
-        ModelRootKind::Ollama => scan_ollama(&root.path, cache, output),
-        ModelRootKind::Folder => scan_folder(&root.path, cache, architectures, output),
-    }
+        ModelRootKind::Ollama => scan_ollama(&root.path, cache, &mut output),
+        ModelRootKind::Folder => scan_folder(&root.path, cache, architectures, &mut output),
+    }?;
+    Ok(output)
 }
 
 fn push_external(
@@ -165,7 +170,7 @@ fn scan_lm_studio(
     root: &Path,
     cache: &ModelCache,
     architectures: &RecognizedArchitectures,
-    output: &mut Vec<DiscoveryCandidate>,
+    output: &mut LocationScan,
 ) -> Result<(), InventoryError> {
     for group in discover_groups(
         root,
@@ -174,6 +179,7 @@ fn scan_lm_studio(
         cache,
         architectures,
         &BTreeMap::new(),
+        &mut output.unreadable,
     )? {
         let hub = lm_studio_hub_file(root, &group.paths[0]);
         push_group(
@@ -181,7 +187,7 @@ fn scan_lm_studio(
             "lm-studio",
             ExternalOrigin::LmStudio { hub },
             &group,
-            output,
+            &mut output.candidates,
         )?;
     }
     Ok(())
@@ -213,7 +219,7 @@ fn scan_llama_cpp(
     declared: &DeclaredProjectors,
     cache: &ModelCache,
     architectures: &RecognizedArchitectures,
-    output: &mut Vec<DiscoveryCandidate>,
+    output: &mut LocationScan,
 ) -> Result<(), InventoryError> {
     for hub in [root.to_path_buf(), root.join("hub")] {
         scan_hf_cache(
@@ -251,6 +257,7 @@ fn scan_llama_cpp(
         cache,
         architectures,
         &declared,
+        &mut output.unreadable,
     )? {
         if hub_layout(&group.paths[0]) {
             continue;
@@ -268,7 +275,7 @@ fn scan_llama_cpp(
             "llama-cpp",
             ExternalOrigin::LlamaCpp { hub },
             &group,
-            output,
+            &mut output.candidates,
         )?;
     }
     Ok(())
@@ -384,18 +391,19 @@ struct OllamaPull {
 /// `manifests-v2/<registry>/<namespace>/<model>/<tag>`, often as a symlink to the manifest stored as
 /// a blob, naming Ollama's own registry `ollama.com` rather than `registry.ollama.ai`. A manifest is
 /// read only when it resolves inside the root. The same model in both trees is one pull, the
-/// manifest whose blobs are all present when only one is complete.
-fn ollama_pulls(root: &Path) -> Result<Vec<OllamaPull>, InventoryError> {
+/// manifest whose blobs are all present when only one is complete. A manifest directory that can't
+/// be read is recorded in `unreadable`, and every other pull is still listed.
+fn ollama_pulls(root: &Path, unreadable: &mut UnreadableDirectories) -> Vec<OllamaPull> {
     let contained = canonical_or_self(root);
     let mut pulls = BTreeMap::<String, OllamaPull>::new();
     for tree in OLLAMA_MANIFEST_TREES {
-        for registry in read_dir_sorted(&root.join(tree))? {
+        for registry in readable_entries(&root.join(tree), unreadable) {
             let registry_name = ollama_registry(&registry.file_name().to_string_lossy());
-            for namespace in read_dir_sorted(&registry.path())? {
+            for namespace in readable_entries(&registry.path(), unreadable) {
                 let namespace_name = namespace.file_name().to_string_lossy().into_owned();
-                for model in read_dir_sorted(&namespace.path())? {
+                for model in readable_entries(&namespace.path(), unreadable) {
                     let model_name = model.file_name().to_string_lossy().into_owned();
-                    for tag in read_dir_sorted(&model.path())? {
+                    for tag in readable_entries(&model.path(), unreadable) {
                         let Some(manifest) = read_ollama_manifest(root, &contained, &tag.path())
                         else {
                             continue;
@@ -422,7 +430,7 @@ fn ollama_pulls(root: &Path) -> Result<Vec<OllamaPull>, InventoryError> {
             }
         }
     }
-    Ok(pulls.into_values().collect())
+    pulls.into_values().collect()
 }
 
 /// The manifest a tag names, read only when it resolves inside the root. A manifest list names one
@@ -533,7 +541,7 @@ pub(crate) fn unresolved_ollama_hub_pulls(
     let mut unresolved = roots
         .iter()
         .filter(|root| root.enabled && root.kind == ModelRootKind::Ollama)
-        .flat_map(|root| ollama_pulls(&root.path).unwrap_or_default())
+        .flat_map(|root| ollama_pulls(&root.path, &mut UnreadableDirectories::new()))
         .filter_map(|pull| {
             let repository = pull.hub_repository()?;
             let sha256 = pull.model_sha256()?.to_owned();
@@ -554,9 +562,9 @@ pub(crate) fn unresolved_ollama_hub_pulls(
 fn scan_ollama(
     root: &Path,
     cache: &ModelCache,
-    output: &mut Vec<DiscoveryCandidate>,
+    output: &mut LocationScan,
 ) -> Result<(), InventoryError> {
-    for pull in ollama_pulls(root)? {
+    for pull in ollama_pulls(root, &mut output.unreadable) {
         let hub = pull.hub_repository().and_then(|repository| {
             let file = read_ollama_hub_file(cache, &repository, pull.model_sha256()?)?.file?;
             hub_file(repository, file)
@@ -584,7 +592,7 @@ fn scan_ollama(
             LocalDeclaration::Discovery,
             components,
             unsupported_format,
-            output,
+            &mut output.candidates,
         );
     }
     Ok(())
@@ -682,7 +690,7 @@ fn scan_folder(
     root: &Path,
     cache: &ModelCache,
     architectures: &RecognizedArchitectures,
-    output: &mut Vec<DiscoveryCandidate>,
+    output: &mut LocationScan,
 ) -> Result<(), InventoryError> {
     for group in discover_groups(
         root,
@@ -691,8 +699,15 @@ fn scan_folder(
         cache,
         architectures,
         &BTreeMap::new(),
+        &mut output.unreadable,
     )? {
-        push_group(root, "folder", ExternalOrigin::Folder, &group, output)?;
+        push_group(
+            root,
+            "folder",
+            ExternalOrigin::Folder,
+            &group,
+            &mut output.candidates,
+        )?;
     }
     Ok(())
 }
@@ -974,6 +989,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::test_gguf::LockedDirectory;
 
     fn sha256(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
@@ -1024,8 +1040,7 @@ mod tests {
     }
 
     fn names(root: &Path) -> Vec<String> {
-        ollama_pulls(root)
-            .unwrap()
+        ollama_pulls(root, &mut UnreadableDirectories::new())
             .into_iter()
             .map(|pull| pull.name)
             .collect()
@@ -1050,7 +1065,7 @@ mod tests {
                 "someone/tool:latest",
             ]
         );
-        let pulls = ollama_pulls(root).unwrap();
+        let pulls = ollama_pulls(root, &mut UnreadableDirectories::new());
         assert!(
             pulls
                 .iter()
@@ -1108,7 +1123,7 @@ mod tests {
         .unwrap();
         assert!(!root.join("manifests").exists());
 
-        let pulls = ollama_pulls(root).unwrap();
+        let pulls = ollama_pulls(root, &mut UnreadableDirectories::new());
         assert_eq!(
             pulls
                 .iter()
@@ -1181,7 +1196,7 @@ mod tests {
         let complete = manifest(root, b"complete weights", 16);
         write_v2(root, "ollama.com", "library/qwen3.5/0.8b", &complete);
 
-        let pulls = ollama_pulls(root).unwrap();
+        let pulls = ollama_pulls(root, &mut UnreadableDirectories::new());
         assert_eq!(pulls.len(), 1);
         assert_eq!(
             pulls[0].model_sha256(),
@@ -1229,9 +1244,10 @@ mod tests {
         );
 
         let cache = ModelCache::new(&temporary.path().join("cache"));
-        let mut output = Vec::new();
+        let mut output = LocationScan::default();
         scan_ollama(root, &cache, &mut output).unwrap();
         let names = output
+            .candidates
             .iter()
             .filter_map(
                 |DiscoveryCandidate::Artifact(artifact)| match &artifact.location {
@@ -1261,7 +1277,7 @@ mod tests {
         write_v2(root, "ollama.com", "library/llama3.2/1b", &llama);
 
         let scan = |root: &Path| {
-            let mut output = Vec::new();
+            let mut output = LocationScan::default();
             scan_ollama(
                 root,
                 &ModelCache::new(&temporary.path().join("cache")),
@@ -1269,6 +1285,7 @@ mod tests {
             )
             .unwrap();
             output
+                .candidates
                 .into_iter()
                 .map(|DiscoveryCandidate::Artifact(artifact)| *artifact)
                 .collect::<Vec<_>>()
@@ -1320,7 +1337,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
         write_ollama_mlx_pull(root, "qwen3.5", "4b", "qwen");
-        let pulls = ollama_pulls(root).unwrap();
+        let pulls = ollama_pulls(root, &mut UnreadableDirectories::new());
         let layer = pulls[0]
             .manifest
             .layers
@@ -1332,13 +1349,143 @@ mod tests {
             .join(format!("sha256-{}", sha256_hex(&layer.digest).unwrap()));
         fs::rename(&blob, blob.with_extension("partial")).unwrap();
 
-        let mut output = Vec::new();
+        let mut output = LocationScan::default();
         scan_ollama(
             root,
             &ModelCache::new(&temporary.path().join("cache")),
             &mut output,
         )
         .unwrap();
-        assert!(output.is_empty());
+        assert!(output.candidates.is_empty());
+    }
+
+    fn unreadable(scan: &LocationScan) -> Vec<PathBuf> {
+        scan.unreadable.keys().cloned().collect()
+    }
+
+    fn scan(kind: ModelRootKind, path: &Path, cache: &ModelCache) -> LocationScan {
+        scan_root(
+            &ModelRoot {
+                kind,
+                path: path.to_path_buf(),
+                enabled: true,
+            },
+            &DeclaredProjectors::new(&LocalModelsConfiguration::default()),
+            cache,
+            &RecognizedArchitectures::default(),
+        )
+        .unwrap()
+    }
+
+    fn primaries(scan: &LocationScan) -> Vec<PathBuf> {
+        scan.candidates
+            .iter()
+            .map(|DiscoveryCandidate::Artifact(artifact)| artifact.primary.clone())
+            .collect()
+    }
+
+    /// A subfolder Magnitude can't read, empty (a disk's `lost+found`) or holding a GGUF, is
+    /// recorded and skipped; every other model of the location is still found.
+    #[test]
+    fn an_unreadable_subfolder_never_hides_the_rest_of_its_location() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = ModelCache::new(&temporary.path().join("cache"));
+        let folder = temporary.path().join("models");
+        crate::test_gguf::write_model(&folder.join("nested/model.gguf"), "nested");
+        crate::test_gguf::write_model(&folder.join("top.gguf"), "top");
+        crate::test_gguf::write_model(&folder.join("locked/hidden.gguf"), "hidden");
+        let Some(_locked) = LockedDirectory::lock(&folder.join("locked")) else {
+            return;
+        };
+        let Some(_empty) = LockedDirectory::lock(&folder.join("empty-locked")) else {
+            return;
+        };
+
+        for kind in [
+            ModelRootKind::Folder,
+            ModelRootKind::LmStudio,
+            ModelRootKind::LlamaCpp,
+        ] {
+            let found = scan(kind, &folder, &cache);
+            assert_eq!(
+                primaries(&found),
+                [folder.join("nested/model.gguf"), folder.join("top.gguf")],
+                "{kind:?}"
+            );
+            assert_eq!(
+                unreadable(&found),
+                [folder.join("empty-locked"), folder.join("locked")],
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// A location that can't be read at all fails its scan, and is reported by its own state
+    /// rather than as an unreadable directory inside it.
+    #[test]
+    fn an_unreadable_location_fails_its_scan() {
+        let temporary = tempfile::tempdir().unwrap();
+        let folder = temporary.path().join("models");
+        let Some(_locked) = LockedDirectory::lock(&folder) else {
+            return;
+        };
+        assert!(
+            scan_root(
+                &ModelRoot {
+                    kind: ModelRootKind::Folder,
+                    path: folder.clone(),
+                    enabled: true,
+                },
+                &DeclaredProjectors::new(&LocalModelsConfiguration::default()),
+                &ModelCache::new(&temporary.path().join("cache")),
+                &RecognizedArchitectures::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_hub_repository_never_hides_the_rest_of_the_cache() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = ModelCache::new(&temporary.path().join("cache"));
+        let hub = temporary.path().join("hub");
+        let model = hub.join("models--owner--good/snapshots/abc/model.gguf");
+        crate::test_gguf::write_model(&model, "good");
+        crate::test_gguf::write_model(
+            &hub.join("models--owner--locked/snapshots/def/model.gguf"),
+            "locked",
+        );
+        let Some(_locked) = LockedDirectory::lock(&hub.join("models--owner--locked")) else {
+            return;
+        };
+
+        let found = scan(ModelRootKind::HuggingFaceCache, &hub, &cache);
+
+        assert_eq!(primaries(&found), [model]);
+        assert_eq!(
+            unreadable(&found),
+            [hub.join("models--owner--locked/snapshots")]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_ollama_namespace_never_hides_the_other_pulls() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        write_v1(root, OLLAMA_REGISTRY, "library/qwen3.5/0.8b", b"qwen weights");
+        write_v1(root, OLLAMA_REGISTRY, "someone/tool/latest", b"tool weights");
+        let namespace = root.join("manifests").join(OLLAMA_REGISTRY).join("someone");
+        let Some(_locked) = LockedDirectory::lock(&namespace) else {
+            return;
+        };
+
+        let mut unreadable = UnreadableDirectories::new();
+        let names = ollama_pulls(root, &mut unreadable)
+            .into_iter()
+            .map(|pull| pull.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["qwen3.5:0.8b"]);
+        assert_eq!(unreadable.into_keys().collect::<Vec<_>>(), [namespace]);
     }
 }

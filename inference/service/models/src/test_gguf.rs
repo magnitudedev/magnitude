@@ -1,4 +1,5 @@
-//! Synthetic GGUF files for tests: real headers with small F32 tensors.
+//! Test fixtures: synthetic GGUF files (real headers with small F32 tensors), and directories
+//! Magnitude can't read.
 
 use std::path::Path;
 
@@ -139,4 +140,26 @@ pub(crate) fn fixture_header(name: &str) -> Vec<u8> {
         .read_to_end(&mut bytes)
         .expect("gzipped fixture");
     bytes
+}
+
+/// A directory whose permissions deny reading it, restored when dropped so the temporary tree can
+/// be removed.
+pub(crate) struct LockedDirectory(std::path::PathBuf);
+
+impl LockedDirectory {
+    /// Locks `path`, or `None` when it stays readable, as it does for root, so a test can skip.
+    pub(crate) fn lock(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let locked = Self(path.to_path_buf());
+        std::fs::read_dir(path).is_err().then_some(locked)
+    }
+}
+
+impl Drop for LockedDirectory {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
 }

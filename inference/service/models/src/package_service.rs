@@ -24,7 +24,8 @@ use sha2::{Digest, Sha256};
 use crate::PreparedPreview;
 use crate::cache::{CachedModelAssessment, ModelIndexKind};
 use crate::inventory::{
-    InstalledPackageRecord, InstalledPackageSnapshot, ManagedModelStore, catalog_packages,
+    InstalledPackageRecord, InstalledPackageSnapshot, ManagedModelStore, UnreadableDirectory,
+    catalog_packages,
     catalog_projector_package, catalog_store_packages,
     catalog_target, origin_precedence,
 };
@@ -1059,6 +1060,7 @@ impl ManagedModelStore {
     pub(crate) fn build_installed_package_snapshot(
         &self,
         models: &BTreeMap<magnitude_service_contracts::InventoryEntryId, InventoryModel>,
+        unreadable_directories: BTreeSet<UnreadableDirectory>,
     ) -> Result<InstalledPackageSnapshot, InventoryError> {
         self.retry_catalog_affiliation_persistence();
         let mut records = BTreeMap::new();
@@ -1104,7 +1106,10 @@ impl ManagedModelStore {
                 },
             );
         }
-        Ok(InstalledPackageSnapshot { records })
+        Ok(InstalledPackageSnapshot {
+            records,
+            unreadable_directories,
+        })
     }
 
     fn retry_catalog_affiliation_persistence(&self) {

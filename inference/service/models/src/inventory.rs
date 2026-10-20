@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hf_hub::HFClient;
 use magnitude_service_contracts::models::{
-    CatalogPackageRole, CustomModelDeclarationOrigin, InstalledCatalogAttribution,
+    CatalogPackageRole, CustomModelDeclarationOrigin, FoundSource, InstalledCatalogAttribution,
     InstalledModelPackage, InstalledModelPackagesResponse, PackageValidation, LocalModelsConfiguration, ModelFileRelationship, ModelFileRole,
     ModelPackage, ModelPackageId, ModelPackageInstallationOrigin, ModelPackageSource, ModelRoot,
     ModelRootKind, RecommendableModel, ServableModelBundle, SpeculativeDraftSource,
@@ -73,9 +73,42 @@ pub(crate) struct InstalledPackageRecord {
     pub(crate) primary: Option<PrimaryEvidence>,
 }
 
+/// Every installed package occurrence, and every directory inside a location that could not be
+/// read. An unreadable directory is skipped so the rest of its location is still listed.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct InstalledPackageSnapshot {
     pub(crate) records: BTreeMap<InventoryEntryId, InstalledPackageRecord>,
+    pub(crate) unreadable_directories: BTreeSet<UnreadableDirectory>,
+}
+
+/// A directory inside the location `source` names, rooted at `root`, that Magnitude could not
+/// read, with why.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub(crate) struct UnreadableDirectory {
+    pub(crate) source: FoundSource,
+    pub(crate) root: PathBuf,
+    pub(crate) path: PathBuf,
+    pub(crate) detail: String,
+}
+
+impl UnreadableDirectory {
+    fn of(root: &ModelRoot, path: PathBuf, detail: String) -> Self {
+        let source = match root.kind {
+            ModelRootKind::HuggingFaceCache => FoundSource::HuggingFaceCache,
+            ModelRootKind::LmStudio => FoundSource::LmStudio,
+            ModelRootKind::LlamaCpp => FoundSource::LlamaCpp,
+            ModelRootKind::Ollama => FoundSource::Ollama,
+            ModelRootKind::Folder => FoundSource::Folder {
+                path: root.path.clone(),
+            },
+        };
+        Self {
+            source,
+            root: root.path.clone(),
+            path,
+            detail,
+        }
+    }
 }
 
 impl InstalledPackageSnapshot {
@@ -820,8 +853,10 @@ impl ManagedModelStore {
 
                 let package_manager = self.clone();
                 let package_models = discovered.clone();
+                let unreadable_directories = scan_result.unreadable_directories;
                 let installed_packages = tokio::task::spawn_blocking(move || {
-                    package_manager.build_installed_package_snapshot(&package_models)
+                    package_manager
+                        .build_installed_package_snapshot(&package_models, unreadable_directories)
                 })
                 .await
                 .map_err(|error| InventoryError::Internal(error.to_string()))??;
@@ -1041,7 +1076,15 @@ impl ManagedModelStore {
         } else {
             cache.remove(&model.id);
         }
-        let installed = self.build_installed_package_snapshot(&models)?;
+        let unreadable_directories = self
+            .installed_packages
+            .read()
+            .map_err(|_| {
+                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+            })?
+            .unreadable_directories
+            .clone();
+        let installed = self.build_installed_package_snapshot(&models, unreadable_directories)?;
         persist_inventory_index(&self.cache, &models, &cache, &installed);
         *self
             .models
@@ -1303,6 +1346,7 @@ struct InventoryScan {
     observations: BTreeMap<InventoryEntryId, String>,
     metadata_keys: BTreeMap<InventoryEntryId, String>,
     root_scans: RootScans,
+    unreadable_directories: BTreeSet<UnreadableDirectory>,
 }
 
 /// Which locations a reconciliation scans. `Roots` names canonical location paths.
@@ -1314,7 +1358,18 @@ pub(crate) enum ScanScope {
 
 /// The last scan of each location, by kind and canonical path, reused for locations outside a
 /// reconciliation's scope.
-type RootScans = BTreeMap<(ModelRootKind, PathBuf), Vec<DiscoveryCandidate>>;
+type RootScans = BTreeMap<(ModelRootKind, PathBuf), LocationScan>;
+
+/// Directories a scan could not read, each with why.
+pub(crate) type UnreadableDirectories = BTreeMap<PathBuf, String>;
+
+/// What scanning one location found: its candidates, and the directories inside it that could not
+/// be read, which the scan skipped.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LocationScan {
+    pub(crate) candidates: Vec<DiscoveryCandidate>,
+    pub(crate) unreadable: UnreadableDirectories,
+}
 
 struct ScannedRoots {
     scope: ScanScope,
@@ -1327,7 +1382,7 @@ impl ScannedRoots {
         &self,
         key: &(ModelRootKind, PathBuf),
         inventory_root: &Path,
-    ) -> Option<&Vec<DiscoveryCandidate>> {
+    ) -> Option<&LocationScan> {
         let in_scope = match &self.scope {
             ScanScope::All => true,
             ScanScope::Roots(roots) => roots.contains(&key.1),
@@ -1335,8 +1390,8 @@ impl ScannedRoots {
         if in_scope {
             return None;
         }
-        self.previous.get(key).filter(|candidates| {
-            candidates
+        self.previous.get(key).filter(|scan| {
+            scan.candidates
                 .iter()
                 .all(|DiscoveryCandidate::Artifact(candidate)| {
                     artifact_observation_key(inventory_root, &candidate.source, &candidate.location)
@@ -1359,7 +1414,8 @@ fn scan(
 
     // Roots scan in precedence order, so the first occurrence of a path is the preferred one. A
     // root that cannot be read is skipped for this reconciliation rather than hiding every other
-    // location's models.
+    // location's models; a directory inside a root that cannot be read is skipped and reported,
+    // rather than hiding the rest of its root.
     let managed_hub = canonical_or_self(&config.root.join("hub"));
     let mut distinct = BTreeSet::new();
     let mut roots = local
@@ -1378,8 +1434,8 @@ fn scan(
     for root in &roots {
         let key = (root.kind, canonical_or_self(&root.path));
         match scanned.reusable(&key, &config.root) {
-            Some(candidates) => {
-                root_scans.insert(key, candidates.clone());
+            Some(scan) => {
+                root_scans.insert(key, scan.clone());
             }
             None => stale_roots.push(root.clone()),
         }
@@ -1395,15 +1451,12 @@ fn scan(
                 .map(|root| {
                     let declared = &declared;
                     scope.spawn(move || {
-                        let mut models = Vec::new();
                         crate::local_roots::scan_root(
                             root,
                             declared,
                             cache,
                             &config.architectures,
-                            &mut models,
                         )
-                        .map(|()| models)
                     })
                 })
                 .collect::<Vec<_>>()
@@ -1420,18 +1473,22 @@ fn scan(
                             %error,
                             "model location could not be scanned"
                         );
-                        Vec::new()
+                        LocationScan::default()
                     }))
                 })
                 .collect::<Result<Vec<_>, InventoryError>>()
         })?;
-        for (root, models) in roots.iter().zip(root_results) {
-            root_scans.insert((root.kind, canonical_or_self(&root.path)), models);
+        for (root, scan) in roots.iter().zip(root_results) {
+            root_scans.insert((root.kind, canonical_or_self(&root.path)), scan);
         }
     }
+    let mut unreadable_directories = BTreeSet::new();
     for root in &roots {
-        if let Some(candidates) = root_scans.get(&(root.kind, canonical_or_self(&root.path))) {
-            discovered.extend(candidates.iter().cloned());
+        if let Some(scan) = root_scans.get(&(root.kind, canonical_or_self(&root.path))) {
+            discovered.extend(scan.candidates.iter().cloned());
+            unreadable_directories.extend(scan.unreadable.iter().map(|(path, detail)| {
+                UnreadableDirectory::of(root, path.clone(), detail.clone())
+            }));
         }
     }
     crate::local_roots::scan_declared_files(local, cache, &config.architectures, &mut discovered);
@@ -1529,6 +1586,7 @@ fn scan(
         observations,
         metadata_keys,
         root_scans,
+        unreadable_directories,
     })
 }
 
@@ -1751,14 +1809,20 @@ fn append_discovered_groups(
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
     let blobs = RepositoryBlobs::open(repository_root).map_err(io_error)?;
-    for group in discover_groups(
+    let mut unreadable = UnreadableDirectories::new();
+    let groups = discover_groups(
         snapshot,
         repository_root,
         LinkedFiles::WithinRoot,
         cache,
         architectures,
         declared,
-    )? {
+        &mut unreadable,
+    )?;
+    for (path, detail) in unreadable {
+        tracing::warn!(path = %path.display(), %detail, "managed snapshot directory could not be read");
+    }
+    for group in groups {
         let components = components_for_group(snapshot, &group, Some(&blobs))?;
         let Some(primary) = primary_path(snapshot, &components) else {
             continue;
@@ -1793,20 +1857,21 @@ fn append_discovered_groups(
 }
 
 /// Snapshot entries may link anywhere inside the hub: current `huggingface_hub` keeps the bytes in
-/// a blob store every repository shares.
+/// a blob store every repository shares. A repository or snapshot that can't be read is skipped
+/// and recorded, so it never hides the rest of the cache.
 pub(crate) fn scan_hf_cache(
     owner: HubCacheOwner,
     cache: &Path,
     declared: &DeclaredProjectors,
     inspections: &ModelCache,
     architectures: &RecognizedArchitectures,
-    output: &mut Vec<DiscoveryCandidate>,
+    output: &mut LocationScan,
 ) -> Result<(), InventoryError> {
     if !cache.is_dir() {
         return Ok(());
     }
     let mut count = 0;
-    for repo_entry in read_dir_sorted(cache)? {
+    for repo_entry in readable_entries(cache, &mut output.unreadable) {
         let repo_name = repo_entry.file_name().to_string_lossy().into_owned();
         let Some(repository) = parse_hf_repo_dir(&repo_name) else {
             continue;
@@ -1817,7 +1882,7 @@ pub(crate) fn scan_hf_cache(
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
         let snapshots = repo_root.join("snapshots");
-        for snapshot_entry in read_dir_sorted(&snapshots)? {
+        for snapshot_entry in readable_entries(&snapshots, &mut output.unreadable) {
             count += 1;
             if count > MAX_SCAN_ENTRIES {
                 return Err(InventoryError::Io(
@@ -1833,8 +1898,15 @@ pub(crate) fn scan_hf_cache(
                 inspections,
                 architectures,
                 &declared.for_snapshot(&repository, &commit, &snapshot),
+                &mut output.unreadable,
             )?;
-            let blobs = RepositoryBlobs::open(&repo_root).map_err(io_error)?;
+            let blobs = match RepositoryBlobs::open(&repo_root) {
+                Ok(blobs) => blobs,
+                Err(error) => {
+                    output.unreadable.insert(repo_root.clone(), error.to_string());
+                    continue;
+                }
+            };
             for group in groups {
                 let components = components_for_group(&snapshot, &group, Some(&blobs))?;
                 let primary = match primary_path(&snapshot, &components) {
@@ -1848,7 +1920,7 @@ pub(crate) fn scan_hf_cache(
                 };
                 let id = inventory_entry_id(kind, &snapshot, &content);
                 let created = modified_seconds(&snapshot).unwrap_or_else(now);
-                output.push(DiscoveryCandidate::Artifact(Box::new(ArtifactCandidate {
+                output.candidates.push(DiscoveryCandidate::Artifact(Box::new(ArtifactCandidate {
                     id,
                     content_id: content,
                     created,
@@ -2300,7 +2372,8 @@ pub(crate) enum LinkedFiles {
 /// Every complete GGUF group under `root`. Projectors are recognized from their headers and pair
 /// with a model by declaration, else as the only projector in its directory. Drafters and
 /// unreadable files form their own groups; what they are is decided from their headers later,
-/// never from their names.
+/// never from their names. A directory that can't be read is recorded in `unreadable` and the
+/// rest of `root` is still discovered.
 pub(crate) fn discover_groups(
     root: &Path,
     containment_root: &Path,
@@ -2308,6 +2381,7 @@ pub(crate) fn discover_groups(
     cache: &ModelCache,
     architectures: &RecognizedArchitectures,
     declared: &BTreeMap<PathBuf, PathBuf>,
+    unreadable: &mut UnreadableDirectories,
 ) -> Result<Vec<ModelGroup>, InventoryError> {
     let mut files = Vec::new();
     collect_gguf(
@@ -2316,7 +2390,8 @@ pub(crate) fn discover_groups(
         linked_files,
         0,
         &mut files,
-    )?;
+        unreadable,
+    );
     let mut groups: BTreeMap<PathBuf, Vec<(u32, u32, PathBuf)>> = BTreeMap::new();
     let mut standalone = Vec::new();
     let mut projectors = Vec::new();
@@ -2419,24 +2494,27 @@ pub(crate) fn components_for_group(
     Ok(components)
 }
 
-pub(crate) fn collect_gguf(
+fn collect_gguf(
     directory: &Path,
     containment_root: &Path,
     linked_files: LinkedFiles,
     depth: usize,
     output: &mut Vec<PathBuf>,
-) -> Result<(), InventoryError> {
+    unreadable: &mut UnreadableDirectories,
+) {
     if depth > MAX_SCAN_DEPTH || output.len() >= MAX_SCAN_ENTRIES {
-        return Ok(());
+        return;
     }
-    for entry in read_dir_sorted(directory)? {
+    for entry in readable_entries(directory, unreadable) {
         let path = entry.path();
         if entry.file_name().to_string_lossy().starts_with('.')
             || crate::local_roots::is_partial_download(&path)
         {
             continue;
         }
-        let file_type = entry.file_type().map_err(io_error)?;
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         if file_type.is_symlink() {
             let canonical = match path.canonicalize() {
                 Ok(canonical)
@@ -2456,7 +2534,14 @@ pub(crate) fn collect_gguf(
                 output.push(path);
             }
         } else if file_type.is_dir() {
-            collect_gguf(&path, containment_root, linked_files, depth + 1, output)?;
+            collect_gguf(
+                &path,
+                containment_root,
+                linked_files,
+                depth + 1,
+                output,
+                unreadable,
+            );
         } else if file_type.is_file()
             && path
                 .extension()
@@ -2469,7 +2554,6 @@ pub(crate) fn collect_gguf(
             break;
         }
     }
-    Ok(())
 }
 
 pub(crate) fn split_shard_name(path: &Path) -> Option<(PathBuf, u32, u32)> {
@@ -2512,10 +2596,36 @@ pub(crate) fn read_dir_sorted(path: &Path) -> Result<Vec<fs::DirEntry>, Inventor
     if !path.is_dir() {
         return Ok(Vec::new());
     }
-    let mut entries = fs::read_dir(path)
-        .map_err(io_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(io_error)?;
+    list_sorted(path).map_err(io_error)
+}
+
+/// The entries of a directory inside a location, sorted. One that can't be read is recorded in
+/// `unreadable` and walked as empty, so it never hides the rest of its location; one that vanished
+/// during the scan is just empty.
+pub(crate) fn readable_entries(
+    directory: &Path,
+    unreadable: &mut UnreadableDirectories,
+) -> Vec<fs::DirEntry> {
+    let listed = fs::metadata(directory).and_then(|metadata| {
+        if metadata.is_dir() {
+            list_sorted(directory)
+        } else {
+            Ok(Vec::new())
+        }
+    });
+    listed.unwrap_or_else(|error| {
+        if !matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) {
+            unreadable.insert(directory.to_path_buf(), error.to_string());
+        }
+        Vec::new()
+    })
+}
+
+fn list_sorted(path: &Path) -> std::io::Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(fs::DirEntry::file_name);
     Ok(entries)
 }
@@ -3597,6 +3707,7 @@ mod tests {
             &ModelCache::new(&temporary.path().join("cache")),
             &RecognizedArchitectures::default(),
             &BTreeMap::new(),
+            &mut UnreadableDirectories::new(),
         )
         .unwrap();
 
@@ -3622,6 +3733,7 @@ mod tests {
             &ModelCache::new(&temporary.path().join("cache")),
             &RecognizedArchitectures::default(),
             &BTreeMap::new(),
+            &mut UnreadableDirectories::new(),
         )
         .unwrap();
 
@@ -3656,6 +3768,7 @@ mod tests {
             &cache,
             &crate::test_gguf::engine_architectures(),
             &BTreeMap::new(),
+            &mut UnreadableDirectories::new(),
         )
         .unwrap();
 
@@ -3708,6 +3821,7 @@ mod tests {
             &cache,
             &RecognizedArchitectures::default(),
             &BTreeMap::new(),
+            &mut UnreadableDirectories::new(),
         )
         .unwrap();
         assert_eq!(
@@ -3723,6 +3837,7 @@ mod tests {
             &cache,
             &RecognizedArchitectures::default(),
             &declared,
+            &mut UnreadableDirectories::new(),
         )
         .unwrap();
         assert_eq!(groups[0].projector, Some(models.join("mmproj-q8.gguf")));

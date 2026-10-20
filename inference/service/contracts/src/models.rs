@@ -1684,7 +1684,8 @@ pub struct CustomModel {
     pub update_commit: Option<String>,
 }
 
-/// A GGUF found on this computer that the engine cannot execute.
+/// A GGUF found on this computer that the engine cannot execute, or a directory inside a model
+/// location that Magnitude can't read, which may hold more models.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1699,7 +1700,8 @@ pub struct UnsupportedLocalModel {
 
 /// `models` are the custom models to offer and assess; `hidden` are the ones the configuration
 /// hides, listed so a client can unhide them, and never assessed. `unsupported` are GGUF groups
-/// that cannot be read at all; a readable model the engine rejects stays in `models` with an
+/// that cannot be read at all, and directories inside a location that cannot be read (the rest of
+/// the location is still listed); a readable model the engine rejects stays in `models` with an
 /// `Unsupported` assessment.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
