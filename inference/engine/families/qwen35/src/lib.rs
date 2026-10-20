@@ -167,7 +167,7 @@ pub fn inspect_components(
     if layer_count > directory.tensors.len() as u64 {
         return Err(invalid("Qwen layer count exceeds available weight roles"));
     }
-    let layers = mixer_kinds(&m, layer_count)?;
+    let layers = mixer_kinds(&m, layer_count, speculative)?;
     let embedding = directory
         .tensor("token_embd.weight")
         .ok_or_else(|| invalid("missing Qwen embedding"))?;

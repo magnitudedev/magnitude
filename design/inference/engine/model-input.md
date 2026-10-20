@@ -65,7 +65,10 @@ the model, and container and uploader namespaces (`split.*`, `quantize.*`, `imat
 key outside its namespace, but never refuses one it does not know, and names (a model's or a base
 model's) never decide a verdict: a projector binds when its output width
 (`clip.vision.projection_dim`) is the target's embedding width, and a header naming no architecture
-is unreadable. Absent head widths read as llama.cpp reads them. The rule is shared by every family,
+is unreadable. Absent head widths read as llama.cpp reads them. The Qwen 3.5 lineage's layer kinds read
+as llama.cpp reads them too: `attention.recurrent_layers` flags every stored block, prediction blocks
+last and never recurrent, and otherwise one layer in every `full_attention_interval` is attention; a
+header carrying both binds only when they agree. The rule is shared by every family,
 so a quantizer's provenance stamp never decides a verdict.
 
 An input row's token also names the rows it reads of a gathered table, by the table's row rule. A

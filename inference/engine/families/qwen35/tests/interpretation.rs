@@ -457,6 +457,51 @@ fn rejects_wrong_shapes_and_unbound_family_roles() {
     );
 }
 
+/// `attention.recurrent_layers` as current llama.cpp conversions write it:
+/// one flag per stored block, the prediction block last and not recurrent.
+/// It binds the layer order the interval places, alone or beside it, and is
+/// refused when it contradicts the interval or flags a prediction block.
+#[test]
+fn recurrent_layer_flags_bind_the_layer_order_the_interval_places() {
+    let identity = PackageIdentity {
+        target: ArtifactIdentity([3; 32]),
+        projector: None,
+    };
+    let with_flags = |flags: &[bool], interval: bool| {
+        let mut directory = mtp_directory();
+        if !interval {
+            directory
+                .metadata
+                .retain(|metadata| metadata.name != "qwen35.full_attention_interval");
+        }
+        directory.metadata.push(Metadata {
+            name: "qwen35.attention.recurrent_layers".into(),
+            value: Value::Array(flags.iter().copied().map(Scalar::Bool).collect()),
+        });
+        inspect_components(&directory, None, identity)
+    };
+    let derived = inspect_components(&mtp_directory(), None, identity).unwrap();
+    assert_eq!(with_flags(&[true, false, false], true).unwrap(), derived);
+    assert_eq!(with_flags(&[true, false, false], false).unwrap(), derived);
+    for (flags, interval, expected) in [
+        (&[false, true, false][..], true, "full_attention_interval 2"),
+        (&[true, false, true][..], true, "prediction blocks"),
+        (&[true, false, true][..], false, "prediction blocks"),
+        (&[true, false][..], true, "each of the 3 blocks"),
+    ] {
+        let refused = with_flags(flags, interval).unwrap_err();
+        assert_eq!(
+            refused.reasons,
+            [
+                magnitude_artifacts::UnsupportedReason::UnrecognizedMetadata {
+                    key: "qwen35.attention.recurrent_layers".into()
+                }
+            ]
+        );
+        assert!(refused.detail.contains(expected), "{}", refused.detail);
+    }
+}
+
 #[test]
 fn binds_every_mtp_role_outside_the_target_geometry() {
     let model = inspect_components(

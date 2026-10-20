@@ -135,7 +135,7 @@ describe("unsupported reasons in the UI", () => {
   })
 
   it("says many unrecognized parts once, with how many there are", () => {
-    const tensors = Array.from({ length: 60 }, (_, index) => reason({ _tag: "UnrecognizedTensor", name: `blk.${15 + Math.floor(index / 3)}.attn_k` }))
+    const tensors = Array.from({ length: 60 }, (_, index) => reason({ _tag: "UnrecognizedTensor", name: `blk.${15 + Math.floor(index / 3)}.attn_${"kqv"[index % 3]}` }))
     expect(unsupportedReasonMessages([
       ...tensors,
       reason({ _tag: "UnrecognizedMetadata", key: "gemma4.a" }),
@@ -371,9 +371,25 @@ describe("repositories where nothing runs", () => {
   it("says why no version runs from the engine's verdicts", () => {
     expect(noRunnableVersionReason([version("Q8_0", tooLarge)])).toEqual(Option.some("Every version is too large for this machine."))
     expect(noRunnableVersionReason([version("Q4_K_M", unsupportedTensors(60)), version("Q8_0", unsupportedTensors(60))]))
-      .toEqual(Option.some("Magnitude can't run any version: Has parts Magnitude doesn't recognize (120 tensors)."))
+      .toEqual(Option.some("Magnitude can't run any version: Has parts Magnitude doesn't recognize (60 tensors)."))
     expect(noRunnableVersionReason([version("Q8_0", tooLarge), version("Q4_K_M", unsupportedTensors(1))]))
       .toEqual(Option.some("Some versions are too large for this machine, and Magnitude can't run the others: Has parts Magnitude doesn't recognize (blk.0.attn_k)."))
+  })
+
+  it("counts a part once however many versions name it", () => {
+    const recurrentLayers = assessment({
+      _tag: "Unsupported",
+      reasons: [reason({ _tag: "UnrecognizedMetadata", key: "qwen35.attention.recurrent_layers" })],
+    })
+    const versions = Array.from({ length: 24 }, (_, index) => version(`V${index}`, recurrentLayers))
+    expect(noRunnableVersionReason(versions))
+      .toEqual(Option.some("Magnitude can't run any version: Has parts Magnitude doesn't recognize (qwen35.attention.recurrent_layers)."))
+    const ropeFrequencies = assessment({
+      _tag: "Unsupported",
+      reasons: [reason({ _tag: "UnrecognizedTensor", name: "rope_freqs.weight" })],
+    })
+    expect(noRunnableVersionReason(Array.from({ length: 15 }, (_, index) => version(`V${index}`, ropeFrequencies))))
+      .toEqual(Option.some("Magnitude can't run any version: Has parts Magnitude doesn't recognize (rope_freqs.weight)."))
   })
 
   it("says nothing when some version fits or hasn't been checked", () => {

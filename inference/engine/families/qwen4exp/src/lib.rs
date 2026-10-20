@@ -309,7 +309,7 @@ pub fn inspect_components(
             "qwen4exp layer count exceeds available weight roles",
         ));
     }
-    let layers = mixer_kinds(&m, layer_count)?;
+    let layers = mixer_kinds(&m, layer_count, predictions)?;
     let extensions = Extensions::read(&m, &layers, predictions)?;
     let geometry = Geometry::read(&m, true)?;
     let hidden = geometry.hidden;

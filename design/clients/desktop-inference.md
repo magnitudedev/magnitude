@@ -157,7 +157,8 @@ Custom models follow [the local-model product projection](../model-management/lo
   one click downloads only the drafter. Catalog models never offer a drafter change. There is no way to
   add a single GGUF file; files on this computer come only from the scanned locations and added folders.
 - **Repeated reasons** are said once: many unrecognized tensors read "Has parts Magnitude doesn't
-  recognize (60 tensors)", in My Models, the repository step and the CLI alike.
+  recognize (60 tensors)", in My Models, the repository step and the CLI alike. The count is of
+  distinct parts, so one key every version refuses is named, not counted once per version.
 - **Models that can't run** never get disabled cards. One collapsed line at the bottom of My Models
   ("N other models on this computer can't run in Magnitude") expands to dimmed rows with name,
   source tag and a plain reason per structured reason; there are no actions. An unknown reason

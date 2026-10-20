@@ -160,32 +160,70 @@ pub enum MixerKind {
     Recurrent,
 }
 
-/// Every layer's mixer: per-layer recurrent flags, or one attention layer
-/// per `full_attention_interval`.
-pub fn mixer_kinds(m: &Metadata, layer_count: u64) -> Result<Vec<MixerKind>, Error> {
-    match m.optional("attention.recurrent_layers") {
-        None => {
-            let interval = m.integer("full_attention_interval")?;
-            Ok((0..layer_count)
-                .map(|i| {
-                    if (i + 1) % interval == 0 {
-                        MixerKind::Attention
-                    } else {
-                        MixerKind::Recurrent
-                    }
-                })
-                .collect())
-        }
-        Some(Value::Array(flags)) if flags.len() as u64 == layer_count => flags
+/// Every decoder layer's mixer, read as llama.cpp reads it:
+/// `attention.recurrent_layers` flags every stored block, the
+/// attention-only prediction blocks last and never recurrent; without it,
+/// one layer in every `full_attention_interval` is attention. A header
+/// carrying both must have them agree.
+pub fn mixer_kinds(
+    m: &Metadata,
+    layer_count: u64,
+    predictions: u64,
+) -> Result<Vec<MixerKind>, Error> {
+    const FLAGS: &str = "attention.recurrent_layers";
+    let by_interval = |interval: u64| -> Vec<MixerKind> {
+        (0..layer_count)
+            .map(|i| {
+                if (i + 1) % interval == 0 {
+                    MixerKind::Attention
+                } else {
+                    MixerKind::Recurrent
+                }
+            })
+            .collect()
+    };
+    let Some(flags) = m.optional(FLAGS) else {
+        return Ok(by_interval(m.integer("full_attention_interval")?));
+    };
+    let flags = match flags {
+        Value::Array(flags) => flags
             .iter()
             .map(|v| match v {
-                Scalar::Bool(true) => Ok(MixerKind::Recurrent),
-                Scalar::Bool(false) => Ok(MixerKind::Attention),
-                _ => Err(m.malformed("attention.recurrent_layers", "per-layer booleans")),
+                Scalar::Bool(recurrent) => Some(*recurrent),
+                _ => None,
             })
-            .collect(),
-        _ => Err(m.malformed("attention.recurrent_layers", "one boolean per layer")),
+            .collect::<Option<Vec<_>>>(),
+        Value::Scalar(_) => None,
     }
+    .ok_or_else(|| m.malformed(FLAGS, "an array of booleans"))?;
+    let blocks = layer_count + predictions;
+    if flags.len() as u64 != blocks {
+        return Err(m.malformed(FLAGS, &format!("one flag for each of the {blocks} blocks")));
+    }
+    let (decoder, prediction) = flags.split_at(layer_count as usize);
+    if prediction.iter().any(|recurrent| *recurrent) {
+        return Err(m.malformed(FLAGS, "false for the attention-only prediction blocks"));
+    }
+    let kinds = decoder
+        .iter()
+        .map(|recurrent| {
+            if *recurrent {
+                MixerKind::Recurrent
+            } else {
+                MixerKind::Attention
+            }
+        })
+        .collect::<Vec<_>>();
+    if m.optional("full_attention_interval").is_some() {
+        let interval = m.integer("full_attention_interval")?;
+        if kinds != by_interval(interval) {
+            return Err(m.malformed(
+                FLAGS,
+                &format!("the layer order full_attention_interval {interval} places"),
+            ));
+        }
+    }
+    Ok(kinds)
 }
 
 /// Expert widths of a routed artifact.

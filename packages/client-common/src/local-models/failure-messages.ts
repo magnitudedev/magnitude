@@ -53,26 +53,29 @@ const backendDevice = (backend: string): string => {
   }
 }
 
-/** Identical reasons collapsed to one, with how many the engine reported; unrecognized parts collapse by kind. */
+/**
+ * Identical reasons collapsed to one; unrecognized parts collapse by kind, counting each distinct part once however
+ * many verdicts name it.
+ */
 export interface UnsupportedReasonGroup {
   readonly reason: UnsupportedReason
   readonly count: number
 }
 
-const reasonGroupKey = (reason: UnsupportedReason): string =>
-  reason._tag === "UnrecognizedTensor" || reason._tag === "UnrecognizedMetadata"
-    ? reason._tag
-    : unsupportedReasonMessage(reason)
+const unrecognizedPart = (reason: UnsupportedReason): string | undefined =>
+  reason._tag === "UnrecognizedTensor" ? reason.name : reason._tag === "UnrecognizedMetadata" ? reason.key : undefined
 
 /** The engine's reasons collapsed into groups, in the order each first appears. */
 export const unsupportedReasonGroups = (reasons: ReadonlyArray<UnsupportedReason>): ReadonlyArray<UnsupportedReasonGroup> => {
-  const groups = new Map<string, UnsupportedReasonGroup>()
+  const groups = new Map<string, { readonly reason: UnsupportedReason; readonly parts: Set<string> }>()
   for (const reason of reasons) {
-    const key = reasonGroupKey(reason)
-    const existing = groups.get(key)
-    groups.set(key, { reason: existing?.reason ?? reason, count: (existing?.count ?? 0) + 1 })
+    const part = unrecognizedPart(reason)
+    const key = part === undefined ? unsupportedReasonMessage(reason) : reason._tag
+    const group = groups.get(key) ?? { reason, parts: new Set<string>() }
+    group.parts.add(part ?? key)
+    groups.set(key, group)
   }
-  return [...groups.values()]
+  return [...groups.values()].map(({ reason, parts }) => ({ reason, count: parts.size }))
 }
 
 /** One group's reason: "Has parts Magnitude doesn't recognize (60 tensors)" for many unrecognized parts. */
