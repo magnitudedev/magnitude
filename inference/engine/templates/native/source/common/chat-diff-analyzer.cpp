@@ -267,6 +267,18 @@ void autoparser::analyze_template(const common_chat_template & tmpl) {
         workaround(tmpl, *this);
     }
 
+    if (tools.format.mode != tool_format::NONE && !tools.is_coherent()) {
+        LOG_DBG(ANSI_ORANGE "%s: Tool format could not be separated from the probe calls, tool calls are unsupported\n" ANSI_RESET, __func__);
+        const std::vector<std::string> kept = { reasoning.start, reasoning.end, content.start, content.end };
+        for (const auto & marker : tools.markers()) {
+            const auto token = trim_whitespace(marker);
+            if (std::find_if(kept.begin(), kept.end(), [&](const std::string & k) { return trim_whitespace(k) == token; }) == kept.end()) {
+                preserved_tokens.erase(std::remove(preserved_tokens.begin(), preserved_tokens.end(), token), preserved_tokens.end());
+            }
+        }
+        tools = analyze_tools();
+    }
+
     LOG_DBG("\n--- Reasoning & Content Structure ---\n");
     LOG_DBG("user_msg_start: %s\n", user_start.c_str());
     LOG_DBG("assistant_msg_start: %s\n", assistant_start.c_str());
@@ -325,23 +337,33 @@ void autoparser::collect_preserved_tokens() {
     add_token(reasoning.end);
     add_token(content.start);
     add_token(content.end);
-    add_token(tools.format.section_start);
-    add_token(tools.format.section_end);
-    add_token(tools.format.per_call_start);
-    add_token(tools.format.per_call_end);
-    add_token(tools.function.name_prefix);
-    add_token(tools.function.name_suffix);
-    add_token(tools.function.args_separator);
-    add_token(tools.function.close);
-    add_token(tools.arguments.start);
-    add_token(tools.arguments.end);
-    add_token(tools.arguments.name_prefix);
-    add_token(tools.arguments.name_suffix);
-    add_token(tools.arguments.separator);
-    add_token(tools.arguments.value_prefix);
-    add_token(tools.arguments.value_suffix);
-    add_token(tools.call_id.prefix);
-    add_token(tools.call_id.suffix);
+    for (const auto & marker : tools.markers()) {
+        add_token(marker);
+    }
+}
+
+std::vector<std::string> analyze_tools::markers() const {
+    return {
+        format.section_start,  format.section_end,     format.per_call_start, format.per_call_end,
+        function.name_prefix,  function.name_suffix,   function.args_separator, function.close,
+        arguments.start,       arguments.end,          arguments.name_prefix, arguments.name_suffix,
+        arguments.separator,   arguments.value_prefix, arguments.value_suffix,
+        call_id.prefix,        call_id.suffix,
+    };
+}
+
+bool analyze_tools::is_coherent() const {
+    static const std::vector<std::string> probe_data = {
+        FUN_FIRST, FUN_SECOND, ARG_FIRST, ARG_SECOND, "XXXX", "YYYY", CALL_ID_001, CALL_ID_002, CALL_ID_999,
+    };
+    for (const auto & marker : markers()) {
+        for (const auto & probe : probe_data) {
+            if (marker.find(probe) != std::string::npos) {
+                return false;
+            }
+        }
+    }
+    return format.mode != tool_format::TAG_WITH_TAGGED || !arguments.value_suffix.empty();
 }
 
 std::string autoparser::detect_assistant_start_marker(const common_chat_template & tmpl) {

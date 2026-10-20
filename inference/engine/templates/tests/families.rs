@@ -12,6 +12,7 @@ const LFM25: &str = include_str!("assets/LFM2.5-2.6B.jinja");
 const LFM25_MOE: &str = include_str!("assets/LFM2.5-8B-A1B.jinja");
 const LFM25_SMALL_THINKING: &str = include_str!("assets/LFM2.5-1.2B-Thinking.jinja");
 const LFM25_SMALL_INSTRUCT: &str = include_str!("assets/LFM2.5-1.2B-Instruct.jinja");
+const LFM25_TBRILLIANCE: &str = include_str!("assets/LFM2.5-8B-A1B-Q3.8-TBrilliance.jinja");
 const LAGUNA: &str = include_str!("assets/Laguna-S-2.1.jinja");
 const MINICPM5: &str = include_str!("assets/MiniCPM5-2B.jinja");
 const MUSE: &str = include_str!("assets/Muse-Glimmer-30B.jinja");
@@ -137,6 +138,15 @@ fn families() -> Vec<Family> {
             enable_thinking: false,
             generation_prompt: "<|im_start|>assistant\n",
             output: "<think>The user wants weather.</think><|tool_call_start|>[get_weather(city='Paris', note='first line\\nsecond <line> & more')]<|tool_call_end|>",
+            reasoning: "The user wants weather.",
+        },
+        Family {
+            name: "lfm2.5-moe-tbrilliance",
+            source: LFM25_TBRILLIANCE,
+            special: special("<|startoftext|>", "<|im_end|>"),
+            enable_thinking: false,
+            generation_prompt: "<|im_start|>assistant\n<think>\n",
+            output: "The user wants weather.</think><|tool_call_start|>[get_weather(city='Paris', note='first line\\nsecond <line> & more')]<|tool_call_end|>",
             reasoning: "The user wants weather.",
         },
         Family {

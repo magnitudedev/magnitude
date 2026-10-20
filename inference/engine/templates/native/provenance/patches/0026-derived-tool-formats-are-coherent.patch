@@ -1,0 +1,131 @@
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -113,7 +113,8 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
+ 
+         auto parser = p.eps();
+ 
+-        bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
++        // Tools render into the prompt either way; without a tool format the reply reads as content.
++        bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty() && tools.format.mode != tool_format::NONE;
+         bool has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
+         bool pure_content        = reasoning.mode == reasoning_mode::NONE;
+ 
+--- a/common/chat-auto-parser.h
++++ b/common/chat-auto-parser.h
+@@ -314,6 +314,14 @@ struct analyze_tools : analyze_base {
+ 
+     common_peg_parser build_parser(parser_build_context & ctx) const override;
+ 
++    // Every marker the analysis derived
++    std::vector<std::string> markers() const;
++
++    // Whether the derived format can delimit a call: no marker holds probe names or values, and a
++    // tagged argument value has a closing marker. A format the analysis could not separate from the
++    // probe data (e.g. Python-style calls) is not a tool format.
++    bool is_coherent() const;
++
+   private:
+     // Extract tool calling 'haystack' for further analysis and delegate further analysis based on format
+     void analyze_tool_calls(const analyze_reasoning & reasoning, bool supports_parallel_tool_calls);
+--- a/common/chat-diff-analyzer.cpp
++++ b/common/chat-diff-analyzer.cpp
+@@ -267,6 +267,18 @@ void autoparser::analyze_template(const common_chat_template & tmpl) {
+         workaround(tmpl, *this);
+     }
+ 
++    if (tools.format.mode != tool_format::NONE && !tools.is_coherent()) {
++        LOG_DBG(ANSI_ORANGE "%s: Tool format could not be separated from the probe calls, tool calls are unsupported\n" ANSI_RESET, __func__);
++        const std::vector<std::string> kept = { reasoning.start, reasoning.end, content.start, content.end };
++        for (const auto & marker : tools.markers()) {
++            const auto token = trim_whitespace(marker);
++            if (std::find_if(kept.begin(), kept.end(), [&](const std::string & k) { return trim_whitespace(k) == token; }) == kept.end()) {
++                preserved_tokens.erase(std::remove(preserved_tokens.begin(), preserved_tokens.end(), token), preserved_tokens.end());
++            }
++        }
++        tools = analyze_tools();
++    }
++
+     LOG_DBG("\n--- Reasoning & Content Structure ---\n");
+     LOG_DBG("user_msg_start: %s\n", user_start.c_str());
+     LOG_DBG("assistant_msg_start: %s\n", assistant_start.c_str());
+@@ -325,23 +337,33 @@ void autoparser::collect_preserved_tokens() {
+     add_token(reasoning.end);
+     add_token(content.start);
+     add_token(content.end);
+-    add_token(tools.format.section_start);
+-    add_token(tools.format.section_end);
+-    add_token(tools.format.per_call_start);
+-    add_token(tools.format.per_call_end);
+-    add_token(tools.function.name_prefix);
+-    add_token(tools.function.name_suffix);
+-    add_token(tools.function.args_separator);
+-    add_token(tools.function.close);
+-    add_token(tools.arguments.start);
+-    add_token(tools.arguments.end);
+-    add_token(tools.arguments.name_prefix);
+-    add_token(tools.arguments.name_suffix);
+-    add_token(tools.arguments.separator);
+-    add_token(tools.arguments.value_prefix);
+-    add_token(tools.arguments.value_suffix);
+-    add_token(tools.call_id.prefix);
+-    add_token(tools.call_id.suffix);
++    for (const auto & marker : tools.markers()) {
++        add_token(marker);
++    }
++}
++
++std::vector<std::string> analyze_tools::markers() const {
++    return {
++        format.section_start,  format.section_end,     format.per_call_start, format.per_call_end,
++        function.name_prefix,  function.name_suffix,   function.args_separator, function.close,
++        arguments.start,       arguments.end,          arguments.name_prefix, arguments.name_suffix,
++        arguments.separator,   arguments.value_prefix, arguments.value_suffix,
++        call_id.prefix,        call_id.suffix,
++    };
++}
++
++bool analyze_tools::is_coherent() const {
++    static const std::vector<std::string> probe_data = {
++        FUN_FIRST, FUN_SECOND, ARG_FIRST, ARG_SECOND, "XXXX", "YYYY", CALL_ID_001, CALL_ID_002, CALL_ID_999,
++    };
++    for (const auto & marker : markers()) {
++        for (const auto & probe : probe_data) {
++            if (marker.find(probe) != std::string::npos) {
++                return false;
++            }
++        }
++    }
++    return format.mode != tool_format::TAG_WITH_TAGGED || !arguments.value_suffix.empty();
+ }
+ 
+ std::string autoparser::detect_assistant_start_marker(const common_chat_template & tmpl) {
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1022,8 +1022,11 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
+         return common_chat_params_init_lfm2(tmpl, params, /* tool_list_tokens = */ true);
+     }
+ 
+-    // LFM2.5 format detection: template uses plain "List of tools: [...]" with no special tokens
+-    if (src.find("List of tools: [") != std::string::npos &&
++    // LFM2.5 format detection: the template writes calls as <|tool_call_start|>[name(args)]<|tool_call_end|>,
++    // the markup the handler parses, and lists tools without tool-list tokens. How the tool list is spelled
++    // (a "List of tools: [" literal or "List of tools: " + tools | tojson) does not decide the format.
++    if (src.find("<|tool_call_start|>[") != std::string::npos &&
++        src.find("]<|tool_call_end|>") != std::string::npos &&
+         src.find("<|tool_list_start|>") == std::string::npos) {
+         LOG_DBG("Using specialized template: LFM2.5\n");
+         return common_chat_params_init_lfm2(tmpl, params, /* tool_list_tokens = */ false);
+--- a/common/peg-parser.cpp
++++ b/common/peg-parser.cpp
+@@ -1512,8 +1512,10 @@ static std::string gbnf_ac_grammar(
+ 
+     // An empty delimiter makes the start state terminal. Emit an entry rule
+     // that matches the empty string so the returned reference stays valid.
++    // The empty string is spelled as a literal: a bare trailing "|" continues
++    // the alternation onto the next line and swallows the following rule.
+     if (ac.is_terminal(0)) {
+-        builder.add_rule(prefix, "|");
++        builder.add_rule(prefix, "\"\"");
+     }
+ 
+     return state_name(0);

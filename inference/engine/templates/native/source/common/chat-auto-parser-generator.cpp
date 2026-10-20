@@ -113,7 +113,8 @@ common_peg_arena autoparser::build_parser(const generation_params & inputs, cons
 
         auto parser = p.eps();
 
-        bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+        // Tools render into the prompt either way; without a tool format the reply reads as content.
+        bool has_tools           = inputs.tools.is_array() && !inputs.tools.empty() && tools.format.mode != tool_format::NONE;
         bool has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
         bool pure_content        = reasoning.mode == reasoning_mode::NONE;
 

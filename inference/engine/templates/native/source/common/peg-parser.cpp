@@ -1512,8 +1512,10 @@ static std::string gbnf_ac_grammar(
 
     // An empty delimiter makes the start state terminal. Emit an entry rule
     // that matches the empty string so the returned reference stays valid.
+    // The empty string is spelled as a literal: a bare trailing "|" continues
+    // the alternation onto the next line and swallows the following rule.
     if (ac.is_terminal(0)) {
-        builder.add_rule(prefix, "|");
+        builder.add_rule(prefix, "\"\"");
     }
 
     return state_name(0);
