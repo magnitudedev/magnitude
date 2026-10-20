@@ -58,6 +58,13 @@ with no closing marker) is no tool format: tools render into the prompt, the rep
 and no tool grammar is built. A rule matching only the empty string is spelled `""`, since a bare
 trailing `|` continues the alternation onto the next rule.
 
+Patch 0027 makes a lenient (streaming) parse decide nothing at the end of its input, so the stream's
+published output is monotonic for every handler at once. A parser that reaches the end of the input
+before it can decide needs more input: `until` at a partial delimiter (upstream succeeded there, so
+the next parser read the delimiter's bytes, and Kimi K2 published `<|` in reasoning as content),
+`end`, and `space`, `chars` and repetitions that could continue. The text before the undecided point
+is still read; strict parses are unchanged.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.

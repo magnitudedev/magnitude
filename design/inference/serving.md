@@ -10,6 +10,7 @@ applies_to:
   - inference/engine/chat/src/output.rs
   - inference/engine/chat/src/stream.rs
   - inference/engine/templates/native/src/output-stream.cpp
+  - inference/engine/templates/native/source/common/peg-parser.cpp
   - inference/engine/chat/src/generation.rs
   - inference/engine/generation/src/controls.rs
 ---
@@ -87,8 +88,16 @@ prefix covers earlier tasks.
 
 Stream parsing emits semantic text, reasoning and complete validated tool calls
 in one ordered stream that non-streaming responses also assemble from. Published
-output is never reinterpreted: output that ends inside reasoning the model
-never closed ends that reasoning, never failing or becoming content. An empty
+output is never reinterpreted, by construction: a reading of the output so far
+decides nothing later output could decide otherwise, so text that may still
+belong to another construct (a partial or differently spelled marker, a token or
+whitespace that may continue, the end of output itself) is withheld until output
+resolves it, as a partial delimiter is. A construct still undecided publishes
+only what every admitted completion reads the same way: outside a grammar, text
+no continuation can reassign (reasoning once its opener is complete); under a
+grammar, a construct whose every admitted continuation completes it (a tool
+call). Output that ends inside reasoning the model never closed ends that
+reasoning, never failing or becoming content. An empty
 generation is an empty assistant turn in each protocol's native shape, and an
 empty assistant turn in history (that output replayed, or a client's record of
 a step that failed before any output) contributes nothing to the prompt. Each
@@ -138,6 +147,7 @@ response event.
 Qualification covers immutable input history, automatic/required/named/allowed/disabled
 tools, reasoning resolution and budgets, grammar and schema enforcement,
 output cut off inside a tool call in streaming and complete responses of every
-protocol, fragmented streams, backpressure, cancellation, replay closure of every emitted
+protocol, fragmented streams (each format's output, including text resembling its
+markers, fed one byte at a time), backpressure, cancellation, replay closure of every emitted
 output shape, and consistency of terminal timing and token counts between
 counting and generation.
