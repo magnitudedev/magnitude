@@ -23,12 +23,13 @@ is configuration of a model, never part of its `ModelId`.
 
 - the engine binds it to the target (`DrafterVerdict::Bound`, see
   [assessment](./assessment-and-ranking.md)); and
-- its lineage matches the target.
+- its lineage matches the target, declared or shown by the target's weights.
 
 ## Ownership
 
-ICN computes catalog targets' shape fingerprints from the release header bundle, enumerates drafter
-candidates for a target (a candidate or a model ID), assesses each candidate's binding, and orders
+ICN computes catalog targets' shape fingerprints from the release header bundle, reads their weight
+samples from it, samples a target's own weights, enumerates drafter candidates for a target (a
+candidate or a model ID), assesses each candidate's binding, and orders
 them for automatic choice, marking each candidate automatic choice may take (`automatic`); the
 recommended drafter of a custom model is the first automatic candidate in ICN's order. ACN keeps ICN's
 order, persists attached drafters as declarations, and exposes the choice. Clients present the list,
@@ -43,17 +44,20 @@ Signals in order of strength; any one is enough and later signals break ties:
 2. **Lineage:** the Hub's `baseModels`, following up to two hops (GGUF → finetune → base), when the
    repository is known; the GGUF's `general.base_model.N.*` for every file; and Ollama's model name
    when it was pulled as `hf.co/<owner>/<repository>:<quant>`.
-3. **Shape fingerprint:** the catalog target whose engine-computed `ModelFingerprint` equals the
+3. **Weight lineage:** the target's weights derive from those of a catalog target of its shape (below),
+   the least divergent when several qualify. It is lineage, and the one signal that tells a
+   same-weights copy without declared lineage (Ollama's blobs, a renamed or folder copy, an
+   abliteration whose header names no base) from another generation of the same shape.
+4. **Shape fingerprint:** the catalog target whose engine-computed `ModelFingerprint` equals the
    target's, else the catalog model the target is a variant of by shape (below). Requantizations,
    finetunes, and abliterations keep every fingerprinted dimension, and converters may rewrite a
    token table's unused entries (Ollama writes them as `[PAD<n>]`), so the token table only breaks
    ties. This covers files with no Hugging Face identity or metadata, but it is not lineage:
    successive generations of one architecture and size share every dimension and often the token
    table (Qwen3.6 27B and Qwen3.8 27B do), and a drafter trained on another generation's hidden
-   states binds yet slows decoding. A catalog drafter matched only by shape is therefore offered,
-   labelled "Untested · Trained for <model>", but never chosen automatically; the user may choose
-   it. Header-only evidence cannot tell a same-weights copy without lineage (Ollama's blobs) from
-   another generation, so making such a drafter automatic needs evidence beyond the header.
+   states binds yet slows decoding. A catalog drafter matched only by shape, without weight
+   lineage, is therefore offered, labelled "Untested · Trained for <model>", but never chosen
+   automatically; the user may choose it.
 
 A catalog model's upstream lineage is the Hub's `baseModels` of its target repository at the locked
 commit, read once and cached with that commit's snapshot, and those base models' own `baseModels`
@@ -62,12 +66,33 @@ commit, read once and cached with that commit's snapshot, and those base models'
 (`google/gemma-4-E2B-it`) community quantizations name instead. Lineage compares repositories,
 never model names. Every Hub lineage answer is persisted, so a model whose repository is known (an
 added model, a Hugging Face cache or LM Studio file, an Ollama `hf.co` pull) has its declared lineage
-from what is on this computer once it has been read, offline included. Catalog fingerprints come
-from the release header bundle.
+from what is on this computer once it has been read, offline included. Catalog fingerprints and weight samples
+come from the release header bundle, which carries each target's weight sample as a small input of
+its own (the variants of one model share it).
 
-The product side matches only on engine-supplied fingerprints and declared lineage; it never parses
-headers or file names. "Variant of" shown to users (a search result, an inspected candidate, a
-custom model) is a display hint decided by shape alone, by one rule: the exact catalog target is
+### Weight lineage
+
+A GGUF's weight sample is the first 64 values of each of its early normalization weights: the
+one-dimensional `output_norm` and `blk.0`/`blk.1` `*norm` weights stored as F32, F16 or BF16, which
+converters keep unquantized, leaving out constant ones. Two samples are compared by the median, over
+the tensors they share (at least three), of one minus the tensors' correlation, which a rescale
+doesn't change; a divergence of at most 2.5e-4 is weight lineage. Measured on real files: every
+requantization, Ollama blob and abliteration of a catalog target carries its values bit for bit
+(divergence 0); full fine-tunes and quantization-aware training diverge at most 1.2e-4; successive
+generations of one shape, continued pretraining included, diverge at least 4.7e-4 (Qwen3.5 to Qwen3.6
+35B-A3B), 3e-3 to 1.3e-2 for Qwen3.5, 3.6 and 3.8 27B, and 3.5e-2 for LFM2 to LFM2.5 2.6B. The limit
+sits between the two groups on a log scale.
+
+A target is sampled only when a catalog target of its shape carries a sample: from the file holding
+its own bytes, once per content sample, or, for a Hub file not on this computer, by one exact range
+request per sampled tensor after its header, through the Hub's rate-limit handling and cached with
+the commit. A file whose tensor data isn't here (a header extended with zeros) has no sample, and a
+target with no sample has no weight lineage. The release bundle's samples are read the same way from
+each catalog target at its locked commit when the bundle is built.
+
+The product side matches only on engine-supplied fingerprints, the weight samples above and
+declared lineage; it never matches on file names. "Variant of" shown to users (a search result, an
+inspected candidate, a custom model) is a display hint decided by shape alone, by one rule: the exact catalog target is
 its catalog model, and anything else is a variant of the first catalog model, in catalog order,
 whose fingerprint has its shape (every fingerprinted dimension but the token table). Declared
 lineage never decides it. Models of one architecture and size can share every dimension and the
@@ -108,7 +133,8 @@ built-in MTP heads. The first candidate that binds, in this order, is preselecte
 
 1. a separate drafter in the model's own repository or folder, any method, by method order, because it was
    built for those exact weights;
-2. the catalog drafter, whatever its method, when the target matched it by exact target or lineage;
+2. the catalog drafter, whatever its method, when the target matched it by exact target, declared
+   lineage or weight lineage;
 3. built-in MTP heads;
 4. no drafter.
 
@@ -180,8 +206,9 @@ doesn't fit this computer at all.
   never pending. What is on this computer decides first and never
   waits for the Hub: a model with no Hub-reaching answer gets one from its own files, the release
   catalog and Hub answers already cached (its shape's "Variant of", drafters in its folder, its
-  built-in heads, the catalog drafter it matches by shape or by lineage its header or its
-  repository's cached Hub answers declare, automatic on that lineage as on the Hub's), which the list
+  built-in heads, the catalog drafter it matches by shape, by lineage its header or its
+  repository's cached Hub answers declare, or by its own file's weights, automatic on that lineage
+  as on the Hub's), which the list
   shows and a load uses at once, while the Hub's part (snapshots, lineage not yet read, drafter
   headers) is worked out alongside and then replaces it; a local answer never replaces a Hub one,
   and drafter pruning waits for the Hub's. A found or imported model with
@@ -225,6 +252,9 @@ doesn't fit this computer at all.
 - Candidate order and tie-breaks are deterministic for equal inputs.
 - Catalog models never expose a drafter change; every custom model does.
 - Lineage never overrides a `Rejected` verdict.
+- A catalog drafter matched by shape is automatic only with declared or weight lineage: another
+  generation of the same shape (Qwen3.6 27B for Qwen3.8 27B) never gets it automatically, and a
+  same-weights copy without declared lineage (Ollama's `qwen3.6:35b-a3b`) does.
 - A drafter choice the engine doesn't bind is refused with its reasons as data
   (`DrafterNotUsable`), never with the engine's detail; clients word the reasons.
 - A custom model's projection carries its persisted drafter choice, so a drafter the user turned off

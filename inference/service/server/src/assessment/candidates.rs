@@ -45,7 +45,8 @@ use magnitude_service_models::lineage::{
 use magnitude_service_models::{
     CachedModelAssessment, CatalogDrafterFit, CatalogFingerprints, ModelShape, CustomModelEnrichment, CustomModelEnrichmentResult,
     CustomModelFacts, DrafterContent, ManagedModelStore, ModelDomainResolver,
-    ServableModelBundleKey, refresh_hugging_face_repository,
+    ServableModelBundleKey, WeightSample, refresh_hugging_face_repository,
+    servable_model_bundle_key_for_bundle,
 };
 use sha2::{Digest, Sha256};
 
@@ -132,6 +133,17 @@ struct DrafterTarget {
     lineage: BTreeSet<String>,
     catalog: Option<ModelId>,
     reach: Reach,
+    weights: Option<WeightSource>,
+}
+
+/// Where a target's own weights are read for its weight sample: a file holding its bytes, or its
+/// file in a Hub repository at a commit.
+enum WeightSource {
+    File(PathBuf),
+    Hub {
+        snapshot: HuggingFaceRepositorySnapshot,
+        path: PathBuf,
+    },
 }
 
 /// The folder whose own files are offered as drafters "in this folder". A model from a known Hub
@@ -170,10 +182,12 @@ struct ClassifiedGroup {
     unreadable: Option<String>,
 }
 
-/// What the release headers say about each catalog model, for matching models without lineage.
+/// What the release bundle says about each catalog model, for matching models without declared
+/// lineage: its target's shape fingerprint and weight sample.
 #[derive(Default)]
 struct CatalogFacts {
     fingerprints: Vec<(ModelId, ModelFingerprint)>,
+    weight_samples: BTreeMap<ModelId, WeightSample>,
 }
 
 /// What an enrichment reads: only what is on this computer (the files here, the release catalog,
@@ -339,6 +353,7 @@ pub struct ManagedModelCandidates {
     gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
     enrichment: Arc<CandidateEnrichment>,
     resolver: std::sync::OnceLock<Arc<ModelDomainResolver>>,
+    weight_samples: std::sync::RwLock<BTreeMap<String, Option<WeightSample>>>,
 }
 
 /// The engine's recognized architectures, which search and file classification use.
@@ -366,6 +381,7 @@ impl ManagedModelCandidates {
             gates: tokio::sync::Mutex::new(BTreeMap::new()),
             enrichment: Arc::new(CandidateEnrichment::default()),
             resolver: std::sync::OnceLock::new(),
+            weight_samples: std::sync::RwLock::new(BTreeMap::new()),
         })
     }
 
@@ -409,14 +425,8 @@ impl ManagedModelCandidates {
         let plain = self
             .assess(&target.material, None, ModelMethod::Auto)
             .await?;
-        let exact = match (&target.repository, &target.primary) {
-            (Some((repository, commit)), Some(primary)) => {
-                Some((repository.as_str(), commit.as_str(), primary.as_path()))
-            }
-            _ => None,
-        };
         let matches = self
-            .catalog_matches(exact, &target.lineage, plain.fingerprint.as_ref(), reach)
+            .catalog_matches(&target, plain.fingerprint.as_ref())
             .await;
         let variant_of = match matches
             .first()
@@ -1568,7 +1578,7 @@ impl ManagedModelCandidates {
     // Catalog matching ----------------------------------------------------------------------
 
     /// Each catalog model's shape fingerprint, computed once and concurrently from the release
-    /// header bundle.
+    /// header bundle, and its target's weight sample from the same bundle.
     async fn catalog_facts(&self) -> &CatalogFacts {
         self.catalog_facts
             .get_or_init(|| async {
@@ -1602,6 +1612,16 @@ impl ManagedModelCandidates {
                         catalog.fingerprints.push((model_id, fingerprint));
                     }
                 }
+                let release = self.assessor.release_catalog();
+                catalog.weight_samples = self
+                    .lineage
+                    .representatives()
+                    .filter_map(|candidate| {
+                        let bundle =
+                            servable_model_bundle_key_for_bundle(&candidate.model.configuration.bundle);
+                        Some((candidate.model_id, release.target_weight_sample(&bundle)?.clone()))
+                    })
+                    .collect();
                 catalog
             })
             .await
@@ -1642,25 +1662,29 @@ impl ManagedModelCandidates {
     /// fallback when the lineage match's is rejected. Locally, catalog upstreams match as far as
     /// the Hub's answers are on this computer.
     ///
-    /// The fingerprint match is the catalog model whose fingerprint equals the target's, else the
-    /// one the target is a variant of by shape (see `ModelShape::variant_of`), so every model shown
-    /// as a variant of a catalog model is offered that model's drafter even when its converter
-    /// wrote another token table (Ollama writes unused entries as `[PAD<n>]`). The engine's verdict
-    /// decides whether it binds, and a drafter matched this way is never automatic (see
-    /// `known_to_work`).
+    /// The fingerprint match is the catalog model of the target's shape whose target weights the
+    /// target's weights derive from (see `weight_match`), which is lineage; else the catalog
+    /// model whose fingerprint equals the target's, else the one the target is a variant of by
+    /// shape (see `ModelShape::variant_of`), so every model shown as a variant of a catalog model
+    /// is offered that model's drafter even when its converter wrote another token table (Ollama
+    /// writes unused entries as `[PAD<n>]`). The engine's verdict decides whether it binds, and a
+    /// drafter matched by shape alone is never automatic (see `known_to_work`).
     async fn catalog_matches(
         &self,
-        exact: Option<(&str, &str, &Path)>,
-        lineage: &BTreeSet<String>,
+        target: &DrafterTarget,
         fingerprint: Option<&ModelFingerprint>,
-        reach: Reach,
     ) -> Vec<(CatalogLineageMatch, DrafterLineage)> {
-        if let Some((repository, commit, primary)) = exact
+        if let (Some((repository, commit)), Some(primary)) = (&target.repository, &target.primary)
             && let Some(matched) = self.lineage.exact_target(repository, commit, primary)
         {
             return vec![(matched, DrafterLineage::Exact)];
         }
+        let weighed = match fingerprint {
+            Some(fingerprint) => self.weight_match(target, fingerprint).await,
+            None => None,
+        };
         let fingerprinted = match fingerprint {
+            Some(_) if weighed.is_some() => weighed.clone(),
             Some(fingerprint) => {
                 let catalog = &self.catalog_facts().await.fingerprints;
                 catalog
@@ -1671,10 +1695,18 @@ impl ManagedModelCandidates {
             }
             None => None,
         };
-        let mut lineage_matches = match reach {
-            Reach::Local => self.lineage.match_known_lineages(lineage),
-            Reach::Hub => self.lineage.match_lineages(lineage).await,
+        let mut lineage_matches = match target.reach {
+            Reach::Local => self.lineage.match_known_lineages(&target.lineage),
+            Reach::Hub => self.lineage.match_lineages(&target.lineage).await,
         };
+        if let Some(weighed) = &weighed
+            && !lineage_matches
+                .iter()
+                .any(|matched| matched.model_id == *weighed)
+            && let Some(matched) = self.lineage.variant(weighed)
+        {
+            lineage_matches.push(matched);
+        }
         if let Some(fingerprinted) = &fingerprinted {
             lineage_matches.sort_by_key(|matched| matched.model_id != *fingerprinted);
         }
@@ -1692,6 +1724,76 @@ impl ManagedModelCandidates {
             matches.push((matched, DrafterLineage::Fingerprint));
         }
         matches
+    }
+
+    /// The catalog model of `fingerprint`'s shape whose target weights the target's weights
+    /// derive from, the least divergent when several do: the same weights requantized, or
+    /// fine-tuned, abliterated or quantization-aware trained from them, never another generation
+    /// of the shape (see `WeightSample`). The target's weights are sampled only when a catalog
+    /// model of its shape carries a sample.
+    async fn weight_match(
+        &self,
+        target: &DrafterTarget,
+        fingerprint: &ModelFingerprint,
+    ) -> Option<ModelId> {
+        let facts = self.catalog_facts().await;
+        let shape = ModelShape::of(fingerprint);
+        let references = facts
+            .fingerprints
+            .iter()
+            .filter(|(_, catalog)| shape.matches(catalog))
+            .filter_map(|(model_id, _)| Some((model_id, facts.weight_samples.get(model_id)?)))
+            .collect::<Vec<_>>();
+        if references.is_empty() {
+            return None;
+        }
+        let sample = self.target_weight_sample(target).await?;
+        references
+            .into_iter()
+            .filter(|(_, reference)| sample.shares_lineage_with(reference))
+            .filter_map(|(model_id, reference)| Some((sample.divergence(reference)?, model_id)))
+            .min_by(|(left, _), (right, _)| left.total_cmp(right))
+            .map(|(_, model_id)| model_id.clone())
+    }
+
+    /// The weight sample of the target's own weights: read from its file once per content (see
+    /// the content sample), or from its Hub file by range requests, cached with the commit.
+    async fn target_weight_sample(&self, target: &DrafterTarget) -> Option<WeightSample> {
+        match target.weights.as_ref()? {
+            WeightSource::File(path) => {
+                let content = self
+                    .models()
+                    .local_gguf(path)
+                    .ok()?
+                    .inspection
+                    .content_sample?;
+                if let Some(known) = self
+                    .weight_samples
+                    .read()
+                    .ok()
+                    .and_then(|samples| samples.get(&content).cloned())
+                {
+                    return known;
+                }
+                let models = Arc::clone(self.models());
+                let path = path.clone();
+                let sample = crate::spawn_blocking_traced(move || models.local_weight_sample(&path))
+                    .await
+                    .ok()?
+                    .map_err(|error| tracing::warn!(%error, "weight sample unavailable"))
+                    .ok()?;
+                if let Ok(mut samples) = self.weight_samples.write() {
+                    samples.insert(content, sample.clone());
+                }
+                sample
+            }
+            WeightSource::Hub { snapshot, path } => self
+                .models()
+                .hub_weight_sample(snapshot, path)
+                .await
+                .map_err(|error| tracing::warn!(%error, "Hub weight sample unavailable"))
+                .ok()?,
+        }
     }
 
     // Drafter targets ------------------------------------------------------------------------
@@ -1722,6 +1824,10 @@ impl ManagedModelCandidates {
                 Ok(DrafterTarget {
                     material,
                     repository: Some((snapshot.repository.clone(), snapshot.commit.clone())),
+                    weights: Some(WeightSource::Hub {
+                        snapshot: snapshot.clone(),
+                        path: primary.clone(),
+                    }),
                     primary: Some(primary),
                     folders: Vec::new(),
                     snapshot: Some(snapshot),
@@ -1745,6 +1851,7 @@ impl ManagedModelCandidates {
                     .into_iter()
                     .collect();
                 Ok(DrafterTarget {
+                    weights: Some(WeightSource::File(material.target.clone())),
                     material,
                     repository: None,
                     primary: None,
@@ -1784,6 +1891,7 @@ impl ManagedModelCandidates {
                 lineage: BTreeSet::new(),
                 catalog: Some(model_id.clone()),
                 reach,
+                weights: None,
             });
         }
         let model = self
@@ -1901,6 +2009,19 @@ impl ManagedModelCandidates {
                 folders.push(folder);
             }
         }
+        // Its own bytes where they are found, else its Hub file when its repository is known.
+        let weights = match (
+            locations.iter().find(|location| location.is_file()),
+            &snapshot,
+            &primary,
+        ) {
+            (Some(location), _, _) => Some(WeightSource::File(location.clone())),
+            (None, Some(snapshot), Some(primary)) => Some(WeightSource::Hub {
+                snapshot: snapshot.clone(),
+                path: primary.clone(),
+            }),
+            _ => None,
+        };
         Ok(DrafterTarget {
             material,
             repository,
@@ -1910,6 +2031,7 @@ impl ManagedModelCandidates {
             lineage,
             catalog: None,
             reach,
+            weights,
         })
     }
 
@@ -1967,12 +2089,6 @@ impl ManagedModelCandidates {
             .await;
         progress.drafter_checked();
         let own = own?;
-        let exact = match (&target.repository, &target.primary) {
-            (Some((repository, commit)), Some(primary)) => {
-                Some((repository.as_str(), commit.as_str(), primary.as_path()))
-            }
-            _ => None,
-        };
         let matches = match &target.catalog {
             Some(model_id) => self
                 .lineage
@@ -1980,15 +2096,7 @@ impl ManagedModelCandidates {
                 .map(|matched| (matched, DrafterLineage::Exact))
                 .into_iter()
                 .collect(),
-            None => {
-                self.catalog_matches(
-                    exact,
-                    &target.lineage,
-                    own.fingerprint.as_ref(),
-                    target.reach,
-                )
-                .await
-            }
+            None => self.catalog_matches(target, own.fingerprint.as_ref()).await,
         };
         let matched = matches.first().cloned();
         let decide = |mut candidate: DrafterCandidate| {

@@ -28,7 +28,7 @@ use magnitude_service_contracts::{
 use magnitude_service_models::lineage::CatalogLineage;
 use magnitude_service_models::{
     CatalogDrafterFit, InventoryConfig, ManagedModelStore, ModelDomainResolver, ReleaseCatalog,
-    refresh_hugging_face_repository,
+    WeightSample, refresh_hugging_face_repository, servable_model_bundle_key_for_bundle,
 };
 use sha2::{Digest, Sha256};
 
@@ -1208,10 +1208,15 @@ async fn fixture_from(
     }
     let lineage = CatalogLineage::new(Arc::clone(&models), catalog.clone());
     let resolver = ModelDomainResolver::new(Arc::clone(&models), catalog.clone());
+    let weight_samples = qwen_generation_weight_samples(&catalog);
     let assessor = Arc::new(ModelAssessor::new(
         Arc::clone(&models),
         resolver,
-        Arc::new(ReleaseCatalog::without_material(catalog).expect("release catalog")),
+        Arc::new(
+            ReleaseCatalog::without_material(catalog)
+                .expect("release catalog")
+                .with_target_weight_samples(weight_samples),
+        ),
         environment,
     ));
     let candidates = ManagedModelCandidates::new(
@@ -1229,6 +1234,34 @@ async fn fixture_from(
         candidates,
         catalog_id,
     }
+}
+
+/// A real file's weight sample, from the assessment fixtures.
+fn weight_sample(name: &str) -> WeightSample {
+    let path = fixtures_root().join(format!("weight-samples/{name}.json"));
+    WeightSample::decode(&std::fs::read(path).expect("weight sample fixture"))
+        .expect("weight sample")
+}
+
+/// The weight samples the release bundle carries for the real Qwen catalog targets listed.
+fn qwen_generation_weight_samples(
+    catalog: &magnitude_service_contracts::models::RecommendableModelCatalog,
+) -> BTreeMap<magnitude_service_models::ServableModelBundleKey, WeightSample> {
+    catalog
+        .models
+        .iter()
+        .filter_map(|model| {
+            let name = match model.model_id.as_str() {
+                "qwen3.6-35b-a3b" => "Qwen3.6-35B-A3B-UD-Q4_K_XL",
+                "qwen3.8-27b" => "Qwen3.8-27B-UD-Q4_K_XL",
+                _ => return None,
+            };
+            Some((
+                servable_model_bundle_key_for_bundle(&model.configuration.bundle),
+                weight_sample(name),
+            ))
+        })
+        .collect()
 }
 
 /// A model store with nothing in it, for what reads local files through its caches.
@@ -2920,6 +2953,7 @@ async fn a_flat_llama_cpp_root_offers_only_the_models_own_repository_drafters() 
         lineage: Default::default(),
         catalog: None,
         reach: super::Reach::Hub,
+        weights: None,
     };
     let offered = fixture
         .candidates
@@ -4484,6 +4518,15 @@ async fn qwen38_catalog_model(models: &Arc<ManagedModelStore>) -> RecommendableM
 /// A fixture serving the Qwen repositories and listing their catalog models, and a folder holding
 /// only the shared fixture header `name`.
 async fn found_qwen(name: &str) -> (Fixture, tempfile::TempDir) {
+    found_qwen_with_weights(name, None).await
+}
+
+/// `found_qwen`, with the file's tensor data holding `weights`, a real file's weight sample, where
+/// its header locates the sampled tensors.
+async fn found_qwen_with_weights(
+    name: &str,
+    weights: Option<&str>,
+) -> (Fixture, tempfile::TempDir) {
     let fixture = fixture_from(
         Vec::new(),
         LocalModelsConfiguration::default(),
@@ -4497,8 +4540,35 @@ async fn found_qwen(name: &str) -> (Fixture, tempfile::TempDir) {
     let StubFile {
         header, size_bytes, ..
     } = fixture_file(&format!("headers/{name}.gz"), name);
-    write_complete_bytes(&folder.path().join(name), &header, size_bytes);
+    let contents = match weights {
+        Some(weights) => with_weights(&header, weights),
+        None => header,
+    };
+    write_complete_bytes(&folder.path().join(name), &contents, size_bytes);
     (fixture, folder)
+}
+
+/// A file's leading bytes: `header`, then zeros but where it locates the tensors a weight sample
+/// reads, which hold `weights`, a real file's weight sample.
+fn with_weights(header: &[u8], weights: &str) -> Vec<u8> {
+    let directory = magnitude_artifacts::gguf::read_header(header).expect("GGUF header");
+    let reads = WeightSample::reads(&directory);
+    let mut bytes = header.to_vec();
+    for (tensor, values) in weight_sample(weights).tensors() {
+        let read = reads
+            .iter()
+            .find(|read| read.tensor == tensor)
+            .expect("a sampled F32 tensor");
+        let start = usize::try_from(read.start).unwrap();
+        let end = start + values.len() * 4;
+        if bytes.len() < end {
+            bytes.resize(end, 0);
+        }
+        for (index, value) in values.iter().enumerate() {
+            bytes[start + index * 4..start + index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    bytes
 }
 
 /// The variant a found file is shown as, and its drafter candidates.
@@ -4581,12 +4651,123 @@ async fn a_variant_without_lineage_is_offered_its_catalog_drafter_as_untested() 
     assert!(!candidates[0].automatic, "{candidates:#?}");
 }
 
+/// The same Ollama blob holding its real weights: its early normalization weights are the catalog
+/// Qwen3.6 35B-A3B target's bit for bit, which is lineage the header can't state, so the catalog
+/// DFlash drafter is known to work and chosen automatically, ahead of the built-in heads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_variant_carrying_its_catalog_models_weights_gets_its_catalog_drafter_automatically() {
+    let (fixture, blobs) =
+        found_qwen_with_weights(OLLAMA_QWEN36_FILE, Some("ollama-qwen3.6-35b-a3b")).await;
+    let (variant_of, candidates) =
+        found_variant_and_drafters(&fixture, blobs.path(), OLLAMA_QWEN36_FILE).await;
+    assert_eq!(variant_of, Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()));
+    let catalog = &candidates[0];
+    assert_eq!(
+        (
+            catalog.category,
+            catalog.lineage,
+            catalog.label.as_str(),
+            is_bound(&catalog.verdict)
+        ),
+        (
+            DrafterCategory::CatalogDrafter,
+            DrafterLineage::Lineage,
+            "Trained for Qwen3.6 35B-A3B",
+            true
+        ),
+        "{candidates:#?}"
+    );
+    assert_eq!(
+        preselected(&candidates).reference,
+        DrafterReference::Catalog {
+            model_id: "qwen3.6-35b-a3b:gguf:q4".parse().unwrap()
+        },
+        "{candidates:#?}"
+    );
+}
+
+/// A Hub file without declared lineage is sampled by range requests: the Ollama blob's weights
+/// re-uploaded get the catalog Qwen3.6 35B-A3B DFlash automatically as lineage, and Qwen3.6 27B,
+/// whose weights are not Qwen3.8 27B's, is only offered its DFlash2 as untested.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hub_files_weights_are_sampled_for_its_catalog_drafter() {
+    let weighted = |name: &str, weights: &str| {
+        let file = fixture_file(&format!("headers/{name}.gz"), name);
+        StubFile {
+            header: with_weights(&file.header, weights),
+            ..file
+        }
+    };
+    let fixture = fixture_from(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::from([
+            (
+                "someone/Qwen3.6-35B-A3B-GGUF".to_owned(),
+                repository(
+                    'c',
+                    vec![weighted(OLLAMA_QWEN36_FILE, "ollama-qwen3.6-35b-a3b")],
+                    &[],
+                ),
+            ),
+            (
+                "someone/Qwen3.6-27B-GGUF".to_owned(),
+                repository(
+                    'd',
+                    vec![weighted(QWEN36_27B_FILE, "Qwen3.6-27B-Q4_K_M")],
+                    &[],
+                ),
+            ),
+        ]),
+        true,
+        cpu_environment(),
+    )
+    .await;
+    let catalog_drafter = |candidates: &[magnitude_service_contracts::models::DrafterCandidate]| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.category == DrafterCategory::CatalogDrafter)
+            .map(|candidate| (candidate.lineage, candidate.automatic, candidate.label.clone()))
+    };
+    let same_weights = drafters_of(
+        &fixture,
+        hugging_face_candidate("someone/Qwen3.6-35B-A3B-GGUF", 'c', OLLAMA_QWEN36_FILE),
+    )
+    .await;
+    assert_eq!(
+        catalog_drafter(&same_weights),
+        Some((
+            DrafterLineage::Lineage,
+            true,
+            "Trained for Qwen3.6 35B-A3B".to_owned()
+        )),
+        "{same_weights:#?}"
+    );
+    let other_generation = drafters_of(
+        &fixture,
+        hugging_face_candidate("someone/Qwen3.6-27B-GGUF", 'd', QWEN36_27B_FILE),
+    )
+    .await;
+    assert_eq!(
+        catalog_drafter(&other_generation),
+        Some((
+            DrafterLineage::Fingerprint,
+            false,
+            "Untested · Trained for Qwen3.8 27B".to_owned()
+        )),
+        "{other_generation:#?}"
+    );
+}
+
 /// Qwen3.6 27B has every fingerprinted dimension and the token table of Qwen3.8 27B, so it is shown
 /// as its variant, and Qwen3.8 27B's DFlash2 binds to it; but that drafter was trained on another
-/// generation's hidden states and slows it down, so a shape match never makes it automatic.
+/// generation's hidden states and slows it down, so a shape match never makes it automatic. Its
+/// real weights, read from the file, are not Qwen3.8 27B's either.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catalog_drafter_matched_by_shape_alone_is_never_automatic() {
-    let (fixture, folder) = found_qwen(QWEN36_27B_FILE).await;
+    let (fixture, folder) =
+        found_qwen_with_weights(QWEN36_27B_FILE, Some("Qwen3.6-27B-Q4_K_M")).await;
     let (variant_of, candidates) =
         found_variant_and_drafters(&fixture, folder.path(), QWEN36_27B_FILE).await;
     assert_eq!(variant_of, Some("qwen3.8-27b:gguf:q4".parse().unwrap()));
