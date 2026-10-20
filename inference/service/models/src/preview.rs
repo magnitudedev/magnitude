@@ -130,6 +130,11 @@ impl HuggingFaceDiscovery {
             let Some(mut result) = model.into_contract() else {
                 continue;
             };
+            // The Hub describes a repository by one GGUF it picks, sometimes its projector: a
+            // projector's architecture is never the model's.
+            result.architecture = result
+                .architecture
+                .filter(|architecture| architecture != magnitude_artifacts::gguf::PROJECTOR_ARCHITECTURE);
             if catalog_repositories.contains(&result.repository.to_lowercase())
                 || self
                     .architectures
@@ -179,17 +184,17 @@ impl HuggingFaceDiscovery {
     /// fingerprint it has. Names and declared lineage never decide. A repository whose headers were read and hold no model file
     /// (no architecture, a projector's or a drafter's, or a layer-split piece) is unreadable,
     /// whatever the Hub's repository-level architecture says; a read that failed or timed out
-    /// (a gated repository's refused files among them) leaves the result as the Hub describes it.
+    /// (a gated repository's refused files among them) leaves the result as the Hub describes it,
+    /// without a projector's architecture, which never stands in for the model.
     /// `false` for a repository whose files read are all drafters' (a separate drafter
     /// architecture, one the engine doesn't run tagged for speculative decoding, or a prediction
     /// head alone, as an MTP block): drafters are offered only in drafter lists, never as results.
+    /// `false` too for one whose only GGUFs are projectors: it holds no GGUF model.
     async fn read_model_file(
         &self,
         result: &mut HuggingFaceModelSearchResult,
         catalog: &[(ModelId, ModelFingerprint)],
     ) -> bool {
-        let hub_projector = result.architecture.as_deref()
-            == Some(magnitude_artifacts::gguf::PROJECTOR_ARCHITECTURE);
         match crate::search_shape::repository_model(
             &self.models,
             &self.architectures,
@@ -219,14 +224,7 @@ impl HuggingFaceDiscovery {
                     KnownUnsupportedReason::Unreadable,
                 )];
             }
-            None if hub_projector => {
-                result.unsupported = vec![UnsupportedReason::Known(
-                    KnownUnsupportedReason::Architecture {
-                        architecture: magnitude_artifacts::gguf::PROJECTOR_ARCHITECTURE.to_owned(),
-                    },
-                )];
-            }
-            Some(RepositoryModel::Drafter) => return false,
+            Some(RepositoryModel::Drafter | RepositoryModel::Projector) => return false,
             None => {}
         }
         true
@@ -3790,30 +3788,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "someone/Llama-MTP-GGUF",
+                "vision/Llama-Vision-GGUF",
                 "community/Llama-Finetune-GGUF",
                 "anonymous/Llama-Uncensored-GGUF",
                 "unsloth/DeepSeek-V4-GGUF",
-                "vision/Llama-Vision-GGUF",
             ],
             "a repository whose name says MTP is a model result: names never decide; drafter \
              repositories are never model results"
         );
         assert!(
-            results.results[..3]
+            results.results[..4]
                 .iter()
                 .all(|result| result.unsupported.is_empty() && result.variant_of.is_none()),
             "declared lineage never makes a result a variant"
         );
         assert_eq!(
-            results.results[4].unsupported,
-            [UnsupportedReason::Known(KnownUnsupportedReason::Architecture {
-                architecture: "clip".to_owned()
-            })],
-            "a repository the Hub describes by a projector, whose model file can't be read, is \
-             shown as the Hub describes it: not runnable"
+            results.results[1].architecture, None,
+            "a repository the Hub describes by its projector, whose model file can't be read, is \
+             shown without an architecture or a verdict: a projector never stands in for the model"
         );
         assert_eq!(
-            results.results[3].unsupported,
+            results.results[4].unsupported,
             [UnsupportedReason::Known(
                 KnownUnsupportedReason::Architecture {
                     architecture: "deepseek4".to_owned()
@@ -4458,6 +4453,47 @@ mod tests {
              drafter repository, offered only in drafter lists"
         );
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_projector_never_stands_in_for_the_model() {
+        let llama = || {
+            crate::test_gguf::gguf_bytes(
+                &[("general.architecture", crate::test_gguf::Meta::Str("llama"))],
+                &["token_embd.weight"],
+            )
+        };
+        let (endpoint, requests, _) = serve_repositories(vec![
+            // The Hub took its architecture from the projector, and the model file's read fails.
+            StubRepository::new("Jackrong/Qwopus3.6-35B-A3B-Coder-MTP-GGUF", Some("clip"))
+                .file("Qwopus3.6-35B-A3B-Coder-Q4_K_M.gguf", 21_000_000_000, None)
+                .file("mmproj-F32.gguf", 1_800_000_000, Some(architecture_only("clip"))),
+            StubRepository::new("someone/Llama-Vision-GGUF", Some("clip"))
+                .file("Llama-Q4_K_M.gguf", 5_000_000_000, Some(llama()))
+                .file("mmproj-F16.gguf", 900_000_000, Some(architecture_only("clip"))),
+            // Safetensors and one projector GGUF: no GGUF model at all.
+            StubRepository::new("huihui-ai/Huihui-Qwen3.5-4B-abliterated", Some("clip"))
+                .file("mmproj-model-f16.gguf", 670_000_000, Some(architecture_only("clip"))),
+        ]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let results = search_all(&shape_discovery(&store, &["llama"], Vec::new())).await;
+        let qwopus = &results["Jackrong/Qwopus3.6-35B-A3B-Coder-MTP-GGUF"];
+        assert_eq!(
+            (qwopus.architecture.as_deref(), qwopus.unsupported.as_slice(), &qwopus.variant_of),
+            (None, &[][..], &None),
+            "an unread model file leaves the row without an architecture, a variant or a verdict"
+        );
+        let vision = &results["someone/Llama-Vision-GGUF"];
+        assert_eq!(vision.architecture.as_deref(), Some("llama"));
+        assert!(vision.unsupported.is_empty(), "the model file's header decides");
+        assert!(
+            !results.contains_key("huihui-ai/Huihui-Qwen3.5-4B-abliterated"),
+            "a repository whose only GGUF is a projector holds no GGUF model"
+        );
+        assert!(
+            requests.load(std::sync::atomic::Ordering::SeqCst) == 3,
+            "one header read per repository: the first file read decides, or fails"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

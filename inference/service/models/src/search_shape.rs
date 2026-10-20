@@ -37,7 +37,7 @@ pub const MAX_MODEL_FILE_READS: usize = 3;
 /// without what it would tell.
 const MODEL_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// Versions the cached outcome: a change to how the model file is found drops older entries.
-const CACHE_VERSION: &str = "model-file.v4";
+const CACHE_VERSION: &str = "model-file.v5";
 const TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 
 /// Each catalog model's shape fingerprint, as its first variant's model ID, in catalog order.
@@ -58,8 +58,9 @@ pub struct ModelShape {
 }
 
 /// What a repository's commit holds for search: the model file's architecture and shape (absent
-/// when its header doesn't state one), headers read that hold no model file, or headers read that
-/// are all drafters' (a drafter repository, never a model result).
+/// when its header doesn't state one), headers read that hold no model file, headers read that
+/// are all drafters' (a drafter repository, never a model result), or headers read that are all
+/// projectors' (no GGUF model at all, never a result).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RepositoryModel {
     Model {
@@ -68,6 +69,7 @@ pub(crate) enum RepositoryModel {
     },
     Unreadable,
     Drafter,
+    Projector,
 }
 
 /// The header metadata in a GGUF prefix: its complete entries, as a header of their own without
@@ -233,6 +235,7 @@ fn unsigned(value: &Scalar) -> Option<u64> {
 enum FileKind {
     Model,
     Drafter,
+    Projector,
     Other,
 }
 
@@ -344,19 +347,26 @@ async fn read_repository_model(
         Ok(snapshot) => snapshot,
         Err(error) => return Err(error),
     };
-    let files = snapshot
-        .gguf_files
-        .iter()
-        .filter(|file| !crate::catalog::is_projector_path(&file.path))
-        .map(|file| CandidateGguf {
-            path: file.path.clone(),
-            size_bytes: file.size_bytes,
-        })
-        .collect::<Vec<_>>();
-    let mut groups = group_ggufs(&files);
+    let files = |projectors: bool| {
+        snapshot
+            .gguf_files
+            .iter()
+            .filter(|file| projectors || !crate::catalog::is_projector_path(&file.path))
+            .map(|file| CandidateGguf {
+                path: file.path.clone(),
+                size_bytes: file.size_bytes,
+            })
+            .collect::<Vec<_>>()
+    };
+    // `mmproj` names only order the reads: when every GGUF is so named, their headers decide.
+    let mut groups = group_ggufs(&files(false));
+    if groups.is_empty() {
+        groups = group_ggufs(&files(true));
+    }
     groups.sort_by_key(|group| std::cmp::Reverse(group.size_bytes()));
     let mut read_any = false;
     let mut drafters_only = true;
+    let mut projectors_only = true;
     for group in groups.iter().take(MAX_MODEL_FILE_READS) {
         let primary = group.primary();
         let prefix = models
@@ -371,7 +381,7 @@ async fn read_repository_model(
                 .map(ToOwned::to_owned)
         });
         let file = match (&architecture, &metadata) {
-            (Some(architecture), _) if architecture == PROJECTOR_ARCHITECTURE => FileKind::Other,
+            (Some(architecture), _) if architecture == PROJECTOR_ARCHITECTURE => FileKind::Projector,
             (Some(architecture), Some(directory))
                 if architectures
                     .declares_drafter(architecture, &crate::gguf::header_tags(directory)) =>
@@ -387,6 +397,7 @@ async fn read_repository_model(
         };
         let Some(architecture) = architecture.filter(|_| file == FileKind::Model) else {
             drafters_only &= file == FileKind::Drafter;
+            projectors_only &= file == FileKind::Projector;
             continue;
         };
         // Keys a writer put after the token list (some put the shape's, or an appended MTP head
@@ -447,6 +458,8 @@ async fn read_repository_model(
     // without a model file to read, nothing is known.
     if read_any && drafters_only {
         Ok(RepositoryModel::Drafter)
+    } else if read_any && projectors_only {
+        Ok(RepositoryModel::Projector)
     } else if read_any {
         Ok(RepositoryModel::Unreadable)
     } else {

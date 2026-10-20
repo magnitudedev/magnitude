@@ -42,7 +42,9 @@ Hugging Face search, repository resolution, and candidate inspection are service
 observational queries. Search returns GGUF repositories with immutable commit identities and the catalog model each is a
 variant of. A repository whose Hub architecture the engine doesn't recognize is still returned,
 marked unsupported with that architecture; the Hub's repository-level architecture is only a
-prefilter against the engine's recognized-architecture list. Repositories the catalog uses are
+prefilter against the engine's recognized-architecture list. The Hub takes it from one GGUF it
+picks, sometimes the projector, so a projector architecture from the Hub is dropped: it never
+stands in for the model, and never makes a row unsupported. Repositories the catalog uses are
 never returned as new models, and drafter repositories (a drafter architecture, such as DFlash,
 EAGLE, a Gemma assistant or MTP-only heads, or the Hub's speculative-decoding tags) are never
 results: they are offered only in drafter lists. "Variant of" and the architecture shown come from
@@ -66,7 +68,8 @@ one whose headers were read but hold no model file (no architecture, a projector
 of a layer-split model, which repeat its metadata over fewer tensors than its blocks) is unsupported
 as unreadable; one whose files read are all drafters' (a drafter by its header as above, or a single
 file declaring prediction layers over fewer tensors than blocks, as an MTP block) is a drafter
-repository and no result. A split set's shards are never judged by their tensor count: the listing
+repository and no result. When every GGUF a listing holds is named as an `mmproj` projector, those
+are read, and one whose files read are all projectors' holds no GGUF model and is no result. A split set's shards are never judged by their tensor count: the listing
 groups them, and a first shard may hold only the metadata. A repository whose listing holds no GGUF at all (the Hub's
 gguf filter also matches a tag) is no result. A query that is a pasted Hugging Face reference
 searches for its repository, read the way a model is added: a link (`https://huggingface.co/owner/repo/…`,
@@ -75,7 +78,8 @@ file (`/path.gguf`), with or without `hf:`; any other query, `owner/repo` alone 
 searched as typed. What a repository's commit holds is cached, so it is read once; reads
 run with bounded concurrency. A failed or slow read (any status but success, a timeout, a listing
 that can't be resolved, a gated repository's refused files) is unknown: it is retried next time,
-never cached, never fails the search, and leaves the row exactly as the Hub's search describes it.
+never cached, never fails the search, and leaves the row as the Hub's search describes it (without a
+projector architecture): no variant and no verdict from a file it couldn't read.
 Only a GGUF header read with a successful status makes a row unreadable, and only a successful
 listing (the search's own `siblings`, or the commit's file listing) makes it no result. A rate
 limit (HTTP 429) is never retried: it pauses every request to that host for its `Retry-After` (at
