@@ -33,6 +33,7 @@ mod store_fs;
 mod test_gguf;
 mod upstream_updates;
 mod validation;
+mod weight_lineage;
 
 pub use cache::{
     CachedModelAssessment, ModelCache, ModelCacheWorkspace, ModelIndexKind,
@@ -62,6 +63,7 @@ pub use package_service::{
 pub use search_shape::{
     CatalogFingerprints, HeaderExtent, HeaderVerdicts, ModelShape, SHAPE_PREFIX_BYTES,
 };
+pub use weight_lineage::{SampleRead, WeightSample};
 pub use preview::{
     HuggingFaceDiscovery, PreparedPreview, PreparedPreviewHeader, RemoteGgufHeader,
     cached_hugging_face_repository, pinned_hugging_face_repository,

@@ -21,7 +21,7 @@ use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 
-const MAGIC: &[u8; 8] = b"MAGPLAN4";
+const MAGIC: &[u8; 8] = b"MAGPLAN5";
 const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PLANNER_INPUT_BYTES: usize = 128 * 1024 * 1024;
 
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn old_bundle_format_is_not_accepted() {
-        assert!(PlannerBundle::parse(b"MAGPLAN3\0\0\0\0").is_err());
+        assert!(PlannerBundle::parse(b"MAGPLAN4\0\0\0\0").is_err());
     }
 
     #[test]

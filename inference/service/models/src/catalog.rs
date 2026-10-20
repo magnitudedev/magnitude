@@ -27,6 +27,7 @@ use crate::package_service::{
     ServableModelBundleKey, servable_model_bundle_key_for_bundle, validated_package_from_resolved,
 };
 use crate::preview::PreparedPreview;
+use crate::weight_lineage::WeightSample;
 use crate::refresh_hugging_face_repository;
 
 #[path = "../../../catalog/planner_bundle.rs"]
@@ -214,6 +215,31 @@ struct ReleasePlannerPackage {
     properties: InventoryProperties,
     primary_gguf: PathBuf,
     components: Vec<ReleasePlannerComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weight_sample: Option<ReleasePlannerWeightSample>,
+}
+
+/// A target's weight sample (see [`WeightSample`]), stored in the bundle as an input of its own,
+/// so the variants of one model, whose sampled weights are the same bytes, share it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReleasePlannerWeightSample {
+    digest: String,
+    size_bytes: u64,
+}
+
+impl ReleasePlannerPackage {
+    /// Every bundle input the package names, with its declared size.
+    fn inputs(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.components
+            .iter()
+            .map(|component| (component.header_digest.as_str(), component.header_size_bytes))
+            .chain(
+                self.weight_sample
+                    .iter()
+                    .map(|sample| (sample.digest.as_str(), sample.size_bytes)),
+            )
+    }
 }
 
 impl ReleasePlannerInput {
@@ -267,6 +293,7 @@ pub struct ReleaseComponentHeader {
 
 #[derive(Clone)]
 pub struct ReleaseCatalog {
+    weight_samples: Arc<BTreeMap<ServableModelBundleKey, WeightSample>>,
     catalog: RecommendableModelCatalog,
     planner_inputs: Arc<BTreeMap<ServableModelBundleKey, ReleasePlannerInput>>,
     planner_bundle: Arc<PlannerBundle<'static>>,
@@ -751,18 +778,12 @@ pub fn load_release_catalog(planner_bundle_path: &Path) -> Result<ReleaseCatalog
     validate_planner_inputs(&catalog, &manifest.planner_inputs)?;
     let mut expected_inputs = BTreeMap::new();
     for input in manifest.planner_inputs.values() {
-        for component in input
-            .packages()
-            .flat_map(|package| package.components.iter())
-        {
-            if let Some(previous_size) = expected_inputs.insert(
-                component.header_digest.as_str(),
-                component.header_size_bytes,
-            ) && previous_size != component.header_size_bytes
+        for (digest, size) in input.packages().flat_map(ReleasePlannerPackage::inputs) {
+            if let Some(previous_size) = expected_inputs.insert(digest, size)
+                && previous_size != size
             {
                 return Err(InventoryError::Integrity(format!(
-                    "planner input {} has inconsistent declared sizes",
-                    component.header_digest
+                    "planner input {digest} has inconsistent declared sizes"
                 )));
             }
         }
@@ -784,10 +805,23 @@ pub fn load_release_catalog(planner_bundle_path: &Path) -> Result<ReleaseCatalog
             )));
         }
     }
+    let mut weight_samples = BTreeMap::new();
+    for (bundle_key, input) in &manifest.planner_inputs {
+        if let Some(sample) = &input.target.weight_sample {
+            let bytes = planner_bundle
+                .input(&sample.digest)
+                .map_err(InventoryError::Integrity)?;
+            let sample = WeightSample::decode(&bytes).map_err(|error| {
+                InventoryError::Integrity(format!("invalid weight sample {}: {error}", sample.digest))
+            })?;
+            weight_samples.insert(bundle_key.clone(), sample);
+        }
+    }
     Ok(ReleaseCatalog {
         catalog,
         planner_inputs: Arc::new(manifest.planner_inputs),
         planner_bundle: Arc::new(planner_bundle),
+        weight_samples: Arc::new(weight_samples),
     })
 }
 
@@ -1112,7 +1146,25 @@ impl ReleaseCatalog {
             catalog,
             planner_inputs: Arc::new(BTreeMap::new()),
             planner_bundle: Arc::new(PlannerBundle::parse(bytes).map_err(InventoryError::Integrity)?),
+            weight_samples: Arc::new(BTreeMap::new()),
         })
+    }
+
+    /// This catalog with `samples` as its targets' weight samples, by bundle, as a release bundle
+    /// carries them. For tests and tools that carry no planner bundle.
+    #[must_use]
+    pub fn with_target_weight_samples(
+        mut self,
+        samples: BTreeMap<ServableModelBundleKey, WeightSample>,
+    ) -> Self {
+        self.weight_samples = Arc::new(samples);
+        self
+    }
+
+    /// The weight sample of a catalog bundle's target, when the release bundle carries one.
+    #[must_use]
+    pub fn target_weight_sample(&self, bundle_key: &ServableModelBundleKey) -> Option<&WeightSample> {
+        self.weight_samples.get(bundle_key)
     }
 }
 
@@ -1592,7 +1644,23 @@ impl ResolvingRecommendableCatalog {
                 snapshot,
             )
             .await?;
-        let (target, mut headers) = self.release_planner_package(target_prepared, &primary.path)?;
+        let (mut target, mut headers) =
+            self.release_planner_package(target_prepared, &primary.path)?;
+        if let Some(sample) = self
+            .models
+            .hub_weight_sample(snapshot, &primary.path)
+            .await?
+        {
+            let bytes = sample.encode();
+            let digest = planner_bundle::sha256(&bytes);
+            target.weight_sample = Some(ReleasePlannerWeightSample {
+                digest: digest.clone(),
+                size_bytes: u64::try_from(bytes.len()).map_err(|_| {
+                    InventoryError::Integrity("weight sample is too large".to_owned())
+                })?,
+            });
+            merge_content_map(&mut headers, BTreeMap::from([(digest, bytes)]))?;
+        }
         let draft = match declaration
             .speculative_decoding
             .as_ref()
@@ -1719,6 +1787,7 @@ impl ResolvingRecommendableCatalog {
             properties: prepared.model.model.properties.clone(),
             primary_gguf: primary.to_path_buf(),
             components,
+            weight_sample: None,
         };
         Ok((planner, headers))
     }

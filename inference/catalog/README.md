@@ -33,7 +33,10 @@ Generation resolves the pinned repositories and writes `model-planner-inputs.bun
 header (every byte through the aligned tensor-data offset) of every package component, which is
 what the engine's header-only planning and chat-template inspection read before a model is
 downloaded. Repeated references to the same immutable package share one package identity and one
-set of bundled headers. The bundle is derived release output and is not committed. It is the only
+set of bundled headers. Each target also carries its weight sample (a few hundred bytes of its early
+normalization weights, read by range requests; see weight lineage in
+`design/model-management/drafter-selection.md`), stored as an input of its own that the variants
+of one model share. The bundle is derived release output and is not committed. It is the only
 catalog-related file shipped alongside the service; catalog definitions and pins are compiled into
 the executable.
 
