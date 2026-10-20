@@ -515,7 +515,7 @@ fn declared_prediction_blocks_with_no_stored_tensor_leave_the_decoder_headless()
         });
         directory.metadata.push(Metadata {
             name: "qwen35.attention.recurrent_layers".into(),
-            value: Value::Array([true, false, false].map(Scalar::Bool).to_vec()),
+            value: Value::Array(vec![true, false, false].into()),
         });
         inspect_components(&directory, None, identity)
     };
