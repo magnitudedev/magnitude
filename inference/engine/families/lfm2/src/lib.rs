@@ -145,7 +145,7 @@ pub fn inspect_components(
 ) -> Result<ModelDefinition, Error> {
     let architecture = recognize(directory)?;
     if projector.is_some() {
-        return Err(invalid("LFM2 packages have no projector"));
+        return Err(Error::mismatch("LFM2 has no vision projector"));
     }
     let family_id = architecture.family_id();
     let m = Metadata::new(directory, family_id, architecture.metadata_keys())?;

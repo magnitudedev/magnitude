@@ -87,6 +87,8 @@ pub enum Error {
     UnboundWeights(Vec<String>),
     /// A layer sequence the family cannot form into blocks.
     Structure(String),
+    /// A projector given to this text-only family.
+    Projector,
     /// The assembled definition failed contract validation.
     Definition(String),
 }
@@ -104,6 +106,7 @@ impl fmt::Display for Error {
                 formatter,
                 "Nemotron-H artifact contains unbound weight roles {names:?}"
             ),
+            Self::Projector => formatter.write_str("Nemotron-H has no vision projector"),
         }
     }
 }
@@ -113,9 +116,13 @@ impl error::Error for Error {}
 impl Error {
     /// The unsupported features this error names; a header missing what the
     /// family needs, or whose values or layers contradict each other, is
-    /// `Unreadable`.
+    /// `Unreadable`, and a projector given to this text-only family does not
+    /// fit it.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
+            Self::Projector => vec![UnsupportedReason::TargetMismatch {
+                detail: self.to_string(),
+            }],
             Self::UnknownMetadata(keys) => keys
                 .iter()
                 .map(|key| UnsupportedReason::UnrecognizedMetadata { key: key.clone() })
@@ -484,9 +491,7 @@ pub fn inspect_components(
 ) -> Result<ModelDefinition, Error> {
     recognize(directory)?;
     if projector.is_some() {
-        return Err(Error::Structure(
-            "Nemotron-H has no vision projector".into(),
-        ));
+        return Err(Error::Projector);
     }
     let m = Metadata::new(directory, ARCHITECTURE, KNOWN_KEYS)?;
     let block_count = m.integer("block_count")?;

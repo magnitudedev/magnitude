@@ -65,7 +65,9 @@ the model, and container and uploader namespaces (`split.*`, `quantize.*`, `imat
 key outside its namespace, but never refuses one it does not know, and names (a model's or a base
 model's) never decide a verdict: a projector binds when its output width
 (`clip.vision.projection_dim`) is the target's embedding width, and a header naming no architecture
-is unreadable. Absent head widths read as llama.cpp reads them. The Qwen 3.5 lineage's layer kinds read
+is unreadable. A projector that does not bind (another width, or any projector given to a text-only
+family) is the projector's refusal, never the target's: the target is interpreted without it and
+takes text input only. Absent head widths read as llama.cpp reads them. The Qwen 3.5 lineage's layer kinds read
 as llama.cpp reads them too: `attention.recurrent_layers` flags every stored block, prediction blocks
 last and never recurrent, and otherwise one layer in every `full_attention_interval` is attention; a
 header carrying both binds only when they agree. The rule is shared by every family,

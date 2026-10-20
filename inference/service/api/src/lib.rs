@@ -3103,6 +3103,7 @@ mod tests {
             ),
             memory: Vec::new(),
             performance: Vec::new(),
+            projector: magnitude_service_contracts::models::ProjectorVerdict::None,
             drafter: DrafterVerdict::Bound {
                 method: SpeculativeMethod::DFlash,
                 memory_bytes: 900,
@@ -3805,6 +3806,7 @@ mod tests {
             memory: Vec::new(),
             limiting_resource: "gpu".to_owned(),
             deficit_bytes: 1,
+            projector: magnitude_service_contracts::models::ProjectorVerdict::None,
             drafter: DrafterVerdict::None,
         }
     }
@@ -4052,6 +4054,7 @@ mod tests {
         for schema in [
             "UnsupportedReason",
             "DrafterVerdict",
+            "ProjectorVerdict",
             "ModelFingerprint",
             "CustomModel",
             "LocalModelsConfiguration",

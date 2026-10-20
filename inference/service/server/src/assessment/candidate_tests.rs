@@ -18,7 +18,7 @@ use magnitude_service_contracts::models::{
     DrafterCategory, DrafterLineage, DrafterReference, DrafterVerdict, HuggingFaceRepositoryId,
     KnownUnsupportedReason, LocalModelRemoval, LocalModels, LocalModelsConfiguration,
     LocalModelsResponse, ModelAssessment, ModelCandidate, ModelCandidates, ModelDomainInvalidation,
-    ModelId, ModelParameterization, ModelReleaseDate, ModelServingConfiguration,
+    ModelId, ModelParameterization, ModelReleaseDate, ModelServingConfiguration, ProjectorVerdict,
     RecommendableModel, RecommendableModelCatalog, ServableModelBundle, ServingProfile,
     SpeculativeDraftSource, SpeculativeMethod, UnsupportedReason,
 };
@@ -1795,6 +1795,26 @@ async fn inspection_selects_the_smallest_projector_and_explains_unknown_architec
             .map(|projector| projector.path.as_str()),
         Some("mmproj-F16.gguf")
     );
+    // QA (Linux CUDA, round 4): a projector the target's family can't bind (llama is text-only,
+    // as Nemotron-H is for Nemotron 3.5 VL repositories) leaves the text model assessed without
+    // it, the projector rejected with a mismatch, never an unreadable or unsupported version.
+    match &vision.versions[0].assessment {
+        Some(
+            ModelAssessment::Fits { projector, .. } | ModelAssessment::DoesNotFit { projector, .. },
+        ) => assert!(
+            matches!(
+                projector,
+                ProjectorVerdict::Rejected { reasons, .. }
+                    if matches!(
+                        reasons.as_slice(),
+                        [UnsupportedReason::Known(KnownUnsupportedReason::TargetMismatch { detail })]
+                            if detail.contains("no vision projector")
+                    )
+            ),
+            "{projector:?}"
+        ),
+        other => panic!("the text model is assessed without its projector: {other:?}"),
+    }
 
     let deepseek = fixture
         .candidates

@@ -7,7 +7,9 @@
 //! through [`crate::planning::plan_execution`] (the production planning
 //! inputs), which decides whether it runs here; its drafter is then planned
 //! with it, and a drafter that does not bind or plan is `Rejected` without
-//! affecting the target. The selected plan is assessed against stable memory
+//! affecting the target. A projector the family cannot bind is `Rejected`
+//! the same way: the target is interpreted and planned without it, taking
+//! text input only. The selected plan is assessed against stable memory
 //! capacity and the selected device's memory bandwidth. No device is opened,
 //! no weight payload is read and nothing is decoded.
 
@@ -16,7 +18,7 @@ use crate::error::{
     UnsupportedReason, WeightTypeCount,
 };
 use crate::fingerprint::ModelFingerprint;
-use crate::host::{bind_draft, vocabulary_mismatch};
+use crate::host::{bind_draft, interpret_target, vocabulary_mismatch, InterpretedTarget};
 use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy, ResolvedMethod};
 use crate::planning::{plan_backend, plan_execution, ExecutionPlanningError};
 use magnitude_artifacts::{
@@ -156,6 +158,17 @@ pub enum DrafterVerdict {
     Rejected(UnsupportedModel),
 }
 
+/// Whether the engine binds the package's projector: none was present
+/// (`None`), it binds and the model takes image input (`Bound`), or it does
+/// not (`Rejected`, with every reason; the target is assessed and loads
+/// without it, taking text input only).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectorVerdict {
+    None,
+    Bound,
+    Rejected(UnsupportedModel),
+}
+
 /// Host-side model facts established from headers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelFacts {
@@ -166,6 +179,7 @@ pub struct ModelFacts {
     /// The model's supported context, which assessment serves.
     pub context_limit: u32,
     pub fingerprint: Option<ModelFingerprint>,
+    pub projector: ProjectorVerdict,
     pub drafter: DrafterVerdict,
 }
 
@@ -608,6 +622,7 @@ struct AdmittedPackage {
     chat: TemplateInspection,
     context_limit: u32,
     fingerprint: Option<ModelFingerprint>,
+    projector: ProjectorVerdict,
     drafter: DrafterAdmission,
 }
 
@@ -632,6 +647,7 @@ impl AdmittedPackage {
             template_fingerprint: self.chat.fingerprint,
             context_limit: self.context_limit,
             fingerprint: self.fingerprint,
+            projector: self.projector,
             drafter,
         }
     }
@@ -692,25 +708,39 @@ fn admit(
     let target = headers.target();
     let fingerprint = ModelFingerprint::from_directory(target).ok();
     let mut refusals = Vec::new();
-    let weights = target
-        .tensors
-        .iter()
-        .map(|tensor| (tensor, Residency::Packed))
-        .chain(
-            headers
-                .projector()
-                .into_iter()
-                .flat_map(|projector| &projector.tensors)
-                .map(|tensor| (tensor, Residency::Dequantized)),
-        );
-    refusals.extend(unsupported_weights(weights, layout));
+    refusals.extend(unsupported_weights(
+        target
+            .tensors
+            .iter()
+            .map(|tensor| (tensor, Residency::Packed)),
+        layout,
+    ));
     let interpreted = interpret_header(
         target,
         headers.projector(),
         headers.identity(),
         &package.target.display().to_string(),
     );
-    let (family, definition, chat) = match interpreted {
+    // A bound projector loads its weights; one that does not bind loads none.
+    if let (Ok((_, interpreted, _)), Some(projector)) = (&interpreted, headers.projector()) {
+        if interpreted.projector_unavailable.is_none() {
+            refusals.extend(unsupported_weights(
+                projector
+                    .tensors
+                    .iter()
+                    .map(|tensor| (tensor, Residency::Dequantized)),
+                layout,
+            ));
+        }
+    }
+    let (
+        family,
+        InterpretedTarget {
+            definition,
+            projector_unavailable,
+        },
+        chat,
+    ) = match interpreted {
         Ok(interpreted) if refusals.is_empty() => interpreted,
         interpreted => {
             refusals.extend(interpreted.err().into_iter().flatten());
@@ -721,6 +751,11 @@ fn admit(
             });
         }
     };
+    let projector = match (headers.projector(), projector_unavailable) {
+        (_, Some(unsupported)) => ProjectorVerdict::Rejected(unsupported),
+        (Some(_), None) => ProjectorVerdict::Bound,
+        (None, None) => ProjectorVerdict::None,
+    };
     let context_limit = u32::try_from(definition.decoder.context_limit)
         .map_err(|_| ModelAssessmentError::ContextLimit(definition.decoder.context_limit))?;
     let drafter = admit_drafter(package, source, &mut headers, family, &definition, layout)?;
@@ -730,26 +765,26 @@ fn admit(
         chat,
         context_limit,
         fingerprint,
+        projector,
         drafter,
     })))
 }
 
-/// A target header's interpretation: its family's definition, the tokenizer
-/// it declares (checked against the definition's vocabulary) and its chat
-/// templates, as independent checks whose refusals are reported together.
-/// It never reads weight encodings, a drafter or a device.
+/// A target header's interpretation: its family's definition with its
+/// projector bound when the family binds it ([`interpret_target`]), the
+/// tokenizer it declares (checked against the definition's vocabulary) and
+/// its chat templates, as independent checks whose refusals are reported
+/// together. It never reads weight encodings, a drafter or a device.
 fn interpret_header(
     target: &Directory,
     projector: Option<&Directory>,
     identity: PackageIdentity,
     name: &str,
-) -> Result<(&'static dyn ModelFamily, ModelDefinition, TemplateInspection), Vec<UnsupportedModel>>
+) -> Result<(&'static dyn ModelFamily, InterpretedTarget, TemplateInspection), Vec<UnsupportedModel>>
 {
     let interpreted = crate::families::recognize(target).and_then(|family| {
-        family
-            .inspect(target, projector, identity)
-            .map(|definition| (family, definition))
-            .map_err(UnsupportedModel::from)
+        interpret_target(family, target, projector, identity)
+            .map(|interpreted| (family, interpreted))
     });
     let tokenizer = TokenizerPayload::from_directory(target);
     // Support and vocabulary are header facts; a load builds the tokenizer.
@@ -760,14 +795,14 @@ fn interpret_header(
         .and_then(|bundle| bundle.inspect_cached())
         .map_err(UnsupportedModel::chat_template);
     let mut refusals = Vec::new();
-    if let (Ok((_, definition)), Ok(vocabulary)) = (&interpreted, &vocabulary) {
-        if u64::try_from(*vocabulary).ok() != Some(definition.decoder.vocabulary) {
+    if let (Ok((_, interpreted)), Ok(vocabulary)) = (&interpreted, &vocabulary) {
+        if u64::try_from(*vocabulary).ok() != Some(interpreted.definition.decoder.vocabulary) {
             refusals.push(vocabulary_mismatch(&tokenizer));
         }
     }
     match (interpreted, vocabulary, chat) {
-        (Ok((family, definition)), Ok(_), Ok(chat)) if refusals.is_empty() => {
-            Ok((family, definition, chat))
+        (Ok((family, interpreted)), Ok(_), Ok(chat)) if refusals.is_empty() => {
+            Ok((family, interpreted, chat))
         }
         (interpreted, vocabulary, chat) => {
             refusals.extend(interpreted.err());

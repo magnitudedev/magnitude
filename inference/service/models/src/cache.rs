@@ -317,6 +317,7 @@ mod tests {
                 context_tokens: 50_000,
                 estimated_tokens_per_second: 2.0,
             }],
+            projector: magnitude_service_contracts::models::ProjectorVerdict::None,
             drafter: magnitude_service_contracts::models::DrafterVerdict::None,
         };
         let does_not_fit = ModelAssessment::DoesNotFit {
@@ -331,6 +332,7 @@ mod tests {
             }],
             limiting_resource: "system memory".to_owned(),
             deficit_bytes: 1,
+            projector: magnitude_service_contracts::models::ProjectorVerdict::None,
             drafter: magnitude_service_contracts::models::DrafterVerdict::None,
         };
 

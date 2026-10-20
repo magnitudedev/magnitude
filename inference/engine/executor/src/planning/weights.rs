@@ -1099,12 +1099,12 @@ impl ModelLoadPlan {
                 "head execution was selected without exactly one drafter definition".into(),
             );
         }
-        if projector.is_some() != definition.vision.is_some() {
-            return Err("projector component and vision definition disagree".into());
+        if definition.vision.is_some() && projector.is_none() {
+            return Err("vision definition requires a projector component".into());
         }
-        // An optional draft can remain in the opened package after semantic
-        // admission rejected it. Only an admitted definition requires its
-        // component; an unbound artifact contributes no weights to Plain.
+        // An optional draft or projector can remain in the opened package
+        // after semantic admission rejected it. Only an admitted definition
+        // requires its component; an unbound artifact contributes no weights.
         // A draft head may be stored in the draft component too.
         let separate_head = definition
             .head

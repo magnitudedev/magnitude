@@ -11,8 +11,9 @@ use std::sync::{Arc, Weak};
 use magnitude_engine::assessment::{
     DrafterVerdict as EngineDrafterVerdict, ModelAssessment as EngineAssessment,
     HeaderExtent as EngineHeaderExtent, ModelAssessmentError, ModelCapabilities as EngineCapabilities,
-    ModelPackagePaths, PreparedModelAssessment, SpeculativeMethod as EngineSpeculativeMethod,
-    finish_model_assessment, header_refusal, prepare_model_assessment,
+    ModelPackagePaths, PreparedModelAssessment, ProjectorVerdict as EngineProjectorVerdict,
+    SpeculativeMethod as EngineSpeculativeMethod, finish_model_assessment, header_refusal,
+    prepare_model_assessment,
 };
 use magnitude_artifacts::gguf::Directory;
 use magnitude_engine::error::{UnsupportedModel, UnsupportedReason as EngineUnsupportedReason};
@@ -24,7 +25,7 @@ use magnitude_service_contracts::models::{
     KnownUnsupportedReason, MemoryAssessment, ModelAssessment, ModelAssessmentId,
     ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure, ModelFingerprint,
     ModelPackageOperand, ModelReasoningCapabilities, ModelServingConfiguration,
-    PerformanceEvidence, ResolvedServableModelBundle, ServableModelBundle, SpeculativeDraftSource,
+    PerformanceEvidence, ProjectorVerdict, ResolvedServableModelBundle, ServableModelBundle, SpeculativeDraftSource,
     SpeculativeDraftSourceInput, SpeculativeMethod, UnsupportedReason, WeightTypeCount,
 };
 use magnitude_service_contracts::{ComponentRole, InventoryError, MemoryDomainId, ResolvedModel};
@@ -453,6 +454,7 @@ pub(crate) fn model_assessment(
             retryable: false,
         });
     }
+    let projector = projector_verdict(facts.projector);
     let drafter = drafter_verdict(facts.drafter);
     let assessment_id = assessment_id(bundle_key, &requested, &environment.id);
     let ModelAssessmentProfile {
@@ -485,6 +487,7 @@ pub(crate) fn model_assessment(
                 assessment_id,
                 memory: memory_assessments(&domains, environment),
                 performance,
+                projector,
                 drafter,
             }
         }
@@ -499,6 +502,7 @@ pub(crate) fn model_assessment(
             memory: memory_assessments(&domains, environment),
             limiting_resource: domain_id(limiting, environment).as_str().to_owned(),
             deficit_bytes,
+            projector,
             drafter,
         },
     };
@@ -594,6 +598,17 @@ fn unsupported_reasons(unsupported: UnsupportedModel) -> (Vec<UnsupportedReason>
             .collect(),
         unsupported.detail,
     )
+}
+
+fn projector_verdict(verdict: EngineProjectorVerdict) -> ProjectorVerdict {
+    match verdict {
+        EngineProjectorVerdict::None => ProjectorVerdict::None,
+        EngineProjectorVerdict::Bound => ProjectorVerdict::Bound,
+        EngineProjectorVerdict::Rejected(unsupported) => {
+            let (reasons, detail) = unsupported_reasons(unsupported);
+            ProjectorVerdict::Rejected { reasons, detail }
+        }
+    }
 }
 
 fn drafter_verdict(verdict: EngineDrafterVerdict) -> DrafterVerdict {

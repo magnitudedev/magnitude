@@ -89,8 +89,11 @@ the memory charge, and its decode speed is the target's plain decode (no accepta
 draft with missing, malformed or unsupported semantics is reported as `DrafterVerdict::Rejected`
 with its reasons, and automatic or separate-draft selection resolves to plain target decoding
 before planning.
-Its weights, history and workflows then contribute nothing to the memory charge. Target
-interpretation failures still fail admission. A successfully admitted draft of another variant
+Its weights, history and workflows then contribute nothing to the memory charge. A projector
+the target's family cannot bind (a text-only family, an output width other than the target's
+embedding width, a malformed projector header) is reported as `ProjectorVerdict::Rejected` with its
+reasons, and the target is interpreted, planned and loaded without it: text input only, its weights
+outside the charge. Target interpretation failures still fail admission, whatever the projector. A successfully admitted draft of another variant
 than the requested method remains an invalid configuration. Assessment and loading share
 these decisions.
 

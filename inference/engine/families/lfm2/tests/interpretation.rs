@@ -361,7 +361,11 @@ fn the_layer_pattern_follows_the_key_head_array() {
 fn a_projector_is_rejected() {
     let directory = variant("lfm2.5-2.6b");
     let error = inspect_components(&directory, Some(&directory), identity()).unwrap_err();
-    assert!(error.to_string().contains("no projector"));
+    assert!(error.to_string().contains("no vision projector"));
+    assert!(matches!(
+        error.reasons.as_slice(),
+        [magnitude_artifacts::UnsupportedReason::TargetMismatch { .. }]
+    ));
 }
 
 #[test]

@@ -1526,6 +1526,20 @@ pub enum DrafterVerdict {
     },
 }
 
+/// Whether the engine binds a model's projector. `None` means the model has no projector; a
+/// `Rejected` projector leaves the model assessed and served without it, taking text input only.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum ProjectorVerdict {
+    None,
+    Bound,
+    Rejected {
+        reasons: Vec<UnsupportedReason>,
+        detail: String,
+    },
+}
+
 /// A drafter's files, independent of which model uses it.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2226,6 +2240,7 @@ pub enum ModelAssessment {
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
         performance: Vec<PerformanceEvidence>,
+        projector: ProjectorVerdict,
         drafter: DrafterVerdict,
     },
     #[serde(rename_all = "camelCase")]
@@ -2235,6 +2250,7 @@ pub enum ModelAssessment {
         memory: Vec<MemoryAssessment>,
         limiting_resource: String,
         deficit_bytes: u64,
+        projector: ProjectorVerdict,
         drafter: DrafterVerdict,
     },
     /// The engine cannot execute a custom model, with every reason it found. A catalog model is
@@ -2822,6 +2838,20 @@ mod custom_model_wire_tests {
             })
             .expect("serialize"),
             json!({ "_tag": "Bound", "method": { "_tag": "Mtp" }, "memoryBytes": 10 })
+        );
+        assert_eq!(
+            serde_json::to_value(ProjectorVerdict::Rejected {
+                reasons: vec![UnsupportedReason::Known(KnownUnsupportedReason::TargetMismatch {
+                    detail: "no vision projector".to_owned()
+                })],
+                detail: "projector: no vision projector".to_owned()
+            })
+            .expect("serialize"),
+            json!({
+                "_tag": "Rejected",
+                "reasons": [{ "_tag": "TargetMismatch", "detail": "no vision projector" }],
+                "detail": "projector: no vision projector"
+            })
         );
         let subject = ModelAssessmentSubject::Custom {
             model_id: format!("local:{}", "0".repeat(64))

@@ -7646,6 +7646,7 @@
               "assessmentId",
               "memory",
               "performance",
+              "projector",
               "drafter",
               "_tag"
             ],
@@ -7668,6 +7669,9 @@
                   "$ref": "#/components/schemas/PerformanceEvidence"
                 }
               },
+              "projector": {
+                "$ref": "#/components/schemas/ProjectorVerdict"
+              },
               "drafter": {
                 "$ref": "#/components/schemas/DrafterVerdict"
               },
@@ -7687,6 +7691,7 @@
               "memory",
               "limitingResource",
               "deficitBytes",
+              "projector",
               "drafter",
               "_tag"
             ],
@@ -7710,6 +7715,9 @@
                 "type": "integer",
                 "format": "int64",
                 "minimum": 0
+              },
+              "projector": {
+                "$ref": "#/components/schemas/ProjectorVerdict"
               },
               "drafter": {
                 "$ref": "#/components/schemas/DrafterVerdict"
@@ -9341,6 +9349,64 @@
           }
         },
         "additionalProperties": false
+      },
+      "ProjectorVerdict": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "None"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Bound"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reasons",
+              "detail",
+              "_tag"
+            ],
+            "properties": {
+              "reasons": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/UnsupportedReason"
+                }
+              },
+              "detail": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Rejected"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Whether the engine binds a model's projector. `None` means the model has no projector; a\n`Rejected` projector leaves the model assessed and served without it, taking text input only."
       },
       "PromptTokensDetails": {
         "type": "object",

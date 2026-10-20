@@ -16,9 +16,9 @@ program slots, method capabilities, service policy, and all device resources. Th
 topology is both the complete requirement set and the construction recipe. Program construction
 attests every exact slot and returns typed callable groups; execution never queries a handle map or
 coarse coverage class after readiness.
-An optional drafter rejected during semantic admission may remain in the opened package.
-Its unbound artifact contributes no weights or residency to the plain execution plan; an admitted
-drafter definition still requires its matching component.
+An optional drafter or projector rejected during semantic admission may remain in the opened
+package. Its unbound artifact contributes no weights or residency to the execution plan; an admitted
+drafter or vision definition still requires its matching component.
 
 Metadata-only model assessment derives resident weight bytes and slab-rounded history and recurrent
 bank bytes from this same model load plan and state layout, for a one-conversation workload at the

@@ -11,7 +11,8 @@ use magnitude_engine::{
     assessment::{
         assess_model, header_refusal, kernel_inventory, prepare_model_assessment,
         AssessmentSetup, DrafterVerdict, HeaderExtent, KernelInventory, ModelAssessment,
-        ModelPackagePaths, PreparedModelAssessment, SpeculativeMethod,
+        ModelFacts, ModelPackagePaths, PreparedModelAssessment, ProjectorVerdict,
+        SpeculativeMethod,
     },
     error::{UnsupportedModel, UnsupportedReason, WeightTypeCount},
     fingerprint::ModelFingerprint,
@@ -1012,7 +1013,8 @@ fn embedded_mtp_heads_stay_bound_beside_a_projector() {
 
 /// A projector binds by its width, never by names: DavidAU's Qwen3.5 9B finetune names another
 /// base model than its repository's projector does, and plans with vision beside it; a projector
-/// of another width (Qwen3.5 0.8B's) is a mismatch, never an unreadable target.
+/// of another width (Qwen3.5 0.8B's) is a mismatch the target plans without, taking text input
+/// only, never an unsupported or unreadable target.
 #[test]
 fn a_projector_binds_by_its_width_not_the_base_model_names() {
     let scratch = Scratch::new("projector-width");
@@ -1030,16 +1032,59 @@ fn a_projector_binds_by_its_width_not_the_base_model_names() {
         panic!("the finetune plans beside its base model's projector");
     };
     assert!(facts.capabilities.vision);
-    let PreparedModelAssessment::Unsupported { unsupported, .. } = prepared(&with(narrow)) else {
-        panic!("a projector of another width can't feed this decoder");
+    assert_eq!(facts.projector, ProjectorVerdict::Bound);
+    let PreparedModelAssessment::Planned { facts, .. } = prepared(&with(narrow)) else {
+        panic!("a projector of another width leaves the target planning text only");
+    };
+    assert!(!facts.capabilities.vision);
+    let ProjectorVerdict::Rejected(rejection) = &facts.projector else {
+        panic!("a projector of another width can't feed this decoder: {:?}", facts.projector);
     };
     assert!(
         matches!(
-            unsupported.reasons.as_slice(),
+            rejection.reasons.as_slice(),
             [UnsupportedReason::TargetMismatch { .. }]
         ),
         "{:?}",
-        unsupported.reasons
+        rejection.reasons
+    );
+}
+
+/// A text-only family given a repository's projector (Nemotron 3.5 VL repositories ship an
+/// mmproj the nemotron_h family has no vision for) gets the same verdict as without it, the
+/// projector `Rejected` with a mismatch: never an unreadable target.
+#[test]
+fn a_text_only_family_is_assessed_without_a_projector_it_cannot_bind() {
+    let scratch = Scratch::new("text-only-projector");
+    let target = real_header(&scratch, "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf");
+    let projector = real_header(&scratch, "mmproj-F16.gguf");
+    let PreparedModelAssessment::Planned { facts: alone, .. } = prepared(&package(target.clone()))
+    else {
+        panic!("the Nemotron target plans");
+    };
+    assert_eq!(alone.projector, ProjectorVerdict::None);
+    let PreparedModelAssessment::Planned { facts, .. } = prepared(&ModelPackagePaths {
+        projector: Some(projector),
+        ..package(target)
+    }) else {
+        panic!("a projector the family cannot bind never refuses the target");
+    };
+    assert!(!facts.capabilities.vision);
+    let ProjectorVerdict::Rejected(rejection) = &facts.projector else {
+        panic!("Nemotron-H has no vision projector: {:?}", facts.projector);
+    };
+    assert_eq!(
+        rejection.reasons,
+        vec![UnsupportedReason::TargetMismatch {
+            detail: "Nemotron-H has no vision projector".to_owned()
+        }]
+    );
+    assert_eq!(
+        ModelFacts {
+            projector: ProjectorVerdict::None,
+            ..facts
+        },
+        alone
     );
 }
 
@@ -1069,5 +1114,34 @@ fn an_unknown_tensor_type_is_an_unsupported_weight_type() {
                 tensor_count: 1,
             }]
         }]
+    );
+}
+
+/// A load interprets the same way: a Nemotron package opened with a projector the family has no
+/// vision for defines its text model, with no image input, and keeps the projector's refusal.
+#[test]
+fn a_load_serves_text_beside_a_projector_the_family_cannot_bind() {
+    let scratch = Scratch::new("text-only-projector-load");
+    let target = real_header(&scratch, "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.gguf");
+    let projector = real_header(&scratch, "mmproj-F16.gguf");
+    // Header fixtures stand in for whole files: their payloads read as sparse zeros.
+    for (path, bytes) in [(&target, 24_u64 << 30), (&projector, 1 << 30)] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(bytes)
+            .unwrap();
+    }
+    let package = magnitude_artifacts::Package::open_with_projector(target, projector).unwrap();
+    let (_, admitted) = magnitude_engine::host::package_definition(&package)
+        .unwrap_or_else(|error| panic!("the text model is defined: {error}"));
+    assert!(package.projector().is_some());
+    assert!(admitted.definition.vision.is_none());
+    assert_eq!(
+        admitted.projector_unavailable.map(|refusal| refusal.reasons),
+        Some(vec![UnsupportedReason::TargetMismatch {
+            detail: "Nemotron-H has no vision projector".to_owned()
+        }])
     );
 }

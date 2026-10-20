@@ -2089,6 +2089,7 @@ export const ModelAssessment = S.Union(
         S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence),
       ),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+      projector: S.suspend((): S.Schema<ProjectorVerdict, ProjectorVerdictEncoded> => ProjectorVerdict),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -2100,6 +2101,7 @@ export const ModelAssessment = S.Union(
       limitingResource: S.String,
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+      projector: S.suspend((): S.Schema<ProjectorVerdict, ProjectorVerdictEncoded> => ProjectorVerdict),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -2787,6 +2789,20 @@ export const PerformanceEvidence = S.Struct({
 })
 export type PerformanceEvidence = S.Schema.Type<typeof PerformanceEvidence>
 export type PerformanceEvidenceEncoded = S.Schema.Encoded<typeof PerformanceEvidence>
+
+export const ProjectorVerdict = S.Union(
+  S.extend(S.TaggedStruct("None", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("Bound", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Rejected", {
+      detail: S.String,
+      reasons: S.Array(S.suspend((): S.Schema<UnsupportedReason, UnsupportedReasonEncoded> => UnsupportedReason)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ProjectorVerdict = S.Schema.Type<typeof ProjectorVerdict>
+export type ProjectorVerdictEncoded = S.Schema.Encoded<typeof ProjectorVerdict>
 
 export const PromptTokensDetails = S.Struct({
   cached_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),

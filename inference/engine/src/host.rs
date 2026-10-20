@@ -8,7 +8,7 @@ use crate::error::{ArtifactError, RequestError, ResolveError, UnsupportedModel, 
 use crate::families;
 use crate::options::InputModalities;
 use magnitude_artifacts::{
-    ImageProcessor, InputLayout, Package, TokenId, TokenizerPayload,
+    ImageProcessor, InputLayout, Package, PackageIdentity, TokenId, TokenizerPayload,
     gguf::{Directory, Value},
 };
 use magnitude_chat::{
@@ -66,10 +66,13 @@ impl MarkerTokens for TokenizerMarkers<'_> {
 /// model. A load whose draft does not bind serves the target without it; the
 /// same binding makes assessment report that drafter `Rejected`. A drafter
 /// assessment rejects for any other reason (its weight encodings, its plan)
-/// is one the host leaves out of the load it requests.
+/// is one the host leaves out of the load it requests. A projector that does
+/// not bind ([`interpret_target`]) leaves the target serving text only, and
+/// assessment reports that projector `Rejected`.
 pub struct AdmittedDefinition {
     pub definition: ModelDefinition,
     pub draft_unavailable: Option<DraftUnavailable>,
+    pub projector_unavailable: Option<UnsupportedModel>,
 }
 
 impl AdmittedDefinition {
@@ -77,6 +80,7 @@ impl AdmittedDefinition {
         Self {
             definition,
             draft_unavailable: None,
+            projector_unavailable: None,
         }
     }
 
@@ -84,8 +88,51 @@ impl AdmittedDefinition {
         Self {
             definition: declared,
             draft_unavailable: Some(reason),
+            projector_unavailable: None,
         }
     }
+}
+
+/// A target interpreted with its projector, and why the projector did not
+/// bind when it did not.
+pub struct InterpretedTarget {
+    pub definition: ModelDefinition,
+    pub projector_unavailable: Option<UnsupportedModel>,
+}
+
+/// Interpret a recognized target with its optional projector. A projector the
+/// family cannot bind (a text-only family, an output width that is not the
+/// target's embedding width, a malformed projector header) leaves the target
+/// interpreted without it, taking text input only, with the projector's
+/// refusal kept apart. A target the family refuses on its own is refused
+/// whatever its projector, so a projector's refusal never becomes the
+/// target's verdict and never hides the target's. A payload-backed load and a
+/// header-only assessment interpret the same way.
+pub fn interpret_target(
+    family: &dyn ModelFamily,
+    target: &Directory,
+    projector: Option<&Directory>,
+    identity: PackageIdentity,
+) -> Result<InterpretedTarget, UnsupportedModel> {
+    let bound = projector.map(|projector| family.inspect(target, Some(projector), identity));
+    let refusal = match bound {
+        Some(Ok(definition)) => {
+            return Ok(InterpretedTarget {
+                definition,
+                projector_unavailable: None,
+            });
+        }
+        Some(Err(error)) => Some(UnsupportedModel::new(
+            error.reasons,
+            format!("projector: {}", error.detail),
+        )),
+        None => None,
+    };
+    let definition = family.inspect(target, None, identity)?;
+    Ok(InterpretedTarget {
+        definition,
+        projector_unavailable: refusal,
+    })
 }
 
 /// Why a package's separate draft is not bound: the drafter family its
@@ -143,19 +190,25 @@ pub fn package_definition(
 ) -> Result<(&'static dyn ModelFamily, AdmittedDefinition), ResolveError> {
     let target = package.target().directory();
     let family = families::recognize(target).map_err(ResolveError::Unsupported)?;
-    let declared = family
-        .inspect(
-            target,
-            package.projector().map(|projector| projector.directory()),
-            package.identity(),
-        )
-        .map_err(|error| ResolveError::Unsupported(error.into()))?;
-    let declared = bind_draft(
+    let interpreted = interpret_target(
         family,
-        declared,
+        target,
+        package.projector().map(|projector| projector.directory()),
+        package.identity(),
+    )
+    .map_err(ResolveError::Unsupported)?;
+    let admitted = bind_draft(
+        family,
+        interpreted.definition,
         package.draft().map(|draft| draft.directory()),
     );
-    Ok((family, declared))
+    Ok((
+        family,
+        AdmittedDefinition {
+            projector_unavailable: interpreted.projector_unavailable,
+            ..admitted
+        },
+    ))
 }
 
 /// Bind an optional draft after target interpretation has succeeded. A draft
@@ -223,9 +276,13 @@ impl HostArtifacts {
         let AdmittedDefinition {
             definition: declared,
             draft_unavailable,
+            projector_unavailable,
         } = admitted;
         if let Some(reason) = &draft_unavailable {
             eprintln!("magnitude-engine: separate drafter disabled: {reason}");
+        }
+        if let Some(reason) = &projector_unavailable {
+            eprintln!("magnitude-engine: image input disabled: {}", reason.detail);
         }
         let mut definition = declared.clone();
         definition.decoder.context_limit =

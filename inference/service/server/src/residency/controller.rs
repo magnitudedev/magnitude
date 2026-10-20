@@ -915,6 +915,7 @@ mod tests {
             "memory": [],
             "limitingResource": "gpu",
             "deficitBytes": deficit_bytes,
+            "projector": { "_tag": "None" },
             "drafter": { "_tag": "None" },
         })
     }
@@ -948,6 +949,7 @@ mod tests {
             "assessmentId": "assessment",
             "memory": [],
             "performance": [],
+            "projector": { "_tag": "None" },
             "drafter": { "_tag": "None" },
         });
         let profile = ServingProfile { context_length: 262_144 };

@@ -81,8 +81,8 @@ presents. Adding a weight type or relaxing a family check changes verdicts, neve
 
 | Outcome | Carries |
 |---|---|
-| `Fits` | Profile, memory, performance, and the drafter verdict |
-| `DoesNotFit` | Profile, memory, the limiting resource and deficit, and the drafter verdict |
+| `Fits` | Profile, memory, performance, and the projector and drafter verdicts |
+| `DoesNotFit` | Profile, memory, the limiting resource and deficit, and the projector and drafter verdicts |
 | `Unsupported` | Profile when one exists, the complete, never empty list of `UnsupportedReason`s, and developer detail; an unreadable file has no profile |
 
 The subject of an assessment is a catalog model (with its selection) or a custom model. A
@@ -93,7 +93,10 @@ verdicts.
 `UnsupportedReason` is a closed, structured set: architecture, weight types (each type with its
 tensor count), rope scaling, unrecognized tensor, unrecognized metadata, missing metadata,
 tokenizer, chat template, kernel domain, backend, unreadable, target mismatch, tied output head,
-and drafter architecture. Target mismatch is a drafter (or projector) that does not fit the target it is bound to;
+and drafter architecture. Target mismatch is a drafter (or projector) that does not fit the target it is bound to,
+reported on that component's verdict: a projector the target's family can't bind (a text-only
+family, another output width) is `ProjectorVerdict::Rejected` and the target is assessed and served
+without it, taking text input only, so a projector never makes a target unsupported or unreadable;
 drafter architecture is a separate drafter whose `general.architecture` no drafter family binds,
 which names what the engine lacks rather than the target's architecture: a Nemotron-H MTP file
 (`nemotron_h_moe`, an architecture the engine runs as a target) is refused this way, because the

@@ -468,10 +468,12 @@ fn text_input_takes_absolute_positions_and_rejects_media_and_foreign_tokens() {
 }
 
 #[test]
-fn a_projector_is_rejected() {
+fn a_projector_is_a_mismatch_never_an_unreadable_target() {
     let directory = lightning_q8();
+    let error = inspect_components(&directory, Some(&directory), identity()).unwrap_err();
+    assert_eq!(error, Error::Projector);
     assert!(matches!(
-        inspect_components(&directory, Some(&directory), identity()),
-        Err(Error::Structure(_))
+        error.reasons().as_slice(),
+        [magnitude_artifacts::UnsupportedReason::TargetMismatch { .. }]
     ));
 }

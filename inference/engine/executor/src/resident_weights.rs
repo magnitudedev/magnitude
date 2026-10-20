@@ -511,15 +511,12 @@ fn validate_projector_binding(
     definition_has_vision: bool,
     package_has_projector: bool,
 ) -> Result<(), ResidencyError> {
-    match (definition_has_vision, package_has_projector) {
-        (true, false) => Err(invalid(
+    if definition_has_vision && !package_has_projector {
+        return Err(invalid(
             "model definition requires a projector component, but the package has none",
-        )),
-        (false, true) => Err(invalid(
-            "package contains a projector component not bound by the model definition",
-        )),
-        _ => Ok(()),
+        ));
     }
+    Ok(())
 }
 
 pub(crate) fn activation_dtype(dtype: ActivationDType) -> DType {
@@ -565,20 +562,15 @@ mod tests {
     }
 
     #[test]
-    fn projector_presence_must_exactly_match_the_family_contract() {
+    fn a_vision_definition_requires_its_projector_and_an_unbound_projector_stays_out() {
         assert!(validate_projector_binding(false, false).is_ok());
         assert!(validate_projector_binding(true, true).is_ok());
+        assert!(validate_projector_binding(false, true).is_ok());
         assert_eq!(
             validate_projector_binding(true, false)
                 .unwrap_err()
                 .to_string(),
             "model definition requires a projector component, but the package has none"
-        );
-        assert_eq!(
-            validate_projector_binding(false, true)
-                .unwrap_err()
-                .to_string(),
-            "package contains a projector component not bound by the model definition"
         );
     }
 }
