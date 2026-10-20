@@ -43,9 +43,17 @@ Signals in order of strength; any one is enough and later signals break ties:
 2. **Lineage:** the Hub's `baseModels`, following up to two hops (GGUF → finetune → base), when the
    repository is known; the GGUF's `general.base_model.N.*` for every file; and Ollama's model name
    when it was pulled as `hf.co/<owner>/<repository>:<quant>`.
-3. **Shape fingerprint:** the target's engine-computed `ModelFingerprint` equals a catalog target's.
-   Requantizations, finetunes, and abliterations keep every fingerprinted dimension, and drafters
-   bind to exactly those dimensions. This covers files with no Hugging Face identity or metadata.
+3. **Shape fingerprint:** the catalog target whose engine-computed `ModelFingerprint` equals the
+   target's, else the catalog model the target is a variant of by shape (below). Requantizations,
+   finetunes, and abliterations keep every fingerprinted dimension, and converters may rewrite a
+   token table's unused entries (Ollama writes them as `[PAD<n>]`), so the token table only breaks
+   ties. This covers files with no Hugging Face identity or metadata, but it is not lineage:
+   successive generations of one architecture and size share every dimension and often the token
+   table (Qwen3.6 27B and Qwen3.8 27B do), and a drafter trained on another generation's hidden
+   states binds yet slows decoding. A catalog drafter matched only by shape is therefore offered,
+   labelled "Untested · Trained for <model>", but never chosen automatically; the user may choose
+   it. Header-only evidence cannot tell a same-weights copy without lineage (Ollama's blobs) from
+   another generation, so making such a drafter automatic needs evidence beyond the header.
 
 A catalog model's upstream lineage is the Hub's `baseModels` of its target repository at the locked
 commit, read once and cached with that commit's snapshot; catalog fingerprints come from the release
@@ -58,8 +66,9 @@ its catalog model, and anything else is a variant of the first catalog model, in
 whose fingerprint has its shape (every fingerprinted dimension but the token table). Declared
 lineage never decides it. Models of one architecture and size can share every dimension and the
 tokenizer (Qwen3.5 27B and Qwen3.8 27B do), so the first of them in catalog order is named. Drafter
-selection still ranks lineage above the fingerprint, as above. The engine verdict alone decides
-compatibility.
+selection still ranks lineage above the fingerprint, as above, and a model shown as a variant is
+always offered that catalog model's drafter, automatic only with lineage. The engine verdict alone
+decides compatibility.
 
 ## Candidates
 
@@ -67,7 +76,8 @@ Only these sources are offered automatically:
 
 - **Separate drafters in the model's own repository (any path in it) or folder**: GGUFs whose header declares a
   drafter role ("In this repository", or "In this folder" for local files).
-- **The catalog drafter of the matched catalog model** ("Trained for <model>").
+- **The catalog drafter of the matched catalog model** ("Trained for <model>"; "Untested · Trained for
+  <model>", and never automatic, when matched by shape alone).
 - **Built-in MTP heads**, detected from the selected file's tensors, never its name ("Built into this model").
 
 Magnitude never searches Hugging Face for drafters and never offers loose drafter files from other locations. A
@@ -92,7 +102,7 @@ built-in MTP heads. The first candidate that binds, in this order, is preselecte
 
 1. a separate drafter in the model's own repository or folder, any method, by method order, because it was
    built for those exact weights;
-2. the catalog drafter, whatever its method;
+2. the catalog drafter, whatever its method, when the target matched it by exact target or lineage;
 3. built-in MTP heads;
 4. no drafter.
 

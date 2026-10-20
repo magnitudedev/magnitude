@@ -25,6 +25,80 @@
       }
     },
     {
+      "name": "qwen35moe-supported",
+      "description": "Catalog Qwen3.6 35B-A3B UD-Q4_K_XL (routed qwen35moe) with its catalog DFlash drafter.",
+      "target": [
+        {
+          "header": "headers/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf.gz",
+          "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+          "revision": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
+          "path": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+        }
+      ],
+      "draft": {
+        "header": "headers/Qwen3.6-35B-A3B-DFlash-Q8_0.gguf.gz",
+        "repository": "magnitudedev/Qwen3.6-35B-A3B-DFlash-GGUF",
+        "revision": "4f5e4df8dc4520256bdc0bc8752c7010bbfb1eec",
+        "path": "Qwen3.6-35B-A3B-DFlash-Q8_0.gguf"
+      },
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "bound": "dflash"
+        }
+      }
+    },
+    {
+      "name": "qwen38-27b-dflash2",
+      "description": "Catalog Qwen3.8 27B UD-Q4_K_XL with its catalog DFlash2 drafter.",
+      "target": [
+        {
+          "header": "headers/Qwen3.8-27B-UD-Q4_K_XL.gguf.gz",
+          "repository": "unsloth/Qwen3.8-27B-GGUF",
+          "revision": "27af057ecb382ddfea5d12837360a8980560e3ed",
+          "path": "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+        }
+      ],
+      "draft": {
+        "header": "headers/Qwen3.8-27B-DFlash2-Q8_0.gguf.gz",
+        "repository": "magnitudedev/Qwen3.8-27B-DFlash2-GGUF",
+        "revision": "ead2a051a43bf91e8982e00d2c060efb3b984cb5",
+        "path": "Qwen3.8-27B-DFlash2-Q8_0.gguf"
+      },
+      "method": "dflash2",
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "bound": "dflash2"
+        }
+      }
+    },
+    {
+      "name": "qwen36-27b-with-qwen38-dflash2",
+      "description": "lmstudio-community Qwen3.6 27B Q4_K_M (no general.base_model; Qwen3.8 27B's shape and token table) with the catalog Qwen3.8 27B DFlash2 drafter. It binds, though trained on another generation's hidden states it accepts about 15% and slows decoding.",
+      "target": [
+        {
+          "header": "headers/Qwen3.6-27B-Q4_K_M.gguf.gz",
+          "repository": "lmstudio-community/Qwen3.6-27B-GGUF",
+          "revision": "58c6607d9c4cae8b071b3781c73be633fb3dee36",
+          "path": "Qwen3.6-27B-Q4_K_M.gguf"
+        }
+      ],
+      "draft": {
+        "header": "headers/Qwen3.8-27B-DFlash2-Q8_0.gguf.gz",
+        "repository": "magnitudedev/Qwen3.8-27B-DFlash2-GGUF",
+        "revision": "ead2a051a43bf91e8982e00d2c060efb3b984cb5",
+        "path": "Qwen3.8-27B-DFlash2-Q8_0.gguf"
+      },
+      "method": "dflash2",
+      "expected": {
+        "target": "supported",
+        "drafter": {
+          "bound": "dflash2"
+        }
+      }
+    },
+    {
       "name": "qwen35-mismatched-dflash",
       "description": "Catalog Qwen3.5 4B with the DFlash drafter trained for Qwen3.5 9B.",
       "target": [

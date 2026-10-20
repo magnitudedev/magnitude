@@ -1635,10 +1635,17 @@ impl ManagedModelCandidates {
     }
 
     /// The catalog models a target derives from, best first: an exact catalog target alone; else
-    /// the lineage match whose shape fingerprint equals the target's, else the first lineage match
-    /// in catalog order; then the fingerprint-matched catalog model when it is another one, whose
-    /// drafter is the fallback when the lineage match's is rejected. Locally, catalog upstreams
-    /// the Hub has not yet supplied match nothing.
+    /// the lineage match that is the target's fingerprint match, else the first lineage match in
+    /// catalog order; then the fingerprint match when it is another one, whose drafter is the
+    /// fallback when the lineage match's is rejected. Locally, catalog upstreams the Hub has not
+    /// yet supplied match nothing.
+    ///
+    /// The fingerprint match is the catalog model whose fingerprint equals the target's, else the
+    /// one the target is a variant of by shape (see `ModelShape::variant_of`), so every model shown
+    /// as a variant of a catalog model is offered that model's drafter even when its converter
+    /// wrote another token table (Ollama writes unused entries as `[PAD<n>]`). The engine's verdict
+    /// decides whether it binds, and a drafter matched this way is never automatic (see
+    /// `known_to_work`).
     async fn catalog_matches(
         &self,
         exact: Option<(&str, &str, &Path)>,
@@ -1652,13 +1659,14 @@ impl ManagedModelCandidates {
             return vec![(matched, DrafterLineage::Exact)];
         }
         let fingerprinted = match fingerprint {
-            Some(fingerprint) => self
-                .catalog_facts()
-                .await
-                .fingerprints
-                .iter()
-                .find(|(_, candidate)| candidate == fingerprint)
-                .map(|(model_id, _)| model_id.clone()),
+            Some(fingerprint) => {
+                let catalog = &self.catalog_facts().await.fingerprints;
+                catalog
+                    .iter()
+                    .find(|(_, candidate)| candidate == fingerprint)
+                    .map(|(model_id, _)| model_id.clone())
+                    .or_else(|| ModelShape::of(fingerprint).variant_of(catalog))
+            }
             None => None,
         };
         let mut lineage_matches = match reach {
@@ -1937,8 +1945,7 @@ impl ManagedModelCandidates {
         progress.drafter_checked();
         let own = own?;
         let regardless_of_fit = |mut candidate: DrafterCandidate| {
-            candidate.automatic = candidate.category != DrafterCategory::Other
-                && is_bound(&candidate.verdict);
+            candidate.automatic = known_to_work(&candidate) && is_bound(&candidate.verdict);
             candidate
         };
         let exact = match (&target.repository, &target.primary) {
@@ -2151,20 +2158,27 @@ impl ManagedModelCandidates {
             .map_err(|error| tracing::warn!(%error, "catalog drafter assessment failed"))
             .ok()?;
         let verdict = verdict_of(&assessed.profile);
-        Some(DrafterCandidate {
+        let trained_for = format!("Trained for {}", matched.model.display_name);
+        let mut candidate = DrafterCandidate {
             category: DrafterCategory::CatalogDrafter,
-            automatic: is_bound(&verdict) && fits(&assessed.profile),
+            automatic: false,
             reference: DrafterReference::Catalog {
                 model_id: matched.model_id.clone(),
             },
             name: catalog_drafter_name(method, &matched.model.display_name),
-            label: format!("Trained for {}", matched.model.display_name),
+            label: match lineage {
+                DrafterLineage::Fingerprint => format!("Untested · {trained_for}"),
+                _ => trained_for,
+            },
             size_bytes,
             lineage,
             method: bound_method(&verdict).or(Some(method.clone())),
             verdict,
             on_this_computer,
-        })
+        };
+        candidate.automatic =
+            known_to_work(&candidate) && is_bound(&candidate.verdict) && fits(&assessed.profile);
+        Some(candidate)
     }
 
     /// The separate drafters in the target's own repository snapshot, or its own folder when it
@@ -2722,6 +2736,16 @@ fn lineage_kind(drafter: &BTreeSet<String>, related: &BTreeSet<String>) -> Draft
 
 fn is_bound(verdict: &DrafterVerdict) -> bool {
     matches!(verdict, DrafterVerdict::Bound { .. })
+}
+
+/// Whether automatic choice may take a candidate the engine binds: its source shows it was made
+/// for this target. A drafter the user entered never is, nor is a catalog drafter matched by shape
+/// alone: one architecture and size share every fingerprinted dimension and often the token table
+/// across model generations, and a drafter trained on another generation's hidden states binds but
+/// slows decoding.
+fn known_to_work(candidate: &DrafterCandidate) -> bool {
+    candidate.category != DrafterCategory::Other
+        && candidate.lineage != DrafterLineage::Fingerprint
 }
 
 fn fits(assessment: &ModelAssessment) -> bool {

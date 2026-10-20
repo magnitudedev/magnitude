@@ -1154,8 +1154,8 @@ async fn fixture_with(
     .await
 }
 
-/// A fixture over every option: with `qwen`, the hub also serves the Qwen3.5 4B repositories and
-/// the catalog also lists Qwen3.5 4B with its DFlash drafter.
+/// A fixture over every option: with `qwen`, the hub also serves the real Qwen repositories and
+/// the catalog also lists Qwen3.5 4B, Qwen3.6 35B-A3B and Qwen3.8 27B with their drafters.
 async fn fixture_from(
     custom: Vec<CustomModel>,
     local_models: LocalModelsConfiguration,
@@ -1168,6 +1168,7 @@ async fn fixture_from(
     stub.repositories.extend(extra_repositories);
     if qwen {
         stub.repositories.extend(qwen_repositories());
+        stub.repositories.extend(qwen_generation_repositories());
     }
     let (endpoint, hub) = stub.serve();
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -1202,6 +1203,8 @@ async fn fixture_from(
     }
     if qwen {
         catalog.models.push(qwen_catalog_model(&models).await);
+        catalog.models.push(qwen36_catalog_model(&models).await);
+        catalog.models.push(qwen38_catalog_model(&models).await);
     }
     let lineage = CatalogLineage::new(Arc::clone(&models), catalog.clone());
     let resolver = ModelDomainResolver::new(Arc::clone(&models), catalog.clone());
@@ -2223,7 +2226,7 @@ async fn drafters_in_a_local_model_folder_precede_the_fingerprint_matched_catalo
         [
             (DrafterCategory::NextToModel, "In this folder"),
             (DrafterCategory::NextToModel, "In this folder"),
-            (DrafterCategory::CatalogDrafter, "Trained for Llama Test"),
+            (DrafterCategory::CatalogDrafter, "Untested · Trained for Llama Test"),
         ],
         "{candidates:#?}"
     );
@@ -2285,6 +2288,7 @@ async fn a_local_file_without_lineage_matches_its_catalog_parent_by_fingerprint(
         .expect("the catalog drafter");
     assert_eq!(catalog.lineage, DrafterLineage::Fingerprint);
     assert!(matches!(catalog.verdict, DrafterVerdict::Bound { .. }));
+    assert!(!catalog.automatic, "a shape match alone is untested");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2969,15 +2973,20 @@ async fn a_drafter_in_a_sibling_subfolder_is_not_in_this_folder() {
 }
 
 /// A local Llama file whose header names `base` as its base model.
-fn local_llama_with_base(base: &str) -> (tempfile::TempDir, ModelCandidate) {
-    let folder = tempfile::tempdir().expect("model folder");
+/// The Llama Q8_0 file declaring `base` as its base model.
+fn llama_with_base(base: &str) -> Gguf {
     let mut gguf = llama(7, Encoding::Q8_0);
     gguf.set("general.base_model.count", Meta::U32(1));
     gguf.set(
         "general.base_model.0.repo_url",
         Meta::Str(format!("https://huggingface.co/{base}")),
     );
-    write_complete(&folder.path().join("model.gguf"), &gguf);
+    gguf
+}
+
+fn local_llama_with_base(base: &str) -> (tempfile::TempDir, ModelCandidate) {
+    let folder = tempfile::tempdir().expect("model folder");
+    write_complete(&folder.path().join("model.gguf"), &llama_with_base(base));
     let candidate = ModelCandidate {
         source: CandidateSource::Local {
             path: folder.path().to_path_buf(),
@@ -3058,7 +3067,7 @@ async fn of_two_lineage_matches_the_one_with_the_targets_fingerprint_supplies_th
 }
 
 /// When the lineage-matched catalog model's drafter is rejected, the fingerprint-matched catalog
-/// model's drafter is offered and preselected.
+/// model's drafter is offered too, untested and never preselected.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rejected_lineage_drafter_falls_back_to_the_fingerprint_matched_catalog_drafter() {
     let fixture = fixture_with_other_catalog_model().await;
@@ -3079,15 +3088,17 @@ async fn a_rejected_lineage_drafter_falls_back_to_the_fingerprint_matched_catalo
         catalog,
         [
             ("Trained for Other Llama", DrafterLineage::Lineage, false),
-            ("Trained for Llama Test", DrafterLineage::Fingerprint, true),
+            (
+                "Untested · Trained for Llama Test",
+                DrafterLineage::Fingerprint,
+                true
+            ),
         ],
         "{candidates:#?}"
     );
-    assert_eq!(
-        preselected(&candidates).reference,
-        DrafterReference::Catalog {
-            model_id: fixture.catalog_id.clone()
-        }
+    assert!(
+        candidates.iter().all(|candidate| !candidate.automatic),
+        "{candidates:#?}"
     );
 }
 
@@ -3931,7 +3942,7 @@ async fn a_found_models_automatic_drafter_follows_its_folder_and_the_catalog_dra
     let folder = locations.path().join("A");
     let drafters = locations.path().join("drafters");
     let model = folder.join("model-IQ3_XXS.gguf");
-    write_sparse(&model, &llama(7, Encoding::Q8_0));
+    write_sparse(&model, &llama_with_base("base/Llama"));
     let catalog_copy = drafters.join("catalog-dflash.gguf");
     write_sparse(&catalog_copy, &dflash(HIDDEN));
     let root = |path: &std::path::Path| magnitude_service_contracts::models::ModelRoot {
@@ -4008,7 +4019,7 @@ async fn a_model_sharing_a_header_with_another_never_takes_the_drafter_in_its_fo
     let picked = locations.path().join("picked");
     let drafters = locations.path().join("drafters");
     let original = pair.join("model-Q8_0.gguf");
-    write_sparse(&original, &llama(7, Encoding::Q8_0));
+    write_sparse(&original, &llama_with_base("base/Llama"));
     let beside = pair.join("mtp-model-Q8_0.gguf");
     write_sparse(&beside, &dflash2());
     write_sparse(&drafters.join("catalog-dflash.gguf"), &dflash(HIDDEN));
@@ -4103,7 +4114,7 @@ async fn a_load_after_a_file_moves_reads_it_where_it_is_now_without_a_restart() 
     let elsewhere = locations.path().join("lfm-imp");
     let other = locations.path().join("other");
     let model = folder.join("model-Q4_K_M.gguf");
-    write_sparse(&model, &llama(7, Encoding::Q8_0));
+    write_sparse(&model, &llama_with_base("base/Llama"));
     let beside = folder.join("folder-dflash.gguf");
     write_sparse(&beside, &dflash(HIDDEN));
     let copy = elsewhere.join("dflash-copy.gguf");
@@ -4356,6 +4367,222 @@ async fn qwen_catalog_model(models: &Arc<ManagedModelStore>) -> RecommendableMod
 
 fn qwen_catalog_id() -> ModelId {
     "qwen3.5-4b:gguf:q4".parse().unwrap()
+}
+
+// Catalog drafters matched by shape ---------------------------------------------------------------
+
+const QWEN36_TARGET: &str = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF";
+const QWEN36_DRAFT: &str = "magnitudedev/Qwen3.6-35B-A3B-DFlash-GGUF";
+const QWEN36_FILE: &str = "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf";
+const QWEN36_DRAFT_FILE: &str = "Qwen3.6-35B-A3B-DFlash-Q8_0.gguf";
+const QWEN38_TARGET: &str = "unsloth/Qwen3.8-27B-GGUF";
+const QWEN38_DRAFT: &str = "magnitudedev/Qwen3.8-27B-DFlash2-GGUF";
+const QWEN38_FILE: &str = "Qwen3.8-27B-UD-Q4_K_XL.gguf";
+const QWEN38_DRAFT_FILE: &str = "Qwen3.8-27B-DFlash2-Q8_0.gguf";
+/// Ollama's `qwen3.6:35b-a3b` model blob.
+const OLLAMA_QWEN36_FILE: &str = "ollama-qwen3.6-35b-a3b.gguf";
+/// lmstudio-community's Qwen3.6 27B: Qwen3.8 27B's shape and token table, another generation.
+const QWEN36_27B_FILE: &str = "Qwen3.6-27B-Q4_K_M.gguf";
+
+/// The real catalog targets of Qwen3.6 35B-A3B (with built-in MTP heads) and Qwen3.8 27B, and
+/// their catalog drafters.
+fn qwen_generation_repositories() -> BTreeMap<String, StubRepository> {
+    let served = |path: &str| fixture_file(&format!("headers/{path}.gz"), path);
+    BTreeMap::from([
+        (
+            QWEN36_TARGET.to_owned(),
+            repository('7', vec![served(QWEN36_FILE)], &["Qwen/Qwen3.6-35B-A3B"]),
+        ),
+        (
+            QWEN36_DRAFT.to_owned(),
+            repository('8', vec![served(QWEN36_DRAFT_FILE)], &["Qwen/Qwen3.6-35B-A3B"]),
+        ),
+        (
+            QWEN38_TARGET.to_owned(),
+            repository('a', vec![served(QWEN38_FILE)], &["Qwen/Qwen3.8-27B"]),
+        ),
+        (
+            QWEN38_DRAFT.to_owned(),
+            repository('b', vec![served(QWEN38_DRAFT_FILE)], &["Qwen/Qwen3.8-27B"]),
+        ),
+    ])
+}
+
+/// A catalog model of the Qwen fixtures, served with its separate drafter.
+async fn qwen_generation_catalog_model(
+    models: &Arc<ManagedModelStore>,
+    (id, display_name): (&str, &str),
+    (target, target_file): (&str, &str),
+    (draft, draft_file): (&str, &str),
+    method: SpeculativeMethod,
+) -> RecommendableModel {
+    let mut model = qwen_catalog_model(models).await;
+    model.model_id = magnitude_service_contracts::models::CatalogBaseId::new(id).unwrap();
+    model.display_name = display_name.to_owned();
+    model.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+        target: hugging_face_package(models, target, target_file).await,
+        draft_source: SpeculativeDraftSource::Separate {
+            draft: hugging_face_package(models, draft, draft_file).await,
+        },
+        method,
+    };
+    model
+}
+
+async fn qwen36_catalog_model(models: &Arc<ManagedModelStore>) -> RecommendableModel {
+    qwen_generation_catalog_model(
+        models,
+        ("qwen3.6-35b-a3b", "Qwen3.6 35B-A3B"),
+        (QWEN36_TARGET, QWEN36_FILE),
+        (QWEN36_DRAFT, QWEN36_DRAFT_FILE),
+        SpeculativeMethod::DFlash,
+    )
+    .await
+}
+
+async fn qwen38_catalog_model(models: &Arc<ManagedModelStore>) -> RecommendableModel {
+    qwen_generation_catalog_model(
+        models,
+        ("qwen3.8-27b", "Qwen3.8 27B"),
+        (QWEN38_TARGET, QWEN38_FILE),
+        (QWEN38_DRAFT, QWEN38_DRAFT_FILE),
+        SpeculativeMethod::DFlash2,
+    )
+    .await
+}
+
+/// A fixture serving the Qwen repositories and listing their catalog models, and a folder holding
+/// only the shared fixture header `name`.
+async fn found_qwen(name: &str) -> (Fixture, tempfile::TempDir) {
+    let fixture = fixture_from(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::new(),
+        true,
+        cpu_environment(),
+    )
+    .await;
+    let folder = tempfile::tempdir().expect("model folder");
+    let StubFile {
+        header, size_bytes, ..
+    } = fixture_file(&format!("headers/{name}.gz"), name);
+    write_complete_bytes(&folder.path().join(name), &header, size_bytes);
+    (fixture, folder)
+}
+
+/// The variant a found file is shown as, and its drafter candidates.
+async fn found_variant_and_drafters(
+    fixture: &Fixture,
+    folder: &std::path::Path,
+    name: &str,
+) -> (
+    Option<ModelId>,
+    Vec<magnitude_service_contracts::models::DrafterCandidate>,
+) {
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::Local {
+            path: folder.join(name),
+        })
+        .await
+        .expect("inspection");
+    let drafters = drafters_of(
+        fixture,
+        ModelCandidate {
+            source: CandidateSource::Local {
+                path: folder.to_path_buf(),
+            },
+            target: vec![name.to_owned()],
+            projector: None,
+            drafter: None,
+        },
+    )
+    .await;
+    (inspection.variant_of, drafters)
+}
+
+/// Ollama's `qwen3.6:35b-a3b` declares no lineage, writes a zero dense `feed_forward_length`, and
+/// writes its tokenizer's audio and padding entries as `[PAD<n>]`, so its token table is not the
+/// catalog target's though its shape is. As a variant of the catalog Qwen3.6 35B-A3B, it is
+/// offered that model's DFlash drafter, which binds, ahead of its built-in heads; with nothing
+/// but its shape to go on, the drafter is untested and never chosen automatically.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_variant_without_lineage_is_offered_its_catalog_drafter_as_untested() {
+    let (fixture, blobs) = found_qwen(OLLAMA_QWEN36_FILE).await;
+    let (variant_of, candidates) =
+        found_variant_and_drafters(&fixture, blobs.path(), OLLAMA_QWEN36_FILE).await;
+    assert_eq!(variant_of, Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()));
+    let listed = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.category,
+                candidate.reference.clone(),
+                candidate.lineage,
+                candidate.method.clone(),
+                is_bound(&candidate.verdict),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed,
+        [
+            (
+                DrafterCategory::CatalogDrafter,
+                DrafterReference::Catalog {
+                    model_id: "qwen3.6-35b-a3b:gguf:q4".parse().unwrap()
+                },
+                DrafterLineage::Fingerprint,
+                Some(SpeculativeMethod::DFlash),
+                true,
+            ),
+            (
+                DrafterCategory::BuiltIn,
+                DrafterReference::Embedded,
+                DrafterLineage::Exact,
+                Some(SpeculativeMethod::Mtp),
+                true,
+            ),
+        ],
+        "{candidates:#?}"
+    );
+    assert_eq!(candidates[0].label, "Untested · Trained for Qwen3.6 35B-A3B");
+    assert!(!candidates[0].automatic, "{candidates:#?}");
+}
+
+/// Qwen3.6 27B has every fingerprinted dimension and the token table of Qwen3.8 27B, so it is shown
+/// as its variant, and Qwen3.8 27B's DFlash2 binds to it; but that drafter was trained on another
+/// generation's hidden states and slows it down, so a shape match never makes it automatic.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalog_drafter_matched_by_shape_alone_is_never_automatic() {
+    let (fixture, folder) = found_qwen(QWEN36_27B_FILE).await;
+    let (variant_of, candidates) =
+        found_variant_and_drafters(&fixture, folder.path(), QWEN36_27B_FILE).await;
+    assert_eq!(variant_of, Some("qwen3.8-27b:gguf:q4".parse().unwrap()));
+    let listed = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.category,
+                candidate.lineage,
+                candidate.method.clone(),
+                is_bound(&candidate.verdict),
+                candidate.automatic,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed,
+        [(
+            DrafterCategory::CatalogDrafter,
+            DrafterLineage::Fingerprint,
+            Some(SpeculativeMethod::DFlash2),
+            true,
+            false,
+        )],
+        "{candidates:#?}"
+    );
 }
 
 /// What a file needs on the standard CPU environment served plain, with its built-in heads, and

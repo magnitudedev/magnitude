@@ -23,7 +23,11 @@ trimmed table's, so it does not match the full file.
 
 To add a header, run `python3 -I fetch_header.py REPO REVISION PATH`. It fetches with ranged GETs
 only (the first few MB, never the whole file), then trims and gzips into `headers/`. `HF_TOKEN` is
-sent when set.
+sent when set. A header from Ollama's registry (`ollama-<model>-<tag>.gguf.gz`) is the model
+layer's blob read the same way and trimmed by the same `trim`. The manifest lists Hugging Face
+files only, so such a header serves the service's tests alone; `ollama-qwen3.6-35b-a3b.gguf.gz` is
+`registry.ollama.ai/library/qwen3.6:35b-a3b`, blob
+`sha256:d372de8e934898a59e6ccfabc3368474711384d8f1fd4d22d87a3f0a45400cdc`.
 
 ## `manifest.json`
 
