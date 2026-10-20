@@ -460,6 +460,28 @@ describe("finding models", () => {
     })
   })
 
+  it("says a repository without GGUF files has none Magnitude can use", async () => {
+    const { run } = harness({
+      inspectFailure: {
+        _tag: "GeneratedClientRemoteError",
+        status: 409,
+        body: {
+          error: {
+            code: "hugging_face_repository_without_gguf",
+            message: "This repository has no GGUF files Magnitude can use.",
+          },
+        },
+      },
+    })
+    const result = await run((commands) => commands.inspectCandidate("meta-llama/Llama-3.2-1B-Instruct").pipe(Effect.either))
+    expect(result._tag === "Left" && result.left).toMatchObject({
+      _tag: "ModelSourceUnavailable",
+      reason: "Unavailable",
+      message: "This repository has no GGUF files Magnitude can use.",
+      retryable: false,
+    })
+  })
+
   it("refuses a version the repository does not have", async () => {
     const { run } = harness()
     const result = await run((commands) => commands.inspectCandidate("owner/model-GGUF:IQ1_M").pipe(Effect.either))

@@ -303,7 +303,10 @@ A download refused the same way fails with `DownloadFailure` `HuggingFaceAccessR
 anonymous request for a repository that doesn't exist with 401, so the repository may be missing,
 private or gated. Clients present it as a typed not-found error whose message asks to check the name
 or to sign in to Hugging Face. A gated repository shows its metadata, so only its refused files get
-the sign-in or terms codes.
+the sign-in or terms codes. A repository whose commit lists no GGUF file (safetensors only, say)
+fails resolution and inspection with the model operation code `hugging_face_repository_without_gguf`
+("This repository has no GGUF files Magnitude can use."), which clients show as the same notice an
+inspection with no usable version gets.
 
 ## Artifact stores and inventory
 

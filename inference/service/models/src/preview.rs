@@ -550,10 +550,7 @@ impl HubModel {
             .collect::<Result<Vec<_>, InventoryError>>()?;
         gguf_files.sort_by(|left, right| left.path.cmp(&right.path));
         if gguf_files.is_empty() {
-            return Err(InventoryError::Unsupported(format!(
-                "{} does not contain GGUF artifacts",
-                requested_repository
-            )));
+            return Err(hub_repository_without_gguf());
         }
         let card = self.card_data.as_ref();
         let license = card
@@ -1826,6 +1823,15 @@ pub(crate) fn hub_repository_not_found() -> InventoryError {
     }
 }
 
+/// A repository whose commit lists no GGUF file (safetensors only, say): nothing in it can be used.
+pub(crate) fn hub_repository_without_gguf() -> InventoryError {
+    InventoryError::ModelOperation {
+        code: "hugging_face_repository_without_gguf".to_owned(),
+        message: "This repository has no GGUF files Magnitude can use.".to_owned(),
+        retryable: false,
+    }
+}
+
 /// One Hub request with the configured token as its Bearer credential when there is one, through
 /// [`send_hub_request`]. Hugging Face rejects an expired or revoked token outright (401), even for
 /// public repositories, so a rejected credential falls back to an anonymous request. Also returns
@@ -2467,6 +2473,40 @@ mod tests {
             snapshot.gguf_files[0].content,
             ContentIdentity::Sha256 { .. }
         ));
+    }
+
+    #[test]
+    fn a_repository_without_gguf_files_says_so_in_product_words() {
+        let error = HubModel {
+            id: Some("meta-llama/Llama-3.2-1B-Instruct".to_owned()),
+            sha: Some("b".repeat(40)),
+            last_modified: None,
+            downloads: None,
+            likes: None,
+            gated: None,
+            private: Some(false),
+            tags: Vec::new(),
+            card_data: None,
+            siblings: vec![HubSibling {
+                rfilename: "model.safetensors".to_owned(),
+                size: Some(5),
+                blob_id: Some("e".repeat(40)),
+                lfs: None,
+            }],
+        }
+        .into_snapshot("meta-llama/Llama-3.2-1B-Instruct".to_owned(), &"b".repeat(40))
+        .unwrap_err();
+        let InventoryError::ModelOperation {
+            code,
+            message,
+            retryable,
+        } = error
+        else {
+            panic!("a repository without GGUFs is a model operation failure: {error:?}");
+        };
+        assert_eq!(code, "hugging_face_repository_without_gguf");
+        assert_eq!(message, "This repository has no GGUF files Magnitude can use.");
+        assert!(!retryable);
     }
 
     #[test]

@@ -189,6 +189,9 @@ export const repositoryNotFoundMessage = (signedIn: boolean): string => signedIn
 export const referencedRepository = (reference: string): string =>
   /^(?:https?:\/\/(?:www\.)?(?:huggingface\.co|hf\.co)\/)?([\w.-]+\/[\w.-]+)/.exec(reference.trim())?.[1] ?? reference
 
+/** The product message for a repository that lists no GGUF file. */
+export const noGgufFilesMessage = "This repository has no GGUF files Magnitude can use."
+
 /** The product message for a file whose contents Magnitude couldn't read. */
 export const unreadableFileMessage = "Magnitude couldn't read this file. It may be incomplete, damaged, "
   + "or use a format Magnitude doesn't support yet."
@@ -208,8 +211,8 @@ const remoteCode = (cause: GeneratedClientError<unknown>): string | undefined =>
 
 /**
  * A rejected reference is the caller's to fix. A gated repository, one Hugging Face won't show
- * (worded by whether Magnitude is signed in to Hugging Face) and a file that can't be read get
- * product messages; other Hugging Face and file failures keep the inference
+ * (worded by whether Magnitude is signed in to Hugging Face), one without GGUF files and a file that
+ * can't be read get product messages; other Hugging Face and file failures keep the inference
  * service's own message. Only a connection that never reached it is a service reachability
  * failure, and a response that doesn't match the contract is never presented as one.
  */
@@ -224,6 +227,8 @@ export const candidateFailure = (reference: string, signedIn: boolean) => (cause
           return new HuggingFaceAccessRequired({ repository: referencedRepository(reference), access: "AcceptTerms", message: termsRequiredMessage })
         case "hugging_face_repository_not_found":
           return new ModelRepositoryNotFound({ reference, message: repositoryNotFoundMessage(signedIn) })
+        case "hugging_face_repository_without_gguf":
+          return new ModelSourceUnavailable({ reason: "Unavailable", message: noGgufFilesMessage, retryable: false })
         case "integrity_failed":
           return new ModelSourceUnavailable({ reason: "Unreadable", message: unreadableFileMessage, retryable: false })
         default: {
