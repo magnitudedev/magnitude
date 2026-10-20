@@ -2122,12 +2122,17 @@ pub enum CatalogInstallationRetentionReason {
     ExternalOwnership,
 }
 
+/// `kept_components`: the parts Magnitude stores for a model whose weights are found elsewhere
+/// that the removal kept, because another model on this computer needs them.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
 pub enum CatalogInstallationRemoval {
     #[serde(rename_all = "camelCase")]
-    Removed { reclaimed_bytes: u64 },
+    Removed {
+        reclaimed_bytes: u64,
+        kept_components: Vec<CatalogComponent>,
+    },
     Retained {
         reason: CatalogInstallationRetentionReason,
     },

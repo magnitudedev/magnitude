@@ -344,7 +344,9 @@ impl ManagedCatalogInstallations {
                 reason: CatalogInstallationRetentionReason::SharedMaterial,
             });
         }
-        if plan.externally_owned && plan.package_ids.is_empty() {
+        // A found target with nothing of Magnitude's is another app's to keep; with stored parts,
+        // removal deletes those no other model needs, even none.
+        if plan.externally_owned && !plan.stores_packages {
             return Ok(CatalogInstallationRemoval::Retained {
                 reason: CatalogInstallationRetentionReason::ExternalOwnership,
             });
@@ -353,7 +355,10 @@ impl ManagedCatalogInstallations {
             .remover
             .remove_catalog_packages(plan.package_ids)
             .await?;
-        Ok(CatalogInstallationRemoval::Removed { reclaimed_bytes })
+        Ok(CatalogInstallationRemoval::Removed {
+            reclaimed_bytes,
+            kept_components: plan.kept_components,
+        })
     }
 
     /// Admits again every download requested before a restart that has not ended, once the files

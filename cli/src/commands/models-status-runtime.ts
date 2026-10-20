@@ -114,11 +114,15 @@ export const renderRemoval = (
   modelId: ModelId,
   kind: Option.Option<RemovalKind>,
   parts: Option.Option<StoredCatalogParts> = Option.none(),
+  kept: readonly CatalogComponent[] = [],
 ): string => {
   if (Option.isSome(parts)) {
-    const names = parts.value.components.map((component) => catalogComponentName(component).toLowerCase()).join(" and ")
+    const names = (components: readonly CatalogComponent[]) =>
+      components.map((component) => catalogComponentName(component).toLowerCase()).join(" and ")
+    const removed = names(parts.value.components.filter((component) => !kept.includes(component)))
     return (parts.value.fetching ? `Cancelled the download Magnitude had in progress for ${modelId}.\n` : "")
-      + (names.length > 0 ? `Removed the ${names} Magnitude downloaded for ${modelId}.\n` : "")
+      + (removed.length > 0 ? `Removed the ${removed} Magnitude downloaded for ${modelId}.\n` : "")
+      + (kept.length > 0 ? `Kept the ${names(kept)} Magnitude downloaded for ${modelId}: another model on this computer uses ${kept.length > 1 ? "them" : "it"}.\n` : "")
       + `It still runs from ${parts.value.weightsPath}, which Magnitude never deletes.\n`
       + `To stop listing it: magnitude models hide ${modelId}\n`
   }
@@ -136,10 +140,10 @@ export const removeModel = (modelInput: string, options: JsonOption = {}) => com
     const model = Option.fromNullable(addressableModels(yield* readCatalog(client)).find((candidate) => candidate.modelId === modelId))
     const kind = Option.map(model, removalKind)
     const parts = Option.flatMap(model, storedCatalogParts)
-    yield* client.models.removeLocalModel({ modelId })
-    return { modelId, kind, parts }
+    const { keptComponents } = yield* client.models.removeLocalModel({ modelId })
+    return { modelId, kind, parts, keptComponents }
   })))),
-  render: ({ modelId, kind, parts }) => renderRemoval(modelId, kind, parts),
+  render: ({ modelId, kind, parts, keptComponents }) => renderRemoval(modelId, kind, parts, keptComponents),
   json: asJson(options, jsonDocument(ModelIdJsonSchema, ({ modelId }: { readonly modelId: ModelId }) => ({ modelId }))),
 })
 

@@ -31,7 +31,8 @@ export interface ModelCommandsApi {
     Effect.Effect<{ readonly started: boolean }, LocalInferenceError>
   readonly cancelSync: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
   readonly acknowledgeSyncFailure: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
-  readonly remove: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
+  /** What a completed removal kept: the parts Magnitude stores for a found catalog model that another model needs. */
+  readonly remove: (modelId: ModelId) => Effect.Effect<{ readonly keptComponents: readonly CatalogComponent[] }, LocalInferenceError>
   readonly loadSlot: (slotId: SlotId) => Effect.Effect<{}, LocalInferenceError>
   readonly previewSlotLoad: (slotId: SlotId) => Effect.Effect<ModelLoadPlan, LocalInferenceError>
   readonly stopSlot: (slotId: SlotId) => Effect.Effect<{}, LocalInferenceError>
@@ -160,6 +161,7 @@ export const ModelCommandsLive: Layer.Layer<
   // Remove never deletes files Magnitude doesn't own. A catalog model whose weights are found elsewhere loses only
   // Magnitude's own parts, the ones it stores and any it is still fetching (that installation is cancelled), and
   // keeps running from the found file; with none, it is hidden instead, as Remove hides any found model.
+  const keptNothing = { keptComponents: [] }
   const catalogRemove = (modelId: CatalogFormModelId) => Effect.all([custom.externalCatalogFiles(modelId), storesComponents(modelId)]).pipe(
     Effect.flatMap(([external, stored]) => Option.isNone(external)
       ? stopModel(modelId).pipe(Effect.zipRight(removals.remove(modelId)))
@@ -167,7 +169,7 @@ export const ModelCommandsLive: Layer.Layer<
           Effect.zipRight(fetching ? catalogCancel(modelId) : Effect.succeed({})),
           Effect.zipRight(stored
             ? removals.remove(modelId)
-            : fetching ? Effect.succeed({}) : custom.hide(modelId).pipe(Effect.as({}))),
+            : fetching ? Effect.succeed(keptNothing) : custom.hide(modelId).pipe(Effect.as(keptNothing))),
         )))),
   )
   return ModelCommands.of({
@@ -183,7 +185,7 @@ export const ModelCommandsLive: Layer.Layer<
     ),
     cancelSync: (modelId) => byForm(modelId, catalogCancel, custom.cancelSync),
     acknowledgeSyncFailure: (modelId) => byForm(modelId, catalogAcknowledge, custom.acknowledgeSyncFailure),
-    remove: (modelId) => byForm(modelId, catalogRemove, (id) => stopModel(id).pipe(Effect.zipRight(custom.remove(id)))),
+    remove: (modelId) => byForm(modelId, catalogRemove, (id) => stopModel(id).pipe(Effect.zipRight(custom.remove(id)), Effect.as(keptNothing))),
     loadSlot: (slotId) => selectedLocalModel(slotId).pipe(
       Effect.flatMap(requestLoad),
       Effect.tap(() => slots.refresh),

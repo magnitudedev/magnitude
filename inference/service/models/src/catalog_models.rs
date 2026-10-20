@@ -19,10 +19,10 @@ use magnitude_service_contracts::models::{
 };
 
 use crate::catalog_installations::ManagedCatalogInstallations;
-use crate::custom_models::CatalogDrafterFit;
+use crate::custom_models::{CatalogDrafterFit, DrafterContent};
 use crate::inventory::{
-    InstalledPackagesObserver, catalog_packages, catalog_projector_package, catalog_store_packages,
-    catalog_target,
+    InstalledPackageRecord, InstalledPackagesObserver, catalog_packages, catalog_projector_package,
+    catalog_store_packages, catalog_target,
 };
 use crate::model_domains::{ModelDomainResolver, domain_changes};
 use crate::model_projection::{
@@ -34,15 +34,18 @@ pub struct CatalogRemovalPlan {
     pub package_ids: Vec<ModelPackageId>,
     pub installed: bool,
     pub externally_owned: bool,
+    pub stores_packages: bool,
+    pub kept_components: Vec<CatalogComponent>,
     pub shared: bool,
 }
 
 /// Removal deletes Magnitude's own copies of the model's packages and never another app's files.
 /// A target with no copy of Magnitude's own is externally owned: only Magnitude's own components
 /// of it (its projector package and drafter) are removed, and the found target stays. A target
-/// that another catalog model shares, or a found target whose stored parts other models all use,
-/// is retained as shared. When an external copy of the target
-/// remains after Magnitude's is removed, it serves the catalog model from where it is.
+/// that another catalog model shares is retained as shared. A found target's removal deletes the
+/// stored parts no other model needs, and completes even when other models need all of them.
+/// When an external copy of the target remains after Magnitude's is removed, it serves the catalog
+/// model from where it is.
 fn removal_plan(
     ids: &BTreeSet<ModelPackageId>,
     target_ids: &BTreeSet<ModelPackageId>,
@@ -61,8 +64,38 @@ fn removal_plan(
             .collect(),
         installed: !target_ids.is_empty(),
         externally_owned: managed_targets.is_empty(),
+        stores_packages: !managed_ids.is_disjoint(ids),
+        kept_components: Vec::new(),
         shared: !managed_targets.is_disjoint(shared_ids),
     }
+}
+
+/// Whether a location other than Magnitude's store holds the bytes of Magnitude's copy of
+/// `package_id`: the same file by its SHA-256, or by its header digest and size.
+fn held_outside_store<'a>(
+    records: impl Iterator<Item = &'a InstalledPackageRecord> + Clone,
+    package_id: &ModelPackageId,
+) -> bool {
+    let content = records
+        .clone()
+        .find(|record| {
+            record.installed.package.id == *package_id
+                && record.installed.origin == ModelPackageInstallationOrigin::Magnitude
+        })
+        .and_then(|own| {
+            DrafterContent::of_package(&own.installed.package).map(|content| DrafterContent {
+                header_digest: own
+                    .primary
+                    .as_ref()
+                    .map(|evidence| evidence.header_digest.clone()),
+                ..content
+            })
+        });
+    content.is_some_and(|content| {
+        records
+            .filter(|record| record.installed.origin != ModelPackageInstallationOrigin::Magnitude)
+            .any(|record| content.held_by(record))
+    })
 }
 
 /// Unavailable catalog models cannot be installed or loaded; their files remain removable.
@@ -476,10 +509,25 @@ impl ModelDomainResolver {
                 &definition.configuration.bundle,
             ));
         }
+        // A model serves with any file holding a drafter's bytes, so Magnitude's copy is needed
+        // only while no other location holds them.
+        let occurrences =
+            self.inventory.installed_packages.read().map_err(|_| {
+                InventoryError::Internal("installed package lock poisoned".to_owned())
+            })?;
+        in_use.retain(|package_id| !held_outside_store(occurrences.records.values(), package_id));
+        drop(occurrences);
         plan.package_ids.retain(|package_id| !in_use.contains(package_id));
-        // Magnitude stores parts of a found target, but another model uses each of them.
-        if plan.externally_owned && plan.package_ids.is_empty() && !managed_ids.is_empty() {
-            plan.shared = true;
+        if plan.externally_owned {
+            plan.kept_components = [
+                (CatalogComponent::Projector, catalog_projector_package(catalog_target(definition))),
+                (CatalogComponent::Drafter, catalog_draft(definition).cloned()),
+            ]
+            .into_iter()
+            .filter_map(|(component, package)| Some((component, package?.id)))
+            .filter(|(_, id)| managed_ids.contains(id) && !plan.package_ids.contains(id))
+            .map(|(component, _)| component)
+            .collect();
         }
         Ok(plan)
     }

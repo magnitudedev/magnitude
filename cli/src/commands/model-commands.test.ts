@@ -133,7 +133,7 @@ describe("model mutations accept hf: and local: IDs", () => {
   ] as const)("catalog remove with a %s ID", async (_, model, expected) => {
     const { text, json, models } = await runBoth({
       getCatalog: succeed(catalogState([model])),
-      removeLocalModel: succeed(),
+      removeLocalModel: succeed({ keptComponents: [] }),
     }, (options) => removeModel(model.modelId, options))
     expect(models.removeLocalModel).toHaveBeenCalledWith({ modelId: model.modelId })
     expect(text).toBe(expected)
@@ -187,7 +187,7 @@ describe("model mutations accept hf: and local: IDs", () => {
     const withParts = found(["Projector", "Drafter"])
     const { text, json, models } = await runBoth({
       getCatalog: succeed(catalogState([withParts])),
-      removeLocalModel: succeed(),
+      removeLocalModel: succeed({ keptComponents: [] }),
     }, (options) => removeModel(withParts.modelId, options))
     expect(models.removeLocalModel).toHaveBeenCalledWith({ modelId: withParts.modelId })
     expect(text).toBe([
@@ -202,7 +202,7 @@ describe("model mutations accept hf: and local: IDs", () => {
     // (QA linux-arch round 3c: it refused here while a found Hugging Face cache model was hidden).
     const hidden = await runBoth({
       getCatalog: succeed(catalogState([found([])])),
-      removeLocalModel: succeed(),
+      removeLocalModel: succeed({ keptComponents: [] }),
     }, (options) => removeModel(withParts.modelId, options))
     expect(hidden.text).toBe([
       `Hid ${withParts.modelId} from Magnitude. Its files are untouched.`,
@@ -223,7 +223,7 @@ describe("model mutations accept hf: and local: IDs", () => {
     })
     const cancelled = await runBoth({
       getCatalog: succeed(catalogState([fetching])),
-      removeLocalModel: succeed(),
+      removeLocalModel: succeed({ keptComponents: [] }),
     }, (options) => removeModel(fetching.modelId, options))
     expect(cancelled.text).toBe([
       `Cancelled the download Magnitude had in progress for ${fetching.modelId}.`,
@@ -231,6 +231,21 @@ describe("model mutations accept hf: and local: IDs", () => {
       `To stop listing it: magnitude models hide ${fetching.modelId}`,
       "",
     ].join("\n"))
+
+    // A drafter another model serves with stays, and the removal says so rather than failing
+    // (QA linux-cuda round 4e: "uses files another model on this computer also uses" and "Removal failed").
+    const shared = await runBoth({
+      getCatalog: succeed(catalogState([withParts])),
+      removeLocalModel: succeed({ keptComponents: ["Drafter"] }),
+    }, (options) => removeModel(withParts.modelId, options))
+    expect(shared.text).toBe([
+      `Removed the image input Magnitude downloaded for ${withParts.modelId}.`,
+      `Kept the drafter Magnitude downloaded for ${withParts.modelId}: another model on this computer uses it.`,
+      `It still runs from ${weightsPath}, which Magnitude never deletes.`,
+      `To stop listing it: magnitude models hide ${withParts.modelId}`,
+      "",
+    ].join("\n"))
+    expect(shared.json).toEqual({ modelId: withParts.modelId })
   })
 
   it("models hide fails with the service's error for an ID that isn't on this computer", async () => {
@@ -412,7 +427,7 @@ describe("hidden models are addressable", () => {
   it("removes a hidden model using what it knows about the model", async () => {
     const { text, models } = await runBoth({
       getCatalog: succeed(catalogState([], [], [hidden])),
-      removeLocalModel: succeed(),
+      removeLocalModel: succeed({ keptComponents: [] }),
     }, (options) => removeModel(hidden.modelId, options))
     expect(models.removeLocalModel).toHaveBeenCalledWith({ modelId: hidden.modelId })
     expect(text).toContain(`Hid ${hidden.modelId} from Magnitude. Its files are untouched.`)

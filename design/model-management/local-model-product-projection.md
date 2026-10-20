@@ -152,6 +152,8 @@ file), and an `External` model with none is hidden instead, as Remove hides any 
 says so ("Hid … from Magnitude"). A component Magnitude is still fetching for an `External` model (a
 queued or running installation) is Magnitude's own part too: Remove cancels that installation,
 deletes any stored components, and never hides the model, which keeps running from the found file.
+A stored component another model needs is kept; the removal still completes, its result names the
+kept components, and clients say they were kept.
 The removal gate checks for stored or in-flight components, not ownership alone, and Hide applies to
 every `External` model.
 An installation's optimization projects as `Optimizing`, an installed-family state that carries

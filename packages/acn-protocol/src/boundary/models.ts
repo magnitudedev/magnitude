@@ -108,9 +108,10 @@ const AcknowledgeLocalModelSyncFailure = Rpc.make(
   }
 ).pipe(atMostOnce)
 
+/** `keptComponents`: the parts Magnitude stores for a found catalog model that the removal kept for another model. */
 const RemoveLocalModel = Rpc.make("RemoveLocalModel", {
   payload: Schema.Struct({ modelId: ModelIdSchema }),
-  success: Schema.Struct({}),
+  success: Schema.Struct({ keptComponents: Schema.Array(CatalogComponentSchema) }),
   error: LocalInferenceError,
 }).pipe(atMostOnce)
 

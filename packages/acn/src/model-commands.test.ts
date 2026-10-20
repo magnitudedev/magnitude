@@ -234,31 +234,35 @@ it("removes only the parts Magnitude stores or is fetching for a catalog model w
   )
 
   // The projector and drafter Magnitude stores are removed; ICN keeps the found weights.
-  expect(await Effect.runPromise(remove(["Projector", "Drafter"], { _tag: "Removed", reclaimedBytes: 2 }))).toEqual({})
+  expect(await Effect.runPromise(remove(["Projector", "Drafter"], { _tag: "Removed", reclaimedBytes: 2, keptComponents: [] }))).toEqual({ keptComponents: [] })
   expect(calls).toEqual(["remove qwen3.5-4b:gguf:q4"])
 
   // With nothing of Magnitude's, Remove never reaches ICN and hides the found copy, as it hides any found model.
   customCalls.length = 0
-  expect(await Effect.runPromise(remove([], { _tag: "Removed", reclaimedBytes: 0 }))).toEqual({})
+  expect(await Effect.runPromise(remove([], { _tag: "Removed", reclaimedBytes: 0, keptComponents: [] }))).toEqual({ keptComponents: [] })
   expect(customCalls).toEqual(["custom hide qwen3.5-4b:gguf:q4"])
   expect(calls).toHaveLength(1)
 
-  // Parts another model still uses stay; ICN retains them as shared, never as another app's files to hide.
-  const retained = await Effect.runPromise(remove(["Drafter"], { _tag: "Retained", reason: "SharedMaterial" }).pipe(Effect.flip))
-  expect(retained._tag === "LocalModelMutationFailed" && retained.code).toBe("model_removal_retained_shared")
-  expect(retained.message).not.toContain("magnitude models hide")
+  // A drafter another model serves with stays, and ICN still completes the removal, so the model is never left as a
+  // failed removal (Linux CUDA round 4e) nor hidden.
+  calls.length = 0
+  customCalls.length = 0
+  expect(await Effect.runPromise(remove(["Drafter"], { _tag: "Removed", reclaimedBytes: 0, keptComponents: ["Drafter"] })))
+    .toEqual({ keptComponents: ["Drafter"] })
+  expect(calls).toEqual(["remove qwen3.5-4b:gguf:q4"])
+  expect(customCalls).toEqual([])
 
   // A drafter still queued is Magnitude's own part too: Remove cancels its installation and never hides the model,
   // which keeps running from the found file (QA mac round 4).
   calls.length = 0
   customCalls.length = 0
-  expect(await Effect.runPromise(remove([], { _tag: "Removed", reclaimedBytes: 0 }, "Pending"))).toEqual({})
+  expect(await Effect.runPromise(remove([], { _tag: "Removed", reclaimedBytes: 0, keptComponents: [] }, "Pending"))).toEqual({ keptComponents: [] })
   expect(calls).toEqual(["cancel op-drafter"])
   expect(customCalls).toEqual([])
 
   // With a stored projector beside the queued drafter, the drafter is cancelled and the projector removed.
   calls.length = 0
-  expect(await Effect.runPromise(remove(["Projector"], { _tag: "Removed", reclaimedBytes: 1 }, "Running"))).toEqual({})
+  expect(await Effect.runPromise(remove(["Projector"], { _tag: "Removed", reclaimedBytes: 1, keptComponents: [] }, "Running"))).toEqual({ keptComponents: [] })
   expect(calls).toEqual(["cancel op-drafter", "remove qwen3.5-4b:gguf:q4"])
 })
 

@@ -414,6 +414,7 @@ export type CatalogInstallationProgressEncoded = S.Schema.Encoded<typeof Catalog
 export const CatalogInstallationRemoval = S.Union(
   S.extend(
     S.TaggedStruct("Removed", {
+      keptComponents: S.Array(S.suspend((): S.Schema<CatalogComponent, CatalogComponentEncoded> => CatalogComponent)),
       reclaimedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
     }),
     S.Record({ key: S.String, value: JsonValue }),

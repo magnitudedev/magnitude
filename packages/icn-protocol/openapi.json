@@ -3472,6 +3472,7 @@
             "type": "object",
             "required": [
               "reclaimedBytes",
+              "keptComponents",
               "_tag"
             ],
             "properties": {
@@ -3479,6 +3480,12 @@
                 "type": "integer",
                 "format": "int64",
                 "minimum": 0
+              },
+              "keptComponents": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CatalogComponent"
+                }
               },
               "_tag": {
                 "type": "string",
@@ -3506,7 +3513,8 @@
               }
             }
           }
-        ]
+        ],
+        "description": "`kept_components`: the parts Magnitude stores for a model whose weights are found elsewhere\nthat the removal kept, because another model on this computer needs them."
       },
       "CatalogInstallationRetentionReason": {
         "type": "string",

@@ -1,6 +1,7 @@
 import { Context, Effect, Layer, Stream, SubscriptionRef } from "effect"
 import {
   LocalModelMutationFailed,
+  type CatalogComponent,
   type LocalInferenceError,
   type ModelFailure,
   type CatalogFormModelId,
@@ -13,10 +14,15 @@ export type LocalModelRemovalState =
   | { readonly _tag: "Removing" }
   | { readonly _tag: "RemoveFailed"; readonly failure: ModelFailure }
 
+/** What a completed removal kept: the parts Magnitude stores for a found model that another model needs. */
+export interface CatalogRemoval {
+  readonly keptComponents: readonly CatalogComponent[]
+}
+
 export interface LocalModelRemovalsApi {
   readonly state: Effect.Effect<ReadonlyMap<CatalogFormModelId, LocalModelRemovalState>>
   readonly changes: Stream.Stream<void>
-  readonly remove: (modelId: CatalogFormModelId) => Effect.Effect<{}, LocalInferenceError>
+  readonly remove: (modelId: CatalogFormModelId) => Effect.Effect<CatalogRemoval, LocalInferenceError>
   /** A new installation supersedes an earlier removal's failure. */
   readonly forget: (modelId: CatalogFormModelId) => Effect.Effect<void>
 }
@@ -29,8 +35,8 @@ export class LocalModelRemovals extends Context.Tag("LocalModelRemovals")<
 /** ICN retains an installation it doesn't own outright: only another app's copy (hide it instead), or shared files. */
 export const catalogRemovalOutcome = (modelId: CatalogFormModelId) => (
   result: CatalogInstallationRemoval,
-): Effect.Effect<{}, LocalModelMutationFailed> => result._tag === "Removed"
-  ? Effect.succeed({})
+): Effect.Effect<CatalogRemoval, LocalModelMutationFailed> => result._tag === "Removed"
+  ? Effect.succeed({ keptComponents: result.keptComponents })
   : Effect.fail(new LocalModelMutationFailed({
       code: result.reason === "ExternalOwnership"
         ? "model_removal_retained_external"
@@ -84,7 +90,7 @@ export const LocalModelRemovalsLive: Layer.Layer<
           retryable: true,
         })
       }
-      yield* restore(client.catalog.removeCatalogModelInstallation({ path: { model_id: modelId } }).pipe(
+      const removal = yield* restore(client.catalog.removeCatalogModelInstallation({ path: { model_id: modelId } }).pipe(
         Effect.mapError((cause) => icnCommandFailure("remove", cause)),
         Effect.mapError((failure) => failure.code === CATALOG_MODEL_NOT_INSTALLED ? notInstalledRemoval(modelId) : failure),
         Effect.flatMap(catalogRemovalOutcome(modelId)),
@@ -101,7 +107,7 @@ export const LocalModelRemovalsLive: Layer.Layer<
         Effect.onInterrupt(() => clear(modelId)),
       ))
       yield* clear(modelId)
-      return {}
+      return removal
     }))
     return LocalModelRemovals.of({
       state: SubscriptionRef.get(removals),

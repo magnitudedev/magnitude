@@ -6,11 +6,12 @@ import { catalogRemovalOutcome, type LocalModelRemovalsApi } from "./local-model
 const modelId = CatalogFormModelIdSchema.make("qwen3.5-4b:gguf:q4")
 
 describe("catalog removal outcomes", () => {
-  it("accepts an actual removal", async () => {
+  it("accepts an actual removal, with the parts it kept for another model", async () => {
     await expect(Effect.runPromise(catalogRemovalOutcome(modelId)({
       _tag: "Removed",
       reclaimedBytes: 42,
-    }))).resolves.toEqual({})
+      keptComponents: ["Drafter"],
+    }))).resolves.toEqual({ keptComponents: ["Drafter"] })
   })
 
   it.each([

@@ -3943,6 +3943,170 @@ mod tests {
         assert_eq!(fs::read(folder.join("Model-DFlash-Q8_0.gguf")).unwrap(), drafter);
     }
 
+    /// Linux CUDA round 4e: the catalog's exact target weights in a Hugging Face cache, the catalog
+    /// drafter's exact file in a user folder, and a found model there serving with that drafter.
+    /// `catalog pull --only drafter` stores Magnitude's own copy, and removing the catalog model
+    /// deletes it: the found model keeps serving with the folder's copy, so no model needs
+    /// Magnitude's, and the removal neither refuses as shared nor touches the found files.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_found_catalog_target_deletes_its_drafter_copy_when_a_folder_holds_the_drafter()
+    {
+        use magnitude_service_contracts::models::{
+            CatalogComponent, CatalogInstallationRemoval, CatalogModelState,
+            InstalledModelPackages as _, SpeculativeDraftSource, SpeculativeMethod,
+        };
+
+        let fixture = Fixture::new().await;
+        let cache = fixture.root.join("hf");
+        let folder = fixture.root.join("models-own").join("pair");
+        let commit = "a".repeat(40);
+        let draft_commit = "b".repeat(40);
+        let weights = model_bytes("model");
+        let drafter = drafter_bytes("drafter");
+        let snapshot = publish_hf_cache(
+            &cache,
+            "owner/Model-GGUF",
+            &commit,
+            &[("Model-Q4_K_M.gguf", weights.clone())],
+        );
+        publish_hf_cache(
+            &cache,
+            "owner/Model-DFlash-GGUF",
+            &draft_commit,
+            &[("Model-DFlash-Q8_0.gguf", drafter.clone())],
+        );
+        let cache_root = root(ModelRootKind::HuggingFaceCache, &cache);
+        fixture.apply(roots(vec![cache_root.clone()])).await;
+        let packages = fixture.inventory().list_installed().await.unwrap().packages;
+        let package = |name: &str| {
+            packages
+                .iter()
+                .map(|installed| installed.package.clone())
+                .find(|package| package.files.iter().any(|file| file.path.ends_with(name)))
+                .unwrap()
+        };
+        let (target, draft) = (package("Model-Q4_K_M.gguf"), package("Model-DFlash-Q8_0.gguf"));
+        fs::remove_dir_all(cache.join(hf_repo_dir("owner/Model-DFlash-GGUF"))).unwrap();
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("Model-DFlash-Q8_0.gguf"), &drafter).unwrap();
+        fs::write(folder.join("Other-Q5_K_M.gguf"), model_bytes("other")).unwrap();
+        let header_digests = BTreeMap::from([(
+            sha256(&drafter),
+            header_digest(&folder.join("Model-DFlash-Q8_0.gguf")),
+        )]);
+
+        let mut definition = catalog_definition(target.clone());
+        definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+            target,
+            draft_source: SpeculativeDraftSource::Separate { draft },
+            method: SpeculativeMethod::DFlash,
+        };
+        let model_id = catalog_id(&definition);
+        let (endpoint, _) = serve_files(vec![
+            (
+                "owner/Model-GGUF",
+                commit.clone(),
+                vec![("Model-Q4_K_M.gguf", weights.clone())],
+            ),
+            (
+                "owner/Model-DFlash-GGUF",
+                draft_commit,
+                vec![("Model-DFlash-Q8_0.gguf", drafter.clone())],
+            ),
+        ]);
+        let fixture = fixture
+            .restart_with_catalog_headers(endpoint, vec![definition], header_digests)
+            .await;
+        // The server knows the catalog drafter's header, by which the folder's file is that drafter.
+        fixture
+            .resolver
+            .set_custom_model_enrichment(Arc::new(KnowsDrafter {
+                reference: DrafterReference::Catalog {
+                    model_id: model_id.clone(),
+                },
+                content: DrafterContent {
+                    header_digest: Some(header_digest(&folder.join("Model-DFlash-Q8_0.gguf"))),
+                    sha256: Some(sha256(&drafter)),
+                    size_bytes: drafter.len() as u64,
+                },
+            }));
+        let shown = roots(vec![
+            cache_root,
+            root(ModelRootKind::Folder, &fixture.root.join("models-own")),
+        ]);
+        fixture.apply(shown.clone()).await;
+        let listed = fixture.local.list_local().await.unwrap().models;
+        let other = listed
+            .iter()
+            .find(|model| model.files.iter().any(|file| file.path.ends_with("Other-Q5_K_M.gguf")))
+            .unwrap_or_else(|| panic!("the other folder file is a found model: {listed:?}"))
+            .model_id
+            .clone();
+        fixture
+            .apply(LocalModelsConfiguration {
+                drafters: vec![DrafterAttachment {
+                    model_id: other.clone(),
+                    drafter: DrafterChoice::Reference {
+                        reference: DrafterReference::Catalog {
+                            model_id: model_id.clone(),
+                        },
+                        method: SpeculativeMethod::DFlash,
+                    },
+                }],
+                ..shown
+            })
+            .await;
+        let serves_with_drafter = || {
+            matches!(
+                fixture.resolver.serving_configuration(&other).map(|configuration| configuration.bundle),
+                Ok(ServableModelBundle::SpeculativeDecoding { .. })
+            )
+        };
+        assert!(serves_with_drafter(), "the found model serves with the folder's drafter");
+
+        let downloads = crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
+            .await
+            .unwrap();
+        let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
+            fixture.resolver.clone(),
+            Arc::new(downloads),
+            Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
+            Arc::new(NoOptimizer),
+        );
+        let stored_components = || match fixture.resolver.catalog_snapshot().unwrap().models[0]
+            .local_state
+            .clone()
+        {
+            CatalogModelState::Installed {
+                stored_components, ..
+            } => stored_components,
+            CatalogModelState::NotInstalled => panic!("the found target installs the catalog model"),
+        };
+        installations
+            .install_component(&model_id, CatalogComponent::Drafter)
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if stored_components() == vec![CatalogComponent::Drafter] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(stored_components(), vec![CatalogComponent::Drafter]);
+
+        let removed = installations.remove(&model_id).await.unwrap();
+        assert!(
+            removed == CatalogInstallationRemoval::Removed { reclaimed_bytes: drafter.len() as u64, kept_components: Vec::new() },
+            "no model needs Magnitude's copy of a drafter a folder also holds: {removed:?}"
+        );
+        fixture.inventory().ensure_installed_model_inventory().await.unwrap();
+        assert!(stored_files(&fixture.store).is_empty());
+        assert!(stored_components().is_empty());
+        assert_eq!(fs::read(folder.join("Model-DFlash-Q8_0.gguf")).unwrap(), drafter);
+        assert_eq!(fs::read(snapshot.join("Model-Q4_K_M.gguf")).unwrap(), weights);
+        assert!(serves_with_drafter(), "the found model still serves with the folder's drafter");
+    }
+
     /// The Debian round 3b sequence on a file system without clones: the catalog's exact target
     /// weights in a Hugging Face cache, its projector and drafter nowhere. Fetching the projector
     /// stores only the projector (the found weights are never copied), and the catalog model serves
@@ -4289,12 +4453,12 @@ mod tests {
     /// `catalog pull --only drafter` stores the catalog drafter. Removing the catalog model removes
     /// that drafter, the only part Magnitude stores for it, rather than keeping it in case the other
     /// model may use it and reporting the model as another app's; the found weights stay and keep
-    /// serving the catalog model. A drafter another model does serve with is kept, reported as
-    /// shared rather than as another app's files.
+    /// serving the catalog model. A drafter another model does serve with is kept, and the removal
+    /// completes with the model in its normal state.
     #[tokio::test(flavor = "multi_thread")]
     async fn removing_a_found_catalog_target_removes_its_stored_drafter() {
         use magnitude_service_contracts::models::{
-            CatalogComponent, CatalogInstallationRemoval, CatalogInstallationRetentionReason,
+            CatalogComponent, CatalogInstallationRemoval,
             CatalogModelState, InstalledModelPackages as _, ModelFileRole, ModelInstallation,
             ModelInstallationOwnership,
         };
@@ -4445,7 +4609,9 @@ mod tests {
             "the catalog model still runs from the found file: {installation:?}"
         );
 
-        // Another model serving with the drafter keeps it: shared, never another app's files.
+        // Another model serving with the drafter keeps it, and the removal still completes: it is
+        // neither retained as shared nor as another app's files (Linux CUDA round 4e left it as
+        // "Removal failed").
         pull_drafter().await;
         fixture
             .apply(LocalModelsConfiguration {
@@ -4461,12 +4627,14 @@ mod tests {
                 ..shown.clone()
             })
             .await;
-        assert!(matches!(
-            installations.remove(&model_id).await.unwrap(),
-            CatalogInstallationRemoval::Retained {
-                reason: CatalogInstallationRetentionReason::SharedMaterial
+        let removed = installations.remove(&model_id).await.unwrap();
+        assert_eq!(
+            removed,
+            CatalogInstallationRemoval::Removed {
+                reclaimed_bytes: 0,
+                kept_components: vec![CatalogComponent::Drafter],
             }
-        ));
+        );
         assert_eq!(installed().1, vec![CatalogComponent::Drafter]);
     }
 

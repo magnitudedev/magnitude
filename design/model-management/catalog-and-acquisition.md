@@ -716,10 +716,13 @@ and no custom model uses, that shares no snapshot file with another package, and
 admits for removal (a package a resident model has loaded is kept).
 Catalog removal itself keeps the catalog model's drafter while a custom model uses it (or may, while
 an automatic drafter is being worked out) and removes the target; pruning removes the drafter once no
-model uses it. A catalog model whose target is found elsewhere has nothing of Magnitude's but its
-stored projector and drafter, so only a custom model actually serving with that drafter keeps it, and
-when every stored part is kept that way the removal is retained as shared (another model uses the
-files), never as another app's files. Remove first cancels any part Magnitude is still fetching for such a
+model uses it. A model serves with any file holding a drafter's bytes, so another model's use keeps
+Magnitude's copy only while no other location holds them. A catalog model whose target is found
+elsewhere has nothing of Magnitude's but its stored projector and drafter, so only a custom model
+actually serving with that drafter keeps it. Its removal deletes every other stored part and always
+completes, even when nothing is left to delete: it reports the parts it kept for another model, and
+the model stays installed from the found file, never a failed removal and never retained as
+another app's files. Remove first cancels any part Magnitude is still fetching for such a
 model, and catalog removal ends every download requested for the model, whatever it retains, so
 none returns after a restart. An added model whose target is still downloading uses the drafter it downloads with
 it, so a drafter that finished first is never pruned before its target lands.
