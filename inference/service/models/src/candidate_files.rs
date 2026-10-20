@@ -688,6 +688,7 @@ mod tests {
                 Path::new("qwen35-9b-instruct-mxfp4.gguf"),
                 Some("FreedomAISVR/Qwen3.5-9B-Instruct-MXFP4-GGUF"),
                 None,
+                &[],
                 Some("MXFP4"),
             )
             .1,
@@ -695,6 +696,7 @@ mod tests {
                 Path::new("qwen35-9b-instruct-mxfp4.gguf"),
                 Some("FreedomAISVR/Qwen3.5-9B-Instruct-MXFP4-GGUF"),
                 None,
+                &[],
                 None,
             )
             .1,
