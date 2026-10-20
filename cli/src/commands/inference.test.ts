@@ -781,6 +781,29 @@ describe("model status", () => {
     expect(await run(readModelsStatus(client, Option.some(FOUND_MODEL_ID), false)))
       .toMatchObject({ _tag: "Left", left: { message: `Unknown model: ${FOUND_MODEL_ID}` } })
   })
+
+  // QA linux-cpu rounds 3c and 4c: a model listed under --all as can't run said "Unknown model".
+  it("shows an addressed model that can't run with its reasons", async () => {
+    const unsupported = makeUnsupportedLocalModel({
+      modelId: Option.some(FOUND_MODEL_ID),
+      displayName: "Qwen3 0.6B",
+      origin: { _tag: "Found", source: { _tag: "HuggingFaceCache" } },
+      path: "/home/ada/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B-GGUF/snapshots/c/Qwen3-0.6B-Q8_0.gguf",
+      reasons: [{ _tag: "Architecture", architecture: "qwen3" }],
+    })
+    const { client, models } = fakeClient({ getCatalog: () => Effect.succeed(catalogState([], [unsupported])) })
+    const detail = await run(readModelsStatus(client, Option.some(FOUND_MODEL_ID), false))
+    expect(models.listDrafterCandidates).toBeUndefined()
+    expect(detail).toMatchObject({ _tag: "Right", right: { _tag: "Unsupported", model: unsupported } })
+    const output = detail._tag === "Right" ? renderModelsStatusResult(detail.right) : ""
+    expect(output).toContain("Qwen3 0.6B")
+    expect(output).toContain(`Model ID   ${FOUND_MODEL_ID}`)
+    expect(output).toContain("Source     Hugging Face cache")
+    expect(output).toContain(`File       ${unsupported.path}`)
+    expect(output).toContain("Can't run  No kernels for the qwen3 architecture")
+    expect(detail._tag === "Right" && encode(modelsStatusResultJson, detail.right))
+      .toMatchObject({ unsupportedModel: { modelId: FOUND_MODEL_ID, displayName: "Qwen3 0.6B" } })
+  })
 })
 
 describe("model locations", () => {

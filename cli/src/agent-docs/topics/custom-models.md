@@ -81,8 +81,8 @@ app's included, is used where it is and never downloaded. When a catalog drafter
 `models status` lists catalog models on this computer and every custom model with its source, then
 counts the models that can't run in Magnitude and hidden models. `--all` lists both: models that
 can't run with a plain reason, such as "No kernels for the deepseek4 architecture" or "Uses IQ1_M
-weights, which Magnitude doesn't support yet", and hidden models marked `Hidden`. `models unhide`
-shows a hidden model again.
+weights, which Magnitude doesn't support yet", and hidden models marked `Hidden`. `models status <model-id>`
+of a model that can't run shows where it is and why. `models unhide` shows a hidden model again.
 
 `models folders list` shows the automatic locations and your own folders, each directory with its
 status: Found, Off, Not found, or Can't read. A directory Magnitude can't read is followed by what

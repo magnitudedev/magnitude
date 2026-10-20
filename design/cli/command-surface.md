@@ -188,7 +188,8 @@ and the drafter candidates with their labels and verdicts; for a catalog model, 
 component ("Image input  Not downloaded (1.03 GB) - magnitude catalog pull <id> --only projector"), which
 is never reported as an update. Addressed model commands
 accept every canonical model ID, hidden models' included; the addressed form of a hidden model says
-it is hidden and how to unhide it. One status field applies product priority:
+it is hidden and how to unhide it. The addressed form of a model that can't run shows its source, file, and
+reasons. One status field applies product priority:
 removal, transfer, failures, load/stop, ready, update availability, then unloaded. An optimizing
 model reports `Optimizing` with its percentage once tuning is measured. The addressed
 form reports installation, transfer or optimization progress, runtime, memory, context, and

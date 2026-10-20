@@ -459,10 +459,29 @@ const listModelDrafters = (client: CliModelsClient, model: LocalModel): Effect.E
         })),
       )
 
+/** A model on this computer that Magnitude can't run, addressed by its ID: where it is and why it can't run. */
+export const renderUnsupportedModelDetail = (model: UnsupportedLocalModel): string => ensureTrailingNewline([
+  model.displayName,
+  renderFields([
+    ...Option.match(model.modelId, { onNone: () => [], onSome: (modelId) => [["Model ID", modelId] as const] }),
+    ["Source", unsupportedLocalModelSourceTag(model)],
+    ["File", model.path],
+    ["Can't run", unsupportedReasonLine(model)],
+  ]),
+].join("\n"))
+
+export const UnsupportedModelDetailJsonSchema = Schema.Struct({ unsupportedModel: UnsupportedLocalModelSchema })
+
+const unsupportedModelDetailJson = jsonDocument(
+  UnsupportedModelDetailJsonSchema,
+  (unsupportedModel: UnsupportedLocalModel) => ({ unsupportedModel }),
+)
+
 export type ModelsStatusResult =
   | { readonly _tag: "Initializing" }
   | { readonly _tag: "List"; readonly view: ModelsStatusView }
   | { readonly _tag: "Detail"; readonly view: ModelDetailView }
+  | { readonly _tag: "Unsupported"; readonly model: UnsupportedLocalModel }
 
 export const modelsStatusResultJson: JsonDocument<ModelsStatusResult> = {
   encode: (result) => {
@@ -470,6 +489,7 @@ export const modelsStatusResultJson: JsonDocument<ModelsStatusResult> = {
       case "Initializing": return Schema.encode(ModelsStatusJsonSchema)({ initializing: true, models: [], unsupported: [], hidden: [] })
       case "List": return modelsStatusJson.encode(result.view)
       case "Detail": return modelDetailJson.encode(result.view)
+      case "Unsupported": return unsupportedModelDetailJson.encode(result.model)
     }
   },
 }
@@ -485,6 +505,8 @@ export const readModelsStatus = (
     _tag: "List" as const,
     view: { models: catalogProducts(catalog), unsupported: catalog.unsupportedLocalModels, hidden: catalog.hiddenLocalModels, all },
   }
+  const unsupported = catalog.unsupportedLocalModels.find((candidate) => Option.contains(candidate.modelId, modelId.value))
+  if (unsupported !== undefined) return { _tag: "Unsupported" as const, model: unsupported }
   const models = addressableModels(catalog)
   const model = yield* findModel(models, modelId.value)
   return {
@@ -498,9 +520,14 @@ export const readModelsStatus = (
   }
 })
 
-export const renderModelsStatusResult = (result: ModelsStatusResult): string => result._tag === "Initializing"
-  ? "Local models are initializing.\n"
-  : result._tag === "List" ? renderModelsStatus(result.view) : renderModelDetail(result.view)
+export const renderModelsStatusResult = (result: ModelsStatusResult): string => {
+  switch (result._tag) {
+    case "Initializing": return "Local models are initializing.\n"
+    case "List": return renderModelsStatus(result.view)
+    case "Detail": return renderModelDetail(result.view)
+    case "Unsupported": return renderUnsupportedModelDetail(result.model)
+  }
+}
 
 export const showModelsStatus = (modelInput?: string, options: JsonOption & { readonly all?: boolean } = {}) => commandEffect({
   effect: (modelInput === undefined ? Effect.succeed(Option.none<ModelId>()) : decodeModelId(modelInput).pipe(Effect.map(Option.some))).pipe(
