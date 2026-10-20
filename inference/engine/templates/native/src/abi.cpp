@@ -223,6 +223,10 @@ int32_t templates_request_create(uint64_t handle, const uint8_t * input, uint64_
         request.messages = common_chat_msgs_parse_oaicompat(data.at("messages"));
         if (request.messages.empty()) { throw std::invalid_argument("Request requires messages"); }
         request.tool_choice = common_chat_tool_choice_parse_oaicompat(data.value("tool_choice", std::string("auto")));
+        // Thinking is enabled unless the caller turns it off, as in upstream
+        // common chat, so a template's own `enable_thinking` fallback never
+        // decides the default.
+        request.enable_thinking = true;
         // Schemas are valid JSON Schemas (the host admits only those) and
         // always lower; lowering records what the constraint does not enforce.
         std::set<subject_relaxation> relaxations;

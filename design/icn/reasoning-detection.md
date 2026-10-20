@@ -64,8 +64,11 @@ the important current example. Such a state remains `adaptive`; it is not mislab
 The normalized default is the behavior produced by the engine's owned template renderer, a pinned
 extraction of llama.cpp's common-chat renderer. Its input exposes `enable_thinking` as a boolean
 whose default is enabled, so a caller that does not choose an effort
-uses the enabled side of a supported toggle. ICN does not maintain a second parser for a template's
-authored Jinja fallback.
+uses the enabled side of a supported toggle. The renderer always passes `enable_thinking`, true
+unless the caller turns it off, so a template's authored Jinja fallback never decides the default:
+Gemma 4's `enable_thinking | default(false)` still defaults to `high`, and a branch taken only when
+`enable_thinking` is undefined, such as MiniCPM5's prompt that leaves thinking to the model, is not
+rendered and is not an option. ICN does not maintain a second parser for that fallback.
 
 ## Model-template formats
 
@@ -377,7 +380,8 @@ advertise a disabling option.
 - Qwen 3.8 normalizes to `none`, `low`, `medium`, and `xhigh`, with `xhigh` as the detected default.
 - Kimi K2.5/K2.6 nonstandard booleans normalize to `none` and `high`.
 - Kimi K2.7 Code and MiniMax M2 fixed reasoning normalize to `high` only.
-- Gemma 4 normalizes to `none` and `high` with the renderer's common-chat default.
+- Gemma 4 normalizes to `none` and `high` with the renderer's common-chat default, `high`, although
+  its template falls back to disabled thinking.
 - GLM-5.2 preserves distinct `none`, `high`, and `max` options.
 - DeepSeek V3/V4 modes map to the correct normalized options and private mode recipes.
 - MiniMax M3 preserves `adaptive` rather than relabeling it as an effort.

@@ -163,8 +163,8 @@ fn families() -> Vec<Family> {
             source: MINICPM5,
             special: special("<s>", "</s>"),
             enable_thinking: false,
-            generation_prompt: "<|im_start|>assistant\n",
-            output: "<think>\nThe user wants weather.\n</think>\n\n<function name=\"get_weather\"><param name=\"city\">Paris</param><param name=\"note\"><![CDATA[first line\nsecond <line> & more]]></param></function>",
+            generation_prompt: "<|im_start|>assistant\n<think>\n",
+            output: "The user wants weather.\n</think>\n\n<function name=\"get_weather\"><param name=\"city\">Paris</param><param name=\"note\"><![CDATA[first line\nsecond <line> & more]]></param></function>",
             reasoning: "The user wants weather.",
         },
         Family {

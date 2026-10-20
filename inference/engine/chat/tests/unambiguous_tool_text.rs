@@ -27,11 +27,24 @@ fn request(tools: Vec<Value>, choice: ToolChoice) -> ChatRequest {
     request
 }
 
-/// Whether MiniCPM5's constraint under `choice`, with a tool taking a string
-/// and a free-form argument, admits `output` and then the end of the turn.
-fn minicpm5_admits(choice: ToolChoice, output: &str) -> bool {
+/// The MiniCPM5 template without its `enable_thinking` branch, so its
+/// generation prompt leaves opening a reasoning block to the model, as a
+/// MiniCPM5-format template that ignores the toggle does.
+fn minicpm5_model_opens_reasoning() -> String {
+    let start = MINICPM5.find("    {%- if enable_thinking is defined %}").unwrap();
+    let tail = "        {%- endif %}\n    {%- endif %}\n";
+    let end = start + MINICPM5[start..].find(tail).unwrap() + tail.len();
+    let source = format!("{}{}", &MINICPM5[..start], &MINICPM5[end..]);
+    assert!(!source.contains("enable_thinking"));
+    source
+}
+
+/// Whether the constraint of a MiniCPM5-format `source` under `choice`, with a
+/// tool taking a string and a free-form argument, admits `output` and then the
+/// end of the turn.
+fn minicpm5_admits(source: &str, choice: ToolChoice, output: &str) -> bool {
     let tokenizer = byte_tokenizer("<|im_end|>");
-    let bundle = bundle(MINICPM5, "<s>", "<|im_end|>");
+    let bundle = bundle(source, "<s>", "<|im_end|>");
     let tools = vec![json!({"type": "function", "function": {
         "name": "write", "description": "",
         "parameters": {"type": "object", "properties": {
@@ -64,7 +77,7 @@ fn minicpm5_admits(choice: ToolChoice, output: &str) -> bool {
 fn minicpm5_string_arguments_read_raw_or_cdata_one_way() {
     let call = |content: &str| {
         format!(
-            "<function name=\"write\"><param name=\"content\">{content}</param>\n\
+            "Write it.\n</think>\n\n<function name=\"write\"><param name=\"content\">{content}</param>\n\
              <param name=\"args\">{{\"a\": [1, {{\"b\": null}}]}}</param>\n</function>"
         )
     };
@@ -75,9 +88,16 @@ fn minicpm5_string_arguments_read_raw_or_cdata_one_way() {
         "<!-- note -->",
         "",
     ] {
-        assert!(minicpm5_admits(ToolChoice::Auto, &call(content)), "{content}");
+        assert!(
+            minicpm5_admits(MINICPM5, ToolChoice::Auto, &call(content)),
+            "{content}"
+        );
     }
-    assert!(!minicpm5_admits(ToolChoice::Auto, &call("<![CDATA[unclosed")));
+    assert!(!minicpm5_admits(
+        MINICPM5,
+        ToolChoice::Auto,
+        &call("<![CDATA[unclosed")
+    ));
 }
 
 /// Text that opens with `<think>` is reasoning, so content no reasoning
@@ -85,15 +105,16 @@ fn minicpm5_string_arguments_read_raw_or_cdata_one_way() {
 /// resembles the tag, is unaffected.
 #[test]
 fn minicpm5_content_never_opens_reasoning_it_does_not_close() {
+    let source = minicpm5_model_opens_reasoning();
     for output in [
         "Hello!",
         "<thinker> said hi",
         "<think>\nNo tool needed.\n</think>\n\nHello!",
         "<think>\nShow it.\n</think>\n\n<think> is a tag.",
     ] {
-        assert!(minicpm5_admits(ToolChoice::Auto, output), "{output}");
+        assert!(minicpm5_admits(&source, ToolChoice::Auto, output), "{output}");
     }
-    assert!(!minicpm5_admits(ToolChoice::Auto, "<think>never closed"));
+    assert!(!minicpm5_admits(&source, ToolChoice::Auto, "<think>never closed"));
 }
 
 /// LFM2.5's Python-style values own no whitespace after them: the separators

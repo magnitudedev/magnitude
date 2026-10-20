@@ -76,7 +76,7 @@ fn rank(effort: &str) -> Option<usize> {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningIntent {
-    /// The template's own default behavior.
+    /// The renderer's default: no reasoning arguments, with thinking enabled.
     #[default]
     ModelDefault,
     Disabled,
@@ -90,7 +90,7 @@ pub enum ReasoningIntent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedReasoning {
     /// The normalized effort whose recipe renders the request; `None` keeps the
-    /// template default without inspecting it.
+    /// renderer default without inspecting it.
     pub effort: Option<String>,
     /// Template arguments that realize the effort.
     pub controls: Controls,

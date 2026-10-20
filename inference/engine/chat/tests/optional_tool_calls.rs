@@ -53,12 +53,13 @@ fn advances(source: &str, bos: &str, choice: ToolChoice, output: &str, end: bool
 
 #[test]
 fn minicpm5_answers_in_text_or_calls_under_auto() {
+    // The generation prompt opens reasoning, which closes before the turn ends.
     let (text, call) = (
-        "<think>\nNo tool needed.\n</think>\n\nHello!",
-        "<think>\nList them.\n</think>\n\n<function name=\"bash\"><param name=\"command\">ls</param></function>",
+        "No tool needed.\n</think>\n\nHello!",
+        "List them.\n</think>\n\n<function name=\"bash\"><param name=\"command\">ls</param></function>",
     );
     assert!(admits(MINICPM5, "<s>", ToolChoice::Auto, text));
-    assert!(admits(MINICPM5, "<s>", ToolChoice::Auto, "Hello!"));
+    assert!(!admits(MINICPM5, "<s>", ToolChoice::Auto, "Hello!"));
     assert!(admits(MINICPM5, "<s>", ToolChoice::Auto, call));
     assert!(!admits(MINICPM5, "<s>", ToolChoice::Required, text));
     assert!(admits(MINICPM5, "<s>", ToolChoice::Required, call));
@@ -117,7 +118,7 @@ fn required_calls_admit_no_text_before_the_call() {
         "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>";
     for (source, bos, reasoning, call) in [
         (LFM25, "<|startoftext|>", "List them.</think>", lfm2_call),
-        (MINICPM5, "<s>", "<think>\nList them.\n</think>\n\n", minicpm5_call),
+        (MINICPM5, "<s>", "List them.\n</think>\n\n", minicpm5_call),
         (QWEN35, "", "List them.\n</think>\n\n", qwen_call),
     ] {
         assert!(admits(source, bos, ToolChoice::Required, &format!("{reasoning}{call}")));

@@ -304,3 +304,45 @@ fn muse_glimmer_reasoning_can_be_disabled() {
         BTreeMap::from([("enable_thinking".to_string(), json!(false))])
     );
 }
+
+/// The renderer enables thinking unless the caller turns it off, so a toggle's
+/// enabled side is the default even when a template's own Jinja falls back to
+/// disabled, as the real Gemma 4 template does with `default(false)`.
+#[test]
+fn an_omitted_effort_selects_the_enabled_side_of_a_toggle() {
+    let gemma = asset_profile(include_str!(
+        "../../templates/tests/assets/gemma-4-12B-it.jinja"
+    ));
+    assert_eq!(
+        gemma
+            .mappings
+            .iter()
+            .map(|mapping| mapping.effort.as_str())
+            .collect::<Vec<_>>(),
+        ["none", "high"]
+    );
+    assert_eq!(gemma.default_effort.as_deref(), Some("high"));
+    assert_eq!(
+        gemma.resolve(&ReasoningIntent::Disabled).unwrap().controls,
+        BTreeMap::from([("enable_thinking".into(), json!(false))])
+    );
+    for (name, default) in [
+        ("BASIC", Some("none")),
+        ("TOGGLE", Some("high")),
+        ("FIXED", Some("high")),
+        ("THINKING_BOOL", Some("none")),
+        ("THINKING_MODE", Some("adaptive")),
+        ("EFFORT_TOGGLE", Some("high")),
+        ("EFFORT_NONE_MATCHES_LOW", Some("high")),
+        ("CLOSED_EFFORT", Some("high")),
+        ("QWEN_3_8_EFFORT", Some("xhigh")),
+        ("REVERSE_EFFORT_ALIAS", Some("high")),
+        ("ONE_ENABLED_EFFORT_BEHAVIOR", Some("max")),
+        ("SHARED_FALLBACK_EFFORT", Some("high")),
+        ("NAMED_SHARED_FALLBACK_EFFORT", Some("max")),
+        ("UNNAMED_DEFAULT_EFFORT", None),
+        ("OPEN_EFFORT", Some("high")),
+    ] {
+        assert_eq!(profile_of(name).default_effort.as_deref(), default, "{name}");
+    }
+}

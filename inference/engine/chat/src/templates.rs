@@ -321,7 +321,7 @@ impl TemplateBundle {
         let variant = self.select(!request.tools.is_empty(), selection)?;
         let template =
             Template::new(&variant.source, &self.special_tokens).map_err(|e| e.to_string())?;
-        // The default renders exactly as the template's own default, so it
+        // The default renders with no reasoning arguments, so it
         // needs no inspection; every other intent resolves against the profile.
         let reasoning = if *intent == ReasoningIntent::ModelDefault {
             ResolvedReasoning {
