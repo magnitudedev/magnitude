@@ -131,6 +131,7 @@ struct DrafterTarget {
     snapshot: Option<HuggingFaceRepositorySnapshot>,
     lineage: BTreeSet<String>,
     catalog: Option<ModelId>,
+    reach: Reach,
 }
 
 /// The folder whose own files are offered as drafters "in this folder". A model from a known Hub
@@ -175,45 +176,68 @@ struct CatalogFacts {
     fingerprints: Vec<(ModelId, ModelFingerprint)>,
 }
 
+/// What an enrichment reads: only what is on this computer (the files here, the release catalog,
+/// and Hub answers already cached), or the Hugging Face Hub as well (repository snapshots, Hub
+/// lineage, drafter headers). What the files here say never waits for the Hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    Local,
+    Hub,
+}
+
 /// Computed lineage hints and automatic drafters, keyed by model and exact target package, each
-/// with the custom-model inputs revision it was computed at, and the bytes of every drafter
-/// reference whose header has been read, keyed by reference.
+/// with the custom-model inputs revision it was computed at and what it read, and the bytes of
+/// every drafter reference whose header has been read, keyed by reference.
 #[derive(Default)]
 struct CandidateEnrichment {
-    results: std::sync::RwLock<BTreeMap<(ModelId, String), (u64, CustomModelEnrichmentResult)>>,
+    results:
+        std::sync::RwLock<BTreeMap<(ModelId, String), (u64, Reach, CustomModelEnrichmentResult)>>,
     drafter_contents: std::sync::RwLock<BTreeMap<String, DrafterContent>>,
     catalog_drafter_fits: std::sync::RwLock<BTreeMap<ModelId, CatalogDrafterFit>>,
 }
 
 impl CandidateEnrichment {
+    /// Whether the Hub-reaching result for `key` is known: the model's automatic drafter is
+    /// worked out, not only from what is on this computer.
     fn knows_key(&self, key: &(ModelId, String)) -> bool {
-        self.results
-            .read()
-            .is_ok_and(|results| results.contains_key(key))
-    }
-
-    /// Whether any result is known for the model, for whichever target.
-    fn knows_model(&self, model_id: &ModelId) -> bool {
-        self.results
-            .read()
-            .is_ok_and(|results| results.keys().any(|(known, _)| known == model_id))
-    }
-
-    /// Whether the result for `key` was computed from the inputs at `revision`. An older result
-    /// keeps answering until it is recomputed.
-    fn is_current(&self, key: &(ModelId, String), revision: u64) -> bool {
         self.results.read().is_ok_and(|results| {
             results
                 .get(key)
-                .is_some_and(|(computed_at, _)| *computed_at == revision)
+                .is_some_and(|(_, reach, _)| *reach == Reach::Hub)
         })
     }
 
-    /// Record a result computed at `revision`; whether it changed what the projection sees.
+    /// Whether any result of `reach` is known for the model, for whichever target.
+    fn knows_model(&self, model_id: &ModelId, reach: Reach) -> bool {
+        self.results.read().is_ok_and(|results| {
+            results
+                .iter()
+                .any(|((known, _), (_, known_reach, _))| known == model_id && *known_reach == reach)
+        })
+    }
+
+    /// Whether `key` needs no computing with `reach` at `revision`: its result of that reach was
+    /// computed from the inputs at `revision`, or, for a local result, the model already has a
+    /// Hub-reaching one, which keeps answering until it is recomputed.
+    fn is_current(&self, key: &(ModelId, String), revision: u64, reach: Reach) -> bool {
+        (reach == Reach::Local && self.knows_model(&key.0, Reach::Hub))
+            || self.results.read().is_ok_and(|results| {
+                results
+                    .get(key)
+                    .is_some_and(|(computed_at, known_reach, _)| {
+                        *computed_at == revision && *known_reach == reach
+                    })
+            })
+    }
+
+    /// Record a result computed at `revision` with `reach`; whether it changed what the
+    /// projection sees. A local result never replaces a Hub-reaching one: the Hub only adds to
+    /// what the files here say.
     fn record(
         &self,
         key: (ModelId, String),
         revision: u64,
+        reach: Reach,
         result: CustomModelEnrichmentResult,
     ) -> bool {
         let Ok(mut results) = self.results.write() else {
@@ -222,11 +246,17 @@ impl CandidateEnrichment {
         let previous = results
             .iter()
             .find(|((model_id, _), _)| model_id == &key.0)
-            .map(|(_, (_, previous))| previous.clone())
-            .unwrap_or_default();
+            .map(|(_, (_, reach, previous))| (*reach, previous.clone()));
+        if reach == Reach::Local
+            && previous
+                .as_ref()
+                .is_some_and(|(previous, _)| *previous == Reach::Hub)
+        {
+            return false;
+        }
         results.retain(|(model_id, _), _| model_id != &key.0);
-        results.insert(key, (revision, result.clone()));
-        previous != result
+        results.insert(key, (revision, reach, result.clone()));
+        previous.map(|(_, previous)| previous).unwrap_or_default() != result
     }
 
     fn knows_catalog_drafter_fit(&self, model_id: &ModelId) -> bool {
@@ -274,7 +304,7 @@ impl CustomModelEnrichment for CandidateEnrichment {
                             .find(|((model_id, _), _)| model_id == model.model_id)
                             .map(|(_, result)| result)
                     })
-                    .map(|(_, result)| result.clone())
+                    .map(|(_, _, result)| result.clone())
             })
             .unwrap_or_default()
     }
@@ -348,7 +378,7 @@ impl ManagedModelCandidates {
         &self,
         model_id: &ModelId,
     ) -> Result<Option<DrafterCandidate>, InventoryError> {
-        let target = self.model_target(model_id).await?;
+        let target = self.model_target(model_id, Reach::Hub).await?;
         Ok(recommended(
             self.enumerate_drafters(&target, None, true).await?,
         ))
@@ -363,17 +393,18 @@ impl ManagedModelCandidates {
         &self,
         model_id: &ModelId,
     ) -> Result<CatalogDrafterFit, InventoryError> {
-        let target = self.model_target(model_id).await?;
+        let target = self.model_target(model_id, Reach::Hub).await?;
         let candidates = self.enumerate_drafters(&target, None, false).await?;
         Ok(catalog_drafter_fit(&candidates))
     }
 
-    /// A custom model's lineage hint and recommended drafter.
+    /// A custom model's lineage hint and recommended drafter, from what `reach` reads.
     async fn enrich_model(
         &self,
         model_id: &ModelId,
+        reach: Reach,
     ) -> Result<CustomModelEnrichmentResult, InventoryError> {
-        let target = self.model_target(model_id).await?;
+        let target = self.model_target(model_id, reach).await?;
         let plain = self
             .assess(&target.material, None, ModelMethod::Auto)
             .await?;
@@ -384,7 +415,7 @@ impl ManagedModelCandidates {
             _ => None,
         };
         let matches = self
-            .catalog_matches(exact, &target.lineage, plain.fingerprint.as_ref())
+            .catalog_matches(exact, &target.lineage, plain.fingerprint.as_ref(), reach)
             .await;
         let variant_of = match matches
             .first()
@@ -404,7 +435,9 @@ impl ManagedModelCandidates {
         // Every automatic candidate, not only the first: the projection attaches the first one on
         // this computer, so built-in heads serve while a better drafter is still to be added.
         let drafters = automatic(self.enumerate_drafters(&target, None, false).await?);
-        if let Some(chosen) = self.chosen_drafter(model_id).await {
+        if reach == Reach::Hub
+            && let Some(chosen) = self.chosen_drafter(model_id).await
+        {
             self.learn_drafter_content(&chosen).await;
         }
         Ok(CustomModelEnrichmentResult {
@@ -423,115 +456,134 @@ impl ManagedModelCandidates {
     /// model's folder or repository included), a drafter package installed or removed, a catalog
     /// installation, or a configuration change. Candidate enumeration is the only source of the
     /// automatic order, so the list and the attachment never disagree for long.
+    ///
+    /// Two passes run side by side: one publishes what is on this computer (the file's
+    /// shape and declared lineage, drafters in its folder, its built-in heads, the catalog drafter
+    /// of a catalog model it matches by shape) for every model with no Hub-reaching result yet,
+    /// and the other adds what the Hub says. A model is never kept waiting on a slow or
+    /// unreachable Hub for what its own files decide, and a load meanwhile uses that.
     pub fn start_enrichment(self: &Arc<Self>, resolver: Arc<ModelDomainResolver>) {
         let warmed = Arc::clone(self);
         tokio::spawn(async move {
             warmed.catalog_facts().await;
         });
-        let enrichment = Arc::clone(&self.enrichment);
-        resolver.set_custom_model_enrichment(enrichment.clone());
+        resolver.set_custom_model_enrichment(self.enrichment.clone());
         let _ = self.resolver.set(Arc::clone(&resolver));
-        let candidates = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut changes = candidates.local.watch_local();
-            let mut failed = BTreeMap::<(ModelId, String), (u64, std::time::Instant)>::new();
-            loop {
-                let Ok(revision) = resolver.custom_model_inputs_revision() else {
-                    return;
-                };
-                let models = candidates
-                    .local
-                    .list_local()
-                    .await
-                    .map(|response| {
-                        response
-                            .models
-                            .into_iter()
-                            .chain(response.hidden)
-                            .map(|model| model.model_id)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                // Models with no result yet come first, so a model just added or installed is
-                // never kept waiting behind recomputing the others; each result is published as
-                // soon as it is known, and a pass restarts as soon as the inputs move again.
-                let mut pending = models
-                    .into_iter()
-                    .filter_map(|model_id| {
-                        let configuration = candidates
-                            .assessor
-                            .configuration_for(&ModelAssessmentSubject::Custom {
-                                model_id: model_id.clone(),
-                            })
-                            .ok()?;
-                        let key = (
-                            model_id.clone(),
-                            bundle_target(&configuration.bundle).id.0.clone(),
-                        );
-                        Some((enrichment.knows_model(&model_id), key))
-                    })
-                    .collect::<Vec<_>>();
-                pending.sort_by_key(|(known, _)| *known);
-                for (_, key) in pending {
-                    if resolver.custom_model_inputs_revision().ok() != Some(revision) {
-                        break;
-                    }
-                    if enrichment.is_current(&key, revision)
-                        || failed.get(&key).is_some_and(|(failed_at, at)| {
-                            *failed_at == revision && at.elapsed() < ENRICHMENT_RETRY_DELAY
+        for reach in [Reach::Local, Reach::Hub] {
+            let candidates = Arc::clone(self);
+            let resolver = Arc::clone(&resolver);
+            tokio::spawn(async move { candidates.enrich_custom_models(&resolver, reach).await });
+        }
+    }
+
+    /// The enrichment pass of `reach` (see `start_enrichment`); the Hub pass also works out each
+    /// catalog model's drafter fit.
+    async fn enrich_custom_models(&self, resolver: &ModelDomainResolver, reach: Reach) {
+        let enrichment = &self.enrichment;
+        let mut changes = self.local.watch_local();
+        let mut failed = BTreeMap::<(ModelId, String), (u64, std::time::Instant)>::new();
+        loop {
+            let Ok(revision) = resolver.custom_model_inputs_revision() else {
+                return;
+            };
+            let models = self
+                .local
+                .list_local()
+                .await
+                .map(|response| {
+                    response
+                        .models
+                        .into_iter()
+                        .chain(response.hidden)
+                        .map(|model| model.model_id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            // Models with no result yet come first, so a model just added or installed is
+            // never kept waiting behind recomputing the others; each result is published as
+            // soon as it is known, and a pass restarts as soon as the inputs move again.
+            let mut pending = models
+                .into_iter()
+                .filter_map(|model_id| {
+                    let configuration = self
+                        .assessor
+                        .configuration_for(&ModelAssessmentSubject::Custom {
+                            model_id: model_id.clone(),
                         })
-                    {
-                        continue;
-                    }
-                    match candidates.enrich_model(&key.0).await {
-                        Ok(result) => {
-                            failed.remove(&key);
-                            if enrichment.record(key, revision, result) {
-                                resolver.custom_model_enrichment_changed();
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(model.id = %key.0.as_str(), %error, "custom model enrichment failed");
-                            failed.insert(key, (revision, std::time::Instant::now()));
-                        }
-                    }
+                        .ok()?;
+                    let key = (
+                        model_id.clone(),
+                        bundle_target(&configuration.bundle).id.0.clone(),
+                    );
+                    Some((enrichment.knows_model(&model_id, reach), key))
+                })
+                .collect::<Vec<_>>();
+            pending.sort_by_key(|(known, _)| *known);
+            for (_, key) in pending {
+                if resolver.custom_model_inputs_revision().ok() != Some(revision) {
+                    break;
                 }
-                // Whether each catalog model with a drafter fits only without it, once: it depends
-                // on the release material and this computer, never on the files here.
-                let catalog = candidates
-                    .catalog
-                    .list_catalog()
-                    .await
-                    .map(|response| response.models)
-                    .unwrap_or_default();
-                let mut catalog_failed = false;
-                for model in catalog {
-                    if resolver.custom_model_inputs_revision().ok() != Some(revision) {
-                        break;
-                    }
-                    if model.desired.speculative_method.is_none()
-                        || enrichment.knows_catalog_drafter_fit(&model.id)
-                    {
-                        continue;
-                    }
-                    match candidates.catalog_drafter_fit(&model.id).await {
-                        Ok(fit) => {
-                            if enrichment.record_catalog_drafter_fit(model.id, fit) {
-                                resolver.catalog_drafter_fit_changed();
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(model.id = %model.id.as_str(), %error, "catalog drafter fit failed");
-                            catalog_failed = true;
-                        }
-                    }
+                if enrichment.is_current(&key, revision, reach)
+                    || failed.get(&key).is_some_and(|(failed_at, at)| {
+                        *failed_at == revision && at.elapsed() < ENRICHMENT_RETRY_DELAY
+                    })
+                {
+                    continue;
                 }
-                tokio::select! {
-                    change = changes.next() => if change.is_none() { return },
-                    () = tokio::time::sleep(ENRICHMENT_RETRY_DELAY), if !failed.is_empty() || catalog_failed => {}
+                match self.enrich_model(&key.0, reach).await {
+                    Ok(result) => {
+                        failed.remove(&key);
+                        if enrichment.record(key, revision, reach, result) {
+                            resolver.custom_model_enrichment_changed();
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(model.id = %key.0.as_str(), ?reach, %error, "custom model enrichment failed");
+                        failed.insert(key, (revision, std::time::Instant::now()));
+                    }
                 }
             }
-        });
+            let catalog_failed =
+                reach == Reach::Hub && !self.fit_catalog_drafters(resolver, revision).await;
+            tokio::select! {
+                change = changes.next() => if change.is_none() { return },
+                () = tokio::time::sleep(ENRICHMENT_RETRY_DELAY), if !failed.is_empty() || catalog_failed => {}
+            }
+        }
+    }
+
+    /// Whether each catalog model with a drafter fits only without it, once: it depends on the
+    /// release material and this computer, never on the files here. Whether every one is known.
+    async fn fit_catalog_drafters(&self, resolver: &ModelDomainResolver, revision: u64) -> bool {
+        let catalog = self
+            .catalog
+            .list_catalog()
+            .await
+            .map(|response| response.models)
+            .unwrap_or_default();
+        let mut complete = true;
+        for model in catalog {
+            if resolver.custom_model_inputs_revision().ok() != Some(revision) {
+                break;
+            }
+            if model.desired.speculative_method.is_none()
+                || self.enrichment.knows_catalog_drafter_fit(&model.id)
+            {
+                continue;
+            }
+            match self.catalog_drafter_fit(&model.id).await {
+                Ok(fit) => {
+                    if self.enrichment.record_catalog_drafter_fit(model.id, fit) {
+                        resolver.catalog_drafter_fit_changed();
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(model.id = %model.id.as_str(), %error, "catalog drafter fit failed");
+                    complete = false;
+                }
+            }
+        }
+        complete
     }
 
     /// The drafter reference a model's configuration chooses explicitly.
@@ -1585,12 +1637,14 @@ impl ManagedModelCandidates {
     /// The catalog models a target derives from, best first: an exact catalog target alone; else
     /// the lineage match whose shape fingerprint equals the target's, else the first lineage match
     /// in catalog order; then the fingerprint-matched catalog model when it is another one, whose
-    /// drafter is the fallback when the lineage match's is rejected.
+    /// drafter is the fallback when the lineage match's is rejected. Locally, catalog upstreams
+    /// the Hub has not yet supplied match nothing.
     async fn catalog_matches(
         &self,
         exact: Option<(&str, &str, &Path)>,
         lineage: &BTreeSet<String>,
         fingerprint: Option<&ModelFingerprint>,
+        reach: Reach,
     ) -> Vec<(CatalogLineageMatch, DrafterLineage)> {
         if let Some((repository, commit, primary)) = exact
             && let Some(matched) = self.lineage.exact_target(repository, commit, primary)
@@ -1607,7 +1661,10 @@ impl ManagedModelCandidates {
                 .map(|(model_id, _)| model_id.clone()),
             None => None,
         };
-        let mut lineage_matches = self.lineage.match_lineages(lineage).await;
+        let mut lineage_matches = match reach {
+            Reach::Local => self.lineage.match_known_lineages(lineage),
+            Reach::Hub => self.lineage.match_lineages(lineage).await,
+        };
         if let Some(fingerprinted) = &fingerprinted {
             lineage_matches.sort_by_key(|matched| matched.model_id != *fingerprinted);
         }
@@ -1660,6 +1717,7 @@ impl ManagedModelCandidates {
                     snapshot: Some(snapshot),
                     lineage,
                     catalog: None,
+                    reach: Reach::Hub,
                 })
             }
             CandidateSource::Local { path } => {
@@ -1684,14 +1742,20 @@ impl ManagedModelCandidates {
                     snapshot: None,
                     lineage,
                     catalog: None,
+                    reach: Reach::Hub,
                 })
             }
         }
     }
 
     /// A model's target: a catalog model's release material, or a custom model's installed
-    /// target package.
-    async fn model_target(&self, model_id: &ModelId) -> Result<DrafterTarget, InventoryError> {
+    /// target package. Locally, a model from a known Hub repository has no snapshot and only the
+    /// lineage its header declares.
+    async fn model_target(
+        &self,
+        model_id: &ModelId,
+        reach: Reach,
+    ) -> Result<DrafterTarget, InventoryError> {
         if let ParsedModelId::Catalog { .. } = model_id.parsed() {
             let matched = self
                 .lineage
@@ -1709,6 +1773,7 @@ impl ManagedModelCandidates {
                 snapshot: None,
                 lineage: BTreeSet::new(),
                 catalog: Some(model_id.clone()),
+                reach,
             });
         }
         let model = self
@@ -1765,7 +1830,7 @@ impl ManagedModelCandidates {
         // A model from a known Hub repository lists that repository's drafters, at its commit or
         // else at `main`; never whatever else shares its folder.
         let snapshot = match &repository {
-            Some((repository, commit)) => {
+            Some((repository, commit)) if reach == Reach::Hub => {
                 lineage.extend(self.lineage.hub().lineage(repository, None).await);
                 let revision = if is_commit(commit) {
                     commit.as_str()
@@ -1774,7 +1839,7 @@ impl ManagedModelCandidates {
                 };
                 self.snapshot(repository, revision).await.ok()
             }
-            None => None,
+            _ => None,
         };
         // Each place this model's own bytes are found gives its folder; never the folder of the
         // file its target package resolves to, nor of another model sharing its header.
@@ -1813,6 +1878,7 @@ impl ManagedModelCandidates {
             snapshot,
             lineage,
             catalog: None,
+            reach,
         })
     }
 
@@ -1889,8 +1955,13 @@ impl ManagedModelCandidates {
                 .into_iter()
                 .collect(),
             None => {
-                self.catalog_matches(exact, &target.lineage, own.fingerprint.as_ref())
-                    .await
+                self.catalog_matches(
+                    exact,
+                    &target.lineage,
+                    own.fingerprint.as_ref(),
+                    target.reach,
+                )
+                .await
             }
         };
         let matched = matches.first().cloned();
@@ -2063,7 +2134,10 @@ impl ManagedModelCandidates {
                 let reference = DrafterReference::Catalog {
                     model_id: matched.model_id.clone(),
                 };
-                let content = self.learn_drafter_content(&reference).await;
+                let content = match target.reach {
+                    Reach::Local => self.enrichment.drafter_content(&reference),
+                    Reach::Hub => self.learn_drafter_content(&reference).await,
+                };
                 let on_this_computer = self.models().has_installed_package(&draft.id)
                     || content
                         .or_else(|| DrafterContent::of_package(draft))
@@ -2449,7 +2523,7 @@ impl ModelCandidates for ManagedModelCandidates {
                     (self.candidate_target(&candidate).await?, other)
                 }
                 DrafterCandidatesRequest::Model { model_id, other } => {
-                    (self.model_target(&model_id).await?, other)
+                    (self.model_target(&model_id, Reach::Hub).await?, other)
                 }
             };
             let list = self

@@ -151,7 +151,13 @@ download; clients say the drafter is off because the model fits only without it.
   or removed; a configuration change), never kept until a restart. While a model's recompute is
   pending (its target package changed, say, when a projector appeared beside it), its previous answer
   stands, so an attached drafter is never shown as none in the meantime; a model with no answer yet
-  is computed before the others are recomputed. A found or imported model with
+  is computed before the others are recomputed. What is on this computer decides first and never
+  waits for the Hub: a model with no Hub-reaching answer gets one from its own files, the release
+  catalog and Hub answers already cached (its shape's "Variant of", drafters in its folder, its
+  built-in heads, the catalog drafter it matches by shape or declared lineage), which the list
+  shows and a load uses at once, while the Hub's part (snapshots, catalog upstream lineage, drafter
+  headers) is worked out alongside and then replaces it; a local answer never replaces a Hub one,
+  and drafter pruning waits for the Hub's. A found or imported model with
   none of its automatic candidates on this computer has no attached drafter: ACN projects it
   without one, and clients offer the recommended drafter ("Faster with a drafter · Add (size)").
 - "In this folder" means the folder of each place this model's own bytes are found, never another

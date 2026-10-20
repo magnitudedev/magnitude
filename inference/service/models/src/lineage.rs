@@ -166,6 +166,30 @@ impl CatalogLineage {
             return Vec::new();
         }
         let upstreams = self.upstreams().await;
+        self.lineage_matches(lineage, &upstreams)
+    }
+
+    /// `match_lineages` without waiting for the Hub: catalog upstreams match only once they have
+    /// been read, so until then only catalog target repositories do.
+    #[must_use]
+    pub fn match_known_lineages(&self, lineage: &BTreeSet<String>) -> Vec<CatalogLineageMatch> {
+        if lineage.is_empty() {
+            return Vec::new();
+        }
+        let upstreams = self
+            .upstreams
+            .try_lock()
+            .ok()
+            .and_then(|cached| cached.clone())
+            .unwrap_or_default();
+        self.lineage_matches(lineage, &upstreams)
+    }
+
+    fn lineage_matches(
+        &self,
+        lineage: &BTreeSet<String>,
+        upstreams: &Upstreams,
+    ) -> Vec<CatalogLineageMatch> {
         self.representatives()
             .filter(|candidate| {
                 let target = catalog_target(&candidate.model);

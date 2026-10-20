@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
@@ -569,6 +569,7 @@ struct StubHub {
     drafter_searches: AtomicUsize,
     header_requests: AtomicUsize,
     header_bytes: AtomicUsize,
+    unreachable: AtomicBool,
 }
 
 fn commit(seed: char) -> String {
@@ -597,6 +598,12 @@ impl StubHub {
         let mut reader = BufReader::new(connection.try_clone().expect("stream"));
         let mut request_line = String::new();
         if reader.read_line(&mut request_line).is_err() {
+            return;
+        }
+        // An unreachable Hub never answers, as when its name doesn't resolve and every request
+        // waits out its timeout.
+        if self.unreachable.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
             return;
         }
         let mut range = None;
@@ -1007,6 +1014,7 @@ fn hub() -> StubHub {
         drafter_searches: AtomicUsize::new(0),
         header_requests: AtomicUsize::new(0),
         header_bytes: AtomicUsize::new(0),
+        unreachable: AtomicBool::new(false),
     }
 }
 
@@ -2506,6 +2514,7 @@ async fn the_recommended_drafter_of_a_catalog_model_is_its_catalog_drafter() {
 
 #[test]
 fn enrichment_for_a_changed_target_keeps_the_models_last_answer_until_it_is_recomputed() {
+    use super::Reach::Hub;
     use magnitude_service_models::{
         CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts,
     };
@@ -2520,14 +2529,14 @@ fn enrichment_for_a_changed_target_keeps_the_models_last_answer_until_it_is_reco
         license: Some("apache-2.0".to_owned()),
     };
     let key = (model_id.clone(), "package_a".to_owned());
-    assert!(enrichment.record(key.clone(), 1, result.clone()));
-    assert!(enrichment.is_current(&key, 1));
+    assert!(enrichment.record(key.clone(), 1, Hub, result.clone()));
+    assert!(enrichment.is_current(&key, 1, Hub));
     assert!(
-        !enrichment.is_current(&key, 2),
+        !enrichment.is_current(&key, 2, Hub),
         "a result is stale once the inputs it was computed from change"
     );
-    assert!(!enrichment.record(key.clone(), 2, result.clone()));
-    assert!(enrichment.is_current(&key, 2));
+    assert!(!enrichment.record(key.clone(), 2, Hub, result.clone()));
+    assert!(enrichment.is_current(&key, 2, Hub));
     let origin = CustomModelOrigin::Imported {
         path: PathBuf::from("/models/model.gguf"),
     };
@@ -2576,11 +2585,87 @@ fn enrichment_for_a_changed_target_keeps_the_models_last_answer_until_it_is_reco
     assert!(enrichment.record(
         (model_id.clone(), "package_b".to_owned()),
         2,
+        Hub,
         CustomModelEnrichmentResult::default()
     ));
     assert_eq!(
         enrichment.enrich(&facts(&package_b)),
         CustomModelEnrichmentResult::default()
+    );
+}
+
+/// QA (macOS, round 4): what the files here say is published before the Hub answers, and stays
+/// pending until it does; the Hub's answer then replaces it and is never replaced by it.
+#[test]
+fn a_local_enrichment_answers_until_the_hub_reaching_one_and_never_replaces_it() {
+    use super::Reach::{Hub, Local};
+    use magnitude_service_models::{
+        CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts,
+    };
+    let enrichment = super::CandidateEnrichment::default();
+    let model_id = ModelId::local(
+        &magnitude_service_contracts::models::LocalModelDigest::new("b".repeat(64)).unwrap(),
+    );
+    let local = CustomModelEnrichmentResult {
+        variant_of: Some("llama-test:gguf:q8".parse().unwrap()),
+        ..CustomModelEnrichmentResult::default()
+    };
+    let hub = CustomModelEnrichmentResult {
+        license: Some("apache-2.0".to_owned()),
+        ..local.clone()
+    };
+    let key = (model_id.clone(), "package".to_owned());
+    let origin = CustomModelOrigin::Imported {
+        path: PathBuf::from("/models/model.gguf"),
+    };
+    let package = magnitude_service_contracts::models::ModelPackage {
+        id: magnitude_service_contracts::models::ModelPackageId("package".to_owned()),
+        source: magnitude_service_contracts::models::ModelPackageSource::Local {
+            path: PathBuf::from("/models"),
+        },
+        files: Vec::new(),
+        relationships: Vec::new(),
+        properties: magnitude_service_contracts::models::ModelPackageProperties {
+            format: "gguf".to_owned(),
+            quantization: "Q8_0".to_owned(),
+            quantization_name: "8-bit".to_owned(),
+            architecture: "llama".to_owned(),
+            maximum_context_length: None,
+            intrinsic_model_id: None,
+            intrinsic_quality_id: None,
+        },
+    };
+    let facts = CustomModelFacts {
+        model_id: &model_id,
+        origin: &origin,
+        display_name: "model",
+        target: &package,
+        hub: None,
+        ollama_name: None,
+        name: None,
+        architecture: Some("llama"),
+        base_models: &[],
+    };
+    assert!(enrichment.record(key.clone(), 1, Local, local.clone()));
+    assert_eq!(enrichment.enrich(&facts), local);
+    assert!(
+        !enrichment.knows(&facts),
+        "a local answer leaves the automatic drafter pending"
+    );
+    assert!(enrichment.is_current(&key, 1, Local));
+    assert!(!enrichment.is_current(&key, 1, Hub));
+    assert!(enrichment.record(key.clone(), 1, Hub, hub.clone()));
+    assert_eq!(enrichment.enrich(&facts), hub);
+    assert!(enrichment.knows(&facts));
+    assert!(
+        enrichment.is_current(&key, 2, Local),
+        "once the Hub has answered, the local pass leaves the model to it"
+    );
+    assert!(!enrichment.record(key.clone(), 2, Local, local));
+    assert_eq!(
+        enrichment.enrich(&facts),
+        hub,
+        "the Hub's answer is never replaced locally"
     );
 }
 
@@ -2809,6 +2894,7 @@ async fn a_flat_llama_cpp_root_offers_only_the_models_own_repository_drafters() 
         snapshot: None,
         lineage: Default::default(),
         catalog: None,
+        reach: super::Reach::Hub,
     };
     let offered = fixture
         .candidates
@@ -3652,6 +3738,17 @@ async fn live_fixture_from(
     qwen: bool,
     environment: Arc<AssessmentEnvironment>,
 ) -> LiveFixture {
+    live_fixture_reaching(local_models, qwen, environment, true).await
+}
+
+/// A live fixture whose Hub, unless `hub_reachable`, stops answering once the catalog is built,
+/// before custom models are enriched.
+async fn live_fixture_reaching(
+    local_models: LocalModelsConfiguration,
+    qwen: bool,
+    environment: Arc<AssessmentEnvironment>,
+    hub_reachable: bool,
+) -> LiveFixture {
     let mut stub = hub();
     if qwen {
         stub.repositories.extend(qwen_repositories());
@@ -3702,6 +3799,7 @@ async fn live_fixture_from(
         services.catalog.clone(),
         services.local.clone(),
     );
+    hub.unreachable.store(!hub_reachable, Ordering::SeqCst);
     candidates.start_enrichment(resolver.clone());
     let configurations = crate::configurations::ResolvedConfigurations::new(
         Arc::clone(&models),
@@ -4614,6 +4712,86 @@ async fn a_found_model_falls_back_to_its_built_in_heads_while_the_catalog_drafte
             "back on disk, the catalog drafter takes over again",
         )
         .await;
+}
+
+/// QA (macOS, round 4): a folder added while Hugging Face was unreachable listed its found models
+/// with no "Variant of" and no drafter for minutes, and a model with built-in MTP heads loaded in
+/// that window served plain: every enrichment waited for the Hub (catalog lineage, the catalog
+/// drafter's header) before publishing anything. What the files here say is published first: the
+/// heads attach and a load uses them while the Hub never answers, and the catalog drafter it
+/// matches stays recommended, to be added.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_found_models_built_in_heads_serve_while_the_hub_is_unreachable() {
+    let locations = tempfile::tempdir().expect("locations");
+    let found = locations.path().join("found");
+    let model = found.join(QWEN_Q3_FILE);
+    write_fixture_sparse(&model, QWEN_Q3_FILE);
+    let fixture = live_fixture_reaching(
+        LocalModelsConfiguration {
+            roots: vec![folder_root(&found)],
+            ..LocalModelsConfiguration::default()
+        },
+        true,
+        cpu_environment(),
+        false,
+    )
+    .await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let listed = loop {
+        let listed = fixture.local.list_local().await.expect("local models");
+        let found = listed
+            .models
+            .into_iter()
+            .find(|listed| {
+                listed
+                    .files
+                    .first()
+                    .is_some_and(|first| first.path == model)
+            })
+            .expect("the found model is listed");
+        if found
+            .drafter
+            .as_ref()
+            .is_some_and(|drafter| drafter.reference == DrafterReference::Embedded)
+        {
+            break found;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the built-in heads attach without the Hub: attached {:?}",
+            found.drafter
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        listed.variant_of.as_ref(),
+        Some(&qwen_catalog_id()),
+        "Variant of comes from the file's shape, never the Hub"
+    );
+    assert_eq!(
+        listed
+            .recommended_drafter
+            .as_ref()
+            .map(|candidate| &candidate.reference),
+        Some(&DrafterReference::Catalog {
+            model_id: qwen_catalog_id(),
+        }),
+        "the catalog drafter it matches by shape stays recommended, to be added"
+    );
+    assert!(
+        matches!(
+            fixture
+                .resolver
+                .serving_configuration(&listed.model_id)
+                .map(|configuration| configuration.bundle),
+            Ok(ServableModelBundle::SpeculativeDecoding {
+                draft_source: SpeculativeDraftSource::Embedded,
+                method: SpeculativeMethod::Mtp,
+                ..
+            })
+        ),
+        "a load in this window serves with the heads"
+    );
 }
 
 /// A catalog model that fits only without its catalog drafter is assessed, and would be served,
