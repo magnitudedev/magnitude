@@ -37,6 +37,10 @@ use std::{error, fmt};
 /// The GGUF architecture this family claims.
 pub const ARCHITECTURE: &str = "nemotron_h_moe";
 
+/// The layout a latent-expert artifact is refused as: users read "No kernels
+/// for the Nemotron-H latent MoE architecture".
+const LATENT_EXPERTS: &str = "Nemotron-H latent MoE";
+
 /// Every architecture metadata key the family reads. The rope keys are
 /// written by the converter but unused: every attention layer is NoPE.
 const KNOWN_KEYS: &[&str] = &[
@@ -91,6 +95,9 @@ pub enum Error {
     Structure(String),
     /// A projector given to this text-only family.
     Projector,
+    /// Latent experts (`moe_latent_size`, the Super and Ultra layout), bound
+    /// and checked but refused until their kernels are ready.
+    LatentExperts,
     /// The assembled definition failed contract validation.
     Definition(String),
 }
@@ -110,6 +117,9 @@ impl fmt::Display for Error {
                 "Nemotron-H artifact contains unbound weight roles {names:?}"
             ),
             Self::Projector => formatter.write_str("Nemotron-H has no vision projector"),
+            Self::LatentExperts => {
+                formatter.write_str("Nemotron-H latent MoE experts are not supported yet")
+            }
         }
     }
 }
@@ -120,11 +130,15 @@ impl Error {
     /// The unsupported features this error names; a header missing a key
     /// names it, one missing a weight the family needs, or whose values or
     /// layers contradict each other, is `Unreadable`, and a projector given
-    /// to this text-only family does not fit it.
+    /// to this text-only family does not fit it. Latent experts name the
+    /// layout that has no kernels yet.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
             Self::Projector => vec![UnsupportedReason::TargetMismatch {
                 detail: self.to_string(),
+            }],
+            Self::LatentExperts => vec![UnsupportedReason::Architecture {
+                architecture: LATENT_EXPERTS.into(),
             }],
             Self::MissingMetadata(key) => {
                 vec![UnsupportedReason::MissingMetadata { key: key.clone() }]
@@ -668,6 +682,13 @@ pub fn inspect_components(
         draft: None,
     };
     definition.validate()?;
+    if geometry
+        .experts
+        .as_ref()
+        .is_some_and(|experts| experts.latent.is_some())
+    {
+        return Err(Error::LatentExperts);
+    }
     Ok(definition)
 }
 

@@ -123,7 +123,12 @@ fn every_admitted_catalog_target_derives_complete_terms() {
         let definition = match family.inspect(&target, None, identity) {
             Ok(definition) => definition,
             Err(error) => {
-                failures.push(format!("{model} {role}: its family fails to inspect it: {error}"));
+                let line = format!("{model} {role}: its family fails to inspect it: {error}");
+                if served {
+                    failures.push(line);
+                } else {
+                    refused.push(line);
+                }
                 continue;
             }
         };

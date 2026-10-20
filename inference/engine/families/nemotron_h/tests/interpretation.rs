@@ -89,10 +89,6 @@ struct Expected {
 }
 
 const LIGHTNING_PATTERN: &str = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
-const SUPER_PATTERN: &str =
-    "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME";
-const ULTRA_PATTERN: &str = "MEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME";
-
 /// Blocks as the family must form them: a mixer takes the feed-forward
 /// layer after it, and a mixer followed by a mixer stands alone.
 fn blocks_of(layers: &str) -> String {
@@ -225,51 +221,22 @@ fn every_lightning_variant_binds_with_its_prediction_block_skipped() {
     }
 }
 
-fn super_() -> Expected {
-    Expected {
-        pattern: SUPER_PATTERN,
-        hidden: 4096,
-        heads: 32,
-        state_heads: 128,
-        norm_group: 1024,
-        experts: 512,
-        selected: 22,
-        intermediate: 2688,
-        shared: 5376,
-        latent: Some(1024),
-        scale: 5.0,
-    }
+fn refused_as_latent_experts(directory: &Directory) {
+    let error = inspect(directory).unwrap_err();
+    assert_eq!(error, Error::LatentExperts);
+    assert_eq!(
+        error.reasons(),
+        [UnsupportedReason::Architecture {
+            architecture: "Nemotron-H latent MoE".into()
+        }]
+    );
 }
 
 #[test]
-fn super_and_ultra_bind_latent_experts() {
-    for file in SUPER {
-        let definition = inspect(&catalog(file)).unwrap_or_else(|error| panic!("{file}: {error}"));
-        check(&definition, &super_());
+fn super_and_ultra_latent_experts_are_refused_until_their_kernels_are_ready() {
+    for file in SUPER.iter().chain([&ULTRA]) {
+        refused_as_latent_experts(&catalog(file));
     }
-    let definition = inspect(&catalog(ULTRA)).unwrap();
-    check(
-        &definition,
-        &Expected {
-            pattern: ULTRA_PATTERN,
-            hidden: 8192,
-            heads: 64,
-            state_heads: 256,
-            norm_group: 2048,
-            experts: 512,
-            selected: 22,
-            intermediate: 5120,
-            shared: 10240,
-            latent: Some(2048),
-            scale: 5.0,
-        },
-    );
-    // Lone state-space blocks: 8 in Super, 12 in Ultra.
-    let lone = pattern(&definition)
-        .split('|')
-        .filter(|block| *block == "M")
-        .count();
-    assert_eq!(lone, 12);
 }
 
 /// The released Nemotron 3.5 Super VL Q4_0 header (ggml-org), which states
@@ -282,11 +249,19 @@ fn super_vl() -> Directory {
 
 #[test]
 fn a_header_without_an_rms_epsilon_normalizes_with_its_layer_norm_epsilon() {
+    let mut directory = lightning_q8();
+    directory
+        .metadata
+        .retain(|entry| entry.name != "nemotron_h_moe.attention.layer_norm_rms_epsilon");
+    check(&inspect(&directory).unwrap(), &lightning());
+
+    // Super VL binds in full on its layer-norm epsilon, then is refused for
+    // its latent experts.
     let directory = super_vl();
     assert!(directory
         .value("nemotron_h_moe.attention.layer_norm_rms_epsilon")
         .is_none());
-    check(&inspect(&directory).unwrap(), &super_());
+    refused_as_latent_experts(&directory);
 
     let mut directory = super_vl();
     directory
