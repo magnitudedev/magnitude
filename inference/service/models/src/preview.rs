@@ -1945,20 +1945,34 @@ pub async fn pinned_hugging_face_repository(
     request: HuggingFaceRepositoryRequest,
 ) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
     validate_repository_request(&request)?;
-    if immutable_commit(request.revision.clone()).is_some() {
-        let cache_key = repository_cache_key(models.client.endpoint(), &request);
-        if let Some(cached) = models
-            .cache
-            .read_index::<CachedHuggingFaceRepositorySnapshot>(
-                ModelIndexKind::HuggingFaceRepositorySnapshot,
-                &cache_key,
-            )
-            .filter(|cached| cached.snapshot.commit == request.revision)
-        {
-            return Ok(cached.snapshot);
-        }
+    if immutable_commit(request.revision.clone()).is_some()
+        && let Some(cached) = cached_hugging_face_repository(models, &request)
+    {
+        return Ok(cached);
     }
     refresh_hugging_face_repository(models, request).await
+}
+
+/// The repository snapshot last read for `request`, without a request: an immutable commit's
+/// own snapshot, or a branch's latest known one.
+#[must_use]
+pub fn cached_hugging_face_repository(
+    models: &ManagedModelStore,
+    request: &HuggingFaceRepositoryRequest,
+) -> Option<HuggingFaceRepositorySnapshot> {
+    validate_repository_request(request).ok()?;
+    let cache_key = repository_cache_key(models.client.endpoint(), request);
+    models
+        .cache
+        .read_index::<CachedHuggingFaceRepositorySnapshot>(
+            ModelIndexKind::HuggingFaceRepositorySnapshot,
+            &cache_key,
+        )
+        .filter(|cached| {
+            immutable_commit(request.revision.clone()).is_none()
+                || cached.snapshot.commit == request.revision
+        })
+        .map(|cached| cached.snapshot)
 }
 
 fn classification_evidence(

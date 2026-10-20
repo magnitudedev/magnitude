@@ -3769,18 +3769,36 @@ async fn live_fixture_from(
     qwen: bool,
     environment: Arc<AssessmentEnvironment>,
 ) -> LiveFixture {
-    live_fixture_reaching(local_models, qwen, environment, true).await
+    live_fixture_reaching(
+        local_models,
+        qwen,
+        environment,
+        LiveHub {
+            reachable: true,
+            ..LiveHub::default()
+        },
+    )
+    .await
 }
 
-/// A live fixture whose Hub, unless `hub_reachable`, stops answering once the catalog is built,
-/// before custom models are enriched.
+/// What a live fixture's Hub serves beyond the standard repositories, what this computer has
+/// already read from it (repository snapshots, each at its revision), and whether it still
+/// answers once that is read, before custom models are enriched.
+#[derive(Default)]
+struct LiveHub {
+    repositories: BTreeMap<String, StubRepository>,
+    snapshots_read: Vec<(&'static str, String)>,
+    reachable: bool,
+}
+
 async fn live_fixture_reaching(
     local_models: LocalModelsConfiguration,
     qwen: bool,
     environment: Arc<AssessmentEnvironment>,
-    hub_reachable: bool,
+    live_hub: LiveHub,
 ) -> LiveFixture {
     let mut stub = hub();
+    stub.repositories.extend(live_hub.repositories);
     if qwen {
         stub.repositories.extend(qwen_repositories());
     }
@@ -3802,6 +3820,17 @@ async fn live_fixture_reaching(
     let (mut catalog, _) = llama_test_catalog(&models).await;
     if qwen {
         catalog.models.push(qwen_catalog_model(&models).await);
+    }
+    for (repository, revision) in live_hub.snapshots_read {
+        magnitude_service_models::pinned_hugging_face_repository(
+            &models,
+            HuggingFaceRepositoryRequest {
+                repository: repository.to_owned(),
+                revision,
+            },
+        )
+        .await
+        .expect("the snapshot is read");
     }
     let lineage = CatalogLineage::new(Arc::clone(&models), catalog.clone());
     let resolver = ModelDomainResolver::new(Arc::clone(&models), catalog.clone());
@@ -3830,7 +3859,7 @@ async fn live_fixture_reaching(
         services.catalog.clone(),
         services.local.clone(),
     );
-    hub.unreachable.store(!hub_reachable, Ordering::SeqCst);
+    hub.unreachable.store(!live_hub.reachable, Ordering::SeqCst);
     candidates.start_enrichment(resolver.clone());
     let configurations = crate::configurations::ResolvedConfigurations::new(
         Arc::clone(&models),
@@ -4980,7 +5009,7 @@ async fn a_found_models_built_in_heads_serve_while_the_hub_is_unreachable() {
         },
         true,
         cpu_environment(),
-        false,
+        LiveHub::default(),
     )
     .await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
@@ -5233,5 +5262,234 @@ async fn search_disables_a_result_whose_header_the_engine_refuses() {
         results.results.last().map(|result| result.repository.as_str()),
         Some("someone/Biased-GGUF"),
         "refused results are listed last"
+    );
+}
+
+// Declared Hub lineage -------------------------------------------------------------------------
+
+const LM_STUDIO_LLAMA: &str = "lmstudio-community/Llama-GGUF";
+const QUANTIZED_LLAMA: &str = "community/Llama-Quantized-GGUF";
+const LM_STUDIO_QWEN36_27B: &str = "lmstudio-community/Qwen3.6-27B-GGUF";
+const QUANTIZED_FILE: &str = "Llama-Q4_K_M.gguf";
+
+fn llama_test_id() -> ModelId {
+    "llama-test:gguf:q8".parse().unwrap()
+}
+
+fn quantized_llama() -> StubFile {
+    StubFile::new(QUANTIZED_FILE, &llama(15, Encoding::Q4K))
+}
+
+fn location(
+    kind: magnitude_service_contracts::models::ModelRootKind,
+    path: &std::path::Path,
+) -> LocalModelsConfiguration {
+    LocalModelsConfiguration {
+        roots: vec![magnitude_service_contracts::models::ModelRoot {
+            kind,
+            path: path.to_path_buf(),
+            enabled: true,
+        }],
+        ..LocalModelsConfiguration::default()
+    }
+}
+
+impl LiveFixture {
+    /// Waits until the custom model whose file is `file` is recommended `expected`.
+    async fn recommended_until(
+        &self,
+        file: &std::path::Path,
+        expected: Option<&DrafterReference>,
+        what: &str,
+    ) -> CustomModel {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+        loop {
+            let listed = self.local.list_local().await.expect("local models");
+            let model = listed
+                .models
+                .iter()
+                .find(|model| model.files.first().is_some_and(|first| first.path == file))
+                .unwrap_or_else(|| panic!("{what}: no model at {}: {listed:#?}", file.display()));
+            let recommended = model
+                .recommended_drafter
+                .as_ref()
+                .map(|candidate| &candidate.reference);
+            if recommended == expected {
+                return model.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: recommended {recommended:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// QA (Linux, round 4): LM Studio's lmstudio-community/gemma-4-E2B-it-GGUF declares
+/// google/gemma-4-E2B-it as its base model, and the catalog Gemma 4 E2B's target is a
+/// quantization of google/gemma-4-E2B-it-qat-q4_0-unquantized, a finetune of it, so the found
+/// model got no catalog drafter. The catalog's upstream follows the same two hops a model's
+/// lineage does, so the repository LM Studio's folders name gives the found model lineage, and its
+/// catalog drafter is chosen automatically.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_found_lm_studio_model_whose_repository_names_the_catalog_targets_parent_takes_its_catalog_drafter()
+ {
+    let lm_studio = tempfile::tempdir().expect("LM Studio folder");
+    let model = lm_studio.path().join(LM_STUDIO_LLAMA).join(QUANTIZED_FILE);
+    write_sparse(&model, &llama(15, Encoding::Q4K));
+    let fixture = live_fixture_reaching(
+        location(
+            magnitude_service_contracts::models::ModelRootKind::LmStudio,
+            lm_studio.path(),
+        ),
+        false,
+        cpu_environment(),
+        LiveHub {
+            repositories: BTreeMap::from([
+                (
+                    "base/Llama".to_owned(),
+                    repository('0', Vec::new(), &["base/Llama-Instruct"]),
+                ),
+                (
+                    LM_STUDIO_LLAMA.to_owned(),
+                    repository('8', vec![quantized_llama()], &["base/Llama-Instruct"]),
+                ),
+            ]),
+            reachable: true,
+            ..LiveHub::default()
+        },
+    )
+    .await;
+    let listed = fixture
+        .recommended_until(
+            &model,
+            Some(&DrafterReference::Catalog {
+                model_id: llama_test_id(),
+            }),
+            "the LM Studio model's repository lineage",
+        )
+        .await;
+    let recommended = listed.recommended_drafter.expect("a recommended drafter");
+    assert_eq!(recommended.lineage, DrafterLineage::Lineage);
+    assert_eq!(recommended.label, "Trained for Llama Test");
+}
+
+/// QA (Linux, round 4): an unsloth quantization added from Hugging Face, whose repository declares
+/// the catalog target's base model, showed no drafter: the answer from what is on this computer
+/// used only the lineage its header declares, and the Hub's answer had not replaced it. Its
+/// repository's lineage and the catalog's upstream, once read, are on this computer, so with the
+/// Hub unreachable that answer already chooses the catalog drafter.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_models_repository_lineage_already_read_chooses_the_catalog_drafter_while_the_hub_is_unreachable()
+ {
+    let cache = tempfile::tempdir().expect("Hugging Face cache");
+    let file = quantized_llama();
+    let repository_root = cache.path().join("models--community--Llama-Quantized-GGUF");
+    let blob = repository_root.join("blobs").join(file.sha256());
+    write_sparse(&blob, &llama(15, Encoding::Q4K));
+    let model = repository_root
+        .join("snapshots")
+        .join(commit('7'))
+        .join(QUANTIZED_FILE);
+    std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&blob, &model).unwrap();
+    std::fs::create_dir_all(repository_root.join("refs")).unwrap();
+    std::fs::write(repository_root.join("refs/main"), commit('7')).unwrap();
+    let fixture = live_fixture_reaching(
+        location(
+            magnitude_service_contracts::models::ModelRootKind::HuggingFaceCache,
+            cache.path(),
+        ),
+        false,
+        cpu_environment(),
+        LiveHub {
+            repositories: BTreeMap::from([(
+                QUANTIZED_LLAMA.to_owned(),
+                repository('7', vec![file], &["base/Llama"]),
+            )]),
+            snapshots_read: vec![
+                (QUANTIZED_LLAMA, commit('7')),
+                (QUANTIZED_LLAMA, "main".to_owned()),
+                (CATALOG_TARGET, commit('a')),
+            ],
+            reachable: false,
+        },
+    )
+    .await;
+    let listed = fixture
+        .recommended_until(
+            &model,
+            Some(&DrafterReference::Catalog {
+                model_id: llama_test_id(),
+            }),
+            "the repository lineage on this computer",
+        )
+        .await;
+    assert_eq!(
+        listed
+            .recommended_drafter
+            .map(|candidate| candidate.lineage),
+        Some(DrafterLineage::Lineage)
+    );
+}
+
+/// mac-r4-16: lmstudio-community/Qwen3.6-27B-GGUF declares Qwen/Qwen3.6-27B, and the catalog
+/// Qwen3.8 27B's upstream is Qwen/Qwen3.8-27B. Declared lineage naming another generation is no
+/// lineage, so the catalog drafter it shares every dimension with stays untested and never
+/// automatic.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repository_declaring_another_generation_never_makes_the_shape_matched_drafter_automatic()
+{
+    let fixture = fixture_from(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::from([(
+            LM_STUDIO_QWEN36_27B.to_owned(),
+            repository(
+                '9',
+                vec![fixture_file(
+                    &format!("headers/{QWEN36_27B_FILE}.gz"),
+                    QWEN36_27B_FILE,
+                )],
+                &["Qwen/Qwen3.6-27B"],
+            ),
+        )]),
+        true,
+        cpu_environment(),
+    )
+    .await;
+    let candidates = fixture
+        .candidates
+        .drafters(DrafterCandidatesRequest::Candidate {
+            candidate: hugging_face_candidate(LM_STUDIO_QWEN36_27B, '9', QWEN36_27B_FILE),
+            other: None,
+        })
+        .await
+        .expect("drafter candidates")
+        .candidates;
+    let listed = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.category,
+                candidate.lineage,
+                candidate.method.clone(),
+                is_bound(&candidate.verdict),
+                candidate.automatic,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed,
+        [(
+            DrafterCategory::CatalogDrafter,
+            DrafterLineage::Fingerprint,
+            Some(SpeculativeMethod::DFlash2),
+            true,
+            false,
+        )],
+        "{candidates:#?}"
     );
 }

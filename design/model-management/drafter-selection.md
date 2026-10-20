@@ -56,8 +56,14 @@ Signals in order of strength; any one is enough and later signals break ties:
    another generation, so making such a drafter automatic needs evidence beyond the header.
 
 A catalog model's upstream lineage is the Hub's `baseModels` of its target repository at the locked
-commit, read once and cached with that commit's snapshot; catalog fingerprints come from the release
-header bundle.
+commit, read once and cached with that commit's snapshot, and those base models' own `baseModels`
+(a second hop, as for a model's lineage): a catalog target is often a quantization of a derivative
+(Gemma 4 E2B's is of `google/gemma-4-E2B-it-qat-q4_0-unquantized`) whose parent
+(`google/gemma-4-E2B-it`) community quantizations name instead. Lineage compares repositories,
+never model names. Every Hub lineage answer is persisted, so a model whose repository is known (an
+added model, a Hugging Face cache or LM Studio file, an Ollama `hf.co` pull) has its declared lineage
+from what is on this computer once it has been read, offline included. Catalog fingerprints come
+from the release header bundle.
 
 The product side matches only on engine-supplied fingerprints and declared lineage; it never parses
 headers or file names. "Variant of" shown to users (a search result, an inspected candidate, a
@@ -164,8 +170,9 @@ download; clients say the drafter is off because the model fits only without it.
   is computed before the others are recomputed. What is on this computer decides first and never
   waits for the Hub: a model with no Hub-reaching answer gets one from its own files, the release
   catalog and Hub answers already cached (its shape's "Variant of", drafters in its folder, its
-  built-in heads, the catalog drafter it matches by shape or declared lineage), which the list
-  shows and a load uses at once, while the Hub's part (snapshots, catalog upstream lineage, drafter
+  built-in heads, the catalog drafter it matches by shape or by lineage its header or its
+  repository's cached Hub answers declare, automatic on that lineage as on the Hub's), which the list
+  shows and a load uses at once, while the Hub's part (snapshots, lineage not yet read, drafter
   headers) is worked out alongside and then replaces it; a local answer never replaces a Hub one,
   and drafter pruning waits for the Hub's. A found or imported model with
   none of its automatic candidates on this computer has no attached drafter: ACN projects it

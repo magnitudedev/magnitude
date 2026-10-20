@@ -2,10 +2,14 @@
 //!
 //! A catalog model's upstream is its target repository's Hub `baseModels` at the locked commit,
 //! read at runtime and persisted through the commit-pinned repository snapshot cache, so it is
-//! fetched once per release and never follows a mutable revision. A candidate's lineage is its
-//! repository, the Hub `baseModels` up to two hops, and the repositories its GGUF names in
-//! `general.base_model.N.repo_url`. Lineage is a display hint and a drafter-selection signal; the
-//! engine verdict alone decides compatibility.
+//! fetched once per release and never follows a mutable revision, and then those base models' own
+//! `baseModels` (a second hop). A candidate's lineage is its repository, the Hub `baseModels` up
+//! to two hops, and the repositories its GGUF names in `general.base_model.N.repo_url`. Both sides
+//! follow two hops because a catalog target is often a quantization of a derivative (a QAT
+//! checkpoint of an instruct model) whose parent community quantizations name instead. Every Hub
+//! answer is persisted, so what is on this computer (`known_*`) answers without a request, offline
+//! included. Lineage is a display hint and a drafter-selection signal; the engine verdict alone
+//! decides compatibility.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -20,6 +24,7 @@ use magnitude_service_contracts::models::{
 use magnitude_service_contracts::{HuggingFaceRepositoryRequest, InventoryError};
 use serde::Deserialize;
 
+use crate::cache::ModelIndexKind;
 use crate::inventory::ManagedModelStore;
 
 const LINEAGE_TTL: Duration = Duration::from_secs(60 * 60);
@@ -169,20 +174,14 @@ impl CatalogLineage {
         self.lineage_matches(lineage, &upstreams)
     }
 
-    /// `match_lineages` without waiting for the Hub: catalog upstreams match only once they have
-    /// been read, so until then only catalog target repositories do.
+    /// `match_lineages` without a request: catalog upstreams match as far as the Hub's answers
+    /// are on this computer.
     #[must_use]
     pub fn match_known_lineages(&self, lineage: &BTreeSet<String>) -> Vec<CatalogLineageMatch> {
         if lineage.is_empty() {
             return Vec::new();
         }
-        let upstreams = self
-            .upstreams
-            .try_lock()
-            .ok()
-            .and_then(|cached| cached.clone())
-            .unwrap_or_default();
-        self.lineage_matches(lineage, &upstreams)
+        self.lineage_matches(lineage, &self.known_upstreams())
     }
 
     fn lineage_matches(
@@ -227,6 +226,8 @@ impl CatalogLineage {
         lineage
     }
 
+    /// Each catalog model's upstream (see the module documentation), read from the Hub where it
+    /// is not on this computer, and kept once every one is known.
     async fn upstreams(&self) -> Arc<Upstreams> {
         let mut cached = self.upstreams.lock().await;
         if let Some(upstreams) = cached.as_ref() {
@@ -243,8 +244,23 @@ impl CatalogLineage {
                 else {
                     return Some((candidate.model_id, BTreeSet::new()));
                 };
-                match pinned_repository_base_models(&self.models, repository, revision).await {
-                    Ok(base_models) => Some((candidate.model_id, base_models)),
+                let upstream = async {
+                    let first_hop = next_hop(
+                        repository,
+                        pinned_repository_base_models(&self.models, repository, revision).await?,
+                    );
+                    let mut second_hop = Vec::new();
+                    for base in &first_hop {
+                        match self.hub.base_models(base).await {
+                            Ok(bases) => second_hop.push(bases),
+                            Err(InventoryError::NotFound(_)) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Ok::<_, InventoryError>(upstream(first_hop, second_hop))
+                };
+                match upstream.await {
+                    Ok(upstream) => Some((candidate.model_id, upstream)),
                     Err(error) => {
                         tracing::warn!(
                             repository = %repository,
@@ -265,6 +281,65 @@ impl CatalogLineage {
         }
         upstreams
     }
+
+    /// `upstreams` from what is on this computer: every one once all are known, else each catalog
+    /// model's as far as its Hub answers are persisted.
+    fn known_upstreams(&self) -> Arc<Upstreams> {
+        if let Ok(cached) = self.upstreams.try_lock()
+            && let Some(upstreams) = cached.as_ref()
+        {
+            return Arc::clone(upstreams);
+        }
+        Arc::new(
+            self.representatives()
+                .filter_map(|candidate| {
+                    let ModelPackageSource::HuggingFace {
+                        repository,
+                        revision,
+                    } = &catalog_target(&candidate.model).source
+                    else {
+                        return None;
+                    };
+                    let snapshot = crate::preview::cached_hugging_face_repository(
+                        &self.models,
+                        &HuggingFaceRepositoryRequest {
+                            repository: repository.clone(),
+                            revision: revision.clone(),
+                        },
+                    )?;
+                    let first_hop = next_hop(repository, snapshot.base_models);
+                    let second_hop = first_hop
+                        .iter()
+                        .filter_map(|base| self.hub.known_base_models(base))
+                        .collect();
+                    Some((candidate.model_id, upstream(first_hop, second_hop)))
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The base models lineage follows from `repository`: at most `MAX_BASE_MODELS_PER_HOP`, never
+/// the repository itself.
+fn next_hop(repository: &str, base_models: Vec<String>) -> Vec<String> {
+    base_models
+        .into_iter()
+        .filter(|base| !base.eq_ignore_ascii_case(repository))
+        .take(MAX_BASE_MODELS_PER_HOP)
+        .collect()
+}
+
+/// The repositories of two hops, lowercased.
+fn upstream(first_hop: Vec<String>, second_hop: Vec<Vec<String>>) -> BTreeSet<String> {
+    first_hop
+        .into_iter()
+        .chain(
+            second_hop
+                .into_iter()
+                .flat_map(|bases| bases.into_iter().take(MAX_BASE_MODELS_PER_HOP)),
+        )
+        .map(|base| base.to_lowercase())
+        .collect()
 }
 
 fn catalog_match(model: &RecommendableModel) -> CatalogLineageMatch {
@@ -316,7 +391,7 @@ async fn pinned_repository_base_models(
     models: &Arc<ManagedModelStore>,
     repository: &str,
     commit: &str,
-) -> Result<BTreeSet<String>, InventoryError> {
+) -> Result<Vec<String>, InventoryError> {
     let snapshot = crate::preview::pinned_hugging_face_repository(
         models,
         HuggingFaceRepositoryRequest {
@@ -325,17 +400,14 @@ async fn pinned_repository_base_models(
         },
     )
     .await?;
-    Ok(snapshot
-        .base_models
-        .iter()
-        .map(|base| base.to_lowercase())
-        .collect())
+    Ok(snapshot.base_models)
 }
 
-/// Hub lineage of arbitrary repositories, cached in memory and fetched with bounded concurrency.
+/// Hub lineage of arbitrary repositories, fetched with bounded concurrency, kept in memory for
+/// `LINEAGE_TTL` and persisted, so a repository's lineage answers without a request once known.
 pub struct HubLineage {
     models: Arc<ManagedModelStore>,
-    cache: tokio::sync::Mutex<BTreeMap<String, (Instant, Vec<String>)>>,
+    cache: std::sync::Mutex<BTreeMap<String, (Instant, Vec<String>)>>,
     permits: tokio::sync::Semaphore,
 }
 
@@ -345,25 +417,92 @@ struct HubBaseModelsResponse {
     base_models: Option<serde_json::Value>,
 }
 
+/// A repository's direct Hub `baseModels` as last read.
+#[derive(Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedBaseModels {
+    base_models: Vec<String>,
+}
+
 impl HubLineage {
     fn new(models: Arc<ManagedModelStore>) -> Self {
         Self {
             models,
-            cache: tokio::sync::Mutex::new(BTreeMap::new()),
+            cache: std::sync::Mutex::new(BTreeMap::new()),
             permits: tokio::sync::Semaphore::new(MAX_LINEAGE_REQUESTS),
         }
     }
 
-    /// The direct Hub `baseModels` of `repository`, as the Hub spells them.
+    fn persisted_key(&self, repository: &str) -> String {
+        format!(
+            "{}:{}",
+            self.models.client.endpoint(),
+            repository.to_lowercase()
+        )
+    }
+
+    /// The direct Hub `baseModels` of `repository` as last read, without a request.
+    #[must_use]
+    pub fn known_base_models(&self, repository: &str) -> Option<Vec<String>> {
+        let remembered = self.cache.lock().ok().and_then(|cache| {
+            cache
+                .get(&repository.to_lowercase())
+                .map(|(_, base_models)| base_models.clone())
+        });
+        remembered.or_else(|| {
+            self.models
+                .cache
+                .read_index::<PersistedBaseModels>(
+                    ModelIndexKind::HuggingFaceBaseModels,
+                    &self.persisted_key(repository),
+                )
+                .map(|persisted| persisted.base_models)
+        })
+    }
+
+    /// The direct Hub `baseModels` of `repository`, as the Hub spells them; the last answer read
+    /// when the Hub can't be reached.
     pub async fn base_models(&self, repository: &str) -> Result<Vec<String>, InventoryError> {
         let key = repository.to_lowercase();
-        {
-            let mut cache = self.cache.lock().await;
+        if let Ok(mut cache) = self.cache.lock() {
             cache.retain(|_, (captured, _)| captured.elapsed() <= LINEAGE_TTL);
             if let Some((_, base_models)) = cache.get(&key) {
                 return Ok(base_models.clone());
             }
         }
+        match self.fetch_base_models(repository).await {
+            Ok(base_models) => {
+                self.models.cache.write_index(
+                    ModelIndexKind::HuggingFaceBaseModels,
+                    &self.persisted_key(repository),
+                    &PersistedBaseModels {
+                        base_models: base_models.clone(),
+                    },
+                );
+                self.remember(key, &base_models);
+                Ok(base_models)
+            }
+            Err(error @ InventoryError::NotFound(_)) => Err(error),
+            Err(error) => self.known_base_models(repository).ok_or(error),
+        }
+    }
+
+    fn remember(&self, key: String, base_models: &[String]) {
+        let Ok(mut cache) = self.cache.lock() else {
+            return;
+        };
+        cache.insert(key, (Instant::now(), base_models.to_vec()));
+        if cache.len() > MAX_LINEAGE_CACHE_ENTRIES
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (captured, _))| *captured)
+                .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+
+    async fn fetch_base_models(&self, repository: &str) -> Result<Vec<String>, InventoryError> {
         let _permit = self
             .permits
             .acquire()
@@ -397,22 +536,11 @@ impl HubLineage {
             &crate::preview::bounded_response_bytes(response, MAX_LINEAGE_METADATA_BYTES).await?,
         )
         .map_err(|error| InventoryError::Upstream(error.to_string()))?;
-        let base_models = body
+        Ok(body
             .base_models
             .as_ref()
             .map(hub_base_model_ids)
-            .unwrap_or_default();
-        let mut cache = self.cache.lock().await;
-        cache.insert(key, (Instant::now(), base_models.clone()));
-        if cache.len() > MAX_LINEAGE_CACHE_ENTRIES
-            && let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, (captured, _))| *captured)
-                .map(|(key, _)| key.clone())
-        {
-            cache.remove(&oldest);
-        }
-        Ok(base_models)
+            .unwrap_or_default())
     }
 
     /// `repository` with its Hub `baseModels` up to two hops (GGUF, then finetune, then base),
@@ -423,17 +551,11 @@ impl HubLineage {
         repository: &str,
         first_hop: Option<Vec<String>>,
     ) -> BTreeSet<String> {
-        let mut lineage = BTreeSet::from([repository.to_lowercase()]);
         let first_hop = match first_hop {
             Some(first_hop) => first_hop,
             None => self.base_models(repository).await.unwrap_or_default(),
         };
-        let first_hop = first_hop
-            .into_iter()
-            .filter(|base| !lineage.contains(&base.to_lowercase()))
-            .take(MAX_BASE_MODELS_PER_HOP)
-            .collect::<Vec<_>>();
-        lineage.extend(first_hop.iter().map(|base| base.to_lowercase()));
+        let first_hop = next_hop(repository, first_hop);
         let mut pending = Vec::new();
         for base in &first_hop {
             pending.push(self.base_models(base));
@@ -441,16 +563,43 @@ impl HubLineage {
         let second_hop = futures_util::stream::iter(pending)
             .buffer_unordered(MAX_LINEAGE_REQUESTS)
             .collect::<Vec<_>>()
-            .await;
-        lineage.extend(second_hop.into_iter().flat_map(|bases| {
-            bases
-                .unwrap_or_default()
-                .into_iter()
-                .take(MAX_BASE_MODELS_PER_HOP)
-                .map(|base| base.to_lowercase())
-        }));
-        lineage
+            .await
+            .into_iter()
+            .map(Result::unwrap_or_default)
+            .collect();
+        repository_lineage(repository, first_hop, second_hop)
     }
+
+    /// `lineage` from the Hub answers on this computer, without a request.
+    #[must_use]
+    pub fn known_lineage(
+        &self,
+        repository: &str,
+        first_hop: Option<Vec<String>>,
+    ) -> BTreeSet<String> {
+        let first_hop = next_hop(
+            repository,
+            first_hop
+                .or_else(|| self.known_base_models(repository))
+                .unwrap_or_default(),
+        );
+        let second_hop = first_hop
+            .iter()
+            .filter_map(|base| self.known_base_models(base))
+            .collect();
+        repository_lineage(repository, first_hop, second_hop)
+    }
+}
+
+/// A repository's lineage: itself and its two hops, lowercased.
+fn repository_lineage(
+    repository: &str,
+    first_hop: Vec<String>,
+    second_hop: Vec<Vec<String>>,
+) -> BTreeSet<String> {
+    let mut lineage = upstream(first_hop, second_hop);
+    lineage.insert(repository.to_lowercase());
+    lineage
 }
 
 /// Repository IDs in a Hub `baseModels` value: `{relation, models: [{id}]}`, or a list of those.

@@ -457,9 +457,10 @@ impl ManagedModelCandidates {
     /// installation, or a configuration change. Candidate enumeration is the only source of the
     /// automatic order, so the list and the attachment never disagree for long.
     ///
-    /// Two passes run side by side: one publishes what is on this computer (the file's
-    /// shape and declared lineage, drafters in its folder, its built-in heads, the catalog drafter
-    /// of a catalog model it matches by shape) for every model with no Hub-reaching result yet,
+    /// Two passes run side by side: one publishes what is on this computer (the file's shape,
+    /// the lineage its header and its repository's Hub answers already here declare, drafters in
+    /// its folder, its built-in heads, the catalog drafter of a catalog model it matches by shape
+    /// or that lineage) for every model with no Hub-reaching result yet,
     /// and the other adds what the Hub says. A model is never kept waiting on a slow or
     /// unreachable Hub for what its own files decide, and a load meanwhile uses that.
     pub fn start_enrichment(self: &Arc<Self>, resolver: Arc<ModelDomainResolver>) {
@@ -1637,8 +1638,8 @@ impl ManagedModelCandidates {
     /// The catalog models a target derives from, best first: an exact catalog target alone; else
     /// the lineage match that is the target's fingerprint match, else the first lineage match in
     /// catalog order; then the fingerprint match when it is another one, whose drafter is the
-    /// fallback when the lineage match's is rejected. Locally, catalog upstreams the Hub has not
-    /// yet supplied match nothing.
+    /// fallback when the lineage match's is rejected. Locally, catalog upstreams match as far as
+    /// the Hub's answers are on this computer.
     ///
     /// The fingerprint match is the catalog model whose fingerprint equals the target's, else the
     /// one the target is a variant of by shape (see `ModelShape::variant_of`), so every model shown
@@ -1757,8 +1758,8 @@ impl ManagedModelCandidates {
     }
 
     /// A model's target: a catalog model's release material, or a custom model's installed
-    /// target package. Locally, a model from a known Hub repository has no snapshot and only the
-    /// lineage its header declares.
+    /// target package. Locally, a model from a known Hub repository has no snapshot, and the
+    /// lineage its header declares and its repository's Hub lineage already on this computer.
     async fn model_target(
         &self,
         model_id: &ModelId,
@@ -1835,19 +1836,40 @@ impl ManagedModelCandidates {
             .map(|file| file.path.clone())
             .min();
         let mut lineage = self.header_lineage(&material.target, &material.headers);
-        // A model from a known Hub repository lists that repository's drafters, at its commit or
-        // else at `main`; never whatever else shares its folder.
+        // A model from a known Hub repository takes the lineage that repository declares, at its
+        // commit or else at `main`, and lists that repository's drafters; never whatever else
+        // shares its folder. Locally, the lineage is the Hub's answers already on this computer.
         let snapshot = match &repository {
-            Some((repository, commit)) if reach == Reach::Hub => {
-                lineage.extend(self.lineage.hub().lineage(repository, None).await);
+            Some((repository, commit)) => {
                 let revision = if is_commit(commit) {
                     commit.as_str()
                 } else {
                     "main"
                 };
-                self.snapshot(repository, revision).await.ok()
+                match reach {
+                    Reach::Hub => {
+                        let snapshot = self.snapshot(repository, revision).await.ok();
+                        let first_hop = snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.base_models.clone());
+                        lineage.extend(self.lineage.hub().lineage(repository, first_hop).await);
+                        snapshot
+                    }
+                    Reach::Local => {
+                        let first_hop = magnitude_service_models::cached_hugging_face_repository(
+                            self.models(),
+                            &HuggingFaceRepositoryRequest {
+                                repository: repository.clone(),
+                                revision: revision.to_owned(),
+                            },
+                        )
+                        .map(|snapshot| snapshot.base_models);
+                        lineage.extend(self.lineage.hub().known_lineage(repository, first_hop));
+                        None
+                    }
+                }
             }
-            _ => None,
+            None => None,
         };
         // Each place this model's own bytes are found gives its folder; never the folder of the
         // file its target package resolves to, nor of another model sharing its header.

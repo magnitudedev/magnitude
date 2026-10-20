@@ -64,5 +64,6 @@ pub use search_shape::{
 };
 pub use preview::{
     HuggingFaceDiscovery, PreparedPreview, PreparedPreviewHeader, RemoteGgufHeader,
-    pinned_hugging_face_repository, refresh_hugging_face_repository,
+    cached_hugging_face_repository, pinned_hugging_face_repository,
+    refresh_hugging_face_repository,
 };
