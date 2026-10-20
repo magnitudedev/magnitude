@@ -13,6 +13,7 @@ describe("ACN subscription protocol", () => {
       "StreamActiveSessionStatuses",
       "StreamChanges",
       "StreamDisplayView",
+      "StreamModelCandidateInspection",
       "WatchApplicationOwner",
       "WatchFile",
       "WatchHarnessConnections",
