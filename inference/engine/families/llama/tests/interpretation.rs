@@ -124,7 +124,7 @@ fn every_minicpm5_variant_binds_the_admitted_feature_set() {
 #[test]
 fn claims_no_other_catalog_component() {
     for (model, role, file) in headers::index() {
-        let expected = model == "minicpm5-2b" && role.starts_with("target-");
+        let expected = model.starts_with("minicpm5-") && role.starts_with("target-");
         assert_eq!(
             LlamaFamily.recognizes(&headers::directory(&file)),
             expected,
