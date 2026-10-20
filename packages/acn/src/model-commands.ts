@@ -36,7 +36,7 @@ export interface ModelCommandsApi {
   readonly previewSlotLoad: (slotId: SlotId) => Effect.Effect<ModelLoadPlan, LocalInferenceError>
   readonly stopSlot: (slotId: SlotId) => Effect.Effect<{}, LocalInferenceError>
   readonly loadModel: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError | ModelVersionNotRunnable>
-  readonly stopModel: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
+  readonly stopModel: (modelId: ModelId) => Effect.Effect<{ readonly stopped: boolean }, LocalInferenceError>
   readonly stopActiveModel: Effect.Effect<{}, LocalInferenceError>
 }
 export class ModelCommands extends Context.Tag("ModelCommands")<ModelCommands, ModelCommandsApi>() {}
@@ -120,7 +120,7 @@ export const ModelCommandsLive: Layer.Layer<
     const instance = (yield* instances.get).instances.findLast((candidate) => candidate.modelId === modelId
       && (candidate.lifecycle._tag === "Loading" || candidate.lifecycle._tag === "Ready" || candidate.lifecycle._tag === "Stopping"))
     if (instance !== undefined) yield* client.models.stopModelInstance({ path: { instance_id: instance.id } })
-    return {}
+    return { stopped: instance !== undefined }
   }).pipe(Effect.mapError((cause) => modelCommandFailure("stop", cause)))
   const byForm = <A>(
     requested: ModelId,
@@ -192,7 +192,7 @@ export const ModelCommandsLive: Layer.Layer<
       Effect.flatMap((modelId) => client.models.previewModelLoad({ path: { model_id: modelId } })),
       Effect.map(projectInferenceLoadPlan),
       Effect.mapError((cause) => cause instanceof ModelSlotMutationRejected ? cause : modelCommandFailure("preview", cause))),
-    stopSlot: (slotId) => selectedLocalModel(slotId).pipe(Effect.flatMap(stopModel)),
+    stopSlot: (slotId) => selectedLocalModel(slotId).pipe(Effect.flatMap(stopModel), Effect.as({})),
     loadModel: (modelId) => canonical(modelId).pipe(
       Effect.flatMap(runnable),
       Effect.flatMap((id) => requestLoad(id).pipe(Effect.mapError((cause) => modelCommandFailure("load", cause)))),

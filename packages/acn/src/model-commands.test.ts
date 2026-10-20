@@ -124,6 +124,7 @@ it("stops a model named by any ID form, and refuses one that isn't on this compu
       models: [
         { _tag: "Catalog", modelId: "model-a:gguf:test", catalogData: { aliases: [UPGRADED_ALIAS] } },
         { _tag: "Custom", modelId: added },
+        { _tag: "Catalog", modelId: "model-b:gguf:test", catalogData: { aliases: [] } },
       ],
       hidden: [{ _tag: "Custom", modelId: imported }],
     }) } as never),
@@ -134,10 +135,15 @@ it("stops a model named by any ID form, and refuses one that isn't on this compu
     Effect.provideService(IcnCatalogInstallations, {} as never),
     Effect.provideService(LocalModelRemovals, {} as never),
   )
-  for (const model of ["model-a:gguf:test", UPGRADED_ALIAS, added, imported]) await Effect.runPromise(stop(model))
+  for (const model of ["model-a:gguf:test", UPGRADED_ALIAS, added, imported]) {
+    expect(await Effect.runPromise(stop(model))).toEqual({ stopped: true })
+  }
   expect(stopped).toEqual(["catalog-instance", "catalog-instance", "added-instance", "imported-instance"])
   const unknown = await Effect.runPromise(stop("hf:owner/repo/missing.gguf").pipe(Effect.flip))
   expect(unknown).toMatchObject({ _tag: "LocalModelMutationFailed", code: "model_not_found", message: "hf:owner/repo/missing.gguf is not a model on this computer." })
+  expect(stopped).toHaveLength(4)
+  // A model on this computer that isn't running has nothing to stop, and says so.
+  expect(await Effect.runPromise(stop("model-b:gguf:test"))).toEqual({ stopped: false })
   expect(stopped).toHaveLength(4)
 })
 

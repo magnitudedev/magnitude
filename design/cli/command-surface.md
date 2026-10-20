@@ -34,7 +34,7 @@ catalog search <query> [--limit <count>]
 catalog inspect <huggingface-url | owner/repo | owner/repo:QUANT>
 catalog pull <model-id | owner/repo[:QUANT]> [--drafter auto|none|<ref>] [--force] [--only projector|drafter]
 catalog cancel <model-id> | remove <model-id>
-models status [model-id] [--all] | load <model-id> | stop
+models status [model-id] [--all] | load <model-id> | stop [model-id]
 models drafter <model-id> <ref | auto | none>
 models hide <model-id> | unhide <model-id>
 models folders list | add <path> | remove <path>
@@ -195,8 +195,8 @@ form reports installation, transfer or optimization progress, runtime, memory, c
 actionable failure details without historical or internal operation state.
 
 Load acknowledges admission and prints the focused status command; it never claims readiness from
-the load acknowledgement. Load and stop delegate directly to their authoritative mutations. Magnitude has one active local
-residency slot, so stop remains unaddressed.
+the load acknowledgement. Load and stop delegate directly to their authoritative mutations. Stop without a model
+stops the active one; stop naming a model that isn't loading or running succeeds and says it wasn't running.
 
 ## Hugging Face account
 

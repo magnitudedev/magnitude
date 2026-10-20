@@ -126,9 +126,10 @@ const StopActiveLocalModel = Rpc.make("StopActiveLocalModel", {
   error: LocalInferenceError,
 }).pipe(atMostOnce)
 
+/** `stopped` is false when the model wasn't loading, running or stopping, so there was nothing to stop. */
 const StopLocalModel = Rpc.make("StopLocalModel", {
   payload: Schema.Struct({ modelId: ModelIdSchema }),
-  success: Schema.Struct({}),
+  success: Schema.Struct({ stopped: Schema.Boolean }),
   error: LocalInferenceError,
 }).pipe(atMostOnce)
 

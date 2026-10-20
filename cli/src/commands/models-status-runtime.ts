@@ -524,9 +524,12 @@ export const stopInstance = (modelInput?: string, options: JsonOption = {}) => m
       render: () => "Stopped the active local model.\n",
       json: asJson(options, jsonDocument(Schema.Struct({}), () => ({}))),
     })
-  : modelMutation(
-      modelInput.trim(),
-      (client, modelId) => client.models.stopModel({ modelId }),
-      (modelId) => `Stopped ${modelId}.\n`,
-      options,
-    )
+  : commandEffect({
+      effect: decodeModelId(modelInput.trim()).pipe(Effect.flatMap((modelId) => withClient((client) =>
+        client.models.stopModel({ modelId }).pipe(Effect.map(({ stopped }) => ({ modelId, stopped })))))),
+      render: ({ modelId, stopped }) => stopped ? `Stopped ${modelId}.\n` : `${modelId} wasn't running.\n`,
+      json: asJson(options, jsonDocument(
+        Schema.Struct({ modelId: ModelIdSchema, stopped: Schema.Boolean }),
+        (result: { readonly modelId: ModelId; readonly stopped: boolean }) => result,
+      )),
+    })

@@ -160,11 +160,18 @@ describe("model mutations accept hf: and local: IDs", () => {
     ["local:", IMPORTED_MODEL_ID],
     ["alias", FOUND_MODEL_ID],
   ] as const)("models stop with a %s ID", async (_, modelId) => {
-    const { text, json, models } = await runBoth({ stopModel: succeed(), stop: succeed() }, (options) => stopInstance(` ${modelId} `, options))
+    const { text, json, models } = await runBoth({ stopModel: succeed({ stopped: true }), stop: succeed() }, (options) => stopInstance(` ${modelId} `, options))
     expect(models.stopModel).toHaveBeenCalledWith({ modelId })
     expect(models.stop).not.toHaveBeenCalled()
     expect(text).toBe(`Stopped ${modelId}.\n`)
-    expect(json).toEqual({ modelId })
+    expect(json).toEqual({ modelId, stopped: true })
+  })
+
+  // QA linux-cpu rounds 3c and 4c: stopping a model that wasn't running said "Stopped".
+  it("models stop of a model that isn't running says so and succeeds", async () => {
+    const { text, json } = await runBoth({ stopModel: succeed({ stopped: false }) }, (options) => stopInstance(ADDED_MODEL_ID, options))
+    expect(text).toBe(`${ADDED_MODEL_ID} wasn't running.\n`)
+    expect(json).toEqual({ modelId: ADDED_MODEL_ID, stopped: false })
   })
 
   it("catalog remove of a found catalog model deletes only the parts Magnitude stores, and hides it without any", async () => {
