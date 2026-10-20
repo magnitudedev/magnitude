@@ -70,6 +70,16 @@ Gemma 4's `enable_thinking | default(false)` still defaults to `high`, and a bra
 `enable_thinking` is undefined, such as MiniCPM5's prompt that leaves thinking to the model, is not
 rendered and is not an option. ICN does not maintain a second parser for that fallback.
 
+Reasoning history is preserved by default the same way. A template whose source names the Jinja
+variable `preserve_thinking`, such as Qwen 3.6 and LFM2.5 8B-A1B, receives it as true unless the
+caller's template arguments set it. Without it, these templates keep reasoning only on assistant
+messages after the latest user message, so each new user message re-renders the previous task's
+replies without their reasoning, the prompt diverges inside that task, and the whole task is
+reprocessed. With it, the prompt stays append-only across user messages and the prefix cache reuses
+earlier tasks. The decision is structural, an identifier token in the template source rather than a
+model name; templates that do not name the variable render unchanged, and a caller's explicit
+`preserve_thinking: false` still strips earlier reasoning.
+
 ## Model-template formats
 
 Reasoning controls in current templates fall into several recurring formats. Detection is based on

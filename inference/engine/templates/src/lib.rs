@@ -62,7 +62,8 @@ pub enum ToolChoice {
 
 /// Native request data. Artifact selection, named-tool normalization, tokenization,
 /// and validation of host options belong to the engine's chat preparation layer.
-/// Omitted template arguments remain omitted, including reasoning controls.
+/// Omitted template arguments remain omitted, except `enable_thinking`, and
+/// `preserve_thinking` for templates that name it, which default to true.
 #[derive(Clone, Debug, Serialize)]
 pub struct Request {
     pub messages: Vec<Value>,

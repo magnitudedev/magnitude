@@ -22,7 +22,16 @@ struct abi_error : std::runtime_error {
 struct template_state {
     common_chat_templates_ptr compiled;
     json special_tokens;
+    bool reads_preserve_thinking;
 };
+// Whether the template source names `preserve_thinking` as a Jinja identifier,
+// decided from its tokens so text and string literals do not count.
+bool reads_preserve_thinking(const std::string & source) {
+    for (const auto & token : jinja::lexer().tokenize(source).tokens) {
+        if (token.t == jinja::token::identifier && token.value == "preserve_thinking") { return true; }
+    }
+    return false;
+}
 // A schema keyword the prepared constraint does not enforce, for a tool's
 // arguments (named) or for the JSON output (unnamed).
 struct subject_relaxation {
@@ -167,6 +176,7 @@ int32_t templates_template_create(const uint8_t * input, uint64_t size,
         state->compiled = common_chat_templates_init(source,
             tokens.value("bos_token", std::string()), tokens.value("eos_token", std::string()));
         state->special_tokens = std::move(tokens);
+        state->reads_preserve_thinking = reads_preserve_thinking(source);
         auto id = allocate_handle();
         templates.emplace(id, std::move(state));
         *output = id;
@@ -263,6 +273,12 @@ int32_t templates_request_create(uint64_t handle, const uint8_t * input, uint64_
                 request.chat_template_kwargs[key] = value.dump();
                 if (key == "enable_thinking") { request.enable_thinking = value.get<bool>(); }
             }
+        }
+        // Reasoning stays on every assistant message unless the caller turns it
+        // off, so a new user message appends to the previous prompt instead of
+        // rewriting earlier replies, and the prefix cache reuses earlier tasks.
+        if (state.reads_preserve_thinking && !request.chat_template_kwargs.count("preserve_thinking")) {
+            request.chat_template_kwargs["preserve_thinking"] = "true";
         }
         if (data.contains("json_schema")) {
             if (!request.tools.empty()) { throw std::invalid_argument("Combining tools with JSON output is unsupported"); }

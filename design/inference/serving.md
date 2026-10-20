@@ -80,6 +80,10 @@ the template's reasoning end tag. No budget is ever derived from an effort.
 Ignoring end of generation removes the model's stop tokens from every selection.
 Prompt caching allowed retains exact prompt prefixes; disallowed requests are
 transient.
+Rendering keeps a conversation's prompt append-only where the template allows:
+templates that name `preserve_thinking` receive it as true unless the caller
+sets it, so a new user message does not rewrite earlier replies and the retained
+prefix covers earlier tasks.
 
 Stream parsing emits semantic text, reasoning and complete validated tool calls
 in one ordered stream that non-streaming responses also assemble from. Published

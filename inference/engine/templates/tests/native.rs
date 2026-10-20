@@ -6,6 +6,7 @@ use serde_json::json;
 
 const QWEN: &str = include_str!("assets/Qwen-Qwen3-0.6B.jinja");
 const QWEN35: &str = include_str!("assets/Qwen3.5-4B.jinja");
+const QWEN36: &str = include_str!("assets/Qwen3.6-35B-A3B.jinja");
 
 fn request() -> Request {
     let mut request = Request::new(vec![json!({"role":"user","content":"Hello"})], 946684800);
@@ -259,4 +260,60 @@ fn natural_end_inside_published_reasoning_keeps_it() {
         .feed(b"consider</think>\n\n<tool_call>\n<function=search>\n<parameter=query>\nhel")
         .unwrap();
     assert!(stream.finish(TerminalCause::Natural).is_err());
+}
+
+/// The prompts of two consecutive tasks: the first mid-task, after a tool
+/// result, and the second at the next user message, after the first task's
+/// final reply. `arguments` are the caller's template arguments.
+fn two_task_prompts(source: &str, arguments: serde_json::Value) -> (String, String) {
+    let template = Template::new(source, &Default::default()).unwrap();
+    let first_task = vec![
+        json!({"role":"user","content":"Find the release notes."}),
+        json!({"role":"assistant","content":"","reasoning_content":"I should search first.",
+            "tool_calls":[{"id":"call_0","type":"function",
+                "function":{"name":"search","arguments":{"query":"release notes"}}}]}),
+        json!({"role":"tool","tool_call_id":"call_0","content":"Release 1.2 fixes the cache."}),
+    ];
+    let mut second_task = first_task.clone();
+    second_task.extend([
+        json!({"role":"assistant","content":"Release 1.2 fixes the cache.",
+            "reasoning_content":"The result answers the question."}),
+        json!({"role":"user","content":"Now summarize it."}),
+    ]);
+    let prompt = |messages: Vec<serde_json::Value>| {
+        let mut request = request();
+        request.messages = messages;
+        request.template_arguments = arguments.as_object().unwrap().clone();
+        template
+            .prepare(&request)
+            .unwrap()
+            .description()
+            .prompt
+            .clone()
+    };
+    (prompt(first_task), prompt(second_task))
+}
+
+#[test]
+fn templates_reading_preserve_thinking_keep_prompts_append_only_across_user_messages() {
+    let (first, second) = two_task_prompts(QWEN36, json!({}));
+    assert!(first.contains("I should search first."));
+    assert!(second.starts_with(&first), "{first:?}\n{second:?}");
+    assert!(second.contains("The result answers the question."));
+
+    let (first, second) = two_task_prompts(QWEN36, json!({"preserve_thinking": false}));
+    assert!(first.contains("I should search first."));
+    assert!(!second.contains("I should search first."));
+    assert!(!second.contains("The result answers the question."));
+}
+
+#[test]
+fn templates_without_preserve_thinking_render_unchanged() {
+    assert!(!QWEN35.contains("preserve_thinking"));
+    let defaults = two_task_prompts(QWEN35, json!({}));
+    assert_eq!(
+        defaults,
+        two_task_prompts(QWEN35, json!({"preserve_thinking": false}))
+    );
+    assert!(!defaults.1.contains("I should search first."));
 }

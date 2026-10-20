@@ -51,7 +51,8 @@ TEMPLATES_API int32_t templates_template_render(templates_handle handle,
 /* Prepared requests retain all parser/grammar data independently of the template.
  * Request payload includes messages, tools, tool_choice, parallel_tool_calls,
  * template_arguments, optional json_schema, and explicit now. enable_thinking is
- * true unless template_arguments sets it. */
+ * true unless template_arguments sets it, and so is preserve_thinking for a
+ * template whose source names that variable. */
 TEMPLATES_API int32_t templates_request_create(templates_handle template_handle,
     const uint8_t * json, uint64_t size, templates_handle * output, templates_buffer * error);
 TEMPLATES_API int32_t templates_request_describe(templates_handle handle,
