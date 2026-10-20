@@ -93,7 +93,7 @@ native draft_rows for vulkan from "vulkan/draft_rows.comp":
 # weight rows, projected against every joined row (the CPU projection
 # library, `cpu/lib/projection/projection.rs`).
 native draft_rows for cpu from "cpu/draft_rows.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     scratch quantized bytes (M * S * ceil_div(2 * D, 256) * 292)
     scratch joined bytes (M * S * D * 8)
     launch draft_rows_join:
@@ -191,7 +191,7 @@ native readout_project_rows for vulkan from "vulkan/readout_project_rows.comp":
 
 native readout_project_rows for cpu from "cpu/readout_project_rows.rs":
     static (WS, I)
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     scratch quantized bytes (O * ceil_div(D, 256) * 292)
     scratch staged bytes (O * D * 4)
     launch readout_project_rows_stage:

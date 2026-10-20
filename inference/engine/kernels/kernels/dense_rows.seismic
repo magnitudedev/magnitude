@@ -480,7 +480,7 @@ native dense_up for vulkan from "vulkan/dense_up.comp":
 
 native dense_up for cpu from "cpu/dense_up.rs":
     static (US)
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where US <= 1
     scratch quantized bytes (O * ceil_div(H, 256) * 292)
     scratch normalized bytes (O * H * 4)
@@ -543,7 +543,7 @@ native short_conv_project for vulkan from "vulkan/short_conv_project.comp":
 
 native short_conv_project for cpu from "cpu/short_conv_project.rs":
     static (H, BS, CS, XS)
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where H > 0 and BS <= 1 and CS <= 1 and XS <= 1
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch normalized bytes (M * H * 4)
@@ -604,7 +604,7 @@ native per_layer_gate for vulkan from "vulkan/per_layer_gate.comp":
 
 native per_layer_gate for cpu from "cpu/per_layer_gate.rs":
     static (GS)
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where GS <= 1
     scratch quantized bytes (M * ceil_div(D, 256) * 292)
     scratch staged bytes (M * D * 4)
@@ -727,9 +727,21 @@ native project_rows for vulkan from "vulkan/project_rows.comp":
 # stage launch writes each normalized (expand) or product (output) row as F32
 # to scratch; the row launch gives each work item ROWS weight rows, projected
 # against every staged row through the weight representation's dot component.
+#
+# INT8 is a form on every CPU projection (here and in the attention, readout,
+# recurrent, routed and draft declarations), as on Metal: INT8 = 1 quantizes
+# the staged rows to Q8 blocks and runs the representation's integer dot
+# (VNNI or AVX2 products, NEON SDOT, eight-row tiles over four activation
+# rows), a different algorithm from the F32 dot whose best ROWS and
+# participant counts say nothing about the F32 form's. As a form its one
+# representative is measured right after the defaults, before any F32
+# refinement. As a plain parameter it came after the three ROWS moves:
+# gemma-4-e2b QAT Q4 on an EPYC 9V45 (8 cores, 60 s) measured only its
+# default for dense_expand (43% of the objective), and project_rows reached
+# INT8 sixth, at 16 us against the F32 form's 278 us per decode row.
 native dense_expand for cpu from "cpu/dense_expand.rs":
     static (GS, US)
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where GS <= 1 and US <= 1
     scratch quantized bytes (O * ceil_div(H, 256) * 292)
     scratch normalized bytes (O * H * 4)
@@ -743,7 +755,7 @@ native dense_expand for cpu from "cpu/dense_expand.rs":
 
 native dense_output for cpu from "cpu/dense_output.rs":
     static (DS)
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where DS <= 1
     scratch quantized bytes (O * ceil_div(F, 256) * 292)
     scratch staged bytes (O * F * 4)
@@ -756,7 +768,7 @@ native dense_output for cpu from "cpu/dense_output.rs":
 
 native project_rows for cpu from "cpu/project_rows.rs":
     static (WS)
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where WS <= 1
     scratch quantized bytes (M * ceil_div(K, 256) * 292)
     scratch staged bytes (M * K * 4)

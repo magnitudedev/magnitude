@@ -240,7 +240,7 @@ native attention_output for vulkan from "vulkan/attention_output.comp":
 # every staged row and added to the hidden row.
 native attention_output for cpu from "cpu/attention_output.rs":
     static (Q, W)
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where Q * W > 0
     scratch quantized bytes (M * ceil_div(Q * W, 256) * 292)
     scratch staged bytes (M * Q * W * 4)
@@ -470,7 +470,7 @@ native attention_project for vulkan from "vulkan/attention_project.comp":
 
 native attention_project for cpu from "cpu/attention_project.rs":
     static (D)
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where D > 0
     scratch quantized bytes (M * ceil_div(D, 256) * 292)
     scratch normalized bytes (M * D * 4)

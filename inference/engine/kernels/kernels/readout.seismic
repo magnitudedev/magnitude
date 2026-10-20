@@ -184,7 +184,7 @@ native readout_head_rows for vulkan from "vulkan/readout_head_rows.comp":
 # every normalized row.
 native readout_head_rows for cpu from "cpu/readout_head_rows.rs":
     static (WS)
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     where WS <= 1
     scratch quantized bytes (O * ceil_div(D, 256) * 292)
     scratch normalized bytes (O * D * 4)
@@ -286,7 +286,7 @@ native readout_selected_rows for vulkan from "vulkan/readout_selected_rows.comp"
 # CPU: as `readout_head_rows`, each work item owning ROWS selected vocabulary
 # rows (not adjacent: one single-row component call per row).
 native readout_selected_rows for cpu from "cpu/readout_selected_rows.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     scratch quantized bytes (O * ceil_div(D, 256) * 292)
     scratch normalized bytes (O * D * 4)
     launch readout_selected_rows_normalize:

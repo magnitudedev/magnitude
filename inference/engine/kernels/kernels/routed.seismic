@@ -300,7 +300,7 @@ native routed_expand for vulkan from "vulkan/routed_expand.comp":
 # features of choice y < M * K, or of the shared expert (y = M * K) for
 # every row.
 native routed_expand for cpu from "cpu/routed_expand.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch staged bytes (M * H * 4)
     launch routed_expand_stage:
@@ -402,7 +402,7 @@ native routed_output for vulkan from "vulkan/routed_output.comp":
 # CPU: the products staged once as F32; work item (x, m) owns ROWS output
 # channels of row m and carries their running sum across the choices.
 native routed_output for cpu from "cpu/routed_output.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     scratch expert_q8 bytes (M * K * ceil_div(F, 256) * 292)
     scratch shared_q8 bytes (M * ceil_div(S, 256) * 292)
     scratch expert bytes (M * K * F * 4)
@@ -577,7 +577,7 @@ native routed_experts for vulkan from "vulkan/routed_experts.comp":
 # features (then ROWS output channels) of block b across its live rows, with
 # the products as F32 in scratch.
 native routed_experts for cpu from "cpu/routed_experts.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch product_q8 bytes (B * T * ceil_div(F, 256) * 292)
     scratch staged bytes (M * H * 4)
@@ -697,7 +697,7 @@ native routed_combine for vulkan from "vulkan/routed_combine.comp":
 # item against every row (F32 products in scratch); then ROWS output channels
 # per work item: the shared down projection and the unpermuting combine.
 native routed_combine for cpu from "cpu/routed_combine.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch shared_q8 bytes (M * ceil_div(S, 256) * 292)
     scratch staged bytes (M * H * 4)
@@ -1049,7 +1049,7 @@ native routed_gate_up for vulkan from "vulkan/routed_gate_up.comp":
         shared_bytes (256 + min(8 * ceil_div(H, 32), 288) * 72)
 
 native routed_gate_up for cpu from "cpu/routed_gate_up.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch staged bytes (M * H * 4)
     launch routed_gate_up_stage:
@@ -1084,7 +1084,7 @@ native routed_up for vulkan from "vulkan/routed_up.comp":
         shared_bytes (256 + min(8 * ceil_div(H, 32), 288) * 72)
 
 native routed_up for cpu from "cpu/routed_up.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch staged bytes (M * H * 4)
     launch routed_up_stage:
@@ -1125,7 +1125,7 @@ native routed_down for vulkan from "vulkan/routed_down.comp":
         shared_bytes (256 + min(ceil_div(F, 32), 288) * 72)
 
 native routed_down for cpu from "cpu/routed_down.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     scratch quantized bytes (M * K * ceil_div(F, 256) * 292)
     scratch staged bytes (M * K * F * 4)
     launch routed_down_stage:
@@ -1185,7 +1185,7 @@ native routed_experts_up for vulkan from "vulkan/routed_experts_up.comp":
         shared_bytes ((TILE_M + TILE_N) * 80)
 
 native routed_experts_up for cpu from "cpu/routed_experts_up.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch product_q8 bytes (B * T * ceil_div(F, 256) * 292)
     scratch staged bytes (M * H * 4)

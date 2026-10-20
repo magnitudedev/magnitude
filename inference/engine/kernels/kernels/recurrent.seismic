@@ -224,7 +224,7 @@ native gated_delta_project for vulkan from "vulkan/gated_delta_project.comp":
 # launch enumerates the segments qkv | z | alpha | beta, ROWS weight rows per
 # work item, projected against every normalized row.
 native gated_delta_project for cpu from "cpu/gated_delta_project.rs":
-    params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
+    params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch normalized bytes (M * H * 4)
     launch gated_delta_project_normalize:
