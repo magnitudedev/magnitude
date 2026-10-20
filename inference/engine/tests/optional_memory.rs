@@ -77,6 +77,7 @@ fn plain_owner(
             limits,
             PrefixCacheCapacity {
                 max_entries: cached,
+                workload_state_bytes: u64::MAX,
             },
             wakes,
         )

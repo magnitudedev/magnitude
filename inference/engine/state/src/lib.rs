@@ -1460,6 +1460,11 @@ impl StateHoldingCensus {
     pub fn total(self) -> u64 {
         self.surplus + self.retained + self.live + self.in_flight + self.model_seed
     }
+
+    /// Every byte a holder references: the total less committed surplus.
+    pub fn occupied(self) -> u64 {
+        self.retained + self.live + self.in_flight + self.model_seed
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

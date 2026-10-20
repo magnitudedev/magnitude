@@ -1,4 +1,4 @@
-use super::{source_import_peak_bytes, weight_bytes_by_component, ModelLoadPlan, PlannedMethod};
+use super::{assessment, source_import_peak_bytes, weight_bytes_by_component, ModelLoadPlan, PlannedMethod};
 use crate::{
     PreparedDrafterGraphs, PreparedStateCopyGraphs, PreparedTargetGraphs,
     PreparedTargetReadoutGraphs, PreparedVisionGraphs,
@@ -262,6 +262,7 @@ pub struct StateCapacityPlan {
     /// Cross-request prefix entries retention may hold.
     pub retention_entries: usize,
     pub history_rows: usize,
+    pub workload_state_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -858,6 +859,25 @@ pub struct StateResourcePlan {
     recurrent_banks_bytes: u64,
 }
 
+/// The state slabs `depth` history rows and `banks` recurrent banks occupy.
+fn fit_state_bytes(
+    target: &StateStorePlan,
+    head: Option<&StateStorePlan>,
+    depth: u64,
+    banks: u64,
+) -> Result<u64, String> {
+    let target_history = target.history_bytes_at_depth(depth)?;
+    let head_history = head
+        .map(|state| state.history_bytes_at_depth(depth))
+        .transpose()?
+        .unwrap_or(0);
+    let target_banks = target.bank_bytes_at_count(banks)?;
+    target_history
+        .checked_add(head_history)
+        .and_then(|bytes| bytes.checked_add(target_banks))
+        .ok_or_else(|| "state fit charge overflows".into())
+}
+
 impl StateResourcePlan {
     pub fn limits(&self) -> ResourceLimits {
         self.limits
@@ -898,18 +918,7 @@ impl StateResourcePlan {
     }
 
     pub fn fit_state_bytes(&self, depth: u64, banks: u64) -> Result<u64, String> {
-        let target_history = self.target_state.history_bytes_at_depth(depth)?;
-        let head_history = self
-            .head_state
-            .as_ref()
-            .map(|state| state.history_bytes_at_depth(depth))
-            .transpose()?
-            .unwrap_or(0);
-        let target_banks = self.target_state.bank_bytes_at_count(banks)?;
-        target_history
-            .checked_add(head_history)
-            .and_then(|bytes| bytes.checked_add(target_banks))
-            .ok_or_else(|| "state fit charge overflows".into())
+        fit_state_bytes(&self.target_state, self.head_state.as_ref(), depth, banks)
     }
 
     /// The state slabs a load commits at startup, before any request.
@@ -1040,15 +1049,10 @@ impl ResourcePlanner {
                 .checked_add(retention_entries)
                 .ok_or("retained numerical capacity overflow")?,
         };
-        let capacity = StateCapacityPlan {
-            live_requests: possible_requests,
-            checkpoints: possible_requests,
-            retention_entries,
-            // The history reservation (graphs are sealed over it): a context
-            // for every bank owner, but never more rows than the device's
-            // stable domain capacity could ever back.
-            history_rows: history_bound.max(context),
-        };
+        // The history reservation (graphs are sealed over it): a context for
+        // every bank owner, but never more rows than the device's stable
+        // domain capacity could ever back.
+        let history_rows = history_bound.max(context);
         let bank_count = bank_capacity
             .storage_total()
             .map_err(|error| error.to_string())?;
@@ -1058,7 +1062,7 @@ impl ResourcePlanner {
         let rows = HistoryRows {
             context,
             max_advance,
-            token: capacity.history_rows,
+            token: history_rows,
             domain_bytes: capacity_bytes.domain_bytes,
         };
         let target_state = state_store_plan(
@@ -1103,6 +1107,21 @@ impl ResourcePlanner {
                     .unwrap_or(0),
             )
             .ok_or("startup bank slab charge overflows")?;
+        // What the standard workload charges of the stores, exactly as
+        // assessment does: retained prefixes are held only within it.
+        let workload_state_bytes = fit_state_bytes(
+            &target_state,
+            head_state.as_ref(),
+            assessment::fit_depth(definition),
+            assessment::conversation_banks(limits.lookahead)?,
+        )?;
+        let capacity = StateCapacityPlan {
+            live_requests: possible_requests,
+            checkpoints: possible_requests,
+            retention_entries,
+            history_rows,
+            workload_state_bytes,
+        };
         Ok(StateResourcePlan {
             definition: definition.clone(),
             load: load.clone(),

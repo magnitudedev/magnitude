@@ -16,7 +16,7 @@ use super::{
         ServiceLimits, Victim, order_victims,
     },
     prefix_cache::{
-        MIN_BRANCH_GAIN, MIN_PREFIX_HIT, PrefixCache, PrefixCacheCapacity, PrefixPath,
+        CachePoint, MIN_BRANCH_GAIN, MIN_PREFIX_HIT, PrefixCache, PrefixCacheCapacity, PrefixPath,
         PrefixRetention,
     },
     protocol::{RequestSnapshot, WorkerReply},
@@ -81,6 +81,20 @@ fn prompt_boundary(record: &Record, generation: &Generation) -> Option<usize> {
         && boundary >= MIN_PREFIX_HIT
         && generation.layout().boundary(boundary))
     .then_some(boundary)
+}
+
+/// The state every holder occupies, cached prefixes included: what the
+/// prefix cache holds within the state the memory plan charges.
+fn occupied_state<F: ProgramFamily>(
+    domain: &ExecutorDomain<F>,
+    cache: &PrefixCache<ResumeState>,
+) -> Result<u64, String> {
+    let cached = cache.states().collect::<Vec<_>>();
+    let (target, head) = domain.state_holding_census(&cached)?;
+    target
+        .occupied()
+        .checked_add(head.map_or(0, |head| head.occupied()))
+        .ok_or_else(|| "occupied state overflows".to_owned())
 }
 
 /// The first position after `position` where the request's prefill stops
@@ -1296,7 +1310,10 @@ impl<F: ProgramFamily> Service<F> {
                 self.enter_memory_condition(self.memory_condition.observe(after, self.now));
             }
         }
-        if self.memory_condition.should_unload(self.now) {
+        // Unloading is the last step of the release order: while a flight
+        // holds the bindings, the releases owed to it (cached prefixes first)
+        // have not run yet, so the decision waits for them.
+        if !self.release_owed && self.memory_condition.should_unload(self.now) {
             tracing::error!(
                 requests = self.requests.len(),
                 "unloading the model: memory stayed below the reclaim reserve"
@@ -2702,14 +2719,19 @@ impl<F: ProgramFamily> Service<F> {
             branches.clear();
         }
         if reached {
-            self.cache_prefix(id, resident)?;
+            self.cache_prefix(id, resident, CachePoint::Branch)?;
         }
         Ok(())
     }
 
     /// Cache the request's reconciled state as the prefix of its path ending
     /// at `position`, where it is resident.
-    fn cache_prefix(&mut self, id: RequestId, position: usize) -> Result<(), RequestError> {
+    fn cache_prefix(
+        &mut self,
+        id: RequestId,
+        position: usize,
+        point: CachePoint,
+    ) -> Result<(), RequestError> {
         let state = self
             .domain
             .resume_state(id)
@@ -2729,9 +2751,16 @@ impl<F: ProgramFamily> Service<F> {
         let method = generation
             .method_checkpoint()
             .map_err(invariant("prefix retention"))?;
-        self.prefix_cache
-            .retain(PrefixPath::of(generation), position, state, method)
+        let retained = self
+            .prefix_cache
+            .retain(PrefixPath::of(generation), position, point, state, method)
             .map_err(invariant("prefix retention"))?;
+        if retained {
+            let domain = &self.domain;
+            self.prefix_cache
+                .release_beyond_workload(|cache| occupied_state(domain, cache))
+                .map_err(invariant("prefix retention"))?;
+        }
         Ok(())
     }
 
@@ -2751,7 +2780,7 @@ impl<F: ProgramFamily> Service<F> {
         {
             return Ok(());
         }
-        self.cache_prefix(id, boundary)?;
+        self.cache_prefix(id, boundary, CachePoint::PromptBoundary)?;
         self.requests.get_mut(&id).unwrap().record.prefill_retained = true;
         Ok(())
     }
@@ -2781,7 +2810,7 @@ impl<F: ProgramFamily> Service<F> {
                 "terminal numerical state is not reconciled at the accepted boundary".into(),
             ));
         }
-        self.cache_prefix(id, end)?;
+        self.cache_prefix(id, end, CachePoint::Terminal)?;
         self.requests.get_mut(&id).unwrap().record.terminal_retained = true;
         Ok(())
     }

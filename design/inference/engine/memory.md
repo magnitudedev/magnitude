@@ -460,10 +460,16 @@ Callers retain logical identities and published placement snapshots, never mutab
 indices.
 
 Assessment's recurrent banks for one conversation are its accepted bank, its in-flight successors,
-the two checkpoints the prefix cache retains of it (the prompt's boundary and the finished turn), and
-the pristine seed, rounded to whole bank slabs. Retained prefixes are released before a claim is
-refused, but a load holds them while it has room. Assessment charges history per domain at slab
-granularity: a Token domain by the rows of the
+the three checkpoints the prefix cache retains of it (its latest prompt boundary, its latest finished
+turn, and the branch point where its last turn began), and the pristine seed, rounded to whole bank
+slabs. The workload's state (its history at the fit depth
+and these banks, `StateCapacityPlan::workload_state_bytes`, the same figure assessment charges) is
+the most the stores hold for cached prefixes: whenever a newly cached prefix leaves the state that
+every holder occupies (live, in flight, retained and the seed, excluding committed surplus) above it,
+the scheduler releases cached prefixes, least recently used first, until it fits or only the latest
+conversation's three checkpoints remain. A load never holds retained prefixes beyond its verdict merely because it has room;
+live requests are not limited by this, and retained prefixes are still released before a claim is
+refused. Assessment charges history per domain at slab granularity: a Token domain by the rows of the
 assessed context, and a Window(n) domain by its steady footprint of `n` plus one advance per live
 history and `n` per checkpoint, independent of the context, each rounded up to whole pages (plus
 one page for a window's partially released first page) and then to whole slabs of the domain.

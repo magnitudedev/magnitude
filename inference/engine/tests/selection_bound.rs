@@ -74,7 +74,7 @@ fn plain_owner(limits: ServiceLimits) -> (Host, usize, std::sync::Arc<ByteBpeTok
             domain,
             bindings,
             limits,
-            PrefixCacheCapacity { max_entries: 0 },
+            PrefixCacheCapacity::disabled(),
             wakes,
         )
     });

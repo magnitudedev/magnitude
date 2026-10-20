@@ -96,7 +96,10 @@ fn owner() -> (Host, usize, std::sync::Arc<ByteBpeTokenizer>) {
             domain,
             bindings,
             limits(),
-            PrefixCacheCapacity { max_entries: 64 },
+            PrefixCacheCapacity {
+                max_entries: 64,
+                workload_state_bytes: u64::MAX,
+            },
             wakes,
         )
     });
@@ -261,6 +264,48 @@ fn conversation_turns_resume_at_the_previous_reply() {
         prompt.extend(text(&tokenizer, 100 + turn, 40));
     }
     assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
+}
+
+/// The prefixes a growing conversation leaves cached never take the state
+/// stores past the workload state the plan charges (one conversation at the
+/// fit depth with its three checkpoints), while every turn still resumes at
+/// the previous reply. A recurrent model pins one bank per cached prefix, so
+/// without the bound each turn would hold two more.
+#[test]
+#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+fn a_growing_conversation_stays_within_the_charged_workload_state() {
+    let resolved = resolved(false);
+    let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
+    let tokenizer = resolved.host.shared_tokenizer();
+    let (domain, bindings, plan) =
+        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+    let workload = plan.capacity().workload_state_bytes;
+    let mut host = Host::new(|wakes| Owner::with_resource_plan(domain, bindings, limits(), &plan, wakes));
+    let mut prompt = text(&tokenizer, 1, 300);
+    let mut previous: Option<usize> = None;
+    for turn in 0..12 {
+        let [done] = run(&mut host, vocabulary, &[prompt.clone()], 12)
+            .try_into()
+            .ok()
+            .unwrap();
+        if let Some(end) = previous {
+            assert_eq!(done.cached, end, "turn {turn} resumes at the last reply");
+        }
+        let charge = host.owner().reconcile_memory_charge().unwrap();
+        let occupied = charge.target_state.occupied()
+            + charge.head_state.map_or(0, |head| head.occupied());
+        eprintln!(
+            "turn {turn}: prompt={} cached={} prefixes={} occupied={occupied} workload={workload}",
+            done.prompt.len(),
+            done.cached,
+            host.owner().cached_prefixes(),
+        );
+        assert!(occupied <= workload, "turn {turn} occupies {occupied} of {workload}");
+        assert_eq!(charge.unattributed, 0);
+        previous = Some(done.prompt.len() + done.output.len());
+        prompt = path(&done);
+        prompt.extend(text(&tokenizer, 100 + turn, 300));
+    }
 }
 
 /// A template that rewrites the previous reply (dropping reasoning, say)

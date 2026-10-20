@@ -112,6 +112,19 @@ plans.
    cache points it planned (unless evicted), so a request that shares an earlier request's path
    through a declared point resumes at least there.
 
+7. Cached prefixes are bounded by the memory plan ([memory](memory.md)): after each prefix is
+   cached, while the state every holder occupies exceeds the workload state the plan charges (one
+   conversation at the fit depth with its three checkpoints), the least recently used entry
+   without submitted use is released, sparing the latest conversation's checkpoints: the latest
+   finished turn, the latest prompt boundary, and the deepest branch point on the newest entry's
+   path. The branch point is where its last turn began (the point opening its user message): a
+   template that renders earlier replies anew once a new user message arrives (Qwen3.5 drops
+   their empty reasoning blocks) makes the next turn diverge at that turn's first reply, so it
+   resumes there. A conversation therefore never grows the load past its verdict however many
+   requests it makes, and beyond the fit depth it keeps exactly what its next turn resumes from.
+   Under memory pressure every entry without submitted use is released, these included, before
+   anything else is given up.
+
 ## Acceptance criteria
 
 - A conversation's next turn whose prompt extends the previous turn's prompt and reply resumes at
@@ -122,3 +135,5 @@ plans.
 - An evicted request with media replays to output identical to an uninterrupted run.
 - A waiting request resumes from its peer's prefix without recomputing or re-encoding it.
 - Every charged byte stays attributed while prefixes are cached, used and evicted.
+- Across any number of growing turns of one conversation, the state the stores occupy stays within
+  the workload state the plan charges, and each turn still resumes at the previous reply.

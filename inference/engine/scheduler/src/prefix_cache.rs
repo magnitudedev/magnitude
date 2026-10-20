@@ -10,11 +10,14 @@
 //! One cache belongs to one loaded model, so artifact, tokenizer and state
 //! codec are fixed for every path it holds.
 //!
-//! The cache keeps no byte budget or price of its own: it bounds the entry
-//! count and supplies victim identity (least recently used, never an entry
-//! in submitted use). What an eviction releases is Seismic's charge, observed
-//! by the memory heap after the entry's state drops.
-use magnitude_executor::ResourcePlan;
+//! The cache prices no entry itself: it bounds the entry count, holds entries
+//! only while the state every holder occupies stays within the state the
+//! memory plan charges its workload (measured by the owner, see
+//! [`PrefixCache::release_beyond_workload`]), and supplies victim identity
+//! (least recently used, never an entry in submitted use). What an eviction
+//! releases is Seismic's charge, observed by the memory heap after the
+//! entry's state drops.
+use magnitude_executor::{CONVERSATION_CHECKPOINTS, ResourcePlan};
 use magnitude_family_contracts::{InputLayout, TokenId};
 use magnitude_generation::{Generation, MethodCheckpoint, MethodChoice};
 use serde::{Deserialize, Serialize};
@@ -40,19 +43,30 @@ pub enum PrefixRetention {
     Retain { cache_points: Vec<usize> },
 }
 
+/// The most entries the cache holds, and the state the memory plan charges
+/// its workload (one conversation at the fit depth with the checkpoints it
+/// retains): entries beyond the latest conversation's
+/// [`CONVERSATION_CHECKPOINTS`] are held only while the state every holder
+/// occupies stays within it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefixCacheCapacity {
     pub max_entries: usize,
+    pub workload_state_bytes: u64,
 }
 
 impl PrefixCacheCapacity {
     pub const fn disabled() -> Self {
-        Self { max_entries: 0 }
+        Self {
+            max_entries: 0,
+            workload_state_bytes: 0,
+        }
     }
 
     pub fn from_resource_plan(plan: &ResourcePlan) -> Self {
+        let capacity = plan.capacity();
         Self {
-            max_entries: plan.capacity().retention_entries,
+            max_entries: capacity.retention_entries,
+            workload_state_bytes: capacity.workload_state_bytes,
         }
     }
 }
@@ -155,6 +169,17 @@ impl<'a> PrefixPath<'a> {
     }
 }
 
+/// Which caching point an entry was retained at (scheduler policy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CachePoint {
+    /// A planned branch point or declared cache point inside the prompt.
+    Branch,
+    /// The prompt one row before its end.
+    PromptBoundary,
+    /// A finished request's whole path.
+    Terminal,
+}
+
 /// A match produced by [`PrefixCache::lookup`]: the entry's path is a prefix
 /// of the queried path, ending at an exact boundary of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +200,7 @@ impl PrefixHit {
 
 pub struct CachedPrefix<S> {
     id: u64,
+    point: CachePoint,
     state: S,
     method: MethodCheckpoint,
     tokens: Vec<TokenId>,
@@ -309,6 +335,7 @@ impl<S> PrefixCache<S> {
         &mut self,
         path: PrefixPath,
         position: usize,
+        point: CachePoint,
         state: S,
         method: MethodCheckpoint,
     ) -> Result<bool, String> {
@@ -344,6 +371,7 @@ impl<S> PrefixCache<S> {
             .ok_or("prefix cache entry identity exhausted")?;
         self.entries.push(CachedPrefix {
             id,
+            point,
             state,
             method,
             tokens,
@@ -401,6 +429,68 @@ impl<S> PrefixCache<S> {
         self.evict_one_except(None)
     }
 
+    /// Hold cached prefixes within the state the memory plan charges: while
+    /// `occupied` (the state every holder occupies, these entries included)
+    /// exceeds it, drop the least-recently-used entry without submitted uses,
+    /// sparing the [`CONVERSATION_CHECKPOINTS`] the plan charges the latest
+    /// conversation (see [`Self::conversation_checkpoints`]). Returns how
+    /// many entries were dropped.
+    pub fn release_beyond_workload<E>(
+        &mut self,
+        mut occupied: impl FnMut(&Self) -> Result<u64, E>,
+    ) -> Result<usize, E> {
+        let mut released = 0;
+        while occupied(self)? > self.capacity.workload_state_bytes {
+            let spared = self.conversation_checkpoints();
+            let candidate = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.submitted == 0 && !spared.contains(&entry.id))
+                .min_by_key(|(_, entry)| entry.last_use)
+                .map(|(index, _)| index);
+            let Some(index) = candidate else {
+                break;
+            };
+            self.entries.remove(index);
+            released += 1;
+        }
+        Ok(released)
+    }
+
+    /// The checkpoints the plan charges the most recently cached
+    /// conversation: its latest finished turn, which its next turn extends;
+    /// its latest prompt boundary, which a repeat of the prompt resumes from;
+    /// and the deepest branch point on the latest entry's path, where its
+    /// last turn began: a template that renders earlier replies anew once a
+    /// new user message arrives makes the next turn diverge there.
+    fn conversation_checkpoints(&self) -> Vec<u64> {
+        let latest = |point: CachePoint| {
+            self.entries
+                .iter()
+                .filter(|entry| entry.point == point)
+                .max_by_key(|entry| entry.id)
+        };
+        let terminal = latest(CachePoint::Terminal);
+        let boundary = latest(CachePoint::PromptBoundary);
+        let path = self.entries.iter().max_by_key(|entry| entry.id);
+        let branch = path.and_then(|path| {
+            self.entries
+                .iter()
+                .filter(|entry| {
+                    entry.point == CachePoint::Branch
+                        && path.tokens.starts_with(&entry.tokens)
+                        && path.conditioning.starts_with(&entry.conditioning)
+                })
+                .max_by_key(|entry| (entry.position(), entry.id))
+        });
+        [terminal, boundary, branch]
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.id)
+            .collect()
+    }
+
     /// Drop every entry without submitted uses.
     pub fn evict_all(&mut self) {
         self.entries.retain(|entry| entry.submitted != 0);
@@ -437,7 +527,10 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     const fn capacity(max_entries: usize) -> PrefixCacheCapacity {
-        PrefixCacheCapacity { max_entries }
+        PrefixCacheCapacity {
+            max_entries,
+            workload_state_bytes: u64::MAX,
+        }
     }
 
     thread_local! {
@@ -531,7 +624,7 @@ mod tests {
 
     fn retain(cache: &mut PrefixCache<Rows>, owned: &Owned, position: usize, state: Rows) -> bool {
         cache
-            .retain(owned.path(), position, state, MethodCheckpoint::Plain)
+            .retain(owned.path(), position, CachePoint::Branch, state, MethodCheckpoint::Plain)
             .unwrap()
     }
 
@@ -696,10 +789,10 @@ mod tests {
         let mut cache = PrefixCache::new(capacity(8));
         let owned = text(100, "artifact");
         assert!(cache
-            .retain(owned.path(), 0, rows(0..0), MethodCheckpoint::Plain)
+            .retain(owned.path(), 0, CachePoint::Branch, rows(0..0), MethodCheckpoint::Plain)
             .is_err());
         assert!(cache
-            .retain(owned.path(), 101, rows(0..101), MethodCheckpoint::Plain)
+            .retain(owned.path(), 101, CachePoint::Branch, rows(0..101), MethodCheckpoint::Plain)
             .is_err());
     }
 
@@ -792,6 +885,104 @@ mod tests {
         assert!(lookup_any(&mut cache, &first).is_none());
         assert!(lookup_any(&mut cache, &second).is_some());
         assert!(lookup_any(&mut cache, &third).is_some());
+    }
+
+    /// An agent conversation of growing user turns, each a tool call and an
+    /// answer, under a template that renders the previous user turn's
+    /// replies anew once a new user message arrives (as Qwen3.5's does): each
+    /// request retains its prompt boundary and finished turn, and the first
+    /// of a user turn also the declared point opening its user message.
+    /// Cached prefixes never take the stores past the workload the plan
+    /// charges, and every request still resumes where it would without a
+    /// bound: a tool result at the previous reply, a new user turn at the
+    /// point opening the previous user message, even far beyond the depth.
+    #[test]
+    fn a_growing_conversation_stays_within_the_charged_workload() {
+        // Rows are history rows named by the token they hold; a bank is one
+        // id from `BANK` on, weighing `BANK_ROWS` rows.
+        const BANK: u32 = 1_000_000;
+        const BANK_ROWS: u64 = 50;
+        const DEPTH: u64 = 2000;
+        const THINK: usize = 4;
+        let workload = DEPTH + 6 * BANK_ROWS;
+        let occupied = |_: &PrefixCache<Rows>| -> Result<u64, String> {
+            Ok(REFERENCES.with_borrow(|references| {
+                references
+                    .iter()
+                    .filter(|(_, count)| **count > 0)
+                    .map(|(&row, _)| if row >= BANK { BANK_ROWS } else { 1 })
+                    .sum()
+            }))
+        };
+        let mut cache = PrefixCache::new(PrefixCacheCapacity {
+            max_entries: 1024,
+            workload_state_bytes: workload,
+        });
+        let next_token = std::cell::Cell::new(1u32);
+        let fresh = |count: usize| {
+            let first = next_token.get();
+            next_token.set(first + count as u32);
+            (first..first + count as u32).collect::<Vec<_>>()
+        };
+        let banks = std::cell::Cell::new(BANK);
+        let cache_at = |cache: &mut PrefixCache<Rows>, path: &[u32], position: usize, point| {
+            banks.set(banks.get() + 1);
+            let state = Rows::new(path[..position].iter().copied().chain([banks.get()]).collect());
+            let owned = tokens(path.to_vec());
+            assert!(cache
+                .retain(owned.path(), position, point, state, MethodCheckpoint::Plain)
+                .unwrap());
+            cache.release_beyond_workload(occupied).unwrap();
+        };
+        // Each request's prompt, what it resumed at, and its reply.
+        let request = |cache: &mut PrefixCache<Rows>, prompt: &[u32], declared: Option<usize>| {
+            let resumed = lookup_any(cache, &tokens(prompt.to_vec())).map(|hit| hit.position());
+            if let Some(point) = declared {
+                cache_at(cache, prompt, point, CachePoint::Branch);
+            }
+            cache_at(cache, prompt, prompt.len() - 1, CachePoint::PromptBoundary);
+            let mut finished = prompt.to_vec();
+            finished.extend(fresh(20));
+            cache_at(cache, &finished, finished.len(), CachePoint::Terminal);
+            (resumed, finished)
+        };
+        let mut history = fresh(100);
+        // Where the previous user turn's message and replies begin.
+        let mut previous: Option<(usize, usize)> = None;
+        for turn in 0..30 {
+            if let Some((_, replies)) = previous {
+                // The previous replies render anew from their first one on.
+                let rendered = history.len() - replies;
+                history.truncate(replies);
+                history.extend(fresh(rendered));
+            }
+            let user = history.len();
+            history.extend(fresh(150));
+            // The generation prompt ends with an empty reasoning block, which
+            // earlier replies render without.
+            history.extend(fresh(THINK));
+            let (resumed, finished) = request(&mut cache, &history, Some(user));
+            assert_eq!(
+                resumed,
+                previous.map(|(user, _)| user),
+                "turn {turn} resumes where the previous user message opens"
+            );
+            let replies = user + 150;
+            let mut prompt = finished.clone();
+            prompt.extend(fresh(300));
+            let (resumed, finished) = request(&mut cache, &prompt, None);
+            assert_eq!(resumed, Some(prompt.len() - 300), "turn {turn}'s tool result resumes at the call");
+            let held = occupied(&cache).unwrap();
+            assert!(
+                held <= workload || cache.len() <= CONVERSATION_CHECKPOINTS,
+                "turn {turn}: {} entries occupy {held} of {workload}",
+                cache.len()
+            );
+            history = finished;
+            previous = Some((user, replies));
+        }
+        assert!(history.len() as u64 > 4 * DEPTH);
+        assert_eq!(cache.len(), CONVERSATION_CHECKPOINTS);
     }
 
     #[test]
