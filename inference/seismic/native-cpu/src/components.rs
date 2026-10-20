@@ -1139,6 +1139,75 @@ mod tests {
         }
     }
 
+    /// Every tier's quantized row dots and four-row tile reproduce the
+    /// lowest tier's scalar integer recipe bit for bit, for every
+    /// representation and row block, across reductions with partial packets
+    /// and partial blocks, and activations with saturated and zero codes.
+    #[test]
+    fn quantized_components_match_the_lowest_tier_bit_for_bit() {
+        use crate::quant::{blocks, quantize};
+        let lowest = Tier::all()[0];
+        let detected = Tier::detected().unwrap();
+        for k in [32usize, 96, 256, 2 * 256 + 96, 704, 2688] {
+            let blocks = blocks(k);
+            let mut quantized = vec![Q8Block::ZERO; 4 * blocks];
+            for m in 0..4 {
+                let mut x = bytes(100 + (m + k) as u64, k)
+                    .iter()
+                    .map(|byte| (*byte as f32 - 128.0) / 100.0)
+                    .collect::<Vec<_>>();
+                if m == 3 {
+                    for value in x.iter_mut().step_by(7) {
+                        *value = 0.0;
+                    }
+                    x[0] = 50.0;
+                }
+                quantize(&x, &mut quantized[m * blocks..(m + 1) * blocks]);
+            }
+            for representation in representations() {
+                let (data, geometry) = rows(representation, 8, k, 17 + k as u64);
+                let reference = resolve(lowest, representation).unwrap();
+                let mut expected = [[0.0f32; 8]; 4];
+                for (m, expected) in expected.iter_mut().enumerate() {
+                    let x = &quantized[m * blocks..(m + 1) * blocks];
+                    unsafe { reference.dot_q8(data.as_ptr(), &geometry, x, k, expected) };
+                }
+                for tier in detected.at_or_below() {
+                    let kernels = resolve(tier, representation).unwrap();
+                    for (m, expected) in expected.iter().enumerate() {
+                        let x = &quantized[m * blocks..(m + 1) * blocks];
+                        for block in ROW_BLOCKS {
+                            for first in (0..8).step_by(block) {
+                                let mut out = vec![0.0f32; block];
+                                let rows = unsafe { data.as_ptr().add(first * geometry.stride) };
+                                unsafe { kernels.dot_q8(rows, &geometry, x, k, &mut out) };
+                                for (r, value) in out.iter().enumerate() {
+                                    assert_eq!(
+                                        value.to_bits(),
+                                        expected[first + r].to_bits(),
+                                        "{representation} {tier:?} k {k} m {m} block {block} row {}",
+                                        first + r
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let mut tile = [0.0f32; 32];
+                    unsafe { kernels.gemm_q8(data.as_ptr(), &geometry, &quantized, k, &mut tile) };
+                    for (m, expected) in expected.iter().enumerate() {
+                        for (r, expected) in expected.iter().enumerate() {
+                            assert_eq!(
+                                tile[m * 8 + r].to_bits(),
+                                expected.to_bits(),
+                                "{representation} {tier:?} k {k} tile m {m} row {r}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn dense_rows_with_a_partial_packet_decode_their_values() {
         let k = 45;
