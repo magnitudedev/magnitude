@@ -371,9 +371,12 @@ advertise a disabling option.
 - Equivalent ordinal inputs use rendered affiliated-name evidence first and normalized rank second.
 - One meaningful alternate effort is not discarded.
 - No fixed-thinking template is advertised as disableable.
-- A template that never opens a reasoning block is not reported as reasoning by its native
-  handler, so it normalizes to `none` and accepts `none`: LFM2.5 1.2B Instruct is `none`, while
-  LFM2.5 2.6B, whose generation prompt always opens one, is fixed `high`.
+- A native handler reports reasoning, and parses emitted reasoning blocks, when the template names
+  a reasoning block, whether by opening it or by stripping its closing tag from history. LFM2.5
+  2.6B, whose generation prompt opens `<think>`, and LFM2.5 1.2B, whose model writes the block
+  itself, are both fixed `high`. The 1.2B Thinking and Instruct finetunes ship byte-identical
+  templates and differ only in name metadata, so the Instruct model also rejects `none`; accepting
+  `none` as a no-op would silently run a model that may reason, which fixed reasoning forbids.
 - Exact supported efforts remain unchanged at admission.
 - Unsupported ordinal efforts round upward within the model domain or clamp to its greatest enabled
   ordinal; unsupported named efforts select the enabled default.

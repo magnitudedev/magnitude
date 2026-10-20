@@ -1,6 +1,6 @@
 --- a/common/parsers/lfm2.cpp
 +++ b/common/parsers/lfm2.cpp
-@@ -37,29 +37,40 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &
+@@ -37,29 +37,42 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &
      data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, adjusted_messages);
      data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, adjusted_messages);
      data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
@@ -14,10 +14,12 @@
  
 -    data.thinking_start_tag = THINK_START;
 -    data.thinking_end_tags  = {THINK_END};
-+    // Instruct templates (e.g. LFM2.5 1.2B Instruct) never open a reasoning
-+    // block; they only strip a closing tag from history. Such a template is
-+    // not a reasoning template.
-+    auto supports_reasoning = tmpl.source().find(THINK_START) != std::string::npos;
++    // A template that opens a <think> block, or strips a closing </think> from
++    // history, serves models that write reasoning blocks; LFM2.5 1.2B leaves
++    // opening the block to the model. Only a template with neither tag is not
++    // a reasoning template.
++    auto supports_reasoning = tmpl.source().find(THINK_START) != std::string::npos ||
++                              tmpl.source().find(THINK_END) != std::string::npos;
 +    data.supports_thinking  = supports_reasoning;
 +    if (supports_reasoning) {
 +        data.thinking_start_tag = THINK_START;

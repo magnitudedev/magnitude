@@ -43,10 +43,12 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
         data.preserved_tokens.push_back(TOOL_LIST_END);
     }
 
-    // Instruct templates (e.g. LFM2.5 1.2B Instruct) never open a reasoning
-    // block; they only strip a closing tag from history. Such a template is
-    // not a reasoning template.
-    auto supports_reasoning = tmpl.source().find(THINK_START) != std::string::npos;
+    // A template that opens a <think> block, or strips a closing </think> from
+    // history, serves models that write reasoning blocks; LFM2.5 1.2B leaves
+    // opening the block to the model. Only a template with neither tag is not
+    // a reasoning template.
+    auto supports_reasoning = tmpl.source().find(THINK_START) != std::string::npos ||
+                              tmpl.source().find(THINK_END) != std::string::npos;
     data.supports_thinking  = supports_reasoning;
     if (supports_reasoning) {
         data.thinking_start_tag = THINK_START;

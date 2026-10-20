@@ -171,33 +171,37 @@ fn a_model_without_enabled_reasoning_cannot_enable_it() {
     ));
 }
 
-/// Real LFM2.5 templates: 1.2B Instruct never opens a reasoning block, while
-/// 2.6B always opens one in its generation prompt.
+/// Real LFM2.5 templates are fixed reasoning: 2.6B opens `<think>` in its
+/// generation prompt, while the 1.2B Thinking and Instruct finetunes share one
+/// byte-identical template that leaves the block to the model and strips
+/// `</think>` from history.
 #[test]
-fn lfm2_5_reasoning_follows_whether_the_template_can_reason() {
-    let instruct = profile_of("LFM2_5_INSTRUCT");
-    let efforts = |profile: &ReasoningProfile| {
-        profile
-            .mappings
-            .iter()
-            .map(|mapping| mapping.effort.clone())
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(efforts(&instruct), ["none"]);
-    assert_eq!(instruct.default_effort.as_deref(), Some("none"));
-    assert_eq!(instruct.supports_reasoning_output, None);
-    let disabled = instruct.resolve(&effort("none")).unwrap();
-    assert_eq!(disabled.effort.as_deref(), Some("none"));
-    assert!(disabled.controls.is_empty());
-
-    let thinking = profile_of("LFM2_5_THINKING");
-    assert_eq!(efforts(&thinking), ["high"]);
-    assert_eq!(thinking.default_effort.as_deref(), Some("high"));
-    assert_eq!(thinking.supports_reasoning_output, Some(true));
-    assert!(matches!(
-        thinking.resolve(&effort("none")),
-        Err(ReasoningError::CannotDisable { .. })
-    ));
+fn lfm2_5_templates_are_fixed_reasoning() {
+    for name in ["LFM2_5_THINKING", "LFM2_5_1_2B_THINKING", "LFM2_5_INSTRUCT"] {
+        let profile = profile_of(name);
+        assert_eq!(
+            profile
+                .mappings
+                .iter()
+                .map(|mapping| mapping.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["high"],
+            "{name}"
+        );
+        assert_eq!(profile.default_effort.as_deref(), Some("high"), "{name}");
+        assert_eq!(profile.supports_reasoning_output, Some(true), "{name}");
+        assert!(
+            matches!(
+                profile.resolve(&effort("none")),
+                Err(ReasoningError::CannotDisable { .. })
+            ),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        fixtures()["LFM2_5_1_2B_THINKING"],
+        fixtures()["LFM2_5_INSTRUCT"]
+    );
 }
 
 /// The real Llama 3.2 1B Instruct template (bartowski/LM Studio GGUF) has no

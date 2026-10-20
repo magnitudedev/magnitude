@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 const GEMMA4: &str = include_str!("assets/gemma-4-12B-it.jinja");
 const LFM25: &str = include_str!("assets/LFM2.5-2.6B.jinja");
 const LFM25_MOE: &str = include_str!("assets/LFM2.5-8B-A1B.jinja");
+const LFM25_SMALL_THINKING: &str = include_str!("assets/LFM2.5-1.2B-Thinking.jinja");
+const LFM25_SMALL_INSTRUCT: &str = include_str!("assets/LFM2.5-1.2B-Instruct.jinja");
 const LAGUNA: &str = include_str!("assets/Laguna-S-2.1.jinja");
 const MINICPM5: &str = include_str!("assets/MiniCPM5-2B.jinja");
 const MUSE: &str = include_str!("assets/Muse-Glimmer-30B.jinja");
@@ -113,6 +115,24 @@ fn families() -> Vec<Family> {
         Family {
             name: "lfm2.5-moe",
             source: LFM25_MOE,
+            special: special("<|startoftext|>", "<|im_end|>"),
+            enable_thinking: false,
+            generation_prompt: "<|im_start|>assistant\n",
+            output: "<think>The user wants weather.</think><|tool_call_start|>[get_weather(city='Paris', note='first line\\nsecond <line> & more')]<|tool_call_end|>",
+            reasoning: "The user wants weather.",
+        },
+        Family {
+            name: "lfm2.5-1.2b-thinking",
+            source: LFM25_SMALL_THINKING,
+            special: special("<|startoftext|>", "<|im_end|>"),
+            enable_thinking: false,
+            generation_prompt: "<|im_start|>assistant\n",
+            output: "<think>The user wants weather.</think><|tool_call_start|>[get_weather(city='Paris', note='first line\\nsecond <line> & more')]<|tool_call_end|>",
+            reasoning: "The user wants weather.",
+        },
+        Family {
+            name: "lfm2.5-1.2b-instruct",
+            source: LFM25_SMALL_INSTRUCT,
             special: special("<|startoftext|>", "<|im_end|>"),
             enable_thinking: false,
             generation_prompt: "<|im_start|>assistant\n",
@@ -320,6 +340,37 @@ fn family_templates_render_tools_and_parse_reasoning_and_calls() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// LFM2.5 1.2B leaves opening the reasoning block to the model; the block it
+/// writes is reasoning, and a reply without one is content.
+#[test]
+fn lfm2_5_small_parses_reasoning_the_model_opens() {
+    let template = Template::new(
+        LFM25_SMALL_THINKING,
+        &special("<|startoftext|>", "<|im_end|>"),
+    )
+    .unwrap();
+    let prepared = template
+        .prepare(&Request::new(
+            vec![json!({"role":"user","content":"Hi"})],
+            946684800,
+        ))
+        .unwrap();
+    assert!(prepared
+        .description()
+        .prompt
+        .ends_with("<|im_start|>assistant\n"));
+    let thought = parse(&prepared, "<think>x</think>y").unwrap();
+    assert_eq!(
+        (thought.reasoning.as_str(), thought.content.as_str()),
+        ("x", "y")
+    );
+    let plain = parse(&prepared, "y").unwrap();
+    assert_eq!(
+        (plain.reasoning.as_str(), plain.content.as_str()),
+        ("", "y")
+    );
 }
 
 /// Muse Glimmer's template has no reasoning switch: disabled reasoning writes

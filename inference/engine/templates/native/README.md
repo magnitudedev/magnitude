@@ -43,10 +43,11 @@ Patch 0024 makes the key grammar of an object's additional properties valid JSON
 spells keys other than the listed properties as escaped JSON text, never as raw characters a JSON
 string cannot hold.
 
-Patch 0025 makes the LFM2 handler report reasoning only when the template can open a `<think>`
-block. LFM2.5 Instruct templates never open one (they only strip a closing tag from history), so
-they declare no thinking support, no reasoning markers and no reasoning continuation, and
-reasoning detection classifies them as non-reasoning rather than fixed reasoning.
+Patch 0025 makes the LFM2 handler report reasoning, and parse emitted `<think>` blocks, exactly
+when the template names a reasoning block: it opens `<think>`, or it strips a closing `</think>`
+from history as LFM2.5 1.2B does while leaving the opening tag to the model. A template with
+neither tag declares no thinking support, no reasoning markers and no reasoning continuation, and
+reasoning detection classifies it as non-reasoning rather than fixed reasoning.
 
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
