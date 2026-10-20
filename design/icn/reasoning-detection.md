@@ -341,6 +341,12 @@ when the selected template behavior has reliable reasoning boundaries.
 For a valid, stable, runtime-supported template, reasoning detection produces a complete result.
 A successful no-reasoning result normalizes to the single option `none`.
 
+Published model capabilities carry the options, the default, and a `supported` flag that is true
+exactly when some option other than `none` exists. A no-reasoning model is therefore unsupported
+with options `["none"]` and default `none`, end to end from the engine through ACN's product
+schema; an empty option list with no default remains the shape for a model that declares no
+reasoning control at all, such as a remote model without reasoning parameters.
+
 Template compilation failure, inability to render the required baseline, unstable rendering, lost
 probe nonces, or inability to derive the declared public property is an assessment failure. It is
 not normalized to `none` and is not cached as a model capability.

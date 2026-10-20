@@ -314,17 +314,24 @@ export const AssessmentEnvironmentIdSchema =
   NonEmptyString.pipe(Schema.brand("AssessmentEnvironmentId"))
 export type AssessmentEnvironmentId = typeof AssessmentEnvironmentIdSchema.Type
 
+/** Reasoning is supported when some effort other than `none` (reasoning disabled) exists. */
+export const reasoningSupported = (efforts: ReadonlyArray<string>): boolean =>
+  efforts.some((effort) => effort !== "none")
+
+/**
+ * A model that never reasons is either `["none"]` (it accepts an explicit `none`) or `[]` (it
+ * declares no reasoning control); any non-empty set carries a default drawn from it.
+ */
 const ModelReasoningCapabilitiesSchema = Schema.Struct({
   supported: Schema.Boolean,
   efforts: Schema.Array(ReasoningEffortSchema),
   defaultEffort: Schema.optionalWith(ReasoningEffortSchema, { as: "Option", exact: true }),
 }).pipe(Schema.filter((reasoning) => {
-  const unique = new Set(reasoning.efforts).size === reasoning.efforts.length
-  if (!unique) return false
-  if (!reasoning.supported) return reasoning.efforts.length === 0 && reasoning.defaultEffort._tag === "None"
-  return reasoning.efforts.length > 0
-    && reasoning.defaultEffort._tag === "Some"
-    && reasoning.efforts.includes(reasoning.defaultEffort.value)
+  if (new Set(reasoning.efforts).size !== reasoning.efforts.length) return false
+  if (reasoning.supported !== reasoningSupported(reasoning.efforts)) return false
+  return reasoning.efforts.length === 0
+    ? reasoning.defaultEffort._tag === "None"
+    : reasoning.defaultEffort._tag === "Some" && reasoning.efforts.includes(reasoning.defaultEffort.value)
 }, { message: () => "reasoning capabilities must have a unique, internally consistent effort set" }))
 
 export const ModelCapabilitiesSchema = Schema.Struct({

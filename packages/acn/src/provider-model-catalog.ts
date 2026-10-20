@@ -6,6 +6,7 @@ import {
   ProviderModelCatalogLoading,
   ProviderModelCatalogStateSchema,
   SECONDARY_SLOT_ID,
+  reasoningSupported,
   type ProviderCatalogEntry,
   type ProviderCatalogFailure,
   type ProviderModelCatalogEntry,
@@ -85,7 +86,7 @@ const toCatalogModel = (
       tools: model.servingCapabilities.tools,
       structuredOutput: model.servingCapabilities.structuredOutput,
       reasoning: {
-        supported: efforts.length > 0,
+        supported: reasoningSupported(efforts),
         efforts,
         defaultEffort: efforts.length > 0 ? Option.some(model.defaultReasoningEffort) : Option.none(),
       },

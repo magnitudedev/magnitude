@@ -14,6 +14,7 @@ import {
   LocalModelPreparationSchema,
   LocalModelSchema,
   LocalModelServingStateSchema,
+  ModelCapabilitiesSchema,
   ModelIdSchema,
   ModelLocationSchema,
   modelLocationState,
@@ -548,5 +549,27 @@ describe("ModelLocationSchema", () => {
       automatic: false,
       state: "Found",
     })._tag).toBe("Left")
+  })
+})
+
+describe("ModelCapabilitiesSchema reasoning", () => {
+  const capabilities = (reasoning: unknown) => Schema.decodeUnknownEither(ModelCapabilitiesSchema)({
+    vision: false, tools: false, structuredOutput: false, reasoning,
+  })
+
+  it("accepts a non-reasoning model that takes an explicit none", () => {
+    expect(capabilities({ supported: false, efforts: ["none"], defaultEffort: "none" })._tag).toBe("Right")
+    expect(capabilities({ supported: false, efforts: [] })._tag).toBe("Right")
+  })
+
+  it("ties supported to an enabled effort and the default to the effort set", () => {
+    expect(capabilities({ supported: true, efforts: ["none", "high"], defaultEffort: "high" })._tag).toBe("Right")
+    expect(capabilities({ supported: true, efforts: ["high"], defaultEffort: "high" })._tag).toBe("Right")
+    expect(capabilities({ supported: true, efforts: ["none"], defaultEffort: "none" })._tag).toBe("Left")
+    expect(capabilities({ supported: false, efforts: ["none", "high"], defaultEffort: "high" })._tag).toBe("Left")
+    expect(capabilities({ supported: false, efforts: ["none"] })._tag).toBe("Left")
+    expect(capabilities({ supported: false, efforts: [], defaultEffort: "none" })._tag).toBe("Left")
+    expect(capabilities({ supported: true, efforts: ["high", "high"], defaultEffort: "high" })._tag).toBe("Left")
+    expect(capabilities({ supported: true, efforts: ["none", "high"], defaultEffort: "low" })._tag).toBe("Left")
   })
 })

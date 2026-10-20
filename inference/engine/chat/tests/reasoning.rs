@@ -192,10 +192,35 @@ fn lfm2_5_reasoning_follows_whether_the_template_can_reason() {
 
     let thinking = profile_of("LFM2_5_THINKING");
     assert_eq!(efforts(&thinking), ["high"]);
+    assert_eq!(thinking.default_effort.as_deref(), Some("high"));
     assert_eq!(thinking.supports_reasoning_output, Some(true));
     assert!(matches!(
         thinking.resolve(&effort("none")),
         Err(ReasoningError::CannotDisable { .. })
+    ));
+}
+
+/// The real Llama 3.2 1B Instruct template (bartowski/LM Studio GGUF) has no
+/// reasoning control, so it is the single disabled option `none`.
+#[test]
+fn llama_3_2_instruct_normalizes_to_none() {
+    let profile = profile_of("LLAMA_3_2_INSTRUCT");
+    assert_eq!(
+        profile
+            .mappings
+            .iter()
+            .map(|mapping| mapping.effort.as_str())
+            .collect::<Vec<_>>(),
+        ["none"]
+    );
+    assert_eq!(profile.default_effort.as_deref(), Some("none"));
+    assert_eq!(profile.supports_reasoning_output, None);
+    let disabled = profile.resolve(&effort("none")).unwrap();
+    assert_eq!(disabled.effort.as_deref(), Some("none"));
+    assert!(disabled.controls.is_empty());
+    assert!(matches!(
+        profile.resolve(&effort("high")),
+        Err(ReasoningError::UnsupportedEffort { .. })
     ));
 }
 

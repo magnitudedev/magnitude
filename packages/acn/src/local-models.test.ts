@@ -53,6 +53,60 @@ describe("local model serving projection", () => {
     expect(state.capabilities.reasoning.defaultEffort).toEqual(Option.some("high"))
   })
 
+  it("projects a non-reasoning model that accepts only an explicit none", () => {
+    const modelId = ModelIdSchema.make("llama-3.2-1b-instruct:gguf:q4")
+    const snapshot = {
+      revision: 1,
+      environmentId: "environment",
+      catalog: {
+        _tag: "Available",
+        sourceRevision: 1,
+        entries: [{
+          subject: { _tag: "Catalog", modelId, selection: "Desired" },
+          state: {
+            _tag: "Assessed",
+            capabilities: {
+              vision: false,
+              tools: true,
+              structuredOutput: true,
+              reasoning: { supported: false, efforts: ["none"], defaultEffort: Option.some("none") },
+            },
+            templateFingerprint: "template",
+            fingerprint: Option.none(),
+            profiles: [{
+              _tag: "Fits",
+              assessmentId: "assessment",
+              profile: { contextLength: 4096 },
+              memory: [],
+              performance: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
+              drafter: { _tag: "None" },
+            }],
+          },
+        }],
+      },
+      custom: { _tag: "Pending", sourceRevision: 1 },
+    } as unknown as ModelAssessmentsSnapshot
+    const ready = {
+      profile: { contextLength: 4096 },
+      metadata: {
+        format: "gguf", architecture: "llama", quantization: "q4_k_m", quantizationName: "Q4_K_M",
+        storageBytes: 1, maximumContextLength: Option.some(131_072),
+      },
+      speculativeMethod: Option.none(),
+    } as unknown as ReadyModel
+
+    const assessment = coordinatedAssessment(snapshot, 1, "catalog", modelId)
+    expect(assessment?._tag).toBe("Assessed")
+    if (assessment?._tag !== "Assessed") return
+    const state = catalogModelServingState(ready, assessment, Option.none())
+
+    expect(state._tag).toBe("Assessed")
+    if (state._tag !== "Assessed") return
+    expect(state.capabilities.reasoning).toEqual({
+      supported: false, efforts: ["none"], defaultEffort: Option.some("none"),
+    })
+  })
+
   it("preserves ICN's native unavailability failure", () => {
     const nativeFailure = {
       code: "invalid_artifact",
