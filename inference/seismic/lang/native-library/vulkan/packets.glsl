@@ -53,8 +53,6 @@
 #define PACKETS_IQ4S 15
 // The vector-coded IQ2_XXS kind.
 #define PACKETS_IQ2XXS 16
-// Every kind, as PROJECTION_GEMM_KINDS bits.
-#define PACKETS_ALL_KINDS 0x1ffff
 
 // Coefficient groups per packet (q6k, nvfp4g16, iq2xs: one per 16 elements).
 uint packets_groups(const int kind) {

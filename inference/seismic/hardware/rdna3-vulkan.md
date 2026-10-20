@@ -83,6 +83,14 @@ Check at least:
     operands, ACO emits `v_mul_f32` + `v_add_f32`.
   - `OpFmaKHR` always gives `v_fma_f32`.
   - glslang cannot emit `OpFmaKHR` from GLSL. See spec §16.1.
+- **Pipeline creation cost:** RADV inlines every function and runs `nir_opt_copy_prop_vars` before it
+  folds constant branches, so code that only a constant argument makes dead still costs its full
+  compile time and memory. A branch per weight kind around the projection GEMM's staging (17 kinds,
+  each passing a struct of eight packets by value) made one GEMM pipeline take 9.8 s and 1.96 GB of
+  host memory to create, against 0.5 s and 213 MB with only the used kind present and identical machine
+  code (RADV 25.1, null device NAVI32; most of the time in copy propagation). On a V710 host forming
+  eight such programs at once, each took about 100 s and the worker peaked at 16 GB. Keep such
+  branches out of the driver's input with preprocessor groups.
 
 ## The AMD Windows driver (V710 MxGPU, 32.0.21017.2052)
 

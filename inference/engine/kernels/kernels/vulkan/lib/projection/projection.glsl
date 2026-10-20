@@ -30,10 +30,15 @@
 // the GEMM body once, with the segment's kind as a workgroup-uniform value:
 // only the weight staging branches on it, over the kinds the entry lists in
 // PROJECTION_GEMM_KINDS (one bit per PACKETS_* kind, defined before this
-// file is included; default: every kind). Instantiating the body once per
-// segment instead defeats the NVIDIA proprietary compiler (580.159.03): a
-// launch holding two or more GEMM bodies ran about 100x slower than the same
-// tiles through one body.
+// file is included). Instantiating the body once per segment instead defeats
+// the NVIDIA proprietary compiler (580.159.03): a launch holding two or more
+// GEMM bodies ran about 100x slower than the same tiles through one body.
+// An entry that defines no PROJECTION_GEMM_KINDS passes a constant kind, and
+// its staging is that kind's alone. The branches are preprocessor groups, so
+// the driver never sees a kind the entry cannot stage: RADV compiles code a
+// constant makes dead at full cost, and the 17 kinds' staging made one GEMM
+// pipeline take 9.8 s and 1.96 GB to create instead of 0.5 s and 213 MB, for
+// the same machine code (seismic/hardware/rdna3-vulkan.md).
 //
 // Row classes pick the launch:
 // - GEMV (M <= 8): lane groups own weight rows, lanes own packets, and each
@@ -66,10 +71,6 @@
 #include "../core/matrix.glsl"
 
 #include "stage.glsl"
-
-#ifndef PROJECTION_GEMM_KINDS
-#define PROJECTION_GEMM_KINDS PACKETS_ALL_KINDS
-#endif
 
 #define PROJECTION_STORE 0
 #define PROJECTION_RESIDUAL 1
@@ -835,87 +836,136 @@ void projection_gemm_store_b_of(const int kind, const uint threads, projection_g
     }
 }
 
-// The weight staging of a kind that may be chosen per workgroup (a segmented
-// launch, see the file header): one branch per kind of PROJECTION_GEMM_KINDS,
-// each a constant-kind staging, so a constant `kind` folds to its branch.
-bool projection_gemm_kind_is(int kind, const int candidate) {
-    return (PROJECTION_GEMM_KINDS & (1 << candidate)) != 0 && kind == candidate;
-}
+// The weight staging of a kind chosen per workgroup (a segmented launch, see
+// the file header): one preprocessor group per kind of PROJECTION_GEMM_KINDS,
+// each a constant-kind staging. Without PROJECTION_GEMM_KINDS the kind is a
+// constant and is staged directly. No segmented entry takes iq4g32s.
+#if defined(PROJECTION_GEMM_KINDS)
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ4S)) != 0
+#error "a segmented projection does not stage iq4g32s"
+#endif
+#endif
+#define PROJECTION_GEMM_LOAD_B(KIND) \
+    if (kind == KIND) { \
+        projection_gemm_load_b_of(KIND, threads, w, first, count, rows, k0, k, regs); \
+        return; \
+    }
+#define PROJECTION_GEMM_STORE_B(KIND) \
+    if (kind == KIND) { \
+        projection_gemm_store_b_of(KIND, threads, regs, count, tile_row0, spacing, b_word); \
+        return; \
+    }
 
 void projection_gemm_load_b(int kind, const uint threads, projection_weights w, uint first, const uint count,
     uint rows, uint k0, uint k, out projection_gemm_b regs) {
-    if (projection_gemm_kind_is(kind, PACKETS_Q4K))
-        projection_gemm_load_b_of(PACKETS_Q4K, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_Q5K))
-        projection_gemm_load_b_of(PACKETS_Q5K, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_Q6K))
-        projection_gemm_load_b_of(PACKETS_Q6K, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_Q8))
-        projection_gemm_load_b_of(PACKETS_Q8, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_IQ4))
-        projection_gemm_load_b_of(PACKETS_IQ4, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_IQ4S))
-        projection_gemm_load_b_of(PACKETS_IQ4S, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_Q4G32S))
-        projection_gemm_load_b_of(PACKETS_Q4G32S, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_MXFP4))
-        projection_gemm_load_b_of(PACKETS_MXFP4, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_NVFP4))
-        projection_gemm_load_b_of(PACKETS_NVFP4, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_Q5G32S))
-        projection_gemm_load_b_of(PACKETS_Q5G32S, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_Q5G32))
-        projection_gemm_load_b_of(PACKETS_Q5G32, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_IQ2XS))
-        projection_gemm_load_b_of(PACKETS_IQ2XS, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_IQ3XXS))
-        projection_gemm_load_b_of(PACKETS_IQ3XXS, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_IQ2XXS))
-        projection_gemm_load_b_of(PACKETS_IQ2XXS, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_BF16))
-        projection_gemm_load_b_of(PACKETS_BF16, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_F16))
-        projection_gemm_load_b_of(PACKETS_F16, threads, w, first, count, rows, k0, k, regs);
-    else if (projection_gemm_kind_is(kind, PACKETS_F32))
-        projection_gemm_load_b_of(PACKETS_F32, threads, w, first, count, rows, k0, k, regs);
+#if defined(PROJECTION_GEMM_KINDS)
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q4K)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_Q4K)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q5K)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_Q5K)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q6K)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_Q6K)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q8)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_Q8)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ4)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_IQ4)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q4G32S)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_Q4G32S)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_MXFP4)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_MXFP4)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_NVFP4)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_NVFP4)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q5G32S)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_Q5G32S)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q5G32)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_Q5G32)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ2XS)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_IQ2XS)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ3XXS)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_IQ3XXS)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ2XXS)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_IQ2XXS)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_BF16)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_BF16)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_F16)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_F16)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_F32)) != 0
+    PROJECTION_GEMM_LOAD_B(PACKETS_F32)
+#endif
+#else
+    projection_gemm_load_b_of(kind, threads, w, first, count, rows, k0, k, regs);
+#endif
 }
 
 void projection_gemm_store_b(int kind, const uint threads, projection_gemm_b regs, const uint count,
     uint tile_row0, uint spacing, uint b_word) {
-    if (projection_gemm_kind_is(kind, PACKETS_Q4K))
-        projection_gemm_store_b_of(PACKETS_Q4K, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_Q5K))
-        projection_gemm_store_b_of(PACKETS_Q5K, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_Q6K))
-        projection_gemm_store_b_of(PACKETS_Q6K, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_Q8))
-        projection_gemm_store_b_of(PACKETS_Q8, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_IQ4))
-        projection_gemm_store_b_of(PACKETS_IQ4, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_IQ4S))
-        projection_gemm_store_b_of(PACKETS_IQ4S, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_Q4G32S))
-        projection_gemm_store_b_of(PACKETS_Q4G32S, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_MXFP4))
-        projection_gemm_store_b_of(PACKETS_MXFP4, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_NVFP4))
-        projection_gemm_store_b_of(PACKETS_NVFP4, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_Q5G32S))
-        projection_gemm_store_b_of(PACKETS_Q5G32S, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_Q5G32))
-        projection_gemm_store_b_of(PACKETS_Q5G32, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_IQ2XS))
-        projection_gemm_store_b_of(PACKETS_IQ2XS, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_IQ3XXS))
-        projection_gemm_store_b_of(PACKETS_IQ3XXS, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_IQ2XXS))
-        projection_gemm_store_b_of(PACKETS_IQ2XXS, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_BF16))
-        projection_gemm_store_b_of(PACKETS_BF16, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_F16))
-        projection_gemm_store_b_of(PACKETS_F16, threads, regs, count, tile_row0, spacing, b_word);
-    else if (projection_gemm_kind_is(kind, PACKETS_F32))
-        projection_gemm_store_b_of(PACKETS_F32, threads, regs, count, tile_row0, spacing, b_word);
+#if defined(PROJECTION_GEMM_KINDS)
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q4K)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_Q4K)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q5K)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_Q5K)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q6K)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_Q6K)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q8)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_Q8)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ4)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_IQ4)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q4G32S)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_Q4G32S)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_MXFP4)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_MXFP4)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_NVFP4)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_NVFP4)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q5G32S)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_Q5G32S)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q5G32)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_Q5G32)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ2XS)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_IQ2XS)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ3XXS)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_IQ3XXS)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ2XXS)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_IQ2XXS)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_BF16)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_BF16)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_F16)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_F16)
+#endif
+#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_F32)) != 0
+    PROJECTION_GEMM_STORE_B(PACKETS_F32)
+#endif
+#else
+    projection_gemm_store_b_of(kind, threads, regs, count, tile_row0, spacing, b_word);
+#endif
 }
 
 // The subgroup's sub-tile origin in the tile.
