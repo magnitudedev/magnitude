@@ -38,10 +38,12 @@ pub(super) struct Lookahead<F: ProgramFamily> {
     selected: Option<Vec<Selected>>,
 }
 
-/// The operation continuing `operation` by one decode row: the same request
-/// and selection, one position later. `None` when the next step depends on
-/// the host (grammar masks, penalty histories, logits or features demanded,
-/// conditioned rows, more than one row).
+/// The operation continuing `operation` by one decode row: the same request,
+/// selection and output demand, one position later. A decode that also
+/// publishes its row's feature for a drafter continues like a plain one: the
+/// queued step publishes its own feature, read by the host only after it
+/// finishes. `None` when the next step depends on the host (grammar masks,
+/// penalty histories, logits demanded, conditioned rows, more than one row).
 pub(super) fn continuation_of(operation: &Operation) -> Option<Operation> {
     let Operation::Forward {
         request,
@@ -60,8 +62,9 @@ pub(super) fn continuation_of(operation: &Operation) -> Option<Operation> {
     let [spec] = select.as_slice() else {
         return None;
     };
+    let select_only = crate::batching::Demand::SELECT;
     if tokens.len() != 1
-        || *demand != crate::batching::Demand::SELECT
+        || (*demand != select_only && *demand != select_only | crate::batching::Demand::FEATURES)
         || spec.mask.is_some()
         || spec.history.is_some()
     {
@@ -580,5 +583,64 @@ impl<F: ProgramFamily> StateBindings<F> {
             lookahead.selected = Some(selected.to_vec());
             lookahead.flight.runnable = completed;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::continuation_of;
+    use crate::batching::Demand;
+    use crate::{Operation, RequestId, Sampling, SelectSpec, Shaping, TokenId, WorkKind};
+
+    fn decode(demand: Demand, tokens: Vec<TokenId>) -> Operation {
+        Operation::Forward {
+            request: RequestId(3),
+            kind: if tokens.len() == 1 { WorkKind::Decode } else { WorkKind::Verify },
+            position: 7,
+            conditioning: None,
+            demand,
+            select: (0..tokens.len())
+                .map(|row| SelectSpec {
+                    sampling: Sampling::Greedy,
+                    seed: 1,
+                    position: 4 + row,
+                    domain: 0,
+                    mask: None,
+                    shaping: Shaping::default(),
+                    history: None,
+                })
+                .collect(),
+            tokens,
+            committed: 1,
+            prime: None,
+        }
+    }
+
+    /// A drafting load's round that drafts nothing is a one-row decode that
+    /// also publishes its feature: it is queued behind like a plain decode,
+    /// keeping its demand, so the step that claims it equals it.
+    #[test]
+    fn a_decode_feeding_a_drafter_continues_like_a_plain_decode() {
+        for demand in [Demand::SELECT, Demand::SELECT | Demand::FEATURES] {
+            let next = continuation_of(&decode(demand, vec![TokenId(5)]))
+                .unwrap_or_else(|| panic!("{demand:?} decode has a continuation"));
+            let Operation::Forward {
+                position,
+                demand: next_demand,
+                select,
+                ..
+            } = &next
+            else {
+                unreachable!()
+            };
+            assert_eq!((*position, *next_demand, select[0].position), (8, demand, 5));
+        }
+        // Logits go to the host, and a verification's rows are the method's.
+        assert!(continuation_of(&decode(Demand::SELECT | Demand::LOGITS, vec![TokenId(5)])).is_none());
+        assert!(continuation_of(&decode(
+            Demand::SELECT | Demand::FEATURES,
+            vec![TokenId(5), TokenId(6)]
+        ))
+        .is_none());
     }
 }

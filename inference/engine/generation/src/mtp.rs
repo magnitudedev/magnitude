@@ -527,14 +527,11 @@ impl MethodState for DrafterState {
             self.verified = Some(count);
             return Propose::Tokens(proposal[..count].to_vec());
         }
-        let (Some(pending), None, None, false) =
+        let (Some(_), None, None, false) =
             (&self.pending, &self.head, &self.open, selects.is_empty())
         else {
             return Propose::Tokens(Vec::new());
         };
-        if pending.tokens.len() > self.entry_bound() {
-            return Propose::Tokens(Vec::new());
-        }
         // A round drafts its whole generated width or nothing. Launch costs
         // depend on the history the round reads, the target's position.
         let position = self
@@ -550,6 +547,17 @@ impl MethodState for DrafterState {
         if generated == 0 || generated > selects.len() {
             return Propose::Tokens(Vec::new());
         }
+        // Rounds that drafted nothing left their pairs pending: the drafter
+        // enters them now, then this round drafts from its anchor.
+        if self.round_state().catching_up().0.is_some() {
+            let effects = self
+                .flush(request, 1, HeadPhase::Generation)
+                .expect("pending pairs slice by their own rows");
+            return Propose::Pending(effects.operations);
+        }
+        let Some(pending) = &self.pending else {
+            unreachable!("a drafting round holds its anchor");
+        };
         let (Some(call), _) = self
             .round_state()
             .proposing(generated)

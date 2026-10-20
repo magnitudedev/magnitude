@@ -4,6 +4,14 @@
 //! head transaction a proposal or maintenance submits, and the boundary each
 //! reconciles to.
 
+/// The most complete pairs an own-history drafter holds while its rounds
+/// draft nothing. Entering pairs is the drafter's work alone, so it waits
+/// for the round that drafts next (`catching_up`), and a round drafting
+/// nothing stays an ordinary decode; past this many pairs a round enters
+/// them anyway, so the pairs held stay bounded. A catch-up transaction is
+/// one launch of at most this many rows.
+pub const CATCH_UP_ROWS: usize = 64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DraftHistory {
     Own,
@@ -120,6 +128,20 @@ impl DraftRoundState {
         ))
     }
 
+    /// The pairs to enter before a round drafts: every pending pair but the
+    /// anchor, when they are more than a drafting transaction admits.
+    pub fn catching_up(self) -> (Option<DraftHeadCall>, Self) {
+        if self.pending_rows <= self.entry_bound || self.open_row {
+            return (None, self);
+        }
+        self.flushing(1)
+    }
+
+    /// The most pairs this drafter holds while it drafts nothing.
+    fn held_bound(self) -> usize {
+        self.entry_bound.max(CATCH_UP_ROWS)
+    }
+
     /// Complete pairs only: an open feature has no successor token to enter.
     /// The returned state has removed the submitted rows but has not yet
     /// advanced their physical position.
@@ -166,7 +188,7 @@ impl DraftRoundState {
         };
         appended.target_position()?;
         let (maintenance, remaining) = if appended.history == DraftHistory::Own
-            && appended.pending_rows > appended.entry_bound
+            && appended.pending_rows > appended.held_bound()
         {
             appended.flushing(1)
         } else {
@@ -300,21 +322,22 @@ mod tests {
     }
 
     #[test]
-    fn rows_past_the_entry_bound_are_entered_by_maintenance_keeping_the_anchor() {
-        // Rounds that draft nothing accumulate one pair each.
+    fn rows_past_the_catch_up_bound_are_entered_by_maintenance_keeping_the_anchor() {
+        // Rounds that draft nothing accumulate one pair each, past what a
+        // drafting transaction admits, without entering any.
         let mut settled = state(DraftHistory::Own, 3, 1, 1, false);
-        for pending in [2, 3] {
+        for pending in 2..=super::CATCH_UP_ROWS {
             let observed = settled.observed(1).unwrap();
             assert_eq!(observed.maintenance, None);
             settled = observed.successor;
             assert_eq!(settled.pending_rows(), pending);
         }
         let observed = settled.observed(1).unwrap();
-        assert_eq!(observed.appended.pending_rows(), 4);
+        assert_eq!(observed.appended.pending_rows(), super::CATCH_UP_ROWS + 1);
         assert_eq!(
             observed.maintenance,
             Some(DraftHeadCall {
-                entry_rows: 3,
+                entry_rows: super::CATCH_UP_ROWS,
                 generated: 0,
                 position: 1,
             })
@@ -324,12 +347,37 @@ mod tests {
                 observed.successor.position(),
                 observed.successor.pending_rows()
             ),
-            (4, 1)
+            (1 + super::CATCH_UP_ROWS, 1)
         );
         assert_eq!(
             observed.successor.target_position(),
             observed.appended.target_position()
         );
+    }
+
+    #[test]
+    fn a_round_that_drafts_after_rounds_that_did_not_first_catches_up() {
+        // Pairs a drafting transaction admits draft at once.
+        let held = state(DraftHistory::Own, 4, 2, 4, false);
+        assert_eq!(held.catching_up(), (None, held));
+        // More are entered first, all but the anchor, which then drafts.
+        let held = state(DraftHistory::Own, 4, 2, 9, false);
+        let (call, caught) = held.catching_up();
+        assert_eq!(
+            call,
+            Some(DraftHeadCall {
+                entry_rows: 8,
+                generated: 0,
+                position: 2,
+            })
+        );
+        let caught = caught.entered(8).unwrap();
+        assert_eq!(caught.target_position(), held.target_position());
+        let (call, _) = caught.proposing(3).unwrap();
+        assert_eq!(call.map(|call| (call.entry_rows, call.position)), Some((1, 10)));
+        // An open feature waits for its successor.
+        let open = state(DraftHistory::Own, 4, 2, 9, true);
+        assert_eq!(open.catching_up(), (None, open));
     }
 
     #[test]

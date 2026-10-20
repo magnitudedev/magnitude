@@ -18,7 +18,9 @@ pub use draft_budget::{DraftBudget, DraftPolicy};
 pub use draft_control::{
     DraftController, DraftLoad, DraftOutlook, RoundChoice, TimedLaunch, share_rows,
 };
-pub use draft_transition::{DraftHeadCall, DraftHistory, DraftRoundState, DraftTargetTransition};
+pub use draft_transition::{
+    CATCH_UP_ROWS, DraftHeadCall, DraftHistory, DraftRoundState, DraftTargetTransition,
+};
 pub use magnitude_artifacts::{BoundaryRule, InputLayout, InputSpan};
 pub use magnitude_executor::{
     Demand, FeatureReader, FeatureRef, Operation, Priming, RequestId, Sampling, SelectSpec,

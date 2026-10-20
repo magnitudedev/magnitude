@@ -1691,7 +1691,8 @@ fn mtp_reading_target_replay_resumes_drafting_after_one_decode() {
 }
 
 /// A budget drafting nothing does not erase the history owner's pending
-/// entries. Its real maintenance transaction must match the method's
+/// entries, and enters none of them while it holds no more than its catch-up
+/// bound. Any real maintenance transaction must match the method's
 /// transition; target-reading heads never submit that transaction.
 #[test]
 fn plain_round_geometry_matches_history_and_target_reading_execution() {
@@ -1743,7 +1744,6 @@ fn plain_round_geometry_matches_history_and_target_reading_execution() {
                     let (tokens, _, position, proposals) = head_parts(operation);
                     assert_eq!((position, tokens.len()), (call.position, call.entry_rows));
                     assert!(proposals.is_empty());
-                    assert_eq!((step, position, tokens.len()), (2, 1, 3));
                     reconcile_head(&mut generation, operation, &[]);
                 }
                 _ => panic!("physical maintenance differs from the method transition"),
@@ -1756,8 +1756,107 @@ fn plain_round_geometry_matches_history_and_target_reading_execution() {
             assert_eq!(checkpoint.position(), state.position());
             generation.take(4).unwrap();
         }
-        assert_eq!(state.pending_rows(), 1);
-        assert_eq!(state.position(), if history == DraftHistory::Own { 4 } else { 5 });
+        // An own history holds its four pairs; a reading head only its anchor.
+        let expected = match history {
+            DraftHistory::Own => (4, 1),
+            DraftHistory::Target => (1, 5),
+        };
+        assert_eq!((state.pending_rows(), state.position()), expected);
+    }
+}
+
+/// Rounds of a drafting load that draft nothing are ordinary one-row
+/// decodes: they publish their row's feature for the drafter, and nothing
+/// else runs for it, so the executor pipelines them as it does plain decodes.
+/// The drafter enters their pairs only when a round drafts again (or past
+/// its catch-up bound), each pair exactly once, in order and at its own
+/// position: the draft that follows reads the history it would have read
+/// had every round drafted.
+#[test]
+fn rounds_that_draft_nothing_defer_the_drafter_until_it_drafts_again() {
+    use magnitude_generation::CATCH_UP_ROWS;
+    const PLAIN: usize = CATCH_UP_ROWS + 6;
+    let methods: [Arc<dyn Method>; 2] = [
+        Arc::new(Mtp::new("fixture", 3).unwrap()),
+        Arc::new(DFlash::new("fixture", 3).unwrap()),
+    ];
+    for method in methods {
+        let mut configured = options();
+        configured.max_tokens = PLAIN + 8;
+        configured.context_limit = PLAIN + 16;
+        configured.method = match method.identity().starts_with("mtp") {
+            true => MethodChoice::Mtp { proposals: 3 },
+            false => MethodChoice::DFlash { proposals: 3 },
+        };
+        let generation = resident(
+            Generation::new_with_method(
+                vec![TokenId(1), TokenId(2)],
+                InputLayout::new(2, vec![]).unwrap(),
+                configured,
+                None,
+                method.clone(),
+            )
+            .unwrap(),
+        );
+        let (mut generation, effects) = resolve(start(generation, 2), &[10], Some(feature(1)));
+        assert!(effects.is_empty());
+        generation.take(4).unwrap();
+        let (MethodCheckpoint::Mtp(primed) | MethodCheckpoint::DFlash(primed)) =
+            generation.method_checkpoint().unwrap()
+        else {
+            panic!("a drafter checkpoint")
+        };
+        // Every pair the drafter must enter: each committed token with the
+        // feature of the row before it.
+        let mut pairs = vec![(TokenId(10), (1, 1))];
+        let mut entered = Vec::new();
+        let mut position = primed.position();
+        // A grant of one row holds no draft: each round is a plain decode.
+        for round in 0..PLAIN {
+            let decode = start(generation, 1);
+            let forward = forward(&decode);
+            assert_eq!(forward.kind, WorkKind::Decode);
+            assert_eq!(forward.tokens, [pairs.last().unwrap().0]);
+            assert_eq!(forward.demand, Demand::SELECT | Demand::FEATURES);
+            assert_eq!((forward.committed, forward.prime), (1, None));
+            let id = 2 + round as u64;
+            let sample = 11 + round as u32;
+            let (next, effects) = resolve(decode, &[sample], Some(feature(id)));
+            generation = next;
+            pairs.push((TokenId(sample), (id as u8, 0)));
+            // Pairs past the catch-up bound enter, keeping the anchor.
+            match effects.as_slice() {
+                [] => {}
+                [operation] => {
+                    let (tokens, rows, at, proposals) = head_parts(operation);
+                    assert_eq!(round + 1, CATCH_UP_ROWS, "{}", method.identity());
+                    assert!(proposals.is_empty());
+                    assert_eq!(at, position);
+                    position += tokens.len();
+                    entered.extend(tokens.into_iter().zip(rows));
+                    reconcile_head(&mut generation, operation, &[]);
+                }
+                _ => panic!("one maintenance transaction at most"),
+            }
+            generation.take(4).unwrap();
+        }
+        assert_eq!(entered.len(), CATCH_UP_ROWS, "{}", method.identity());
+        // The next round that drafts first enters what the plain rounds left.
+        let (mut generation, catch_up) = draft(generation, 4);
+        let [catch_up] = <[Operation; 1]>::try_from(catch_up).unwrap();
+        let (tokens, rows, at, proposals) = head_parts(&catch_up);
+        assert!(proposals.is_empty());
+        assert_eq!(at, position);
+        position += tokens.len();
+        entered.extend(tokens.into_iter().zip(rows));
+        reconcile_head(&mut generation, &catch_up, &[]);
+        // Then it drafts from its anchor alone.
+        let (_, drafted) = draft(generation, 4);
+        let (tokens, rows, at, proposals) = head_parts(&drafted[0]);
+        assert_eq!(proposals.len(), 3);
+        assert_eq!(at, position);
+        entered.extend(tokens.into_iter().zip(rows));
+        assert_eq!(entered, pairs, "{}", method.identity());
     }
 }
 

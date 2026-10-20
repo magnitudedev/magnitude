@@ -141,7 +141,20 @@ execution. Retained logical tokens alone are not a physical-memory estimate.
 The method reconciles its drafter with the accepted target features. Necessary
 catch-up may be deferred if recorded explicitly and performed before that
 drafter's next use. Checkpoints include that obligation, target state, method
-state, and compatibility identity. Restoring target KV alone is insufficient
+state, and compatibility identity.
+
+**An idle drafter costs its features only.** A round of a drafting load that
+drafts nothing is an ordinary one-row decode: it adds only its row's feature
+to its outputs and is pipelined exactly as plain serving pipelines decode. The
+feature is captured then, because recomputing it later would replay the target
+(impossible over recurrent state without a snapshot). Its pair waits on the host:
+the drafter enters held pairs only when a round drafts again, as one catch-up
+transaction before that round's draft from its anchor alone, or once more than
+a fixed bound of pairs is held. Each pair is entered exactly once, in order, at
+its own position, so the draft that follows is the one it would have been had
+no round been plain. Any drafter transaction resolves a queued lookahead, so
+work that runs the drafter on a round drafting nothing would end the pipelining
+the round exists to keep. Restoring target KV alone is insufficient
 when a drafter requires missing hidden states; the method must reseed/replay or
 decline that checkpoint.
 
@@ -188,7 +201,7 @@ Retained checkpoints detach their row so prefix retention does not pin peer stat
 | Case | Required behavior |
 |---|---|
 | All, some, or no proposals accepted | Resolve each row independently; peers keep their accepted progress |
-| No draft seed, plain decoding, or one output slot left | Use zero proposals and ordinary target advancement |
+| No draft seed, plain decoding, or one output slot left | Use zero proposals and ordinary, pipelined target advancement; defer drafter entry to the next drafting round |
 | Different widths or draft depths | Batch compatible ready operations; regroup as rows reach verification |
 | Multiple drafter instances | Group by the actual executable and its contract, never a model-name string |
 | Forced grammar tokens | Advance the known prefix without drafting; still update required method features |
