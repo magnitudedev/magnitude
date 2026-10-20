@@ -157,6 +157,43 @@ describe("automatic assessment projection", () => {
     expect(coordinatedAssessment(targetFailure, 1, "catalog", modelId)).toEqual({ _tag: "Dropped" })
     expect(assessmentTargetVisible({ _tag: "Dropped" })).toBe(false)
   })
+
+  it("drops only the target whose capabilities violate the product contract", () => {
+    const badId = ModelIdSchema.make("bad-model:gguf:q4")
+    const entry = (id: typeof modelId, reasoning: unknown) => ({
+      subject: { _tag: "Catalog", modelId: id, selection: "Desired" },
+      state: {
+        _tag: "Assessed",
+        capabilities: { vision: false, tools: true, structuredOutput: true, reasoning },
+        templateFingerprint: "template",
+        fingerprint: Option.none(),
+        profiles: [{
+          _tag: "Fits",
+          assessmentId: "assessment",
+          profile: { contextLength: 4096 },
+          memory: [],
+          performance: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
+          drafter: { _tag: "None" },
+        }],
+      },
+    })
+    const snapshot = {
+      revision: 1,
+      environmentId: "environment",
+      catalog: {
+        _tag: "Available",
+        sourceRevision: 1,
+        entries: [
+          entry(modelId, { supported: true, efforts: ["none", "high"], defaultEffort: Option.some("high") }),
+          entry(badId, { supported: true, efforts: [], defaultEffort: Option.none() }),
+        ],
+      },
+      custom: { _tag: "Pending", sourceRevision: 1 },
+    } as unknown as ModelAssessmentsSnapshot
+
+    expect(coordinatedAssessment(snapshot, 1, "catalog", modelId)?._tag).toBe("Assessed")
+    expect(coordinatedAssessment(snapshot, 1, "catalog", badId)).toEqual({ _tag: "Dropped" })
+  })
 })
 
 describe("local model preparation projection", () => {

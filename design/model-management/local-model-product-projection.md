@@ -182,7 +182,8 @@ data, not `Schema.equivalence`, which rebuilds parsers for every union member it
   are found.
 - `Unsupported` assessment outcomes (custom models only) never become offerings; for found and
   imported models they appear only in the unsupported list, with every reason; targets whose
-  assessment attempt fails are omitted.
+  assessment attempt fails are omitted, as is a target whose assessed capabilities violate the
+  product contract, so one model's malformed evidence never fails the list or ACN startup.
 - Hidden models appear only in the hidden list, are never assessed, and are never offered. A catalog
   model whose installation is entirely externally owned is a found copy: hiding it adds the catalog
   model's `aliases` (the `hf:` IDs its external files have as found models) to the hidden IDs, so ICN

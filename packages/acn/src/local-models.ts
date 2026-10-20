@@ -31,6 +31,7 @@ import {
   type LocalModel,
   type LocalModelsState,
   type LocalModelPreparation,
+  type ModelCapabilities,
   type ModelId,
   type ModelFailure,
   type ModelResidency,
@@ -48,7 +49,6 @@ import type {
   ModelAssessment,
   ModelAssessmentDomainSnapshot,
   ModelAssessmentsSnapshot,
-  ModelCapabilities,
   ModelInstance,
   ReadyModel,
   UnsupportedLocalModel as NativeUnsupportedLocalModel,
@@ -84,7 +84,7 @@ import { LocalModelRemovals, type LocalModelRemovalState } from "./local-model-r
 // seconds of event-loop time when the whole list is projected on each inference change.
 const decodeLocalModelAssessment = Schema.decodeUnknownSync(LocalModelAssessmentSchema)
 const decodeDrafterVerdict = Schema.decodeUnknownOption(DrafterVerdictSchema)
-const validateModelCapabilities = Schema.validateSync(ModelCapabilitiesSchema)
+const validateModelCapabilities = Schema.validateOption(ModelCapabilitiesSchema)
 const validateDoesNotFitAssessment = Schema.validateSync(LocalModelDoesNotFitAssessmentSchema)
 const validateCatalogLocalModel = Schema.validateSync(CatalogLocalModelSchema)
 const validateCustomLocalModel = Schema.validateSync(CustomLocalModelSchema)
@@ -194,12 +194,14 @@ export const coordinatedAssessment = (
   if (entry === undefined || entry.state._tag === "Assessing") return undefined
   if (entry.state._tag === "Dropped") return { _tag: "Dropped" }
   const assessment = entry.state.profiles[0]
-  return assessment === undefined
+  // Capabilities that violate the product contract fail this one assessment, never the whole list.
+  const capabilities = validateModelCapabilities(entry.state.capabilities)
+  return assessment === undefined || Option.isNone(capabilities)
     ? { _tag: "Dropped" }
     : {
         _tag: "Assessed",
         assessment: projectAssessment(snapshot.environmentId, assessment),
-        capabilities: entry.state.capabilities,
+        capabilities: capabilities.value,
         drafter: assessment._tag === "Unsupported" ? undefined : productDrafterVerdict(assessment.drafter),
       }
 }
@@ -288,7 +290,7 @@ export const catalogModelServingState = (
   }
   const assessed = {
     metadata: ready.metadata,
-    capabilities: validateModelCapabilities(assessment.capabilities),
+    capabilities: assessment.capabilities,
     speculativeMethod: ready.speculativeMethod,
   }
   return assessment.assessment._tag === "Fits"
@@ -401,7 +403,7 @@ export const customModelServingState = (
   return {
     _tag: "Assessed",
     metadata: state.model.metadata,
-    capabilities: validateModelCapabilities(assessment.capabilities),
+    capabilities: assessment.capabilities,
     speculativeMethod: state.model.speculativeMethod,
     assessment: assessment.assessment,
   }
