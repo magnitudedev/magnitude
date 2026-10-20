@@ -356,8 +356,6 @@ mod attr {
     pub const COOPERATIVE_LAUNCH: i32 = 99;
     pub const MAX_BLOCKS_PER_MULTIPROCESSOR: i32 = 106;
     pub const INTEGRATED: i32 = 18;
-    pub const MEMORY_CLOCK_RATE: i32 = 36;
-    pub const GLOBAL_MEMORY_BUS_WIDTH: i32 = 37;
     /// `CU_DEVICE_ATTRIBUTE_NUMA_CONFIG`: whether the device's memory is an
     /// OS NUMA node.
     pub const NUMA_CONFIG: i32 = 130;
@@ -389,11 +387,8 @@ pub struct DeviceDescriptor {
     pub total_memory_bytes: u64,
     /// `CU_DEVICE_ATTRIBUTE_INTEGRATED`: the device shares host memory.
     pub integrated: bool,
-    /// Peak memory bandwidth in bytes per second of a discrete device:
-    /// double-data-rate memory clock times bus width. `None` for an
-    /// integrated device, or when the driver reports either as zero or does
-    /// not report it.
-    pub memory_bandwidth: Option<u64>,
+    /// `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`: zero for a device without one.
+    pub l2_cache_bytes: u64,
     /// `cuDriverGetVersion`.
     pub driver_api: DriverApiVersion,
     /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR` / `_MINOR`.
@@ -510,19 +505,6 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
         .attribute(attr::INTEGRATED, device)
         .map_err(unavailable)?
         != 0;
-    // A discrete board's memory clock and bus give its bandwidth. An
-    // integrated device's shared memory has no meaningful board clock (GB10
-    // reports twice its LPDDR5X bandwidth), and newer drivers may not report
-    // the clock at all; either way bandwidth is resolved from the device's
-    // published specification.
-    let (clock_khz, bus_bits) = if integrated {
-        (None, None)
-    } else {
-        (
-            driver.attribute(attr::MEMORY_CLOCK_RATE, device).ok(),
-            driver.attribute(attr::GLOBAL_MEMORY_BUS_WIDTH, device).ok(),
-        )
-    };
     Ok(DeviceDescriptor {
         ordinal,
         uuid,
@@ -531,9 +513,12 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
             .into_owned(),
         total_memory_bytes: memory as u64,
         integrated,
-        memory_bandwidth: clock_khz.zip(bus_bits).and_then(|(clock, bus)| {
-            memory_bandwidth(u64::try_from(clock).ok()?, u64::try_from(bus).ok()?)
-        }),
+        l2_cache_bytes: u64::try_from(
+            driver
+                .attribute(attr::L2_CACHE_SIZE, device)
+                .map_err(unavailable)?,
+        )
+        .map_err(|_| TargetError::DeviceUnavailable("negative L2 cache size".into()))?,
         driver_api: DriverApiVersion(u32::try_from(version).map_err(|_| {
             TargetError::UnsupportedDriver(format!("driver API version {version}"))
         })?),
@@ -541,28 +526,6 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
         numa_node: numa_node(&driver, device)?,
         luid: luid(&driver, device)?,
     })
-}
-
-/// Double-data-rate bandwidth of a memory clock (kHz) over a bus (bits).
-fn memory_bandwidth(clock_khz: u64, bus_bits: u64) -> Option<u64> {
-    if clock_khz == 0 || bus_bits == 0 {
-        return None;
-    }
-    Some(2 * clock_khz * 1000 * bus_bits / 8)
-}
-
-#[cfg(test)]
-mod memory_bandwidth_tests {
-    use super::memory_bandwidth;
-
-    #[test]
-    fn published_boards_follow_from_clock_and_bus() {
-        // RTX 4090: 10,501 MHz on 384 bits.
-        assert_eq!(memory_bandwidth(10_501_000, 384), Some(1_008_096_000_000));
-        // RTX 5090: 14,001 MHz on 512 bits.
-        assert_eq!(memory_bandwidth(14_001_000, 512), Some(1_792_128_000_000));
-        assert_eq!(memory_bandwidth(0, 384), None);
-    }
 }
 
 /// `CUDA_ERROR_INVALID_VALUE`.

@@ -49,13 +49,17 @@ const kindOrder: Record<LocalModelOption["kind"], number> = {
   downloadable: 2,
 }
 
+/** Utility over the scores present; without a speed estimate it is intelligence and fidelity alone. */
 export const localModelRankingUtility = (
   scores: LocalModelRankingScores,
   fastToSmart: number,
 ): number => {
   const preference = clamp01(fastToSmart)
   return scores.intelligence ** (0.9 * preference)
-    * scores.speed ** (0.9 * (1 - preference))
+    * Option.match(scores.speed, {
+      onNone: () => 1,
+      onSome: (speed) => speed ** (0.9 * (1 - preference)),
+    })
     * scores.fidelity ** 0.1
 }
 
@@ -69,7 +73,8 @@ export const rankedLocalModelOptions = (
 ): readonly LocalModelOption[] => options
   .flatMap((option): readonly {
     readonly option: LocalModelOption
-    readonly utility: Option.Option<number>
+    readonly speedEstimated: boolean
+    readonly utility: number
   }[] => {
     if (option.model._tag !== "Catalog" || !localModelIsAvailable(option.model)) return []
     const serving = option.model.servingState
@@ -80,18 +85,15 @@ export const rankedLocalModelOptions = (
       || serving.assessment.memory.totalRequiredBytes > Math.max(0, preference.memoryBudgetBytes)) return []
     return [{
       option,
-      utility: Option.map(serving.rankingScores, (scores) =>
-        localModelRankingUtility(scores, preference.fastToSmart)),
+      speedEstimated: Option.isSome(serving.rankingScores.speed),
+      utility: localModelRankingUtility(serving.rankingScores, preference.fastToSmart),
     }]
   })
-  // A fitting model without ranking scores (its speed is unavailable) follows every ranked model.
-  .sort((left, right) => Option.match(left.utility, {
-    onNone: () => Option.isSome(right.utility) ? 1 : 0,
-    onSome: (leftUtility) => Option.match(right.utility, {
-      onNone: () => -1,
-      onSome: (rightUtility) => rightUtility - leftUtility,
-    }),
-  }) || left.option.model.modelId.localeCompare(right.option.model.modelId))
+  // Utilities with and without the speed term are not comparable, so a fitting model whose speed
+  // is pending or unavailable follows every model with an estimate, ranked among its own kind.
+  .sort((left, right) => Number(right.speedEstimated) - Number(left.speedEstimated)
+    || right.utility - left.utility
+    || left.option.model.modelId.localeCompare(right.option.model.modelId))
   .slice(0, Math.max(0, Math.floor(limit)))
   .map(({ option }) => option)
 

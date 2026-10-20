@@ -23,7 +23,24 @@
 //! <root>/prepared/<key>                a Prepare of the load this key names ran to
 //!                                      its end: a load asked to report unprepared
 //!                                      units finds none before it opens a device
+//! <root>/records/<digest>.json         Seismic's measurement records, one outcome
+//!                                      per point key (its timing, or why it is
+//!                                      unobtainable)
+//!                                      ([`KernelCache::measurement_records`])
+//! <root>/measurement-attempts/<digest>.json
+//!                                      how many measurement jobs ended while
+//!                                      measuring one point
+//!                                      ([`KernelCache::measurement_attempts`])
 //! ```
+//!
+//! The measurement records and their attempts are not the cache's entries.
+//! A record is valid while its key (the executor's hardware and driver, the
+//! kernel's source, its configuration and point) matches, and is taken
+//! again when it does not; losing one costs a measurement job. An attempt is
+//! the measurement job's record of a point that ended jobs, and losing one
+//! would have the job retry a point that hangs the driver. So eviction never
+//! removes them and their use time is never kept; everything below about
+//! entries is about the other directories.
 //!
 //! A unit's record is its choice and its evidence. They are separate files
 //! because their readers are: every load decodes the choice, and the
@@ -52,6 +69,7 @@
 //! time, and opening the cache evicts the least recently used entries above
 //! its capacity.
 
+use seismic::measure::JsonFileStore;
 #[cfg(test)]
 use seismic::TuningTime;
 use seismic::{ArtifactKey, ArtifactStore, TuningResult};
@@ -74,6 +92,11 @@ const TUNING: &str = "tuning";
 const EVIDENCE: &str = "evidence";
 const READOUT: &str = "readout";
 const PREPARED: &str = "prepared";
+const RECORDS: &str = "records";
+const MEASUREMENT_ATTEMPTS: &str = "measurement-attempts";
+/// The directories under the root that hold no entry: eviction never walks
+/// them.
+const KEPT: [&str; 2] = [RECORDS, MEASUREMENT_ATTEMPTS];
 
 /// The bytes at `path`, refreshing its use time; `None` on any failure.
 fn read_entry(path: &Path) -> Option<Vec<u8>> {
@@ -180,6 +203,21 @@ impl KernelCache {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The measurement job's attempt records kept in the kernel cache at
+    /// `root`, beside the measurement records they are of. Eviction leaves
+    /// them alone.
+    pub fn measurement_attempts(root: &Path) -> JsonFileStore {
+        JsonFileStore::new(&root.join(MEASUREMENT_ATTEMPTS))
+    }
+
+    /// Seismic's measurement records kept in the kernel cache at `root`, one
+    /// file per point key: the store a measurement reads and writes them
+    /// through. Eviction leaves them alone: a record is valid while its key
+    /// matches.
+    pub fn measurement_records(root: &Path) -> JsonFileStore {
+        JsonFileStore::new(&root.join(RECORDS))
     }
 
     fn entry(&self, directory: &str, key: &str, extension: &str) -> PathBuf {
@@ -346,10 +384,11 @@ impl KernelCache {
     }
 
     /// Remove abandoned temporary files, then the least recently used
-    /// entries until the rest fit `capacity`. Every file under the root
-    /// belongs to an entry ([`Self::eviction_entry`]); an entry is as large
-    /// as its files together, was used when the latest of them was, and is
-    /// removed whole.
+    /// entries until the rest fit `capacity`. Every file under the root but
+    /// the measurement records and their attempts belongs to an entry
+    /// ([`Self::eviction_entry`]); an entry is as large as its files
+    /// together, was used when the latest of them was, and is removed whole.
+    /// The directories of [`KEPT`] are never walked.
     fn evict(&self, capacity: u64) {
         let now = SystemTime::now();
         let mut files = Vec::new();
@@ -364,7 +403,11 @@ impl KernelCache {
                 };
                 let path = item.path();
                 if metadata.is_dir() {
-                    directories.push(path);
+                    // Measurement records and the job's attempts are valid by
+                    // their key, not their use time.
+                    if !KEPT.iter().any(|kept| path == self.root.join(kept)) {
+                        directories.push(path);
+                    }
                     continue;
                 }
                 let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -465,6 +508,26 @@ mod tests {
         drop(KernelCache::open(root.clone(), 1000).unwrap());
         assert!(!old.exists());
         assert!(recent.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Measurement records and the job's attempts are no entry of the
+    /// cache: eviction leaves them however old they are and whatever the
+    /// capacity.
+    #[test]
+    fn eviction_leaves_the_measurements() {
+        let root = scratch("measurements");
+        let kept = KEPT.map(|directory| {
+            fs::create_dir_all(root.join(directory)).unwrap();
+            let path = root.join(directory).join("digest.json");
+            fs::write(&path, [0; 600]).unwrap();
+            let file = fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+                .unwrap();
+            path
+        });
+        drop(KernelCache::open(root.clone(), 0).unwrap());
+        assert!(kept.iter().all(|path| path.exists()));
         fs::remove_dir_all(root).unwrap();
     }
 

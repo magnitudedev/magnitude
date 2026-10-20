@@ -123,36 +123,6 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "rotary sin/cos shared by attention and vision; inside `attention.h` / `attention.cuh` elsewhere",
     ),
     (
-        "lib/routed/expert_gate",
-        &[BackendName::Vulkan],
-        "representation ladder of `expert_gate` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
-    ),
-    (
-        "lib/routed/expert_up",
-        &[BackendName::Vulkan],
-        "representation ladder of `expert_up` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
-    ),
-    (
-        "lib/routed/expert_down",
-        &[BackendName::Vulkan],
-        "representation ladder of `expert_down` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
-    ),
-    (
-        "lib/streams/down_weight",
-        &[BackendName::Vulkan],
-        "representation ladder of a mix site's `down_weight` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
-    ),
-    (
-        "lib/streams/inject_weight",
-        &[BackendName::Vulkan],
-        "representation ladder of a mix site's `inject_weight` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
-    ),
-    (
-        "lib/streams/up_weight",
-        &[BackendName::Vulkan],
-        "representation ladder of a mix site's `up_weight` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
-    ),
-    (
         "lib/recurrent/convolution",
         &[BackendName::Metal],
         "the gated-delta convolution and window publication, apart from `recurrent.h` because the Metal-only `gated_delta_step_convolved` binds no window; the other backends keep them in their recurrent library",

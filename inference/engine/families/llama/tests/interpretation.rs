@@ -1,5 +1,6 @@
 use magnitude_artifacts::{
-    gguf::{Array, Directory, Scalar, Value},
+    catalog_headers::ComponentRole,
+    gguf::{Directory, Scalar, Value},
     ArtifactIdentity, PackageIdentity,
 };
 use magnitude_family_common::headers::{self, add_tensor, set as set_metadata};
@@ -11,10 +12,7 @@ use magnitude_artifacts::UnsupportedReason;
 use magnitude_family_contracts::FamilyError;
 use magnitude_family_llama::{admit, inspect_components, Error, Feature, LlamaFamily};
 
-const VARIANTS: [&str; 2] = [
-    "minicpm5-2b__target-gguf_q4.json",
-    "minicpm5-2b__target-gguf_q8.json",
-];
+const VARIANTS: [&str; 2] = ["minicpm5-2b__target-gguf:q4", "minicpm5-2b__target-gguf:q8"];
 
 fn identity() -> PackageIdentity {
     PackageIdentity {
@@ -28,13 +26,13 @@ fn inspect(directory: &Directory) -> Result<ModelDefinition, Error> {
 }
 
 fn minicpm5() -> Directory {
-    headers::directory(VARIANTS[0])
+    headers::catalog(VARIANTS[0])
 }
 
 #[test]
 fn every_minicpm5_variant_binds_the_admitted_feature_set() {
     let definitions = VARIANTS.map(|file| {
-        inspect(&headers::directory(file)).unwrap_or_else(|error| panic!("{file}: {error}"))
+        inspect(&headers::catalog(file)).unwrap_or_else(|error| panic!("{file}: {error}"))
     });
     // Variants differ only in encodings, which the definition does not carry.
     assert_eq!(definitions[0], definitions[1]);
@@ -123,12 +121,15 @@ fn every_minicpm5_variant_binds_the_admitted_feature_set() {
 
 #[test]
 fn claims_no_other_catalog_component() {
-    for (model, role, file) in headers::index() {
-        let expected = model.starts_with("minicpm5-") && role.starts_with("target-");
+    for component in headers::index() {
+        // MiniCPM5's targets, the 1B and the 2B.
+        let expected = component.model.starts_with("minicpm5-")
+            && matches!(component.role, ComponentRole::Target { .. });
         assert_eq!(
-            LlamaFamily.recognizes(&headers::directory(&file)),
+            LlamaFamily.recognizes(&headers::component(component)),
             expected,
-            "{file}"
+            "{}",
+            headers::key(component)
         );
     }
 }

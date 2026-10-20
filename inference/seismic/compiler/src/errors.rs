@@ -135,6 +135,14 @@ pub enum InvocationError {
         required: seismic_lang::expr::BigUint,
         available: u64,
     },
+    /// A call-time dimension that a native implementation's calls are held
+    /// to a range of is outside it in this invocation.
+    OutsideRange {
+        dimension: String,
+        low: u64,
+        high: u64,
+        actual: u64,
+    },
     /// A dimension fixed when a native implementation was prepared has a
     /// different value in this invocation.
     StaticDimension {
@@ -290,6 +298,15 @@ impl fmt::Display for InvocationError {
                     "allocation needs {required} bytes but {available} are available"
                 )
             }
+            Self::OutsideRange {
+                dimension,
+                low,
+                high,
+                actual,
+            } => write!(
+                f,
+                "dimension `{dimension}` is {actual}, outside the range {low}..={high} the native implementation was prepared for"
+            ),
             Self::StaticDimension {
                 dimension,
                 expected,

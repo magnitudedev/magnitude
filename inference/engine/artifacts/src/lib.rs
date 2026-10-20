@@ -4,6 +4,7 @@
 //! and owns bounded prepared media values before device execution. Model
 //! families assign numerical meaning to those facts elsewhere.
 
+pub mod catalog_headers;
 mod error;
 pub mod gguf;
 mod identity;

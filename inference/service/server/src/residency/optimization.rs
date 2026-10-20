@@ -1,9 +1,10 @@
 //! Post-install kernel tuning: after a catalog download, one inference worker runs the model's
 //! Prepare on the device a load would select, so the first load finds every tuning record in the
 //! kernel cache and is one worker, as any later load. The job resolves and previews exactly as a
-//! load does, holds the residency side of the device exclusion, and never imports the model. A
-//! load of the same bundle stops it; the records it published stand, and the load has its own
-//! Prepare search the units the job had not reached.
+//! load does, shares the device against the measurement job as a load does
+//! ([`crate::device_lock`]), and never imports the model. A load of the same bundle stops it; the
+//! records it published stand, and the load has its own Prepare search the units the job had not
+//! reached.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -149,7 +150,8 @@ async fn prepare(
     };
     let device = load_plan(&preview)?.device;
     progress(CatalogOptimizationProgress::preparing(Some(device.clone())));
-    let spawned = EngineWorker::spawn(&environment.launcher).map_err(|error| {
+    let share = Arc::new(environment.device.share().await);
+    let spawned = EngineWorker::spawn(&environment.launcher, share).map_err(|error| {
         ModelOperationFailure::new("worker_spawn_failed", format!("{error:#}"), true)
     })?;
     let worker = Arc::clone(&spawned.worker);

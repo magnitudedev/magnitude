@@ -34,9 +34,9 @@ pub use host::{
 pub use inventory::Inventory;
 pub use model::{
     AccessPath, AccessPathId, AccessRoute, Availability, DeviceMemory, DeviceTopology, Diagnostic,
-    DiagnosticSource, Executor, ExecutorId, ExecutorKind, Limits, PhysicalDevice, PhysicalDeviceId,
-    PhysicalIdentity, Reported, ReportedBy, Revision, StorageKind, Store, StoreId, StoreIdentity,
-    StoreKind, TransferPath, TransferPathId, VolumeId,
+    DiagnosticSource, Executor, ExecutorId, ExecutorKind, Identity, Limits, PhysicalDevice,
+    PhysicalDeviceId, PhysicalIdentity, Reported, ReportedBy, Revision, StorageKind, Store,
+    StoreId, StoreIdentity, StoreKind, TransferPath, TransferPathId, VolumeId,
 };
 pub use seismic_lang::registry::BackendName;
 pub use selector::{ExecutorSelector, SelectorParseError};

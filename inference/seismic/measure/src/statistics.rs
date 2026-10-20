@@ -1,5 +1,6 @@
-//! The sampling statistics: the median, the paired sign test a timed
-//! comparison is resolved by, and the order of a round's samples.
+//! The sampling statistics: the median and its anytime-valid interval, the
+//! paired sign test a timed comparison is resolved by, the one stopping rule
+//! of a measured time, and the order of a round's samples.
 //!
 //! # What a comparison decides, and by which statistic
 //!
@@ -49,6 +50,8 @@
 //! from `α` and what it has seen ([`Tally::fewest`]): every one of them
 //! ahead. With `α = 0.05` a new comparison leads after seven rounds all
 //! ahead (`M_7(7) = 255 / 8 ≥ 20 > 127 / 7 = M_6(6)`).
+
+use serde::{Deserialize, Serialize};
 
 /// The median of `samples`; the mean of the middle two for an even count.
 pub fn median(samples: &[f64]) -> f64 {
@@ -102,6 +105,52 @@ fn wealth(rounds: u32, favourable: u32) -> f64 {
     sum / (n + 1.)
 }
 
+/// An anytime-valid confidence interval for the median of the distribution
+/// `samples` are drawn from, at error rate `rate`; none while no interval
+/// is resolved (too few samples).
+///
+/// The same test as a comparison's, of a claim about one value `m`: "the
+/// median is above `m`" counts as favourable the samples above `m`, and
+/// while the median is not above `m` a sample is above it with probability
+/// at most one half, so `M_n(above)` is a nonnegative supermartingale that
+/// starts at one; likewise "below". Each claim is given `rate / 2`, so the
+/// median lies outside the interval of every `m` neither claim resolves with
+/// probability at most `rate`, however many samples are taken and whenever
+/// the caller stops. With `s` the fewest of `n` favourable samples that
+/// resolve a claim, "above `m`" is resolved for every `m` below the `s`-th
+/// largest sample and "below `m`" for every `m` above the `s`-th smallest:
+/// the interval is those two order statistics.
+pub fn median_interval(samples: &[f64], rate: f64) -> Option<(f64, f64)> {
+    let n = u32::try_from(samples.len()).expect("fewer than 2^32 samples");
+    let resolving = resolving(n, rate)?;
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    // A claim with at most half its samples favourable is never resolved
+    // (`M_n(s) ≤ 1` for `s ≤ n / 2`), so `resolving > n / 2` and the lower
+    // order statistic is at most the upper.
+    Some((
+        sorted[(n - resolving) as usize],
+        sorted[resolving as usize - 1],
+    ))
+}
+
+/// The fewest of `samples` favourable samples that resolve a claim about
+/// the median at error rate `rate` ([`median_interval`]); none while no
+/// count of them does.
+fn resolving(samples: u32, rate: f64) -> Option<u32> {
+    (0..=samples).find(|&favourable| wealth(samples, favourable) * rate / 2. >= 1.)
+}
+
+/// The fewest samples [`median_interval`] bounds the median of at error
+/// rate `rate`: below them no sampling is resolved, whatever it read.
+pub(crate) fn fewest_bounding(rate: f64) -> usize {
+    // All of `n` samples favourable multiply the mixture by a factor that
+    // tends to two each, so some count resolves.
+    (1..)
+        .find(|&samples| resolving(samples, rate).is_some())
+        .expect("samples all favourable resolve a claim") as usize
+}
+
 impl Tally {
     /// One more round came out at `difference` (`d_r`).
     pub fn observe(&mut self, difference: f64) {
@@ -141,6 +190,57 @@ impl Tally {
     }
 }
 
+/// How close to its median a measured time is resolved, as a fraction of
+/// the median on either side: 10%. Measured times price the engine's
+/// estimate, whose own error is about ±15% typical
+/// (specs/26-10-18/device-topology.md §2.14), so precision finer than 10%
+/// is discarded (§2.6). The one place it is said; [`Timing::resolved`]
+/// reads it.
+pub const MEDIAN_TOLERANCE: f64 = 0.10;
+
+/// One measured time: the median of its samples, the anytime-valid
+/// confidence interval for it at the error rate it was sampled at (none
+/// while too few samples bound one), and how many samples it is of.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Timing {
+    /// Median of the samples, in seconds per call.
+    pub median: f64,
+    /// The anytime-valid interval for the median; none while too few
+    /// samples bound one, or where no stopping rule decided their count.
+    pub interval: Option<(f64, f64)>,
+    /// How many samples it is of.
+    pub samples: u32,
+}
+
+impl Timing {
+    /// The timing of `samples` at error rate `error_rate`: the one stopping
+    /// rule every measured time is read by.
+    pub fn of(samples: &[f64], error_rate: f64) -> Self {
+        Self {
+            median: median(samples),
+            interval: median_interval(samples, error_rate),
+            samples: u32::try_from(samples.len()).expect("fewer than 2^32 samples"),
+        }
+    }
+
+    /// Whether the interval lies within [`MEDIAN_TOLERANCE`] of the median
+    /// on either side, so sampling may stop.
+    pub fn resolved(&self) -> bool {
+        self.interval.is_some_and(|(lower, upper)| {
+            lower >= self.median * (1. - MEDIAN_TOLERANCE)
+                && upper <= self.median * (1. + MEDIAN_TOLERANCE)
+        })
+    }
+}
+
+/// When the stopping rule is next read: at counts growing by a sixteenth,
+/// so reading it over `n` samples costs O(n log² n) rather than
+/// O(n² log n), and sampling ends at most a sixteenth past where it first
+/// holds; an anytime-valid interval may be read at any count.
+pub(crate) fn next_reading(samples: usize) -> usize {
+    (samples + samples / 16).max(samples + 1)
+}
+
 /// The order of a round's samples: a new random one each round
 /// (xorshift64*). A device whose speed is still changing gives the later
 /// samples of a round a different clock than the earlier ones; in a fixed
@@ -177,6 +277,25 @@ mod tests {
     use super::*;
 
     const RATE: f64 = 0.05;
+
+    /// The interval needs the samples a one-sided claim at half the rate
+    /// needs all favourable (8 at one in twenty), and then lies between
+    /// order statistics that close on the median as samples accumulate.
+    #[test]
+    fn a_median_interval_is_resolved_by_order_statistics() {
+        let fewest = fewest_bounding(RATE);
+        assert_eq!(fewest, 8);
+        let samples = (0..fewest)
+            .map(|index| 1. + index as f64)
+            .collect::<Vec<_>>();
+        assert_eq!(median_interval(&samples[..fewest - 1], RATE), None);
+        assert_eq!(median_interval(&samples, RATE), Some((1., fewest as f64)));
+        let many = (0..1000)
+            .map(|index| f64::from(index % 101))
+            .collect::<Vec<_>>();
+        let (lower, upper) = median_interval(&many, RATE).unwrap();
+        assert!(lower < 50. && 50. < upper && upper - lower < 20.);
+    }
 
     #[test]
     fn the_mixture_is_the_closed_form_of_its_integral() {
@@ -239,5 +358,21 @@ mod tests {
     fn an_even_count_median_is_the_mean_of_the_middle_two() {
         assert_eq!(median(&[4., 1., 3., 2.]), 2.5);
         assert_eq!(median(&[3., 1., 2.]), 2.);
+    }
+
+    /// The stopping rule is read at every count to 32 and then at counts
+    /// growing by a sixteenth.
+    #[test]
+    fn the_stopping_rule_is_read_at_counts_growing_by_a_sixteenth() {
+        let mut readings = Vec::new();
+        let mut next = 1;
+        for _ in 0..200 {
+            readings.push(next);
+            next = next_reading(next);
+        }
+        assert!(readings.windows(2).all(|pair| pair[1] > pair[0]));
+        assert!(readings
+            .windows(2)
+            .all(|pair| pair[0] < 16 || pair[1] <= pair[0] * 17 / 16));
     }
 }

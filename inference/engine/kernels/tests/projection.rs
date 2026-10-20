@@ -5386,7 +5386,7 @@ fn report(label: &str, m: usize, mapping: Mapping, seconds: f64, bytes: usize, m
 }
 
 const TIMING_OPTIONS: seismic::measure::Measure = seismic::measure::Measure {
-    samples: std::num::NonZeroUsize::new(9).unwrap(),
+    stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(9).unwrap()),
     min_sample_seconds: 0.02,
 };
 
@@ -6138,8 +6138,8 @@ fn embedding_rows_read_the_slots_their_directory_names() {
             Err(error) => panic!("gathered rows: CPU unavailable: {error}"),
         };
         eprintln!("gathered rows: testing {backend:?}");
-        let directory = i32_tensor(&device, &[logical], &directory_values);
-        let direct = i32_tensor(&device, &[0], &[]);
+        let directory = i32_tensor(&device, &[logical, 1], &directory_values);
+        let direct = i32_tensor(&device, &[0, 1], &[]);
         for repr in [Repr::Q4k, Repr::Q6k, Repr::Bf16] {
             let table = weight(repr, v, d, 91, 8.0);
             let resident = table.tensor(&device);
@@ -6206,7 +6206,7 @@ fn embedding_rows_read_the_slots_their_directory_names() {
                         vec![
                             Input::Data(table.oracle()),
                             ints(&[rows, 2], &selected),
-                            ints(&[logical], &directory_values),
+                            ints(&[logical, 1], &directory_values),
                             Input::F32(1.0),
                             Input::I32(0),
                             Input::F32(0.0),
@@ -6265,7 +6265,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
             .call(embedding_rows::Args {
                 table: &table.tensor(&device),
                 tokens: &i32_tensor(&device, &[rows, 2], &pairs),
-                directory: &i32_tensor(&device, &[0], &[]),
+                directory: &i32_tensor(&device, &[0, 1], &[]),
                 scale: 1.0,
                 normalize: 0,
                 epsilon: 0.0,
@@ -6290,7 +6290,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
                 .call(embedding_rows::Args {
                     table: &table.tensor(&device),
                     tokens: &i32_tensor(&device, &[rows, 2], &pairs),
-                    directory: &i32_tensor(&device, &[0], &[]),
+                    directory: &i32_tensor(&device, &[0, 1], &[]),
                     scale,
                     normalize,
                     epsilon: 1e-5,
@@ -6346,7 +6346,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
                     vec![
                         Input::Data(table.oracle()),
                         ints(&[rows, 2], &pairs),
-                        ints(&[0], &[]),
+                        ints(&[0, 1], &[]),
                         Input::F32(1.0),
                         Input::I32(0),
                         Input::F32(0.0),
@@ -6763,7 +6763,7 @@ fn time_draft_full_vocabulary_readout() {
             let measurement = measured(
                 point,
                 &seismic::measure::Measure {
-                    samples: std::num::NonZeroUsize::MIN,
+                    stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::MIN),
                     min_sample_seconds: 0.0,
                 },
             );
@@ -6779,10 +6779,12 @@ fn time_draft_full_vocabulary_readout() {
 /// gathered RMS inputs, both activation fragments, and split-K reduction.
 #[test]
 fn metal_q4_verify_rows_match_host() {
-    let device = devices()
+    let Some(device) = devices()
         .into_iter()
         .find(|d| d.backend() == BackendName::Metal)
-        .unwrap();
+    else {
+        return;
+    };
     let act = Act::Bf16;
     let (h, f) = (2560, 131);
     let gate = weight(Repr::Q4g32s, f, h, 61, 1.0);
@@ -6921,10 +6923,12 @@ fn gemma_q4_verify_timing() {
 /// nonzero term, so accumulation reassociation cannot explain a difference.
 #[test]
 fn metal_normalize_prepass_matches_small_row_tree() {
-    let device = devices()
+    let Some(device) = devices()
         .into_iter()
         .find(|d| d.backend() == BackendName::Metal)
-        .unwrap();
+    else {
+        return;
+    };
     let h = 3840usize;
     let mut identity = Weight {
         repr: Repr::Bf16,

@@ -141,6 +141,38 @@ impl Workers {
         self.shared.wake.notify_one();
     }
 
+    /// `a` and `b` at once, as [`Workers::each`] runs two items: what each
+    /// returned. Work of different types is joined so, never gathered by
+    /// its position in one batch.
+    pub fn join<RA: Send, RB: Send>(
+        &self,
+        a: impl FnOnce() -> RA + Send,
+        b: impl FnOnce() -> RB + Send,
+    ) -> (RA, RB) {
+        /// Run the work in `work` once into `into`: `each` runs every item
+        /// once, and resumes a panic of one before it returns.
+        fn run<R>(work: &Mutex<Option<impl FnOnce() -> R>>, into: &Mutex<Option<R>>) {
+            let work = work.lock().expect("no work panics holding its slot").take();
+            let work = work.expect("each runs every item once");
+            *into.lock().expect("no work panics holding its slot") = Some(work());
+        }
+        fn result<R>(slot: Mutex<Option<R>>) -> R {
+            slot.into_inner()
+                .expect("no work panics holding its slot")
+                .expect("each runs every item before it returns")
+        }
+        let (a, b) = (Mutex::new(Some(a)), Mutex::new(Some(b)));
+        let (ra, rb) = (Mutex::new(None), Mutex::new(None));
+        self.each(&[false, true], |&second| {
+            if second {
+                run(&b, &rb);
+            } else {
+                run(&a, &ra);
+            }
+        });
+        (result(ra), result(rb))
+    }
+
     /// `form` each of `work`, as many at once as the set has threads free
     /// and the calling thread besides; what each formed, in order. The
     /// caller takes part, so this returns whether or not a thread of the
@@ -408,6 +440,25 @@ mod tests {
             outer.iter().map(|outer| outer * 50 + 10).collect::<Vec<_>>()
         );
         assert!(threads.lock().unwrap().len() <= 3);
+    }
+
+    /// Joined work of different types returns each result as its own, at
+    /// once, nested as deep as it is handed out.
+    #[test]
+    fn joined_work_returns_each_result_in_its_type() {
+        let workers = Workers::new(2);
+        let started = std::sync::Barrier::new(2);
+        let (text, (number, flag)) = workers.join(
+            || {
+                started.wait();
+                String::from("formed")
+            },
+            || {
+                started.wait();
+                workers.join(|| 7u64, || true)
+            },
+        );
+        assert_eq!((text.as_str(), number, flag), ("formed", 7, true));
     }
 
     /// A narrowed set works a batch on no more threads than it was allowed,

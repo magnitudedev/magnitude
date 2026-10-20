@@ -40,16 +40,17 @@ use crate::api::device::DeviceInner;
 use crate::api::kernel::{EncodedArgs, PrepareError};
 use crate::api::{CallError, TensorError};
 use seismic_compiler::errors::ExecutionError;
-use seismic_compiler::prepared::{InvocationContract, validate_invocation};
+use seismic_compiler::prepared::{validate_invocation, InvocationContract};
 use seismic_lang::checked::{CheckedModule, NativeImplementation, NativeSpecialization};
 use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::EntryId;
+use seismic_lang::registry::BackendName;
 use seismic_measure::{
-    Clock, Counted, Deadline, Raise, Rounds, Shuffle, Slotted, Tally, Verdict, WorkError, median,
-    median_of, sample, warm,
+    median, median_of, sample, warm, Clock, Counted, Deadline, Raise, Rounds, Shuffle, Slotted,
+    Tally, Verdict, WorkError,
 };
-pub use seismic_native_target::process::{ProcessMemory, return_freed_pages};
+pub use seismic_native_target::process::{return_freed_pages, ProcessMemory};
 pub use seismic_native_target::workers::{Narrowed, Workers};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -7210,6 +7211,119 @@ pub fn implementation_digest(
     Ok(crate::telemetry::hex(&digest.finalize()))
 }
 
+/// Digest of an entry's kernel on `backend` without a device: what a
+/// measurement of its kernel is a function of besides the executor (whose
+/// identity carries the device, its driver and the feature macros its
+/// native sources test) and the configuration measured. It covers the
+/// declaration and the module's source texts, the element bindings by
+/// storage name, the static values, the backend, and, for Metal, CUDA and
+/// Vulkan, the source rendered for the defaults at these bindings and
+/// static values with no device feature enabled (the asset and the ABI
+/// prefix this build renders); for CPU, the compiled implementation's
+/// digest. Vulkan is not rendered where it is not built (macOS).
+///
+/// The toolchain that compiles the source is in the key where nothing else
+/// names it. CUDA's NVRTC is loaded from its own directory
+/// (`SEISMIC_NVRTC_DIRECTORY`) and changes without a driver change, so its
+/// release and this build's compile options are digested; NVRTC that
+/// cannot be loaded is an error. Vulkan's shader compiler is built into
+/// this binary, which the rendered source and the CPU digest do not name
+/// but the engine build's identity does. Metal's compiler is the operating
+/// system's, named by the OS build in the executor's identity. CPU kernels
+/// are compiled into the binary, named by their digest.
+pub fn kernel_digest(
+    backend: BackendName,
+    module: &CheckedModule,
+    entry: EntryId,
+    bindings: &ElementBindings,
+    statics: &NativeSpecialization,
+    cpu: Option<&'static CpuNativeKernels>,
+) -> Result<String, PrepareError> {
+    let entry_name = super::entry_name(module, entry);
+    let declaration = |detail: String| {
+        PrepareError::Preparation(
+            seismic_compiler::errors::PreparationError::NativeSpecialization(detail),
+        )
+    };
+    let implementation = module
+        .native_implementation(entry, backend)
+        .ok_or_else(|| {
+            declaration(format!(
+                "`{entry_name}` has no native implementation for `{}`",
+                backend.as_str()
+            ))
+        })?;
+    let default = implementation
+        .default_specialization(statics)
+        .map_err(|error| declaration(error.to_string()))?;
+    let mut digest = Sha256::new();
+    digest.update(b"kernel-identity-v1");
+    digest.update(backend.as_str().as_bytes());
+    update_declaration_digest(&mut digest, module, &entry_name, implementation);
+    for (parameter, representation) in bindings.iter() {
+        let storage = seismic_lang::registry::representation_info(representation).name;
+        digest.update(format!("{parameter:?}={storage:?};").as_bytes());
+    }
+    digest.update(format!("{default:?}").as_bytes());
+    let dialect = match backend {
+        BackendName::Cpu => {
+            let kernels = cpu.ok_or_else(|| {
+                declaration(format!(
+                    "`{entry_name}` has no compiled CPU native functions in this build"
+                ))
+            })?;
+            digest.update(kernels.digest.as_bytes());
+            None
+        }
+        BackendName::Metal => Some(super::abi::Dialect::Metal(Default::default())),
+        BackendName::Cuda => {
+            // NVRTC is loaded from a directory of its own and can change
+            // without the driver: its release and this build's options
+            // compile the source. It needs no device to be asked.
+            let (major, minor) = seismic_cuda::nvrtc::release()
+                .map_err(|error| declaration(format!("NVRTC is unavailable: {error}")))?;
+            digest.update(format!("nvrtc {major}.{minor};").as_bytes());
+            digest.update(seismic_cuda::nvrtc::COMPILE_OPTIONS.join(" ").as_bytes());
+            Some(super::abi::Dialect::Cuda)
+        }
+        // The lane count is a value the prefix states, not a feature: any
+        // one renders the same source otherwise.
+        #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+        BackendName::Vulkan => Some(super::abi::Dialect::Vulkan(
+            super::abi::vulkan::VulkanFeatures {
+                subgroup_lanes: 32,
+                float16: false,
+                matrix: false,
+                wide_accumulators: false,
+                mixed_dot: false,
+                f32_atomic_add: false,
+                shared_int64_atomics: false,
+            },
+        )),
+        #[cfg(not(any(not(target_os = "macos"), test, feature = "coverage")))]
+        BackendName::Vulkan => {
+            return Err(declaration(
+                "Vulkan sources are not rendered on this host".into(),
+            ));
+        }
+    };
+    if let Some(dialect) = dialect {
+        let logical = module
+            .entry(entry, bindings)
+            .map_err(PrepareError::Source)?;
+        let asset = module.native_asset(entry, backend).ok_or_else(|| {
+            declaration(format!(
+                "native asset of `{entry_name}` is absent from the module"
+            ))
+        })?;
+        digest.update(
+            super::abi::render_source(dialect, &logical, bindings, implementation, &default, asset)
+                .as_bytes(),
+        );
+    }
+    Ok(crate::telemetry::hex(&digest.finalize()))
+}
+
 /// Checked entry IDs carry a process-local owner. A tuning result names the
 /// declaration's values and stable source identity, never that owner. Where
 /// the declaring file was read from is not the implementation either: a build
@@ -9888,12 +10002,16 @@ mod session_golden {
     impl Work for Scripted {
         type Error = CallError;
         type Pending = Read;
+        type Clock = ();
         fn submit(&self, passes: usize) -> Result<Read, CallError> {
             self.log.borrow_mut().push((self.id, passes));
             Ok(Read(self.pass * passes as f64))
         }
         fn calls_per_pass(&self) -> usize {
             1
+        }
+        fn clock(&self) -> Option<()> {
+            Some(())
         }
         fn gauge(&self) -> Result<Box<dyn Gauge<CallError>>, CallError> {
             Ok(Box::new(Scripted {

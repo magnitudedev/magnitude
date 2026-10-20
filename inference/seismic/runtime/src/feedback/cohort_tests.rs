@@ -224,70 +224,77 @@ fn ordered_prefix(input: &tensor[4] i32, out: &mut tensor[4] i32):
         .into(),
     }]))
     .unwrap();
-    let cases: Vec<(&str, Vec<i32>, Option<[i32; 4]>, Vec<i32>, Option<&str>)> = vec![
+    use seismic_lang::reference_math::ScalarFailure;
+    let cases: Vec<(
+        &str,
+        Vec<i32>,
+        Option<[i32; 4]>,
+        Vec<i32>,
+        Option<ScalarFailure>,
+    )> = vec![
         ("divide", vec![20, 2], None, vec![10], None),
         (
             "divide",
             vec![20, 0],
             None,
             vec![7],
-            Some("integer division by zero"),
+            Some(ScalarFailure::IntegerDivisionByZero),
         ),
         (
             "divide",
             vec![i32::MIN, -1],
             None,
             vec![7],
-            Some("signed integer division overflow"),
+            Some(ScalarFailure::SignedDivisionOverflow),
         ),
         (
             "remainder",
             vec![20, 0],
             None,
             vec![7],
-            Some("integer division by zero"),
+            Some(ScalarFailure::IntegerDivisionByZero),
         ),
         (
             "remainder",
             vec![i32::MIN, -1],
             None,
             vec![7],
-            Some("signed integer division overflow"),
+            Some(ScalarFailure::SignedDivisionOverflow),
         ),
         (
             "lanes",
             vec![],
             Some([2, 0, 4, 0]),
             vec![10, 7, 5, 7],
-            Some("integer division by zero"),
+            Some(ScalarFailure::IntegerDivisionByZero),
         ),
         (
             "shifts",
             vec![],
             Some([1, 32, 3, -1]),
             vec![2, 7, 8, 7],
-            Some("integer shift count must be in 0..32"),
+            Some(ScalarFailure::ShiftCount),
         ),
         (
             "unused_tensor",
             vec![],
             Some([2, 0, 4, 0]),
             vec![7],
-            Some("integer division by zero"),
+            Some(ScalarFailure::IntegerDivisionByZero),
         ),
         (
             "unused_local_tensor",
             vec![],
             Some([2, 0, 4, 0]),
             vec![7; 4],
-            Some("integer division by zero"),
+            Some(ScalarFailure::IntegerDivisionByZero),
         ),
         (
             "ordered_prefix",
             vec![],
             Some([2, 0, 4, 0]),
             vec![8; 4],
-            Some("integer division by zero"),
+            Some(ScalarFailure::IntegerDivisionByZero),
         ),
     ];
     for (name, scalars, input, expected, error) in cases {
@@ -337,7 +344,10 @@ fn ordered_prefix(input: &tensor[4] i32, out: &mut tensor[4] i32):
                 .err()
                 .expect("source recipe must report its failure")
                 .to_string();
-            assert!(actual.contains(expected), "{backend:?} {name}: {actual}");
+            assert!(
+                actual.contains(expected.message()),
+                "{backend:?} {name}: {actual}"
+            );
         } else {
             result.unwrap();
         }

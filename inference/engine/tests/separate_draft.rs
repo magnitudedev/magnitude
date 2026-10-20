@@ -12,7 +12,7 @@
 
 use magnitude_engine::{
     assessment::{
-        prepare_model_assessment, AssessmentSetup, ModelPackagePaths, PreparedModelAssessment,
+        prepare_model_assessment, AssessmentStructure, ModelPackagePaths, PreparedModelAssessment,
     },
     build_native_domain,
     composition::{EngineConfiguration, ResolvedEngineConfiguration},
@@ -364,7 +364,7 @@ fn draft_state_copies_and_restores_reproduce_its_proposals() {
 #[ignore = "requires a device, MAGNITUDE_TEST_TARGET_GGUF and MAGNITUDE_TEST_DRAFT_GGUF"]
 fn header_only_assessment_charges_what_a_load_commits() {
     let catalog = seismic::Devices::discover(&[]).unwrap();
-    let setup = AssessmentSetup::discover(
+    let structure = AssessmentStructure::discover(
         &catalog,
         DeviceRequest::Automatic,
         MemoryReserves::standard(),
@@ -379,7 +379,7 @@ fn header_only_assessment_charges_what_a_load_commits() {
             draft: Some(path("MAGNITUDE_TEST_DRAFT_GGUF")),
             method: method(),
         },
-        &setup,
+        &structure,
     )
     .unwrap();
     let PreparedModelAssessment::Planned { draft: plan, .. } = prepared else {

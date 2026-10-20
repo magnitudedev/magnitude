@@ -10,8 +10,9 @@
 //! affecting the target. A projector the family cannot bind is `Rejected`
 //! the same way: the target is interpreted and planned without it, taking
 //! text input only. The selected plan is assessed against stable memory
-//! capacity and the selected device's memory bandwidth. No device is opened,
-//! no weight payload is read and nothing is decoded.
+//! capacity and, once the measurement job has stored them, the selected
+//! executor's measured costs. No device is opened, no weight payload is
+//! read, nothing is decoded and nothing is measured.
 
 use crate::error::{
     classify_catalog, classify_graph, classify_plan, PlanOutcome, UnsupportedModel,
@@ -32,19 +33,20 @@ use magnitude_chat::{
 };
 use magnitude_executor::{
     assessment::{
-        finish_execution_assessment, prepare_execution_assessment, resolve_bandwidth,
-        AssessmentError, AssessmentRequest, DeviceBandwidth, ExecutionAssessment,
-        PreparedExecutionAssessment,
+        assess_execution_fit, estimate_execution, prepare_execution_assessment, AssessmentError,
+        AssessmentRequest, ExecutionAssessment, ExecutionFit, ExecutionShortfall, ExecutorCosts,
+        PerformanceEstimate, PreparedExecutionAssessment, StoredCosts,
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformError, SelectedDevice},
     resident_element, resident_layout, source_element, ExecutionPath, ExecutionPlanDraft,
+    KernelCache,
 };
 use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily};
 use magnitude_scheduler::ServiceLimits;
 use seismic::{DType, DeviceTopology, Devices, Layout, Status};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The package components to assess and the generation method the bundle
@@ -62,23 +64,23 @@ pub struct ModelPackagePaths {
     pub method: ModelMethod,
 }
 
-/// The execution configuration every model is assessed on: the device a
-/// native load selects, its memory bandwidth, one status sample and the
-/// serving policy.
-pub struct AssessmentSetup {
+/// The structural part of the configuration every model is assessed on:
+/// the device a native load selects, the topology, one status sample and
+/// the serving policy. Discovery establishes it and nothing in it is
+/// measured, so the service has it at once.
+pub struct AssessmentStructure {
     pub topology: Arc<DeviceTopology>,
     pub status: Status,
     pub device: DeviceRequest,
     pub selected: SelectedDevice,
-    pub bandwidth: DeviceBandwidth,
     pub reserves: MemoryReserves,
     pub policy: ModelPolicy,
     pub service: ServiceLimits,
 }
 
-impl AssessmentSetup {
-    /// Select the device a native load would select, resolve its bandwidth
-    /// and take one status sample. Opens no device.
+impl AssessmentStructure {
+    /// Select the device a native load would select and take one status
+    /// sample. Opens no device and measures nothing.
     pub fn discover(
         catalog: &Devices,
         device: DeviceRequest,
@@ -88,23 +90,65 @@ impl AssessmentSetup {
     ) -> Result<Self, ModelAssessmentError> {
         let selected = platform::select_device(catalog, ExecutionPath::Native, device, &reserves)
             .map_err(ModelAssessmentError::Platform)?;
-        let topology = catalog.topology();
-        // Apple silicon, the only chips whose bins the core count selects,
-        // has no simultaneous multithreading.
-        let cpu_cores = std::thread::available_parallelism()
-            .map_or(1, |cores| u32::try_from(cores.get()).unwrap_or(u32::MAX));
-        let bandwidth = resolve_bandwidth(&topology, &selected.info, cpu_cores);
         Ok(Self {
-            topology,
+            topology: catalog.topology(),
             status: catalog.status(),
             device,
             selected,
-            bandwidth,
             reserves,
             policy,
             service,
         })
     }
+
+    /// What this machine's stored records give assessment now: the selected
+    /// executor's costs, derived from the records of its cost points in the
+    /// kernel cache at `kernels`, opening no device and measuring nothing.
+    /// A point the measurement job found unobtainable is a record too, so
+    /// the costs complete without it; a point with no record leaves them
+    /// `Pending`, for the job to take. Costs that cannot be derived from
+    /// what is stored (an unreadable record, or a point every estimate
+    /// needs recorded unobtainable) are `Unavailable`.
+    pub fn stored_measurements(&self, kernels: &Path) -> Measurements {
+        let records = KernelCache::measurement_records(kernels);
+        match ExecutorCosts::stored(&self.topology, &self.selected.info, &records) {
+            Ok(StoredCosts::Complete { costs, records }) => Measurements::Measured {
+                costs: Arc::new(costs),
+                records: Arc::new(records),
+            },
+            Ok(StoredCosts::Missing(_)) => Measurements::Pending,
+            Err(error) => Measurements::Unavailable {
+                reason: error.to_string(),
+            },
+        }
+    }
+}
+
+/// What this machine's measurements give assessment. Only the measurement
+/// job takes them (device topology spec §2.15); assessment reads what it
+/// stored.
+#[derive(Clone)]
+pub enum Measurements {
+    /// The job has not stored a record of every point yet: fit is assessed
+    /// and speed is pending.
+    Pending,
+    /// The stored records give no costs, and why: every fitting model's
+    /// speed is unavailable.
+    Unavailable { reason: String },
+    /// The selected executor's costs, and the stored records they were
+    /// derived from, which identify them. What could not be measured is in
+    /// them, so a model whose calls need it estimates as unavailable.
+    Measured {
+        costs: Arc<ExecutorCosts>,
+        records: Arc<Vec<(seismic::PointKey, seismic::measure::Record)>>,
+    },
+}
+
+/// The configuration every model is assessed on: its structure, and what
+/// is measured of this machine. New measurements keep the structure.
+pub struct AssessmentSetup {
+    pub structure: Arc<AssessmentStructure>,
+    pub measurements: Measurements,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -190,12 +234,34 @@ pub struct ModelFacts {
 pub enum ModelAssessment {
     Assessed {
         facts: ModelFacts,
-        execution: ExecutionAssessment,
+        execution: ModelExecution,
     },
     Unsupported {
         unsupported: UnsupportedModel,
         fingerprint: Option<ModelFingerprint>,
     },
+}
+
+/// How a package executes on the setup's selected device: a fitting one
+/// with its decode speed, or why it does not fit.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelExecution {
+    Fits {
+        fit: ExecutionFit,
+        performance: Performance,
+    },
+    DoesNotFit(ExecutionShortfall),
+}
+
+/// A fitting model's decode speed, as this machine's measurements give it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Performance {
+    /// The measurements it is estimated from are not stored yet.
+    Pending,
+    /// A measurement it is estimated from cannot be taken on this machine.
+    Unavailable { reason: String },
+    /// One estimate per requested depth, ascending.
+    Estimated(Vec<PerformanceEstimate>),
 }
 
 /// An operational failure: no result is produced for the package. A
@@ -244,12 +310,14 @@ pub enum PreparedModelAssessment {
     },
 }
 
-/// Complete a prepared model against stable capacity and the device's
-/// bandwidth.
+/// Complete a prepared model against stable capacity and, when it fits,
+/// estimate its decode speed with `sequences` conversations decoding at
+/// once from the setup's measurements: arithmetic over the prepared demand.
 pub fn finish_model_assessment(
     prepared: &PreparedModelAssessment,
     setup: &AssessmentSetup,
     performance_depths: &[u32],
+    sequences: u32,
 ) -> Result<ModelAssessment, ModelAssessmentError> {
     let (facts, draft, preparation) = match prepared {
         PreparedModelAssessment::Unsupported {
@@ -267,19 +335,44 @@ pub fn finish_model_assessment(
             execution,
         } => (facts, draft, execution),
     };
-    let execution = finish_execution_assessment(
+    let structure = &setup.structure;
+    let request = AssessmentRequest {
+        context_limit: facts.context_limit,
+        performance_depths: performance_depths.to_vec(),
+        reserves: structure.reserves,
+        sequences,
+    };
+    let fit = assess_execution_fit(
         preparation,
         draft,
-        &setup.topology,
-        &setup.status,
-        setup.bandwidth,
-        &AssessmentRequest {
-            context_limit: facts.context_limit,
-            performance_depths: performance_depths.to_vec(),
-            reserves: setup.reserves,
-        },
+        &structure.topology,
+        &structure.status,
+        &request,
     )
     .map_err(ModelAssessmentError::Assessment)?;
+    let execution = match fit {
+        ExecutionAssessment::DoesNotFit(shortfall) => ModelExecution::DoesNotFit(shortfall),
+        ExecutionAssessment::Fits(fit) => ModelExecution::Fits {
+            fit,
+            performance: match &setup.measurements {
+                Measurements::Pending => Performance::Pending,
+                Measurements::Unavailable { reason } => Performance::Unavailable {
+                    reason: reason.clone(),
+                },
+                Measurements::Measured { costs, .. } => {
+                    match estimate_execution(preparation, draft, costs, &request) {
+                        Ok(estimates) => Performance::Estimated(estimates),
+                        // A cost the model's calls need could not be measured
+                        // on this machine: its speed is unavailable.
+                        Err(AssessmentError::Unmeasured(reason)) => {
+                            Performance::Unavailable { reason }
+                        }
+                        Err(error) => return Err(ModelAssessmentError::Assessment(error)),
+                    }
+                }
+            },
+        },
+    };
     Ok(ModelAssessment::Assessed {
         facts: facts.clone(),
         execution,
@@ -291,9 +384,10 @@ pub fn assess_model(
     package: &ModelPackagePaths,
     setup: &AssessmentSetup,
     performance_depths: &[u32],
+    sequences: u32,
 ) -> Result<ModelAssessment, ModelAssessmentError> {
-    let prepared = prepare_model_assessment(package, setup)?;
-    finish_model_assessment(&prepared, setup, performance_depths)
+    let prepared = prepare_model_assessment(package, &setup.structure)?;
+    finish_model_assessment(&prepared, setup, performance_depths, sequences)
 }
 
 /// Prepare one package from its headers on the selected execution
@@ -305,12 +399,13 @@ pub fn assess_model(
 /// ([`magnitude_executor::AssessmentMemoryCharge::serving_bytes`]) and the
 /// host memory of its kernels and graphs
 /// ([`magnitude_executor::AssessmentMemoryCharge::host_bytes`]); the drafted
-/// plan is the one assessed.
+/// plan is the one assessed. Reads only the structure, so a preparation
+/// holds under every measurement of it.
 pub fn prepare_model_assessment(
     package: &ModelPackagePaths,
-    setup: &AssessmentSetup,
+    structure: &AssessmentStructure,
 ) -> Result<PreparedModelAssessment, ModelAssessmentError> {
-    prepare_model_assessment_from(package, &FileHeaders, setup)
+    prepare_model_assessment_from(package, &FileHeaders, structure)
 }
 
 /// [`prepare_model_assessment`] with the package's headers from `headers`,
@@ -318,9 +413,9 @@ pub fn prepare_model_assessment(
 pub fn prepare_model_assessment_from(
     package: &ModelPackagePaths,
     headers: &dyn HeaderSource,
-    setup: &AssessmentSetup,
+    structure: &AssessmentStructure,
 ) -> Result<PreparedModelAssessment, ModelAssessmentError> {
-    let layout = resident_layout(ExecutionPath::Native, setup.selected.info.backend());
+    let layout = resident_layout(ExecutionPath::Native, structure.selected.info.backend());
     let admitted = match admit(package, headers, layout)? {
         Admission::Unsupported {
             unsupported,
@@ -334,16 +429,16 @@ pub fn prepare_model_assessment_from(
         Admission::Admitted(admitted) => *admitted,
     };
     let environment = Environment {
-        policy: &setup.policy,
-        service: &setup.service,
-        device: setup.device,
-        reserves: setup.reserves,
+        policy: &structure.policy,
+        service: &structure.service,
+        device: structure.device,
+        reserves: structure.reserves,
     };
     let plain = environment
         .plain(&admitted)
         .map_err(ModelAssessmentError::Configuration)?;
     let (plain_draft, plain_execution) =
-        match prepare_plan(&plain, &setup.selected, admitted.context_limit) {
+        match prepare_plan(&plain, &structure.selected, admitted.context_limit) {
             Ok(planned) => planned,
             Err(Refusal::Unsupported(unsupported)) => {
                 return Ok(PreparedModelAssessment::Unsupported {
@@ -361,7 +456,7 @@ pub fn prepare_model_assessment_from(
         DrafterAdmission::Candidate { definition, method } => environment
             .drafted(&admitted, definition, *method)
             .and_then(|(manifest, method)| {
-                match prepare_plan(&manifest, &setup.selected, admitted.context_limit) {
+                match prepare_plan(&manifest, &structure.selected, admitted.context_limit) {
                     Ok((draft, execution)) => Ok((method, draft, execution)),
                     Err(Refusal::Unsupported(unsupported)) => Err(unsupported),
                     Err(Refusal::Failed(error)) => {

@@ -40,12 +40,32 @@
 //!
 //! How many samples a session takes is its [`Rounds`]' decision, round by
 //! round: a comparison's rounds end when it is resolved
-//! ([`crate::statistics`]), and a measurement of a point's own time takes
-//! the count it was asked for ([`Counted`]).
+//! ([`crate::statistics`]), and a counted session takes the count it was
+//! asked for ([`Counted`]).
+//!
+//! # One work alone
+//!
+//! A measurement of one work's own time ([`crate::measure`]) samples one
+//! slot, so nothing but the work itself need come between its samples, and
+//! each sample's lead is the sample before it: every later sample is
+//! submitted before the one before it is read, and the device goes from
+//! one into the next without a pause. Only the first sample is behind a
+//! lead of its own. Where the stopping rule is read after a sample
+//! ([`Stopping`]), whether a next sample is taken is not known before that
+//! sample is read, so what follows it is a lead: the next sample follows
+//! the lead if the rule continues, and the lead is waited for and nothing
+//! more is taken if it stops. Every sample counted is one the rule read,
+//! no sample is taken beyond where it stops, and a lead is submitted only
+//! where the rule may stop: never more passes than a lead per sample would
+//! take. Work timed on the host completes
+//! inside its submission, so the sample before is complete when the next
+//! is submitted, as a lead of its own would be.
 
 use crate::clock::Clock;
 use crate::deadline::{Deadline, WorkError};
-use crate::statistics::{Shuffle, median, median_of};
+use crate::statistics::{
+    fewest_bounding, median, median_interval, median_of, next_reading, Shuffle, Timing,
+};
 use crate::work::{Pending, Work};
 use std::time::{Duration, Instant};
 
@@ -87,6 +107,52 @@ impl<W: Work> PendingSample<W> {
     fn seconds(self) -> Result<f64, W::Error> {
         Ok(self.pending.seconds()? / self.calls as f64)
     }
+
+    /// Wait for the submission without timing it: a lead, or what is
+    /// drained after a failure.
+    fn wait(self) -> Result<(), W::Error> {
+        self.pending.wait()
+    }
+}
+
+/// A sample begun behind its lead: read already (an uncalibrated slot's
+/// calibrating pass, where that is the sample), or submitted.
+enum Begun<W: Work> {
+    Read(f64),
+    Submitted(PendingSample<W>),
+}
+
+/// What a slot sampled alone submits behind a sample before reading it.
+enum Follow<'a, W: Work> {
+    /// The next sample, where the stopping rule certainly continues.
+    Sample(PendingSample<W>),
+    /// A lead, where the rule is read: the next sample follows it if the
+    /// rule continues.
+    Lead(PendingSample<W>, &'a mut Resolution),
+    /// Nothing, where the rule certainly stops.
+    Nothing,
+}
+
+impl<W: Work> Follow<'_, W> {
+    /// Wait for what was submitted, untimed.
+    fn wait(self) -> Result<(), W::Error> {
+        match self {
+            Self::Sample(pending) | Self::Lead(pending, _) => pending.wait(),
+            Self::Nothing => Ok(()),
+        }
+    }
+}
+
+/// `outcome` of work submitted behind a lead, given the lead's own outcome
+/// (`drained`, waited for after it): the work's failure first, then the
+/// lead's.
+fn behind<T, E>(
+    outcome: Result<T, WorkError<E>>,
+    drained: Result<(), E>,
+) -> Result<T, WorkError<E>> {
+    let value = outcome?;
+    drained?;
+    Ok(value)
 }
 
 impl<W: Work> Slot<W> {
@@ -103,6 +169,11 @@ impl<W: Work> Slot<W> {
     /// The work the slot times.
     pub fn work(&self) -> &W {
         &self.work
+    }
+
+    /// The work the slot times, to be changed between sessions.
+    pub fn work_mut(&mut self) -> &mut W {
+        &mut self.work
     }
 
     /// Seconds per call of every sample taken.
@@ -152,9 +223,7 @@ impl<W: Work> Slot<W> {
     ) -> Result<usize, WorkError<W::Error>> {
         let lead = self.submit_passes(1, deadline)?;
         let measured = self.calibrating_pass(min_sample_seconds, deadline);
-        let drained = lead.pending.wait();
-        let calibration = measured?;
-        drained?;
+        let calibration = behind(measured, lead.wait())?;
         Ok(self.calibrated(calibration))
     }
 
@@ -182,51 +251,130 @@ impl<W: Work> Slot<W> {
         calibration.repetitions
     }
 
+    /// Begin a sample behind `lead`, a pass of the work submitted before
+    /// it: the sample, and the repetitions it takes. An uncalibrated slot's
+    /// sample is first one pass, which gives its repetitions, and is the
+    /// sample itself when they are one; otherwise the sample follows it at
+    /// once.
+    fn begin(
+        &mut self,
+        lead: &PendingSample<W>,
+        min_sample_seconds: f64,
+        deadline: Deadline,
+    ) -> Result<(Begun<W>, usize), WorkError<W::Error>> {
+        if self.pass_seconds.is_none() {
+            // A challenger can inherit the incumbent's repetitions, but not
+            // its latency. Price the already submitted lead before
+            // admitting that first repeated batch.
+            self.pass_seconds = Some(lead.pending.seconds()?);
+        }
+        let repetitions = match self.repetitions {
+            Some(repetitions) => repetitions,
+            None => {
+                let calibration = self.calibrating_pass(min_sample_seconds, deadline)?;
+                let pass = calibration.per_call;
+                let repetitions = self.calibrated(calibration);
+                if repetitions == 1 {
+                    return Ok((Begun::Read(pass), repetitions));
+                }
+                // The calibrating pass just ran: it leads the sample.
+                repetitions
+            }
+        };
+        let sample = self.submit_passes(repetitions, deadline)?;
+        Ok((Begun::Submitted(sample), repetitions))
+    }
+
+    /// A begun sample's seconds per call, once it completes. A submitted
+    /// sample's also price the slot's pass.
+    fn read(&mut self, sample: Begun<W>) -> Result<f64, WorkError<W::Error>> {
+        match sample {
+            Begun::Read(seconds) => Ok(seconds),
+            Begun::Submitted(pending) => {
+                let seconds = pending.seconds()?;
+                // A pending sample already divides by repetitions and call
+                // count. Multiplying by the calls of a pass recovers one
+                // pass.
+                self.pass_seconds = Some(seconds * self.work.calls_per_pass() as f64);
+                Ok(seconds)
+            }
+        }
+    }
+
     /// Take one sample: its seconds per call. The sample is queued behind
-    /// its lead, one pass that is not timed (module documentation). An
-    /// uncalibrated slot's sample is first one pass, which gives its
-    /// repetitions, and is the sample itself when they are one; otherwise
-    /// the sample follows it at once.
+    /// its lead, one pass that is not timed (module documentation).
     fn sample(
         &mut self,
         min_sample_seconds: f64,
         deadline: Deadline,
     ) -> Result<f64, WorkError<W::Error>> {
         let lead = self.submit_passes(1, deadline)?;
-        let measured = (|| -> Result<f64, WorkError<W::Error>> {
-            if self.pass_seconds.is_none() {
-                // A challenger can inherit the incumbent's repetitions,
-                // but not its latency. Price the already submitted lead
-                // before admitting that first repeated batch.
-                self.pass_seconds = Some(lead.pending.seconds()?);
-            }
-            let repetitions = match self.repetitions {
-                Some(repetitions) => repetitions,
-                None => {
-                    let calibration = self.calibrating_pass(min_sample_seconds, deadline)?;
-                    let pass = calibration.per_call;
-                    let repetitions = self.calibrated(calibration);
-                    if repetitions == 1 {
-                        return Ok(pass);
-                    }
-                    // The calibrating pass just ran: it leads the sample.
-                    repetitions
-                }
-            };
-            let seconds = self.submit_passes(repetitions, deadline)?.seconds()?;
-            // A pending sample already divides by repetitions and call
-            // count. Multiplying by the calls of a pass recovers one pass.
-            self.pass_seconds = Some(seconds * self.work.calls_per_pass() as f64);
-            Ok(seconds)
-        })();
-        let drained = lead.pending.wait();
-        let seconds = measured?;
-        drained?;
-        Ok(seconds)
+        let measured = self
+            .begin(&lead, min_sample_seconds, deadline)
+            .and_then(|(sample, _)| self.read(sample));
+        behind(measured, lead.wait())
     }
 
-    /// The samples so far as a measurement.
-    pub fn measurement(&self) -> Measurement {
+    /// Sample the slot alone until `stopping` ends it, each sample queued
+    /// behind the one before it: a measurement of the work's own time,
+    /// raised before by `clock`, the clock it records its first sample
+    /// with (module documentation, "One work alone").
+    pub(crate) fn sample_alone(
+        &mut self,
+        min_sample_seconds: f64,
+        stopping: &mut Stopping,
+        clock: Option<&Clock<W::Error>>,
+        deadline: Deadline,
+    ) -> Result<(), WorkError<W::Error>> {
+        let lead = self.submit_passes(1, deadline)?;
+        let begun = self.begin(&lead, min_sample_seconds, deadline);
+        let (mut sample, repetitions) = behind(begun, lead.wait())?;
+        loop {
+            // Submitted before the sample is read, so that the device goes
+            // from the sample into it without a pause.
+            let follow = match stopping.after(self.samples.len() + 1) {
+                After::Continues => self
+                    .submit_passes(repetitions, deadline)
+                    .map(Follow::Sample),
+                After::Reads(resolution) => self
+                    .submit_passes(1, deadline)
+                    .map(|lead| Follow::Lead(lead, resolution)),
+                After::Stops => Ok(Follow::Nothing),
+            };
+            let read = self.read(sample);
+            // The sample has completed: nothing else is in flight where
+            // what follows it failed to submit.
+            let follow = match follow {
+                Ok(follow) => follow,
+                Err(error) => return read.and(Err(error)),
+            };
+            let seconds = match read {
+                Ok(seconds) => seconds,
+                Err(error) => return behind(Err(error), follow.wait()),
+            };
+            self.samples.push(seconds);
+            if let (Some(clock), 1) = (clock, self.samples.len()) {
+                clock.followed(seconds);
+            }
+            sample = match follow {
+                Follow::Sample(next) => Begun::Submitted(next),
+                Follow::Lead(lead, resolution) => {
+                    if resolution.stops(&self.samples) {
+                        return behind(Ok(()), lead.wait());
+                    }
+                    let next = self.submit_passes(repetitions, deadline);
+                    Begun::Submitted(behind(next, lead.wait())?)
+                }
+                Follow::Nothing => return Ok(()),
+            };
+        }
+    }
+
+    /// The samples so far as a measurement: with the anytime-valid
+    /// interval for their median at `error_rate` where they were sampled to
+    /// the stopping rule at that rate, and none where their count was
+    /// decided otherwise (counted, or matched rounds).
+    pub fn measurement(&self, error_rate: Option<f64>) -> Measurement {
         let median = median(&self.samples);
         let deviation = median_of(
             self.samples
@@ -239,6 +387,7 @@ impl<W: Work> Slot<W> {
             median,
             deviation,
             repetitions: self.repetitions.unwrap_or(1) * self.work.calls_per_pass(),
+            interval: error_rate.and_then(|rate| median_interval(&self.samples, rate)),
         }
     }
 }
@@ -270,8 +419,9 @@ impl<W: Work> Slotted for Slot<W> {
 }
 
 /// The samples of one work: seconds per call of every sample, their median
-/// and median absolute deviation, and the calls a sample's submission
-/// makes.
+/// and median absolute deviation, the calls a sample's submission makes,
+/// and the anytime-valid interval for the median where the measurement was
+/// sampled to a stopping rule.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Measurement {
     /// Seconds per call of every sample, in the order taken.
@@ -282,6 +432,21 @@ pub struct Measurement {
     pub deviation: f64,
     /// Calls per sample submission.
     pub repetitions: usize,
+    /// The anytime-valid interval for the median at the error rate the
+    /// samples were sampled to; none where no stopping rule decided their
+    /// count, or while too few samples bound one.
+    pub interval: Option<(f64, f64)>,
+}
+
+impl Measurement {
+    /// The measurement as the time it records.
+    pub fn timing(&self) -> Timing {
+        Timing {
+            median: self.median,
+            interval: self.interval,
+            samples: u32::try_from(self.samples.len()).expect("fewer than 2^32 samples"),
+        }
+    }
 }
 
 /// A slot whose sample failed, and why.
@@ -335,6 +500,69 @@ impl Rounds for Counted {
 
     fn sampled(&mut self, _: &[(usize, f64)]) {
         self.rounds -= 1;
+    }
+}
+
+/// When a slot sampled alone stops ([`Slot::sample_alone`]): after a count
+/// of samples its caller named, or once its median is resolved
+/// ([`Timing::resolved`] at the error rate), the rule read at counts
+/// growing by a sixteenth. The fewest samples a resolved median takes
+/// follow from the error rate, and its bound holds however many are taken:
+/// a measurement for a caller that names how precise, not how many.
+pub(crate) enum Stopping {
+    /// After this many samples.
+    Count(usize),
+    /// Once the median is resolved.
+    Resolved(Resolution),
+}
+
+/// The stopping rule of a resolved median: its error rate, and the count
+/// it is next read at.
+pub(crate) struct Resolution {
+    error_rate: f64,
+    next: usize,
+}
+
+/// What the stopping rule does once a given count of samples is read.
+enum After<'a> {
+    /// Sampling certainly continues.
+    Continues,
+    /// The rule is read.
+    Reads(&'a mut Resolution),
+    /// Sampling certainly stops.
+    Stops,
+}
+
+impl Stopping {
+    /// Sampling until the median is resolved at `error_rate`. The rule's
+    /// readings are those of counts growing by a sixteenth from one; none
+    /// of them below the fewest samples that bound a median can resolve
+    /// it, so the first reading is the first at or above them.
+    pub(crate) fn resolved(error_rate: f64) -> Self {
+        let fewest = fewest_bounding(error_rate);
+        let mut next = 1;
+        while next < fewest {
+            next = next_reading(next);
+        }
+        Self::Resolved(Resolution { error_rate, next })
+    }
+
+    /// What the rule does once `count` samples are read.
+    fn after(&mut self, count: usize) -> After<'_> {
+        match self {
+            Self::Count(samples) if count < *samples => After::Continues,
+            Self::Count(_) => After::Stops,
+            Self::Resolved(resolution) if count == resolution.next => After::Reads(resolution),
+            Self::Resolved(_) => After::Continues,
+        }
+    }
+}
+
+impl Resolution {
+    /// Whether sampling stops at `samples`, a count the rule is read at.
+    fn stops(&mut self, samples: &[f64]) -> bool {
+        self.next = next_reading(samples.len());
+        Timing::of(samples, self.error_rate).resolved()
     }
 }
 
@@ -423,24 +651,63 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    /// Every submission of the scripted works, as (work, passes); a gauge is
-    /// its work's number plus 100.
-    type Log = Rc<RefCell<Vec<(usize, usize)>>>;
+    /// What the scripted works were asked, in order: each submission as
+    /// (work, passes), a gauge's work numbered its work's plus 100, and
+    /// each read and wait of a submission, by its place among them.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Event {
+        Submitted(usize, usize),
+        Read(usize),
+        Waited(usize),
+    }
 
-    /// Work whose pass takes `pass` seconds on a device with one clock.
+    type Log = Rc<RefCell<Vec<Event>>>;
+
+    /// Every submission of `log`, as (work, passes).
+    fn submissions(log: &Log) -> Vec<(usize, usize)> {
+        log.borrow()
+            .iter()
+            .filter_map(|event| match *event {
+                Event::Submitted(work, passes) => Some((work, passes)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Work whose pass takes `pass` seconds on a device with one clock,
+    /// each submission's passes longer by up to `spread` of it, as a fixed
+    /// sequence of submissions gives.
     struct Scripted {
         id: usize,
         pass: f64,
+        spread: f64,
         log: Log,
     }
 
-    struct Read(f64);
+    impl Scripted {
+        fn new(id: usize, pass: f64, log: &Log) -> Self {
+            Self {
+                id,
+                pass,
+                spread: 0.,
+                log: log.clone(),
+            }
+        }
+    }
+
+    struct Read {
+        seconds: f64,
+        submission: usize,
+        log: Log,
+    }
 
     impl Pending<()> for Read {
         fn seconds(&self) -> Result<f64, ()> {
-            Ok(self.0)
+            self.log.borrow_mut().push(Event::Read(self.submission));
+            Ok(self.seconds)
         }
         fn wait(&self) -> Result<(), ()> {
+            self.log.borrow_mut().push(Event::Waited(self.submission));
             Ok(())
         }
     }
@@ -454,18 +721,29 @@ mod tests {
     impl Work for Scripted {
         type Error = ();
         type Pending = Read;
+        type Clock = ();
         fn submit(&self, passes: usize) -> Result<Read, ()> {
-            self.log.borrow_mut().push((self.id, passes));
-            Ok(Read(self.pass * passes as f64))
+            let submission = submissions(&self.log).len();
+            self.log
+                .borrow_mut()
+                .push(Event::Submitted(self.id, passes));
+            let jitter = (submission * 7919 % 101) as f64 / 101.;
+            Ok(Read {
+                seconds: self.pass * passes as f64 * (1. + self.spread * jitter),
+                submission,
+                log: self.log.clone(),
+            })
         }
         fn calls_per_pass(&self) -> usize {
             1
         }
+        fn clock(&self) -> Option<()> {
+            Some(())
+        }
         fn gauge(&self) -> Result<Box<dyn Gauge<()>>, ()> {
             Ok(Box::new(Scripted {
                 id: self.id + 100,
-                pass: self.pass,
-                log: self.log.clone(),
+                ..Scripted::new(self.id, self.pass, &self.log)
             }))
         }
     }
@@ -493,13 +771,7 @@ mod tests {
         let mut slots = [1e-4, 3e-4]
             .into_iter()
             .enumerate()
-            .map(|(id, pass)| {
-                Slot::new(Scripted {
-                    id,
-                    pass,
-                    log: log.clone(),
-                })
-            })
+            .map(|(id, pass)| Slot::new(Scripted::new(id, pass, &log)))
             .collect::<Vec<_>>();
         let clock = Clock::new(slots[0].work(), 2e-3, 0.05).unwrap();
         warm(&clock, &slots, Deadline::default()).unwrap();
@@ -530,7 +802,7 @@ mod tests {
         ]);
         // The raise after the session: one reading, which passes.
         expected.extend([(100, 20), (100, 20)]);
-        assert_eq!(*log.borrow(), expected);
+        assert_eq!(submissions(&log), expected);
         let raises = clock
             .raises()
             .iter()
@@ -555,11 +827,98 @@ mod tests {
         );
         let measurements = slots
             .iter()
-            .map(|slot| slot.measurement())
+            .map(|slot| slot.measurement(None))
             .collect::<Vec<_>>();
         assert_eq!(measurements[0].samples, [1e-4; 3]);
         assert_eq!(measurements[0].repetitions, 20);
         assert_eq!(measurements[1].samples, [3e-4; 3]);
         assert_eq!(measurements[1].repetitions, 7);
+    }
+
+    /// A work sampled alone a counted number of times is behind one lead:
+    /// each later sample is submitted before the one before it is read, and
+    /// nothing follows the last.
+    #[test]
+    fn a_work_alone_is_led_once_and_each_sample_follows_the_one_before() {
+        use Event::{Read, Submitted, Waited};
+        let log = Log::default();
+        let mut slot = Slot::new(Scripted::new(0, 1e-4, &log));
+        slot.sample_alone(2e-3, &mut Stopping::Count(4), None, Deadline::default())
+            .unwrap_or_else(|_| panic!("scripted work does not fail"));
+        assert_eq!(
+            *log.borrow(),
+            [
+                // The lead, priced; the calibrating pass behind it, whose
+                // 0.1 ms give 20 passes to cover 2 ms; the first sample
+                // behind it; the lead drained.
+                Submitted(0, 1),
+                Read(0),
+                Submitted(0, 1),
+                Read(1),
+                Submitted(0, 20),
+                Waited(0),
+                // Each later sample submitted before the one before it is
+                // read.
+                Submitted(0, 20),
+                Read(2),
+                Submitted(0, 20),
+                Read(3),
+                Submitted(0, 20),
+                Read(4),
+                Read(5),
+            ]
+        );
+        assert_eq!(slot.samples(), [1e-4; 4]);
+    }
+
+    /// A work sampled alone until its median is resolved stops at the
+    /// count the rule stops at read sample by sample from one, with a lead
+    /// behind a sample only where the rule is read: from the fewest samples
+    /// that bound a median on. Its first sample is the one its clock's
+    /// raise records.
+    #[test]
+    fn a_work_alone_stops_where_its_rule_does_with_leads_only_where_it_is_read() {
+        const RATE: f64 = 0.05;
+        let log = Log::default();
+        let mut slot = Slot::new(Scripted {
+            spread: 0.3,
+            ..Scripted::new(0, 1e-4, &log)
+        });
+        let clock = Clock::new(slot.work(), 2e-3, RATE).unwrap();
+        warm(&clock, std::slice::from_ref(&slot), Deadline::default()).unwrap();
+        slot.sample_alone(
+            2e-3,
+            &mut Stopping::resolved(RATE),
+            Some(&clock),
+            Deadline::default(),
+        )
+        .unwrap_or_else(|_| panic!("scripted work does not fail"));
+        let samples = slot.samples();
+        let mut reading = 1;
+        let mut readings = Vec::new();
+        while !Timing::of(&samples[..reading], RATE).resolved() {
+            readings.push(reading);
+            reading = next_reading(reading);
+        }
+        readings.push(reading);
+        assert_eq!(reading, samples.len());
+        // The rule was read and continued before it stopped.
+        assert!(samples.len() > fewest_bounding(RATE));
+        let repetitions = slot.repetitions().unwrap();
+        let mut expected = vec![(0, 1), (0, 1), (0, repetitions)];
+        for count in 1..=samples.len() {
+            if count >= fewest_bounding(RATE) && readings.contains(&count) {
+                expected.push((0, 1));
+            }
+            if count < samples.len() {
+                expected.push((0, repetitions));
+            }
+        }
+        let submitted = submissions(&log)
+            .into_iter()
+            .filter(|&(work, _)| work == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(submitted, expected);
+        assert_eq!(clock.raises()[0].sample, Some(samples[0]));
     }
 }

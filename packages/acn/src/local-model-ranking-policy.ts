@@ -1,8 +1,8 @@
 import { Option } from "effect"
-import type {
-  GenerationPerformanceSamples,
-  LocalModelRankingScores,
-  ServingProfile,
+import {
+  type LocalModelPerformance,
+  type LocalModelRankingScores,
+  type ServingProfile,
 } from "@magnitudedev/acn-protocol"
 
 const COMPARISON_CONTEXT_LENGTH = 50_000
@@ -13,7 +13,7 @@ export interface LocalModelRankingCandidate {
   readonly intelligenceScore: number
   readonly fidelityRank: number
   readonly profile: ServingProfile
-  readonly performance: GenerationPerformanceSamples
+  readonly performance: LocalModelPerformance
 }
 
 const clamp01 = (value: number): number => Math.max(0, Math.min(1, value))
@@ -27,19 +27,24 @@ export const normalizedModelSpeedScore = (tokensPerSecond: number): number => {
   return rawScore / maximumScore
 }
 
+/** The speed term is the estimate at the comparison depth; none while speed is not estimated. */
 export const modelRankingScores = (
   candidate: LocalModelRankingCandidate,
-): Option.Option<LocalModelRankingScores> => {
+): LocalModelRankingScores => {
   const comparisonContext = Math.min(
     COMPARISON_CONTEXT_LENGTH,
     candidate.profile.contextLength,
   )
-  const generation = candidate.performance.find(({ contextTokens }) =>
-    contextTokens === comparisonContext)
-  if (generation === undefined) return Option.none()
-  return Option.some({
+  const speed = candidate.performance._tag === "Estimated"
+    ? Option.map(
+        Option.fromNullable(candidate.performance.samples.find(({ contextTokens }) =>
+          contextTokens === comparisonContext)),
+        ({ estimatedTokensPerSecond }) => normalizedModelSpeedScore(estimatedTokensPerSecond),
+      )
+    : Option.none()
+  return {
     intelligence: clamp01(candidate.intelligenceScore / 100),
-    speed: normalizedModelSpeedScore(generation.estimatedTokensPerSecond),
+    speed,
     fidelity: clamp01(candidate.fidelityRank / 100),
-  })
+  }
 }

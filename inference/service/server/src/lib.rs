@@ -1,11 +1,13 @@
 //! The inference service's composition-root library: model assessment (the environment and its
-//! identity, and the automatic assessment pool), model residency on the engine worker, the model
-//! store with the devices it serves, the shared resolved-configuration cache, the hardware
-//! endpoint's provider and contained child processes.
+//! identity, the measurement job and the automatic assessment pool), model residency on the
+//! engine worker and its exclusion with the measurement job, the model store with the devices
+//! it serves, the shared resolved-configuration cache, the hardware endpoint's provider and
+//! contained child processes.
 
 pub mod assessment;
 pub mod build_identity;
 pub mod configurations;
+pub mod device_lock;
 pub mod hardware;
 pub mod memory_domains;
 pub mod model_store;

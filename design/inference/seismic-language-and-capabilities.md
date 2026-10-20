@@ -108,7 +108,16 @@ it rejects vendor and system headers, absolute paths, other extensions and files
 roots. `#include <seismic/<name>>` names Seismic's native library for the backend — dense element
 types, packed-weight decoders and layouts, weight slot bindings — which Seismic owns because it owns
 representation semantics; library files are embedded in Seismic, inlined and hashed like any include,
-and include only each other. A Metal implementation's
+and include only each other. An asset binds each weight tensor it decodes to a slot of the library
+(`#define KERNEL_W0 SEISMIC_GATE_WEIGHT`), and the library alone maps the bound representation to
+its decoder and row geometry; no asset restates that map. Metal and CUDA select a decoder type per
+slot. GLSL has no templates, so Vulkan's decoders take a constant kind, and the code that loads or
+decodes a kind, in the library and in the libraries over it, is a preprocessor group of the kinds
+the slots bind: a pipeline holds its own weights' decode paths alone, since drivers compile code a
+constant makes dead at full cost (`seismic/hardware/rdna3-vulkan.md`). A slot bound to a
+representation the library has no kind for is an `#error`, so preprocessing alone decides which
+representations a slot takes. The ABI names each tensor's representation (`<prefix>_REPRESENTATION`)
+for the library to resolve. A Metal implementation's
 buffers, argument words and scalar slots must fit Metal's 31-entry argument table, checked at
 build and at preparation.
 
@@ -293,6 +302,14 @@ An inactive launch is neither encoded nor checked against pipeline or device lim
 evaluated, and it keeps its ordinal (formed functions and trace entries stay in declaration order;
 a trace records it as an empty launch). An inactive scratch buffer keeps its ABI slot at the minimum
 charge without evaluating its size. A call whose launches are all inactive is legal and does nothing.
+A specialization may hold a call-time dimension to a range (`with_range`): a launch whose
+condition is false at every value in the ranges is not formed (no pipeline, function or source of
+its own; its ordinal stays), and a call outside a range is refused before any launch is. A backend
+forms a pipeline or function per launch, and on some drivers that is most of formation (NVIDIA's
+Vulkan compiles inside pipeline creation), so a caller that knows its rows forms only what they
+run. A specialization without ranges forms every launch. A range is refused at preparation unless
+it holds a call-time dimension of the entry with a nonempty range: on a static dimension, on a name
+the entry does not have, or with its low above its high.
 A native declaration may name natural-number expressions: `let NAME = E` lines after `params` and
 `elements`, each over entry dimensions, entry parameters and the terms before it. A term is
 substitution: the `where` condition, scratch sizes and guards, launch conditions and

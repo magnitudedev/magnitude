@@ -7,17 +7,18 @@ use flate2::read::GzDecoder;
 use magnitude_artifacts::gguf::{Array, Directory, Metadata, Scalar, Value, inspect_header};
 use magnitude_engine::{
     assessment::{
-        AssessmentSetup, DrafterVerdict, ModelAssessment, ModelPackagePaths, SpeculativeMethod,
-        assess_model,
+        AssessmentSetup, AssessmentStructure, DrafterVerdict, Measurements, ModelAssessment,
+        ModelPackagePaths, SpeculativeMethod, assess_model,
     },
     error::UnsupportedReason,
     fingerprint::ModelFingerprint,
-    options::{ModelMethod, ModelPolicy, standard_service_limits},
+    options::{ModelMethod, ModelPolicy, PROFILE_SEQUENCES, standard_service_limits},
 };
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use seismic::BackendName;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -170,9 +171,9 @@ impl Drop for Scratch {
     }
 }
 
-fn cpu_setup() -> AssessmentSetup {
+fn cpu_structure() -> AssessmentStructure {
     let catalog = seismic::Devices::discover(&[]).unwrap();
-    AssessmentSetup::discover(
+    AssessmentStructure::discover(
         &catalog,
         DeviceRequest::Backend(BackendName::Cpu),
         MemoryReserves::standard(),
@@ -180,6 +181,14 @@ fn cpu_setup() -> AssessmentSetup {
         standard_service_limits(),
     )
     .unwrap_or_else(|error| panic!("the CPU backend is selectable: {error}"))
+}
+
+/// The CPU backend before any measurement: fit is assessed, speed is pending.
+fn cpu_setup() -> AssessmentSetup {
+    AssessmentSetup {
+        structure: Arc::new(cpu_structure()),
+        measurements: Measurements::Pending,
+    }
 }
 
 /// Every Unsupported carries at least one reason, and so does a rejected
@@ -250,7 +259,7 @@ fn every_fixture_has_its_expected_verdict() {
             method: fixture.method.into(),
         };
         target.for_each(drop);
-        let assessment = assess_model(&package, &setup, &[])
+        let assessment = assess_model(&package, &setup, &[], PROFILE_SEQUENCES)
             .unwrap_or_else(|error| panic!("{}: operational failure: {error}", fixture.name));
         if let ModelAssessment::Unsupported { unsupported, .. } = &assessment {
             assert!(
@@ -437,6 +446,7 @@ fn a_qwen4exp_target_with_its_prediction_block_is_assessed_with_built_in_heads()
         },
         &cpu_setup(),
         &[],
+        PROFILE_SEQUENCES,
     )
     .unwrap_or_else(|error| panic!("operational failure: {error}")) else {
         panic!("a target with built-in heads is assessed");
@@ -492,6 +502,7 @@ fn a_separate_nemotron_head_names_its_drafter_architecture() {
         },
         &cpu_setup(),
         &[],
+        PROFILE_SEQUENCES,
     )
     .unwrap_or_else(|error| panic!("operational failure: {error}")) else {
         panic!("the Nemotron target is assessed");

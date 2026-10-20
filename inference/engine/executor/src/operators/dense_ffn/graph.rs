@@ -112,7 +112,7 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
     let gate = packed(graph, WeightKind::DenseGate)?;
     let up = packed(graph, WeightKind::DenseUp)?;
     let down = packed(graph, WeightKind::DenseDown)?;
-    let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
+    let out_rows = GraphConstant::identity(graph, rows)?;
     let expand_dimensions = [
         dimensions.as_slice(),
         &[

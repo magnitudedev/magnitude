@@ -1,20 +1,14 @@
 //! The four official LFM2.5 24B-A2B GGUF inventories at the catalog's pinned revision.
 
 use magnitude_artifacts::{ArtifactIdentity, PackageIdentity};
-use magnitude_family_common::headers::directory_from_bytes;
+use magnitude_family_common::headers;
 use magnitude_family_contracts::{ExpertSelection, Operator, RouteNormalization, ScoreFunction};
 use magnitude_family_lfm2::inspect_components;
 
 #[test]
 fn released_quantizations_bind_the_complete_24b_decoder() {
-    let fixtures: [&[u8]; 4] = [
-        include_bytes!("fixtures/lfm2.5-24b-a2b-q4_k_m.json"),
-        include_bytes!("fixtures/lfm2.5-24b-a2b-q5_k_m.json"),
-        include_bytes!("fixtures/lfm2.5-24b-a2b-q6_k.json"),
-        include_bytes!("fixtures/lfm2.5-24b-a2b-q8_0.json"),
-    ];
-    for fixture in fixtures {
-        let directory = directory_from_bytes(fixture);
+    for variant in ["q4", "q5", "q6", "q8"] {
+        let directory = headers::catalog(&format!("lfm2.5-24b-a2b__target-gguf:{variant}"));
         let definition = inspect_components(
             &directory,
             None,

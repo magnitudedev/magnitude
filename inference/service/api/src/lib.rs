@@ -2755,6 +2755,7 @@ mod tests {
             ),
             catalog: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
             custom: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
+            measurement: magnitude_service_contracts::models::MeasurementState::Measuring,
         }));
         let response = test_app(AppState::new().with_model_assessments(assessments))
             .oneshot(
@@ -2772,6 +2773,7 @@ mod tests {
         assert_eq!(body["revision"], 7);
         assert_eq!(body["environmentId"], "environment");
         assert_eq!(body["catalog"]["_tag"], "Pending");
+        assert_eq!(body["measurement"]["_tag"], "Measuring");
     }
 
     #[test]
@@ -3116,7 +3118,7 @@ mod tests {
                 "assessment".to_owned(),
             ),
             memory: Vec::new(),
-            performance: Vec::new(),
+            performance: magnitude_service_contracts::models::ModelPerformance::Pending,
             projector: magnitude_service_contracts::models::ProjectorVerdict::None,
             drafter: DrafterVerdict::Bound {
                 method: SpeculativeMethod::DFlash,
@@ -3876,6 +3878,7 @@ mod tests {
                 source_revision: 4,
                 entries: custom,
             },
+            measurement: magnitude_service_contracts::models::MeasurementState::Measured,
         }
     }
 

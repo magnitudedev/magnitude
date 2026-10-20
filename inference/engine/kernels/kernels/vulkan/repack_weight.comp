@@ -187,11 +187,15 @@ uint repack_source_code(uint64_t gp, uint p) {
     return (low | (high << 2)) + 28u;
 #elif defined(REPACK_IQ3S)
     // 32 plus the signed grid magnitude (the registry's exact q6k re-basing).
-    const uint block = p / 32u, group = p % 32u / 8u, slot = p % 8u;
-    const uint point = repack_byte(gp, 2u + 8u * block + 2u * group + slot / 4u)
-        | (((repack_byte(gp, 66u + block) >> (2u * group + slot / 4u)) & 1u) << 8);
+    // Value p's grid index is byte p / 4 of the indices (bit p / 4 % 8 of
+    // its block's high byte) and its sign byte p / 8, each written over `p`
+    // itself: NVIDIA's compiler traps on a value's split bit fields added
+    // back together (`packets_kquant_coefficients`).
+    const uint slot = p % 8u;
+    const uint point = repack_byte(gp, 2u + p / 4u)
+        | (((repack_byte(gp, 66u + p / 32u) >> (p / 4u % 8u)) & 1u) << 8);
     const uint magnitude = (repack_iq3s_grid[point] >> (8u * (slot % 4u))) & 255u;
-    return ((repack_byte(gp, 74u + 4u * block + group) >> slot) & 1u) != 0u ? 32u - magnitude : 32u + magnitude;
+    return ((repack_byte(gp, 74u + p / 8u) >> slot) & 1u) != 0u ? 32u - magnitude : 32u + magnitude;
 #elif defined(REPACK_Q8)
     return repack_byte(gp, 2u + p);
 #elif defined(REPACK_IQ4NL)
@@ -230,8 +234,9 @@ uint repack_word(uint64_t gp, uint offset) {
 // `gguf_iq3_xxs`, `gguf_iq2_xxs`).
 uint repack_grid_entry(uint64_t gp, uint e) {
 #if defined(REPACK_IQ3XXS)
+    // Entry e's two grid bytes are 2 e and 2 e + 1 past the scale.
     const uint block = e / 4u, group = e % 4u;
-    return repack_byte(gp, 2u + 8u * block + 2u * group) | (repack_byte(gp, 3u + 8u * block + 2u * group) << 8)
+    return repack_byte(gp, 2u + 2u * e) | (repack_byte(gp, 3u + 2u * e) << 8)
         | (((repack_word(gp, REPACK_GRID_AUX(block)) >> (7u * group)) & 127u) << 16);
 #elif defined(REPACK_IQ2XXS)
     const uint block = e / 4u, group = e % 4u;

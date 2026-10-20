@@ -9,11 +9,13 @@
 //! A load never searches kernels. A worker process given `Prepare` instead
 //! of `Load` runs the engine's only search and exits. Every host loads
 //! through [`load_prepared`], which has the Prepare run, to its end, only
-//! when a load finds tuning units without a stored record.
+//! when a load finds tuning units without a stored record. Given `Measure`,
+//! it runs the measurement job ([`measure`]) and exits.
 
 mod binding;
 mod client;
 mod execution;
+pub mod measure;
 mod preparation;
 pub mod protocol;
 mod session;
@@ -63,6 +65,8 @@ pub enum WorkerExit {
     Shutdown,
     /// A `Prepare` finished; the host received `Prepared`.
     Prepared,
+    /// A `Measure` finished; the host received `MeasureFinished`.
+    Measured,
     /// A `Load` asked to report tuning units without a stored record met
     /// one and placed nothing; the host received `Unprepared`.
     Unprepared,
@@ -99,7 +103,8 @@ pub fn run_worker(
 }
 
 /// A worker process's entry: accept the host's `Hello`, then either run the
-/// worker on a `Load`'s manifest or only prepare a `Prepare`'s.
+/// worker on a `Load`'s manifest, only prepare a `Prepare`'s, or only
+/// measure the machine for a `Measure`.
 pub fn serve_worker(transport: impl WorkerTransport) -> WorkerExit {
     let (mut receiver, mut sender) = transport.split();
     let worker = EngineBuild::current();
@@ -126,7 +131,12 @@ pub fn serve_worker(transport: impl WorkerTransport) -> WorkerExit {
             unprepared,
         })) => (manifest, unprepared),
         Ok(Some(HostMessage::Prepare { manifest })) => return prepare_only(manifest, sender),
-        Ok(Some(_)) => return WorkerExit::ProtocolViolation("expected Load or Prepare".into()),
+        Ok(Some(HostMessage::Measure { request })) => {
+            return measure::measure_only(request, sender)
+        }
+        Ok(Some(_)) => {
+            return WorkerExit::ProtocolViolation("expected Load, Prepare or Measure".into())
+        }
         Ok(None) => return WorkerExit::HostLost { reason: None },
         Err(error) => {
             return WorkerExit::HostLost {

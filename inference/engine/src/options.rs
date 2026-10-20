@@ -31,6 +31,11 @@ pub fn standard_service_limits() -> ServiceLimits {
     }
 }
 
+/// The conversations a serving profile decodes at once, which assessment
+/// estimates its decode speed at (device topology spec §2.14): a profile
+/// serves one conversation, so its speed is that conversation's.
+pub const PROFILE_SEQUENCES: u32 = 1;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectorSelection {
     Discover,

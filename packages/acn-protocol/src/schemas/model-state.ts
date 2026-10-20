@@ -400,7 +400,7 @@ export const MemoryAssessmentSchema = Schema.Struct({
 })
 export type MemoryAssessment = typeof MemoryAssessmentSchema.Type
 
-/** An estimated decode speed at one context depth: bytes per decode step over the device's bandwidth. */
+/** An estimated decode speed at one context depth, from this machine's measured rates and costs. */
 export const GenerationPerformanceEvidenceSchema = Schema.Struct({
   contextTokens: PositiveSafeInteger,
   estimatedTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
@@ -416,6 +416,31 @@ export const GenerationPerformanceSamplesSchema = Schema.Array(
     || samples[index - 1]!.contextTokens < sample.contextTokens),
 { message: () => "performance samples must be nonempty and ordered by unique context" }))
 export type GenerationPerformanceSamples = typeof GenerationPerformanceSamplesSchema.Type
+
+/** Progress of the measurements this machine's speed estimates are computed from. */
+export const MachineMeasurementSchema = Schema.Union(
+  /** No measurement job has run yet: it waits for the accelerators to be free of models. */
+  Schema.TaggedStruct("Unmeasured", {}),
+  /** A job is measuring this machine. */
+  Schema.TaggedStruct("Measuring", {}),
+  /** Every measurement an estimate reads is stored, or recorded unobtainable. */
+  Schema.TaggedStruct("Measured", {}),
+  /** The last job did not store every measurement; the next starts at `retryAt` (Unix epoch ms). */
+  Schema.TaggedStruct("Failed", { retryAt: NonNegativeSafeInteger }),
+)
+export type MachineMeasurement = typeof MachineMeasurementSchema.Type
+
+/**
+ * A fitting model's decode speed: pending until this machine's measurements are stored (with
+ * their progress), unavailable when one it is estimated from cannot be taken, otherwise one
+ * estimate per assessed context depth.
+ */
+export const LocalModelPerformanceSchema = Schema.Union(
+  Schema.TaggedStruct("Pending", { measurement: MachineMeasurementSchema }),
+  Schema.TaggedStruct("Unavailable", { failure: ModelFailureSchema }),
+  Schema.TaggedStruct("Estimated", { samples: GenerationPerformanceSamplesSchema }),
+)
+export type LocalModelPerformance = typeof LocalModelPerformanceSchema.Type
 
 export const localModelPerformanceContexts = (contextLength: number): readonly number[] => [...new Set([
   ...[25_000, 50_000, 75_000].filter((value) => value <= contextLength),
@@ -667,9 +692,10 @@ const NormalizedRankingScoreSchema = Schema.Number.pipe(
   Schema.between(0, 1),
 )
 
+/** A fitting catalog model's normalized ranking terms; speed is absent until it is estimated. */
 export const LocalModelRankingScoresSchema = Schema.Struct({
   intelligence: NormalizedRankingScoreSchema,
-  speed: NormalizedRankingScoreSchema,
+  speed: Schema.optionalWith(NormalizedRankingScoreSchema, { as: "Option", exact: true }),
   fidelity: NormalizedRankingScoreSchema,
 })
 export type LocalModelRankingScores = typeof LocalModelRankingScoresSchema.Type
@@ -691,13 +717,13 @@ export const LocalModelMemorySchema = Schema.Struct({
 }, { message: () => "local model memory totals and domains must agree with their evidence" }))
 export type LocalModelMemory = typeof LocalModelMemorySchema.Type
 
-/** A fitting model, with one decode-speed estimate per assessed context depth. */
+/** A fitting model, with its decode speed. */
 export const LocalModelFitsAssessmentSchema = Schema.TaggedStruct("Fits", {
   assessmentId: ModelAssessmentIdSchema,
   environmentId: AssessmentEnvironmentIdSchema,
   profile: ServingProfileSchema,
   memory: LocalModelMemorySchema,
-  performance: GenerationPerformanceSamplesSchema,
+  performance: LocalModelPerformanceSchema,
 })
 export type LocalModelFitsAssessment = typeof LocalModelFitsAssessmentSchema.Type
 
@@ -837,10 +863,7 @@ const LocalModelAssessedFields = {
 const CatalogModelAssessedFitsServingStateSchema = Schema.TaggedStruct("Assessed", {
   ...LocalModelAssessedFields,
   assessment: LocalModelFitsAssessmentSchema,
-  rankingScores: Schema.optionalWith(LocalModelRankingScoresSchema, {
-    as: "Option",
-    exact: true,
-  }),
+  rankingScores: LocalModelRankingScoresSchema,
 })
 const CatalogModelAssessedDoesNotFitServingStateSchema = Schema.TaggedStruct("Assessed", {
   ...LocalModelAssessedFields,

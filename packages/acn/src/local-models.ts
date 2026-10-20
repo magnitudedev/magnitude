@@ -26,8 +26,8 @@ import {
   type DrafterVerdict,
   type LocalModelAcquisitionState,
   type CatalogLocalModelServingState,
-  type LocalModelRankingScores,
   type LocalModelAssessment,
+  type MachineMeasurement,
   type LocalModel,
   type LocalModelsState,
   type LocalModelPreparation,
@@ -49,7 +49,9 @@ import type {
   ModelAssessment,
   ModelAssessmentDomainSnapshot,
   ModelAssessmentsSnapshot,
+  MeasurementState,
   ModelInstance,
+  ModelPerformance,
   ReadyModel,
   UnsupportedLocalModel as NativeUnsupportedLocalModel,
 } from "@magnitudedev/icn-protocol/schemas"
@@ -77,7 +79,7 @@ import {
   type RelatedDownload,
 } from "./custom-model-downloads"
 import { materializeProjection } from "./materialized-projection"
-import { modelRankingScores } from "./local-model-ranking-policy"
+import { modelRankingScores, type LocalModelRankingCandidate } from "./local-model-ranking-policy"
 import { LocalModelRemovals, type LocalModelRemovalState } from "./local-model-removals"
 
 // Compiled once: `Schema.validateSync(schema)` rebuilds its parser on every call, which costs
@@ -152,7 +154,22 @@ export const assessmentTargetVisible = (
   assessment: CoordinatedLocalModelAssessment | undefined,
 ): assessment is VisibleCoordinatedLocalModelAssessment | undefined => assessment?._tag !== "Dropped"
 
-export const projectAssessment = (environmentId: string, assessment: ModelAssessment): LocalModelAssessment => {
+const projectMeasurement = (measurement: MeasurementState): MachineMeasurement =>
+  measurement._tag === "Failed"
+    ? { _tag: "Failed", retryAt: measurement.retryAt }
+    : { _tag: measurement._tag }
+
+/** A pending speed carries the machine's measurement progress, which is what it waits on. */
+const projectPerformance = (performance: ModelPerformance, measurement: MeasurementState) =>
+  performance._tag === "Pending"
+    ? { _tag: "Pending" as const, measurement: projectMeasurement(measurement) }
+    : performance
+
+export const projectAssessment = (
+  snapshot: ModelAssessmentsSnapshot,
+  assessment: ModelAssessment,
+): LocalModelAssessment => {
+  const environmentId = snapshot.environmentId
   if (assessment._tag === "Fits") {
     const totalRequiredBytes = assessment.memory.reduce((total, item) => total + item.requiredBytes, 0)
     const requiredSystemMemoryBytes = assessment.memory.filter((item) => item.memoryDomainId === "system")
@@ -163,7 +180,7 @@ export const projectAssessment = (environmentId: string, assessment: ModelAssess
       memory: {
         domains: assessment.memory, totalRequiredBytes, requiredSystemMemoryBytes,
       },
-      performance: assessment.performance,
+      performance: projectPerformance(assessment.performance, snapshot.measurement),
     })
   }
   if (assessment._tag === "DoesNotFit") {
@@ -200,7 +217,7 @@ export const coordinatedAssessment = (
     ? { _tag: "Dropped" }
     : {
         _tag: "Assessed",
-        assessment: projectAssessment(snapshot.environmentId, assessment),
+        assessment: projectAssessment(snapshot, assessment),
         capabilities: capabilities.value,
         drafter: assessment._tag === "Unsupported" ? undefined : productDrafterVerdict(assessment.drafter),
       }
@@ -279,7 +296,7 @@ export const catalogAcquisition = (
 export const catalogModelServingState = (
   ready: ReadyModel | undefined,
   assessment: VisibleCoordinatedLocalModelAssessment | undefined,
-  rankingScores: Option.Option<LocalModelRankingScores>,
+  catalogScores: Pick<LocalModelRankingCandidate, "intelligenceScore" | "fidelityRank">,
   unavailableFailure?: ModelFailure,
 ): CatalogLocalModelServingState => {
   if (ready === undefined) return { _tag: "Failed", profile: Option.none(), failure: unavailableFailure ?? failure(
@@ -294,7 +311,14 @@ export const catalogModelServingState = (
     speculativeMethod: ready.speculativeMethod,
   }
   return assessment.assessment._tag === "Fits"
-    ? { _tag: "Assessed", ...assessed, assessment: assessment.assessment, rankingScores }
+    ? {
+        _tag: "Assessed", ...assessed, assessment: assessment.assessment,
+        rankingScores: modelRankingScores({
+          ...catalogScores,
+          profile: assessment.assessment.profile,
+          performance: assessment.assessment.performance,
+        }),
+      }
     // The service never reports a catalog model as Unsupported; validation rejects that contract violation.
     : { _tag: "Assessed", ...assessed,
         assessment: validateDoesNotFitAssessment(assessment.assessment) }
@@ -348,14 +372,7 @@ const catalogModel = (
     && source.localState.effective._tag === "Unavailable"
     ? source.localState.effective.failure
     : undefined
-  const rankingScores = assessment?._tag === "Assessed" && assessment.assessment._tag === "Fits"
-    ? modelRankingScores({
-        intelligenceScore: source.intelligence,
-        fidelityRank: source.fidelityRank,
-        profile: ready?.profile ?? source.desired.profile,
-        performance: assessment.assessment.performance,
-      })
-    : Option.none()
+  const catalogScores = { intelligenceScore: source.intelligence, fidelityRank: source.fidelityRank }
   return validateCatalogLocalModel({
     _tag: "Catalog",
     modelId: entry.id,
@@ -378,7 +395,7 @@ const catalogModel = (
         Option.toArray(decodeCustomFormModelId(alias))),
     },
     acquisitionState,
-    servingState: catalogModelServingState(ready, assessment, rankingScores, unavailableFailure),
+    servingState: catalogModelServingState(ready, assessment, catalogScores, unavailableFailure),
     missingComponents: source.localState._tag === "Installed" ? source.localState.missingComponents : [],
     storedComponents: source.localState._tag === "Installed" ? source.localState.storedComponents : [],
     drafterWithheld: source.localState._tag === "Installed" && source.localState.drafterWithheld,

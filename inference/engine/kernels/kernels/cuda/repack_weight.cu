@@ -180,8 +180,8 @@ __device__ __forceinline__ u32 grid_entry(const u8 *in, u32 e) {
     const u32 signs = (u32)in[aux] | ((u32)in[aux + 1] << 8) | ((u32)in[aux + 2] << 16) | ((u32)in[aux + 3] << 24);
 #endif
 #if defined(REPACK_IQ3XXS)
-    return (u32)in[2 + 8 * block + 2 * group] | ((u32)in[3 + 8 * block + 2 * group] << 8) |
-           (((signs >> (7 * group)) & 127u) << 16);
+    // Entry e's two grid bytes are 2 e and 2 e + 1 past the scale.
+    return (u32)in[2 + 2 * e] | ((u32)in[3 + 2 * e] << 8) | (((signs >> (7 * group)) & 127u) << 16);
 #elif defined(REPACK_IQ2XXS)
     return (u32)in[2 + 8 * block + group] | (((signs >> (7 * group)) & 127u) << 8);
 #else
@@ -210,11 +210,13 @@ __device__ __forceinline__ u32 source_code(const u8 *in, u32 p) {
     return (low | (high << 2)) + 28u;
 #elif defined(REPACK_IQ3S)
     // 32 plus the signed grid magnitude (the registry's exact q6k re-basing).
-    u32 block = p / 32, group = p % 32 / 8, slot = p % 8;
-    u32 point = (u32)in[2 + 8 * block + 2 * group + slot / 4] |
-                ((((u32)in[66 + block] >> (2 * group + slot / 4)) & 1u) << 8);
+    // Value p's grid index is byte p / 4 of the indices (bit p / 4 % 8 of
+    // its block's high byte) and its sign byte p / 8, written over `p`
+    // itself as the Vulkan repack is.
+    u32 slot = p % 8;
+    u32 point = (u32)in[2 + p / 4] | ((((u32)in[66 + p / 32] >> (p / 4 % 8)) & 1u) << 8);
     u32 magnitude = (iq3s_grid[point] >> (8 * (slot % 4))) & 255u;
-    return ((in[74 + 4 * block + group] >> slot) & 1u) != 0 ? 32u - magnitude : 32u + magnitude;
+    return ((in[74 + p / 8] >> slot) & 1u) != 0 ? 32u - magnitude : 32u + magnitude;
 #elif defined(REPACK_Q8)
     return (u32)in[2 + p];
 #elif defined(REPACK_IQ4NL)

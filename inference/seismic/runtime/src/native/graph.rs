@@ -11,6 +11,7 @@
 //! and the tensors bound to external ports; attaching checks those bindings
 //! alone, so per-run host work does not revalidate nodes.
 
+use super::point::{GraphPoint, GraphTiming};
 use super::timeline::{TimelineInner, TimelineNode, TimelineOperation};
 use super::{
     merge_access, submit, word_bytes, CallLaunches, Dispatch, DispatchList, LaunchGeometry,
@@ -1753,6 +1754,24 @@ impl NativeGraphPlan {
     pub fn upload_bytes(&self) -> u64 {
         self.upload_bytes
     }
+    /// Runs of the plan with `bindings` as `seismic-measure` times them,
+    /// on a slot of their own ([`GraphPoint`]); a plan with timeline nodes
+    /// is refused.
+    pub fn point(
+        self: &Arc<Self>,
+        bindings: NativeGraphBindings,
+        timing: GraphTiming,
+    ) -> Result<GraphPoint, CallError> {
+        GraphPoint::new(self, bindings, timing)
+    }
+    /// The device the plan runs on.
+    pub(super) fn device(&self) -> &Arc<DeviceInner> {
+        &self.device
+    }
+    /// Whether a run of the plan waits on or signals a timeline.
+    pub(super) fn has_timelines(&self) -> bool {
+        !self.executable.timelines.is_empty()
+    }
     pub fn bindings(&self) -> NativeGraphBindings {
         NativeGraphBindings {
             identity: self.identity,
@@ -2780,6 +2799,11 @@ impl NativeGraphCompletion {
     /// Wait for the run and report its outcome.
     pub fn wait(self) -> Result<(), CallError> {
         self.submission.wait()
+    }
+    /// The submission of the run (every run of a sequence), whose device
+    /// time its trace reports ([`super::GraphPoint`]).
+    pub(super) fn into_submission(self) -> NativeSubmission {
+        self.submission
     }
 }
 

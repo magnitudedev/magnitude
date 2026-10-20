@@ -127,9 +127,16 @@ fn dense_expand_weights_are_packed_planes_and_its_row_table_is_discrete() {
             ("out_rows", "discrete"),
             ("gate_scale", "f32"),
             ("up_scale", "f32"),
+            ("gate_bound", "f32"),
+            ("up_bound", "f32"),
         ]
     );
-    assert_eq!(stored(&analysis, "gate_weight"), &Stored::Packed { planes: q4k_planes() });
+    assert_eq!(
+        stored(&analysis, "gate_weight"),
+        &Stored::Packed {
+            planes: q4k_planes()
+        }
+    );
     assert_eq!(
         stored(&analysis, "up_weight"),
         &Stored::Packed {
@@ -180,6 +187,10 @@ fn attention_project_classifies_each_weight_by_its_own_representation() {
             ("gate_weight", "packed"),
             ("key_weight", "packed"),
             ("value_weight", "bf16"),
+            ("query_bound", "f32"),
+            ("gate_bound", "f32"),
+            ("key_bound", "f32"),
+            ("value_bound", "f32"),
         ]
     );
     assert_eq!(coded(&analysis, "query_weight"), Q4K_CODES);
@@ -228,9 +239,15 @@ fn dense_output_has_one_packed_weight_and_a_discrete_row_table() {
             ("down_weight", "packed"),
             ("out_rows", "discrete"),
             ("down_scale", "f32"),
+            ("down_bound", "f32"),
         ]
     );
-    assert_eq!(stored(&analysis, "down_weight"), &Stored::Packed { planes: q4k_planes() });
+    assert_eq!(
+        stored(&analysis, "down_weight"),
+        &Stored::Packed {
+            planes: q4k_planes()
+        }
+    );
     assert_eq!(coded(&analysis, "down_weight"), Q4K_CODES);
     assert_eq!(analysis.grids.len(), 3);
 }

@@ -4,7 +4,9 @@ applies_to:
   - inference/service/models/src/cache.rs
   - inference/service/models/src/catalog.rs
   - inference/engine/src/assessment.rs
+  - inference/engine/src/worker/measure.rs
   - inference/engine/executor/src/assessment/**
+  - inference/service/server/src/device_lock.rs
   - packages/icn-protocol/**
   - packages/acn/src/local-model*.ts
   - packages/acn-protocol/src/schemas/model-state.ts
@@ -17,7 +19,8 @@ applies_to:
 | Concern | Owner |
 | ------- | ----- |
 | Hardware graph and observations | Seismic topology/runtime |
-| Device bandwidth, decode costs, per-model memory fit, executability, performance, capabilities | Engine |
+| Measuring points, their records and keys | Seismic measure |
+| Executor costs, per-model memory fit, executability, performance, capabilities | Engine |
 | Device selection for assessment (the rule loads use) | Engine |
 | Assessment environment identity, targets, pool, cache, deadlines, publication | Service |
 | Serving-configuration construction, canonical identity, validation | Service |
@@ -28,23 +31,45 @@ applies_to:
 
 | Term | Meaning |
 | ---- | ------- |
-| **Assessment environment** | The selected device, its resolved memory bandwidth and the engine configuration every model is assessed with |
+| **Assessment environment** | Its structure (the selected executor, topology, status sample and engine configuration) and its measured part (the selected executor's costs, derived from its cost points' records), which every model is assessed with |
+| **Measurement job** | The contained worker mode that measures this machine and stores what assessment's measured part reads |
 | **Model assessment** | Analytical evaluation of one exact resolved model at its serving profile |
 | **Assessing** | Ephemeral observable state while an admitted assessment scope is alive |
 | **Dropped** | Terminal disposition for a target whose one assessment attempt failed |
 
 ## Assessment environment
 
-The environment is established once, during service start, from the device topology the service
-discovers there: the device a native load would select, the host's stable memory, and the selected
-device's memory bandwidth (see [performance estimation](performance-estimation.md)). Establishing
-it opens no device and is arithmetic over discovered facts; a failure to establish it fails service
-start, which the service's own health reports. After start, the environment cannot fail: the pool
-has no environment phase, no environment failure and no environment retry.
+The environment's structure is established once, during service start, from the device topology
+the service discovers there: the device a native load would select and the host's stable memory. A
+failure to establish it fails service start, which the service's own health reports. Its measured
+part, the selected executor's costs (see [performance estimation](performance-estimation.md)), is
+derived from the records of its cost points in the kernel cache, whose keys are formed without a
+device, so nothing is opened or measured: measuring runs kernels, which can fault or hang in a
+driver, so nothing in the service process measures or waits on a measurement, and the service is
+ready at once.
+
+What is missing is taken by the measurement job, a mode of the inference worker that opens the
+selected executor and measures its cost points through Seismic's measurer, storing each record as
+it is taken, under hardware, driver and kernel keys. When every point is stored, no job runs. The
+job runs only with the device to itself (loads and catalog optimization share it for their
+lifetime; the job only tries to take it, and defers while a model is resident or loading), is
+killed at a hard deadline, and retries a failure after a doubling backoff. Before each point it
+records the key it attempts; a point that ends two jobs is recorded unobtainable with its reason,
+so the costs complete without it and only a model whose calls need it estimates `Unavailable`. A
+kernel that cannot be formed is recorded unobtainable at once, since formation is deterministic for
+its key; a point whose timing fails, or whose operands cannot be made now, is left unrecorded and
+counts as one ended job. Its state
+(`Unmeasured`, `Measuring`, `Measured`, `Failed { retry_at }`) is the snapshot's.
+
+Until its measurements exist a fitting model's performance is `Pending`. When they arrive the
+environment identity changes; every assessed model is finished again under it (arithmetic over its
+prepared demand) and published together in one revision, never passing back through `Assessing`.
+The pool never fails on the environment: it has no environment phase and no environment retry.
 
 ```text
-service start -> device discovery -> environment (selection, host memory, bandwidth)
-    -> pool: per-target preparation from headers -> complete assessment
+service start -> topology discovery -> structure (selection, status) + stored measurements
+    -> pool: per-target preparation from headers -> fit, and speed when measured
+measurement job -> stored measurements -> new environment -> every assessed model, one revision
 ```
 
 ## Assessment environment identity
@@ -52,9 +77,10 @@ service start -> device discovery -> environment (selection, host memory, bandwi
 Every cached assessment is keyed by the environment identity, a digest of:
 
 - the engine build (engine version and source digest, covering model families, the fit workload,
-  decode costs and the bandwidth table);
+  the cost points and estimate, and demand calculation);
 - the backend, device selector and device name;
-- the resolved bandwidth and its source;
+- once measured, the executor costs derived from the stored records, excluding measurement
+  timestamps; otherwise, that they are pending, or unavailable and why;
 - the normalized stable topology: physical devices, executors, stores, paths and capacities,
   without live free memory or process-local revisions;
 - the process memory limits that bound stable fit capacity;
@@ -183,7 +209,7 @@ engine is new work.
 
 ## Automatic assessment pool
 
-The service maintains one pool over the current catalog and custom-model sources in its one
+The service maintains one pool over the current catalog and custom-model sources in its current
 environment. Each source slice is `Pending` until its source is read (custom models until their
 inventory snapshot is authoritative), then `Available` with one entry per target. Catalog desired
 material is admitted immediately when not installed; effective material is used when installed.
@@ -209,9 +235,15 @@ a fixed cap, and every target has one absolute deadline.
 
 ## Conformance
 
-- Assessment reads no tensor payload, opens no device, loads no model and runs no measurement.
-- The environment is established before the pool starts; the pool has no environment failure.
-- Every `Fits` result contains ordered performance samples at exactly the requested depths.
+- Assessment reads no tensor payload, opens no device, loads no model and runs no measurement;
+  only the measurement job measures, in a worker process of its own.
+- The environment's structure is established before the pool starts; the pool has no environment
+  failure.
+- Every `Fits` result's performance is `Pending`, `Unavailable` with its failure, or `Estimated`
+  with ordered samples at exactly the requested depths.
+- New measurements republish every assessed model in one revision; none passes back through
+  `Assessing`.
+- A job that never answers is killed at its deadline while the service stays ready.
 - No result can state that a model the engine executes cannot run on this computer: `Unsupported`
   comes only from the derivations a load makes.
 - Warm exact-cache reads invoke no engine assessment.

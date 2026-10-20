@@ -1043,7 +1043,7 @@ fn launch_medians(device: &Device, run: impl FnOnce()) -> String {
 #[ignore = "timing; run explicitly on the measurement host"]
 fn state_space_timings() {
     let options = seismic::measure::Measure {
-        samples: std::num::NonZeroUsize::new(11).unwrap(),
+        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(11).unwrap()),
         min_sample_seconds: 0.01,
     };
     let measure = |point| timing_common::measured(point, &options);

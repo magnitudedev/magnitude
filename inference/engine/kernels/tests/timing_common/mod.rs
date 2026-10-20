@@ -21,11 +21,11 @@ impl<E: seismic::Entry> Timed<E> for seismic::NativeKernel<E> {
         rotation: Vec<E::Args<'_>>,
         how: &Measure,
     ) -> Result<Measurement, seismic::CallError> {
-        seismic::measure::measure(self.point(rotation)?, how)
+        seismic::measure::measure(self.point(rotation)?, how, None)
     }
 }
 
 /// `point` measured as `how` says; a failure fails the test.
 pub fn measured(point: seismic::KernelPoint, how: &Measure) -> Measurement {
-    seismic::measure::measure(point, how).unwrap()
+    seismic::measure::measure(point, how, None).unwrap()
 }

@@ -500,14 +500,15 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
             // The decode step streams every block's windows and weights.
-            let demand = crate::assessment::DecodeDemand::from_model(
+            let demand = crate::assessment::demand::tests::demand_on(
                 &definition,
                 &load,
                 magnitude_state::KvCodec::Dense,
+                backend,
             )
             .unwrap();
             assert!(
-                demand.streamed_bytes > 0 && demand.launches > 0,
+                crate::assessment::demand::tests::streamed(&demand) > 0,
                 "{backend:?}"
             );
         }

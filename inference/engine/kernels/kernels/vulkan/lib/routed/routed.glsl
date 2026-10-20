@@ -8,11 +8,6 @@
 // expert.
 uint64_t routed_expert_row(uint64_t expert, uint64_t rows) { return expert * rows; }
 
-// The row geometry of a dense expert-stacked [E, N, K] weight tensor T of
-// BYTES-byte elements: its rows are axis 1 (`PACKETS_ROWS16_DENSE` takes
-// axis 0, the row axis of a two-dimensional weight).
-#define ROUTED_EXPERT_ROWS_DENSE(T, BYTES) packets_rows16(T##_STRIDE_1 * uint64_t(BYTES), 0ul, 0ul, 0ul, 0ul)
-
 // Rows of the weight tensor at `base` starting at row `first`.
 projection_weights routed_weights(uint64_t base, packets_rows16 geometry, uint64_t first, uint k) {
     return projection_weights(base + first * geometry.stride, geometry, k, 0ul, 1ul);

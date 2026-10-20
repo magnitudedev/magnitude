@@ -9,7 +9,7 @@ use crate::fixtures::{
     strix_halo_linux, strix_halo_linux_vulkan, strix_halo_windows, topology, uuid,
     A10_8Q_CUDA_USABLE, A10_8Q_VULKAN_HEAP, GB, GB10_CUDA_TOTAL, GB10_UUID, GB10_VULKAN_HEAP,
     LUNAR_LAKE_HEAP, LUNAR_LAKE_UUID, M4_PRO_REGISTRY, M4_PRO_WORKING_SET, RTX3090_CUDA_TOTAL,
-    RTX3090_CUDA_USABLE, RTX3090_HOST, RTX3090_VOLUME, RTX3090_VULKAN_HEAP,
+    RTX3090_CUDA_USABLE, RTX3090_HOST, RTX3090_VOLUME, RTX3090_VULKAN_DRIVER, RTX3090_VULKAN_HEAP,
     RTX4070_HEAP, RTX4070_UUID, RYZEN_IGPU_HEAPS, RYZEN_IGPU_UUID, STRIX_HALO_LINUX_HEAPS,
     STRIX_HALO_LINUX_UUID, STRIX_HALO_WINDOWS_DEDICATED, STRIX_HALO_WINDOWS_HEAPS,
     STRIX_HALO_WINDOWS_LUID, STRIX_HALO_WINDOWS_UUID,
@@ -874,15 +874,16 @@ fn a_new_adapter_luid_changes_no_identity() {
     assert_eq!(identity(&after), PhysicalIdentity::Uuid(gpu));
 }
 
-/// The host's identity is its CPU's reported hardware, not only the OS
-/// build: a change of it is a new host identity.
+/// The CPU's identity is its reported hardware, not only the OS build: a
+/// change of either is a new executor identity, and so a new measurement
+/// key.
 #[test]
-fn cpu_hardware_changes_change_the_host_identity() {
+fn cpu_hardware_changes_change_the_cpu_executor_identity() {
     let mut reports = m4_pro();
     let identity = |reports: &Reports| {
         let topology = topology(reports);
-        let cpu = topology.resolve(ExecutorSelector::HostCpu).unwrap().physical();
-        topology.physical_device(cpu).unwrap().identity().clone()
+        let cpu = topology.resolve(ExecutorSelector::HostCpu).unwrap().id();
+        topology.executor_identity(cpu).unwrap()
     };
     let before = identity(&reports);
     assert_eq!(identity(&reports), before);
@@ -890,28 +891,68 @@ fn cpu_hardware_changes_change_the_host_identity() {
     assert_ne!(identity(&reports), before);
 }
 
-/// A memory bandwidth is what an executor's API reports: CUDA's for a
-/// discrete device, none for its Vulkan view or an integrated device.
+/// A device's cache is what an API reports for it: the host's is its CPU's
+/// last-level total, a GPU's is its CUDA L2 for its CUDA and Vulkan views
+/// alike, and a device no API reports one for has none.
 #[test]
-fn an_executor_carries_the_bandwidth_its_api_reports() {
-    let topology = topology(&rtx3090());
-    let gpu = PhysicalIdentity::Uuid(rtx3090_uuid());
-    let bandwidth = |topology: &DeviceTopology, backend, identity: &PhysicalIdentity| {
-        executor(topology, backend, identity).limits().memory_bandwidth
+fn a_device_carries_the_cache_its_apis_report() {
+    let topology = topology(&gb10());
+    let cache = |identity: &PhysicalIdentity| {
+        topology
+            .physical_devices()
+            .iter()
+            .find(|device| device.identity() == identity)
+            .unwrap()
+            .cache()
     };
+    let host = topology.physical_devices()[0].identity().clone();
+    assert!(matches!(host, PhysicalIdentity::Host { .. }));
     assert_eq!(
-        bandwidth(&topology, BackendName::Cuda, &gpu),
-        reported(
-            crate::fixtures::RTX3090_CUDA_BANDWIDTH,
-            ReportedBy::CudaMemoryClockBusWidth
-        )
+        cache(&host),
+        reported(crate::fixtures::GB10_CPU_CACHE, ReportedBy::LinuxSysfsCache)
     );
-    assert_eq!(bandwidth(&topology, BackendName::Vulkan, &gpu), None);
-    let gb10 = crate::fixtures::topology(&gb10());
     assert_eq!(
-        bandwidth(&gb10, BackendName::Cuda, &PhysicalIdentity::Uuid(GB10_UUID)),
-        None
+        cache(&PhysicalIdentity::Uuid(GB10_UUID)),
+        reported(crate::fixtures::GB10_CUDA_L2, ReportedBy::CudaL2Cache)
     );
+    let mut vulkan_only = gb10();
+    vulkan_only.cuda.clear();
+    let topology = crate::fixtures::topology(&vulkan_only);
+    let gpu = topology
+        .physical_devices()
+        .iter()
+        .find(|device| *device.identity() == PhysicalIdentity::Uuid(GB10_UUID))
+        .unwrap();
+    assert_eq!(gpu.cache(), None);
+}
+
+/// A driver update changes the identity of that driver's executor only.
+#[test]
+fn a_driver_update_changes_only_its_executor_identity() {
+    let gpu = PhysicalIdentity::Uuid(rtx3090_uuid());
+    let identities = |driver: &str| {
+        let topology = rtx3090_topology(driver);
+        [BackendName::Cpu, BackendName::Cuda, BackendName::Vulkan].map(|backend| {
+            let executor = match backend {
+                BackendName::Cpu => topology.resolve(ExecutorSelector::HostCpu).unwrap(),
+                backend => executor(&topology, backend, &gpu),
+            };
+            topology.executor_identity(executor.id()).unwrap()
+        })
+    };
+    let [cpu, cuda, vulkan] = identities(RTX3090_VULKAN_DRIVER);
+    let [cpu_after, cuda_after, vulkan_after] = identities("vulkan driver 4 version 616.92.0");
+    assert_eq!((cpu, cuda), (cpu_after, cuda_after));
+    assert_ne!(vulkan, vulkan_after);
+    assert_eq!(vulkan_after.driver, "vulkan driver 4 version 616.92.0");
+    assert_eq!(vulkan.physical, gpu);
+}
+
+/// The rtx3090 machine with Vulkan driver `driver`.
+fn rtx3090_topology(driver: &str) -> Arc<DeviceTopology> {
+    let mut reports = rtx3090();
+    reports.vulkan[0].driver = driver.into();
+    Arc::new(topology(&reports))
 }
 
 /// The machine this runs on: its reports, the topology they make, and one

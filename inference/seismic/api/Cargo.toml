@@ -11,6 +11,7 @@ seismic-runtime.workspace = true
 seismic-topology.workspace = true
 seismic-measure.workspace = true
 seismic-native-cpu.workspace = true
+serde.workspace = true
 seismic-std.workspace = true
 sha2 = "0.10"
 self_cell = "1"

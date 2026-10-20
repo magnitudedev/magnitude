@@ -104,6 +104,7 @@ Any job can run locally or on a host named by ssh alias or pool.
   - The agent exits when the controlling session's heartbeat stops, and it has a hard maximum hold time.
   - A lock can therefore never outlive its work, and work never outlives its lock.
 - Synchronization, building, model acquisition, thermal settling and measurement all happen under the lock.
+- A job that reads catalog headers (header-only family and assessment tests) asks for them: the catalog tool exports the exact headers of the lock's components, and of the few pinned artifacts outside the catalog those tests read, into the host's cache, rebuilt only for another lock or other artifacts, and names the export to the job. No test reads headers a host happens to hold.
 - Measurement starts only after temperatures are flat and the machine is idle.
 
 ## Evidence

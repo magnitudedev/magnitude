@@ -1,154 +1,90 @@
 # ICN Memory Abstractions
 
-ICN memory planning separates two facts that native inference reports tend to mix together:
+ICN memory planning separates three facts that native inference reports tend to mix together:
 
-- **where an allocation was made**; and
-- **how much memory that allocation requires**.
+- **where bytes live** (a store);
+- **how an executor reaches it** (an access path, under its driver's grant); and
+- **how much a load requires there**.
 
-Hardware inventory is the sole authority for translating a native allocation location into a
-physical memory pool. Native fitting and runtime reports supply allocation evidence only.
+The device topology is the sole authority for the first two. Fit decides the third against it.
+Native allocation reports supply charges only; they never create stores.
 
 ## Architectural relationship
 
 ```text
-HardwareSnapshot
+DeviceTopology (seismic-topology)
+  - physical devices and the executors that drive them
+  - stores: host RAM, device memory, volumes
+  - access paths (executor -> store, with a grant) and placements
+      |
+      +-- Status: each store's headroom, what is left of each grant
       |
       v
-MemoryTopology
-  - physical memory domains and capacities
-  - canonical native device identities
-  - device-to-domain bindings
-      ^
-      | resolves MemoryLocation
+Fit (engine platform policy)
+  - store fit: capacity less the planning reserve; live ceiling: headroom less it
+  - a path takes the smaller of its store's room and its grant's (less the same reserve)
       |
-MemoryCharge
-  - MemoryChargeOwner
-  - MemoryLocation
-  - MemoryBreakdown
+      +-- assessment: does a model fit, and what room each store has for it
+      +-- admission: DeviceHeap claims from a fresh status sample
+      +-- tuning room, the hardware view, downloads
       |
       v
-MemoryAccountant
-  - aggregates by resolved physical domain
-  - applies device-local limits
-  - produces MemoryAccounting
+Seismic ledgers (runtime)
+  - every allocation charged along its access paths to its stores
+  - enforced store, path and storage limits
       |
-      +-- fitting policy --> HardwareAssessment
-      |
-      +-- runtime observation --> ModelInstanceAllocation
+      v
+Store census (engine)
+  - each store's charge by class: model, context, compute, auxiliary
 ```
 
 ## Entities
 
-### `HardwareSnapshot`
+### `DeviceTopology`
 
-A point-in-time hardware observation. It records system memory, native device views, physical
-memory domains, capacities, and the bindings discovered between them. Planning and load admission
-must use the exact snapshot supplied by the owning ICN process; a worker must not rediscover a
-different topology while interpreting an allocation.
+An immutable revision of the machine as its APIs report it. Physical devices are identified by the
+identity their drivers share, so a GPU seen through CUDA and Vulkan is one device. Each executor
+(one backend's handle on a device) has a placement per storage kind (device and upload storage): an
+ordered list of access paths. A placement may span stores, and several paths may reach one store.
+Host RAM is one store however many executors use it. Identifiers belong to one revision; stable
+selectors and store identities cross processes.
 
-### `NativeDeviceIdentity`
+### Grant
 
-The canonical identity of a device view in the process-global native registry. It contains:
+What an executor's driver lets this process place along one access path: CUDA's usable memory, a
+Vulkan heap's budget, Metal's recommended working set. A grant bounds its store as the store's
+headroom does, so it keeps the store's planning reserve inside it: a grant filled to its end fails
+the device's own work beside the charges.
 
-- canonical backend identity;
-- optional physical-device identity; and
-- native registry index.
+### `Status`
 
-Backend aliases are canonicalized here and nowhere else. Hardware discovery uses this identity
-when it constructs stable device IDs and groups backend views that are proven to share a physical
-device.
+One timestamped sample of each store's headroom for this process and what is left of each grant,
+from the OS and drivers without an opened executor, plus what only opened executors know (their
+ledgers' charges and CUDA's free memory).
 
-### `NativeDeviceLocator`
+### `Fit`
 
-The device evidence supplied by one native allocation report. It is deliberately distinct from
-device identity because different native APIs expose different amounts of evidence:
+The engine's single interpretation of stores, grants and reserves. Stable fit uses capacities;
+live fit uses the sample. Direct host demands (tables, staging) and executor storage share one
+budget per store and one budget per grant. Nothing outside fit infers a placement from a backend
+name, platform or device kind.
 
-- an exact locator supplies a non-empty backend, optional physical identity, and native index;
-- an observed locator preserves whatever evidence a native allocation report supplied, treating
-  blank backend or physical-identity strings as absent rather than contradictory identity; and
-- an index locator supplies only the process-global native index.
+### Claims and the `DeviceHeap`
 
-A locator cannot select a memory domain. It can only be matched against an identity already owned
-by `MemoryTopology`.
+A loaded engine claims each physical operation's peak before it allocates, from a fresh sample, in
+the Normal band of every store it uses. Seismic's enforced limits are refreshed from the same
+sample. A claim may also take the free space of blocks the device already holds.
 
-### `MemoryLocation`
+### Store census
 
-The unresolved location of one allocation:
-
-- host memory; or
-- a native device locator.
-
-This type is the boundary between native allocation evidence and topology-owned physical memory
-semantics.
-
-### `MemoryTopology`
-
-An immutable, validated interpretation of one `HardwareSnapshot`. It owns:
-
-- physical memory-domain identity;
-- stable and total capacities;
-- canonical native device identities;
-- native-device-to-domain bindings; and
-- optional device-local memory constraints.
-
-`MemoryTopology.resolve` is the only operation that may translate a `MemoryLocation` into a
-physical memory domain. Unknown or contradictory device evidence fails closed as a topology
-mismatch. Code outside topology must not infer shared memory from platform, backend, device name,
-or architecture.
-
-### `MemoryBreakdown`
-
-The complete memory requirement at one allocation location, divided into:
-
-- model storage;
-- context state;
-- compute workspace; and
-- auxiliary allocations.
-
-It owns category-wise aggregation and total-byte derivation. This prevents every planner,
-accountant, and resident observer from reimplementing four parallel counters or recomputing totals
-with subtly different rules.
-
-### `MemoryCharge`
-
-One source's complete memory claim at one unresolved location. It combines:
-
-- the owner of the allocation;
-- its `MemoryLocation`; and
-- its complete `MemoryBreakdown`.
-
-A charge is not split into category-shaped fragments. Its owner and location are resolved once,
-then the whole breakdown is aggregated together. Source-specific rules belong at normalization:
-for example, bundled MTP keeps its working-memory breakdown but removes duplicate model storage.
-
-### `MemoryAccountant`
-
-The single consumer of topology and charges. For every charge it:
-
-1. resolves the location through `MemoryTopology`;
-2. adds the breakdown to the resolved physical-domain ledger;
-3. adds the same breakdown to an applicable device-local constraint;
-4. derives totals from the aggregate breakdowns; and
-5. compares those totals with topology-owned capacities.
-
-The accountant does not receive platform, architecture, backend, unified-memory, or
-component-specific placement switches.
-
-### `MemoryAccounting`
-
-The factual result of accounting: aggregate breakdowns and usable capacities for every charged
-physical domain and device-local limit. It contains no fitting verdict and no runtime presentation
-state. Fitting policy converts it into a hardware assessment; resident observation converts its
-domain allocations into model-instance state.
+The classification of a device's charges by store and class, each allocation counted once
+whatever holds it. Store identities cross the worker boundary; host-resident tables, which the
+runtime does not allocate, are added to host RAM.
 
 ## Invariants
 
-1. A physical allocation is charged exactly once.
-2. Every charge is resolved through the snapshot-derived topology.
-3. Native reports describe allocations; they never create memory domains.
-4. Backend aliases have one canonicalization authority.
-5. The native registry index is unique within a topology.
-6. Missing location evidence may be resolved from the native index; inconsistent non-empty
-   evidence fails closed.
-7. Category totals are derived from `MemoryBreakdown`, not maintained independently.
-8. Planning, admission, and resident accounting use the same abstractions and resolution rules.
+1. Every byte is charged to the store it lives in, exactly once.
+2. Every fit question goes through `Fit`; reserves are subtracted once per store.
+3. Native reports describe charges; they never create stores or paths.
+4. A placement is what the backend actually allocates from.
+5. Planning, admission, tuning and resident accounting read the same topology and fit rules.

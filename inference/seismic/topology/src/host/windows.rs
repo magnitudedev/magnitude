@@ -95,6 +95,52 @@ pub(super) fn os_build() -> Result<String, String> {
     ))
 }
 
+/// `GetLogicalProcessorInformationEx(RelationCache)`: the highest-level data
+/// or unified caches, one record per instance, summed; `None` when the OS
+/// describes none. A failed call is an error.
+pub(super) fn last_level_cache() -> Result<Option<Reported<u64>>, String> {
+    use windows_sys::Win32::System::SystemInformation::{
+        CacheData, CacheUnified, GetLogicalProcessorInformationEx, RelationCache,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    let mut length = 0u32;
+    unsafe { GetLogicalProcessorInformationEx(RelationCache, std::ptr::null_mut(), &mut length) };
+    // Records are variable-length; a u64 buffer aligns each.
+    let mut buffer = vec![0u64; (length as usize).div_ceil(8)];
+    if unsafe {
+        GetLogicalProcessorInformationEx(RelationCache, buffer.as_mut_ptr().cast(), &mut length)
+    } == 0
+    {
+        return Err(format!(
+            "GetLogicalProcessorInformationEx(RelationCache) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let bytes = buffer.as_ptr().cast::<u8>();
+    let mut offset = 0usize;
+    // The highest level seen, and its instances' bytes together.
+    let mut last: Option<(u8, u64)> = None;
+    while offset < length as usize {
+        // SAFETY: the OS wrote `length` bytes of consecutive records, each
+        // `Size` bytes long.
+        let record =
+            unsafe { &*(bytes.add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) };
+        if record.Relationship == RelationCache {
+            let cache = unsafe { &record.Anonymous.Cache };
+            if matches!(cache.Type, CacheData | CacheUnified) {
+                let size = u64::from(cache.CacheSize);
+                last = match last {
+                    Some((level, total)) if level == cache.Level => Some((level, total + size)),
+                    Some((level, _)) if level > cache.Level => last,
+                    _ => Some((cache.Level, size)),
+                };
+            }
+        }
+        offset += record.Size as usize;
+    }
+    Ok(last.map(|(_, total)| Reported::new(total, ReportedBy::WindowsProcessorCache)))
+}
+
 pub(super) fn sample() -> Result<HostSample, ObservationError> {
     let status = memory_status().map_err(ObservationError::Failed)?;
     Ok(HostSample {

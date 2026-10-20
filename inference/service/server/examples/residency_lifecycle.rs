@@ -32,6 +32,7 @@ use magnitude_service_models::{
     managed_model_services,
 };
 use magnitude_service_server::configurations::ResolvedConfigurations;
+use magnitude_service_server::device_lock::DeviceLock;
 use magnitude_service_server::hardware::HardwareInventory;
 use magnitude_service_server::model_store::{ServedStore, open_served_store};
 use magnitude_service_server::residency::controller::{ModelInstances, ResidencyEnvironment};
@@ -128,6 +129,7 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
             host_memory: host_memory.clone(),
             idle_timeout,
             launcher: WorkerLauncher::current().expect("harness executable"),
+            device: DeviceLock::default(),
             instance_id_namespace: namespace.to_owned(),
         });
         let router = app(

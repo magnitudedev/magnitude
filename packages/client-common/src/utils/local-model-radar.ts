@@ -1,9 +1,12 @@
 import { Option } from "effect"
 import {
   localModelServingState,
+  type GenerationPerformanceEvidence,
   type GenerationPerformanceSamples,
   type LocalModel,
+  type LocalModelPerformance,
   type LocalModelServingState,
+  type MachineMeasurement,
 } from "@magnitudedev/sdk"
 import { formatMemorySize } from "./format-bytes"
 import { localModelSpeculativeMethodLabel } from "./model-presentation"
@@ -99,37 +102,47 @@ const memoryFitLabel = (assessment: ModelAssessment): string => {
   return "Tight"
 }
 
-/** How to read an estimated speed: arithmetic over bandwidth, not a benchmark. */
+/** How to read an estimated speed: arithmetic over this machine's measurements, not a benchmark. */
 export const localModelSpeedNote = "Rough estimate. Does not account for speculative decoding."
 
 /** The explanation behind an estimated speed's info icon. */
 export const localModelSpeedTooltip =
-  "Estimated from your machine's memory bandwidth. Actual performance will differ. Does not include speculative decoding."
+  "Estimated from measurements of your machine running Magnitude's own kernels. Actual performance will differ. Does not include speculative decoding."
+
+/** The estimate whose context depth is nearest `contextTokens`. */
+const nearestSample = (
+  samples: GenerationPerformanceSamples,
+  contextTokens: number,
+): GenerationPerformanceEvidence => samples.reduce((closest, candidate) =>
+  Math.abs(candidate.contextTokens - contextTokens) < Math.abs(closest.contextTokens - contextTokens)
+    ? candidate
+    : closest)
+
+const measurementLabel = (measurement: MachineMeasurement): string =>
+  measurement._tag === "Failed"
+    ? `Measuring this machine failed; retrying at ${new Date(measurement.retryAt).toLocaleTimeString([], {
+        hour: "numeric",
+        minute: "2-digit",
+      })}`
+    : "Measuring this machine…"
 
 export const performanceRangeSpeedLabel = (
-  samples: GenerationPerformanceSamples,
+  performance: LocalModelPerformance,
   contextLength: number
 ): string => {
-  const lowerContext = Math.min(25_000, contextLength)
-  const upperContext = Math.min(75_000, contextLength)
-  const lowerSample = samples.find(
-    ({ contextTokens }) => contextTokens === lowerContext
-  )
-  const upperSample = samples.find(
-    ({ contextTokens }) => contextTokens === upperContext
-  )
-  if (lowerSample === undefined || upperSample === undefined) return "Not assessed"
-  const lower = Math.min(
-    lowerSample.estimatedTokensPerSecond,
-    upperSample.estimatedTokensPerSecond
-  )
-  const upper = Math.max(
-    lowerSample.estimatedTokensPerSecond,
-    upperSample.estimatedTokensPerSecond
-  )
-  return Math.round(lower) === Math.round(upper)
-    ? `~${Math.round(lower)} tok/s`
-    : `~${Math.round(lower)}–${Math.round(upper)} tok/s`
+  switch (performance._tag) {
+    case "Pending": return measurementLabel(performance.measurement)
+    case "Unavailable": return performance.failure.message
+    case "Estimated": {
+      const speeds = [
+        nearestSample(performance.samples, Math.min(25_000, contextLength)),
+        nearestSample(performance.samples, Math.min(75_000, contextLength)),
+      ].map(({ estimatedTokensPerSecond }) => Math.round(estimatedTokensPerSecond))
+      const lower = Math.min(...speeds)
+      const upper = Math.max(...speeds)
+      return lower === upper ? `~${lower} tok/s` : `~${lower}–${upper} tok/s`
+    }
+  }
 }
 
 export const localModelRadarAxes = (
@@ -142,7 +155,6 @@ export const localModelRadarAxes = (
 
   const assessment = serving.assessment
   const comparisonContext = Math.min(50_000, assessment.profile.contextLength)
-  const samples = assessment.performance
   const catalog = model._tag === "Catalog" ? Option.some(model.catalogData) : Option.none()
   const speculation = Option.getOrElse(localModelSpeculativeMethodLabel(model), () => "None")
   const variant = String(model.presentation.variantLabel)
@@ -162,14 +174,14 @@ export const localModelRadarAxes = (
       }),
     },
     {
-      value: Option.some(normalizeLocalModelRadarSpeed(samples.reduce((closest, candidate) =>
-        Math.abs(candidate.contextTokens - comparisonContext) <
-        Math.abs(closest.contextTokens - comparisonContext)
-          ? candidate
-          : closest
-      ).estimatedTokensPerSecond)),
+      // The estimate nearest the comparison depth; none while speed is pending or unavailable.
+      value: assessment.performance._tag === "Estimated"
+        ? Option.some(normalizeLocalModelRadarSpeed(
+            nearestSample(assessment.performance.samples, comparisonContext).estimatedTokensPerSecond,
+          ))
+        : Option.none(),
       label: "SPEED",
-      detail: performanceRangeSpeedLabel(samples, assessment.profile.contextLength),
+      detail: performanceRangeSpeedLabel(assessment.performance, assessment.profile.contextLength),
     },
     {
       value: Option.some(speculationValue(model)),

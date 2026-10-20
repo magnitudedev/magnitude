@@ -18,7 +18,7 @@ use magnitude_engine::assessment::{
     prepare_model_assessment_from,
 };
 use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
-use magnitude_engine::options::ModelMethod;
+use magnitude_engine::options::{ModelMethod, PROFILE_SEQUENCES};
 use magnitude_service_contracts::models::{
     CandidateDrafter, CandidateFile, CandidateInspection, CandidateInspectionProgressSink,
     CandidateInspectionRequest, CandidateSource, CandidateVersion, CatalogModelState, CatalogModels, CustomModel,
@@ -660,8 +660,9 @@ impl ManagedModelCandidates {
         drafter: Option<&DrafterMaterial>,
         method: ModelMethod,
     ) -> Result<CachedModelAssessment, InventoryError> {
-        let environment = Arc::clone(self.assessor.environment());
-        let evidence = self.assessment_evidence(
+        let environment = self.assessor.environment();
+        let evidence = assessment_evidence(
+            &environment.id,
             &target.identity,
             drafter.map(|drafter| drafter.identity.as_str()),
             &method,
@@ -691,7 +692,8 @@ impl ManagedModelCandidates {
         };
         let setup_environment = Arc::clone(&environment);
         let (prepared, fallback_context) = crate::spawn_blocking_traced(move || {
-            let prepared = prepare_model_assessment_from(&paths, &headers, &setup_environment.setup);
+            let prepared =
+                prepare_model_assessment_from(&paths, &headers, &setup_environment.setup.structure);
             // An unsupported file is profiled at its training context when its header names one;
             // without one it has no profile.
             let fallback_context = match &prepared {
@@ -724,7 +726,7 @@ impl ManagedModelCandidates {
         let depths = profile.performance_context_tokens.clone();
         let finish_environment = Arc::clone(&environment);
         let assessed = crate::spawn_blocking_traced(move || {
-            finish_model_assessment(&prepared, &finish_environment.setup, &depths)
+            finish_model_assessment(&prepared, &finish_environment.setup, &depths, PROFILE_SEQUENCES)
         })
         .await
         .map_err(|error| InventoryError::Internal(format!("candidate assessment failed: {error}")))?

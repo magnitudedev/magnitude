@@ -1,44 +1,60 @@
 //! Metadata-only model assessment on this machine's selected device.
 //!
-//! Prepares every model from its headers and assesses it against stable
-//! memory capacity and the device's memory bandwidth; prints one JSON object
-//! per model, shaped like the service's per-profile assessment result, with
-//! the model's capabilities and template fingerprint alongside. With
-//! `--topology`, prints the device topology and its discovery diagnostics
-//! instead. Opens no device.
+//! Measures the machine first, in process, through the function the
+//! measurement job runs (`worker::measure::measure_machine`): the records of
+//! the selected executor's cost points the kernel cache holds are kept, and
+//! only the points without one are timed (which opens the executor). Then
+//! derives the executor's costs from the records as a start does, prepares
+//! every model from its headers and assesses it against stable memory
+//! capacity and, when it fits, estimates its decode speed from those costs;
+//! prints one JSON object per model, shaped like the service's per-profile
+//! assessment result, with the model's capabilities and template
+//! fingerprint alongside. `--topology` prints the topology, its discovery
+//! diagnostics and the executor's costs (each with its samples and interval)
+//! instead; `--breakdown` prints each model's step call by call.
 
 use magnitude_engine::{
     assessment::{
-        AssessmentSetup, DrafterVerdict, ModelAssessment, ModelPackagePaths,
-        PreparedModelAssessment, finish_model_assessment, prepare_model_assessment,
+        finish_model_assessment, prepare_model_assessment, AssessmentSetup, AssessmentStructure,
+        DrafterVerdict, Measurements, ModelAssessment, ModelExecution, ModelPackagePaths,
+        Performance, PreparedModelAssessment,
     },
     error::UnsupportedModel,
-    options::{ModelMethod, ModelPolicy, standard_service_limits},
+    options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
+    worker::measure::{measure_machine, MeasureEvent, MeasureJob, MeasureRequest},
 };
 use magnitude_executor::{
-    assessment::{BandwidthSource, DeviceClass, DomainFit, ExecutionAssessment, step_seconds},
+    assessment::{
+        decode_pricing, step_seconds, DomainFit, ExecutionFit, ExecutionShortfall, ExecutorCosts,
+        MeasuredCost,
+    },
     platform::{DeviceRequest, MemoryReserves},
 };
 use seismic::{Devices, DiagnosticSource, StoreId, StoreIdentity};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 const STANDARD_DEPTHS: [u32; 3] = [25_000, 50_000, 75_000];
 
 struct Options {
     device: DeviceRequest,
+    /// The kernel cache, which holds the machine's measurements.
+    kernels: PathBuf,
     depths: Vec<u32>,
-    /// Print the parts of the step at each depth.
+    /// The conversations decoding together.
+    sequences: u32,
+    /// Print each model's step call by call at each depth.
     breakdown: bool,
-    /// Print the topology and its discovery diagnostics rather than assess
-    /// models.
+    /// Print the topology, its discovery diagnostics, its measurements and
+    /// the executor costs rather than assess models.
     topology: bool,
     models: Vec<ModelPackagePaths>,
 }
 
-const USAGE: &str = "magnitude-assess --device auto|metal|cuda|vulkan|cpu \
-     [--depths 25000,50000,75000] [--breakdown] [--method auto|plain] \
+const USAGE: &str = "magnitude-assess --device auto|metal|cuda|vulkan|cpu --kernels DIR \
+     [--depths 25000,50000,75000] [--sequences 1] [--breakdown] [--method auto|plain] \
      (--topology | TARGET.gguf[,[PROJECTOR.gguf][,DRAFT.gguf]]...)";
 
 fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
@@ -48,7 +64,10 @@ fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, 
 
 fn parse() -> Result<Options, String> {
     let mut device = None;
+    let mut kernels = None;
     let mut depths = STANDARD_DEPTHS.to_vec();
+    // A serving profile's, as the service estimates.
+    let mut sequences = PROFILE_SEQUENCES;
     let mut breakdown = false;
     let mut method = ModelMethod::Auto;
     let mut topology = false;
@@ -73,6 +92,12 @@ fn parse() -> Result<Options, String> {
                     })
                     .collect::<Result<_, _>>()?
             }
+            "--sequences" => {
+                sequences = value(&argument, &mut args)?
+                    .parse()
+                    .map_err(|error| format!("--sequences: {error}"))?
+            }
+            "--kernels" => kernels = Some(PathBuf::from(value(&argument, &mut args)?)),
             "--breakdown" => breakdown = true,
             "--method" => {
                 method = match value(&argument, &mut args)?.as_str() {
@@ -114,7 +139,9 @@ fn parse() -> Result<Options, String> {
     }
     Ok(Options {
         device: device.ok_or("--device is required")?,
+        kernels: kernels.ok_or("--kernels is required")?,
         depths,
+        sequences,
         breakdown,
         topology,
         models,
@@ -136,9 +163,10 @@ fn main() {
 /// Returns whether every model produced a result.
 fn run() -> Result<bool, String> {
     let options = parse()?;
-    // The directory of each model is a served path: its assessed load reads
-    // from that volume.
-    let mut served = Vec::new();
+    // The kernel cache's volume is a served path, and so is the directory
+    // of each model, whose volume its assessed load reads from.
+    std::fs::create_dir_all(&options.kernels).map_err(|error| error.to_string())?;
+    let mut served = vec![options.kernels.clone()];
     for model in &options.models {
         let directory = std::path::absolute(&model.target)
             .map_err(|error| error.to_string())?
@@ -150,8 +178,7 @@ fn run() -> Result<bool, String> {
         }
     }
     let catalog = Devices::discover(&served).map_err(|error| error.to_string())?;
-    // The standalone engine's defaults: one conversation per batch.
-    let setup = AssessmentSetup::discover(
+    let structure = AssessmentStructure::discover(
         &catalog,
         options.device,
         MemoryReserves::standard(),
@@ -159,30 +186,65 @@ fn run() -> Result<bool, String> {
         standard_service_limits(),
     )
     .map_err(|error| error.to_string())?;
-    let source = match setup.bandwidth.source {
-        BandwidthSource::Reported => "reported by the driver".to_owned(),
-        BandwidthSource::Published => "published".to_owned(),
-        BandwidthSource::Assumed(class) => format!(
-            "assumed for {}",
-            match class {
-                DeviceClass::DedicatedGpu => "a dedicated GPU",
-                DeviceClass::IntegratedGpu => "an integrated GPU",
-                DeviceClass::Cpu => "a CPU",
-            }
-        ),
-    };
-    let executor = &setup.selected.info;
+    let executor = &structure.selected.info;
     eprintln!(
-        "magnitude-assess: {} ({}): {:.0} GB/s, {source}",
+        "magnitude-assess: {} ({})",
         executor.name(),
-        executor.backend().as_str(),
-        setup.bandwidth.bytes_per_second as f64 / 1e9
+        executor.backend().as_str()
     );
+
+    // The models are prepared from their headers; the measurements are
+    // the executor's own, whatever the models read.
+    let prepared = options
+        .models
+        .iter()
+        .map(|model| {
+            let started = Instant::now();
+            (
+                prepare_model_assessment(model, &structure),
+                started.elapsed(),
+            )
+        })
+        .collect::<Vec<_>>();
+    // Measured as the job measures: what is stored is kept, and each record
+    // stored now is printed.
+    let started = Instant::now();
+    let failures = measure_machine(
+        &MeasureRequest {
+            paths: served,
+            kernels: options.kernels.clone(),
+            executor: executor.selector(),
+            // Nothing preempts the tool's job; its process names it.
+            job: MeasureJob(u64::from(std::process::id())),
+        },
+        &mut |event| {
+            if let MeasureEvent::Recorded(key, record) = event {
+                eprintln!(
+                    "magnitude-assess: {:.3} s: {key:?}: {record:?}",
+                    started.elapsed().as_secs_f64()
+                )
+            }
+        },
+    );
+    let measure_seconds = started.elapsed().as_secs_f64();
+    eprintln!("magnitude-assess: measured in {measure_seconds:.3} s");
+    for failure in &failures {
+        eprintln!("magnitude-assess: not measured: {failure}");
+    }
+    let measurements = structure.stored_measurements(&options.kernels);
+
     if options.topology {
+        let costs = match &measurements {
+            Measurements::Measured {
+                costs: measured, ..
+            } => costs(measured),
+            Measurements::Pending => json!("pending"),
+            Measurements::Unavailable { reason } => json!({ "unavailable": reason }),
+        };
+        let topology = catalog.topology();
         // Why a backend or adapter is absent from the graph (an absent
         // driver, an enumeration failure), as discovery retained it.
-        let diagnostics = setup
-            .topology
+        let diagnostics = topology
             .diagnostics()
             .iter()
             .map(|diagnostic| {
@@ -193,32 +255,41 @@ fn run() -> Result<bool, String> {
                 json!({ "source": source, "message": diagnostic.message })
             })
             .collect::<Vec<_>>();
-        let topology: Value = serde_json::from_str(&setup.topology.normalized())
-            .expect("the normalized topology is JSON");
+        let normalized: Value =
+            serde_json::from_str(&topology.normalized()).expect("the normalized topology is JSON");
         println!(
             "{}",
             json!({
-                "topology": topology,
+                "topology": normalized,
                 "diagnostics": diagnostics,
                 "executor": executor.selector().to_string(),
+                "executorCosts": costs,
+                "failures": failures.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "measureSeconds": measure_seconds,
             })
         );
-        return Ok(true);
+        return Ok(failures.is_empty());
     }
+
+    let setup = AssessmentSetup {
+        structure: Arc::new(structure),
+        measurements,
+    };
     let mut complete = true;
-    for model in &options.models {
+    for (model, (prepared, preparation)) in options.models.iter().zip(prepared) {
         let started = Instant::now();
-        let assessed = prepare_model_assessment(model, &setup).and_then(|prepared| {
+        let assessed = prepared.and_then(|prepared| {
             if options.breakdown {
-                print_breakdown(model, &prepared, &setup, &options.depths);
+                print_breakdown(model, &prepared, &setup, &options)?;
             }
-            finish_model_assessment(&prepared, &setup, &options.depths)
+            finish_model_assessment(&prepared, &setup, &options.depths, options.sequences)
         });
         match assessed {
             Ok(assessment) => {
                 let mut object = render(&setup, &assessment);
                 object["model"] = json!(model.target.display().to_string());
-                object["assessmentSeconds"] = json!(started.elapsed().as_secs_f64());
+                object["assessmentSeconds"] =
+                    json!((preparation + started.elapsed()).as_secs_f64());
                 println!("{object}");
             }
             Err(error) => {
@@ -230,16 +301,72 @@ fn run() -> Result<bool, String> {
     Ok(complete)
 }
 
-/// The parts of the step at each depth, on stderr: the estimate's
-/// composition, to compare with a real decode.
+fn cost(cost: &MeasuredCost) -> Value {
+    json!({ "value": cost.value, "interval": cost.interval, "samples": cost.samples })
+}
+
+/// The executor's costs, each with its interval and samples.
+fn costs(costs: &ExecutorCosts) -> Value {
+    json!({
+        "weightRates": costs.weight_rates.iter().map(|rate| {
+            // The launch cost's share of one call: its two weights of F × 4096
+            // at the rate measured.
+            let call = rate
+                .format
+                .canonical_byte_len(&[rate.features, 4096])
+                .map(|bytes| 2.0 * bytes as f64 / rate.bytes_per_second.value)
+                .ok();
+            json!({
+                "route": rate.route,
+                "format": rate.format.name(),
+                "bytesPerSecond": cost(&rate.bytes_per_second),
+                "features": rate.features,
+                "launchFraction": call.map(|call| costs.launch_seconds.value / call),
+            })
+        }).collect::<Vec<_>>(),
+        "matrixFlopsPerSecond": costs.matrices.iter().map(|matrix| json!({
+            "format": matrix.format.name(),
+            "flops": cost(&matrix.flops),
+            "features": matrix.features,
+        })).collect::<Vec<_>>(),
+        "history": costs.histories.iter().map(|history| json!({
+            "layout": history.layout.identity(),
+            "fixedSeconds": cost(&history.fixed_seconds),
+            "bytesPerSecond": cost(&history.bytes_per_second),
+            "depths": history.depths,
+        })).collect::<Vec<_>>(),
+        "composition": cost(&costs.composition),
+        "launchSeconds": cost(&costs.launch_seconds),
+        "stepPipelinedSeconds": cost(&costs.step_pipelined_seconds),
+        "stepRoundTripSeconds": cost(&costs.step_round_trip_seconds),
+        "unmeasured": costs.unmeasured.iter().map(|unmeasured| json!({
+            "figure": unmeasured.figure.to_string(),
+            "reason": unmeasured.reason,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Each call of the step at each depth, on stderr: whether its bytes or its
+/// arithmetic bound it, its launches, and the step cost, to compare with a
+/// real decode.
 fn print_breakdown(
     model: &ModelPackagePaths,
     prepared: &PreparedModelAssessment,
     setup: &AssessmentSetup,
-    depths: &[u32],
-) {
-    let PreparedModelAssessment::Planned { execution, .. } = prepared else {
-        return;
+    options: &Options,
+) -> Result<(), magnitude_engine::assessment::ModelAssessmentError> {
+    let PreparedModelAssessment::Planned {
+        draft, execution, ..
+    } = prepared
+    else {
+        return Ok(());
+    };
+    let Measurements::Measured { costs, .. } = &setup.measurements else {
+        eprintln!(
+            "magnitude-assess: {}: no breakdown without measurements",
+            model.target.display()
+        );
+        return Ok(());
     };
     let charge = execution.memory_charge();
     let bounds = &charge.bounds;
@@ -271,25 +398,59 @@ fn print_breakdown(
             "host_bytes": charge.host_bytes().ok(),
         })
     );
+    let failed = magnitude_engine::assessment::ModelAssessmentError::Assessment;
+    let sequences = u64::from(options.sequences);
+    let pricing = decode_pricing(draft, costs);
     let demand = execution.demand();
     eprintln!(
-        "magnitude-assess: {}: {} launches, {:.2} GB streamed per step",
+        "magnitude-assess: {}: {} calls, {sequences} sequences, lookahead {}, activations at \
+         {:.1} GB/s, uploads at {:.1} GB/s",
         model.target.display(),
-        demand.launches,
-        demand.streamed_bytes as f64 / 1e9
+        demand.calls.len(),
+        pricing.lookahead,
+        pricing
+            .activations(seismic::StorageKind::Device)
+            .map_err(failed)?
+            / 1e9,
+        pricing
+            .activations(seismic::StorageKind::Upload)
+            .map_err(failed)?
+            / 1e9,
     );
-    for &depth in depths {
-        let parts = step_seconds(demand, setup.bandwidth, depth);
+    for &depth in &options.depths {
+        let step = step_seconds(demand, &pricing, sequences, depth).map_err(failed)?;
+        let bound = |compute: bool| {
+            step.calls
+                .iter()
+                .filter(|call| call.compute_bound() == compute)
+                .map(|call| call.bytes.max(call.compute))
+                .sum::<f64>()
+        };
         eprintln!(
-            "magnitude-assess:   at {depth}: {:.1} µs per step = step {:.1} + launches {:.1} \
-             + weights {:.1} + history {:.1}",
-            parts.total() * 1e6,
-            parts.step * 1e6,
-            parts.launches * 1e6,
-            parts.weights * 1e6,
-            parts.history * 1e6,
+            "magnitude-assess:   at {depth}: {:.1} µs per step = {:.3} × (bytes-bound {:.1} + \
+             compute-bound {:.1} + attention fixed {:.1} + {} launches {:.1}) + step {:.1}",
+            step.total() * 1e6,
+            step.composition,
+            bound(false) * 1e6,
+            bound(true) * 1e6,
+            step.calls.iter().map(|call| call.fixed).sum::<f64>() * 1e6,
+            step.calls.iter().map(|call| call.launches).sum::<u64>(),
+            step.calls.iter().map(|call| call.launch).sum::<f64>() * 1e6,
+            step.step * 1e6,
         );
+        for (call, seconds) in demand.calls.iter().zip(&step.calls) {
+            eprintln!(
+                "magnitude-assess:     {:<32} {:>9.2} µs bytes {:>9.2} µs compute \
+                 {:>7.2} µs fixed {} launches",
+                call.launches.kernel().name(),
+                seconds.bytes * 1e6,
+                seconds.compute * 1e6,
+                seconds.fixed * 1e6,
+                seconds.launches,
+            );
+        }
     }
+    Ok(())
 }
 
 fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
@@ -320,24 +481,32 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
             .collect::<Vec<_>>()
     };
     let mut object = match execution {
-        ExecutionAssessment::Fits {
-            domains,
+        ModelExecution::Fits {
+            fit: ExecutionFit { domains, .. },
             performance,
-            ..
         } => json!({
             "_tag": "Fits",
             "memory": memory(domains),
-            "performance": performance.iter().map(|estimate| json!({
-                "contextTokens": estimate.context_tokens,
-                "estimatedTokensPerSecond": estimate.tokens_per_second,
-            })).collect::<Vec<_>>(),
+            "performance": match performance {
+                Performance::Pending => json!({ "_tag": "Pending" }),
+                Performance::Unavailable { reason } => {
+                    json!({ "_tag": "Unavailable", "reason": reason })
+                }
+                Performance::Estimated(estimates) => json!({
+                    "_tag": "Estimated",
+                    "decode": estimates.iter().map(|estimate| json!({
+                        "contextTokens": estimate.context_tokens,
+                        "estimatedTokensPerSecond": estimate.tokens_per_second,
+                    })).collect::<Vec<_>>(),
+                }),
+            },
         }),
-        ExecutionAssessment::DoesNotFit {
+        ModelExecution::DoesNotFit(ExecutionShortfall {
             domains,
             limiting,
             deficit_bytes,
             ..
-        } => json!({
+        }) => json!({
             "_tag": "DoesNotFit",
             "memory": memory(domains),
             "limitingResource": domain_id(setup, *limiting),
@@ -390,9 +559,11 @@ fn unsupported_json(unsupported: &UnsupportedModel) -> Value {
     })
 }
 
-/// Host RAM is the `system` domain; another store is named by its identity.
+/// Host RAM is the `system` domain; every other store is named by its store
+/// identity.
 fn domain_id(setup: &AssessmentSetup, domain: StoreId) -> String {
     match setup
+        .structure
         .topology
         .store_identity(domain)
         .expect("assessment domain belongs to topology")

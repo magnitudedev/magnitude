@@ -658,9 +658,13 @@ fn render_symbolic_rows(
 
 fn render_representation(out: &mut String, prefix: &str, representation: RepresentationId) {
     let info = registry::representation_info(representation);
+    // The representation as a flag; as a name a library can paste onto its
+    // own table's names; and as `SEISMIC_REPRESENTATION_<NAME>` through the
+    // tensor's prefix (`<prefix>()`), which reaches it by expansion alone, so
+    // a library can evaluate it in `#if` (glslang pastes no tokens there).
     out.push_str(&format!(
-        "#define {prefix}_REPRESENTATION_{} 1\n",
-        native_macro(info.representation)
+        "#define {prefix}_REPRESENTATION_{name} 1\n#define {prefix}_REPRESENTATION {name}\n#define {prefix}() SEISMIC_REPRESENTATION_{name}\n",
+        name = native_macro(info.representation)
     ));
     out.push_str(&format!(
         "#define {prefix}_DECODED_{} 1\n",

@@ -64,11 +64,16 @@ export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readon
           totalRequiredBytes: 0,
           requiredSystemMemoryBytes: 0,
         },
-        performance: [{ contextTokens: 32_768, estimatedTokensPerSecond: 50 }],
+        performance: {
+          _tag: "Estimated",
+          samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 50 }],
+        },
       },
-      rankingScores: installed
-        ? Option.none()
-        : Option.some({ intelligence: 0.7, speed: 0.8, fidelity: 0.9 }),
+      rankingScores: {
+        intelligence: 0.7,
+        speed: installed ? Option.none() : Option.some(0.8),
+        fidelity: 0.9,
+      },
     },
   }
 }
@@ -125,7 +130,10 @@ export const makeFoundModel = (
       assessmentId: ModelAssessmentIdSchema.make("found-assessment"),
       environmentId: AssessmentEnvironmentIdSchema.make("setup-environment"),
       memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0 },
-      performance: [{ contextTokens: 32_768, estimatedTokensPerSecond: 40 }],
+      performance: {
+        _tag: "Estimated",
+        samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 40 }],
+      },
     },
   },
   storageBytes: 2,

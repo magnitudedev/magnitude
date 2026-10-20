@@ -234,7 +234,7 @@ fn cuda_eight_query_group_decode_and_prefill_match_host_model() {
 fn cuda_attention_timings() {
     let Some(device) = cuda() else { return };
     let options = seismic::measure::Measure {
-        samples: std::num::NonZeroUsize::new(15).unwrap(),
+        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
         min_sample_seconds: 0.002,
     };
     let measure = |point| timing_common::measured(point, &options);

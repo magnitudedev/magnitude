@@ -222,7 +222,10 @@ impl Session {
 
     fn handle(&mut self, message: HostMessage) -> Result<Flow, TransportError> {
         match message {
-            HostMessage::Hello { .. } | HostMessage::Load { .. } | HostMessage::Prepare { .. } => {
+            HostMessage::Hello { .. }
+            | HostMessage::Load { .. }
+            | HostMessage::Prepare { .. }
+            | HostMessage::Measure { .. } => {
                 return Ok(Flow::Exit(WorkerExit::ProtocolViolation(
                     "handshake message after readiness".into(),
                 )))

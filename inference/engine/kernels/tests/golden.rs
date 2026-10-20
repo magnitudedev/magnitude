@@ -1243,14 +1243,15 @@ fn draft_rows(ctx: &Ctx) -> Vec<Variant> {
             .map(|m| Case {
                 label: format!("m{m}"),
                 args: vec![
+                    // (token, status) rows, the `sample_rows` result layout.
                     ctx.ints(
-                        &[m as u64],
+                        &[m as u64, 2],
                         &(0..m)
-                            .map(|_| rng.below(VOCABULARY_SLICE) as i32)
+                            .flat_map(|_| [rng.below(VOCABULARY_SLICE) as i32, 0])
                             .collect::<Vec<_>>(),
                     ),
                     // An empty directory: the tokens are the table's rows.
-                    ctx.ints(&[0], &[]),
+                    ctx.ints(&[0, 1], &[]),
                     Arg::Shared(table.clone()),
                     ctx.dense(
                         a,
@@ -1269,6 +1270,7 @@ fn draft_rows(ctx: &Ctx) -> Vec<Variant> {
             elements: vec![
                 ("EW", element(tf)),
                 ("A", a),
+                ("C", a),
                 ("EN", norm_element),
                 ("HN", norm_element),
                 ("CW", element(combine_format)),
@@ -1308,7 +1310,7 @@ fn embedding_rows(ctx: &Ctx) -> Vec<Variant> {
                             .collect::<Vec<_>>(),
                     ),
                     // An empty directory: the tokens are the table's rows.
-                    ctx.ints(&[0], &[]),
+                    ctx.ints(&[0, 1], &[]),
                     // The Qwen entry: unscaled, not normalized.
                     f32s(1.0),
                     i32s(0),

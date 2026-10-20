@@ -5,8 +5,7 @@
 # Local compiler/runtime cache.
 .seismic-cache/
 
-# Local catalog GGUF header dumps and hardware-research outputs.
-catalog/headers
+# Local hardware-research outputs.
 catalog/results/
 seismic/hardware/results/
 

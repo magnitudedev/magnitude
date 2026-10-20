@@ -3,7 +3,7 @@
 
 use crate::discovery::{self, DiscoveryError, Gathered, Natives};
 use crate::host::{self, DisplacementHistory, HostStatus, ObservationError};
-use crate::model::{DeviceTopology, Revision};
+use crate::model::{DeviceTopology, ExecutorId, Identity, Revision};
 use crate::status::{self, Sample};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -93,5 +93,12 @@ impl Inventory {
             ..
         } = &mut *state;
         status::sample(topology, natives, displacement)
+    }
+
+    /// The persistent identity of an executor of the current revision, what
+    /// measurements of work on it are keyed by; none for an executor of
+    /// another revision.
+    pub fn executor_identity(&self, executor: ExecutorId) -> Option<Identity> {
+        self.topology().executor_identity(executor)
     }
 }

@@ -1,4 +1,3 @@
-mod headers;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,11 +6,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use magnitude_artifacts::catalog_headers::{self, HeaderIndex};
 use magnitude_service_contracts::ModelDownloadEvent;
 use magnitude_service_contracts::models::{ModelId, SpeculativeMethod};
 use magnitude_service_models::{
     AcquiredCatalogModel, AcquiredFile, CatalogLockAdvance, InventoryConfig, ManagedModelStore,
-    ResolvingRecommendableCatalog, advance_model_catalog_lock, load_release_catalog,
+    ResolvingRecommendableCatalog, advance_model_catalog_lock, catalog_lock_digest,
+    load_release_catalog,
 };
 use serde_json::{Value, json};
 
@@ -54,6 +55,20 @@ enum Command {
         #[arg(long = "hf-cache")]
         hf_caches: Vec<PathBuf>,
     },
+    /// Export every catalog component's exact header at its locked revision, and each pinned
+    /// artifact's outside the catalog, for header-only tests: builds the header bundle under
+    /// `output` (only when it is not current for the lock), then writes the headers to
+    /// `output/headers/` with their index (`magnitude_artifacts::catalog_headers`) unless that
+    /// export is of the current lock and artifacts.
+    Headers {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        model_store: PathBuf,
+        /// Derived-cache root for repository metadata and GGUF headers.
+        #[arg(long)]
+        cache_root: Option<PathBuf>,
+    },
     /// Download (only what is missing) and verify one catalog model's target, drafter and
     /// projector at their locked revisions, then print their paths as JSON.
     Acquire {
@@ -65,14 +80,6 @@ enum Command {
         /// Derived-cache root for repository metadata and GGUF headers.
         #[arg(long)]
         cache_root: Option<PathBuf>,
-    },
-    /// Dump every catalog component's GGUF header from a planner bundle as the JSON the engine
-    /// family tests read, replacing the contents of `--output`.
-    DumpHeaders {
-        #[arg(long)]
-        bundle: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
     },
 }
 
@@ -167,6 +174,64 @@ async fn build_bundle(
         "built planner inputs changed the resolved catalog"
     );
     println!("generated {}", output.display());
+    Ok(())
+}
+
+async fn headers(
+    output: PathBuf,
+    model_store: PathBuf,
+    cache_root: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let output = std::path::absolute(&output)?;
+    let cache_root = match cache_root {
+        Some(cache_root) => cache_root,
+        None => InventoryConfig::default_cache_root()?,
+    };
+    let bundle = output.join("model-planner-inputs.bundle");
+    build_bundle(
+        bundle.clone(),
+        std::path::absolute(&model_store)?,
+        std::path::absolute(&cache_root)?,
+        Vec::new(),
+    )
+    .await?;
+    let exported = output.join("headers");
+    let artifacts = catalog_headers::artifacts();
+    // An export of another lock or other artifacts, or none, is replaced.
+    let current = std::fs::read(exported.join(catalog_headers::INDEX))
+        .ok()
+        .and_then(|index| serde_json::from_slice::<HeaderIndex>(&index).ok())
+        .is_some_and(|index| index.lock == catalog_lock_digest() && index.artifacts == artifacts);
+    if current {
+        eprintln!("Catalog headers are already current.");
+    } else {
+        let staging = output.join("headers.tmp");
+        if staging.exists() {
+            tokio::fs::remove_dir_all(&staging).await?;
+        }
+        let components = load_release_catalog(&bundle)?.export_headers(&staging)?;
+        let models = open_catalog_models(
+            std::path::absolute(&model_store)?,
+            std::path::absolute(&cache_root)?,
+            Vec::new(),
+        )
+        .await?;
+        for artifact in &artifacts {
+            models.export_artifact_header(artifact, &staging).await?;
+        }
+        let index = HeaderIndex {
+            lock: catalog_lock_digest(),
+            components,
+            artifacts,
+        };
+        let encoded = serde_json::to_vec_pretty(&index)?;
+        tokio::fs::write(staging.join(catalog_headers::INDEX), encoded).await?;
+        if exported.exists() {
+            tokio::fs::remove_dir_all(&exported).await?;
+        }
+        tokio::fs::rename(&staging, &exported).await?;
+    }
+    println!("{}", exported.display());
     Ok(())
 }
 
@@ -295,16 +360,16 @@ async fn main() -> anyhow::Result<()> {
             cache_root,
             hf_caches,
         } => build_bundle(output, model_store, cache_root, hf_caches).await,
+        Command::Headers {
+            output,
+            model_store,
+            cache_root,
+        } => headers(output, model_store, cache_root).await,
         Command::Acquire {
             model,
             model_store,
             cache_root,
         } => acquire(model, model_store, cache_root).await,
-        Command::DumpHeaders { bundle, output } => {
-            let count = headers::dump(&bundle, &output)?;
-            println!("dumped {count} component headers into {}", output.display());
-            Ok(())
-        }
     }
 }
 

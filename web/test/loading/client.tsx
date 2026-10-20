@@ -11,10 +11,10 @@ const params = new URLSearchParams(location.search)
 let phase = params.get('phase') ?? 'loading'
 let page = params.get('page') ?? 'discover'
 const listeners = new Set<() => void>()
-const models = ['Qwen3.6 35B-A3B','Gemma 4 26B-A4B','Nemotron 3.5 Lightning 30B-A3B','Qwen3.5 4B','Gemma 4 12B'].map((name,index) => ({...makeSetupModel(true), modelId: `${['qwen','gemma','nemotron','qwen','gemma'][index]}-${index}:gguf:q4`, presentation:{...makeSetupModel(true).presentation,displayName:name}, storageBytes:17800000000, servingState:{...makeSetupModel(false).servingState,assessment:{...makeSetupModel(false).servingState.assessment,performance:[{contextTokens:25000,estimatedTokensPerSecond:66},{contextTokens:50000,estimatedTokensPerSecond:59},{contextTokens:75000,estimatedTokensPerSecond:54},{contextTokens:100000,estimatedTokensPerSecond:49}]}}}))
+const models = ['Qwen3.6 35B-A3B','Gemma 4 26B-A4B','Nemotron 3.5 Lightning 30B-A3B','Qwen3.5 4B','Gemma 4 12B'].map((name,index) => ({...makeSetupModel(true), modelId: `${['qwen','gemma','nemotron','qwen','gemma'][index]}-${index}:gguf:q4`, presentation:{...makeSetupModel(true).presentation,displayName:name}, storageBytes:17800000000, servingState:{...makeSetupModel(false).servingState,assessment:{...makeSetupModel(false).servingState.assessment,performance:{_tag:'Estimated' as const,samples:[{contextTokens:25000,estimatedTokensPerSecond:66},{contextTokens:50000,estimatedTokensPerSecond:59},{contextTokens:75000,estimatedTokensPerSecond:54},{contextTokens:100000,estimatedTokensPerSecond:49}]}}}}))
 const preferenceModels = models.map((model, index) => ({ ...model,
  catalogData: { ...model.catalogData, intelligence: 10 + index * 20 },
- servingState: { ...model.servingState, rankingScores: Option.some({ intelligence: 0.1 + index * 0.2, speed: 0.9 - index * 0.2, fidelity: 0.9 }) },
+ servingState: { ...model.servingState, rankingScores: { intelligence: 0.1 + index * 0.2, speed: Option.some(0.9 - index * 0.2), fidelity: 0.9 } },
 }))
 const modelState = {models, preparation:{assessment:{complete:true,settledModels:5,totalModels:5}}}
 const hardware = makeHardware('Apple M4 Max', 64, 16, [{ name: 'Apple M4 Max', memory: 64, shared: true }])

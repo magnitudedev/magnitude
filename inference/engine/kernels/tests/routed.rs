@@ -1932,8 +1932,8 @@ fn native_decode_expand_and_output_match_reference_rows(
                     A: seismic::Element::bf16(),
                     EGW: block.expert_gate.element(),
                     EUW: block.expert_up.element(),
-                    SGW: element(&device, "q8g32s"),
-                    SUW: element(&device, "q8g32s"),
+                    SGW: block.shared_gate.element(),
+                    SUW: block.shared_up.element(),
                 },
                 &specialization,
             )
@@ -1968,7 +1968,7 @@ fn native_decode_expand_and_output_match_reference_rows(
                 routed_output::Elements {
                     A: seismic::Element::bf16(),
                     EDW: block.expert_down.element(),
-                    SDW: element(&device, "q8g32s"),
+                    SDW: block.shared_down.element(),
                 },
                 &output_specialization,
             )
@@ -2366,9 +2366,9 @@ fn native_grouped_prefill_matches_reference_on(
                 &device,
                 routed_combine::Elements {
                     A: seismic::Element::bf16(),
-                    SGW: element(&device, "q8g32s"),
-                    SUW: element(&device, "q8g32s"),
-                    SDW: element(&device, "q8g32s"),
+                    SGW: block.shared_gate.element(),
+                    SUW: block.shared_up.element(),
+                    SDW: block.shared_down.element(),
                 },
                 &specialization(&joined_statics(&[("H", h), ("K", k), ("S", s)])),
             )
@@ -3003,10 +3003,14 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
         let residual_tensor = f32_tensor(&device, &[m, h], &residual);
         for mapping in grouped_mappings(&device) {
             let label = format!("35B grouped rows {rows} mapping {mapping:?}");
+            // CUDA's operand form at its first value: the staged form is the
+            // grouped test's (`OPERAND` 1).
             let specialization = |statics: &[(&str, u64)]| {
                 let specialization = specialization_on(device, statics, &mapping);
                 if is_cpu(device) {
                     specialization.with_param("INT8", 0)
+                } else if device.backend() == seismic::BackendName::Cuda {
+                    specialization.with_param("OPERAND", 0)
                 } else {
                     specialization
                 }
@@ -3262,10 +3266,13 @@ fn native_35b_grouped_capacity_keeps_every_bit_on(device: &seismic::Device) {
         let padded = (m * k + e * (t - 1)).div_ceil(t);
         let bounded = (m * k + e.min(m * k) * (t - 1)).div_ceil(t);
         for mapping in grouped_mappings(device) {
+            // CUDA's operand form at its first value, as the 35B chain's.
             let specialization = |statics: &[(&str, u64)]| {
                 let specialization = specialization_on(device, statics, &mapping);
                 if is_cpu(device) {
                     specialization.with_param("INT8", 0)
+                } else if device.backend() == seismic::BackendName::Cuda {
+                    specialization.with_param("OPERAND", 0)
                 } else {
                     specialization
                 }

@@ -40,7 +40,7 @@ pub use weights::{
     NGramBinding, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding,
     ReadoutClassChoice, ReadoutHead, RecurrentBinding, RoutedBinding, ScalableWeight,
     SelectionBinding, SelectionShape, SublayerTail, WeightPlan, WeightScalePlan, WeightStorageIdentity,
-    resident_element, resident_layout, source_element,
+    resident_element, resident_elements, resident_layout, source_element,
 };
 
 pub(crate) use weights::{activation_dtype, packing_residue, packing_run};

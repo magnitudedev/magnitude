@@ -1336,14 +1336,16 @@ impl<'a> Checker<'a> {
                 );
                 return None;
             }
+            // A constant count fails here as it would when run.
+            let width = reference_math::word_bits(a);
             if r.integer()
                 .and_then(|value| super::prove::constant(&self.arena, value))
-                .is_some_and(|n| !(0..32).contains(&n))
+                .is_some_and(|n| !(0..i64::from(width)).contains(&n))
             {
                 self.error(
                     DiagnosticRule::Type,
                     r.span,
-                    "integer shift count must be in 0..32",
+                    reference_math::ScalarFailure::ShiftCount.message(),
                 );
                 return None;
             }
@@ -2250,5 +2252,27 @@ mod word_value_tests {
         let error = check("fn probe() -> f32:\n    let w = 2147483647 + 1\n    let t = tensor[w] f32\n    return 0.0\n").unwrap_err();
         assert!(error.contains("tensor extent may be negative"), "{error}");
         check("fn probe() -> f32:\n    let w = (7 * 3) % 8\n    let mut t = tensor[w] f32\n    t[:] = ones_like(t)\n    return reduce(t, 0, sum)\n").unwrap();
+    }
+
+    /// A constant shift count is refused exactly where running the shift
+    /// fails: at or beyond the operand's word width, or negative.
+    #[test]
+    fn a_constant_shift_count_follows_the_operand_width() {
+        use crate::reference_math::ScalarFailure;
+        let shift = |dtype: &str, count: &str| {
+            check(&format!(
+                "fn probe(x: &tensor[1] {dtype}, o: &mut tensor[1] {dtype}):\n    o[0] = x[0] << {count}\n"
+            ))
+        };
+        for (dtype, count) in [("u32", "31"), ("i32", "0"), ("u64", "32"), ("u64", "63")] {
+            shift(dtype, count).unwrap_or_else(|error| panic!("{dtype} << {count}: {error}"));
+        }
+        for (dtype, count) in [("u32", "32"), ("i32", "-1"), ("u64", "64")] {
+            let error = shift(dtype, count).unwrap_err();
+            assert!(
+                error.contains(ScalarFailure::ShiftCount.message()),
+                "{dtype} << {count}: {error}"
+            );
+        }
     }
 }

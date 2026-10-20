@@ -47,6 +47,9 @@ pub(crate) struct CpuReport {
     pub(crate) name: String,
     /// The CPU as the OS reports it: model, instruction set and caches.
     pub(crate) identity: String,
+    /// Its last-level caches, summed over their instances
+    /// ([`host::last_level_cache`]).
+    pub(crate) cache: Option<Reported<u64>>,
     pub(crate) availability: Availability,
     pub(crate) max_allocation: u64,
 }
@@ -83,9 +86,8 @@ pub(crate) struct CudaReport {
     pub(crate) max_allocation: u64,
     /// `CU_DEVICE_ATTRIBUTE_INTEGRATED`, which describes the device.
     pub(crate) integrated: bool,
-    /// A discrete device's peak memory bandwidth, its memory clock times
-    /// its bus width (`seismic_cuda::DeviceDescriptor::memory_bandwidth`).
-    pub(crate) memory_bandwidth: Option<u64>,
+    /// `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`; none where it reads zero.
+    pub(crate) l2: Option<u64>,
     pub(crate) memory: CudaMemory,
     /// The CUDA devices whose memory it reads and writes directly
     /// (`cuDeviceCanAccessPeer`).
@@ -167,6 +169,9 @@ pub enum DiscoveryError {
     OsBuild(String),
     /// The CPU as the OS reports it could not be read.
     CpuIdentity(String),
+    /// A cache the OS reports for the CPU, part of its identity, could not
+    /// be read.
+    CpuCache(String),
     /// A served path's volume could not be identified or sized.
     Volume { path: PathBuf, message: String },
 }
@@ -179,6 +184,7 @@ impl fmt::Display for DiscoveryError {
             Self::CpuIdentity(message) => {
                 write!(f, "the CPU identity could not be read: {message}")
             }
+            Self::CpuCache(message) => write!(f, "the CPU's caches could not be read: {message}"),
             Self::Volume { path, message } => {
                 write!(
                     f,
@@ -234,6 +240,17 @@ fn device_memory(reports: &Reports, uuid: [u8; 16]) -> DeviceMemory {
     }
 }
 
+/// The last-level cache of the GPU of `uuid`, as its CUDA view reports it:
+/// Vulkan reports no cache size, so a device without a CUDA view has none.
+fn device_cache(reports: &Reports, uuid: [u8; 16]) -> Option<Reported<u64>> {
+    reports
+        .cuda
+        .iter()
+        .filter(|cuda| cuda.uuid == uuid)
+        .find_map(|cuda| cuda.l2)
+        .map(|bytes| Reported::new(bytes, ReportedBy::CudaL2Cache))
+}
+
 /// The OS adapter LUID of the GPU of `uuid`, as any of its views reports it.
 fn adapter_luid(reports: &Reports, uuid: [u8; 16]) -> Option<[u8; 8]> {
     reports
@@ -263,7 +280,12 @@ fn undecided(reports: &Reports, uuid: [u8; 16]) -> String {
 /// The revision `revision` of the machine `reports` describe.
 pub(crate) fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
     let machine = format!("{};ram={}", reports.cpu.identity, reports.host.value);
-    let mut builder = Builder::new(revision, PhysicalIdentity::Host { machine }, reports.host);
+    let mut builder = Builder::new(
+        revision,
+        PhysicalIdentity::Host { machine },
+        reports.cpu.cache,
+        reports.host,
+    );
     let host = builder.host();
     let host_ram = builder.host_ram();
 
@@ -276,7 +298,7 @@ pub(crate) fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
         } else {
             DeviceMemory::Own
         };
-        builder.physical(PhysicalIdentity::Registry(metal.registry_id), memory);
+        builder.physical(PhysicalIdentity::Registry(metal.registry_id), memory, None);
     }
     for uuid in reports
         .cuda
@@ -284,7 +306,11 @@ pub(crate) fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
         .map(|cuda| cuda.uuid)
         .chain(reports.vulkan.iter().map(|vulkan| vulkan.uuid))
     {
-        builder.physical(PhysicalIdentity::Uuid(uuid), device_memory(reports, uuid));
+        builder.physical(
+            PhysicalIdentity::Uuid(uuid),
+            device_memory(reports, uuid),
+            device_cache(reports, uuid),
+        );
     }
 
     // Each GPU's own memory. A device whose memory is its own has its
@@ -360,7 +386,6 @@ pub(crate) fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                     reports.cpu.max_allocation,
                     ReportedBy::CpuAddressSpace,
                 ),
-                memory_bandwidth: None,
             },
             tensor_operations: false,
         });
@@ -402,7 +427,6 @@ pub(crate) fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                     metal.max_allocation,
                     ReportedBy::MetalMaxBufferLength,
                 ),
-                memory_bandwidth: None,
             },
             tensor_operations: metal.tensor_operations,
         });
@@ -458,9 +482,6 @@ pub(crate) fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
             driver: cuda.driver.clone(),
             limits: Limits {
                 max_allocation: Reported::new(cuda.max_allocation, ReportedBy::CudaTotalMemory),
-                memory_bandwidth: cuda.memory_bandwidth.map(|bytes_per_second| {
-                    Reported::new(bytes_per_second, ReportedBy::CudaMemoryClockBusWidth)
-                }),
             },
             tensor_operations: false,
         });
@@ -514,7 +535,6 @@ pub(crate) fn build(revision: Revision, reports: &Reports) -> DeviceTopology {
                     vulkan.max_allocation,
                     ReportedBy::VulkanMaxAllocation,
                 ),
-                memory_bandwidth: None,
             },
             tensor_operations: false,
         });
@@ -753,9 +773,12 @@ pub(crate) fn gather(paths: &[PathBuf]) -> Result<Gathered, DiscoveryError> {
     let os_build = host::os_build().map_err(DiscoveryError::OsBuild)?;
     let mut diagnostics = Vec::new();
 
+    let cache = host::last_level_cache().map_err(DiscoveryError::CpuCache)?;
     let cpu = CpuReport {
         name: format!("Host CPU ({})", std::env::consts::ARCH),
-        identity: host::cpu_identity().map_err(DiscoveryError::CpuIdentity)?,
+        identity: host::cpu_identity(cache.map(|cache| cache.value))
+            .map_err(DiscoveryError::CpuIdentity)?,
+        cache,
         availability: cpu_availability(seismic_native_cpu::Tier::detected()),
         max_allocation: seismic_cpu::MAX_ALLOCATION_BYTES,
     };
@@ -916,7 +939,7 @@ fn cuda_reports(diagnostics: &mut Vec<Diagnostic>) -> Vec<CudaReport> {
             total: descriptor.total_memory_bytes,
             max_allocation: seismic_cuda::max_allocation_bytes(descriptor.total_memory_bytes),
             integrated: descriptor.integrated,
-            memory_bandwidth: descriptor.memory_bandwidth,
+            l2: (descriptor.l2_cache_bytes > 0).then_some(descriptor.l2_cache_bytes),
             memory: if descriptor.integrated || descriptor.numa_node {
                 CudaMemory::Host
             } else {

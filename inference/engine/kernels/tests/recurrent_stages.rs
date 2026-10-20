@@ -2153,7 +2153,7 @@ fn metal_recurrent_timings() {
         return;
     };
     let options = seismic::measure::Measure {
-        samples: std::num::NonZeroUsize::new(15).unwrap(),
+        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
         min_sample_seconds: 0.01,
     };
     let measure = |point| timing_common::measured(point, &options);

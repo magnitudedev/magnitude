@@ -589,7 +589,7 @@ fn time_top_k_full_vocabulary() {
                 let measured = timing_common::measured(
                     point,
                     &seismic::measure::Measure {
-                        samples: std::num::NonZeroUsize::MIN,
+                        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::MIN),
                         min_sample_seconds: 0.0,
                     },
                 );

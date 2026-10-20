@@ -48,6 +48,32 @@ fn sysctl_exact<const N: usize>(name: &str) -> Result<[u8; N], String> {
     Ok(bytes)
 }
 
+/// The integer `sysctl` `name` reports, none where the OS defines no such
+/// name, reports no value for it, or reports zero; any other failure is an
+/// error.
+fn sysctl_u64(name: &str) -> Result<Option<u64>, String> {
+    let mut bytes = [0u8; 8];
+    let length = match sysctl(name, Some(&mut bytes)) {
+        Ok(length) => length,
+        // `ENOENT`: the OS defines no such name. `EINVAL`: it defines the
+        // name but reports no value for this machine, as macOS 15 does for
+        // `hw.perflevel0.l3cachesize` and `hw.l3cachesize` on an M4 Pro
+        // (read on m4-pro-01, where `hw.nonexistent` is `ENOENT`), though
+        // the buffer holds any 32- or 64-bit value.
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::EINVAL)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(failed(name, error)),
+    };
+    // The values are 32- or 64-bit integers by name and OS release.
+    let value = match length {
+        4 => u64::from(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        8 => u64::from_ne_bytes(bytes),
+        _ => return Err(format!("sysctl {name} returned {length} bytes")),
+    };
+    Ok((value > 0).then_some(value))
+}
+
 pub(super) fn cpu_identity() -> Result<String, String> {
     let mut fields = Vec::new();
     for key in [
@@ -65,6 +91,37 @@ pub(super) fn cpu_identity() -> Result<String, String> {
 /// Metal compiler.
 pub(super) fn os_build() -> Result<String, String> {
     Ok(seismic_metal::profile::operating_system())
+}
+
+/// The last-level caches of every core type (`hw.perflevel<n>.*` for each
+/// of `hw.nperflevels`), summed over their instances: per core type, the
+/// L3 where the OS reports one, else the L2, of `l<k>cachesize` bytes, one
+/// instance per `cpusperl<k>` of its `logicalcpu`. A core type whose cache
+/// or sharing the OS reports none of leaves the caches unknown; any other
+/// failure is an error.
+pub(super) fn last_level_cache() -> Result<Option<Reported<u64>>, String> {
+    let Some(levels) = sysctl_u64("hw.nperflevels")? else {
+        return Ok(None);
+    };
+    let mut total = 0_u64;
+    for level in 0..levels {
+        let field = |name: &str| sysctl_u64(&format!("hw.perflevel{level}.{name}"));
+        let Some(logical) = field("logicalcpu")? else {
+            return Ok(None);
+        };
+        let mut cache = None;
+        for (size, sharing) in [("l3cachesize", "cpusperl3"), ("l2cachesize", "cpusperl2")] {
+            if let Some(bytes) = field(size)? {
+                cache = Some((bytes, field(sharing)?));
+                break;
+            }
+        }
+        let Some((bytes, Some(sharing))) = cache else {
+            return Ok(None);
+        };
+        total += bytes * logical.div_ceil(sharing);
+    }
+    Ok(Some(Reported::new(total, ReportedBy::MacOsSysctlCache)))
 }
 
 pub(super) fn capacity() -> Result<Reported<u64>, String> {

@@ -37,13 +37,28 @@ pub(crate) fn os_build() -> Result<String, String> {
 /// Windows' processor architecture, count, level and revision with its
 /// CPUID vendor, signature and feature, and brand leaves), then
 /// `;isa=<tier>` for the highest native tier it supports, where it supports
-/// one.
-pub(crate) fn cpu_identity() -> Result<String, String> {
+/// one, and `;cache=<bytes>` for its last-level `cache`
+/// ([`last_level_cache`]), where the OS reports one.
+pub(crate) fn cpu_identity(cache: Option<u64>) -> Result<String, String> {
     let mut identity = platform::cpu_identity()?;
     if let Some(tier) = seismic_native_cpu::Tier::detected() {
         identity.push_str(&format!(";isa={}", tier.name()));
     }
+    if let Some(cache) = cache {
+        identity.push_str(&format!(";cache={cache}"));
+    }
     Ok(identity)
+}
+
+/// The CPU's last-level caches: the highest-level data or unified caches the
+/// OS reports, each instance's size as the OS reports it summed over the
+/// instances (no memory-side cache, which no OS reports): part of the CPU's
+/// identity, and the host's reported cache. `None` only where the OS
+/// reports no such cache, or no size or sharing for one; a cache the OS
+/// reports but that cannot be read is an error, never a lower level
+/// standing in for it.
+pub(crate) fn last_level_cache() -> Result<Option<Reported<u64>>, String> {
+    platform::last_level_cache()
 }
 
 /// One host RAM status. `history` holds the displacement windows of the

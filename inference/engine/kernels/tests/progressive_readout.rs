@@ -1151,7 +1151,7 @@ fn progressive_portable_bodies_match_the_natives() {
 // Timing.
 
 const TIMING_OPTIONS: seismic::measure::Measure = seismic::measure::Measure {
-    samples: std::num::NonZeroUsize::new(9).unwrap(),
+    stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(9).unwrap()),
     min_sample_seconds: 0.02,
 };
 

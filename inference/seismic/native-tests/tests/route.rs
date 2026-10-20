@@ -3,7 +3,7 @@
 //! memory, conditional (`when`) launches and scratch, graphs with
 //! host-written inputs, asynchronous submission, measurement and tuning.
 
-use seismic::measure::{measure, Measure};
+use seismic::measure::{measure, Measure, Stop};
 use seismic::{
     Availability, BackendName, CallError, Device, Devices, Element, Exclusion, InvocationError,
     NativeGraphFamily, NativeSpecialization, NumericalRequirement, Outcome, SearchPlan,
@@ -603,9 +603,10 @@ fn measurement_reports_device_time() {
         let measurement = measure(
             point,
             &Measure {
-                samples: NonZeroUsize::new(3).unwrap(),
+                stop: Stop::Count(NonZeroUsize::new(3).unwrap()),
                 min_sample_seconds: 0.0005,
             },
+            None,
         )
         .unwrap();
         assert_eq!(measurement.samples.len(), 3);
@@ -3356,4 +3357,53 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
     device.set_storage_limit(StorageKind::Device, None);
     unit.perform(&mut source, None).unwrap();
     assert_ne!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
+}
+
+/// A range on a call-time dimension forms only the launches its values can
+/// activate: `gated_sum` held to `N` in 65..=1000 at `SMALL` 64 forms the
+/// mirrored launch alone, sums as the portable body inside the range, refuses
+/// a call outside it, and a range on a name that is not an entry dimension is
+/// refused at preparation.
+#[test]
+fn a_ranged_kernel_forms_and_serves_only_its_range() {
+    for device in devices() {
+        let ranged = NativeSpecialization::new()
+            .with_param("SMALL", 64)
+            .with_range("N", 65, 1000);
+        let kernel = gated_sum::native_for_device(&device, &ranged)
+            .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
+        let values = exact_values(200);
+        let x = f32_tensor(&device, &[200], &values);
+        let value = kernel.call(gated_sum::Args { x: &x }).unwrap().value;
+        assert_eq!(
+            read_f32(&value),
+            [portable_gated_sum(&values)],
+            "{:?}",
+            device.backend()
+        );
+        let small = f32_tensor(&device, &[10], &exact_values(10));
+        match kernel.call(gated_sum::Args { x: &small }) {
+            Err(CallError::Invocation(InvocationError::OutsideRange {
+                dimension,
+                low: 65,
+                high: 1000,
+                actual: 10,
+            })) => assert_eq!(dimension, "N"),
+            other => panic!(
+                "{:?}: N 10 outside the range: {:?}",
+                device.backend(),
+                other.err()
+            ),
+        }
+        let unknown = NativeSpecialization::new()
+            .with_param("SMALL", 64)
+            .with_range("Q", 1, 1);
+        let error = gated_sum::native_for_device(&device, &unknown)
+            .err()
+            .expect("Q is not a dimension of gated_sum");
+        assert!(
+            error.to_string().contains("`Q` is not a dimension"),
+            "{error}"
+        );
+    }
 }

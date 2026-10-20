@@ -141,10 +141,18 @@ pub enum ReportedBy {
     /// `DedicatedSystemMemory` together: the memory the OS does not manage
     /// that it reports as the adapter's.
     DxgiDedicatedMemory,
-    /// `CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE` (double data rate) times
-    /// `CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH`: a discrete device's
-    /// peak memory bandwidth.
-    CudaMemoryClockBusWidth,
+    /// Linux cacheinfo (`/sys/devices/system/cpu/cpu*/cache/index*`): the
+    /// highest-level data or unified caches, summed over their instances.
+    LinuxSysfsCache,
+    /// macOS `sysctl hw.perflevel*.l{2,3}cachesize` over
+    /// `hw.perflevel*.cpusperl{2,3}`: each core type's last-level caches,
+    /// summed over their instances.
+    MacOsSysctlCache,
+    /// Windows `GetLogicalProcessorInformationEx(RelationCache)`: the
+    /// highest-level data or unified caches, summed over their records.
+    WindowsProcessorCache,
+    /// `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`.
+    CudaL2Cache,
     /// The filesystem's size (`statvfs` blocks, `GetDiskFreeSpaceExW`
     /// total).
     FilesystemSize,
@@ -159,6 +167,7 @@ pub struct PhysicalDevice {
     id: PhysicalDeviceId,
     identity: PhysicalIdentity,
     memory: DeviceMemory,
+    cache: Option<Reported<u64>>,
 }
 
 impl PhysicalDevice {
@@ -174,6 +183,12 @@ impl PhysicalDevice {
     /// device from its backends' reports.
     pub fn memory(&self) -> DeviceMemory {
         self.memory
+    }
+    /// The device's last-level cache as an API reports it: the host CPU's
+    /// summed over its instances, a CUDA device's L2. None where no API
+    /// reports one (Metal, Vulkan, and every memory-side cache).
+    pub fn cache(&self) -> Option<Reported<u64>> {
+        self.cache
     }
 }
 
@@ -196,8 +211,9 @@ pub enum DeviceMemory {
 /// The identity a physical device's drivers share.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PhysicalIdentity {
-    /// The host: its CPU as the OS reports it (model and instruction set)
-    /// and its RAM.
+    /// The host: its CPU as the OS reports it (model, instruction set,
+    /// caches) and its RAM, whose change invalidates what was measured on
+    /// it.
     Host { machine: String },
     /// A GPU's device UUID, which CUDA (`cuDeviceGetUuid_v2`) and Vulkan
     /// (`VkPhysicalDeviceIDProperties::deviceUUID`) report alike, so their
@@ -223,6 +239,20 @@ impl fmt::Display for PhysicalIdentity {
             }
         }
     }
+}
+
+/// An executor's hardware and driver across revisions: the physical
+/// device, the backend and the driver as the backend reports it. What a
+/// measurement of work on the executor is keyed by, so it is taken again
+/// when the hardware or driver under it changes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Identity {
+    /// The physical device's identity.
+    pub physical: PhysicalIdentity,
+    /// The backend.
+    pub backend: BackendName,
+    /// The driver, as the backend reports it.
+    pub driver: String,
 }
 
 /// A store across revisions.
@@ -266,9 +296,6 @@ pub enum Availability {
 pub struct Limits {
     /// The largest single allocation; neither capacity nor availability.
     pub max_allocation: Reported<u64>,
-    /// The peak bandwidth of the memory it allocates from, where its API
-    /// reports one: none but CUDA's for a discrete device.
-    pub memory_bandwidth: Option<Reported<u64>>,
 }
 
 /// The kinds of storage an executor allocates.
@@ -565,6 +592,20 @@ impl DeviceTopology {
     pub fn revision(&self) -> Revision {
         self.revision
     }
+    /// The persistent identity of an executor of this revision; none for an
+    /// executor of another.
+    pub fn executor_identity(&self, executor: ExecutorId) -> Option<Identity> {
+        let executor = self.executor(executor)?;
+        Some(Identity {
+            physical: self
+                .physical_device(executor.physical())
+                .expect("an executor's device is of its revision")
+                .identity()
+                .clone(),
+            backend: executor.backend(),
+            driver: executor.driver().to_owned(),
+        })
+    }
     /// The persistent identity of a store of this revision; none for a
     /// store of another.
     pub fn store_identity(&self, id: StoreId) -> Option<StoreIdentity> {
@@ -626,6 +667,10 @@ impl DeviceTopology {
     pub fn access_path(&self, id: AccessPathId) -> Option<&AccessPath> {
         (id.revision == self.revision).then(|| &self.access[id.index as usize])
     }
+    /// The transfer path `id`; none for an identifier of another revision.
+    pub fn transfer_path(&self, id: TransferPathId) -> Option<&TransferPath> {
+        (id.revision == self.revision).then(|| &self.transfer[id.index as usize])
+    }
 
     /// The host RAM store; every topology has exactly one.
     pub fn host_ram(&self) -> &Store {
@@ -661,9 +706,14 @@ pub(crate) struct Builder {
 }
 
 impl Builder {
-    /// A revision holding the host of identity `host` and host RAM of
-    /// `capacity`.
-    pub(crate) fn new(revision: Revision, host: PhysicalIdentity, capacity: Reported<u64>) -> Self {
+    /// A revision holding the host of identity `host`, whose CPU's
+    /// last-level cache is `cache`, and host RAM of `capacity`.
+    pub(crate) fn new(
+        revision: Revision,
+        host: PhysicalIdentity,
+        cache: Option<Reported<u64>>,
+        capacity: Reported<u64>,
+    ) -> Self {
         let mut builder = Self {
             topology: DeviceTopology {
                 revision,
@@ -676,7 +726,7 @@ impl Builder {
                 diagnostics: Vec::new(),
             },
         };
-        builder.physical(host, DeviceMemory::Host);
+        builder.physical(host, DeviceMemory::Host, cache);
         builder.store(StoreKind::HostRam, capacity);
         builder
     }
@@ -699,12 +749,14 @@ impl Builder {
             .id
     }
 
-    /// The physical device of `identity`, whose memory is `memory`, added
-    /// when it is new. Its memory is decided once for the device.
+    /// The physical device of `identity`, whose memory is `memory` and whose
+    /// reported cache is `cache`, added when it is new. Both are decided
+    /// once for the device.
     pub(crate) fn physical(
         &mut self,
         identity: PhysicalIdentity,
         memory: DeviceMemory,
+        cache: Option<Reported<u64>>,
     ) -> PhysicalDeviceId {
         if let Some(device) = self
             .topology
@@ -713,6 +765,7 @@ impl Builder {
             .find(|device| device.identity == identity)
         {
             assert_eq!(device.memory, memory, "a device's memory is decided once");
+            assert_eq!(device.cache, cache, "a device's cache is decided once");
             return device.id;
         }
         let id = PhysicalDeviceId {
@@ -723,6 +776,7 @@ impl Builder {
             id,
             identity,
             memory,
+            cache,
         });
         id
     }

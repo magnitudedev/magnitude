@@ -78,6 +78,112 @@ pub(super) fn os_build() -> Result<String, String> {
     ))
 }
 
+/// One cache cacheinfo describes for one CPU: its `level`, its `size`
+/// (`<n>K`, as the kernel writes it) and the CPUs sharing it
+/// (`shared_cpu_list`), each none where the kernel leaves it out.
+struct CpuCache {
+    level: Option<u32>,
+    bytes: Option<u64>,
+    shared: Option<String>,
+}
+
+/// `/sys/devices/system/cpu/cpu*/cache/index*`: the `Data` or `Unified`
+/// caches of the highest `level` over every CPU, each instance (its
+/// `shared_cpu_list`) counted once, their sizes summed. The kernel leaves
+/// out an attribute it does not know (a type, level or size of zero), and a
+/// CPU it describes no caches of has no `cache` directory, so an absent
+/// directory or attribute is the OS reporting none: with a level, or a last
+/// level's size or sharing, unknown, the last-level caches are unknown. Any
+/// other read failure, or a value that does not parse, is an error.
+pub(super) fn last_level_cache() -> Result<Option<Reported<u64>>, String> {
+    let root = Path::new("/sys/devices/system/cpu");
+    let failed = |error: std::io::Error| format!("{}: {error}", root.display());
+    let listing = std::fs::read_dir(root).map_err(failed)?;
+    let mut caches = Vec::new();
+    for cpu in listing {
+        let cpu = cpu.map_err(failed)?;
+        let name = cpu.file_name();
+        let is_cpu = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("cpu"))
+            .is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()));
+        if is_cpu {
+            cpu_caches(&cpu.path().join("cache"), &mut caches)?;
+        }
+    }
+    let Some(levels) = caches
+        .iter()
+        .map(|cache| cache.level)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let Some(&last) = levels.iter().max() else {
+        return Ok(None);
+    };
+    let mut instances = std::collections::BTreeMap::new();
+    for cache in caches.iter().filter(|cache| cache.level == Some(last)) {
+        let (Some(shared), Some(bytes)) = (&cache.shared, cache.bytes) else {
+            return Ok(None);
+        };
+        instances.insert(shared.clone(), bytes);
+    }
+    Ok(Some(Reported::new(
+        instances.values().sum(),
+        ReportedBy::LinuxSysfsCache,
+    )))
+}
+
+/// The data and unified caches of one CPU's cacheinfo directory `root`.
+fn cpu_caches(root: &Path, caches: &mut Vec<CpuCache>) -> Result<(), String> {
+    let listing = match std::fs::read_dir(root) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("{}: {error}", root.display())),
+    };
+    for entry in listing {
+        let entry = entry.map_err(|error| format!("{}: {error}", root.display()))?;
+        if !entry.file_name().to_string_lossy().starts_with("index") {
+            continue;
+        }
+        let index = entry.path();
+        let field = |name: &str| -> Result<Option<String>, String> {
+            let path = index.join(name);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => Ok(Some(text.trim().to_owned())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(format!("{}: {error}", path.display())),
+            }
+        };
+        let unparsed = |name: &str, value: &str| {
+            format!(
+                "{}: {value:?} is not a cache {name}",
+                index.join(name).display()
+            )
+        };
+        if !matches!(field("type")?.as_deref(), Some("Data" | "Unified")) {
+            continue;
+        }
+        let level = field("level")?
+            .map(|level| level.parse::<u32>().map_err(|_| unparsed("level", &level)))
+            .transpose()?;
+        let bytes = field("size")?
+            .map(|size| {
+                size.strip_suffix('K')
+                    .and_then(|kib| kib.parse::<u64>().ok())
+                    .and_then(|kib| kib.checked_mul(1024))
+                    .ok_or_else(|| unparsed("size", &size))
+            })
+            .transpose()?;
+        caches.push(CpuCache {
+            level,
+            bytes,
+            shared: field("shared_cpu_list")?,
+        });
+    }
+    Ok(())
+}
+
 pub(super) fn sample() -> Result<HostSample, ObservationError> {
     let meminfo = read("/proc/meminfo")?;
     let mem_available_bytes = kib_field(&meminfo, "MemAvailable:").ok_or_else(|| {

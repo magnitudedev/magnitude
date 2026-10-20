@@ -1,8 +1,8 @@
 """Running one evaluation job, on a host under its agent's lock or locally.
 
 Steps, in order, all as children of the lock-holding agent on a host:
-sync (remote only) -> build -> build provenance -> catalog acquisition -> thermal gate ->
-job (recorded) -> fetch.
+sync (remote only) -> build -> build provenance -> catalog acquisition -> catalog headers ->
+thermal gate -> job (recorded) -> fetch.
 The job's run directory is `<runs>/<run id>/` on the executing host and is copied to
 `inference/evaluation/results/<run id>/` (local runs write there directly).
 
@@ -50,9 +50,12 @@ from .hosts import HostConfig, Hosts
 
 RESULTS = sync.INFERENCE / "evaluation" / "results"
 HOST_PACKAGE = "evaluation/remote/src"
-CATALOG_ACQUIRE = (
-    "cargo", "run", "--release", "--quiet", "-p", "magnitude-service-catalog-tool", "--", "acquire"
-)
+CATALOG_TOOL = ("cargo", "run", "--release", "--quiet", "-p", "magnitude-service-catalog-tool", "--")
+CATALOG_ACQUIRE = (*CATALOG_TOOL, "acquire")
+# The catalog header export (`catalog-tool headers`), under the host's cache root and kept across
+# runs; the tool rebuilds it only for another lock. Header-only tests read it through this variable.
+CATALOG_HEADERS = (*CATALOG_TOOL, "headers")
+CATALOG_HEADERS_ENV = "MAGNITUDE_CATALOG_HEADERS"
 PROBED_TOOLS = ("uv",)  # `{uv}` resolves to the host's own executable, probed on use
 COMPILER = "RUSTC_WORKSPACE_WRAPPER"  # cargo runs rustc for workspace crates through it
 # The environment variable each coding agent gives its commands to identify its session.
@@ -78,6 +81,7 @@ class Job:
     model: str | None = None
     gate: GateSettings | None = field(default_factory=GateSettings)
     max_hold_seconds: float = 6 * 3600
+    catalog_headers: bool = False  # export the catalog's headers and name them to the job
     trees: tuple[Tree, ...] = ()
     env: tuple[tuple[str, str], ...] = ()  # (name, value) for the build and job steps
 
@@ -410,6 +414,16 @@ def perform(
             env=recorded,
         )
         _write(executor, artifacts, json.dumps(json.loads(output), indent=2))
+    if job.catalog_headers:
+        output = f"{layout.root}/catalog-headers"
+        log(f"catalog headers: into {output}")
+        exported = _step(
+            executor,
+            "catalog headers",
+            [*CATALOG_HEADERS, "--output", output, "--model-store", layout.models],
+            env=recorded,
+        )
+        env = {**env, CATALOG_HEADERS_ENV: exported.strip().splitlines()[-1]}
     if job.gate is not None:
         log("thermal gate: waiting for flat temperatures and an idle host")
         settings = [

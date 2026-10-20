@@ -2151,6 +2151,25 @@ pub fn resident_element(
     Element::stored(representation, layout)
 }
 
+/// Every element a weight can be resident as in `layout`: the image of
+/// [`resident_element`] over every encoding and dense dtype, and both
+/// IQ4_NL sources (rows whose width is a multiple of 256, and rows whose
+/// width is not), each once, in a fixed order.
+pub fn resident_elements(layout: Layout) -> Vec<Element> {
+    let mut elements = Vec::new();
+    for dense in [DType::BF16, DType::F16, DType::F32] {
+        for encoding in Encoding::ALL {
+            for width in [256, 32] {
+                match resident_element(encoding, width, dense, layout) {
+                    Some(element) if !elements.contains(&element) => elements.push(element),
+                    _ => {}
+                }
+            }
+        }
+    }
+    elements
+}
+
 fn representation_bytes(element: Element, shape: &[u64]) -> Result<u64, String> {
     element
         .canonical_byte_len(shape)

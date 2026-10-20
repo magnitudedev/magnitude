@@ -1,20 +1,23 @@
 //! The automatic assessment pool: one revisioned snapshot over the current catalog and custom-model
-//! sources in the service's one environment, with exact-work reconciliation, deduplication,
-//! per-target deadlines, publication guards and one-attempt `Dropped` semantics.
+//! sources in the service's current environment, with exact-work reconciliation, deduplication,
+//! per-target deadlines, publication guards and one-attempt `Dropped` semantics. When the
+//! measurement job stores this machine's measurements, every assessed model is finished again
+//! under the new environment and published together in one revision.
 
 pub mod assessor;
 pub mod candidates;
 pub mod catalog_kernels;
 pub mod environment;
 mod inspection_progress;
+pub mod measurement;
 
 use std::sync::{Arc, Mutex, Weak};
 
 use futures_util::{StreamExt, future::BoxFuture, stream::BoxStream};
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
-    CatalogModel, CatalogModelSelection, CatalogModelState, CatalogModels, CustomModel,
-    CustomModelState, EffectiveModel, LocalModels, ModelAssessment,
+    AssessmentEnvironmentId, CatalogModel, CatalogModelSelection, CatalogModelState, CatalogModels,
+    CustomModel, CustomModelState, EffectiveModel, LocalModels, MeasurementState, ModelAssessment,
     ModelAssessmentDomainSnapshot, ModelAssessmentEntry, ModelAssessmentEntryState,
     ModelAssessmentSubject, ModelAssessments, ModelAssessmentsInvalidation,
     ModelAssessmentsSnapshot, ModelFailure as DomainModelFailure, ModelId,
@@ -28,6 +31,8 @@ use assessor::{
     AssessmentOutcome, AssessmentWork, AssessmentWorkKey, ModelAssessor, PreparationResult,
     inventory_model_failure,
 };
+use environment::AssessmentEnvironment;
+use measurement::MeasurementStatus;
 
 /// Bounds one target's whole attempt: material resolution and the engine's arithmetic.
 const MODEL_ASSESSMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -125,6 +130,9 @@ fn custom_candidates(
 struct AssessmentPoolCurrent {
     snapshot: ModelAssessmentsSnapshot,
     entry_keys: std::collections::BTreeMap<ModelAssessmentSubject, AssessmentWorkKey>,
+    /// The work of every key an entry references, with its preparation: a new environment
+    /// finishes each assessed model again from it.
+    works: std::collections::BTreeMap<AssessmentWorkKey, AssessmentWork>,
     /// Sources whose last read failed. A failed read is the model inventory's failure, which the
     /// catalog reports from the same listing; the pool keeps the slice it has and reads again.
     failed_reads: std::collections::BTreeSet<AssessmentDomain>,
@@ -224,8 +232,112 @@ impl AssessmentPoolCurrent {
             self.entry_keys.remove(&subject);
         }
         self.entry_keys.extend(work_by_entry);
+        for target in targets {
+            if let Some(work) = &target.work {
+                self.works
+                    .entry(work.key.clone())
+                    .or_insert_with(|| work.clone());
+            }
+        }
+        self.retain_referenced_works();
         *self.domain_mut(domain) = next;
         true
+    }
+
+    fn retain_referenced_works(&mut self) {
+        let referenced = self
+            .entry_keys
+            .values()
+            .collect::<std::collections::BTreeSet<_>>();
+        self.works.retain(|key, _| referenced.contains(key));
+    }
+
+    /// The keys of the entries assessed now, whose results a new environment replaces in one
+    /// revision.
+    fn assessed_keys(&self) -> std::collections::BTreeSet<AssessmentWorkKey> {
+        self.domains()
+            .into_iter()
+            .flat_map(assessment_domain_entries)
+            .filter(|entry| matches!(entry.state, ModelAssessmentEntryState::Assessed { .. }))
+            .filter_map(|entry| self.entry_keys.get(&entry.subject).cloned())
+            .collect()
+    }
+
+    /// Move every entry not assessed now to its work in a new environment (`rekeyed`, by old
+    /// key): its old work's outcome no longer applies. Its visible state is unchanged, so this
+    /// publishes nothing.
+    fn rekey_unassessed(
+        &mut self,
+        rekeyed: &std::collections::BTreeMap<AssessmentWorkKey, AssessmentWork>,
+        assessed: &std::collections::BTreeSet<AssessmentWorkKey>,
+    ) {
+        for key in self.entry_keys.values_mut() {
+            if assessed.contains(key) {
+                continue;
+            }
+            if let Some(work) = rekeyed.get(key) {
+                *key = work.key.clone();
+            }
+        }
+        self.works.extend(
+            rekeyed
+                .iter()
+                .filter(|(old, _)| !assessed.contains(*old))
+                .map(|(_, work)| (work.key.clone(), work.clone())),
+        );
+        self.retain_referenced_works();
+    }
+
+    /// Replace every assessed entry's result with its result in `environment` (`outcomes`, the
+    /// finishes of its work there, whose key `rekeyed` maps its old key to), with the snapshot's
+    /// environment and measurement state, all as one change. No entry is seen passing through
+    /// `Assessing`.
+    fn republish(
+        &mut self,
+        environment: &AssessmentEnvironmentId,
+        measurement: MeasurementState,
+        rekeyed: &std::collections::BTreeMap<AssessmentWorkKey, AssessmentWorkKey>,
+        outcomes: &[AssessmentOutcome],
+    ) -> AppliedAssessmentOutcome {
+        for (domain_kind, subject) in self
+            .domains()
+            .into_iter()
+            .zip([AssessmentDomain::Catalog, AssessmentDomain::Custom])
+            .flat_map(|(domain, kind)| {
+                assessment_domain_entries(domain)
+                    .iter()
+                    .map(move |entry| (kind, entry.subject.clone()))
+            })
+            .collect::<Vec<_>>()
+        {
+            let Some(key) = self
+                .entry_keys
+                .get(&subject)
+                .and_then(|key| rekeyed.get(key))
+            else {
+                continue;
+            };
+            self.entry_keys.insert(subject.clone(), key.clone());
+            if let ModelAssessmentDomainSnapshot::Available { entries, .. } =
+                self.domain_mut(domain_kind)
+            {
+                for entry in entries.iter_mut().filter(|entry| entry.subject == subject) {
+                    entry.state = ModelAssessmentEntryState::Assessing;
+                }
+            }
+        }
+        self.retain_referenced_works();
+        let mut applied = AppliedAssessmentOutcome::default();
+        for outcome in outcomes {
+            let mut one = self.apply_outcome(outcome);
+            applied
+                .dropped_catalog_models
+                .append(&mut one.dropped_catalog_models);
+        }
+        applied.changed = true;
+        self.snapshot.environment_id = environment.clone();
+        self.snapshot.measurement = measurement;
+        applied
     }
 
     fn set_domain_pending(&mut self, domain: AssessmentDomain, source_revision: u64) -> bool {
@@ -241,6 +353,7 @@ impl AssessmentPoolCurrent {
         for subject in old_subjects {
             self.entry_keys.remove(&subject);
         }
+        self.retain_referenced_works();
         *self.domain_mut(domain) = next;
         true
     }
@@ -254,7 +367,11 @@ impl AssessmentPoolCurrent {
         })
     }
 
-    fn references_dropped(&self, subject: &ModelAssessmentSubject, key: &AssessmentWorkKey) -> bool {
+    fn references_dropped(
+        &self,
+        subject: &ModelAssessmentSubject,
+        key: &AssessmentWorkKey,
+    ) -> bool {
         self.entry_keys.get(subject) == Some(key)
             && self.domains().into_iter().any(|domain| {
                 assessment_domain_entries(domain).iter().any(|entry| {
@@ -392,16 +509,18 @@ impl ActiveAssessments {
 }
 
 impl ManagedModelAssessments {
-    /// Start the pool in the assessor's environment. Both source slices are `Pending` until
-    /// their first read.
+    /// Start the pool in the assessor's environment, adopting each new one `measurement`
+    /// brings. Both source slices are `Pending` until their first read.
     pub fn start(
         assessor: Arc<ModelAssessor>,
         catalog: Arc<dyn CatalogModels>,
         local: Arc<dyn LocalModels>,
+        measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
     ) -> Arc<Self> {
         let (changes, _) = tokio::sync::broadcast::channel(64);
         let concurrency = assessment_concurrency();
         let environment_id = assessor.environment().id.clone();
+        let state = measurement.borrow().state.clone();
         let service = Arc::new(Self {
             assessor,
             catalog,
@@ -412,8 +531,10 @@ impl ManagedModelAssessments {
                     environment_id,
                     catalog: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
                     custom: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
+                    measurement: state,
                 },
                 entry_keys: std::collections::BTreeMap::new(),
+                works: std::collections::BTreeMap::new(),
                 failed_reads: std::collections::BTreeSet::new(),
             }),
             changes,
@@ -422,7 +543,7 @@ impl ManagedModelAssessments {
             concurrency: Arc::new(tokio::sync::Semaphore::new(concurrency)),
         });
         let owner = Arc::clone(&service);
-        tokio::spawn(async move { owner.run().await });
+        tokio::spawn(async move { owner.run(measurement).await });
         service
     }
 
@@ -447,14 +568,10 @@ impl ManagedModelAssessments {
         subject: ModelAssessmentSubject,
         profile: ServingProfile,
     ) -> AssessmentTarget {
+        // A target that cannot be resolved has no environment to be assessed in.
         let unresolved_key = AssessmentWorkKey(
-            serde_json::to_string(&(
-                &self.assessor.environment().id,
-                &subject,
-                &profile,
-                "unresolved",
-            ))
-            .expect("assessment target identity is serializable"),
+            serde_json::to_string(&(&subject, &profile, "unresolved"))
+                .expect("assessment target identity is serializable"),
         );
         if self
             .current
@@ -471,12 +588,13 @@ impl ManagedModelAssessments {
                 work: None,
             };
         }
+        let environment = self.assessor.environment();
         let work = self
             .assessor
             .configuration_for(&subject)
-            .and_then(|configuration| {
+            .map(|configuration| {
                 let preparation = self.preparations.prepare(&configuration);
-                self.assessor.work_for(configuration, profile, preparation)
+                ModelAssessor::work_for(&environment, configuration, profile, preparation)
             });
         match work {
             Ok(work) => AssessmentTarget {
@@ -513,7 +631,9 @@ impl ManagedModelAssessments {
         let source = self.catalog.list_catalog().await?;
         let targets = catalog_candidates(source.models)
             .into_iter()
-            .map(|(subject, profile)| self.target_entry(AssessmentDomain::Catalog, subject, profile))
+            .map(|(subject, profile)| {
+                self.target_entry(AssessmentDomain::Catalog, subject, profile)
+            })
             .collect::<Vec<_>>();
         self.replace_domain(AssessmentDomain::Catalog, source.revision, targets);
         Ok(())
@@ -591,30 +711,9 @@ impl ManagedModelAssessments {
             let task_key = item.key.clone();
             let runner_key = task_key.clone();
             let handle = tokio::spawn(async move {
-                let Ok(_permit) = Arc::clone(&service.concurrency).acquire_owned().await else {
-                    let mut active = service
-                        .active
-                        .lock()
-                        .expect("assessment owner lock poisoned");
-                    active.finish(&runner_key, active_id);
-                    return;
-                };
-                let outcome =
-                    tokio::time::timeout(MODEL_ASSESSMENT_TIMEOUT, service.assessor.assess(item))
-                        .await
-                        .unwrap_or_else(|_| {
-                            Err(InventoryError::ModelOperation {
-                                code: "assessment_deadline".to_owned(),
-                                message: "model assessment target deadline expired".to_owned(),
-                                retryable: true,
-                            })
-                        })
-                        .unwrap_or_else(|error| AssessmentOutcome {
-                            key: runner_key.clone(),
-                            result: Err(inventory_model_failure(error)),
-                        });
-                drop(_permit);
-                service.publish_outcome(outcome);
+                if let Some(outcome) = service.attempt(item).await {
+                    service.publish_outcome(outcome);
+                }
                 let mut active = service
                     .active
                     .lock()
@@ -629,6 +728,131 @@ impl ManagedModelAssessments {
         }
     }
 
+    /// One attempt at `item` within the pool's concurrency and the target deadline; `None` when
+    /// the pool is closing.
+    async fn attempt(&self, item: AssessmentWork) -> Option<AssessmentOutcome> {
+        let _permit = Arc::clone(&self.concurrency).acquire_owned().await.ok()?;
+        let key = item.key.clone();
+        Some(
+            tokio::time::timeout(MODEL_ASSESSMENT_TIMEOUT, self.assessor.assess(item))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(InventoryError::ModelOperation {
+                        code: "assessment_deadline".to_owned(),
+                        message: "model assessment target deadline expired".to_owned(),
+                        retryable: true,
+                    })
+                })
+                .unwrap_or_else(|error| AssessmentOutcome {
+                    key,
+                    result: Err(inventory_model_failure(error)),
+                }),
+        )
+    }
+
+    /// Adopt what the measurement job reports (`measurement`'s current status): its state, and
+    /// a new environment when its measurements change the current one.
+    fn adopt_measurement(
+        self: &Arc<Self>,
+        measurement: &mut tokio::sync::watch::Receiver<MeasurementStatus>,
+    ) {
+        let status = measurement.borrow_and_update().clone();
+        match self.assessor.adopt(status.measurements) {
+            Some(environment) => self.adopt_environment(environment, measurement.clone()),
+            None => {
+                self.publish(|current| {
+                    let changed = current.snapshot.measurement != status.state;
+                    current.snapshot.measurement = status.state;
+                    changed
+                });
+            }
+        }
+    }
+
+    /// Move the pool to `environment`: work not yet assessed moves at once, and every assessed
+    /// model is finished again in it (arithmetic over its prepared demand) on a task of its own,
+    /// off the run loop. Its results are published together with `measurement`'s state then in
+    /// one revision, never passing back through `Assessing`, unless the environment has moved
+    /// on by then: the next one finishes them again.
+    fn adopt_environment(
+        self: &Arc<Self>,
+        environment: Arc<AssessmentEnvironment>,
+        measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
+    ) {
+        let (rekeyed, assessed) = {
+            let current = self.current.read().expect("assessment state lock poisoned");
+            let rekeyed = current
+                .works
+                .iter()
+                .map(|(key, work)| {
+                    let next = ModelAssessor::work_for(
+                        &environment,
+                        work.configuration.clone(),
+                        work.profile.profile.clone(),
+                        Arc::clone(&work.preparation),
+                    );
+                    (key.clone(), next)
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            (rekeyed, current.assessed_keys())
+        };
+        self.current
+            .write()
+            .expect("assessment state lock poisoned")
+            .rekey_unassessed(&rekeyed, &assessed);
+        self.cancel_unreferenced();
+        self.schedule(
+            rekeyed
+                .iter()
+                .filter(|(old, _)| !assessed.contains(*old))
+                .map(|(_, work)| work.clone())
+                .collect(),
+        );
+        let refinished = rekeyed
+            .into_iter()
+            .filter(|(old, _)| assessed.contains(old))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            let outcomes = futures_util::future::join_all(
+                refinished
+                    .values()
+                    .map(|work| service.attempt(work.clone())),
+            )
+            .await;
+            let Some(outcomes) = outcomes.into_iter().collect::<Option<Vec<_>>>() else {
+                return;
+            };
+            let mut current = service
+                .current
+                .write()
+                .expect("assessment state lock poisoned");
+            // The environment moved on while these were finished: its own adoption finishes
+            // the assessed models again.
+            if service.assessor.environment().id != environment.id {
+                return;
+            }
+            let keys = refinished
+                .iter()
+                .map(|(old, work)| (old.clone(), work.key.clone()))
+                .collect();
+            current.works.extend(
+                refinished
+                    .into_values()
+                    .map(|work| (work.key.clone(), work)),
+            );
+            let state = measurement.borrow().state.clone();
+            let applied = current.republish(&environment.id, state, &keys, &outcomes);
+            current.snapshot.revision = current.snapshot.revision.saturating_add(1);
+            let revision = current.snapshot.revision;
+            drop(current);
+            log_dropped_catalog_models(applied.dropped_catalog_models);
+            let _ = service
+                .changes
+                .send(ModelAssessmentsInvalidation { revision });
+        });
+    }
+
     fn publish_outcome(&self, outcome: AssessmentOutcome) {
         let mut current = self
             .current
@@ -641,14 +865,7 @@ impl ManagedModelAssessments {
         current.snapshot.revision = current.snapshot.revision.saturating_add(1);
         let revision = current.snapshot.revision;
         drop(current);
-        for (model_id, failure) in applied.dropped_catalog_models {
-            tracing::error!(
-                model.id = %model_id.as_str(),
-                failure.code = %failure.code,
-                failure.message = %failure.message,
-                "catalog model assessment dropped"
-            );
-        }
+        log_dropped_catalog_models(applied.dropped_catalog_models);
         let _ = self.changes.send(ModelAssessmentsInvalidation { revision });
     }
 
@@ -665,16 +882,21 @@ impl ManagedModelAssessments {
         active.cancel_unreferenced(&referenced);
     }
 
-    async fn run(self: Arc<Self>) {
+    async fn run(
+        self: Arc<Self>,
+        mut measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
+    ) {
         // Subscribe before the initial reads so a source revision published between a read and
         // entering the select loop is buffered and reconciled rather than missed.
         let mut catalog = self.catalog.watch_catalog().skip(1);
         let mut discovered = self.local.watch_local().skip(1);
+        self.adopt_measurement(&mut measurement);
         self.read_source(AssessmentDomain::Catalog).await;
         self.read_source(AssessmentDomain::Custom).await;
         let mut source_retry = tokio::time::interval(MODEL_ASSESSMENT_SOURCE_RETRY_DELAY);
         source_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         source_retry.tick().await;
+        let mut reporting = true;
         loop {
             tokio::select! {
                 event = catalog.next() => match event {
@@ -684,6 +906,11 @@ impl ManagedModelAssessments {
                 event = discovered.next() => match event {
                     Some(_) => self.read_source(AssessmentDomain::Custom).await,
                     None => return,
+                },
+                changed = measurement.changed(), if reporting => match changed {
+                    Ok(()) => self.adopt_measurement(&mut measurement),
+                    // The job's owner is gone: its last state stands.
+                    Err(_) => reporting = false,
                 },
                 _ = source_retry.tick() => {
                     let failed = self
@@ -738,6 +965,17 @@ impl ModelAssessments for ManagedModelAssessments {
     }
 }
 
+fn log_dropped_catalog_models(dropped: Vec<(ModelId, DomainModelFailure)>) {
+    for (model_id, failure) in dropped {
+        tracing::error!(
+            model.id = %model_id.as_str(),
+            failure.code = %failure.code,
+            failure.message = %failure.message,
+            "catalog model assessment dropped"
+        );
+    }
+}
+
 fn assessment_concurrency() -> usize {
     std::thread::available_parallelism()
         .map_or(1, |cores| cores.get().min(MAX_ASSESSMENT_CONCURRENCY))
@@ -746,10 +984,7 @@ fn assessment_concurrency() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_service_contracts::models::{
-        AssessmentEnvironmentId, ModelAssessmentProfile, ModelPackageId, ModelServingConfiguration,
-        ServableModelBundle,
-    };
+    use magnitude_service_contracts::models::{ModelPackageId, ServableModelBundle};
     use std::path::PathBuf;
 
     fn test_configuration(model_id: &str) -> ModelServingConfiguration {
@@ -793,26 +1028,19 @@ mod tests {
         }
     }
 
+    /// A target being assessed under `key`. Its work is the pool's to run, which these tests
+    /// do not.
     fn assessment_target(
         subject: magnitude_service_contracts::models::ModelAssessmentSubject,
         key: &str,
     ) -> AssessmentTarget {
-        let configuration = test_configuration(subject.model_id().as_str());
         AssessmentTarget {
             entry: ModelAssessmentEntry {
-                subject: subject.clone(),
+                subject,
                 state: ModelAssessmentEntryState::Assessing,
             },
             key: AssessmentWorkKey(key.to_owned()),
-            work: Some(AssessmentWork {
-                key: AssessmentWorkKey(key.to_owned()),
-                profile: ModelAssessmentProfile {
-                    profile: configuration.profile.clone(),
-                    performance_context_tokens: vec![configuration.profile.context_length],
-                },
-                configuration,
-                preparation: Arc::new(tokio::sync::OnceCell::new()),
-            }),
+            work: None,
         }
     }
 
@@ -823,10 +1051,115 @@ mod tests {
                 environment_id: AssessmentEnvironmentId("test-environment".to_owned()),
                 catalog: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
                 custom: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
+                measurement: MeasurementState::Unmeasured,
             },
             entry_keys: std::collections::BTreeMap::new(),
+            works: std::collections::BTreeMap::new(),
             failed_reads: std::collections::BTreeSet::new(),
         }
+    }
+
+    fn fits(
+        subject: &ModelAssessmentSubject,
+        performance: magnitude_service_contracts::models::ModelPerformance,
+    ) -> CachedModelAssessment {
+        let profile = test_configuration(subject.model_id().as_str()).profile;
+        CachedModelAssessment {
+            capabilities: magnitude_service_contracts::models::ModelCapabilities {
+                vision: false,
+                tools: false,
+                structured_output: false,
+                reasoning: magnitude_service_contracts::models::ModelReasoningCapabilities {
+                    supported: false,
+                    efforts: Vec::new(),
+                    default_effort: None,
+                },
+            },
+            template_fingerprint: String::new(),
+            fingerprint: None,
+            profile: ModelAssessment::Fits {
+                profile,
+                assessment_id: magnitude_service_contracts::models::ModelAssessmentId(
+                    "assessment".to_owned(),
+                ),
+                memory: Vec::new(),
+                performance,
+                projector: magnitude_service_contracts::models::ProjectorVerdict::None,
+                drafter: magnitude_service_contracts::models::DrafterVerdict::None,
+            },
+        }
+    }
+
+    /// Measurements arriving finish every assessed model again and publish them all, with the
+    /// new environment and the job's state, as one change: no entry shows `Assessing`, and each
+    /// carries its estimate.
+    #[test]
+    fn arriving_measurements_republish_every_assessed_model_at_once() {
+        use magnitude_service_contracts::models::{ModelPerformance, PerformanceEvidence};
+        let subjects = ["first", "second"]
+            .map(|base| assessment_subject(base, CatalogModelSelection::Desired));
+        let mut current = assessment_pool_current();
+        current.replace_domain(
+            AssessmentDomain::Catalog,
+            1,
+            &[
+                assessment_target(subjects[0].clone(), "first-pending"),
+                assessment_target(subjects[1].clone(), "second-pending"),
+            ],
+        );
+        for (subject, key) in subjects.iter().zip(["first-pending", "second-pending"]) {
+            current.apply_outcome(&AssessmentOutcome {
+                key: AssessmentWorkKey(key.to_owned()),
+                result: Ok(fits(subject, ModelPerformance::Pending)),
+            });
+        }
+        let assessed = current.assessed_keys();
+        assert_eq!(assessed.len(), 2);
+        let estimated = ModelPerformance::Estimated {
+            samples: vec![PerformanceEvidence {
+                context_tokens: 8_192,
+                estimated_tokens_per_second: 40.0,
+            }],
+        };
+        let key = |key: &str| AssessmentWorkKey(key.to_owned());
+        let rekeyed = [
+            (key("first-pending"), key("first-measured")),
+            (key("second-pending"), key("second-measured")),
+        ]
+        .into_iter()
+        .collect();
+        let outcomes = subjects
+            .iter()
+            .zip(["first-measured", "second-measured"])
+            .map(|(subject, key)| AssessmentOutcome {
+                key: AssessmentWorkKey(key.to_owned()),
+                result: Ok(fits(subject, estimated.clone())),
+            })
+            .collect::<Vec<_>>();
+        let measured = AssessmentEnvironmentId("measured-environment".to_owned());
+        let applied = current.republish(&measured, MeasurementState::Measured, &rekeyed, &outcomes);
+        assert!(applied.changed);
+        assert_eq!(current.snapshot.environment_id, measured);
+        assert_eq!(current.snapshot.measurement, MeasurementState::Measured);
+        let ModelAssessmentDomainSnapshot::Available { entries, .. } =
+            current.domain(AssessmentDomain::Catalog)
+        else {
+            panic!("the catalog slice is available")
+        };
+        for entry in entries {
+            assert!(matches!(
+                &entry.state,
+                ModelAssessmentEntryState::Assessed { profiles, .. }
+                    if matches!(profiles.as_slice(), [ModelAssessment::Fits { performance, .. }]
+                        if *performance == estimated)
+            ));
+        }
+        assert!(
+            current
+                .assessed_keys()
+                .iter()
+                .all(|key| key.0.ends_with("-measured"))
+        );
     }
 
     fn assessment_failure() -> DomainModelFailure {

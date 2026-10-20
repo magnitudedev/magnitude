@@ -20,6 +20,7 @@ use magnitude_executor::UnpreparedUnits;
 
 use super::ResidencyWorker;
 use super::controller::GRACEFUL_EXIT;
+use crate::device_lock::DeviceShare;
 use crate::worker_process::{BlockingChild, BlockingProcess, WorkerLauncher, WorkerRole};
 
 /// The most recent worker diagnostics kept for failure reports.
@@ -31,6 +32,7 @@ pub fn worker_exit_code(exit: &WorkerExit) -> i32 {
     match exit {
         WorkerExit::Shutdown
         | WorkerExit::Prepared
+        | WorkerExit::Measured
         | WorkerExit::Unprepared
         | WorkerExit::HostLost { .. } => 0,
         WorkerExit::Unloaded(UnloadCause::MemoryPressure) => 10,
@@ -66,8 +68,14 @@ fn log_exit(pid: u32, status: ExitStatus) {
     }
 }
 
+/// A worker process, and the device share of the load or optimization that started it: the
+/// device is shared until the process is proven retired.
 enum ProcessState {
-    Owned(BlockingProcess),
+    Owned {
+        process: BlockingProcess,
+        /// Held, never read: dropping it with the owner releases the device.
+        _device: Arc<DeviceShare>,
+    },
     Retired(ExitStatus),
 }
 
@@ -114,8 +122,11 @@ pub struct SpawnedWorker {
 }
 
 impl EngineWorker {
-    /// Spawn an `inference-worker` process.
-    pub fn spawn(launcher: &WorkerLauncher) -> anyhow::Result<SpawnedWorker> {
+    /// Spawn an `inference-worker` process for the load or optimization holding `device`.
+    pub fn spawn(
+        launcher: &WorkerLauncher,
+        device: Arc<DeviceShare>,
+    ) -> anyhow::Result<SpawnedWorker> {
         let command = launcher.command(WorkerRole::Inference)?;
         let BlockingChild {
             process,
@@ -125,7 +136,10 @@ impl EngineWorker {
         } = launcher.spawn_blocking_io(command)?;
         let pid = process_id(&process);
         let worker = Arc::new(Self {
-            process: Mutex::new(ProcessState::Owned(process)),
+            process: Mutex::new(ProcessState::Owned {
+                process,
+                _device: device,
+            }),
             client: OnceLock::new(),
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
         });
@@ -138,21 +152,17 @@ impl EngineWorker {
 
     /// The worker's recent standard error, for failure reports.
     pub fn diagnostics(&self) -> String {
-        self.diagnostics.lock().expect("diagnostic tail lock").text()
+        self.diagnostics
+            .lock()
+            .expect("diagnostic tail lock")
+            .text()
     }
 
-    /// Prove retired a worker that reported its outcome and is exiting on its own: it is
-    /// left to exit, as a released worker is after its shutdown, for the same bound
-    /// ([`GRACEFUL_EXIT`]), and stopped only if it has not exited by then. Killing it at once
-    /// would skip everything its normal exit completes (the system's compiled-kernel cache a
-    /// Prepare's search wrote among it).
+    /// Prove retired a worker that reported its outcome and is exiting on its own
+    /// ([`reported_exit`]), stopping it only if it has not exited in time.
     fn retire_reported(&self) -> std::io::Result<ExitStatus> {
-        let deadline = std::time::Instant::now() + GRACEFUL_EXIT;
-        while std::time::Instant::now() < deadline {
-            if let Some(status) = self.try_wait()? {
-                return Ok(status);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        if let Some(status) = reported_exit(|| self.try_wait())? {
+            return Ok(status);
         }
         tracing::warn!(
             worker.pid = self.pid(),
@@ -181,7 +191,7 @@ impl EngineWorker {
         let mut state = self.process.lock().expect("worker process lock");
         match &mut *state {
             ProcessState::Retired(status) => Ok(*status),
-            ProcessState::Owned(process) => {
+            ProcessState::Owned { process, .. } => {
                 // An error leaves the exact owner in place. Only proof of retirement replaces it.
                 let pid = process_id(process);
                 let status = stop(process)?;
@@ -249,10 +259,71 @@ impl SpawnedWorker {
     }
 }
 
+/// An inference worker process run for one job outside residency (the measurement job): it
+/// holds no device share, and its owner retires it.
+pub struct JobWorker {
+    process: BlockingProcess,
+    diagnostics: Arc<Mutex<DiagnosticTail>>,
+}
+
+impl JobWorker {
+    /// Spawn an `inference-worker` process, with the host end of its transport.
+    pub fn spawn(launcher: &WorkerLauncher) -> anyhow::Result<(Self, HostEnd)> {
+        let command = launcher.command(WorkerRole::Inference)?;
+        let BlockingChild {
+            process,
+            stdin,
+            stdout,
+            stderr,
+        } = launcher.spawn_blocking_io(command)?;
+        let pid = process_id(&process);
+        let worker = Self {
+            process,
+            diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
+        };
+        if let Err(error) = drain_diagnostics(stderr, Arc::clone(&worker.diagnostics), pid) {
+            worker.retire(false)?;
+            return Err(error.into());
+        }
+        let transport = FramedTransport::new(std::io::BufReader::new(stdout), stdin);
+        Ok((worker, transport))
+    }
+
+    pub fn pid(&self) -> u32 {
+        process_id(&self.process)
+    }
+
+    /// The worker's recent standard error, for failure reports.
+    pub fn diagnostics(&self) -> String {
+        self.diagnostics
+            .lock()
+            .expect("diagnostic tail lock")
+            .text()
+    }
+
+    /// Return once the process is proven gone. One that `reported` its outcome is left to exit
+    /// on its own ([`reported_exit`]); any other, or one that has not exited by then, is
+    /// stopped. Blocking.
+    pub fn retire(mut self, reported: bool) -> std::io::Result<ExitStatus> {
+        let pid = process_id(&self.process);
+        let exited = if reported {
+            reported_exit(|| observe_exit(&mut self.process))?
+        } else {
+            None
+        };
+        let status = match exited {
+            Some(status) => status,
+            None => stop(&mut self.process)?,
+        };
+        log_exit(pid, status);
+        Ok(status)
+    }
+}
+
 impl ResidencyWorker for EngineWorker {
     fn pid(&self) -> Option<u32> {
         match &*self.process.lock().expect("worker process lock") {
-            ProcessState::Owned(process) => Some(process_id(process)),
+            ProcessState::Owned { process, .. } => Some(process_id(process)),
             ProcessState::Retired(_) => None,
         }
     }
@@ -261,7 +332,7 @@ impl ResidencyWorker for EngineWorker {
         let mut state = self.process.lock().expect("worker process lock");
         match &mut *state {
             ProcessState::Retired(status) => Ok(Some(*status)),
-            ProcessState::Owned(process) => {
+            ProcessState::Owned { process, .. } => {
                 let pid = process_id(process);
                 let status = observe_exit(process)?;
                 if let Some(status) = status {
@@ -302,6 +373,7 @@ impl Drop for EngineWorker {
     }
 }
 
+/// Log a worker's standard error line by line as it arrives, keeping its tail in `tail`.
 fn drain_diagnostics(
     mut stderr: crate::worker_process::BlockingStderr,
     tail: Arc<Mutex<DiagnosticTail>>,
@@ -368,6 +440,30 @@ fn process_id(process: &BlockingProcess) -> u32 {
     process.id()
 }
 
+/// Wait for a worker that reported its outcome to exit on its own, as `exited` observes it: it
+/// is left to exit, as a released worker is after its shutdown, for the same bound
+/// ([`GRACEFUL_EXIT`]). Killing it at once would skip everything its normal exit completes (the
+/// system's compiled-kernel cache a Prepare's search wrote among it). `None` if it has not
+/// exited by then, and must be stopped.
+fn reported_exit(
+    mut exited: impl FnMut() -> std::io::Result<Option<ExitStatus>>,
+) -> std::io::Result<Option<ExitStatus>> {
+    let deadline = std::time::Instant::now() + GRACEFUL_EXIT;
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = exited()? {
+            return Ok(Some(status));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(None)
+}
+
+/// How long a stopped worker is waited for once killed: on Windows, the bound [`stop`] gives
+/// its job object's processes to be proven gone. On Unix a killed process is reaped once the
+/// kernel releases it, which a driver can delay without bound, so a caller that must not wait
+/// on that holds it to the same bound.
+pub(crate) const KILL_REAP: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[cfg(unix)]
 fn observe_exit(process: &mut BlockingProcess) -> std::io::Result<Option<ExitStatus>> {
     process.try_wait()
@@ -388,7 +484,7 @@ fn stop(process: &mut BlockingProcess) -> std::io::Result<ExitStatus> {
 
 #[cfg(windows)]
 fn stop(process: &mut BlockingProcess) -> std::io::Result<ExitStatus> {
-    process.retire(std::time::Duration::from_secs(2))
+    process.retire(KILL_REAP)
 }
 
 #[cfg(test)]
@@ -439,16 +535,26 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = process.id();
+        let device = crate::device_lock::DeviceLock::default();
         let worker = EngineWorker {
-            process: Mutex::new(ProcessState::Owned(process)),
+            process: Mutex::new(ProcessState::Owned {
+                process,
+                _device: Arc::new(device.try_share().unwrap()),
+            }),
             client: OnceLock::new(),
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
         };
         assert_eq!(worker.pid(), Some(pid));
         assert!(worker.try_wait().unwrap().is_none());
+        // The device is shared while the worker runs and released once it is proven retired.
+        assert!(device.try_measure().is_none());
         worker.shutdown();
-        let status = worker.try_wait().unwrap().expect("unready shutdown terminates");
+        let status = worker
+            .try_wait()
+            .unwrap()
+            .expect("unready shutdown terminates");
         assert_eq!(worker.pid(), None);
+        assert!(device.try_measure().is_some());
         assert_eq!(worker.retire().unwrap(), status);
     }
 }

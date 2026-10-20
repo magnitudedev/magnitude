@@ -94,18 +94,21 @@ children and marks it close-on-exec. The desktop retains package admission until
 service and update-helper children cannot inherit the lease and block their own installation.
 Recommendations order fitting assessed configurations using the shared preference. The remaining
 curated catalog stays discoverable with explicit pending, assessment-failed, or insufficient-memory
-explanations; every fitting model has a speed estimate. A model card's Details have one layout for
-catalog and custom models alike: on the left the Drafter row (always present; for a catalog model the
-drafter it serves with, such as "Magnitude MTP for Gemma 4 26B-A4B", its download offer when the found
-target lacks it, Off with the reason when it fits only without it, or None), then the source (catalog
-Hugging Face links, or a custom model's Source and Variant of), then License and Context window; on
-the right the radar. The estimated speed appears only on the radar's Speed axis, as one range with an
-info tooltip saying it is a rough estimate that does not account for speculative decoding, never
-as a separate text block. A custom model's radar shows Intelligence as "Not rated" with that axis
-empty, since no score is inherited; its Fidelity comes from its own weight type on the catalog's
-scale (ten per weight bit, as the catalog ranks Q4 at 40 and Q8 at 80), and Speed, Fit, and
-Speculation come from its assessment and attached drafter as for a catalog model. Speed is a plain-decode estimate from memory bandwidth, accurate to roughly ±20% for most
-models, and is never shown as a per-context table of exact rates.
+explanations; a fitting model has a speed estimate once this machine is measured. Until then its
+speed reads as this machine being measured, or as a failed measurement with its retry time; when a
+measurement it needs cannot be taken, its speed shows that failure. A model card's Details have one
+layout for catalog and custom models alike: on the left the Drafter row (always present; for a
+catalog model the drafter it serves with, such as "Magnitude MTP for Gemma 4 26B-A4B", its download
+offer when the found target lacks it, Off with the reason when it fits only without it, or None),
+then the source (catalog Hugging Face links, or a custom model's Source and Variant of), then
+License and Context window; on the right the radar. The estimated speed appears only on the radar's
+Speed axis, as one range with an info tooltip saying it is a rough estimate that does not account
+for speculative decoding, never as a separate text block. A custom model's radar shows Intelligence
+as "Not rated" with that axis empty, since no score is inherited; its Fidelity comes from its own
+weight type on the catalog's scale (ten per weight bit, as the catalog ranks Q4 at 40 and Q8 at
+80), and Speed, Fit, and Speculation come from its assessment and attached drafter as for a catalog
+model. Speed is a plain-decode estimate from measurements of this machine running the engine's own
+kernels, and is never shown as a per-context table of exact rates.
 Source links open HTTPS destinations in the system browser. Loading a different model asks
 explicitly before replacing observed active residency.
 

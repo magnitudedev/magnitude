@@ -287,14 +287,31 @@ native routed_expand for cuda from "cuda/routed_expand.cu":
         threadgroups (ceil_div(ceil_div(ceil_div(max(F, S), 16), TPW), 4 / KSPLIT), M * K + 1, 1)
         threads_per_threadgroup (128, 1, 1)
 
-# Vulkan: the Metal form; decode lane groups are whole subgroups.
+# Vulkan: the Metal form; decode lane groups are whole subgroups. One launch
+# per activation-row bound of the shared expert's GEMV (see `dense_expand`).
 native routed_expand for vulkan from "vulkan/routed_expand.comp":
     static (H, K, F, S)
     params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
-    launch routed_expand:
-        threadgroups (ceil_div(max(F, S), SIMDGROUPS * ROWS), M * K + 1, 1)
-        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + min(8 * ceil_div(H, 32), 288) * 72)
+    let GEMV_GROUPS = ceil_div(max(F, S), SIMDGROUPS * ROWS)
+    let GEMV_GROUPS_Y = M * K + 1
+    let GEMV_THREADS = 32 * SIMDGROUPS
+    let GEMV_SHARED = 256 + min(8 * ceil_div(H, 32), 288) * 72
+    launch routed_expand1 when M <= 1:
+        threadgroups (GEMV_GROUPS, GEMV_GROUPS_Y, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
+    launch routed_expand2 when M == 2:
+        threadgroups (GEMV_GROUPS, GEMV_GROUPS_Y, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
+    launch routed_expand4 when M >= 3 and M <= 4:
+        threadgroups (GEMV_GROUPS, GEMV_GROUPS_Y, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
+    launch routed_expand8 when M >= 5:
+        threadgroups (GEMV_GROUPS, GEMV_GROUPS_Y, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
 
 # CPU: the normalized rows staged once as F32; work item (x, y) expands ROWS
 # features of choice y < M * K, or of the shared expert (y = M * K) for

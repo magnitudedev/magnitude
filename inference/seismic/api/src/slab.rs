@@ -17,6 +17,10 @@ pub struct SlabRegion {
 pub struct SlabLayout {
     pub slab_bytes: u64,
     pub address_table_bytes: u64,
+    /// The least multiple of every region's alignment in a slab: a slab
+    /// whose storage starts at a multiple of it in its allocation lays its
+    /// regions out aligned as one of its own allocation does.
+    pub slab_alignment: u64,
 }
 
 impl SlabLayout {
@@ -25,7 +29,8 @@ impl SlabLayout {
         logical_rows: u64,
         regions: &[SlabRegion],
     ) -> Result<Self, TensorError> {
-        let (bytes, _, capacity) = layout_regions(rows_per_slab, logical_rows, regions)?;
+        let (bytes, _, capacity, slab_alignment) =
+            layout_regions(rows_per_slab, logical_rows, regions)?;
         let region_count = u64::try_from(regions.len())
             .map_err(|_| TensorError::SlabLayout("region count exceeds u64".into()))?;
         let (address_table_bytes, _) =
@@ -33,15 +38,18 @@ impl SlabLayout {
         Ok(Self {
             slab_bytes: bytes,
             address_table_bytes,
+            slab_alignment,
         })
     }
 }
 
+/// A slab's bytes, each region's offset in it, the slots of the logical
+/// rows, and the alignment every offset is a multiple of.
 fn layout_regions(
     rows_per_slab: u64,
     logical_rows: u64,
     regions: &[SlabRegion],
-) -> Result<(u64, Vec<u64>, usize), TensorError> {
+) -> Result<(u64, Vec<u64>, usize, u64), TensorError> {
     if rows_per_slab == 0 || logical_rows == 0 || regions.is_empty() {
         return Err(TensorError::SlabLayout(
             "a slab needs rows, logical extent and at least one region".into(),
@@ -51,6 +59,7 @@ fn layout_regions(
         .map_err(|_| TensorError::SlabLayout("slab capacity exceeds host domain".into()))?;
     let mut offsets = Vec::with_capacity(regions.len());
     let mut bytes = 0u64;
+    let mut slab_alignment = 1u64;
     for region in regions {
         if region.row_shape.contains(&0) {
             return Err(TensorError::SlabLayout(
@@ -62,6 +71,12 @@ fn layout_regions(
             .collect::<Vec<_>>();
         let (length, alignment) = Tensor::canonical_layout(region.element, &extents)?;
         let alignment = alignment.max(256);
+        // The least multiple of every region's alignment.
+        let (mut a, mut b) = (slab_alignment, alignment);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        slab_alignment = slab_alignment / a * alignment;
         bytes = bytes
             .checked_add(alignment - 1)
             .map(|value| value / alignment * alignment)
@@ -71,7 +86,7 @@ fn layout_regions(
             .checked_add(length)
             .ok_or_else(|| TensorError::SlabLayout("slab size overflows".into()))?;
     }
-    Ok((bytes, offsets, capacity))
+    Ok((bytes, offsets, capacity, slab_alignment))
 }
 
 /// One physical allocation, with typed component views over disjoint regions.
@@ -120,7 +135,7 @@ impl SlabTensor {
         logical_rows: u64,
         regions: Vec<SlabRegion>,
     ) -> Result<Self, TensorError> {
-        let (bytes, offsets, capacity) = layout_regions(rows_per_slab, logical_rows, &regions)?;
+        let (bytes, offsets, capacity, _) = layout_regions(rows_per_slab, logical_rows, &regions)?;
         let capacity_u64 = capacity as u64;
         let region_count = u64::try_from(regions.len())
             .map_err(|_| TensorError::SlabLayout("region count exceeds u64".into()))?;
@@ -151,6 +166,41 @@ impl SlabTensor {
             address_words: vec![0; table_bytes],
             lease: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// A store whose every slot is backed, in slot order, by one of `slabs`:
+    /// tensors of [`Self::slab_bytes`] bytes each, all views of one
+    /// allocation the caller made (its contents are the slabs'), on
+    /// `device`. The store's address table joins that allocation's hazard
+    /// domain, so one fence orders every access to either.
+    pub fn over(
+        device: &Device,
+        rows_per_slab: u64,
+        logical_rows: u64,
+        regions: Vec<SlabRegion>,
+        slabs: Vec<Tensor>,
+    ) -> Result<Self, TensorError> {
+        let mut store = Self::new(device, rows_per_slab, logical_rows, regions)?;
+        if slabs.len() != store.capacity
+            || slabs.iter().any(|slab| {
+                slab.byte_len() != store.slab_bytes
+                    || !slab.belongs_to(device)
+                    || !slab.shares_allocation(&slabs[0])
+            })
+        {
+            return Err(TensorError::SlabLayout(
+                "a store over storage takes one slab of its slab bytes per slot, all views of one \
+                 allocation on its device"
+                    .into(),
+            ));
+        }
+        store.addresses.share_slab_access_with(&slabs[0]);
+        store.slabs = slabs
+            .into_iter()
+            .map(|storage| store.backed(storage).map(Some))
+            .collect::<Result<_, _>>()?;
+        store.publish_addresses()?;
+        Ok(store)
     }
 
     pub fn rows_per_slab(&self) -> u64 {
@@ -283,17 +333,7 @@ impl SlabTensor {
         }
         let storage = Tensor::zeros(&self.device, Element::bool(), &[self.slab_bytes])?;
         storage.share_slab_access_with(&self.addresses);
-        let mut views = Vec::with_capacity(self.regions.len());
-        for (region, &offset) in self.regions.iter().zip(&self.offsets) {
-            let extents = std::iter::once(self.rows_per_slab)
-                .chain(region.row_shape.iter().copied())
-                .collect::<Vec<_>>();
-            views.push(storage.region(region.element, &extents, offset)?);
-        }
-        let slab = Slab {
-            storage,
-            regions: views,
-        };
+        let slab = self.backed(storage)?;
         if index == self.slabs.len() {
             self.slabs.push(None);
         }
@@ -303,6 +343,22 @@ impl SlabTensor {
             return Err(error);
         }
         Ok(index)
+    }
+
+    /// A slab over `storage`: each region a typed view of its bytes.
+    fn backed(&self, storage: Tensor) -> Result<Slab, TensorError> {
+        let regions = self
+            .regions
+            .iter()
+            .zip(&self.offsets)
+            .map(|(region, &offset)| {
+                let extents = std::iter::once(self.rows_per_slab)
+                    .chain(region.row_shape.iter().copied())
+                    .collect::<Vec<_>>();
+                storage.region(region.element, &extents, offset)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Slab { storage, regions })
     }
 
     /// Remove one slab. The observer reports when all device uses and views

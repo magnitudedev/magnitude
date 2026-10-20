@@ -71,9 +71,6 @@ impl Recipe {
     }
 }
 
-fn bits_of(word: DType) -> u32 {
-    if word == DType::U64 { 64 } else { 32 }
-}
 fn wide(b: &Recipe, x: V, n: usize) -> Wide {
     assert!(n > 0);
     let mut v = vec![b.u(0); n];
@@ -915,7 +912,7 @@ fn integer_binary(b: &Recipe, op: SourceBinary, a: V, c: V) -> V {
     let dtype = a.ty;
     let x = b.bits(a);
     let word = x.ty;
-    let width = if word == DType::U64 { 64 } else { 32 };
+    let width = word_bits(word);
     // A shift count of another integer dtype keeps its value; a negative I32
     // count is a huge word and fails like any other count out of range.
     let y = b.resize(b.bits(c), word);
@@ -925,7 +922,7 @@ fn integer_binary(b: &Recipe, op: SourceBinary, a: V, c: V) -> V {
     let result = match op {
         SourceBinary::Add => b.add(x, y),
         SourceBinary::Sub => b.sub(x, y),
-        SourceBinary::Mul => joined(&wide_multiply(b, &limbs(x), &limbs(y), width)),
+        SourceBinary::Mul => joined(&wide_multiply(b, &limbs(x), &limbs(y), width as usize)),
         SourceBinary::BitAnd => b.word(WordOp::And, x, y),
         SourceBinary::BitOr => b.union(x, y),
         SourceBinary::BitXor => b.xor(x, y),
@@ -966,7 +963,7 @@ fn integer_binary(b: &Recipe, op: SourceBinary, a: V, c: V) -> V {
             }
         }
         SourceBinary::Shl | SourceBinary::Shr => {
-            let valid = b.lt(y, b.k(word, width as u64));
+            let valid = b.lt(y, b.k(word, u64::from(width)));
             b.fail_if(b.not(valid), ScalarFailure::ShiftCount);
             let count = b.select(valid, y, b.k(word, 0));
             if op == SourceBinary::Shl {
@@ -1190,7 +1187,10 @@ pub(super) fn operation(b: &Recipe, op: ScalarOp, args: &[V]) -> V {
                 SourceUnary::Not => b.not(args[0]),
                 SourceUnary::BitNot => {
                     let bits = b.bits(args[0]);
-                    b.typed(b.xor(bits, b.k(bits.ty, u64::MAX >> (64 - bits_of(bits.ty)))), args[0].ty)
+                    b.typed(
+                        b.xor(bits, b.k(bits.ty, u64::MAX >> (64 - word_bits(bits.ty)))),
+                        args[0].ty,
+                    )
                 }
             }
         }

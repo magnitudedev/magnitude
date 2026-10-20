@@ -2301,6 +2301,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
 ]
 
@@ -4113,6 +4114,7 @@ dependencies = [
  "seismic-std",
  "seismic-topology",
  "self_cell",
+ "serde",
  "sha2 0.10.9",
 ]
 
@@ -4229,6 +4231,9 @@ name = "seismic-measure"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]

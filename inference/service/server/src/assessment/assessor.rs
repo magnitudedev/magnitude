@@ -9,24 +9,28 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use magnitude_engine::assessment::{
-    DrafterVerdict as EngineDrafterVerdict, ModelAssessment as EngineAssessment,
-    HeaderExtent as EngineHeaderExtent, ModelAssessmentError, ModelCapabilities as EngineCapabilities,
-    ModelPackagePaths, PreparedModelAssessment, ProjectorVerdict as EngineProjectorVerdict,
+    DrafterVerdict as EngineDrafterVerdict, HeaderExtent as EngineHeaderExtent, Measurements,
+    ModelAssessment as EngineAssessment, ModelAssessmentError,
+    ModelCapabilities as EngineCapabilities, ModelExecution, ModelPackagePaths, Performance,
+    PreparedModelAssessment, ProjectorVerdict as EngineProjectorVerdict,
     SpeculativeMethod as EngineSpeculativeMethod, finish_model_assessment, header_refusal,
     prepare_model_assessment,
 };
 use magnitude_artifacts::gguf::Directory;
 use magnitude_engine::error::{UnsupportedModel, UnsupportedReason as EngineUnsupportedReason};
 use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
-use magnitude_engine::options::ModelMethod;
-use magnitude_executor::assessment::{DomainFit, ExecutionAssessment, PerformanceEstimate};
+use magnitude_engine::options::{ModelMethod, PROFILE_SEQUENCES};
+use magnitude_executor::assessment::{
+    DomainFit, ExecutionFit, ExecutionShortfall, PerformanceEstimate,
+};
 use magnitude_service_contracts::models::{
     AssessmentEnvironmentId, DrafterVerdict, InstalledModelPackages as _, KernelStatic,
     KnownUnsupportedReason, MemoryAssessment, ModelAssessment, ModelAssessmentId,
     ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure, ModelFingerprint,
-    ModelPackageOperand, ModelReasoningCapabilities, ModelServingConfiguration,
-    PerformanceEvidence, ProjectorVerdict, ResolvedServableModelBundle, ServableModelBundle, SpeculativeDraftSource,
-    SpeculativeDraftSourceInput, SpeculativeMethod, UnsupportedReason, WeightTypeCount,
+    ModelPackageOperand, ModelPerformance, ModelReasoningCapabilities, ModelServingConfiguration,
+    PerformanceEvidence, ProjectorVerdict, ResolvedServableModelBundle, ServableModelBundle,
+    SpeculativeDraftSource, SpeculativeDraftSourceInput, SpeculativeMethod, UnsupportedReason,
+    WeightTypeCount,
 };
 use magnitude_service_contracts::{ComponentRole, InventoryError, MemoryDomainId, ResolvedModel};
 use magnitude_service_models::{
@@ -52,6 +56,7 @@ pub fn performance_depths(context_length: u32) -> Vec<u32> {
 #[derive(Clone)]
 pub struct AssessmentWork {
     pub key: AssessmentWorkKey,
+    pub environment: Arc<AssessmentEnvironment>,
     pub profile: ModelAssessmentProfile,
     pub configuration: ModelServingConfiguration,
     pub preparation: Arc<tokio::sync::OnceCell<PreparationResult>>,
@@ -106,16 +111,18 @@ pub struct AssessmentOutcome {
     pub result: Result<CachedModelAssessment, ModelFailure>,
 }
 
-/// Assesses resolved targets in one environment.
+/// Assesses resolved targets in the current environment: one structure, under whatever the
+/// measurement job has stored of the machine.
 pub struct ModelAssessor {
     models: Arc<ManagedModelStore>,
     model_domains: Arc<ModelDomainResolver>,
     release_catalog: Arc<ReleaseCatalog>,
-    environment: Arc<AssessmentEnvironment>,
+    environment: std::sync::RwLock<Arc<AssessmentEnvironment>>,
     work_gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl ModelAssessor {
+    /// The assessor of targets in `environment`.
     pub fn new(
         models: Arc<ManagedModelStore>,
         model_domains: Arc<ModelDomainResolver>,
@@ -126,14 +133,34 @@ impl ModelAssessor {
             models,
             model_domains,
             release_catalog,
-            environment,
+            environment: std::sync::RwLock::new(environment),
             work_gates: tokio::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// The environment every model is assessed in.
-    pub fn environment(&self) -> &Arc<AssessmentEnvironment> {
-        &self.environment
+    /// The environment new work is assessed in.
+    pub fn environment(&self) -> Arc<AssessmentEnvironment> {
+        Arc::clone(
+            &self
+                .environment
+                .read()
+                .expect("assessment environment lock poisoned"),
+        )
+    }
+
+    /// Assess new work under `measurements` of the same structure. The new environment when its
+    /// identity differs from the current one's; `None` when the measurements change nothing.
+    pub fn adopt(&self, measurements: Measurements) -> Option<Arc<AssessmentEnvironment>> {
+        let mut current = self
+            .environment
+            .write()
+            .expect("assessment environment lock poisoned");
+        let next = current.measured(measurements);
+        if next.id == current.id {
+            return None;
+        }
+        *current = Arc::new(next);
+        Some(Arc::clone(&current))
     }
 
     pub fn models(&self) -> &Arc<ManagedModelStore> {
@@ -161,31 +188,34 @@ impl ModelAssessor {
         self.model_domains.assessment_configuration(subject)
     }
 
+    /// The work of assessing `configuration` at `profile` in `environment`.
     pub fn work_for(
-        &self,
+        environment: &Arc<AssessmentEnvironment>,
         configuration: ModelServingConfiguration,
         profile: magnitude_service_contracts::models::ServingProfile,
         preparation: Arc<tokio::sync::OnceCell<PreparationResult>>,
-    ) -> Result<AssessmentWork, InventoryError> {
+    ) -> AssessmentWork {
         let profile = ModelAssessmentProfile {
             performance_context_tokens: performance_depths(profile.context_length),
             profile,
         };
         let bundle = servable_model_bundle_key_for_bundle(&configuration.bundle);
-        Ok(AssessmentWork {
-            key: AssessmentWorkKey::new(&self.environment.id, &bundle, &profile),
+        AssessmentWork {
+            key: AssessmentWorkKey::new(&environment.id, &bundle, &profile),
+            environment: Arc::clone(environment),
             profile,
             configuration,
             preparation,
-        })
+        }
     }
 
-    /// Resolve and prepare one bundle from its headers.
+    /// Resolve and prepare one bundle from its headers. A preparation reads only the
+    /// environment's structure, which every environment of this assessor shares.
     pub async fn prepare_bundle(
         &self,
         configuration: ModelServingConfiguration,
     ) -> PreparationResult {
-        let environment = Arc::clone(&self.environment);
+        let structure = Arc::clone(&self.environment().setup.structure);
         let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
         let resolved = self
             .resolve(&bundle_key, configuration.bundle)
@@ -196,7 +226,7 @@ impl ModelAssessor {
             // The resolved material (a catalog bundle's materialized headers) lives until
             // preparation has read it.
             let _material = resolved;
-            prepare_model_assessment(&package, &environment.setup)
+            prepare_model_assessment(&package, &structure)
         })
         .await
         .map_err(preparation_task_failure)?
@@ -207,9 +237,9 @@ impl ModelAssessor {
     /// One attempt at `work`. `Ok` carries the target's terminal disposition; `Err` is an
     /// operational failure the pool records as `Dropped`.
     pub async fn assess(&self, work: AssessmentWork) -> Result<AssessmentOutcome, InventoryError> {
-        let environment = Arc::clone(&self.environment);
         let AssessmentWork {
             key,
+            environment,
             profile,
             configuration,
             preparation,
@@ -234,10 +264,10 @@ impl ModelAssessor {
                 result: Ok(cached),
             });
         }
-        let prepared = preparation
+        let prepared = match preparation
             .get_or_init(|| self.prepare_bundle(configuration))
-            .await;
-        let prepared = match prepared {
+            .await
+        {
             Ok(prepared) => Arc::clone(prepared),
             Err(failure) => {
                 return Ok(AssessmentOutcome {
@@ -399,7 +429,8 @@ async fn assess_prepared(
     let engine_environment = Arc::clone(&environment);
     let started = std::time::Instant::now();
     let assessed = crate::spawn_blocking_traced(move || {
-        finish_model_assessment(&prepared, &engine_environment.setup, &depths)
+        let setup = &engine_environment.setup;
+        finish_model_assessment(&prepared, setup, &depths, PROFILE_SEQUENCES)
     })
     .await
     .map_err(|error| InventoryError::Internal(format!("model assessment task failed: {error}")))?;
@@ -462,41 +493,23 @@ pub(crate) fn model_assessment(
         performance_context_tokens,
     } = requested;
     let assessment = match execution {
-        ExecutionAssessment::Fits {
-            domains,
+        ModelExecution::Fits {
+            fit: ExecutionFit { domains, .. },
             performance,
-            ..
-        } => {
-            let performance = performance
-                .iter()
-                .map(performance_evidence)
-                .collect::<Vec<_>>();
-            if performance
-                .iter()
-                .map(|sample| sample.context_tokens)
-                .ne(performance_context_tokens.iter().copied())
-            {
-                return Err(InventoryError::ModelOperation {
-                    code: "assessment_incomplete".to_owned(),
-                    message: "the engine did not estimate every requested depth".to_owned(),
-                    retryable: false,
-                });
-            }
-            ModelAssessment::Fits {
-                profile,
-                assessment_id,
-                memory: memory_assessments(&domains, environment),
-                performance,
-                projector,
-                drafter,
-            }
-        }
-        ExecutionAssessment::DoesNotFit {
+        } => ModelAssessment::Fits {
+            profile,
+            assessment_id,
+            memory: memory_assessments(&domains, environment),
+            performance: model_performance(performance, &performance_context_tokens)?,
+            projector,
+            drafter,
+        },
+        ModelExecution::DoesNotFit(ExecutionShortfall {
             domains,
             limiting,
             deficit_bytes,
             ..
-        } => ModelAssessment::DoesNotFit {
+        }) => ModelAssessment::DoesNotFit {
             profile,
             assessment_id,
             memory: memory_assessments(&domains, environment),
@@ -711,7 +724,43 @@ fn capabilities(capabilities: EngineCapabilities) -> ModelCapabilities {
 }
 
 fn domain_id(domain: seismic::StoreId, environment: &AssessmentEnvironment) -> MemoryDomainId {
-    crate::memory_domains::store_domain_id(&environment.setup.topology, domain)
+    crate::memory_domains::store_domain_id(&environment.setup.structure.topology, domain)
+}
+
+/// A fitting model's speed on the contract: estimated at exactly the requested depths, pending,
+/// or unavailable with why.
+fn model_performance(
+    performance: Performance,
+    depths: &[u32],
+) -> Result<ModelPerformance, InventoryError> {
+    Ok(match performance {
+        Performance::Pending => ModelPerformance::Pending,
+        Performance::Unavailable { reason } => ModelPerformance::Unavailable {
+            failure: ModelFailure {
+                code: "performance_unavailable".to_owned(),
+                message: reason,
+                retryable: false,
+            },
+        },
+        Performance::Estimated(estimates) => {
+            let samples = estimates
+                .iter()
+                .map(performance_evidence)
+                .collect::<Vec<_>>();
+            if samples
+                .iter()
+                .map(|sample| sample.context_tokens)
+                .ne(depths.iter().copied())
+            {
+                return Err(InventoryError::ModelOperation {
+                    code: "assessment_incomplete".to_owned(),
+                    message: "the engine did not estimate every requested depth".to_owned(),
+                    retryable: false,
+                });
+            }
+            ModelPerformance::Estimated { samples }
+        }
+    })
 }
 
 fn memory_assessments(

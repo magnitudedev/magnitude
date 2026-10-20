@@ -955,6 +955,14 @@ checked boundaries. It supplies model topology, resident tensors, owned state cl
 values, but does not restate numerical tensor shapes in a separate scratch recipe or resolve named
 intermediate buffers during submission.
 
+Native Vulkan and CUDA sources never add a value's own split bit fields back together (an address
+or value written as `8 * (p >> 3) + (p & 7)` or `12 * (p >> 3) + ((3 * (p & 7)) >> 1)`): each is
+written over the value itself (`p`, `(3 * p) >> 1`). NVIDIA's NVVM-based compiler on aarch64 (GB10,
+driver 580) traps in pipeline creation folding such an add in the inlined projection kernels, while
+the value itself, or the fields joined with `|`, compile; the trigger also depends on the
+surrounding code, so no minimal shader reproduces it. Fields that place different values, or one
+value's fields at scales that do not recombine it, are not this case.
+
 ## Public integration
 
 `seismic-build` checks sources at build time, emits a versioned checked

@@ -181,8 +181,11 @@ impl State {
             | WorkerMessage::Ready { .. }
             | WorkerMessage::Prepared
             | WorkerMessage::Unprepared
-            | WorkerMessage::LoadFailed { .. } => {
-                return Err("load message after readiness".into())
+            | WorkerMessage::LoadFailed { .. } => return Err("load message after readiness".into()),
+            WorkerMessage::Attempting { .. }
+            | WorkerMessage::Recorded { .. }
+            | WorkerMessage::MeasureFinished { .. } => {
+                return Err("measurement message from a serving worker".into())
             }
         }
         Ok(())
@@ -252,36 +255,14 @@ pub fn connect_worker(
 ) -> Result<LoadAttempt<WorkerConnection>, LoadError> {
     let (mut receiver, mut sender) = transport.split();
     let lost = |reason: String| LoadError::WorkerLost { reason };
-    let build = EngineBuild::current();
-    if let Some((manifest, unprepared)) = load {
-        sender
-            .send(HostMessage::Hello {
-                build: build.clone(),
-            })
-            .and_then(|()| {
-                sender.send(HostMessage::Load {
-                    manifest,
-                    unprepared,
-                })
-            })
-            .map_err(|error| lost(error.to_string()))?;
-    }
-    let mut next = || match receiver.receive() {
-        Ok(Some(message)) => Ok(message),
-        Ok(None) => Err(lost("the worker ended before it was ready".into())),
-        Err(error) => Err(lost(error.to_string())),
-    };
-    match next()? {
-        WorkerMessage::Hello { build: worker } if worker == build => {}
-        WorkerMessage::Hello { build: worker } => {
-            return Err(lost(format!(
-                "worker build {worker} differs from host build {build}"
-            )))
-        }
-        _ => return Err(lost("the worker did not greet the host".into())),
-    }
+    let ended = "it was ready";
+    let load = load.map(|(manifest, unprepared)| HostMessage::Load {
+        manifest,
+        unprepared,
+    });
+    handshake(&mut sender, &mut receiver, load, ended, lost)?;
     let ready = loop {
-        match next()? {
+        match receive(&mut receiver, ended, lost)? {
             WorkerMessage::LoadProgress { progress: current } => progress(current),
             WorkerMessage::Ready { ready } => break ready,
             WorkerMessage::Unprepared => return Ok(LoadAttempt::Unprepared),
@@ -340,34 +321,59 @@ pub(super) fn prepare_worker(
 ) -> Result<Result<(), LoadError>, LoadError> {
     let (mut receiver, mut sender) = transport.split();
     let lost = |reason: String| LoadError::WorkerLost { reason };
-    let build = EngineBuild::current();
-    sender
-        .send(HostMessage::Hello {
-            build: build.clone(),
-        })
-        .and_then(|()| sender.send(HostMessage::Prepare { manifest }))
-        .map_err(|error| lost(error.to_string()))?;
-    let mut next = || match receiver.receive() {
-        Ok(Some(message)) => Ok(message),
-        Ok(None) => Err(lost("the worker ended before it was prepared".into())),
-        Err(error) => Err(lost(error.to_string())),
-    };
-    match next()? {
-        WorkerMessage::Hello { build: worker } if worker == build => {}
-        WorkerMessage::Hello { build: worker } => {
-            return Err(lost(format!(
-                "worker build {worker} differs from host build {build}"
-            )))
-        }
-        _ => return Err(lost("the worker did not greet the host".into())),
-    }
+    let ended = "it was prepared";
+    let prepare = HostMessage::Prepare { manifest };
+    handshake(&mut sender, &mut receiver, Some(prepare), ended, lost)?;
     loop {
-        match next()? {
+        match receive(&mut receiver, ended, lost)? {
             WorkerMessage::LoadProgress { progress: current } => progress(current),
             WorkerMessage::Prepared => return Ok(Ok(())),
             WorkerMessage::LoadFailed { error } => return Ok(Err(error)),
             _ => return Err(lost("unexpected message during preparation".into())),
         }
+    }
+}
+
+/// Open an exchange with a worker: send it this build's `Hello` and then
+/// `first`, unless it was given its work directly (in-process, `None`), and
+/// require its own `Hello` to carry this build. Every failure is the worker
+/// lost, as `lost` names it; `ended` is what its stream ended before.
+pub(super) fn handshake<E>(
+    sender: &mut impl MessageSender<HostMessage>,
+    receiver: &mut impl MessageReceiver<WorkerMessage>,
+    first: Option<HostMessage>,
+    ended: &str,
+    lost: impl Fn(String) -> E,
+) -> Result<(), E> {
+    let build = EngineBuild::current();
+    if let Some(first) = first {
+        sender
+            .send(HostMessage::Hello {
+                build: build.clone(),
+            })
+            .and_then(|()| sender.send(first))
+            .map_err(|error| lost(error.to_string()))?;
+    }
+    match receive(receiver, ended, &lost)? {
+        WorkerMessage::Hello { build: worker } if worker == build => Ok(()),
+        WorkerMessage::Hello { build: worker } => Err(lost(format!(
+            "worker build {worker} differs from host build {build}"
+        ))),
+        _ => Err(lost("the worker did not greet the host".into())),
+    }
+}
+
+/// The worker's next message. Its stream ending, before `ended`, or
+/// failing is the worker lost, as `lost` names it.
+pub(super) fn receive<E>(
+    receiver: &mut impl MessageReceiver<WorkerMessage>,
+    ended: &str,
+    lost: impl Fn(String) -> E,
+) -> Result<WorkerMessage, E> {
+    match receiver.receive() {
+        Ok(Some(message)) => Ok(message),
+        Ok(None) => Err(lost(format!("the worker ended before {ended}"))),
+        Err(error) => Err(lost(error.to_string())),
     }
 }
 

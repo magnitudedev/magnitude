@@ -51,7 +51,10 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
         totalRequiredBytes: 0,
         requiredSystemMemoryBytes: 0,
       },
-      performance: [{ contextTokens: 32_768, estimatedTokensPerSecond: 25 }],
+      performance: {
+        _tag: "Estimated",
+        samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 25 }],
+      },
     },
   } as const
   if (source === "Discovered") {
@@ -97,7 +100,10 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
       aliases: [],
     },
     acquisitionState: { _tag: "Installed", installation, residencyState: { _tag: "Unloaded" } },
-    servingState: { ...servingState, rankingScores: Option.none() },
+    servingState: {
+      ...servingState,
+      rankingScores: { intelligence: 0.01, speed: Option.none(), fidelity: 0.01 },
+    },
     missingComponents: [],
     storedComponents: [],
     drafterWithheld: false,

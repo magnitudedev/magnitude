@@ -1,6 +1,8 @@
 //! Assess the complete release catalog through the service's production assessment path (the
 //! environment and its identity, the automatic pool and the per-target assessor) and report the
-//! snapshot with its timings. Development evidence only.
+//! snapshot with its timings. Speeds are estimated from the measurements a service's
+//! measurement job stored in the cache root; without them they are pending. Development evidence
+//! only.
 //!
 //! ```text
 //! catalog_assessment --bundle model-planner-inputs.bundle --cache-root DIR --model-store DIR \
@@ -12,20 +14,23 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
+use magnitude_executor::platform::MemoryReserves;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover, ModelAssessment,
     ModelAssessmentDomainSnapshot, ModelAssessmentEntryState, ModelAssessments, ModelId,
-    ModelPackageId,
+    ModelPackageId, ModelPerformance,
 };
-use magnitude_executor::platform::MemoryReserves;
 use magnitude_service_models::{
     InventoryConfig, ManagedModelDownloads, ModelDomainResolver, load_release_catalog,
     managed_model_services,
 };
 use magnitude_service_server::assessment::ManagedModelAssessments;
 use magnitude_service_server::assessment::assessor::ModelAssessor;
-use magnitude_service_server::assessment::environment::AssessmentEnvironment;
+use magnitude_service_server::assessment::environment::{
+    AssessmentEnvironment, assessment_structure,
+};
+use magnitude_service_server::assessment::measurement::MeasurementStatus;
 use magnitude_service_server::model_store::{ServedStore, open_served_store};
 use serde_json::json;
 
@@ -99,16 +104,35 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
         store: inventory,
         devices: catalog,
     } = open_served_store(config, MemoryReserves::standard()).await?;
+    let kernels = inventory.derived_cache().kernel_directory();
     let resolver = ModelDomainResolver::new(inventory.clone(), release.catalog().clone());
     let downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()).await?);
-    let services = managed_model_services(resolver.clone(), downloads, Arc::new(NoCatalogEffects), Arc::new(NoCatalogEffects))?;
-    let environment = Arc::new(AssessmentEnvironment::establish(&catalog)?);
+    let services = managed_model_services(
+        resolver.clone(),
+        downloads,
+        Arc::new(NoCatalogEffects),
+        Arc::new(NoCatalogEffects),
+    )?;
+    let structure = Arc::new(assessment_structure(&catalog)?);
+    let stored = structure.stored_measurements(&kernels);
+    let environment = Arc::new(AssessmentEnvironment::new(
+        Arc::clone(&structure),
+        stored.clone(),
+    )?);
     let environment_established = started.elapsed();
-    let assessor = Arc::new(ModelAssessor::new(inventory, resolver, release, environment));
+    let assessor = Arc::new(ModelAssessor::new(
+        inventory,
+        resolver,
+        release,
+        environment,
+    ));
+    // No job runs here: what is stored stands.
+    let (_measurement, status) = tokio::sync::watch::channel(MeasurementStatus::stored(stored));
     let pool = ManagedModelAssessments::start(
         assessor,
         services.catalog.clone(),
         services.local.clone(),
+        status,
     );
     let pool_started = Instant::now();
     let snapshot = loop {
@@ -140,10 +164,17 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
                     "result": "Fits",
                     "context": profile.context_length,
                     "requiredBytes": memory.iter().map(|domain| domain.required_bytes).collect::<Vec<_>>(),
-                    "tokensPerSecond": performance
-                        .iter()
-                        .map(|sample| (sample.context_tokens, (sample.estimated_tokens_per_second * 10.0).round() / 10.0))
-                        .collect::<Vec<_>>(),
+                    "tokensPerSecond": match performance {
+                        ModelPerformance::Estimated { samples } => json!(samples
+                            .iter()
+                            .map(|sample| (
+                                sample.context_tokens,
+                                (sample.estimated_tokens_per_second * 10.0).round() / 10.0,
+                            ))
+                            .collect::<Vec<_>>()),
+                        ModelPerformance::Pending => json!("pending"),
+                        ModelPerformance::Unavailable { failure } => json!(failure.message),
+                    },
                 }),
                 [
                     ModelAssessment::DoesNotFit {

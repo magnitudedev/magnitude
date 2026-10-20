@@ -57,15 +57,15 @@ use crate::api::device::DeviceInner;
 use crate::api::kernel::{DecodedResults, DecodedValue, EncodedArgs, EncodedOutputs, PrepareError};
 use crate::api::tensor::TensorInner;
 use crate::api::{CallError, OutputError};
+use crate::artifacts::ArtifactKey;
 use crate::backends::{CpuOpened, CudaOpened, OpenedKind};
 use crate::driver::{
     collect_native_access, typed_buffer, write_zeros, Allocation, DeviceCompletion,
 };
 pub(crate) use crate::formation::FormationClass;
-pub use budget::{Footprint, Linear, Observed, Quote};
-pub use point::KernelPoint;
-use crate::artifacts::ArtifactKey;
 use crate::formation::{Compile, Keyed, ProgramFormer};
+pub use budget::{Footprint, Linear, Observed, Quote};
+pub use point::{GraphPending, GraphPoint, GraphTiming, KernelPoint, Point, PointPending};
 use seismic_compiler::errors::{ExecutionError, InvocationError, PreparationError};
 use seismic_compiler::prepared::{
     validate_invocation, ArgumentValue, DeviceIdentity, InvocationContract,
@@ -231,9 +231,11 @@ impl NativeRoute {
 /// its source's text. A whole-entry source is one compile with one entry
 /// per launch; a launch-scoped source is one text per launch, whose
 /// compile may hold more variants than the launch uses. The implementation
-/// holds the compiles its launches run and no other of their texts.
+/// holds the compiles its launches run and no other of their texts. A
+/// launch no call within the specialization's ranges activates is not
+/// formed (`None`).
 struct Launches<P> {
-    launches: Vec<(Arc<Compile<P>>, usize, ArtifactKey)>,
+    launches: Vec<Option<(Arc<Compile<P>>, usize, ArtifactKey)>>,
 }
 
 impl<P> Clone for Launches<P> {
@@ -245,17 +247,28 @@ impl<P> Clone for Launches<P> {
 }
 
 impl<P> Launches<P> {
+    /// The program and entry of active launch `ordinal`. A launch is active
+    /// only for a call within the specialization's ranges
+    /// ([`NativePrepared::launches`] refuses any other), and every launch
+    /// such a call can activate is formed.
     fn launch(&self, ordinal: usize) -> (&P, usize) {
-        let (compile, entry, _) = &self.launches[ordinal];
+        let (compile, entry, _) = self.launches[ordinal]
+            .as_ref()
+            .expect("an active launch is formed: its call is within the specialization's ranges");
         (compile.program(), *entry)
     }
 
     /// Each launch's program text address and entry, which with the
     /// toolchain identity determine the implementation's code.
     fn identify(&self, digest: &mut Sha256) {
-        for (compile, entry, key) in &self.launches {
-            digest.update(key.as_str());
-            digest.update(format!("{:?}", compile.entries()[*entry]));
+        for launch in &self.launches {
+            match launch {
+                Some((compile, entry, key)) => {
+                    digest.update(key.as_str());
+                    digest.update(format!("{:?}", compile.entries()[*entry]));
+                }
+                None => digest.update(b"unformed"),
+            }
         }
     }
 }
@@ -273,15 +286,17 @@ impl Launches<Vec<seismic_metal::DirectPipeline>> {
             launches: self
                 .launches
                 .iter()
-                .map(|(compile, entry, key)| {
-                    (
-                        Arc::new(Compile::of(
-                            vec![compile.entries()[*entry].clone()],
-                            vec![compile.program()[*entry].clone()],
-                        )),
-                        0,
-                        key.clone(),
-                    )
+                .map(|launch| {
+                    launch.as_ref().map(|(compile, entry, key)| {
+                        (
+                            Arc::new(Compile::of(
+                                vec![compile.entries()[*entry].clone()],
+                                vec![compile.program()[*entry].clone()],
+                            )),
+                            0,
+                            key.clone(),
+                        )
+                    })
                 })
                 .collect(),
         }
@@ -590,14 +605,16 @@ fn cpu_route(
     })
 }
 
-fn entry_name(module: &CheckedModule, entry: EntryId) -> String {
+fn entry_info(module: &CheckedModule, entry: EntryId) -> &seismic_lang::checked::EntryInfo {
     module
         .entries()
         .iter()
         .find(|candidate| candidate.id == entry)
         .expect("entry belongs to its module")
-        .name
-        .clone()
+}
+
+fn entry_name(module: &CheckedModule, entry: EntryId) -> String {
+    entry_info(module, entry).name.clone()
 }
 
 fn preparation(message: impl Into<String>) -> PrepareError {
@@ -750,8 +767,11 @@ pub(crate) fn implementation_programs(
 /// The program sources a device's toolchain forms `implementation` at
 /// `specialization` from, and by launch the source and the entry of it the
 /// launch runs: each launch's single variant, the specialization's code
-/// values and static group size. The CPU backend renders nothing and is
-/// never asked.
+/// values and static group size. A launch no call within the
+/// specialization's ranges activates has no entry and no source of its own,
+/// so nothing of it is formed: a backend forms a pipeline or function per
+/// entry, and on some drivers that is most of the compile. The CPU backend
+/// renders nothing and is never asked.
 fn rendered_programs(
     device: &Arc<DeviceInner>,
     module: &CheckedModule,
@@ -760,7 +780,26 @@ fn rendered_programs(
     bindings: &ElementBindings,
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
-) -> Result<(Vec<ProgramSource>, Vec<(usize, ProgramEntry)>), PrepareError> {
+) -> Result<(Vec<ProgramSource>, Vec<Option<(usize, ProgramEntry)>>), PrepareError> {
+    let reachable = (0..implementation.launches.len())
+        .map(|ordinal| implementation.reachable(specialization, ordinal))
+        .collect::<Vec<_>>();
+    // A whole-entry source keeps the entries of its reachable launches, and
+    // each reachable launch runs its own entry of it.
+    let whole = |mut source: ProgramSource| {
+        let requests = source
+            .entries
+            .iter()
+            .zip(&reachable)
+            .map(|(entry, &reachable)| reachable.then(|| (0, entry.clone())))
+            .collect::<Vec<_>>();
+        source.entries = requests
+            .iter()
+            .flatten()
+            .map(|(_, entry)| entry.clone())
+            .collect();
+        (vec![source], requests)
+    };
     let asset = |backend| {
         module.native_asset(entry, backend).ok_or_else(|| {
             preparation(format!(
@@ -787,20 +826,27 @@ fn rendered_programs(
             asset,
             &variants,
         );
-        let requests = if implementation.launch_scoped() {
-            sources
-                .iter()
-                .enumerate()
-                .map(|(ordinal, source)| (ordinal, source.entries[0].clone()))
-                .collect::<Vec<_>>()
+        if implementation.launch_scoped() {
+            // One source per launch: the reachable launches' sources, each
+            // launch at its own.
+            let mut kept = Vec::new();
+            let requests = sources
+                .into_iter()
+                .zip(&reachable)
+                .map(|(source, &reachable)| {
+                    reachable.then(|| {
+                        let request = (kept.len(), source.entries[0].clone());
+                        kept.push(source);
+                        request
+                    })
+                })
+                .collect();
+            (kept, requests)
         } else {
-            sources[0]
-                .entries
-                .iter()
-                .map(|entry| (0, entry.clone()))
-                .collect()
-        };
-        (sources, requests)
+            whole(sources.into_iter().next().expect(
+                "`implementation_programs` renders a whole-entry implementation as one source",
+            ))
+        }
     };
     match &device.kind {
         OpenedKind::Cpu(_) => unreachable!("the CPU backend renders no programs"),
@@ -839,12 +885,7 @@ fn rendered_programs(
                     })
                     .collect(),
             };
-            let requests = source
-                .entries
-                .iter()
-                .map(|entry| (0, entry.clone()))
-                .collect();
-            Ok((vec![source], requests))
+            Ok(whole(source))
         }
     }
 }
@@ -936,18 +977,21 @@ fn launch_programs(
 }
 
 /// Form `sources` and place each launch at its entry: `requests` names, by
-/// launch ordinal, the source and entry it runs.
+/// launch ordinal, the source and entry it runs (none for a launch that is
+/// not formed).
 fn form_launches<T: Toolchain>(
     former: &ProgramFormer<T>,
     sources: &[ProgramSource],
-    requests: &[(usize, ProgramEntry)],
+    requests: &[Option<(usize, ProgramEntry)>],
 ) -> Result<Launches<T::Program>, PrepareError> {
     let formed = former.form(sources).map_err(compilation)?;
     let launches = requests
         .iter()
-        .map(|(source, entry)| {
-            let (compile, position) = formed[*source].entry(entry);
-            (compile.clone(), position, formed[*source].key().clone())
+        .map(|request| {
+            request.as_ref().map(|(source, entry)| {
+                let (compile, position) = formed[*source].entry(entry);
+                (compile.clone(), position, formed[*source].key().clone())
+            })
         })
         .collect();
     Ok(Launches { launches })
@@ -1260,14 +1304,19 @@ impl NativePrepared {
         implementation
             .validate(&specialization)
             .map_err(|error| preparation(format!("`{name}`: {error}")))?;
-        let handoff = NativeHandoffKey::new(
-            module,
-            entry,
-            logical,
-            &specialization,
-            backend,
-            cpu,
-        );
+        // A range holds a call-time dimension of the entry; the declaration
+        // alone does not know them.
+        let dimensions = &entry_info(module, entry).dimensions;
+        if let Some(ranged) = specialization
+            .ranges()
+            .keys()
+            .find(|ranged| !dimensions.contains(ranged))
+        {
+            return Err(preparation(format!(
+                "`{name}`: `{ranged}` is not a dimension of the entry and takes no range"
+            )));
+        }
+        let handoff = NativeHandoffKey::new(module, entry, logical, &specialization, backend, cpu);
         // A specialization tuning already formed and chose is served as
         // formed: it is never formed twice.
         let handed_off = device
@@ -1637,6 +1686,23 @@ impl NativePrepared {
         &self,
         dimension: &dyn Fn(&str) -> Option<u64>,
     ) -> Result<CallLaunches, CallError> {
+        // Only the launches a call within the ranges can activate are
+        // formed, so a call outside them is refused before any launch is.
+        for (name, &(low, high)) in self.specialization.ranges() {
+            let actual = dimension(name).ok_or_else(|| {
+                self.evaluation_error(seismic_lang::checked::NativeEvalError::Unbound(
+                    name.clone(),
+                ))
+            })?;
+            if !(low..=high).contains(&actual) {
+                return Err(CallError::Invocation(InvocationError::OutsideRange {
+                    dimension: name.clone(),
+                    low,
+                    high,
+                    actual,
+                }));
+            }
+        }
         let mut geometry = Vec::with_capacity(self.implementation.launches.len());
         for (ordinal, launch) in self.implementation.launches.iter().enumerate() {
             if !self.active_at(&launch.when, dimension, Some(ordinal))? {
@@ -2465,11 +2531,11 @@ fn encode(
                         .implementation
                         .dispatch_order(dispatch.rounds)
                     {
-                        let pipeline = pipelines.pipeline(ordinal);
                         let Some(launch) = &dispatch.launches[ordinal] else {
                             batch.skip();
                             continue;
                         };
+                        let pipeline = pipelines.pipeline(ordinal);
                         batch
                             .encode(&seismic_metal::DirectLaunch {
                                 pipeline,

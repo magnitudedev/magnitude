@@ -1058,7 +1058,7 @@ async fn hugging_face_package(
 
 fn cpu_environment() -> Arc<AssessmentEnvironment> {
     let catalog = seismic::Devices::discover(&[]).expect("device catalog");
-    let setup = magnitude_engine::assessment::AssessmentSetup::discover(
+    let structure = magnitude_engine::assessment::AssessmentStructure::discover(
         &catalog,
         magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
         magnitude_executor::platform::MemoryReserves::standard(),
@@ -1066,10 +1066,13 @@ fn cpu_environment() -> Arc<AssessmentEnvironment> {
         magnitude_engine::options::standard_service_limits(),
     )
     .expect("the CPU backend is selectable");
-    Arc::new(AssessmentEnvironment {
-        id: magnitude_service_contracts::models::AssessmentEnvironmentId("cpu-test".to_owned()),
-        setup,
-    })
+    Arc::new(
+        AssessmentEnvironment::new(
+            Arc::new(structure),
+            magnitude_engine::assessment::Measurements::Pending,
+        )
+        .expect("the CPU environment"),
+    )
 }
 
 async fn fixture(custom: Vec<CustomModel>) -> Fixture {
@@ -4881,7 +4884,7 @@ impl Requirements {
             }))
             .expect("memory reserves");
         let catalog = seismic::Devices::discover(&[]).expect("device catalog");
-        let setup = magnitude_engine::assessment::AssessmentSetup::discover(
+        let structure = magnitude_engine::assessment::AssessmentStructure::discover(
             &catalog,
             magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
             reserves,
@@ -4889,12 +4892,14 @@ impl Requirements {
             magnitude_engine::options::standard_service_limits(),
         )
         .expect("the CPU backend is selectable");
-        Arc::new(AssessmentEnvironment {
-            id: magnitude_service_contracts::models::AssessmentEnvironmentId(format!(
-                "cpu-test-{budget}"
-            )),
-            setup,
-        })
+        // The reserves enter the environment's identity, so each budget is its own.
+        Arc::new(
+            AssessmentEnvironment::new(
+                Arc::new(structure),
+                magnitude_engine::assessment::Measurements::Pending,
+            )
+            .expect("the CPU environment"),
+        )
     }
 }
 

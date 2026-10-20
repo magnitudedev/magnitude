@@ -10,20 +10,21 @@ use magnitude_artifacts::gguf::Encoding;
 use magnitude_engine::{
     assessment::{
         assess_model, header_refusal, kernel_inventory, prepare_model_assessment,
-        AssessmentSetup, DrafterVerdict, HeaderExtent, KernelInventory, ModelAssessment,
-        ModelFacts, ModelPackagePaths, PreparedModelAssessment, ProjectorVerdict,
-        SpeculativeMethod,
+        AssessmentSetup, AssessmentStructure, DrafterVerdict, HeaderExtent, KernelInventory,
+        Measurements, ModelAssessment, ModelExecution, ModelFacts, ModelPackagePaths,
+        PreparedModelAssessment, ProjectorVerdict, SpeculativeMethod,
     },
     error::{UnsupportedModel, UnsupportedReason, WeightTypeCount},
     fingerprint::ModelFingerprint,
-    options::{standard_service_limits, ModelMethod, ModelPolicy},
+    options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
 };
 use magnitude_executor::{
-    assessment::ExecutionAssessment,
+    assessment::ExecutionFit,
     platform::{DeviceRequest, MemoryReserves},
 };
 use seismic::BackendName;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 enum Meta {
     U32(u32),
@@ -682,9 +683,9 @@ fn the_fingerprint_reads_the_header_shape_and_the_token_table() {
     );
 }
 
-fn cpu_setup() -> AssessmentSetup {
+fn cpu_structure() -> AssessmentStructure {
     let catalog = seismic::Devices::discover(&[]).unwrap();
-    AssessmentSetup::discover(
+    AssessmentStructure::discover(
         &catalog,
         DeviceRequest::Backend(BackendName::Cpu),
         MemoryReserves::standard(),
@@ -694,8 +695,16 @@ fn cpu_setup() -> AssessmentSetup {
     .unwrap_or_else(|error| panic!("the CPU backend is selectable: {error}"))
 }
 
+/// The CPU backend before any measurement: fit is assessed, speed is pending.
+fn cpu_setup() -> AssessmentSetup {
+    AssessmentSetup {
+        structure: Arc::new(cpu_structure()),
+        measurements: Measurements::Pending,
+    }
+}
+
 fn prepared(package: &ModelPackagePaths) -> PreparedModelAssessment {
-    prepare_model_assessment(package, &cpu_setup())
+    prepare_model_assessment(package, &cpu_structure())
         .unwrap_or_else(|error| panic!("operational failure: {error}"))
 }
 
@@ -856,7 +865,7 @@ fn cpu_refusal(package: &ModelPackagePaths, policy: ModelPolicy) -> UnsupportedM
         panic!("the package is admitted");
     };
     let catalog = seismic::Devices::discover(&[]).unwrap();
-    let setup = AssessmentSetup::discover(
+    let structure = AssessmentStructure::discover(
         &catalog,
         DeviceRequest::Backend(BackendName::Cpu),
         MemoryReserves::standard(),
@@ -867,7 +876,7 @@ fn cpu_refusal(package: &ModelPackagePaths, policy: ModelPolicy) -> UnsupportedM
     let PreparedModelAssessment::Unsupported {
         unsupported: assessed,
         ..
-    } = prepare_model_assessment(package, &setup)
+    } = prepare_model_assessment(package, &structure)
         .unwrap_or_else(|error| panic!("operational failure: {error}"))
     else {
         panic!("the package plans");
@@ -941,9 +950,13 @@ fn widened_weights_are_charged_as_resident() {
         }
         let target = gguf.write(&scratch.file(name));
         let ModelAssessment::Assessed {
-            execution: ExecutionAssessment::Fits { domains, .. },
+            execution:
+                ModelExecution::Fits {
+                    fit: ExecutionFit { domains, .. },
+                    ..
+                },
             ..
-        } = assess_model(&package(target), &cpu_setup(), &[])
+        } = assess_model(&package(target), &cpu_setup(), &[], PROFILE_SEQUENCES)
             .unwrap_or_else(|error| panic!("operational failure: {error}"))
         else {
             panic!("{name} fits");

@@ -519,7 +519,7 @@ fn cuda_chunk_every_catalog_value_head_count_matches_the_host_model() {
 fn cuda_recurrent_timings() {
     let Some(device) = cuda() else { return };
     let options = seismic::measure::Measure {
-        samples: std::num::NonZeroUsize::new(15).unwrap(),
+        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
         min_sample_seconds: 0.002,
     };
     let measure = |point| timing_common::measured(point, &options);

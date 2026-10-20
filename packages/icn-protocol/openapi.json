@@ -6436,7 +6436,10 @@
           "cuda_total_beyond_dedicated",
           "metal_working_set_beyond_dedicated",
           "dxgi_dedicated_memory",
-          "cuda_memory_clock_bus_width",
+          "linux_sysfs_cache",
+          "mac_os_sysctl_cache",
+          "windows_processor_cache",
+          "cuda_l2_cache",
           "filesystem_size",
           "filesystem_available"
         ]
@@ -7646,6 +7649,77 @@
         },
         "additionalProperties": false
       },
+      "MeasurementState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Measurements are missing and no job has run yet: it waits for the device to be free.",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Unmeasured"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A job is measuring this machine.",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Measuring"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Every measurement that estimates read is stored, or recorded as unobtainable on this\nmachine.",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Measured"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The last job did not store every measurement; the next starts at `retry_at`\n(milliseconds since the Unix epoch).",
+            "required": [
+              "retryAt",
+              "_tag"
+            ],
+            "properties": {
+              "retryAt": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "The state of the measurement job, which measures this machine's selected executor in a\nworker process of its own, only while no model is loaded, loading or being optimized, so that\nspeed estimates can be made. It moves from `Unmeasured` to `Measuring`, then to `Measured`, or\nto `Failed` and back to `Measuring` at its retry, or back to `Unmeasured` when a load\npreempts the job."
+      },
       "MemoryAssessment": {
         "type": "object",
         "required": [
@@ -7906,7 +7980,7 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "A fitting model, with one decode-speed estimate per requested depth.",
+            "description": "A fitting model, with its decode-speed estimates.",
             "required": [
               "profile",
               "assessmentId",
@@ -7930,10 +8004,7 @@
                 }
               },
               "performance": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/PerformanceEvidence"
-                }
+                "$ref": "#/components/schemas/ModelPerformance"
               },
               "projector": {
                 "$ref": "#/components/schemas/ProjectorVerdict"
@@ -8208,12 +8279,13 @@
       },
       "ModelAssessmentsSnapshot": {
         "type": "object",
-        "description": "Every model assessment in the service's one environment, established at service start.",
+        "description": "Every model assessment in the service's current environment: its structure is established at\nservice start, and its identity changes when the measurement job stores this machine's\nmeasurements.",
         "required": [
           "revision",
           "environmentId",
           "catalog",
-          "custom"
+          "custom",
+          "measurement"
         ],
         "properties": {
           "revision": {
@@ -8229,6 +8301,10 @@
           },
           "custom": {
             "$ref": "#/components/schemas/ModelAssessmentDomainSnapshot"
+          },
+          "measurement": {
+            "$ref": "#/components/schemas/MeasurementState",
+            "description": "Whether this machine's measurements, which speed estimates read, exist."
           }
         },
         "additionalProperties": false
@@ -9315,6 +9391,67 @@
           }
         ]
       },
+      "ModelPerformance": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "This machine's measurements do not exist yet: the measurement job has not stored them.",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Pending"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A measurement the estimate needs could not be taken on this machine.",
+            "required": [
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Unavailable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "One decode-speed estimate per requested depth, ascending.",
+            "required": [
+              "samples",
+              "_tag"
+            ],
+            "properties": {
+              "samples": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PerformanceEvidence"
+                }
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Estimated"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A fitting model's speed estimates."
+      },
       "ModelReasoningCapabilities": {
         "type": "object",
         "required": [
@@ -9598,7 +9735,7 @@
       },
       "PerformanceEvidence": {
         "type": "object",
-        "description": "An estimated decode speed at one context depth: the model's bytes per decode step over the\ndevice's memory bandwidth.",
+        "description": "An estimated decode speed at one context depth, in tokens per second per conversation, from\nthe costs measured of this machine's selected executor: what the engine's own kernels achieve\non it.",
         "required": [
           "contextTokens",
           "estimatedTokensPerSecond"

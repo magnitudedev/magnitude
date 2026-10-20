@@ -117,6 +117,9 @@ pub enum WorkflowError {
     /// A family that keeps a prewritten port in workspace between runs
     /// cannot bind a shared execution arena.
     NativeArenaPrewrittenPort,
+    /// A graph with timeline nodes was given to be measured: a run that
+    /// waits on or signals a timeline is not repeatable as the same work.
+    NativeGraphTimelineMeasured,
     /// The device's backend is native-only (Vulkan): planned workflows are
     /// refused.
     PlannedRouteUnavailable {
@@ -196,6 +199,9 @@ impl fmt::Display for CallError {
             Self::Workflow(WorkflowError::NativeArenaPrewrittenPort) => f.write_str(
                 "a native graph family with a prewritten port cannot bind a shared execution arena",
             ),
+            Self::Workflow(WorkflowError::NativeGraphTimelineMeasured) => {
+                f.write_str("a native graph with timeline nodes cannot be measured")
+            }
             Self::Workflow(WorkflowError::PlannedRouteUnavailable { backend }) => write!(
                 f,
                 "`{}` is a native-only backend: planned workflows are unavailable",
@@ -285,7 +291,48 @@ pub enum TensorError {
     },
     /// A view's store charges cannot be read.
     ViewCharge(ViewChargeError),
+    /// A typed region of a view's bytes cannot be formed.
+    Region(RegionError),
     Execution(ExecutionError),
+}
+
+/// Why a typed region of a view's bytes cannot be formed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegionError {
+    /// The view is no one contiguous byte range of a backed allocation: it
+    /// is reserved, slabbed or strided.
+    NotContiguous,
+    /// The region's `bytes` from `offset` reach past the view's.
+    Outside {
+        offset: u64,
+        bytes: u64,
+        view_bytes: u64,
+    },
+    /// The region would start at `offset` in its allocation, off its
+    /// layout's `alignment`.
+    Unaligned { offset: u64, alignment: u64 },
+}
+
+impl fmt::Display for RegionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotContiguous => {
+                f.write_str("a region needs a contiguous view of a backed allocation")
+            }
+            Self::Outside {
+                offset,
+                bytes,
+                view_bytes,
+            } => write!(
+                f,
+                "a region of {bytes} bytes at {offset} reaches past its view's {view_bytes}"
+            ),
+            Self::Unaligned { offset, alignment } => write!(
+                f,
+                "a region at allocation offset {offset} is off its layout's {alignment}-byte alignment"
+            ),
+        }
+    }
 }
 
 /// Why a view's store charges cannot be read.
@@ -363,6 +410,7 @@ impl fmt::Display for TensorError {
                 "access to {rows} leading rows of a reserved tensor with {committed} committed rows"
             ),
             Self::ViewCharge(error) => write!(f, "{error}"),
+            Self::Region(error) => write!(f, "{error}"),
             Self::Execution(error) => write!(f, "{error}"),
         }
     }
@@ -602,7 +650,7 @@ pub mod device {
 }
 
 pub mod tensor {
-    use super::{device::DeviceInner, HostRegion, TensorError, ViewChargeError};
+    use super::{device::DeviceInner, HostRegion, RegionError, TensorError, ViewChargeError};
     use crate::driver::{write_zeros, Allocation};
     use crate::layout;
     use seismic_compiler::errors::ExecutionError;
@@ -841,9 +889,13 @@ pub mod tensor {
             Ok((layout.byte_len, layout.alignment))
         }
 
-        /// A typed region of an owned, byte-addressed allocation. Its
-        /// allocation remains shared with the byte tensor and every sibling
-        /// region, so each view carries the slab's lifetime into a launch.
+        /// A canonical-layout tensor of `representation` and `extents` over
+        /// this view's bytes from `offset`: its allocation remains shared
+        /// with this view and every sibling region, so each view carries the
+        /// allocation's lifetime into a launch. This view must be one
+        /// contiguous byte range of a backed allocation (not reserved, not
+        /// slabbed), and the region must lie within it, starting at a
+        /// multiple of its layout's alignment in the allocation.
         pub fn region(
             &self,
             representation: RepresentationId,
@@ -856,26 +908,33 @@ pub mod tensor {
                     representation: representation_info(representation).name,
                 });
             }
-            let layout = layout::canonical(representation, extents)?;
-            let end = offset
-                .checked_add(layout.byte_len)
-                .ok_or_else(|| TensorError::SlabLayout("region offset overflows".into()))?;
-            if self.byte_offset != 0
-                || self.reserved
-                || self.byte_len != self.allocation.bytes()
-                || self.representation
-                    != seismic_lang::registry::dense(seismic_lang::types::DType::Bool)
-                || offset % layout.alignment != 0
-                || end > self.allocation.bytes()
+            if self.reserved
+                || self.slabs.is_some()
+                || layout::canonical(self.representation, &self.extents)?.strides != self.strides
             {
-                return Err(TensorError::SlabLayout(
-                    "region is unaligned or outside its slab".into(),
-                ));
+                return Err(TensorError::Region(RegionError::NotContiguous));
+            }
+            let layout = layout::canonical(representation, extents)?;
+            let outside = TensorError::Region(RegionError::Outside {
+                offset,
+                bytes: layout.byte_len,
+                view_bytes: self.byte_len,
+            });
+            let end = offset.checked_add(layout.byte_len).ok_or(outside.clone())?;
+            if end > self.byte_len {
+                return Err(outside);
+            }
+            let start = self.byte_offset + offset;
+            if start % layout.alignment != 0 {
+                return Err(TensorError::Region(RegionError::Unaligned {
+                    offset: start,
+                    alignment: layout.alignment,
+                }));
             }
             Ok(Self::new_view(
                 self.device.clone(),
                 self.allocation.clone(),
-                offset,
+                start,
                 layout.byte_len,
                 representation,
                 extents.to_vec(),
@@ -887,9 +946,10 @@ pub mod tensor {
             self.device.allocation_address(&self.allocation) + self.byte_offset
         }
 
-        /// Publish a new slab under its address table's hazard domain.
-        pub fn share_slab_access_with(&self, table: &Self) {
-            self.allocation.share_access_with(&table.allocation);
+        /// Join `other`'s hazard domain: a new slab its address table's, or a
+        /// new table that of the allocation its slabs view.
+        pub fn share_slab_access_with(&self, other: &Self) {
+            self.allocation.share_access_with(&other.allocation);
         }
 
         /// A zero-filled tensor over `extents` whose leading rows

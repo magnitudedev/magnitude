@@ -44,8 +44,11 @@ silent. Candidate assessments are requested on demand for a candidate's target, 
 drafter, from headers fetched by range request, and are cached like every assessment.
 
 One assessment reads the target's Assessment Material headers once, in the service process, and
-is arithmetic over them and the assessment environment the service establishes at start (the
-selected device, its memory bandwidth and the host). The engine's own tokenizer,
+is arithmetic over them and the assessment environment: its structure, established at start (the
+selected device and the host), and what the measurement job has stored of this machine (the
+selected device's costs, derived from its measured cost points). Until those exist a fitting model's
+speed is pending; when they arrive every assessed model is finished again and published in one
+revision. The engine's own tokenizer,
 template and reasoning inspection supplies capabilities and the template fingerprint; its method
 resolution decides speculative execution.
 One deadline covers the target, and one flat assessed result
@@ -60,11 +63,12 @@ Transport or operation failure drops the target rather than fabricating assessme
 Hardware observations that were not performed are represented as `NotObserved`; zero-valued
 headroom is never fabricated.
 
-Ranking exists only for reviewed catalog models with `Fits` evidence and the required bounded
-performance sample. Intelligence and fidelity come from authored catalog evidence; speed comes
-from engine assessment, which every fitting model has. Missing evidence yields absent ranking
-scores, never zeros. Custom models are never ranked and never inherit an intelligence or fidelity
-score from the catalog model they are a variant of.
+Ranking exists only for reviewed catalog models with `Fits` evidence. Intelligence and fidelity
+come from authored catalog evidence; speed comes from engine assessment, at the bounded comparison
+depth, once this machine is measured. A speed that is pending or unavailable yields an absent speed
+score, never a zero: such a model is ranked by intelligence and fidelity alone, after every model
+with a speed score, and never by name. Custom models are never ranked and never inherit an
+intelligence or fidelity score from the catalog model they are a variant of.
 
 Provider selection requires `Fits`, current selectability, profile, and capabilities from the same
 assessed state. Package validation establishes only structural artifact validity and presence;

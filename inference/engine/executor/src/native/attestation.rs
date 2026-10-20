@@ -511,7 +511,12 @@ impl AttestedPrograms {
             )?;
             self.drafter_graphs = Some(crate::PreparedDrafterGraphs::Draft(Rc::new(
                 crate::programs::native_draft::PreparedDraftGraphs::prepare(
-                    device, handles, load, &geometry, classes,
+                    device,
+                    handles,
+                    load,
+                    programs.draft().ok_or("draft graphs require a draft program")?,
+                    &geometry,
+                    classes,
                 )
                 .map_err(|error| error.to_string())?,
             )));

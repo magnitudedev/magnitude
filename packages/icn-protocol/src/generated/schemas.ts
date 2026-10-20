@@ -1652,7 +1652,10 @@ export const HardwareReportedBy = S.Union(
   S.Literal("cuda_total_beyond_dedicated"),
   S.Literal("metal_working_set_beyond_dedicated"),
   S.Literal("dxgi_dedicated_memory"),
-  S.Literal("cuda_memory_clock_bus_width"),
+  S.Literal("linux_sysfs_cache"),
+  S.Literal("mac_os_sysctl_cache"),
+  S.Literal("windows_processor_cache"),
+  S.Literal("cuda_l2_cache"),
   S.Literal("filesystem_size"),
   S.Literal("filesystem_available"),
 )
@@ -2095,6 +2098,20 @@ export const LocalModelsResponse = S.Struct({
 export type LocalModelsResponse = S.Schema.Type<typeof LocalModelsResponse>
 export type LocalModelsResponseEncoded = S.Schema.Encoded<typeof LocalModelsResponse>
 
+export const MeasurementState = S.Union(
+  S.extend(S.TaggedStruct("Unmeasured", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("Measuring", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("Measured", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Failed", {
+      retryAt: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type MeasurementState = S.Schema.Type<typeof MeasurementState>
+export type MeasurementStateEncoded = S.Schema.Encoded<typeof MeasurementState>
+
 export const MemoryAssessment = S.Struct({
   capacityBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   compatibilityReserveBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -2202,9 +2219,7 @@ export const ModelAssessment = S.Union(
       assessmentId: S.suspend((): S.Schema<ModelAssessmentId, ModelAssessmentIdEncoded> => ModelAssessmentId),
       drafter: S.suspend((): S.Schema<DrafterVerdict, DrafterVerdictEncoded> => DrafterVerdict),
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
-      performance: S.Array(
-        S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence),
-      ),
+      performance: S.suspend((): S.Schema<ModelPerformance, ModelPerformanceEncoded> => ModelPerformance),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
       projector: S.suspend((): S.Schema<ProjectorVerdict, ProjectorVerdictEncoded> => ProjectorVerdict),
     }),
@@ -2299,6 +2314,7 @@ export const ModelAssessmentsSnapshot = S.Struct({
   environmentId: S.suspend(
     (): S.Schema<AssessmentEnvironmentId, AssessmentEnvironmentIdEncoded> => AssessmentEnvironmentId,
   ),
+  measurement: S.suspend((): S.Schema<MeasurementState, MeasurementStateEncoded> => MeasurementState),
   revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type ModelAssessmentsSnapshot = S.Schema.Type<typeof ModelAssessmentsSnapshot>
@@ -2749,6 +2765,24 @@ export const ModelParameterization = S.Union(
 )
 export type ModelParameterization = S.Schema.Type<typeof ModelParameterization>
 export type ModelParameterizationEncoded = S.Schema.Encoded<typeof ModelParameterization>
+
+export const ModelPerformance = S.Union(
+  S.extend(S.TaggedStruct("Pending", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Unavailable", {
+      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Estimated", {
+      samples: S.Array(S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelPerformance = S.Schema.Type<typeof ModelPerformance>
+export type ModelPerformanceEncoded = S.Schema.Encoded<typeof ModelPerformance>
 
 export const ModelReasoningCapabilities = S.Struct({
   defaultEffort: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),

@@ -26,14 +26,14 @@ pub use seismic_lang::checked::{
 pub use seismic_lang::precision::{Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
 /// Numerical comparison helpers used by validation frontends.
 pub mod testing {
-    pub use seismic_compiler::numerics::{ElementComparison, compare_element};
+    pub use seismic_compiler::numerics::{compare_element, ElementComparison};
 }
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions};
 /// Offline formation coverage of a generated module's native
 /// implementations, and offline formation of the kernels a program requests.
 #[cfg(feature = "coverage")]
 pub mod coverage {
-    use crate::{KernelRequest, NativeSpecialization, generated::Module};
+    use crate::{generated::Module, KernelRequest, NativeSpecialization};
     pub use seismic_runtime::native::coverage::{
         Configuration, Coverage, CoverageError, Formation, FormationFailure, Forming, GroupSite,
         InProcess, ProgramEntry, ProgramSource, Progress, RequestFailure, Target, Toolchain,
@@ -111,18 +111,18 @@ pub use seismic_runtime::native::search::{
     Cost, LaunchKey, ParameterValues, SearchSettings, SearchStop,
 };
 pub use seismic_runtime::native::trace::{
-    SubmissionTrace, TraceDetail, TraceError, TracedLaunch, TracedLaunchGeometry, TracedSubmission,
-    host_seconds,
+    host_seconds, SubmissionTrace, TraceDetail, TraceError, TracedLaunch, TracedLaunchGeometry,
+    TracedSubmission,
 };
 pub use seismic_runtime::native::tune::{
-    BuildError, COMPARISON_VERSION, Configuration, ConfigurationRecord, Constraint, CoverageCheck,
-    CoverageOutcome, DeclaredParameter, Difference, Exclusion, FormationRecord, Formed,
-    GOVERNING_STEP, GoverningStep, Grounded, Narrowed, NumericalObservation, NumericalRequirement,
-    Outcome, Performed, PieceMemory, PointInputs, PointMeasurement, PointRecord, PointSpec,
-    ProcessMemory, Publication, Reselection, SearchPlan, Spent, Stage, Standing, StepPower,
-    Strategy, SubjectComparison, SubjectMeasurement, SurveyPlan, TuneError, TuningDisposition,
-    TuningInitializer, TuningMethod, TuningResult, TuningTime, UnitPlan, Violation, Work, Workers,
-    WorkloadRotation, WrittenRows, admit, governing_ratio, reselect, return_freed_pages,
+    admit, governing_ratio, reselect, return_freed_pages, BuildError, Configuration,
+    ConfigurationRecord, Constraint, CoverageCheck, CoverageOutcome, DeclaredParameter, Difference,
+    Exclusion, FormationRecord, Formed, GoverningStep, Grounded, Narrowed, NumericalObservation,
+    NumericalRequirement, Outcome, Performed, PieceMemory, PointInputs, PointMeasurement,
+    PointRecord, PointSpec, ProcessMemory, Publication, Reselection, SearchPlan, Spent, Stage,
+    Standing, StepPower, Strategy, SubjectComparison, SubjectMeasurement, SurveyPlan, TuneError,
+    TuningDisposition, TuningInitializer, TuningMethod, TuningResult, TuningTime, UnitPlan,
+    Violation, Work, Workers, WorkloadRotation, WrittenRows, COMPARISON_VERSION, GOVERNING_STEP,
 };
 pub use seismic_runtime::native::{Footprint, NativeArtifactIdentity, Observed, Quote};
 
@@ -167,13 +167,13 @@ pub mod native_cpu {
 
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
-pub use seismic_lang::registry::{BackendName, Layout, f16_bits, f16_to_f32};
+pub use seismic_lang::registry::{f16_bits, f16_to_f32, BackendName, Layout};
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
 pub use seismic_native_cpu as cpu;
 pub use seismic_runtime::api::HostRegion;
 pub use seismic_runtime::api::{
-    CallError, OutputError, TensorError, ViewChargeError, WorkflowError,
+    CallError, OutputError, RegionError, TensorError, ViewChargeError, WorkflowError,
 };
 pub use seismic_runtime::native::recorded_graph_device_bytes;
 /// The largest block a dedicated device's allocator takes from its driver
@@ -181,20 +181,24 @@ pub use seismic_runtime::native::recorded_graph_device_bytes;
 pub use seismic_compiler::blocks::BLOCK_CAP_BYTES as DEVICE_BLOCK_CAP_BYTES;
 mod slab;
 /// Measuring work on a device (`seismic-measure`): the timing session, the
-/// sustained clock and the statistics. The runtime's measurable work is
-/// [`KernelPoint`].
+/// sustained clock, the statistics and the records of measured points. The
+/// runtime's measurable work is [`KernelPoint`] and [`GraphPoint`].
 pub use seismic_measure as measure;
 pub use seismic_runtime::devices::{LimitError, MemoryUsage, OpenError, ResolveError};
-pub use seismic_runtime::native::KernelPoint;
+pub use seismic_runtime::native::{
+    GraphPending, GraphPoint, GraphTiming, KernelPoint, Point, PointPending,
+};
 pub use seismic_topology::{
     volume_available, AccessPath, AccessPathId, AccessRoute, Availability, DeviceMemory,
     DeviceTopology, Diagnostic, DiagnosticSource, DiscoveryError, DisplacementWindow, Executor,
-    ExecutorId, ExecutorKind, ExecutorSelector, HostDisplacement, HostStatus, Inventory,
+    ExecutorId, ExecutorKind, ExecutorSelector, HostDisplacement, HostStatus, Identity, Inventory,
     KernelPressure, LimitVisibility, Limits, ObservationError, PhysicalDevice, PhysicalDeviceId,
     PhysicalIdentity, ProcessLimitKind, ProcessMemoryLimit, Reported, ReportedBy, Revision,
     RuntimeStatus, Sample, Status, StorageKind, Store, StoreId, StoreIdentity, StoreKind,
     TransferPath, TransferPathId, VolumeId, DISPLACEMENT_HISTORY,
 };
+mod measurer;
+pub use measurer::{KernelIdentity, Measurer, PointKey};
 /// The recorded machines (`fixtures::recorded`), for other crates' tests.
 #[cfg(feature = "fixtures")]
 pub use seismic_topology::fixtures;
@@ -478,6 +482,19 @@ impl Element {
     /// for dense storage, for floating codes and for grid codes (vector
     /// entries indexing a value grid, whose indices are not magnitudes).
     pub fn integer_codes(&self) -> Option<IntegerCodes> {
+        // A pure function of the registry's recipe: derived once per
+        // representation rather than re-interpreting its codes per query.
+        type Codes = std::collections::HashMap<RepresentationId, Option<IntegerCodes>>;
+        static CODES: std::sync::OnceLock<std::sync::RwLock<Codes>> = std::sync::OnceLock::new();
+        let codes = CODES.get_or_init(Default::default);
+        if let Some(known) = codes.read().unwrap().get(&self.0) {
+            return *known;
+        }
+        let derived = self.derive_integer_codes();
+        *codes.write().unwrap().entry(self.0).or_insert(derived)
+    }
+
+    fn derive_integer_codes(&self) -> Option<IntegerCodes> {
         use seismic_lang::reference_math::ReferenceScalar;
         use seismic_lang::registry::{DecodeComponent, DecodeStep, QuantizedComponent};
         let recipe = seismic_lang::registry::decode_recipe(self.0, DType::F32)?;
@@ -735,6 +752,11 @@ impl TensorStorageObserver {
     pub fn store_charges(&self) -> Option<Vec<(StoreId, u64)>> {
         self.inner.store_charges()
     }
+    /// The observed allocation's charge along each access path; `None`
+    /// once released.
+    pub fn path_charges(&self) -> Option<Vec<(AccessPathId, u64)>> {
+        self.inner.path_charges()
+    }
     pub fn identity(&self) -> u64 {
         self.inner.identity()
     }
@@ -780,9 +802,13 @@ impl Tensor {
         seismic_runtime::api::tensor::TensorInner::canonical_layout(element.id(), extents)
     }
 
-    /// A typed region inside a byte-addressed tensor allocation. Views share
-    /// the allocation and its device-use lifetime.
-    pub(crate) fn region(
+    /// A canonical-layout tensor of `element` and `extents` viewing this
+    /// tensor's bytes from `byte_offset`: it shares the allocation and its
+    /// device-use lifetime. This tensor must be one contiguous byte range of
+    /// a backed allocation (not reserved or slabbed), and the region must lie
+    /// within it, starting at a multiple of its layout's alignment in the
+    /// allocation ([`TensorError::Region`] otherwise).
+    pub fn region(
         &self,
         element: Element,
         extents: &[u64],
@@ -799,8 +825,8 @@ impl Tensor {
         self.inner.device_address()
     }
 
-    pub(crate) fn share_slab_access_with(&self, table: &Tensor) {
-        self.inner.share_slab_access_with(&table.inner)
+    pub(crate) fn share_slab_access_with(&self, other: &Tensor) {
+        self.inner.share_slab_access_with(&other.inner)
     }
 
     /// Allocate without initializing storage. A pure-output kernel can use
@@ -1758,6 +1784,28 @@ pub struct NativeGraphMetadata {
     inner: seismic_runtime::native::graph::NativeGraphMetadataDraft,
     template: Option<MetadataTemplateRecorder>,
     class_scope: Option<&'static str>,
+    /// What each distinct call checks to, derived once: a graph repeats the
+    /// same calls in every layer.
+    checked: CheckedCalls,
+}
+
+/// A graph's checked calls, keyed by the entry (its module and name), its
+/// element bindings and, for a node, its dimensions. Only successes are
+/// held, so every failure is the call's own.
+#[derive(Default)]
+struct CheckedCalls {
+    entries: std::collections::HashMap<EntryKey, generated::NativeGraphCheckedEntry>,
+    nodes: std::collections::HashMap<(EntryKey, Vec<(String, u64)>), Arc<CheckedNode>>,
+}
+
+type EntryKey = (usize, &'static str, Vec<(String, Element)>);
+
+/// A node's checked shapes and scratch, and the entry they were checked by.
+struct CheckedNode {
+    checked: generated::NativeGraphCheckedEntry,
+    parameters: Vec<Option<(RepresentationId, Vec<u64>)>>,
+    results: Vec<Option<(RepresentationId, Vec<u64>)>>,
+    scratch: Vec<seismic_runtime::native::ScratchNeed>,
 }
 
 struct MetadataTemplateRecorder {
@@ -2339,6 +2387,16 @@ pub struct BoundEntry<E> {
     entry: std::marker::PhantomData<fn() -> E>,
 }
 
+impl<E> Clone for BoundEntry<E> {
+    fn clone(&self) -> Self {
+        Self {
+            elements: self.elements.clone(),
+            cpu: self.cpu,
+            entry: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<E: Entry> BoundEntry<E> {
     /// Every element parameter of the entry with the element it is bound
     /// to: with the entry and its static values, what the entry's native
@@ -2434,6 +2492,7 @@ impl NativeGraphMetadata {
             inner: seismic_runtime::native::graph::NativeGraphMetadataDraft::new(),
             template: None,
             class_scope: None,
+            checked: CheckedCalls::default(),
         }
     }
 
@@ -2446,6 +2505,7 @@ impl NativeGraphMetadata {
                 nodes: Vec::new(),
             }),
             class_scope: None,
+            checked: CheckedCalls::default(),
         }
     }
 
@@ -2515,13 +2575,33 @@ impl NativeGraphMetadata {
         Ok(port)
     }
 
+    fn entry_key<E: Entry>(
+        elements: &[(&str, Element)],
+    ) -> Result<EntryKey, NativeGraphMetadataError> {
+        let module = E::module().map_err(NativeGraphMetadataError::Bundle)?;
+        Ok((
+            std::ptr::from_ref(module) as usize,
+            E::NAME,
+            elements
+                .iter()
+                .map(|(name, element)| ((*name).to_owned(), *element))
+                .collect(),
+        ))
+    }
+
     fn bind_checked<E: Entry>(
-        &self,
+        &mut self,
         elements: &[(&str, Element)],
     ) -> Result<generated::NativeGraphCheckedEntry, NativeGraphMetadataError> {
-        generated::NativeGraphCheckedEntry::bind::<E>(self.backend, elements)
+        let key = Self::entry_key::<E>(elements)?;
+        if let Some(checked) = self.checked.entries.get(&key) {
+            return Ok(checked.clone());
+        }
+        let checked = generated::NativeGraphCheckedEntry::bind::<E>(self.backend, elements)
             .map_err(NativeGraphMetadataError::Bundle)?
-            .map_err(NativeGraphMetadataError::Unsupported)
+            .map_err(NativeGraphMetadataError::Unsupported)?;
+        self.checked.entries.insert(key, checked.clone());
+        Ok(checked)
     }
 
     fn checked_port<E: Entry>(
@@ -2586,6 +2666,42 @@ impl NativeGraphMetadata {
         dimensions: &[(&str, u64)],
         args: E::WorkflowArgs<'_>,
     ) -> Result<E::WorkflowResults, NativeGraphMetadataError> {
+        let node = self.checked_node::<E>(elements, dimensions)?;
+        let pending = self
+            .inner
+            .enqueue(
+                E::encode_workflow(args),
+                node.parameters.clone(),
+                node.results.clone(),
+                node.scratch.clone(),
+                node.checked.sealed_node().clone(),
+            )
+            .map_err(NativeGraphMetadataError::Call)?;
+        if let Some(template) = &mut self.template {
+            template.nodes.push(MetadataNodeSource {
+                checked: node.checked.clone(),
+                entry_name: E::NAME,
+                class_scope: self.class_scope,
+                dimensions: owned_dimensions(dimensions),
+            });
+        }
+        Ok(E::decode_workflow(pending))
+    }
+
+    /// What a call of `E` at `dimensions` checks to: its shapes, its domain
+    /// (a call at statics outside it is refused) and its scratch.
+    fn checked_node<E: Entry>(
+        &mut self,
+        elements: &[(&str, Element)],
+        dimensions: &[(&str, u64)],
+    ) -> Result<Arc<CheckedNode>, NativeGraphMetadataError> {
+        let key = (
+            Self::entry_key::<E>(elements)?,
+            owned_dimensions(dimensions),
+        );
+        if let Some(node) = self.checked.nodes.get(&key) {
+            return Ok(Arc::clone(node));
+        }
         let checked = self.bind_checked::<E>(elements)?;
         let (parameters, results) = checked
             .shapes(dimensions)
@@ -2637,33 +2753,22 @@ impl NativeGraphMetadata {
         .map_err(|reason| {
             NativeGraphMetadataError::Unsupported(format!("`{}` scratch bound: {reason}", E::NAME))
         })?;
-        let shapes = results
-            .into_iter()
-            .map(|result| result.map(|metadata| (metadata.element.id(), metadata.extents)))
-            .collect();
-        let parameter_shapes = parameters
-            .into_iter()
-            .map(|parameter| parameter.map(|metadata| (metadata.element.id(), metadata.extents)))
-            .collect();
-        let pending = self
-            .inner
-            .enqueue(
-                E::encode_workflow(args),
-                parameter_shapes,
-                shapes,
-                scratch,
-                checked.sealed_node().clone(),
-            )
-            .map_err(NativeGraphMetadataError::Call)?;
-        if let Some(template) = &mut self.template {
-            template.nodes.push(MetadataNodeSource {
-                checked,
-                entry_name: E::NAME,
-                class_scope: self.class_scope,
-                dimensions: owned_dimensions(dimensions),
-            });
-        }
-        Ok(E::decode_workflow(pending))
+        let node = Arc::new(CheckedNode {
+            parameters: parameters
+                .into_iter()
+                .map(|parameter| {
+                    parameter.map(|metadata| (metadata.element.id(), metadata.extents))
+                })
+                .collect(),
+            results: results
+                .into_iter()
+                .map(|result| result.map(|metadata| (metadata.element.id(), metadata.extents)))
+                .collect(),
+            scratch,
+            checked,
+        });
+        self.checked.nodes.insert(key, Arc::clone(&node));
+        Ok(node)
     }
 
     pub fn export(&mut self, result: &WorkflowTensor) -> Result<(), NativeGraphMetadataError> {
@@ -2838,6 +2943,16 @@ impl NativeGraphPlan {
     }
     pub fn new_slot(&self) -> Result<NativeGraphSlot, TensorError> {
         self.inner.new_slot().map(|inner| NativeGraphSlot { inner })
+    }
+    /// Runs of the plan with `bindings`, on a slot of their own, as
+    /// [`measure`] times them, each pass one run timed as `timing` says. A
+    /// plan with timeline nodes is refused.
+    pub fn point(
+        &self,
+        bindings: NativeGraphBindings,
+        timing: GraphTiming,
+    ) -> Result<GraphPoint, CallError> {
+        self.inner.point(bindings.inner, timing)
     }
     pub fn new_outputs(&self) -> Result<NativeGraphOutputs, TensorError> {
         self.inner
@@ -3014,8 +3129,7 @@ impl NativeGraphBindings {
         timeline: &Timeline,
         value: u64,
     ) -> Result<(), WorkflowError> {
-        self.inner
-            .set_timeline(port, timeline.inner.clone(), value)
+        self.inner.set_timeline(port, timeline.inner.clone(), value)
     }
 
     /// Bind an unsubmitted exported output lease as a graph destination.
@@ -3545,7 +3659,7 @@ pub mod generated {
     #[cfg(test)]
     mod logical_entry_cache_tests {
         use super::*;
-        use seismic_lang::checked::{SourceFile, SourceSet, check_source};
+        use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 
         #[test]
         fn reuses_one_semantic_entry_per_element_binding() {
@@ -3818,9 +3932,12 @@ pub mod generated {
     /// A checked entry and its backend declaration resolved once for a graph
     /// resource template. Numeric dimensions can then be evaluated without
     /// repeating module resolution or element monomorphization.
+    #[derive(Clone)]
     pub struct NativeGraphCheckedEntry {
         shapes: Arc<seismic_lang::entry::CompiledEntryShapes>,
-        implementation: NativeImplementation,
+        /// The module's own declaration: bound for every node and port a
+        /// graph makes, so it is borrowed, never copied.
+        implementation: &'static NativeImplementation,
         /// The lengths of the vectors a sealed node calling the entry holds.
         sealed_node: seismic_runtime::native::graph::SealedNodeShape,
     }
@@ -3832,10 +3949,7 @@ pub mod generated {
         ) -> Result<Result<Self, String>, CheckedBundleError> {
             let module = E::module()?;
             let entry = E::resolve(module)?;
-            let Some(implementation) = module
-                .checked()
-                .native_implementation(entry.id(), backend)
-                .cloned()
+            let Some(implementation) = module.checked().native_implementation(entry.id(), backend)
             else {
                 return Ok(Err(format!(
                     "`{}` has no native implementation for `{}`",
@@ -3851,7 +3965,7 @@ pub mod generated {
             let sealed_node = match module.logical_entry(entry.id(), &bindings) {
                 Ok(logical) => seismic_runtime::native::graph::SealedNodeShape::of(
                     logical.schema(),
-                    &implementation,
+                    implementation,
                 ),
                 Err(error) => return Ok(Err(error.to_string())),
             };
@@ -3862,8 +3976,8 @@ pub mod generated {
             }))
         }
 
-        pub fn implementation(&self) -> &NativeImplementation {
-            &self.implementation
+        pub fn implementation(&self) -> &'static NativeImplementation {
+            self.implementation
         }
 
         pub(crate) fn sealed_node(&self) -> &seismic_runtime::native::graph::SealedNodeShape {

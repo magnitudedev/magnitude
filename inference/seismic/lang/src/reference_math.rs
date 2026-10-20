@@ -319,6 +319,17 @@ pub fn word_type(dtype: DType) -> DType {
         DType::U32
     }
 }
+
+/// The bits of `dtype`'s word. An integer shift count is read as that word
+/// (a negative count is a huge one) and must be below this width
+/// ([`ScalarFailure::ShiftCount`]).
+pub fn word_bits(dtype: DType) -> u32 {
+    if word_type(dtype) == DType::U64 {
+        64
+    } else {
+        32
+    }
+}
 fn terminal(node: &ReferenceNode, get: impl Fn(V) -> ReferenceScalar) -> ReferenceScalar {
     // A word of either width, with the width of its operands.
     let words = |a: V, b: V| match (get(a), get(b)) {

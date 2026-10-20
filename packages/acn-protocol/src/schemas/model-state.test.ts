@@ -242,13 +242,16 @@ describe("LocalModelSchema invariants", () => {
         memory: {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
         },
-        performance: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
+        performance: {
+          _tag: "Estimated",
+          samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
+        },
       },
     } as const
     expect(() => Schema.decodeUnknownSync(LocalModelServingStateSchema)(assessed)).not.toThrow()
   })
 
-  it("requires performance for fitting models and admits Unsupported only for custom models", () => {
+  it("requires estimates for estimated performance and admits Unsupported only for custom models", () => {
     const assessed = {
       _tag: "Assessed",
       metadata: {
@@ -270,10 +273,35 @@ describe("LocalModelSchema invariants", () => {
         memory: {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
         },
-        performance: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
+        performance: {
+          _tag: "Estimated",
+          samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
+        },
+      },
+      rankingScores: { intelligence: 0.5, speed: 0.1, fidelity: 0.5 },
+    }
+    const withoutPerformance = {
+      ...fits,
+      assessment: { ...fits.assessment, performance: { _tag: "Estimated", samples: [] } },
+    }
+    const pending = {
+      ...fits,
+      assessment: {
+        ...fits.assessment,
+        performance: { _tag: "Pending", measurement: { _tag: "Failed", retryAt: 1_000 } },
+      },
+      rankingScores: { intelligence: 0.5, fidelity: 0.5 },
+    }
+    const unavailable = {
+      ...fits,
+      assessment: {
+        ...fits.assessment,
+        performance: {
+          _tag: "Unavailable",
+          failure: { code: "performance_unavailable", message: "hung", retryable: false },
+        },
       },
     }
-    const withoutPerformance = { ...fits, assessment: { ...fits.assessment, performance: [] } }
     const unsupported = {
       ...assessed,
       assessment: {
@@ -286,6 +314,8 @@ describe("LocalModelSchema invariants", () => {
     }
     expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(fits)).not.toThrow()
     expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(withoutPerformance)).toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(pending)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(unavailable)).not.toThrow()
     expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(unsupported)).toThrow()
     expect(() => Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)(unsupported)).not.toThrow()
     const { profile: _profile, ...unreadable } = unsupported.assessment

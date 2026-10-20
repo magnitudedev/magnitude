@@ -32,6 +32,7 @@ impl DeviceTopology {
                 json!({
                     "identity": device.identity(),
                     "memory": device.memory(),
+                    "cache": device.cache(),
                 })
             })
             .collect::<Vec<_>>();
@@ -79,7 +80,6 @@ impl DeviceTopology {
                     "driver": executor.driver(),
                     "availability": executor.availability(),
                     "max_allocation": executor.limits().max_allocation,
-                    "memory_bandwidth": executor.limits().memory_bandwidth,
                     "tensor_operations": executor.forms_tensor_operations(),
                     "placements": placements,
                 })

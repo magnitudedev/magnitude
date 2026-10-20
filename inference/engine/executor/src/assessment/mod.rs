@@ -2,32 +2,38 @@
 //!
 //! Every model is assessed analytically from its headers and
 //! allocation-free execution plan: memory fit ([`assess`]), and decode speed
-//! at each requested depth from its decode demand ([`demand`]) over the
-//! device's memory bandwidth ([`bandwidth`], [`costs`], [`estimate`]). No
-//! model is loaded and nothing runs on the device.
+//! at each requested depth ([`estimate`]) from its per-call decode demand
+//! ([`demand`], each call's launches from its entry's declaration,
+//! [`launches`]) over its executor's measured kernel costs
+//! ([`executor_costs`]). No model is loaded and nothing runs on a device:
+//! the costs derive from measurements the measurement job recorded.
 
 pub mod assess;
-pub mod bandwidth;
 #[cfg(test)]
 mod catalog;
-pub mod costs;
 pub mod demand;
 pub mod estimate;
+pub mod executor_costs;
 #[cfg(test)]
 pub(crate) mod fixtures;
+pub mod launches;
 
 pub use assess::{
-    AssessmentRequest, DomainFit, ExecutionAssessment, PreparedExecutionAssessment,
-    assess_execution, finish_execution_assessment, prepare_execution_assessment,
+    assess_execution_fit, decode_pricing, estimate_execution, prepare_execution_assessment,
+    AssessmentRequest, DomainFit, ExecutionAssessment, ExecutionFit, ExecutionShortfall,
+    PreparedExecutionAssessment,
 };
-pub use bandwidth::{
-    BandwidthSource, DeviceBandwidth, DeviceClass, normalize_name, resolve_bandwidth,
-};
-pub use costs::{DECODE_COSTS, DecodeCosts};
-pub use demand::{DecodeDemand, HistoryRead};
+pub use demand::{Bytes, Call, DecodeDemand, Experts, Flops, HistoryRead, Work};
 pub use estimate::{
-    PerformanceEstimate, StepSeconds, estimate_performance, performance_depths, step_seconds,
+    estimate_decode, performance_depths, step_seconds, CallSeconds, PerformanceEstimate, Pricing,
+    StepSeconds,
 };
+pub use executor_costs::{
+    ExecutorCosts, ExecutorCostsError, Figure, HistoryCosts, MatrixCosts,
+    MeasuredCost, Measurement, Placement, Placements, StoredCosts, Unmeasured, WeightRate,
+    HISTORY_LAYOUTS,
+};
+pub use launches::{Declarations, Kernel, Launches};
 
 use crate::GraphError;
 use std::fmt;
@@ -46,6 +52,10 @@ pub enum AssessmentError {
     Graph(GraphError),
     /// A memory observation or fit bound could not be established.
     Memory(String),
+    /// A figure the estimate needs (a weight format's throughput, a history
+    /// layout's attention cost) is not measured on the executor: the
+    /// estimate is unavailable.
+    Unmeasured(String),
 }
 
 impl fmt::Display for AssessmentError {
@@ -57,6 +67,7 @@ impl fmt::Display for AssessmentError {
                 write!(formatter, "assessment graph construction failed: {error}")
             }
             Self::Memory(message) => write!(formatter, "assessment memory bound failed: {message}"),
+            Self::Unmeasured(message) => write!(formatter, "not measured: {message}"),
         }
     }
 }

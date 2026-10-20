@@ -33,7 +33,11 @@ describe("local model serving projection", () => {
     } as unknown as ReadyModel
     const assessment = {
       _tag: "Assessed",
-      assessment: { _tag: "Fits" },
+      assessment: {
+        _tag: "Fits",
+        profile: { contextLength: 32_768 },
+        performance: { _tag: "Pending", measurement: { _tag: "Measuring" } },
+      },
       capabilities: {
         vision: false,
         tools: true,
@@ -46,11 +50,17 @@ describe("local model serving projection", () => {
       },
     } as unknown as Parameters<typeof catalogModelServingState>[1]
 
-    const state = catalogModelServingState(ready, assessment, Option.none())
+    const state = catalogModelServingState(ready, assessment, { intelligenceScore: 80, fidelityRank: 60 })
 
     expect(state._tag).toBe("Assessed")
     if (state._tag !== "Assessed") return
     expect(state.capabilities.reasoning.defaultEffort).toEqual(Option.some("high"))
+    // A pending speed still ranks by the catalog's terms.
+    expect("rankingScores" in state && state.rankingScores).toEqual({
+      intelligence: 0.8,
+      speed: Option.none(),
+      fidelity: 0.6,
+    })
   })
 
   it("projects a non-reasoning model that accepts only an explicit none", () => {
@@ -78,7 +88,7 @@ describe("local model serving projection", () => {
               assessmentId: "assessment",
               profile: { contextLength: 4096 },
               memory: [],
-              performance: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
+              performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
               drafter: { _tag: "None" },
             }],
           },
@@ -98,7 +108,7 @@ describe("local model serving projection", () => {
     const assessment = coordinatedAssessment(snapshot, 1, "catalog", modelId)
     expect(assessment?._tag).toBe("Assessed")
     if (assessment?._tag !== "Assessed") return
-    const state = catalogModelServingState(ready, assessment, Option.none())
+    const state = catalogModelServingState(ready, assessment, { intelligenceScore: 50, fidelityRank: 40 })
 
     expect(state._tag).toBe("Assessed")
     if (state._tag !== "Assessed") return
@@ -116,7 +126,7 @@ describe("local model serving projection", () => {
     expect(catalogModelServingState(
       undefined,
       undefined,
-      Option.none(),
+      { intelligenceScore: 80, fidelityRank: 60 },
       nativeFailure,
     )).toEqual({
       _tag: "Failed",
@@ -133,6 +143,7 @@ describe("automatic assessment projection", () => {
     const pending = {
       revision: 1,
       environmentId: "environment",
+      measurement: { _tag: "Measured" },
       catalog: { _tag: "Pending", sourceRevision: 1 },
       custom: { _tag: "Pending", sourceRevision: 1 },
     } as unknown as ModelAssessmentsSnapshot
@@ -144,6 +155,7 @@ describe("automatic assessment projection", () => {
     const targetFailure = {
       revision: 3,
       environmentId: "environment",
+      measurement: { _tag: "Measured" },
       catalog: {
         _tag: "Available",
         sourceRevision: 1,
@@ -172,7 +184,7 @@ describe("automatic assessment projection", () => {
           assessmentId: "assessment",
           profile: { contextLength: 4096 },
           memory: [],
-          performance: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
+          performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
           drafter: { _tag: "None" },
         }],
       },
@@ -180,6 +192,7 @@ describe("automatic assessment projection", () => {
     const snapshot = {
       revision: 1,
       environmentId: "environment",
+      measurement: { _tag: "Measured" },
       catalog: {
         _tag: "Available",
         sourceRevision: 1,
@@ -193,6 +206,45 @@ describe("automatic assessment projection", () => {
 
     expect(coordinatedAssessment(snapshot, 1, "catalog", modelId)?._tag).toBe("Assessed")
     expect(coordinatedAssessment(snapshot, 1, "catalog", badId)).toEqual({ _tag: "Dropped" })
+  })
+
+  it("carries the machine's measurement progress into a pending speed", () => {
+    const snapshot = {
+      revision: 4,
+      environmentId: "environment",
+      measurement: { _tag: "Failed", retryAt: 1_000 },
+      catalog: {
+        _tag: "Available",
+        sourceRevision: 1,
+        entries: [{
+          subject: { _tag: "Catalog", modelId, selection: "Desired" },
+          state: {
+            _tag: "Assessed",
+            capabilities: {
+              vision: false,
+              tools: true,
+              structuredOutput: true,
+              reasoning: { supported: true, efforts: ["none", "high"], defaultEffort: Option.some("high") },
+            },
+            profiles: [{
+              _tag: "Fits",
+              profile: { contextLength: 32_768 },
+              assessmentId: "assessment",
+              memory: [],
+              performance: { _tag: "Pending" },
+              drafter: { _tag: "None" },
+            }],
+          },
+        }],
+      },
+      custom: { _tag: "Pending", sourceRevision: 1 },
+    } as unknown as ModelAssessmentsSnapshot
+    const coordinated = coordinatedAssessment(snapshot, 1, "catalog", modelId)
+    expect(coordinated?._tag === "Assessed" && coordinated.assessment._tag === "Fits"
+      && coordinated.assessment.performance).toEqual({
+      _tag: "Pending",
+      measurement: { _tag: "Failed", retryAt: 1_000 },
+    })
   })
 })
 
@@ -227,6 +279,7 @@ describe("local model preparation projection", () => {
       {
         revision: 1,
         environmentId: "environment",
+        measurement: { _tag: "Measured" },
         catalog: {
           _tag: "Available",
           sourceRevision: 1,
@@ -240,6 +293,7 @@ describe("local model preparation projection", () => {
       {
         revision: 2,
         environmentId: "environment",
+        measurement: { _tag: "Measured" },
         catalog: {
           _tag: "Available",
           sourceRevision: 1,
@@ -269,6 +323,7 @@ describe("local model preparation projection", () => {
       {
         revision: 1,
         environmentId: "environment",
+        measurement: { _tag: "Measured" },
         catalog: {
           _tag: "Available",
           sourceRevision: 1,
@@ -292,6 +347,7 @@ describe("local model preparation projection", () => {
       {
         revision: 2,
         environmentId: "environment",
+        measurement: { _tag: "Measured" },
         catalog: {
           _tag: "Available",
           sourceRevision: 1,

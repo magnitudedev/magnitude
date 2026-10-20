@@ -128,7 +128,8 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
                 out_rows: out_rows.into(),
                 epsilon,
                 scale,
-            },        )?
+            },
+        )?
         .value)
 }
 
@@ -144,7 +145,7 @@ pub(crate) struct PostNormShape {
 
 #[cfg(test)]
 mod tests {
-    use crate::assessment::demand::DecodeDemand;
+    use crate::assessment::demand::tests::demand_on;
     use crate::planning::tests::{fixture_definition, fixture_manifest};
     use crate::programs::native_target_graph::checked_target_family_storage;
     use crate::{
@@ -242,9 +243,9 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
             // Each post-norm tail is a projection into F32 rows and a row
-            // op: two sublayers add two launches to the plain fixture's nine.
-            let demand = DecodeDemand::from_model(&definition, &load, KvCodec::Dense).unwrap();
-            assert_eq!(demand.launches, 11);
+            // op: two sublayers add two calls to the plain fixture's nine.
+            let demand = demand_on(&definition, &load, KvCodec::Dense, backend).unwrap();
+            assert_eq!(demand.calls.len(), 11);
         }
     }
 

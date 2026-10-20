@@ -251,8 +251,8 @@ mod tests {
     use super::*;
     use magnitude_service_contracts::MemoryDomainId;
     use magnitude_service_contracts::models::{
-        MemoryAssessment, ModelAssessmentId, ModelCapabilities, ModelReasoningCapabilities,
-        PerformanceEvidence, ServingProfile,
+        MemoryAssessment, ModelAssessmentId, ModelCapabilities, ModelPerformance,
+        ModelReasoningCapabilities, PerformanceEvidence, ServingProfile,
     };
 
     fn profile(context_length: u32) -> ServingProfile {
@@ -317,10 +317,12 @@ mod tests {
                 compatibility_reserve_bytes: 0,
                 remaining_bytes: 50,
             }],
-            performance: vec![PerformanceEvidence {
-                context_tokens: 50_000,
-                estimated_tokens_per_second: 2.0,
-            }],
+            performance: ModelPerformance::Estimated {
+                samples: vec![PerformanceEvidence {
+                    context_tokens: 50_000,
+                    estimated_tokens_per_second: 2.0,
+                }],
+            },
             projector: magnitude_service_contracts::models::ProjectorVerdict::None,
             drafter: magnitude_service_contracts::models::DrafterVerdict::None,
         };

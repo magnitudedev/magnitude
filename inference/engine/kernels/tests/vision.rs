@@ -831,7 +831,7 @@ fn attention_timing() {
             let measurement = timing_common::measured(
                 point,
                 &seismic::measure::Measure {
-                    samples: std::num::NonZeroUsize::new(15).unwrap(),
+                    stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
                     min_sample_seconds: 0.005,
                 },
             );

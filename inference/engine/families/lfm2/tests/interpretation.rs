@@ -1,8 +1,9 @@
 //! Interpretation of every LFM2 catalog variant's real GGUF header
-//! (`inference/catalog/headers/`).
+//! (`headers::catalog`).
 
 use magnitude_artifacts::{
-    gguf::{Array, Directory, Scalar, Value},
+    catalog_headers::ComponentRole,
+    gguf::{Directory, Scalar, Value},
     ArtifactIdentity, InputLayout, PackageIdentity, TokenId,
 };
 use magnitude_family_contracts::{
@@ -15,31 +16,26 @@ use magnitude_family_lfm2::{inspect_components, recognize, Architecture};
 
 struct Variant {
     model: String,
-    role: String,
+    variant: String,
     directory: Directory,
 }
 
-/// Every LFM2 catalog target. The dump records integers without their GGUF
-/// type: scalar integers are stored unsigned, integer arrays (per-layer
-/// `head_count_kv`) as INT32, as gguf-py writes them.
+/// Every catalog target of the two models the geometry brief documents
+/// (`expected`); the 24B-A2B binds in `released_24b.rs`.
 fn catalog() -> Vec<Variant> {
     headers::index()
-        .into_iter()
-        .filter(|(model, role, _)| model.starts_with("lfm2") && role.starts_with("target"))
-        .map(|(model, role, file)| {
-            let mut directory = headers::directory(&file);
-            for entry in &mut directory.metadata {
-                if let Value::Array(Array::Unsigned(values)) = &entry.value {
-                    entry.value = Value::Array(Array::Signed(
-                        values.iter().map(|&integer| integer as i64).collect(),
-                    ));
-                }
+        .iter()
+        .filter_map(|component| match &component.role {
+            ComponentRole::Target { variant }
+                if matches!(component.model.as_str(), "lfm2.5-2.6b" | "lfm2.5-8b-a1b") =>
+            {
+                Some(Variant {
+                    model: component.model.clone(),
+                    variant: variant.clone(),
+                    directory: headers::component(component),
+                })
             }
-            Variant {
-                model,
-                role,
-                directory,
-            }
+            _ => None,
         })
         .collect()
 }
@@ -58,7 +54,7 @@ fn inspect(directory: &Directory) -> Result<ModelDefinition, String> {
 fn variant(model: &str) -> Directory {
     catalog()
         .into_iter()
-        .find(|variant| variant.model == model && variant.role == "target-gguf_q4")
+        .find(|variant| variant.model == model && variant.variant == "gguf:q4")
         .expect("catalog variant")
         .directory
 }
@@ -185,14 +181,14 @@ fn every_catalog_variant_binds_its_documented_geometry() {
     assert_eq!(catalog.len(), 8, "four quantizations of two models");
     for Variant {
         model,
-        role,
+        variant,
         directory,
     } in &catalog
     {
         let expected = expected(model);
         assert_eq!(recognize(directory).unwrap(), expected.architecture);
         let definition =
-            inspect(directory).unwrap_or_else(|error| panic!("{model} {role}: {error}"));
+            inspect(directory).unwrap_or_else(|error| panic!("{model} {variant}: {error}"));
         assert!(definition.deferred_forms().is_empty());
         let decoder = &definition.decoder;
         assert_eq!(

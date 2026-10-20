@@ -6,11 +6,13 @@
 //! admission whose terms or graphs fail is a failure.
 
 use super::demand::DecodeDemand;
+use super::launches::Declarations;
+use super::AssessmentError;
 use crate::{
-    AssessmentGraphResourceBounds, AssessmentMemoryTerms, ComponentSelection, ExecutionPath,
-    ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner,
-    resident_layout,
+    resident_layout, AssessmentGraphResourceBounds, AssessmentMemoryTerms, ComponentSelection,
+    ExecutionPath, ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner,
 };
+use magnitude_artifacts::catalog_headers::{CatalogComponent, ComponentRole};
 use magnitude_artifacts::{
     ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
 };
@@ -26,6 +28,7 @@ use magnitude_family_qwen4exp::Qwen4ExpFamily;
 use magnitude_state::KvCodec;
 use seismic::BackendName;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 const FAMILIES: [&dyn ModelFamily; 7] = [
     &Qwen35Family,
@@ -38,15 +41,16 @@ const FAMILIES: [&dyn ModelFamily; 7] = [
 ];
 
 /// Catalog targets whose load must derive whatever their catalog support
-/// level: (model, role).
-const REQUIRED: [(&str, &str); 1] = [("qwen3.8-flash-next", "target-gguf_q4")];
+/// level (`headers::key`).
+const REQUIRED: [&str; 1] = ["qwen3.8-flash-next__target-gguf:q4"];
 
 /// Each catalog model's support level (`catalog/models.json`).
 fn support_levels() -> BTreeMap<String, String> {
-    let path = headers::root().join("../models.json");
-    let catalog: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|error| panic!("{path:?}: {error}")))
-            .unwrap();
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../catalog/models.json");
+    let catalog: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path).unwrap_or_else(|error| panic!("{path:?}: {error}")),
+    )
+    .unwrap();
     catalog["models"]
         .as_array()
         .unwrap()
@@ -59,13 +63,6 @@ fn support_levels() -> BTreeMap<String, String> {
         })
         .collect()
 }
-
-const BACKENDS: [BackendName; 4] = [
-    BackendName::Metal,
-    BackendName::Cuda,
-    BackendName::Vulkan,
-    BackendName::Cpu,
-];
 
 /// The standard service's limits, as assessment plans them.
 const LIMITS: ResourceLimits = ResourceLimits {
@@ -90,40 +87,33 @@ fn every_admitted_catalog_target_derives_complete_terms() {
     let mut failures = Vec::new();
     let levels = support_levels();
     let mut required_seen = Vec::new();
-    for (model, role, file) in headers::index() {
-        if !role.starts_with("target") || file.ends_with("-allshards.json") {
+    for component in headers::index() {
+        let ComponentRole::Target { .. } = component.role else {
             continue;
-        }
-        // A split target's full tensor directory is dumped beside its first
-        // shard's.
-        let all_shards = file.replace(".json", "-allshards.json");
-        let file = if headers::root().join(&all_shards).exists() {
-            all_shards
-        } else {
-            file
         };
-        let target = headers::directory(&file);
+        let name = headers::key(component);
+        let target = headers::component(component);
         // A target that must serve: its catalog model is neither disabled
         // nor deprecated, or it is named in `REQUIRED`.
-        let required = REQUIRED.contains(&(model.as_str(), role.as_str()));
+        let required = REQUIRED.contains(&name.as_str());
         if required {
-            required_seen.push((model.clone(), role.clone()));
+            required_seen.push(name.clone());
         }
         let served = required
             || !matches!(
-                levels.get(&model).map(String::as_str),
+                levels.get(&component.model).map(String::as_str),
                 Some("disabled" | "deprecated")
             );
         let Some(family) = FAMILIES.iter().find(|family| family.recognizes(&target)) else {
             if served {
-                failures.push(format!("{model} {role}: no family recognizes the target"));
+                failures.push(format!("{name}: no family recognizes the target"));
             }
             continue;
         };
         let definition = match family.inspect(&target, None, identity) {
             Ok(definition) => definition,
             Err(error) => {
-                let line = format!("{model} {role}: its family fails to inspect it: {error}");
+                let line = format!("{name}: its family fails to inspect it: {error}");
                 if served {
                     failures.push(line);
                 } else {
@@ -133,14 +123,14 @@ fn every_admitted_catalog_target_derives_complete_terms() {
             }
         };
         if let Err(error) = crate::operators::admit(&definition, false) {
-            refused.push(format!("{model} {role}: {error}"));
+            refused.push(format!("{name}: {error}"));
             continue;
         }
         let manifest = PackageManifest {
             identity,
             target: ComponentManifest {
                 files: vec![ComponentFile {
-                    path: file.clone().into(),
+                    path: component.path.clone(),
                     size: target.tensors.iter().map(|tensor| tensor.nbytes).sum(),
                 }],
                 identity: identity.target,
@@ -153,14 +143,14 @@ fn every_admitted_catalog_target_derives_complete_terms() {
             head: false,
             vision: false,
         };
-        for backend in BACKENDS {
+        for backend in BackendName::ALL {
             let layout = resident_layout(ExecutionPath::Native, backend);
             let load = match ModelLoadPlan::derive(&manifest, &definition, selection, layout) {
                 Ok(load) => load,
                 // A target that must serve derives its load on every
                 // backend; another may lack a resident form.
                 Err(error) => {
-                    let line = format!("{model} {role} {}: {error}", backend.as_str());
+                    let line = format!("{name} {}: {error}", backend.as_str());
                     if served {
                         failures.push(line);
                     } else {
@@ -172,13 +162,36 @@ fn every_admitted_catalog_target_derives_complete_terms() {
             // Admission binds every weight to its entries' ports, a
             // second-level scale included (`PlanError::UnportedScale`).
             if let Err(error) = load.program_plan(&definition, KvCodec::AffineK8V4) {
-                failures.push(format!("{model} {role} {}: {error}", backend.as_str()));
+                failures.push(format!("{name} {}: {error}", backend.as_str()));
                 continue;
             }
+            // Each call's launches are its entry's declaration's at the
+            // statics the load prepares it with.
             let demands = [KvCodec::Dense, KvCodec::AffineK8V4]
                 .into_iter()
-                .map(|codec| DecodeDemand::from_model(&definition, &load, codec))
-                .collect::<Result<Vec<_>, _>>();
+                .map(|codec| {
+                    let program = load
+                        .program_plan(&definition, codec)
+                        .map_err(|error| AssessmentError::Demand(error.to_string()))?;
+                    let declarations = Declarations::of_load(
+                        backend,
+                        &program,
+                        &definition,
+                        &load,
+                        crate::native::TuningLimits::of(LIMITS, &definition),
+                    )?;
+                    let demand =
+                        DecodeDemand::from_model(&definition, &load, codec, &declarations)?;
+                    // Every call's launches at one and at the decode rows'
+                    // most.
+                    for call in &demand.calls {
+                        for rows in [1, crate::operators::attention::graph::DECODE_ROWS] {
+                            call.launches.at(rows)?;
+                        }
+                    }
+                    Ok(demand)
+                })
+                .collect::<Result<Vec<_>, AssessmentError>>();
             let memory = AssessmentMemoryTerms::derive(
                 &definition,
                 &load,
@@ -215,23 +228,32 @@ fn every_admitted_catalog_target_derives_complete_terms() {
             match (demands, memory, graphs) {
                 // A decode step streams its weights and launches its entries.
                 (Ok(demands), Ok(_), Ok(_))
-                    if demands
-                        .iter()
-                        .all(|demand| demand.streamed_bytes > 0 && demand.launches > 0) =>
+                    if demands.iter().all(|demand| {
+                        !demand.calls.is_empty()
+                            && demand
+                                .calls
+                                .iter()
+                                .any(|call| call.work.weights.iter().any(|bytes| bytes.bytes > 0))
+                    }) =>
                 {
                     admitted.push(format!(
-                        "{model} {role} {}: {} launches, {} bytes",
+                        "{name} {}: {} calls, {} weight bytes",
                         backend.as_str(),
-                        demands[0].launches,
-                        demands[0].streamed_bytes
+                        demands[0].calls.len(),
+                        demands[0]
+                            .calls
+                            .iter()
+                            .flat_map(|call| &call.work.weights)
+                            .map(|bytes| bytes.bytes)
+                            .sum::<u64>()
                     ))
                 }
                 (Ok(demands), Ok(_), Ok(_)) => failures.push(format!(
-                    "{model} {role} {}: an empty decode step: {demands:?}",
+                    "{name} {}: an empty decode step: {demands:?}",
                     backend.as_str()
                 )),
                 (demands, memory, graphs) => failures.push(format!(
-                    "{model} {role} {}: {:?} / {:?} / {:?}",
+                    "{name} {}: {:?} / {:?} / {:?}",
                     backend.as_str(),
                     demands.err(),
                     memory.err(),
@@ -250,20 +272,41 @@ fn every_admitted_catalog_target_derives_complete_terms() {
     assert!(!admitted.is_empty());
     // Every required target is in the catalog's headers and admitted on
     // every backend.
-    for (model, role) in REQUIRED {
+    for name in REQUIRED {
         assert!(
-            required_seen
-                .iter()
-                .any(|(seen_model, seen_role)| seen_model == model && seen_role == role),
-            "required target {model} {role} has no catalog header"
+            required_seen.iter().any(|seen| seen == name),
+            "required target {name} has no catalog header"
         );
-        for backend in BACKENDS {
-            let prefix = format!("{model} {role} {}:", backend.as_str());
+        for backend in BackendName::ALL {
+            let prefix = format!("{name} {}:", backend.as_str());
             assert!(
                 admitted.iter().any(|line| line.starts_with(&prefix)),
-                "required target {model} {role} is not admitted on {}",
+                "required target {name} is not admitted on {}",
                 backend.as_str()
             );
+        }
+    }
+}
+
+/// A separate draft's header: a catalog component (`headers::key`) or a
+/// pinned artifact the catalog does not ship (`headers::artifact`).
+#[derive(Clone, Copy)]
+enum DraftHeader {
+    Catalog(&'static str),
+    Artifact(&'static str),
+}
+
+impl DraftHeader {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Catalog(name) | Self::Artifact(name) => name,
+        }
+    }
+
+    fn directory(self) -> magnitude_artifacts::gguf::Directory {
+        match self {
+            Self::Catalog(name) => headers::catalog(name),
+            Self::Artifact(name) => headers::artifact(name),
         }
     }
 }
@@ -273,37 +316,38 @@ fn every_admitted_catalog_target_derives_complete_terms() {
 /// charges its weights, state and every draft graph class from headers
 /// alone, on every backend: the draft graphs are sealed exactly, in
 /// metadata, for the planned method's proposals.
-const SEPARATE_DRAFTS: [(&str, &str, &dyn ModelFamily); 6] = [
+const SEPARATE_DRAFTS: [(&str, DraftHeader, &dyn ModelFamily); 6] = [
     (
-        "qwen3.6-35b-a3b__target-gguf_q4.json",
-        "qwen3.6-35b-a3b__draft.json",
+        "qwen3.6-35b-a3b__target-gguf:q4",
+        DraftHeader::Catalog("qwen3.6-35b-a3b__draft"),
         &Qwen35Family,
     ),
     (
-        "lfm2.5-2.6b__target-gguf_q4.json",
-        "lfm2.5-2.6b__draft.json",
+        "lfm2.5-2.6b__target-gguf:q4",
+        DraftHeader::Catalog("lfm2.5-2.6b__draft"),
         &Lfm2Family,
     ),
     (
-        "qwen3.8-27b__target-gguf_q4.json",
-        "qwen3.8-27b__draft-dspark.json",
+        "qwen3.8-27b__target-gguf:q4",
+        DraftHeader::Artifact("qwen3.8-27b__draft-dspark"),
         &Qwen35Family,
     ),
+    // The catalog's DFlash2 draft.
     (
-        "qwen3.8-27b__target-gguf_q4.json",
-        "qwen3.8-27b__draft-dflash2.json",
+        "qwen3.8-27b__target-gguf:q4",
+        DraftHeader::Catalog("qwen3.8-27b__draft"),
         &Qwen35Family,
     ),
     // An NVFP4 draft (scaled fusion and feed-forward) beside a Q4_K_M
     // target, and beside the NVFP4 target (a scaled vocabulary projection).
     (
-        "nemotron-3.5-lightning-30b-a3b__target-gguf_q4.json",
-        "nemotron-3.5-lightning-30b-a3b__draft.json",
+        "nemotron-3.5-lightning-30b-a3b__target-gguf:q4",
+        DraftHeader::Catalog("nemotron-3.5-lightning-30b-a3b__draft"),
         &NemotronHFamily,
     ),
     (
-        "nemotron-3.5-lightning-30b-a3b__target-gguf_nvfp4-qat.json",
-        "nemotron-3.5-lightning-30b-a3b__draft.json",
+        "nemotron-3.5-lightning-30b-a3b__target-gguf:nvfp4-qat",
+        DraftHeader::Catalog("nemotron-3.5-lightning-30b-a3b__draft"),
         &NemotronHFamily,
     ),
 ];
@@ -312,17 +356,17 @@ const SEPARATE_DRAFTS: [(&str, &str, &dyn ModelFamily); 6] = [
 /// explicit attention semantics for each named draft. These do not establish
 /// admission of the captured artifacts; binary-header admission is qualified
 /// separately by the DFlash family's publication test.
-fn synthetic_separate_draft_directory(file: &str) -> magnitude_artifacts::gguf::Directory {
+fn synthetic_separate_draft_directory(draft: DraftHeader) -> magnitude_artifacts::gguf::Directory {
     use magnitude_artifacts::gguf::{Metadata, Value};
-    let causal: &[bool] = match file {
-        "qwen3.6-35b-a3b__draft.json" => &[true, true, true, true, true, false],
-        "lfm2.5-2.6b__draft.json" => &[false; 5],
-        "qwen3.8-27b__draft-dspark.json" => &[false; 5],
-        "qwen3.8-27b__draft-dflash2.json" => &[false; 5],
-        "nemotron-3.5-lightning-30b-a3b__draft.json" => &[false; 6],
-        _ => panic!("no synthetic attention semantics for {file}"),
+    let causal: &[bool] = match draft.name() {
+        "qwen3.6-35b-a3b__draft" => &[true, true, true, true, true, false],
+        "lfm2.5-2.6b__draft" => &[false; 5],
+        "qwen3.8-27b__draft-dspark" => &[false; 5],
+        "qwen3.8-27b__draft" => &[false; 5],
+        "nemotron-3.5-lightning-30b-a3b__draft" => &[false; 6],
+        name => panic!("no synthetic attention semantics for {name}"),
     };
-    let mut directory = headers::directory(file);
+    let mut directory = draft.directory();
     directory
         .metadata
         .retain(|entry| entry.name != "dflash.attention.causal");
@@ -335,6 +379,23 @@ fn synthetic_separate_draft_directory(file: &str) -> magnitude_artifacts::gguf::
 
 #[test]
 fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
+    for (target, draft, family) in SEPARATE_DRAFTS {
+        plan_and_charge_separate_draft(
+            (target, &headers::catalog(target)),
+            (draft.name(), &synthetic_separate_draft_directory(draft)),
+            family,
+        );
+    }
+}
+
+/// A separate draft read against its target admits, prepares only its
+/// load's generated width, and derives its memory terms, state plan and
+/// graph bounds on every backend.
+fn plan_and_charge_separate_draft(
+    (target_file, target): (&str, &magnitude_artifacts::gguf::Directory),
+    (draft_file, draft): (&str, &magnitude_artifacts::gguf::Directory),
+    family: &dyn ModelFamily,
+) {
     let identity = PackageIdentity {
         target: ArtifactIdentity([7; 32]),
         projector: None,
@@ -349,9 +410,7 @@ fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
             tensors: directory.tensors.clone(),
         }
     };
-    for (target_file, draft_file, family) in SEPARATE_DRAFTS {
-        let target = headers::directory(target_file);
-        let draft = synthetic_separate_draft_directory(draft_file);
+    {
         let declared = family.inspect(&target, None, identity).unwrap();
         let bound = magnitude_family_dflash::inspect(&draft, &declared, &|layer| {
             family.layer_entry(&declared, layer)
@@ -400,7 +459,7 @@ fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
             generated: proposals,
             ladder: false,
         };
-        for backend in BACKENDS {
+        for backend in BackendName::ALL {
             let context = format!("{draft_file} {}", backend.as_str());
             let layout = resident_layout(ExecutionPath::Native, backend);
             let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout)
@@ -441,6 +500,30 @@ fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
             )
             .unwrap_or_else(|error| panic!("{context}: {error}"));
             assert!(graph.total_bytes > 0, "{context}");
+            // Every draft class's exact graph seals into its certified layout.
+            let programs = load
+                .program_plan(&definition, KvCodec::AffineK8V4)
+                .unwrap_or_else(|error| panic!("{context}: {error}"));
+            let geometry = crate::programs::native_draft::DraftGeometry::new(
+                &definition,
+                state.head_state().unwrap(),
+            )
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+            let classes = crate::programs::native_draft::draft_graph_classes(
+                LIMITS,
+                method.draft_rows(),
+                &method.block_widths(),
+                definition.draft.as_ref().unwrap(),
+            )
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+            crate::programs::native_draft::verify_draft_family_certificates(
+                backend,
+                &load,
+                programs.draft().unwrap(),
+                &geometry,
+                &classes,
+            )
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
         }
     }
 }
@@ -498,14 +581,11 @@ fn bind_catalog_draft(
 /// derive or list its kernels with no view selected is outside this test.
 #[test]
 fn every_catalog_variant_lists_kernels_over_every_finalized_readout() {
-    let models: BTreeMap<String, Vec<(String, String)>> =
-        headers::index()
-            .into_iter()
-            .fold(BTreeMap::new(), |mut models, (model, role, file)| {
-                models.entry(model).or_default().push((role, file));
-                models
-            });
-    let component = |file: &str, directory: &magnitude_artifacts::gguf::Directory, identity| {
+    let mut models = BTreeMap::<&str, Vec<&CatalogComponent>>::new();
+    for component in headers::index() {
+        models.entry(&component.model).or_default().push(component);
+    }
+    let component = |file: &Path, directory: &magnitude_artifacts::gguf::Directory, identity| {
         ComponentManifest {
             files: vec![ComponentFile {
                 path: file.into(),
@@ -518,37 +598,26 @@ fn every_catalog_variant_lists_kernels_over_every_finalized_readout() {
     let mut finalized = Vec::new();
     let mut outside = Vec::new();
     let mut failures = Vec::new();
-    for (model, components) in &models {
-        let file = |role: &str| {
+    for components in models.values() {
+        let file = |role: ComponentRole| {
             components
                 .iter()
-                .find(|(component, _)| component == role)
-                .map(|(_, file)| file.clone())
+                .find(|component| component.role == role)
+                .map(|component| (component.path.clone(), headers::component(component)))
         };
-        let projector = file("projector").map(|file| {
-            let directory = headers::directory(&file);
-            (file, directory)
-        });
-        let draft = file("draft").map(|file| {
-            let directory = headers::directory(&file);
-            (file, directory)
-        });
+        let projector = file(ComponentRole::Projector);
+        let draft = file(ComponentRole::Draft);
         let identity = PackageIdentity {
             target: ArtifactIdentity([7; 32]),
             projector: projector.as_ref().map(|_| ArtifactIdentity([8; 32])),
         };
-        for (role, target_file) in components {
-            if !role.starts_with("target") || target_file.ends_with("-allshards.json") {
+        for target_component in components {
+            let ComponentRole::Target { .. } = target_component.role else {
                 continue;
-            }
-            let all_shards = target_file.replace(".json", "-allshards.json");
-            let target_file = if headers::root().join(&all_shards).exists() {
-                all_shards
-            } else {
-                target_file.clone()
             };
-            let target = headers::directory(&target_file);
-            let context = format!("{model} {role}");
+            let target_file = &target_component.path;
+            let target = headers::component(target_component);
+            let context = headers::key(target_component);
             let Some(family) = FAMILIES.iter().find(|family| family.recognizes(&target)) else {
                 outside.push(format!("{context}: no family recognizes the target"));
                 continue;
@@ -594,7 +663,7 @@ fn every_catalog_variant_lists_kernels_over_every_finalized_readout() {
                     head,
                     vision: projector.is_some(),
                 };
-                for backend in BACKENDS {
+                for backend in BackendName::ALL {
                     let context = format!("{context} {method} {}", backend.as_str());
                     let progressive =
                         crate::programs::graph::readout::reads_progressive_heads(backend).unwrap();

@@ -1,12 +1,12 @@
 import { createRoot } from "react-dom/client"
 import { Option } from "effect"
-import { HardwareSummary, HardwarePhotograph } from "../../src/discovery-visuals"
-import { hardwarePhotoInventory } from "../../src/hardware-photos"
+import { HardwareSummary, HardwarePhotograph } from "../../src/components/discovery-visuals"
+import { hardwarePhotoInventory } from "../../src/components/hardware-photos"
 import { hardwareScenarios, hardware, identity } from "./fixtures"
 import coverage from "../../../assets/hardware/coverage.json"
 import facts from "../../../assets/hardware/facts.json"
-import "../../../web/src/styles/tailwind.css"
-import { injectPaletteCssVars } from "../../../web/src/styles/palette-css-vars"
+import "../../src/styles/tailwind.css"
+import { injectPaletteCssVars } from "../../src/styles/palette-css-vars"
 injectPaletteCssVars()
 const dark = new URLSearchParams(location.search).has("dark")
 document.documentElement.dataset.theme = dark ? "dark" : "light"

@@ -1706,7 +1706,7 @@ fn time_decode(
     )
     .map_err(|error| error.to_string())?;
     let options = seismic::measure::Measure {
-        samples: std::num::NonZeroUsize::new(15).unwrap(),
+        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
         min_sample_seconds: 0.005,
     };
     let point = kernel
@@ -1733,7 +1733,7 @@ fn time_decode(
             slab_rows: case.slab_rows as u32,
         }])
         .map_err(|error| format!("{error:?}"))?;
-    let seconds = seismic::measure::measure(point, &options)
+    let seconds = seismic::measure::measure(point, &options, None)
         .map_err(|error| format!("{error:?}"))?
         .median;
     Ok(seconds * 1.0e6)

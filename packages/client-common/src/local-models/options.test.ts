@@ -13,7 +13,7 @@ import {
 const option = (
   modelId: string,
   totalRequiredBytes: number,
-  scores: { intelligence: number; speed: number; fidelity: number } | null,
+  scores: { intelligence: number; speed: number | null; fidelity: number },
   kind: LocalModelOption["kind"] = "downloadable",
   support: CatalogSupport = { _tag: "Supported" },
 ): LocalModelOption => ({
@@ -29,7 +29,7 @@ const option = (
         _tag: "Fits",
         memory: { totalRequiredBytes },
       },
-      rankingScores: Option.fromNullable(scores),
+      rankingScores: { ...scores, speed: Option.fromNullable(scores.speed) },
     },
   } as unknown as LocalModel,
 })
@@ -53,9 +53,11 @@ describe("local model ranking", () => {
   })
 
   it("moves utility from speed toward intelligence while fidelity always contributes", () => {
-    const scores = { intelligence: 0.8, speed: 0.4, fidelity: 0.5 }
+    const scores = { intelligence: 0.8, speed: Option.some(0.4), fidelity: 0.5 }
     expect(localModelRankingUtility(scores, 0)).toBeCloseTo(0.4 ** 0.9 * 0.5 ** 0.1)
     expect(localModelRankingUtility(scores, 1)).toBeCloseTo(0.8 ** 0.9 * 0.5 ** 0.1)
+    const pending = { ...scores, speed: Option.none() }
+    expect(localModelRankingUtility(pending, 0.5)).toBeCloseTo(0.8 ** 0.45 * 0.5 ** 0.1)
   })
 
   it("filters by the exact memory budget before sorting and truncating", () => {
@@ -79,13 +81,23 @@ describe("local model ranking", () => {
     )).toEqual([first, second])
   })
 
-  it("orders fitting models without ranking scores after every ranked model", () => {
-    const ranked = option("z-ranked", 1, { intelligence: 0.1, speed: 0.1, fidelity: 0.1 })
-    const unranked = option("a-unranked", 1, null)
+  it("orders fitting models without a speed estimate after every estimated model", () => {
+    const estimated = option("z-estimated", 1, { intelligence: 0.1, speed: 0.1, fidelity: 0.1 })
+    const pending = option("a-pending", 1, { intelligence: 1, speed: null, fidelity: 1 })
     expect(rankedLocalModelOptions(
-      [unranked, ranked],
+      [pending, estimated],
       { fastToSmart: 0.5, memoryBudgetBytes: 1 },
-    )).toEqual([ranked, unranked])
+    )).toEqual([estimated, pending])
+  })
+
+  it("ranks models without a speed estimate by intelligence and fidelity, not by name", () => {
+    const smarter = option("z-smarter", 1, { intelligence: 0.9, speed: null, fidelity: 0.5 })
+    const faithful = option("m-faithful", 1, { intelligence: 0.5, speed: null, fidelity: 1 })
+    const weaker = option("a-weaker", 1, { intelligence: 0.5, speed: null, fidelity: 0.5 })
+    expect(rankedLocalModelOptions(
+      [weaker, faithful, smarter],
+      { fastToSmart: 0.5, memoryBudgetBytes: 1 },
+    )).toEqual([smarter, faithful, weaker])
   })
 
   it("ranks installed and downloadable choices together", () => {

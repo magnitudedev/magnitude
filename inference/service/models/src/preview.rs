@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,6 +9,7 @@ use futures_util::future::BoxFuture;
 use magnitude_service_contracts::models::{
     KnownUnsupportedReason, ModelFingerprint, ModelId, ModelPackage, UnsupportedReason,
 };
+use magnitude_artifacts::catalog_headers::ArtifactHeader;
 use magnitude_service_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, HuggingFaceCredential,
     HuggingFaceModelCatalog,
@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 
 use crate::cache::{ModelCacheWorkspace, ModelIndexKind};
 use crate::candidate_files::RecognizedArchitectures;
+use crate::catalog::write_header_file;
 use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::content_id;
 use crate::inventory::{ManagedModelStore, build_model, now};
@@ -865,6 +866,45 @@ impl ManagedModelStore {
         &self,
         source: &ModelPreviewSource,
     ) -> Result<PreparedPreview, InventoryError> {
+        let artifact = self.preview_artifact(source).await?;
+        self.materialize_preview(artifact)
+    }
+
+    /// Write `artifact`'s exact header, extended sparsely to its file's size, under `root` at
+    /// `<repository>/<revision>/<path>`, read as a preview of its pinned source reads it (from
+    /// the derived cache when it holds it).
+    pub async fn export_artifact_header(
+        &self,
+        artifact: &ArtifactHeader,
+        root: &Path,
+    ) -> Result<(), InventoryError> {
+        let source = ModelPreviewSource {
+            repository: artifact.repository.clone(),
+            revision: artifact.revision.clone(),
+            primary_gguf: artifact.path.clone(),
+            additional_components: Vec::new(),
+        };
+        let cached = self.preview_artifact(&source).await?;
+        let [component] = cached.components.as_slice() else {
+            return Err(InventoryError::Integrity(format!(
+                "{} is not one GGUF file",
+                artifact.path.display()
+            )));
+        };
+        let header = self
+            .cache
+            .read_header(&component.header_digest)
+            .or_else(|| component.acquired_header.clone())
+            .ok_or_else(|| InventoryError::Internal("preview header cache miss".to_owned()))?;
+        write_header_file(&header, component.component.size_bytes, &artifact.file(root))
+    }
+
+    /// The preview artifact of `source`: its components and their header digests, from the
+    /// derived cache when it holds every header, else fetched and cached.
+    async fn preview_artifact(
+        &self,
+        source: &ModelPreviewSource,
+    ) -> Result<CachedArtifact, InventoryError> {
         validate_source(source)?;
         let evidence = serde_json::to_string(source)
             .map_err(|error| InventoryError::Internal(error.to_string()))?;
@@ -874,7 +914,7 @@ impl ManagedModelStore {
                 .iter()
                 .all(|component| self.cache.has_header(&component.header_digest))
         });
-        let artifact = match cached {
+        Ok(match cached {
             Some(artifact) => artifact,
             None => {
                 let artifact = self.acquire_preview_artifact(source).await?;
@@ -882,8 +922,7 @@ impl ManagedModelStore {
                     .write_index(ModelIndexKind::Artifact, &evidence, &artifact);
                 artifact
             }
-        };
-        self.materialize_preview(artifact)
+        })
     }
 
     pub async fn prepare_preview_from_repository_snapshot(
@@ -1061,24 +1100,11 @@ impl ManagedModelStore {
                 .read_header(&cached.header_digest)
                 .or_else(|| cached.acquired_header.clone())
                 .ok_or_else(|| InventoryError::Internal("preview header cache miss".to_owned()))?;
-            let path = workspace.path().join(&cached.component.path);
-            let parent = path.parent().ok_or_else(|| {
-                InventoryError::InvalidRequest("preview component has no parent".to_owned())
-            })?;
-            fs::create_dir_all(parent).map_err(|error| InventoryError::Io(error.to_string()))?;
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-                .map_err(|error| InventoryError::Io(error.to_string()))?;
-            file.write_all(&bytes)
-                .and_then(|()| {
-                    magnitude_service_utils::sparse_file::set_sparse_len(
-                        &file,
-                        cached.component.size_bytes,
-                    )
-                })
-                .map_err(|error| InventoryError::Io(error.to_string()))?;
+            write_header_file(
+                &bytes,
+                cached.component.size_bytes,
+                &workspace.path().join(&cached.component.path),
+            )?;
         }
         let components = artifact
             .components
@@ -4938,7 +4964,7 @@ mod tests {
                     "profile": { "contextLength": 8192 },
                     "assessmentId": "assessment_old",
                     "memory": [],
-                    "performance": [],
+                    "performance": { "_tag": "Pending" },
                 },
             }),
         );

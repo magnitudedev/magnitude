@@ -220,12 +220,27 @@ native attention_output for vulkan from "vulkan/attention_output.comp":
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64],
             arithmetic SPLIT in [1, 2, 4])
+    let GEMV_GROUPS = ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES)
+    let GEMV_THREADS = SIMDGROUPS * 32
+    let GEMV_SHARED = 256 + min(8 * ceil_div(Q * W, 32), 288) * 72
     where Q * W > 0 and SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch partials bytes (SPLIT * M * D * 4) when M > 8 and SPLIT > 1
-    launch attention_output_gemv when M <= 8:
-        threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (256 + min(8 * ceil_div(Q * W, 32), 288) * 72)
+    launch attention_output_gemv1 when M <= 1:
+        threadgroups (GEMV_GROUPS, 1, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
+    launch attention_output_gemv2 when M == 2:
+        threadgroups (GEMV_GROUPS, 1, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
+    launch attention_output_gemv4 when M >= 3 and M <= 4:
+        threadgroups (GEMV_GROUPS, 1, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
+    launch attention_output_gemv8 when M >= 5 and M <= 8:
+        threadgroups (GEMV_GROUPS, 1, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
     launch attention_output_gemm when M > 8:
         threadgroups (ceil_div(D, TILE_N), ceil_div(M, TILE_M), SPLIT)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
@@ -449,19 +464,31 @@ native attention_project for vulkan from "vulkan/attention_project.comp":
     static (D, PT, NM, Q, GR, K, V)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
+    let GEMV_GROUPS = ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES)
+    let GEMV_THREADS = SIMDGROUPS * 32
+    let GEMV_SHARED = 256 + min(8 * ceil_div(D, 32), 288) * 72
     where D > 0 and SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch normalized bytes (M * D * 2) when M > 8
     launch attention_project_stage when M > 8:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (128)
-    launch attention_project_gemv when M <= 8:
-        threadgroups (ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES)
-            + ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
-        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (256 + min(8 * ceil_div(D, 32), 288) * 72)
+    launch attention_project_gemv1 when M <= 1:
+        threadgroups (GEMV_GROUPS, 1, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
+    launch attention_project_gemv2 when M == 2:
+        threadgroups (GEMV_GROUPS, 1, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
+    launch attention_project_gemv4 when M >= 3 and M <= 4:
+        threadgroups (GEMV_GROUPS, 1, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
+    launch attention_project_gemv8 when M >= 5 and M <= 8:
+        threadgroups (GEMV_GROUPS, 1, 1)
+        threads_per_threadgroup (GEMV_THREADS, 1, 1)
+        shared_bytes (GEMV_SHARED)
     launch attention_project_gemm when M > 8:
         threadgroups (ceil_div(Q, TILE_N) + ceil_div(GR, TILE_N) + ceil_div(K, TILE_N) + ceil_div(V, TILE_N),
             ceil_div(M, TILE_M), 1)

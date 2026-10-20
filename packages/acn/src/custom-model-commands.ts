@@ -338,7 +338,9 @@ export const CustomModelCommandsLive: Layer.Layer<
   const fs = yield* FileSystem.FileSystem
   const huggingFace = yield* HuggingFaceAccount
 
-  const environmentId = assessments.get.pipe(Effect.map(({ state }) => state.environmentId))
+  // The assessments a candidate's versions are projected against: their environment and the
+  // machine's measurement progress, which a pending speed waits on.
+  const assessmentsSnapshot = assessments.get.pipe(Effect.map(({ state }) => state))
 
   const candidateFailed = (reference: string) => (cause: GeneratedClientError<unknown>) => huggingFace.account.pipe(
     Effect.flatMap((account) => Effect.fail(candidateFailure(reference, account._tag === "SignedIn")(cause))),
@@ -354,7 +356,7 @@ export const CustomModelCommandsLive: Layer.Layer<
     selection: { readonly file: Option.Option<string>; readonly quant: Option.Option<string> },
     reference: string,
   ) => Effect.gen(function* () {
-    const environment = yield* environmentId
+    const snapshot = yield* assessmentsSnapshot
     const source = native.source
     const versions = yield* Effect.forEach(native.versions, (version) => Effect.gen(function* () {
       const decoded = Schema.decodeUnknownOption(CustomFormModelIdSchema)(version.modelId)
@@ -371,7 +373,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         files: version.files.map(({ path }) => path),
         sizeBytes: version.sizeBytes,
         downloadBytes: version.downloadBytes,
-        assessment: Option.map(version.assessment, (assessment) => projectAssessment(environment, assessment)),
+        assessment: Option.map(version.assessment, (assessment) => projectAssessment(snapshot, assessment)),
         recommended: version.recommended,
         catalogModel: Option.flatMap(version.catalogModel, Schema.decodeUnknownOption(CatalogFormModelIdSchema)),
         onThisComputer: version.onThisComputer,
@@ -425,27 +427,27 @@ export const CustomModelCommandsLive: Layer.Layer<
     )
   })
 
-  const productProgress = (environment: string, native: Native.CandidateInspectionProgress): CandidateInspectionProgress => ({
+  const productProgress = (snapshot: Native.ModelAssessmentsSnapshot, native: Native.CandidateInspectionProgress): CandidateInspectionProgress => ({
     phase: native.phase._tag === "CheckingDrafters"
       ? { _tag: "CheckingDrafters", version: native.phase.version, completed: native.phase.completed, total: native.phase.total }
       : { _tag: native.phase._tag, completed: native.phase.completed, total: native.phase.total },
     versions: native.versions.map((version) => ({
       label: version.label,
       sizeBytes: version.sizeBytes,
-      assessment: Option.map(version.assessment, (assessment) => projectAssessment(environment, assessment)),
+      assessment: Option.map(version.assessment, (assessment) => projectAssessment(snapshot, assessment)),
     })),
   })
 
   const inspectWithProgress = (reference: string) => Stream.unwrap(Effect.gen(function* () {
     const parsed = yield* parse(reference)
-    const environment = yield* environmentId
+    const snapshot = yield* assessmentsSnapshot
     return icn.inspectWithProgress(parsed._tag === "HuggingFace"
       ? { _tag: "HuggingFace", repository: parsed.repository, revision: parsed.revision }
       : { _tag: "Local", path: parsed.path },
     ).pipe(
       Stream.catchAll((cause) => Stream.fromEffect(candidateFailed(reference)(cause))),
       Stream.mapEffect((event): Effect.Effect<CandidateInspectionUpdate, ModelCandidateError> => event._tag === "Progress"
-        ? Effect.succeed({ _tag: "Inspecting", progress: productProgress(environment, event.progress) })
+        ? Effect.succeed({ _tag: "Inspecting", progress: productProgress(snapshot, event.progress) })
         : productInspection(
           event.inspection,
           parsed._tag === "HuggingFace" ? parsed : { file: Option.none(), quant: Option.none() },

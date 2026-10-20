@@ -449,7 +449,7 @@ fn tape_versions_equal_runs_that_stopped_there() {
 #[ignore = "timing; run explicitly on the measurement host"]
 fn short_conv_timings() {
     let options = seismic::measure::Measure {
-        samples: std::num::NonZeroUsize::new(11).unwrap(),
+        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(11).unwrap()),
         min_sample_seconds: 0.01,
     };
     let measure = |point| timing_common::measured(point, &options);

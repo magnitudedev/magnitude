@@ -1,15 +1,16 @@
-//! One complete model assessment: memory fit per domain and decode-speed
-//! estimates, all from headers and the allocation-free execution plan draft.
-//!
-//! The standard workload's clean-load charge is compared with every domain
-//! the load touches (`DoesNotFit` names the domain with the largest deficit);
-//! only a fitting model is estimated, from its decode demand over the
-//! device's bandwidth.
+//! One complete model assessment, from headers and the allocation-free
+//! execution plan draft, as two questions with one owner each: whether the
+//! standard workload fits ([`assess_execution_fit`]: the clean-load charge
+//! against every domain the load touches, `DoesNotFit` naming the domain
+//! with the largest deficit), and how fast a fitting model decodes
+//! ([`estimate_execution`]: its per-call decode demand over the executor's
+//! measured kernel costs).
 
-use super::AssessmentError;
-use super::bandwidth::DeviceBandwidth;
 use super::demand::DecodeDemand;
-use super::estimate::{PerformanceEstimate, estimate_performance, performance_depths};
+use super::estimate::{estimate_decode, performance_depths, PerformanceEstimate, Pricing};
+use super::executor_costs::ExecutorCosts;
+use super::launches::Declarations;
+use super::AssessmentError;
 use crate::platform::{DomainRole, MemoryReserves};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
@@ -17,7 +18,7 @@ use crate::{
     HostProcessBytes, ResourceCapacity, ResourcePlanner,
 };
 use magnitude_family_contracts::ModelDefinition;
-use seismic::{DeviceTopology, Status, StoreId};
+use seismic::{DeviceTopology, Executor, Status, StoreId};
 
 /// Engine inputs to one assessment. No service profile or model identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +27,9 @@ pub struct AssessmentRequest {
     pub context_limit: u32,
     /// Requested decode-speed depths before filtering.
     pub performance_depths: Vec<u32>,
+    /// The conversations decoding together: the serving profile's decode
+    /// concurrency.
+    pub sequences: u32,
     pub reserves: MemoryReserves,
 }
 
@@ -45,20 +49,28 @@ pub struct DomainFit {
     pub remaining_bytes: i64,
 }
 
+/// Whether the standard workload fits, each verdict with its own evidence.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExecutionAssessment {
-    Fits {
-        fit_context_tokens: u32,
-        domains: Vec<DomainFit>,
-        /// One estimate per requested depth, ascending.
-        performance: Vec<PerformanceEstimate>,
-    },
-    DoesNotFit {
-        fit_context_tokens: u32,
-        domains: Vec<DomainFit>,
-        limiting: StoreId,
-        deficit_bytes: u64,
-    },
+    Fits(ExecutionFit),
+    DoesNotFit(ExecutionShortfall),
+}
+
+/// The standard workload fits every domain the load touches.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionFit {
+    pub fit_context_tokens: u32,
+    pub domains: Vec<DomainFit>,
+}
+
+/// The standard workload exceeds some domain; `limiting` is the one with
+/// the largest deficit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionShortfall {
+    pub fit_context_tokens: u32,
+    pub domains: Vec<DomainFit>,
+    pub limiting: StoreId,
+    pub deficit_bytes: u64,
 }
 
 /// Basis-independent decode demand and the standard workload's checked
@@ -97,7 +109,7 @@ pub fn prepare_execution_assessment(
         )));
     }
     let policy = draft.policy();
-    let demand = DecodeDemand::from_model(definition, draft.load(), policy.codec())?;
+    let backend = draft.device().backend();
     let terms = AssessmentMemoryTerms::derive(
         definition,
         draft.load(),
@@ -109,13 +121,8 @@ pub fn prepare_execution_assessment(
     .map_err(AssessmentError::Memory)?;
     let fit_context_tokens = u32::try_from(terms.fit_depth)
         .map_err(|_| AssessmentError::Memory("fit depth exceeds u32".into()))?;
-    let header = AssessmentHeaderBounds::derive(
-        definition,
-        draft.load(),
-        policy.codec(),
-        draft.device().backend(),
-    )
-    .map_err(AssessmentError::Memory)?;
+    let header = AssessmentHeaderBounds::derive(definition, draft.load(), policy.codec(), backend)
+        .map_err(AssessmentError::Memory)?;
     let state = ResourcePlanner::state_plan(
         definition,
         draft.load(),
@@ -135,7 +142,7 @@ pub fn prepare_execution_assessment(
         policy.method(),
         policy.codec(),
         policy.limits(),
-        draft.device().backend(),
+        backend,
     )
     .map_err(AssessmentError::Graph)?;
     let host_process = HostProcessBytes::derive(
@@ -159,6 +166,16 @@ pub fn prepare_execution_assessment(
                 })
         })
         .map_err(AssessmentError::Memory)?;
+    // The kernels a load prepares, at the statics it prepares them with:
+    // what each call's launches are declared over.
+    let declarations = Declarations::of_load(
+        backend,
+        draft.programs(),
+        definition,
+        draft.load(),
+        crate::native::TuningLimits::of(policy.limits(), definition),
+    )?;
+    let demand = DecodeDemand::from_model(definition, draft.load(), policy.codec(), &declarations)?;
     Ok(PreparedExecutionAssessment {
         demand,
         fit_context_tokens,
@@ -166,72 +183,95 @@ pub fn prepare_execution_assessment(
     })
 }
 
-/// Join one prepared model with stable capacity and the device's bandwidth.
-/// No graph or model material is constructed here.
-pub fn finish_execution_assessment(
-    prepared: &PreparedExecutionAssessment,
+/// The executor the draft plans on.
+fn planned_executor<'a>(
     draft: &ExecutionPlanDraft,
-    topology: &DeviceTopology,
-    status: &Status,
-    bandwidth: DeviceBandwidth,
-    request: &AssessmentRequest,
-) -> Result<ExecutionAssessment, AssessmentError> {
-    let device = topology.resolve(draft.device().selector()).ok_or_else(|| {
+    topology: &'a DeviceTopology,
+) -> Result<&'a Executor, AssessmentError> {
+    topology.resolve(draft.device().selector()).ok_or_else(|| {
         AssessmentError::Memory(format!(
             "planned device {} is absent from the topology",
             draft.device().selector()
         ))
-    })?;
+    })
+}
+
+/// Whether the standard workload of one prepared model fits stable
+/// capacity. No graph or model material is constructed here.
+pub fn assess_execution_fit(
+    prepared: &PreparedExecutionAssessment,
+    draft: &ExecutionPlanDraft,
+    topology: &DeviceTopology,
+    status: &Status,
+    request: &AssessmentRequest,
+) -> Result<ExecutionAssessment, AssessmentError> {
+    let device = planned_executor(draft, topology)?;
     let fit = prepared
         .charge
         .assess_fit(topology, device, status, &request.reserves)
         .map_err(AssessmentError::Memory)?;
     let fit_context_tokens = prepared.fit_context_tokens;
-    match fit.verdict {
+    Ok(match fit.verdict {
         AssessmentFitVerdict::DoesNotFit {
             limiting,
             deficit_bytes,
-        } => Ok(ExecutionAssessment::DoesNotFit {
+        } => ExecutionAssessment::DoesNotFit(ExecutionShortfall {
             fit_context_tokens,
             domains: fit.domains,
             limiting,
             deficit_bytes,
         }),
-        AssessmentFitVerdict::Fits => Ok(ExecutionAssessment::Fits {
+        AssessmentFitVerdict::Fits => ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens,
             domains: fit.domains,
-            performance: estimate_performance(
-                &prepared.demand,
-                bandwidth,
-                &performance_depths(request.context_limit, &request.performance_depths),
-            ),
         }),
+    })
+}
+
+/// What the draft's decode is priced with on `costs`: its resolved
+/// lookahead policy.
+pub fn decode_pricing<'a>(draft: &ExecutionPlanDraft, costs: &'a ExecutorCosts) -> Pricing<'a> {
+    Pricing {
+        costs,
+        lookahead: draft.policy().limits().lookahead,
     }
 }
 
-/// Assess one planned model against stable capacity and the device's
-/// bandwidth. Opens no device, reads no weight payload and allocates
-/// nothing.
-pub fn assess_execution(
-    definition: &ModelDefinition,
+/// One prepared model's decode speed at each requested depth, from the
+/// planned executor's measured kernel costs.
+pub fn estimate_execution(
+    prepared: &PreparedExecutionAssessment,
     draft: &ExecutionPlanDraft,
-    topology: &DeviceTopology,
-    status: &Status,
-    bandwidth: DeviceBandwidth,
+    costs: &ExecutorCosts,
     request: &AssessmentRequest,
-) -> Result<ExecutionAssessment, AssessmentError> {
-    let prepared = prepare_execution_assessment(definition, draft, request.context_limit)?;
-    finish_execution_assessment(&prepared, draft, topology, status, bandwidth, request)
+) -> Result<Vec<PerformanceEstimate>, AssessmentError> {
+    estimate_decode(
+        &prepared.demand,
+        &decode_pricing(draft, costs),
+        u64::from(request.sequences),
+        &performance_depths(request.context_limit, &request.performance_depths),
+    )
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::assessment::bandwidth::BandwidthSource;
     use crate::{
         ComponentSelection, ExecutionPath, ExecutionPlanner, PlannedMethod, ResourceLimits,
     };
     use magnitude_state::KvCodec;
+
+    /// The limits the tests plan with.
+    pub(crate) const LIMITS: ResourceLimits = ResourceLimits {
+        max_launch_rows: 512,
+        max_launch_slots: 32,
+        max_selected_rows: 32,
+        max_drafting_slots: 32,
+        exported_logits_rows: 0,
+        max_images_per_request: 1,
+        max_image_cells: 0,
+        lookahead: true,
+    };
 
     struct Environment {
         topology: std::sync::Arc<DeviceTopology>,
@@ -241,7 +281,8 @@ mod tests {
     }
 
     fn environment(context_limit: u64) -> Environment {
-        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let inventory = std::sync::Arc::new(seismic::Inventory::discover(&[]).unwrap());
+        let catalog = seismic::Devices::new(inventory.clone());
         let selected = crate::platform::select_device(
             &catalog,
             ExecutionPath::Native,
@@ -263,16 +304,7 @@ mod tests {
             ExecutionPath::Native,
             PlannedMethod::Plain,
             KvCodec::Dense,
-            ResourceLimits {
-                max_launch_rows: 512,
-                max_launch_slots: 32,
-                max_selected_rows: 32,
-                max_drafting_slots: 32,
-                exported_logits_rows: 0,
-                max_images_per_request: 1,
-                max_image_cells: 0,
-                lookahead: true,
-            },
+            LIMITS,
         )
         .unwrap();
         Environment {
@@ -283,26 +315,27 @@ mod tests {
         }
     }
 
-    const BANDWIDTH: DeviceBandwidth = DeviceBandwidth {
-        bytes_per_second: 100_000_000_000,
-        source: BandwidthSource::Published,
-    };
-
     fn request(context_limit: u32, depths: &[u32]) -> AssessmentRequest {
         AssessmentRequest {
             context_limit,
             performance_depths: depths.to_vec(),
+            sequences: 1,
             reserves: MemoryReserves::standard(),
         }
     }
 
     fn assess(environment: &Environment, request: &AssessmentRequest) -> ExecutionAssessment {
-        assess_execution(
+        let prepared = prepare_execution_assessment(
             &environment.definition,
+            &environment.draft,
+            request.context_limit,
+        )
+        .unwrap();
+        assess_execution_fit(
+            &prepared,
             &environment.draft,
             &environment.topology,
             &environment.status,
-            BANDWIDTH,
             request,
         )
         .unwrap()
@@ -311,11 +344,10 @@ mod tests {
     #[test]
     fn fit_depth_is_independent_of_performance_depths() {
         let environment = environment(150_000);
-        let ExecutionAssessment::Fits {
+        let ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens,
             domains,
-            performance,
-        } = assess(
+        }) = assess(
             &environment,
             &request(150_000, &[25_000, 50_000, 50_000, 200_000]),
         )
@@ -323,24 +355,9 @@ mod tests {
             panic!("the fixture fits every supported host");
         };
         assert_eq!(fit_context_tokens, 100_000);
-        assert_eq!(
-            performance
-                .iter()
-                .map(|estimate| estimate.context_tokens)
-                .collect::<Vec<_>>(),
-            vec![25_000, 50_000, 150_000]
-        );
-        assert!(
-            performance
-                .iter()
-                .all(|estimate| estimate.tokens_per_second.is_finite()
-                    && estimate.tokens_per_second > 0.0)
-        );
-        assert!(
-            domains
-                .iter()
-                .any(|domain| domain.role == DomainRole::Allocation)
-        );
+        assert!(domains
+            .iter()
+            .any(|domain| domain.role == DomainRole::Allocation));
         assert!(domains.iter().all(|domain| domain.remaining_bytes >= 0));
         for domain in &domains {
             assert_eq!(
@@ -351,10 +368,10 @@ mod tests {
             );
         }
         // The charge depends on the fit depth only, not on the depths asked.
-        let ExecutionAssessment::Fits {
+        let ExecutionAssessment::Fits(ExecutionFit {
             domains: other_domains,
             ..
-        } = assess(&environment, &request(150_000, &[1_000]))
+        }) = assess(&environment, &request(150_000, &[1_000]))
         else {
             panic!("expected a fit");
         };
@@ -370,18 +387,38 @@ mod tests {
         );
     }
 
+    /// The estimate covers the requested depths within the limit and the
+    /// limit itself, slowing with depth.
+    #[test]
+    fn a_fitting_model_is_estimated_at_each_depth() {
+        let environment = environment(150_000);
+        let request = request(150_000, &[25_000, 50_000, 50_000, 200_000]);
+        let prepared =
+            prepare_execution_assessment(&environment.definition, &environment.draft, 150_000)
+                .unwrap();
+        let costs = crate::assessment::fixtures::costs();
+        let estimates =
+            estimate_execution(&prepared, &environment.draft, &costs, &request).unwrap();
+        assert_eq!(
+            estimates
+                .iter()
+                .map(|estimate| estimate.context_tokens)
+                .collect::<Vec<_>>(),
+            vec![25_000, 50_000, 150_000]
+        );
+        for pair in estimates.windows(2) {
+            assert!(pair[0].tokens_per_second > pair[1].tokens_per_second);
+        }
+        assert!(estimates
+            .iter()
+            .all(|estimate| estimate.tokens_per_second.is_finite()));
+    }
+
     #[test]
     fn a_mismatched_context_limit_is_an_error() {
         let environment = environment(128);
         assert!(matches!(
-            assess_execution(
-                &environment.definition,
-                &environment.draft,
-                &environment.topology,
-                &environment.status,
-                BANDWIDTH,
-                &request(256, &[64]),
-            ),
+            prepare_execution_assessment(&environment.definition, &environment.draft, 256),
             Err(AssessmentError::Plan(_))
         ));
     }

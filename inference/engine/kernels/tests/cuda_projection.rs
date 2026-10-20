@@ -1147,6 +1147,9 @@ fn dense_expand_host_model_matches_portable_body() {
                 Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::I32, vec![o], rows))),
                 Arg::Scalar(ReferenceScalar::F32(EPSILON.to_bits())),
                 Arg::Scalar(ReferenceScalar::I32(0)),
+                // No scales and no bounds.
+                Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::F32, vec![0], vec![]))),
+                Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::F32, vec![0], vec![]))),
                 Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::F32, vec![0], vec![]))),
                 Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::F32, vec![0], vec![]))),
             ];
@@ -1190,10 +1193,7 @@ fn cuda_embedding_rows_decode_table_rows() {
                 EW: format.resident(),
                 A: Element::bf16(),
             },
-            &NativeSpecialization::new()
-                .with_static("D", d as u64)
-                .with_static("PT", 1)
-                .with_static("NM", d as u64),
+            &NativeSpecialization::new().with_static("D", d as u64),
         )
         .unwrap()
         .call(embedding_rows::Args {
@@ -1253,10 +1253,7 @@ fn cuda_embedding_rows_read_the_slots_their_directory_names() {
                 EW: format.resident(),
                 A: Element::bf16(),
             },
-            &NativeSpecialization::new()
-                .with_static("D", d as u64)
-                .with_static("PT", 1)
-                .with_static("NM", d as u64),
+            &NativeSpecialization::new().with_static("D", d as u64),
         )
         .unwrap();
         for rows in [1usize, 3, 64, 513] {
@@ -1603,7 +1600,7 @@ fn cuda_gemm_timings() {
     let absent_scale = f32_tensor(&device, &[0], &[]);
     let mut rng = Rng(37);
     let options = seismic::measure::Measure {
-        samples: std::num::NonZeroUsize::new(15).unwrap(),
+        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
         min_sample_seconds: 0.002,
     };
     let measure = |point| timing_common::measured(point, &options);
@@ -1719,7 +1716,7 @@ fn cuda_projection_timings() {
     let absent_scale = f32_tensor(&device, &[0], &[]);
     let mut rng = Rng(29);
     let options = seismic::measure::Measure {
-        samples: std::num::NonZeroUsize::new(15).unwrap(),
+        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
         min_sample_seconds: 0.002,
     };
     let measure = |point| timing_common::measured(point, &options);
@@ -1800,7 +1797,7 @@ fn cuda_head_timings() {
     let Some(device) = cuda() else { return };
     let mut rng = Rng(31);
     let options = seismic::measure::Measure {
-        samples: std::num::NonZeroUsize::new(15).unwrap(),
+        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
         min_sample_seconds: 0.002,
     };
     let measure = |point| timing_common::measured(point, &options);

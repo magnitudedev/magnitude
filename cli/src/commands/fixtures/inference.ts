@@ -17,6 +17,7 @@ import {
   type CustomLocalModel,
   type DrafterCandidate,
   type HuggingFaceSearchResponse,
+  localModelPerformanceContexts,
   type LocalInferenceHardware,
   type LocalModel,
   type LocalModelAcquisitionState,
@@ -73,13 +74,13 @@ const capabilities = {
 
 const CONTEXT_LENGTH = 32_768
 
-const performance = (contextLength: number) => [...new Set([
-  ...[25_000, 50_000, 75_000].filter((context) => context <= contextLength),
-  contextLength,
-])].sort((left, right) => left - right).map((contextTokens) => ({
-  contextTokens,
-  estimatedTokensPerSecond: contextTokens === contextLength ? 24 : 28,
-}))
+const performance = (contextLength: number) => ({
+  _tag: "Estimated" as const,
+  samples: localModelPerformanceContexts(contextLength).map((contextTokens) => ({
+    contextTokens,
+    estimatedTokensPerSecond: contextTokens === contextLength ? 24 : 28,
+  })),
+})
 
 const metadata = {
   format: "gguf",
@@ -161,7 +162,7 @@ const makeCatalogOnlyModel = (
     capabilities,
     speculativeMethod: Option.some({ _tag: "DFlash" }),
     assessment: fitsAssessment(),
-    rankingScores: Option.some({ intelligence: 0.75, speed: 0.65, fidelity: 0.75 }),
+    rankingScores: { intelligence: 0.75, speed: Option.some(0.65), fidelity: 0.75 },
   },
   ...overrides,
 })

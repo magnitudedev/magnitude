@@ -950,6 +950,7 @@ mod internals {
         // Authored helper macros commonly receive the ABI family prefix and
         // token-paste suffixes such as `_PACKET_SIZE` onto it.
         symbols.insert(prefix.to_owned());
+        symbols.insert(format!("{prefix}_REPRESENTATION"));
         for representation in representations {
             symbols.insert(format!(
                 "{prefix}_REPRESENTATION_{}",

@@ -1,11 +1,26 @@
-//! Header-derived decode demand: the bytes one plain target decode step
-//! streams, the history it reads per token of context, and the entry calls
-//! it launches. Derived from the same program and load plans native
-//! preparation uses, and from the state layout the memory terms use for
-//! history bytes.
+//! Header-derived decode demand: one record per call of a plain target
+//! decode step, in the order the step runs them. Each names the entry it
+//! runs ([`Launches`], whose launches at a row count are the backend's
+//! declaration's) and the work it does: the weights it reads once per step,
+//! the bytes and FLOPs of each row, the state of each sequence, and the
+//! history it reads per token of context. Derived from the same program and
+//! load plans native preparation uses, and from the state layout the memory
+//! terms use for state and history bytes.
+//!
+//! Matmul FLOPs are 2 × the weight's logical elements per row (a multiply
+//! and an add per weight), of a routed tensor the selected experts' slabs.
+//! Attention FLOPs per row and token read are 2 · KV · G · (W_k + W_v): each
+//! query head scores a key and accumulates a value of its head width.
+//! Recurrent and state-space state advances are priced by their bytes only:
+//! their arithmetic per state element is the kernels', which no plan
+//! states.
 
+use super::launches::{Declarations, Kernel, Launches};
 use super::AssessmentError;
-use crate::operators::{InputForm, parallel::DenseBesideRouted, streams::StreamsBinding};
+use crate::operators::attention::graph::selected_segments;
+use crate::operators::gated_delta::graph::StepForm;
+use crate::operators::routed::fused_graph::DecodeForm;
+use crate::operators::{parallel::DenseBesideRouted, streams::StreamsBinding, InputForm};
 use crate::{
     FeedForwardProgramSlot, GeneralRoutedBinding, MixerProgramSlot, ModelLoadPlan,
     PerLayerEntryBinding, ReadoutHead, SublayerTail, WeightPlan,
@@ -13,139 +28,340 @@ use crate::{
 use magnitude_family_contracts::{
     InputNorm, ModelDefinition, SublayerIndex, WeightKind, WeightScope,
 };
-use magnitude_state::{HistoryDomainLayout, KvCodec, LayerRef, ModelStateLayout};
+use magnitude_kernels as kernels;
+use magnitude_state::{HistoryDomainLayout, HistoryEncoding, KvCodec, LayerRef, ModelStateLayout};
 use seismic::Element;
+use std::collections::HashMap;
 
-/// History one decode step reads for each token of context, summed over the
-/// attention layers that share a window.
+/// History one call reads for each token of context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryRead {
+    /// The layout an attention entry reads it in; none for an indexer's
+    /// F32 block keys and scores, which a selection call streams.
+    pub layout: Option<KvCodec>,
     pub bytes_per_token: u64,
+    /// FLOPs of one row per token read: attention's bf16 score and value
+    /// products.
+    pub flops_per_token: u64,
     /// The most tokens read: a window domain's window, or the blocks a
     /// selected read reads and its tail. `None` reads every token.
     pub window: Option<u64>,
 }
 
 impl HistoryRead {
-    /// The bytes read at `depth` tokens of context.
-    pub fn bytes_at(&self, depth: u32) -> u64 {
-        let tokens = self
-            .window
-            .map_or(u64::from(depth), |window| window.min(u64::from(depth)));
-        self.bytes_per_token.saturating_mul(tokens)
+    /// The tokens read at `depth` tokens of context.
+    pub fn tokens_at(&self, depth: u32) -> u64 {
+        self.window
+            .map_or(u64::from(depth), |window| window.min(u64::from(depth)))
     }
 }
 
-/// One plain target decode step of one row.
+/// Matmul FLOPs over weights resident in one format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Flops {
+    pub format: Element,
+    pub flops: u64,
+}
+
+/// Weight bytes resident in one format, which its own weight rate prices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bytes {
+    pub format: Element,
+    pub bytes: u64,
+}
+
+/// An amount of one weight format's, summed per format.
+trait PerFormat {
+    /// What the amounts are, as an overflow names them.
+    const WHAT: &'static str;
+    fn format(&self) -> Element;
+    fn amount(&mut self) -> &mut u64;
+}
+
+impl PerFormat for Bytes {
+    const WHAT: &'static str = "weight bytes";
+    fn format(&self) -> Element {
+        self.format
+    }
+    fn amount(&mut self) -> &mut u64 {
+        &mut self.bytes
+    }
+}
+
+impl PerFormat for Flops {
+    const WHAT: &'static str = "matmul FLOPs";
+    fn format(&self) -> Element {
+        self.format
+    }
+    fn amount(&mut self) -> &mut u64 {
+        &mut self.flops
+    }
+}
+
+/// `item` added to `into`'s entry of its format.
+fn add<T: PerFormat>(into: &mut Vec<T>, mut item: T) -> Result<(), AssessmentError> {
+    match into
+        .iter_mut()
+        .find(|entry| entry.format() == item.format())
+    {
+        Some(entry) => {
+            let sum = entry
+                .amount()
+                .checked_add(*item.amount())
+                .ok_or_else(|| demand_error(format!("{} overflow", T::WHAT)))?;
+            *entry.amount() = sum;
+        }
+        None => into.push(item),
+    }
+    Ok(())
+}
+
+/// The bytes of `weights`, by format.
+fn weight_bytes(weights: &[&WeightPlan]) -> Result<Vec<Bytes>, AssessmentError> {
+    let mut bytes = Vec::new();
+    for weight in weights {
+        add(
+            &mut bytes,
+            Bytes {
+                format: weight.resident,
+                bytes: weight.resident_bytes,
+            },
+        )?;
+    }
+    Ok(bytes)
+}
+
+/// The expert slabs a routed call reads: `selected` of `experts` equal
+/// slabs per row, the union of the rows' choices once per step.
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Experts {
+    pub experts: u64,
+    pub selected: u64,
+    /// One expert's bytes over every expert tensor the call reads, by
+    /// format.
+    pub slab_bytes: Vec<Bytes>,
+    /// One expert's FLOPs per row over those tensors, by format.
+    pub slab_flops: Vec<Flops>,
+}
+
+/// What one call reads and computes. Resident weights and per-sequence
+/// state are in device storage, as the load plan places them; the host
+/// writes upload rows (`Tensor::shared`, upload storage).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Work {
+    /// Weights read whole, once per step, by format.
+    pub weights: Vec<Bytes>,
+    pub experts: Option<Experts>,
+    /// Device bytes each row reads and writes.
+    pub row_bytes: u64,
+    /// Upload bytes each row reads.
+    pub upload_row_bytes: u64,
+    /// Each row's matmul FLOPs, by weight format.
+    pub row_flops: Vec<Flops>,
+    /// Device state each sequence reads and writes, whatever its depth.
+    pub sequence_bytes: u64,
+    pub history: Option<HistoryRead>,
+}
+
+/// One call of the step: its entry and its work.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Call {
+    pub launches: Launches,
+    pub work: Work,
+}
+
+/// One plain target decode step, call by call.
+#[derive(Clone, Debug, PartialEq)]
 pub struct DecodeDemand {
-    /// Bytes streamed independent of context depth: weights (a routed
-    /// layer's selected experts only), norms, routers, recurrent and
-    /// state-space state, rows, logits and per-layer table uploads.
-    pub streamed_bytes: u64,
-    /// History read per token of context.
-    pub history: Vec<HistoryRead>,
-    /// Entry calls.
-    pub launches: u64,
+    pub calls: Vec<Call>,
 }
 
 fn demand_error(message: impl Into<String>) -> AssessmentError {
     AssessmentError::Demand(message.into())
 }
 
-/// The output rows of a weight matrix (every extent but the reduction; an
-/// expert tensor's rows over all its experts).
-fn output_rows(weight: &WeightPlan) -> Result<u64, AssessmentError> {
-    let [leading @ .., _] = weight.shape.as_slice() else {
-        return Err(demand_error(format!(
-            "weight {:?} has no extents",
-            weight.descriptor.name
-        )));
-    };
-    leading
+/// The logical elements of a weight.
+fn elements(weight: &WeightPlan) -> Result<u64, AssessmentError> {
+    weight
+        .shape
         .iter()
-        .try_fold(1u64, |rows, extent| rows.checked_mul(*extent))
-        .ok_or_else(|| demand_error("weight rows overflow"))
+        .try_fold(1u64, |elements, extent| elements.checked_mul(*extent))
+        .ok_or_else(|| {
+            demand_error(format!(
+                "weight {:?} elements overflow",
+                weight.descriptor.name
+            ))
+        })
 }
 
-/// The bytes a decode row streams of `selected` of an expert tensor's
-/// `experts` equal slabs.
-fn selected_bytes(
-    weight: &WeightPlan,
-    experts: u64,
-    selected: u64,
-) -> Result<u64, AssessmentError> {
-    let rows = output_rows(weight)?;
-    if experts == 0
-        || selected > experts
-        || weight.resident_bytes % experts != 0
-        || rows % experts != 0
-    {
+/// The FLOPs of one row through `weight`, a matrix: a multiply and an add
+/// per logical element. A vector (a norm, a gate's scale) is read, not
+/// multiplied through: none.
+fn matmul_flops(weight: &WeightPlan) -> Result<Option<Flops>, AssessmentError> {
+    if weight.shape.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(Flops {
+        format: weight.resident,
+        flops: elements(weight)?
+            .checked_mul(2)
+            .ok_or_else(|| demand_error("matmul FLOPs overflow"))?,
+    }))
+}
+
+/// The work of projecting each row through every weight in `weights`.
+fn projection(weights: &[&WeightPlan]) -> Result<Work, AssessmentError> {
+    let mut row_flops = Vec::new();
+    for weight in weights {
+        if let Some(flops) = matmul_flops(weight)? {
+            add(&mut row_flops, flops)?;
+        }
+    }
+    Ok(Work {
+        weights: weight_bytes(weights)?,
+        row_flops,
+        ..Work::default()
+    })
+}
+
+/// Weights read whole without a matmul (norms, routers' biases, taps).
+fn weights(weights: &[&WeightPlan]) -> Result<Work, AssessmentError> {
+    Ok(Work {
+        weights: weight_bytes(weights)?,
+        ..Work::default()
+    })
+}
+
+fn rows(bytes: u64) -> Work {
+    Work {
+        row_bytes: bytes,
+        ..Work::default()
+    }
+}
+
+fn sequences(bytes: u64) -> Work {
+    Work {
+        sequence_bytes: bytes,
+        ..Work::default()
+    }
+}
+
+/// One expert's bytes and FLOPs per row of an expert tensor of `experts`
+/// equal slabs.
+fn slab(weight: &WeightPlan, experts: u64) -> Result<(Bytes, Flops), AssessmentError> {
+    let elements = elements(weight)?;
+    if experts == 0 || weight.resident_bytes % experts != 0 || elements % experts != 0 {
         return Err(demand_error(format!(
             "expert tensor {:?} does not split into {experts} slabs",
             weight.descriptor.name
         )));
     }
-    (weight.resident_bytes / experts)
-        .checked_mul(selected)
-        .ok_or_else(|| demand_error("selected expert streaming overflows"))
+    Ok((
+        Bytes {
+            format: weight.resident,
+            bytes: weight.resident_bytes / experts,
+        },
+        Flops {
+            format: weight.resident,
+            flops: 2 * (elements / experts),
+        },
+    ))
+}
+
+/// The slabs of `tensors`, `selected` of `experts` per row.
+fn experts(
+    tensors: &[&WeightPlan],
+    experts: u64,
+    selected: u64,
+) -> Result<Experts, AssessmentError> {
+    if selected > experts {
+        return Err(demand_error(format!(
+            "{selected} selected of {experts} experts"
+        )));
+    }
+    let slabs = tensors
+        .iter()
+        .map(|tensor| slab(tensor, experts))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut slab_bytes = Vec::new();
+    let mut slab_flops = Vec::new();
+    for (bytes, flops) in &slabs {
+        add(&mut slab_bytes, *bytes)?;
+        add(&mut slab_flops, *flops)?;
+    }
+    Ok(Experts {
+        experts,
+        selected,
+        slab_bytes,
+        slab_flops,
+    })
+}
+
+/// Work done by one call: the sum of each part's.
+fn join(parts: impl IntoIterator<Item = Work>) -> Result<Work, AssessmentError> {
+    let mut joined = Work::default();
+    for part in parts {
+        let sum = |left: u64, right: u64, what: &str| {
+            left.checked_add(right)
+                .ok_or_else(|| demand_error(format!("call {what} overflow")))
+        };
+        for bytes in part.weights {
+            add(&mut joined.weights, bytes)?;
+        }
+        joined.row_bytes = sum(joined.row_bytes, part.row_bytes, "row bytes")?;
+        joined.upload_row_bytes = sum(
+            joined.upload_row_bytes,
+            part.upload_row_bytes,
+            "upload bytes",
+        )?;
+        for flops in part.row_flops {
+            add(&mut joined.row_flops, flops)?;
+        }
+        joined.sequence_bytes = sum(joined.sequence_bytes, part.sequence_bytes, "state bytes")?;
+        joined.experts = match (joined.experts.take(), part.experts) {
+            (None, experts) | (experts, None) => experts,
+            (Some(_), Some(_)) => return Err(demand_error("a call reads two expert sets")),
+        };
+        joined.history = match (joined.history, part.history) {
+            (None, history) | (history, None) => history,
+            (Some(_), Some(_)) => return Err(demand_error("a call reads two histories")),
+        };
+    }
+    Ok(joined)
 }
 
 /// The step as it accumulates.
-#[derive(Default)]
-struct Step {
-    streamed_bytes: u64,
-    history: Vec<HistoryRead>,
-    launches: u64,
+struct Step<'a> {
+    declarations: &'a Declarations,
+    /// Each entry's launches, resolved once.
+    resolved: HashMap<&'static str, Launches>,
+    calls: Vec<Call>,
 }
 
-impl Step {
-    /// One entry call streaming `bytes`.
-    fn launch(&mut self, bytes: u64) -> Result<(), AssessmentError> {
-        self.launches = self
-            .launches
-            .checked_add(1)
-            .ok_or_else(|| demand_error("entry call count overflows"))?;
-        self.streamed_bytes = self
-            .streamed_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| demand_error("streamed bytes overflow"))?;
+impl Step<'_> {
+    /// One call of `kernel` doing `work`.
+    fn call(&mut self, kernel: Kernel, work: Work) -> Result<(), AssessmentError> {
+        let launches = match self.resolved.get(kernel.name()) {
+            Some(launches) => launches.clone(),
+            None => {
+                let launches = self.declarations.launches(kernel, &[])?;
+                self.resolved.insert(kernel.name(), launches.clone());
+                launches
+            }
+        };
+        self.calls.push(Call { launches, work });
         Ok(())
     }
 
-    /// One entry call streaming every weight in `weights` whole.
-    fn project(&mut self, weights: &[&WeightPlan]) -> Result<(), AssessmentError> {
-        let bytes = weights
-            .iter()
-            .try_fold(0u64, |total, weight| {
-                total.checked_add(weight.resident_bytes)
-            })
-            .ok_or_else(|| demand_error("projection bytes overflow"))?;
-        self.launch(bytes)
-    }
-
-    /// One attention entry call reading `bytes_per_token` of history per
-    /// token of context, up to `window` tokens.
-    fn attend(&mut self, bytes_per_token: u64, window: Option<u64>) -> Result<(), AssessmentError> {
-        self.launch(0)?;
-        self.read(bytes_per_token, window)
-    }
-
-    /// `bytes_per_token` of history read per token of context, up to
-    /// `window` tokens, by an entry call already counted.
-    fn read(&mut self, bytes_per_token: u64, window: Option<u64>) -> Result<(), AssessmentError> {
-        match self.history.iter_mut().find(|read| read.window == window) {
-            Some(read) => {
-                read.bytes_per_token = read
-                    .bytes_per_token
-                    .checked_add(bytes_per_token)
-                    .ok_or_else(|| demand_error("history bytes overflow"))?;
-            }
-            None => self.history.push(HistoryRead {
-                bytes_per_token,
-                window,
-            }),
-        }
+    /// One call of `kernel` stating `dimensions` its launch clauses read.
+    fn call_with(
+        &mut self,
+        kernel: Kernel,
+        dimensions: &[(&'static str, u64)],
+        work: Work,
+    ) -> Result<(), AssessmentError> {
+        let launches = self.declarations.launches(kernel, dimensions)?;
+        self.calls.push(Call { launches, work });
         Ok(())
     }
 }
@@ -179,31 +395,39 @@ fn planned<'a>(
 }
 
 /// A sublayer's output by its tail: the operator's own output entry
-/// (`residual`), or the `output` projection into F32 rows and the post-norm
-/// row op, whose norm weight `planned` checks.
+/// (`residual`, which joins the residual), or the `output` projection into
+/// F32 rows and the post-norm row op, whose norm weight `planned` checks.
 fn tail<'a>(
-    step: &mut Step,
+    step: &mut Step<'_>,
     tail: SublayerTail,
+    residual: Kernel,
     output: &WeightPlan,
     planned: impl Fn(WeightKind, Element) -> Result<&'a WeightPlan, AssessmentError>,
 ) -> Result<(), AssessmentError> {
     match tail {
-        SublayerTail::Residual => step.project(&[output]),
+        SublayerTail::Residual => step.call(residual, projection(&[output])?),
         SublayerTail::PostNorm { norm, .. } => {
             post_norm(step, output, planned(WeightKind::PostNorm, norm)?)
         }
     }
 }
 
-/// A post-norm tail: the `output` projection into F32 rows, then the row op
-/// normalizing it with `norm` into the residual.
+/// A post-norm tail (`operators::output`): the `output` projection into F32
+/// rows (`project_rows`), then the row op normalizing it with `norm` into
+/// the residual (`post_norm_residual`).
 fn post_norm(
-    step: &mut Step,
+    step: &mut Step<'_>,
     output: &WeightPlan,
     norm: &WeightPlan,
 ) -> Result<(), AssessmentError> {
-    step.project(&[output])?;
-    step.launch(norm.resident_bytes)
+    step.call(
+        Kernel::of::<kernels::project_rows::Entry>(),
+        projection(&[output])?,
+    )?;
+    step.call(
+        Kernel::of::<kernels::post_norm_residual::Entry>(),
+        weights(&[norm])?,
+    )
 }
 
 /// The bytes of `elements` values of `element`.
@@ -213,13 +437,15 @@ fn row_bytes(element: Element, elements: u64) -> Result<u64, AssessmentError> {
         .map_err(|error| demand_error(format!("{} row of {elements}: {error}", element.name())))
 }
 
-/// `programs::graph::per_layer::per_layer_entry`, once per step after the
-/// embedding: the row's host-table row gathered and uploaded, the embedded
-/// row rounded and projected to every layer's channels, the uploaded row
-/// converted to its resident representation, both combined, and the result
-/// copied into the program's per-layer rows.
+/// `operators::per_layer::graph::per_layer_entry`, once per step after the
+/// embedding: the embedded row rounded (`import_dense`) and projected to
+/// every layer's channels (`project_rows`), the row's host-table row, which
+/// the host uploads, converted to its resident representation
+/// (`import_dense` or `repack_weight`), both combined (`per_layer_inputs`),
+/// and the result copied into the program's per-layer rows
+/// (`conditioning_overlay`).
 fn per_layer_entry(
-    step: &mut Step,
+    step: &mut Step<'_>,
     load: &ModelLoadPlan,
     entry: PerLayerEntryBinding,
 ) -> Result<(), AssessmentError> {
@@ -232,23 +458,42 @@ fn per_layer_entry(
         .iter()
         .find(|table| table.role.kind == WeightKind::PerLayerTable)
         .ok_or_else(|| demand_error("a per-layer entry without its host table"))?;
-    let rows = table.shape[0];
-    if table.source != entry.table_source || rows == 0 || table.bytes % rows != 0 {
+    let table_rows = table.shape[0];
+    if table.source != entry.table_source || table_rows == 0 || table.bytes % table_rows != 0 {
         return Err(demand_error(format!(
             "host table {:?} disagrees with the per-layer entry",
             table.descriptor.name
         )));
     }
-    step.launch(table.bytes / rows)?;
-    step.launch(row_bytes(Element::f32(), entry.hidden)?)?;
-    let projection = planned(
+    step.call(
+        Kernel::of::<kernels::import_dense::Entry>(),
+        rows(row_bytes(Element::f32(), entry.hidden)?),
+    )?;
+    let projected = planned(
         load,
         WeightScope::Target,
         WeightKind::PerLayerModelProjection,
         entry.projection,
     )?;
-    step.project(&[projection])?;
-    step.launch(row_bytes(entry.table_source, channels)?)?;
+    step.call(
+        Kernel::of::<kernels::project_rows::Entry>(),
+        projection(&[projected])?,
+    )?;
+    // A dense table converts by import, any other by repacking
+    // (`CheckedPerLayerEntryEntries`).
+    let conversion = if entry.table_source.dtype().is_some() && entry.table.dtype().is_some() {
+        Kernel::of::<kernels::import_dense::Entry>()
+    } else {
+        Kernel::of::<kernels::repack_weight::Entry>()
+    };
+    step.call(
+        conversion,
+        Work {
+            row_bytes: row_bytes(entry.table_source, channels)?,
+            upload_row_bytes: table.bytes / table_rows,
+            ..Work::default()
+        },
+    )?;
     planned(
         load,
         WeightScope::Target,
@@ -256,17 +501,23 @@ fn per_layer_entry(
         entry.norm,
     )?;
     let f32_rows = row_bytes(Element::f32(), channels)?;
-    step.launch(f32_rows)?;
-    step.launch(f32_rows)
+    step.call(
+        Kernel::of::<kernels::per_layer_inputs::Entry>(),
+        rows(f32_rows),
+    )?;
+    step.call(
+        Kernel::of::<kernels::conditioning_overlay::Entry>(),
+        rows(f32_rows),
+    )
 }
 
 /// `operators::streams::graph::mix_site` in `scope`: `stream_mix_down`
 /// streams the site's norm and down weights (and, `injected`, its inject
 /// weights), and `stream_mix_up` its up weights and norm. The consumer entry
 /// sums the partials in its prologue, and the sublayer's output entry
-/// scatters into the streams in its epilogue: neither launches.
+/// scatters into the streams in its epilogue: neither is a call.
 fn mix_site(
-    step: &mut Step,
+    step: &mut Step<'_>,
     load: &ModelLoadPlan,
     scope: WeightScope,
     streams: StreamsBinding,
@@ -278,15 +529,21 @@ fn mix_site(
     if injected {
         down.push(weight(WeightKind::HyperConnectionInject, streams.inject)?);
     }
-    step.project(&down)?;
-    step.project(&[weight(WeightKind::HyperConnectionUp, streams.up)?, norm])
+    step.call(
+        Kernel::of::<kernels::stream_mix_down::Entry>(),
+        projection(&down)?,
+    )?;
+    step.call(
+        Kernel::of::<kernels::stream_mix_up::Entry>(),
+        projection(&[weight(WeightKind::HyperConnectionUp, streams.up)?, norm])?,
+    )
 }
 
 /// The input of the sublayer at `scope` as it runs: the residual under its
 /// RMS input norm, which the consumer entry fuses (bound at `norm`), or the
 /// mix site of a hyper-connection sublayer.
 fn sublayer_input(
-    step: &mut Step,
+    step: &mut Step<'_>,
     load: &ModelLoadPlan,
     definition: &ModelDefinition,
     scope: WeightScope,
@@ -315,11 +572,12 @@ fn sublayer_input(
 /// `operators::ngram` in `scope`, whose bank components (its window, then
 /// its token window) start at `component`: the row rule over the token
 /// window (`ngram_rows`), the read of its heads' stored rows from the
-/// table's slots (`stored_rows`), the key and value projections, the gate
-/// over the key and query norms (`ngram_gate`), and the row op over the
-/// convolution norm, the taps and the window (`ngram_inject`).
+/// table's slots (`stored_rows`), the key and value projections
+/// (`project_rows`), the gate over the key and query norms (`ngram_gate`),
+/// and the row op over the convolution norm, the taps and the window
+/// (`ngram_inject`).
 fn ngram(
-    step: &mut Step,
+    step: &mut Step<'_>,
     load: &ModelLoadPlan,
     layout: &ModelStateLayout,
     scope: WeightScope,
@@ -328,7 +586,10 @@ fn ngram(
     index: usize,
 ) -> Result<(), AssessmentError> {
     let weight = |kind, bound| planned(load, scope, kind, bound);
-    step.launch(bank_bytes(layout, component + 1, 1, index)?)?;
+    step.call(
+        Kernel::of::<kernels::ngram_rows::Entry>(),
+        sequences(bank_bytes(layout, component + 1, 1, index)?),
+    )?;
     let table = weight(WeightKind::NGramTable, binding.table_source)?;
     let slots = table.shape[0];
     if slots == 0 || table.resident_bytes % slots != 0 {
@@ -337,29 +598,52 @@ fn ngram(
             table.descriptor.name
         )));
     }
-    step.launch(
-        (table.resident_bytes / slots)
-            .checked_mul(binding.heads())
-            .ok_or_else(|| demand_error("n-gram row bytes overflow"))?,
+    step.call(
+        Kernel::of::<kernels::stored_rows::Entry>(),
+        rows(
+            (table.resident_bytes / slots)
+                .checked_mul(binding.heads())
+                .ok_or_else(|| demand_error("n-gram row bytes overflow"))?,
+        ),
     )?;
-    step.project(&[weight(WeightKind::NGramKey, binding.key)?])?;
-    step.project(&[weight(WeightKind::NGramValue, binding.value)?])?;
-    step.launch(
-        weight(WeightKind::NGramKeyNorm, binding.norm)?.resident_bytes
-            + weight(WeightKind::NGramQueryNorm, binding.norm)?.resident_bytes,
+    let project = Kernel::of::<kernels::project_rows::Entry>();
+    step.call(
+        project,
+        projection(&[weight(WeightKind::NGramKey, binding.key)?])?,
     )?;
-    step.launch(
-        weight(WeightKind::NGramConvolutionNorm, binding.norm)?.resident_bytes
-            + weight(WeightKind::NGramConvolution, Element::f32())?.resident_bytes
-            + bank_bytes(layout, component, 1, index)?,
+    step.call(
+        project,
+        projection(&[weight(WeightKind::NGramValue, binding.value)?])?,
+    )?;
+    step.call(
+        Kernel::of::<kernels::ngram_gate::Entry>(),
+        weights(&[
+            weight(WeightKind::NGramKeyNorm, binding.norm)?,
+            weight(WeightKind::NGramQueryNorm, binding.norm)?,
+        ])?,
+    )?;
+    step.call(
+        Kernel::of::<kernels::ngram_inject::Entry>(),
+        Work {
+            weights: weight_bytes(&[
+                weight(WeightKind::NGramConvolutionNorm, binding.norm)?,
+                weight(WeightKind::NGramConvolution, Element::f32())?,
+            ])?,
+            sequence_bytes: bank_bytes(layout, component, 1, index)?,
+            ..Work::default()
+        },
     )
 }
 
-/// `operators::routed` in `scope`: the shared expert onto the sum's root,
-/// selection, the latent projections, and the selected experts' expansion
-/// and down projection. Its input is the caller's.
+/// `operators::routed::graph` at decode rows in `scope`: the shared
+/// expert's expansion (`dense_expand`, or `dense_up` up-only) and down
+/// projection onto the sum's root (`dense_output`), selection
+/// (`routed_select`), the latent projections (`project_rows`,
+/// `dense_output`), and the selected experts' expansion (`routed_gate_up`,
+/// or `routed_up` up-only) and down projection (`routed_down`). Its input
+/// is the caller's.
 fn general_routed(
-    step: &mut Step,
+    step: &mut Step<'_>,
     load: &ModelLoadPlan,
     scope: WeightScope,
     binding: &GeneralRoutedBinding,
@@ -369,28 +653,57 @@ fn general_routed(
     if let Some((gate, up, down)) = binding.shared {
         let up = weight(WeightKind::SharedUp, up)?;
         match gate {
-            Some(gate) => step.project(&[weight(WeightKind::SharedGate, gate)?, up])?,
-            None => step.project(&[up])?,
+            Some(gate) => step.call(
+                Kernel::of::<kernels::dense_expand::Entry>(),
+                projection(&[weight(WeightKind::SharedGate, gate)?, up])?,
+            )?,
+            None => step.call(Kernel::of::<kernels::dense_up::Entry>(), projection(&[up])?)?,
         }
-        step.project(&[weight(WeightKind::SharedDown, down)?])?;
+        step.call(
+            Kernel::of::<kernels::dense_output::Entry>(),
+            projection(&[weight(WeightKind::SharedDown, down)?])?,
+        )?;
     }
-    step.launch(weight(WeightKind::Router, binding.router)?.resident_bytes)?;
+    step.call(
+        Kernel::of::<kernels::routed_select::Entry>(),
+        projection(&[weight(WeightKind::Router, binding.router)?])?,
+    )?;
     if let Some((down, up)) = binding.latent {
-        step.project(&[weight(WeightKind::LatentDown, down)?])?;
-        step.project(&[weight(WeightKind::LatentUp, up)?])?;
+        step.call(
+            Kernel::of::<kernels::project_rows::Entry>(),
+            projection(&[weight(WeightKind::LatentDown, down)?])?,
+        )?;
+        step.call(
+            Kernel::of::<kernels::dense_output::Entry>(),
+            projection(&[weight(WeightKind::LatentUp, up)?])?,
+        )?;
     }
-    let chosen = |weight: &WeightPlan| selected_bytes(weight, shape.experts, shape.selected);
-    let mut expansion = chosen(weight(WeightKind::ExpertUp, binding.expert_up)?)?;
-    if let Some(gate) = binding.expert_gate {
-        expansion = expansion
-            .checked_add(chosen(weight(WeightKind::ExpertGate, gate)?)?)
-            .ok_or_else(|| demand_error("expert expansion bytes overflow"))?;
-    }
-    step.launch(expansion)?;
-    step.launch(chosen(weight(
-        WeightKind::ExpertDown,
-        binding.expert_down,
-    )?)?)
+    let up = weight(WeightKind::ExpertUp, binding.expert_up)?;
+    let (expansion, tensors) = match binding.expert_gate {
+        Some(gate) => (
+            Kernel::of::<kernels::routed_gate_up::Entry>(),
+            vec![weight(WeightKind::ExpertGate, gate)?, up],
+        ),
+        None => (Kernel::of::<kernels::routed_up::Entry>(), vec![up]),
+    };
+    let chosen = |tensors: &[&WeightPlan]| experts(tensors, shape.experts, shape.selected);
+    step.call(
+        expansion,
+        Work {
+            experts: Some(chosen(&tensors)?),
+            ..Work::default()
+        },
+    )?;
+    step.call(
+        Kernel::of::<kernels::routed_down::Entry>(),
+        Work {
+            experts: Some(chosen(&[weight(
+                WeightKind::ExpertDown,
+                binding.expert_down,
+            )?])?),
+            ..Work::default()
+        },
+    )
 }
 
 fn usize_bytes(bytes: usize) -> Result<u64, AssessmentError> {
@@ -451,9 +764,12 @@ fn component_row_bytes(
 /// it in its block and writes its own and the block it completes, then
 /// scores every complete block (reading its key, writing and reading its F32
 /// score) and selects. Per token of context that is one block's key and
-/// score traffic over the block's rows.
+/// score traffic over the block's rows; its scoring arithmetic is priced by
+/// those bytes. Its launch clauses read its bitmap words (`B`) and, at
+/// decode rows, its selected segments (`C`, `operators::attention::graph::
+/// select`).
 fn indexer_select(
-    step: &mut Step,
+    step: &mut Step<'_>,
     domains: &[HistoryDomainLayout],
     layer: u32,
     shape: crate::SelectionShape,
@@ -482,11 +798,23 @@ fn indexer_select(
         .checked_mul(block)
         .and_then(|bytes| bytes.checked_add(finished))
         .ok_or_else(|| demand_error("indexer row bytes overflow"))?;
-    step.launch(local)?;
     let scored = finished
         .checked_add(2 * 4)
         .ok_or_else(|| demand_error("indexer block bytes overflow"))?;
-    step.read(scored.div_ceil(block), None)
+    step.call_with(
+        Kernel::of::<kernels::indexer_select::Entry>(),
+        &[("B", shape.words), ("C", selected_segments(shape.blocks))],
+        Work {
+            row_bytes: local,
+            history: Some(HistoryRead {
+                layout: None,
+                bytes_per_token: scored.div_ceil(block),
+                flops_per_token: 0,
+                window: None,
+            }),
+            ..Work::default()
+        },
+    )
 }
 
 /// The bytes of `count` recurrent bank components from `first`.
@@ -509,20 +837,27 @@ fn bank_bytes(
 }
 
 impl DecodeDemand {
-    /// What one plain decode step of one row streams and launches, from the
-    /// model's program plan, resident load plan and state layout.
+    /// The calls of one plain decode step, from the model's program plan,
+    /// resident load plan and state layout, each naming the entry its graph
+    /// runs at decode rows on the declarations' backend.
     pub fn from_model(
         definition: &ModelDefinition,
         load: &ModelLoadPlan,
         codec: KvCodec,
+        declarations: &Declarations,
     ) -> Result<Self, AssessmentError> {
         let program = load
             .program_plan(definition, codec)
             .map_err(|error| demand_error(error.to_string()))?;
         let layout =
             ModelStateLayout::derive(&definition.decoder, &[], codec, 0).map_err(demand_error)?;
+        let backend = declarations.backend();
         let target = program.target();
-        let mut step = Step::default();
+        let mut step = Step {
+            declarations,
+            resolved: HashMap::new(),
+            calls: Vec::new(),
+        };
 
         let embedding = target.embedding();
         let table = planned(
@@ -531,7 +866,10 @@ impl DecodeDemand {
             WeightKind::Embedding,
             embedding.table,
         )?;
-        step.launch(table.resident_bytes / table.shape[0])?;
+        step.call(
+            Kernel::of::<kernels::embedding_rows::Entry>(),
+            rows(table.resident_bytes / table.shape[0]),
+        )?;
         if let Some(entry) = target.per_layer() {
             per_layer_entry(&mut step, load, entry)?;
         }
@@ -547,13 +885,14 @@ impl DecodeDemand {
             // Block 0 widens the embedded row into the streams
             // (`repeat_rows`), which streams no weight.
             if index == 0 && streams.is_some() {
-                step.launch(0)?;
+                step.call(Kernel::of::<kernels::repeat_rows::Entry>(), Work::default())?;
             }
-            let input = |step: &mut Step, scope, norm| {
+            let input = |step: &mut Step<'_>, scope, norm| {
                 sublayer_input(step, load, definition, scope, norm, streams)
             };
             let scope = mixer_scope;
             let weight = |kind, bound| planned(load, scope, kind, bound);
+            let output = Kernel::of::<kernels::attention_output::Entry>();
             match block.mixer() {
                 MixerProgramSlot::Attention(binding) => {
                     input(&mut step, scope, binding.norm)?;
@@ -577,89 +916,162 @@ impl DecodeDemand {
                     .filter(|(present, _, _)| *present)
                     .map(|(_, kind, bound)| weight(kind, bound))
                     .collect::<Result<Vec<_>, _>>()?;
-                    step.project(&projections)?;
-                    if binding.history.encoding() == magnitude_state::HistoryEncoding::Unsupported {
-                        return Err(demand_error(
-                            "rotated K4/V4 history has no native attention entry",
-                        ));
-                    }
+                    let project = Kernel::of::<kernels::attention_project::Entry>();
+                    step.call(project, projection(&projections)?)?;
+                    let attend = match binding.history.encoding() {
+                        HistoryEncoding::Dense => Kernel::of::<kernels::attention_decode::Entry>(),
+                        HistoryEncoding::Affine => {
+                            Kernel::of::<kernels::attention_decode_k8v4::Entry>()
+                        }
+                        HistoryEncoding::Unsupported => {
+                            return Err(demand_error(
+                                "rotated K4/V4 history has no native attention entry",
+                            ));
+                        }
+                    };
                     let (row_bytes, window) =
                         history_read(&layout.target_history, LayerRef::Target(layer))?;
+                    let flops_per_token = 2 * shape.kv_heads * shape.group * (2 * shape.width);
+                    let read = |window| HistoryRead {
+                        layout: Some(codec),
+                        bytes_per_token: row_bytes,
+                        flops_per_token,
+                        window,
+                    };
                     match binding.selection {
-                        None => step.attend(row_bytes, window)?,
+                        None => step.call(
+                            attend,
+                            Work {
+                                history: Some(read(window)),
+                                ..Work::default()
+                            },
+                        )?,
                         // The indexer projects its query and key, selects,
                         // and attention reads the selected blocks and the
                         // row's tail: at most one block past them.
                         Some(selection) => {
-                            step.project(&[
-                                weight(WeightKind::IndexerQuery, selection.query)?,
-                                weight(WeightKind::IndexerKey, selection.key)?,
-                            ])?;
+                            step.call(
+                                project,
+                                projection(&[
+                                    weight(WeightKind::IndexerQuery, selection.query)?,
+                                    weight(WeightKind::IndexerKey, selection.key)?,
+                                ])?,
+                            )?;
                             indexer_select(
                                 &mut step,
                                 &layout.target_history,
                                 layer,
                                 selection.shape,
                             )?;
-                            let read = (selection.shape.blocks + 1)
+                            let selected = (selection.shape.blocks + 1)
                                 .checked_mul(selection.shape.block)
                                 .ok_or_else(|| demand_error("selected tokens overflow"))?;
-                            step.attend(
-                                row_bytes,
-                                Some(window.map_or(read, |window| window.min(read))),
+                            step.call(
+                                attend,
+                                Work {
+                                    history: Some(read(Some(
+                                        window.map_or(selected, |window| window.min(selected)),
+                                    ))),
+                                    ..Work::default()
+                                },
                             )?;
                         }
                     }
-                    let output = weight(WeightKind::AttentionOutput, binding.output)?;
-                    tail(&mut step, binding.tail, output, weight)?;
+                    let projected = weight(WeightKind::AttentionOutput, binding.output)?;
+                    tail(&mut step, binding.tail, output, projected, weight)?;
                 }
-                // The query-only projection row, the state advance over the
-                // layer's bank (window, state and tape components), the gated
-                // group norm and the output projection
+                // The query-only projection row (`attention_project`), the
+                // state advance over the layer's bank (window, state and
+                // tape components, `state_space_step`), the gated group norm
+                // (`state_space_gate`) and the output projection
                 // (`operators::state_space`).
                 MixerProgramSlot::StateSpace(binding) => {
                     input(&mut step, scope, binding.norm)?;
-                    step.project(&[weight(
-                        WeightKind::StateSpaceProjection,
-                        binding.projection,
-                    )?])?;
-                    step.launch(bank_bytes(&layout, recurrent_component, 3, index)?)?;
-                    recurrent_component += 3;
-                    step.launch(
-                        weight(WeightKind::StateSpaceNorm, Element::f32())?.resident_bytes,
+                    step.call(
+                        Kernel::of::<kernels::attention_project::Entry>(),
+                        projection(&[weight(
+                            WeightKind::StateSpaceProjection,
+                            binding.projection,
+                        )?])?,
                     )?;
-                    step.project(&[weight(WeightKind::RecurrentOutput, binding.output)?])?;
+                    step.call(
+                        Kernel::of::<kernels::state_space_step::Entry>(),
+                        sequences(bank_bytes(&layout, recurrent_component, 3, index)?),
+                    )?;
+                    recurrent_component += 3;
+                    step.call(
+                        Kernel::of::<kernels::state_space_gate::Entry>(),
+                        weights(&[weight(WeightKind::StateSpaceNorm, Element::f32())?])?,
+                    )?;
+                    step.call(
+                        output,
+                        projection(&[weight(WeightKind::RecurrentOutput, binding.output)?])?,
+                    )?;
                 }
-                // The segmented `u | C` projection, the gated taps over the
-                // layer's window (its only bank component) and the output
-                // projection (`operators::short_conv`).
+                // The segmented `u | C` projection (`short_conv_project`),
+                // the gated taps over the layer's window (its only bank
+                // component, `short_conv_rows`) and the output projection
+                // (`operators::short_conv`).
                 MixerProgramSlot::ShortConv(binding) => {
                     input(&mut step, scope, binding.norm)?;
-                    step.project(&[
-                        weight(WeightKind::ShortConvInputGate, binding.input_gate)?,
-                        weight(WeightKind::ShortConvOutputGate, binding.output_gate)?,
-                        weight(WeightKind::ShortConvValue, binding.value)?,
-                    ])?;
-                    step.launch(bank_bytes(&layout, recurrent_component, 1, index)?)?;
+                    step.call(
+                        Kernel::of::<kernels::short_conv_project::Entry>(),
+                        projection(&[
+                            weight(WeightKind::ShortConvInputGate, binding.input_gate)?,
+                            weight(WeightKind::ShortConvOutputGate, binding.output_gate)?,
+                            weight(WeightKind::ShortConvValue, binding.value)?,
+                        ])?,
+                    )?;
+                    let taps = weight(WeightKind::RecurrentConvolution, Element::f32())?;
+                    step.call(
+                        Kernel::of::<kernels::short_conv_rows::Entry>(),
+                        Work {
+                            weights: weight_bytes(&[taps])?,
+                            sequence_bytes: bank_bytes(&layout, recurrent_component, 1, index)?,
+                            ..Work::default()
+                        },
+                    )?;
                     recurrent_component += 1;
-                    weight(WeightKind::RecurrentConvolution, Element::f32())?;
-                    step.project(&[weight(WeightKind::RecurrentOutput, binding.output)?])?;
+                    step.call(
+                        output,
+                        projection(&[weight(WeightKind::RecurrentOutput, binding.output)?])?,
+                    )?;
                 }
                 // The segmented projection, the step over the layer's
-                // recurrent bank (window, delta and tape components) and the
+                // recurrent bank (window, delta and tape components), in the
+                // backend's step form (`operators::gated_delta`), and the
                 // output projection.
                 MixerProgramSlot::Recurrent(binding) => {
                     input(&mut step, scope, binding.norm)?;
-                    step.project(&[
-                        weight(WeightKind::RecurrentQueryKeyValue, binding.qkv)?,
-                        weight(WeightKind::RecurrentGate, binding.gate)?,
-                        weight(WeightKind::RecurrentAlpha, binding.alpha)?,
-                        weight(WeightKind::RecurrentBeta, binding.beta)?,
-                    ])?;
-                    step.launch(bank_bytes(&layout, recurrent_component, 3, index)?)?;
+                    let (project, advance) = match StepForm::of(backend).map_err(demand_error)? {
+                        StepForm::Step => (
+                            Kernel::of::<kernels::gated_delta_project::Entry>(),
+                            Kernel::of::<kernels::gated_delta_step::Entry>(),
+                        ),
+                        StepForm::Convolved => (
+                            Kernel::of::<kernels::gated_delta_project_convolved::Entry>(),
+                            Kernel::of::<kernels::gated_delta_step_convolved::Entry>(),
+                        ),
+                    };
+                    step.call(
+                        project,
+                        projection(&[
+                            weight(WeightKind::RecurrentQueryKeyValue, binding.qkv)?,
+                            weight(WeightKind::RecurrentGate, binding.gate)?,
+                            weight(WeightKind::RecurrentAlpha, binding.alpha)?,
+                            weight(WeightKind::RecurrentBeta, binding.beta)?,
+                        ])?,
+                    )?;
+                    step.call(
+                        advance,
+                        sequences(bank_bytes(&layout, recurrent_component, 3, index)?),
+                    )?;
                     recurrent_component += 3;
                     weight(WeightKind::RecurrentNorm, binding.recurrent_norm)?;
-                    step.project(&[weight(WeightKind::RecurrentOutput, binding.output)?])?;
+                    step.call(
+                        output,
+                        projection(&[weight(WeightKind::RecurrentOutput, binding.output)?])?,
+                    )?;
                 }
             }
             let scope = feed_forward_scope;
@@ -670,42 +1082,83 @@ impl DecodeDemand {
             match feed_forward {
                 FeedForwardProgramSlot::Dense(binding) => {
                     input(&mut step, scope, binding.norm)?;
-                    step.project(&[
-                        weight(WeightKind::DenseGate, binding.gate)?,
-                        weight(WeightKind::DenseUp, binding.up)?,
-                    ])?;
+                    step.call(
+                        Kernel::of::<kernels::dense_expand::Entry>(),
+                        projection(&[
+                            weight(WeightKind::DenseGate, binding.gate)?,
+                            weight(WeightKind::DenseUp, binding.up)?,
+                        ])?,
+                    )?;
                     let down = weight(WeightKind::DenseDown, binding.down)?;
-                    tail(&mut step, binding.tail, down, weight)?;
+                    tail(
+                        &mut step,
+                        binding.tail,
+                        Kernel::of::<kernels::dense_output::Entry>(),
+                        down,
+                        weight,
+                    )?;
                 }
+                // `operators::routed::fused_graph` at decode rows, in the
+                // backend's decode form: routing (`routed_route`), then the
+                // choices' and the shared expert's gate/up
+                // (`routed_expand`); or routing with the shared expert's
+                // gate/up (`routed_route_shared`), then the choices'
+                // (`routed_gate_up`). Then the choices' and the shared
+                // expert's down projections (`routed_output`).
                 FeedForwardProgramSlot::Routed(binding) => {
                     input(&mut step, scope, binding.norm)?;
-                    step.launch(weight(WeightKind::Router, binding.router)?.resident_bytes)?;
-                    let chosen = |weight: &WeightPlan| {
-                        selected_bytes(weight, binding.experts, binding.selected)
+                    let router = projection(&[weight(WeightKind::Router, binding.router)?])?;
+                    let shared = projection(&[
+                        weight(WeightKind::SharedGate, binding.shared_gate)?,
+                        weight(WeightKind::SharedUp, binding.shared_up)?,
+                    ])?;
+                    let choices = Work {
+                        experts: Some(experts(
+                            &[
+                                weight(WeightKind::ExpertGate, binding.expert_gate)?,
+                                weight(WeightKind::ExpertUp, binding.expert_up)?,
+                            ],
+                            binding.experts,
+                            binding.selected,
+                        )?),
+                        ..Work::default()
                     };
-                    let shared_expansion = [
-                        weight(WeightKind::SharedGate, binding.shared_gate)?.resident_bytes,
-                        weight(WeightKind::SharedUp, binding.shared_up)?.resident_bytes,
-                    ];
-                    let expansion = [
-                        chosen(weight(WeightKind::ExpertGate, binding.expert_gate)?)?,
-                        chosen(weight(WeightKind::ExpertUp, binding.expert_up)?)?,
-                    ]
-                    .into_iter()
-                    .chain(shared_expansion)
-                    .try_fold(0u64, u64::checked_add)
-                    .ok_or_else(|| demand_error("routed expansion bytes overflow"))?;
-                    step.launch(expansion)?;
-                    let output = chosen(weight(WeightKind::ExpertDown, binding.expert_down)?)?
-                        .checked_add(
-                            weight(WeightKind::SharedDown, binding.shared_down)?.resident_bytes,
-                        )
-                        .ok_or_else(|| demand_error("routed output bytes overflow"))?;
-                    step.launch(output)?;
+                    match DecodeForm::of(backend).map_err(demand_error)? {
+                        DecodeForm::Expand => {
+                            step.call(Kernel::of::<kernels::routed_route::Entry>(), router)?;
+                            step.call(
+                                Kernel::of::<kernels::routed_expand::Entry>(),
+                                join([choices, shared])?,
+                            )?;
+                        }
+                        DecodeForm::SharedRoute => {
+                            step.call(
+                                Kernel::of::<kernels::routed_route_shared::Entry>(),
+                                join([router, shared])?,
+                            )?;
+                            step.call(Kernel::of::<kernels::routed_gate_up::Entry>(), choices)?;
+                        }
+                    }
+                    let down = Work {
+                        experts: Some(experts(
+                            &[weight(WeightKind::ExpertDown, binding.expert_down)?],
+                            binding.experts,
+                            binding.selected,
+                        )?),
+                        ..Work::default()
+                    };
+                    step.call(
+                        Kernel::of::<kernels::routed_output::Entry>(),
+                        join([
+                            down,
+                            projection(&[weight(WeightKind::SharedDown, binding.shared_down)?])?,
+                        ])?,
+                    )?;
                 }
                 // `programs::graph::parallel`: the dense branch's expansion
-                // and its projection into F32 rows, the routed branch (summed
-                // onto zeros) in its own scope, then `moe_tail`.
+                // (`dense_expand`) and its projection into F32 rows
+                // (`project_rows`), the routed branch (summed onto zeros) in
+                // its own scope, then `moe_tail`.
                 FeedForwardProgramSlot::Parallel(binding) => {
                     let WeightScope::TargetSublayer(sublayer) = scope else {
                         return Err(demand_error("parallel branches outside a target sublayer"));
@@ -714,11 +1167,17 @@ impl DecodeDemand {
                     let dense = binding.dense;
                     let weight = |kind, bound| planned(load, dense_scope, kind, bound);
                     weight(WeightKind::InputNorm, dense.norm)?;
-                    step.project(&[
-                        weight(WeightKind::DenseGate, dense.gate)?,
-                        weight(WeightKind::DenseUp, dense.up)?,
-                    ])?;
-                    step.project(&[weight(WeightKind::DenseDown, dense.down)?])?;
+                    step.call(
+                        Kernel::of::<kernels::dense_expand::Entry>(),
+                        projection(&[
+                            weight(WeightKind::DenseGate, dense.gate)?,
+                            weight(WeightKind::DenseUp, dense.up)?,
+                        ])?,
+                    )?;
+                    step.call(
+                        Kernel::of::<kernels::project_rows::Entry>(),
+                        projection(&[weight(WeightKind::DenseDown, dense.down)?])?,
+                    )?;
                     planned(
                         load,
                         routed_scope,
@@ -727,16 +1186,13 @@ impl DecodeDemand {
                     )?;
                     general_routed(&mut step, load, routed_scope, &binding.routed)?;
                     // The branch and tail norms share the tail's element.
-                    let mut norms = 0u64;
-                    for norm_scope in [dense_scope, routed_scope, scope] {
-                        norms = norms
-                            .checked_add(
-                                planned(load, norm_scope, WeightKind::PostNorm, binding.norm)?
-                                    .resident_bytes,
-                            )
-                            .ok_or_else(|| demand_error("tail norm bytes overflow"))?;
-                    }
-                    step.launch(norms)?;
+                    let norms = [dense_scope, routed_scope, scope]
+                        .into_iter()
+                        .map(|norm_scope| {
+                            planned(load, norm_scope, WeightKind::PostNorm, binding.norm)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    step.call(Kernel::of::<kernels::moe_tail::Entry>(), weights(&norms)?)?;
                 }
                 FeedForwardProgramSlot::GeneralRouted(binding) => {
                     input(&mut step, scope, binding.norm)?;
@@ -744,7 +1200,8 @@ impl DecodeDemand {
                 }
             }
             // `programs::graph::per_layer`: the gate over the layer's slice
-            // of the per-layer rows, then its post-norm tail.
+            // of the per-layer rows (`per_layer_gate`), then its post-norm
+            // tail.
             if let Some(binding) = block.per_layer() {
                 let scope = WeightScope::TargetSublayer(SublayerIndex {
                     block: layer,
@@ -755,12 +1212,15 @@ impl DecodeDemand {
                         "a per-layer input sublayer without a post-norm tail",
                     ));
                 };
-                step.project(&[planned(
-                    load,
-                    scope,
-                    WeightKind::PerLayerGate,
-                    binding.gate,
-                )?])?;
+                step.call(
+                    Kernel::of::<kernels::per_layer_gate::Entry>(),
+                    projection(&[planned(
+                        load,
+                        scope,
+                        WeightKind::PerLayerGate,
+                        binding.gate,
+                    )?])?,
+                )?;
                 post_norm(
                     &mut step,
                     planned(
@@ -797,53 +1257,126 @@ impl DecodeDemand {
         }
 
         // The selection readout graph: the features over the final row under
-        // the exit norm (or the exit site's partials, unnormalized), the
-        // vocabulary projection (its physical matrix, even when tied to the
-        // embedding), and sampling of the one F32 logits row.
+        // the exit norm (or the exit site's partials, unnormalized,
+        // `readout_features_rows`), the vocabulary projection (its physical
+        // matrix, even when tied to the embedding, `readout_head_rows`), and
+        // sampling of the one F32 logits row (`sample_rows`).
         let readout = target.readout();
         let norm = if InputForm::exit(&definition.decoder).normalized {
-            planned(
+            vec![planned(
                 load,
                 WeightScope::Target,
                 WeightKind::OutputNorm,
                 readout.norm,
-            )?
-            .resident_bytes
+            )?]
         } else {
-            0
+            Vec::new()
         };
-        step.launch(norm)?;
+        step.call(
+            Kernel::of::<kernels::readout_features_rows::Entry>(),
+            weights(&norm)?,
+        )?;
         match readout.head {
             // Admission keeps the canonical full-projection demand even
             // when bounded classes have an optional qualified implementation.
             ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => {
-                step.project(&[planned(
-                    load,
-                    WeightScope::Target,
-                    WeightKind::Output,
-                    weight,
-                )?])?;
+                step.call(
+                    Kernel::of::<kernels::readout_head_rows::Entry>(),
+                    projection(&[planned(
+                        load,
+                        WeightScope::Target,
+                        WeightKind::Output,
+                        weight,
+                    )?])?,
+                )?;
             }
         }
-        step.launch(
-            definition
-                .decoder
-                .vocabulary
-                .checked_mul(4)
-                .ok_or_else(|| demand_error("logits bytes overflow"))?,
+        step.call(
+            Kernel::of::<kernels::sample_rows::Entry>(),
+            rows(
+                definition
+                    .decoder
+                    .vocabulary
+                    .checked_mul(4)
+                    .ok_or_else(|| demand_error("logits bytes overflow"))?,
+            ),
         )?;
-        Ok(Self {
-            streamed_bytes: step.streamed_bytes,
-            history: step.history,
-            launches: step.launches,
-        })
+        Ok(Self { calls: step.calls })
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use seismic::Layout;
+    use seismic::{BackendName, Layout};
+
+    /// The declarations of a load of `definition` under `codec` on
+    /// `backend`, from its kernel inventory.
+    pub(crate) fn declarations(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        codec: KvCodec,
+        backend: BackendName,
+    ) -> Result<Declarations, AssessmentError> {
+        let program = load
+            .program_plan(definition, codec)
+            .map_err(|error| demand_error(error.to_string()))?;
+        Declarations::of_load(
+            backend,
+            &program,
+            definition,
+            load,
+            crate::native::TuningLimits::of(crate::assessment::assess::tests::LIMITS, definition),
+        )
+    }
+
+    /// The decode demand of `definition` under `codec` on `backend`.
+    pub(crate) fn demand_on(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        codec: KvCodec,
+        backend: BackendName,
+    ) -> Result<DecodeDemand, AssessmentError> {
+        let declarations = declarations(definition, load, codec, backend)?;
+        DecodeDemand::from_model(definition, load, codec, &declarations)
+    }
+
+    /// The decode demand of `definition` under `codec` on the CPU backend.
+    pub(crate) fn demand(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        codec: KvCodec,
+    ) -> Result<DecodeDemand, AssessmentError> {
+        demand_on(definition, load, codec, BackendName::Cpu)
+    }
+
+    /// The bytes one row of one sequence streams, weights and expert slabs
+    /// included, beside history.
+    pub(crate) fn streamed(demand: &DecodeDemand) -> u64 {
+        demand
+            .calls
+            .iter()
+            .map(|call| {
+                let work = &call.work;
+                let bytes = |bytes: &[Bytes]| bytes.iter().map(|bytes| bytes.bytes).sum::<u64>();
+                bytes(&work.weights)
+                    + work.row_bytes
+                    + work.sequence_bytes
+                    + work
+                        .experts
+                        .as_ref()
+                        .map_or(0, |experts| experts.selected * bytes(&experts.slab_bytes))
+            })
+            .sum()
+    }
+
+    fn histories(demand: &DecodeDemand) -> Vec<HistoryRead> {
+        demand
+            .calls
+            .iter()
+            .filter_map(|call| call.work.history)
+            .collect()
+    }
 
     fn fixture() -> (ModelDefinition, ModelLoadPlan) {
         let definition = crate::planning::tests::fixture_definition();
@@ -855,7 +1388,7 @@ mod tests {
                 head: false,
                 vision: false,
             },
-            Layout::Rows16,
+            Layout::Rows8,
         )
         .unwrap();
         (definition, load)
@@ -871,12 +1404,29 @@ mod tests {
     #[test]
     fn a_plain_decode_step_streams_every_planned_weight_once() {
         let (definition, load) = fixture();
-        let demand = DecodeDemand::from_model(&definition, &load, KvCodec::Dense).unwrap();
+        let demand = demand(&definition, &load, KvCodec::Dense).unwrap();
         // Embedding, attention projection, attention, attention output,
         // dense expansion, dense output, readout features, readout head,
         // sampling.
-        assert_eq!(demand.launches, 9);
-        let weights = [
+        assert_eq!(
+            demand
+                .calls
+                .iter()
+                .map(|call| call.launches.kernel().name())
+                .collect::<Vec<_>>(),
+            [
+                "embedding_rows",
+                "attention_project",
+                "attention_decode",
+                "attention_output",
+                "dense_expand",
+                "dense_output",
+                "readout_features_rows",
+                "readout_head_rows",
+                "sample_rows",
+            ]
+        );
+        let matrices = [
             WeightKind::QueryGate,
             WeightKind::Key,
             WeightKind::Value,
@@ -884,18 +1434,30 @@ mod tests {
             WeightKind::DenseGate,
             WeightKind::DenseUp,
             WeightKind::DenseDown,
-            WeightKind::OutputNorm,
             WeightKind::Output,
-        ]
-        .iter()
-        .map(|kind| resident(&load, *kind).resident_bytes)
-        .sum::<u64>();
+        ];
+        let weights = matrices
+            .iter()
+            .chain(&[WeightKind::OutputNorm])
+            .map(|kind| resident(&load, *kind).resident_bytes)
+            .sum::<u64>();
         let vocabulary = definition.decoder.vocabulary;
         let embedding = resident(&load, WeightKind::Embedding);
         let embedding_row = embedding.resident_bytes / embedding.shape[0];
+        assert_eq!(streamed(&demand), weights + embedding_row + vocabulary * 4);
+        // Every matrix's FLOPs are 2 × its elements per row.
+        let flops = matrices
+            .iter()
+            .map(|kind| 2 * resident(&load, *kind).shape.iter().product::<u64>())
+            .sum::<u64>();
         assert_eq!(
-            demand.streamed_bytes,
-            weights + embedding_row + vocabulary * 4
+            demand
+                .calls
+                .iter()
+                .flat_map(|call| &call.work.row_flops)
+                .map(|flops| flops.flops)
+                .sum::<u64>(),
+            flops
         );
     }
 
@@ -912,14 +1474,14 @@ mod tests {
                 head: false,
                 vision: false,
             },
-            Layout::Rows16,
+            Layout::Rows8,
         )
         .unwrap();
-        let demand = DecodeDemand::from_model(&definition, &load, KvCodec::Dense).unwrap();
+        let demand = demand(&definition, &load, KvCodec::Dense).unwrap();
         // Embedding, widening, mix site (two stages), attention projection,
         // attention, attention output, exit site (two stages), readout
         // features, readout head, sampling.
-        assert_eq!(demand.launches, 12);
+        assert_eq!(demand.calls.len(), 12);
         let mixer = WeightScope::TargetSublayer(SublayerIndex {
             block: 0,
             sublayer: 0,
@@ -955,7 +1517,7 @@ mod tests {
         let embedding = resident(&load, WeightKind::Embedding);
         let embedding_row = embedding.resident_bytes / embedding.shape[0];
         assert_eq!(
-            demand.streamed_bytes,
+            streamed(&demand),
             weights
                 + site(mixer, true)
                 + site(WeightScope::Target, false)
@@ -979,7 +1541,7 @@ mod tests {
                     head: false,
                     vision: false,
                 },
-                Layout::Rows16,
+                Layout::Rows8,
             )
             .unwrap()
         };
@@ -987,15 +1549,15 @@ mod tests {
         let mut plain = definition.clone();
         plain.decoder.blocks[0].sublayers.truncate(2);
         let load = load_of(&definition);
-        let with = DecodeDemand::from_model(&definition, &load, KvCodec::Dense).unwrap();
-        let without = DecodeDemand::from_model(&plain, &load_of(&plain), KvCodec::Dense).unwrap();
+        let with = demand(&definition, &load, KvCodec::Dense).unwrap();
+        let without = demand(&plain, &load_of(&plain), KvCodec::Dense).unwrap();
         // Embedding and widening; per block a mix site (two stages) before
         // its mixer and its feed-forward; the gated delta's projection, step
         // and output; the routed router, expansion and output; the
         // attention's projection, read and output; the exit site and the
         // readout's three.
-        assert_eq!(without.launches, 2 + 2 * 2 * 2 + 3 + 3 + 3 + 3 + 2 + 3);
-        assert_eq!(with.launches, without.launches + 6);
+        assert_eq!(without.calls.len(), 2 + 2 * 2 * 2 + 3 + 3 + 3 + 3 + 2 + 3);
+        assert_eq!(with.calls.len(), without.calls.len() + 6);
         let scope = WeightScope::TargetSublayer(SublayerIndex {
             block: 0,
             sublayer: 2,
@@ -1027,33 +1589,40 @@ mod tests {
             .map(|kind| bytes(*kind).resident_bytes)
             .sum::<u64>()
             + windows;
-        assert_eq!(with.streamed_bytes, without.streamed_bytes + ngram);
+        assert_eq!(streamed(&with), streamed(&without) + ngram);
     }
 
     #[test]
     fn history_bytes_per_token_follow_the_state_layout_and_codec() {
         let (definition, load) = fixture();
-        // One kv head of width 64: dense bf16 keys and values, 2 × 64 × 2.
-        let dense = DecodeDemand::from_model(&definition, &load, KvCodec::Dense).unwrap();
+        // One kv head of width 64, a group of two: dense bf16 keys and
+        // values, 2 × 64 × 2 bytes; each row scores and accumulates both
+        // heads of the group over 64 columns each.
+        let dense = demand(&definition, &load, KvCodec::Dense).unwrap();
+        let flops_per_token = 2 * 2 * (64 + 64);
         assert_eq!(
-            dense.history,
+            histories(&dense),
             [HistoryRead {
+                layout: Some(KvCodec::Dense),
                 bytes_per_token: 256,
+                flops_per_token,
                 window: None,
             }]
         );
         // Affine: 64 key bytes, 32 value bytes and two (scale, zero) f16
         // pairs per 32-value group for each.
-        let affine = DecodeDemand::from_model(&definition, &load, KvCodec::AffineK8V4).unwrap();
+        let affine = demand(&definition, &load, KvCodec::AffineK8V4).unwrap();
         assert_eq!(
-            affine.history,
+            histories(&affine),
             [HistoryRead {
+                layout: Some(KvCodec::AffineK8V4),
                 bytes_per_token: 64 + 32 + 2 * (2 * 2 * 2),
+                flops_per_token,
                 window: None,
             }]
         );
         assert!(matches!(
-            DecodeDemand::from_model(&definition, &load, KvCodec::RotatedK4V4),
+            demand(&definition, &load, KvCodec::RotatedK4V4),
             Err(AssessmentError::Demand(_))
         ));
     }
@@ -1098,58 +1667,66 @@ mod tests {
                 head: false,
                 vision: false,
             },
-            Layout::Rows16,
+            Layout::Rows8,
         )
         .unwrap();
         let (plain_definition, plain_load) = fixture();
-        let plain =
-            DecodeDemand::from_model(&plain_definition, &plain_load, KvCodec::Dense).unwrap();
-        let selected = DecodeDemand::from_model(&definition, &load, KvCodec::Dense).unwrap();
+        let plain = demand(&plain_definition, &plain_load, KvCodec::Dense).unwrap();
+        let selected = demand(&definition, &load, KvCodec::Dense).unwrap();
         // The indexer's projection and select calls.
-        assert_eq!(selected.launches, plain.launches + 2);
+        assert_eq!(selected.calls.len(), plain.calls.len() + 2);
         // Its projection weights; the select call's raw keys (four F32 rows
         // of 64 plus their coordinates) and finished block key.
         let projection = resident(&load, WeightKind::IndexerQuery).resident_bytes
             + resident(&load, WeightKind::IndexerKey).resident_bytes;
         let raw = 64 * 4 + 4 * 4;
         assert_eq!(
-            selected.streamed_bytes,
-            plain.streamed_bytes + projection + 4 * raw + 64 * 4
+            streamed(&selected),
+            streamed(&plain) + projection + 4 * raw + 64 * 4
         );
-        // Attention reads at most the eight selected blocks and its tail;
-        // the indexer one block key and two scores per four tokens.
-        assert_eq!(
-            selected.history,
-            [
-                HistoryRead {
-                    bytes_per_token: (64 * 4 + 8) / 4,
-                    window: None,
-                },
-                HistoryRead {
-                    bytes_per_token: 256,
-                    window: Some(9 * 4),
-                },
-            ]
-        );
+        // The indexer reads one block key and two scores per four tokens;
+        // attention at most the eight selected blocks and its tail.
+        let history = histories(&selected);
+        assert_eq!(history[0].bytes_per_token, (64 * 4 + 8) / 4);
+        assert_eq!(history[0].window, None);
+        assert_eq!(history[1].bytes_per_token, 256);
+        assert_eq!(history[1].window, Some(9 * 4));
     }
 
     #[test]
     fn a_window_reads_at_most_its_tokens() {
         let read = HistoryRead {
+            layout: Some(KvCodec::Dense),
             bytes_per_token: 10,
+            flops_per_token: 0,
             window: Some(100),
         };
-        assert_eq!(read.bytes_at(40), 400);
-        assert_eq!(read.bytes_at(4_000), 1_000);
+        assert_eq!(read.tokens_at(40), 40);
+        assert_eq!(read.tokens_at(4_000), 100);
     }
 
     #[test]
-    fn a_selected_expert_share_streams_its_slabs() {
+    fn a_selected_expert_share_reads_its_slabs() {
         let (_, load) = fixture();
-        let mut experts = resident(&load, WeightKind::DenseUp).clone();
-        experts.shape = vec![8, 32, 64];
-        experts.resident_bytes = 8 * 32 * 64 * 2;
-        assert_eq!(selected_bytes(&experts, 8, 2).unwrap(), 2 * 32 * 64 * 2);
-        assert!(selected_bytes(&experts, 3, 1).is_err());
+        let mut tensor = resident(&load, WeightKind::DenseUp).clone();
+        tensor.shape = vec![8, 32, 64];
+        tensor.resident_bytes = 8 * 32 * 64 * 2;
+        assert_eq!(
+            experts(&[&tensor], 8, 2).unwrap(),
+            Experts {
+                experts: 8,
+                selected: 2,
+                slab_bytes: vec![Bytes {
+                    format: tensor.resident,
+                    bytes: 32 * 64 * 2,
+                }],
+                slab_flops: vec![Flops {
+                    format: tensor.resident,
+                    flops: 2 * 32 * 64,
+                }],
+            }
+        );
+        assert!(experts(&[&tensor], 3, 1).is_err());
+        assert!(experts(&[&tensor], 8, 9).is_err());
     }
 }

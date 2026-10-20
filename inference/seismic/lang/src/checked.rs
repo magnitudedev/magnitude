@@ -1427,13 +1427,15 @@ impl NativeLaunch {
 }
 
 /// One value for every static dimension and tuning parameter of a native
-/// implementation. It is the complete compile-time input of native formation
-/// beyond element bindings.
+/// implementation, and the range of any call-time dimension its calls are
+/// held to. It is the complete compile-time input of native formation beyond
+/// element bindings.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NativeSpecialization {
     statics: std::collections::BTreeMap<String, u64>,
     params: std::collections::BTreeMap<String, u64>,
     launch_params: std::collections::BTreeMap<(usize, String), u64>,
+    ranges: std::collections::BTreeMap<String, (u64, u64)>,
 }
 
 impl NativeSpecialization {
@@ -1454,6 +1456,16 @@ impl NativeSpecialization {
     pub fn with_launch_param(mut self, launch: usize, name: impl Into<String>, value: u64) -> Self {
         self.launch_params.insert((launch, name.into()), value);
         self
+    }
+    /// Hold every call to call-time dimension `name` in `low..=high`: a
+    /// launch no value in the range activates is not formed, and a call
+    /// outside it is refused.
+    pub fn with_range(mut self, name: impl Into<String>, low: u64, high: u64) -> Self {
+        self.ranges.insert(name.into(), (low, high));
+        self
+    }
+    pub fn ranges(&self) -> &std::collections::BTreeMap<String, (u64, u64)> {
+        &self.ranges
     }
     pub fn statics(&self) -> &std::collections::BTreeMap<String, u64> {
         &self.statics
@@ -1506,6 +1518,14 @@ pub enum NativeSpecializationError {
     /// The configuration violates the `where` condition.
     Inadmissible,
     Evaluation(NativeEvalError),
+    /// A range is given for a static dimension, whose value is fixed.
+    RangedStatic(String),
+    /// A range admits no value.
+    EmptyRange {
+        name: String,
+        low: u64,
+        high: u64,
+    },
 }
 
 impl std::fmt::Display for NativeSpecializationError {
@@ -1538,6 +1558,12 @@ impl std::fmt::Display for NativeSpecializationError {
                 f.write_str("configuration violates the native `where` condition")
             }
             Self::Evaluation(error) => write!(f, "{error}"),
+            Self::RangedStatic(name) => {
+                write!(f, "`{name}` is a static dimension and takes no range")
+            }
+            Self::EmptyRange { name, low, high } => {
+                write!(f, "the range {low}..={high} of `{name}` admits no value")
+            }
         }
     }
 }
@@ -1553,6 +1579,18 @@ impl NativeImplementation {
         for name in &self.statics {
             if specialization.static_value(name).is_none() {
                 return Err(NativeSpecializationError::MissingStatic(name.clone()));
+            }
+        }
+        for (name, &(low, high)) in specialization.ranges() {
+            if self.statics.contains(name) {
+                return Err(NativeSpecializationError::RangedStatic(name.clone()));
+            }
+            if low > high {
+                return Err(NativeSpecializationError::EmptyRange {
+                    name: name.clone(),
+                    low,
+                    high,
+                });
             }
         }
         if let Some(name) = specialization
@@ -1646,6 +1684,29 @@ impl NativeImplementation {
             }
         }
         Ok(())
+    }
+
+    /// Whether some call `specialization` admits activates launch `launch`:
+    /// false only when its `when` condition is false at every value of the
+    /// call-time dimensions within the specialization's ranges (a dimension
+    /// without one ranges over every value).
+    pub fn reachable(&self, specialization: &NativeSpecialization, launch: usize) -> bool {
+        let Some(when) = &self.launches[launch].when else {
+            return true;
+        };
+        let dimension = |name: &str| {
+            specialization
+                .static_value(name)
+                .map(|value| (value, value))
+                .or_else(|| specialization.ranges().get(name).copied())
+        };
+        let parameter = |name: &str| {
+            specialization
+                .launch_param(launch, name)
+                .or_else(|| specialization.param(name))
+                .map(|value| (value, value))
+        };
+        when.bounded(&dimension, &parameter) != NativeBounded::Always(false)
     }
 
     /// The group size of launch `launch` under `specialization`, when every
@@ -2659,6 +2720,50 @@ mod native_tests {
         ));
     }
 
+    /// A range on a call-time dimension leaves unreachable exactly the
+    /// launches no value in it activates; static and empty ranges are refused.
+    #[test]
+    fn a_range_reaches_only_the_launches_its_values_activate() {
+        let module = check_source(source(
+            "native scale for metal from \"scale.metal\":\n    launch small when N < 8:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N >= 8:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        ))
+        .expect("conditional launches check");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let reached = |specialization: &NativeSpecialization| {
+            native.validate(specialization).unwrap();
+            [0, 1].map(|launch| native.reachable(specialization, launch))
+        };
+        assert_eq!(reached(&NativeSpecialization::new()), [true, true]);
+        assert_eq!(
+            reached(&NativeSpecialization::new().with_range("N", 1, 7)),
+            [true, false]
+        );
+        assert_eq!(
+            reached(&NativeSpecialization::new().with_range("N", 8, 8)),
+            [false, true]
+        );
+        assert_eq!(
+            reached(&NativeSpecialization::new().with_range("N", 7, 8)),
+            [true, true]
+        );
+        assert!(matches!(
+            native.validate(&NativeSpecialization::new().with_range("N", 5, 4)),
+            Err(NativeSpecializationError::EmptyRange { .. })
+        ));
+        let fixed = check_source(source(
+            "native scale for metal from \"scale.metal\":\n    static (N)\n    launch all:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        ))
+        .expect("static native checks");
+        let fixed = fixed
+            .native_implementation(fixed.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        assert!(matches!(
+            fixed.validate(&NativeSpecialization::new().with_static("N", 4).with_range("N", 4, 4)),
+            Err(NativeSpecializationError::RangedStatic(name)) if name == "N"
+        ));
+    }
 
     #[test]
     fn ordinary_boolean_shape_domain_is_retained_and_not_split() {

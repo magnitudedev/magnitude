@@ -1,9 +1,8 @@
-//! Every catalog component's definition, pinned. For each target header in
-//! `inference/catalog/headers/` (all shards of a split
-//! target) the family that
+//! Every catalog component's definition, pinned. For each catalog target
+//! (`headers::index`; all shards of a split target) the family that
 //! recognizes it builds its `ModelDefinition` (with the model's projector,
-//! when the catalog has one), and the `dflash` family builds each of the
-//! model's drafts against it. The serialized definitions' SHA-256 digests
+//! when the catalog has one), and the `dflash` family builds the model's
+//! draft against it. The serialized definitions' SHA-256 digests
 //! must equal `fixtures/catalog-definitions.json`, first recorded from the
 //! family code before it moved onto this crate. A change that means to alter
 //! a definition re-records the fixture in the same change.
@@ -11,7 +10,7 @@
 //! `CATALOG_DEFINITIONS=record` rewrites the fixture;
 //! `CATALOG_DEFINITIONS_DUMP=<dir>` also writes each serialized definition.
 
-use magnitude_artifacts::{ArtifactIdentity, PackageIdentity};
+use magnitude_artifacts::{catalog_headers::ComponentRole, ArtifactIdentity, PackageIdentity};
 use magnitude_family_common::headers;
 use magnitude_family_contracts::ModelFamily;
 use magnitude_family_gemma4::Gemma4Family;
@@ -63,41 +62,30 @@ fn outcome<T: Serialize, E>(key: &str, built: &Result<T, E>) -> String {
 
 fn outcomes() -> BTreeMap<String, String> {
     let index = headers::index();
-    let component = |model: &str, role: &str| -> Vec<&String> {
+    let component = |model: &str, role: ComponentRole| {
         index
             .iter()
-            .filter(|(m, r, _)| m == model && r == role)
-            .map(|(_, _, file)| file)
-            .collect()
+            .find(|component| component.model == model && component.role == role)
     };
     let mut outcomes = BTreeMap::new();
-    for (model, role, file) in &index {
-        if !role.starts_with("target") {
-            continue;
-        }
-        // A split target's full tensor directory is dumped beside its first
-        // shard's.
-        let all_shards = file.replace(".json", "-allshards.json");
-        let file = if headers::root().join(&all_shards).exists() {
-            &all_shards
-        } else {
-            file
-        };
-        let target = headers::directory(file);
-        let Some(family) = FAMILIES.iter().find(|family| family.recognizes(&target)) else {
-            outcomes.insert(file.clone(), "unrecognized".into());
+    for target in index {
+        let ComponentRole::Target { .. } = target.role else {
             continue;
         };
-        let projector = component(model, "projector")
-            .first()
-            .map(|file| headers::directory(file));
-        let built = family.inspect(&target, projector.as_ref(), identity());
-        outcomes.insert(file.clone(), outcome(file, &built));
+        let name = headers::key(target);
+        let directory = headers::component(target);
+        let Some(family) = FAMILIES.iter().find(|family| family.recognizes(&directory)) else {
+            outcomes.insert(name, "unrecognized".into());
+            continue;
+        };
+        let projector = component(&target.model, ComponentRole::Projector).map(headers::component);
+        let built = family.inspect(&directory, projector.as_ref(), identity());
+        outcomes.insert(name.clone(), outcome(&name, &built));
         let Ok(definition) = built else { continue };
-        for draft in component(model, "draft") {
-            let key = format!("{draft}@{file}");
+        if let Some(draft) = component(&target.model, ComponentRole::Draft) {
+            let key = format!("{}@{name}", headers::key(draft));
             let built = magnitude_family_dflash::inspect(
-                &headers::directory(draft),
+                &headers::component(draft),
                 &definition,
                 &|layer| family.layer_entry(&definition, layer),
             );

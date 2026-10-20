@@ -1,28 +1,22 @@
 use magnitude_artifacts::{
-    ArtifactIdentity, ImageProcessor, InputLayout, PackageIdentity, TokenId,
     media::{DType, PreparedMedia, PreparedTensor},
+    ArtifactIdentity, ImageProcessor, InputLayout, PackageIdentity, TokenId,
 };
-use magnitude_family_common::headers::directory_from_bytes;
+use magnitude_family_common::headers::catalog;
 use magnitude_family_contracts::{
     FamilyError, MarkerTokens, ModelDefinition, PositionSampling, TokenPlan, VisionResize,
 };
 use magnitude_family_qwen35::{inspect_components, minicpm};
 
 fn definition(large: bool) -> ModelDefinition {
-    let (target, projector): (&[u8], &[u8]) = if large {
-        (
-            include_bytes!("fixtures/minicpm-v-4.7-35b-a3b-target.json"),
-            include_bytes!("fixtures/minicpm-v-4.7-35b-a3b-projector.json"),
-        )
+    let model = if large {
+        "minicpm-v-4.7-35b-a3b"
     } else {
-        (
-            include_bytes!("fixtures/minicpm-v-4.7-1b-target.json"),
-            include_bytes!("fixtures/minicpm-v-4.7-1b-projector.json"),
-        )
+        "minicpm-v-4.7-1b"
     };
     inspect_components(
-        &directory_from_bytes(target),
-        Some(&directory_from_bytes(projector)),
+        &catalog(&format!("{model}__target-gguf:q4")),
+        Some(&catalog(&format!("{model}__projector"))),
         PackageIdentity {
             target: ArtifactIdentity([0; 32]),
             projector: Some(ArtifactIdentity([1; 32])),
@@ -64,7 +58,7 @@ fn both_released_projectors_bind_the_exact_tower_and_merger() {
 #[test]
 fn unsupported_compression_and_unknown_weights_are_refused() {
     use magnitude_artifacts::gguf::{Scalar, Value};
-    let mut p = directory_from_bytes(include_bytes!("fixtures/minicpm-v-4.7-1b-projector.json"));
+    let mut p = catalog("minicpm-v-4.7-1b__projector");
     let original = p.clone();
     p.metadata
         .iter_mut()

@@ -22,7 +22,10 @@
 //! differed by 5% at the median and 35% at the 90th percentile within one
 //! load, and the defaults' own time at 8 of 105 points by more than 30%
 //! between two loads. A GB10 has no such states: its samples read the same
-//! at every duty and after every idle.
+//! at every duty and after every idle. A CPU's do not move by more than the
+//! stopping rule's tolerance either: one copy unraised and raised read 0.4%
+//! apart on rtx3090 and 4.3% on GB10 (2026-10-19), so no clock is raised for
+//! work whose [`Work::clock`] is none.
 //!
 //! So a session reads at one state, the device's *sustained clock*: the one
 //! it reaches under work without pause, which is also the one serving runs
@@ -70,9 +73,12 @@
 //! joins the reference, and no level costs an allowance twice.
 
 use crate::deadline::{Deadline, WorkError};
-use crate::session::{Slot, Slotted, passes_covering};
-use crate::statistics::{Tally, median_of};
+use crate::session::{passes_covering, Slot, Slotted};
+use crate::statistics::{median_of, Tally};
 use crate::work::{Gauge, Pending, Work};
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -636,6 +642,69 @@ pub fn warm<S: Slotted>(
         first.warmed(began.elapsed().as_secs_f64());
     }
     raised
+}
+
+/// Raise the device `slots` run on with its held `clock`, without a
+/// deadline (an establishment's length is bounded by its rule); nothing for
+/// work whose clock is not held ([`HeldClocks`]).
+pub(crate) fn raise_held<S: Slotted>(
+    clock: Option<&Clock<<S::Work as Work>::Error>>,
+    slots: &[S],
+) -> Result<(), <S::Work as Work>::Error> {
+    let Some(clock) = clock else {
+        return Ok(());
+    };
+    warm(clock, slots, Deadline::default()).map_err(|error| match error {
+        WorkError::Failed(error) => error,
+        WorkError::Expired => unreachable!("a raise without a deadline does not expire"),
+    })
+}
+
+/// The sustained clocks a caller holds across measurements, one per clock
+/// key (a physical device, shared by its executors). Each is established
+/// by the first measurement under its key, with that measurement's work
+/// placed as its gauge, with readings of `reading_seconds` and the evidence
+/// a lead takes at `error_rate`, and raised again by every later one. Work
+/// whose clock is none is never raised. Opaque; it keeps every gauge alive.
+pub struct HeldClocks<K, E> {
+    clocks: HashMap<K, Arc<Clock<E>>>,
+    reading_seconds: f64,
+    error_rate: f64,
+}
+
+impl<K: Eq + Hash + Clone, E> HeldClocks<K, E> {
+    /// No clock held yet; clocks established with readings of
+    /// `reading_seconds` of device time and the evidence a lead takes at
+    /// `error_rate`.
+    pub fn new(error_rate: f64, reading_seconds: f64) -> Self {
+        Self {
+            clocks: HashMap::new(),
+            reading_seconds,
+            error_rate,
+        }
+    }
+
+    /// The clock `slot`'s work runs under: the one held under its key, else
+    /// one gauged with its work; none for work whose clock is none.
+    pub fn hold<W: Work<Clock = K, Error = E>>(
+        &mut self,
+        slot: &Slot<W>,
+    ) -> Result<Option<Arc<Clock<E>>>, E> {
+        let Some(key) = slot.work().clock() else {
+            return Ok(None);
+        };
+        let clock = match self.clocks.entry(key) {
+            Entry::Occupied(held) => held.get().clone(),
+            Entry::Vacant(vacant) => vacant
+                .insert(Arc::new(Clock::new(
+                    slot.work(),
+                    self.reading_seconds,
+                    self.error_rate,
+                )?))
+                .clone(),
+        };
+        Ok(Some(clock))
+    }
 }
 
 #[cfg(test)]

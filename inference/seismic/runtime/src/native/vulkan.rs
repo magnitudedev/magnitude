@@ -682,14 +682,16 @@ fn each_launch(
         );
         let scalars = vulkan_buffer(&dispatch.kernel.scalars);
         for (ordinal, launch) in dispatch.launches.iter().enumerate() {
-            let (module, function) = launches.launch(ordinal);
-            let launch = launch.map(|launch| DirectLaunch {
-                module,
-                function,
-                buffers: &typed,
-                words: dispatch.word_bytes,
-                scalar_results: (scalars, 0),
-                groups: launch.groups,
+            let launch = launch.map(|launch| {
+                let (module, function) = launches.launch(ordinal);
+                DirectLaunch {
+                    module,
+                    function,
+                    buffers: &typed,
+                    words: dispatch.word_bytes,
+                    scalar_results: (scalars, 0),
+                    groups: launch.groups,
+                }
             });
             visit(launch.as_ref()).map_err(CallError::Execution)?;
         }

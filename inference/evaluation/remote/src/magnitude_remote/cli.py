@@ -60,6 +60,7 @@ def _run(arguments) -> int:
         model=arguments.model,
         gate=_gate(arguments, not arguments.no_gate),
         max_hold_seconds=arguments.max_hold,
+        catalog_headers=arguments.catalog_headers,
     )
     return _finish(job, arguments.host)
 
@@ -123,6 +124,9 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--host", help="ssh alias or pool; omitted runs locally")
     run.add_argument("--model", help="catalog reference <model>:<variant> to acquire")
     run.add_argument("--build", action="append", default=[], help="build command (repeatable)")
+    run.add_argument("--catalog-headers", action="store_true",
+                     help="export the catalog's headers on the host and name them to the job "
+                          "(MAGNITUDE_CATALOG_HEADERS)")
     run.add_argument("--no-gate", action="store_true", help="skip the thermal gate")
     run.add_argument("--max-hold", type=float, default=Job.max_hold_seconds, help="seconds")
     _gate_arguments(run)

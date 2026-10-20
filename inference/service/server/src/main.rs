@@ -17,9 +17,13 @@ use magnitude_service_server::assessment::assessor::{EngineHeaderVerdicts, Model
 use magnitude_service_server::assessment::candidates::{
     ManagedModelCandidates, engine_architectures,
 };
-use magnitude_service_server::assessment::environment::AssessmentEnvironment;
+use magnitude_service_server::assessment::environment::{
+    AssessmentEnvironment, assessment_structure,
+};
+use magnitude_service_server::assessment::measurement::{self, ServiceMachine};
 use magnitude_service_server::build_identity;
 use magnitude_service_server::configurations::ResolvedConfigurations;
+use magnitude_service_server::device_lock::DeviceLock;
 use magnitude_service_server::hardware::HardwareInventory;
 use magnitude_service_server::model_store::{ServedStore, open_served_store};
 use magnitude_service_server::residency::controller::{
@@ -167,17 +171,39 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 store: inventory,
                 devices: catalog,
             } = open_served_store(inventory_config, reserves).await?;
+            let kernels = inventory.derived_cache().kernel_directory();
             // Every model is assessed on the device a load selects, established once from the
-            // discovered topology: selection, a status sample and bandwidth.
-            let assessment_environment = {
+            // discovered topology (selection and a status sample), under what the measurement
+            // job has stored of this machine. Nothing is measured here: the service is ready at
+            // once, and the job measures what is missing in a worker of its own: the
+            // executor's fixed cost points, whatever the models.
+            let (structure, stored) = {
                 let catalog = Arc::clone(&catalog);
-                Arc::new(
-                    tokio::task::spawn_blocking(move || AssessmentEnvironment::establish(&catalog))
-                        .await
-                        .context("assessment environment task failed")?
-                        .context("failed to establish the assessment environment")?,
-                )
+                let kernels = kernels.clone();
+                tokio::task::spawn_blocking(move || {
+                    let structure = assessment_structure(&catalog)?;
+                    let stored = structure.stored_measurements(&kernels);
+                    anyhow::Ok((Arc::new(structure), stored))
+                })
+                .await
+                .context("assessment structure task failed")?
+                .context("failed to establish the assessment structure")?
             };
+            let assessment_environment = Arc::new(
+                AssessmentEnvironment::new(Arc::clone(&structure), stored.clone())
+                    .context("failed to establish the assessment environment")?,
+            );
+            let device = DeviceLock::default();
+            let measurement = measurement::start(
+                Arc::new(ServiceMachine::new(
+                    structure,
+                    worker_launcher.clone(),
+                    inventory.served_paths(),
+                    kernels.clone(),
+                )),
+                stored,
+                device.clone(),
+            );
             let model_downloads = Arc::new(
                 ManagedModelDownloads::open(inventory.clone())
                     .await
@@ -186,7 +212,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
             let native_build = build_identity::native_build();
             let model_variants =
                 ModelDomainResolver::new(inventory.clone(), release_catalog.catalog().clone());
-            let kernel_directory = inventory.derived_cache().kernel_directory();
             let assessor = Arc::new(ModelAssessor::new(
                 inventory.clone(),
                 model_variants.clone(),
@@ -198,7 +223,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 model_variants: model_variants.clone(),
                 configurations: Arc::new(ResolvedConfigurations::new(
                     inventory.clone(),
-                    kernel_directory,
+                    kernels,
                     reserves,
                 )),
                 host_memory: Arc::new(SeismicHostMemory::new(catalog.clone(), reserves)),
@@ -206,6 +231,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 reserves,
                 idle_timeout: MODEL_IDLE_TIMEOUT,
                 launcher: worker_launcher,
+                device,
                 instance_id_namespace: instance_id.clone(),
             });
             let model_services = managed_model_services(
@@ -233,6 +259,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 assessor,
                 model_services.catalog.clone(),
                 model_services.local.clone(),
+                measurement,
             );
             instances.attach_assessments(assessments.clone());
             let mut state = AppState::new()

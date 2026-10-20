@@ -35,6 +35,19 @@ Every file-backed format must be classified before its persistence behavior is d
 | Recomputable index | local-model inventory, session lookup index | Re-enumerate authoritative files or records | Never |
 | Durable user state | user preferences with defined defaults | Preserve valid values; default damaged values | Only if recovery is catastrophic |
 | Irreplaceable record | session events, user content, credentials | Format-specific durability and repair protocol | Yes; this document's defaulting rules do not apply |
+| Hardware measurement evidence | a measured point's timing (an executor's cost point) | Explicit measurement under the point's current executor, driver and kernel key | Yes; persistence and measurement failures are explicit |
+
+Hardware measurements record active observations, not a pure derivation from immutable source
+data. Seismic's measurer owns their keys, validity and remeasurement; the kernel cache stores them
+through Seismic's record store trait and reports absence separately from read, decode and write
+errors, so it cannot silently discard failures or substitute timings. Writes are atomic. Reads are
+bounded by the largest file a timing record can be written as, and a larger file is an error like
+any other unreadable one. Records live beside the kernel cache's entries but are not its entries:
+kernel-cache eviction never removes them, since their validity is their key, not their use. Only
+the measurement job, a contained worker, writes them; the service only reads them, at start and
+after each job, and never measures. The job's attempt records live beside them under the same
+rules: one per point key, counting the jobs that ended while timing it, so a point that ended two
+jobs is unobtainable until its hardware or driver changes, and eviction never removes them.
 
 Release artifacts are a separate class from files in a user data directory. Reviewed catalog
 declarations and their minimal ID-to-commit lock generate one self-describing planner-input bundle,
@@ -153,22 +166,24 @@ same-directory atomic rename where the platform supports it. Restrictive permiss
 temporary-file cleanup still apply. Locking may reduce duplicate work, but correctness comes from
 tolerant readers and atomic publication, not from the lock.
 
-Cache deletion and garbage collection are always safe. Size and age policies may remove any entry;
-the next access regenerates it. Negative or operational results are cached only when they are stable
+Cache deletion and garbage collection are always safe. Size and age policies may remove any cache
+entry, and the next access regenerates it; hardware measurement evidence is not a cache entry and
+is never removed by them. Negative or operational results are cached only when they are stable
 domain facts with complete validity evidence; transient failures are never persisted as facts.
 The remote GGUF header cache is bounded by size with least-recently-used eviction and stores the
 large metadata entries headers share once; its policy is in
 [Model catalog and acquisition](../model-management/catalog-and-acquisition.md#header-cache).
 
 Model-assessment entries are keyed by the complete assessment identity: the assessment environment
-(engine build, device and its resolved memory bandwidth, normalized stable topology and process
-limits, reserve policy and serving configuration), the exact bundle, and the profile with its
-performance depths. Live available/free memory is not cached assessment evidence. An absent or unreadable entry is an entry-level miss; readers do not
-recognize historical aliases or add a cache-format revision to force invalidation.
+(engine build, device and its executor costs, normalized stable topology and process limits,
+reserve policy and serving configuration), the exact bundle, and the profile with its performance
+depths. Live available/free memory is not cached assessment evidence. An absent or unreadable entry
+is an entry-level miss; readers do not recognize historical aliases or add a cache-format revision
+to force invalidation.
 
 Model inventory indexes, content hashes, GGUF inspection, source resolution, package construction,
-tensor storage, hardware calibration, model assessment, execution planning, and timing evidence are
-all recomputable caches. Completed artifact files and immutable release catalog data are their
+tensor storage, model assessment, execution planning and load timing evidence are all recomputable
+caches. Completed artifact files and immutable release catalog data are their
 authorities. Removing or corrupting any such cache cannot change which artifacts are present,
 create or remove a serving configuration, or change durable user intent.
 

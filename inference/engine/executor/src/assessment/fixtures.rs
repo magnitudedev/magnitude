@@ -5,6 +5,93 @@
 use crate::source_element;
 use magnitude_artifacts::gguf::Encoding;
 
+/// The encodings the synthetic costs measure: every one the fixtures and
+/// the catalog's models hold.
+const FORMATS: [Encoding; 16] = [
+    Encoding::Q8_0,
+    Encoding::Q5K,
+    Encoding::Q6K,
+    Encoding::Q4K,
+    Encoding::Mxfp4,
+    Encoding::Iq4Nl,
+    Encoding::Nvfp4,
+    Encoding::Q5_1,
+    Encoding::Iq2Xs,
+    Encoding::Q4_0,
+    Encoding::Q5_0,
+    Encoding::Iq2Xxs,
+    Encoding::Iq3Xxs,
+    Encoding::Q3K,
+    Encoding::Iq4Xs,
+    Encoding::Iq3S,
+];
+
+/// Synthetic executor costs, each from one sample: 300 GB/s weight
+/// streaming of every format, both storage kinds on device storage's
+/// route; 20 TFLOP/s over every format's representation on every backend
+/// (with the dense f32 and bf16); every history layout at 10 µs per call
+/// plus 200 GB/s; 5 µs launches; a 1.2 composition ratio; a 50 µs
+/// pipelined and a 150 µs round-trip step.
+pub(crate) fn costs() -> super::ExecutorCosts {
+    use super::executor_costs::{
+        HistoryCosts, MatrixCosts, MeasuredCost, Placement, Placements, WeightRate,
+    };
+    let cost = |value| MeasuredCost {
+        value,
+        interval: None,
+        samples: 1,
+    };
+    let mut formats = seismic::BackendName::ALL
+        .into_iter()
+        .flat_map(|backend| {
+            let layout = crate::resident_layout(crate::ExecutionPath::Native, backend);
+            FORMATS.iter().filter_map(move |encoding| {
+                crate::resident_element(*encoding, 4096, seismic::DType::BF16, layout)
+            })
+        })
+        .chain([seismic::Element::bf16(), seismic::Element::f32()])
+        .collect::<Vec<_>>();
+    formats.sort_unstable_by_key(|element| element.name());
+    formats.dedup();
+    super::ExecutorCosts {
+        weight_rates: formats
+            .iter()
+            .map(|&format| WeightRate {
+                route: seismic::AccessRoute::Device,
+                format,
+                bytes_per_second: cost(300e9),
+                features: 16384,
+            })
+            .collect(),
+        placements: Placements {
+            device: Placement::along(seismic::AccessRoute::Device),
+            upload: Placement::along(seismic::AccessRoute::Device),
+        },
+        matrices: formats
+            .into_iter()
+            .map(|format| MatrixCosts {
+                format,
+                flops: cost(20e12),
+                features: 16384,
+            })
+            .collect(),
+        histories: super::HISTORY_LAYOUTS
+            .iter()
+            .map(|&layout| HistoryCosts {
+                layout,
+                fixed_seconds: cost(10e-6),
+                bytes_per_second: cost(200e9),
+                depths: [2048, 4096],
+            })
+            .collect(),
+        composition: cost(1.2),
+        launch_seconds: cost(5e-6),
+        step_pipelined_seconds: cost(50e-6),
+        step_round_trip_seconds: cost(150e-6),
+        unmeasured: Vec::new(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeclaredFeedForward {
     Dense {

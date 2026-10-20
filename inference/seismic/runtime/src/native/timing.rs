@@ -161,7 +161,7 @@ impl<'a> PointTiming<'a> {
     /// The samples so far as a measurement. Tuning counts or matches its
     /// samples and samples to no stopping rule, so it has no interval.
     pub(crate) fn measurement(&self) -> Measurement {
-        self.slot.measurement()
+        self.slot.measurement(None)
     }
 
     /// Run every call of the rotation once from pristine state and hand

@@ -640,7 +640,10 @@ pub enum HardwareReportedBy {
     CudaTotalBeyondDedicated,
     MetalWorkingSetBeyondDedicated,
     DxgiDedicatedMemory,
-    CudaMemoryClockBusWidth,
+    LinuxSysfsCache,
+    MacOsSysctlCache,
+    WindowsProcessorCache,
+    CudaL2Cache,
     FilesystemSize,
     FilesystemAvailable,
 }

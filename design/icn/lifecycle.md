@@ -40,13 +40,14 @@ observes both root exit and zero job members through retained handles; a deadlin
 those handles and does not authorize a replacement. Environment blocks use Windows ordinal name
 comparison, reject duplicate names, preserve inherited per-drive current-directory entries,
 and preserve UTF-16 arguments without shell interpretation.
-Both measurement and inference workers use this acquisition boundary. Measurement pipes are
-transferred through owned Windows handles into Tokio's standard child-stream adapters; dropping the
-measurement owner closes its job before disposing of the adapters, so pending pipe reads can finish
-on child exit. Inference-worker ownership begins immediately after spawn, before the load
+Inference workers, including the measurement job (an inference worker given `Measure`), use this
+acquisition boundary. Worker ownership begins immediately after spawn, before the protocol
 handshake. The engine protocol runs over the worker's standard input and output as blocking
-handles; its standard error is drained into ICN's log and a bounded tail accompanies load
-failures. Dropping the last engine client closes the transport, and the worker exits.
+handles; its standard error is drained into ICN's log and a bounded tail accompanies load and
+measurement failures. Dropping the last engine client closes the transport, and the worker exits.
+The measurement job's frames are read on a dedicated thread into the async runtime, which owns the
+job's hard deadline; on the deadline or an error the job is killed and waited for a bounded time on
+a detached task, never through the residency worker's unbounded retirement.
 No independent ICN discovery or durable owner store exists.
 Platform child acquisition is a scoped capability supplied by ACN's host composition. It owns exact
 process identity, separate standard streams, exit observation and single-flight tree retirement.
@@ -347,8 +348,11 @@ Startup is one scoped acquisition:
 ICN's HTTP listener is created before it emits the startup record. Its readiness response is
 successful only after storage, inventory recovery and API state are usable. After the server
 state is constructed, ICN starts inventory discovery and the automatic assessment pool without
-awaiting either. The assessment environment is established during startup, beside device
-discovery, and a failure to establish it fails startup. Startup retry applies only to
+awaiting either. The assessment environment's structure (the selected device, a status sample and
+the serving policy) is established during startup, beside device discovery, and a failure to
+establish it fails startup; its measured part is only derived from records in the kernel cache, so
+nothing at startup measures or waits on a measurement, and a missing or unreadable measurement
+leaves speeds pending for the measurement job. Startup retry applies only to
 transient connection/unready outcomes. Authentication failure, instance mismatch, incompatible
 identity, malformed response, and child exit fail immediately.
 
@@ -559,7 +563,8 @@ The lifecycle conforms when:
 - launch is model-free and changing the active model never replaces the ICN process;
 - ICN's first local-model scan uses the configuration snapshot named at spawn, and every later
   configuration change arrives as a whole idempotent snapshot without restarting ICN;
-- ICN readiness never waits for measurement; the assessment pool is `Preparing` until its basis exists;
+- ICN establishes the assessment environment's structure before readiness, measuring nothing;
+  model discovery, assessment and the measurement job then run in the background;
 - loopback binding has no probe-then-bind race and readiness proves child instance identity;
 - every bootstrap record produced by ICN is accepted by its generated Bun schema, and generated
   contract drift fails validation;

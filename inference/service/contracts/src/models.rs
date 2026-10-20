@@ -2230,8 +2230,9 @@ pub struct MemoryAssessment {
     pub remaining_bytes: i64,
 }
 
-/// An estimated decode speed at one context depth: the model's bytes per decode step over the
-/// device's memory bandwidth.
+/// An estimated decode speed at one context depth, in tokens per second per conversation, from
+/// the costs measured of this machine's selected executor: what the engine's own kernels achieve
+/// on it.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2240,17 +2241,52 @@ pub struct PerformanceEvidence {
     pub estimated_tokens_per_second: f64,
 }
 
+/// A fitting model's speed estimates.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum ModelPerformance {
+    /// This machine's measurements do not exist yet: the measurement job has not stored them.
+    Pending,
+    /// A measurement the estimate needs could not be taken on this machine.
+    Unavailable { failure: ModelFailure },
+    /// One decode-speed estimate per requested depth, ascending.
+    Estimated { samples: Vec<PerformanceEvidence> },
+}
+
+/// The state of the measurement job, which measures this machine's selected executor in a
+/// worker process of its own, only while no model is loaded, loading or being optimized, so that
+/// speed estimates can be made. It moves from `Unmeasured` to `Measuring`, then to `Measured`, or
+/// to `Failed` and back to `Measuring` at its retry, or back to `Unmeasured` when a load
+/// preempts the job.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum MeasurementState {
+    /// Measurements are missing and no job has run yet: it waits for the device to be free.
+    Unmeasured,
+    /// A job is measuring this machine.
+    Measuring,
+    /// Every measurement that estimates read is stored, or recorded as unobtainable on this
+    /// machine.
+    Measured,
+    /// The last job did not store every measurement; the next starts at `retry_at`
+    /// (milliseconds since the Unix epoch).
+    #[serde(rename_all = "camelCase")]
+    Failed { retry_at: u64 },
+}
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
 pub enum ModelAssessment {
-    /// A fitting model, with one decode-speed estimate per requested depth.
+    /// A fitting model, with its decode-speed estimates.
     #[serde(rename_all = "camelCase")]
     Fits {
         profile: ServingProfile,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
-        performance: Vec<PerformanceEvidence>,
+        performance: ModelPerformance,
         projector: ProjectorVerdict,
         drafter: DrafterVerdict,
     },
@@ -2316,7 +2352,9 @@ pub enum ModelAssessmentDomainSnapshot {
     },
 }
 
-/// Every model assessment in the service's one environment, established at service start.
+/// Every model assessment in the service's current environment: its structure is established at
+/// service start, and its identity changes when the measurement job stores this machine's
+/// measurements.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2325,6 +2363,8 @@ pub struct ModelAssessmentsSnapshot {
     pub environment_id: AssessmentEnvironmentId,
     pub catalog: ModelAssessmentDomainSnapshot,
     pub custom: ModelAssessmentDomainSnapshot,
+    /// Whether this machine's measurements, which speed estimates read, exist.
+    pub measurement: MeasurementState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

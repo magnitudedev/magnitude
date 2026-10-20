@@ -1,141 +1,113 @@
-//! Exact GGUF headers of catalog components, as dumped under
-//! `inference/catalog/headers/` (metadata plus the full
-//! tensor directory; long metadata arrays keep only their head), for family
-//! tests.
+//! GGUF headers for family and assessment tests: the release catalog's
+//! components at their locked revisions, and the pinned artifacts outside the
+//! catalog the tests read ([`catalog_headers::artifacts`]).
+//!
+//! The catalog's headers are exported from `inference/catalog/models.lock.json`
+//! by `magnitude-service-catalog-tool headers --output DIR --model-store STORE`
+//! (the evaluation flow's `--catalog-headers` runs it on the host), and
+//! `MAGNITUDE_CATALOG_HEADERS` names the export (`DIR/headers`). Each is the
+//! exact header, read as the engine reads a component before its payload
+//! exists ([`PackageHeaders`]): a split target is all its shards. An export
+//! of another lock or other artifacts is refused.
 
-use magnitude_artifacts::gguf::{
-    Array, ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value,
+use magnitude_artifacts::catalog_headers::{
+    self, lock_digest, CatalogComponent, ComponentRole, HeaderIndex, INDEX,
 };
-use serde_json::Value as Json;
-use std::path::PathBuf;
+use magnitude_artifacts::gguf::{Directory, Encoding, Metadata, TensorDescriptor, Value};
+use magnitude_artifacts::PackageHeaders;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
+/// The environment variable naming the catalog header export.
+pub const ROOT: &str = "MAGNITUDE_CATALOG_HEADERS";
+
+/// The catalog lock, of which the export must be.
+const LOCK: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../catalog/models.lock.json"
+);
+
+/// The catalog header export.
 pub fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../catalog/headers")
-}
-
-/// Every dumped component: `(model, role, file)`.
-pub fn index() -> Vec<(String, String, String)> {
-    let index: Json =
-        serde_json::from_slice(&std::fs::read(root().join("index.json")).unwrap()).unwrap();
-    index
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| {
-            let field = |name: &str| row[name].as_str().unwrap().to_owned();
-            (field("model"), field("role"), field("file"))
+    std::env::var_os(ROOT)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!(
+                "{ROOT} must name the catalog header export: \
+             `cargo run -p magnitude-service-catalog-tool -- headers --output DIR \
+             --model-store STORE` writes DIR/headers"
+            )
         })
-        .collect()
 }
 
-fn scalar(value: &Json) -> Scalar {
-    match value {
-        Json::Bool(value) => Scalar::Bool(*value),
-        Json::String(value) => Scalar::String(value.clone()),
-        Json::Number(number) => {
-            if let Some(value) = number.as_u64() {
-                Scalar::Unsigned(value)
-            } else if let Some(value) = number.as_i64() {
-                Scalar::Signed(value)
-            } else {
-                Scalar::Float(number.as_f64().unwrap())
-            }
-        }
-        other => panic!("metadata scalar expected, received {other}"),
+/// Every catalog component, from an export of this tree's lock.
+pub fn index() -> &'static [CatalogComponent] {
+    &export().components
+}
+
+/// The export's index, of this tree's lock and artifacts.
+fn export() -> &'static HeaderIndex {
+    static EXPORT: OnceLock<HeaderIndex> = OnceLock::new();
+    EXPORT.get_or_init(|| {
+        let path = root().join(INDEX);
+        let index: HeaderIndex = serde_json::from_slice(
+            &std::fs::read(&path).unwrap_or_else(|error| panic!("{path:?}: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("{path:?}: {error}"));
+        let lock = lock_digest(&std::fs::read(LOCK).unwrap());
+        assert_eq!(
+            index.lock, lock,
+            "{path:?} is an export of another catalog lock; export this tree's"
+        );
+        assert_eq!(
+            index.artifacts,
+            catalog_headers::artifacts(),
+            "{path:?} is an export of other artifacts; export this tree's"
+        );
+        index
+    })
+}
+
+/// The directory of one catalog component.
+pub fn component(component: &CatalogComponent) -> Directory {
+    open(&component.file(&root()))
+}
+
+/// The directory of the pinned artifact `name` ([`catalog_headers::artifacts`]).
+pub fn artifact(name: &str) -> Directory {
+    let artifact = export()
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.name == name)
+        .unwrap_or_else(|| panic!("no pinned artifact is named {name}"));
+    open(&artifact.file(&root()))
+}
+
+fn open(file: &Path) -> Directory {
+    PackageHeaders::open(file, None)
+        .unwrap_or_else(|error| panic!("{file:?}: {error}"))
+        .target()
+        .clone()
+}
+
+/// A catalog component's name in tests: `<model>__target-<variant>`
+/// (`qwen3.5-4b__target-gguf:q4`), `<model>__draft` or `<model>__projector`.
+pub fn key(component: &CatalogComponent) -> String {
+    match &component.role {
+        ComponentRole::Target { variant } => format!("{}__target-{variant}", component.model),
+        ComponentRole::Draft => format!("{}__draft", component.model),
+        ComponentRole::Projector => format!("{}__projector", component.model),
     }
 }
 
-/// A dumped array. JSON keeps no element type, so integers are signed when any element is
-/// negative and every number is a float when any element is fractional.
-fn array(values: &[Json]) -> Value {
-    let scalars = values.iter().map(scalar).collect::<Vec<_>>();
-    let float = scalars
-        .iter()
-        .any(|value| matches!(value, Scalar::Float(_)));
-    let signed = scalars
-        .iter()
-        .any(|value| matches!(value, Scalar::Signed(_)));
-    let scalars = scalars.into_iter().map(|value| match value {
-        Scalar::Unsigned(value) if float => Scalar::Float(value as f64),
-        Scalar::Signed(value) if float => Scalar::Float(value as f64),
-        Scalar::Unsigned(value) if signed => Scalar::Signed(value as i64),
-        value => value,
-    });
-    Value::Array(Array::of(scalars).expect("a dumped GGUF array has one element type"))
-}
-
-fn value(value: &Json) -> Value {
-    match value {
-        Json::Array(values) => array(values),
-        Json::Object(truncated) => array(truncated["head"].as_array().unwrap()),
-        other => Value::Scalar(scalar(other)),
-    }
-}
-
-fn encoding(name: &str) -> Encoding {
-    Encoding::ALL
-        .into_iter()
-        .find(|encoding| encoding.ggml_name() == name)
-        .unwrap_or_else(|| panic!("unmapped GGML type {name}"))
-}
-
-/// The directory of one dumped component file.
-pub fn directory(file: &str) -> Directory {
-    let path = root().join(file);
-    let header: Json = serde_json::from_slice(
-        &std::fs::read(&path).unwrap_or_else(|error| panic!("{path:?}: {error}")),
+/// The directory of the catalog component [`key`] names.
+pub fn catalog(name: &str) -> Directory {
+    component(
+        index()
+            .iter()
+            .find(|component| key(component) == name)
+            .unwrap_or_else(|| panic!("the catalog has no component {name}")),
     )
-    .unwrap();
-    directory_from_json(&header)
-}
-
-/// A header fixture supplied by a family test, without a global catalog dump.
-pub fn directory_from_bytes(bytes: &[u8]) -> Directory {
-    directory_from_json(&serde_json::from_slice(bytes).unwrap())
-}
-
-fn directory_from_json(header: &Json) -> Directory {
-    let metadata = header["metadata"]
-        .as_object()
-        .unwrap()
-        .iter()
-        .map(|(name, item)| Metadata {
-            name: name.clone(),
-            value: value(item),
-        })
-        .collect();
-    let tensors = header["tensors"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|tensor| {
-            let encoding = encoding(tensor["type"].as_str().unwrap());
-            // Dumped in GGML storage order; the directory is outermost first.
-            let mut shape = tensor["shape"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|extent| extent.as_u64().unwrap())
-                .collect::<Vec<_>>();
-            let elements = shape.iter().product::<u64>();
-            shape.reverse();
-            TensorDescriptor {
-                name: tensor["name"].as_str().unwrap().to_owned(),
-                shape,
-                encoding,
-                offset: 0,
-                nbytes: elements / encoding.block_elements() * encoding.block_bytes(),
-            }
-        })
-        .collect();
-    Directory {
-        version: 3,
-        byte_order: ByteOrder::Little,
-        alignment: 32,
-        data_offset: 0,
-        metadata,
-        tensors,
-    }
 }
 
 /// Sets metadata `name` to `value`, replacing any recorded value.

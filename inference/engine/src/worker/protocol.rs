@@ -11,6 +11,7 @@
 //! The encoding (serde) is versioned with the engine build: both ends
 //! exchange [`EngineBuild`] first and refuse a mismatch.
 
+use super::measure::{MeasureFailure, MeasureRequest};
 use crate::census::AllocationCensus;
 use crate::error::{LoadError, RequestError, UnloadCause};
 use crate::options::{ExecutionManifest, ReadyInfo};
@@ -19,7 +20,8 @@ use magnitude_executor::UnpreparedUnits;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
 use magnitude_scheduler::prefix_cache::PrefixRetention;
-use seismic::StoreIdentity;
+use seismic::measure::Record;
+use seismic::{PointKey, StoreIdentity};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -82,15 +84,32 @@ pub enum HostMessage {
     /// Search the tuning units of `manifest`'s model the kernel cache has no
     /// record for, on the device its load selects, publishing each record;
     /// then exit without loading the model. The only search there is.
-    Prepare { manifest: ExecutionManifest },
+    Prepare {
+        manifest: ExecutionManifest,
+    },
+    /// Measure this machine as `request` asks (the measurement job,
+    /// [`super::measure`]), reporting each record as it is stored; then
+    /// exit. Nothing is loaded.
+    Measure {
+        request: MeasureRequest,
+    },
     Admit(Admission),
     /// The host's consumer drained `batches` output batches.
-    Credit { request_id: HostRequestId, batches: u32 },
+    Credit {
+        request_id: HostRequestId,
+        batches: u32,
+    },
     /// Ordered stop: accepted output drains, then `Completed`.
-    Stop { request_id: HostRequestId },
+    Stop {
+        request_id: HostRequestId,
+    },
     /// The host abandoned the request; no further messages arrive for it.
-    Cancel { request_id: HostRequestId },
-    Status { request_id: HostRequestId },
+    Cancel {
+        request_id: HostRequestId,
+    },
+    Status {
+        request_id: HostRequestId,
+    },
     Observe,
     Shutdown,
 }
@@ -164,18 +183,48 @@ pub struct StoreHeadroom {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
-    Hello { build: EngineBuild },
-    LoadProgress { progress: LoadProgress },
-    Ready { ready: ReadyInfo },
+    Hello {
+        build: EngineBuild,
+    },
+    LoadProgress {
+        progress: LoadProgress,
+    },
+    Ready {
+        ready: ReadyInfo,
+    },
     /// A `Prepare` finished; the worker exits after this message.
     Prepared,
+    /// A `Measure` is about to record its attempt of `key` and time it.
+    Attempting {
+        key: PointKey,
+    },
+    /// A `Measure` stored `record` of `key`.
+    Recorded {
+        key: PointKey,
+        record: Record,
+    },
+    /// A `Measure` finished, with what it could not measure; the worker
+    /// exits after this message.
+    MeasureFinished {
+        failures: Vec<MeasureFailure>,
+    },
     /// A `Load` asked to report tuning units without a stored record met
     /// one and placed nothing; the worker exits after this message.
     Unprepared,
-    LoadFailed { error: LoadError },
-    Admitted { request_id: HostRequestId },
-    AdmissionRefused { request_id: HostRequestId, error: RequestError },
-    Output { request_id: HostRequestId, tokens: Vec<OutputToken> },
+    LoadFailed {
+        error: LoadError,
+    },
+    Admitted {
+        request_id: HostRequestId,
+    },
+    AdmissionRefused {
+        request_id: HostRequestId,
+        error: RequestError,
+    },
+    Output {
+        request_id: HostRequestId,
+        tokens: Vec<OutputToken>,
+    },
     Completed {
         request_id: HostRequestId,
         finish: FinishReason,

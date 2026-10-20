@@ -6,19 +6,24 @@ use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
+use magnitude_artifacts::catalog_headers::{
+    CatalogComponent, ComponentRole as HeaderRole, lock_digest,
+};
+use magnitude_service_contracts::ComponentRole;
 use magnitude_service_contracts::models::{
-    CatalogBaseId, CatalogDiagnostic, CatalogSupport, CatalogVariantId, ModelFailure, ModelFileRole, ModelId, ModelPackage, ModelPackageSource,
-    ModelParameterization, ModelReleaseDate, ModelServingConfiguration, PackageValidation,
-    ParsedModelId,
+    CatalogBaseId, CatalogDiagnostic, CatalogSupport, CatalogVariantId, ModelFailure,
+    ModelFileRole, ModelId, ModelPackage, ModelPackageSource, ModelParameterization,
+    ModelReleaseDate, ModelServingConfiguration, PackageValidation, ParsedModelId,
     RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
     ResolvedServableModelBundle, ServableModelBundle, ServingProfile, SpeculativeDraftSource,
     SpeculativeMethod,
 };
 use magnitude_service_contracts::{
-    ContentId, HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot, Integrity,
-    InventoryEntryId, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
-    ModelComponent, ModelLocation, ModelPreviewComponentRole, ModelPreviewComponentSource,
-    ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
+    ContentId, HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest,
+    HuggingFaceRepositorySnapshot, Integrity, InventoryEntryId, InventoryError, InventoryModel,
+    InventoryProperties, ModelAvailability, ModelComponent, ModelLocation,
+    ModelPreviewComponentRole, ModelPreviewComponentSource, ModelPreviewSource, ModelSource,
+    ResolvedComponent, ResolvedModel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -273,22 +278,6 @@ pub struct GeneratedReleaseCatalog {
     pub catalog: RecommendableModelCatalog,
     planner_inputs: BTreeMap<ServableModelBundleKey, ReleasePlannerInput>,
     headers: BTreeMap<String, Vec<u8>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReleasePackageRole {
-    Target,
-    Draft,
-}
-
-/// One package component of a release catalog bundle and its exact GGUF header.
-#[derive(Clone, Debug)]
-pub struct ReleaseComponentHeader {
-    pub model_id: CatalogBaseId,
-    pub variant_id: CatalogVariantId,
-    pub package: ReleasePackageRole,
-    pub component: ModelComponent,
-    pub header: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -586,6 +575,11 @@ pub(crate) fn valid_variant_id(value: &str) -> bool {
         (Some(format), Some(quality), None)
             if valid_identity_component(format) && valid_identity_component(quality)
     )
+}
+
+/// The compiled catalog lock's identity (`magnitude_artifacts::catalog_headers::lock_digest`).
+pub fn catalog_lock_digest() -> String {
+    lock_digest(CATALOG_LOCK.as_bytes())
 }
 
 pub fn model_catalog_lock() -> Result<ModelCatalogLock, InventoryError> {
@@ -1055,31 +1049,6 @@ impl ReleaseCatalog {
         &self.catalog
     }
 
-    /// Every bundled package component with its exact GGUF header, bundle by bundle and in
-    /// package order. Each header is reassembled and verified when its item is reached.
-    pub fn component_headers(
-        &self,
-    ) -> impl Iterator<Item = Result<ReleaseComponentHeader, InventoryError>> + '_ {
-        self.planner_inputs.values().flat_map(move |input| {
-            let packages = std::iter::once((ReleasePackageRole::Target, &input.target))
-                .chain(input.draft.iter().map(|draft| (ReleasePackageRole::Draft, draft)));
-            packages.flat_map(move |(package, planner)| {
-                planner.components.iter().map(move |component| {
-                    Ok(ReleaseComponentHeader {
-                        model_id: input.model_id.clone(),
-                        variant_id: input.variant_id.clone(),
-                        package,
-                        component: component.component.clone(),
-                        header: self
-                            .planner_bundle
-                            .input(&component.header_digest)
-                            .map_err(InventoryError::Integrity)?,
-                    })
-                })
-            })
-        })
-    }
-
     /// The header digest of every bundled package file, by the file's Hub SHA-256.
     #[must_use]
     pub fn file_header_digests(&self) -> BTreeMap<String, String> {
@@ -1097,6 +1066,100 @@ impl ReleaseCatalog {
                 })
             })
             .collect()
+    }
+
+    /// Write every catalog component's exact header, extended sparsely to its file's size, under
+    /// `root` at `<repository>/<revision>/<path>`, and return them
+    /// (`magnitude_artifacts::catalog_headers`): each variant's target, and each model's draft
+    /// and projector.
+    pub fn export_headers(&self, root: &Path) -> Result<Vec<CatalogComponent>, InventoryError> {
+        let mut components = BTreeMap::new();
+        let mut written = BTreeSet::new();
+        for input in self.planner_inputs.values() {
+            let model = input.model_id.as_str();
+            let target = (
+                HeaderRole::Target {
+                    variant: input.variant_id.as_str().to_owned(),
+                },
+                &input.target,
+                input.target.primary_gguf.clone(),
+                &[ComponentRole::Weights, ComponentRole::Shard] as &[ComponentRole],
+            );
+            let projector = input
+                .target
+                .components
+                .iter()
+                .find(|component| component.component.role == ComponentRole::Projector)
+                .map(|projector| {
+                    (
+                        HeaderRole::Projector,
+                        &input.target,
+                        projector.component.path.clone(),
+                        &[ComponentRole::Projector] as &[ComponentRole],
+                    )
+                });
+            let draft = input.draft.as_ref().map(|draft| {
+                (
+                    HeaderRole::Draft,
+                    draft,
+                    draft.primary_gguf.clone(),
+                    &[
+                        ComponentRole::Weights,
+                        ComponentRole::Shard,
+                        ComponentRole::Draft,
+                        ComponentRole::Mtp,
+                    ] as &[ComponentRole],
+                )
+            });
+            for (role, package, path, roles) in
+                std::iter::once(target).chain(projector).chain(draft)
+            {
+                let ModelPackageSource::HuggingFace {
+                    repository,
+                    revision,
+                } = &package.package.source
+                else {
+                    return Err(InventoryError::Integrity(
+                        "release catalog package must have an immutable Hugging Face source"
+                            .to_owned(),
+                    ));
+                };
+                let component = CatalogComponent {
+                    model: model.to_owned(),
+                    role: role.clone(),
+                    repository: repository.clone(),
+                    revision: revision.clone(),
+                    path,
+                };
+                for file in package
+                    .components
+                    .iter()
+                    .filter(|file| roles.contains(&file.component.role))
+                {
+                    let path = root
+                        .join(repository)
+                        .join(revision)
+                        .join(&file.component.path);
+                    if written.insert(path.clone()) {
+                        let header = self
+                            .planner_bundle
+                            .input(&file.header_digest)
+                            .map_err(InventoryError::Integrity)?;
+                        write_component_header(file, &header, &path)?;
+                    }
+                }
+                if let Some(previous) =
+                    components.insert((model.to_owned(), role), component.clone())
+                    && previous != component
+                {
+                    return Err(InventoryError::Integrity(format!(
+                        "catalog model {model} has two {:?} components",
+                        component.role
+                    )));
+                }
+            }
+        }
+        Ok(components.into_values().collect())
     }
 
     pub fn resolve_bundle(
@@ -1168,6 +1231,40 @@ impl ReleaseCatalog {
     }
 }
 
+/// One component's exact header at `path`, extended sparsely to the component's logical size so
+/// no tensor payload occupies disk.
+fn write_component_header(
+    component: &ReleasePlannerComponent,
+    header: &[u8],
+    path: &Path,
+) -> Result<(), InventoryError> {
+    if u64::try_from(header.len()).ok() != Some(component.header_size_bytes) {
+        return Err(InventoryError::Integrity(format!(
+            "planner input for {} has the wrong length",
+            component.component.path.display()
+        )));
+    }
+    write_header_file(header, component.component.size_bytes, path)
+}
+
+/// A GGUF file's exact `header` at `path`, extended sparsely to the file's `size` so no tensor
+/// payload occupies disk: it opens as the file it was read from.
+pub(crate) fn write_header_file(header: &[u8], size: u64, path: &Path) -> Result<(), InventoryError> {
+    let io = |error: std::io::Error| InventoryError::Io(error.to_string());
+    let parent = path
+        .parent()
+        .ok_or_else(|| InventoryError::Integrity("a header file has no parent".to_owned()))?;
+    fs::create_dir_all(parent).map_err(io)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(io)?;
+    file.write_all(header)
+        .and_then(|()| magnitude_service_utils::sparse_file::set_sparse_len(&file, size))
+        .map_err(io)
+}
+
 /// Materialize the bundle's assessment material: each component's exact header, extended
 /// sparsely to the component's logical size so no tensor payload occupies disk.
 fn materialize_planner_bundle(
@@ -1237,31 +1334,11 @@ fn materialize_planner_package(
     let package_identity = package.id.0.clone();
     let workspace = tempfile::tempdir().map_err(|error| InventoryError::Io(error.to_string()))?;
     for component in &artifact.components {
-        let header = header_for(component)?;
-        if u64::try_from(header.len()).ok() != Some(component.header_size_bytes) {
-            return Err(InventoryError::Integrity(format!(
-                "planner input for {} has the wrong length",
-                component.component.path.display()
-            )));
-        }
-        let path = workspace.path().join(&component.component.path);
-        let parent = path.parent().ok_or_else(|| {
-            InventoryError::Integrity("planner component has no parent".to_owned())
-        })?;
-        fs::create_dir_all(parent).map_err(|error| InventoryError::Io(error.to_string()))?;
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .map_err(|error| InventoryError::Io(error.to_string()))?;
-        file.write_all(&header)
-            .and_then(|()| {
-                magnitude_service_utils::sparse_file::set_sparse_len(
-                    &file,
-                    component.component.size_bytes,
-                )
-            })
-            .map_err(|error| InventoryError::Io(error.to_string()))?;
+        write_component_header(
+            component,
+            &header_for(component)?,
+            &workspace.path().join(&component.component.path),
+        )?;
     }
     let components = artifact
         .components
@@ -1412,11 +1489,13 @@ fn validate_resolved_catalog(
             .iter()
             .filter(|file| file.role == ModelFileRole::Projector)
             .collect::<Vec<_>>();
+        // As `resolve_projector_path` selects: the declared projector, or
+        // without a declaration the repository's sole mmproj, if any.
         let projector_matches = match &declaration.projector {
             Some(projector) => {
                 projector_files.len() == 1 && projector_files[0].path == projector.path
             }
-            None => projector_files.is_empty(),
+            None => projector_files.len() <= 1,
         };
         if target.properties.maximum_context_length
             != Some(model.configuration.profile.context_length)

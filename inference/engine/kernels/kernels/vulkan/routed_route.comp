@@ -15,6 +15,7 @@
 //     coefficient from column E.
 // Every logit accumulates over the hidden axis in the same order for every
 // expert, so experts with equal router rows tie exactly.
+#define KERNEL_W0 SEISMIC_ROUTER
 #include "lib/core/activation.glsl"
 #include "lib/core/reduce.glsl"
 #include <seismic/packets.glsl>
@@ -34,75 +35,7 @@
 #else
 #error "routed norm must be dense"
 #endif
-#if defined(SEISMIC_ROUTER_REPRESENTATION_F32)
-#define ROUTE_PACKED 0
-#define ROUTE_ROUTER ELEMENT_F32
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_F16)
-#define ROUTE_PACKED 0
-#define ROUTE_ROUTER ELEMENT_F16
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_BF16)
-#define ROUTE_PACKED 0
-#define ROUTE_ROUTER ELEMENT_BF16
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_Q4K)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_Q4K
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_Q4K(SEISMIC_ROUTER)
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_Q5K)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_Q5K
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_HIGH(SEISMIC_ROUTER)
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_Q6K)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_Q6K
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_HIGH(SEISMIC_ROUTER)
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_Q8G32S)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_Q8
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_Q8(SEISMIC_ROUTER)
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_IQ4G32)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_IQ4
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_C4(SEISMIC_ROUTER)
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_Q4G32S)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_Q4G32S
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_C4(SEISMIC_ROUTER)
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_IQ4G32S)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_IQ4S
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_C4(SEISMIC_ROUTER)
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_MXFP4G32)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_MXFP4
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_C4(SEISMIC_ROUTER)
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_NVFP4G16)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_NVFP4
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_C4(SEISMIC_ROUTER)
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_Q5G32S)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_Q5G32S
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_Q5(SEISMIC_ROUTER)
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_Q5G32)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_Q5G32
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_Q5(SEISMIC_ROUTER)
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_IQ2XS)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_IQ2XS
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_GRID(SEISMIC_ROUTER)
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_IQ3XXS)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_IQ3XXS
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_GRID(SEISMIC_ROUTER)
-#elif defined(SEISMIC_ROUTER_REPRESENTATION_IQ2XXS)
-#define ROUTE_PACKED 1
-#define ROUTE_ROUTER_KIND PACKETS_IQ2XXS
-#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_GRID(SEISMIC_ROUTER)
-#else
-#error "unsupported routed router representation"
-#endif
-#if ROUTE_PACKED && !defined(SEISMIC_ROUTER_LAYOUT_ROWS16)
+#if defined(SEISMIC_ROUTER_KIND_PACKED) && !defined(SEISMIC_ROUTER_LAYOUT_ROWS16)
 #error "packed routed router requires rows16"
 #endif
 
@@ -149,11 +82,11 @@ uint64_t route_logit(uint64_t row, uint expert) {
     return SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS) + (row * (ROUTE_E + 1u) + expert) * 4ul;
 }
 
-#if !ROUTE_PACKED
+#if !defined(SEISMIC_ROUTER_KIND_PACKED)
 // Dense weight of logit column `expert` at hidden coordinate `source`.
 float route_column_weight(uint expert, uint source) {
     return expert < ROUTE_E
-        ? element_at(ROUTE_ROUTER, SEISMIC_PTR(SEISMIC_BUFFER_ROUTER),
+        ? element_at(packets_element(PACKETS_W0), SEISMIC_PTR(SEISMIC_BUFFER_ROUTER),
             uint64_t(expert) * SEISMIC_ROUTER_STRIDE_0 + uint64_t(source) * SEISMIC_ROUTER_STRIDE_1)
         : element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_ROUTER) + uint64_t(source) * SEISMIC_SHARED_ROUTER_STRIDE_0 * 4ul);
 }
@@ -218,20 +151,20 @@ void routed_route_gemv() {
     float sums[8];
     [[unroll]] for (uint row = 0u; row < 8u; ++row)
         sums[row] = 0.0;
-#if ROUTE_PACKED
-    const packets_rows16 router_layout = ROUTE_ROUTER_LAYOUT;
+#if defined(SEISMIC_ROUTER_KIND_PACKED)
+    const packets_rows16 router_layout = PACKETS_W0_ROWS;
     const uint64_t router = SEISMIC_PTR(SEISMIC_BUFFER_ROUTER);
     for (uint p = lane; p < hidden / 32u; p += 32u) {
         if (expert < ROUTE_E) {
-            const packets_packet packet = packets_load(ROUTE_ROUTER_KIND,
+            const packets_packet packet = packets_load(PACKETS_W0,
                 router + uint64_t(expert) * router_layout.stride, router_layout, p, hidden);
             [[unroll]] for (uint step = 0u; step < 4u; ++step) {
                 vec4 even, odd;
-                packets_codes(ROUTE_ROUTER_KIND, packet, step, even, odd);
+                packets_codes(PACKETS_W0, packet, step, even, odd);
                 [[unroll]] for (uint i = 0u; i < 8u; ++i) {
                     const uint source = 32u * p + 8u * step + i;
                     const float code = (i & 1u) != 0u ? odd[i >> 1] : even[i >> 1];
-                    const float weight = packets_value(ROUTE_ROUTER_KIND, packet, step, code);
+                    const float weight = packets_value(PACKETS_W0, packet, step, code);
                     const float scale = route_norm(source);
                     [[unroll]] for (uint row = 0u; row < 8u; ++row)
                         if (row < rows)
@@ -304,24 +237,24 @@ void routed_route_gemm() {
                 ? element_at(ROUTE_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
                     row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(k0 + k) * SEISMIC_RESULT_0_STRIDE_1)
                 : 0.0;
-#if !ROUTE_PACKED
+#if !defined(SEISMIC_ROUTER_KIND_PACKED)
             seismic_shared_f32[columns_tile + k * ROUTE_PITCH + i] = expert <= ROUTE_E ? route_column_weight(expert, k0 + k) : 0.0;
 #endif
         }
-#if ROUTE_PACKED
+#if defined(SEISMIC_ROUTER_KIND_PACKED)
         if (thread < ROUTE_TILE) {
             const uint expert = expert0 + thread;
             if (expert < ROUTE_E) {
-                const packets_rows16 router_layout = ROUTE_ROUTER_LAYOUT;
+                const packets_rows16 router_layout = PACKETS_W0_ROWS;
                 const uint64_t row = SEISMIC_PTR(SEISMIC_BUFFER_ROUTER) + uint64_t(expert) * router_layout.stride;
-                const packets_packet packet = packets_load(ROUTE_ROUTER_KIND, row, router_layout, k0 / 32u, hidden);
+                const packets_packet packet = packets_load(PACKETS_W0, row, router_layout, k0 / 32u, hidden);
                 [[unroll]] for (uint step = 0u; step < 4u; ++step) {
                     vec4 even, odd;
-                    packets_codes(ROUTE_ROUTER_KIND, packet, step, even, odd);
+                    packets_codes(PACKETS_W0, packet, step, even, odd);
                     [[unroll]] for (uint i = 0u; i < 8u; ++i) {
                         const float code = (i & 1u) != 0u ? odd[i >> 1] : even[i >> 1];
                         seismic_shared_f32[columns_tile + (8u * step + i) * ROUTE_PITCH + thread] =
-                            packets_value(ROUTE_ROUTER_KIND, packet, step, code);
+                            packets_value(PACKETS_W0, packet, step, code);
                     }
                 }
             } else {

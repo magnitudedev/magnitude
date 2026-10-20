@@ -19,7 +19,7 @@ use std::fs;
 
 /// How the paired rounds time each projection.
 const TIMING: seismic::measure::Measure = seismic::measure::Measure {
-    samples: std::num::NonZeroUsize::new(13).unwrap(),
+    stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(13).unwrap()),
     min_sample_seconds: 0.02,
 };
 

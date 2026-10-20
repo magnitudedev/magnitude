@@ -164,7 +164,10 @@ pub fn reported_by(by: ReportedBy) -> HardwareReportedBy {
             HardwareReportedBy::MetalWorkingSetBeyondDedicated
         }
         ReportedBy::DxgiDedicatedMemory => HardwareReportedBy::DxgiDedicatedMemory,
-        ReportedBy::CudaMemoryClockBusWidth => HardwareReportedBy::CudaMemoryClockBusWidth,
+        ReportedBy::LinuxSysfsCache => HardwareReportedBy::LinuxSysfsCache,
+        ReportedBy::MacOsSysctlCache => HardwareReportedBy::MacOsSysctlCache,
+        ReportedBy::WindowsProcessorCache => HardwareReportedBy::WindowsProcessorCache,
+        ReportedBy::CudaL2Cache => HardwareReportedBy::CudaL2Cache,
         ReportedBy::FilesystemSize => HardwareReportedBy::FilesystemSize,
         ReportedBy::FilesystemAvailable => HardwareReportedBy::FilesystemAvailable,
     }

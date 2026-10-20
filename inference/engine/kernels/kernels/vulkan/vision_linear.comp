@@ -1,6 +1,7 @@
 // vision_linear: one 64 x 64 GEMM tile of y = x . transpose(weight) over the
 // projection library with the Linear epilogue (`lib/vision/vision.glsl`): the
 // bias, the clamp, then the activation, the gate or the F32 residual.
+#define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/core/activation.glsl"
 #include "lib/vision/vision.glsl"
 
@@ -8,18 +9,6 @@
 #error "vision_linear requires a bf16 or f16 activation"
 #endif
 
-#if defined(SEISMIC_WEIGHT_REPRESENTATION_BF16)
-#define WEIGHT_KIND PACKETS_BF16
-#define WEIGHT_BYTES 2
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F16)
-#define WEIGHT_KIND PACKETS_F16
-#define WEIGHT_BYTES 2
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F32)
-#define WEIGHT_KIND PACKETS_F32
-#define WEIGHT_BYTES 4
-#else
-#error "unsupported vision_linear weight representation"
-#endif
 
 #if defined(SEISMIC_BIAS_REPRESENTATION_BF16)
 #define BIAS_KIND ELEMENT_BF16
@@ -53,7 +42,6 @@ void vision_linear() {
         SEISMIC_GATE_STRIDE_1, clamped,
         clamped ? element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_MINIMUM)) : 0.0,
         clamped ? element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_MAXIMUM)) : 0.0);
-    const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), SEISMIC_WEIGHT_STRIDE_0,
-        WEIGHT_BYTES, k);
-    vision_gemm(WEIGHT_KIND, in_, out_, w, uint(SEISMIC_DIM_M), n, k, gl_WorkGroupID.y, gl_WorkGroupID.x);
+    const projection_weights w = vision_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), PACKETS_W0_ROWS, k);
+    vision_gemm(PACKETS_W0, in_, out_, w, uint(SEISMIC_DIM_M), n, k, gl_WorkGroupID.y, gl_WorkGroupID.x);
 }

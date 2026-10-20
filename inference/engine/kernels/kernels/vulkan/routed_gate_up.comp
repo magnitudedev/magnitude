@@ -2,10 +2,10 @@
 // (m, k), a K1 paired GEMV over the feature tile `x` of expert routes[m, k]'s
 // gate and up rows with the activation-generic Glu epilogue. The Vulkan form
 // of `metal/routed_gate_up.metal`; lane groups are whole subgroups.
+#define KERNEL_W0 SEISMIC_EXPERT_GATE
+#define KERNEL_W1 SEISMIC_EXPERT_UP
 #include "lib/core/activation.glsl"
 #include "lib/routed/routed.glsl"
-#include "lib/routed/expert_gate.glsl"
-#include "lib/routed/expert_up.glsl"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
 #define ROUTED_ACT ELEMENT_ACT
@@ -25,13 +25,13 @@ void routed_gate_up() {
     const projection_prologue x = projection_plain(ROUTED_ACT,
         SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED) + m * SEISMIC_NORMALIZED_STRIDE_0 * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
         SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul);
-    const projection_weights gate = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), EG_GEOMETRY,
+    const projection_weights gate = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), PACKETS_W0_STACKED_ROWS,
         routed_expert_row(expert, SEISMIC_DIM_F), hidden);
-    const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), EU_GEOMETRY,
+    const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), PACKETS_W1_STACKED_ROWS,
         routed_expert_row(expert, SEISMIC_DIM_F), hidden);
     const projection_epilogue out_ = projection_glu(ROUTED_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
             + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
         0ul, SEISMIC_RESULT_0_STRIDE_2, int(SEISMIC_PARAM_ACTIVATION));
-    projection_gemv_bounded(EG_KIND, EU_KIND, true, SEISMIC_TUNE_ROWS, 32u, 1u, PROJECTION_NORM_NONE, x, out_, gate,
-        up, 1u, uint(SEISMIC_DIM_F), hidden, tile);
+    projection_gemv(PACKETS_W0, PACKETS_W1, true, SEISMIC_TUNE_ROWS, 32u, 1u, PROJECTION_NORM_NONE, x, out_, gate, up, 1u,
+        uint(SEISMIC_DIM_F), hidden, tile);
 }

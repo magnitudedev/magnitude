@@ -1,4 +1,5 @@
 use magnitude_artifacts::{
+    catalog_headers::{self, ComponentRole},
     gguf::{Array, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
     ArtifactIdentity, PackageIdentity, TokenId,
 };
@@ -24,31 +25,32 @@ fn identity() -> PackageIdentity {
 
 /// Every catalog draft with its target's family and header.
 const PAIRS: [(&str, &str); 6] = [
+    ("qwen3.6-35b-a3b__draft", "qwen3.6-35b-a3b__target-gguf:q4"),
     (
-        "qwen3.6-35b-a3b__draft.json",
-        "qwen3.6-35b-a3b__target-gguf_q4.json",
+        "muse-glimmer-30b__draft",
+        "muse-glimmer-30b__target-gguf:q4",
     ),
     (
-        "muse-glimmer-30b__draft.json",
-        "muse-glimmer-30b__target-gguf_q4.json",
+        "nemotron-3.5-lightning-30b-a3b__draft",
+        "nemotron-3.5-lightning-30b-a3b__target-gguf:nvfp4-qat",
     ),
-    (
-        "nemotron-3.5-lightning-30b-a3b__draft.json",
-        "nemotron-3.5-lightning-30b-a3b__target-gguf_nvfp4-qat.json",
-    ),
-    (
-        "lfm2.5-2.6b__draft.json",
-        "lfm2.5-2.6b__target-gguf_q4.json",
-    ),
-    (
-        "lfm2.5-8b-a1b__draft.json",
-        "lfm2.5-8b-a1b__target-gguf_q4.json",
-    ),
-    (
-        "minicpm5-2b__draft.json",
-        "minicpm5-2b__target-gguf_q4.json",
-    ),
+    ("lfm2.5-2.6b__draft", "lfm2.5-2.6b__target-gguf:q4"),
+    ("lfm2.5-8b-a1b__draft", "lfm2.5-8b-a1b__target-gguf:q4"),
+    ("minicpm5-2b__draft", "minicpm5-2b__target-gguf:q4"),
 ];
+
+/// A catalog component (`headers::key`), or a pinned artifact the catalog
+/// does not ship (`headers::artifact`).
+fn header(name: &str) -> Directory {
+    if catalog_headers::artifacts()
+        .iter()
+        .any(|artifact| artifact.name == name)
+    {
+        headers::artifact(name)
+    } else {
+        headers::catalog(name)
+    }
+}
 
 fn family(target: &str) -> &'static dyn ModelFamily {
     match target.split("__").next().unwrap() {
@@ -65,14 +67,14 @@ fn family(target: &str) -> &'static dyn ModelFamily {
 
 fn target(file: &str) -> ModelDefinition {
     family(file)
-        .inspect(&headers::directory(file), None, identity())
+        .inspect(&header(file), None, identity())
         .unwrap_or_else(|error| panic!("{file}: {error}"))
 }
 
-/// Prospective explicit headers from the publication audit. Keep the captured
-/// upstream fixtures untouched so omission remains independently testable.
+/// Prospective explicit headers from the publication audit. Keep the upstream
+/// headers untouched so omission remains independently testable.
 fn explicit_directory(file: &str) -> Directory {
-    let mut directory = headers::directory(file);
+    let mut directory = header(file);
     directory
         .metadata
         .retain(|entry| entry.name != "dflash.attention.causal");
@@ -176,8 +178,8 @@ fn qwen_dflash_taps_eight_layers_with_five_sliding_windows() {
             window.clone(),
             window,
             // The full layer reads back as far as the draft's declared
-            // context, here its header's 262144 tokens.
-            HistoryDomain::Window { tokens: 262144 }
+            // context, here its locked header's 40960 tokens.
+            HistoryDomain::Window { tokens: 40960 }
         ]
     );
     // Sliding layers read their block causally, the full layer wholly.
@@ -323,12 +325,10 @@ fn drafts_and_targets_are_recognized_by_disjoint_families() {
         &Lfm2Family,
         &LlamaFamily,
     ];
-    for (_, role, file) in headers::index() {
-        if file.contains("allshards") {
-            continue;
-        }
-        let directory = headers::directory(&file);
-        let draft = role == "draft";
+    for component in headers::index() {
+        let file = headers::key(component);
+        let directory = headers::component(component);
+        let draft = component.role == ComponentRole::Draft;
         let architecture = directory
             .value("general.architecture")
             .and_then(Value::string)
@@ -339,7 +339,12 @@ fn drafts_and_targets_are_recognized_by_disjoint_families() {
             assert!(!recognizes(&directory), "{file}");
             continue;
         }
-        assert_eq!(recognizes(&directory), draft, "{file}");
+        // The catalog's other drafts are a Gemma assistant or an MTP head.
+        assert_eq!(
+            recognizes(&directory),
+            draft && architecture == "dflash",
+            "{file}"
+        );
         if draft {
             for family in targets {
                 assert!(
@@ -439,7 +444,7 @@ fn a_wrong_shape_is_refused() {
 fn a_draft_for_another_target_is_refused() {
     // The Qwen draft against the MiniCPM5 target: the taps fit, the width
     // does too, but the mask token is outside its vocabulary.
-    let directory = headers::directory(PAIRS[0].0);
+    let directory = header(PAIRS[0].0);
     let model = target(PAIRS[5].1);
     assert!(matches!(
         inspect(&directory, &model, &|layer| LlamaFamily
@@ -447,7 +452,7 @@ fn a_draft_for_another_target_is_refused() {
         Err(Error::Metadata { .. })
     ));
     // The Muse draft against the Qwen target: the width differs.
-    let directory = headers::directory(PAIRS[1].0);
+    let directory = header(PAIRS[1].0);
     let model = target(PAIRS[0].1);
     assert!(matches!(
         inspect_qwen(&directory, &model),
@@ -474,19 +479,19 @@ fn a_tap_beyond_the_target_is_refused() {
 #[test]
 fn signed_tap_indices_bind_as_unsigned_ones_do() {
     let (mut directory, model) = qwen_draft();
-    let unsigned = inspect_qwen(&directory, &model).unwrap();
+    let signed = inspect_qwen(&directory, &model).unwrap();
     let layers = directory
         .metadata
         .iter_mut()
         .find(|item| item.name == "dflash.target_layers")
         .unwrap();
-    let Value::Array(Array::Unsigned(values)) = &layers.value else {
-        panic!("target layers are an unsigned array");
+    let Value::Array(Array::Signed(values)) = &layers.value else {
+        panic!("the published target layers are a signed array");
     };
-    layers.value = Value::Array(Array::Signed(
-        values.iter().map(|&layer| layer as i64).collect(),
+    layers.value = Value::Array(Array::Unsigned(
+        values.iter().map(|&layer| layer as u64).collect(),
     ));
-    assert_eq!(inspect_qwen(&directory, &model).unwrap(), unsigned);
+    assert_eq!(inspect_qwen(&directory, &model).unwrap(), signed);
     let layers = directory
         .metadata
         .iter_mut()
@@ -499,15 +504,16 @@ fn signed_tap_indices_bind_as_unsigned_ones_do() {
     ));
 }
 
-/// The released Qwen3.8 27B drafts (not catalog entries; headers of the exact
-/// qualification artifacts) against the Qwen3.8 27B target.
-const QWEN38_TARGET: &str = "qwen3.8-27b__target-gguf_q4.json";
-const QWEN38_DSPARK: &str = "qwen3.8-27b__draft-dspark.json";
-const QWEN38_DFLASH2: &str = "qwen3.8-27b__draft-dflash2.json";
+/// The released Qwen3.8 27B drafts against the Qwen3.8 27B target: the
+/// catalog's DFlash2, and a DSpark the catalog does not ship (a pinned
+/// artifact).
+const QWEN38_TARGET: &str = "qwen3.8-27b__target-gguf:q4";
+const QWEN38_DSPARK: &str = "qwen3.8-27b__draft-dspark";
+const QWEN38_DFLASH2: &str = "qwen3.8-27b__draft";
 
 fn qwen38(draft: &str) -> Result<DraftDefinition, Error> {
     let model = Qwen35Family
-        .inspect(&headers::directory(QWEN38_TARGET), None, identity())
+        .inspect(&header(QWEN38_TARGET), None, identity())
         .unwrap();
     inspect(&explicit_directory(draft), &model, &|layer| {
         Qwen35Family.layer_entry(&model, layer)
@@ -596,14 +602,14 @@ fn qwen38_dflash2_convolves_every_sublayer_and_selects_a_path() {
 #[test]
 fn dflash2_roles_are_all_or_nothing() {
     let model = Qwen35Family
-        .inspect(&headers::directory(QWEN38_TARGET), None, identity())
+        .inspect(&header(QWEN38_TARGET), None, identity())
         .unwrap();
     let bind = |directory: &Directory| {
         inspect(directory, &model, &|layer| {
             Qwen35Family.layer_entry(&model, layer)
         })
     };
-    let mut missing = headers::directory(QWEN38_DFLASH2);
+    let mut missing = header(QWEN38_DFLASH2);
     headers::remove_tensor(&mut missing, "blk.4.ffn_conv_proj.weight");
     assert_eq!(
         bind(&missing).unwrap_err(),
@@ -618,7 +624,7 @@ fn dflash2_roles_are_all_or_nothing() {
     );
     assert!(matches!(bind(&stray), Err(Error::Geometry(_))));
     // Sections that rotate a pair by an image axis are refused.
-    let mut sectioned = headers::directory(QWEN38_DFLASH2);
+    let mut sectioned = header(QWEN38_DFLASH2);
     headers::set(
         &mut sectioned,
         "dflash.rope.dimension_sections",
@@ -682,7 +688,7 @@ fn scalar_causality_is_independent_of_window_pattern() {
                 6
             ]
         );
-        assert_eq!(domains(&draft)[5], HistoryDomain::Window { tokens: 262144 });
+        assert_eq!(domains(&draft)[5], HistoryDomain::Window { tokens: 40960 });
     }
 }
 
@@ -712,11 +718,11 @@ fn publication_binary_headers_bind() {
     for (name, target_file) in [
         ("Qwen3.6-35B-A3B-DFlash", PAIRS[0].1),
         ("Muse-Glimmer-30B-DFlash", PAIRS[1].1),
-        ("Qwen3.6-27B-DFlash", "qwen3.6-27b__target-gguf_q4.json"),
-        ("Qwen3.5-4B-DFlash", "qwen3.5-4b__target-gguf_q4.json"),
-        ("Qwen3.5-9B-DFlash", "qwen3.5-9b__target-gguf_q4.json"),
-        ("Qwen3.8-27B-DFlash2", "qwen3.8-27b__target-gguf_q4.json"),
-        ("Qwen3.8-27B-DSpark", "qwen3.8-27b__target-gguf_q4.json"),
+        ("Qwen3.6-27B-DFlash", "qwen3.6-27b__target-gguf:q4"),
+        ("Qwen3.5-4B-DFlash", "qwen3.5-4b__target-gguf:q4"),
+        ("Qwen3.5-9B-DFlash", "qwen3.5-9b__target-gguf:q4"),
+        ("Qwen3.8-27B-DFlash2", QWEN38_TARGET),
+        ("Qwen3.8-27B-DSpark", QWEN38_TARGET),
         ("MiniCPM5-2B-DSpark", PAIRS[5].1),
         ("LFM2.5-2.6B-DSpark", PAIRS[3].1),
         ("LFM2.5-8B-A1B-DSpark", PAIRS[4].1),

@@ -45,6 +45,7 @@ use super::{
     ResidencyLease, ResidencyNotification, ResidencyWorker, ResolvedResidencyTarget,
 };
 use crate::configurations::{ResolvedConfiguration, ResolvedConfigurations};
+use crate::device_lock::{DeviceLock, DeviceShare};
 use crate::hardware::execution_backend;
 use crate::memory_domains::instance_allocation;
 use crate::worker_process::WorkerLauncher;
@@ -52,7 +53,7 @@ use crate::worker_process::WorkerLauncher;
 /// How long a ready instance with no lease stays resident.
 pub const MODEL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 /// How long a released worker has to unload and exit before it is killed.
-pub(super) const GRACEFUL_EXIT: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const GRACEFUL_EXIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// The same bound for an explicit stop, which must end active execution promptly.
 const INTERRUPTED_EXIT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -81,6 +82,8 @@ pub struct ResidencyEnvironment {
     /// [`MODEL_IDLE_TIMEOUT`] in the service.
     pub idle_timeout: std::time::Duration,
     pub launcher: WorkerLauncher,
+    /// Shared by every load and optimization for its lifetime, against the measurement job.
+    pub device: DeviceLock,
     /// Distinguishes this service run's instance identifiers.
     pub instance_id_namespace: String,
 }
@@ -579,15 +582,16 @@ impl EngineResidency {
             });
     }
 
-    /// Spawn an inference worker for `instance_id`'s load and hand it to the residency, which
-    /// terminates it when the load is stopped.
+    /// Spawn an inference worker for `instance_id`'s load, sharing the load's `device`, and
+    /// hand it to the residency, which terminates it when the load is stopped.
     fn spawn_load_worker(
         &self,
         instance_id: &ModelInstanceId,
+        device: &Arc<DeviceShare>,
     ) -> Result<SpawnedWorker, ModelOperationFailure> {
-        let spawned = EngineWorker::spawn(&self.environment.launcher).map_err(|error| {
-            ModelOperationFailure::new("worker_spawn_failed", format!("{error:#}"), true)
-        })?;
+        let spawned = EngineWorker::spawn(&self.environment.launcher, Arc::clone(device)).map_err(
+            |error| ModelOperationFailure::new("worker_spawn_failed", format!("{error:#}"), true),
+        )?;
         let worker: Arc<dyn ResidencyWorker> = spawned.worker.clone();
         self.client
             .notifier()
@@ -605,6 +609,19 @@ impl EngineResidency {
     ) -> Result<PreparedResidency<ResidentEngine>, ModelOperationFailure> {
         let environment = &self.environment;
         let resolved = environment.configurations.resolve(&configuration).await?;
+        // The load shares the device for its lifetime: its workers hold the share until each is
+        // proven retired. A measurement job holding it is preempted: the load waits only for its
+        // bounded kill.
+        let device = Arc::new(match environment.device.try_share() {
+            Some(device) => device,
+            None => {
+                self.progress(instance_id, ModelLoadStage::Queued, None);
+                tracing::info!("load preempts the measurement job and waits for its kill");
+                let device = environment.device.share().await;
+                self.progress(instance_id, ModelLoadStage::Preparing, None);
+                device
+            }
+        });
         if !self.supervisor.admission_open() {
             self.progress(instance_id, ModelLoadStage::Queued, None);
             tracing::info!("load waits for system memory to recover from pressure");
@@ -654,7 +671,7 @@ impl EngineResidency {
                 if abandoned.load(Ordering::Acquire) {
                     return Err(stopped("the load was stopped".into()));
                 }
-                match driver.spawn_load_worker(&load_instance) {
+                match driver.spawn_load_worker(&load_instance, &device) {
                     Ok(spawned) => {
                         *last_worker.borrow_mut() = Some(Arc::clone(&spawned.worker));
                         Ok(spawned)
@@ -898,6 +915,7 @@ mod tests {
                 }],
             },
             "custom": { "_tag": "Pending", "sourceRevision": 0 },
+            "measurement": { "_tag": "Unmeasured" },
         }))
         .expect("assessment snapshot")
     }
@@ -943,7 +961,7 @@ mod tests {
             "profile": { "contextLength": 262_144 },
             "assessmentId": "assessment",
             "memory": [],
-            "performance": [],
+            "performance": { "_tag": "Pending" },
             "projector": { "_tag": "None" },
             "drafter": { "_tag": "None" },
         });

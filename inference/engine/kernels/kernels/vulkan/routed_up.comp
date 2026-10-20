@@ -4,9 +4,9 @@
 // `metal/routed_up.metal`; lane groups are whole subgroups.
 // Every expert's up rows carry their `up_scale` entry.
 #define PROJECTION_SCALED
+#define KERNEL_W0 SEISMIC_EXPERT_UP
 #include "lib/core/activation.glsl"
 #include "lib/routed/routed.glsl"
-#include "lib/routed/expert_up.glsl"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
 #define ROUTED_ACT ELEMENT_ACT
@@ -26,7 +26,7 @@ void routed_up() {
     const projection_prologue x = projection_plain(ROUTED_ACT,
         SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED) + m * SEISMIC_NORMALIZED_STRIDE_0 * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
         SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul);
-    const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), EU_GEOMETRY,
+    const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), PACKETS_W0_STACKED_ROWS,
         routed_expert_row(expert, SEISMIC_DIM_F), hidden);
     const projection_epilogue out_ = projection_scaled(projection_activated(ROUTED_ACT,
             SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
@@ -34,6 +34,6 @@ void routed_up() {
             0ul, SEISMIC_RESULT_0_STRIDE_2, int(SEISMIC_PARAM_ACTIVATION)),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_E, SEISMIC_UP_SCALE_STRIDE_0, expert),
         1.0);
-    projection_gemv_bounded(EU_KIND, EU_KIND, false, SEISMIC_TUNE_ROWS, 32u, 1u, PROJECTION_NORM_NONE, x, out_, up,
-        up, 1u, uint(SEISMIC_DIM_F), hidden, tile);
+    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, 32u, 1u, PROJECTION_NORM_NONE, x, out_, up, up, 1u,
+        uint(SEISMIC_DIM_F), hidden, tile);
 }

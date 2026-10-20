@@ -19,9 +19,8 @@ context from its GGUF metadata, which is the context the engine resolves, serves
 ```sh
 cargo run --release -p magnitude-service-catalog-tool -- update-lock ...   # advance the commit map
 cargo run --release -p magnitude-service-catalog-tool -- build-bundle ...  # build the header bundle
+cargo run --release -p magnitude-service-catalog-tool -- headers --output DIR --model-store DIR  # headers for tests
 cargo run --release -p magnitude-service-catalog-tool -- acquire --model qwen3.5-4b:gguf:q4 --model-store DIR
-cargo run --release -p magnitude-service-catalog-tool -- dump-headers \
-  --bundle target/catalog-inputs/model-planner-inputs.bundle --output catalog/headers
 ```
 
 `acquire` resolves one catalog model at its locked revisions, downloads into a managed model store
@@ -40,14 +39,10 @@ of one model share. The bundle is derived release output and is not committed. I
 catalog-related file shipped alongside the service; catalog definitions and pins are compiled into
 the executable.
 
-`dump-headers` writes the bundle's headers as the JSON the engine family tests read
-(`catalog/headers/`, not committed), replacing that directory. `index.json` lists every component
-as `{model, role, file}`. A target is `<model>__target-<variant>.json` (the variant ID with `:`
-as `_`), a separate draft package `<model>__draft.json` and a projector `<model>__projector.json`;
-a draft or projector must be identical across the model's variants. Each file holds the
-component's metadata and its tensor directory (`name`, GGML `type`, `shape` in GGML storage
-order). Metadata arrays longer than 1024 entries, such as tokenizer vocabularies and merges, keep
-only `{"head": [first 64], "length": total}`; shorter arrays, including every per-layer array,
-are complete. A split target's file is its first shard, and `<file>-allshards.json` beside it
-holds the first shard's metadata with every shard's tensors. Build the bundle first when it is
-absent (`bun run catalog:build-bundle`).
+`headers` builds that bundle under `--output` (only when it is not current for this lock) and
+writes each component's exact header, extended sparsely to its file's size, to `--output/headers/`
+at `<repository>/<revision>/<path>`, with an index naming the lock. Family and assessment tests read
+that export through `MAGNITUDE_CATALOG_HEADERS` and refuse an export of another lock; the
+evaluation flow's `--catalog-headers` runs the export on the host and sets the variable. A header
+a test needs outside the lock is a pinned artifact (`magnitude_artifacts::catalog_headers::artifacts`:
+its repository, revision and path), exported beside the catalog's the same way.

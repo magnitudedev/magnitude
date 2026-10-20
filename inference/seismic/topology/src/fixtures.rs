@@ -82,9 +82,9 @@ pub(crate) const RTX3090_HOST: u64 = 50_437_746_688;
 pub(crate) const RTX3090_OS: &str = "Linux";
 pub(crate) const RTX3090_CUDA_TOTAL: u64 = 25_298_141_184;
 pub(crate) const RTX3090_CUDA_USABLE: u64 = 25_024_135_168;
-/// The RTX 3090's peak memory bandwidth, as its CUDA view reports it: a
-/// 9,751 MHz double-data-rate memory clock on a 384-bit bus.
-pub(crate) const RTX3090_CUDA_BANDWIDTH: u64 = 936_096_000_000;
+/// The RTX 3090's L2, as rtx3090 reported it (run
+/// 20261019T040157Z-fix.seismic-088b6b).
+pub(crate) const RTX3090_CUDA_L2: u64 = 6_291_456;
 pub(crate) const RTX3090_CUDA_DRIVER: &str = "cuda driver 12.8";
 #[cfg(test)]
 pub(crate) const RTX3090_VOLUME: (u64, Option<&str>, u64) = (82, None, 128_849_018_880);
@@ -102,6 +102,7 @@ fn cpu() -> CpuReport {
     CpuReport {
         name: "Host CPU (x86_64)".into(),
         identity: "recorded x86_64 host".into(),
+        cache: None,
         availability: Availability::Available,
         max_allocation: seismic_cpu::MAX_ALLOCATION_BYTES,
     }
@@ -246,7 +247,7 @@ pub(crate) fn rtx3090_cuda(uuid: [u8; 16], peers: Vec<[u8; 16]>) -> CudaReport {
         total: RTX3090_CUDA_TOTAL,
         max_allocation: RTX3090_CUDA_TOTAL,
         integrated: false,
-        memory_bandwidth: Some(RTX3090_CUDA_BANDWIDTH),
+        l2: Some(RTX3090_CUDA_L2),
         memory: CudaMemory::Own {
             usable: Ok(RTX3090_CUDA_USABLE),
         },
@@ -275,6 +276,9 @@ pub(crate) const M4_PRO_OS: &str = "Version 15.7.9 (Build 24G830)";
 pub(crate) const M4_PRO_REGISTRY: u64 = 4_294_968_578;
 pub(crate) const M4_PRO_WORKING_SET: u64 = 38_654_705_664;
 pub(crate) const M4_PRO_MAX_BUFFER: u64 = 28_991_029_248;
+/// Two 16 MiB performance-cluster L2s and one 4 MiB efficiency-cluster L2,
+/// as m4-pro-01 reported them (run 20261019T040157Z-fix.seismic-24bcae).
+pub(crate) const M4_PRO_CPU_CACHE: u64 = 37_748_736;
 
 pub(crate) fn m4_pro() -> Reports {
     let mut reports = reports(
@@ -283,6 +287,10 @@ pub(crate) fn m4_pro() -> Reports {
         CpuReport {
             name: "Host CPU (aarch64)".into(),
             identity: "Apple M4 Pro".into(),
+            cache: Some(Reported::new(
+                M4_PRO_CPU_CACHE,
+                ReportedBy::MacOsSysctlCache,
+            )),
             availability: Availability::Available,
             max_allocation: seismic_cpu::MAX_ALLOCATION_BYTES,
         },
@@ -321,6 +329,10 @@ pub(crate) const GB10_VULKAN_HEAP: u64 = 97_997_423_616;
 pub(crate) const GB10_VULKAN_DRIVER: &str = "vulkan driver 4 version 2435301568";
 pub(crate) const GB10_OS: &str =
     "Linux 6.17.0-1026-nvidia #26-Ubuntu SMP PREEMPT_DYNAMIC Thu Jun 25 00:57:17 UTC 2026";
+/// The CPU's last-level caches together, and the GPU's L2, as sparky
+/// reported them (run 20261019T040157Z-fix.seismic-24d66f).
+pub(crate) const GB10_CPU_CACHE: u64 = 25_165_824;
+pub(crate) const GB10_CUDA_L2: u64 = 25_165_824;
 
 pub(crate) fn gb10() -> Reports {
     let mut reports = reports(
@@ -329,6 +341,7 @@ pub(crate) fn gb10() -> Reports {
         CpuReport {
             name: "Host CPU (aarch64)".into(),
             identity: "NVIDIA GB10".into(),
+            cache: Some(Reported::new(GB10_CPU_CACHE, ReportedBy::LinuxSysfsCache)),
             availability: Availability::Available,
             max_allocation: seismic_cpu::MAX_ALLOCATION_BYTES,
         },
@@ -342,8 +355,7 @@ pub(crate) fn gb10() -> Reports {
         total: GB10_CUDA_TOTAL,
         max_allocation: GB10_CUDA_TOTAL,
         integrated: true,
-        // An integrated device reports no board bandwidth.
-        memory_bandwidth: None,
+        l2: Some(GB10_CUDA_L2),
         memory: CudaMemory::Host,
         peers: Vec::new(),
     });
@@ -563,7 +575,7 @@ pub(crate) fn a10_8q() -> Reports {
         total: A10_8Q_CUDA_TOTAL,
         max_allocation: A10_8Q_CUDA_TOTAL,
         integrated: false,
-        memory_bandwidth: None,
+        l2: None,
         memory: CudaMemory::Own {
             usable: Ok(A10_8Q_CUDA_USABLE),
         },

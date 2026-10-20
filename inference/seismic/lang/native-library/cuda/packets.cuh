@@ -1159,6 +1159,7 @@ template <class G> struct Grid {
 
 typedef Grid<Iq2XsGrid> IQ2XS;
 typedef Grid<Iq3XxsGrid> IQ3XXS;
+typedef Grid<Iq2XxsGrid> IQ2XXS;
 
 // q5g32s (GGUF Q5_0: value = d * (code - 16)) and q5g32 (GGUF Q5_1: value =
 // d * code + m, the bias -m): q5k's code planes, one f16 d (and m) per 32.

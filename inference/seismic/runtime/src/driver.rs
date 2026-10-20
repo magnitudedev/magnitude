@@ -612,31 +612,27 @@ impl Allocation {
     pub(crate) fn storage(&self) -> &dyn Storage {
         &*self.storage
     }
-    fn access_group(&self) -> &AccessGroup {
-        self.shared_access
-            .get()
-            .map(Arc::as_ref)
-            .unwrap_or(&self.access)
+    fn access_group(&self) -> &Arc<AccessGroup> {
+        self.shared_access.get().unwrap_or(&self.access)
     }
 
     pub(crate) fn access_identity(&self) -> usize {
-        self.access_group() as *const AccessGroup as usize
+        Arc::as_ptr(self.access_group()) as usize
     }
 
-    /// A slab and its address table share one hazard domain. The slab must
-    /// be unpublished when this is called; all later host and device access
-    /// to either allocation is ordered by the table's submission fence.
-    pub(crate) fn share_access_with(&self, table: &Arc<Allocation>) {
+    /// Join `other`'s hazard domain: a slab its address table's, or a table
+    /// that of the storage its slabs view. This allocation must be unused
+    /// (a slab unpublished, a table never bound) when this is called; all
+    /// later host and device access to either allocation is ordered by one
+    /// fence.
+    pub(crate) fn share_access_with(&self, other: &Arc<Allocation>) {
         self.shared_access
-            .set(table.access.clone())
+            .set(other.access_group().clone())
             .unwrap_or_else(|_| panic!("slab access group was already assigned"));
     }
 
-    pub(crate) fn shares_access_with(&self, table: &Arc<Allocation>) -> bool {
-        Arc::ptr_eq(
-            self.shared_access.get().unwrap_or(&self.access),
-            &table.access,
-        )
+    pub(crate) fn shares_access_with(&self, other: &Arc<Allocation>) -> bool {
+        Arc::ptr_eq(self.access_group(), other.access_group())
     }
 
     /// Host access: waits for conflicting host permits and for submitted

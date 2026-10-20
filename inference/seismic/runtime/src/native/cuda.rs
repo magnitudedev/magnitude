@@ -165,16 +165,18 @@ fn each_launch(
         );
         let scalars = typed_buffer::<Cuda, Executor>(&dispatch.kernel.scalars);
         for (function, launch) in dispatch.launches.iter().enumerate() {
-            let (module, module_function) = launches.launch(function);
-            let launch = launch.map(|launch| DirectLaunch {
-                module,
-                function: module_function,
-                buffers: &typed,
-                words: dispatch.word_bytes,
-                scalar_results: (scalars, 0),
-                grid: launch.groups,
-                block: launch.threads,
-                shared_bytes: launch.shared_bytes,
+            let launch = launch.map(|launch| {
+                let (module, module_function) = launches.launch(function);
+                DirectLaunch {
+                    module,
+                    function: module_function,
+                    buffers: &typed,
+                    words: dispatch.word_bytes,
+                    scalar_results: (scalars, 0),
+                    grid: launch.groups,
+                    block: launch.threads,
+                    shared_bytes: launch.shared_bytes,
+                }
             });
             visit(launch.as_ref()).map_err(CallError::Execution)?;
         }

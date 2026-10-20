@@ -24,30 +24,30 @@
 use super::{DeviceSubmission, HeadProgram};
 use crate::operators::{self, InputForm, Join, Mixer, SublayerInput};
 use crate::{
-    DeviceError, DraftProgramPlan, GraphOutputTensor, HeadLaunchCore, InvariantError,
-    ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead, ResidentOutput,
-    ResidentWeight, ResourceLimits, StateStorePlan, SubmitError, ValidatedHeadLaunch,
     completion::CompletionWaiter,
     native::AttestedDraft,
     operators::attention::graph::{
-        self as attention_graph, AttentionBlock, AttentionBounds, AttentionControlPorts,
-        AttentionGraphEntries, AttentionHistoryEntries, AttentionWeights, CheckedAttentionEntries,
-        ProjectedRows, attention_weights,
+        self as attention_graph, attention_weights, AttentionBlock, AttentionBounds,
+        AttentionControlPorts, AttentionGraphEntries, AttentionHistoryEntries, AttentionWeights,
+        CheckedAttentionEntries, ProjectedRows,
     },
     operators::dense_ffn::graph::{self as dense_graph, CheckedDenseEntries, DenseGraphEntries},
     programs::{
-        graph::readout::{self, SelectionPorts, shapes, write_selection_rows},
-        graph::{GraphError, draft::GraphDraft},
+        graph::readout::{self, shapes, write_selection_rows, SelectionPorts},
+        graph::{draft::GraphDraft, GraphError, RowForm},
         native_constants::{
-            CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
-            distinct_storage_bytes,
+            distinct_storage_bytes, CheckedGraphFamilyResources, CheckedGraphResources,
+            ConstantTensors, GraphConstant,
         },
         native_target_graph::{
-            GatheredTable, PackingBound, RowDirectory, WeightPort, weight, weight_scale_port,
+            weight, weight_scale_port, GatheredTable, PackingBound, RowDirectory, WeightPort,
         },
     },
+    DeviceError, DraftProgramPlan, GraphOutputTensor, HeadLaunchCore, InvariantError,
+    ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead, ResidentOutput,
+    ResidentWeight, ResourceLimits, StateStorePlan, SubmitError, ValidatedHeadLaunch,
 };
-use magnitude_batching::{TargetBatchUpload, row_class};
+use magnitude_batching::{row_class, TargetBatchUpload};
 use magnitude_family_contracts::{
     ActivationDType, BlockAttention, DraftDefinition, DraftEmbedding, DraftMethod, HistoryDomain,
     KeyValue, ModelDefinition, SublayerIndex, WeightKind, WeightRole, WeightScope,
@@ -59,8 +59,9 @@ use magnitude_kernels::{
 };
 use magnitude_state::LayerRef;
 use seismic::{
-    BackendName, BoundNativeGraphPlan, Device, Element, NativeGraph, NativeGraphFamily,
-    NativeGraphMetadata, NativeGraphPlan, NativePort, Tensor, WorkflowTensor,
+    BackendName, BoundNativeGraphPlan, Device, Element, NativeGraph, NativeGraphClassSlice,
+    NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan, NativePort, Tensor,
+    WorkflowTensor,
 };
 use std::{collections::BTreeMap, rc::Rc};
 
@@ -549,9 +550,15 @@ impl CheckedDraftEntries {
     }
 }
 
+/// The class scope of a draft graph's injection pass, whose rows are the
+/// class's entry rows.
+const INJECTION: &str = "draft-injection";
+/// The class dimension of the injection pass's rows, for the ports it
+/// declares with them.
+const ENTRY_ROWS: &str = "draft_entry_rows";
+
 /// The storage and bound constants of the draft's graph family over
-/// `classes`, from metadata alone: each class is sealed exactly, and the
-/// family holds the largest of each arena.
+/// `classes`, from metadata alone (`certify_draft_family`).
 pub(crate) fn checked_draft_family_storage(
     backend: BackendName,
     load: &ModelLoadPlan,
@@ -559,16 +566,68 @@ pub(crate) fn checked_draft_family_storage(
     geometry: &DraftGeometry<'_>,
     classes: impl IntoIterator<Item = DraftGraphClass>,
 ) -> Result<CheckedGraphResources, GraphError> {
+    let classes = classes.into_iter().collect::<Vec<_>>();
+    certify_draft_family(backend, load, plan, geometry, &classes).map(|(resources, _)| resources)
+}
+
+/// The family's storage and each class's layout. Every class field but the
+/// entry rows fixes a graph's topology, as does the attention form those
+/// rows take (`RowForm`): only the injection pass follows them, the block
+/// pass's rows being its slots' and proposals'. So each topology is one
+/// template, built at its largest entry rows and certified over every
+/// class's, and each class seals into its topology's layout
+/// (`PreparedDraftGraphs::prepare`). The injection pass's only constants
+/// that follow its rows are empty (an attention prefill's `[rows, 0]`
+/// bitmap), so the template's constants are every class's.
+fn certify_draft_family(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    plan: &DraftProgramPlan,
+    geometry: &DraftGeometry<'_>,
+    classes: &[DraftGraphClass],
+) -> Result<
+    (
+        CheckedGraphResources,
+        BTreeMap<DraftGraphClass, NativeGraphLayout>,
+    ),
+    GraphError,
+> {
     let checked = CheckedDraftEntries::new(plan);
+    let mut groups: BTreeMap<(u64, u64, bool, bool, bool, RowForm), Vec<DraftGraphClass>> =
+        BTreeMap::new();
+    for &class in classes {
+        if groups.values().any(|group| group.contains(&class)) {
+            return Err("draft graph class is duplicated".into());
+        }
+        groups
+            .entry((
+                class.slots,
+                class.proposals,
+                class.shaped,
+                class.windowed,
+                class.device,
+                RowForm::of(class.entry_rows),
+            ))
+            .or_default()
+            .push(class);
+    }
+    if groups.is_empty() {
+        return Err("draft graph family has no classes".into());
+    }
     let mut family = CheckedGraphFamilyResources::new();
-    for class in classes {
-        let context = || format!("draft graph class {class:?}");
+    let mut layouts = BTreeMap::new();
+    for group in groups.into_values() {
+        let largest = *group
+            .iter()
+            .max_by_key(|class| class.entry_rows)
+            .expect("a topology holds a class");
+        let context = || format!("draft graph class {largest:?}");
         let parts = draft_graph(
-            NativeGraphMetadata::new(backend),
+            NativeGraphMetadata::new_template(backend),
             checked.entries()?,
             load,
             geometry,
-            class,
+            largest,
         )
         .map_err(|error| error.context(context()))?;
         #[cfg(test)]
@@ -578,11 +637,77 @@ pub(crate) fn checked_draft_family_storage(
                 "separate draft graph must retain every artifact vocabulary row"
             );
         }
-        family.include_plan(parts.plan.plan_heap())?;
-        let storage = GraphDraft::seal(parts.plan).map_err(|error| error.context(context()))?;
-        family.include(storage, parts.constants);
+        let template = parts
+            .plan
+            .seal_template()
+            .map_err(|error| GraphError::from(error).context(context()))?;
+        let slices = group
+            .iter()
+            .map(|class| {
+                NativeGraphClassSlice::new()
+                    .dimension(ENTRY_ROWS, [class.entry_rows])
+                    .scoped(INJECTION, "M", [class.entry_rows])
+            })
+            .collect::<Vec<_>>();
+        let layout = template
+            .certify(&slices)
+            .map_err(|error| GraphError::from(error).context(context()))?;
+        family.include(layout.storage_bytes(), parts.constants);
+        for &class in &group {
+            family.include_plan(layout.plan_heap())?;
+            layouts.insert(class, layout.clone());
+        }
     }
-    Ok(family.finish()?)
+    Ok((family.finish()?, layouts))
+}
+
+/// Every class's exact graph seals into the layout it is certified into, at
+/// that layout's storage, and holds no nonempty constant the family does
+/// not charge.
+#[cfg(test)]
+pub(crate) fn verify_draft_family_certificates(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    plan: &DraftProgramPlan,
+    geometry: &DraftGeometry<'_>,
+    classes: &[DraftGraphClass],
+) -> Result<(), GraphError> {
+    let (resources, layouts) = certify_draft_family(backend, load, plan, geometry, classes)?;
+    let checked = CheckedDraftEntries::new(plan);
+    let mut exact = CheckedGraphFamilyResources::new();
+    for &class in classes {
+        let parts = draft_graph(
+            NativeGraphMetadata::new(backend),
+            checked.entries()?,
+            load,
+            geometry,
+            class,
+        )?;
+        let charged = parts
+            .plan
+            .seal_with_layout(&layouts[&class])
+            .map_err(|error| GraphError::from(error).context(format!("draft class {class:?}")))?;
+        if charged != layouts[&class].storage_bytes() {
+            return Err(format!("draft class {class:?} charged a different layout").into());
+        }
+        exact.include(
+            seismic::NativeGraphStorageBytes {
+                workspace: 0,
+                output: 0,
+                upload: 0,
+            },
+            parts.constants,
+        );
+    }
+    let exact = exact.finish()?;
+    if exact.binding_constant_bytes != resources.binding_constant_bytes {
+        return Err(format!(
+            "the draft family charges {} constant bytes, its classes hold {}",
+            resources.binding_constant_bytes, exact.binding_constant_bytes
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// One layer's per-run ports in one pass: its attention controls and its
@@ -766,9 +891,12 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         .find_map(|(index, layer)| layer.as_ref().map(|layer| (index, layer)))
         .ok_or("a draft has no injected layers")?;
     let first_bounds = first_weights.bounds.project_dimensions(true);
+    // Only the injection pass follows the entry rows: its rows are a
+    // topology's class dimension (`certify_draft_family`).
+    graph.set_class_scope(Some(INJECTION));
     let (conditioning, conditioning_rows) = if class.device {
         let features =
-            graph.port_with_class_extent(activation, &[class.entry_rows, hidden], 0, "M")?;
+            graph.port_with_class_extent(activation, &[class.entry_rows, hidden], 0, ENTRY_ROWS)?;
         let widened = graph
             .enqueue(
                 entries.widen,
@@ -802,7 +930,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             injection.push(None);
             continue;
         };
-        let join = Join::single(Some("M"));
+        let join = Join::single(Some(ENTRY_ROWS));
         let (mixed, state, controls) = attention_graph::attention(
             &mut graph,
             layer.injection,
@@ -829,6 +957,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         injected = Some(mixed);
     }
     let injected = injected.ok_or("a draft has no layers")?;
+    graph.set_class_scope(None);
     if class.slots == 0 {
         graph.export(&injected)?;
         return Ok(DraftGraphParts {
@@ -890,7 +1019,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     // row map of the block rows.
     let dflash2 = match (&draft.method, &entries.dflash2) {
         (DraftMethod::DFlash2 { kernel, group, .. }, Some(dflash2)) => {
-            let identity = GraphConstant::identity_for_class(&mut graph, rows, Some("M"))?;
+            let identity = GraphConstant::identity(&mut graph, rows)?;
             let rows_map = identity.port().tensor().clone();
             constants.push(identity);
             Some((dflash2, *kernel, *group, rows_map))
@@ -959,7 +1088,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             bounds: injection_weights.bounds.clone(),
             indexer: None,
         };
-        let join = Join::single(Some("M"));
+        let join = Join::single(None);
         let (mixed, state, controls) = attention_graph::attention(
             &mut graph,
             layer.attention,
@@ -1555,7 +1684,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
             selection: None,
         },
         None,
-        Some("M"),
+        None,
     )?;
     let attended = attended.ok_or("draft block attention result is absent")?;
     let output = project(
@@ -1855,22 +1984,27 @@ impl PreparedDraftGraphs {
         )
     }
 
+    /// Every class's graph, sealed into the layout its topology is certified
+    /// into (`certify_draft_family`), so a load holds what its assessment
+    /// charged.
     pub(crate) fn prepare(
         target_device: &Device,
         draft: &AttestedDraft,
         load: &ModelLoadPlan,
+        plan: &DraftProgramPlan,
         geometry: &DraftGeometry<'_>,
         classes: impl IntoIterator<Item = DraftGraphClass>,
     ) -> Result<Self, SubmitError> {
+        let classes = classes.into_iter().collect::<Vec<_>>();
+        let (_, layouts) =
+            certify_draft_family(target_device.backend(), load, plan, geometry, &classes)
+                .map_err(|error| invalid(error.to_string()))?;
         let mut prepared = BTreeMap::new();
         for class in classes {
-            if prepared.contains_key(&class) {
-                return Err(invalid("draft graph class is duplicated"));
-            }
             let class_error =
                 |error: GraphError| invalid(format!("draft graph class {class:?}: {error}"));
             let parts = draft_graph(
-                target_device.native_graph(),
+                target_device.native_graph_with_layout(&layouts[&class]),
                 DraftGraphEntries::prepared(draft),
                 load,
                 geometry,
@@ -1890,9 +2024,6 @@ impl PreparedDraftGraphs {
                     output: parts.output,
                 },
             );
-        }
-        if prepared.is_empty() {
-            return Err(invalid("draft graph family has no classes"));
         }
         let plans = prepared
             .values()

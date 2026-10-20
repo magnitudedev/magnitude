@@ -544,14 +544,15 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
             // The decode step streams every block's state and weights.
-            let demand = crate::assessment::DecodeDemand::from_model(
+            let demand = crate::assessment::demand::tests::demand_on(
                 &definition,
                 &load,
                 magnitude_state::KvCodec::Dense,
+                backend,
             )
             .unwrap();
             assert!(
-                demand.streamed_bytes > 0 && demand.launches > 0,
+                crate::assessment::demand::tests::streamed(&demand) > 0,
                 "{backend:?}"
             );
         }
@@ -698,13 +699,21 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
 
-            // Scales change no launch or history read: they ride with their
+            // Scales change no call or history read: they ride with their
             // weights.
             let shape = |definition: &ModelDefinition, load: &ModelLoadPlan| {
-                let demand =
-                    crate::assessment::DecodeDemand::from_model(definition, load, KvCodec::Dense)
-                        .unwrap();
-                (demand.launches, demand.history)
+                let demand = crate::assessment::demand::tests::demand_on(
+                    definition,
+                    load,
+                    KvCodec::Dense,
+                    backend,
+                )
+                .unwrap();
+                demand
+                    .calls
+                    .iter()
+                    .map(|call| (call.launches.kernel(), call.work.history))
+                    .collect::<Vec<_>>()
             };
             let unscaled_load =
                 ModelLoadPlan::derive(&unscaled_manifest, &unscaled, selection, layout).unwrap();

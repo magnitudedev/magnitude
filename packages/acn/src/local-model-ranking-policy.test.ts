@@ -19,10 +19,15 @@ const candidate = (input: {
     intelligenceScore: input.intelligence ?? 80,
     fidelityRank: input.fidelity ?? 60,
     profile: { contextLength },
-    performance: input.includeComparisonSample === false ? [] : [{
-        contextTokens: comparisonContext,
-        estimatedTokensPerSecond: input.speed ?? 40,
-      }],
+    performance: input.includeComparisonSample === false
+      ? { _tag: "Pending", measurement: { _tag: "Measuring" } }
+      : {
+          _tag: "Estimated",
+          samples: [{
+            contextTokens: comparisonContext,
+            estimatedTokensPerSecond: input.speed ?? 40,
+          }],
+        },
   }
 }
 
@@ -38,39 +43,41 @@ describe("normalizedModelSpeedScore", () => {
 
 describe("modelRankingScores", () => {
   it("normalizes intelligence, target speed, and quantization fidelity independently", () => {
-    const scores = Option.getOrThrow(modelRankingScores(candidate({
+    const scores = modelRankingScores(candidate({
       intelligence: 75,
       fidelity: 50,
       speed: 40,
-    })))
+    }))
     expect(scores).toEqual({
       intelligence: 0.75,
-      speed: normalizedModelSpeedScore(40),
+      speed: Option.some(normalizedModelSpeedScore(40)),
       fidelity: 0.5,
     })
   })
 
   it("clamps catalog scores to the normalized range", () => {
-    const scores = Option.getOrThrow(modelRankingScores(candidate({
+    const scores = modelRankingScores(candidate({
       intelligence: 150,
       fidelity: -10,
-    })))
+    }))
     expect(scores.intelligence).toBe(1)
     expect(scores.fidelity).toBe(0)
   })
 
-  it("omits ranking when the bounded comparison sample is absent", () => {
+  it("keeps the catalog terms and omits only speed while speed is pending", () => {
     const scores = modelRankingScores(candidate({
+      intelligence: 75,
+      fidelity: 50,
       includeComparisonSample: false,
     }))
-    expect(Option.isNone(scores)).toBe(true)
+    expect(scores).toEqual({ intelligence: 0.75, speed: Option.none(), fidelity: 0.5 })
   })
 
   it("uses the configured context as the comparison point below 50K", () => {
-    const scores = Option.getOrThrow(modelRankingScores(candidate({
+    const scores = modelRankingScores(candidate({
       context: 32_768,
       speed: 24,
-    })))
-    expect(scores.speed).toBeCloseTo(normalizedModelSpeedScore(24))
+    }))
+    expect(Option.getOrThrow(scores.speed)).toBeCloseTo(normalizedModelSpeedScore(24))
   })
 })

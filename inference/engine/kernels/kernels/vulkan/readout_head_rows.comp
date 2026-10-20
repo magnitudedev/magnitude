@@ -1,6 +1,7 @@
 // readout_head_rows: final RMS prologue over the `out_rows` rows, then the
 // vocabulary projection into F32 logits. The Vulkan form of
 // `metal/readout_head_rows.metal` over `lib/projection/projection.glsl`.
+#define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_WS != 0
 #define PROJECTION_SCALED
@@ -22,63 +23,6 @@
 #error "readout_head_rows requires a dense norm"
 #endif
 
-#if defined(SEISMIC_WEIGHT_REPRESENTATION_Q4K)
-#define HEAD_KIND PACKETS_Q4K
-#define HEAD_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q5K)
-#define HEAD_KIND PACKETS_Q5K
-#define HEAD_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q6K)
-#define HEAD_KIND PACKETS_Q6K
-#define HEAD_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q8G32S)
-#define HEAD_KIND PACKETS_Q8
-#define HEAD_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_IQ4G32)
-#define HEAD_KIND PACKETS_IQ4
-#define HEAD_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q4G32S)
-#define HEAD_KIND PACKETS_Q4G32S
-#define HEAD_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_IQ4G32S)
-#define HEAD_KIND PACKETS_IQ4S
-#define HEAD_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_MXFP4G32)
-#define HEAD_KIND PACKETS_MXFP4
-#define HEAD_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_NVFP4G16)
-#define HEAD_KIND PACKETS_NVFP4
-#define HEAD_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q5G32S)
-#define HEAD_KIND PACKETS_Q5G32S
-#define HEAD_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q5G32)
-#define HEAD_KIND PACKETS_Q5G32
-#define HEAD_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_IQ2XS)
-#define HEAD_KIND PACKETS_IQ2XS
-#define HEAD_GEOMETRY PACKETS_ROWS16_GRID(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_IQ3XXS)
-#define HEAD_KIND PACKETS_IQ3XXS
-#define HEAD_GEOMETRY PACKETS_ROWS16_GRID(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_IQ2XXS)
-#define HEAD_KIND PACKETS_IQ2XXS
-#define HEAD_GEOMETRY PACKETS_ROWS16_GRID(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_BF16)
-#define HEAD_KIND PACKETS_BF16
-#define HEAD_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_WEIGHT, 2)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F16)
-#define HEAD_KIND PACKETS_F16
-#define HEAD_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_WEIGHT, 2)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F32)
-#define HEAD_KIND PACKETS_F32
-#define HEAD_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_WEIGHT, 4)
-#else
-#error "unsupported readout_head_rows weight representation"
-#endif
-#if defined(SEISMIC_WEIGHT_KIND_PACKED) && !defined(SEISMIC_WEIGHT_LAYOUT_ROWS16)
-#error "readout_head_rows requires the rows16 layout for weight"
-#endif
 
 #define HEAD_K uint(SEISMIC_DIM_D)
 
@@ -96,15 +40,22 @@ projection_epilogue head_rows_output() {
 }
 
 projection_weights head_rows_weight() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), HEAD_GEOMETRY, HEAD_K, 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), PACKETS_W0_ROWS, HEAD_K, 0ul, 1ul);
 }
 
-void readout_head_rows_gemv() {
+// The GEMV with the activation-row bound `maxm` (`projection_gemv`: one bound
+// per pipeline, so one entry per bound).
+void readout_head_rows_gemv_bounded(const uint maxm) {
     const projection_weights w = head_rows_weight();
-    projection_gemv(HEAD_KIND, HEAD_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_SHARED,
+    projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM_SHARED,
         head_rows_input(), head_rows_output(), w, w, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V), HEAD_K,
         gl_WorkGroupID.x);
 }
+
+void readout_head_rows_gemv1() { readout_head_rows_gemv_bounded(1u); }
+void readout_head_rows_gemv2() { readout_head_rows_gemv_bounded(2u); }
+void readout_head_rows_gemv4() { readout_head_rows_gemv_bounded(4u); }
+void readout_head_rows_gemv8() { readout_head_rows_gemv_bounded(8u); }
 
 void readout_head_rows_stage() {
     projection_stage(head_rows_input(), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED), HEAD_K);
@@ -113,6 +64,6 @@ void readout_head_rows_stage() {
 void readout_head_rows_gemm() {
     const projection_prologue x = projection_plain(HEAD_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_NORMALIZED),
         uint64_t(HEAD_K), 1ul, HEAD_K, 0ul);
-    projection_gemm(HEAD_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, head_rows_output(), head_rows_weight(),
+    projection_gemm(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N, x, head_rows_output(), head_rows_weight(),
         uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V), HEAD_K, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
 }

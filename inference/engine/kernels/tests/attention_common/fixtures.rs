@@ -464,7 +464,7 @@ fn speculative_rows(rows: usize, context: i32) -> Vec<Row> {
 /// unused.
 #[allow(dead_code)]
 const TIMING: seismic::measure::Measure = seismic::measure::Measure {
-    samples: std::num::NonZeroUsize::new(15).unwrap(),
+    stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
     min_sample_seconds: 0.005,
 };
 

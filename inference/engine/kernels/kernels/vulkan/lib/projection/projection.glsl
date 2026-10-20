@@ -28,17 +28,11 @@
 // segment; entries map their workgroup index to a segment and call the GEMV
 // or GEMM body with that segment's weights and epilogue. A GEMM launch calls
 // the GEMM body once, with the segment's kind as a workgroup-uniform value:
-// only the weight staging branches on it, over the kinds the entry lists in
-// PROJECTION_GEMM_KINDS (one bit per PACKETS_* kind, defined before this
-// file is included). Instantiating the body once per segment instead defeats
-// the NVIDIA proprietary compiler (580.159.03): a launch holding two or more
-// GEMM bodies ran about 100x slower than the same tiles through one body.
-// An entry that defines no PROJECTION_GEMM_KINDS passes a constant kind, and
-// its staging is that kind's alone. The branches are preprocessor groups, so
-// the driver never sees a kind the entry cannot stage: RADV compiles code a
-// constant makes dead at full cost, and the 17 kinds' staging made one GEMM
-// pipeline take 9.8 s and 1.96 GB to create instead of 0.5 s and 213 MB, for
-// the same machine code (seismic/hardware/rdna3-vulkan.md).
+// only the weight staging branches on it, over the kinds the entry's slots
+// bind, each a preprocessor group (<seismic/packets.glsl>). Instantiating the
+// body once per segment instead defeats the NVIDIA proprietary compiler
+// (580.159.03): a launch holding two or more GEMM bodies ran about 100x slower
+// than the same tiles through one body.
 //
 // Row classes pick the launch:
 // - GEMV (M <= 8): lane groups own weight rows, lanes own packets, and each
@@ -71,6 +65,7 @@
 #include "../core/matrix.glsl"
 
 #include "stage.glsl"
+
 
 #define PROJECTION_STORE 0
 #define PROJECTION_RESIDUAL 1
@@ -409,6 +404,10 @@ float projection_stage_stream(projection_prologue in_, uint m, uint stream, uint
 // Row-norm partial squares at float 0: 8 rows x PROJECTION_RMS_PARTS.
 #define PROJECTION_GEMV_SQUARES_BYTES 256
 #define PROJECTION_GEMV_STAGE_WORD 16u      // first uvec4 of the staging
+// The register arrays are sized for the largest R and bound; every loop over
+// weight rows runs to `r_rows` and every loop over activation rows to `maxm`,
+// both literals in each pipeline, so the driver unrolls only the iterations
+// that run (its compile time grows with the unrolled body).
 #define PROJECTION_GEMV_MAX_R 4
 #define PROJECTION_GEMV_MAX_M 8
 #define PROJECTION_GEMV_SUMS (PROJECTION_GEMV_MAX_R * PROJECTION_GEMV_MAX_M)
@@ -479,13 +478,11 @@ void projection_gemv_stage(projection_prologue in_, const int norm, uint m_rows,
 void projection_gemv_load(const int wk, const int uk, const bool paired, const uint r_rows, projection_weights w,
     projection_weights u, uint first_row, uint rows, uint p, out packets_packet a[PROJECTION_GEMV_MAX_R],
     out packets_packet b[PROJECTION_GEMV_MAX_R]) {
-    [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
-        if (r < r_rows) {
-            const uint n = min(first_row + r, rows - 1u);
-            a[r] = projection_packet(wk, w, n, p);
-            if (paired)
-                b[r] = projection_packet(uk, u, n, p);
-        }
+    [[unroll]] for (uint r = 0u; r < r_rows; ++r) {
+        const uint n = min(first_row + r, rows - 1u);
+        a[r] = projection_packet(wk, w, n, p);
+        if (paired)
+            b[r] = projection_packet(uk, u, n, p);
     }
 }
 
@@ -511,57 +508,53 @@ void projection_gemv_accumulate(const int wk, const int uk, const bool paired, c
     const uint sums = 4u * (PROJECTION_GEMV_STAGE_WORD + 4u * m_rows * chunk);
     [[unroll]] for (uint step = 0u; step < 4u; ++step) {
         vec4 ae[PROJECTION_GEMV_MAX_R], ao[PROJECTION_GEMV_MAX_R], be[PROJECTION_GEMV_MAX_R], bo[PROJECTION_GEMV_MAX_R];
-        [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
-            if (r < r_rows) {
-                packets_codes(wk, a[r], step, ae[r], ao[r]);
-                if (paired)
-                    packets_codes(uk, b[r], step, be[r], bo[r]);
-            }
+        [[unroll]] for (uint r = 0u; r < r_rows; ++r) {
+            packets_codes(wk, a[r], step, ae[r], ao[r]);
+            if (paired)
+                packets_codes(uk, b[r], step, be[r], bo[r]);
         }
-        [[unroll]] for (uint m = 0u; m < PROJECTION_GEMV_MAX_M; ++m) {
-            if (m < maxm && m < m_rows) {
+        [[unroll]] for (uint m = 0u; m < maxm; ++m) {
+            if (m < m_rows) {
                 vec4 xe, xo;
                 element_split8(act, seismic_shared_uvec4[PROJECTION_GEMV_STAGE_WORD + (m * 4u + step) * chunk + local], xe, xo);
-                [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
-                    if (r < r_rows) {
-                        const uint at = r * PROJECTION_GEMV_MAX_M + m;
-                        acc[at] = seismic_fma_rn(packets_scale(wk, a[r], step), projection_dot8(ae[r], ao[r], xe, xo), acc[at]);
-                        if (paired)
-                            acc2[at] = seismic_fma_rn(packets_scale(uk, b[r], step), projection_dot8(be[r], bo[r], xe, xo), acc2[at]);
-                    }
+                [[unroll]] for (uint r = 0u; r < r_rows; ++r) {
+                    const uint at = r * PROJECTION_GEMV_MAX_M + m;
+                    acc[at] = seismic_fma_rn(packets_scale(wk, a[r], step), projection_dot8(ae[r], ao[r], xe, xo), acc[at]);
+                    if (paired)
+                        acc2[at] = seismic_fma_rn(packets_scale(uk, b[r], step), projection_dot8(be[r], bo[r], xe, xo), acc2[at]);
                 }
             }
         }
     }
+#if PACKETS_ANY(PACKETS_BIASED_KINDS)
     if (packets_biased(wk) || (paired && packets_biased(uk))) {
-        [[unroll]] for (uint m = 0u; m < PROJECTION_GEMV_MAX_M; ++m) {
-            if (m < maxm && m < m_rows) {
+        [[unroll]] for (uint m = 0u; m < maxm; ++m) {
+            if (m < m_rows) {
                 const vec2 s = vec2(seismic_shared_f32[sums + 2u * (m * chunk + local)],
                     seismic_shared_f32[sums + 2u * (m * chunk + local) + 1u]);
-                [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
-                    if (r < r_rows) {
-                        const uint at = r * PROJECTION_GEMV_MAX_M + m;
-                        if (packets_biased(wk)) {
-                            if (packets_groups(wk) == 1u) {
-                                acc[at] = seismic_fma_rn(packets_bias(wk, a[r], 0u), s.x + s.y, acc[at]);
-                            } else {
-                                acc[at] = seismic_fma_rn(packets_bias(wk, a[r], 0u), s.x, acc[at]);
-                                acc[at] = seismic_fma_rn(packets_bias(wk, a[r], 1u), s.y, acc[at]);
-                            }
+                [[unroll]] for (uint r = 0u; r < r_rows; ++r) {
+                    const uint at = r * PROJECTION_GEMV_MAX_M + m;
+                    if (packets_biased(wk)) {
+                        if (packets_groups(wk) == 1u) {
+                            acc[at] = seismic_fma_rn(packets_bias(wk, a[r], 0u), s.x + s.y, acc[at]);
+                        } else {
+                            acc[at] = seismic_fma_rn(packets_bias(wk, a[r], 0u), s.x, acc[at]);
+                            acc[at] = seismic_fma_rn(packets_bias(wk, a[r], 1u), s.y, acc[at]);
                         }
-                        if (paired && packets_biased(uk)) {
-                            if (packets_groups(uk) == 1u) {
-                                acc2[at] = seismic_fma_rn(packets_bias(uk, b[r], 0u), s.x + s.y, acc2[at]);
-                            } else {
-                                acc2[at] = seismic_fma_rn(packets_bias(uk, b[r], 0u), s.x, acc2[at]);
-                                acc2[at] = seismic_fma_rn(packets_bias(uk, b[r], 1u), s.y, acc2[at]);
-                            }
+                    }
+                    if (paired && packets_biased(uk)) {
+                        if (packets_groups(uk) == 1u) {
+                            acc2[at] = seismic_fma_rn(packets_bias(uk, b[r], 0u), s.x + s.y, acc2[at]);
+                        } else {
+                            acc2[at] = seismic_fma_rn(packets_bias(uk, b[r], 0u), s.x, acc2[at]);
+                            acc2[at] = seismic_fma_rn(packets_bias(uk, b[r], 1u), s.y, acc2[at]);
                         }
                     }
                 }
             }
         }
     }
+#endif
 }
 
 // The sums of one GEMV workgroup with the activation-row bound `maxm` (1, 2, 4
@@ -594,62 +587,67 @@ void projection_gemv_sums(const int wk, const int uk, const bool paired, const u
         barrier();
         if (owns_rows) {
             for (uint local = sub; local < count; local += lanes) {
-                if (first + local + lanes < packets)
+                // The next packet is copied only when it was loaded: copying
+                // the unwritten registers past the last packet is undefined
+                // (the NVIDIA driver then zeroed paired dense sums).
+                const bool more = first + local + lanes < packets;
+                if (more)
                     projection_gemv_load(wk, uk, paired, r_rows, w, u, first_row, rows, first + local + lanes, next_a, next_b);
                 projection_gemv_accumulate(wk, uk, paired, r_rows, maxm, in_.act, acc, acc2, current_a, current_b, local,
                     m_rows, chunk);
-                current_a = next_a;
-                current_b = next_b;
+                if (more) {
+                    current_a = next_a;
+                    current_b = next_b;
+                }
             }
         }
     }
     [[unroll]] for (uint i = 0u; i < PROJECTION_GEMV_SUMS; ++i) {
-        const uint r = i / PROJECTION_GEMV_MAX_M, m = i % PROJECTION_GEMV_MAX_M;
         totals[i] = 0.0;
         totals2[i] = 0.0;
-        if (r < r_rows && m < maxm && m < m_rows) {
-            totals[i] = reduce_lanes_sum(acc[i], lanes);
-            if (paired)
-                totals2[i] = reduce_lanes_sum(acc2[i], lanes);
-        }
     }
-}
-
-// One GEMV workgroup with the activation-row bound `maxm`: the sums, then the
-// epilogue of each (weight row, activation row) from one lane of its group.
-void projection_gemv_bounded(const int wk, const int uk, const bool paired, const uint r_rows, const uint lanes,
-    const uint maxm, const int norm, projection_prologue in_, projection_epilogue out_, projection_weights w,
-    projection_weights u, uint m_rows, uint rows, uint k, uint tile) {
-    float totals[PROJECTION_GEMV_SUMS], totals2[PROJECTION_GEMV_SUMS];
-    projection_gemv_sums(wk, uk, paired, r_rows, lanes, maxm, norm, in_, w, u, m_rows, rows, k, tile, totals, totals2);
-    const uint sub = SEISMIC_LANE % lanes;
-    const uint first_row = projection_gemv_first_row(r_rows, lanes, tile);
-    [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
-        [[unroll]] for (uint m = 0u; m < PROJECTION_GEMV_MAX_M; ++m) {
+    [[unroll]] for (uint r = 0u; r < r_rows; ++r) {
+        [[unroll]] for (uint m = 0u; m < maxm; ++m) {
             const uint at = r * PROJECTION_GEMV_MAX_M + m;
-            if (r < r_rows && m < maxm && m < m_rows && sub == (r * maxm + m) % lanes && first_row + r < rows)
-                projection_emit(out_, paired, m, first_row + r, totals[at], totals2[at]);
+            if (m < m_rows) {
+                totals[at] = reduce_lanes_sum(acc[at], lanes);
+                if (paired)
+                    totals2[at] = reduce_lanes_sum(acc2[at], lanes);
+            }
         }
     }
 }
 
 // The GEMV of one segment: weight kinds `wk` (and `uk` of the up weights when
-// paired), R rows per lane group, LANES lanes per group. Rms prologues first
-// reduce their rows' squares (norm SHARED). Every invocation of the workgroup
-// must call it (it contains barriers).
-void projection_gemv(const int wk, const int uk, const bool paired, const uint r_rows, const uint lanes, const int norm,
-    projection_prologue in_, projection_epilogue out_, projection_weights w, projection_weights u, uint m_rows,
-    uint rows, uint k, uint tile) {
+// paired), R rows per lane group, LANES lanes per group, and the
+// activation-row bound `maxm` (1, 2, 4 or 8; m_rows <= maxm): the sums, then
+// the epilogue of each (weight row, activation row) from one lane of its
+// group. Rms prologues first reduce their rows' squares (norm SHARED). Every
+// invocation of the workgroup must call it (it contains barriers).
+//
+// One bound per pipeline: every call passes `maxm` as a literal, and an entry
+// serving several bounds has one entry function (and one launch) per bound.
+// The body unrolls over MAX_R x MAX_M x 4 steps, and the NVIDIA proprietary
+// driver's pipeline creation is superlinear in function size: one pipeline
+// holding the four bounds behind a runtime row-count switch took 10-25 s to
+// create (dense_expand, rtx3090), against about 1 s for one bound, while a
+// single bound of 8 for every row count lost 16% of one-row decode bandwidth.
+void projection_gemv(const int wk, const int uk, const bool paired, const uint r_rows, const uint lanes,
+    const uint maxm, const int norm, projection_prologue in_, projection_epilogue out_, projection_weights w,
+    projection_weights u, uint m_rows, uint rows, uint k, uint tile) {
     if (norm == PROJECTION_NORM_SHARED)
         projection_gemv_squares(in_, m_rows);
-    if (m_rows <= 1u)
-        projection_gemv_bounded(wk, uk, paired, r_rows, lanes, 1u, norm, in_, out_, w, u, m_rows, rows, k, tile);
-    else if (m_rows <= 2u)
-        projection_gemv_bounded(wk, uk, paired, r_rows, lanes, 2u, norm, in_, out_, w, u, m_rows, rows, k, tile);
-    else if (m_rows <= 4u)
-        projection_gemv_bounded(wk, uk, paired, r_rows, lanes, 4u, norm, in_, out_, w, u, m_rows, rows, k, tile);
-    else
-        projection_gemv_bounded(wk, uk, paired, r_rows, lanes, 8u, norm, in_, out_, w, u, m_rows, rows, k, tile);
+    float totals[PROJECTION_GEMV_SUMS], totals2[PROJECTION_GEMV_SUMS];
+    projection_gemv_sums(wk, uk, paired, r_rows, lanes, maxm, norm, in_, w, u, m_rows, rows, k, tile, totals, totals2);
+    const uint sub = SEISMIC_LANE % lanes;
+    const uint first_row = projection_gemv_first_row(r_rows, lanes, tile);
+    [[unroll]] for (uint r = 0u; r < r_rows; ++r) {
+        [[unroll]] for (uint m = 0u; m < maxm; ++m) {
+            const uint at = r * PROJECTION_GEMV_MAX_M + m;
+            if (m < m_rows && sub == (r * maxm + m) % lanes && first_row + r < rows)
+                projection_emit(out_, paired, m, first_row + r, totals[at], totals2[at]);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -836,10 +834,9 @@ void projection_gemm_store_b_of(const int kind, const uint threads, projection_g
     }
 }
 
-// The weight staging of a kind chosen per workgroup (a segmented launch, see
-// the file header): one preprocessor group per kind of PROJECTION_GEMM_KINDS,
-// each a constant-kind staging. Without PROJECTION_GEMM_KINDS the kind is a
-// constant and is staged directly.
+// The weight staging of a kind that may be chosen per workgroup (a segmented
+// launch, see the file header): one preprocessor group per kind a slot
+// binds, each a constant-kind staging.
 #define PROJECTION_GEMM_LOAD_B(KIND) \
     if (kind == KIND) { \
         projection_gemm_load_b_of(KIND, threads, w, first, count, rows, k0, k, regs); \
@@ -853,119 +850,111 @@ void projection_gemm_store_b_of(const int kind, const uint threads, projection_g
 
 void projection_gemm_load_b(int kind, const uint threads, projection_weights w, uint first, const uint count,
     uint rows, uint k0, uint k, out projection_gemm_b regs) {
-#if defined(PROJECTION_GEMM_KINDS)
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q4K)) != 0
+#if PACKETS_HOLDS(PACKETS_Q4K)
     PROJECTION_GEMM_LOAD_B(PACKETS_Q4K)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q5K)) != 0
+#if PACKETS_HOLDS(PACKETS_Q5K)
     PROJECTION_GEMM_LOAD_B(PACKETS_Q5K)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q6K)) != 0
+#if PACKETS_HOLDS(PACKETS_Q6K)
     PROJECTION_GEMM_LOAD_B(PACKETS_Q6K)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q8)) != 0
+#if PACKETS_HOLDS(PACKETS_Q8)
     PROJECTION_GEMM_LOAD_B(PACKETS_Q8)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ4)) != 0
+#if PACKETS_HOLDS(PACKETS_IQ4)
     PROJECTION_GEMM_LOAD_B(PACKETS_IQ4)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q4G32S)) != 0
-    PROJECTION_GEMM_LOAD_B(PACKETS_Q4G32S)
-#endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ4S)) != 0
+#if PACKETS_HOLDS(PACKETS_IQ4S)
     PROJECTION_GEMM_LOAD_B(PACKETS_IQ4S)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_MXFP4)) != 0
+#if PACKETS_HOLDS(PACKETS_Q4G32S)
+    PROJECTION_GEMM_LOAD_B(PACKETS_Q4G32S)
+#endif
+#if PACKETS_HOLDS(PACKETS_MXFP4)
     PROJECTION_GEMM_LOAD_B(PACKETS_MXFP4)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_NVFP4)) != 0
+#if PACKETS_HOLDS(PACKETS_NVFP4)
     PROJECTION_GEMM_LOAD_B(PACKETS_NVFP4)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q5G32S)) != 0
+#if PACKETS_HOLDS(PACKETS_Q5G32S)
     PROJECTION_GEMM_LOAD_B(PACKETS_Q5G32S)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q5G32)) != 0
+#if PACKETS_HOLDS(PACKETS_Q5G32)
     PROJECTION_GEMM_LOAD_B(PACKETS_Q5G32)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ2XS)) != 0
+#if PACKETS_HOLDS(PACKETS_IQ2XS)
     PROJECTION_GEMM_LOAD_B(PACKETS_IQ2XS)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ3XXS)) != 0
+#if PACKETS_HOLDS(PACKETS_IQ3XXS)
     PROJECTION_GEMM_LOAD_B(PACKETS_IQ3XXS)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ2XXS)) != 0
+#if PACKETS_HOLDS(PACKETS_IQ2XXS)
     PROJECTION_GEMM_LOAD_B(PACKETS_IQ2XXS)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_BF16)) != 0
+#if PACKETS_HOLDS(PACKETS_BF16)
     PROJECTION_GEMM_LOAD_B(PACKETS_BF16)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_F16)) != 0
+#if PACKETS_HOLDS(PACKETS_F16)
     PROJECTION_GEMM_LOAD_B(PACKETS_F16)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_F32)) != 0
+#if PACKETS_HOLDS(PACKETS_F32)
     PROJECTION_GEMM_LOAD_B(PACKETS_F32)
-#endif
-#else
-    projection_gemm_load_b_of(kind, threads, w, first, count, rows, k0, k, regs);
 #endif
 }
 
 void projection_gemm_store_b(int kind, const uint threads, projection_gemm_b regs, const uint count,
     uint tile_row0, uint spacing, uint b_word) {
-#if defined(PROJECTION_GEMM_KINDS)
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q4K)) != 0
+#if PACKETS_HOLDS(PACKETS_Q4K)
     PROJECTION_GEMM_STORE_B(PACKETS_Q4K)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q5K)) != 0
+#if PACKETS_HOLDS(PACKETS_Q5K)
     PROJECTION_GEMM_STORE_B(PACKETS_Q5K)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q6K)) != 0
+#if PACKETS_HOLDS(PACKETS_Q6K)
     PROJECTION_GEMM_STORE_B(PACKETS_Q6K)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q8)) != 0
+#if PACKETS_HOLDS(PACKETS_Q8)
     PROJECTION_GEMM_STORE_B(PACKETS_Q8)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ4)) != 0
+#if PACKETS_HOLDS(PACKETS_IQ4)
     PROJECTION_GEMM_STORE_B(PACKETS_IQ4)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q4G32S)) != 0
-    PROJECTION_GEMM_STORE_B(PACKETS_Q4G32S)
-#endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ4S)) != 0
+#if PACKETS_HOLDS(PACKETS_IQ4S)
     PROJECTION_GEMM_STORE_B(PACKETS_IQ4S)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_MXFP4)) != 0
+#if PACKETS_HOLDS(PACKETS_Q4G32S)
+    PROJECTION_GEMM_STORE_B(PACKETS_Q4G32S)
+#endif
+#if PACKETS_HOLDS(PACKETS_MXFP4)
     PROJECTION_GEMM_STORE_B(PACKETS_MXFP4)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_NVFP4)) != 0
+#if PACKETS_HOLDS(PACKETS_NVFP4)
     PROJECTION_GEMM_STORE_B(PACKETS_NVFP4)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q5G32S)) != 0
+#if PACKETS_HOLDS(PACKETS_Q5G32S)
     PROJECTION_GEMM_STORE_B(PACKETS_Q5G32S)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_Q5G32)) != 0
+#if PACKETS_HOLDS(PACKETS_Q5G32)
     PROJECTION_GEMM_STORE_B(PACKETS_Q5G32)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ2XS)) != 0
+#if PACKETS_HOLDS(PACKETS_IQ2XS)
     PROJECTION_GEMM_STORE_B(PACKETS_IQ2XS)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ3XXS)) != 0
+#if PACKETS_HOLDS(PACKETS_IQ3XXS)
     PROJECTION_GEMM_STORE_B(PACKETS_IQ3XXS)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_IQ2XXS)) != 0
+#if PACKETS_HOLDS(PACKETS_IQ2XXS)
     PROJECTION_GEMM_STORE_B(PACKETS_IQ2XXS)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_BF16)) != 0
+#if PACKETS_HOLDS(PACKETS_BF16)
     PROJECTION_GEMM_STORE_B(PACKETS_BF16)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_F16)) != 0
+#if PACKETS_HOLDS(PACKETS_F16)
     PROJECTION_GEMM_STORE_B(PACKETS_F16)
 #endif
-#if (PROJECTION_GEMM_KINDS & (1 << PACKETS_F32)) != 0
+#if PACKETS_HOLDS(PACKETS_F32)
     PROJECTION_GEMM_STORE_B(PACKETS_F32)
-#endif
-#else
-    projection_gemm_store_b_of(kind, threads, regs, count, tile_row0, spacing, b_word);
 #endif
 }
 
@@ -1149,8 +1138,10 @@ vec2 projection_gemm_pair(inout projection_gemm_acc acc, const uint wn, uint q) 
     return acc.scale[(q / 4u) / (wn / 16u)]
         * vec2(seismic_shared_f32[scratch + 2u * pair], seismic_shared_f32[scratch + 2u * pair + 1u]);
 #else
+    // Pair q's two accumulators are 2 q and 2 q + 1, written over `q` itself
+    // (`packets_kquant_coefficients`).
     const uint block = q / 16u, within = q % 16u;
-    const uint at = 32u * block + 8u * (within / 4u) + 2u * (within % 4u);
+    const uint at = 2u * q;
     return acc.scale[4u * (block / (wn / 32u)) + within / 4u] * vec2(acc.c[at], acc.c[at + 1u]);
 #endif
 }

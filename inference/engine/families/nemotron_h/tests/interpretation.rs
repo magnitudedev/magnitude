@@ -1,21 +1,20 @@
 //! Interpretation of every catalog Nemotron-H header, plus negative cases.
 //!
-//! The headers are the metadata and full tensor directories of the locked
-//! catalog files (`inference/catalog/headers`).
+//! The headers are the locked catalog components' (`headers::catalog`).
 
 use magnitude_artifacts::{
     gguf::{Array, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
     ArtifactIdentity, InputLayout, PackageIdentity, TokenId, UnsupportedReason,
 };
 use magnitude_family_common::{
-    headers::{directory as catalog, directory_from_bytes},
+    headers::{artifact, catalog},
     TextInput,
 };
 use magnitude_family_contracts::{
     ActivationFunction, AttentionGate, ExitNorm, ExpertSelection, FeedForwardUp, HeadNorm,
-    ImportTransform,
-    InputNorm, InputPreparationError, KeyValue, ModelDefinition, ModelInputAdapter, Operator,
-    Rotary, ScoreFunction, SharedExpertGate, TokenPlan, WeightDescriptor,
+    ImportTransform, InputNorm, InputPreparationError, KeyValue, ModelDefinition,
+    ModelInputAdapter, Operator, Rotary, ScoreFunction, SharedExpertGate, TokenPlan,
+    WeightDescriptor,
 };
 use magnitude_family_nemotron_h::{inspect_components, recognize, Error};
 
@@ -31,15 +30,15 @@ fn inspect(directory: &Directory) -> Result<ModelDefinition, Error> {
 }
 
 const LIGHTNING: [&str; 3] = [
-    "nemotron-3.5-lightning-30b-a3b__target-gguf_nvfp4-qat.json",
-    "nemotron-3.5-lightning-30b-a3b__target-gguf_q4.json",
-    "nemotron-3.5-lightning-30b-a3b__target-gguf_q8.json",
+    "nemotron-3.5-lightning-30b-a3b__target-gguf:nvfp4-qat",
+    "nemotron-3.5-lightning-30b-a3b__target-gguf:q4",
+    "nemotron-3.5-lightning-30b-a3b__target-gguf:q8",
 ];
 const SUPER: [&str; 2] = [
-    "nemotron-3-super-120b-a12b__target-gguf_mxfp4-allshards.json",
-    "nemotron-3-super-120b-a12b__target-gguf_q4-allshards.json",
+    "nemotron-3-super-120b-a12b__target-gguf:mxfp4",
+    "nemotron-3-super-120b-a12b__target-gguf:q4",
 ];
-const ULTRA: &str = "nemotron-3-ultra-550b-a55b__target-gguf_mxfp4-allshards.json";
+const ULTRA: &str = "nemotron-3-ultra-550b-a55b__target-gguf:mxfp4";
 
 /// The layer pattern, one character per sublayer (`M` state space, `*`
 /// attention, `E` routed), with `|` between blocks.
@@ -242,9 +241,7 @@ fn super_and_ultra_latent_experts_are_refused_until_their_kernels_are_ready() {
 /// The released Nemotron 3.5 Super VL Q4_0 header (ggml-org), which states
 /// only `layer_norm_epsilon`.
 fn super_vl() -> Directory {
-    directory_from_bytes(include_bytes!(
-        "fixtures/nemotron-3.5-super-vl-120b-a12b-q4_0.json"
-    ))
+    artifact("nemotron-3.5-super-vl-120b-a12b__target-gguf:q4_0")
 }
 
 #[test]
@@ -328,9 +325,9 @@ fn recognizes_only_the_nemotron_h_architecture() {
     for file in LIGHTNING.iter().chain(&SUPER).chain([&ULTRA]) {
         assert!(recognize(&catalog(file)).is_ok(), "{file}");
     }
-    let draft = catalog("nemotron-3.5-lightning-30b-a3b__draft.json");
+    let draft = catalog("nemotron-3.5-lightning-30b-a3b__draft");
     assert!(matches!(recognize(&draft), Err(Error::Architecture(_))));
-    let qwen = catalog("qwen3.5-4b__target-gguf_q4.json");
+    let qwen = catalog("qwen3.5-4b__target-gguf:q4");
     assert!(matches!(recognize(&qwen), Err(Error::Architecture(_))));
 }
 
