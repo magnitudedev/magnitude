@@ -28,8 +28,23 @@ pub struct NativeStateProgram {
     graphs: Rc<PreparedStateCopyGraphs>,
 }
 
+/// The map row classes a store copy of a plane holding `plane_rows` rows or
+/// banks launches: each chunk of at most the launch row limit runs at the
+/// row class of its moves (`magnitude_batching::row_class`), and a copy
+/// moves distinct rows of one plane, so every launch row class up to the
+/// first covering the plane.
+fn plane_copy_row_classes(row_classes: &[u64], plane_rows: u64) -> &[u64] {
+    let covered = row_classes
+        .iter()
+        .position(|&rows| rows >= plane_rows)
+        .map_or(row_classes.len(), |index| index + 1);
+    &row_classes[..covered]
+}
+
 /// The exact state-copy classes prepared for the target and optional head
-/// state planes. Assessment uses this list before opening a device.
+/// state planes, history rows and recurrent banks alike, at every row class
+/// a store copy of the plane launches. Assessment uses this list before
+/// opening a device.
 pub(crate) fn state_copy_classes(
     target: &StateStorePlan,
     head: Option<&StateStorePlan>,
@@ -48,12 +63,10 @@ pub(crate) fn state_copy_classes(
         for (domain, plane) in planes {
             let width =
                 u64::try_from(plane.row_elements).map_err(|_| "state plane width exceeds u64")?;
-            let extents = vec![
-                u64::try_from(domain.rows).map_err(|_| "state history rows exceed u64")?,
-                1,
-                width,
-            ];
-            for &rows in row_classes {
+            let history_rows =
+                u64::try_from(domain.rows).map_err(|_| "state history rows exceed u64")?;
+            let extents = vec![history_rows, 1, width];
+            for &rows in plane_copy_row_classes(row_classes, history_rows) {
                 let class = StateCopyGraphClass {
                     element: Element::dense(plane.dtype),
                     source_extents: extents.clone(),
@@ -82,15 +95,17 @@ pub(crate) fn state_copy_classes(
                         size.checked_mul(u64::try_from(extent).ok()?)
                     })
                     .ok_or("state bank component width exceeds u64")?;
-                let class = StateCopyGraphClass {
-                    element: Element::dense(component.dtype),
-                    source_extents: vec![banks, 1, width],
-                    destination_extents: vec![banks, 1, width],
-                    map_rows: 1,
-                    slab_rows: state.bank_slab_banks()?,
-                };
-                if !classes.contains(&class) {
-                    classes.push(class);
+                for &rows in plane_copy_row_classes(row_classes, banks) {
+                    let class = StateCopyGraphClass {
+                        element: Element::dense(component.dtype),
+                        source_extents: vec![banks, 1, width],
+                        destination_extents: vec![banks, 1, width],
+                        map_rows: rows,
+                        slab_rows: state.bank_slab_banks()?,
+                    };
+                    if !classes.contains(&class) {
+                        classes.push(class);
+                    }
                 }
             }
         }
@@ -618,12 +633,64 @@ mod tests {
             zero_seed_bytes: 16,
             recurrent_pool_bytes: 48,
         };
-        let classes = state_copy_classes(&plan, None, &[1, 2]).unwrap();
-        assert_eq!(classes.len(), 1);
-        assert_eq!(classes[0].element, Element::f32());
-        assert_eq!(classes[0].source_extents, vec![4, 1, 4]);
-        assert_eq!(classes[0].map_rows, 1);
-        assert_eq!(classes[0].slab_rows, plan.bank_slab_banks().unwrap());
+        let classes = state_copy_classes(&plan, None, &[1, 2, 4, 8]).unwrap();
+        assert_eq!(
+            classes
+                .iter()
+                .map(|class| class.map_rows)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4]
+        );
+        for class in &classes {
+            assert_eq!(class.element, Element::f32());
+            assert_eq!(class.source_extents, vec![4, 1, 4]);
+            assert_eq!(class.slab_rows, plan.bank_slab_banks().unwrap());
+        }
+    }
+
+    /// Reclaim moves every claimed bank outside the kept slabs in one store
+    /// copy, which the domain launches in chunks at the row class of their
+    /// moves. Each such class must be prepared, not only the single-bank one.
+    #[test]
+    fn every_store_copy_launch_of_banks_has_a_prepared_class() {
+        let plan = StateStorePlan {
+            context_rows: 8,
+            max_advance: 8,
+            history: Vec::new(),
+            domains: Vec::new(),
+            recurrent_components: vec![ComponentSpec {
+                shape: vec![4],
+                dtype: seismic::DType::F32,
+            }],
+            bank_capacity: BankCapacity {
+                active: 3,
+                in_flight: 3,
+                retained: 3,
+            },
+            recurrent_bank_bytes: 16,
+            zero_seed_bytes: 16,
+            recurrent_pool_bytes: 160,
+        };
+        let banks = plan.bank_capacity.storage_total().unwrap();
+        let max_launch_rows = 64;
+        let row_classes = crate::batching::row_classes(max_launch_rows)
+            .into_iter()
+            .map(|rows| rows as u64)
+            .collect::<Vec<_>>();
+        let classes = state_copy_classes(&plan, None, &row_classes).unwrap();
+        for moves in 1..=banks.min(max_launch_rows) {
+            let class = StateCopyGraphClass {
+                element: Element::f32(),
+                source_extents: vec![banks as u64, 1, 4],
+                destination_extents: vec![banks as u64, 1, 4],
+                map_rows: crate::batching::row_class(moves).unwrap() as u64,
+                slab_rows: plan.bank_slab_banks().unwrap(),
+            };
+            assert!(
+                classes.contains(&class),
+                "a copy of {moves} banks launches an unprepared class {class:?}"
+            );
+        }
     }
 
     #[test]

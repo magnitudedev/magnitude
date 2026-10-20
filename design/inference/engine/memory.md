@@ -481,7 +481,9 @@ authoritative; failure leaves accepted values, placement and charge unchanged. I
 empties the least occupied slabs so they can be freed, moving whole occupied pages to free pages at
 the same offsets, so every history keeps its page structure and its span limit. Empty slabs are
 released at once in Reclaim and, at idle, beyond one free slab per store. No compaction requires a
-memory claim.
+memory claim. A copy launches in chunks of at most the launch row limit, each at the row class of
+its moves, so every history and bank plane prepares a copy graph at each row class up to the first
+covering its rows or banks: Reclaim moves several banks in one copy.
 
 The memory heap is the sole authority for claims, bands, holding classes and
 release decisions. Seismic is the sole byte and allocation-charge authority.

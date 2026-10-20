@@ -3,8 +3,9 @@
 //! `metal`, `cuda`, `vulkan`, or `cpu` to qualify a specific backend.
 //! `MAGNITUDE_TEST_KV_CODEC=dense` reduces the number of rows needed to span
 //! a slab on a slower backend.
-//! The bank-only test needs a model with multiple banks per slab; the
-//! Qwen3.5-0.8B Q4_K_M GGUF has three with the 64 MiB slab target.
+//! The bank-only test moves several banks in one copy and needs a model with
+//! multiple banks per slab; the Qwen3.5-0.8B Q4_K_M and BF16 GGUFs have three
+//! with the 64 MiB slab target.
 //! Run with `MAGNITUDE_TEST_MTP_GGUF=<model.gguf> cargo test --release
 //! -p magnitude-engine --test reclaim_compaction -- --ignored --nocapture`.
 
@@ -184,9 +185,15 @@ fn reclaim_relocates_live_banks_without_changing_continuation() {
     let (mut domain, mut bindings, vocabulary, _, slab_banks) = domain();
     assert!(slab_banks > 1, "model needs multiple banks per slab");
 
-    let peers = slab_banks * 2;
+    // Closing every other peer leaves live banks scattered over several
+    // slabs, so Reclaim moves more than one bank in one store copy, which
+    // launches above the single-bank copy class.
+    let peers = slab_banks * 4;
     let reference = RequestId(peers as u64 + 1);
-    let relocated = RequestId(peers as u64 + 2);
+    let relocated = (0..peers)
+        .filter(|index| index % 2 == 1)
+        .map(|index| RequestId(index as u64 + 1))
+        .collect::<Vec<_>>();
     open(&mut domain, &mut bindings, reference);
     bindings = prefill(&mut domain, bindings, reference, vocabulary, 1);
     for index in 0..peers {
@@ -194,9 +201,7 @@ fn reclaim_relocates_live_banks_without_changing_continuation() {
         open(&mut domain, &mut bindings, request);
         bindings = prefill(&mut domain, bindings, request, vocabulary, 1);
     }
-    open(&mut domain, &mut bindings, relocated);
-    bindings = prefill(&mut domain, bindings, relocated, vocabulary, 1);
-    for index in 0..peers {
+    for index in (0..peers).filter(|index| index % 2 == 0) {
         domain.close(RequestId(index as u64 + 1)).unwrap();
     }
 
@@ -218,27 +223,36 @@ fn reclaim_relocates_live_banks_without_changing_continuation() {
         .unwrap();
     let after = domain.state_compactions().0;
     let charge_after = domain.reconcile_memory_charge(&[]).unwrap();
-    assert!(after.banks > before.banks, "banks were not relocated");
+    assert!(
+        after.banks >= before.banks + 2,
+        "{} banks were relocated, not several",
+        after.banks - before.banks
+    );
     assert!(released > 0 && charge_after.charged < charge_before.charged);
     assert_eq!(released, charge_before.charged - charge_after.charged);
     assert_eq!(charge_after.unattributed, 0, "{charge_after:?}");
 
-    let (actual, _) = forward(
-        &mut domain,
-        bindings,
-        relocated,
-        1,
-        WorkKind::Decode,
-        tokens(vocabulary, 1, 1),
-        true,
-    );
-    assert_eq!(
-        actual.unwrap(),
-        expected,
-        "continuation changed after bank relocation"
-    );
+    for &request in &relocated {
+        let actual;
+        (actual, bindings) = forward(
+            &mut domain,
+            bindings,
+            request,
+            1,
+            WorkKind::Decode,
+            tokens(vocabulary, 1, 1),
+            true,
+        );
+        assert_eq!(
+            actual.unwrap(),
+            expected,
+            "continuation changed after bank relocation"
+        );
+    }
     domain.close(reference).unwrap();
-    domain.close(relocated).unwrap();
+    for request in relocated {
+        domain.close(request).unwrap();
+    }
 }
 
 #[test]
