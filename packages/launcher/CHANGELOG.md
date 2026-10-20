@@ -1,5 +1,30 @@
 # @magnitudedev/cli
 
+## 0.2.10
+
+### Patch Changes
+
+- [`15ff695`](https://github.com/magnitudedev/magnitude/commit/15ff69513ec4ce5a2420cbdaf5bde9657493f8b4) Thanks [@anerli](https://github.com/anerli)! - Fix memory planning on unified-memory and integrated GPUs.
+
+  - On NVIDIA GB10 and Apple Silicon, the one-time optimization counts the memory the loaded model already uses instead of overcommitting it ([#199](https://github.com/magnitudedev/magnitude/issues/199), [#206](https://github.com/magnitudedev/magnitude/issues/206)).
+  - Integrated GPUs such as AMD Strix Halo use their shared memory as well as the dedicated carve-out, instead of stopping when the carve-out is full ([#207](https://github.com/magnitudedev/magnitude/issues/207)).
+  - The optimization retries an allocation the GPU refuses instead of failing.
+  - The app lists each GPU once and shows the backend Magnitude uses for it.
+
+- [`7f02906`](https://github.com/magnitudedev/magnitude/commit/7f029060a37ed1f7884db038222dc8f36430a08e) Thanks [@anerli](https://github.com/anerli)! - Support models with IQ2_XXS weights on every backend, and fix models with IQ2_XS weights failing to load on a Mac ([#195](https://github.com/magnitudedev/magnitude/issues/195)).
+
+- [`7ec9327`](https://github.com/magnitudedev/magnitude/commit/7ec93279cbd5aa32ae9aa7c6078a1248aec181d9) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Fix model loads failing on Linux machines and virtual machines ([#196](https://github.com/magnitudedev/magnitude/issues/196)).
+
+  - Memory held by the file cache counts as available, so loads no longer fail for lack of memory that the system could free.
+  - A real memory shortage at startup is reported as one that can be retried, instead of failing the load partway through.
+  - A CPU without the instructions the engine needs is reported plainly before loading starts.
+
+- [`151bf9a`](https://github.com/magnitudedev/magnitude/commit/151bf9aefcbda14ffa4b420b40a25830fbe7af7b) Thanks [@anerli](https://github.com/anerli)! - Fix models with a Q8_0 output head failing to load, including MiniCPM5 1B Q8 and, with drafting off, Qwen3.6 35B-A3B and Qwen3.5 9B Q6. Faster output for large vocabularies can be selected again during the one-time optimization.
+
+- [`1f54d5b`](https://github.com/magnitudedev/magnitude/commit/1f54d5b7e871aff1d1ae276d6a7cc3a3553baabf) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - The web app's model status explains that a model loads automatically on the first request, and the Update button explains what an update brings.
+
+- [`fc5e2e8`](https://github.com/magnitudedev/magnitude/commit/fc5e2e8adebfe9ab84ccbc95cdf5886c282ace40) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Fix the RPM package conflicting with other installed applications over shared build IDs ([#200](https://github.com/magnitudedev/magnitude/issues/200)).
+
 ## 0.2.9
 
 ### Patch Changes
