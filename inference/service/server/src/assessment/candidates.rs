@@ -385,8 +385,9 @@ impl ManagedModelCandidates {
     }
 
     /// How a catalog model serves without its catalog drafter. Catalog models use their catalog
-    /// drafter unless it doesn't fit: withheld when the engine binds it and the model fits served
-    /// plain and not with it, so the model still loads, served plain. Its built-in heads serve
+    /// drafter unless it doesn't fit: withheld when the engine binds it and the model doesn't fit
+    /// with it, so the model is served plain, and loads when it fits plain or is refused with its
+    /// own shortfall. Its built-in heads serve
     /// while the drafter is not on this computer when they are automatic: the engine binds them
     /// and they keep the model fitting.
     async fn catalog_drafter_fit(
@@ -1919,11 +1920,11 @@ impl ManagedModelCandidates {
     /// `stop_at_first_automatic`, sources after the first one automatic choice may take are not
     /// assessed.
     ///
-    /// A drafter the engine binds is automatic unless the model fits without a drafter and not
-    /// with it: a drafter never makes a model that fits not fit, so the next candidate, or none, is
-    /// chosen instead. "Without a drafter" is the model served plain, never with its built-in heads.
-    /// When the model doesn't fit even without one, fit doesn't decide. A catalog model, and a
-    /// catalog model's exact target, are offered only the catalog drafter, under the same rule.
+    /// A drafter the engine binds is automatic only when the model fits with it: a drafter never
+    /// makes a model that fits not fit, so the next candidate, or none, is chosen instead. When the
+    /// model doesn't fit without a drafter, served plain, never with its built-in heads, no drafter
+    /// is automatic, so a refusal reports the model's own shortfall. A catalog model, and a catalog
+    /// model's exact target, are offered only the catalog drafter, under the same rule.
     async fn enumerate_drafters(
         &self,
         target: &DrafterTarget,
@@ -1958,7 +1959,7 @@ impl ManagedModelCandidates {
         if matches!(bare.profile, ModelAssessment::Unsupported { .. }) {
             return Ok(DrafterList::default());
         }
-        let fit_decides = fits(&bare.profile);
+        let fits_plain = fits(&bare.profile);
         // The target as the engine takes it on its own: with its built-in heads when it has any.
         progress.drafters_planned(1);
         let own = self
@@ -1966,10 +1967,6 @@ impl ManagedModelCandidates {
             .await;
         progress.drafter_checked();
         let own = own?;
-        let regardless_of_fit = |mut candidate: DrafterCandidate| {
-            candidate.automatic = known_to_work(&candidate) && is_bound(&candidate.verdict);
-            candidate
-        };
         let exact = match (&target.repository, &target.primary) {
             (Some((repository, commit)), Some(primary)) => {
                 Some((repository.as_str(), commit.as_str(), primary.as_path()))
@@ -1994,12 +1991,9 @@ impl ManagedModelCandidates {
             }
         };
         let matched = matches.first().cloned();
-        let decide = |candidate: DrafterCandidate| {
-            if fit_decides {
-                candidate
-            } else {
-                regardless_of_fit(candidate)
-            }
+        let decide = |mut candidate: DrafterCandidate| {
+            candidate.automatic &= fits_plain;
+            candidate
         };
         let embedded_catalog = matched.as_ref().is_some_and(|(matched, _)| {
             matches!(

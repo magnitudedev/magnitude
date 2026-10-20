@@ -4681,7 +4681,16 @@ impl Requirements {
     /// A CPU environment whose host may use halfway between serving plain and serving with the
     /// cheaper drafter: the model fits plain and with neither its heads nor the DFlash.
     fn between(&self) -> Arc<AssessmentEnvironment> {
-        let budget = (self.plain + self.heads.min(self.dflash)) / 2;
+        self.with_budget((self.plain + self.heads.min(self.dflash)) / 2)
+    }
+
+    /// A CPU environment whose host may use a little less than serving plain needs: the model
+    /// fits neither plain nor with its heads or the DFlash.
+    fn short(&self) -> Arc<AssessmentEnvironment> {
+        self.with_budget(self.plain - (self.heads.min(self.dflash) - self.plain) / 2)
+    }
+
+    fn with_budget(&self, budget: u64) -> Arc<AssessmentEnvironment> {
         let reserve = |floor: u64| serde_json::json!({ "fraction_divisor": u64::MAX, "floor_bytes": floor });
         let reserves: magnitude_executor::platform::MemoryReserves =
             serde_json::from_value(serde_json::json!({
@@ -4797,6 +4806,104 @@ async fn a_model_that_fits_only_served_plain_gets_no_automatic_drafter_even_with
             built_in_heads: false,
         },
         "served plain, never with heads that would stop it fitting"
+    );
+}
+
+/// QA (V710 27 GB, round 4): Qwen3.6 35B-A3B MXFP4 needed 83.5 MB more served plain, yet Auto
+/// attached its catalog DFlash and the refusal asked for 1.4 GB more. When the model doesn't fit
+/// served plain, no drafter is automatic, for a file from any repository, the exact catalog target
+/// and the catalog model alike; each stays listed with its verdict, and the shortfall reported is
+/// the model's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_that_does_not_fit_served_plain_gets_no_automatic_drafter() {
+    let requirements = Requirements::of(QWEN_FILE).await;
+    let fixture = fixture_from(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::new(),
+        true,
+        requirements.short(),
+    )
+    .await;
+    let drafters = |repository: &'static str, seed: char| {
+        let candidates = Arc::clone(&fixture.candidates);
+        async move {
+            candidates
+                .drafters(DrafterCandidatesRequest::Candidate {
+                    candidate: hugging_face_candidate(repository, seed, QWEN_FILE),
+                    other: None,
+                })
+                .await
+                .expect("drafter candidates")
+                .candidates
+        }
+    };
+
+    for (repository, seed) in [(QWEN_COMMUNITY, '3'), (QWEN_TARGET, '1')] {
+        let listed = drafters(repository, seed).await;
+        for category in [DrafterCategory::CatalogDrafter, DrafterCategory::BuiltIn] {
+            let candidate = listed
+                .iter()
+                .find(|candidate| candidate.category == category)
+                .unwrap_or_else(|| panic!("{category:?} is listed: {listed:#?}"));
+            assert!(is_bound(&candidate.verdict), "{category:?} binds: {candidate:?}");
+            assert!(
+                !candidate.automatic,
+                "{repository}: {category:?} is not automatic for a model that doesn't fit plain"
+            );
+        }
+    }
+
+    let plain = fixture
+        .candidates
+        .assess_candidate(hugging_face_candidate(QWEN_COMMUNITY, '3', QWEN_FILE))
+        .await
+        .expect("plain assessment");
+    let ModelAssessment::DoesNotFit {
+        deficit_bytes: plain_deficit,
+        ..
+    } = plain
+    else {
+        panic!("the model doesn't fit served plain: {plain:?}");
+    };
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::HuggingFace {
+            repository: HuggingFaceRepositoryId::new(QWEN_COMMUNITY.to_owned()).unwrap(),
+            revision: commit('3'),
+        })
+        .await
+        .expect("inspection");
+    let verdict = version(&inspection, QWEN_FILE).assessment.clone();
+    assert!(
+        matches!(
+            verdict,
+            Some(ModelAssessment::DoesNotFit { deficit_bytes, .. }) if deficit_bytes == plain_deficit
+        ),
+        "the shortfall reported is the model's own, {plain_deficit} bytes: {verdict:?}"
+    );
+
+    assert_eq!(
+        fixture
+            .candidates
+            .recommended_drafter(&qwen_catalog_id())
+            .await
+            .expect("recommendation"),
+        None,
+        "the catalog model is recommended no drafter"
+    );
+    assert_eq!(
+        fixture
+            .candidates
+            .catalog_drafter_fit(&qwen_catalog_id())
+            .await
+            .expect("catalog drafter fit"),
+        CatalogDrafterFit {
+            withheld: true,
+            built_in_heads: false,
+        },
+        "the catalog model is served plain"
     );
 }
 

@@ -116,11 +116,15 @@ Ties within one method go to the smaller download (nothing, when its files are a
 enumeration order. Candidates are listed in this same order: by source, then method, then download. A
 rejected candidate is listed but never preselected.
 
-A drafter never makes a model that fits stop fitting. A candidate that binds is automatic unless the model fits
-without a drafter and not with it; such a candidate is listed with its verdict, and the next automatic one, or no
-drafter, is preselected. "Without a drafter" is the model served plain (`ModelMethod::Plain`), never the engine's
-automatic method, which takes built-in heads; the heads are a candidate like any other, judged with them. When the
-model doesn't fit even without a drafter, fit doesn't decide. The rule holds for every origin and every path: the
+A drafter never makes a model that fits stop fitting. A candidate that binds is automatic only when the model fits
+with it; one it doesn't fit with is listed with its verdict, and the next automatic one, or no drafter, is
+preselected. "Without a drafter" is the model served plain (`ModelMethod::Plain`), never the engine's automatic
+method, which takes built-in heads; the heads are a candidate like any other, judged with them. When the model
+doesn't fit even without a drafter, no drafter is automatic: every candidate stays listed and choosable, and the
+model is served and assessed plain, so a refusal reports the model's own shortfall rather than a larger one for a
+drafter the user can't use (a drafter only adds memory, so it can never make such a model fit). A catalog model
+whose bound catalog drafter is therefore not automatic is withheld and served plain too, so its refusal reports
+its own shortfall. The rule holds for every origin and every path: the
 candidate list, the recommended drafter, and the attachment, which takes only automatic candidates. A user-entered
 drafter is never automatic. Inspection composes only the recommended version with its preselected drafter (or
 serves it plain when none is preselected), exactly what adding it installs; every other version carries its plain

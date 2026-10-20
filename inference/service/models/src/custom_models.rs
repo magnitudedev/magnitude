@@ -101,8 +101,9 @@ pub trait CustomModelEnrichment: Send + Sync + 'static {
 }
 
 /// How a catalog model serves without its catalog drafter, which depends on the release material
-/// and this computer, never on the files here. `withheld`: it fits served plain and not with that
-/// drafter, so it is served plain whether or not the drafter is here. `built_in_heads`: its target
+/// and this computer, never on the files here. `withheld`: the engine binds that drafter and the model
+/// doesn't fit with it, so it is served plain whether or not the drafter is here: it then loads
+/// when it fits plain, and is otherwise refused with its own shortfall. `built_in_heads`: its target
 /// has built-in heads the engine binds and that keep it fitting, which serve while the catalog
 /// drafter is not on this computer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
