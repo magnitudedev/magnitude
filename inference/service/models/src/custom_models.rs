@@ -6698,6 +6698,36 @@ mod tests {
         assert!(eventually(&fixture.local, |listed| listed.models.len() == 1).await);
     }
 
+    /// QA (macOS, round 4b): a link created in a watched folder to a GGUF outside it stayed unlisted
+    /// until some other change in the folder. The event named the link, which resolved to its
+    /// target outside every watched location, so it was dropped.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_created_in_a_watched_folder_is_found_without_a_refresh() {
+        let fixture = Fixture::new().await;
+        let target = fixture.root.join("elsewhere/model.gguf");
+        write_model(&target, "linked");
+        let folder = fixture.root.join("models");
+        fs::create_dir_all(folder.join("links")).unwrap();
+        fixture
+            .local
+            .configure(roots(vec![root(ModelRootKind::Folder, &folder)]))
+            .await
+            .unwrap();
+        assert!(fixture.local.list_local().await.unwrap().models.is_empty());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let link = folder.join("links/file-link.gguf");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(eventually(&fixture.local, |listed| listed.models.len() == 1).await);
+
+        fs::remove_file(&link).unwrap();
+        assert!(eventually(&fixture.local, |listed| listed.models.is_empty()).await);
+
+        std::os::unix::fs::symlink(&target, folder.join("links/second-link.gguf")).unwrap();
+        assert!(eventually(&fixture.local, |listed| listed.models.len() == 1).await);
+    }
+
     /// A location that could not be read (a permission it lacked, say) is scanned as soon as it
     /// can be, without a restart.
     #[tokio::test]

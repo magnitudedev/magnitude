@@ -112,6 +112,15 @@ fn stable_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Where an event happened, as `stable_path` names it but without following the path itself: a
+/// link created in a location is a change there, wherever it points.
+fn event_path(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => stable_path(parent).join(name),
+        _ => stable_path(path),
+    }
+}
+
 /// The configured paths a change concerns: the locations it happened in, or a missing location
 /// it may have created.
 fn affected(event: &notify::Event, interests: &[PathBuf]) -> BTreeSet<PathBuf> {
@@ -121,7 +130,7 @@ fn affected(event: &notify::Event, interests: &[PathBuf]) -> BTreeSet<PathBuf> {
     event
         .paths
         .iter()
-        .map(|path| stable_path(path))
+        .map(|path| event_path(path))
         .filter(|path| !is_partial_download(path))
         .flat_map(|path| {
             interests

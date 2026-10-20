@@ -416,7 +416,9 @@ bytes; otherwise the model keeps the identity and origin its found locations giv
 keeps it available when those files disappear. ACN reports such an import as already on this
 computer, records the path under the file's own `local:` ID, and leaves the model's drafter choice
 unchanged unless the import names a drafter or turns it off. ICN watches every enabled root, so models appear and disappear
-without a restart; a watch event triggers scoped reconciliation of that root, never a global scan.
+without a restart; a watch event triggers scoped reconciliation of that root, never a global scan. An event is attributed
+to a root by where it happened, never by where a changed path leads, so creating, renaming or removing a
+link in a root reconciles that root wherever the link points.
 
 Magnitude never writes to, moves, adopts, or deletes from an external location. Scans read GGUF
 headers only (and, for identity, the first and last 1 MiB of each file's tensor data), never
