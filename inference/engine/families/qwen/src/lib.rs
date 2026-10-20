@@ -74,7 +74,10 @@ impl<'a> Metadata<'a> {
         let key = self.key(key);
         self.directory
             .value(&key)
-            .ok_or_else(|| Error::invalid(format!("missing Qwen metadata {key}")))
+            .ok_or_else(|| {
+                let detail = format!("missing Qwen metadata {key}");
+                Error::missing_metadata(key, detail)
+            })
     }
     pub fn optional(&self, key: &str) -> Option<&Value> {
         self.directory.value(&self.key(key))

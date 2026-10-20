@@ -91,9 +91,10 @@ impl HeaderError {
     /// The unsupported features this error names: unknown keys, keys or
     /// tensors stored in a form the family doesn't read (such as a weight
     /// with an extra unit dimension), unbound tensors, rope scaling outside
-    /// the admitted ranges, and an output head absent because it is tied to
-    /// the embedding. A header missing anything else the family needs, or
-    /// whose values contradict each other, is `Unreadable`.
+    /// the admitted ranges, a key the family requires that the header omits,
+    /// and an output head absent because it is tied to the embedding. A
+    /// header missing a weight the family needs, or whose values contradict
+    /// each other, is `Unreadable`.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
             Self::UnknownMetadata(keys) => keys
@@ -115,13 +116,15 @@ impl HeaderError {
             Self::Yarn => vec![UnsupportedReason::RopeScaling {
                 kind: "yarn".into(),
             }],
+            Self::MissingMetadata(key) => {
+                vec![UnsupportedReason::MissingMetadata { key: key.clone() }]
+            }
             Self::MissingWeight(name) if name == OUTPUT_HEAD => {
                 vec![UnsupportedReason::TiedOutputHead]
             }
-            Self::MissingMetadata(_)
-            | Self::MissingWeight(_)
-            | Self::Rotary { .. }
-            | Self::Definition(_) => vec![UnsupportedReason::Unreadable],
+            Self::MissingWeight(_) | Self::Rotary { .. } | Self::Definition(_) => {
+                vec![UnsupportedReason::Unreadable]
+            }
         }
     }
 }
@@ -162,14 +165,23 @@ mod tests {
     }
 
     #[test]
-    fn a_header_missing_what_the_family_needs_is_unreadable_unless_its_head_is_tied() {
+    fn a_header_missing_a_key_names_it() {
+        assert_eq!(
+            HeaderError::MissingMetadata("lfm2.block_count".into()).reasons(),
+            [UnsupportedReason::MissingMetadata {
+                key: "lfm2.block_count".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_header_missing_a_weight_is_unreadable_unless_its_head_is_tied() {
         assert_eq!(
             HeaderError::MissingWeight("output.weight".into()).reasons(),
             [UnsupportedReason::TiedOutputHead]
         );
         for error in [
             HeaderError::MissingWeight("blk.0.attn_q.weight".into()),
-            HeaderError::MissingMetadata("lfm2.block_count".into()),
             HeaderError::Rotary {
                 rotated: 3,
                 width: 64,

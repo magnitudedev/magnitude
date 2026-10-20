@@ -67,7 +67,8 @@ model's) never decide a verdict: a projector binds when its output width
 (`clip.vision.projection_dim`) is the target's embedding width, and a header naming no architecture
 is unreadable. A projector that does not bind (another width, or any projector given to a text-only
 family) is the projector's refusal, never the target's: the target is interpreted without it and
-takes text input only. Absent head widths read as llama.cpp reads them. The Qwen 3.5 lineage's layer kinds read
+takes text input only. Absent head widths read as llama.cpp reads them, and so does an absent RMS
+norm epsilon where llama.cpp takes the layer-norm epsilon in its place (Nemotron-H). The Qwen 3.5 lineage's layer kinds read
 as llama.cpp reads them too: `attention.recurrent_layers` flags every stored block, prediction blocks
 last and never recurrent, and otherwise one layer in every `full_attention_interval` is attention; a
 header carrying both binds only when they agree. The rule is shared by every family,

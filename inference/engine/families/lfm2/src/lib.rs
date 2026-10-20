@@ -339,10 +339,9 @@ pub fn inspect_components(
             })),
             _ => {
                 let intermediate = dense_intermediate.ok_or_else(|| {
-                    invalid(format!(
-                        "missing LFM2 metadata {} for dense layer {index}",
-                        m.key("feed_forward_length")
-                    ))
+                    let key = m.key("feed_forward_length");
+                    let detail = format!("missing LFM2 metadata {key} for dense layer {index}");
+                    Error::missing_metadata(key, detail)
                 })?;
                 Operator::DenseFfn(Box::new(DenseFfn {
                     intermediate,

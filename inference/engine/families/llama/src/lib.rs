@@ -123,9 +123,10 @@ pub enum Error {
 }
 
 impl Error {
-    /// The unsupported features this error names; a header missing what the
-    /// family needs, or whose values contradict each other, is `Unreadable`,
-    /// and a projector given to this text-only family does not fit it.
+    /// The unsupported features this error names; a header missing a key
+    /// names it, one missing a weight the family needs, or whose values
+    /// contradict each other, is `Unreadable`, and a projector given to this
+    /// text-only family does not fit it.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
             Self::Unadmitted(features) => features.iter().map(Feature::reason).collect(),
@@ -140,8 +141,9 @@ impl Error {
                 architecture: architecture.clone(),
             }],
             Self::Metadata {
-                expected: PRESENT, ..
-            } => vec![UnsupportedReason::Unreadable],
+                key,
+                expected: PRESENT,
+            } => vec![UnsupportedReason::MissingMetadata { key: key.clone() }],
             Self::Metadata { key, .. } => {
                 vec![UnsupportedReason::UnrecognizedMetadata { key: key.clone() }]
             }

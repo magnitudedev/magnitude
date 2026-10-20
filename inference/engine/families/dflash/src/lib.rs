@@ -193,9 +193,9 @@ impl Error {
     /// The unsupported features this error names. A draft that disagrees
     /// with its target, or whose geometry or assembled definition are
     /// outside what drafting admits, does not fit the target it was bound
-    /// to; one that omits its attention causality names that key, since a
-    /// published file that predates the declaration is otherwise sound; one
-    /// missing another key or a weight it needs is `Unreadable`.
+    /// to; one that omits a key it needs names that key (its attention
+    /// causality is one a published file may predate); one missing a weight
+    /// it needs is `Unreadable`.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
             Self::Architecture(architecture) => vec![UnsupportedReason::Architecture {
@@ -223,9 +223,10 @@ impl Error {
                 vec![UnsupportedReason::UnrecognizedTensor { name: name.clone() }]
             }
             Self::Metadata {
-                expected: PRESENT, ..
-            }
-            | Self::MissingWeight(_) => vec![UnsupportedReason::Unreadable],
+                key,
+                expected: PRESENT,
+            } => vec![UnsupportedReason::MissingMetadata { key: key.clone() }],
+            Self::MissingWeight(_) => vec![UnsupportedReason::Unreadable],
             Self::Metadata { key, .. } => {
                 vec![UnsupportedReason::UnrecognizedMetadata { key: key.clone() }]
             }

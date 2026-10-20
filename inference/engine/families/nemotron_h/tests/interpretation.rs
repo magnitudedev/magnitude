@@ -5,9 +5,12 @@
 
 use magnitude_artifacts::{
     gguf::{Array, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
-    ArtifactIdentity, InputLayout, PackageIdentity, TokenId,
+    ArtifactIdentity, InputLayout, PackageIdentity, TokenId, UnsupportedReason,
 };
-use magnitude_family_common::{headers::directory as catalog, TextInput};
+use magnitude_family_common::{
+    headers::{directory as catalog, directory_from_bytes},
+    TextInput,
+};
 use magnitude_family_contracts::{
     ActivationFunction, AttentionGate, ExitNorm, ExpertSelection, FeedForwardUp, HeadNorm,
     ImportTransform,
@@ -222,26 +225,27 @@ fn every_lightning_variant_binds_with_its_prediction_block_skipped() {
     }
 }
 
+fn super_() -> Expected {
+    Expected {
+        pattern: SUPER_PATTERN,
+        hidden: 4096,
+        heads: 32,
+        state_heads: 128,
+        norm_group: 1024,
+        experts: 512,
+        selected: 22,
+        intermediate: 2688,
+        shared: 5376,
+        latent: Some(1024),
+        scale: 5.0,
+    }
+}
+
 #[test]
 fn super_and_ultra_bind_latent_experts() {
     for file in SUPER {
         let definition = inspect(&catalog(file)).unwrap_or_else(|error| panic!("{file}: {error}"));
-        check(
-            &definition,
-            &Expected {
-                pattern: SUPER_PATTERN,
-                hidden: 4096,
-                heads: 32,
-                state_heads: 128,
-                norm_group: 1024,
-                experts: 512,
-                selected: 22,
-                intermediate: 2688,
-                shared: 5376,
-                latent: Some(1024),
-                scale: 5.0,
-            },
-        );
+        check(&definition, &super_());
     }
     let definition = inspect(&catalog(ULTRA)).unwrap();
     check(
@@ -266,6 +270,39 @@ fn super_and_ultra_bind_latent_experts() {
         .filter(|block| *block == "M")
         .count();
     assert_eq!(lone, 12);
+}
+
+/// The released Nemotron 3.5 Super VL Q4_0 header (ggml-org), which states
+/// only `layer_norm_epsilon`.
+fn super_vl() -> Directory {
+    directory_from_bytes(include_bytes!(
+        "fixtures/nemotron-3.5-super-vl-120b-a12b-q4_0.json"
+    ))
+}
+
+#[test]
+fn a_header_without_an_rms_epsilon_normalizes_with_its_layer_norm_epsilon() {
+    let directory = super_vl();
+    assert!(directory
+        .value("nemotron_h_moe.attention.layer_norm_rms_epsilon")
+        .is_none());
+    check(&inspect(&directory).unwrap(), &super_());
+
+    let mut directory = super_vl();
+    directory
+        .metadata
+        .retain(|entry| entry.name != "nemotron_h_moe.attention.layer_norm_epsilon");
+    let error = inspect(&directory).unwrap_err();
+    assert_eq!(
+        error,
+        Error::MissingMetadata("nemotron_h_moe.attention.layer_norm_epsilon".into())
+    );
+    assert_eq!(
+        error.reasons(),
+        [UnsupportedReason::MissingMetadata {
+            key: "nemotron_h_moe.attention.layer_norm_epsilon".into()
+        }]
+    );
 }
 
 #[test]

@@ -101,10 +101,11 @@ drafter architecture is a separate drafter whose `general.architecture` no draft
 which names what the engine lacks rather than the target's architecture: a Nemotron-H MTP file
 (`nemotron_h_moe`, an architecture the engine runs as a target) is refused this way, because the
 engine drafts with no Nemotron-H prediction head, separate or built in;
-missing metadata is a well-formed file that omits a declaration the engine requires and never
-infers (a block drafter's attention causality, which some published drafters predate); tied output
+missing metadata is a well-formed file that omits a key its family requires and never infers,
+naming that key (a block drafter's attention causality, which some published drafters predate, or
+a target's normalization epsilon); tied output
 head is a target whose output projection is its embedding where the family needs a separate one. Every refusal names
-at least one reason: a header missing what its family needs, or contradicting itself, is
+at least one reason: a header missing a weight its family needs, or contradicting itself, is
 unreadable, and a planner refusal of a validated definition names the backend. The assessment
 collects every reason, not the first: a representation failure does not stop the weight-type
 check, and a file with two unsupported types reports both. Clients own user-facing wording per

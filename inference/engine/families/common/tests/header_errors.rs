@@ -114,8 +114,13 @@ fn every_unbound_tensor_is_named() {
 }
 
 #[test]
-fn a_header_missing_what_the_family_needs_is_unreadable() {
+fn a_header_missing_a_key_the_family_needs_names_it() {
     let error = FamilyError::from(HeaderError::MissingMetadata("arch.block_count".into()));
-    assert_eq!(error.reasons, [UnsupportedReason::Unreadable]);
+    assert_eq!(
+        error.reasons,
+        [UnsupportedReason::MissingMetadata {
+            key: "arch.block_count".into()
+        }]
+    );
     assert_eq!(error.detail, "missing metadata arch.block_count");
 }

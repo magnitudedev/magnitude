@@ -77,7 +77,9 @@ const KNOWN_KEYS: &[&str] = &[
 pub enum Error {
     /// The artifact is not a `nemotron_h_moe` target.
     Architecture(String),
-    /// Missing or malformed metadata.
+    /// A required architecture key the header omits.
+    MissingMetadata(String),
+    /// Malformed or contradictory metadata.
     Metadata(String),
     /// Every architecture key the family does not interpret.
     UnknownMetadata(Vec<String>),
@@ -101,6 +103,7 @@ impl fmt::Display for Error {
             | Self::Weight(message)
             | Self::Structure(message)
             | Self::Definition(message) => formatter.write_str(message),
+            Self::MissingMetadata(key) => write!(formatter, "missing metadata {key}"),
             Self::UnknownMetadata(keys) => write!(formatter, "unknown Nemotron-H metadata {keys:?}"),
             Self::UnboundWeights(names) => write!(
                 formatter,
@@ -114,15 +117,18 @@ impl fmt::Display for Error {
 impl error::Error for Error {}
 
 impl Error {
-    /// The unsupported features this error names; a header missing what the
-    /// family needs, or whose values or layers contradict each other, is
-    /// `Unreadable`, and a projector given to this text-only family does not
-    /// fit it.
+    /// The unsupported features this error names; a header missing a key
+    /// names it, one missing a weight the family needs, or whose values or
+    /// layers contradict each other, is `Unreadable`, and a projector given
+    /// to this text-only family does not fit it.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
             Self::Projector => vec![UnsupportedReason::TargetMismatch {
                 detail: self.to_string(),
             }],
+            Self::MissingMetadata(key) => {
+                vec![UnsupportedReason::MissingMetadata { key: key.clone() }]
+            }
             Self::UnknownMetadata(keys) => keys
                 .iter()
                 .map(|key| UnsupportedReason::UnrecognizedMetadata { key: key.clone() })
@@ -156,6 +162,7 @@ impl From<HeaderError> for Error {
     fn from(error: HeaderError) -> Self {
         match error {
             HeaderError::UnknownMetadata(keys) => Self::UnknownMetadata(keys),
+            HeaderError::MissingMetadata(key) => Self::MissingMetadata(key),
             HeaderError::MissingWeight(name) => {
                 Self::Weight(format!("missing Nemotron-H weight {name:?}"))
             }
@@ -171,8 +178,7 @@ impl From<HeaderError> for Error {
             error @ (HeaderError::NotMatrix { .. } | HeaderError::CompanionScale { .. }) => {
                 Self::Weight(error.to_string())
             }
-            error @ (HeaderError::MissingMetadata(_)
-            | HeaderError::MetadataType { .. }
+            error @ (HeaderError::MetadataType { .. }
             | HeaderError::Rotary { .. }
             | HeaderError::Yarn) => metadata_error(error.to_string()),
         }
@@ -552,9 +558,15 @@ pub fn inspect_components(
             })
         }
     };
+    // Converters since Nemotron 3.5 write only `layer_norm_epsilon`, which
+    // llama.cpp then uses for the RMS norms too.
+    let epsilon = match m.optional_number("attention.layer_norm_rms_epsilon")? {
+        Some(epsilon) => epsilon,
+        None => m.number("attention.layer_norm_epsilon")?,
+    };
     let geometry = Geometry {
         hidden,
-        epsilon: m.number("attention.layer_norm_rms_epsilon")?,
+        epsilon,
         attention_heads: m.integer("attention.head_count")?,
         attention_width,
         state_space: StateSpaceGeometry {

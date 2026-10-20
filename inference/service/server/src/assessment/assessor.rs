@@ -867,6 +867,27 @@ mod tests {
         );
     }
 
+    /// A readable header that omits a required key names it rather than reading as unreadable.
+    #[test]
+    fn a_missing_key_keeps_its_name_in_the_contract() {
+        let key = "nemotron_h_moe.attention.layer_norm_epsilon";
+        let (reasons, detail) = unsupported_reasons(UnsupportedModel::reason(
+            EngineUnsupportedReason::MissingMetadata {
+                key: key.to_owned(),
+            },
+            format!("missing metadata {key}"),
+        ));
+        assert_eq!(
+            reasons,
+            [UnsupportedReason::Known(
+                KnownUnsupportedReason::MissingMetadata {
+                    key: key.to_owned()
+                }
+            )]
+        );
+        assert_eq!(detail, format!("missing metadata {key}"));
+    }
+
     fn resolved_model(path: &str) -> ResolvedModel {
         use magnitude_service_contracts::{
             ContentId, InventoryEntryId, InventoryModel, InventoryProperties, ModelAvailability,

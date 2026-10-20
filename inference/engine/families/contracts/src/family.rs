@@ -23,10 +23,17 @@ pub struct FamilyError {
 
 impl FamilyError {
     /// Material whose header does not describe a model the family can
-    /// build: a required key or weight is missing, or values contradict
-    /// each other.
+    /// build: a required weight is missing, or values contradict each other.
     pub fn invalid(detail: impl Into<String>) -> Self {
         Self::unsupported(vec![UnsupportedReason::Unreadable], detail)
+    }
+
+    /// A metadata key the family requires that the header omits.
+    pub fn missing_metadata(key: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::unsupported(
+            vec![UnsupportedReason::MissingMetadata { key: key.into() }],
+            detail,
+        )
     }
 
     /// A metadata key present with a value the family does not read.

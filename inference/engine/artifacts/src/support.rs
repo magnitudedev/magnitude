@@ -9,9 +9,10 @@ use std::fmt;
 
 /// One cause a model or drafter cannot run. `TargetMismatch` is a drafter
 /// or projector that does not fit its target; `MissingMetadata` is a
-/// well-formed file that omits a declaration the engine requires and never
-/// infers (a block drafter's attention causality); `Unreadable` is a
-/// truncated or invalid GGUF, or a header missing what its family needs;
+/// well-formed file that omits a key its family requires and never infers
+/// (a block drafter's attention causality); `Unreadable` is a truncated or
+/// invalid GGUF, or a header missing a weight its family needs or
+/// contradicting itself;
 /// `DraftArchitecture` is a separate drafter whose `general.architecture`
 /// no drafter family binds (a model architecture's prediction head the
 /// engine drafts with only when it is built in, or not at all).

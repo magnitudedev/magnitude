@@ -76,7 +76,7 @@ fn every_unknown_key_of_the_family_is_named() {
 }
 
 #[test]
-fn a_missing_key_is_unreadable_and_a_malformed_one_is_named() {
+fn missing_and_malformed_keys_are_named() {
     let header = header(&[(
         "qwen35.embedding_length",
         Value::Scalar(Scalar::String("wide".into())),
@@ -84,7 +84,9 @@ fn a_missing_key_is_unreadable_and_a_malformed_one_is_named() {
     let m = Metadata::new(&header, "qwen35", GEOMETRY_KEYS).unwrap();
     assert_eq!(
         m.integer("attention.head_count").unwrap_err().reasons,
-        [UnsupportedReason::Unreadable]
+        [UnsupportedReason::MissingMetadata {
+            key: "qwen35.attention.head_count".into()
+        }]
     );
     assert_eq!(
         m.integer("embedding_length").unwrap_err().reasons,
