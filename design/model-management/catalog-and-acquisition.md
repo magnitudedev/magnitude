@@ -118,7 +118,9 @@ reason and the parser's detail; it never fails the repository's inspection, and 
 failure is never reported as a network failure unless the inference service was unreachable. Each version also reports the bytes adding it downloads before any drafter: its
 files and the repository's projector, or nothing when it is already on this computer or is a local
 file used in place. Each version carries its canonical model ID,
-so clients never form identities, and a label: the header's `general.file_type` label, spelled as
+so clients never form identities, and a label: the header's `general.file_type` label (the weights'
+type when the file's tensors contradict the declared type, none of them stored in it, as an MXFP4
+file whose writer declared `Q2_0`: then the type most of its weight bytes are stored in), spelled as
 the file or folder name spells it when that names the same weight type more precisely (`UD-Q4_K_XL`
 or `Q4_K_P` for a `Q4_K_M` header); a name naming another type is ignored, since files are renamed
 freely (`renamed-q8.gguf` with a `Q4_K_M` header is `Q4_K_M`). With nothing in the header, the

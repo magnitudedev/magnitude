@@ -5,7 +5,7 @@
 //! geometry and offsets; this module only interprets catalog and inventory metadata.
 
 use crate::candidate_files::RecognizedArchitectures;
-use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value};
+use magnitude_artifacts::gguf::{Directory, Encoding, PROJECTOR_ARCHITECTURE, Scalar, Value};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read};
@@ -256,9 +256,12 @@ fn read_counted(file: &mut Counted) -> Result<LocalGgufRead, GgufError> {
             )));
         }
     }
-    let directory = known_tensors(magnitude_artifacts::gguf::read_header(&bytes[..header_end]))
-        .and_then(|directory| directory.require_execution_byte_order().map(|()| directory))
-        .map_err(GgufError::Header)?;
+    let (directory, unknown_types) =
+        known_tensors_and_unknown_types(magnitude_artifacts::gguf::read_header(&bytes[..header_end]))
+            .and_then(|(directory, unknown)| {
+                directory.require_execution_byte_order().map(|()| (directory, unknown))
+            })
+            .map_err(GgufError::Header)?;
     let declared = declared_length(&directory);
     let truncated = (length < declared).then(|| {
         format!(
@@ -266,7 +269,7 @@ fn read_counted(file: &mut Counted) -> Result<LocalGgufRead, GgufError> {
         )
     });
     let header_digest = format!("{:x}", Sha256::digest(&bytes[..header_end]));
-    let mut inspection = interpret(&directory, header_digest, header_bytes)?;
+    let mut inspection = interpret(&directory, &unknown_types, header_digest, header_bytes)?;
     inspection.content_sample = Some(content_sample_digest(
         &mut Prefixed {
             prefix: &bytes,
@@ -292,9 +295,19 @@ fn read_counted(file: &mut Counted) -> Result<LocalGgufRead, GgufError> {
 pub fn known_tensors(
     parsed: Result<Directory, magnitude_artifacts::Error>,
 ) -> Result<Directory, magnitude_artifacts::Error> {
+    known_tensors_and_unknown_types(parsed).map(|(directory, _)| directory)
+}
+
+/// [`known_tensors`], with the type ids of the tensors left out of the directory.
+pub fn known_tensors_and_unknown_types(
+    parsed: Result<Directory, magnitude_artifacts::Error>,
+) -> Result<(Directory, Vec<u32>), magnitude_artifacts::Error> {
     match parsed {
-        Err(magnitude_artifacts::Error::UnknownTensorTypes { directory, .. }) => Ok(*directory),
-        parsed => parsed,
+        Err(magnitude_artifacts::Error::UnknownTensorTypes { types, directory }) => Ok((
+            *directory,
+            types.into_iter().map(|(id, _)| id).collect(),
+        )),
+        parsed => parsed.map(|directory| (directory, Vec::new())),
     }
 }
 
@@ -542,8 +555,11 @@ fn is_nextn_tensor(name: &str) -> bool {
         })
 }
 
+/// `unknown_types` are the type ids of the header's tensors that `directory` leaves out (see
+/// [`known_tensors_and_unknown_types`]).
 pub(crate) fn interpret(
     directory: &Directory,
+    unknown_types: &[u32],
     header_digest: String,
     header_bytes: u64,
 ) -> Result<GgufInspection, GgufError> {
@@ -573,10 +589,14 @@ pub(crate) fn interpret(
         .collect();
     // `general.*` describes the file and never decides: a file type this service doesn't know
     // (a quantization newer than it) is no declared quantization, and the label comes from the name.
-    let file_type = directory
-        .value("general.file_type")
-        .and_then(Value::unsigned)
-        .and_then(|raw| FileType::from_raw(raw).ok());
+    let quantization = Quantization::of(
+        directory,
+        unknown_types,
+        directory
+            .value("general.file_type")
+            .and_then(Value::unsigned)
+            .and_then(|raw| FileType::from_raw(raw).ok()),
+    );
     let tensor_storage_bytes = directory.tensors.iter().try_fold(0_u64, |total, tensor| {
         total.checked_add(tensor.nbytes).ok_or_else(|| {
             GgufError::Header(magnitude_artifacts::Error::Invalid(
@@ -630,8 +650,8 @@ pub(crate) fn interpret(
         license,
         architecture,
         name: string_value(directory, "general.name"),
-        quantization: file_type.map(|file_type| file_type.name()),
-        quantization_name: file_type.map(|file_type| file_type.bit_width().to_owned()),
+        quantization: quantization.map(Quantization::name),
+        quantization_name: quantization.map(|quantization| quantization.bit_width().to_owned()),
         parameter_count,
         active_parameter_count,
         training_context_length,
@@ -694,6 +714,89 @@ enum FileTypeKind {
     MostlyNvfp4,
     MostlyQ1_0,
     MostlyQ2_0,
+}
+
+/// What a file's weights are stored as: its declared `general.file_type`, unless its tensors
+/// contradict it, as a file declaring a type none of its tensors is stored in does (a writer's
+/// slip: an MXFP4 file declaring `Q2_0`); then the type most of its weight bytes are stored in. A
+/// split set's shard holds only part of the set and a guessed type declares nothing, so those
+/// stand as declared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Quantization {
+    Declared(FileType),
+    Weights(Encoding),
+}
+
+impl Quantization {
+    fn of(directory: &Directory, unknown_types: &[u32], declared: Option<FileType>) -> Option<Self> {
+        let split = directory
+            .value("split.count")
+            .and_then(Value::unsigned)
+            .is_some_and(|count| count > 1);
+        let Some(file_type) = declared.filter(|file_type| !file_type.guessed && !split) else {
+            return declared.map(Self::Declared);
+        };
+        let declared_type = file_type.kind.weight_type();
+        if unknown_types.contains(&declared_type)
+            || directory
+                .tensors
+                .iter()
+                .any(|tensor| tensor.encoding as u32 == declared_type)
+        {
+            return Some(Self::Declared(file_type));
+        }
+        // Weights are matrices; norms and biases are vectors kept in full precision.
+        let mut bytes = std::collections::BTreeMap::<u32, (Encoding, u64)>::new();
+        for tensor in directory.tensors.iter().filter(|tensor| tensor.shape.len() > 1) {
+            let entry = bytes
+                .entry(tensor.encoding as u32)
+                .or_insert((tensor.encoding, 0));
+            entry.1 = entry.1.saturating_add(tensor.nbytes);
+        }
+        Some(
+            bytes
+                .into_values()
+                .max_by_key(|(_, bytes)| *bytes)
+                .map_or(Self::Declared(file_type), |(encoding, _)| {
+                    Self::Weights(encoding)
+                }),
+        )
+    }
+
+    fn name(self) -> String {
+        match self {
+            Self::Declared(file_type) => file_type.name(),
+            Self::Weights(encoding) => encoding.ggml_name().to_owned(),
+        }
+    }
+
+    fn bit_width(self) -> &'static str {
+        match self {
+            Self::Declared(file_type) => file_type.bit_width(),
+            Self::Weights(encoding) => match encoding {
+                Encoding::F64 | Encoding::I64 => "64-bit",
+                Encoding::F32 | Encoding::I32 => "32-bit",
+                Encoding::F16 | Encoding::BF16 | Encoding::I16 => "16-bit",
+                Encoding::Q8_0 | Encoding::Q8_1 | Encoding::Q8K | Encoding::I8 => "8-bit",
+                Encoding::Q6K => "6-bit",
+                Encoding::Q5_0 | Encoding::Q5_1 | Encoding::Q5K => "5-bit",
+                Encoding::Q4_0
+                | Encoding::Q4_1
+                | Encoding::Q4K
+                | Encoding::Iq4Nl
+                | Encoding::Iq4Xs
+                | Encoding::Mxfp4
+                | Encoding::Nvfp4 => "4-bit",
+                Encoding::Q3K | Encoding::Iq3Xxs | Encoding::Iq3S => "3-bit",
+                Encoding::Q2K
+                | Encoding::Iq2Xxs
+                | Encoding::Iq2Xs
+                | Encoding::Iq2S
+                | Encoding::Tq2_0 => "2-bit",
+                Encoding::Iq1S | Encoding::Iq1M | Encoding::Tq1_0 | Encoding::Q1_0 => "1-bit",
+            },
+        }
+    }
 }
 
 /// The flag writers set when the file type was inferred rather than declared.
@@ -815,6 +918,41 @@ impl FileTypeKind {
         }
     }
 
+    /// The ggml type id (`ggml_type`) a file of this type stores its weights in by default
+    /// (`llama_model_quantize`'s default type), which every such file holds.
+    const fn weight_type(self) -> u32 {
+        match self {
+            Self::AllF32 => 0,
+            Self::MostlyF16 => 1,
+            Self::MostlyQ4_0 => 2,
+            Self::MostlyQ4_1 => 3,
+            Self::MostlyQ5_0 => 6,
+            Self::MostlyQ5_1 => 7,
+            Self::MostlyQ8_0 => 8,
+            Self::MostlyQ2K | Self::MostlyQ2KSmall => 10,
+            Self::MostlyQ3KSmall | Self::MostlyQ3KMedium | Self::MostlyQ3KLarge => 11,
+            Self::MostlyQ4KSmall | Self::MostlyQ4KMedium => 12,
+            Self::MostlyQ5KSmall | Self::MostlyQ5KMedium => 13,
+            Self::MostlyQ6K => 14,
+            Self::MostlyIq2Xxs => 16,
+            Self::MostlyIq2Xs => 17,
+            Self::MostlyIq3Xxs => 18,
+            Self::MostlyIq1Small => 19,
+            Self::MostlyIq4Nl => 20,
+            Self::MostlyIq3Xs | Self::MostlyIq3Small | Self::MostlyIq3Medium => 21,
+            Self::MostlyIq2Small | Self::MostlyIq2Medium => 22,
+            Self::MostlyIq4Xs => 23,
+            Self::MostlyIq1Medium => 29,
+            Self::MostlyBf16 => 30,
+            Self::MostlyTq1_0 => 34,
+            Self::MostlyTq2_0 => 35,
+            Self::MostlyMxfp4Moe => 39,
+            Self::MostlyNvfp4 => 40,
+            Self::MostlyQ1_0 => 41,
+            Self::MostlyQ2_0 => 42,
+        }
+    }
+
     const fn bit_width(self) -> &'static str {
         match self {
             Self::AllF32 => "32-bit",
@@ -872,6 +1010,23 @@ pub fn quantization_label(quantization: &str) -> Option<&'static str> {
         "Q8_0" => "Q8_0",
         "MXFP4 MoE" => "MXFP4_MOE",
         "NVFP4" => "NVFP4",
+        "F32" => "F32",
+        "MXFP4" => "MXFP4",
+        "Q2_K" => "Q2_K",
+        "Q3_K" => "Q3_K",
+        "Q4_K" => "Q4_K",
+        "Q5_K" => "Q5_K",
+        "TQ1_0" => "TQ1_0",
+        "TQ2_0" => "TQ2_0",
+        "IQ2_XXS" => "IQ2_XXS",
+        "IQ2_XS" => "IQ2_XS",
+        "IQ2_S" => "IQ2_S",
+        "IQ3_XXS" => "IQ3_XXS",
+        "IQ3_S" => "IQ3_S",
+        "IQ1_S" => "IQ1_S",
+        "IQ1_M" => "IQ1_M",
+        "IQ4_NL" => "IQ4_NL",
+        "IQ4_XS" => "IQ4_XS",
         "Q2_K - Medium" => "Q2_K",
         "Q2_K - Small" => "Q2_K_S",
         "Q3_K - Small" => "Q3_K_S",
@@ -942,20 +1097,34 @@ mod tests {
 
     /// A header-only GGUF with one Q8_0 tensor of shape [64, 2] (GGML order).
     fn header(metadata: impl FnOnce(&mut Vec<u8>) -> u64) -> Vec<u8> {
+        header_with_tensors(metadata, &[("blk.0.weight", &[64, 2], 8, 4 * 34)])
+    }
+
+    /// A header-only GGUF with these tensors: name, GGML-order dimensions, ggml type id and
+    /// stored bytes.
+    fn header_with_tensors(
+        metadata: impl FnOnce(&mut Vec<u8>) -> u64,
+        tensors: &[(&str, &[u64], u32, u64)],
+    ) -> Vec<u8> {
         let mut entries = Vec::new();
         let metadata_count = metadata(&mut entries);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"GGUF");
         bytes.extend_from_slice(&3_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&metadata_count.to_le_bytes());
         bytes.extend_from_slice(&entries);
-        push_string(&mut bytes, "blk.0.weight");
-        bytes.extend_from_slice(&2_u32.to_le_bytes());
-        bytes.extend_from_slice(&64_u64.to_le_bytes());
-        bytes.extend_from_slice(&2_u64.to_le_bytes());
-        bytes.extend_from_slice(&8_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        let mut offset = 0_u64;
+        for (name, dimensions, ggml_type, size) in tensors {
+            push_string(&mut bytes, name);
+            bytes.extend_from_slice(&(dimensions.len() as u32).to_le_bytes());
+            for dimension in *dimensions {
+                bytes.extend_from_slice(&dimension.to_le_bytes());
+            }
+            bytes.extend_from_slice(&ggml_type.to_le_bytes());
+            bytes.extend_from_slice(&offset.to_le_bytes());
+            offset = (offset + size).next_multiple_of(32);
+        }
         bytes.resize(bytes.len().next_multiple_of(32), 0);
         bytes
     }
@@ -990,15 +1159,15 @@ mod tests {
         let bytes = header(|entries| {
             push_string_entry(entries, "general.architecture", "qwen35");
             push_string_entry(entries, "general.name", "Test");
-            push_u32_entry(entries, "general.file_type", 15);
+            push_u32_entry(entries, "general.file_type", 7);
             push_u32_entry(entries, "qwen35.context_length", 262_144);
             push_u32_entry(entries, "qwen35.nextn_predict_layers", 1);
             5
         });
         let inspection = inspect_bytes(&bytes).unwrap();
         assert_eq!(inspection.architecture.as_deref(), Some("qwen35"));
-        assert_eq!(inspection.quantization.as_deref(), Some("Q4_K - Medium"));
-        assert_eq!(inspection.quantization_name.as_deref(), Some("4-bit"));
+        assert_eq!(inspection.quantization.as_deref(), Some("Q8_0"));
+        assert_eq!(inspection.quantization_name.as_deref(), Some("8-bit"));
         assert_eq!(inspection.training_context_length, Some(262_144));
         assert_eq!(inspection.nextn_predict_layers, Some(1));
         // Two rows of 64 Q8_0 elements: two 32-element blocks of 34 bytes each per row.
@@ -1230,10 +1399,82 @@ mod tests {
         assert_eq!(guessed.name(), "(guessed) all F32");
         assert_eq!(guessed.bit_width(), "unknown");
         assert!(FileType::from_raw(GUESSED_FILE_TYPE | 15).is_err());
-        let mxfp4 = FileType::from_raw(38).unwrap();
+        // llama.cpp's `llama_ftype`: 38 MXFP4_MOE, 39 NVFP4, 40 Q1_0, 41 Q2_0.
+        for (raw, name, bits) in [
+            (36, "TQ1_0 - 1.69 bpw ternary", "1-bit"),
+            (37, "TQ2_0 - 2.06 bpw ternary", "2-bit"),
+            (38, "MXFP4 MoE", "4-bit"),
+            (39, "NVFP4", "4-bit"),
+            (40, "Q1_0", "1-bit"),
+            (41, "Q2_0", "2-bit"),
+        ] {
+            let file_type = FileType::from_raw(raw).unwrap();
+            assert_eq!((file_type.name().as_str(), file_type.bit_width()), (name, bits), "{raw}");
+        }
+        assert!(FileType::from_raw(42).is_err());
+    }
+
+    /// A one-layer header declaring `file_type`, with these tensors (GGML-order dimensions,
+    /// ggml type id, stored bytes) beside an F32 norm.
+    fn quantization_of(
+        file_type: u32,
+        split: bool,
+        tensors: &[(&str, &[u64], u32, u64)],
+    ) -> (Option<String>, Option<String>) {
+        let mut all = vec![("blk.0.attn_norm.weight", &[256_u64][..], 0, 1024)];
+        all.extend_from_slice(tensors);
+        let bytes = header_with_tensors(
+            |entries| {
+                push_string_entry(entries, "general.architecture", "qwen35");
+                push_u32_entry(entries, "general.file_type", file_type);
+                if split {
+                    push_u32_entry(entries, "split.count", 2);
+                }
+                2 + u64::from(split)
+            },
+            &all,
+        );
+        let inspection = inspect_bytes(&bytes).unwrap();
+        (inspection.quantization, inspection.quantization_name)
+    }
+
+    #[test]
+    fn a_declared_file_type_no_tensor_is_stored_in_yields_to_the_weights() {
+        let pair = |name: &str, bits: &str| (Some(name.to_owned()), Some(bits.to_owned()));
+        // An MXFP4 file whose writer declared 41 (Q2_0): MXFP4 matrices (17 bytes per 32
+        // elements) and a Q8_0 embedding.
+        let mxfp4 = quantization_of(
+            41,
+            false,
+            &[
+                ("blk.0.ffn_up.weight", &[256, 64], 39, 256 * 64 / 32 * 17),
+                ("blk.0.ffn_down.weight", &[256, 64], 39, 256 * 64 / 32 * 17),
+                ("token_embd.weight", &[256, 16], 8, 256 * 16 / 32 * 34),
+            ],
+        );
+        assert_eq!(mxfp4, pair("MXFP4", "4-bit"));
+        assert_eq!(quantization_label(mxfp4.0.as_deref().unwrap()), Some("MXFP4"));
+        // A Q4_K_M file holds Q6_K tensors beside its Q4_K ones and keeps its declared type.
         assert_eq!(
-            (mxfp4.name().as_str(), mxfp4.bit_width()),
-            ("MXFP4 MoE", "4-bit")
+            quantization_of(
+                15,
+                false,
+                &[
+                    ("blk.0.ffn_up.weight", &[256, 64], 12, 64 * 144),
+                    ("output.weight", &[256, 256], 14, 256 * 210),
+                ],
+            ),
+            pair("Q4_K - Medium", "4-bit")
+        );
+        // A real Q2_0 file's Q2_0 tensors (ggml type 42) are newer than the parser, and count.
+        assert_eq!(
+            quantization_of(41, false, &[("blk.0.ffn_up.weight", &[256, 64], 42, 4096)]),
+            pair("Q2_0", "2-bit")
+        );
+        // A split set's shard holds part of the set: its declared type stands.
+        assert_eq!(
+            quantization_of(15, true, &[("output.weight", &[256, 256], 14, 256 * 210)]),
+            pair("Q4_K - Medium", "4-bit")
         );
     }
 }

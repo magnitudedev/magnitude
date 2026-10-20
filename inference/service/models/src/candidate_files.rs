@@ -135,10 +135,15 @@ pub fn header_inspection(
     header: &[u8],
 ) -> Result<(Directory, crate::gguf::GgufInspection), InventoryError> {
     use sha2::Digest;
-    let directory = header_directory(header)?;
+    let (directory, unknown_types) =
+        crate::gguf::known_tensors_and_unknown_types(magnitude_artifacts::gguf::read_header(header))
+            .and_then(|(directory, unknown)| {
+                directory.require_execution_byte_order().map(|()| (directory, unknown))
+            })
+            .map_err(|error| InventoryError::Integrity(error.to_string()))?;
     let digest = format!("{:x}", sha2::Sha256::digest(header));
     let header_bytes = crate::gguf::header_extent(&directory, header.len() as u64);
-    let inspection = crate::gguf::interpret(&directory, digest, header_bytes)
+    let inspection = crate::gguf::interpret(&directory, &unknown_types, digest, header_bytes)
         .map_err(|error| InventoryError::Integrity(error.to_string()))?;
     Ok((directory, inspection))
 }
@@ -631,6 +636,28 @@ mod tests {
             version_label(Path::new("my-model-final.gguf"), Some("Q6_K")),
             "Q6_K",
             "a name with no quantization takes the header's, never the whole name"
+        );
+        assert_eq!(
+            version_label(Path::new("qwen35-9b-instruct-mxfp4.gguf"), Some("MXFP4")),
+            "MXFP4",
+            "weights an undeclared file type names label it as the header's do"
+        );
+        assert_eq!(
+            model_presentation(
+                Path::new("qwen35-9b-instruct-mxfp4.gguf"),
+                Some("FreedomAISVR/Qwen3.5-9B-Instruct-MXFP4-GGUF"),
+                None,
+                Some("MXFP4"),
+            )
+            .1,
+            model_presentation(
+                Path::new("qwen35-9b-instruct-mxfp4.gguf"),
+                Some("FreedomAISVR/Qwen3.5-9B-Instruct-MXFP4-GGUF"),
+                None,
+                None,
+            )
+            .1,
+            "an installed model is labelled as its file arriving is"
         );
     }
 
