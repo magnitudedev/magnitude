@@ -1947,13 +1947,16 @@ mod tests {
         }
 
         async fn with_hub(endpoint: String) -> Self {
-            Self::open(tempfile::tempdir().unwrap(), endpoint, Vec::new()).await
+            Self::open(tempfile::tempdir().unwrap(), endpoint, Vec::new(), BTreeMap::new()).await
         }
 
+        /// `header_digests` are the release catalog's header digest of each catalog file, by its
+        /// Hub SHA-256.
         async fn open(
             temporary: tempfile::TempDir,
             endpoint: String,
             catalog: Vec<RecommendableModel>,
+            header_digests: BTreeMap<String, String>,
         ) -> Self {
             let root = temporary.path().canonicalize().unwrap();
             let store = root.join("store");
@@ -1961,6 +1964,7 @@ mod tests {
                 InventoryConfig::with_roots(store.clone(), root.join("cache")).unwrap();
             config.hub_endpoint = Some(endpoint);
             config.catalog_models = catalog.clone();
+            config.catalog_header_digests = header_digests;
             config.architectures = crate::test_gguf::engine_architectures();
             let inventory = Arc::new(ManagedModelStore::open(config).await.unwrap());
             inventory.ensure_installed_model_inventory().await.unwrap();
@@ -2004,6 +2008,16 @@ mod tests {
             endpoint: String,
             catalog: Vec<RecommendableModel>,
         ) -> Self {
+            self.restart_with_catalog_headers(endpoint, catalog, BTreeMap::new())
+                .await
+        }
+
+        async fn restart_with_catalog_headers(
+            self,
+            endpoint: String,
+            catalog: Vec<RecommendableModel>,
+            header_digests: BTreeMap<String, String>,
+        ) -> Self {
             let Self {
                 _temporary: temporary,
                 resolver,
@@ -2012,7 +2026,7 @@ mod tests {
             } = self;
             drop(local);
             drop(resolver);
-            Self::open(temporary, endpoint, catalog).await
+            Self::open(temporary, endpoint, catalog, header_digests).await
         }
     }
 
@@ -3757,6 +3771,145 @@ mod tests {
         let mut files = Vec::new();
         walk(&store.join("hub"), &mut files);
         files
+    }
+
+    /// Linux CUDA round 4: the catalog's exact target weights in a Hugging Face cache, and the
+    /// catalog drafter's exact file in a user folder (which gives it no Hub SHA-256). The drafter's
+    /// bytes are on this computer for the catalog model as they are for found models: it offers the
+    /// drafter with nothing to download, and fetching it makes Magnitude's own copy of the folder's
+    /// file, never a link to it, without a request to the Hub.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_catalog_drafter_found_in_a_folder_is_never_downloaded_for_its_catalog_model() {
+        use magnitude_service_contracts::models::{
+            CatalogComponent, CatalogMissingComponent, CatalogModelState,
+            InstalledModelPackages as _, SpeculativeDraftSource, SpeculativeMethod,
+        };
+
+        let fixture = Fixture::new().await;
+        let cache = fixture.root.join("hf");
+        let folder = fixture.root.join("models-own").join("pair");
+        let commit = "a".repeat(40);
+        let draft_commit = "b".repeat(40);
+        let weights = model_bytes("model");
+        let drafter = drafter_bytes("drafter");
+        publish_hf_cache(
+            &cache,
+            "owner/Model-GGUF",
+            &commit,
+            &[("Model-Q4_K_M.gguf", weights.clone())],
+        );
+        publish_hf_cache(
+            &cache,
+            "owner/Model-DFlash-GGUF",
+            &draft_commit,
+            &[("Model-DFlash-Q8_0.gguf", drafter.clone())],
+        );
+        let cache_root = root(ModelRootKind::HuggingFaceCache, &cache);
+        fixture.apply(roots(vec![cache_root.clone()])).await;
+        let packages = fixture.inventory().list_installed().await.unwrap().packages;
+        let package = |name: &str| {
+            packages
+                .iter()
+                .map(|installed| installed.package.clone())
+                .find(|package| package.files.iter().any(|file| file.path.ends_with(name)))
+                .unwrap()
+        };
+        let (target, draft) = (package("Model-Q4_K_M.gguf"), package("Model-DFlash-Q8_0.gguf"));
+        fs::remove_dir_all(cache.join(hf_repo_dir("owner/Model-DFlash-GGUF"))).unwrap();
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("Model-DFlash-Q8_0.gguf"), &drafter).unwrap();
+        fs::write(folder.join("Other-Q5_K_M.gguf"), model_bytes("other")).unwrap();
+        let header_digests = BTreeMap::from([(
+            sha256(&drafter),
+            header_digest(&folder.join("Model-DFlash-Q8_0.gguf")),
+        )]);
+
+        let mut definition = catalog_definition(target.clone());
+        definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+            target,
+            draft_source: SpeculativeDraftSource::Separate { draft },
+            method: SpeculativeMethod::DFlash,
+        };
+        let model_id = catalog_id(&definition);
+        let (endpoint, requests) = serve_files(vec![
+            (
+                "owner/Model-GGUF",
+                commit,
+                vec![("Model-Q4_K_M.gguf", weights)],
+            ),
+            (
+                "owner/Model-DFlash-GGUF",
+                draft_commit,
+                vec![("Model-DFlash-Q8_0.gguf", drafter.clone())],
+            ),
+        ]);
+        let fixture = fixture
+            .restart_with_catalog_headers(endpoint, vec![definition], header_digests)
+            .await;
+        fixture
+            .apply(roots(vec![
+                cache_root,
+                root(ModelRootKind::Folder, &fixture.root.join("models-own")),
+            ]))
+            .await;
+        let state = || fixture.resolver.catalog_snapshot().unwrap().models[0].local_state.clone();
+        let missing = || match state() {
+            CatalogModelState::Installed {
+                missing_components, ..
+            } => missing_components,
+            CatalogModelState::NotInstalled => panic!("the found target installs the catalog model"),
+        };
+        assert_eq!(
+            missing(),
+            vec![CatalogMissingComponent {
+                component: CatalogComponent::Drafter,
+                download_bytes: 0,
+            }],
+            "the drafter's bytes are already on this computer"
+        );
+
+        let downloads = crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
+            .await
+            .unwrap();
+        let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
+            fixture.resolver.clone(),
+            Arc::new(downloads),
+            Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
+            Arc::new(NoOptimizer),
+        );
+        installations
+            .install_component(&model_id, CatalogComponent::Drafter)
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            if missing().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(missing().is_empty(), "{:?}", missing());
+        let fetched = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("GET ") && request.contains("/resolve/"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(fetched.is_empty(), "nothing is downloaded: {fetched:?}");
+        let stored = stored_files(&fixture.store);
+        let (blob, _) = stored
+            .iter()
+            .find(|(_, size)| *size == drafter.len() as u64)
+            .expect("Magnitude stores its own copy of the drafter");
+        assert_eq!(fs::read(blob).unwrap(), drafter);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let found = fs::metadata(folder.join("Model-DFlash-Q8_0.gguf")).unwrap();
+            assert_eq!(found.nlink(), 1, "the folder's file is never hard linked");
+            assert_ne!(fs::metadata(blob).unwrap().ino(), found.ino());
+        }
+        assert_eq!(fs::read(folder.join("Model-DFlash-Q8_0.gguf")).unwrap(), drafter);
     }
 
     /// The Debian round 3b sequence on a file system without clones: the catalog's exact target

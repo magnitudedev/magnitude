@@ -2286,6 +2286,21 @@ impl ManagedModelStore {
         Ok((package, prepared))
     }
 
+    /// The bytes of a release-catalog package file: its Hub SHA-256 and size, and the header
+    /// digest the release catalog records for it, so a copy found anywhere (a folder holds no
+    /// Hub SHA-256) is recognised by its header and size as found models recognise it.
+    pub(crate) fn catalog_file_content(
+        &self,
+        sha256: &str,
+        size_bytes: u64,
+    ) -> crate::DrafterContent {
+        crate::DrafterContent {
+            header_digest: self.config.catalog_header_digests.get(sha256).cloned(),
+            sha256: Some(sha256.to_owned()),
+            size_bytes,
+        }
+    }
+
     /// Whether an installed package, in any location, another app's included, holds these
     /// drafter bytes.
     #[must_use]

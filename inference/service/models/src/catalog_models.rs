@@ -237,11 +237,27 @@ impl ModelDomainResolver {
             records.records.values().map(|record| &record.installed),
             Some(&self.catalog.models),
         );
+        // A catalog drafter's bytes found in any location (a folder's file has its own identity)
+        // are on this computer, as they are for the found models that use that drafter.
+        let found_drafter_files = self
+            .catalog
+            .models
+            .iter()
+            .filter_map(catalog_draft)
+            .flat_map(|draft| &draft.files)
+            .filter(|file| {
+                let content = self
+                    .inventory
+                    .catalog_file_content(&file.sha256, file.size_bytes);
+                records.records.values().any(|record| content.held_by(record))
+            })
+            .map(|file| file.id.clone());
         let local_files = records
             .records
             .values()
             .flat_map(|record| &record.installed.package.files)
             .map(|file| file.id.clone())
+            .chain(found_drafter_files)
             .collect::<BTreeSet<_>>();
         let occurrence_origins = records
             .records

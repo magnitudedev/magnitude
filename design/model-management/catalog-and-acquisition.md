@@ -655,7 +655,10 @@ projector package and served composed of the found weights and that package (see
 mapping](./intrinsic-target-mapping.md)). Any other package file whose exact bytes are already in an
 external location (a hidden exact copy, say) is never downloaded:
 Magnitude's blob is its own file made from that one and verified in full like a download, so only
-files present nowhere else are fetched. The blob is never a hard link or any other link to the
+files present nowhere else are fetched. A file's bytes are found by its Hub SHA-256 or, for a file
+with no Hub identity (in a user folder, say), by the header digest and size the release catalog
+records for it, the evidence by which found models reuse a catalog drafter; a catalog model's
+missing drafter whose bytes are found this way offers nothing to download. The blob is never a hard link or any other link to the
 external file, which is only ever read. Where the file system supports copy-on-write clones (APFS,
 btrfs, XFS), the blob is a clone sharing the external file's extents until either changes, so the
 bytes stay on disk once; elsewhere, or across volumes, it is a streamed copy hashed as it is

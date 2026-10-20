@@ -589,10 +589,38 @@ impl ManagedModelStore {
             .map(|component| match &component.content {
                 ContentIdentity::Sha256 { value } => by_content
                     .get(&(value.clone(), component.size_bytes))
-                    .cloned(),
+                    .cloned()
+                    .or_else(|| self.external_copy_by_header(value, component.size_bytes)),
                 _ => None,
             })
             .collect()
+    }
+
+    /// A file outside Magnitude's store whose header and size are a release-catalog file's (a
+    /// folder's file, which has no Hub SHA-256): the copy found models use for those bytes. It is
+    /// verified in full when copied, so a file that only shares the header is downloaded instead.
+    fn external_copy_by_header(&self, sha256: &str, size_bytes: u64) -> Option<PathBuf> {
+        use magnitude_service_contracts::models::ModelPackageInstallationOrigin;
+        let content = self.catalog_file_content(sha256, size_bytes);
+        content.header_digest.as_ref()?;
+        let records = self.installed_packages.read().ok()?;
+        records
+            .records
+            .values()
+            .filter(|record| {
+                record.installed.origin != ModelPackageInstallationOrigin::Magnitude
+                    && content.held_by(record)
+            })
+            .find_map(|record| {
+                let declared = record.model.location.components();
+                let resolved =
+                    crate::service::resolve_components(&self.config.root, &record.model).ok()?;
+                declared
+                    .iter()
+                    .zip(resolved)
+                    .find(|(declared, _)| declared.size_bytes == size_bytes)
+                    .map(|(_, resolved)| resolved.path)
+            })
     }
 
     async fn release_operation(&self, key: &str, operation: &Arc<DownloadOperation>) {
