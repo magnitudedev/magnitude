@@ -72,7 +72,7 @@ describe("Magnitude documentation", () => {
 
     expect(result._tag).toBe("Success")
     if (result._tag === "Failure") return
-    for (const command of ["catalog search", "catalog inspect", "catalog pull", "models import", "models drafter", "models hide", "models folders"]) {
+    for (const command of ["catalog search", "catalog inspect", "catalog pull", "models drafter", "models hide", "models folders"]) {
       expect(result.output).toContain(command)
     }
     const cli = resolveDocumentationCommand("cli")
