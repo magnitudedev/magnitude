@@ -256,15 +256,46 @@ fn names_exactly(repository: &str, query: &str) -> bool {
         })
 }
 
+/// The repository a pasted Hugging Face reference names, read the way a model is added: a link
+/// (`https://huggingface.co/owner/repo/…`, `hf.co/owner/repo`), or `owner/repo` naming a version
+/// (`:QUANT`, `:path.gguf`), a revision (`@revision`) or a file (`/path.gguf`), with or without
+/// `hf:`. Anything else, `owner/repo` alone among it, is searched as typed.
+fn pasted_repository(query: &str) -> Option<String> {
+    let query = query.trim();
+    if let Some(repository) = crate::candidate_files::hugging_face_repository_from_url(query) {
+        return Some(repository);
+    }
+    let (prefixed, reference) = match query.strip_prefix("hf:") {
+        Some(reference) => (true, reference),
+        None => (false, query),
+    };
+    let (head, version) = match reference.split_once(':') {
+        Some((head, version)) => (head, Some(version)),
+        None => (reference, None),
+    };
+    let (head, revision) = match head.split_once('@') {
+        Some((head, revision)) => (head, Some(revision)),
+        None => (head, None),
+    };
+    let mut parts = head.splitn(3, '/');
+    let owner = parts.next()?;
+    let name = parts.next()?;
+    let file = parts.next();
+    let qualified = prefixed
+        || version.is_some_and(|version| !version.is_empty())
+        || revision.is_some_and(valid_hub_revision)
+        || file.is_some_and(|file| file.to_ascii_lowercase().ends_with(".gguf"));
+    (qualified && valid_repository_part(owner) && valid_repository_part(name))
+        .then(|| format!("{owner}/{name}"))
+}
+
 impl HuggingFaceModelCatalog for HuggingFaceDiscovery {
     fn search(
         &self,
         request: HuggingFaceModelSearchRequest,
     ) -> BoxFuture<'_, Result<HuggingFaceModelSearchResults, InventoryError>> {
         Box::pin(async move {
-            // A pasted Hugging Face link (`https://huggingface.co/owner/repo/…`, `hf.co/owner/repo`)
-            // searches for its repository.
-            let repository = crate::candidate_files::hugging_face_repository_from_url(&request.query);
+            let repository = pasted_repository(&request.query);
             let query = repository.as_deref().unwrap_or(request.query.trim());
             if query.is_empty()
                 || query.len() > MAX_HUB_SEARCH_QUERY_BYTES
@@ -2322,6 +2353,34 @@ mod tests {
     use magnitude_service_contracts::LocalDeclaration;
 
     #[test]
+    fn a_pasted_reference_searches_for_its_repository() {
+        for (query, repository) in [
+            ("unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M", "unsloth/Qwen3.5-0.8B-GGUF"),
+            ("  unsloth/Qwen3.5-0.8B-GGUF:UD-Q4_K_XL ", "unsloth/Qwen3.5-0.8B-GGUF"),
+            ("owner/repo/sub/model-Q4_K_M.gguf", "owner/repo"),
+            ("hf:owner/repo/model.gguf", "owner/repo"),
+            ("hf:owner/repo", "owner/repo"),
+            ("owner/repo@main:Q8_0", "owner/repo"),
+            ("owner/repo@refs/pr/3:draft/model.gguf", "owner/repo"),
+            ("https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF", "bartowski/qwen_qwen3.5-2b-gguf"),
+            ("hf.co/owner/repo/blob/main/model.gguf", "owner/repo"),
+        ] {
+            assert_eq!(pasted_repository(query).as_deref(), Some(repository), "{query}");
+        }
+        for query in [
+            "owner/repo",
+            "Qwen3.5 4B",
+            "qwen 3.5:Q4",
+            "owner/repo:",
+            "owner/repo/notes.txt",
+            "../repo:Q4_0",
+            "Qwen3.5-4B-DFlash",
+        ] {
+            assert_eq!(pasted_repository(query), None, "{query}");
+        }
+    }
+
+    #[test]
     fn hub_coordinates_reject_path_traversal_but_allow_branch_names() {
         assert!(valid_repository("owner/model.gguf"));
         assert!(!valid_repository("../model"));
@@ -4302,6 +4361,9 @@ mod tests {
             "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/blob/main/Qwen3.5-9B-Q4_K_M.gguf",
             "hf.co/unsloth/Qwen3.5-9B-GGUF",
             "unsloth/Qwen3.5-9B-GGUF",
+            "unsloth/Qwen3.5-9B-GGUF:Q4_K_M",
+            "unsloth/Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf",
+            "hf:unsloth/Qwen3.5-9B-GGUF:Q4_K_M",
         ] {
             let results = discovery
                 .search(HuggingFaceModelSearchRequest {

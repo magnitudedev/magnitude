@@ -65,8 +65,11 @@ as unreadable; one whose files read are all drafters' (a separate drafter archit
 file declaring prediction layers over fewer tensors than blocks, as an MTP block) is a drafter
 repository and no result. A split set's shards are never judged by their tensor count: the listing
 groups them, and a first shard may hold only the metadata. A repository whose listing holds no GGUF at all (the Hub's
-gguf filter also matches a tag) is no result. A query that is a Hugging Face link
-(`https://huggingface.co/owner/repo/…`, `hf.co/owner/repo`) searches for that repository. What a repository's commit holds is cached, so it is read once; reads
+gguf filter also matches a tag) is no result. A query that is a pasted Hugging Face reference
+searches for its repository, read the way a model is added: a link (`https://huggingface.co/owner/repo/…`,
+`hf.co/owner/repo`), or `owner/repo` naming a version (`:QUANT`), a revision (`@revision`) or a
+file (`/path.gguf`), with or without `hf:`; any other query, `owner/repo` alone among them, is
+searched as typed. What a repository's commit holds is cached, so it is read once; reads
 run with bounded concurrency. A failed or slow read (any status but success, a timeout, a listing
 that can't be resolved, a gated repository's refused files) is unknown: it is retried next time,
 never cached, never fails the search, and leaves the row exactly as the Hub's search describes it.
