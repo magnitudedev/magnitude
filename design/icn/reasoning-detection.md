@@ -108,6 +108,15 @@ and the MiniMax M2 family are representative.
 `none` is not advertised for these templates. A request for `none` is rejected rather than silently
 running the model with reasoning enabled.
 
+A template can react to an off setting and still be fixed reasoning. The DavidAU LFM2.5 8B-A1B
+TBrilliance finetune swaps its system prompt for `enable_thinking=false` and for
+`reasoning_effort="off"`, yet its generation prompt always ends by opening `<think>`, so the model
+reasons regardless. Its native low, medium and high instructions remain distinct enabled efforts.
+
+| Example | Native behavior | Normalized options | Normalized default |
+| --- | --- | --- | --- |
+| LFM2.5 8B-A1B TBrilliance | Effort instructions; `<think>` always opened | `low`, `medium`, `high` | `high` |
+
 ### Toggle plus discrete symbolic effort
 
 GLM-5.2 supports disabling thinking and distinguishes high from max. DeepSeek V4 exposes the same
@@ -248,6 +257,14 @@ Differential rendering can establish that:
 - an effort only matters when thinking is enabled;
 - a control affects reasoning history rather than initial generation.
 
+A rendered difference alone does not establish that a setting disables reasoning. An off value of a
+boolean or string mode, or a disabling effort spelling, counts as disabling only when its generation
+prompt no longer leaves the reply inside a reasoning block: the prompt does not end with the
+template's reasoning-start marker left unclosed by one of its end markers. Closing the block empty,
+as Qwen 3.5 does with `<think>\n\n</think>\n\n`, disables reasoning; a changed system prompt
+followed by an opened `<think>` does not. A mode whose off side still opens reasoning is not a
+toggle, and a disabling spelling that still opens it is not `none`.
+
 Probing does not establish that one prompt is higher quality, that changed strings form an ordered
 scale, or that a pass-through value was used during training.
 
@@ -370,7 +387,10 @@ advertise a disabling option.
 - Equivalent native spellings collapse to one normalized option in deterministic order.
 - Equivalent ordinal inputs use rendered affiliated-name evidence first and normalized rank second.
 - One meaningful alternate effort is not discarded.
-- No fixed-thinking template is advertised as disableable.
+- No fixed-thinking template is advertised as disableable. An off setting whose generation prompt
+  still opens the reasoning block is not a disabling control: LFM2.5 8B-A1B TBrilliance normalizes
+  to `low`, `medium`, and `high` and rejects `none`, while Qwen 3.5's empty closed block keeps
+  `none`.
 - A native handler reports reasoning, and parses emitted reasoning blocks, when the template names
   a reasoning block, whether by opening it or by stripping its closing tag from history. LFM2.5
   2.6B, whose generation prompt opens `<think>`, and LFM2.5 1.2B, whose model writes the block

@@ -240,6 +240,47 @@ fn disabled_and_extra_high_spellings_normalize() {
     assert_eq!(normalize_effort("ultra"), None);
 }
 
+fn asset_profile(source: &str) -> ReasoningProfile {
+    let template = Template::new(source, &Default::default()).unwrap();
+    inspect_reasoning(&template, &Default::default()).unwrap()
+}
+
+/// Turning reasoning off counts only when the generation prompt no longer
+/// leaves the reply inside a reasoning block. The DavidAU LFM2.5 8B-A1B
+/// TBrilliance template swaps its system prompt for `enable_thinking=false`
+/// and for `reasoning_effort="off"` but always ends by opening `<think>`, so
+/// it keeps its native efforts and cannot be disabled. Qwen 3.5 closes the
+/// block empty when reasoning is off, which does disable it.
+#[test]
+fn an_off_setting_that_still_opens_reasoning_does_not_disable_it() {
+    let tbrilliance = asset_profile(include_str!(
+        "../../templates/tests/assets/LFM2.5-8B-A1B-Q3.8-TBrilliance.jinja"
+    ));
+    assert_eq!(
+        tbrilliance
+            .mappings
+            .iter()
+            .map(|mapping| mapping.effort.as_str())
+            .collect::<Vec<_>>(),
+        ["low", "medium", "high"]
+    );
+    assert_eq!(tbrilliance.default_effort.as_deref(), Some("high"));
+    for intent in [effort("none"), ReasoningIntent::Disabled] {
+        assert!(
+            matches!(
+                tbrilliance.resolve(&intent),
+                Err(ReasoningError::CannotDisable { .. })
+            ),
+            "{intent:?}"
+        );
+    }
+    let qwen = asset_profile(include_str!("../../templates/tests/assets/Qwen3.5-4B.jinja"));
+    assert_eq!(
+        qwen.resolve(&ReasoningIntent::Disabled).unwrap().controls,
+        BTreeMap::from([("enable_thinking".into(), json!(false))])
+    );
+}
+
 #[test]
 fn muse_glimmer_reasoning_can_be_disabled() {
     let template = Template::new(
