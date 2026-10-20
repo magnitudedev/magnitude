@@ -3702,7 +3702,7 @@
             }
           }
         ],
-        "description": "A catalog model's state here. `drafter_withheld`: it serves without its catalog drafter, which\nit fits only without, so it loads rather than being refused. `stored_components`: the parts\nMagnitude stores for a model whose weights are only in another app's location (its projector\npackage and drafter), which Remove deletes while the found weights stay and keep serving."
+        "description": "A catalog model's state here. `drafter_withheld`: it serves, and is assessed, without its\ncatalog drafter, which it doesn't fit with: it loads when it fits without it, and otherwise is\nrefused with its own shortfall. `stored_components`: the parts\nMagnitude stores for a model whose weights are only in another app's location (its projector\npackage and drafter), which Remove deletes while the found weights stay and keep serving."
       },
       "CatalogModelUpdate": {
         "oneOf": [

@@ -342,7 +342,7 @@ const componentSize = ({ downloadBytes }: CatalogMissingComponent): string =>
 
 /**
  * One line per catalog component the model lacks, each with the command that downloads only it, and the
- * drafter it runs without because it fits only without it.
+ * drafter it runs without because it doesn't fit with it.
  */
 const catalogComponentFields = (model: LocalModel): readonly (readonly [string, string])[] => [
   ...catalogComponentOffers(model).map((offer) => [

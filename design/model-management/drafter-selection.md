@@ -141,7 +141,8 @@ drafter is withheld. A catalog model that fits
 served plain and not with its catalog drafter is served plain instead of being refused: ICN works this out once
 per catalog model (it depends on the release material and this computer, not on the files here), the catalog
 projection then serves and assesses the model's target alone, reports `drafterWithheld`, and offers no drafter
-download; clients say the drafter is off because the model fits only without it.
+download; clients say the drafter is off and, from the model's plain verdict, why: it fits only without it, or it
+doesn't fit this computer at all.
 
 ## Controls
 

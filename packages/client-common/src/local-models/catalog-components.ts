@@ -17,15 +17,22 @@ export const catalogComponentOffers = (model: LocalModel): readonly CatalogMissi
 export const catalogComponentDownloadLabel = ({ downloadBytes }: CatalogMissingComponent): string =>
   downloadBytes > 0 ? `Download (${formatStorageSize(downloadBytes)})` : "Download"
 
-/** Why an installed catalog model runs without its catalog drafter: it fits this computer only without it. */
-export const catalogDrafterWithheldNote = (model: LocalModel): Option.Option<string> =>
-  model._tag === "Catalog" && model.drafterWithheld
-    ? Option.some("Off - this model fits this computer only without it")
-    : Option.none()
+/**
+ * Why an installed catalog model runs without its catalog drafter: it doesn't fit this computer with it. A withheld
+ * model is assessed served plain, so its verdict tells whether it fits only without the drafter or not at all.
+ */
+export const catalogDrafterWithheldNote = (model: LocalModel): Option.Option<string> => {
+  if (model._tag !== "Catalog" || !model.drafterWithheld) return Option.none()
+  const serving = model.servingState
+  if (serving._tag !== "Assessed") return Option.some("Off - this model doesn't fit this computer with it")
+  return Option.some(serving.assessment._tag === "Fits"
+    ? "Off - this model fits this computer only without it"
+    : "Off - this model doesn't fit this computer")
+}
 
 /**
  * What a catalog model's Drafter row says: the download offer when its found target lacks the drafter, Off when
- * it fits only without it, the drafter it serves with, None when it has none, or Unknown before it is assessed.
+ * it doesn't fit with it, the drafter it serves with, None when it has none, or Unknown before it is assessed.
  */
 export type CatalogDrafterState =
   | { readonly _tag: "Offer"; readonly offer: CatalogMissingComponent }

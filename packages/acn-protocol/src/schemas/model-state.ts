@@ -1079,8 +1079,9 @@ export const CatalogMissingComponentSchema = Schema.Struct({
 export type CatalogMissingComponent = typeof CatalogMissingComponentSchema.Type
 
 /**
- * A catalog model on this computer. `drafterWithheld`: it runs without its catalog drafter, because it fits this
- * computer only without it, so it loads rather than being refused. `storedComponents`: the parts Magnitude stores
+ * A catalog model on this computer. `drafterWithheld`: it runs and is assessed without its catalog drafter, because
+ * it doesn't fit this computer with it: it loads when it fits without it, and otherwise is refused with its own
+ * shortfall. `storedComponents`: the parts Magnitude stores
  * for a model whose weights are only in another app's location (its projector and drafter); Remove deletes these
  * and the model keeps running from the found file, and with none of them Remove is Hide.
  */

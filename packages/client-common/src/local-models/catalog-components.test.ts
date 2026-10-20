@@ -35,10 +35,37 @@ describe("catalog component offers", () => {
     expect(catalogComponentDownloadLabel({ component: "Drafter", downloadBytes: 0 })).toBe("Download")
   })
 
-  it("says when a catalog model runs without its drafter because it fits only without it", () => {
-    expect(catalogDrafterWithheldNote({ ...makeSetupModel(true), drafterWithheld: true }))
+  it("says why a catalog model runs without its drafter: it fits only without it, or doesn't fit at all", () => {
+    const model = makeSetupModel(true)
+    const serving = model.servingState
+    if (serving._tag !== "Assessed" || serving.assessment._tag !== "Fits") throw new Error("fixture fits")
+    const { profile, assessmentId, environmentId } = serving.assessment
+    const doesNotFit = {
+      ...model,
+      drafterWithheld: true,
+      servingState: {
+        _tag: "Assessed" as const,
+        capabilities: serving.capabilities,
+        speculativeMethod: serving.speculativeMethod,
+        metadata: serving.metadata,
+        assessment: {
+          _tag: "DoesNotFit" as const,
+          profile,
+          assessmentId,
+          environmentId,
+          memoryDomains: [],
+          totalRequiredBytes: 2,
+          deficitBytes: 1,
+          limitingResource: "System memory",
+        },
+      },
+    }
+    expect(catalogDrafterWithheldNote({ ...model, drafterWithheld: true }))
       .toEqual(Option.some("Off - this model fits this computer only without it"))
-    expect(catalogDrafterWithheldNote(makeSetupModel(true))).toEqual(Option.none())
+    expect(catalogDrafterWithheldNote(doesNotFit)).toEqual(Option.some("Off - this model doesn't fit this computer"))
+    expect(catalogDrafterWithheldNote({ ...model, drafterWithheld: true, servingState: { _tag: "Assessing", profile: { contextLength: 32_768 } } }))
+      .toEqual(Option.some("Off - this model doesn't fit this computer with it"))
+    expect(catalogDrafterWithheldNote(model)).toEqual(Option.none())
   })
 
   it("names the Drafter row's state for every catalog model", () => {
