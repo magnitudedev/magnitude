@@ -1,7 +1,7 @@
 //! The Qwen3-VL projector (`qwen3vl_merger`).
 
 use crate::{Error, product};
-use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value};
+use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
 use magnitude_family_common::Tensors;
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling, RowRange,
@@ -42,9 +42,9 @@ fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
     let values = values
         .iter()
         .map(|value| match value {
-            Scalar::Float(value) if value.is_finite() => Some(*value),
-            Scalar::Unsigned(value) => Some(*value as f64),
-            Scalar::Signed(value) => Some(*value as f64),
+            Element::Float(value) if value.is_finite() => Some(value),
+            Element::Unsigned(value) => Some(value as f64),
+            Element::Signed(value) => Some(value as f64),
             _ => None,
         })
         .collect::<Option<Vec<_>>>()
@@ -101,7 +101,7 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
         }
     }
     if let Some(deepstack) = directory.value("clip.vision.is_deepstack_layers") {
-        if !matches!(deepstack, Value::Array(values) if values.len() as u64 == depth && values.iter().all(|value| matches!(value, Scalar::Bool(false))))
+        if !matches!(deepstack, Value::Array(values) if values.len() as u64 == depth && values.iter().all(|value| matches!(value, Element::Bool(false))))
         {
             return Err(invalid("deepstack projector layers are unsupported"));
         }

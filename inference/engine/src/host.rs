@@ -543,12 +543,8 @@ mod tests {
                 magnitude_family_dflash::Error::Metadata { .. }
             ))
         ));
-        directory.metadata.last_mut().unwrap().value = Value::Array(
-            vec![true, true, true, true, true, false]
-                .into_iter()
-                .map(Scalar::Bool)
-                .collect(),
-        );
+        directory.metadata.last_mut().unwrap().value =
+            Value::Array(vec![true, true, true, true, true, false].into());
         let admitted = bind_draft(&family, target.clone(), Some(&directory));
         assert!(admitted.draft_unavailable.is_none());
         assert!(admitted.definition.draft.is_some());

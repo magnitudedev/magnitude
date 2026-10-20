@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, bail, ensure};
-use magnitude_artifacts::gguf::{self, Directory, Scalar, TensorDescriptor, Value};
+use magnitude_artifacts::gguf::{self, Array, Directory, Scalar, TensorDescriptor, Value};
 use magnitude_service_contracts::ComponentRole;
 use magnitude_service_models::{ReleasePackageRole, load_release_catalog};
 use serde_json::{Map, Value as Json, json};
@@ -155,19 +155,20 @@ fn header_json<'a>(
 }
 
 fn value_json(value: &Value) -> anyhow::Result<Json> {
-    let array = |values: &[Scalar]| {
+    let array = |values: &Array, length: usize| {
         values
             .iter()
-            .map(scalar_json)
+            .take(length)
+            .map(|value| scalar_json(&value.to_scalar()))
             .collect::<anyhow::Result<Vec<_>>>()
     };
     Ok(match value {
         Value::Scalar(scalar) => scalar_json(scalar)?,
         Value::Array(values) if values.len() > MAX_WHOLE_ARRAY => json!({
-            "head": array(&values[..TRUNCATED_HEAD])?,
+            "head": array(values, TRUNCATED_HEAD)?,
             "length": values.len(),
         }),
-        Value::Array(values) => Json::Array(array(values)?),
+        Value::Array(values) => Json::Array(array(values, values.len())?),
     })
 }
 
@@ -196,11 +197,11 @@ mod tests {
 
     #[test]
     fn long_arrays_keep_their_head_and_length() {
-        let long = Value::Array((0..2000).map(Scalar::Unsigned).collect());
+        let long = Value::Array((0..2000).collect::<Vec<u64>>().into());
         let dumped = value_json(&long).unwrap();
         assert_eq!(dumped["length"], 2000);
         assert_eq!(dumped["head"].as_array().unwrap().len(), TRUNCATED_HEAD);
-        let short = Value::Array((0..MAX_WHOLE_ARRAY as u64).map(Scalar::Unsigned).collect());
+        let short = Value::Array((0..MAX_WHOLE_ARRAY as u64).collect::<Vec<_>>().into());
         assert_eq!(
             value_json(&short).unwrap().as_array().unwrap().len(),
             MAX_WHOLE_ARRAY

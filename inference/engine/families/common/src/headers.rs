@@ -4,7 +4,7 @@
 //! tests.
 
 use magnitude_artifacts::gguf::{
-    ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value,
+    Array, ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value,
 };
 use serde_json::Value as Json;
 use std::path::PathBuf;
@@ -45,17 +45,29 @@ fn scalar(value: &Json) -> Scalar {
     }
 }
 
+/// A dumped array. JSON keeps no element type, so integers are signed when any element is
+/// negative and every number is a float when any element is fractional.
+fn array(values: &[Json]) -> Value {
+    let scalars = values.iter().map(scalar).collect::<Vec<_>>();
+    let float = scalars
+        .iter()
+        .any(|value| matches!(value, Scalar::Float(_)));
+    let signed = scalars
+        .iter()
+        .any(|value| matches!(value, Scalar::Signed(_)));
+    let scalars = scalars.into_iter().map(|value| match value {
+        Scalar::Unsigned(value) if float => Scalar::Float(value as f64),
+        Scalar::Signed(value) if float => Scalar::Float(value as f64),
+        Scalar::Unsigned(value) if signed => Scalar::Signed(value as i64),
+        value => value,
+    });
+    Value::Array(Array::of(scalars).expect("a dumped GGUF array has one element type"))
+}
+
 fn value(value: &Json) -> Value {
     match value {
-        Json::Array(values) => Value::Array(values.iter().map(scalar).collect()),
-        Json::Object(truncated) => Value::Array(
-            truncated["head"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(scalar)
-                .collect(),
-        ),
+        Json::Array(values) => array(values),
+        Json::Object(truncated) => array(truncated["head"].as_array().unwrap()),
         other => Value::Scalar(scalar(other)),
     }
 }

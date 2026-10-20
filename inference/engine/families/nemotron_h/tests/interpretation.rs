@@ -4,7 +4,7 @@
 //! catalog files (`inference/catalog/headers`).
 
 use magnitude_artifacts::{
-    gguf::{Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
+    gguf::{Array, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
     ArtifactIdentity, InputLayout, PackageIdentity, TokenId,
 };
 use magnitude_family_common::{headers::directory as catalog, TextInput};
@@ -403,7 +403,7 @@ fn rejects_layer_sequences_that_form_no_blocks() {
             .iter_mut()
             .find(|item| item.name == name)
             .unwrap();
-        let Value::Array(values) = &mut item.value else {
+        let Value::Array(Array::Unsigned(values)) = &mut item.value else {
             unreachable!()
         };
         values.swap(0, 1);

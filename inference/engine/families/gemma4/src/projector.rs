@@ -4,7 +4,7 @@
 //! interpreted; every vision tensor is bound once.
 
 use crate::{invalid, product, Error};
-use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value};
+use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
 use magnitude_family_common::{architecture_keys, HeaderError, Tensors};
 use magnitude_family_contracts::{
     CellReduction, ImportTransform, LinearClamp, MergerStage, PositionSampling, RmsNorm,
@@ -58,7 +58,7 @@ impl Reader<'_> {
             Some(Value::Array(values)) if values.len() == 3 => values
                 .iter()
                 .map(|value| match value {
-                    Scalar::Float(value) if value.is_finite() => Some(*value),
+                    Element::Float(value) if value.is_finite() => Some(value),
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>(),

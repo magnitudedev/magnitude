@@ -1,5 +1,5 @@
 use magnitude_artifacts::{
-    gguf::{Directory, Scalar, Value},
+    gguf::{Array, Directory, Scalar, Value},
     ArtifactIdentity, InputLayout, PackageIdentity, TokenId,
 };
 use magnitude_family_contracts::{
@@ -142,7 +142,7 @@ fn every_catalog_variant_binds_to_the_released_geometry() {
 #[test]
 fn a_per_layer_window_pattern_and_partial_rotary_are_read_from_the_header() {
     let mut directory = headers::directory(VARIANTS[0]);
-    let flags = (0..52).map(|layer| Scalar::Bool(layer % 2 == 0)).collect();
+    let flags = (0..52).map(|layer| layer % 2 == 0).collect::<Vec<_>>().into();
     headers::set(
         &mut directory,
         "muse-glimmer.attention.sliding_window_pattern",
@@ -215,7 +215,7 @@ fn rejects_missing_misshapen_unbound_and_unknown_roles() {
             headers::set(
                 d,
                 "muse-glimmer.attention.head_count",
-                Value::Array(vec![Scalar::Unsigned(32); 52]),
+                Value::Array(vec![32_u64; 52].into()),
             )
         },
         "muse-glimmer.attention.head_count must be a positive integer",
@@ -225,7 +225,7 @@ fn rejects_missing_misshapen_unbound_and_unknown_roles() {
             headers::set(
                 d,
                 "muse-glimmer.attention.sliding_window_pattern",
-                Value::Array(vec![Scalar::Bool(true); 51]),
+                Value::Array(vec![true; 51].into()),
             )
         },
         "one flag per layer",

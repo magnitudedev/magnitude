@@ -3,7 +3,7 @@
 //! derived from them.
 
 use magnitude_artifacts::{
-    gguf::{Directory, Metadata, Scalar, Value},
+    gguf::{Array, Directory, Metadata, Scalar, Value},
     ArtifactIdentity, InputLayout, PackageIdentity, TokenId,
 };
 use magnitude_family_common::headers::directory as header;
@@ -343,7 +343,7 @@ fn rejects_missing_tensors_unknown_metadata_wrong_shapes_and_unbound_roles() {
         .iter_mut()
         .find(|entry| entry.name == "gemma4.attention.sliding_window_pattern")
         .unwrap();
-    flags.value = Value::Array(vec![Scalar::Bool(true); 34]);
+    flags.value = Value::Array(vec![true; 34].into());
     assert_eq!(
         inspect(&pattern).unwrap_err(),
         "the Gemma window pattern must hold one flag per layer"

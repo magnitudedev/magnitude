@@ -2,7 +2,7 @@
 //! (`inference/catalog/headers/`).
 
 use magnitude_artifacts::{
-    gguf::{Directory, Scalar, Value},
+    gguf::{Array, Directory, Scalar, Value},
     ArtifactIdentity, InputLayout, PackageIdentity, TokenId,
 };
 use magnitude_family_contracts::{
@@ -29,12 +29,10 @@ fn catalog() -> Vec<Variant> {
         .map(|(model, role, file)| {
             let mut directory = headers::directory(&file);
             for entry in &mut directory.metadata {
-                if let Value::Array(values) = &mut entry.value {
-                    for value in values {
-                        if let Scalar::Unsigned(integer) = *value {
-                            *value = Scalar::Signed(integer as i64);
-                        }
-                    }
+                if let Value::Array(Array::Unsigned(values)) = &entry.value {
+                    entry.value = Value::Array(Array::Signed(
+                        values.iter().map(|&integer| integer as i64).collect(),
+                    ));
                 }
             }
             Variant {
@@ -302,16 +300,16 @@ fn rejects_unknown_and_malformed_metadata() {
     let short_kv = with_metadata(
         variant("lfm2.5-2.6b"),
         "lfm2.attention.head_count_kv",
-        Value::Array(vec![Scalar::Unsigned(0); 29]),
+        Value::Array(vec![0_u64; 29].into()),
     );
     assert!(inspect(&short_kv).unwrap_err().contains("one entry per layer"));
 
-    let mut negative = vec![Scalar::Signed(0); 30];
-    negative[2] = Scalar::Signed(-8);
+    let mut negative = vec![0_i64; 30];
+    negative[2] = -8;
     let negative_kv = with_metadata(
         variant("lfm2.5-2.6b"),
         "lfm2.attention.head_count_kv",
-        Value::Array(negative),
+        Value::Array(negative.into()),
     );
     assert!(inspect(&negative_kv).unwrap_err().contains("nonnegative"));
 
@@ -341,15 +339,15 @@ fn rejects_unknown_and_malformed_metadata() {
 fn the_layer_pattern_follows_the_key_head_array() {
     // The array alone decides each layer's operator: reading layer 2 as a
     // conv layer demands conv weights the file does not have.
-    let mut pattern = vec![Scalar::Unsigned(0); 30];
+    let mut pattern = vec![0_u64; 30];
     for layer in [2, 5, 9, 13, 17, 21, 24, 27] {
-        pattern[layer] = Scalar::Unsigned(8);
+        pattern[layer] = 8;
     }
-    pattern[2] = Scalar::Unsigned(0);
+    pattern[2] = 0;
     let directory = with_metadata(
         variant("lfm2.5-2.6b"),
         "lfm2.attention.head_count_kv",
-        Value::Array(pattern),
+        Value::Array(pattern.into()),
     );
     // Layer 2 is now read as a conv layer, which has no in_proj.
     assert!(inspect(&directory)

@@ -1,5 +1,5 @@
 use magnitude_artifacts::{
-    gguf::{Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
+    gguf::{Array, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
     ArtifactIdentity, PackageIdentity, TokenId,
 };
 use magnitude_family_common::headers;
@@ -77,12 +77,7 @@ fn explicit_directory(file: &str) -> Directory {
         .metadata
         .retain(|entry| entry.name != "dflash.attention.causal");
     let value = if file == PAIRS[0].0 {
-        Value::Array(
-            vec![true, true, true, true, true, false]
-                .into_iter()
-                .map(Scalar::Bool)
-                .collect(),
-        )
+        Value::Array(vec![true, true, true, true, true, false].into())
     } else {
         Value::Scalar(Scalar::Bool(false))
     };
@@ -468,7 +463,7 @@ fn a_tap_beyond_the_target_is_refused() {
         .iter_mut()
         .find(|item| item.name == "dflash.target_layers")
         .unwrap();
-    layers.value = Value::Array(vec![Scalar::Unsigned(2), Scalar::Unsigned(41)]);
+    layers.value = Value::Array(vec![2_u64, 41].into());
     assert!(matches!(
         inspect_qwen(&directory, &model),
         Err(Error::Target(_))
@@ -485,25 +480,19 @@ fn signed_tap_indices_bind_as_unsigned_ones_do() {
         .iter_mut()
         .find(|item| item.name == "dflash.target_layers")
         .unwrap();
-    let Value::Array(values) = &layers.value else {
-        panic!("target layers are an array");
+    let Value::Array(Array::Unsigned(values)) = &layers.value else {
+        panic!("target layers are an unsigned array");
     };
-    layers.value = Value::Array(
-        values
-            .iter()
-            .map(|value| match value {
-                Scalar::Unsigned(layer) => Scalar::Signed(*layer as i64),
-                other => other.clone(),
-            })
-            .collect(),
-    );
+    layers.value = Value::Array(Array::Signed(
+        values.iter().map(|&layer| layer as i64).collect(),
+    ));
     assert_eq!(inspect_qwen(&directory, &model).unwrap(), unsigned);
     let layers = directory
         .metadata
         .iter_mut()
         .find(|item| item.name == "dflash.target_layers")
         .unwrap();
-    layers.value = Value::Array(vec![Scalar::Signed(-1)]);
+    layers.value = Value::Array(vec![-1_i64].into());
     assert!(matches!(
         inspect_qwen(&directory, &model),
         Err(Error::Metadata { .. })
@@ -633,12 +622,7 @@ fn dflash2_roles_are_all_or_nothing() {
     headers::set(
         &mut sectioned,
         "dflash.rope.dimension_sections",
-        Value::Array(vec![
-            Scalar::Unsigned(32),
-            Scalar::Unsigned(32),
-            Scalar::Unsigned(0),
-            Scalar::Unsigned(0),
-        ]),
+        Value::Array(vec![32_u64, 32, 0, 0].into()),
     );
     assert!(matches!(bind(&sectioned), Err(Error::Geometry(_))));
 }
@@ -659,8 +643,8 @@ fn missing_causality_is_not_inferred_from_windows() {
 fn causality_requires_booleans_and_exact_layer_count() {
     for value in [
         Value::Scalar(Scalar::Unsigned(1)),
-        Value::Array(vec![Scalar::Bool(true); 5]),
-        Value::Array(vec![Scalar::Unsigned(1); 6]),
+        Value::Array(vec![true; 5].into()),
+        Value::Array(vec![1_u64; 6].into()),
     ] {
         let (mut directory, model) = qwen_draft();
         directory

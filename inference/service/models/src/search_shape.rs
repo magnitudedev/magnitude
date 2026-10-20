@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
-use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value, read_header};
+use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Value, read_header};
 use magnitude_service_contracts::models::{ModelFingerprint, ModelId, UnsupportedReason};
 use magnitude_service_contracts::{HuggingFaceRepositoryRequest, InventoryError};
 use reqwest::header::RANGE;
@@ -153,7 +153,7 @@ impl ModelShape {
                 None => Some(None),
                 Some(Value::Array(values)) => {
                     values.iter().try_fold(None, |largest: Option<u64>, value| {
-                        Some(Some(largest.unwrap_or(0).max(unsigned(value)?)))
+                        Some(Some(largest.unwrap_or(0).max(value.unsigned()?)))
                     })
                 }
                 Some(value) => value.unsigned().map(Some),
@@ -246,14 +246,6 @@ impl ModelShape {
             expert_count: self.expert_count,
             tokenizer_digest: String::new(),
         }
-    }
-}
-
-fn unsigned(value: &Scalar) -> Option<u64> {
-    match value {
-        Scalar::Unsigned(value) => Some(*value),
-        Scalar::Signed(value) => u64::try_from(*value).ok(),
-        _ => None,
     }
 }
 

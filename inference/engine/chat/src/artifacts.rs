@@ -5,20 +5,17 @@ use super::{
     TemplateVariant, TokenId, TokenizerError,
 };
 use magnitude_artifacts::{
-    gguf::{Scalar, Value as GgufValue},
+    gguf::{Array, Element, Scalar, Value as GgufValue},
     TemplatePayload, TokenizerPayload, UnsupportedReason,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
 fn strings(payload: &TokenizerPayload, key: &str) -> Result<Vec<String>, String> {
     match payload.value(key) {
-        Some(GgufValue::Array(values)) => values
-            .iter()
-            .map(|v| match v {
-                Scalar::String(s) => Ok(s.clone()),
-                _ => Err(format!("{key} requires strings")),
-            })
-            .collect(),
+        Some(GgufValue::Array(Array::String(values))) => {
+            Ok(values.iter().map(str::to_owned).collect())
+        }
+        Some(GgufValue::Array(_)) => Err(format!("{key} requires strings")),
         _ => Err(format!("missing string array {key}")),
     }
 }
@@ -41,15 +38,10 @@ pub fn gguf_templates(
         );
     }
     let pieces = match tokenizer.value("tokenizer.ggml.tokens") {
-        Some(GgufValue::Array(pieces)) => pieces,
+        Some(GgufValue::Array(Array::String(pieces))) => pieces,
+        Some(GgufValue::Array(_)) => return Err("tokenizer.ggml.tokens requires strings".into()),
         _ => return Err("missing string array tokenizer.ggml.tokens".into()),
     };
-    if !pieces
-        .iter()
-        .all(|piece| matches!(piece, Scalar::String(_)))
-    {
-        return Err("tokenizer.ggml.tokens requires strings".into());
-    }
     let mut tokens = BTreeMap::new();
     for (native, name) in [
         ("bos", "bos_token"),
@@ -65,12 +57,10 @@ pub fn gguf_templates(
                 .unsigned()
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or("invalid special-token ID")?;
-            let piece = match pieces.get(id) {
-                Some(Scalar::String(piece)) => piece,
-                Some(_) => return Err("tokenizer.ggml.tokens requires strings".into()),
-                None => return Err("special-token ID outside vocabulary".into()),
-            };
-            tokens.insert(name.into(), piece.clone());
+            let piece = pieces
+                .get(id)
+                .ok_or("special-token ID outside vocabulary")?;
+            tokens.insert(name.into(), piece.to_owned());
         }
     }
     TemplateBundle::new(variants.into_values().collect(), "default".into(), tokens)
@@ -360,8 +350,8 @@ fn additional_eos(payload: &TokenizerPayload, vocabulary: usize) -> Result<Vec<T
         None => Ok(Vec::new()),
         Some(GgufValue::Array(values)) => values.iter().map(|value| {
             match value {
-                Scalar::Unsigned(n) => u32::try_from(*n).ok(),
-                Scalar::Signed(n) => u32::try_from(*n).ok(),
+                Element::Unsigned(n) => u32::try_from(n).ok(),
+                Element::Signed(n) => u32::try_from(n).ok(),
                 _ => None,
             }.filter(|&n| (n as usize) < vocabulary).map(TokenId)
                 .ok_or_else(|| TokenizerError::Invalid(format!("{key} requires vocabulary tokens")))
@@ -383,8 +373,8 @@ pub fn gguf_byte_bpe(
             .iter()
             .map(|v| {
                 let kind = match v {
-                    Scalar::Unsigned(n) => *n,
-                    Scalar::Signed(n) => u64::try_from(*n).map_err(|_| "invalid piece kind")?,
+                    Element::Unsigned(n) => n,
+                    Element::Signed(n) => u64::try_from(n).map_err(|_| "invalid piece kind")?,
                     _ => return Err("invalid piece kind"),
                 };
                 Ok(match kind {
@@ -452,8 +442,8 @@ pub fn gguf_byte_bpe(
             .iter()
             .map(|value| {
                 match value {
-                    Scalar::Signed(n) => u32::try_from(*n).ok(),
-                    Scalar::Unsigned(n) => u32::try_from(*n).ok(),
+                    Element::Signed(n) => u32::try_from(n).ok(),
+                    Element::Unsigned(n) => u32::try_from(n).ok(),
                     _ => None,
                 }
                 .filter(|&n| (n as usize) < pieces.len())
@@ -496,9 +486,10 @@ mod eos_tests {
             name: "tokenizer.ggml.eos_token_ids".into(), value,
         }] };
         assert_eq!(additional_eos(&TokenizerPayload {metadata: vec![]}, 4).unwrap(), vec![]);
-        let valid = payload(GgufValue::Array(vec![Scalar::Unsigned(1), Scalar::Signed(3)]));
-        assert_eq!(additional_eos(&valid, 4).unwrap(), vec![TokenId(1), TokenId(3)]);
-        for values in [vec![Scalar::Signed(-1)], vec![Scalar::Unsigned(4)], vec![Scalar::String("1".into())]] {
+        for values in [Array::from(vec![1_u64, 3]), Array::from(vec![1_i64, 3])] {
+            assert_eq!(additional_eos(&payload(GgufValue::Array(values)), 4).unwrap(), vec![TokenId(1), TokenId(3)]);
+        }
+        for values in [Array::from(vec![-1_i64]), Array::from(vec![4_u64]), Array::String(["1"].into_iter().collect())] {
             assert!(additional_eos(&payload(GgufValue::Array(values)), 4).is_err());
         }
     }

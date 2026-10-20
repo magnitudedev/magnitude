@@ -11,7 +11,7 @@ mod projector;
 pub use projector::describe_projector;
 
 use magnitude_artifacts::{
-    gguf::{Directory, Scalar, Value},
+    gguf::{Directory, Element, Scalar, Value},
     UnsupportedReason,
 };
 use magnitude_family_common::architecture_keys;
@@ -107,8 +107,8 @@ impl<'a> Metadata<'a> {
         values
             .iter()
             .map(|value| match value {
-                Scalar::Unsigned(n) => Some(*n),
-                Scalar::Signed(n) => u64::try_from(*n).ok(),
+                Element::Unsigned(n) => Some(n),
+                Element::Signed(n) => u64::try_from(n).ok(),
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()
@@ -189,7 +189,7 @@ pub fn mixer_kinds(
         Value::Array(flags) => flags
             .iter()
             .map(|v| match v {
-                Scalar::Bool(recurrent) => Some(*recurrent),
+                Element::Bool(recurrent) => Some(recurrent),
                 _ => None,
             })
             .collect::<Option<Vec<_>>>(),
@@ -275,8 +275,8 @@ impl Geometry {
         let sections = sections
             .iter()
             .map(|v| match v {
-                Scalar::Unsigned(n) => Some(*n),
-                Scalar::Signed(n) => u64::try_from(*n).ok(),
+                Element::Unsigned(n) => Some(n),
+                Element::Signed(n) => u64::try_from(n).ok(),
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()

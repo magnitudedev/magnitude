@@ -245,7 +245,210 @@ pub enum Scalar {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Scalar(Scalar),
-    Array(Vec<Scalar>),
+    Array(Array),
+}
+
+/// One GGUF metadata array. A GGUF array has a single element type, so its elements are held
+/// unboxed in one buffer of that type rather than as a [`Scalar`] (and, for text, an allocation)
+/// apiece: a tokenizer's hundreds of thousands of pieces, merges, scores and kinds then take about
+/// the bytes they occupy in the file, where boxed scalars took several times that.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Array {
+    String(Strings),
+    Bool(Vec<bool>),
+    Unsigned(Vec<u64>),
+    Signed(Vec<i64>),
+    Float(Vec<f64>),
+}
+
+/// The elements of a text array, concatenated, with where each one ends.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Strings {
+    text: String,
+    ends: Vec<u32>,
+}
+
+/// One element of an [`Array`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Element<'a> {
+    String(&'a str),
+    Bool(bool),
+    Unsigned(u64),
+    Signed(i64),
+    Float(f64),
+}
+
+impl Strings {
+    fn push(&mut self, value: &str) -> Result<(), Error> {
+        self.text.push_str(value);
+        self.ends.push(
+            u32::try_from(self.text.len())
+                .map_err(|_| invalid("GGUF string array exceeds its addressable length"))?,
+        );
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&str> {
+        let end = *self.ends.get(index)? as usize;
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |previous| self.ends[previous] as usize);
+        Some(&self.text[start..end])
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &str> + '_ {
+        (0..self.len()).map(|index| self.get(index).expect("an index below the length"))
+    }
+}
+
+impl<S: AsRef<str>> FromIterator<S> for Strings {
+    fn from_iter<I: IntoIterator<Item = S>>(values: I) -> Self {
+        let mut strings = Self::default();
+        for value in values {
+            strings
+                .push(value.as_ref())
+                .expect("an in-memory string array within its addressable length");
+        }
+        strings
+    }
+}
+
+impl Array {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::String(values) => values.len(),
+            Self::Bool(values) => values.len(),
+            Self::Unsigned(values) => values.len(),
+            Self::Signed(values) => values.len(),
+            Self::Float(values) => values.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<Element<'_>> {
+        Some(match self {
+            Self::String(values) => Element::String(values.get(index)?),
+            Self::Bool(values) => Element::Bool(*values.get(index)?),
+            Self::Unsigned(values) => Element::Unsigned(*values.get(index)?),
+            Self::Signed(values) => Element::Signed(*values.get(index)?),
+            Self::Float(values) => Element::Float(*values.get(index)?),
+        })
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = Element<'_>> + '_ {
+        (0..self.len()).map(|index| self.get(index).expect("an index below the length"))
+    }
+
+    /// The array of `values`, which must share one element type.
+    pub fn of(values: impl IntoIterator<Item = Scalar>) -> Result<Self, Error> {
+        let mut values = values.into_iter().peekable();
+        let mismatch = || invalid("GGUF array elements must share one type");
+        Ok(match values.peek() {
+            None | Some(Scalar::Unsigned(_)) => Self::Unsigned(
+                values
+                    .map(|value| match value {
+                        Scalar::Unsigned(value) => Ok(value),
+                        _ => Err(mismatch()),
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(Scalar::Signed(_)) => Self::Signed(
+                values
+                    .map(|value| match value {
+                        Scalar::Signed(value) => Ok(value),
+                        _ => Err(mismatch()),
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(Scalar::Float(_)) => Self::Float(
+                values
+                    .map(|value| match value {
+                        Scalar::Float(value) => Ok(value),
+                        _ => Err(mismatch()),
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(Scalar::Bool(_)) => Self::Bool(
+                values
+                    .map(|value| match value {
+                        Scalar::Bool(value) => Ok(value),
+                        _ => Err(mismatch()),
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(Scalar::String(_)) => {
+                let mut strings = Strings::default();
+                for value in values {
+                    match value {
+                        Scalar::String(value) => strings.push(&value)?,
+                        _ => return Err(mismatch()),
+                    }
+                }
+                Self::String(strings)
+            }
+        })
+    }
+}
+
+impl From<Vec<bool>> for Array {
+    fn from(values: Vec<bool>) -> Self {
+        Self::Bool(values)
+    }
+}
+
+impl From<Vec<u64>> for Array {
+    fn from(values: Vec<u64>) -> Self {
+        Self::Unsigned(values)
+    }
+}
+
+impl From<Vec<i64>> for Array {
+    fn from(values: Vec<i64>) -> Self {
+        Self::Signed(values)
+    }
+}
+
+impl From<Vec<f64>> for Array {
+    fn from(values: Vec<f64>) -> Self {
+        Self::Float(values)
+    }
+}
+
+impl From<Strings> for Array {
+    fn from(values: Strings) -> Self {
+        Self::String(values)
+    }
+}
+
+impl Element<'_> {
+    pub fn unsigned(self) -> Option<u64> {
+        match self {
+            Self::Unsigned(value) => Some(value),
+            Self::Signed(value) => u64::try_from(value).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn to_scalar(self) -> Scalar {
+        match self {
+            Self::String(value) => Scalar::String(value.to_owned()),
+            Self::Bool(value) => Scalar::Bool(value),
+            Self::Unsigned(value) => Scalar::Unsigned(value),
+            Self::Signed(value) => Scalar::Signed(value),
+            Self::Float(value) => Scalar::Float(value),
+        }
+    }
 }
 
 impl Value {
@@ -435,17 +638,64 @@ impl<R: Read> Reader<'_, R> {
         }
         let element = self.u32()?;
         let count = self.u64()?;
-        if element == 9 || count > self.end - self.offset {
+        // The smallest encoding of one element, so a count is bounded by the header's bytes before
+        // its elements are allocated.
+        let encoded = match element {
+            0 | 1 | 7 => 1,
+            2 | 3 => 2,
+            4..=6 => 4,
+            _ => 8,
+        };
+        if element == 9 || count > (self.end - self.offset) / encoded {
             return Err(invalid("nested or oversized GGUF array"));
         }
+        let count = usize::try_from(count).map_err(|_| invalid("oversized GGUF array"))?;
+        Ok(Value::Array(match element {
+            8 => {
+                let mut strings = Strings::default();
+                strings
+                    .ends
+                    .try_reserve_exact(count)
+                    .map_err(|_| invalid("cannot allocate bounded GGUF array"))?;
+                for _ in 0..count {
+                    strings.push(&self.string()?)?;
+                }
+                strings.text.shrink_to_fit();
+                Array::String(strings)
+            }
+            7 => Array::Bool(self.elements(count, element, |scalar| match scalar {
+                Scalar::Bool(value) => value,
+                _ => unreachable!("a GGUF boolean element reads as a boolean"),
+            })?),
+            1 | 3 | 5 | 11 => Array::Signed(self.elements(count, element, |scalar| match scalar {
+                Scalar::Signed(value) => value,
+                _ => unreachable!("a signed GGUF element reads as signed"),
+            })?),
+            6 | 12 => Array::Float(self.elements(count, element, |scalar| match scalar {
+                Scalar::Float(value) => value,
+                _ => unreachable!("a GGUF float element reads as a float"),
+            })?),
+            _ => Array::Unsigned(self.elements(count, element, |scalar| match scalar {
+                Scalar::Unsigned(value) => value,
+                _ => unreachable!("an unsigned GGUF element reads as unsigned"),
+            })?),
+        }))
+    }
+
+    fn elements<T>(
+        &mut self,
+        count: usize,
+        kind: u32,
+        unwrap: impl Fn(Scalar) -> T,
+    ) -> Result<Vec<T>, Error> {
         let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|_| invalid("cannot allocate bounded GGUF array"))?;
         for _ in 0..count {
-            values
-                .try_reserve(1)
-                .map_err(|_| invalid("cannot allocate bounded GGUF array"))?;
-            values.push(self.scalar(element)?);
+            values.push(unwrap(self.scalar(kind)?));
         }
-        Ok(Value::Array(values))
+        Ok(values)
     }
 }
 

@@ -1,6 +1,6 @@
 use magnitude_artifacts::{
     ArtifactIdentity, PackageIdentity,
-    gguf::{ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
+    gguf::{Array, ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
 };
 use magnitude_artifacts::{
     ImageProcessor, InputLayout, TokenId,
@@ -66,12 +66,7 @@ fn directory(routed: bool) -> Directory {
     }
     metadata.push(Metadata {
         name: format!("{architecture}.rope.dimension_sections"),
-        value: Value::Array(vec![
-            Scalar::Unsigned(1),
-            Scalar::Unsigned(1),
-            Scalar::Unsigned(0),
-            Scalar::Unsigned(0),
-        ]),
+        value: Value::Array(vec![1_u64, 1, 0, 0].into()),
     });
 
     let mut tensors = Vec::new();
@@ -311,15 +306,15 @@ fn projector() -> Directory {
         scalar("clip.use_gelu", Scalar::Bool(true)),
         Metadata {
             name: "clip.vision.image_mean".into(),
-            value: Value::Array(vec![Scalar::Float(0.5); 3]),
+            value: Value::Array(vec![0.5_f64; 3].into()),
         },
         Metadata {
             name: "clip.vision.image_std".into(),
-            value: Value::Array(vec![Scalar::Float(0.5); 3]),
+            value: Value::Array(vec![0.5_f64; 3].into()),
         },
         Metadata {
             name: "clip.vision.is_deepstack_layers".into(),
-            value: Value::Array(vec![Scalar::Bool(false)]),
+            value: Value::Array(vec![false].into()),
         },
     ];
     metadata.shrink_to_fit();
@@ -476,7 +471,7 @@ fn recurrent_layer_flags_bind_the_layer_order_the_interval_places() {
         }
         directory.metadata.push(Metadata {
             name: "qwen35.attention.recurrent_layers".into(),
-            value: Value::Array(flags.iter().copied().map(Scalar::Bool).collect()),
+            value: Value::Array(flags.to_vec().into()),
         });
         inspect_components(&directory, None, identity)
     };
@@ -699,7 +694,7 @@ fn projector_deepstack_metadata_is_optional_but_rejects_enabled_layers() {
         .iter_mut()
         .find(|metadata| metadata.name == "clip.vision.is_deepstack_layers")
         .unwrap()
-        .value = Value::Array(vec![Scalar::Bool(true)]);
+        .value = Value::Array(vec![true].into());
     assert!(describe_projector(&enabled).is_err());
 }
 

@@ -4,7 +4,7 @@
 //! manifest format is described in the fixtures' README.
 
 use flate2::read::GzDecoder;
-use magnitude_artifacts::gguf::{Directory, Metadata, Scalar, Value, inspect_header};
+use magnitude_artifacts::gguf::{Array, Directory, Metadata, Scalar, Value, inspect_header};
 use magnitude_engine::{
     assessment::{
         AssessmentSetup, DrafterVerdict, ModelAssessment, ModelPackagePaths, SpeculativeMethod,
@@ -320,10 +320,11 @@ fn gguf_header(directory: &Directory) -> Vec<u8> {
             }
             Value::Array(values) => {
                 out.extend(9u32.to_le_bytes());
-                out.extend(values.first().map_or(8, kind).to_le_bytes());
+                let element = values.iter().next().map(|value| kind(&value.to_scalar()));
+                out.extend(element.unwrap_or(8).to_le_bytes());
                 out.extend((values.len() as u64).to_le_bytes());
-                for value in values {
-                    scalar(&mut out, value);
+                for value in values.iter() {
+                    scalar(&mut out, &value.to_scalar());
                 }
             }
         }
@@ -407,13 +408,17 @@ fn a_qwen4exp_target_with_its_prediction_block_is_assessed_with_built_in_heads()
         name: "qwen4exp.nextn_predict_layers".into(),
         value: Value::Scalar(Scalar::Unsigned(1)),
     });
-    let Some(Value::Array(mut ratios)) = combined
-        .value("qwen4exp.attention.compress_ratios")
-        .cloned()
-    else {
-        panic!("the target names its compression ratios");
+    let ratios = match combined.value("qwen4exp.attention.compress_ratios").cloned() {
+        Some(Value::Array(Array::Signed(mut ratios))) => {
+            ratios.push(0);
+            Array::Signed(ratios)
+        }
+        Some(Value::Array(Array::Unsigned(mut ratios))) => {
+            ratios.push(0);
+            Array::Unsigned(ratios)
+        }
+        _ => panic!("the target names its compression ratios"),
     };
-    ratios.push(Scalar::Unsigned(0));
     set(
         &mut combined,
         "qwen4exp.attention.compress_ratios",

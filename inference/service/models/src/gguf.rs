@@ -5,7 +5,7 @@
 //! geometry and offsets; this module only interprets catalog and inventory metadata.
 
 use crate::candidate_files::RecognizedArchitectures;
-use magnitude_artifacts::gguf::{Directory, Encoding, PROJECTOR_ARCHITECTURE, Scalar, Value};
+use magnitude_artifacts::gguf::{Directory, Element, Encoding, PROJECTOR_ARCHITECTURE, Scalar, Value};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read};
@@ -158,7 +158,7 @@ pub fn header_tags(directory: &Directory) -> Vec<String> {
         Some(Value::Array(values)) => values
             .iter()
             .filter_map(|value| match value {
-                Scalar::String(tag) => Some(tag.clone()),
+                Element::String(tag) => Some(tag.to_owned()),
                 _ => None,
             })
             .collect(),

@@ -4,7 +4,7 @@
 //! three-stage erf-GELU adapter to the decoder width.
 
 use crate::{invalid, product, Error};
-use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value};
+use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
 use magnitude_family_common::{architecture_keys, rotary, Tensors};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling,
@@ -63,7 +63,7 @@ fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
         Some(Value::Array(values)) if values.len() == 3 => values
             .iter()
             .map(|value| match value {
-                Scalar::Float(value) if value.is_finite() => Some(*value),
+                Element::Float(value) if value.is_finite() => Some(value),
                 _ => None,
             })
             .collect::<Option<Vec<_>>>(),

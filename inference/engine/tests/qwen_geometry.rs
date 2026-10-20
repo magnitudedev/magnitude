@@ -1,5 +1,5 @@
 use magnitude_artifacts::{
-    gguf::{ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
+    gguf::{Array, ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
     ArtifactIdentity, PackageIdentity,
 };
 use magnitude_family_contracts::{Operator, RecurrentHeadMapping};
@@ -68,12 +68,7 @@ fn directory(routed: bool) -> Directory {
     }
     metadata.push(Metadata {
         name: format!("{architecture}.rope.dimension_sections"),
-        value: Value::Array(vec![
-            Scalar::Unsigned(1),
-            Scalar::Unsigned(1),
-            Scalar::Unsigned(0),
-            Scalar::Unsigned(0),
-        ]),
+        value: Value::Array(vec![1_u64, 1, 0, 0].into()),
     });
     let mut tensors = Vec::new();
     let mut add = |name: String, shape: &[u64]| {
@@ -213,7 +208,7 @@ fn explicit_mixer_flags_bind_the_named_layer_order() {
     set(
         &mut d,
         "attention.recurrent_layers",
-        Value::Array(vec![Scalar::Bool(true), Scalar::Bool(false)]),
+        Value::Array(vec![true, false].into()),
     );
     assert_eq!(
         inspect(&d, ArtifactIdentity([0; 32]))
@@ -226,13 +221,13 @@ fn explicit_mixer_flags_bind_the_named_layer_order() {
     set(
         &mut d,
         "attention.recurrent_layers",
-        Value::Array(vec![Scalar::Unsigned(1), Scalar::Bool(false)]),
+        Value::Array(vec![1_u64, 0].into()),
     );
     assert!(inspect(&d, ArtifactIdentity([0; 32])).is_err());
     set(
         &mut d,
         "attention.recurrent_layers",
-        Value::Array(vec![Scalar::Bool(true)]),
+        Value::Array(vec![true].into()),
     );
     assert!(inspect(&d, ArtifactIdentity([0; 32])).is_err());
 }
@@ -284,11 +279,11 @@ fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
             next += 1;
         }
     }
-    let mut pieces = vec![Scalar::String(String::new()); 256];
+    let mut pieces = vec![String::new(); 256];
     for (b, code) in alphabet.into_iter().zip(codes) {
-        pieces[b as usize] = Scalar::String(char::from_u32(code).unwrap().to_string());
+        pieces[b as usize] = char::from_u32(code).unwrap().to_string();
     }
-    pieces.push(Scalar::String("<eos>".into()));
+    pieces.push("<eos>".into());
     for (name, value) in [
         (
             "tokenizer.ggml.model",
@@ -298,16 +293,23 @@ fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
             "tokenizer.ggml.pre",
             Value::Scalar(Scalar::String("qwen35".into())),
         ),
-        ("tokenizer.ggml.tokens", Value::Array(pieces)),
+        (
+            "tokenizer.ggml.tokens",
+            Value::Array(Array::String(pieces.into_iter().collect())),
+        ),
         (
             "tokenizer.ggml.token_type",
             Value::Array(
                 (0..257)
-                    .map(|i| Scalar::Unsigned(if i == 256 { 3 } else { 1 }))
-                    .collect(),
+                    .map(|i| if i == 256 { 3_u64 } else { 1 })
+                    .collect::<Vec<_>>()
+                    .into(),
             ),
         ),
-        ("tokenizer.ggml.merges", Value::Array(vec![])),
+        (
+            "tokenizer.ggml.merges",
+            Value::Array(Array::String(Default::default())),
+        ),
         (
             "tokenizer.ggml.eos_token_id",
             Value::Scalar(Scalar::Unsigned(256)),
@@ -342,10 +344,11 @@ fn local_gguf_loading_shares_artifact_identity_with_tokenizer_and_templates() {
             }
             Value::Array(values) => {
                 bytes.extend_from_slice(&9u32.to_le_bytes());
-                bytes.extend_from_slice(&values.first().map_or(8, kind).to_le_bytes());
+                let element = values.iter().next().map(|value| kind(&value.to_scalar()));
+                bytes.extend_from_slice(&element.unwrap_or(8).to_le_bytes());
                 bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
-                for value in values {
-                    scalar(&mut bytes, value);
+                for value in values.iter() {
+                    scalar(&mut bytes, &value.to_scalar());
                 }
             }
         }

@@ -2,7 +2,7 @@
 pub mod inputs;
 
 use crate::{Error, invalid};
-use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Scalar, Value};
+use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
 use magnitude_family_common::{Tensors, architecture_keys};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, MergerStage, PositionSampling, VisionActivation,
@@ -50,7 +50,7 @@ impl Reader<'_> {
         let values = values
             .iter()
             .map(|v| match v {
-                Scalar::Float(x) if x.is_finite() => Some(*x),
+                Element::Float(x) if x.is_finite() => Some(x),
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()

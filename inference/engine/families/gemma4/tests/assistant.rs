@@ -5,7 +5,7 @@
 
 use magnitude_artifacts::{
     ArtifactIdentity, PackageIdentity,
-    gguf::{ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
+    gguf::{Array, ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
 };
 use magnitude_family_common::headers::{self, directory as header};
 use magnitude_family_contracts::{
@@ -106,7 +106,7 @@ fn assistant(p: &Published) -> Directory {
         ("attention.head_count", unsigned(p.heads)),
         (
             "attention.head_count_kv",
-            Value::Array(p.kv_heads.map(Scalar::Unsigned).to_vec()),
+            Value::Array(p.kv_heads.to_vec().into()),
         ),
         ("rope.freq_base", float(1_000_000.0)),
         ("rope.freq_base_swa", float(10_000.0)),
@@ -118,7 +118,7 @@ fn assistant(p: &Published) -> Directory {
         ("embedding_length_per_layer_input", unsigned(0)),
         (
             "attention.sliding_window_pattern",
-            Value::Array([true, true, true, false].map(Scalar::Bool).to_vec()),
+            Value::Array(vec![true, true, true, false].into()),
         ),
         ("attention.key_length_swa", unsigned(WINDOW_HEAD)),
         ("attention.value_length_swa", unsigned(WINDOW_HEAD)),
@@ -211,7 +211,7 @@ fn trained_cluster_readout_preserves_canonical_tokens_and_rejects_invalid_orderi
         },
         Metadata {
             name: key("output.cluster_token_order"),
-            value: Value::Array((0..VOCABULARY).rev().map(Scalar::Unsigned).collect()),
+            value: Value::Array((0..VOCABULARY).rev().collect::<Vec<u64>>().into()),
         },
     ]);
     directory.tensors.push(TensorDescriptor {
@@ -240,10 +240,10 @@ fn trained_cluster_readout_preserves_canonical_tokens_and_rejects_invalid_orderi
         .iter_mut()
         .find(|value| value.name == key("output.cluster_token_order"))
         .unwrap();
-    let Value::Array(values) = &mut ordering.value else {
+    let Value::Array(Array::Unsigned(values)) = &mut ordering.value else {
         unreachable!()
     };
-    values[1] = values[0].clone();
+    values[1] = values[0];
     assert!(
         inspect_assistant(&directory, &target)
             .unwrap_err()

@@ -6,7 +6,7 @@
 //! catalog target it derives from when no lineage metadata does.
 
 use magnitude_artifacts::{
-    gguf::{Directory, Scalar, Value},
+    gguf::{Array, Directory, Value},
     PackageHeaders,
 };
 use serde::{Deserialize, Serialize};
@@ -79,7 +79,9 @@ impl ModelFingerprint {
                 Some(Value::Array(values)) => values
                     .iter()
                     .map(|value| {
-                        unsigned(value).ok_or_else(|| FingerprintError::Invalid(key.clone()))
+                        value
+                            .unsigned()
+                            .ok_or_else(|| FingerprintError::Invalid(key.clone()))
                     })
                     .try_fold(None, |largest: Option<u64>, value| {
                         Ok(Some(largest.unwrap_or(0).max(value?)))
@@ -140,15 +142,14 @@ impl ModelFingerprint {
 /// little-endian) so no two tables share a digest.
 fn tokenizer_digest(directory: &Directory) -> Result<String, FingerprintError> {
     let key = "tokenizer.ggml.tokens";
-    let Some(Value::Array(tokens)) = directory.value(key) else {
-        return Err(FingerprintError::Missing(key.into()));
+    let tokens = match directory.value(key) {
+        Some(Value::Array(Array::String(tokens))) => tokens,
+        Some(Value::Array(_)) => return Err(FingerprintError::Invalid(key.into())),
+        _ => return Err(FingerprintError::Missing(key.into())),
     };
     let mut digest = Sha256::new();
     length_prefixed(&mut digest, TOKENIZER_DIGEST_TAG);
-    for token in tokens {
-        let Scalar::String(token) = token else {
-            return Err(FingerprintError::Invalid(key.into()));
-        };
+    for token in tokens.iter() {
         length_prefixed(&mut digest, token.as_bytes());
     }
     Ok(digest
@@ -161,12 +162,4 @@ fn tokenizer_digest(directory: &Directory) -> Result<String, FingerprintError> {
 fn length_prefixed(digest: &mut Sha256, bytes: &[u8]) {
     digest.update((bytes.len() as u64).to_le_bytes());
     digest.update(bytes);
-}
-
-fn unsigned(value: &Scalar) -> Option<u64> {
-    match value {
-        Scalar::Unsigned(value) => Some(*value),
-        Scalar::Signed(value) => u64::try_from(*value).ok(),
-        _ => None,
-    }
 }

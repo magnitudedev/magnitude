@@ -3,7 +3,7 @@
 //! its reader admits.
 
 use crate::HeaderError;
-use magnitude_artifacts::gguf::{self, Directory, Scalar, Value};
+use magnitude_artifacts::gguf::{self, Directory, Element, Scalar, Value};
 
 /// Every metadata entry in `architecture`'s own namespace, with its name
 /// within that namespace.
@@ -153,7 +153,7 @@ impl<'a> Metadata<'a> {
             match value {
                 Value::Array(values) if values.len() as u64 == layers => values
                     .iter()
-                    .map(|value| nonnegative(value).filter(|value| *value > 0))
+                    .map(|value| value.unsigned().filter(|value| *value > 0))
                     .collect(),
                 Value::Array(_) => None,
                 value => value
@@ -169,7 +169,7 @@ impl<'a> Metadata<'a> {
     pub fn counts(&self, key: &str) -> Result<Vec<u64>, HeaderError> {
         let value = self.typed(key, "an array of nonnegative integers", |value| {
             match value {
-                Value::Array(values) => values.iter().map(nonnegative).collect(),
+                Value::Array(values) => values.iter().map(Element::unsigned).collect(),
                 Value::Scalar(_) => None,
             }
         })?;
@@ -183,7 +183,7 @@ impl<'a> Metadata<'a> {
             "a per-layer array of nonnegative integers with one entry per layer",
             |value| match value {
                 Value::Array(values) if values.len() as u64 == layers => {
-                    values.iter().map(nonnegative).collect()
+                    values.iter().map(Element::unsigned).collect()
                 }
                 _ => None,
             },
@@ -197,7 +197,7 @@ impl<'a> Metadata<'a> {
             Value::Array(values) if values.len() as u64 == layers => values
                 .iter()
                 .map(|value| match value {
-                    Scalar::Bool(value) => Some(*value),
+                    Element::Bool(value) => Some(value),
                     _ => None,
                 })
                 .collect(),
@@ -219,13 +219,4 @@ fn number(value: &Value) -> Option<f64> {
         _ => None,
     }
     .filter(|value| value.is_finite())
-}
-
-/// An array entry; converters store integer arrays signed or unsigned.
-fn nonnegative(value: &Scalar) -> Option<u64> {
-    match value {
-        Scalar::Unsigned(value) => Some(*value),
-        Scalar::Signed(value) => u64::try_from(*value).ok(),
-        _ => None,
-    }
 }

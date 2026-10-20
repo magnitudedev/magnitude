@@ -308,7 +308,7 @@ const SEPARATE_DRAFTS: [(&str, &str, &dyn ModelFamily); 6] = [
 /// admission of the captured artifacts; binary-header admission is qualified
 /// separately by the DFlash family's publication test.
 fn synthetic_separate_draft_directory(file: &str) -> magnitude_artifacts::gguf::Directory {
-    use magnitude_artifacts::gguf::{Metadata, Scalar, Value};
+    use magnitude_artifacts::gguf::{Metadata, Value};
     let causal: &[bool] = match file {
         "qwen3.6-35b-a3b__draft.json" => &[true, true, true, true, true, false],
         "lfm2.5-2.6b__draft.json" => &[false; 5],
@@ -323,7 +323,7 @@ fn synthetic_separate_draft_directory(file: &str) -> magnitude_artifacts::gguf::
         .retain(|entry| entry.name != "dflash.attention.causal");
     directory.metadata.push(Metadata {
         name: "dflash.attention.causal".into(),
-        value: Value::Array(causal.iter().copied().map(Scalar::Bool).collect()),
+        value: Value::Array(causal.to_vec().into()),
     });
     directory
 }

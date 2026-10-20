@@ -1,5 +1,5 @@
 use magnitude_artifacts::{
-    gguf::{Directory, Scalar, Value},
+    gguf::{Array, Directory, Scalar, Value},
     ArtifactIdentity, PackageIdentity,
 };
 use magnitude_family_common::headers::{self, add_tensor, set as set_metadata};
@@ -150,7 +150,7 @@ fn features_outside_the_admitted_set_are_each_refused_by_name() {
     set_metadata(
         &mut per_layer,
         "llama.attention.head_count_kv",
-        Value::Array(vec![Scalar::Unsigned(2); 42]),
+        Value::Array(vec![2_u64; 42].into()),
     );
     assert_eq!(
         admit(&per_layer),

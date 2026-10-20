@@ -135,13 +135,58 @@ fn metadata_types_arrays_and_full_width_integers_are_preserved() {
     assert_eq!(d.value("flag"), Some(&Value::Scalar(Scalar::Bool(true))));
     assert_eq!(
         d.value("values"),
-        Some(&Value::Array(vec![
-            Scalar::Float(0.5),
-            Scalar::Float(1.0),
-            Scalar::Float(-2.0)
-        ]))
+        Some(&Value::Array(vec![0.5, 1.0, -2.0].into()))
     );
     assert_eq!(d.value("unsigned").unwrap().unsigned(), Some(u64::MAX));
+}
+#[test]
+fn arrays_are_held_by_their_element_type() {
+    let array = |kind: u32, count: u64, elements: &[u8]| {
+        let mut bytes = kind.to_le_bytes().to_vec();
+        bytes.extend(count.to_le_bytes());
+        bytes.extend(elements);
+        bytes
+    };
+    let mut pieces = Vec::new();
+    for piece in ["a", "", "héllo"] {
+        pieces.extend((piece.len() as u64).to_le_bytes());
+        pieces.extend(piece.as_bytes());
+    }
+    let kinds = [1i32, -3].map(i32::to_le_bytes).concat();
+    let d = read(container(
+        false,
+        &[entry()],
+        &[
+            ("pieces", 9, array(8, 3, &pieces)),
+            ("kinds", 9, array(5, 2, &kinds)),
+            ("bytes", 9, array(0, 1, &[7])),
+        ],
+        32,
+    ))
+    .unwrap();
+    let Some(Value::Array(gguf::Array::String(strings))) = d.value("pieces") else {
+        panic!("a text array is held as text");
+    };
+    assert_eq!(strings.iter().collect::<Vec<_>>(), ["a", "", "héllo"]);
+    assert_eq!(strings.get(2), Some("héllo"));
+    assert_eq!(strings.get(3), None);
+    assert_eq!(d.value("kinds"), Some(&Value::Array(vec![1_i64, -3].into())));
+    assert_eq!(d.value("bytes"), Some(&Value::Array(vec![7_u64].into())));
+    assert_eq!(
+        gguf::Array::of([Scalar::Unsigned(1), Scalar::Unsigned(2)]).unwrap(),
+        vec![1_u64, 2].into()
+    );
+    assert!(gguf::Array::of([Scalar::Unsigned(1), Scalar::Bool(true)]).is_err());
+
+    // A count the remaining header cannot hold at its element's size is refused before its
+    // elements are allocated.
+    let oversized = read(container(
+        false,
+        &[entry()],
+        &[("kinds", 9, array(5, 1 << 20, &kinds))],
+        32,
+    ));
+    assert!(matches!(oversized, Err(Error::Invalid(message)) if message.contains("oversized")));
 }
 #[test]
 fn rejects_truncation_geometry_overlap_and_duplicate_names() {
