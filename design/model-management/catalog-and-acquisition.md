@@ -396,8 +396,11 @@ unchanged unless the import names a drafter or turns it off. ICN watches every e
 without a restart; a watch event triggers scoped reconciliation of that root, never a global scan.
 
 Magnitude never writes to, moves, adopts, or deletes from an external location. Scans read GGUF
-headers only (and, for identity, the first and last 1 MiB of each file's tensor data), follow no
-link out of a root, and skip partial downloads and temporary files. External models are identified
+headers only (and, for identity, the first and last 1 MiB of each file's tensor data), never
+descend a linked directory, follow a cache's links only within it, and skip partial downloads and
+temporary files. A linked GGUF in a user folder or LM Studio's models folder (whose import can link
+files in place) is read through its link wherever its file lies and named by the link's path; a
+broken link is ignored, and only the folder holding the link is watched, not its target. External models are identified
 by their local digest and never hashed in full; a package file whose SHA-256
 is not known from a blob name takes its identity from that digest and its size, unless it is a
 catalog file's exact copy in a Hugging Face cache (same repository, commit, path, size and header

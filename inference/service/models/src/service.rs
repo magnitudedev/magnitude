@@ -8,7 +8,7 @@ use magnitude_service_contracts::{
     ModelInventory, ModelLocation, ModelSource, ResolvedComponent, ResolvedModel,
 };
 
-use crate::inventory::{ManagedModelStore, hf_repo_dir, repository_lock_path};
+use crate::inventory::{LinkedFiles, ManagedModelStore, hf_repo_dir, repository_lock_path};
 use crate::snapshot_blobs::{BlobStorage, RepositoryBlobs};
 use crate::store_fs::acquire_exclusive_lock;
 
@@ -169,12 +169,13 @@ fn ensure_deletable_status(model: &InventoryModel) -> Result<(), InventoryError>
 }
 
 /// The files a model is served from, each contained in the root its location scans. Imported
-/// files are named one by one by the user's declaration, so a link there may point anywhere.
+/// files are named one by one by the user's declaration, so a link there may point anywhere; a
+/// file found in a user folder or LM Studio's folder lies there itself or as a link to anywhere.
 pub(crate) fn resolve_components(
     root: &Path,
     model: &InventoryModel,
 ) -> Result<Vec<ResolvedComponent>, InventoryError> {
-    let (base, containment) = match (&model.location, &model.source) {
+    let (base, containment, linked_files) = match (&model.location, &model.source) {
         (
             ModelLocation::MagnitudeCache { .. },
             ModelSource::HuggingFace {
@@ -185,11 +186,14 @@ pub(crate) fn resolve_components(
             (
                 repository_root.join("snapshots").join(commit),
                 Some(repository_root),
+                LinkedFiles::WithinRoot,
             )
         }
-        (ModelLocation::HuggingFaceCache { cache_root, .. }, _) => {
-            (cache_root.clone(), Some(hf_hub_root(cache_root)?))
-        }
+        (ModelLocation::HuggingFaceCache { cache_root, .. }, _) => (
+            cache_root.clone(),
+            Some(hf_hub_root(cache_root)?),
+            LinkedFiles::WithinRoot,
+        ),
         (
             ModelLocation::External {
                 origin: ExternalOrigin::Imported,
@@ -197,16 +201,24 @@ pub(crate) fn resolve_components(
                 ..
             },
             _,
-        ) => (root.clone(), None),
+        ) => (root.clone(), None, LinkedFiles::Anywhere),
+        (
+            ModelLocation::External {
+                origin: ExternalOrigin::Folder | ExternalOrigin::LmStudio { .. },
+                root,
+                ..
+            },
+            _,
+        ) => (root.clone(), Some(root.clone()), LinkedFiles::Anywhere),
         (ModelLocation::Directory { root, .. } | ModelLocation::External { root, .. }, _) => {
-            (root.clone(), Some(root.clone()))
+            (root.clone(), Some(root.clone()), LinkedFiles::WithinRoot)
         }
         (ModelLocation::File { path, .. }, _) => {
             let parent = path
                 .parent()
                 .ok_or_else(|| InventoryError::Internal("ad-hoc model has no parent".to_owned()))?
                 .to_path_buf();
-            (parent.clone(), Some(parent))
+            (parent.clone(), Some(parent), LinkedFiles::WithinRoot)
         }
         _ => {
             return Err(InventoryError::Internal(
@@ -227,9 +239,15 @@ pub(crate) fn resolve_components(
                 _ => base.join(&component.path),
             };
             let canonical = path.canonicalize().map_err(io_error)?;
+            let contained = match (linked_files, path.parent(), path.file_name()) {
+                (LinkedFiles::Anywhere, Some(parent), Some(name)) => {
+                    parent.canonicalize().map_err(io_error)?.join(name)
+                }
+                _ => canonical,
+            };
             if canonical_containment
                 .as_ref()
-                .is_some_and(|containment| !canonical.starts_with(containment))
+                .is_some_and(|containment| !contained.starts_with(containment))
             {
                 return Err(InventoryError::DeletionUnsafe(format!(
                     "model component escaped its source root: {}",

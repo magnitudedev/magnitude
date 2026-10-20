@@ -3138,6 +3138,73 @@ mod tests {
         assert_eq!(after.models[0].files[0].path, second.join("renamed.gguf"));
     }
 
+    /// A folder of links to model files kept elsewhere lists each file once, by its link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_link_to_a_file_elsewhere_is_found_by_its_link() {
+        let fixture = Fixture::new().await;
+        let target = fixture.root.join("elsewhere/model.gguf");
+        let folder = fixture.root.join("models");
+        write_model(&target, "linked");
+        fs::create_dir_all(folder.join("links")).unwrap();
+        let link = folder.join("links/model-link.gguf");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &folder)]))
+            .await;
+
+        assert_eq!(ids(&listed.models), [local_id(&target).to_string()]);
+        assert_eq!(listed.models[0].files[0].path, link);
+        assert!(listed.unsupported.is_empty());
+
+        std::os::unix::fs::symlink(&target, folder.join("second-link.gguf")).unwrap();
+        let both = fixture
+            .apply(roots(vec![
+                root(ModelRootKind::Folder, &folder),
+                root(ModelRootKind::Folder, &fixture.root.join("elsewhere")),
+            ]))
+            .await;
+        assert_eq!(ids(&both.models), [local_id(&target).to_string()]);
+    }
+
+    /// A linked directory is never descended: following one could scan any tree on the disk.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_does_not_descend_into_a_linked_directory() {
+        let fixture = Fixture::new().await;
+        let elsewhere = fixture.root.join("elsewhere");
+        let folder = fixture.root.join("models");
+        write_model(&elsewhere.join("model.gguf"), "beyond");
+        fs::create_dir_all(&folder).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, folder.join("linked-directory")).unwrap();
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &folder)]))
+            .await;
+
+        assert!(listed.models.is_empty());
+        assert!(listed.unsupported.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_within_a_folder_to_a_file_in_it_is_one_model() {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        let target = folder.join("real/model.gguf");
+        write_model(&target, "inside");
+        fs::create_dir_all(folder.join("links")).unwrap();
+        std::os::unix::fs::symlink("../real/model.gguf", folder.join("links/alias.gguf")).unwrap();
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &folder)]))
+            .await;
+
+        assert_eq!(ids(&listed.models), [local_id(&target).to_string()]);
+        assert!(listed.unsupported.is_empty());
+    }
+
     /// The `local:` identity covers more than the header: two files with the same header but
     /// different weights are two models.
     #[tokio::test]

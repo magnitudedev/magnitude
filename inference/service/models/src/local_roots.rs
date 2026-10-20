@@ -19,7 +19,8 @@ use crate::cache::{ModelCache, ModelIndexKind};
 use crate::candidate_files::RecognizedArchitectures;
 use crate::identity::{content_id, inventory_entry_id};
 use crate::inventory::{
-    ArtifactCandidate, DeclaredProjectors, DiscoveryCandidate, ModelGroup, canonical_or_self,
+    ArtifactCandidate, DeclaredProjectors, DiscoveryCandidate, LinkedFiles, ModelGroup,
+    canonical_or_self,
     components_for_group, discover_groups, inspect_cached, modified_seconds, now, primary_path,
     read_dir_sorted, scan_hf_cache, split_shard_name,
 };
@@ -169,6 +170,7 @@ fn scan_lm_studio(
     for group in discover_groups(
         root,
         &canonical_or_self(root),
+        LinkedFiles::Anywhere,
         cache,
         architectures,
         &BTreeMap::new(),
@@ -245,6 +247,7 @@ fn scan_llama_cpp(
     for group in discover_groups(
         root,
         &canonical_or_self(root),
+        LinkedFiles::WithinRoot,
         cache,
         architectures,
         &declared,
@@ -684,6 +687,7 @@ fn scan_folder(
     for group in discover_groups(
         root,
         &canonical_or_self(root),
+        LinkedFiles::Anywhere,
         cache,
         architectures,
         &BTreeMap::new(),

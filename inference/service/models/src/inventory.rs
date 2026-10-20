@@ -1751,7 +1751,14 @@ fn append_discovered_groups(
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
     let blobs = RepositoryBlobs::open(repository_root).map_err(io_error)?;
-    for group in discover_groups(snapshot, repository_root, cache, architectures, declared)? {
+    for group in discover_groups(
+        snapshot,
+        repository_root,
+        LinkedFiles::WithinRoot,
+        cache,
+        architectures,
+        declared,
+    )? {
         let components = components_for_group(snapshot, &group, Some(&blobs))?;
         let Some(primary) = primary_path(snapshot, &components) else {
             continue;
@@ -1822,6 +1829,7 @@ pub(crate) fn scan_hf_cache(
             let groups = discover_groups(
                 &snapshot,
                 cache,
+                LinkedFiles::WithinRoot,
                 inspections,
                 architectures,
                 &declared.for_snapshot(&repository, &commit, &snapshot),
@@ -2280,6 +2288,15 @@ impl ManagedModelStore {
     }
 }
 
+/// Where a symlinked GGUF found under a root may lead. A cache keeps its files inside itself; a
+/// user's folder is often links to model files kept elsewhere, which are read in place through the
+/// link like any found file. A symlinked directory is never descended either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinkedFiles {
+    WithinRoot,
+    Anywhere,
+}
+
 /// Every complete GGUF group under `root`. Projectors are recognized from their headers and pair
 /// with a model by declaration, else as the only projector in its directory. Drafters and
 /// unreadable files form their own groups; what they are is decided from their headers later,
@@ -2287,12 +2304,19 @@ impl ManagedModelStore {
 pub(crate) fn discover_groups(
     root: &Path,
     containment_root: &Path,
+    linked_files: LinkedFiles,
     cache: &ModelCache,
     architectures: &RecognizedArchitectures,
     declared: &BTreeMap<PathBuf, PathBuf>,
 ) -> Result<Vec<ModelGroup>, InventoryError> {
     let mut files = Vec::new();
-    collect_gguf(root, &canonical_or_self(containment_root), 0, &mut files)?;
+    collect_gguf(
+        root,
+        &canonical_or_self(containment_root),
+        linked_files,
+        0,
+        &mut files,
+    )?;
     let mut groups: BTreeMap<PathBuf, Vec<(u32, u32, PathBuf)>> = BTreeMap::new();
     let mut standalone = Vec::new();
     let mut projectors = Vec::new();
@@ -2398,6 +2422,7 @@ pub(crate) fn components_for_group(
 pub(crate) fn collect_gguf(
     directory: &Path,
     containment_root: &Path,
+    linked_files: LinkedFiles,
     depth: usize,
     output: &mut Vec<PathBuf>,
 ) -> Result<(), InventoryError> {
@@ -2414,7 +2439,12 @@ pub(crate) fn collect_gguf(
         let file_type = entry.file_type().map_err(io_error)?;
         if file_type.is_symlink() {
             let canonical = match path.canonicalize() {
-                Ok(canonical) if canonical.starts_with(containment_root) => canonical,
+                Ok(canonical)
+                    if linked_files == LinkedFiles::Anywhere
+                        || canonical.starts_with(containment_root) =>
+                {
+                    canonical
+                }
                 _ => continue,
             };
             if canonical.is_file()
@@ -2426,7 +2456,7 @@ pub(crate) fn collect_gguf(
                 output.push(path);
             }
         } else if file_type.is_dir() {
-            collect_gguf(&path, containment_root, depth + 1, output)?;
+            collect_gguf(&path, containment_root, linked_files, depth + 1, output)?;
         } else if file_type.is_file()
             && path
                 .extension()
@@ -3563,6 +3593,7 @@ mod tests {
                 .path()
                 .canonicalize()
                 .expect("canonical temporary root"),
+            LinkedFiles::WithinRoot,
             &ModelCache::new(&temporary.path().join("cache")),
             &RecognizedArchitectures::default(),
             &BTreeMap::new(),
@@ -3587,6 +3618,7 @@ mod tests {
         let groups = discover_groups(
             &folder,
             &folder,
+            LinkedFiles::WithinRoot,
             &ModelCache::new(&temporary.path().join("cache")),
             &RecognizedArchitectures::default(),
             &BTreeMap::new(),
@@ -3620,6 +3652,7 @@ mod tests {
         let groups = discover_groups(
             &models,
             &models,
+            LinkedFiles::WithinRoot,
             &cache,
             &crate::test_gguf::engine_architectures(),
             &BTreeMap::new(),
@@ -3671,6 +3704,7 @@ mod tests {
         let undeclared = discover_groups(
             &models,
             &models,
+            LinkedFiles::WithinRoot,
             &cache,
             &RecognizedArchitectures::default(),
             &BTreeMap::new(),
@@ -3685,6 +3719,7 @@ mod tests {
         let groups = discover_groups(
             &models,
             &models,
+            LinkedFiles::WithinRoot,
             &cache,
             &RecognizedArchitectures::default(),
             &declared,
