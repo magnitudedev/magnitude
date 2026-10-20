@@ -4468,6 +4468,296 @@ mod tests {
         assert_eq!(installed().1, vec![CatalogComponent::Drafter]);
     }
 
+    /// A catalog model whose exact target weights are found in a Hugging Face cache, with its
+    /// projector and drafter nowhere on this computer.
+    struct FoundTarget {
+        fixture: Fixture,
+        shown: LocalModelsConfiguration,
+        catalog: Vec<RecommendableModel>,
+        model_id: ModelId,
+        target: ModelPackage,
+        draft: ModelPackage,
+        weights: PathBuf,
+    }
+
+    impl FoundTarget {
+        async fn new() -> Self {
+            use magnitude_service_contracts::models::{
+                InstalledModelPackages as _, ModelFile, ModelFileRole, SpeculativeDraftSource,
+                SpeculativeMethod,
+            };
+
+            let fixture = Fixture::new().await;
+            let cache = fixture.root.join("hf");
+            let projector = gguf_bytes(
+                &[
+                    ("general.architecture", Meta::Str("clip")),
+                    ("general.name", Meta::Str("projector")),
+                ],
+                &["v.patch_embd.weight"],
+            );
+            let snapshot = publish_hf_cache(
+                &cache,
+                "owner/Model-GGUF",
+                &"a".repeat(40),
+                &[
+                    ("Model-Q4_K_M.gguf", model_bytes("model")),
+                    ("mmproj-F16.gguf", projector),
+                ],
+            );
+            publish_hf_cache(
+                &cache,
+                "owner/Model-DFlash-GGUF",
+                &"b".repeat(40),
+                &[("Model-DFlash.gguf", drafter_bytes("drafter"))],
+            );
+            let shown = roots(vec![root(ModelRootKind::HuggingFaceCache, &cache)]);
+            fixture.apply(shown.clone()).await;
+            let packages = fixture.inventory().list_installed().await.unwrap().packages;
+            let package = |holds: &dyn Fn(&ModelFile) -> bool| {
+                packages
+                    .iter()
+                    .map(|installed| installed.package.clone())
+                    .find(|package| package.files.iter().any(holds))
+                    .unwrap()
+            };
+            let target = package(&|file| file.role == ModelFileRole::Projector);
+            let draft = package(&|file| file.path.ends_with("Model-DFlash.gguf"));
+            fs::remove_file(snapshot.join("mmproj-F16.gguf")).unwrap();
+            fs::remove_dir_all(cache.join(hf_repo_dir("owner/Model-DFlash-GGUF"))).unwrap();
+            let mut definition = catalog_definition(target.clone());
+            definition.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+                target: target.clone(),
+                draft_source: SpeculativeDraftSource::Separate {
+                    draft: draft.clone(),
+                },
+                method: SpeculativeMethod::DFlash,
+            };
+            let catalog = vec![definition];
+            let model_id = catalog_id(&catalog[0]);
+            let fixture = fixture.restart(catalog.clone()).await;
+            fixture.apply(shown.clone()).await;
+            Self {
+                fixture,
+                shown,
+                catalog,
+                model_id,
+                target,
+                draft,
+                weights: snapshot.join("Model-Q4_K_M.gguf"),
+            }
+        }
+
+        /// Downloads and catalog installations over the store, as the service composes them.
+        async fn services(&self) -> (Arc<crate::ManagedModelDownloads>, Arc<crate::ManagedCatalogInstallations>) {
+            let downloads = Arc::new(
+                crate::ManagedModelDownloads::open(self.fixture.resolver.inventory.clone())
+                    .await
+                    .unwrap(),
+            );
+            let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
+                self.fixture.resolver.clone(),
+                downloads.clone(),
+                Arc::new(StoreRemover(self.fixture.resolver.inventory.clone())),
+                Arc::new(NoOptimizer),
+            );
+            (downloads, installations)
+        }
+
+        /// The service stopped and started again over the same store, then resuming what was
+        /// requested before.
+        async fn restart(self) -> (Self, Arc<crate::ManagedModelDownloads>, Arc<crate::ManagedCatalogInstallations>) {
+            let Self {
+                fixture,
+                shown,
+                catalog,
+                model_id,
+                target,
+                draft,
+                weights,
+            } = self;
+            let fixture = fixture.restart(catalog.clone()).await;
+            fixture.apply(shown.clone()).await;
+            let restarted = Self {
+                fixture,
+                shown,
+                catalog,
+                model_id,
+                target,
+                draft,
+                weights,
+            };
+            let (downloads, installations) = restarted.services().await;
+            installations.resume_requested_downloads().await;
+            (restarted, downloads, installations)
+        }
+
+        /// Holds both repositories' locks, so admitted package work stays queued, as behind other
+        /// downloads on a slow link, and never reaches the network.
+        fn queue(&self) -> Vec<std::fs::File> {
+            ["owner/Model-GGUF", "owner/Model-DFlash-GGUF"]
+                .into_iter()
+                .map(|repository| {
+                    crate::store_fs::acquire_exclusive_lock(&crate::inventory::repository_lock_path(
+                        &self.fixture.store,
+                        repository,
+                    ))
+                    .unwrap()
+                })
+                .collect()
+        }
+    }
+
+    fn queued(state: &magnitude_service_contracts::models::ModelDownloadState) -> bool {
+        use magnitude_service_contracts::models::ModelDownloadState;
+        matches!(state, ModelDownloadState::Pending { .. } | ModelDownloadState::Downloading { .. })
+    }
+
+    /// QA mac-r4-14: a drafter fetched alone for a found model (`magnitude models drafter
+    /// local:… auto`) was queued when the service restarted, and afterwards nothing was
+    /// downloading and the drafter was simply not there. A requested download that has not ended
+    /// is admitted again when the service starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_drafter_download_resumes_after_a_restart() {
+        use magnitude_service_contracts::models::{ModelDownloads as _, StartModelDownloadRequest};
+
+        let found = FoundTarget::new().await;
+        let _queue = found.queue();
+        let request = StartModelDownloadRequest {
+            bundle: ServableModelBundle::Standalone {
+                package: found.draft.clone(),
+            },
+            for_model: Some(local_id(&found.weights)),
+        };
+        let (downloads, _) = found.services().await;
+        let started = downloads.start(request.clone()).await.unwrap().download;
+        assert!(started.is_some_and(|download| queued(&download.state)));
+        drop(downloads);
+
+        let (_found, downloads, _) = found.restart().await;
+        let listed = downloads.list().await.unwrap().downloads;
+        assert!(
+            matches!(listed.as_slice(), [download]
+                if download.bundle == request.bundle
+                    && download.for_model == request.for_model
+                    && queued(&download.state)),
+            "the drafter is downloading again: {listed:?}"
+        );
+    }
+
+    /// QA mac-r4-14: `magnitude catalog pull … --only projector` was queued when the service
+    /// restarted, and afterwards the projector was "Not downloaded" with no download and no error.
+    /// The component installation is admitted again through the catalog when the service starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_projector_installation_resumes_after_a_restart() {
+        use magnitude_service_contracts::models::{
+            CatalogComponent, CatalogInstallationOperationState, CatalogInstallations as _,
+            ModelDownloads as _,
+        };
+
+        let found = FoundTarget::new().await;
+        let _queue = found.queue();
+        let (_, installations) = found.services().await;
+        installations
+            .install_component(&found.model_id, CatalogComponent::Projector)
+            .await
+            .unwrap();
+        drop(installations);
+
+        let (found, downloads, installations) = found.restart().await;
+        let operations = installations.list_catalog_installations().await.unwrap().operations;
+        assert!(
+            matches!(operations.as_slice(), [operation]
+                if operation.model_id == found.model_id
+                    && matches!(operation.state, CatalogInstallationOperationState::Pending { .. }
+                        | CatalogInstallationOperationState::Running { .. })),
+            "the projector is installing again: {operations:?}"
+        );
+        let listed = downloads.list().await.unwrap().downloads;
+        assert!(
+            matches!(listed.as_slice(), [download]
+                if download.bundle == ServableModelBundle::Standalone { package: found.target.clone() }),
+            "only the projector's package is fetched, never the whole model: {listed:?}"
+        );
+    }
+
+    /// QA mac-r4-14: a queued pull that was cancelled came back queued after a restart. Cancelling
+    /// ends the request, so only the downloads still requested are admitted again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_queued_download_does_not_return_after_a_restart() {
+        use magnitude_service_contracts::models::{
+            CatalogComponent, ModelDownloads as _, StartModelDownloadRequest,
+        };
+
+        let found = FoundTarget::new().await;
+        let _queue = found.queue();
+        let (downloads, installations) = found.services().await;
+        let pulled = downloads
+            .start(StartModelDownloadRequest {
+                bundle: ServableModelBundle::Standalone {
+                    package: found.draft.clone(),
+                },
+                for_model: Some("hf:owner/Model-DFlash-GGUF/Model-DFlash.gguf".parse().unwrap()),
+            })
+            .await
+            .unwrap()
+            .download
+            .unwrap();
+        installations
+            .install_component(&found.model_id, CatalogComponent::Projector)
+            .await
+            .unwrap();
+        downloads.cancel(&pulled.id).await.unwrap();
+        drop((downloads, installations));
+
+        let (found, downloads, _) = found.restart().await;
+        let listed = downloads.list().await.unwrap().downloads;
+        assert!(
+            matches!(listed.as_slice(), [download]
+                if download.for_model.as_ref() == Some(&found.model_id) && queued(&download.state)),
+            "only the projector, which was not cancelled, is downloading again: {listed:?}"
+        );
+    }
+
+    /// Remove of a found catalog target cancels the parts Magnitude is still fetching and then
+    /// removes the model, and neither the cancelled installation nor any other request for the
+    /// model comes back after a restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_removed_found_target_resumes_nothing_after_a_restart() {
+        use magnitude_service_contracts::models::{
+            CatalogComponent, CatalogInstallationAdmission, CatalogInstallations as _,
+            ModelDownloads as _,
+        };
+
+        let found = FoundTarget::new().await;
+        let _queue = found.queue();
+        let (_, installations) = found.services().await;
+        let CatalogInstallationAdmission::Admitted { operation_id } = installations
+            .install_component(&found.model_id, CatalogComponent::Projector)
+            .await
+            .unwrap()
+        else {
+            panic!("the projector installation is admitted");
+        };
+        installations
+            .cancel_catalog_installation(&operation_id)
+            .await
+            .unwrap();
+        installations.remove(&found.model_id).await.unwrap();
+        drop(installations);
+
+        let (_found, downloads, installations) = found.restart().await;
+        assert!(downloads.list().await.unwrap().downloads.is_empty());
+        assert!(
+            installations
+                .list_catalog_installations()
+                .await
+                .unwrap()
+                .operations
+                .is_empty()
+        );
+    }
+
     /// Hiding changes only what is shown: installing a catalog model whose target is exactly a
     /// hidden found copy copies that copy's bytes into Magnitude's store instead of downloading
     /// them, needs no further download, and leaves the copy's files where they are.

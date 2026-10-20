@@ -30,9 +30,10 @@ inventory, download, and deletion behavior. Terms follow
 ## Ownership
 
 ICN owns the recommendable catalog, exact packages and sources, the managed model store, scanning
-of model locations, filesystem inventory, Hugging Face access, and process-local download
-coordination. ACN persists the user's custom-model choices, resolves location paths, observes ICN's
-authorities and produces product projections. Clients initiate native mutations through ACN and do
+of model locations, filesystem inventory, Hugging Face access, process-local download
+coordination, and the requested downloads that outlive a restart. ACN persists the user's
+custom-model choices, resolves location paths, observes ICN's authorities and produces product
+projections. Clients initiate native mutations through ACN and do
 not infer command authorization or completion from cached projections.
 
 Catalog membership, artifact presence, download activity, package validation, assessment, provider
@@ -549,6 +550,17 @@ and never joins work that belongs to the failed occurrence. A retry creates a ne
 occurrence. Restart ends all occurrences, attempt history, cancellation state, and failure
 dismissal.
 
+Every download a user requests, whichever command asked for it, is one persisted request in
+Magnitude's store: a catalog installation or one catalog component by its catalog `ModelId`, any
+other download as its exact bundle and the model it serves. A request lasts until its download
+completes, is cancelled, or has its failure dismissed, or until its model is removed; a retry
+replaces it. When ICN starts, once the files on this computer are known, it admits every persisted
+request again as a new occurrence that resumes from its checkpoints: a catalog request through
+catalog admission, so it resolves against the current catalog and files, and a request with nothing
+left to fetch, or that can no longer be admitted, ends. A cancelled download therefore never
+returns after a restart, an undismissed failure is tried again, and ACN starts no download on its
+own at startup.
+
 Progress is relative to the work admitted by that catalog installation occurrence. Its total is the byte size
 of missing packages whose attempts it owns or joins, and completed bytes come only from those
 attempts. Packages already installed at admission contribute neither baseline progress nor total.
@@ -707,7 +719,9 @@ an automatic drafter is being worked out) and removes the target; pruning remove
 model uses it. A catalog model whose target is found elsewhere has nothing of Magnitude's but its
 stored projector and drafter, so only a custom model actually serving with that drafter keeps it, and
 when every stored part is kept that way the removal is retained as shared (another model uses the
-files), never as another app's files. An added model whose target is still downloading uses the drafter it downloads with
+files), never as another app's files. Remove first cancels any part Magnitude is still fetching for such a
+model, and catalog removal ends every download requested for the model, whatever it retains, so
+none returns after a restart. An added model whose target is still downloading uses the drafter it downloads with
 it, so a drafter that finished first is never pruned before its target lands.
 
 Removing a catalog model that is not installed changes nothing: it is reported as not installed,
@@ -759,6 +773,8 @@ product-owned artifact mutations update the same materialized derivation.
 - Inventory reconciliation never mutates managed artifacts.
 - One artifact failure cannot hide unrelated valid artifacts.
 - Download identities and terminal history do not survive ICN restart.
+- A requested download survives ICN restart until it completes, is cancelled, has its failure
+  dismissed, or its model is removed; a cancelled download never returns.
 - Optimization never changes an installation's outcome: cancellation, load, removal, failure, or
   restart during it leaves the installed model intact and loadable.
 - Valid partial bytes may be reused only with matching integrity evidence.

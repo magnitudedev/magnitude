@@ -19,6 +19,7 @@ use magnitude_service_contracts::models::{
 use crate::ManagedModelDownloads;
 use crate::catalog_models::reject_unavailable;
 use crate::model_domains::ModelDomainResolver;
+use crate::requested_downloads::RequestedDownload;
 
 #[derive(Debug, Clone)]
 struct OperationBinding {
@@ -203,7 +204,8 @@ impl ManagedCatalogInstallations {
         reject_unavailable(id, definition)?;
         self.reject_active(id).await?;
         let bundle = definition.configuration.bundle.clone();
-        self.admit(id, bundle).await
+        let requested = RequestedDownload::CatalogModel { model: id.clone() };
+        self.admit(id, bundle, requested).await
     }
 
     /// Fetches only one component a found exact target lacks; the found weights stay where they
@@ -217,7 +219,13 @@ impl ManagedCatalogInstallations {
         reject_unavailable(id, self.resolver.catalog_definition(id)?)?;
         self.reject_active(id).await?;
         match self.resolver.catalog_component_download(id, component)? {
-            Some(bundle) => self.admit(id, bundle).await,
+            Some(bundle) => {
+                let requested = RequestedDownload::CatalogComponent {
+                    model: id.clone(),
+                    component,
+                };
+                self.admit(id, bundle, requested).await
+            }
             None => Ok(CatalogInstallationAdmission::Current),
         }
     }
@@ -253,13 +261,17 @@ impl ManagedCatalogInstallations {
         &self,
         id: &ModelId,
         bundle: ServableModelBundle,
+        requested: RequestedDownload,
     ) -> Result<CatalogInstallationAdmission, InventoryError> {
         let started = self
             .downloads
-            .start(StartModelDownloadRequest {
-                bundle,
-                for_model: Some(id.clone()),
-            })
+            .start_requested(
+                StartModelDownloadRequest {
+                    bundle,
+                    for_model: Some(id.clone()),
+                },
+                requested,
+            )
             .await?;
         let Some(download) = started.download else {
             self.cleanup_model(id).await?;
@@ -325,6 +337,8 @@ impl ManagedCatalogInstallations {
                 retryable: false,
             });
         }
+        // Remove ends every download requested for the model, whatever it keeps, so none resumes.
+        self.downloads.forget_requests_for(id);
         if plan.shared {
             return Ok(CatalogInstallationRemoval::Retained {
                 reason: CatalogInstallationRetentionReason::SharedMaterial,
@@ -340,6 +354,37 @@ impl ManagedCatalogInstallations {
             .remove_catalog_packages(plan.package_ids)
             .await?;
         Ok(CatalogInstallationRemoval::Removed { reclaimed_bytes })
+    }
+
+    /// Admits again every download requested before a restart that has not ended, once the files
+    /// on this computer are known: a catalog installation or component through its own admission,
+    /// so it resolves against the current catalog, any other download as its exact bundle. A
+    /// request already admitted again meanwhile is left alone, and one with nothing left to fetch,
+    /// or that can no longer be admitted, ends.
+    pub async fn resume_requested_downloads(&self) {
+        if let Err(error) = self.resolver.inventory.ensure_installed_model_inventory().await {
+            tracing::warn!(%error, "resuming requested downloads before the model inventory is complete");
+        }
+        for requested in self.downloads.unresumed_requests() {
+            if !self.downloads.is_unresumed(&requested) {
+                continue;
+            }
+            let admitted = match &requested {
+                RequestedDownload::CatalogModel { model } => self.install(model).await.map(drop),
+                RequestedDownload::CatalogComponent { model, component } => {
+                    self.install_component(model, *component).await.map(drop)
+                }
+                RequestedDownload::Bundle { request } => self
+                    .downloads
+                    .start_requested(request.clone(), requested.clone())
+                    .await
+                    .map(drop),
+            };
+            if let Err(error) = admitted {
+                tracing::warn!(%error, ?requested, "a requested download could not be resumed");
+            }
+            self.downloads.forget_unresumed_request(&requested);
+        }
     }
 }
 

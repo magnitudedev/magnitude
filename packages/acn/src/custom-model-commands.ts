@@ -63,6 +63,7 @@ import {
   downloadHasUnacknowledgedFailure,
   downloadIsActive,
   drafterPackage,
+  type RelatedDownload,
 } from "./custom-model-downloads"
 import {
   DrafterMethods,
@@ -279,11 +280,6 @@ const withoutKey = <K extends string, V>(record: Readonly<Record<K, V>>, key: K)
   delete next[key]
   return next
 }
-
-/** Just after a restart no download exists, so a missing part of a model was interrupted by it. */
-export const interruptedByRestart = (model: CustomLocalModel): boolean =>
-  (model.origin._tag === "Added" && model.acquisitionState._tag === "NotInstalled")
-  || Option.exists(model.drafter, ({ availability }) => availability._tag === "DownloadFailed")
 
 /** A resolved candidate pinned with the method the engine binds it with; nothing binding keeps Auto. */
 const pinnedChoice = (requested: DrafterChoice, chosen: Option.Option<DrafterCandidate>): PersistedDrafterChoice =>
@@ -884,6 +880,15 @@ export const CustomModelCommandsLive: Layer.Layer<
     return folder
   })
 
+  /** Ends a removed model's downloads: running ones are cancelled and failed ones dismissed, so none resumes. */
+  const endDownloads = (related: readonly RelatedDownload[]) => Effect.forEach(related, ({ download }) =>
+    downloadIsActive(download)
+      ? downloads.cancel(download.id).pipe(Effect.ignore)
+      : downloadHasUnacknowledgedFailure(download)
+        ? downloads.acknowledgeFailure(download.id).pipe(Effect.ignore)
+        : Effect.void,
+  { discard: true })
+
   const commands = CustomModelCommands.of({
     searchHuggingFace: ({ query, limit }) => icn.search({
       query,
@@ -1086,14 +1091,14 @@ export const CustomModelCommandsLive: Layer.Layer<
       }), current)
       if (declaration === undefined) {
         if (Option.isNone(yield* rowFor(modelId))) return yield* notFound(modelId)
+        yield* endDownloads(related)
         yield* customModels.modify((current) => Effect.succeed([undefined, forgetDuplicates(current.hidden.includes(modelId)
           ? current
           : { ...current, hidden: [...current.hidden, modelId] })] as const))
         yield* settle
         return {}
       }
-      yield* Effect.forEach(related.filter(({ download }) => downloadIsActive(download)), ({ download }) =>
-        downloads.cancel(download.id).pipe(Effect.ignore), { discard: true })
+      yield* endDownloads(related)
       if (declaration.origin._tag === "Added") {
         // ICN deletes only Magnitude's copy; the same bytes elsewhere remain and the model stays as found.
         yield* localModels_.removeFiles(modelId).pipe(
@@ -1177,22 +1182,16 @@ export const CustomModelCommandsLive: Layer.Layer<
     ),
   })
 
-  // Downloads do not outlive the service; every part a restart interrupted resumes, keeping its bytes:
-  // an added model's target (with its drafter), and any model's chosen drafter that hasn't arrived.
-  // A push first relearns the drafter methods its bundle needs.
+  // ICN resumes every requested download a restart interrupted and drops a cancelled one, so ACN starts none
+  // itself. An update a restart interrupted is fetched again only when ICN no longer has its download, one that
+  // finished or ended meanwhile settles, and from then on each update settles as its download changes. A push
+  // first relearns the drafter methods an update's bundle needs.
   yield* Effect.gen(function* () {
     yield* reconciler.push.pipe(Effect.ignore)
-    const state = yield* localModels.state.pipe(
+    yield* localModels.state.pipe(
       Effect.filterOrFail((current) => current.preparation.discovery.complete, () => "discovering" as const),
       Effect.retry(Schedule.spaced("1 second")),
     )
-    const interrupted = state.models.filter((model): model is CustomLocalModel => model._tag === "Custom")
-      .filter(interruptedByRestart)
-    yield* Effect.forEach(interrupted, (model) => commands.sync(model.modelId as CustomFormModelId).pipe(
-      Effect.catchAll((error) => Effect.logWarning(`Unable to resume the download of ${model.modelId}: ${error.message}`)),
-    ), { discard: true })
-    // An update a restart interrupted resumes, one that finished or ended meanwhile settles, and from
-    // then on each update settles as its download changes.
     yield* settlePendingUpdates
     yield* Stream.merge(downloads.changes, customModels.changes).pipe(Stream.runForEach(() => settlePendingUpdates))
   }).pipe(Effect.forkScoped)

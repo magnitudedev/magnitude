@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use magnitude_service_contracts::models::{
     CatalogBaseId, CatalogPackageAffiliation, CatalogPackageRole, CatalogVariantId, ModelPackageId,
@@ -67,34 +65,7 @@ impl CatalogAffiliations {
             affiliations: self.entries.iter().collect(),
         })
         .map_err(std::io::Error::other)?;
-        let destination = path(root);
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temporary = root.join(format!("catalog-affiliations.json.tmp-{nonce}"));
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
-        if let Err(error) = (|| {
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temporary, &destination)?;
-            #[cfg(unix)]
-            std::fs::File::open(root)?.sync_all()?;
-            Ok(())
-        })() {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
-        }
-        Ok(())
+        crate::store_fs::replace_file_sync(root, "catalog-affiliations.json", &bytes)
     }
 }
 

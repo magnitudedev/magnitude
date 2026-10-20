@@ -21,6 +21,7 @@ mod local_watch;
 pub mod lineage;
 mod model_domains;
 mod model_projection;
+mod requested_downloads;
 mod package_service;
 mod preview;
 mod remote_header;

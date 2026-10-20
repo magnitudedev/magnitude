@@ -221,6 +221,10 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 Arc::new(instances.clone()),
             )
             .context("failed to initialize model domains")?;
+            tokio::spawn({
+                let installations = model_services.installations.clone();
+                async move { installations.resume_requested_downloads().await }
+            });
             let architectures = engine_architectures();
             let lineage = CatalogLineage::new(inventory.clone(), release_catalog.catalog().clone());
             let candidates = ManagedModelCandidates::new(

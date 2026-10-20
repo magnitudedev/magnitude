@@ -950,6 +950,19 @@ describe("removal by origin", () => {
     expect(config.hidden).toEqual([foundId])
   })
 
+  it("ends a removed model's downloads, so none resumes after a restart", async () => {
+    const { run, recorded } = harness({
+      downloads: [
+        drafterDownload("running", { _tag: "Pending", completedBytes: 0, totalBytes: 9 }),
+        drafterDownload("failed", { _tag: "Failed", acknowledged: false, completedBytes: 0, totalBytes: 9, failure: { _tag: "Interrupted" } }),
+      ],
+    })
+    const config = await run((commands, models) => commands.remove(foundId).pipe(Effect.zipRight(models.get)))
+    expect(recorded.cancelled).toEqual(["running"])
+    expect(recorded.acknowledged).toEqual(["failed"])
+    expect(config.hidden).toEqual([foundId])
+  })
+
   it("removes only Magnitude's copy of an added model also found in llama.cpp, and never hides it", async () => {
     const { run, recorded } = harness({
       customModels: [nativeCustomModel({
@@ -1021,24 +1034,21 @@ describe("drafter and download recovery", () => {
     expect(recorded.bundles[0]).toMatchObject({ target: ["model-Q4_K_M.gguf"] })
   })
 
-  it("resumes an added model's interrupted download when the service starts", async () => {
+  // QA mac-r4-14: a cancelled queued pull came back after a restart, because ACN took every added model still
+  // missing its files for an interrupted download. ICN resumes exactly the downloads still requested.
+  it("starts no download when the service starts, so a cancelled one stays cancelled", async () => {
     const { run, recorded } = harness({
-      customModels: [nativeCustomModel(), nativeCustomModel({
-        modelId: addedId,
-        origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
-        state: { _tag: "NotInstalled" },
-      })],
+      customModels: [
+        nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: drafterReference, state: { _tag: "NotInstalled" }, updateAvailable: false } }),
+        nativeCustomModel({
+          modelId: addedId,
+          origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
+          state: { _tag: "NotInstalled" },
+        }),
+      ],
     })
     await run(() => Effect.sleep("50 millis"))
-    expect(recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: addedId }])
-  })
-
-  it("resumes a drafter download a restart interrupted when the service starts", async () => {
-    const { run, recorded } = harness({
-      customModels: [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: drafterReference, state: { _tag: "NotInstalled" }, updateAvailable: false } })],
-    })
-    await run(() => Effect.sleep("50 millis"))
-    expect(recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: foundId }])
+    expect(recorded.started).toEqual([])
   })
 
   it("lists an added model's drafters from its declared repository file while it downloads", async () => {

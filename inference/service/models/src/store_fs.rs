@@ -1,4 +1,5 @@
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +26,38 @@ pub(crate) async fn ensure_store_layout(root: &Path) -> Result<(), InventoryErro
 
     for relative in ["hub", "locks"] {
         ensure_owned_directory(&root.join(relative)).await?;
+    }
+    Ok(())
+}
+
+/// Atomically replaces `root/name` with `bytes`: written to a private temporary file, flushed,
+/// renamed over the destination, and the directory flushed on Unix.
+pub(crate) fn replace_file_sync(root: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = root.join(format!("{name}.tmp-{nonce}"));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    if let Err(error) = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, root.join(name))?;
+        #[cfg(unix)]
+        File::open(root)?.sync_all()?;
+        Ok(())
+    })() {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
     }
     Ok(())
 }

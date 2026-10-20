@@ -33,10 +33,10 @@ have `NotInstalled` or `Installed` local state. Custom-model rows exist because 
 observed or declared. Observed material has exactly one truthful state, `Ready` or `Unavailable`,
 both containing the selected resolved installation. An added model whose target has not landed in
 the store is a `NotInstalled` row from its declaration, so ACN projects its download as installation
-progress; it cannot be served until the target lands. Downloads do not outlive the service, so ACN
-restarts every part a restart interrupted when it starts: the download of every such row (its target
-with its drafter), and the drafter of any model whose chosen drafter has not arrived. Each resumes
-from its durable checkpoint.
+progress; it cannot be served until the target lands. ICN resumes every requested download a restart
+interrupted, an added model's target with its drafter and a drafter fetched alone included, from its
+durable checkpoint (see [Catalog and acquisition](./catalog-and-acquisition.md)). ACN starts none
+itself, so a cancelled download stays cancelled and its row stays `NotInstalled` until Sync.
 
 ## ACN projection
 

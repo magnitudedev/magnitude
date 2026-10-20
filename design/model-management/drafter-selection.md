@@ -166,10 +166,10 @@ download; clients say the drafter is off because the model fits only without it.
   computer wherever that folder is: ICN observes and watches them with the imported file, so the
   automatic choice attaches them in place even outside every model location, as it does a drafter
   chosen by local path. A drafter the user chose that is
-  missing with no download running is an interrupted download that Sync resumes, and that ACN
-  resumes by itself when the service starts. A catalog drafter whose current revision is not on
-  this computer keeps serving with the earlier revision of that catalog model's drafter (matched by
-  catalog model and drafter role, never package ID), and ICN reports `updateAvailable` on the
+  missing with no download running is fetched again by Sync, keeping its bytes; a drafter download
+  a restart interrupted is resumed by ICN as a requested download, and a cancelled one is not. A
+  catalog drafter whose current revision is not on this computer keeps serving with the earlier
+  revision of that catalog model's drafter (matched by catalog model and drafter role, never package ID), and ICN reports `updateAvailable` on the
   attached drafter; ACN uses that flag as-is, whether or not the catalog model itself is installed.
   A catalog model's update of other parts (its target or projector) is not its drafter's. An attached
   drafter's verdict is its own: the assessment's when it names the attached method, else ICN's

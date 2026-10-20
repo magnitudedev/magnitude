@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
@@ -14,6 +14,7 @@ use magnitude_service_contracts::models::{
 use magnitude_service_contracts::{DownloadFailure, DownloadStage, InventoryError, ModelDownloadEvent};
 
 use crate::inventory::ManagedModelStore;
+use crate::requested_downloads::{RequestedDownload, RequestedDownloads};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DownloadAttemptId(String);
@@ -56,6 +57,7 @@ pub struct ManagedModelDownloads {
     manager: Arc<ManagedModelStore>,
     records: Arc<RwLock<BTreeMap<DownloadAttemptId, AttemptRecord>>>,
     downloads: Arc<RwLock<BTreeMap<ModelDownloadId, DownloadRecord>>>,
+    requests: Arc<Mutex<RequestedDownloads>>,
     starts: Arc<tokio::sync::Mutex<()>>,
     revision: Arc<AtomicU64>,
     changes: tokio::sync::broadcast::Sender<ModelDownloadsInvalidation>,
@@ -82,10 +84,12 @@ struct DownloadRecord {
 impl ManagedModelDownloads {
     pub async fn open(manager: Arc<ManagedModelStore>) -> Result<Self, InventoryError> {
         let (changes, _) = tokio::sync::broadcast::channel(64);
+        let requests = RequestedDownloads::load(manager.root());
         Ok(Self {
             manager,
             records: Arc::new(RwLock::new(BTreeMap::new())),
             downloads: Arc::new(RwLock::new(BTreeMap::new())),
+            requests: Arc::new(Mutex::new(requests)),
             starts: Arc::new(tokio::sync::Mutex::new(())),
             revision: Arc::new(AtomicU64::new(0)),
             changes,
@@ -93,11 +97,233 @@ impl ManagedModelDownloads {
     }
 
     fn invalidate(&self) {
+        self.settle_requests();
         let revision = self
             .revision
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
         let _ = self.changes.send(ModelDownloadsInvalidation { revision });
+    }
+
+    /// Ends every requested download whose download completed, was cancelled, or had its failure
+    /// dismissed; a running or undismissed failed download stays requested, so a restart resumes it.
+    fn settle_requests(&self) {
+        let (Ok(attempts), Ok(downloads), Ok(mut requests)) =
+            (self.records.read(), self.downloads.read(), self.requests.lock())
+        else {
+            return;
+        };
+        let changed = requests.retain_live(|id| {
+            downloads.get(id).is_some_and(|record| {
+                matches!(
+                    model_download(record, &attempts).state,
+                    ModelDownloadState::Pending { .. }
+                        | ModelDownloadState::Downloading { .. }
+                        | ModelDownloadState::Failed {
+                            acknowledged: false,
+                            ..
+                        }
+                )
+            })
+        });
+        drop(downloads);
+        drop(attempts);
+        if changed {
+            self.persist_requests(&requests);
+        }
+    }
+
+    fn change_requests(&self, change: impl FnOnce(&mut RequestedDownloads) -> bool) {
+        let Ok(mut requests) = self.requests.lock() else {
+            tracing::warn!("requested download lock poisoned");
+            return;
+        };
+        if change(&mut requests) {
+            self.persist_requests(&requests);
+        }
+    }
+
+    fn persist_requests(&self, requests: &RequestedDownloads) {
+        if let Err(error) = requests.persist(self.manager.root()) {
+            tracing::warn!(%error, "failed to persist requested downloads");
+        }
+    }
+
+    /// Requests a restart interrupted that have not been admitted again.
+    pub(crate) fn unresumed_requests(&self) -> Vec<RequestedDownload> {
+        self.requests
+            .lock()
+            .map(|requests| requests.unresumed())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn is_unresumed(&self, request: &RequestedDownload) -> bool {
+        self.requests
+            .lock()
+            .is_ok_and(|requests| requests.is_unresumed(request))
+    }
+
+    /// Ends an interrupted request that admission did not take up again: everything it asked for
+    /// is already here, or it can no longer be admitted.
+    pub(crate) fn forget_unresumed_request(&self, request: &RequestedDownload) {
+        self.change_requests(|requests| requests.forget_unresumed(request));
+    }
+
+    /// Ends every request for a model that was removed.
+    pub(crate) fn forget_requests_for(&self, model: &ModelId) {
+        self.change_requests(|requests| requests.forget_model(model));
+    }
+
+    /// Admits a download as `requested`, which is kept until the download ends so a restart
+    /// admits it again.
+    pub(crate) async fn start_requested(
+        &self,
+        request: StartModelDownloadRequest,
+        requested: RequestedDownload,
+    ) -> Result<StartModelDownloadResponse, InventoryError> {
+        let _start_guard = self.starts.lock().await;
+        let packages = bundle_packages(&request.bundle)
+            .into_iter()
+            .map(|package| self.manager.acquisition_package(package.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if packages
+            .iter()
+            .map(|package| &package.id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != packages.len()
+        {
+            return Err(InventoryError::InvalidRequest(
+                "a separate speculative draft must be distinct from its target".to_owned(),
+            ));
+        }
+        validate_bundle_repository_revisions(&packages)?;
+        let active = {
+            let existing = self.records.read().map_err(|_| {
+                InventoryError::Internal("download registry lock poisoned".to_owned())
+            })?;
+            packages
+                .iter()
+                .map(|package| {
+                    existing
+                        .values()
+                        .find(|record| {
+                            record.package.id == package.id
+                                && matches!(
+                                    record.attempt,
+                                    DownloadAttempt::Pending { .. }
+                                        | DownloadAttempt::Downloading { .. }
+                                )
+                        })
+                        .map(|record| record.attempt.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let candidates = packages
+            .iter()
+            .zip(&active)
+            .filter_map(|(package, attempt)| attempt.is_none().then_some(package.clone()))
+            .collect::<Vec<_>>();
+        let mut missing = Vec::new();
+        for package in candidates {
+            match self.manager.acquired_package_from_snapshot(&package.id) {
+                Ok(_) => {}
+                Err(InventoryError::NotFound(_)) | Err(InventoryError::NotReady(_)) => {
+                    missing.push(package);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let new_attempts = missing
+            .iter()
+            .map(|package| {
+                let id = random_attempt_id()?;
+                let attempt = DownloadAttempt::Pending {
+                    id: id.clone(),
+                    package_id: package.id.clone(),
+                };
+                Ok((id, attempt))
+            })
+            .collect::<Result<Vec<_>, InventoryError>>()?;
+        let streams = self.manager.start_target_downloads(missing.clone()).await?;
+        if streams.len() != missing.len() {
+            return Err(InventoryError::Internal(
+                "download admission returned an unexpected number of streams".to_owned(),
+            ));
+        }
+        let mut admitted = active.into_iter().flatten().collect::<Vec<_>>();
+        {
+            let mut records = self.records.write().map_err(|_| {
+                InventoryError::Internal("download registry lock poisoned".to_owned())
+            })?;
+            let mut sequence = records
+                .values()
+                .map(|record| record.sequence)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            for (package, (id, attempt)) in missing.iter().zip(&new_attempts) {
+                records.insert(
+                    id.clone(),
+                    AttemptRecord {
+                        attempt: attempt.clone(),
+                        package: package.clone(),
+                        sequence,
+                    },
+                );
+                sequence = sequence.saturating_add(1);
+            }
+        }
+        for ((package, (id, attempt)), stream) in missing
+            .into_iter()
+            .zip(new_attempts.into_iter())
+            .zip(streams)
+        {
+            tokio::spawn(self.clone().consume(id, package, stream));
+            admitted.push(attempt);
+        }
+        let download = if admitted.is_empty() {
+            None
+        } else {
+            let id = random_download_id()?;
+            let mut record = DownloadRecord {
+                id: id.clone(),
+                bundle: request.bundle,
+                for_model: request.for_model,
+                attempt_ids: admitted
+                    .iter()
+                    .map(|attempt| attempt_identity(attempt).0)
+                    .collect(),
+                cancelled: false,
+                failure_acknowledged: false,
+                sequence: 0,
+            };
+            let attempts = self.records.read().map_err(|_| {
+                InventoryError::Internal("download registry lock poisoned".to_owned())
+            })?;
+            let projected = model_download(&record, &attempts);
+            drop(attempts);
+            let mut downloads = self.downloads.write().map_err(|_| {
+                InventoryError::Internal("model download registry lock poisoned".to_owned())
+            })?;
+            record.sequence = downloads
+                .values()
+                .map(|record| record.sequence)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            downloads.insert(id.clone(), record);
+            drop(downloads);
+            self.change_requests(|requests| {
+                requests.admitted(requested, id);
+                true
+            });
+            Some(projected)
+        };
+        if download.is_some() {
+            self.invalidate();
+        }
+        Ok(StartModelDownloadResponse { download })
     }
 
     fn update(&self, id: &DownloadAttemptId, attempt: DownloadAttempt) {
@@ -515,146 +741,8 @@ impl ModelDownloads for ManagedModelDownloads {
         &self,
         request: StartModelDownloadRequest,
     ) -> BoxFuture<'_, Result<StartModelDownloadResponse, InventoryError>> {
-        Box::pin(async move {
-            let _start_guard = self.starts.lock().await;
-            let packages = bundle_packages(&request.bundle)
-                .into_iter()
-                .map(|package| self.manager.acquisition_package(package.clone()))
-                .collect::<Result<Vec<_>, _>>()?;
-            if packages
-                .iter()
-                .map(|package| &package.id)
-                .collect::<BTreeSet<_>>()
-                .len()
-                != packages.len()
-            {
-                return Err(InventoryError::InvalidRequest(
-                    "a separate speculative draft must be distinct from its target".to_owned(),
-                ));
-            }
-            validate_bundle_repository_revisions(&packages)?;
-            let active = {
-                let existing = self.records.read().map_err(|_| {
-                    InventoryError::Internal("download registry lock poisoned".to_owned())
-                })?;
-                packages
-                    .iter()
-                    .map(|package| {
-                        existing
-                            .values()
-                            .find(|record| {
-                                record.package.id == package.id
-                                    && matches!(
-                                        record.attempt,
-                                        DownloadAttempt::Pending { .. }
-                                            | DownloadAttempt::Downloading { .. }
-                                    )
-                            })
-                            .map(|record| record.attempt.clone())
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let candidates = packages
-                .iter()
-                .zip(&active)
-                .filter_map(|(package, attempt)| attempt.is_none().then_some(package.clone()))
-                .collect::<Vec<_>>();
-            let mut missing = Vec::new();
-            for package in candidates {
-                match self.manager.acquired_package_from_snapshot(&package.id) {
-                    Ok(_) => {}
-                    Err(InventoryError::NotFound(_)) | Err(InventoryError::NotReady(_)) => {
-                        missing.push(package);
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            let new_attempts = missing
-                .iter()
-                .map(|package| {
-                    let id = random_attempt_id()?;
-                    let attempt = DownloadAttempt::Pending {
-                        id: id.clone(),
-                        package_id: package.id.clone(),
-                    };
-                    Ok((id, attempt))
-                })
-                .collect::<Result<Vec<_>, InventoryError>>()?;
-            let streams = self.manager.start_target_downloads(missing.clone()).await?;
-            if streams.len() != missing.len() {
-                return Err(InventoryError::Internal(
-                    "download admission returned an unexpected number of streams".to_owned(),
-                ));
-            }
-            let mut admitted = active.into_iter().flatten().collect::<Vec<_>>();
-            {
-                let mut records = self.records.write().map_err(|_| {
-                    InventoryError::Internal("download registry lock poisoned".to_owned())
-                })?;
-                let mut sequence = records
-                    .values()
-                    .map(|record| record.sequence)
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                for (package, (id, attempt)) in missing.iter().zip(&new_attempts) {
-                    records.insert(
-                        id.clone(),
-                        AttemptRecord {
-                            attempt: attempt.clone(),
-                            package: package.clone(),
-                            sequence,
-                        },
-                    );
-                    sequence = sequence.saturating_add(1);
-                }
-            }
-            for ((package, (id, attempt)), stream) in missing
-                .into_iter()
-                .zip(new_attempts.into_iter())
-                .zip(streams)
-            {
-                tokio::spawn(self.clone().consume(id, package, stream));
-                admitted.push(attempt);
-            }
-            let download = if admitted.is_empty() {
-                None
-            } else {
-                let id = random_download_id()?;
-                let mut record = DownloadRecord {
-                    id: id.clone(),
-                    bundle: request.bundle,
-                    for_model: request.for_model,
-                    attempt_ids: admitted
-                        .iter()
-                        .map(|attempt| attempt_identity(attempt).0)
-                        .collect(),
-                    cancelled: false,
-                    failure_acknowledged: false,
-                    sequence: 0,
-                };
-                let attempts = self.records.read().map_err(|_| {
-                    InventoryError::Internal("download registry lock poisoned".to_owned())
-                })?;
-                let projected = model_download(&record, &attempts);
-                drop(attempts);
-                let mut downloads = self.downloads.write().map_err(|_| {
-                    InventoryError::Internal("model download registry lock poisoned".to_owned())
-                })?;
-                record.sequence = downloads
-                    .values()
-                    .map(|record| record.sequence)
-                    .max()
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                downloads.insert(id.clone(), record);
-                Some(projected)
-            };
-            if download.is_some() {
-                self.invalidate();
-            }
-            Ok(StartModelDownloadResponse { download })
-        })
+        let requested = RequestedDownload::bundle(&request);
+        Box::pin(self.start_requested(request, requested))
     }
 
     fn list(&self) -> BoxFuture<'_, Result<ModelDownloadsResponse, InventoryError>> {
