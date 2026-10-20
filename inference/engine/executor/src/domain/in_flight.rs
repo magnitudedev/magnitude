@@ -4,6 +4,51 @@
 use super::*;
 use crate::programs::SubmittedTarget;
 
+/// The host's turn after a flight finished: until the next launch, the host
+/// reconciles the flight and prepares that launch for the flight's requests.
+pub(super) struct HostTurn {
+    since: Instant,
+    requests: Vec<RequestId>,
+}
+
+impl<F: ProgramFamily> ExecutorDomain<F> {
+    /// A finished flight of `requests` hands the host its turn.
+    pub(super) fn begin_host_turn(&mut self, requests: impl IntoIterator<Item = RequestId>) {
+        self.host_turn = Some(HostTurn {
+            since: Instant::now(),
+            requests: requests.into_iter().collect(),
+        });
+    }
+
+    /// The host's turn starts again now: what it waited for since it began
+    /// prepared no launch.
+    pub(super) fn restart_host_turn(&mut self) {
+        if let Some(turn) = &mut self.host_turn {
+            turn.since = Instant::now();
+        }
+    }
+
+    /// When the service of a launch of `requests` submitted at `submitted`
+    /// starts: where the flight before it finished, when that flight
+    /// carried one of its requests and the owner did not idle since, so a
+    /// launch is charged the host work that prepared it (a round's host
+    /// time is part of its cost); at its submission otherwise, so neither
+    /// idle time nor another request's work is charged to it.
+    pub(super) fn service_start(&mut self, requests: &[RequestId], submitted: Instant) -> Instant {
+        match self.host_turn.take() {
+            Some(turn) if requests.iter().any(|request| turn.requests.contains(request)) => {
+                turn.since
+            }
+            _ => submitted,
+        }
+    }
+
+    /// The owner has no work: time until its next launch is idle, not service.
+    pub fn host_idle(&mut self) {
+        self.host_turn = None;
+    }
+}
+
 pub struct VisionFlight<F: ProgramFamily = NativeFamily> {
     pub(super) request: RequestId,
     pub(super) image: ImageRef,

@@ -606,6 +606,44 @@ fn ready_target_can_abort_then_reconcile() {
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 1);
 }
 
+/// A launch is charged the host work since the flight before it finished
+/// when that flight carried its request: a round's host time is part of its
+/// cost. Time the owner spent idle, or a flight of other requests, is
+/// charged to no launch.
+#[test]
+fn a_launch_is_charged_its_requests_host_turn_but_not_idle_time() {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
+        return;
+    };
+    let gap = std::time::Duration::from_millis(60);
+    let (first, second) = (RequestId(70), RequestId(71));
+    open(&mut domain, &mut bindings, first);
+    open(&mut domain, &mut bindings, second);
+    let step = |domain: &mut ExecutorDomain<TestFamily>,
+                bindings: StateBindings<TestFamily>,
+                request: RequestId,
+                position: usize| {
+        let flight = submit_reserved_target(domain, bindings, vec![forward(request, position)]);
+        let (pending, bindings) = finish_one(domain, flight);
+        let duration = pending.physical_duration();
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .unwrap();
+        (duration, bindings)
+    };
+    let (_, bindings) = step(&mut domain, bindings, first, 0);
+    std::thread::sleep(gap);
+    let (charged, bindings) = step(&mut domain, bindings, first, 1);
+    assert!(charged >= gap, "the host turn of its own request: {charged:?}");
+    std::thread::sleep(gap);
+    let (other, bindings) = step(&mut domain, bindings, second, 0);
+    assert!(other < gap, "another request's turn: {other:?}");
+    std::thread::sleep(gap);
+    domain.host_idle();
+    let (idle, _) = step(&mut domain, bindings, second, 1);
+    assert!(idle < gap, "after the owner idled: {idle:?}");
+}
+
 /// Growth changes bindings: every entry that can grow resolves a queued
 /// lookahead first, then commits the slab.
 #[test]

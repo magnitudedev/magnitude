@@ -339,12 +339,23 @@ alone, and corrected by the rounds that follow any change of generated count.
 
 **Costs.** The load keeps the measured durations of each drafter launch by
 generated count and each target launch by rows, per context class and per number
-of requests sharing the launch. Nothing is forecast. A launch costs the median of
+of requests sharing the launch. A launch's duration includes the host work that
+prepared it: it runs from the end of the flight before it when that flight carried
+one of its requests and the owner did not idle between, and from its submission
+otherwise, so idle time and other requests' work are charged to no launch. A
+pipelined decode's runs from its predecessor's completion, so a round that drafts
+and one that does not are both priced at what they take end to end. Nothing is
+forecast. A launch costs the median of
 its latest few durations, so a launch another process held up once prices
 nothing; durations older than a fixed number of the load's rounds are dropped when
 the launch is measured again. A launch not yet measured costs at least what a
 smaller one measured, and at least what the same launch measured at a shorter
-context; a larger launch proves nothing about a smaller one. With nothing
+context; a larger launch proves no lower bound for a smaller one. A launch measured
+fewer times than its median needs costs no more than a larger launch proven in
+its class, nor than the same launch proven at a shorter context times the ratio
+of the classes (only attention reads the longer history): a width is measured
+again only when it is taken, so a first duration another process held up would
+otherwise price drafting that pays out of a load for good. With nothing
 measured every width costs the same. The machine's speed moves every launch
 alike, so each plain launch (one target row) scales every other measurement of
 its context class and request count with its cost: a launch no longer taken

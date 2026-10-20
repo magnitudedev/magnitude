@@ -141,10 +141,20 @@ impl LaunchCosts {
 /// launch. A launch not measured there costs at least what its other
 /// measurements prove, and at least what the same launch measured over no
 /// longer a history and among no more requests: neither makes it cheaper.
+///
+/// A launch measured there fewer times than its cost needs costs no more
+/// than a larger launch proven there, nor than the same launch proven among
+/// as many requests over a shorter history times the ratio of the context
+/// classes (only its attention reads a longer history, and reads it at most
+/// that many times as long). One held-up duration would otherwise price it
+/// out of being taken, and so of ever being measured again.
 struct RoundCosts {
     own: LaunchCosts,
     /// Measurements at no longer a context and of no more requests.
     lesser: Vec<LaunchCosts>,
+    /// Measurements of as many requests at a shorter context, with how many
+    /// times longer this context class is.
+    shorter: Vec<(f64, LaunchCosts)>,
     /// Requests sharing each launch.
     sequences: usize,
 }
@@ -166,13 +176,32 @@ impl RoundCosts {
                 })
                 .map(|(_, costs)| costs.clone())
                 .collect(),
+            shorter: costs
+                .iter()
+                .filter(|((context, shared), _)| *context < context_class && *shared == sequences)
+                .map(|((context, _), costs)| (context_class as f64 / *context as f64, costs.clone()))
+                .collect(),
             sequences,
         }
     }
 
     fn seconds(&self, costs: fn(&LaunchCosts) -> &BTreeMap<usize, Durations>, size: usize) -> f64 {
-        match costs(&self.own).get(&size) {
-            Some(durations) => durations.cost(),
+        let own = costs(&self.own);
+        match own.get(&size) {
+            Some(durations) if durations.proven() => durations.cost(),
+            Some(durations) => {
+                let larger = own
+                    .range(size + 1..)
+                    .filter(|(_, larger)| larger.proven())
+                    .map(|(_, larger)| larger.cost());
+                let shorter = self.shorter.iter().filter_map(|(ratio, measured)| {
+                    costs(measured)
+                        .get(&size)
+                        .filter(|durations| durations.proven())
+                        .map(|durations| ratio * durations.cost())
+                });
+                larger.chain(shorter).fold(durations.cost(), f64::min)
+            }
             None => std::iter::once(&self.own)
                 .chain(&self.lesser)
                 .map(|measured| LaunchCosts::at_least(costs(measured), size))

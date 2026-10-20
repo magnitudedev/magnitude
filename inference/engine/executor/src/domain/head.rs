@@ -261,11 +261,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(SubmitFailure::Failed(error.into()));
             }
         };
+        let requests = metadata.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
         Ok(HeadFlight {
+            started: self.service_start(&requests, started),
             requests: metadata,
             steps,
             submission,
-            started,
             launch_trace,
             bindings,
         })
@@ -334,11 +335,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(SubmitFailure::Failed(error.into()));
             }
         };
+        let requests = metadata.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
         Ok(HeadFlight {
+            started: self.service_start(&requests, started),
             requests: metadata,
             steps,
             submission,
-            started,
             launch_trace: None,
             bindings,
         })
@@ -832,6 +834,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         for item in &mut pending {
             item.physical_duration = duration;
         }
+        self.begin_host_turn(pending.iter().map(|item| item.request));
         Ok((pending, bindings))
     }
 }

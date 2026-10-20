@@ -23,6 +23,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         )
         .map_err(|(_, error)| SubmitFailure::Failed(DomainError::Invariant(error)))?;
         let started = Instant::now();
+        // An encoder launch is no round's: the host turn before it ends.
+        self.host_turn = None;
         let submission = self
             .family
             .submit_vision(launch)

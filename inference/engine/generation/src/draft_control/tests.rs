@@ -669,3 +669,37 @@ fn a_launch_held_up_once_does_not_make_drafting_that_loses_look_faster() {
         run.rounds()
     );
 }
+
+/// QA (mac-r4, Qwen3.5 4B with its DFlash drafter on a loaded M4 Max): a
+/// width's drafter launch in a context class was held up by another process
+/// (100 ms against 7 ms) on the only time it was measured there, and that
+/// priced it for good: a width is measured again only when it is taken, and
+/// a price that high is never taken, so drafting that pays stopped for the
+/// rest of the load. A launch measured fewer times than its price needs costs
+/// no more than the same launch proven over a shorter history, scaled by the
+/// longer history, so it is taken, and measured, again.
+#[test]
+fn a_width_held_up_on_its_first_launch_is_taken_again() {
+    let stream = Stream::of(&[(3_000, PREDICTABLE)]);
+    assert_eq!(fastest_fixed(&stream, SHORT).0, 7, "drafting pays");
+    let warm = warmed(&Stream::of(&[(500, PREDICTABLE)]), SHORT);
+    let class = (4 * CONTEXT).next_power_of_two();
+    for held in 0..12 {
+        let load = Arc::new(DraftLoad {
+            costs: std::sync::Mutex::new(warm.costs.lock().unwrap().clone()),
+            rounds: std::sync::Mutex::new(*warm.rounds.lock().unwrap()),
+            right: std::sync::Mutex::new(warm.right.lock().unwrap().clone()),
+            look_run: std::sync::Mutex::new(*warm.look_run.lock().unwrap()),
+            look_seconds: std::sync::Mutex::new(*warm.look_seconds.lock().unwrap()),
+        });
+        let round = std::cell::Cell::new(0usize);
+        let run = adaptive_on(&stream, SHORT, &load, class - 50, |position| {
+            if position < class {
+                return 1.0;
+            }
+            round.set(round.get() + 1);
+            if round.get() == held + 1 { 15.0 } else { 1.0 }
+        });
+        within_of_fixed(&run, &stream, SHORT, 7, 0.05);
+    }
+}

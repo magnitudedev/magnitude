@@ -1261,6 +1261,8 @@ impl<F: ProgramFamily> Service<F> {
                         }
                         Selected::Retry => Pipeline::Idle(bindings),
                         Selected::Empty => {
+                            // Waiting for work is no launch's service.
+                            self.domain.host_idle();
                             if self.fail_capacity_waiters() {
                                 Pipeline::Idle(bindings)
                             } else {

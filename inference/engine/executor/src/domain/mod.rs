@@ -495,6 +495,7 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     planned: Vec<Operation>,
     /// Identity of the next target flight.
     next_flight: u64,
+    host_turn: Option<in_flight::HostTurn>,
     /// Log lookahead queues, claims and orphans (read once at start).
     trace_lookahead: bool,
     /// Sequences a step of which could not read its table rows: every
@@ -1554,6 +1555,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             trace_host_steps: std::env::var_os("MAGNITUDE_TRACE_HOST_STEP").is_some(),
             planned: Vec::new(),
             next_flight: 0,
+            host_turn: None,
             trace_lookahead: std::env::var_os("MAGNITUDE_TRACE_LOOKAHEAD").is_some(),
             poisoned: BTreeMap::new(),
         };

@@ -417,13 +417,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(Unsubmitted::Failed(error.into()));
             }
         };
+        let requests = metadata.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
+        let runnable = self.service_start(&requests, started);
         Ok(TargetWork {
             requests: metadata,
             submission,
             priming: None,
+            runnable,
             launch_trace,
             started,
-            runnable: started,
             previous_selection: self.selection_read.take(),
             id: self.flight_id(),
             continuation: None,
@@ -775,6 +777,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             item.physical_duration += timing.finish;
         }
         self.target_timing = Some(timing);
+        self.begin_host_turn(pending.iter().map(|item| item.request));
         Ok(pending)
     }
 
