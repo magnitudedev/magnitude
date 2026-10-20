@@ -47,11 +47,16 @@ instances separately, then publishes one `LocalModel` union:
 - `Custom` carries its `origin` (`Added`, `Imported`, or `Found` with its source), the catalog model
   it is a variant of, its attached and recommended drafters, serving
   state, and, for `Added` only, managed acquisition state. ICN names it: the repository's name when
-  the file has a Hub identity (as the repository step does), else the GGUF's `general.name` unless
-  that is only a hexadecimal digest (a source commit some converters write there), else the file
-  name, each without the quantization and with separators as spaces, and as the variant label its
-  header's `general.file_type` label (the weights' type when its tensors contradict it), kept as its
-  file name spells it only when that names
+  the file has a Hub identity (as the repository step does), else the first of the GGUF's
+  `general.name`, the file name, and the header's one declared base model (`general.base_model.0.name`
+  when it declares exactly one; a merge's several bases do not name it) that identifies anything,
+  else the file name, each without the quantization and with separators as spaces. Whether a name
+  identifies anything is judged from its form alone, never against a list of names: it needs at least
+  three letters or digits, so a converter's placeholder such as `Hf` (written from a source folder
+  named `hf`) does not, and must not be only a hexadecimal digest, alone (a source commit some
+  converters write there) or after an algorithm name (`sha256-…`, a content-addressed blob). As the variant
+  label its header's `general.file_type` label (the weights' type when its tensors contradict it),
+  kept as its file name spells it only when that names
   the same weight type more precisely (`UD-Q4_K_XL` for a Q4_K_M header), as a candidate version is
   labelled, so a renamed file is never labelled from its name; else the quantization its file name
   spells; only without either does ACN label it by bit width. ICN also gives its license when known: the Hub

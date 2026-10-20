@@ -1170,6 +1170,7 @@ impl ModelContext<'_> {
             ),
             hub.map(|hub| hub.repository.as_str()),
             evidence.name.as_deref(),
+            &evidence.base_models,
             evidence.quantization.as_deref(),
         );
         let display_name = match (representative.ollama_name, hub) {
@@ -1424,6 +1425,7 @@ impl ModelContext<'_> {
             Path::new(primary),
             Some(repository.as_str()),
             None,
+            &[],
             None,
         );
         Some(ProjectedModel {

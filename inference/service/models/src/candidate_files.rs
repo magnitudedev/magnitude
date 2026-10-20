@@ -494,14 +494,15 @@ pub fn display_name(name: &str) -> String {
 /// How a model on this computer is named: its display name and the quantization label of the
 /// variant, the one its file names (`Q4_K_M`, `UD-Q4_K_XL`) or else its header's. The name is the repository's when
 /// the file has a Hub identity (`Qwen3.5 4B` for `lmstudio-community/Qwen3.5-4B-GGUF`), else the
-/// GGUF's `general.name` unless that is only a digest (some converters write the source commit
-/// there), else the file name, each without its quantization and with separators as spaces. Names
-/// are presentation only.
+/// GGUF's `general.name`, else the file name, else the one base model the header declares, the
+/// first that identifies anything (`identifies`), each without its quantization and with
+/// separators as spaces. Names are presentation only.
 #[must_use]
 pub fn model_presentation(
     primary: &Path,
     repository: Option<&str>,
     header_name: Option<&str>,
+    header_base_models: &[crate::gguf::GgufBaseModel],
     header_quantization: Option<&str>,
 ) -> (String, Option<String>) {
     let stem = primary
@@ -536,15 +537,22 @@ pub fn model_presentation(
             .collect::<Vec<_>>()
             .join(" ")
     };
+    // A merge declares several bases, and none of them alone names it.
+    let base_model = match header_base_models {
+        [base] => base.name.as_deref(),
+        _ => None,
+    };
     let name = repository
         .map(display_name)
-        .or_else(|| {
-            header_name
-                .filter(|name| !is_digest(name))
-                .map(without_label)
-        })
         .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| without_label(stem));
+        .unwrap_or_else(|| {
+            [header_name, Some(stem), base_model]
+                .into_iter()
+                .flatten()
+                .map(without_label)
+                .find(|name| identifies(name))
+                .unwrap_or_else(|| without_label(stem))
+        });
     let name = if name.trim().is_empty() {
         stem.to_owned()
     } else {
@@ -553,12 +561,29 @@ pub fn model_presentation(
     (name, label)
 }
 
-/// Whether a name is only a hexadecimal digest, such as a commit hash, rather than a model's name.
+/// Whether a name tells a model apart, judged by its form alone and never against a list of names:
+/// it has at least three letters or digits, which a converter's placeholder (`Hf`, from a source
+/// directory named `hf`) lacks, and is not only a digest (a source commit, a content address).
+fn identifies(name: &str) -> bool {
+    name.chars().filter(|c| c.is_alphanumeric()).count() >= 3 && !is_digest(name)
+}
+
+/// Whether a name is only a hexadecimal digest: a commit hash (`2639448d…`), or a content digest
+/// after its algorithm's name (`sha256 4cd5…` for an Ollama blob, once separators are spaces).
 fn is_digest(name: &str) -> bool {
+    let is_hex = |text: &str, lengths: std::ops::RangeInclusive<usize>| {
+        lengths.contains(&text.len())
+            && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && text.bytes().any(|byte| byte.is_ascii_digit())
+    };
     let name = name.trim();
-    (7..=64).contains(&name.len())
-        && name.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && name.bytes().any(|byte| byte.is_ascii_digit())
+    is_hex(name, 7..=64)
+        || name
+            .split_once([' ', '-', ':'])
+            .is_some_and(|(algorithm, digest)| {
+                algorithm.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                    && is_hex(digest, 32..=128)
+            })
 }
 
 /// Whether a version's quantization (the GGUF's `general.file_type` name) is in the Q4_K class,
@@ -1091,6 +1116,7 @@ mod tests {
                 Path::new("MiniCPM5-1B-Q3_K_M.gguf"),
                 Some("NANI-Nithin/MiniCPM5-1B-GGUF"),
                 Some("MiniCPM5-1B"),
+                &[],
                 Some("Q3_K - Medium")
             ),
             ("MiniCPM5 1B".to_owned(), Some("Q3_K_M".to_owned()))
@@ -1100,6 +1126,7 @@ mod tests {
                 Path::new("blobs/sha256-abc"),
                 None,
                 Some("Qwen3.5-4B-Q4_K_M"),
+                &[],
                 None
             ),
             ("Qwen3.5 4B".to_owned(), None)
@@ -1109,12 +1136,19 @@ mod tests {
                 Path::new("blobs/sha256-abc"),
                 None,
                 Some("Qwen3.5-4B-Q4_K_M"),
+                &[],
                 Some("Q4_K - Medium")
             ),
             ("Qwen3.5 4B".to_owned(), Some("Q4_K_M".to_owned()))
         );
         assert_eq!(
-            model_presentation(Path::new("models/new-q40.gguf"), None, None, Some("Q4_0")),
+            model_presentation(
+                Path::new("models/new-q40.gguf"),
+                None,
+                None,
+                &[],
+                Some("Q4_0")
+            ),
             ("new q40".to_owned(), Some("Q4_0".to_owned()))
         );
         assert_eq!(
@@ -1122,6 +1156,7 @@ mod tests {
                 Path::new("models/MiniCPM5-1B-q4_k_s.gguf"),
                 None,
                 None,
+                &[],
                 None
             ),
             ("MiniCPM5 1B".to_owned(), Some("Q4_K_S".to_owned()))
@@ -1131,6 +1166,7 @@ mod tests {
                 Path::new("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
                 None,
                 None,
+                &[],
                 None
             ),
             ("Qwen3.6 35B A3B".to_owned(), Some("UD-Q4_K_XL".to_owned()))
@@ -1148,6 +1184,7 @@ mod tests {
                 Path::new("models/R/renamed-q8.gguf"),
                 None,
                 Some("Qwen3.5-0.8B"),
+                &[],
                 Some("Q4_K - Medium")
             ),
             ("Qwen3.5 0.8B".to_owned(), Some("Q4_K_M".to_owned()))
@@ -1157,6 +1194,7 @@ mod tests {
                 Path::new("renamed-q8.gguf"),
                 None,
                 Some("4cd563d5"),
+                &[],
                 Some("Q5_K - Medium")
             )
             .1,
@@ -1167,6 +1205,7 @@ mod tests {
                 Path::new("Qwen3.5-4B-UD-Q4_K_XL.gguf"),
                 Some("unsloth/Qwen3.5-4B-GGUF"),
                 None,
+                &[],
                 Some("Q4_K - Medium")
             )
             .1,
@@ -1174,7 +1213,7 @@ mod tests {
             "a name spelling the header's type more precisely keeps it"
         );
         assert_eq!(
-            model_presentation(Path::new("renamed-q8.gguf"), None, None, None).1,
+            model_presentation(Path::new("renamed-q8.gguf"), None, None, &[], None).1,
             Some("Q8".to_owned()),
             "without a header type, the name's"
         );
@@ -1190,31 +1229,92 @@ mod tests {
                 Path::new("models/LFM2.5-230M-Q8_0.gguf"),
                 None,
                 Some("2639448dbae4a4cc657be3a5a8fcce8e531ee6c4"),
+                &[],
                 Some("Q8_0")
             ),
             ("LFM2.5 230M".to_owned(), Some("Q8_0".to_owned()))
         );
         assert_eq!(
-            model_presentation(Path::new("weights.gguf"), None, Some("4cd563d"), None).0,
+            model_presentation(Path::new("weights.gguf"), None, Some("4cd563d"), &[], None).0,
             "weights"
         );
-        for name in [
-            "Qwen3-8B-abcdef",
-            "LFM2.5 230M",
-            "deadbeefcafe",
-            "Llama 3.1 8B",
-        ] {
-            assert!(!is_digest(name), "{name}");
-        }
         assert_eq!(
             model_presentation(
                 Path::new("weights.gguf"),
                 None,
                 Some("Qwen3-8B-abcdef"),
+                &[],
                 None
             )
             .0,
             "Qwen3 8B abcdef"
         );
+    }
+
+    /// QA (linux-cpu-10): Google's `gemma-4-E4B_q4_0-it.gguf` names its converter's source folder
+    /// as its `general.name` (`Hf`), and was shown as "Hf". A placeholder identifies nothing, so the
+    /// file names the model, and the header's one base model when the file name is no better.
+    #[test]
+    fn a_placeholder_header_name_gives_way_to_the_file_then_the_base_model() {
+        let gemma = [crate::gguf::GgufBaseModel {
+            name: Some("Gemma 4 E4B It".to_owned()),
+            organization: Some("Google".to_owned()),
+            repo_url: None,
+        }];
+        assert_eq!(
+            model_presentation(
+                Path::new("models/gemma-4-E4B_q4_0-it.gguf"),
+                None,
+                Some("Hf"),
+                &gemma,
+                Some("Q4_0")
+            ),
+            ("gemma 4 E4B q4 0 it".to_owned(), Some("Q4_0".to_owned()))
+        );
+        assert_eq!(
+            model_presentation(
+                Path::new(
+                    "blobs/sha256-4cd563d5f1e2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c"
+                ),
+                None,
+                Some("Hf"),
+                &gemma,
+                None
+            )
+            .0,
+            "Gemma 4 E4B It"
+        );
+        assert_eq!(
+            model_presentation(Path::new("m.gguf"), None, Some("2639448d"), &gemma, None).0,
+            "Gemma 4 E4B It"
+        );
+        let merge = [gemma[0].clone(), gemma[0].clone()];
+        assert_eq!(
+            model_presentation(Path::new("m.gguf"), None, Some("Hf"), &merge, None).0,
+            "m",
+            "a merge's bases do not name it, and nothing better than the file name is left"
+        );
+        for name in [
+            "Phi 4",
+            "Qwen3.5 4B",
+            "Gemma 4 E2B It",
+            "Yi 6B",
+            "deadbeefcafe",
+            "LFM2.5 230M",
+        ] {
+            assert_eq!(
+                model_presentation(Path::new("other.gguf"), None, Some(name), &gemma, None).0,
+                name,
+                "a real name, however short, names the model"
+            );
+        }
+        for name in [
+            "Hf",
+            "",
+            "4cd563d",
+            "sha256 4cd563d5f1e2a3b4c5d6e7f8091a2b3c4d5e",
+        ] {
+            assert!(!identifies(name), "{name}");
+        }
     }
 }
