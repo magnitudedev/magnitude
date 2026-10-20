@@ -28,10 +28,15 @@ export const ApplicationRouterMemory = Layer.effect(ApplicationRouter, Effect.ge
 /** Browser navigation: the page is the URL path, so reload, back, forward and links work. An unknown path is replaced with the default page's. */
 export const ApplicationRouterLocation = Layer.scoped(ApplicationRouter, Effect.gen(function* () {
   const registry = yield* Registry.AtomRegistry
-  const current = () => Option.getOrElse(pageFromPath(window.location.pathname), () => {
-    window.history.replaceState(null, "", pagePath(DEFAULT_PAGE))
-    return DEFAULT_PAGE
-  })
+  const current = () => {
+    // The dedicated loopback Chat port opens directly into Chat; the canonical
+    // service port continues to open the normal Magnitude landing page.
+    if (window.location.pathname === "/" && window.location.port === "10101") return "chat" as ApplicationPage
+    return Option.getOrElse(pageFromPath(window.location.pathname), () => {
+      window.history.replaceState(null, "", pagePath(DEFAULT_PAGE))
+      return DEFAULT_PAGE
+    })
+  }
   const page = Atom.keepAlive(Atom.make<ApplicationPage>(current()))
   const onPopState = () => registry.set(page, current())
   yield* Effect.acquireRelease(

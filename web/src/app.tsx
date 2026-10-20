@@ -18,6 +18,7 @@ import {
   CaretDownIcon,
   EyeIcon,
   ArrowUpRightIcon,
+  ChatCircleIcon,
   StackIcon,
   SquaresFourIcon,
   CubeIcon,
@@ -38,7 +39,7 @@ import {
   BuildingsIcon,
 } from "@phosphor-icons/react"
 import { CopyCommand } from "./components/copy-command"
-import { useId, useMemo, useRef, useState, type ReactNode } from "react"
+import { lazy, Suspense, useId, useMemo, useRef, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
 import { localModelDeprecation, type ProviderModelId, type CatalogLocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
@@ -66,6 +67,7 @@ import { HarnessConnections, type CommandModel } from "./components/harness-conn
 import { HarnessSetupList } from "./components/harness-setup"
 import { OtherApps } from "./components/other-apps"
 import { LabLogo, ModelLogo, modelLab, modelLabs, type ModelLab } from "./components/model-logo"
+const ChatPage = lazy(() => import("./components/chat-page").then(module => ({ default: module.ChatPage })))
 
 const ALL_INTERFACES = "all"
 const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
@@ -73,8 +75,8 @@ const inferenceUrl = (address: string, port: number) => `http://${address}:${por
 const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
   ? `robocopy "${from}" "${to}" /E /MOVE`
   : `mv "${from}/"* "${to}/"`
-const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
-const pageIcons = { discover: StackIcon, catalog: SquaresFourIcon, models: CubeIcon, connections: PlugIcon, usage: ChartBarIcon, status: PulseIcon, settings: SlidersIcon }
+const pageNames: Record<ApplicationPage, string> = { chat: "Chat", discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
+const pageIcons = { chat: ChatCircleIcon, discover: StackIcon, catalog: SquaresFourIcon, models: CubeIcon, connections: PlugIcon, usage: ChartBarIcon, status: PulseIcon, settings: SlidersIcon }
 
 function ModelDetails({ model, radar = false, open, contentId, compact = false }: { model: CatalogLocalModel; radar?: boolean; open?: boolean; contentId?: string; compact?: boolean }) {
   const serving = model.servingState
@@ -881,6 +883,7 @@ export function App() {
   return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><AppShell page={page} navigate={navigate} platform={platform}>
       {service?._tag === "Unreachable" ? <CannotReachMagnitude />
       : service?._tag === "Reconnecting" ? <ReconnectingToMagnitude />
+      : page === "chat" ? <Suspense fallback={<div className="p-6 text-sm text-slate-500">Loading Chat…</div>}><ChatPage /></Suspense>
       : page === "status" ? Result.isFailure(observation.service) ? <ErrorNotice title="Couldn’t read service status" description="Magnitude can’t confirm the service’s current state." className="mt-7" /> : <Status observation={observation} />
       : page === "usage" ? <ServingUsage />
       : page === "settings" ? <SettingsPage />
