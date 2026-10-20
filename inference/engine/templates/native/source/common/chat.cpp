@@ -1022,12 +1022,14 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         return common_chat_params_init_lfm2(tmpl, params, /* tool_list_tokens = */ true);
     }
 
-    // LFM2.5 format detection: the template writes calls as <|tool_call_start|>[name(args)]<|tool_call_end|>,
-    // the markup the handler parses, and lists tools without tool-list tokens. How the tool list is spelled
-    // (a "List of tools: [" literal or "List of tools: " + tools | tojson) does not decide the format.
-    if (src.find("<|tool_call_start|>[") != std::string::npos &&
-        src.find("]<|tool_call_end|>") != std::string::npos &&
-        src.find("<|tool_list_start|>") == std::string::npos) {
+    // LFM2.5 format detection: the template lists tools without tool-list tokens and either writes calls as
+    // <|tool_call_start|>[name(args)]<|tool_call_end|>, the markup the handler parses, or leaves calls to the
+    // model behind a "List of tools: [" literal (LFM2.5 1.2B). Finetunes that spell the list
+    // "List of tools: " + tools | tojson are recognized by their call markup.
+    if (src.find("<|tool_list_start|>") == std::string::npos &&
+        ((src.find("<|tool_call_start|>[") != std::string::npos &&
+          src.find("]<|tool_call_end|>") != std::string::npos) ||
+         src.find("List of tools: [") != std::string::npos)) {
         LOG_DBG("Using specialized template: LFM2.5\n");
         return common_chat_params_init_lfm2(tmpl, params, /* tool_list_tokens = */ false);
     }

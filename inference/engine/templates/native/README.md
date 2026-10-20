@@ -51,8 +51,8 @@ reasoning detection classifies it as non-reasoning rather than fixed reasoning.
 
 Patch 0026 makes every template's tool format yield a grammar the compiler accepts, or no tool
 support. LFM2.5 templates are recognized by their `<|tool_call_start|>[...]<|tool_call_end|>` call
-markup rather than by how the tool list is spelled, so finetunes that write
-`"List of tools: " + tools | tojson` keep the LFM2.5 handler. A format the generic analysis cannot
+markup, so finetunes that write `"List of tools: " + tools | tojson` keep the LFM2.5 handler, or by
+the `"List of tools: ["` literal of a template that leaves calls to the model, as LFM2.5 1.2B does. A format the generic analysis cannot
 separate from its probe calls (a marker holding a probe name or value, or a tagged argument value
 with no closing marker) is no tool format: tools render into the prompt, the reply reads as content,
 and no tool grammar is built. A rule matching only the empty string is spelled `""`, since a bare
