@@ -1343,6 +1343,9 @@ impl ModelContext<'_> {
             .chain(projector.iter())
             .map(|file| file.size_bytes)
             .sum();
+        // Only a model that serves is enriched; one that can't serve has no drafter to await.
+        let drafter_pending =
+            matches!(choice, DrafterChoice::Auto) && !enrichment_known && configuration.is_ok();
         Some(ProjectedModel {
             locations: group
                 .occurrences
@@ -1351,10 +1354,7 @@ impl ModelContext<'_> {
                 .collect(),
             lineage_repository: group.lineage_repository(),
             candidate_drafters,
-            // Only a model that serves is enriched; one that can't serve has no drafter to await.
-            drafter_pending: matches!(choice, DrafterChoice::Auto)
-                && !enrichment_known
-                && configuration.is_ok(),
+            drafter_pending,
             awaited_drafter: None,
             managed_packages: group
                 .occurrences
@@ -1373,6 +1373,7 @@ impl ModelContext<'_> {
                 files,
                 size_bytes,
                 projector,
+                drafter_pending: drafter_pending && drafter.is_none(),
                 drafter: drafter.map(|drafter| drafter.attached),
                 // A model whose drafter is turned off is offered none.
                 recommended_drafter: enriched
@@ -1397,22 +1398,23 @@ impl ModelContext<'_> {
             return None;
         };
         let primary = declaration.target.first()?;
-        let resolved = self
+        let choice = self
             .configuration
             .drafters
             .iter()
             .find(|attachment| attachment.model_id == declaration.model_id)
-            .and_then(|attachment| match &attachment.drafter {
-                DrafterChoice::Reference { reference, method } => Some(resolve_drafter(
-                    reference.clone(),
-                    method.clone(),
-                    self.enrichment.drafter_content(reference),
-                    self.catalog,
-                    self.catalog_drafters,
-                    self.occurrences,
-                )),
-                DrafterChoice::Auto | DrafterChoice::None => None,
-            });
+            .map_or(DrafterChoice::Auto, |attachment| attachment.drafter.clone());
+        let resolved = match &choice {
+            DrafterChoice::Reference { reference, method } => Some(resolve_drafter(
+                reference.clone(),
+                method.clone(),
+                self.enrichment.drafter_content(reference),
+                self.catalog,
+                self.catalog_drafters,
+                self.occurrences,
+            )),
+            DrafterChoice::Auto | DrafterChoice::None => None,
+        };
         // The drafter it downloads with its target is in use while the target is still arriving.
         let awaited_drafter = resolved
             .as_ref()
@@ -1452,6 +1454,7 @@ impl ModelContext<'_> {
                 size_bytes: 0,
                 projector: None,
                 drafter,
+                drafter_pending: choice == DrafterChoice::Auto,
                 recommended_drafter: None,
                 license: None,
                 profile: ServingProfile {
@@ -7089,6 +7092,72 @@ mod tests {
                 license: None,
             }
         }
+    }
+
+    /// Right after a restart, before the lookup has an answer for it, a model whose drafter is
+    /// automatic reports its drafter as not worked out yet rather than none, then the drafter the
+    /// answer names. A model whose drafter is turned off is never pending.
+    #[tokio::test]
+    async fn an_automatic_drafter_is_pending_until_the_lookup_answers() {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("target.gguf"), "target");
+        write_dflash_drafter(&folder.join("drafter.gguf"), "drafter");
+        let target = local_id(&folder.join("target.gguf"));
+        fixture
+            .resolver
+            .set_custom_model_enrichment(Arc::new(NotWorkedOut));
+        fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &folder)]))
+            .await;
+        let listed = fixture.local.list_local().await.unwrap();
+        let model = listed
+            .models
+            .iter()
+            .find(|model| model.model_id == target)
+            .unwrap();
+        assert_eq!(model.drafter, None);
+        assert!(model.drafter_pending, "no answer yet is not no drafter");
+
+        fixture
+            .resolver
+            .set_custom_model_enrichment(Arc::new(Recommends {
+                drafter: folder.join("drafter.gguf"),
+                variant_of: "qwen3.6-35b-a3b:gguf:q4".parse().unwrap(),
+                method: SpeculativeMethod::DFlash,
+            }));
+        let listed = fixture.local.refresh_local().await.unwrap();
+        let model = listed
+            .models
+            .iter()
+            .find(|model| model.model_id == target)
+            .unwrap();
+        assert_eq!(
+            model.drafter.as_ref().map(|drafter| drafter.state.clone()),
+            Some(AttachedDrafterState::Ready)
+        );
+        assert!(!model.drafter_pending);
+
+        fixture
+            .resolver
+            .set_custom_model_enrichment(Arc::new(NotWorkedOut));
+        let listed = fixture
+            .apply(LocalModelsConfiguration {
+                roots: vec![root(ModelRootKind::Folder, &folder)],
+                drafters: vec![DrafterAttachment {
+                    model_id: target.clone(),
+                    drafter: DrafterChoice::None,
+                }],
+                ..LocalModelsConfiguration::default()
+            })
+            .await;
+        let model = listed
+            .models
+            .iter()
+            .find(|model| model.model_id == target)
+            .unwrap();
+        assert_eq!(model.drafter, None);
+        assert!(!model.drafter_pending, "a drafter turned off is none");
     }
 
     #[tokio::test]

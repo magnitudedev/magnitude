@@ -472,6 +472,14 @@ describe("models status variant and drafter columns", () => {
     expect(rowOf(output, catalog.modelId)).toMatch(/Catalog\s+—\s+—\s/)
   })
 
+  it("shows an automatic drafter that isn't worked out yet as being found, never as none", () => {
+    const pending = makeFoundModel({ drafterPending: true, recommendedDrafter: Option.none() })
+    expect(rowOf(renderModelsStatus(statusView({ models: [pending] })), FOUND_MODEL_ID)).toMatch(/qwen-test:gguf:q4\s+Finding drafter…\s/)
+    const output = renderModelDetail({ model: pending, models: [], drafters: { _tag: "Listed", candidates: [] }, hidden: false })
+    expect(output).toMatch(/^ {2}Drafter\s+Finding drafter…$/m)
+    expect(output).not.toMatch(/^ {2}Drafter\s+None/m)
+  })
+
   it("names the variant by its ID when the catalog doesn't list it", () => {
     const output = renderModelsStatus(statusView({ models: [makeFoundModel()] }))
     expect(rowOf(output, FOUND_MODEL_ID)).toMatch(/Hugging Face cache\s+qwen-test:gguf:q4\s/)

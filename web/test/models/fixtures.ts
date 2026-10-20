@@ -78,6 +78,7 @@ export const customModel = (origin: CustomModelOrigin, overrides: Partial<Custom
   origin,
   presentation: { displayName: "Qwen3.6 35B A3B Uncensored", variantLabel: ModelVariantLabelSchema.make("Q4_K_P"), sourceLabel: sourceLabel(origin), variantOf: Option.some(catalogId), license: Option.none(), sourceUrls: [] },
   drafter: Option.none(),
+  drafterPending: false,
   drafterChoice: { _tag: "Auto" },
   recommendedDrafter: Option.none(),
   acquisitionState: origin._tag === "Added"

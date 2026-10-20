@@ -32,6 +32,7 @@ export const nativeCustomModel = (overrides: Readonly<Record<string, unknown>> =
     origin: { _tag: "Found", source: { _tag: "LmStudio" } },
     files: [{ path: "/models/found-Q8_0.gguf", sizeBytes: 1_000 }],
     sizeBytes: 1_000,
+    drafterPending: false,
     profile: { contextLength: 32_768 },
     state: {
       _tag: "Ready",

@@ -5,7 +5,7 @@ import { ArrowClockwiseIcon, ArrowUpRightIcon, CaretDownIcon, DotsThreeVerticalI
 import {
   catalogComponentName, catalogComponentOffers, catalogModelReplacement, customModelDrafterOffer,
   formatLocalModelDisplayName, formatMemorySize, formatStorageSize, localModelFacts,
-  localModelIsInstalled, localModelMemoryUse, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory, removalKind,
+  localModelIsInstalled, localModelMemoryUse, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory, PENDING_DRAFTER_LABEL, removalKind,
   useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus,
 } from "@magnitudedev/client-common"
 import { customModelSourceLabel, localModelDeprecation, type CatalogLocalModel, type LocalInferenceHardware, type LocalModel } from "@magnitudedev/sdk"
@@ -144,6 +144,7 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
       }} />
       case "Adding": return <span className="tabular-nums text-blue-700 dark:text-blue-300">Adding · {drafterState.percent === null ? "Preparing" : `${drafterState.percent}%`}</span>
       case "Withheld": return <span className="text-slate-500" title={drafterState.note}>Off · doesn’t fit</span>
+      case "Pending": return <span className="text-slate-500">{PENDING_DRAFTER_LABEL}</span>
       case "Unknown": return <span className="text-slate-500">—</span>
       case "Attached":
       case "None": {

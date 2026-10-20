@@ -267,6 +267,7 @@ export const makeFoundModel = (overrides: Partial<CustomLocalModel> = {}): Custo
   origin: { _tag: "Found", source: { _tag: "HuggingFaceCache" } },
   presentation: customPresentation("Hugging Face cache"),
   drafter: Option.none(),
+  drafterPending: false,
   drafterChoice: { _tag: "Auto" },
   recommendedDrafter: Option.some(makeDrafterCandidate()),
   acquisitionState: {

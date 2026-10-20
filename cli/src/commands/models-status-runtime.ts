@@ -4,6 +4,7 @@ import {
   catalogDrafterWithheldNote,
   catalogVariantOfName,
   customModelDrafterOffer,
+  PENDING_DRAFTER_LABEL,
   formatLocalModelDisplayName,
   formatModelLoadPercentage,
   formatModelOptimization,
@@ -214,7 +215,10 @@ const variantOfLabel = (model: LocalModel, models: readonly LocalModel[]): Optio
       onSome: (name) => `${name} (${variantOf})`,
     }))
 
-/** The attached drafter, "Turned off", or the recommended drafter's offer when it isn't the one attached. */
+/**
+ * The attached drafter, "Turned off", that the automatic one is still being found, or the recommended drafter's offer
+ * when it isn't the one attached.
+ */
 const drafterSummary = (model: CustomLocalModel): Option.Option<string> => Option.match(model.drafter, {
   onSome: (drafter) => Option.some([
     drafter.name,
@@ -223,7 +227,9 @@ const drafterSummary = (model: CustomLocalModel): Option.Option<string> => Optio
   ].join(" · ")),
   onNone: () => model.drafterChoice._tag === "None"
     ? Option.some(DRAFTER_TURNED_OFF)
-    : Option.map(customModelDrafterOffer(model), ({ label }) => label),
+    : model.drafterPending
+      ? Option.some(PENDING_DRAFTER_LABEL)
+      : Option.map(customModelDrafterOffer(model), ({ label }) => label),
 })
 
 /** Catalog models on this computer or with local work, and every custom model the service lists. */
@@ -361,7 +367,7 @@ const customSourceDetail = (model: CustomLocalModel): string => {
   }
 }
 
-const attachedDrafterLabel = (model: CustomLocalModel): string => Option.isNone(model.drafter) && model.drafterChoice._tag === "Auto"
+const attachedDrafterLabel = (model: CustomLocalModel): string => Option.isNone(model.drafter) && model.drafterChoice._tag === "Auto" && !model.drafterPending
   ? Option.match(customModelDrafterOffer(model), { onNone: () => "None", onSome: ({ label }) => `None · ${label}` })
   : Option.getOrElse(drafterSummary(model), () => "None")
 

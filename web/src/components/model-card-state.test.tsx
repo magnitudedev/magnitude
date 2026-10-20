@@ -35,6 +35,10 @@ describe("model card drafter", () => {
     expect(modelCardDrafter(customModel(added, { recommendedDrafter: Option.some(drafterCandidate()) }))).toEqual({ _tag: "Add" })
     expect(modelCardDrafter(customModel(added, { drafterChoice: { _tag: "None" }, recommendedDrafter: Option.some(drafterCandidate()) }))).toEqual({ _tag: "None", changeable: true })
   })
+  it("shows an automatic drafter that isn't worked out yet as pending, never as none", () => {
+    expect(modelCardDrafter(customModel(imported, { drafterPending: true }))).toEqual({ _tag: "Pending" })
+    expect(modelCardDrafter(customModel(added, { drafterPending: true, recommendedDrafter: Option.some(drafterCandidate()) }))).toEqual({ _tag: "Pending" })
+  })
   it("shows a drafter-only download's progress in the cell", () => {
     const downloading = attachedDrafter({ _tag: "Downloading", progress: { stage: "downloading", completedBytes: 450, totalBytes: 900, bytesPerSecond: Option.none() } })
     expect(modelCardDrafter(customModel(added, { drafter: Option.some(downloading) }))).toEqual({ _tag: "Adding", percent: 50 })

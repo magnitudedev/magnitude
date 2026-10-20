@@ -154,7 +154,8 @@ Custom models follow [the local-model product projection](../model-management/lo
   model's repository pinned to its commit), Variant of, and the drafter's name with Change and Turn
   off for every custom model. A custom model with no drafter,
   when one is recommended, shows "Faster with a drafter · Add (size)" on its card and in Details;
-  one click downloads only the drafter. Catalog models never offer a drafter change. There is no way to
+  one click downloads only the drafter. One whose automatic drafter isn't worked out yet shows
+  "Finding drafter…", never no drafter. Catalog models never offer a drafter change. There is no way to
   add a single GGUF file; files on this computer come only from the scanned locations and added folders.
 - **Repeated reasons** are said once: many unrecognized tensors read "Has parts Magnitude doesn't
   recognize (60 tensors)", in My Models, the repository step and the CLI alike. The count is of

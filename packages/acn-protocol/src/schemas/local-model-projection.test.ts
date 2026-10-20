@@ -7,6 +7,7 @@ const addedModel = (servingState: unknown) => Schema.decodeUnknownSync(LocalMode
   _tag: "Custom",
   modelId: "hf:owner/repository/model.gguf",
   origin: { _tag: "Added", repository: "owner/repository", commit: "a".repeat(40) },
+  drafterPending: false,
   drafterChoice: { _tag: "Auto" },
   presentation: { displayName: "Model", variantLabel: "Q4_K_M", sourceLabel: "Hugging Face", sourceUrls: [] },
   acquisitionState: {

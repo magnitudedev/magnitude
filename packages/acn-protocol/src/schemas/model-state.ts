@@ -1097,11 +1097,16 @@ export const CatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
 })
 export type CatalogLocalModel = typeof CatalogLocalModelSchema.Type
 
+/**
+ * A model on this computer that is not a catalog model. `drafterPending`: its drafter choice is automatic and its
+ * automatic drafter isn't worked out yet, so it has no drafter for now rather than none.
+ */
 export const CustomLocalModelSchema = Schema.TaggedStruct("Custom", {
   modelId: CustomFormModelIdSchema,
   origin: CustomModelOriginSchema,
   presentation: CustomModelPresentationSchema,
   drafter: Schema.optionalWith(AttachedDrafterSchema, { as: "Option", exact: true }),
+  drafterPending: Schema.Boolean,
   drafterChoice: DrafterChoiceSchema,
   recommendedDrafter: Schema.optionalWith(DrafterCandidateSchema, { as: "Option", exact: true }),
   acquisitionState: CustomModelAcquisitionStateSchema,

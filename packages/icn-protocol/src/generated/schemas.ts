@@ -1018,6 +1018,7 @@ export const CustomModel = S.Struct({
     S.suspend((): S.Schema<AttachedDrafter, AttachedDrafterEncoded> => AttachedDrafter),
     { exact: true, as: "Option" },
   ),
+  drafterPending: S.Boolean,
   files: S.Array(S.suspend((): S.Schema<CustomModelFile, CustomModelFileEncoded> => CustomModelFile)),
   license: S.optionalWith(S.String, { exact: true, as: "Option" }),
   modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),

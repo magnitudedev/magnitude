@@ -4856,13 +4856,14 @@
       },
       "CustomModel": {
         "type": "object",
-        "description": "A model on this computer that is not a catalog model. `update_commit` is set only for an added\nmodel whose repository's `main` has moved to a commit where its target file has other content.",
+        "description": "A model on this computer that is not a catalog model. `drafter_pending`: its drafter choice is\nautomatic and its automatic drafter isn't worked out yet, so it has no drafter for now rather\nthan none. `update_commit` is set only for an added model whose repository's `main` has moved to\na commit where its target file has other content.",
         "required": [
           "modelId",
           "origin",
           "displayName",
           "files",
           "sizeBytes",
+          "drafterPending",
           "profile",
           "state"
         ],
@@ -4898,6 +4899,9 @@
           },
           "drafter": {
             "$ref": "#/components/schemas/AttachedDrafter"
+          },
+          "drafterPending": {
+            "type": "boolean"
           },
           "recommendedDrafter": {
             "$ref": "#/components/schemas/DrafterCandidate"

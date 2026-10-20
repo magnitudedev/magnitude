@@ -1648,8 +1648,10 @@ pub struct DrafterAttachment {
     pub drafter: DrafterChoice,
 }
 
-/// A model on this computer that is not a catalog model. `update_commit` is set only for an added
-/// model whose repository's `main` has moved to a commit where its target file has other content.
+/// A model on this computer that is not a catalog model. `drafter_pending`: its drafter choice is
+/// automatic and its automatic drafter isn't worked out yet, so it has no drafter for now rather
+/// than none. `update_commit` is set only for an added model whose repository's `main` has moved to
+/// a commit where its target file has other content.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1671,6 +1673,7 @@ pub struct CustomModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub drafter: Option<AttachedDrafter>,
+    pub drafter_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub recommended_drafter: Option<DrafterCandidate>,

@@ -561,6 +561,7 @@ export const customModel = (inputs: CustomModelInputs): Option.Option<CustomLoca
       sourceUrls: sourceUrls(entry.id),
     },
     drafter,
+    drafterPending: entry.source.drafterPending,
     drafterChoice: inputs.drafterChoice,
     recommendedDrafter: Option.flatMap(entry.source.recommendedDrafter, (candidate) => Option.flatMap(
       productDrafterReference(candidate.reference),

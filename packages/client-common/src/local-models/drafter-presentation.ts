@@ -58,6 +58,12 @@ export const candidateDownloadBytes = (
 }
 
 /**
+ * What a custom model whose automatic drafter isn't worked out yet shows in place of its drafter, so it never reads
+ * as having none.
+ */
+export const PENDING_DRAFTER_LABEL = "Finding drafter…"
+
+/**
  * "Faster with a drafter · Add (0.9 GB)" for a custom model whose recommended drafter isn't attached: none is, or,
  * under automatic choice, a lesser one on this computer serves meanwhile (its built-in heads, say). Never once its
  * drafter was turned off or chosen.

@@ -45,7 +45,8 @@ instances separately, then publishes one `LocalModel` union:
 
 - `Catalog` contains catalog membership and managed acquisition state.
 - `Custom` carries its `origin` (`Added`, `Imported`, or `Found` with its source), the catalog model
-  it is a variant of, its attached and recommended drafters, serving
+  it is a variant of, its attached and recommended drafters (and `drafterPending` while its automatic
+  drafter isn't worked out yet, which is never shown as no drafter), serving
   state, and, for `Added` only, managed acquisition state. ICN names it: the repository's name when
   the file has a Hub identity (as the repository step does), else the first of the GGUF's
   `general.name`, the file name, and the header's one declared base model (`general.base_model.0.name`

@@ -54,6 +54,7 @@ const foundModel = {
   _tag: "Custom",
   modelId: "hf:owner/repository/model.gguf",
   origin: { _tag: "Found", source: { _tag: "HuggingFaceCache" } },
+  drafterPending: false,
   drafterChoice: { _tag: "Auto" },
   presentation: {
     displayName: "Model",

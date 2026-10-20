@@ -85,6 +85,13 @@ describe("custom model rows", () => {
       .toEqual(Option.none())
   })
 
+  it("keeps an automatic drafter ICN hasn't worked out yet apart from no drafter", () => {
+    const pending = Option.getOrThrow(customModel(inputs(customSource(nativeCustomModel({ drafterPending: true })))))
+    expect(pending.drafter).toEqual(Option.none())
+    expect(pending.drafterPending).toBe(true)
+    expect(Option.getOrThrow(customModel(inputs())).drafterPending).toBe(false)
+  })
+
   it("names a model by ICN's display name and the quantization its file names", () => {
     const row = Option.getOrThrow(customModel(inputs(customSource(nativeCustomModel({
       displayName: "MiniCPM5 1B",

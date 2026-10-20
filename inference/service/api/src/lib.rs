@@ -2962,6 +2962,7 @@ mod tests {
             size_bytes: 100,
             projector: None,
             drafter: None,
+            drafter_pending: false,
             recommended_drafter: None,
             license: None,
             profile: ServingProfile {

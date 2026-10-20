@@ -1755,6 +1755,7 @@ fn custom_model(model_id: ModelId, size_bytes: u64) -> CustomModel {
         size_bytes,
         projector: None,
         drafter: None,
+        drafter_pending: false,
         recommended_drafter: None,
         license: None,
         profile: ServingProfile {

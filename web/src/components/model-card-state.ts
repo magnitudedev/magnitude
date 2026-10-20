@@ -16,11 +16,13 @@ export type ModelCardDrafter =
   | { readonly _tag: "Attached"; readonly label: string; readonly title: string; readonly changeable: boolean; readonly update: boolean }
   | { readonly _tag: "None"; readonly changeable: boolean }
   | { readonly _tag: "Withheld"; readonly note: string }
+  | { readonly _tag: "Pending" }
   | { readonly _tag: "Unknown" }
 
 /**
  * A catalog model offers its catalog drafter or shows the one it serves with; a custom model shows its attached
- * drafter (changeable, with Update when a newer revision exists), the recommended one to add, or None to choose one.
+ * drafter (changeable, with Update when a newer revision exists), that its automatic drafter is still being found,
+ * the recommended one to add, or None to choose one.
  */
 export const modelCardDrafter = (model: LocalModel): ModelCardDrafter => {
   const method = localModelSpeculativeMethodLabel(model)
@@ -41,6 +43,7 @@ export const modelCardDrafter = (model: LocalModel): ModelCardDrafter => {
     return { _tag: "Adding", percent: progress.totalBytes > 0 ? Math.floor(progress.completedBytes * 100 / progress.totalBytes) : null }
   }
   if (attached !== undefined) return { _tag: "Attached", label: Option.getOrElse(method, () => attached.name), title: attached.name, changeable: true, update: drafterUpdateAvailable(model) }
+  if (model.drafterPending) return { _tag: "Pending" }
   return Option.match(customModelDrafterOffer(model), {
     onNone: (): ModelCardDrafter => ({ _tag: "None", changeable: true }),
     onSome: (): ModelCardDrafter => ({ _tag: "Add" }),

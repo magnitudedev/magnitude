@@ -167,7 +167,12 @@ download; clients say the drafter is off because the model fits only without it.
   or removed; a configuration change), never kept until a restart. While a model's recompute is
   pending (its target package changed, say, when a projector appeared beside it), its previous answer
   stands, so an attached drafter is never shown as none in the meantime; a model with no answer yet
-  is computed before the others are recomputed. What is on this computer decides first and never
+  is computed before the others are recomputed. A model whose choice is automatic and that has no
+  drafter while its automatic drafter isn't worked out yet (right after a restart, or as an added
+  model's target lands, until the lookup answers for it) is reported as `drafterPending`, which ICN,
+  ACN and every client keep apart from having no drafter: clients show "Finding drafter…", never
+  none. A drafter already worked out keeps answering instead, and a turned-off or chosen drafter is
+  never pending. What is on this computer decides first and never
   waits for the Hub: a model with no Hub-reaching answer gets one from its own files, the release
   catalog and Hub answers already cached (its shape's "Variant of", drafters in its folder, its
   built-in heads, the catalog drafter it matches by shape or by lineage its header or its
