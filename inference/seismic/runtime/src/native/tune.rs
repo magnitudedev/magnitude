@@ -1495,6 +1495,11 @@ impl<'m> Formation<'_, 'm> {
         self.rendered(formable).class(self.device)
     }
 
+    /// Whether forming `formable` renders any program for a toolchain.
+    fn compiles(&self, formable: &Formable) -> bool {
+        !matches!(self.rendered(formable), Rendered::Sources(sources) if sources.is_empty())
+    }
+
     /// The programs the one call forming `formable` forms, rendered once
     /// for the unit ([`Rendered`]).
     fn rendered(&self, formable: &Formable) -> Rendered {
@@ -3302,6 +3307,18 @@ impl Piece {
             Piece::Sweep { ahead, .. } => ahead,
         }
     }
+
+    /// Measure only the first challenger: a whole piece's others are
+    /// planned again, a sweep's follow it.
+    fn keep_first(&mut self) {
+        match self {
+            Piece::Whole(challengers) => challengers.truncate(1),
+            Piece::Sweep { ready, ahead, .. } => {
+                let rest = ready.split_off(ready.len().min(1));
+                ahead.splice(0..0, rest);
+            }
+        }
+    }
 }
 
 /// A unit's search as it runs on the device: the order it asks its domain
@@ -3578,12 +3595,23 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// What `piece` compiles before it measures, and so what may be
     /// compiled ahead of it: the launch sources its challengers run that no
     /// held program has, or the programs of its challengers not yet
-    /// formed.
+    /// formed. A formation that renders no program (every CPU
+    /// implementation: its kernels are compiled into the binary) compiles
+    /// nothing: the piece prepares it as it starts, for nothing a compile
+    /// is priced by. Quoted as a compile, its first call was an operation
+    /// of a class not yet observed, priced at the load's longest operation
+    /// (6 s on an EPYC 9V45 tuning gemma-4-e2b), and every unit's first
+    /// piece waited behind that forecast while a unit whose formation had
+    /// been observed took the device for the rest of the minute.
     fn compiled_ahead(&self, searching: &Searching<'a>, piece: &Piece) -> Vec<Formable> {
+        let formation = self.formation();
         searching
             .run
             .programs
             .formables(&self.implementation, piece.challengers(), piece.ahead())
+            .into_iter()
+            .filter(|formable| formation.compiles(formable))
+            .collect()
     }
 
     /// The compile of the unit's next piece of work
@@ -4712,6 +4740,21 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .planning
             .observe(search.requests - asked, began.elapsed().as_secs_f64());
         searching.planned = planned?;
+        // A sweep's chunk shares one compile among its challengers. A CPU
+        // unit compiles nothing (its kernels are in the binary), so its
+        // pieces measure one challenger each: a chunk would only take the
+        // device from every other unit for its whole session and, cut off
+        // at the deadline, keep none of its challengers. Its matched rounds
+        // sample the served choice beside each challenger either way. On an
+        // EPYC 9V45 a 12-challenger dense_expand chunk of gemma-4-e2b,
+        // priced 21 s from the default's samples, ran 39 s to the cutoff
+        // without completing a round (its single-participant challengers
+        // sample 7 s at 512 rows) and recorded nothing.
+        if matches!(self.device.kind, crate::backends::OpenedKind::Cpu(_)) {
+            if let Some(piece) = &mut searching.planned {
+                piece.keep_first();
+            }
+        }
         Ok(())
     }
 

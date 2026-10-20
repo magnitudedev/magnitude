@@ -322,6 +322,9 @@ revoke that admission. Discovery remains bounded by its allocated fair slice. In
 defaults; exact cost ties retain the seed mapping. A group's other candidates are formed and measured a chunk at a time, so a step can end
 between chunks; a later step uses the same order, takes what earlier steps measured and measures
 only what is missing.
+A chunk exists to share a compile. Where nothing compiles at run time (the CPU backend, whose
+kernels are in the binary), preparing a candidate is part of measuring it rather than a compile
+ahead of it, and each chunk is one candidate.
 The search runs within the consumer's limit, less what confirming the
 assembled choice and validating it at untimed points will cost; when that time ends, unmeasured
 groups keep their defaults, an interrupted group's measured candidates are
