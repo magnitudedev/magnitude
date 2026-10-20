@@ -251,11 +251,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Commit state backing for a launch before its capacity check: the rows
     /// and successor banks its operations will claim, placed so histories
     /// keep growing in place. A refused minimum grant returns a byte deficit.
-    /// Histories at the segment limit are repacked first.
+    /// Histories at the segment limit are repacked first. With a `ceiling`,
+    /// growth that would take the stores' committed state past it grows
+    /// nothing and returns [`DomainError::StateCeiling`].
     pub fn provision(
         &mut self,
         bindings: &mut StateBindings<F>,
         operations: &[Operation],
+        ceiling: Option<u64>,
     ) -> Result<(), DomainError> {
         fn primed(operation: &Operation) -> Option<&Priming> {
             match operation {
@@ -320,6 +323,33 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 _ => {}
             }
         }
+        if let Some(ceiling) = ceiling {
+            let mut growth = 0u64;
+            if target_banks != 0 {
+                growth = bindings
+                    .store(false)?
+                    .growth_claim(&target, target_banks)?
+                    .minimum_bytes;
+            }
+            if head_banks != 0 && self.head_store.is_some() {
+                growth = growth
+                    .checked_add(
+                        bindings
+                            .store(true)?
+                            .growth_claim(&head, head_banks)?
+                            .minimum_bytes,
+                    )
+                    .ok_or_else(|| DomainError::invariant("state growth overflows"))?;
+            }
+            let committed = self.committed_state_bytes();
+            if growth != 0 && committed.saturating_add(growth) > ceiling {
+                return Err(DomainError::StateCeiling {
+                    committed,
+                    growth,
+                    ceiling,
+                });
+            }
+        }
         // Stores without history domains still grow banks.
         if target_banks != 0 {
             self.grant_state_growth(bindings, false, &target, target_banks)?;
@@ -344,6 +374,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None => return Ok(()),
         };
         self.provision_output(lane)
+    }
+
+    /// The state the stores commit: every history and bank slab they back,
+    /// whether a holder references it or not.
+    pub fn committed_state_bytes(&self) -> u64 {
+        self.target_store.committed_bytes()
+            + self
+                .head_store
+                .as_ref()
+                .map_or(0, |store| store.committed_bytes())
     }
 
     /// Grow the vision storage of `patch_rows`'s class by an activation and

@@ -120,8 +120,12 @@ plans.
    path. The branch point is where its last turn began (the point opening its user message): a
    template that renders earlier replies anew once a new user message arrives (Qwen3.5 drops
    their empty reasoning blocks) makes the next turn diverge at that turn's first reply, so it
-   resumes there. A conversation therefore never grows the load past its verdict however many
-   requests it makes, and beyond the fit depth it keeps exactly what its next turn resumes from.
+   resumes there. The same entries are released, in the same order, before state growth would take
+   the stores' committed state (whole slabs, the unreferenced rows of every page a history holds
+   included) past that workload state, so the growth takes their rows and banks instead. A
+   conversation therefore never grows the load past its verdict however many requests it makes,
+   nor do many distinct conversations, and beyond the fit depth it keeps exactly what its next turn
+   resumes from.
    Under memory pressure every entry without submitted use is released, these included, before
    anything else is given up.
 
@@ -137,3 +141,5 @@ plans.
 - Every charged byte stays attributed while prefixes are cached, used and evicted.
 - Across any number of growing turns of one conversation, the state the stores occupy stays within
   the workload state the plan charges, and each turn still resumes at the previous reply.
+- Across any number of distinct conversations, the state the stores commit stays within the
+  workload state the plan charges.

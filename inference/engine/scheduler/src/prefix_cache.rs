@@ -247,6 +247,10 @@ impl<S> PrefixCache<S> {
         self.capacity.max_entries
     }
 
+    pub const fn workload_state_bytes(&self) -> u64 {
+        self.capacity.workload_state_bytes
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -440,22 +444,38 @@ impl<S> PrefixCache<S> {
         mut occupied: impl FnMut(&Self) -> Result<u64, E>,
     ) -> Result<usize, E> {
         let mut released = 0;
-        while occupied(self)? > self.capacity.workload_state_bytes {
-            let spared = self.conversation_checkpoints();
-            let candidate = self
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| entry.submitted == 0 && !spared.contains(&entry.id))
-                .min_by_key(|(_, entry)| entry.last_use)
-                .map(|(index, _)| index);
-            let Some(index) = candidate else {
-                break;
-            };
-            self.entries.remove(index);
+        while occupied(self)? > self.capacity.workload_state_bytes && self.release_unspared() {
             released += 1;
         }
         Ok(released)
+    }
+
+    /// Whether an entry beyond the latest conversation's checkpoints, and in
+    /// no submitted use, could be released.
+    pub fn holds_unspared(&self) -> bool {
+        self.unspared().is_some()
+    }
+
+    /// Drop the least-recently-used entry beyond the latest conversation's
+    /// checkpoints and in no submitted use: what retained state gives back
+    /// before it would make the stores grow past the workload the plan
+    /// charges. Returns whether one was dropped.
+    pub fn release_unspared(&mut self) -> bool {
+        let Some(index) = self.unspared() else {
+            return false;
+        };
+        self.entries.remove(index);
+        true
+    }
+
+    fn unspared(&self) -> Option<usize> {
+        let spared = self.conversation_checkpoints();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.submitted == 0 && !spared.contains(&entry.id))
+            .min_by_key(|(_, entry)| entry.last_use)
+            .map(|(index, _)| index)
     }
 
     /// The checkpoints the plan charges the most recently cached
@@ -630,6 +650,36 @@ mod tests {
 
     fn lookup_any(cache: &mut PrefixCache<Rows>, owned: &Owned) -> Option<PrefixHit> {
         cache.lookup(owned.path(), usize::MAX).unwrap()
+    }
+
+    /// What state growth releases instead of growing: the oldest
+    /// conversations' entries, least recently used first, never the latest
+    /// conversation's checkpoints.
+    #[test]
+    fn growth_releases_older_conversations_before_the_latest_checkpoints() {
+        let mut cache = PrefixCache::new(capacity(16));
+        let conversation = |cache: &mut PrefixCache<Rows>, name: &str, first: u32| {
+            let prompt = text(100, name);
+            let mut finished = text(120, name);
+            finished.prompt[100..].iter_mut().for_each(|token| token.0 += 500);
+            for (owned, position, point, state) in [
+                (&prompt, 99, CachePoint::PromptBoundary, rows(first..first + 99)),
+                (&finished, 120, CachePoint::Terminal, rows(first..first + 120)),
+            ] {
+                assert!(cache
+                    .retain(owned.path(), position, point, state, MethodCheckpoint::Plain)
+                    .unwrap());
+            }
+        };
+        conversation(&mut cache, "a", 0);
+        assert!(!cache.holds_unspared(), "the only conversation is the latest");
+        conversation(&mut cache, "b", 1000);
+        conversation(&mut cache, "c", 2000);
+        assert!(cache.holds_unspared());
+        while cache.release_unspared() {}
+        assert_eq!(cache.len(), 2);
+        assert!(!referenced(0) && !referenced(1000), "the older conversations were released");
+        assert!(referenced(2000), "the latest conversation's checkpoints remain");
     }
 
     #[test]

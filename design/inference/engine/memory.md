@@ -467,7 +467,15 @@ and these banks, `StateCapacityPlan::workload_state_bytes`, the same figure asse
 the most the stores hold for cached prefixes: whenever a newly cached prefix leaves the state that
 every holder occupies (live, in flight, retained and the seed, excluding committed surplus) above it,
 the scheduler releases cached prefixes, least recently used first, until it fits or only the latest
-conversation's three checkpoints remain. A load never holds retained prefixes beyond its verdict merely because it has room;
+conversation's three checkpoints remain. Nor do cached prefixes make the stores grow past it: every
+history holds whole pages, the rows after its end in its last page included, which no other history
+takes and which the occupied state does not count, so each distinct conversation a cached prefix
+keeps pins at least a page per domain (a page is about a 62nd of the context: hundreds of megabytes
+of a long-context model's history, its drafter's included). While a cached prefix beyond those
+checkpoints remains, state growth that would take the stores' committed state (every slab they
+back, referenced or not) past the workload's state releases cached prefixes, least recently used
+first, and takes their rows and banks instead; the stores grow past it only when nothing cached
+could be released. A load never holds retained prefixes beyond its verdict merely because it has room;
 live requests are not limited by this, and retained prefixes are still released before a claim is
 refused. Assessment charges history per domain at slab granularity: a Token domain by the rows of the
 assessed context, and a Window(n) domain by its steady footprint of `n` plus one advance per live

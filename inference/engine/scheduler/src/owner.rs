@@ -428,6 +428,10 @@ fn classify_domain_error(error: DomainError) -> RequestError {
             RequestError::Invariant(error)
         }
         DomainError::TableRead(error) => RequestError::TableRead(error),
+        error @ DomainError::StateCeiling { .. } => RequestError::Invariant(InvariantError {
+            context: "state ceiling",
+            detail: error.to_string(),
+        }),
     }
 }
 
@@ -2248,6 +2252,14 @@ impl<F: ProgramFamily> Service<F> {
         let short = |current: &Result<(), DomainError>| matches!(current, Err(DomainError::Capacity(_)));
         let mut group_ = group_;
         let mut current = self.fits(bindings, &group_);
+        // Retained prefixes never make the stores grow past the workload
+        // state the plan charges: the group takes the rows and banks of the
+        // least recently used ones instead. Once none is left to release,
+        // `fits` sets no ceiling.
+        while matches!(current, Err(DomainError::StateCeiling { .. })) {
+            self.prefix_cache.release_unspared();
+            current = self.fits(bindings, &group_);
+        }
         if short(&current) {
             self.domain
                 .shrink_state(bindings, ShrinkPolicy::Reclaim)
@@ -2301,9 +2313,14 @@ impl<F: ProgramFamily> Service<F> {
 
     /// Whether the group fits now: provision it, then check the reservation
     /// its requirement, derived from the layout it was just provisioned
-    /// into, would take.
+    /// into, would take. While a retained prefix could be released instead,
+    /// state growth stops at the workload state the plan charges.
     fn fits(&mut self, bindings: &mut StateBindings<F>, group_: &OperationGroup) -> Result<(), DomainError> {
-        self.domain.provision(bindings, group_.operations())?;
+        let ceiling = self
+            .prefix_cache
+            .holds_unspared()
+            .then(|| self.prefix_cache.workload_state_bytes());
+        self.domain.provision(bindings, group_.operations(), ceiling)?;
         let requirement = requirements(&self.domain, bindings, group_)?;
         self.domain
             .can_reserve(&requirement)

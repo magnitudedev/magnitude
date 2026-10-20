@@ -86,6 +86,14 @@ pub enum DomainError {
     /// One sequence's table rows could not be read: that sequence fails,
     /// and execution continues.
     TableRead(crate::TableReadError),
+    /// The state growth a group needs would take the stores' committed
+    /// state (`committed` with `growth` more) past the ceiling its caller
+    /// set; nothing grew. The caller releases retained state and retries.
+    StateCeiling {
+        committed: u64,
+        growth: u64,
+        ceiling: u64,
+    },
 }
 
 impl DomainError {
@@ -109,6 +117,14 @@ impl std::fmt::Display for DomainError {
             Self::Device(error) => error.fmt(f),
             Self::Invariant(error) => error.fmt(f),
             Self::TableRead(error) => error.fmt(f),
+            Self::StateCeiling {
+                committed,
+                growth,
+                ceiling,
+            } => write!(
+                f,
+                "state growth of {growth} bytes beside {committed} committed exceeds the {ceiling}-byte state ceiling"
+            ),
         }
     }
 }
@@ -1295,8 +1311,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         // Commit the selected group's numerical backing before a lazy
         // component import. Provisioning grants the physical growth peak
-        // through the heap before any backing allocation.
-        self.provision(bindings, operations)?;
+        // through the heap before any backing allocation. The owner applied
+        // any state ceiling when it selected the group.
+        self.provision(bindings, operations, None)?;
         // Provisioning may relocate a shared tail into a fresh page. Recompute
         // row demand against that layout: the next append can now fit in place.
         let requirements = self.requirements(bindings, operations)?;

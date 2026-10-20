@@ -308,6 +308,43 @@ fn a_growing_conversation_stays_within_the_charged_workload_state() {
     }
 }
 
+/// Distinct conversations, each retaining its own checkpoints (a recurrent
+/// model pins a bank per cached prefix), never make the state stores commit
+/// more than the workload state the plan charges: once retained prefixes
+/// fill it, a new conversation takes the backing of the least recently used
+/// ones instead of growing beside them. Holding only what holders occupy
+/// within it is not enough: the slabs a new conversation grew while the
+/// retained prefixes stood stay committed after its own caching releases
+/// them.
+#[test]
+#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+fn distinct_conversations_commit_no_state_beyond_the_charged_workload() {
+    let resolved = resolved(false);
+    let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
+    let tokenizer = resolved.host.shared_tokenizer();
+    let (domain, bindings, plan) =
+        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+    let workload = plan.capacity().workload_state_bytes;
+    let mut host = Host::new(|wakes| Owner::with_resource_plan(domain, bindings, limits(), &plan, wakes));
+    let mut released = false;
+    for conversation in 0..24 {
+        let prompt = text(&tokenizer, 200 + conversation, 600);
+        run(&mut host, vocabulary, &[prompt], 12);
+        let charge = host.owner().reconcile_memory_charge().unwrap();
+        let committed =
+            charge.target_state.total() + charge.head_state.map_or(0, |head| head.total());
+        let prefixes = host.owner().cached_prefixes();
+        released |= prefixes < 2 * (conversation as usize + 1);
+        eprintln!("conversation {conversation}: prefixes={prefixes} committed={committed} workload={workload}");
+        assert!(
+            committed <= workload,
+            "conversation {conversation} commits {committed} of {workload}"
+        );
+        assert_eq!(charge.unattributed, 0);
+    }
+    assert!(released, "the conversations filled the workload state");
+}
+
 /// A template that rewrites the previous reply (dropping reasoning, say)
 /// diverges inside it; the next turn resumes one row before the previous
 /// prompt's end.

@@ -728,7 +728,7 @@ fn drafter_work_resolves_its_requests_lookahead_before_provisioning() {
     };
     // The fixture has no drafter weights, so provisioning ends at loading the
     // head component: after the lookahead and every relocation are resolved.
-    match domain.provision(&mut bindings, &[draft]) {
+    match domain.provision(&mut bindings, &[draft], None) {
         Ok(()) => {}
         Err(DomainError::Input(detail)) if detail == "head component is disabled" => {}
         Err(error) => panic!("provisioning drafter work failed: {error}"),
