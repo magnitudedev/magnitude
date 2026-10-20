@@ -3,7 +3,7 @@
 #include "json.h"
 #include <algorithm>
 #include <memory>
-#include <stdexcept>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -87,8 +87,9 @@ class common_peg_text {
 
     // Verify the old output is still a prefix, skipping shared subtrees in O(1).
     // A changed leaf can extend its immutable source range or literal prefix.
-    // Returns only the newly emitted bytes, using the exact upstream JSON encoder.
-    std::string suffix(const common_peg_text & previous, std::string_view input) const {
+    // Returns only the newly emitted bytes, using the exact upstream JSON encoder,
+    // or nothing when this output does not extend the old one.
+    std::optional<std::string> suffix(const common_peg_text & previous, std::string_view input) const {
         std::vector<ptr> old, current;
         if (previous.root) { old.push_back(previous.root); }
         if (root) { current.push_back(root); }
@@ -122,14 +123,14 @@ class common_peg_text {
                                    : p->literal.substr(new_skip, count);
                 auto b = q->source ? escape(std::string(input.substr(q->start + old_skip, count)), q->escaping)
                                    : q->literal.substr(old_skip, count);
-                if (a != b) { throw std::runtime_error("Output parser would change published text"); }
+                if (a != b) { return std::nullopt; }
             }
             new_skip += count; old_skip += count;
             if (new_skip == length) { current.pop_back(); new_skip = 0; }
             if (old_skip == old_length) { old.pop_back(); old_skip = 0; }
         }
-        if (!old.empty()) { throw std::runtime_error("Output parser would retract published text"); }
+        if (!old.empty()) { return std::nullopt; }
         return result;
     }
-    std::string str(std::string_view input) const { return suffix({}, input); }
+    std::string str(std::string_view input) const { return *suffix({}, input); }
 };

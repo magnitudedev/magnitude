@@ -9,6 +9,7 @@ applies_to:
   - inference/engine/chat/src/request.rs
   - inference/engine/chat/src/output.rs
   - inference/engine/chat/src/stream.rs
+  - inference/engine/templates/native/src/output-stream.cpp
   - inference/engine/chat/src/generation.rs
   - inference/engine/generation/src/controls.rs
 ---
@@ -81,7 +82,9 @@ Prompt caching allowed retains exact prompt prefixes; disallowed requests are
 transient.
 
 Stream parsing emits semantic text, reasoning and complete validated tool calls
-in one ordered stream that non-streaming responses also assemble from. An empty
+in one ordered stream that non-streaming responses also assemble from. Published
+output is never reinterpreted: output that ends inside reasoning the model
+never closed ends that reasoning, never failing or becoming content. An empty
 generation is an empty assistant turn in each protocol's native shape, and an
 empty assistant turn in history (that output replayed, or a client's record of
 a step that failed before any output) contributes nothing to the prompt. Each

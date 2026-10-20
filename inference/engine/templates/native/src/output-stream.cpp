@@ -1,8 +1,10 @@
 #include "output-stream.h"
 #include "chat-peg-parser.h"
 
-#include <stdexcept>
+#include <algorithm>
 #include <cctype>
+#include <iterator>
+#include <stdexcept>
 
 namespace templates_native {
 namespace {
@@ -93,20 +95,24 @@ output_stream::output_stream(const common_chat_params & plan, uint64_t limit)
             has_explicit_ids |= tag->tag == common_chat_peg_builder::TOOL_ID;
         }
     }
-    parse(false, true);
+    // The generation prompt's own reading is the baseline, never published.
+    if (auto baseline = read(true)) {
+        publish(*baseline);
+        values.clear();
+        pending_reasoning.clear();
+    }
 }
 
-void output_stream::parse(bool natural, bool baseline) {
+// One complete reading of the output so far. A lenient reading treats the end
+// of the input as a point where more output may follow; a strict one treats it
+// as the end of the output and exists only when the whole output satisfies the
+// parser, every call it holds then being complete.
+std::optional<output_stream::reading> output_stream::read(bool lenient) {
     context.parse_depth = 0;
-    context.flags = natural ? COMMON_PEG_PARSE_FLAG_NONE : COMMON_PEG_PARSE_FLAG_LENIENT;
+    context.flags = lenient ? COMMON_PEG_PARSE_FLAG_LENIENT : COMMON_PEG_PARSE_FLAG_NONE;
     auto result = parser.parse(context);
-    if (natural && (!result.success() || result.end != context.input.size())) {
-        throw std::runtime_error("Naturally completed output does not satisfy its parser");
-    }
-    if (result.fail() && result.nodes.empty()) {
-        if (baseline) { return; }
-        throw std::runtime_error("Output does not match its prepared parser");
-    }
+    if (!lenient && (!result.success() || result.end != context.input.size())) { return std::nullopt; }
+    if (result.fail() && result.nodes.empty()) { return std::nullopt; }
     common_chat_msg message;
     std::vector<text_spans> mapped_arguments;
     std::vector<std::vector<argument_insertion>> mapped_strings;
@@ -125,47 +131,18 @@ void output_stream::parse(bool natural, bool baseline) {
         mapped_arguments = std::move(mapper.arguments);
         mapped_strings = std::move(mapper.strings);
     }
-    auto new_content = message.content_output.suffix(content_output, context.input);
-    auto new_reasoning = message.reasoning_output.suffix(reasoning_output, context.input);
-    content_output = message.content_output;
-    reasoning_output = message.reasoning_output;
-    if (!visible_reasoning) {
-        pending_reasoning += new_reasoning;
-        if (new_reasoning.find_first_not_of(" \n\r\t") != std::string::npos) {
-            visible_reasoning = true;
-            new_reasoning = std::move(pending_reasoning);
-            pending_reasoning.clear();
-        } else {
-            new_reasoning.clear();
-        }
-    }
-    if (baseline) { pending_reasoning.clear(); return; }
-    if (!new_reasoning.empty()) { values.push_back({TEMPLATES_REASONING, 0, std::move(new_reasoning), {}}); }
-    if (!new_content.empty()) { values.push_back({TEMPLATES_CONTENT, 0, std::move(new_content), {}}); }
-
     std::vector<bool> closed;
     context.ast.visit_tags(result, [&](const common_peg_ast_node & node) {
         if (node.tag == common_chat_peg_builder::TOOL) { closed.push_back(!node.is_partial); }
     });
-    if (message.tool_calls.size() < calls.size()) {
-        throw std::runtime_error("Output parser would retract a published tool call");
-    }
-    calls.resize(message.tool_calls.size());
-    for (size_t i = 0; i < calls.size(); ++i) {
-        auto & cursor = calls[i];
+    reading next{message.content_output, message.reasoning_output, {}};
+    next.calls.resize(message.tool_calls.size());
+    for (size_t i = 0; i < next.calls.size(); ++i) {
         const auto & current = message.tool_calls[i];
-        const bool complete = (i < closed.size() && closed[i]) || natural;
-        if (current.name.empty()) { continue; }
-        if (!cursor.started) {
-            if (has_explicit_ids && current.id.empty() && !complete) { continue; }
-            cursor.name = current.name;
-            // Only the model's own ID; the host mints one when the format has none.
-            cursor.id = current.id;
-            cursor.started = true;
-            values.push_back({TEMPLATES_TOOL_START, static_cast<uint32_t>(i), cursor.name, cursor.id});
-        } else if (cursor.name != current.name || (!current.id.empty() && cursor.id != current.id)) {
-            throw std::runtime_error("Output parser changed a published tool identity");
-        }
+        auto & call = next.calls[i];
+        call.name = current.name;
+        call.id = current.id;
+        call.closed = !lenient || (i < closed.size() && closed[i]);
         common_peg_text text = current.argument_output;
         if (text.empty() && i < mapped_arguments.size() && !mapped_arguments[i].empty()) {
             for (const auto & span : mapped_arguments[i]) {
@@ -184,15 +161,88 @@ void output_stream::parse(bool natural, bool baseline) {
             }
             text += current.arguments.substr(offset);
         }
-        auto suffix = text.suffix(cursor.argument_output, context.input);
-        if (!suffix.empty()) {
-            values.push_back({TEMPLATES_TOOL_ARGUMENTS, static_cast<uint32_t>(i), std::move(suffix), {}});
+        call.arguments = std::move(text);
+    }
+    return next;
+}
+
+// Publishes what a reading adds to the published output. A reading that does
+// not extend it (retracting or changing published text, a published call or a
+// call's identity) publishes nothing and is refused.
+bool output_stream::publish(const reading & next) {
+    auto new_content = next.content.suffix(content_output, context.input);
+    auto new_reasoning = next.reasoning.suffix(reasoning_output, context.input);
+    if (!new_content || !new_reasoning) { return false; }
+    for (size_t i = next.calls.size(); i < calls.size(); ++i) {
+        if (calls[i].started) { return false; }
+    }
+    std::vector<event_value> emitted;
+    auto pending = pending_reasoning;
+    bool visible = visible_reasoning;
+    if (!visible) {
+        pending += *new_reasoning;
+        if (new_reasoning->find_first_not_of(" \n\r\t") != std::string::npos) {
+            visible = true;
+            *new_reasoning = std::move(pending);
+            pending.clear();
+        } else {
+            new_reasoning->clear();
         }
-        cursor.argument_output = std::move(text);
-        if (complete && !cursor.complete) {
-            values.push_back({TEMPLATES_TOOL_COMPLETE, static_cast<uint32_t>(i), {}, {}});
+    }
+    if (!new_reasoning->empty()) { emitted.push_back({TEMPLATES_REASONING, 0, std::move(*new_reasoning), {}}); }
+    if (!new_content->empty()) { emitted.push_back({TEMPLATES_CONTENT, 0, std::move(*new_content), {}}); }
+
+    auto cursors = calls;
+    cursors.resize(next.calls.size());
+    for (size_t i = 0; i < cursors.size(); ++i) {
+        auto & cursor = cursors[i];
+        const auto & current = next.calls[i];
+        if (current.name.empty()) { continue; }
+        if (!cursor.started) {
+            if (has_explicit_ids && current.id.empty() && !current.closed) { continue; }
+            cursor.name = current.name;
+            // Only the model's own ID; the host mints one when the format has none.
+            cursor.id = current.id;
+            cursor.started = true;
+            emitted.push_back({TEMPLATES_TOOL_START, static_cast<uint32_t>(i), cursor.name, cursor.id});
+        } else if (cursor.name != current.name || (!current.id.empty() && cursor.id != current.id)) {
+            return false;
+        }
+        auto suffix = current.arguments.suffix(cursor.argument_output, context.input);
+        if (!suffix) { return false; }
+        if (!suffix->empty()) {
+            emitted.push_back({TEMPLATES_TOOL_ARGUMENTS, static_cast<uint32_t>(i), std::move(*suffix), {}});
+        }
+        cursor.argument_output = current.arguments;
+        if (current.closed && !cursor.complete) {
+            emitted.push_back({TEMPLATES_TOOL_COMPLETE, static_cast<uint32_t>(i), {}, {}});
             cursor.complete = true;
         }
+    }
+
+    content_output = next.content;
+    reasoning_output = next.reasoning;
+    pending_reasoning = std::move(pending);
+    visible_reasoning = visible;
+    calls = std::move(cursors);
+    values.insert(values.end(), std::make_move_iterator(emitted.begin()), std::make_move_iterator(emitted.end()));
+    return true;
+}
+
+// The strict reading resolves what the stream withheld at the end of output,
+// such as a provisional delimiter. It never reinterprets published output:
+// when the model ends inside a construct the stream already published from,
+// such as reasoning it never closed, the strict reading backtracks out of that
+// construct and reads it again as something else. The end of output then
+// closes the construct instead, and the published reading stands, provided it
+// leaves no tool call open.
+void output_stream::finish_natural() {
+    if (auto strict = read(false); strict && publish(*strict)) { return; }
+    auto published = read(true);
+    const bool open_call = published && std::any_of(published->calls.begin(), published->calls.end(),
+        [](const call_reading & call) { return !call.closed; });
+    if (!published || open_call || !publish(*published)) {
+        throw std::runtime_error("Naturally completed output does not satisfy its parser");
     }
 }
 
@@ -220,7 +270,9 @@ templates_events output_stream::feed(const uint8_t * bytes, uint64_t size) {
         if (complete) {
             context.input.append(utf8_pending, 0, complete);
             utf8_pending.erase(0, complete);
-            parse(false);
+            auto next = read(true);
+            if (!next) { throw std::runtime_error("Output does not match its prepared parser"); }
+            if (!publish(*next)) { throw std::runtime_error("Output parser would change published output"); }
         }
         return batch();
     } catch (...) {
@@ -240,7 +292,7 @@ templates_events output_stream::finish(uint32_t cause) {
     try {
         if (cause == TEMPLATES_NATURAL) {
             if (!utf8_pending.empty()) { throw std::invalid_argument("Naturally completed output ends inside UTF-8"); }
-            parse(true);
+            finish_natural();
         }
         values.push_back({TEMPLATES_FINISH, cause, {}, {}});
         return batch();

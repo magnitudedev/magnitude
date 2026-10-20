@@ -3,6 +3,8 @@
 #include "chat.h"
 #include "templates.h"
 
+#include <optional>
+
 namespace templates_native {
 
 using text_spans = std::vector<std::pair<size_t, size_t>>;
@@ -18,6 +20,17 @@ class output_stream {
         uint32_t index;
         std::string text;
         std::string id;
+    };
+    struct call_reading {
+        std::string name;
+        std::string id;
+        common_peg_text arguments;
+        bool closed = false;
+    };
+    struct reading {
+        common_peg_text content;
+        common_peg_text reasoning;
+        std::vector<call_reading> calls;
     };
     struct call_cursor {
         std::string name;
@@ -42,7 +55,9 @@ class output_stream {
     std::vector<event_value> values;
     std::vector<templates_event> events;
 
-    void parse(bool natural, bool baseline = false);
+    std::optional<reading> read(bool lenient);
+    bool publish(const reading & next);
+    void finish_natural();
 
     templates_events batch();
 };

@@ -212,3 +212,51 @@ fn required_tools_fail_explicitly_and_every_schema_prepares() {
         }]
     );
 }
+
+/// Qwen3.5's prompt opens reasoning and the model ends without closing it. The
+/// stream has already published that text as reasoning; ending the output
+/// closes the reasoning instead of reading it again as content.
+#[test]
+fn natural_end_inside_published_reasoning_keeps_it() {
+    let output = "He is the capital city of Australia.";
+    for request in [
+        Request::new(
+            vec![json!({"role":"user","content":"What is the capital city of Australia? Reply with one word."})],
+            0,
+        ),
+        request(),
+    ] {
+        let plan = Template::new(QWEN35, &Default::default())
+            .unwrap()
+            .prepare(&request)
+            .unwrap();
+        assert!(plan.description().prompt.ends_with("<think>\n"));
+        let bytes = output.as_bytes();
+        for split in 0..=bytes.len() {
+            let mut stream = plan.stream(4096).unwrap();
+            let mut result = Transcript::default();
+            result.accept(stream.feed(&bytes[..split]).unwrap());
+            result.accept(stream.feed(&bytes[split..]).unwrap());
+            result.accept(stream.finish(TerminalCause::Natural).unwrap());
+            assert_eq!(
+                result,
+                Transcript {
+                    reasoning: output.into(),
+                    finish: Some(TerminalCause::Natural),
+                    ..Default::default()
+                },
+                "split {split}"
+            );
+        }
+    }
+    // A call the model leaves open is still not a natural completion.
+    let plan = Template::new(QWEN35, &Default::default())
+        .unwrap()
+        .prepare(&request())
+        .unwrap();
+    let mut stream = plan.stream(4096).unwrap();
+    stream
+        .feed(b"consider</think>\n\n<tool_call>\n<function=search>\n<parameter=query>\nhel")
+        .unwrap();
+    assert!(stream.finish(TerminalCause::Natural).is_err());
+}
