@@ -139,8 +139,11 @@ pub const GEOMETRY_KEYS: &[&str] = &[
 /// The keys [`Geometry::read`] interprets in a dense artifact.
 pub const DENSE_KEYS: &[&str] = &["feed_forward_length"];
 
-/// The keys [`Geometry::read`] interprets in a routed artifact.
+/// The keys [`Geometry::read`] interprets in a routed artifact, and the
+/// dense `feed_forward_length` converters write beside them (Ollama's as
+/// zero), which sizes no sublayer of an all-routed decoder and is ignored.
 pub const ROUTED_KEYS: &[&str] = &[
+    "feed_forward_length",
     "expert_count",
     "expert_used_count",
     "expert_feed_forward_length",

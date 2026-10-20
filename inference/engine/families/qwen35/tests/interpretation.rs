@@ -254,6 +254,30 @@ fn routed_mtp_head_uses_expert_roles_without_dense_intermediate_metadata() {
     assert!(matches!(sublayers[1].op, Operator::RoutedFfn(_)));
 }
 
+#[test]
+fn routed_header_ignores_the_dense_feed_forward_width() {
+    let inspect = |directory: &Directory| {
+        inspect_components(
+            directory,
+            None,
+            PackageIdentity {
+                target: ArtifactIdentity([9; 32]),
+                projector: None,
+            },
+        )
+        .unwrap()
+    };
+    let without = inspect(&routed_mtp_directory());
+    for width in [0, 12] {
+        let mut directory = routed_mtp_directory();
+        directory.metadata.push(Metadata {
+            name: "qwen35moe.feed_forward_length".into(),
+            value: Value::Scalar(Scalar::Unsigned(width)),
+        });
+        assert_eq!(inspect(&directory), without);
+    }
+}
+
 fn projector() -> Directory {
     let scalar = |name: &str, value: Scalar| Metadata {
         name: name.into(),

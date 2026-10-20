@@ -56,6 +56,9 @@ counts such a tensor's stored type.
 Metadata is read strictly only where it can change what the model computes. Every key in the
 component's own architecture namespace (`<general.architecture>.*`) must be one its family reads,
 and the chat layer reads `tokenizer.*` the same way; any other such key is unrecognized metadata.
+A family may likewise accept a key its model provably never uses: a routed Qwen 3.5 header's
+`feed_forward_length`, which converters write beside the expert widths (Ollama's as zero), sizes
+no sublayer of an all-routed decoder, so it is accepted and ignored whatever it holds.
 Every other namespace configures nothing and is ignored whatever it holds: `general.*` describes
 the model, and container and uploader namespaces (`split.*`, `quantize.*`, `imatrix.*`,
 `mradermacher.*`, `unsloth.*` and the like) record how the file was made. A family may read a named
