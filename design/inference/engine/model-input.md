@@ -71,7 +71,9 @@ takes text input only. Absent head widths read as llama.cpp reads them, and so d
 norm epsilon where llama.cpp takes the layer-norm epsilon in its place (Nemotron-H). The Qwen 3.5 lineage's layer kinds read
 as llama.cpp reads them too: `attention.recurrent_layers` flags every stored block, prediction blocks
 last and never recurrent, and otherwise one layer in every `full_attention_interval` is attention; a
-header carrying both binds only when they agree. The rule is shared by every family,
+header carrying both binds only when they agree. Declared prediction blocks of which no tensor is
+stored (a conversion that dropped the MTP weights but still counts their blocks) leave the decoder
+to run without a built-in head; a partly stored prediction block is refused. The rule is shared by every family,
 so a quantizer's provenance stamp never decides a verdict.
 
 An input row's token also names the rows it reads of a gathered table, by the table's row rule. A

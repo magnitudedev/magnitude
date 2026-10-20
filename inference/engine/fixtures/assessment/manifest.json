@@ -611,6 +611,21 @@
       }
     },
     {
+      "name": "qwen35-dropped-mtp-weights",
+      "description": "mradermacher Abliterix Qwen3.5 2B i1 Q4_K_M: block_count 25 with nextn_predict_layers 1 and a 25-flag attention.recurrent_layers, but no tensor of the prediction block blk.24 (the conversion dropped the MTP weights). The 24-layer decoder runs without a built-in head.",
+      "target": [
+        {
+          "header": "headers/Qwen3.5-2B-Uncensored-Abliterix-SOM.i1-Q4_K_M.gguf.gz",
+          "repository": "mradermacher/Qwen3.5-2B-Uncensored-Abliterix-SOM-i1-GGUF",
+          "revision": "3ae39c8545304849e58b3a4d94881474bc2b959a",
+          "path": "Qwen3.5-2B-Uncensored-Abliterix-SOM.i1-Q4_K_M.gguf"
+        }
+      ],
+      "expected": {
+        "target": "supported"
+      }
+    },
+    {
       "name": "qwen35-headless-mtp-drafter-q80",
       "description": "FadedRedStar Qwen3.5 9B heretic Q4_K_M with the repository's Q8_0 MTP draft file: it declares qwen35 with 33 blocks and one prediction layer but holds only the token embedding, output norm and output head, no block. The service classifies it as a drafter from its tensors; the engine does not bind a qwen35 file as a separate drafter.",
       "target": [

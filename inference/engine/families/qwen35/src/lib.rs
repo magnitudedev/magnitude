@@ -23,7 +23,7 @@ use magnitude_family_contracts::{
 };
 use magnitude_family_qwen::{
     DENSE_KEYS, GEOMETRY_KEYS, Geometry, MIXER_KEYS, Metadata, MixerKind, ROUTED_KEYS, Weight,
-    check_projector_width, mixer_kinds, product,
+    check_projector_width, mixer_kinds, prediction_blocks, product, stores_prediction_blocks,
 };
 
 pub use magnitude_family_qwen::Error;
@@ -152,15 +152,7 @@ pub fn inspect_components(
         }
     }
     let block_count = m.integer("block_count")?;
-    // More than one prediction layer is not admitted until its GGUF roles
-    // and execution semantics are qualified.
-    let speculative = match m.optional("nextn_predict_layers") {
-        None => 0,
-        Some(v) => v
-            .unsigned()
-            .filter(|n| *n <= 1 && *n < block_count)
-            .ok_or_else(|| m.malformed("nextn_predict_layers", "at most one prediction layer"))?,
-    };
+    let speculative = prediction_blocks(&m, block_count)?;
     let layer_count = block_count - speculative;
     // Each real layer requires distinct stored weights. Reject impossible counts
     // before allocating architecture vectors from untrusted metadata.
@@ -205,7 +197,7 @@ pub fn inspect_components(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let head = if speculative == 0 {
+    let head = if !stores_prediction_blocks(directory, layer_count, speculative) {
         None
     } else {
         let mut head_blocks = Vec::with_capacity(speculative as usize);

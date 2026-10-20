@@ -497,6 +497,40 @@ fn recurrent_layer_flags_bind_the_layer_order_the_interval_places() {
     }
 }
 
+/// A conversion that dropped the MTP weights but still counts their block in
+/// `block_count`, `nextn_predict_layers` and `attention.recurrent_layers`
+/// (mradermacher's Abliterix Qwen3.5 2B quants) runs its decoder without a
+/// built-in head. A prediction block stored only in part is refused.
+#[test]
+fn declared_prediction_blocks_with_no_stored_tensor_leave_the_decoder_headless() {
+    let identity = PackageIdentity {
+        target: ArtifactIdentity([3; 32]),
+        projector: None,
+    };
+    let dropped = |kept: &[&str]| {
+        let mut directory = mtp_directory();
+        directory.tensors.retain(|tensor| {
+            !tensor.name.starts_with("blk.2.")
+                || kept.iter().any(|name| tensor.name == format!("blk.2.{name}"))
+        });
+        directory.metadata.push(Metadata {
+            name: "qwen35.attention.recurrent_layers".into(),
+            value: Value::Array([true, false, false].map(Scalar::Bool).to_vec()),
+        });
+        inspect_components(&directory, None, identity)
+    };
+    let headless = dropped(&[]).unwrap();
+    let plain = inspect_components(&directory(false), None, identity).unwrap();
+    assert_eq!(headless.head, None);
+    assert_eq!(headless.decoder, plain.decoder);
+    let partial = dropped(&["nextn.enorm.weight"]).unwrap_err();
+    assert!(
+        partial.detail.contains("missing weight \"blk.2."),
+        "{}",
+        partial.detail
+    );
+}
+
 #[test]
 fn binds_every_mtp_role_outside_the_target_geometry() {
     let model = inspect_components(

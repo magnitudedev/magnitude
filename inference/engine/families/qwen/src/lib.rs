@@ -156,6 +156,34 @@ pub const ROUTED_KEYS: &[&str] = &[
 /// The keys [`mixer_kinds`] interprets.
 pub const MIXER_KEYS: &[&str] = &["attention.recurrent_layers", "full_attention_interval"];
 
+/// The trailing prediction blocks `nextn_predict_layers` declares among the
+/// `block_count` stored blocks. More than one is not admitted until its GGUF
+/// roles and execution semantics are qualified.
+pub fn prediction_blocks(m: &Metadata, block_count: u64) -> Result<u64, Error> {
+    match m.optional("nextn_predict_layers") {
+        None => Ok(0),
+        Some(value) => value
+            .unsigned()
+            .filter(|layers| *layers <= 1 && *layers < block_count)
+            .ok_or_else(|| m.malformed("nextn_predict_layers", "at most one prediction layer")),
+    }
+}
+
+/// Whether any tensor of the prediction blocks after `layers` decoder layers
+/// is stored. A conversion that drops the MTP weights can still count their
+/// blocks in `block_count`, `nextn_predict_layers` and
+/// `attention.recurrent_layers`; with none of them stored the decoder runs
+/// without a built-in head, and a partly stored block is bound and refused.
+pub fn stores_prediction_blocks(directory: &Directory, layers: u64, predictions: u64) -> bool {
+    (layers..layers + predictions).any(|index| {
+        let prefix = format!("blk.{index}.");
+        directory
+            .tensors
+            .iter()
+            .any(|tensor| tensor.name.starts_with(&prefix))
+    })
+}
+
 /// The mixer of one decoder layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MixerKind {
