@@ -184,10 +184,25 @@ const CONTEXT: usize = 60_000;
 /// One request over `stream` under the controller, after a prompt of
 /// `context` tokens.
 fn adaptive_at(stream: &Stream, costs: Costs, load: &Arc<DraftLoad>, context: usize) -> Run {
+    adaptive_on(stream, costs, load, context, |_| 1.0)
+}
+
+/// One request over `stream` on a machine whose launches in a round anchored
+/// at context position `p` take `slowdown(p)` times their cost. The run's
+/// time counts the launches' own costs, so it compares the controller's
+/// choices alone.
+fn adaptive_on(
+    stream: &Stream,
+    costs: Costs,
+    load: &Arc<DraftLoad>,
+    context: usize,
+    slowdown: impl Fn(usize) -> f64,
+) -> Run {
     let mut controller = DraftController::new(WIDEST, load.clone());
     let mut run = Run::default();
     let mut position = 0;
     while position < stream.len() {
+        let slowdown = slowdown(context + position);
         let limit = (stream.len() - position - 1).min(WIDEST);
         let generated = controller.generate(limit, context + position);
         let mut verified = 0;
@@ -196,7 +211,7 @@ fn adaptive_at(stream: &Stream, costs: Costs, load: &Arc<DraftLoad>, context: us
             run.milliseconds += seconds * 1000.0;
             controller.timed(
                 TimedLaunch::Draft,
-                Duration::from_secs_f64(seconds),
+                Duration::from_secs_f64(seconds * slowdown),
                 1,
                 generated + 1,
             );
@@ -208,7 +223,7 @@ fn adaptive_at(stream: &Stream, costs: Costs, load: &Arc<DraftLoad>, context: us
         run.milliseconds += seconds * 1000.0;
         controller.timed(
             TimedLaunch::Target,
-            Duration::from_secs_f64(seconds),
+            Duration::from_secs_f64(seconds * slowdown),
             1,
             verified + 1,
         );
@@ -501,7 +516,9 @@ fn a_chained_head_widens_again_when_the_text_turns_predictable() {
         .count();
     let rounds = run
         .within(400..800)
-        .map(|(choice, committed)| format!("{}/{}/{}", choice.generated, choice.verified, committed))
+        .map(|(choice, committed)| {
+            format!("{}/{}/{}", choice.generated, choice.verified, committed)
+        })
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
@@ -588,5 +605,67 @@ fn drafting_stopped_on_a_busy_cpu_resumes_once_it_is_free() {
     assert!(
         resumed.is_some(),
         "short requests over predictable text on the freed CPU draft again"
+    );
+}
+
+/// A mixture-of-experts target with about a billion active parameters on a
+/// GPU (LFM2.5 8B-A1B with its DSpark drafter on an M4 Max, measured): every
+/// verified row reaches more experts, so verification costs much more than
+/// a plain decode, and a drafter launch costs half of one.
+const SPARSE: Costs = Costs {
+    draft: |generated| match generated {
+        0 => 0.0,
+        1 => 2.3,
+        2..=3 => 2.6,
+        4..=7 => 4.4,
+        _ => 6.5,
+    },
+    verify: |rows| match rows {
+        1 => 4.7,
+        2 => 6.3,
+        3..=4 => 9.0,
+        5..=8 => 16.5,
+        _ => 23.5,
+    },
+};
+
+/// Its acceptance on reasoning prose (measured).
+const PROSE: [f64; WIDEST] = [
+    0.55, 0.30, 0.17, 0.13, 0.10, 0.07, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+];
+
+/// QA (mac-r4-12): on a loaded M4 Max the drafter made decoding 25 % slower
+/// than plain at 45 % acceptance. In a context class where only plain
+/// decodes had been measured, one was held up by another process (traced:
+/// 12.3 ms against 4.8 ms; 15 ms plain costs stuck for whole requests in
+/// another run, here five times its cost); the verification
+/// launches, first measured there afterwards, were not, so drafting looked
+/// faster, the plain launch was no longer taken, and its cost stayed raised
+/// for the rest of the request. A launch held up once moves no launch's
+/// cost relative to another's, so drafting that does not pay stays off.
+#[test]
+fn a_launch_held_up_once_does_not_make_drafting_that_loses_look_faster() {
+    let stream = Stream::of(&[(3_000, PROSE)]);
+    let (width, plain) = fastest_fixed(&stream, SPARSE);
+    assert_eq!(width, 0, "plain decoding is the fastest");
+    // A load that measured its launches at a shorter context, then decodes
+    // at a new class where a plain decode is held up once.
+    let load = warmed(&Stream::of(&[(500, PROSE)]), SPARSE);
+    let class = (4 * CONTEXT).next_power_of_two();
+    let context = class - 50;
+    let held_up = std::cell::Cell::new(false);
+    let run = adaptive_on(&stream, SPARSE, &load, context, |position| {
+        if position >= class + 20 && !held_up.replace(true) {
+            5.0
+        } else {
+            1.0
+        }
+    });
+    assert!(
+        run.milliseconds <= plain * 1.02,
+        "adaptive {:.0} ms, plain {plain:.0} ms ({:+.1}%): {}",
+        run.milliseconds,
+        (run.milliseconds / plain - 1.0) * 100.0,
+        run.rounds()
     );
 }

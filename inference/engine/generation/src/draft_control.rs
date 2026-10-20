@@ -26,8 +26,16 @@ use std::{
 /// its share of blocks. A depth scored every round follows the text within a
 /// few rounds; one scored only by looks moves as slowly as they come.
 const MEMORY: f64 = 0.25;
-/// The weight of a new launch duration once a launch has been measured.
-const COST_MEMORY: f64 = 0.25;
+/// The latest durations a launch's cost is the median of. A launch another
+/// process held up once does not move the median, so it reprices nothing:
+/// a launch priced by such a duration and then no longer taken would keep
+/// that price, and the launches measured after it would look cheaper.
+const COST_SAMPLES: usize = 3;
+/// The rounds of a load after which a launch's durations are stale: a
+/// launch measured again after them is priced by its new durations alone,
+/// and a plain decode not taken for that long is taken again, so a price
+/// left by a busier or freer machine lasts no longer.
+const STALE_ROUNDS: u64 = 100;
 /// The share of decode time spent on looks.
 const LOOK_SHARE: f64 = 0.01;
 
@@ -40,41 +48,80 @@ pub enum TimedLaunch {
     Target,
 }
 
-/// Measured launch seconds at one context class and sequence count.
+/// A launch's latest durations in seconds, oldest first, each with the
+/// load's round it was measured in.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Durations(Vec<(u64, f64)>);
+
+impl Durations {
+    fn record(&mut self, round: u64, seconds: f64) {
+        self.0
+            .retain(|(measured, _)| round.saturating_sub(*measured) < STALE_ROUNDS);
+        if self.0.len() == COST_SAMPLES {
+            self.0.remove(0);
+        }
+        self.0.push((round, seconds));
+    }
+
+    /// The launch's cost: the median of its durations, the lower of two.
+    fn cost(&self) -> f64 {
+        let mut sorted = self
+            .0
+            .iter()
+            .map(|(_, seconds)| *seconds)
+            .collect::<Vec<_>>();
+        sorted.sort_by(f64::total_cmp);
+        sorted[(sorted.len() - 1) / 2]
+    }
+
+    /// Whether the cost rests on its full share of durations.
+    fn proven(&self) -> bool {
+        self.0.len() == COST_SAMPLES
+    }
+
+    fn latest(&self) -> u64 {
+        self.0.last().map_or(0, |(round, _)| *round)
+    }
+
+    fn scale(&mut self, factor: f64) {
+        for (_, seconds) in &mut self.0 {
+            *seconds *= factor;
+        }
+    }
+}
+
+/// Measured launch costs at one context class and sequence count.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LaunchCosts {
     /// By generated proposals.
-    draft: BTreeMap<usize, f64>,
+    draft: BTreeMap<usize, Durations>,
     /// By target rows.
-    verify: BTreeMap<usize, f64>,
+    verify: BTreeMap<usize, Durations>,
 }
 
 impl LaunchCosts {
-    fn record(costs: &mut BTreeMap<usize, f64>, size: usize, seconds: f64) {
-        costs
-            .entry(size)
-            .and_modify(|mean| *mean += COST_MEMORY * (seconds - *mean))
-            .or_insert(seconds);
+    fn record(costs: &mut BTreeMap<usize, Durations>, round: u64, size: usize, seconds: f64) {
+        costs.entry(size).or_default().record(round, seconds);
     }
 
     /// A plain launch (one target row) took `seconds`. The machine's speed
     /// moves every launch alike (another process taking the CPU, or giving
-    /// it back), so each other measurement moves with the plain one's mean:
+    /// it back), so each other measurement moves with the plain one's cost:
     /// a launch no longer taken keeps its cost relative to a plain decode
     /// rather than the seconds it took on a machine that was busier or
     /// freer, until it is measured again.
-    fn record_plain(&mut self, seconds: f64) {
-        let before = self.verify.get(&1).copied();
-        Self::record(&mut self.verify, 1, seconds);
+    fn record_plain(&mut self, round: u64, seconds: f64) {
+        let before = self.verify.get(&1).map(Durations::cost);
+        Self::record(&mut self.verify, round, 1, seconds);
         let Some(before) = before.filter(|before| *before > 0.0) else {
             return;
         };
-        let factor = self.verify[&1] / before;
-        for (_, mean) in self.verify.iter_mut().filter(|(rows, _)| **rows != 1) {
-            *mean *= factor;
+        let factor = self.verify[&1].cost() / before;
+        for (_, durations) in self.verify.iter_mut().filter(|(rows, _)| **rows != 1) {
+            durations.scale(factor);
         }
-        for mean in self.draft.values_mut() {
-            *mean *= factor;
+        for durations in self.draft.values_mut() {
+            durations.scale(factor);
         }
     }
 
@@ -82,10 +129,10 @@ impl LaunchCosts {
     /// larger launch costs no less than a smaller one. A larger launch
     /// proves nothing about a smaller one (a 16-row launch costs more than
     /// twice an 8-row one where the rows cross a class).
-    fn at_least(costs: &BTreeMap<usize, f64>, size: usize) -> f64 {
+    fn at_least(costs: &BTreeMap<usize, Durations>, size: usize) -> f64 {
         costs
             .range(..=size)
-            .map(|(_, seconds)| *seconds)
+            .map(|(_, durations)| durations.cost())
             .fold(0.0, f64::max)
     }
 }
@@ -123,9 +170,9 @@ impl RoundCosts {
         }
     }
 
-    fn seconds(&self, costs: fn(&LaunchCosts) -> &BTreeMap<usize, f64>, size: usize) -> f64 {
+    fn seconds(&self, costs: fn(&LaunchCosts) -> &BTreeMap<usize, Durations>, size: usize) -> f64 {
         match costs(&self.own).get(&size) {
-            Some(seconds) => *seconds,
+            Some(durations) => durations.cost(),
             None => std::iter::once(&self.own)
                 .chain(&self.lesser)
                 .map(|measured| LaunchCosts::at_least(costs(measured), size))
@@ -230,6 +277,7 @@ pub fn share_rows(outlooks: &[DraftOutlook], rows: usize) -> Option<Vec<usize>> 
 #[derive(Debug, Default)]
 pub struct DraftLoad {
     costs: Mutex<BTreeMap<(usize, usize), LaunchCosts>>,
+    rounds: Mutex<u64>,
     right: Mutex<Option<Vec<f64>>>,
     /// The run of accepted rounds that earned its latest request a look.
     look_run: Mutex<Option<u32>>,
@@ -409,6 +457,16 @@ impl DraftController {
             }
         }
         let (fastest, verified, rate) = fastest;
+        // The plain decode is the one launch no look takes, so while it is
+        // measured here but its cost is unproven or stale it is taken again
+        // in place of drafting: a duration another process held up, or a
+        // machine since freed, would otherwise price it for good.
+        let plain_unsettled = fastest > 0 && {
+            let round = *self.load.rounds.lock().expect("draft load rounds");
+            costs.own.verify.get(&1).is_some_and(|plain| {
+                !plain.proven() || round.saturating_sub(plain.latest()) >= STALE_ROUNDS
+            })
+        };
         // How much faster than the fastest pair a width could be at best:
         // its rate if every proposal it drafts were right, over the fastest
         // pair's, less one.
@@ -495,6 +553,7 @@ impl DraftController {
                 kept
             }
         };
+        let generated = if plain_unsettled { 0 } else { generated };
         *self.load.look_seconds.lock().expect("draft load look time") = self.look_seconds;
         self.choice = RoundChoice {
             generated,
@@ -600,18 +659,22 @@ impl DraftController {
             return;
         };
         self.sequences = sequences.max(1);
+        let round = {
+            let mut rounds = self.load.rounds.lock().expect("draft load rounds");
+            if launch == TimedLaunch::Target {
+                *rounds += 1;
+            }
+            *rounds
+        };
         let mut costs = self.load.costs.lock().expect("draft load costs");
         let costs = costs
             .entry((self.context_class, self.sequences))
             .or_default();
+        let seconds = duration.as_secs_f64();
         match launch {
-            TimedLaunch::Draft => {
-                LaunchCosts::record(&mut costs.draft, size, duration.as_secs_f64())
-            }
-            TimedLaunch::Target if size == 1 => costs.record_plain(duration.as_secs_f64()),
-            TimedLaunch::Target => {
-                LaunchCosts::record(&mut costs.verify, size, duration.as_secs_f64())
-            }
+            TimedLaunch::Draft => LaunchCosts::record(&mut costs.draft, round, size, seconds),
+            TimedLaunch::Target if size == 1 => costs.record_plain(round, seconds),
+            TimedLaunch::Target => LaunchCosts::record(&mut costs.verify, round, size, seconds),
         }
     }
 }

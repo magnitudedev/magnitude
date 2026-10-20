@@ -324,16 +324,24 @@ A block's proposals depend on how many were generated, because bidirectional
 drafter layers see the whole block. Acceptance is nevertheless kept by depth
 alone, and corrected by the rounds that follow any change of generated count.
 
-**Costs.** The load keeps the measured duration of each drafter launch by
+**Costs.** The load keeps the measured durations of each drafter launch by
 generated count and each target launch by rows, per context class and per number
-of requests sharing the launch. Nothing is forecast. A launch not yet measured
-costs at least what a smaller one measured, and at least what the same launch
-measured at a shorter context; a larger launch proves nothing about a smaller
-one. With nothing measured every width costs the same. The machine's speed moves
-every launch alike, so each plain launch (one target row) scales every other
-measurement of its context class and request count with its mean: a launch no
-longer taken keeps its cost relative to a plain decode, not the seconds it took on
-a machine another process made busier or freer, until it is measured again.
+of requests sharing the launch. Nothing is forecast. A launch costs the median of
+its latest few durations, so a launch another process held up once prices
+nothing; durations older than a fixed number of the load's rounds are dropped when
+the launch is measured again. A launch not yet measured costs at least what a
+smaller one measured, and at least what the same launch measured at a shorter
+context; a larger launch proves nothing about a smaller one. With nothing
+measured every width costs the same. The machine's speed moves every launch
+alike, so each plain launch (one target row) scales every other measurement of
+its context class and request count with its cost: a launch no longer taken
+keeps its cost relative to a plain decode, not the seconds it took on a machine
+another process made busier or freer, until it is measured again. The plain
+decode is the one launch no look takes, so once measured in a context class it is
+taken in place of drafting while its cost rests on fewer than its full share of
+durations, or on durations as old as that fixed number of rounds: a plain cost
+left high by one held-up decode or a since-freed machine would otherwise make
+drafting that loses look faster for good.
 
 **Choice.** Expected tokens are one plus the acceptance of each verified depth;
 a round's time is its two launches. Three rules:
@@ -381,7 +389,8 @@ separate launches.
   round after round while they keep finding their blocks right; this is what
   returns a chained head, whose deeper proposals each cost a pass and so stop
   being drafted, to its wider widths.
-- Measuring a load's launches costs one round per width per context class.
+- Measuring a load's launches costs one round per width per context class, and the
+  plain decode up to its share of rounds per context class and per stale period.
 - The means, the kept rounds and the looks' share are fixed constants, not
   statistical guarantees. Acceptance that alternates faster than the means move
   is not followed.
