@@ -447,16 +447,11 @@ native attention_project for metal from "metal/attention_project.metal":
         threads_per_threadgroup (128, 1, 1)
 
 # CUDA: the K1 projection (`attention_output`'s row bands). The 1..8-row GEMV
-# splits K eight ways. In a state-space layer its successor, the state step,
-# is a programmatic launch that starts under the projection's last blocks;
-# with KSPLIT 4 (half as many blocks, each twice as long) it started 17.6
-# rather than 8.7 us before the NVFP4 4096 -> 18560 projection ended, the
-# projection ran 198 rather than 187 us, the two together 7.7 us longer, and
-# decode ran 37.9 rather than 38.4 tok/s (GB10, 2026-10-16, four runs each).
-# Tuning times the projection alone, its weights out of the cache, and reads
-# the two within 1% (177.7 and 178.8 us): it does not see the overlap, so it
-# is not offered the choice (nor are the attention projections, which share
-# this launch).
+# splits K KSPLIT ways. KSPLIT 8 is the default (Bolt decode on a GB10,
+# 2026-10-17, nsys in service): the NVFP4 4096 -> 18560 projection and its
+# programmatic state step took 212.5 us with 8 and 218.0 with 4; the q8
+# attention projection 92.3 with 8 and 89.0 with 4 (every other parameter
+# alike). 8 is at most 3.3 us from the best, 4 at most 5.5.
 native attention_project for cuda from "cuda/attention_project.cu":
     static (D, PT, NM, Q, GR, K, V, QS, GS, KS, VS)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
@@ -468,7 +463,7 @@ native attention_project for cuda from "cuda/attention_project.cu":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch attention_project_gemv when M <= 8:
-        params (code arithmetic KSPLIT in [8])
+        params (code arithmetic KSPLIT in [8, 4, 2])
         threadgroups (ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, M - 1)) * D * 2)
