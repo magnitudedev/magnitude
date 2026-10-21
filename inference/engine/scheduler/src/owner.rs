@@ -70,6 +70,20 @@ fn plan_branch(branches: &mut BTreeSet<usize>, point: usize, from: usize, prompt
     }
 }
 
+/// Plan a declared cache point at `point` when it is a hit inside the prompt
+/// beyond `from`, where the request resumes. Unlike a discovered divergence,
+/// a declared point is not held to [`MIN_BRANCH_GAIN`]: the host declares it
+/// where later requests are expected to diverge, and each turn of a
+/// conversation resumes at the point its previous turn declared. A turn
+/// shorter than the gain would otherwise retain nothing beyond where it
+/// resumed, so every following turn would resume there too and recompute
+/// all the turns since.
+fn plan_declared(branches: &mut BTreeSet<usize>, point: usize, from: usize, prompt: usize) {
+    if point >= MIN_PREFIX_HIT && point > from && point < prompt {
+        branches.insert(point);
+    }
+}
+
 /// Where a request's prompt is retained: one row before the prompt end, the
 /// deepest point a request with the same prompt can resume from (it must
 /// compute the row it samples from). None when that is not an exact input
@@ -1001,7 +1015,7 @@ impl<F: ProgramFamily> Service<F> {
         let mut branches = BTreeSet::new();
         for &point in cache_points {
             if !self.prefix_cache.holds(path, point) {
-                plan_branch(&mut branches, point, resumed, path.len());
+                plan_declared(&mut branches, point, resumed, path.len());
             }
         }
         let cached = self.prefix_cache.shared_boundary(path);
@@ -3073,8 +3087,31 @@ fn memory_observation(result: Result<(), DomainError>) -> Result<MemoryObservati
 
 #[cfg(test)]
 mod branch_plan_tests {
-    use super::{MIN_BRANCH_GAIN, MIN_PREFIX_HIT, plan_branch};
+    use super::{MIN_BRANCH_GAIN, MIN_PREFIX_HIT, plan_branch, plan_declared};
     use std::collections::BTreeSet;
+
+    /// A short turn of a conversation: it resumes where the previous turn
+    /// declared the next one leaves the prompt, and declares the opening of
+    /// its last message and where its own next turn leaves the prompt, all
+    /// within the gain. Both are planned, so the next turn resumes beyond
+    /// this one instead of where this one resumed.
+    #[test]
+    fn a_short_turn_plans_its_declared_points() {
+        let (resumed, prompt) = (459, 490);
+        let mut branches = BTreeSet::new();
+        for point in [466, 483] {
+            assert!(point < resumed + MIN_BRANCH_GAIN);
+            plan_declared(&mut branches, point, resumed, prompt);
+        }
+        assert_eq!(branches, BTreeSet::from([466, 483]));
+        // Never at or below the resume point, below a hit, or past the prompt.
+        let mut branches = BTreeSet::new();
+        for point in [resumed - 1, resumed, prompt] {
+            plan_declared(&mut branches, point, resumed, prompt);
+        }
+        plan_declared(&mut branches, MIN_PREFIX_HIT - 1, 0, prompt);
+        assert!(branches.is_empty());
+    }
 
     #[test]
     fn a_branch_point_saves_enough_over_the_resume_point_and_lower_branches() {
@@ -3086,8 +3123,8 @@ mod branch_plan_tests {
         plan_branch(&mut branches, prompt, 0, prompt);
         plan_branch(&mut branches, 1000 + MIN_BRANCH_GAIN - 1, 1000, prompt);
         assert!(branches.is_empty());
-        // The declared start of the last message, then a divergence just
-        // beyond it and one far beyond it.
+        // A branch point, then a divergence just beyond it and one far
+        // beyond it.
         plan_branch(&mut branches, 5800, 0, prompt);
         plan_branch(&mut branches, 5800 + MIN_BRANCH_GAIN - 1, 0, prompt);
         plan_branch(&mut branches, 5800 + MIN_BRANCH_GAIN, 0, prompt);
