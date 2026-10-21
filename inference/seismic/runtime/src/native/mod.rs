@@ -30,7 +30,7 @@ mod graph_replays;
 mod handoff_tests;
 mod observation;
 pub mod plan;
-mod point;
+pub(crate) mod point;
 pub mod replay;
 pub mod sampling;
 pub mod search;

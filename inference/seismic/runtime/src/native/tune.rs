@@ -255,6 +255,10 @@ pub(crate) struct TuningPoint<'a> {
     pub class: Option<String>,
     pub rotation: Vec<EncodedArgs>,
     pub(super) workload: Vec<usize>,
+    /// Cold copies of the workload rotation, which timed passes run after
+    /// it ([`super::point::cold_copies`]); none for a point that is only
+    /// observed.
+    pub(super) copies: Vec<EncodedArgs>,
     pub initialize: Option<TuningInitializer<'a>>,
     pub written: BTreeMap<String, WrittenRows>,
 }
@@ -271,9 +275,23 @@ impl<'a> TuningPoint<'a> {
             class: spec.class.clone(),
             rotation: inputs.rotation,
             workload,
+            copies: Vec::new(),
             initialize: inputs.initialize,
             written: inputs.written,
         })
+    }
+
+    /// The point with the cold copies its timed passes on `device` run.
+    fn timed(mut self, device: &DeviceInner) -> Result<Self, BuildError> {
+        if let Some(cold) = super::point::cold_bytes(device) {
+            let workload = self
+                .workload
+                .iter()
+                .map(|index| self.rotation[*index].clone())
+                .collect::<Vec<_>>();
+            self.copies = super::point::cold_copies(&workload, cold).map_err(BuildError::of)?;
+        }
+        Ok(self)
     }
 }
 
@@ -846,17 +864,23 @@ fn held_bytes(device: &DeviceInner, charged: u64, retained: u64, footprint: Opti
 /// left `available`, and the `required` bytes refused. `None` ends the
 /// piece. Offered again at that price, it is admitted as any priced piece:
 /// once enough is free, so the same allocation is not refused again, or
-/// never, its unit then stopped for want of room.
+/// never, its unit then stopped for want of room. The point is built for
+/// timing: with the cold copies of its workload ([`TuningPoint::timed`]),
+/// which are part of its build.
 fn build_point<'a>(
     device: &DeviceInner,
     source: &mut dyn PointSource<'a>,
     spec: &PointSpec,
     index: usize,
     resident: &mut Observed,
-) -> Result<Option<PointInputs<'a>>, TuneError> {
+) -> Result<Option<TuningPoint<'a>>, TuneError> {
     let before = device.storage_available(seismic_topology::StorageKind::Device);
-    match source.build(index) {
-        Ok(inputs) => Ok(Some(inputs)),
+    let built = match source.build(index) {
+        Ok(inputs) => TuningPoint::new(spec, inputs)?.timed(device),
+        Err(error) => Err(error),
+    };
+    match built {
+        Ok(point) => Ok(Some(point)),
         Err(BuildError::Refused {
             required,
             available,
@@ -2206,6 +2230,7 @@ fn measure_matched(
             let mut timing = match PointTiming::reusing_outputs(
                 &formed.kernel,
                 workload.workload_rotation(),
+                workload.copies(),
                 outputs.at(&workload.label),
             ) {
                 Ok(timing) => timing,
@@ -2302,6 +2327,7 @@ fn measure_matched(
         let beside = PointTiming::reusing_outputs(
             incumbent.kernel,
             workload.workload_rotation(),
+            workload.copies(),
             outputs.at(&workload.label),
         )
         .map_err(|error| WorkError::Failed(measurement_failure(points, point, error)))
@@ -2684,6 +2710,7 @@ fn place<'a>(
                     Ok(PointTiming::reusing_outputs(
                         kernel,
                         point.workload_rotation(),
+                        point.copies(),
                         outputs.at(&point.label),
                     )
                     .map_err(|error| measurement_failure(points, index, error))?)
@@ -4099,7 +4126,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             deadline.check(Duration::ZERO)?;
             let before = held();
             let building = Instant::now();
-            let Some(inputs) = build_point(
+            let Some(built_point) = build_point(
                 device,
                 source,
                 &specs[index],
@@ -4112,7 +4139,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             let built = building.elapsed().as_secs_f64();
             builds[index].observe(built);
             time.building_seconds += built;
-            validator.restore(point, TuningPoint::new(&specs[index], inputs)?)?;
+            validator.restore(point, built_point)?;
             resident_bytes[index].observe(held().saturating_sub(before) as f64);
         }
         Ok(true)
@@ -4714,7 +4741,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .device
             .storage_available(seismic_topology::StorageKind::Device);
         let building = Instant::now();
-        let Some(inputs) = build_point(
+        let Some(point) = build_point(
             &self.device,
             source,
             &self.specs[index],
@@ -4724,11 +4751,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         else {
             return Ok(false);
         };
-        let spec = &self.specs[index];
         let built = building.elapsed().as_secs_f64();
         self.builds[index].observe(built);
         self.time.building_seconds += built;
-        let point = TuningPoint::new(spec, inputs)?;
         let ground = self
             .ground
             .as_ref()
@@ -5457,8 +5482,14 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 point: spec.label.clone(),
                 detail: error.to_string(),
             })?;
+            let point = TuningPoint::new(spec, inputs)?
+                .timed(&self.device)
+                .map_err(|error| TuneError::Inputs {
+                    point: spec.label.clone(),
+                    detail: error.to_string(),
+                })?;
             self.time.building_seconds += began.elapsed().as_secs_f64();
-            points.push(ground.validator.point(TuningPoint::new(spec, inputs)?)?);
+            points.push(ground.validator.point(point)?);
         }
         if self.implementation.launch_scoped() {
             return Err(TuneError::Domain(
@@ -10008,6 +10039,12 @@ mod session_golden {
             Ok(Read(self.pass * passes as f64))
         }
         fn calls_per_pass(&self) -> usize {
+            1
+        }
+        fn submit_cold(&self, passes: usize) -> Result<Read, CallError> {
+            Work::submit(self, passes)
+        }
+        fn cold_calls_per_pass(&self) -> usize {
             1
         }
         fn clock(&self) -> Option<()> {

@@ -35,8 +35,10 @@
 //! - tuning points over the shape classes the entry serves (§5.3), with
 //!   weights;
 //! - rotations built from real resident weights of up to
-//!   [`ROTATION_LAYERS`] distinct layers, so repeated calls stream from
-//!   memory as a real step does;
+//!   [`ROTATION_LAYERS`] distinct layers, whose values a real step reads;
+//!   where the device reports its last-level cache, Seismic times copies of
+//!   a rotation whose bytes the cache could hold beside it, so that
+//!   repeated calls stream from memory as a real step does;
 //! - control tables built as the batch builder builds them
 //!   ([`TuningInputs::batch`]);
 //! - scratch state, KV history and routing tables owned by each case. An
@@ -207,10 +209,12 @@ pub const TUNING_ROWS: [u64; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
 /// representatives independently in [`apply_invocation_counts`].
 pub const TUNING_CONTEXTS: [u64; 5] = [0, 256, 4096, 16384, 65536];
 /// Distinct layers a decode-row rotation cycles through where the model has
-/// them. Decode rows stream every weight once per call, so repeated calls
-/// must not find the weights cache resident. A prefill chunk reuses each
-/// weight across its row tile and is compute bound, so one argument set
-/// measures it.
+/// them. Decode rows stream every weight once per call; that repeated calls
+/// do not find a rotation's bytes cache resident is Seismic's to ensure,
+/// whatever their size, by timing copies of a rotation the cache could
+/// hold beside it, where the device reports its cache. A prefill chunk
+/// reuses each weight across its row tile and is compute bound, so one
+/// argument set measures it.
 pub const ROTATION_LAYERS: usize = 4;
 /// The largest row count at which projections stream their weights (the K1
 /// GEMV bound); larger counts run tiled GEMMs. Every point of at most these

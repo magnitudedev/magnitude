@@ -54,6 +54,8 @@ pub(super) struct PreparedPoint<'a> {
 struct Inputs<'a> {
     rotation: Vec<EncodedArgs>,
     workload: Vec<usize>,
+    /// Cold copies of the workload rotation (`super::point::cold_copies`).
+    copies: Vec<EncodedArgs>,
     initialize: Option<Initializer<'a>>,
     states: Vec<StateRegion>,
     subjects: Vec<Subject>,
@@ -125,6 +127,11 @@ impl<'a> PreparedPoint<'a> {
             .iter()
             .map(|index| inputs.rotation[*index].clone())
             .collect()
+    }
+
+    /// The cold copies of the workload rotation a timed pass runs after it.
+    pub(super) fn copies(&self) -> Vec<EncodedArgs> {
+        self.inputs().copies.clone()
     }
 
     /// Give up the point's inputs and the default's observations of them:
@@ -253,6 +260,7 @@ impl<'a> PreparedPoint<'a> {
                 .iter()
                 .map(|rotation| inputs.rotation[*rotation].clone())
                 .collect(),
+            Vec::new(),
         )
         .map_err(Exclusion::execution)?;
         witnesses.track(self.prices.clone());
@@ -571,6 +579,7 @@ impl Validator {
             reference: RefCell::new((0..point.rotation.len()).map(|_| None).collect()),
             rotation: point.rotation,
             workload: point.workload,
+            copies: point.copies,
         })
     }
 }

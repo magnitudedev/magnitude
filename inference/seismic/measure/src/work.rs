@@ -38,6 +38,15 @@ pub trait Work {
     fn submit(&self, passes: usize) -> Result<Self::Pending, Self::Error>;
     /// The calls one pass makes: a sample's seconds per call divide by it.
     fn calls_per_pass(&self) -> usize;
+    /// Submit `passes` cold passes as one unit, without waiting: each is
+    /// the work's calls, then the calls of its copies (the same work over
+    /// storage of its own), so that no call finds its bytes left in a cache
+    /// by an earlier call of the submission, as served work does not (the
+    /// session's module documentation, "What a pass reads"). Work without
+    /// copies submits its passes.
+    fn submit_cold(&self, passes: usize) -> Result<Self::Pending, Self::Error>;
+    /// The calls one cold pass makes: the work's, then its copies'.
+    fn cold_calls_per_pass(&self) -> usize;
     /// The clock the work runs under; none where no clock is raised (a CPU,
     /// whose raised and unraised times read within the tolerance).
     fn clock(&self) -> Option<Self::Clock>;
@@ -56,6 +65,12 @@ impl<W: Work> Work for &W {
     }
     fn calls_per_pass(&self) -> usize {
         (**self).calls_per_pass()
+    }
+    fn submit_cold(&self, passes: usize) -> Result<Self::Pending, Self::Error> {
+        (**self).submit_cold(passes)
+    }
+    fn cold_calls_per_pass(&self) -> usize {
+        (**self).cold_calls_per_pass()
     }
     fn clock(&self) -> Option<Self::Clock> {
         (**self).clock()

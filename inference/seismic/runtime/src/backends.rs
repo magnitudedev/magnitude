@@ -643,6 +643,15 @@ impl OpenedKind {
         }
     }
 
+    /// The device's last-level cache in bytes, where its backend reports
+    /// one: CUDA's L2. Metal, Vulkan and the CPU route report none.
+    pub(crate) fn last_level_cache_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Cuda(device) => Some(device.device_description().facts().l2_cache_bytes),
+            _ => None,
+        }
+    }
+
     /// Facts that distinguish performance behavior, for keying per-device
     /// native tuning, including the toolchain and driver versions. Equal
     /// identities denote the same device model and configuration; there is

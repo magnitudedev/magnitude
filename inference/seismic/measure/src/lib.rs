@@ -34,7 +34,7 @@ pub use measure::{
     measure, measure_all, Attempt, Measure, Outcome, Reason, Record, RecordStore, Stop, StoreError,
     Unformed,
 };
-pub use session::{sample, Counted, Measurement, Rounds, Slot, SlotFailure, Slotted};
+pub use session::{sample, Counted, Measurement, Passes, Rounds, Slot, SlotFailure, Slotted};
 pub use statistics::{
     median, median_interval, median_of, Shuffle, Tally, Timing, Verdict, MEDIAN_TOLERANCE,
 };
