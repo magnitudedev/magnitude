@@ -489,7 +489,7 @@ fn norm_matches_its_portable_body() {
     }
 }
 
-/// Projections with their epilogues: the residual form (F32), the three
+/// Projections with their epilogues: the residual form (F32), the four
 /// activations (A), the gated and the clamped forms, and F32 weights over a
 /// depth that is no whole GEMM step.
 #[test]
@@ -512,6 +512,7 @@ fn linear_matches_its_portable_body() {
         (true, false, false, false, 1, DType::F16, DType::F16, 128),
         (true, false, false, false, 2, DType::F16, DType::F16, 128),
         (false, false, false, false, 3, DType::F32, DType::F16, 128),
+        (false, false, false, false, 4, DType::F16, DType::F16, 128),
         (false, false, true, false, 0, DType::F16, DType::F16, 128),
         (true, true, false, true, 0, DType::F32, DType::F16, 128),
         (true, false, false, false, 0, DType::F16, DType::F32, 136),
@@ -587,6 +588,9 @@ fn linear_matches_its_portable_body() {
                 })
                 .unwrap()
                 .value;
+            // The squared ReLU doubles the relative size of a flip of its
+            // rounded input (d(a²)/a² = 2 da/a).
+            let flips = if activation == 4 { 2.0 } else { 1.0 };
             relative_error(
                 &format!(
                     "vision_linear {:?} NB{nb} NR{nr} NG{ng} NC{nc} activation {activation} {weights:?} K{k}",
@@ -594,8 +598,8 @@ fn linear_matches_its_portable_body() {
                 ),
                 &read_values(&result),
                 &expected,
-                3e-3,
-                3e-4,
+                3e-3 * flips,
+                3e-4 * flips,
             );
         }
     }

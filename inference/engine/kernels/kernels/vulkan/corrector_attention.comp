@@ -1,0 +1,66 @@
+// corrector_attention: one workgroup of 256 invocations per (node, head).
+// Each subgroup scores keys subgroup, subgroup + SEISMIC_SUBGROUPS, ...: the
+// biased query against the biased key over its lanes, scaled by 1/sqrt(W)
+// plus the head's additive bias, kept in shared memory. Then each invocation
+// owns columns of the head and accumulates the softmax-weighted biased
+// values in key order, divides by the total and publishes the head rounded
+// once to A. Mirrors `cpu/corrector_attention.rs`.
+#include "lib/core/activation.glsl"
+
+// Shared: the N scores from float 32 (floats 0..32 reserved, unused).
+#define ATTENTION_SCORES 32u
+
+void corrector_attention() {
+    const uint64_t qkv = SEISMIC_PTR(SEISMIC_BUFFER_QKV);
+    const uint64_t input_bias = SEISMIC_PTR(SEISMIC_BUFFER_INPUT_BIAS);
+    const uint64_t bias = SEISMIC_PTR(SEISMIC_BUFFER_BIAS);
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t nodes = SEISMIC_DIM_N, width = SEISMIC_DIM_W;
+    const uint64_t row = gl_WorkGroupID.x, head = gl_WorkGroupID.y;
+    const uint64_t block = row / nodes, query = row % nodes;
+    const float scale = seismic_div_rn(1.0, seismic_sqrt_rn(float(width)));
+
+    // Row (block, node, part, head) of qkv and of the input bias.
+    const uint64_t query_row = block * SEISMIC_QKV_STRIDE_0 + query * SEISMIC_QKV_STRIDE_1 + head * SEISMIC_QKV_STRIDE_3;
+    const uint64_t query_bias = head * SEISMIC_INPUT_BIAS_STRIDE_1;
+    const uint64_t key_bias = SEISMIC_INPUT_BIAS_STRIDE_0 + head * SEISMIC_INPUT_BIAS_STRIDE_1;
+    const uint64_t value_bias = 2ul * SEISMIC_INPUT_BIAS_STRIDE_0 + head * SEISMIC_INPUT_BIAS_STRIDE_1;
+
+    for (uint64_t key = SEISMIC_SUBGROUP; key < nodes; key += SEISMIC_SUBGROUPS) {
+        const uint64_t key_row = block * SEISMIC_QKV_STRIDE_0 + key * SEISMIC_QKV_STRIDE_1 + SEISMIC_QKV_STRIDE_2
+            + head * SEISMIC_QKV_STRIDE_3;
+        float partial = 0.0;
+        for (uint64_t c = SEISMIC_LANE; c < width; c += 32ul) {
+            const float q = element_f32_at(qkv + (query_row + c * SEISMIC_QKV_STRIDE_4) * 4ul)
+                + element_f32_at(input_bias + (query_bias + c * SEISMIC_INPUT_BIAS_STRIDE_2) * 4ul);
+            const float k = element_f32_at(qkv + (key_row + c * SEISMIC_QKV_STRIDE_4) * 4ul)
+                + element_f32_at(input_bias + (key_bias + c * SEISMIC_INPUT_BIAS_STRIDE_2) * 4ul);
+            partial = seismic_fma_rn(q, k, partial);
+        }
+        const float dot = seismic_subgroup_sum_f32(partial);
+        if (SEISMIC_LANE == 0u)
+            seismic_shared_f32[ATTENTION_SCORES + uint(key)] = dot * scale
+                + element_f32_at(bias + (head * SEISMIC_BIAS_STRIDE_0 + query * SEISMIC_BIAS_STRIDE_1
+                    + key * SEISMIC_BIAS_STRIDE_2) * 4ul);
+    }
+    barrier();
+
+    float maximum = -uintBitsToFloat(0x7f800000u);
+    for (uint key = 0u; key < uint(nodes); ++key)
+        maximum = max(maximum, seismic_shared_f32[ATTENTION_SCORES + key]);
+    float total = 0.0;
+    for (uint key = 0u; key < uint(nodes); ++key)
+        total += exp(seismic_shared_f32[ATTENTION_SCORES + key] - maximum);
+    for (uint64_t c = gl_LocalInvocationIndex; c < width; c += gl_WorkGroupSize.x) {
+        const float b = element_f32_at(input_bias + (value_bias + c * SEISMIC_INPUT_BIAS_STRIDE_2) * 4ul);
+        float out_value = 0.0;
+        for (uint64_t key = 0ul; key < nodes; ++key) {
+            const float weight = exp(seismic_shared_f32[ATTENTION_SCORES + uint(key)] - maximum);
+            const float v = element_f32_at(qkv + (block * SEISMIC_QKV_STRIDE_0 + key * SEISMIC_QKV_STRIDE_1
+                + 2ul * SEISMIC_QKV_STRIDE_2 + head * SEISMIC_QKV_STRIDE_3 + c * SEISMIC_QKV_STRIDE_4) * 4ul);
+            out_value = seismic_fma_rn(weight, v + b, out_value);
+        }
+        element_put(ELEMENT_ACT, result, block * SEISMIC_RESULT_0_STRIDE_0 + query * SEISMIC_RESULT_0_STRIDE_1
+            + head * SEISMIC_RESULT_0_STRIDE_2 + c * SEISMIC_RESULT_0_STRIDE_3, seismic_div_rn(out_value, total));
+    }
+}

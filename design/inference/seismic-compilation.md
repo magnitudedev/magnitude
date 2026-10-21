@@ -130,7 +130,21 @@ Given an evaluator's costs and where its time ends, frontier generation and rank
 deterministic, so recorded evidence can replay selection. Measurement is device time: a
 point's calls are placed once and calibrated so one sample covers a minimum device time. Each
 sample completes before the next is submitted, since a device queue overlaps independent work and
-back-to-back samples would each include the other's. A point's first pass pays the first-use costs
+back-to-back samples would each include the other's. A sample repeats one pass over the point's
+workload, and a timed pass never reads from cache what served work reads from memory: served
+decode streams every layer's weights and states once per step, so no call finds its bytes left
+in the last-level cache by an earlier one. A pass whose argument sets occupy less than four
+times the device's last-level cache (CUDA's reported L2; 64 MiB where a backend reports none)
+therefore runs, after the workload's own calls, whole copies of its argument sets over storage
+of their own (weights, tables, slab and reserved state alike), until it occupies that much, and
+holds at most 64 argument sets: a point that would need more is latency-bound. The copies are
+made deterministically when the point's inputs are built for timing, held and released with
+them and charged to their building time and bytes; they are timed and never observed, and
+write their source's results. Hot passes made a GB10's router GEMV read half its served time and
+a state-space step's row mappings indistinguishable. A pass still runs one kernel alone: how a
+configuration overlaps the different launches beside it in a served graph (a programmatic
+successor that starts under its tail) is not measured, and a declaration that depends on it
+says so where it restricts its domain. A point's first pass pays the first-use costs
 of what it is the first to run (launches no earlier point ran, scratch no earlier call touched) and
 is never a sample, whatever earlier points of the kernel ran: when a later point's calibrating pass
 counted as its sample, a token-packing GEMM whose packing launches first ran at 512 rows read 1.6×

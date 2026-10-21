@@ -183,12 +183,17 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
     // One output head of every channel.
     let gated = gated.reshape(&[block.rows, 1, shape.channels]);
     let inject = join.inject(graph, block.rows, constants)?;
+    // The short convolution binds no second-level scale (`UNSCALED_OUTPUT`).
+    let unscaled = GraphConstant::absent(graph, constants)?.tensor().clone();
     let output = graph
         .enqueue(
             kernels.output,
             &[
                 shape.output_dimensions(block.rows).as_slice(),
-                &[("OB", output_bound.extent)],
+                &[
+                    crate::operators::attention::UNSCALED_OUTPUT,
+                    ("OB", output_bound.extent),
+                ],
             ]
             .concat(),
             attention_output::WorkflowArgs {
@@ -196,6 +201,7 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
                 inject: (&inject).into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight).into(),
+                output_scale: (&unscaled).into(),
                 output_bound: (&output_bound.tensor).into(),
             },
         )?
@@ -315,6 +321,7 @@ mod tests {
                     scale: 1.0 / 8.0,
                     reads: HistoryReads::Visible,
                     media_rows: MediaRowAttention::Causal,
+                    sinks: None,
                     output: tensor(name("attn_output"), vec![HIDDEN, HIDDEN]),
                 })),
                 output: OutputForm::Residual,

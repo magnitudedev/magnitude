@@ -351,6 +351,9 @@ pub struct AttentionShape {
     pub value_norm: u64,
     /// Whether values have their own projection (else they are the raw key).
     pub projected_value: bool,
+    /// `SK` ∈ {0, 1}: whether each query head has a sink logit
+    /// (`Attention::sinks`).
+    pub sinks: u64,
 }
 
 impl AttentionShape {
@@ -408,7 +411,7 @@ impl AttentionShape {
     }
 
     /// The static axes of the fused attention entries.
-    pub fn mix_statics(&self) -> [(&'static str, u64); 9] {
+    pub fn mix_statics(&self) -> [(&'static str, u64); 10] {
         [
             ("KV", self.kv_heads),
             ("G", self.group),
@@ -419,14 +422,15 @@ impl AttentionShape {
             ("F", self.fresh),
             ("N", self.head_norm),
             ("NV", self.value_norm),
+            ("SK", self.sinks),
         ]
     }
 
-    /// Cache publication has no query-head or gate geometry.
+    /// Cache publication has no query-head, gate or sink geometry.
     pub fn append_statics(&self) -> Vec<(&'static str, u64)> {
         self.mix_statics()
             .into_iter()
-            .filter(|(name, _)| !matches!(*name, "G" | "I" | "U"))
+            .filter(|(name, _)| !matches!(*name, "G" | "I" | "U" | "SK"))
             .collect()
     }
 
@@ -437,8 +441,8 @@ impl AttentionShape {
         rows: u64,
         history_rows: u64,
         segments: u64,
-    ) -> [(&'static str, u64); 12] {
-        let [kv, g, p, s, i, u, f, n, nv] = self.mix_statics();
+    ) -> [(&'static str, u64); 13] {
+        let [kv, g, p, s, i, u, f, n, nv, sk] = self.mix_statics();
         [
             ("M", rows),
             ("T", history_rows),
@@ -451,6 +455,7 @@ impl AttentionShape {
             f,
             n,
             nv,
+            sk,
             ("R", segments),
         ]
     }

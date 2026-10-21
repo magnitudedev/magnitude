@@ -105,9 +105,6 @@ drafter architecture is a separate drafter whose `general.architecture` no draft
 which names what the engine lacks rather than the target's architecture: a Nemotron-H MTP file
 (`nemotron_h_moe`, an architecture the engine runs as a target) is refused this way, because the
 engine drafts with no Nemotron-H prediction head, separate or built in;
-architecture also names a layout of a known architecture that has no kernels yet, decided by the
-header's structure: a Nemotron-H target with latent experts (`moe_latent_size`, the Super and Ultra
-layout) binds in full and is then refused as the Nemotron-H latent MoE architecture;
 missing metadata is a well-formed file that omits a key its family requires and never infers,
 naming that key (a block drafter's attention causality, which some published drafters predate, or
 a target's normalization epsilon); tied output

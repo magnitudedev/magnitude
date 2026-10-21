@@ -164,6 +164,8 @@ pub(super) fn qualify_attention(
     let query_norm = zeros(Element::f32(), &[shape.head_norm, width])?;
     let key_norm = zeros(Element::f32(), &[shape.head_norm, width])?;
     let value_norm = zeros(Element::f32(), &[shape.value_norm, width])?;
+    // The sink logits (zero rows without sinks).
+    let sinks = zeros(Element::f32(), &[shape.sinks, heads])?;
     let pairs = [shape.rotary_pairs];
     let rotary_components = zeros(Element::i32(), &pairs)?;
     let rotary_frequencies = zeros(Element::f32(), &pairs)?;
@@ -179,6 +181,8 @@ pub(super) fn qualify_attention(
     let block_slots = semantic_i32(device, &[0, 1], &[], ENTRY, label)?;
     let selection = Tensor::from_host(device, Element::u32(), &[1, 0], &[])
         .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
+    // Attention binds no second-level scale.
+    let absent_scale = zeros(Element::f32(), &[0])?;
     let projected = kernels
         .project
         .call(attention_project::Args {
@@ -190,6 +194,10 @@ pub(super) fn qualify_attention(
             value_weight: &value,
             epsilon: 1.0e-5,
             project_mode: 0,
+            query_scale: &absent_scale,
+            gate_scale: &absent_scale,
+            key_scale: &absent_scale,
+            value_scale: &absent_scale,
             query_bound: &any_row_bound(device, &kernels.project, "QB", ENTRY, label)?,
             gate_bound: &any_row_bound(device, &kernels.project, "GB", ENTRY, label)?,
             key_bound: &any_row_bound(device, &kernels.project, "KB", ENTRY, label)?,
@@ -245,6 +253,7 @@ pub(super) fn qualify_attention(
                     query_norm: &query_norm,
                     key_norm: &key_norm,
                     value_norm: &value_norm,
+                    sinks: &sinks,
                     rotary_components: &rotary_components,
                     rotary_frequencies: &rotary_frequencies,
                     rotary_amplitudes: &rotary_amplitudes,
@@ -316,6 +325,7 @@ pub(super) fn qualify_attention(
                         inject: &inject,
                         gated,
                         output_weight: &output,
+                        output_scale: &absent_scale,
                         output_bound: &any_row_bound(device, output_kernel, "OB", ENTRY, label)?,
                     })
                     .map_err(|e| qualification_dynamic("attention_output", label, e))?

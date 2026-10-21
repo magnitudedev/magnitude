@@ -25,7 +25,8 @@ use std::{
 /// A reader whose rows the host knows gathers by `indices`. A reader whose
 /// rows the device selects finds their slots in the directory and says so
 /// when it is queued (`read_selected`); what it is given tells, once the host
-/// knows the rows, whether the device held them.
+/// knows the rows, whether the device held them, and brings the ones it did
+/// not hold (`SelectedRead::observe`).
 ///
 /// A stored table (`StoredTable`) is read only through its directory, by
 /// steps that wait at its gate until the host has written the rows they
@@ -134,6 +135,16 @@ impl SelectedRead {
         self.queued
             .as_ref()
             .is_none_or(|(table, changes)| table.held_since(row, *changes))
+    }
+
+    /// The rows the read selected, once the host knows them: a streamed
+    /// table serves the ones it holds and brings the others, so that later
+    /// reads find them (`DeviceTable::observe`).
+    pub fn observe(&self, rows: &[u64]) -> Result<(), String> {
+        match &self.queued {
+            Some((table, _)) => table.observe(rows),
+            None => Ok(()),
+        }
     }
 }
 
@@ -388,6 +399,47 @@ impl DeviceTable {
         let slot = (slot / state.tiles.tile_rows()) as usize;
         state.served[slot] = true;
         state.brought_at[slot] <= changes
+    }
+
+    /// The rows a reader of the directory selected, once the host knows
+    /// them. The ones held are served, as a step's are; the tiles of the
+    /// others are brought, together, into tiles of slots no step named since
+    /// the clock last passed them, as a step's absent rows are (`slots`).
+    /// The read missed them; later reads find them. A selection whose tiles
+    /// outnumber the slots the clock frees brings as many as it frees: never
+    /// one the current step names, nor one this selection holds.
+    fn observe(&self, rows: &[u64]) -> Result<(), String> {
+        let mut guard = self.state.borrow_mut();
+        let state = &mut *guard;
+        let tile = state.tiles.tile_rows();
+        let mut absent = Vec::new();
+        for &row in rows {
+            if !state.tiles.has_row(row) {
+                return Err(format!("table row {row} is outside the table"));
+            }
+            match state.tiles.use_slot(row) {
+                Some(slot) => {
+                    let slot = (slot / tile) as usize;
+                    state.served[slot] = true;
+                    state.named[slot] = state.step;
+                }
+                None => absent.push(row - row % tile),
+            }
+        }
+        absent.sort_unstable();
+        absent.dedup();
+        let mut taken = Vec::with_capacity(absent.len());
+        for _ in &absent {
+            let (named, step) = (&state.named, state.step);
+            let Some((slot, _)) = state.tiles.free(|slot| named[slot] == step) else {
+                break;
+            };
+            state.named[slot] = state.step;
+            taken.push(slot);
+        }
+        absent.truncate(taken.len());
+        taken.sort_unstable();
+        self.bring(state, &absent, &taken, true)
     }
 
     /// The slots of `rows`, named by one step. The tiles of those the device
@@ -689,6 +741,37 @@ mod tests {
         assert!(!read.found(5));
         assert!(table.read_selected().found(5));
         assert!(!read.found(8));
+    }
+
+    #[test]
+    fn a_selected_read_brings_the_rows_it_missed_for_the_reads_after_it() {
+        let table = ResidentTable::streamed(device_table(None));
+        let ResidentTable::Streamed(streamed) = &table else {
+            unreachable!("a streamed table");
+        };
+        let read = table.read_selected();
+        assert!(!read.found(5));
+        // The read selected rows 1 (held) and 5 and 6 (missed): the missed
+        // rows take tiles no step named, never the one the read held.
+        read.observe(&[1, 5, 6, 5]).unwrap();
+        assert_eq!(directory(streamed), [-1, 1, -1, 3, -1, 0, 2, -1]);
+        assert_eq!(slot(streamed, 0), row(5));
+        assert!(!read.found(5));
+        let next = table.read_selected();
+        assert!(next.found(1) && next.found(5) && next.found(6));
+        // Every tile is replaced once none is the current step's.
+        next.observe(&[0, 2, 4, 7]).unwrap();
+        let held = table.read_selected();
+        assert!([0, 2, 4, 7].iter().all(|row| held.found(*row)));
+        // A selection beyond the slots the clock frees brings what it can,
+        // keeping the row it held.
+        held.observe(&[0, 1, 3, 5, 6]).unwrap();
+        let after = table.read_selected();
+        assert!([0, 1, 3, 5].iter().all(|row| after.found(*row)));
+        assert!(!after.found(6));
+        assert!(after.observe(&[8]).is_err());
+        // A table held whole holds every row.
+        ResidentTable::whole().read_selected().observe(&[8]).unwrap();
     }
 
     #[test]

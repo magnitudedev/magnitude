@@ -11,7 +11,7 @@ use crate::operators::gated_delta::graph::{
 use crate::operators::{InputForm, Join};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{PackingBound, WeightPort, weight};
+use crate::programs::native_target_graph::{PackingBound, WeightPort, scaled_weight, weight};
 use crate::{
     ModelLoadPlan, StateResourcePlan, StateSpaceBinding, StateSpaceShape, native::StateSpaceKernels,
 };
@@ -109,29 +109,36 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     };
     let projection_bound = bound(graph, WeightKind::StateSpaceProjection)?;
     let output_bound = bound(graph, WeightKind::RecurrentOutput)?;
-    // The projection's other segments are absent, and so are their bounds.
+    // The projection's other segments are absent, and so are their bounds
+    // and scales.
     let absent = PackingBound::absent(graph, constants)?;
+    let projection_weight =
+        scaled_weight(graph, load, scope, WeightKind::StateSpaceProjection, weights, constants)?;
+    let output_weight =
+        scaled_weight(graph, load, scope, WeightKind::RecurrentOutput, weights, constants)?;
     let mut weight = |graph: &mut G, kind| weight(graph, load, scope, kind, weights);
     let input_norm = weight(graph, WeightKind::InputNorm)?;
-    let projection_weight = weight(graph, WeightKind::StateSpaceProjection)?;
     let convolution = weight(graph, WeightKind::RecurrentConvolution)?;
     let convolution_bias = weight(graph, WeightKind::RecurrentConvolutionBias)?;
     let time_bias = weight(graph, WeightKind::RecurrentTimeBias)?;
     let rate = weight(graph, WeightKind::RecurrentDecay)?;
     let skip = weight(graph, WeightKind::StateSpaceSkip)?;
     let state_norm = weight(graph, WeightKind::StateSpaceNorm)?;
-    let output_weight = weight(graph, WeightKind::RecurrentOutput)?;
 
     let (mut ports, banks, tape_rows) = bank_ports(graph, state, block.component_index)?;
     // The projection has only its query segment: the others read zero rows
     // of the projection weight.
-    let empty = projection_weight.slice_leading(0, 0);
+    let empty = projection_weight.weight.slice_leading(0, 0);
     let projection = graph
         .enqueue(
             kernels.project,
             &[
                 shape.project_dimensions(block.rows).as_slice(),
                 &[
+                    ("QS", projection_weight.extent),
+                    ("GS", 0),
+                    ("KS", 0),
+                    ("VS", 0),
                     ("QB", projection_bound.extent),
                     ("GB", 0),
                     ("KB", 0),
@@ -143,12 +150,16 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
             attention_project::WorkflowArgs {
                 hidden: hidden.into(),
                 input_norm: (&input_norm).into(),
-                query_weight: (&projection_weight).into(),
+                query_weight: (&projection_weight.weight).into(),
                 gate_weight: (&empty).into(),
                 key_weight: (&empty).into(),
                 value_weight: (&empty).into(),
                 epsilon: block.epsilon,
                 project_mode: 0,
+                query_scale: (&projection_weight.scale).into(),
+                gate_scale: (&absent.tensor).into(),
+                key_scale: (&absent.tensor).into(),
+                value_scale: (&absent.tensor).into(),
                 query_bound: (&projection_bound.tensor).into(),
                 gate_bound: (&absent.tensor).into(),
                 key_bound: (&absent.tensor).into(),
@@ -220,14 +231,15 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
             kernels.output,
             &[
                 shape.output_dimensions(block.rows).as_slice(),
-                &[("OB", output_bound.extent)],
+                &[("OS", output_weight.extent), ("OB", output_bound.extent)],
             ]
             .concat(),
             attention_output::WorkflowArgs {
                 hidden: hidden.into(),
                 inject: (&inject).into(),
                 gated: (&gated).into(),
-                output_weight: (&output_weight).into(),
+                output_weight: (&output_weight.weight).into(),
+                output_scale: (&output_weight.scale).into(),
                 output_bound: (&output_bound.tensor).into(),
             },
         )?
@@ -243,7 +255,7 @@ mod tests {
         PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner, resident_layout,
         source_element,
     };
-    use crate::{DenseScales, GeneralRoutedScales, PlanError};
+    use crate::{DenseScales, GeneralRoutedScales, PlanError, StateSpaceScales};
     use magnitude_artifacts::{
         ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
         gguf::{Encoding, TensorDescriptor},
@@ -409,6 +421,7 @@ mod tests {
                     scale: 1.0 / 128f64.sqrt(),
                     reads: HistoryReads::Visible,
                     media_rows: MediaRowAttention::Causal,
+                    sinks: None,
                     output: tensor(name("attn_output"), vec![HIDDEN, 512]),
                 })),
                 output: OutputForm::Residual,
@@ -560,15 +573,21 @@ mod tests {
 
     /// The matrices Nemotron's NVFP4 files scale: routed experts per expert
     /// (block 2's up weight stores one value for its whole stack), shared
-    /// experts, latent projections and the vocabulary projection per tensor.
+    /// experts, latent projections, the Mamba-2 input and output projections
+    /// and the vocabulary projection per tensor.
     fn nemotron_scales(name: &str) -> Option<Vec<u64>> {
         match name {
             "blk.4.ffn_up_exps" => Some(vec![1]),
             name if name.ends_with("_exps") => Some(vec![32]),
             name if name.ends_with("_shexp") || name.contains("ffn_latent") => Some(vec![1]),
+            name if name.ends_with(".ssm_in") || name.ends_with(".ssm_out") => Some(vec![1]),
             "output" => Some(vec![1]),
             _ => None,
         }
+    }
+
+    fn mixer_scope(block: u32) -> WeightScope {
+        WeightScope::TargetSublayer(SublayerIndex { block, sublayer: 0 })
     }
 
     fn feed_forward_scope(block: u32) -> WeightScope {
@@ -628,6 +647,16 @@ mod tests {
                 extent(WeightScope::Target, WeightKind::Output),
                 (1, Some(4))
             );
+            for block in [0, 1] {
+                assert_eq!(
+                    extent(mixer_scope(block), WeightKind::StateSpaceProjection),
+                    (1, Some(4))
+                );
+                assert_eq!(
+                    extent(mixer_scope(block), WeightKind::RecurrentOutput),
+                    (1, Some(4))
+                );
+            }
             assert_eq!(extent(plain, WeightKind::Router), (0, None));
             let scale_bytes = load
                 .target()
@@ -651,6 +680,19 @@ mod tests {
 
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
             let blocks = plan.target().blocks();
+            // Both state-space mixers bind their projections' scales.
+            for block in &blocks[..2] {
+                let MixerProgramSlot::StateSpace(binding) = block.mixer() else {
+                    panic!("blocks 0 and 1 are state-space");
+                };
+                assert_eq!(
+                    binding.scales,
+                    StateSpaceScales {
+                        projection: 1,
+                        output: 1
+                    }
+                );
+            }
             let Some(FeedForwardProgramSlot::GeneralRouted(latent_binding)) =
                 blocks[1].feed_forward()
             else {

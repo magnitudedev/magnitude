@@ -1617,6 +1617,15 @@ impl<'a> Emitter<'a> {
                             }
                             value
                         }
+                        DecodeStep::Constant { value, .. } => {
+                            let constant = self.f32();
+                            let bits = match value {
+                                seismic_lang::reference_math::ReferenceScalar::F32(bits) => *bits,
+                                other => unreachable!("a decode constant is f32, not {other:?}"),
+                            };
+                            self.line(format!("mov.f32 {constant}, 0f{bits:08X};"));
+                            constant
+                        }
                         DecodeStep::Multiply { left, right, .. } => {
                             let value = self.f32();
                             self.line(format!(

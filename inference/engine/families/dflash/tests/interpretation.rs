@@ -563,18 +563,13 @@ fn qwen38_dflash2_convolves_every_sublayer_and_selects_a_path() {
         draft.block_attention,
         vec![BlockAttention::Bidirectional; 5]
     );
-    let DraftMethod::DFlash2 {
-        kernel,
-        group,
-        convolutions,
-        selector,
-    } = &draft.method
-    else {
+    let DraftMethod::DFlash2 { selector } = &draft.method else {
         unreachable!()
     };
-    assert_eq!((*kernel, *group), (2, 16));
-    assert_eq!(convolutions.len(), 5);
-    for layer in convolutions {
+    let convolutions = draft.convolutions.as_ref().unwrap();
+    assert_eq!((convolutions.kernel, convolutions.group), (2, 16));
+    assert_eq!(convolutions.layers.len(), 5);
+    for layer in &convolutions.layers {
         for convolution in [&layer.attention, &layer.feed_forward] {
             assert_eq!(convolution.base.shape, [2, 2, 5120]);
             assert_eq!(convolution.projection.shape, [1280, 5120]);

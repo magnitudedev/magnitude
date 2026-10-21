@@ -15,7 +15,8 @@
 // rows (`int8_activations`): see `QuantizedRows`. Reductions across K run in a
 // fixed order. A row's GEMV
 // result does not depend on M (every activation row is its own MMA column),
-// so rows 1..GEMV_ROWS of one request match M = 1 bit for bit.
+// so rows 1..GEMV_ROWS of one request match M = 1 bit for bit under one
+// launch configuration (TPW, KSPLIT).
 //
 // Rows. A prologue that is not a plain read of A forms its rows with
 // `form_row` (the staging launch into global scratch, or at M = 1 the GEMV
@@ -30,8 +31,12 @@
 // planes as whole-superblock loads redistributed by shuffles); the codes and
 // packed coefficients of the next superblock are in flight in registers while
 // the current one decodes (an explicit L2 prefetch, and pipelining across
-// consecutive tiles, measured no gain on top of that). Group sums of x come
-// from the same B operands through an all-ones A fragment.
+// consecutive tiles, measured no gain on top of that), except that a staged
+// weight's group copies its tiles' coefficient fields into shared memory as
+// whole-row runs once (`GemvStaged`). Group sums of x come
+// from the same B operands through an all-ones A fragment. Vector-coded
+// weights run in entry order (`gemv_entries_group`): k permuted within each
+// scale group so a lane's A values are half an entry, looked up once per row.
 //
 // GEMM (M > GEMV_ROWS): a staging launch writes the prologue's rows when the
 // prologue is not a plain read of A; the main launch runs BM x 128 x 64 block
@@ -93,9 +98,30 @@ constexpr u32 GEMV_ROWS = 16;
 
 __device__ __forceinline__ float silu(float value) { return value / (1.0f + expf(-value)); }
 
-__device__ __forceinline__ void named_barrier(u32 id, u32 threads) {
-    asm volatile("barrier.sync %0, %1;" ::"r"(id), "r"(threads) : "memory");
-}
+// The named barrier of a GEMV block's tile group `group`, for the group's
+// KSPLIT warps: barrier FIRST + group of GROUPS. A block reserves the hardware
+// barriers 0 .. FIRST + GROUPS - 1 (ptxas counts up to the largest id) of an
+// SM's 16, so the ids bound how many synchronizing blocks, of its own launch
+// or another, share its SM (`GemvResidency`): with RESIDENCY R > 0 the block
+// takes the top ids 16 / R - GROUPS .. 16 / R - 1 and at most R blocks fit
+// (R = 1 holds the SM alone); with 0 it takes ids 1 .. GROUPS and registers
+// and shared memory alone bound the blocks per SM. The id is selected among
+// compile-time constants (a run-time id would reserve all 16 whatever the
+// block's residency).
+template <int GROUPS_, int RESIDENCY> struct GroupBarrier {
+    static constexpr int GROUPS = GROUPS_;
+    static constexpr int FIRST = RESIDENCY == 0 ? 1 : 16 / RESIDENCY - GROUPS;
+    static_assert(FIRST >= 1, "barrier 0 is the block's own");
+    u32 group;
+    template <int ID = FIRST> __device__ __forceinline__ void sync(u32 threads) const {
+        if constexpr (ID < FIRST + GROUPS - 1)
+            if (group + FIRST != ID) {
+                sync<ID + 1>(threads);
+                return;
+            }
+        asm volatile("barrier.sync %0, %1;" ::"n"(ID), "r"(threads) : "memory");
+    }
+};
 
 // The segment of a segmented projection holding work item `index`, given the
 // items (GEMV tile groups or GEMM block columns) of each segment in order;
@@ -380,6 +406,7 @@ struct NoWeight {
     struct Block {};
     struct Super {};
     __device__ __forceinline__ Super fetch_superblock(u64, u64, u64, u32) const { return Super{}; }
+    __device__ __forceinline__ Raw fetch(u64, u64, u32) const { return Raw{}; }
     __device__ __forceinline__ Raw raw(const Super &, int, u32) const { return Raw{}; }
     __device__ __forceinline__ Block block(u64, u64, u32) const { return Block{}; }
 };
@@ -432,122 +459,67 @@ __device__ __forceinline__ void gemv_accumulate(float (&acc)[NB][4], const typen
     }
 }
 
-// One warp of a tile group: tiles [tile0, tile0 + TPW) of a segment with
-// `tiles` tiles and `rows` valid rows, superblock share `part` of KSPLIT, for
-// M <= 8 * NB activation rows (column block nb holds rows 8 nb .. 8 nb + 7).
-// Each iteration decodes one superblock (4 k-blocks) while the codes and
-// packed coefficients of the next are in flight in registers. `ready()`
-// returns the activation source, which reads its A operands in place
-// (`pair`); it runs once the first superblock's weight loads are issued, so
-// it may wait for the previous launch (`seismic_dependency_wait`) while they
-// are in flight. A group past the segment (tile0 >= tiles) loads nothing but
-// still runs `ready()`, which may be block-collective. `reduce` is the
-// group's reduction area, `barrier` its named barrier.
-template <int TPW, int KSPLIT, int NB, class Ready, class WA, class WB, class Epi>
-__device__ __forceinline__ void gemv_group(const Ready &ready, u32 M, u64 kblocks, u64 tile0, u64 tiles, u64 rows,
-                                           const WA &wa, const WB &wb, const Epi &epi, float *reduce, u32 barrier,
-                                           u32 part) {
-    constexpr bool PAIR = !Same<WB, NoWeight>::value;
-    constexpr bool BIAS = WA::BIAS || WB::BIAS;
+// Whether a weight's GEMV reads its k-blocks in the permuted column order
+// (`fetch_superblock_permuted`): dense weights, whose rows load as whole
+// vectors that way.
+template <class W, class = void> struct GemvPermuted {
+    static constexpr bool value = false;
+};
+template <class W> struct GemvPermuted<W, decltype((void)W::GEMV_PERMUTED)> {
+    static constexpr bool value = W::GEMV_PERMUTED;
+};
+
+// Whether a weight's GEMV stages its tiles' coefficient fields in shared
+// memory (`W::GEMV_STAGED`, see `Coded4::stage`).
+template <class W, class = void> struct GemvStaged {
+    static constexpr bool value = false;
+};
+template <class W> struct GemvStaged<W, decltype((void)W::GEMV_STAGED)> {
+    static constexpr bool value = W::GEMV_STAGED;
+};
+// The staged bytes of one tile of W (0 when W is not staged).
+template <class W> __host__ __device__ constexpr u64 gemv_staged_tile(u64 kblocks) {
+    if constexpr (GemvStaged<W>::value)
+        return W::staged_bytes(kblocks);
+    else
+        return 0;
+}
+
+// Whether a weight's GEMV runs in entry order (`W::GEMV_ENTRIES`): vector
+// codes, whose eight values an entry names together, run
+// `gemv_entries_group`, which looks each entry up once per row instead of
+// once per two values.
+template <class W, class = void> struct GemvEntries {
+    static constexpr bool value = false;
+};
+template <class W> struct GemvEntries<W, decltype((void)W::GEMV_ENTRIES)> {
+    static constexpr bool value = W::GEMV_ENTRIES;
+};
+
+// Whether a weight's GEMV reads its superblocks as records
+// (`W::GEMV_RECORDS`, see `gemv_records_group`).
+template <class W, class = void> struct GemvRecords {
+    static constexpr bool value = false;
+};
+template <class W> struct GemvRecords<W, decltype((void)W::GEMV_RECORDS)> {
+    static constexpr bool value = W::GEMV_RECORDS;
+};
+
+// The K-split reduction and epilogue of a GEMV group's accumulators (the
+// MMA C-fragment places: (row g, col 2t), (row g, col 2t+1), (row g+8, col
+// 2t), (row g+8, col 2t+1) of each column block).
+template <int TPW, int KSPLIT, int NB, class Epi, class Barrier>
+__device__ __forceinline__ void gemv_finish(float (&acc)[2][TPW][NB][4], u32 M, u64 tile0, u64 tiles, u64 rows,
+                                            const Epi &epi, float *reduce, const Barrier &barrier, u32 part) {
     const u32 lane = threadIdx.x % 32;
     const u32 g = lane / 4;
     const u32 t = lane % 4;
-    const float *factors = nullptr;
-    float acc[2][TPW][NB][4];
-#pragma unroll
-    for (int stream = 0; stream < 2; ++stream)
-#pragma unroll
-        for (int i = 0; i < TPW; ++i)
-#pragma unroll
-            for (int nb = 0; nb < NB; ++nb)
-#pragma unroll
-                for (int e = 0; e < 4; ++e)
-                    acc[stream][i][nb][e] = 0.0f;
-    const u64 superblocks = (kblocks + 3) / 4;
-    const u64 begin = superblocks * part / KSPLIT;
-    const u64 end = superblocks * (part + 1) / KSPLIT;
-    // Codes and packed coefficients of one superblock of the group's tiles.
-    struct Stage {
-        typename WA::Super ra[TPW];
-        typename WB::Super rb[TPW];
-        typename WA::Block ba[TPW];
-        typename WB::Block bb[TPW];
-    };
-    auto load = [&](Stage &stage, u64 sb) {
-#pragma unroll
-        for (int i = 0; i < TPW; ++i) {
-            if (tile0 + i >= tiles)
-                continue;
-            stage.ra[i] = wa.fetch_superblock(tile0 + i, sb, kblocks, lane);
-            if constexpr (PAIR)
-                stage.rb[i] = wb.fetch_superblock(tile0 + i, sb, kblocks, lane);
-            stage.ba[i] = wa.block(tile0 + i, sb, lane);
-            if constexpr (PAIR)
-                stage.bb[i] = wb.block(tile0 + i, sb, lane);
-        }
-    };
-    // The next superblock's loads are in flight while the current one
-    // decodes; the first one's are issued before the source is ready.
-    Stage current;
-    if (tile0 < tiles && begin < end)
-        load(current, begin);
-    const auto pro = ready();
-    static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
-    if (tile0 >= tiles)
-        return;
-    auto compute = [&](const Stage &stage, u64 sb) {
-#pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            if (4 * sb + q >= kblocks)
-                break;
-            const u64 k0 = (4 * sb + q) * 64;
-            u32 b[NB][4][2];
-#pragma unroll
-            for (int nb = 0; nb < NB; ++nb) {
-                const u32 m = 8 * nb + g;
-                const bool feeds = m < M;
-#pragma unroll
-                for (int s = 0; s < 4; ++s) {
-                    b[nb][s][0] = feeds ? pro.pair(factors, m, k0 + 16 * s + 2 * t) : 0u;
-                    b[nb][s][1] = feeds ? pro.pair(factors, m, k0 + 16 * s + 2 * t + 8) : 0u;
-                }
-            }
-            GroupSums<NB> sums;
-            if constexpr (BIAS) {
-                const u32 ones[4] = {Op::ONES, Op::ONES, Op::ONES, Op::ONES};
-#pragma unroll
-                for (int nb = 0; nb < NB; ++nb)
-#pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        float x[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                        Op::mma(x, ones, b[nb][2 * h]);
-                        Op::mma(x, ones, b[nb][2 * h + 1]);
-                        sums.half[nb][h][0] = x[0];
-                        sums.half[nb][h][1] = x[1];
-                    }
-            }
-#pragma unroll
-            for (int i = 0; i < TPW; ++i)
-                if (tile0 + i < tiles) {
-                    gemv_accumulate<NB>(acc[0][i], wa.raw(stage.ra[i], q, lane), wa, stage.ba[i], q, b, sums);
-                    if constexpr (PAIR)
-                        gemv_accumulate<NB>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb, stage.bb[i], q, b, sums);
-                }
-        }
-    };
-    for (u64 sb = begin; sb < end; ++sb) {
-        Stage next;
-        if (sb + 1 < end)
-            load(next, sb + 1);
-        compute(current, sb);
-        current = next;
-    }
     if constexpr (KSPLIT > 1) {
         constexpr int VALUES = 2 * TPW * NB * 4;
 #pragma unroll
         for (int v = 0; v < VALUES; ++v)
             reduce[(part * VALUES + v) * 32 + lane] = acc[v / (TPW * NB * 4)][(v / (NB * 4)) % TPW][(v / 4) % NB][v % 4];
-        named_barrier(barrier, KSPLIT * 32);
+        barrier.sync(KSPLIT * 32);
         if (part != 0)
             return;
 #pragma unroll
@@ -580,6 +552,407 @@ __device__ __forceinline__ void gemv_group(const Ready &ready, u32 M, u64 kblock
     }
 }
 
+// One warp of a tile group: tiles [tile0, tile0 + TPW) of a segment with
+// `tiles` tiles and `rows` valid rows, superblock share `part` of KSPLIT, for
+// M <= 8 * NB activation rows (column block nb holds rows 8 nb .. 8 nb + 7).
+// Each iteration decodes one superblock (4 k-blocks) while the codes and
+// packed coefficients of the next are in flight in registers. `ready()`
+// returns the activation source, which reads its A operands in place
+// (`pair`); it runs once the first superblock's weight loads are issued, so
+// it may wait for the previous launch (`seismic_dependency_wait`) while they
+// are in flight. A group past the segment (tile0 >= tiles) loads nothing but
+// still runs `ready()`, which may be block-collective. `reduce` is the
+// group's reduction area, `barrier` its named barrier. With STAGING (the
+// launch's shared `staging` area holds the group's tiles: `gemv_staging`)
+// an unpaired staged weight (`GemvStaged`) reads its coefficients from the
+// group's copy of its tiles' fields, issued with the first superblock's
+// loads and complete before the first decode.
+template <int TPW, int KSPLIT, int NB, bool STAGING, class Ready, class WA, class WB, class Epi, class Barrier>
+__device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kblocks, u64 tile0, u64 tiles,
+                                               u64 rows, const WA &wa, const WB &wb, const Epi &epi, float *reduce,
+                                               const Barrier &barrier, u32 part, u8 *staging) {
+    constexpr bool PAIR = !Same<WB, NoWeight>::value;
+    constexpr bool STAGED = STAGING && !PAIR && GemvStaged<WA>::value;
+    // Both weights read permuted, or neither: the activations follow one order.
+    constexpr bool PERMUTED = GemvPermuted<WA>::value && (!PAIR || GemvPermuted<WB>::value);
+    constexpr bool BIAS = WA::BIAS || WB::BIAS;
+    const u32 lane = threadIdx.x % 32;
+    const u32 g = lane / 4;
+    const u32 t = lane % 4;
+    const float *factors = nullptr;
+    float acc[2][TPW][NB][4];
+#pragma unroll
+    for (int stream = 0; stream < 2; ++stream)
+#pragma unroll
+        for (int i = 0; i < TPW; ++i)
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    acc[stream][i][nb][e] = 0.0f;
+    const u64 superblocks = (kblocks + 3) / 4;
+    const u64 begin = superblocks * part / KSPLIT;
+    const u64 end = superblocks * (part + 1) / KSPLIT;
+    // Codes and packed coefficients of one superblock of the group's tiles.
+    struct Stage {
+        typename WA::Super ra[TPW];
+        typename WB::Super rb[TPW];
+        typename WA::Block ba[TPW];
+        typename WB::Block bb[TPW];
+    };
+    auto load = [&](Stage &stage, u64 sb) {
+#pragma unroll
+        for (int i = 0; i < TPW; ++i) {
+            if (tile0 + i >= tiles)
+                continue;
+            if constexpr (PERMUTED) {
+                stage.ra[i] = wa.fetch_superblock_permuted(tile0 + i, sb, kblocks, lane);
+                if constexpr (PAIR)
+                    stage.rb[i] = wb.fetch_superblock_permuted(tile0 + i, sb, kblocks, lane);
+            } else {
+                stage.ra[i] = wa.fetch_superblock(tile0 + i, sb, kblocks, lane);
+                if constexpr (PAIR)
+                    stage.rb[i] = wb.fetch_superblock(tile0 + i, sb, kblocks, lane);
+            }
+            if constexpr (!STAGED)
+                stage.ba[i] = wa.block(tile0 + i, sb, lane);
+            if constexpr (PAIR)
+                stage.bb[i] = wb.block(tile0 + i, sb, lane);
+        }
+    };
+    // The staged coefficient fields of tile tile0 + i.
+    const u64 staged_tile = gemv_staged_tile<WA>(kblocks);
+    // The next superblock's loads are in flight while the current one
+    // decodes; the first one's are issued before the source is ready.
+    Stage current;
+    if constexpr (STAGED) {
+#pragma unroll
+        for (int i = 0; i < TPW; ++i)
+            if (tile0 + i < tiles)
+                wa.stage(tile0 + i, kblocks, staging + i * staged_tile, part * 32 + lane, KSPLIT * 32);
+    }
+    if (tile0 < tiles && begin < end)
+        load(current, begin);
+    const auto pro = ready();
+    static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
+    if (tile0 >= tiles)
+        return;
+    if constexpr (STAGED) {
+        seismic_cp_async_wait_all();
+        barrier.sync(KSPLIT * 32);
+    }
+    auto compute = [&](const Stage &stage, u64 sb) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            if (4 * sb + q >= kblocks)
+                break;
+            const u64 k0 = (4 * sb + q) * 64;
+            u32 b[NB][4][2];
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb) {
+                const u32 m = 8 * nb + g;
+                const bool feeds = m < M;
+#pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    // The B fragment's columns 2t, 2t + 1 and 2t + 8, 2t + 9 of
+                    // step s, or their permuted places (`GemvPermuted`).
+                    const u64 low = PERMUTED ? 16 * t + 4 * s : 16 * s + 2 * t;
+                    const u64 high = PERMUTED ? low + 2 : low + 8;
+                    b[nb][s][0] = feeds ? pro.pair(factors, m, k0 + low) : 0u;
+                    b[nb][s][1] = feeds ? pro.pair(factors, m, k0 + high) : 0u;
+                }
+            }
+            GroupSums<NB> sums;
+            if constexpr (BIAS) {
+                const u32 ones[4] = {Op::ONES, Op::ONES, Op::ONES, Op::ONES};
+#pragma unroll
+                for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        float x[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        Op::mma(x, ones, b[nb][2 * h]);
+                        Op::mma(x, ones, b[nb][2 * h + 1]);
+                        sums.half[nb][h][0] = x[0];
+                        sums.half[nb][h][1] = x[1];
+                    }
+            }
+#pragma unroll
+            for (int i = 0; i < TPW; ++i)
+                if (tile0 + i < tiles) {
+                    if constexpr (STAGED)
+                        gemv_accumulate<NB>(acc[0][i], wa.raw(stage.ra[i], q, lane), wa,
+                                            wa.staged_block(staging + i * staged_tile, kblocks, sb, lane), q, b,
+                                            sums);
+                    else
+                        gemv_accumulate<NB>(acc[0][i], wa.raw(stage.ra[i], q, lane), wa, stage.ba[i], q, b, sums);
+                    if constexpr (PAIR)
+                        gemv_accumulate<NB>(acc[1][i], wb.raw(stage.rb[i], q, lane), wb, stage.bb[i], q, b, sums);
+                }
+        }
+    };
+    for (u64 sb = begin; sb < end; ++sb) {
+        Stage next;
+        if (sb + 1 < end)
+            load(next, sb + 1);
+        compute(current, sb);
+        current = next;
+    }
+    gemv_finish<TPW, KSPLIT, NB>(acc, M, tile0, tiles, rows, epi, reduce, barrier, part);
+}
+
+// One k-block of an entry-order GEMV (`W::GEMV_ENTRIES`) for one tile:
+// rows g and g + 8 of the lane (`raw`, the k-block's entries of both), the
+// k-block's scales (`c`), the M <= 8 NB activation rows as the N columns of
+// NB column blocks. Each scale group's steps accumulate into a fresh MMA
+// sum, which then takes the group's scale once per row; every column is its
+// own activation row, so a row's bits do not depend on M.
+template <int NB, class Pro, class W>
+__device__ __forceinline__ void gemv_entries_kblock(float (&acc)[NB][4], const W &, const typename W::Raw &raw,
+                                                    const Coefficients<W::GROUPS> &c, const Pro &pro, u32 M,
+                                                    u64 kblock) {
+    const u32 lane = threadIdx.x % 32;
+    const u32 g = lane / 4, t = lane % 4;
+    const float *factors = nullptr;
+#pragma unroll
+    for (int group = 0; group < W::GROUPS; ++group) {
+        const int entry = W::gemv_entry(group, t);
+        float d[NB][4];
+#pragma unroll
+        for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                d[nb][e] = 0.0f;
+#pragma unroll
+        for (int step = 0; step < W::GROUP_STEPS; ++step) {
+            const int h = W::gemv_half(step, t);
+            u32 a[4];
+            W::template entry_pairs<Op>(raw.g, entry, h, a[0], a[2]);
+            W::template entry_pairs<Op>(raw.g8, entry, h, a[1], a[3]);
+            const u64 k = kblock * 64 + 8 * entry + 4 * h;
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb) {
+                const u32 m = 8 * nb + g;
+                const u32 b[2] = {m < M ? pro.pair(factors, m, k) : 0u, m < M ? pro.pair(factors, m, k + 2) : 0u};
+                Op::mma(d[nb], a, b);
+            }
+        }
+#pragma unroll
+        for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+                acc[nb][e] = seismic_fma_rn(c.scale[e / 2][group], d[nb][e], acc[nb][e]);
+    }
+}
+
+// One warp of a tile group of an entry-order weight (and its pair, when WB is
+// one): tiles [tile0, tile0 + TPW) over superblock share `part` of KSPLIT.
+// Each pass loads one superblock per tile and stream whole (rows g and g + 8
+// of its k-blocks, and their coefficient words, every load in flight at
+// once) and then decodes it; the next pass's loads follow the decode (on GB10
+// a lane with more superblocks in flight, prefetched or batched, measured
+// slower). The first superblock's loads are issued before `ready()`.
+template <int TPW, int KSPLIT, int NB, class Ready, class WA, class WB, class Epi, class Barrier>
+__device__ __forceinline__ void gemv_entries_group(const Ready &ready, u32 M, u64 kblocks, u64 tile0, u64 tiles,
+                                                   u64 rows, const WA &wa, const WB &wb, const Epi &epi,
+                                                   float *reduce, const Barrier &barrier, u32 part) {
+    constexpr bool PAIR = !Same<WB, NoWeight>::value;
+    const u32 lane = threadIdx.x % 32;
+    float acc[2][TPW][NB][4];
+#pragma unroll
+    for (int stream = 0; stream < 2; ++stream)
+#pragma unroll
+        for (int i = 0; i < TPW; ++i)
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    acc[stream][i][nb][e] = 0.0f;
+    const u64 superblocks = (kblocks + 3) / 4;
+    const u64 begin = superblocks * part / KSPLIT;
+    const u64 end = superblocks * (part + 1) / KSPLIT;
+    struct Stage {
+        typename WA::Raw ra[TPW][4];
+        typename WB::Raw rb[TPW][4];
+        typename WA::Block ba[TPW];
+        typename WB::Block bb[TPW];
+    };
+    auto load = [&](Stage &stage, u64 sb) {
+#pragma unroll
+        for (int i = 0; i < TPW; ++i)
+            if (tile0 + i < tiles) {
+#pragma unroll
+                for (int q = 0; q < 4; ++q)
+                    if (4 * sb + q < kblocks) {
+                        stage.ra[i][q] = wa.fetch(tile0 + i, 4 * sb + q, lane);
+                        if constexpr (PAIR)
+                            stage.rb[i][q] = wb.fetch(tile0 + i, 4 * sb + q, lane);
+                    }
+                stage.ba[i] = wa.block(tile0 + i, sb, lane);
+                if constexpr (PAIR)
+                    stage.bb[i] = wb.block(tile0 + i, sb, lane);
+            }
+    };
+    Stage stage;
+    if (tile0 < tiles && begin < end)
+        load(stage, begin);
+    const auto pro = ready();
+    static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
+    if (tile0 >= tiles)
+        return;
+    for (u64 sb = begin; sb < end; ++sb) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const u64 kblock = 4 * sb + q;
+#pragma unroll
+            for (int i = 0; i < TPW; ++i) {
+                if (kblock >= kblocks || tile0 + i >= tiles)
+                    continue;
+                Coefficients<WA::GROUPS> ca;
+                wa.coefficients(stage.ba[i], q, ca);
+                gemv_entries_kblock<NB>(acc[0][i], wa, stage.ra[i][q], ca, pro, M, kblock);
+                if constexpr (PAIR) {
+                    Coefficients<WB::GROUPS> cb;
+                    wb.coefficients(stage.bb[i], q, cb);
+                    gemv_entries_kblock<NB>(acc[1][i], wb, stage.rb[i][q], cb, pro, M, kblock);
+                }
+            }
+        }
+        if (sb + 1 < end)
+            load(stage, sb + 1);
+    }
+    gemv_finish<TPW, KSPLIT, NB>(acc, M, tile0, tiles, rows, epi, reduce, barrier, part);
+}
+
+// One warp of a tile group of a records weight (`W::GEMV_RECORDS`; WB its
+// pair of the same representation, or none): tiles [tile0, tile0 + TPW)
+// over superblock share `part` of KSPLIT. A superblock of a tile is one
+// record whose bytes the lanes load 16 at a time, contiguous over the warp;
+// the next superblock's records are in flight while the current one decodes.
+// As in `gemv_entries_kblock`, the k of a step is permuted within its scale
+// group so that lane t's four A values of a row are half of its entry
+// 4 group + t, and its B values are x at the same places: one 16-byte read
+// of x covers a group's two steps. Each group's MMA sum takes its scale once
+// per row, so a row's bits do not depend on M. The group's warps form the
+// representation's decode table (`W::Table`) in shared memory while the first
+// records load, and synchronize on the group's barrier.
+template <int TPW, int KSPLIT, int NB, class Ready, class WA, class WB, class Epi, class Barrier>
+__device__ __forceinline__ void gemv_records_group(const Ready &ready, u32 M, u64 kblocks, u64 tile0, u64 tiles,
+                                                   u64 rows, const WA &wa, const WB &wb, const Epi &epi,
+                                                   float *reduce, const Barrier &barrier, u32 part) {
+    constexpr bool PAIR = !Same<WB, NoWeight>::value;
+    static_assert(!PAIR || Same<WA, WB>::value, "paired records weights share one representation");
+    __shared__ typename WA::Table tables[Barrier::GROUPS];
+    typename WA::Table &table = tables[barrier.group];
+    const u32 lane = threadIdx.x % 32;
+    const u32 g = lane / 4, t = lane % 4;
+    const float *factors = nullptr;
+    float acc[2][TPW][NB][4];
+#pragma unroll
+    for (int stream = 0; stream < 2; ++stream)
+#pragma unroll
+        for (int i = 0; i < TPW; ++i)
+#pragma unroll
+            for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    acc[stream][i][nb][e] = 0.0f;
+    const u64 superblocks = (kblocks + 3) / 4;
+    const u64 begin = superblocks * part / KSPLIT;
+    const u64 end = superblocks * (part + 1) / KSPLIT;
+    struct Stage {
+        typename WA::Record ra[TPW];
+        typename WA::Record rb[TPW];
+    };
+    auto load = [&](Stage &stage, u64 sb) {
+#pragma unroll
+        for (int i = 0; i < TPW; ++i)
+            if (tile0 + i < tiles) {
+                stage.ra[i] = wa.record(tile0 + i, sb, lane);
+                if constexpr (PAIR)
+                    stage.rb[i] = wb.record(tile0 + i, sb, lane);
+            }
+    };
+    Stage stage;
+    if (tile0 < tiles) {
+        if (begin < end)
+            load(stage, begin);
+        WA::form_table(table, part * 32 + lane, KSPLIT * 32);
+    }
+    const auto pro = ready();
+    static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
+    if (tile0 >= tiles)
+        return;
+    barrier.sync(KSPLIT * 32);
+    // One record of one tile and stream into its accumulators.
+    auto accumulate = [&](float (&sum)[NB][4], const typename WA::Record &record, u64 sb) {
+        const typename WA::Scales scale = WA::scales(record, t);
+        // Records hold whole superblocks: all four k-blocks exist.
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const u64 kblock = 4 * sb + q;
+#pragma unroll
+            for (int group = 0; group < WA::GROUPS; ++group) {
+                // Entry 4 group + t of rows g and g + 8: values 0..3 (step
+                // 0) and 4..7 (step 1) of the lane's A pairs.
+                u32 rg[4], rg8[4];
+                WA::template operands<Op>(table, record.w[2 * q] >> (16 * group), rg);
+                WA::template operands<Op>(table, record.w[2 * q + 1] >> (16 * group), rg8);
+                const u64 k = kblock * 64 + 8 * (4 * group + t);
+                float d[NB][4];
+#pragma unroll
+                for (int nb = 0; nb < NB; ++nb) {
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                        d[nb][e] = 0.0f;
+                    const u32 m = 8 * nb + g;
+                    const uint4 x = m < M ? pro.octet(factors, m, k) : make_uint4(0u, 0u, 0u, 0u);
+                    const u32 a0[4] = {rg[0], rg8[0], rg[1], rg8[1]}, b0[2] = {x.x, x.y};
+                    const u32 a1[4] = {rg[2], rg8[2], rg[3], rg8[3]}, b1[2] = {x.z, x.w};
+                    Op::mma(d[nb], a0, b0);
+                    Op::mma(d[nb], a1, b1);
+                }
+#pragma unroll
+                for (int nb = 0; nb < NB; ++nb)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                        sum[nb][e] = seismic_fma_rn(scale(e / 2, 2 * q + group), d[nb][e], sum[nb][e]);
+            }
+        }
+    };
+    for (u64 sb = begin; sb < end; ++sb) {
+        const Stage current = stage;
+        if (sb + 1 < end)
+            load(stage, sb + 1);
+#pragma unroll
+        for (int i = 0; i < TPW; ++i)
+            if (tile0 + i < tiles) {
+                accumulate(acc[0][i], current.ra[i], sb);
+                if constexpr (PAIR)
+                    accumulate(acc[1][i], current.rb[i], sb);
+            }
+    }
+    gemv_finish<TPW, KSPLIT, NB>(acc, M, tile0, tiles, rows, epi, reduce, barrier, part);
+}
+
+// One warp of a tile group: `gemv_records_group` for records weights,
+// `gemv_entries_group` for entry-order weights, otherwise `gemv_mma_group`
+// (`staging`: see there).
+template <int TPW, int KSPLIT, int NB, bool STAGING = false, class Ready, class WA, class WB, class Epi,
+          class Barrier>
+__device__ __forceinline__ void gemv_group(const Ready &ready, u32 M, u64 kblocks, u64 tile0, u64 tiles, u64 rows,
+                                           const WA &wa, const WB &wb, const Epi &epi, float *reduce,
+                                           const Barrier &barrier, u32 part, u8 *staging = nullptr) {
+    if constexpr (GemvRecords<WA>::value && (Same<WB, NoWeight>::value || Same<WA, WB>::value))
+        gemv_records_group<TPW, KSPLIT, NB>(ready, M, kblocks, tile0, tiles, rows, wa, wb, epi, reduce, barrier,
+                                            part);
+    else if constexpr (GemvEntries<WA>::value && (Same<WB, NoWeight>::value || GemvEntries<WB>::value))
+        gemv_entries_group<TPW, KSPLIT, NB>(ready, M, kblocks, tile0, tiles, rows, wa, wb, epi, reduce, barrier,
+                                            part);
+    else
+        gemv_mma_group<TPW, KSPLIT, NB, STAGING>(ready, M, kblocks, tile0, tiles, rows, wa, wb, epi, reduce, barrier,
+                                                 part, staging);
+}
+
 // Launch shape of a GEMV: WARPS warps per block in groups of KSPLIT; a group
 // owns TPW tiles for up to 8 * NB activation rows. Threads per block = 32 *
 // WARPS; tile groups per block = WARPS / KSPLIT.
@@ -599,9 +972,24 @@ template <int WARPS_, int TPW_, int KSPLIT_, int NB_> struct GemvShape {
     __device__ static __forceinline__ u64 tile_group() { return (u64)blockIdx.x * GROUPS + group(); }
 };
 
-// Shared memory of a GEMV block: the KSPLIT reduction of each tile group.
-template <class Shape, class Pro> struct GemvShared {
+// Coefficient staging bytes of a GEMV tile group (`gemv_mma_group`) over
+// weights WS... of `kblocks` k-blocks: the most any staged weight takes for
+// the group's TPW tiles, or 0 when none is staged or the block's groups
+// would take more than STAGING_BYTES with their reduction areas.
+constexpr u64 STAGING_BYTES = 40960;
+template <class Shape, class... WS> __host__ __device__ constexpr u64 gemv_staging(u64 kblocks) {
+    u64 bytes = 0;
+    ((bytes = gemv_staged_tile<WS>(kblocks) > bytes ? gemv_staged_tile<WS>(kblocks) : bytes), ...);
+    bytes *= Shape::TPW;
+    return Shape::GROUPS * (bytes + 4 * Shape::REDUCE) <= STAGING_BYTES ? bytes : 0;
+}
+
+// Shared memory of a GEMV block: the KSPLIT reduction of each tile group,
+// and its coefficient staging (STAGING bytes, `gemv_staging`).
+template <class Shape, class Pro, u64 STAGING = 0> struct GemvShared {
     float reduce[Shape::GROUPS][Shape::REDUCE];
+    uint4 staging[Shape::GROUPS][STAGING > 0 ? STAGING / 16 : 1];
+    static constexpr bool STAGED = STAGING > 0;
 };
 
 // Tile groups of a segment of `rows` rows.
@@ -609,21 +997,71 @@ template <class Shape> __device__ __forceinline__ u64 gemv_groups(u64 rows) {
     return ((rows + 15) / 16 + Shape::TPW - 1) / Shape::TPW;
 }
 
-// Run a GEMV warp over one segment: `group` is the segment-local tile group.
-// `ready()` returns the activation source once the warp's first weight loads
-// are issued (see `gemv_group`).
-template <class Shape, class Ready, class WA, class WB, class Epi, class Shared>
-__device__ __forceinline__ void gemv_segment_ready(Shared &shared, const Ready &ready, u32 M, u64 kblocks, u64 group,
-                                                   u64 rows, const WA &wa, const WB &wb, const Epi &epi) {
-    gemv_group<Shape::TPW, Shape::KSPLIT, Shape::NB>(ready, M, kblocks, group * Shape::TPW, (rows + 15) / 16, rows,
-                                                     wa, wb, epi, shared.reduce[Shape::group()], 1 + Shape::group(),
-                                                     Shape::part());
+// Blocks of a launch of `rows` rows (one segment, `gemv_groups` blocks of
+// Shape::GROUPS tile groups).
+template <class Shape> __host__ __device__ constexpr u64 gemv_grid(u64 rows) {
+    return (((rows + 15) / 16 + Shape::TPW - 1) / Shape::TPW + Shape::GROUPS - 1) / Shape::GROUPS;
 }
 
-template <class Shape, class Pro, class WA, class WB, class Epi, class Shared>
+// How many blocks of a GEMV launch of weights WA (and WB) share an SM
+// (`GroupBarrier`): a launch of GRID blocks (0 when the kernel does not state
+// its grid) on a device of SEISMIC_MULTIPROCESSORS SMs.
+//
+// A streaming weight's warp keeps whole superblocks of 2 to 4 KiB per tile in
+// flight: one block per SM already draws the device's memory rate, and the
+// block holds its SM alone. Measured on GB10 (Nemotron 3.5 Bolt decode, 4096
+// context, against these weights sharing their SMs): the q8 output head
+// 2400 -> 2308 us, a q8 attention input projection 107 -> 92 us, an NVFP4
+// state-space input projection 196 -> 193 us, a step 25.0 -> 24.6 ms.
+//
+// A records weight's warp (`GemvRecords`) keeps one 1 KiB record per tile in
+// flight, so its launch needs its blocks resident together, up to four per
+// SM. A launch that states its grid takes exactly the blocks per SM that
+// hold it in one wave, ceil(GRID / SMs): fewer leave a second wave of a few
+// blocks, each re-forming its source row, behind the first; more let the SMs
+// that free first take more than their share, since a programmatic launch's
+// blocks are placed as its predecessor's retire, each freed SM filling to
+// its residency. The kernel declares the same residency as its launch bounds
+// (`gemv_min_blocks`), so its registers admit it. Measured on GB10 (Bolt, 48
+// SMs, the IQ2_XXS shared expert decode chain): the up (168 blocks) at 4
+// rather than 3 per SM 33.3 -> 28.5 us; the down that follows (128 blocks)
+// at 3 rather than 4 per SM 28.6 -> 25.4 us. A records launch that does not
+// state its grid shares its SM as registers allow.
+template <class Shape, class WA, class WB, u64 GRID> struct GemvResidency {
+    static constexpr bool RECORDS =
+        GemvRecords<WA>::value && (Same<WB, NoWeight>::value || GemvRecords<WB>::value);
+    // The most blocks whose barrier ids fit an SM's 16 (barrier 0 is each
+    // block's own), and the records design's four.
+    static constexpr u64 MOST = 16 / (Shape::GROUPS + 1) < 4 ? 16 / (Shape::GROUPS + 1) : 4;
+    __host__ __device__ static constexpr u64 wave() {
+        const u64 per = (GRID + SEISMIC_MULTIPROCESSORS - 1) / SEISMIC_MULTIPROCESSORS;
+        return per < 1 ? 1 : per > MOST ? MOST : per;
+    }
+    static constexpr int value = !RECORDS ? 1 : GRID == 0 ? 0 : (int)wave();
+};
+
+// The launch bounds' minimum blocks per SM of a GEMV kernel of that launch.
+template <class Shape, class WA, class WB, u64 GRID> __host__ __device__ constexpr int gemv_min_blocks() {
+    return GemvResidency<Shape, WA, WB, GRID>::value > 1 ? GemvResidency<Shape, WA, WB, GRID>::value : 1;
+}
+
+// Run a GEMV warp over one segment of a launch of GRID blocks (0: not
+// stated, see `GemvResidency`): `group` is the segment-local tile group.
+// `ready()` returns the activation source once the warp's first weight loads
+// are issued (see `gemv_group`).
+template <class Shape, u64 GRID = 0, class Ready, class WA, class WB, class Epi, class Shared>
+__device__ __forceinline__ void gemv_segment_ready(Shared &shared, const Ready &ready, u32 M, u64 kblocks, u64 group,
+                                                   u64 rows, const WA &wa, const WB &wb, const Epi &epi) {
+    gemv_group<Shape::TPW, Shape::KSPLIT, Shape::NB, Shared::STAGED>(
+        ready, M, kblocks, group * Shape::TPW, (rows + 15) / 16, rows, wa, wb, epi, shared.reduce[Shape::group()],
+        GroupBarrier<Shape::GROUPS, GemvResidency<Shape, WA, WB, GRID>::value>{Shape::group()}, Shape::part(),
+        reinterpret_cast<u8 *>(shared.staging[Shape::group()]));
+}
+
+template <class Shape, u64 GRID = 0, class Pro, class WA, class WB, class Epi, class Shared>
 __device__ __forceinline__ void gemv_segment(Shared &shared, const Pro &pro, u32 M, u64 kblocks, u64 group,
                                              u64 rows, const WA &wa, const WB &wb, const Epi &epi) {
-    gemv_segment_ready<Shape>(shared, [&] { return pro; }, M, kblocks, group, rows, wa, wb, epi);
+    gemv_segment_ready<Shape, GRID>(shared, [&] { return pro; }, M, kblocks, group, rows, wa, wb, epi);
 }
 
 // Ready callbacks of a programmatic dependent (SEISMIC_PROGRAMMATIC_DEPENDENCY):
@@ -651,6 +1089,15 @@ template <class Pro> __device__ __forceinline__ auto after_dependency(const Pro 
 // superblock's first k-block (or of the share's first). Each warp decodes its
 // own rows' coefficients of every k-block into its area (16 B per row per
 // stream).
+// Bytes of one staged code chunk of W: 16, or `W::CHUNK_BYTES` (a
+// representation whose k-block's bytes are 8-byte pieces of its storage).
+template <class W, class = void> struct ChunkBytes {
+    static constexpr int value = 16;
+};
+template <class W> struct ChunkBytes<W, decltype((void)W::CHUNK_BYTES)> {
+    static constexpr int value = W::CHUNK_BYTES;
+};
+
 template <int BM_, int WM_, int WN_, int STAGES_, bool ORDERED_ = false, int ROTATE_ = 1, int SPAN_ = 1>
 struct GemmShape {
     static constexpr int BM = BM_;
@@ -678,7 +1125,7 @@ struct GemmShape {
     template <bool S8> static constexpr int A_PITCH = S8 ? 80 : 144;
     // Activation bytes per row per stage (s8 rows carry their groups).
     template <bool S8> static constexpr int A_ROW = S8 ? 96 : 144;
-    template <class W> static constexpr int TILE = W::CHUNKS * 16;
+    template <class W> static constexpr int TILE = W::CHUNKS * ChunkBytes<W>::value;
     template <class W> static constexpr int RECORD = (W::SUPER_WORDS * 4 + 15) / 16 * 16;
     static constexpr int COEF_WARP = NJ * 16 * 16;
     template <class WA, class WB, bool S8>
@@ -768,17 +1215,30 @@ __device__ __forceinline__ void cp_async_4_zfill(void *shared, const void *globa
                  "r"(source_bytes)
                  : "memory");
 }
+__device__ __forceinline__ void cp_async_8_zfill(void *shared, const void *global, u32 source_bytes) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(seismic_shared_address(shared)), "l"(global),
+                 "r"(source_bytes)
+                 : "memory");
+}
+// One staged chunk of CHUNK bytes (`ChunkBytes`), zero when not `valid`.
+template <int CHUNK> __device__ __forceinline__ void cp_async_chunk(u8 *shared, const u8 *global, bool valid) {
+    if constexpr (CHUNK == 16)
+        seismic_cp_async_16_zfill(shared, global, valid ? 16u : 0u);
+    else
+        cp_async_8_zfill(shared, global, valid ? 8u : 0u);
+}
 
 // One stream's part of a stage: the code chunks (TILE bytes per tile) of tiles
 // [tile0, tile0 + 8) (zero past `tiles`), by threads `first`, `first + STRIDE`, ...
 template <class W, int STRIDE, int TILE>
 __device__ __forceinline__ void gemm_load_codes(const W &w, u64 tile0, u64 tiles, u64 kblock, u8 *codes, u32 first) {
+    constexpr int CHUNK = ChunkBytes<W>::value;
     for (int c = first; c < 8 * W::CHUNKS; c += STRIDE) {
         const u64 j = c / W::CHUNKS;
         const u32 q = c % W::CHUNKS;
         const bool valid = tile0 + j < tiles;
-        seismic_cp_async_16_zfill(codes + j * TILE + q * 16, w.chunk_source(valid ? tile0 + j : tile0, kblock, q),
-                                  valid ? 16u : 0u);
+        cp_async_chunk<CHUNK>(codes + j * TILE + q * CHUNK, w.chunk_source(valid ? tile0 + j : tile0, kblock, q),
+                              valid);
     }
 }
 
@@ -800,8 +1260,8 @@ __device__ __forceinline__ void gemm_load_codes_span(const W &w, u64 tile0, u64 
         const u64 j = position / W::CHUNKS;
         const u32 q = position % W::CHUNKS;
         const bool valid = tile0 + j < tiles;
-        seismic_cp_async_16_zfill(codes + d * STAGE + j * TILE + q * 16,
-                                  w.chunk_source(valid ? tile0 + j : tile0, kblock + d, q), valid ? 16u : 0u);
+        cp_async_chunk<ChunkBytes<W>::value>(codes + d * STAGE + j * TILE + q * ChunkBytes<W>::value,
+                                             w.chunk_source(valid ? tile0 + j : tile0, kblock + d, q), valid);
     }
 }
 
@@ -826,9 +1286,9 @@ __device__ __forceinline__ void gemm_load_records(const W &w, u64 tile0, u64 til
 // (block-tile rows first..first + NJ * 16) from their records (the record
 // buffer of the k-block's superblock), area[row * GROUPS + group] as F32
 // (scale, -bias), the bias absent when the representation has none.
-template <class W, int NJ, int RECORD>
-__device__ __forceinline__ void gemm_decode_coefficients(const W &w, const u8 *records, u32 first, u64 kblock,
-                                                         float *area) {
+template <class W, int NJ, int RECORD, int TILE>
+__device__ __forceinline__ void gemm_decode_coefficients(const W &w, const u8 *records, const u8 *codes, u32 first,
+                                                         u64 kblock, float *area) {
     if constexpr (W::DENSE)
         return;
     constexpr int ITEMS = NJ * 16 * W::GROUPS;
@@ -836,8 +1296,9 @@ __device__ __forceinline__ void gemm_decode_coefficients(const W &w, const u8 *r
     for (int item = threadIdx.x % 32; item < ITEMS; item += 32) {
         const u32 row = item / W::GROUPS;
         float scale, bias;
-        w.staged_coefficient(reinterpret_cast<const u32 *>(records + (first + row) * RECORD), kblock,
-                             item % W::GROUPS, scale, bias);
+        w.staged_coefficient(reinterpret_cast<const u32 *>(records + (first + row) * RECORD),
+                             codes + (first + row) / 16 * TILE, (first + row) % 16, kblock, item % W::GROUPS, scale,
+                             bias);
         area[item * WORDS] = scale;
         if constexpr (W::BIAS)
             area[item * WORDS + 1] = -bias;
@@ -1109,11 +1570,13 @@ template <class Shape, class WA, class WB, bool S8> struct GemmWeights {
                                                         buffer + 128 * RECORD_A, first);
         }
     }
-    __device__ __forceinline__ void decode(u64 index, u32 warp, u32 first) const {
+    __device__ __forceinline__ void decode(int s, u64 index, u32 warp, u32 first) const {
         const u64 kb = kbegin + index;
-        gemm_decode_coefficients<WA, Shape::NJ, RECORD_A>(wa, records(kb, 0), first, kb, area(warp, 0));
+        gemm_decode_coefficients<WA, Shape::NJ, RECORD_A, TILE_A>(wa, records(kb, 0), codes(s, 0, 0), first, kb,
+                                                                  area(warp, 0));
         if constexpr (PAIR)
-            gemm_decode_coefficients<WB, Shape::NJ, RECORD_B>(wb, records(kb, 1), first, kb, area(warp, 1));
+            gemm_decode_coefficients<WB, Shape::NJ, RECORD_B, TILE_B>(wb, records(kb, 1), codes(s, 1, 0), first, kb,
+                                                                      area(warp, 1));
     }
 };
 
@@ -1131,7 +1594,7 @@ __device__ __forceinline__ void gemm_multiply(float (&acc)[2][Shape::NJ][Shape::
     const u32 wn = warp / Shape::WM;
     const u8 *base = weights.stage(stage);
     const u64 kb = weights.kbegin + index;
-    weights.decode(index, warp, wn * NJ * 16);
+    weights.decode(stage, index, warp, wn * NJ * 16);
     const float *coefficients_a = weights.area(warp, 0);
     const float *coefficients_b = weights.area(warp, 1);
     typename decltype(weights.wa)::Raw raw_a[NJ];
@@ -1450,7 +1913,7 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const QuantizedRows 
             continue;
         const int stage = (int)(kb % Shape::STAGES);
         const u8 *base = weights.stage(stage);
-        weights.decode(kb, warp, wn * NJ * 16);
+        weights.decode(stage, kb, warp, wn * NJ * 16);
         // Activation fragments and (d, d * sum q) of the two 32-code groups.
         u32 a[2][MI][4];
         float2 groups[2][MI][2];
@@ -1477,6 +1940,7 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const QuantizedRows 
 }
 
 // ---------------------------------------------------------------------------
+
 // Operand eligibility is independent of row scheduling. GEMV reads semantic
 // Act; either matrix tile band can consume exact semantic operands, explicitly
 // admitted S8 activations, or a separately admitted materialized F16 operand

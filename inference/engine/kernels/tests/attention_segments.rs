@@ -54,7 +54,7 @@ fn decode_time_by_segment_count_on(device: &Device) {
     let kernel = attention_decode::native_for_device_with(
         device,
         attention_decode::Elements { A: Element::bf16() },
-        &specialization,
+        &specialization.with_static("SK", 0),
     )
     .unwrap();
     for context in [4096usize, 16384] {
@@ -93,6 +93,7 @@ fn decode_time_by_segment_count_on(device: &Device) {
                 let query_norm = f32_tensor(device, &[1, w], &case.query_norm);
                 let key_norm = f32_tensor(device, &[1, w], &case.key_norm);
                 let value_norm = f32_tensor(device, &[0, w], &[]);
+                let sinks = f32_tensor(device, &[0, kv * g], &[]);
                 let components = i32_tensor(device, &[p], &case.components);
                 let frequencies = f32_tensor(device, &[p], &case.frequencies);
                 let amplitudes = f32_tensor(device, &[p], &vec![1.0; p]);
@@ -112,6 +113,7 @@ fn decode_time_by_segment_count_on(device: &Device) {
                             query_norm: &query_norm,
                             key_norm: &key_norm,
                             value_norm: &value_norm,
+                            sinks: &sinks,
                             rotary_components: &components,
                             rotary_frequencies: &frequencies,
                             rotary_amplitudes: &amplitudes,

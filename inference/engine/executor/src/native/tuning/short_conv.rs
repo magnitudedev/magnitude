@@ -142,6 +142,8 @@ pub(crate) struct ShortConvOutputCase {
     gated: Tensor,
     output: Tensor,
     bound: Tensor,
+    /// The absent operand of the output's scale port.
+    absent: Tensor,
 }
 
 impl EntryTuning for ShortConvOutputTuning {
@@ -171,6 +173,7 @@ impl EntryTuning for ShortConvOutputTuning {
         }
         let [_, statics @ ..] = shape.output_dimensions(0);
         let mut statics = statics.to_vec();
+        statics.push(crate::operators::attention::UNSCALED_OUTPUT);
         statics.extend(packing_statics(
             inputs,
             &self.scopes,
@@ -208,6 +211,7 @@ impl EntryTuning for ShortConvOutputTuning {
                     )?,
                     output: inputs.weight(scope, WeightKind::RecurrentOutput)?,
                     bound: inputs.bound(scope, WeightKind::RecurrentOutput)?,
+                    absent: inputs.unit_scale(0)?,
                 })
             })
             .collect()
@@ -219,6 +223,7 @@ impl EntryTuning for ShortConvOutputTuning {
             inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
+            output_scale: &case.absent,
             output_bound: &case.bound,
         }
     }

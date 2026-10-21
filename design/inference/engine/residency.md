@@ -52,7 +52,14 @@ scale field that is NaN in its format (E8M0 0xff, UE4M3 0x7f) decodes as NaN. IQ
 and IQ3_XXS import into vector-coded representations of their own (`iq2xxs`, `iq2xs`,
 `iq3xxs`): each eight-value entry (its grid indices and seven sign bits, the eighth of even
 parity) and each 4-bit sub-block scale code move bit for bit, and the f16 block scale becomes an
-F32 factor scaled by a power of two, exactly. A second-level
+F32 factor scaled by a power of two, exactly. `iq2xxs` instead keeps the f16 block scale as
+stored and applies its 1/8 in the decode, and its row layouts store no scales plane: the 16-bit
+entries leave their top bit free, so bit j of a 32-value sub-block's scale code rides in bit 15 of
+the sub-block's entry j. Its resident row then reads 66 bytes per 256 values, as GGUF does.
+CUDA's `mma16` holds an `iq2xxs` row tile as one `records` plane: per 256 columns a 1056-byte
+record of the tile's 16 rows, 1024 bytes of entries in the order one warp's lanes load them (two
+16-byte loads a lane) and 32 bytes of the rows' f16 scales, so a single-row product reads each
+record once with whole-sector loads. A second-level
 scale (NVFP4's per-tensor or per-expert F32 `.scale`) is a separate stored tensor, not part of the
 representation: the weight's bytes import as stored, and the scale becomes resident beside it as
 one F32 value per matrix (a stored single value repeats per matrix of a stack), keyed and charged
@@ -161,7 +168,12 @@ the whole table's bit for bit.
   calculation: no entry runs before the reader and no reader knows a table is streamed.
 - **A device-selected row an imported table does not hold** is a miss: the target's lookahead is orphaned
   and resubmitted with the row brought ([state transactions](state-transactions.md)); a
-  head's chained proposal embeds another row, and target verification rejects what follows.
+  head's chained proposal, or a LiLiCorr corrector's candidate, embeds another row, and target
+  verification rejects what follows. A drafter step's selected rows are observed when it completes
+  (`SelectedRead::observe`): the held ones are served as a step's named rows are, and the tiles of
+  the missed ones are brought, as a step's absent rows are, into slots no step named since the
+  replacement last passed them, never the current step's nor one the selection holds. Later rounds
+  find them, and the kept rows seed them the next time.
 - **Replacement** takes the slot of a row no step named since the replacement last passed it,
   never one the current step names. A directory change that follows a queued read of selected rows
   waits for the fill it belongs to.
@@ -177,7 +189,7 @@ The target component is imported before engine readiness. Enabled optional head 
 components are held by typed one-shot ComponentLoaders. Each loader owns its import store and
 caches either its assembled component or its typed failure. The head loader inherits the target
 store so tied embedding and output weights retain their exact resident tensors; the vision loader
-owns an isolated projector store. A separate draft (DFlash, DSpark, DFlash2) is the head lane's drafter: its
+owns an isolated projector store. A separate draft (DFlash, DSpark, DFlash2, LiLiCorr) is the head lane's drafter: its
 fusion weights are target weights (every target step fuses the draft's taps), imported with the
 target from the draft component, and its loader imports the rest of the draft component through
 the inherited target store. Vocabulary projection ownership and model-defined proposal candidate policy are independent.

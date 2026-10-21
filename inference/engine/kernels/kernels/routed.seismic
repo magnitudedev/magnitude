@@ -54,8 +54,10 @@ fn routed_route[M, H, PT, NM, E, K](residual: &tensor[M, PT * H] f32, norm: &ten
 
 # Both backends: rows <= 8 form the router logits as a GEMV (one simdgroup or
 # warp per logit column); larger classes normalize once per row (`stage`),
-# then a 32 x 32 tiled GEMM; selection with one simdgroup or warp per row.
-# SIMDGROUPS (columns per GEMV threadgroup) never changes result bits.
+# then a 32 x 32 tiled GEMM (edge tiles guarded); selection with one
+# simdgroup or warp per row, ceil(E / 32) experts per lane (lanes at or past
+# E % 32 exclude their last register). SIMDGROUPS (columns per GEMV
+# threadgroup) never changes result bits.
 #
 # Metal: the GEMV is the K1 GEMV body (32-lane groups, dense rows loaded a
 # whole packet at a time) over the normalized rows each threadgroup stages,
@@ -69,7 +71,7 @@ fn routed_route[M, H, PT, NM, E, K](residual: &tensor[M, PT * H] f32, norm: &ten
 native routed_route for metal from "metal/routed_route.metal":
     static (H, PT, NM, E, K)
     params (SIMDGROUPS in [8, 16, 4, 2])
-    where H % 32 == 0 and E % 32 == 0 and E <= 1024
+    where H % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
     launch routed_route_stage when M > 8:
@@ -95,7 +97,7 @@ native routed_route for metal from "metal/routed_route.metal":
 native routed_route for cuda from "cuda/routed_route.cu":
     static (H, PT, NM, E, K)
     params (SIMDGROUPS in [8, 4, 2], arithmetic SPLIT in [8, 4, 16])
-    where H % 32 == 0 and E % 32 == 0 and E <= 1024
+    where H % 32 == 0 and E <= 1024
     scratch logits bytes (SPLIT * M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
     launch routed_route_stage when M > 8:
@@ -119,7 +121,7 @@ native routed_route for cuda from "cuda/routed_route.cu":
 native routed_route for vulkan from "vulkan/routed_route.comp":
     static (H, PT, NM, E, K)
     params (SIMDGROUPS in [8, 4, 2])
-    where H % 32 == 0 and E % 32 == 0 and E <= 1024
+    where H % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
     launch routed_route_stage when M > 8:
         threadgroups (M, 1, 1)
@@ -222,7 +224,7 @@ fn routed_route_shared[M, H, PT, NM, E, K, S](residual: &tensor[M, PT * H] f32,
 native routed_route_shared for metal from "metal/routed_route_shared.metal":
     static (H, PT, NM, E, K, S)
     params (SIMDGROUPS in [8, 16, 4, 2], ROWS in [1, 2, 4], arithmetic LANES in [32, 16])
-    where H % 32 == 0 and E % 32 == 0 and E <= 1024
+    where H % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
     launch routed_route_shared:
@@ -275,15 +277,17 @@ native routed_expand for metal from "metal/routed_expand.metal":
 # gathered form: a choice's blocks run only for its expert's first choice,
 # over the rows of every choice of that expert, so a step streams each chosen
 # expert once; one row has nothing to share and runs the per-choice form.
-# (Metal: the rows16 GEMV.)
+# Both forms share TPW and KSPLIT, so a choice's product has its one-row bits
+# in either. (Metal: the rows16 GEMV.)
 native routed_expand for cuda from "cuda/routed_expand.cu":
     static (H, K, F, S)
+    params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
     launch routed_expand when M == 1:
-        params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+        reads (TPW, KSPLIT)
         threadgroups (ceil_div(ceil_div(ceil_div(max(F, S), 16), TPW), 4 / KSPLIT), M * K + 1, 1)
         threads_per_threadgroup (128, 1, 1)
     launch routed_expand_gathered when M > 1:
-        params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+        reads (TPW, KSPLIT)
         threadgroups (ceil_div(ceil_div(ceil_div(max(F, S), 16), TPW), 4 / KSPLIT), M * K + 1, 1)
         threads_per_threadgroup (128, 1, 1)
 
@@ -387,17 +391,19 @@ native routed_output for metal from "metal/routed_output.metal":
 # (row, slot); the last block of a channel tile to arrive combines them in
 # slot order. Several rows run the gathered form: each chosen expert once
 # over the rows of its choices and the shared expert once over every row;
-# one row runs one block per slot. (Metal: the side-by-side form.)
+# one row runs one block per slot; both forms share TPW and KSPLIT. (Metal:
+# the side-by-side form.)
 native routed_output for cuda from "cuda/routed_output.cu":
     static (H, SN, IN, K, F, S)
+    params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
     scratch published bytes (M * (K + 1) * H * 4)
     scratch arrivals bytes (ceil_div(H, 16) * 4) sync
     launch routed_output when M == 1:
-        params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+        reads (TPW, KSPLIT)
         threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * (K + 1), 1)
         threads_per_threadgroup (128, 1, 1)
     launch routed_output_gathered when M > 1:
-        params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+        reads (TPW, KSPLIT)
         threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * (K + 1), 1)
         threads_per_threadgroup (128, 1, 1)
 
@@ -814,18 +820,20 @@ fn routed_select[M, H, E, K](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
     return normalized
 
 # All backends: the `routed_route` launch structure over E logit columns:
-# rows <= 8 form the logits as a GEMV (one simdgroup or warp per column,
-# forming the router input on the fly, threadgroup 0 publishing
-# `normalized`); larger classes stage both normalized forms once, then a
-# 32 x 32 tiled GEMM over the router input; the selection with one
-# simdgroup or warp per row sorts each lane's E / 32 candidates once, then
-# takes K single-argmax rounds over the lane heads (the single-pass top-K).
+# rows <= 8 form the logits as a GEMV (Metal, Vulkan: one simdgroup or warp
+# per column, forming the router input on the fly, threadgroup 0 publishing
+# `normalized`; CUDA: below); larger classes stage both normalized forms once, then a
+# 32 x 32 tiled GEMM over the router input (edge tiles guarded); the
+# selection with one simdgroup or warp per row sorts each lane's
+# ceil(E / 32) candidates once (lanes at or past E % 32 pad their last
+# register with an excluded entry), then takes K single-argmax rounds over
+# the lane heads (the single-pass top-K).
 # Metal's GEMV is `routed_route`'s (`metal/lib/routed/router.h`): the K1 GEMV
 # body over the router input each threadgroup stages.
 native routed_select for metal from "metal/routed_select.metal":
     static (H, E, K)
     params (SIMDGROUPS in [8, 16, 4, 2])
-    where H % 32 == 0 and E % 32 == 0 and E <= 1024 and K <= E
+    where H % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (M * E * 4)
     scratch router_rows bytes (M * H * 4) when M > 8
     launch routed_select_stage when M > 8:
@@ -842,19 +850,21 @@ native routed_select for metal from "metal/routed_select.metal":
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# CUDA: the GEMM splits the hidden axis into SPLIT partial planes that the
-# selection sums in order (SPLIT is arithmetic).
+# CUDA: the GEMV (one warp per logit column over a hidden share whose router
+# input rows each threadgroup forms in shared memory) and the GEMM split the
+# hidden axis into SPLIT partial planes that the selection sums in order
+# (SPLIT is arithmetic).
 native routed_select for cuda from "cuda/routed_select.cu":
     static (H, E, K)
     params (SIMDGROUPS in [8, 4, 2], arithmetic SPLIT in [8, 4, 16])
-    where H % 32 == 0 and E % 32 == 0 and E <= 1024 and K <= E
+    where H % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (SPLIT * M * E * 4)
     scratch router_rows bytes (M * H * 4) when M > 8
     launch routed_select_stage when M > 8:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch routed_select_gemv when M <= 8:
-        threadgroups (ceil_div(E, SIMDGROUPS), 1, 1)
+        threadgroups (ceil_div(E, SIMDGROUPS), 1, SPLIT)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
     launch routed_select_gemm when M > 8:
         threadgroups (ceil_div(E, 32), ceil_div(M, 32), SPLIT)
@@ -866,7 +876,7 @@ native routed_select for cuda from "cuda/routed_select.cu":
 native routed_select for vulkan from "vulkan/routed_select.comp":
     static (H, E, K)
     params (SIMDGROUPS in [8, 4, 2])
-    where H % 32 == 0 and E % 32 == 0 and E <= 1024 and K <= E
+    where H % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (M * E * 4)
     scratch router_rows bytes (M * H * 4) when M > 8
     launch routed_select_stage when M > 8:
@@ -1125,13 +1135,19 @@ native routed_down for metal from "metal/routed_down.metal":
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * K, 1, 1)
 
+# CUDA: the choices' projections in parallel blocks, A-rounded into
+# `projected`, then the slot-order combine.
 native routed_down for cuda from "cuda/routed_down.cu":
     static (H, K, F)
     where F % 64 == 0
+    scratch projected bytes (M * K * H * 4)
     launch routed_down:
         params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
-        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M, 1)
+        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * K, 1)
         threads_per_threadgroup (128, 1, 1)
+    launch routed_down_combine:
+        threadgroups (ceil_div(H, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
 
 native routed_down for vulkan from "vulkan/routed_down.comp":
     static (H, K, F)

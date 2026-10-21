@@ -7188,7 +7188,7 @@ pub fn implementation_digest(
         }
         #[cfg(target_os = "macos")]
         crate::backends::OpenedKind::Metal(opened) => Some(super::metal_dialect(opened)),
-        crate::backends::OpenedKind::Cuda(_) => Some(super::abi::Dialect::Cuda),
+        crate::backends::OpenedKind::Cuda(opened) => Some(super::cuda_dialect(opened)),
         #[cfg(not(target_os = "macos"))]
         crate::backends::OpenedKind::Vulkan(opened) => {
             Some(super::abi::Dialect::Vulkan(opened.features()))
@@ -7284,7 +7284,7 @@ pub fn kernel_digest(
                 .map_err(|error| declaration(format!("NVRTC is unavailable: {error}")))?;
             digest.update(format!("nvrtc {major}.{minor};").as_bytes());
             digest.update(seismic_cuda::nvrtc::COMPILE_OPTIONS.join(" ").as_bytes());
-            Some(super::abi::Dialect::Cuda)
+            Some(super::abi::Dialect::Cuda(super::abi::CudaFeatures::UNOPENED))
         }
         // The lane count is a value the prefix states, not a feature: any
         // one renders the same source otherwise.

@@ -31,9 +31,10 @@ pub use submission::{
 };
 
 use crate::{
-    GraphOutputTensor, HeadLaunchCore, ImportLaunchCore, ResidentWeightSlot, StateLaunchCore,
-    SubmitError, TargetLaunchCore, ValidatedHeadLaunch, ValidatedImportLaunch,
-    ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchCore,
+    DeviceError, GraphOutputTensor, HeadLaunchCore, ImportLaunchCore, InvariantError,
+    ResidentWeightSlot, StateLaunchCore, SubmitError, TargetLaunchCore, ValidatedHeadLaunch,
+    ValidatedImportLaunch, ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch,
+    VisionLaunchCore,
 };
 
 /// Submit one ready native graph run and wait for its outcome. Programs
@@ -48,9 +49,82 @@ pub(crate) fn run_graph(
 }
 
 pub type CompletedTargetWork = CompletedWork<TargetLaunchCore, TargetOutput>;
-/// A head's selections, `[steps, slot class, 2]` (token, status) rows in
-/// step-major order; absent for a causal-only head.
-pub type CompletedHeadWork = CompletedWork<HeadLaunchCore, Option<GraphOutputTensor>>;
+pub type CompletedHeadWork = CompletedWork<HeadLaunchCore, HeadOutput>;
+
+/// What a head step leaves the host.
+pub struct HeadOutput {
+    /// The step's selections, `[steps, slot class, 2]` (token, status) rows
+    /// in step-major order; absent for a causal-only head.
+    pub selections: Option<GraphOutputTensor>,
+    /// The step's read of table rows its device work selected, which the
+    /// host observes once the step completed.
+    pub selected_rows: Option<SelectedRows>,
+}
+
+/// A head step's read of table rows its device work selected
+/// (`ResidentTable::read_selected`), and where the host finds those rows.
+pub struct SelectedRows {
+    read: crate::device_table::SelectedRead,
+    rows: SelectedRowsSource,
+}
+
+enum SelectedRowsSource {
+    /// The step's selected tokens: a chained pass embeds each one.
+    Selections,
+    /// `[.., 2]` i32 rows the step exported, the first column a token (a
+    /// corrector's candidates).
+    Exported(GraphOutputTensor),
+}
+
+impl SelectedRows {
+    /// A read of the tokens the step selects.
+    pub(crate) fn selections(read: crate::device_table::SelectedRead) -> Self {
+        Self {
+            read,
+            rows: SelectedRowsSource::Selections,
+        }
+    }
+
+    /// A read of the tokens of the step's exported `rows`.
+    pub(crate) fn exported(
+        read: crate::device_table::SelectedRead,
+        rows: GraphOutputTensor,
+    ) -> Self {
+        Self {
+            read,
+            rows: SelectedRowsSource::Exported(rows),
+        }
+    }
+
+    /// Observe the rows the read selected once the step completed
+    /// (`SelectedRead::observe`): `selected`, the step's selected tokens, or
+    /// the tokens of its exported rows.
+    pub fn observe(&self, selected: &[crate::TokenId]) -> Result<(), SubmitError> {
+        let invalid = |detail: String| {
+            SubmitError::Invariant(InvariantError {
+                context: "selected table rows",
+                detail,
+            })
+        };
+        let rows = match &self.rows {
+            SelectedRowsSource::Selections => {
+                selected.iter().map(|token| u64::from(token.0)).collect()
+            }
+            SelectedRowsSource::Exported(rows) => rows
+                .tensor()
+                .read_to_host()
+                .map_err(|error| SubmitError::Device(DeviceError::Transfer(error.to_string())))?
+                .chunks_exact(8)
+                .map(|row| {
+                    let token = i32::from_le_bytes(row[0..4].try_into().expect("four token bytes"));
+                    u64::try_from(token)
+                        .map_err(|_| invalid(format!("selected row {token} is negative")))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        self.read.observe(&rows).map_err(invalid)
+    }
+}
 pub type CompletedVisionWork = CompletedWork<VisionLaunchCore, GraphOutputTensor>;
 pub type CompletedStateWork = CompletedWork<StateLaunchCore, ()>;
 pub type CompletedImportWork = CompletedWork<ImportLaunchCore, ResidentWeightSlot>;

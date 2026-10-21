@@ -378,11 +378,13 @@ representation!(IQ2XSRows32, "iq2xs", Rows32, F32, 3);
 representation!(IQ3XXSRows32, "iq3xxs", Rows32, F32, 3);
 representation!(IQ2XSMma16, "iq2xs", Mma16, F32, 3);
 representation!(IQ3XXSMma16, "iq3xxs", Mma16, F32, 3);
+// iq2xxs carries its scale codes in its entries: row layouts hold `grids`
+// and `supers`, and `mma16` one `records` plane.
 representation!(IQ2XXS, "iq2xxs", F32, 3);
-representation!(IQ2XXSRows16, "iq2xxs", Rows16, F32, 3);
-representation!(IQ2XXSRows8, "iq2xxs", Rows8, F32, 3);
-representation!(IQ2XXSRows32, "iq2xxs", Rows32, F32, 3);
-representation!(IQ2XXSMma16, "iq2xxs", Mma16, F32, 3);
+representation!(IQ2XXSRows16, "iq2xxs", Rows16, F32, 2);
+representation!(IQ2XXSRows8, "iq2xxs", Rows8, F32, 2);
+representation!(IQ2XXSRows32, "iq2xxs", Rows32, F32, 2);
+representation!(IQ2XXSMma16, "iq2xxs", Mma16, F32, 1);
 
 /// Dispatches a runtime representation id into the typed world.
 pub trait RepresentationVisitor {

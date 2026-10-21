@@ -28,6 +28,10 @@ typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
     device half *weight_factors [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_FACTORS)]],      \
     device float *token_scales [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_SCALES)]],         \
     device float *weight_scales [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_SCALES)]],       \
+    device const float *query_scale [[buffer(SEISMIC_BUFFER_QUERY_SCALE)]],             \
+    device const float *gate_scale [[buffer(SEISMIC_BUFFER_GATE_SCALE)]],               \
+    device const float *key_scale [[buffer(SEISMIC_BUFFER_KEY_SCALE)]],                 \
+    device const float *value_scale [[buffer(SEISMIC_BUFFER_VALUE_SCALE)]],             \
     device const float *query_bound [[buffer(SEISMIC_BUFFER_QUERY_BOUND)]],             \
     device const float *gate_bound [[buffer(SEISMIC_BUFFER_GATE_BOUND)]],               \
     device const float *key_bound [[buffer(SEISMIC_BUFFER_KEY_BOUND)]],                 \
@@ -48,14 +52,20 @@ typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
     projection::Weights<packets::W1> gate_w{gate_weight, KERNEL_W1_LAYOUT(k), k};       \
     projection::Weights<packets::W2> key_w{key_weight, KERNEL_W2_LAYOUT(k), k};         \
     projection::Weights<packets::W3> value_w{value_weight, KERNEL_W3_LAYOUT(k), k};     \
-    projection::Store<activation> query_out{query, SEISMIC_RESULT_0_STRIDE_0,           \
-        SEISMIC_RESULT_0_STRIDE_1, 0};                                                  \
-    projection::Store<activation> gate_out{gate, SEISMIC_RESULT_1_STRIDE_0,             \
-        SEISMIC_RESULT_1_STRIDE_1, 0};                                                  \
-    projection::Store<activation> key_out{key, SEISMIC_RESULT_2_STRIDE_0,               \
-        SEISMIC_RESULT_2_STRIDE_1, 0};                                                  \
-    projection::Store<activation> value_out{value, SEISMIC_RESULT_3_STRIDE_0,           \
-        SEISMIC_RESULT_3_STRIDE_1, 0}
+    const auto query_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_QS, query_scale,        \
+        (projection::Store<activation>{query, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0})); \
+    const auto gate_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_GS, gate_scale,          \
+        (projection::Store<activation>{gate, SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1, 0})); \
+    const auto key_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_KS, key_scale,            \
+        (projection::Store<activation>{key, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, 0})); \
+    const auto value_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_VS, value_scale,        \
+        (projection::Store<activation>{value, SEISMIC_RESULT_3_STRIDE_0, SEISMIC_RESULT_3_STRIDE_1, 0}))
+
+// A segment's result after its weight's second-level scale, where the
+// segment's scale port (static extent EXTENT) is present.
+#define ATTENTION_PROJECT_SCALED(EXTENT, SCALE, STORE)                                  \
+    projection::scaling<(EXTENT != 0)>::wrap(STORE,                                     \
+        projection::scale_factor(SCALE, EXTENT, 0, 0), 1.0f)
 
 template <typename Output>
 inline void attention_project_zero_tile(Output out, uint rows, uint columns,

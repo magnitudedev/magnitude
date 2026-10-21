@@ -8,9 +8,11 @@ SEISMIC_PROGRAMMATIC_DEPENDENCY
 
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
 // The residual join: the residual add, or (hyper-connection streams) the
-// scatter of the projection into each stream.
+// scatter of the projection into each stream, after the weight's
+// second-level scale where it has one.
 using Output = projection::OutputOf<projection::AllRows, SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>;
-using Epi = Output::type;
+using Scaling = projection::scaling<(SEISMIC_DIM_OS != 0)>;
+using Epi = Scaling::type<Output::type>;
 
 #define HEADS (SEISMIC_DIM_Q * SEISMIC_DIM_W)
 #define GATED_ROWS Pro{SEISMIC_PTR(SEISMIC_BUFFER_GATED), SEISMIC_GATED_STRIDE_0, projection::AllRows{}}
@@ -19,17 +21,19 @@ using Epi = Output::type;
 #define OUTPUT KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_WEIGHT))
 #define PARTIALS reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS))
 #define EPILOGUE                                                                                     \
-    Output::make(reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0, \
-                 projection::AllRows{}, reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)),     \
-                 SEISMIC_RESULT_0_STRIDE_0, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INJECT)), \
-                 SEISMIC_INJECT_STRIDE_0, SEISMIC_DIM_D)
+    Scaling::wrap(                                                                                   \
+        Output::make(reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0, \
+                     projection::AllRows{}, reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)), \
+                     SEISMIC_RESULT_0_STRIDE_0, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INJECT)), \
+                     SEISMIC_INJECT_STRIDE_0, SEISMIC_DIM_D),                                        \
+        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_SCALE), SEISMIC_DIM_OS, 0, 0), 1.0f)
 
 // The GEMV over NB column blocks of 8 rows.
 template <int NB, int KSPLIT>
 __device__ __forceinline__ void output_gemv(const Pro &heads, unsigned M, unsigned long long K, unsigned long long D,
                                             const packets::W0 &output, const Epi &epi) {
     using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
-    __shared__ projection::GemvShared<Shape, Pro> shared;
+    __shared__ projection::GemvShared<Shape, Pro, projection::gemv_staging<Shape, packets::W0>(HEADS / 64)> shared;
     projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(heads), M, K / 64, Shape::tile_group(),
                                           D, output, projection::NoWeight{}, epi);
 }

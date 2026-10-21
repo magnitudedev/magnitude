@@ -3,11 +3,13 @@
 #
 # Every K1 CUDA entry runs the GEMV to 16 rows and the GEMM beyond, in two row
 # bands. The GEMV is the 16-bit path (the A-rounded activation in bf16/f16
-# MMAs against exact codes, rows independent of O, so each row matches O = 1
-# bit for bit): `gemv` to 8 rows, `gemv16` (two 8-row column blocks) from 9 to
-# 16; 8 warps per block in groups of KSPLIT that split K and reduce in part
-# order. The small-band GEMM (`gemm_small`, 17 to 64 rows: 64-row block tiles,
-# 3 cp.async stages) has two operand paths: the 16-bit path (weights
+# MMAs against exact codes, rows independent of O): `gemv` to 8 rows,
+# `gemv16` (two 8-row column blocks) from 9 to 16; 8 warps per block in groups
+# of KSPLIT that split K and reduce in part order. `dense_up` and
+# `dense_output` share one KSPLIT between their two GEMV launches, so every
+# row of the band has its O = 1 bits. The small-band GEMM
+# (`gemm_small`, 17 to 64 rows: 64-row block tiles, 3 cp.async stages) has
+# two operand paths: the 16-bit path (weights
 # dequantized to A) and the INT8 candidate (arithmetic INT8 = 1: activations
 # quantized per 32 codes as q8_1 does, s8 MMAs); the tuner keeps INT8 only
 # where it is faster within tolerance. The large-band GEMM (`gemm`, beyond 64
@@ -23,7 +25,10 @@
 # split up to 128 rows. Staging launches form the rows a launch does not read in
 # place: `stage` a normalized input's A rows (at O = 1 the GEMV block forms
 # its row in its shared memory instead), the shared operand stage the INT8 candidate's q8_1
-# rows plus (d, d * sum q) groups.
+# rows plus (d, d * sum q) groups. `dense_up` and `dense_output` are programmatic
+# launches: a GEMV warp issues its first weight loads before it waits for the
+# previous launch, so a shared expert's down projection streams under its
+# expansion's last blocks (Nemotron 3.5 Bolt decode on GB10: 33.6 -> 25.0 us).
 
 native dense_expand for cuda from "cuda/dense_expand.cu":
     static (H, F, GS, US)
@@ -59,7 +64,7 @@ native dense_expand for cuda from "cuda/dense_expand.cu":
 # `dense_expand`'s bands with one weight stream.
 native dense_up for cuda from "cuda/dense_up.cu":
     static (H, F, US)
-    params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
+    params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1], code arithmetic KSPLIT in [4, 2, 8])
     where H % 64 == 0 and US <= 1 and (OPERAND == 0 or INT8 == 0)
     scratch staged bytes (O * H * 2) when O > 1
     scratch groups bytes (O * H / 4) when INT8 == 1 and O > 16
@@ -68,12 +73,12 @@ native dense_up for cuda from "cuda/dense_up.cu":
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_up_gemv when O <= 8:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        reads (KSPLIT)
         threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, O - 1)) * H * 2)
     launch dense_up_gemv16 when O > 8 and O <= 16:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        reads (KSPLIT)
         threadgroups (ceil_div(ceil_div(F, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_up_gemm_small when O > 16 and O <= 64:
@@ -192,7 +197,7 @@ native project_rows for cuda from "cuda/project_rows.cu":
 
 native dense_output for cuda from "cuda/dense_output.cu":
     static (H, F, DS)
-    params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
+    params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1], code arithmetic KSPLIT in [4, 2, 8])
     where F % 64 == 0 and DS <= 1 and (OPERAND == 0 or INT8 == 0)
     scratch staged bytes (O * F * (1 + OPERAND)) when O > 16 and (INT8 == 1 or OPERAND == 1)
     scratch groups bytes (O * F / 4) when INT8 == 1 and O > 16
@@ -202,11 +207,11 @@ native dense_output for cuda from "cuda/dense_output.cu":
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_output_gemv when O <= 8:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        reads (KSPLIT)
         threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_output_gemv16 when O > 8 and O <= 16:
-        params (code arithmetic KSPLIT in [4, 2, 8])
+        reads (KSPLIT)
         threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_output_gemm_small when O > 16 and O <= 64:

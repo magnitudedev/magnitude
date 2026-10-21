@@ -187,6 +187,10 @@ fn attention_project_classifies_each_weight_by_its_own_representation() {
             ("gate_weight", "packed"),
             ("key_weight", "packed"),
             ("value_weight", "bf16"),
+            ("query_scale", "f32"),
+            ("gate_scale", "f32"),
+            ("key_scale", "f32"),
+            ("value_scale", "f32"),
             ("query_bound", "f32"),
             ("gate_bound", "f32"),
             ("key_bound", "f32"),
@@ -335,7 +339,7 @@ fn assert_affine_history(analysis: &EntryAnalysis) {
 #[test]
 fn attention_decode_k8v4_has_one_grid_per_code_plane() {
     let analysis = analyze(&kernel("attention_decode_k8v4", &[("A", "bf16")]));
-    assert_eq!(analysis.parameters.len(), 18);
+    assert_eq!(analysis.parameters.len(), 19);
     assert_affine_history(&analysis);
 }
 
@@ -343,7 +347,7 @@ fn attention_decode_k8v4_has_one_grid_per_code_plane() {
 fn attention_prefill_k8v4_decodes_history_it_has_already_appended_to() {
     let analysis = analyze(&kernel("attention_prefill_k8v4", &[("A", "bf16")]));
     // The WorkList bitmap and its block keys' extent-only table among them.
-    assert_eq!(analysis.parameters.len(), 21);
+    assert_eq!(analysis.parameters.len(), 22);
     assert_eq!(stored(&analysis, "history_tiles"), &Stored::Discrete);
     assert_affine_history(&analysis);
 }
@@ -361,6 +365,7 @@ fn dense_attention_history_is_floating_and_has_no_grid() {
             ("query_norm", "f32"),
             ("key_norm", "f32"),
             ("value_norm", "f32"),
+            ("sinks", "f32"),
             ("rotary_components", "discrete"),
             ("rotary_frequencies", "f32"),
             ("rotary_amplitudes", "f32"),

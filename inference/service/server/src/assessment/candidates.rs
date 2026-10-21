@@ -2828,6 +2828,7 @@ fn engine_method(method: &SpeculativeMethod) -> ModelMethod {
         SpeculativeMethod::DFlash => ModelMethod::DFlash,
         SpeculativeMethod::DFlash2 => ModelMethod::DFlash2,
         SpeculativeMethod::DSpark => ModelMethod::DSpark,
+        SpeculativeMethod::LiLiCorr => ModelMethod::LiLiCorr,
     }
 }
 
@@ -2879,7 +2880,7 @@ fn fits(assessment: &ModelAssessment) -> bool {
 }
 
 /// Candidates in automatic-choice order: by category (`DrafterCategory`'s order), then by method
-/// (DFlash2, DSpark, DFlash, MTP; one with no known method last), then the smaller download, and
+/// (LiLiCorr, DFlash2, DSpark, DFlash, MTP; one with no known method last), then the smaller download, and
 /// otherwise in enumeration order. The first bound candidate in this order is the recommendation.
 fn in_choice_order(mut candidates: Vec<DrafterCandidate>) -> Vec<DrafterCandidate> {
     candidates.sort_by_key(|candidate| {
@@ -2892,13 +2893,16 @@ fn in_choice_order(mut candidates: Vec<DrafterCandidate>) -> Vec<DrafterCandidat
     candidates
 }
 
-/// The speculation order of the model radar: DFlash2, DSpark, DFlash, then MTP.
+/// The speculation order of the model radar: LiLiCorr (DFlash2's
+/// convolved backbone with a corrector over its candidates), DFlash2,
+/// DSpark, DFlash, then MTP.
 fn method_rank(method: &SpeculativeMethod) -> usize {
     match method {
-        SpeculativeMethod::DFlash2 => 0,
-        SpeculativeMethod::DSpark => 1,
-        SpeculativeMethod::DFlash => 2,
-        SpeculativeMethod::Mtp => 3,
+        SpeculativeMethod::LiLiCorr => 0,
+        SpeculativeMethod::DFlash2 => 1,
+        SpeculativeMethod::DSpark => 2,
+        SpeculativeMethod::DFlash => 3,
+        SpeculativeMethod::Mtp => 4,
     }
 }
 
@@ -3053,6 +3057,7 @@ fn method_name(method: &SpeculativeMethod) -> &'static str {
         SpeculativeMethod::DFlash => "DFlash",
         SpeculativeMethod::DFlash2 => "DFlash2",
         SpeculativeMethod::DSpark => "DSpark",
+        SpeculativeMethod::LiLiCorr => "LiLiCorr",
     }
 }
 

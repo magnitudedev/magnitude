@@ -10,7 +10,7 @@
 use crate::options::{DraftPolicy, ExecutionManifest, ResolvedMethod, ResolvedModelPolicy};
 use magnitude_batching::MAX_CLASS_ROWS;
 use magnitude_executor::{
-    image_cell_limit, platform::SelectedDevice, BackendPlan, ComponentSelection,
+    image_cell_limit, platform::SelectedDevice, BackendPlan, ComponentSelection, DraftWidths,
     ExecutionPlanDraft, ExecutionPlanner, PlanError, PlannedMethod, ResourceLimits,
 };
 use magnitude_scheduler::ServiceLimits;
@@ -95,6 +95,12 @@ fn planner_inputs(
         head: !matches!(manifest.model.method, ResolvedMethod::Plain),
         vision: manifest.definition.vision.is_some(),
     };
+    // A fixed budget drafts its generated width, or a narrower one at a
+    // request's end; an adaptive load any width its controller chooses.
+    let widths = match manifest.model.draft_policy {
+        Some(DraftPolicy::Fixed(budget)) => DraftWidths::Fixed(budget.generated as u8),
+        Some(DraftPolicy::Adaptive) | None => DraftWidths::Adaptive,
+    };
     let method = match manifest.model.method {
         ResolvedMethod::Plain => PlannedMethod::Plain,
         ResolvedMethod::Mtp {
@@ -104,26 +110,9 @@ fn planner_inputs(
         } => PlannedMethod::Mtp {
             greedy_proposals,
             sampled_proposals,
+            widths,
         },
-        // A block pass drafts exactly a fixed budget's generated width, or
-        // any width an adaptive load may choose.
-        ResolvedMethod::DFlash { proposals } => match manifest.model.draft_policy {
-            Some(DraftPolicy::Fixed(budget)) => PlannedMethod::DFlash {
-                proposals,
-                generated: budget.generated as u8,
-                ladder: false,
-            },
-            Some(DraftPolicy::Adaptive) => PlannedMethod::DFlash {
-                proposals,
-                generated: proposals,
-                ladder: true,
-            },
-            None => PlannedMethod::DFlash {
-                proposals,
-                generated: proposals,
-                ladder: false,
-            },
-        },
+        ResolvedMethod::DFlash { proposals } => PlannedMethod::DFlash { proposals, widths },
     };
     let image_cells = image_cell_limit(&manifest.definition, manifest.service.launch_rows())
         .map_err(ExecutionPlanningError::Plan)?;

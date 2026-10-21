@@ -276,7 +276,7 @@ struct Routing {
 
 const CLAMP: f32 = 6.103_515_6e-5;
 
-const ROUTINGS: [Routing; 5] = [
+const ROUTINGS: [Routing; 7] = [
     Routing {
         name: "lfm2-moe",
         hidden: 2048,
@@ -336,6 +336,34 @@ const ROUTINGS: [Routing; 5] = [
         biased: true,
         expert_scales: false,
         router_norm: false,
+    },
+    // Nemotron 3.5 Bolt's smallest routed layer: E = 240 is not a multiple
+    // of 32 (lanes 16..31 exclude their last register).
+    Routing {
+        name: "nemotron-bolt-240",
+        hidden: 4096,
+        experts: 240,
+        selected: 9,
+        score: 1,
+        normalization: 3,
+        scale: 5.0,
+        biased: true,
+        expert_scales: false,
+        router_norm: false,
+    },
+    // A small odd expert count under softmax, whose maximum and sum must
+    // skip the excluded registers: one partial lane run.
+    Routing {
+        name: "odd-softmax-23",
+        hidden: 512,
+        experts: 23,
+        selected: 5,
+        score: 0,
+        normalization: 1,
+        scale: 1.0,
+        biased: false,
+        expert_scales: true,
+        router_norm: true,
     },
 ];
 
@@ -1613,6 +1641,12 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                     let label = format!("{label} {mapping:?} INT8 {int8}");
                     let specialization =
                         expert_specialization(device, &[("H", h), ("F", f)], &mapping, false, int8);
+                    // CUDA's grouped experts also take their activation operand.
+                    let specialization = if device.backend() == seismic::BackendName::Cuda {
+                        specialization.with_param("OPERAND", 0)
+                    } else {
+                        specialization
+                    };
                     let grouped = match &experts.expansion {
                         DeviceExpansion::Gated(gate) => {
                             routed_experts::native_for_device_with(

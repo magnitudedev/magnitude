@@ -615,6 +615,7 @@ mod tests {
             scale: 1.0,
             reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
+            sinks: None,
             output: weight(&[32, 128]),
         }))
     }

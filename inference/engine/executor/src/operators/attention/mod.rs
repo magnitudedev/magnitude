@@ -14,6 +14,14 @@ use magnitude_family_contracts::{
 use magnitude_state::KvCodec;
 use seismic::Element;
 
+/// The accumulator-scale extents of `attention_project` and
+/// `attention_output` bound with every scale port absent. Attention, the
+/// gated delta, the short convolution and draft heads bind these entries so
+/// (a scaled weight of theirs is refused at plan time:
+/// `PlanError::UnportedScale`); only the state-space mixer binds its scales.
+pub(crate) const UNSCALED_PROJECT: [(&str, u64); 4] = [("QS", 0), ("GS", 0), ("KS", 0), ("VS", 0)];
+pub(crate) const UNSCALED_OUTPUT: (&str, u64) = ("OS", 0);
+
 /// The attention forms the attention entries implement: any output gate,
 /// query and key norms both present or both absent, projected values or
 /// values from the raw key, an optional unweighted value norm, one norm
@@ -205,6 +213,7 @@ pub(crate) fn shape(hidden: u64, attention: &Attention) -> Result<AttentionShape
         head_norm: u64::from(matches!(attention.query_norm, HeadNorm::Rms(_))),
         value_norm,
         projected_value,
+        sinks: u64::from(attention.sinks.is_some()),
     })
 }
 
@@ -301,6 +310,9 @@ pub(super) fn weights<'a>(attention: &'a Attention, push: &mut WeightPush<'_, 'a
         push(WeightKind::IndexerKey, &indexer.key);
         push(WeightKind::IndexerQueryNorm, &indexer.query_norm.weight);
         push(WeightKind::IndexerKeyNorm, &indexer.key_norm.weight);
+    }
+    if let Some(sinks) = &attention.sinks {
+        push(WeightKind::AttentionSinks, sinks);
     }
     push(WeightKind::AttentionOutput, &attention.output);
 }
@@ -518,6 +530,7 @@ mod tests {
                             },
                         },
                         media_rows: MediaRowAttention::Causal,
+                        sinks: None,
                         output: tensor(name("attn_output"), vec![HIDDEN, HIDDEN]),
                     })),
                     output: OutputForm::Residual,

@@ -67,6 +67,7 @@ fn portable(case: &Case, bits: &[u32], words: usize) -> Vec<f32> {
         tensor(DType::F32, vec![1, w], floats(&case.query_norm)),
         tensor(DType::F32, vec![1, w], floats(&case.key_norm)),
         tensor(DType::F32, vec![0, w], Vec::new()),
+        tensor(DType::F32, vec![0, kv * g], Vec::new()),
         tensor(DType::I32, vec![p], ints(&case.components)),
         tensor(DType::F32, vec![p], floats(&case.frequencies)),
         tensor(DType::F32, vec![p], vec![1.0; p]),
@@ -98,7 +99,7 @@ fn native(device: &Device, specialization: &NativeSpecialization, case: &Case, b
     let kernel = attention_prefill::native_for_device_with(
         device,
         attention_prefill::Elements { A: Element::bf16() },
-        specialization,
+        &specialization.clone().with_static("SK", 0),
     )
     .unwrap();
     let plane = |values: &[f32]| {
@@ -136,6 +137,7 @@ fn native(device: &Device, specialization: &NativeSpecialization, case: &Case, b
             query_norm: &f32_tensor(device, &[1, w], &case.query_norm),
             key_norm: &f32_tensor(device, &[1, w], &case.key_norm),
             value_norm: &f32_tensor(device, &[0, w], &[]),
+            sinks: &f32_tensor(device, &[0, kv * g], &[]),
             rotary_components: &i32_tensor(device, &[p], &case.components),
             rotary_frequencies: &f32_tensor(device, &[p], &case.frequencies),
             rotary_amplitudes: &f32_tensor(device, &[p], &vec![1.0; p]),

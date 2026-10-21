@@ -24,6 +24,8 @@ struct Bound {
     query_norm: Tensor,
     key_norm: Tensor,
     value_norm: Tensor,
+    /// No sinks (`[0, heads]`).
+    sinks: Tensor,
     components: Tensor,
     frequencies: Tensor,
     amplitudes: Tensor,
@@ -137,6 +139,7 @@ impl Bound {
             query_norm: f32_tensor(device, &[1, w], &case.query_norm),
             key_norm: f32_tensor(device, &[1, w], &case.key_norm),
             value_norm: f32_tensor(device, &[0, w], &[]),
+            sinks: f32_tensor(device, &[0, kv * g], &[]),
             components: i32_tensor(device, &[p], &case.components),
             frequencies: f32_tensor(device, &[p], &case.frequencies),
             amplitudes: f32_tensor(device, &[p], &vec![1.0; p]),
@@ -352,10 +355,11 @@ fn decode_kernel(
     device: &Device,
     specialization: &NativeSpecialization,
 ) -> seismic::NativeKernel<attention_decode::Entry> {
+    // Without sinks (`attention_family.rs` covers them).
     attention_decode::native_for_device_with(
         device,
         attention_decode::Elements { A: Element::bf16() },
-        specialization,
+        &specialization.clone().with_static("SK", 0),
     )
     .unwrap()
 }
@@ -367,7 +371,7 @@ fn prefill_kernel(
     attention_prefill::native_for_device_with(
         device,
         attention_prefill::Elements { A: Element::bf16() },
-        &visible_prefill(device, specialization.clone()),
+        &visible_prefill(device, specialization.clone().with_static("SK", 0)),
     )
     .unwrap()
 }
@@ -400,6 +404,7 @@ macro_rules! args {
             query_norm: &$bound.query_norm,
             key_norm: &$bound.key_norm,
             value_norm: &$bound.value_norm,
+            sinks: &$bound.sinks,
             rotary_components: &$bound.components,
             rotary_frequencies: &$bound.frequencies,
             rotary_amplitudes: &$bound.amplitudes,
@@ -426,6 +431,7 @@ macro_rules! args {
             query_norm: &$bound.query_norm,
             key_norm: &$bound.key_norm,
             value_norm: &$bound.value_norm,
+            sinks: &$bound.sinks,
             rotary_components: &$bound.components,
             rotary_frequencies: &$bound.frequencies,
             rotary_amplitudes: &$bound.amplitudes,
@@ -553,6 +559,8 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         tensor(DType::F32, vec![1, w], floats(&case.query_norm)),
         tensor(DType::F32, vec![1, w], floats(&case.key_norm)),
         tensor(DType::F32, vec![0, w], Vec::new()),
+        // No sinks.
+        tensor(DType::F32, vec![0, kv * g], Vec::new()),
         tensor(DType::I32, vec![p], ints(&case.components)),
         tensor(DType::F32, vec![p], floats(&case.frequencies)),
         tensor(DType::F32, vec![p], vec![1.0; p]),
@@ -571,11 +579,11 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     // (BR = 1) after the destinations.
     let prefill = entry == "attention_prefill";
     if prefill {
-        args.insert(14, tensor(DType::I32, vec![0, 1], Vec::new()));
-        args.insert(14, tensor(DType::U32, vec![m, 0], Vec::new()));
+        args.insert(15, tensor(DType::I32, vec![0, 1], Vec::new()));
+        args.insert(15, tensor(DType::U32, vec![m, 0], Vec::new()));
     }
     // The history planes' parameter ordinals.
-    let planes = if prefill { 16 } else { 14 };
+    let planes = if prefill { 17 } else { 15 };
     let outcome = interpreter.run(&args).unwrap();
     if let SourceTermination::Failed(failure) = outcome.termination() {
         panic!("{entry} portable body failed: {failure}");

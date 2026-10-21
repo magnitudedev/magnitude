@@ -35,8 +35,10 @@ inline bool precedes(float probability, int expert, float best, int best_expert)
 }
 
 // The selection of one row by one simdgroup, reading the row's logits
-// through `logit(index)`: the softmax over every expert (E / 32 experts per
-// lane), K rounds of simdgroup argmax (ties to the higher expert index), the
+// through `logit(index)`: the softmax over every expert (lane `lane` holds
+// experts lane + 32 i, ceil(E / 32) registers; when E is not a multiple of
+// 32 the last register of lanes at or past E % 32 is excluded: never read,
+// summed or selected), K rounds of simdgroup argmax (ties to the higher expert index), the
 // optional renormalization and the shared-expert coefficient from column E.
 // Every register array is indexed by unrolled loops only: a dynamically
 // indexed one lives in stack memory, and its K dependent rounds then dominate
@@ -44,27 +46,31 @@ inline bool precedes(float probability, int expert, float best, int best_expert)
 template <typename Logit>
 inline void select_row(ulong row, Logit logit, device int *routes, device float *scores,
     device float *coefficient, constant ulong *seismic_words, uint lane) {
-    constexpr uint per_lane = SEISMIC_DIM_E / 32;
+    constexpr uint per_lane = (uint(SEISMIC_DIM_E) + 31) / 32;
     constexpr uint K = SEISMIC_DIM_K;
-    // Lane `lane` holds experts lane + 32 i.
+    // The lane's experts: per_lane when 32 divides E (a constant).
+    const uint held = uint(SEISMIC_DIM_E) / 32 + (uint(SEISMIC_DIM_E) % 32 != 0 && lane < uint(SEISMIC_DIM_E) % 32 ? 1u : 0u);
     float probability[per_lane];
     float maximum = -INFINITY;
     PROJECTION_UNROLL
     for (uint i = 0; i < per_lane; ++i) {
-        probability[i] = logit(logit_index(row, lane + 32 * i));
+        probability[i] = i < held ? logit(logit_index(row, lane + 32 * i)) : -INFINITY;
         maximum = metal::max(maximum, probability[i]);
     }
     maximum = simd_max(maximum);
     float total = 0.0f;
     PROJECTION_UNROLL
     for (uint i = 0; i < per_lane; ++i) {
-        probability[i] = metal::exp(probability[i] - maximum);
-        total += probability[i];
+        if (i < held) {
+            probability[i] = metal::exp(probability[i] - maximum);
+            total += probability[i];
+        }
     }
     total = simd_sum(total);
     PROJECTION_UNROLL
     for (uint i = 0; i < per_lane; ++i)
-        probability[i] = probability[i] / total;
+        if (i < held)
+            probability[i] = probability[i] / total;
 
     float chosen[K];
     int winners[K];
@@ -75,7 +81,7 @@ inline void select_row(ulong row, Logit logit, device int *routes, device float 
         PROJECTION_UNROLL
         for (uint i = 0; i < per_lane; ++i) {
             const int expert = int(lane + 32 * i);
-            if (precedes(probability[i], expert, best, best_expert)) {
+            if (i < held && precedes(probability[i], expert, best, best_expert)) {
                 best = probability[i];
                 best_expert = expert;
             }

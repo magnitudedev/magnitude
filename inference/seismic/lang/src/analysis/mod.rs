@@ -462,6 +462,7 @@ fn packed(
             | DecodeStep::InterpretGridCode { raw: from, .. }
             | DecodeStep::DecodeFloatCode { raw: from, .. }
             | DecodeStep::ConvertToF32 { from, .. } => get(*from),
+            DecodeStep::Constant { value, .. } => Term::constant(value.to_f64()),
             DecodeStep::Cast { from, to, .. } => Term::round(*to, get(*from)),
             DecodeStep::Multiply { left, right, .. } => get(*left).mul(get(*right)),
             DecodeStep::Negate { from, .. } => Term::unary(term::Unary::Neg, get(*from)),

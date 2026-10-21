@@ -185,6 +185,18 @@ pub fn prepare_form_row<'q, A: Dense>(
     }
 }
 
+/// What a sink logit `sink` adds to the denominator of a head's softmax whose
+/// running maximum is `maximum` (`exp(sink - maximum)`, the portable
+/// `attention_rows`): infinite for a head that read no key, whose output
+/// stays zero.
+pub fn sink_weight(sink: f32, maximum: f32) -> f32 {
+    if maximum == f32::NEG_INFINITY {
+        f32::INFINITY
+    } else {
+        math::exp(sink - maximum)
+    }
+}
+
 /// One query head's output stored to `A`: `accumulator / max(denominator,
 /// 1e-30)`, column c times its gate c % U (sigmoid, or softplus when
 /// `softplus`); no gates pass the row through.

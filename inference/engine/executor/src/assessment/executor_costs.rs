@@ -1564,6 +1564,8 @@ struct AttendCase {
     key: Tensor,
     value: Tensor,
     norms: Tensor,
+    /// No sinks (`SK = 0`).
+    sinks: Tensor,
     rotary_components: Tensor,
     rotary_frequencies: Tensor,
     rotary_amplitudes: Tensor,
@@ -1772,6 +1774,7 @@ impl AttendCase {
         let key = zeros(Element::bf16(), &[1, 1, KV_HEADS * HEAD_WIDTH])?;
         let value = zeros(Element::bf16(), &[1, 1, KV_HEADS * HEAD_WIDTH])?;
         let norms = zeros(Element::f32(), &[0, HEAD_WIDTH])?;
+        let sinks = zeros(Element::f32(), &[0, heads])?;
         let rotary_components = host(Element::i32(), &[ROTARY_PAIRS], words(&components))?;
         let rotary_frequencies = host(
             Element::f32(),
@@ -1830,6 +1833,7 @@ impl AttendCase {
                     key: key.clone(),
                     value: value.clone(),
                     norms: norms.clone(),
+                    sinks: sinks.clone(),
                     rotary_components: rotary_components.clone(),
                     rotary_frequencies: rotary_frequencies.clone(),
                     rotary_amplitudes: rotary_amplitudes.clone(),
@@ -1857,6 +1861,7 @@ impl AttendCase {
             query_norm: &self.norms,
             key_norm: &self.norms,
             value_norm: &self.norms,
+            sinks: &self.sinks,
             rotary_components: &self.rotary_components,
             rotary_frequencies: &self.rotary_frequencies,
             rotary_amplitudes: &self.rotary_amplitudes,
@@ -1886,6 +1891,7 @@ impl AttendCase {
             query_norm: &self.norms,
             key_norm: &self.norms,
             value_norm: &self.norms,
+            sinks: &self.sinks,
             rotary_components: &self.rotary_components,
             rotary_frequencies: &self.rotary_frequencies,
             rotary_amplitudes: &self.rotary_amplitudes,
@@ -2225,6 +2231,7 @@ fn composition_chain(
     let key = bind(&mut graph, &attend.key)?;
     let value = bind(&mut graph, &attend.value)?;
     let norms = bind(&mut graph, &attend.norms)?;
+    let sinks = bind(&mut graph, &attend.sinks)?;
     let components = bind(&mut graph, &attend.rotary_components)?;
     let frequencies = bind(&mut graph, &attend.rotary_frequencies)?;
     let amplitudes = bind(&mut graph, &attend.rotary_amplitudes)?;
@@ -2270,6 +2277,7 @@ fn composition_chain(
                     query_norm: norms.tensor().into(),
                     key_norm: norms.tensor().into(),
                     value_norm: norms.tensor().into(),
+                    sinks: sinks.tensor().into(),
                     rotary_components: components.tensor().into(),
                     rotary_frequencies: frequencies.tensor().into(),
                     rotary_amplitudes: amplitudes.tensor().into(),

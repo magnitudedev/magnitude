@@ -361,7 +361,11 @@ mod tests {
         assert_eq!(draft.method.variant().to_string(), "DSpark");
         assert!(resolved.manifest.package.draft.is_some());
 
-        for method in [ModelMethod::DFlash, ModelMethod::DFlash2] {
+        for method in [
+            ModelMethod::DFlash,
+            ModelMethod::DFlash2,
+            ModelMethod::LiLiCorr,
+        ] {
             let Err(error) =
                 engine_configuration(material(method), kernels.clone(), MemoryReserves::standard())
                     .resolve()

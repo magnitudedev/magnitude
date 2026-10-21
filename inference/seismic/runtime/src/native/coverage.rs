@@ -71,7 +71,7 @@ impl Configuration {
     fn dialect(self) -> Dialect {
         match self {
             Self::Vulkan(facts) => Dialect::Vulkan(abi::vulkan::VulkanFeatures::of(&facts)),
-            Self::Cuda { .. } => Dialect::Cuda,
+            Self::Cuda { .. } => Dialect::Cuda(abi::CudaFeatures::UNOPENED),
             Self::Metal { tensor_ops } => Dialect::Metal(abi::MetalFeatures { tensor_ops }),
         }
     }
@@ -964,7 +964,7 @@ impl<'m> Subject<'m> {
                     .map(|launch| ProgramEntry::named(launch.kernel.as_str()))
                     .collect(),
             }],
-            Dialect::Cuda | Dialect::Metal(_) => super::implementation_programs(
+            Dialect::Cuda(_) | Dialect::Metal(_) => super::implementation_programs(
                 dialect,
                 &logical,
                 &row.bindings,

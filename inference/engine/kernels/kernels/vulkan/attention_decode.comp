@@ -12,6 +12,9 @@
 #define ATTENTION_GATE_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_GATE)
 #define ATTENTION_AMPLITUDE_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)
 #define ATTENTION_VALUE_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_VALUE_NORM)
+// The query heads' sink logits (SK = 1), joined at every normalization.
+#define ATTENTION_SINKS (SEISMIC_DIM_SK != 0)
+#define ATTENTION_SINK_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_SINKS)
 // Both forms' shared code (an entry's includes expand once, whatever the
 // branch).
 #include "lib/attention/history.glsl"

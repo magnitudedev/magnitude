@@ -290,6 +290,8 @@ pub(crate) struct AttentionProjectCase {
     epsilon: f32,
     /// The segments' packing bounds, query, gate, key, value.
     bounds: [Tensor; 4],
+    /// The absent operand of every segment's scale port.
+    absent: Tensor,
 }
 
 impl AttentionProjectTuning {
@@ -365,6 +367,7 @@ impl EntryTuning for AttentionProjectTuning {
             shape.project_dimensions(0)
         };
         let mut statics = statics.to_vec();
+        statics.extend(operators::attention::UNSCALED_PROJECT);
         let [query, gate, key, value] = self.bound_kinds(query);
         statics.extend(packing_statics(
             inputs,
@@ -445,6 +448,7 @@ impl EntryTuning for AttentionProjectTuning {
                             bound(kinds[3])?,
                         ]
                     },
+                    absent: inputs.unit_scale(0)?,
                 })
             })
             .collect()
@@ -460,6 +464,10 @@ impl EntryTuning for AttentionProjectTuning {
             value_weight: &case.value,
             epsilon: case.epsilon,
             project_mode: 0,
+            query_scale: &case.absent,
+            gate_scale: &case.absent,
+            key_scale: &case.absent,
+            value_scale: &case.absent,
             query_bound: &case.bounds[0],
             gate_bound: &case.bounds[1],
             key_bound: &case.bounds[2],
@@ -523,6 +531,7 @@ impl EntryTuning for IndexerProjectTuning {
         }
         let (parts, norm) = inputs.input_form(&self.scopes, hidden)?;
         let mut statics = [statics.as_slice(), &[("PT", parts), ("NM", norm)]].concat();
+        statics.extend(operators::attention::UNSCALED_PROJECT);
         statics.extend(packing_statics(
             inputs,
             &self.scopes,
@@ -578,6 +587,7 @@ impl EntryTuning for IndexerProjectTuning {
                         inputs.bound(scope, WeightKind::IndexerKey)?,
                         inputs.unit_scale(0)?,
                     ],
+                    absent: inputs.unit_scale(0)?,
                 })
             })
             .collect()
@@ -605,6 +615,8 @@ pub(crate) struct AttentionOutputCase {
     gated: Tensor,
     output: Tensor,
     bound: Tensor,
+    /// The absent operand of the output's scale port.
+    absent: Tensor,
 }
 
 impl AttentionOutputTuning {
@@ -636,7 +648,12 @@ impl EntryTuning for AttentionOutputTuning {
         {
             return Err("the attention output projection disagrees with the binding".into());
         }
-        let mut statics = vec![("D", shape.hidden), ("Q", heads), ("W", shape.width)];
+        let mut statics = vec![
+            ("D", shape.hidden),
+            ("Q", heads),
+            ("W", shape.width),
+            operators::attention::UNSCALED_OUTPUT,
+        ];
         statics.extend(packing_statics(
             inputs,
             &self.scopes,
@@ -677,6 +694,7 @@ impl EntryTuning for AttentionOutputTuning {
                     )?,
                     output: inputs.weight(scope, WeightKind::AttentionOutput)?,
                     bound: inputs.bound(scope, WeightKind::AttentionOutput)?,
+                    absent: inputs.unit_scale(0)?,
                 })
             })
             .collect()
@@ -688,6 +706,7 @@ impl EntryTuning for AttentionOutputTuning {
             inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
+            output_scale: &case.absent,
             output_bound: &case.bound,
         }
     }
@@ -850,6 +869,8 @@ pub(crate) struct AttentionMixCase<H> {
     query_norm: Tensor,
     key_norm: Tensor,
     value_norm: Tensor,
+    /// The layer's sink logits `[SK, heads]` (the dense entries').
+    sinks: Tensor,
     rotary_components: Tensor,
     rotary_frequencies: Tensor,
     rotary_amplitudes: Tensor,
@@ -1243,6 +1264,15 @@ impl AttentionMix {
                 } else {
                     head_norm(WeightKind::KeyNorm)?
                 };
+                // Sinks are the layers' own logits, or none.
+                let sinks = if shape.sinks > 0 {
+                    inputs
+                        .weight(scope, WeightKind::AttentionSinks)?
+                        .reshape(&[1, heads])
+                        .map_err(|error| error.to_string())?
+                } else {
+                    inputs.f32s(&[0, heads], &[])?
+                };
                 Ok(AttentionMixCase {
                     query_norm,
                     key_norm,
@@ -1250,6 +1280,7 @@ impl AttentionMix {
                         &[shape.value_norm, width],
                         &vec![1.0; (shape.value_norm * width) as usize],
                     )?,
+                    sinks,
                     query: inputs.activation(
                         self.activation,
                         &[rows, heads, width + shape.interleaved_gate],
@@ -1429,6 +1460,7 @@ macro_rules! mix_entry {
                     query_norm: &$case.query_norm,
                     key_norm: &$case.key_norm,
                     value_norm: &$case.value_norm,
+                    sinks: &$case.sinks,
                     rotary_components: &$case.rotary_components,
                     rotary_frequencies: &$case.rotary_frequencies,
                     rotary_amplitudes: &$case.rotary_amplitudes,
@@ -1581,6 +1613,7 @@ mod tests {
                         head_norm: 1,
                         value_norm: 0,
                         projected_value: true,
+                        sinks: 0,
                     },
                     scopes: Vec::new(),
                     epsilon: 1.0e-5,
@@ -1679,6 +1712,7 @@ mod tests {
                     head_norm: 1,
                     value_norm: 1,
                     projected_value: true,
+                    sinks: 0,
                 },
                 scopes: Vec::new(),
                 epsilon: 1.0e-6,
@@ -1762,6 +1796,7 @@ mod tests {
                         head_norm: 1,
                         value_norm: 0,
                         projected_value: true,
+                        sinks: 0,
                     },
                     scopes: Vec::new(),
                     epsilon: 1.0e-5,
@@ -1876,6 +1911,7 @@ mod tests {
                 head_norm: 1,
                 value_norm: 0,
                 projected_value: true,
+                sinks: 0,
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,
@@ -1998,6 +2034,7 @@ mod tests {
                 head_norm: 1,
                 value_norm: 0,
                 projected_value: true,
+                sinks: 0,
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,

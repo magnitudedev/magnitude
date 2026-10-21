@@ -11,7 +11,7 @@
 //! state; the published bank is the case state restored before each
 //! validation run.
 
-use super::cases::{packing_statics, projection_shape};
+use super::cases::{packing_statics, projection_shape, scale_extent};
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
     served_row_points,
@@ -47,8 +47,10 @@ pub(crate) struct StateSpaceProjectCase {
     projection: Tensor,
     empty: Tensor,
     epsilon: f32,
+    scale: Tensor,
     bound: Tensor,
-    no_bound: Tensor,
+    /// The absent operand of every other segment's scale and bound.
+    absent: Tensor,
 }
 
 impl StateSpaceProjectTuning {
@@ -95,6 +97,15 @@ impl EntryTuning for StateSpaceProjectTuning {
         }
         let [_, statics @ ..] = shape.project_dimensions(0);
         let mut statics = statics.to_vec();
+        statics.extend([
+            (
+                "QS",
+                scale_extent(inputs, &self.scopes, WeightKind::StateSpaceProjection)?,
+            ),
+            ("GS", 0),
+            ("KS", 0),
+            ("VS", 0),
+        ]);
         statics.extend(packing_statics(
             inputs,
             &self.scopes,
@@ -136,8 +147,11 @@ impl EntryTuning for StateSpaceProjectTuning {
                         .map_err(|error| error.to_string())?,
                     projection,
                     epsilon: self.epsilon,
+                    scale: inputs.unit_scale(
+                        inputs.scale_extent(scope, WeightKind::StateSpaceProjection)?,
+                    )?,
                     bound: inputs.bound(scope, WeightKind::StateSpaceProjection)?,
-                    no_bound: inputs.unit_scale(0)?,
+                    absent: inputs.unit_scale(0)?,
                 })
             })
             .collect()
@@ -153,10 +167,14 @@ impl EntryTuning for StateSpaceProjectTuning {
             value_weight: &case.empty,
             epsilon: case.epsilon,
             project_mode: 0,
+            query_scale: &case.scale,
+            gate_scale: &case.absent,
+            key_scale: &case.absent,
+            value_scale: &case.absent,
             query_bound: &case.bound,
-            gate_bound: &case.no_bound,
-            key_bound: &case.no_bound,
-            value_bound: &case.no_bound,
+            gate_bound: &case.absent,
+            key_bound: &case.absent,
+            value_bound: &case.absent,
         }
     }
 
@@ -175,6 +193,7 @@ pub(crate) struct StateSpaceOutputCase {
     inject: Tensor,
     gated: Tensor,
     output: Tensor,
+    scale: Tensor,
     bound: Tensor,
 }
 
@@ -203,6 +222,10 @@ impl EntryTuning for StateSpaceOutputTuning {
         }
         let [_, statics @ ..] = shape.output_dimensions(0);
         let mut statics = statics.to_vec();
+        statics.push((
+            "OS",
+            scale_extent(inputs, &self.scopes, WeightKind::RecurrentOutput)?,
+        ));
         statics.extend(packing_statics(
             inputs,
             &self.scopes,
@@ -239,6 +262,8 @@ impl EntryTuning for StateSpaceOutputTuning {
                         seed + 2,
                     )?,
                     output: inputs.weight(scope, WeightKind::RecurrentOutput)?,
+                    scale: inputs
+                        .unit_scale(inputs.scale_extent(scope, WeightKind::RecurrentOutput)?)?,
                     bound: inputs.bound(scope, WeightKind::RecurrentOutput)?,
                 })
             })
@@ -251,6 +276,7 @@ impl EntryTuning for StateSpaceOutputTuning {
             inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
+            output_scale: &case.scale,
             output_bound: &case.bound,
         }
     }

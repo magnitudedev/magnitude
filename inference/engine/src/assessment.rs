@@ -53,7 +53,7 @@ use std::sync::Arc;
 /// declares (`Auto` for a standalone package). Only their headers are read.
 /// `target` is the target GGUF or the first shard of a split GGUF (the other
 /// shards are found beside it by the split naming convention); `draft` is a
-/// separate drafter (DFlash, DSpark, DFlash2, a Gemma assistant or a
+/// separate drafter (DFlash, DSpark, DFlash2, LiLiCorr, a Gemma assistant or a
 /// prediction head). A drafter the method cannot draft with is `Rejected`
 /// and the target is assessed without it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,6 +182,7 @@ pub enum SpeculativeMethod {
     DFlash,
     DSpark,
     DFlash2,
+    LiLiCorr,
 }
 
 /// Whether the engine binds the package's drafter: none was declared or
@@ -664,6 +665,7 @@ impl Environment<'_> {
                 {
                     Some(DraftVariant::DSpark) => SpeculativeMethod::DSpark,
                     Some(DraftVariant::DFlash2) => SpeculativeMethod::DFlash2,
+                    Some(DraftVariant::LiLiCorr) => SpeculativeMethod::LiLiCorr,
                     Some(DraftVariant::DFlash) | None => SpeculativeMethod::DFlash,
                 }
             }
@@ -972,7 +974,10 @@ fn admit_drafter(
             }
             ModelMethod::Auto => Ok(DrafterAdmission::None),
             ModelMethod::Mtp => rejected("MTP was requested but the target has no draft head"),
-            ModelMethod::DFlash | ModelMethod::DSpark | ModelMethod::DFlash2 => {
+            ModelMethod::DFlash
+            | ModelMethod::DSpark
+            | ModelMethod::DFlash2
+            | ModelMethod::LiLiCorr => {
                 rejected("a separate-draft method was requested but the package has no draft")
             }
         };

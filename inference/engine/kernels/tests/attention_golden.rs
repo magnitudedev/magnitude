@@ -403,6 +403,8 @@ struct Family {
     query_norm: Tensor,
     key_norm: Tensor,
     value_norm: Tensor,
+    /// No sinks (`[0, heads]`, the dense entries' `SK = 0`).
+    sinks: Tensor,
     amplitudes: Tensor,
 }
 
@@ -422,6 +424,7 @@ impl Family {
             query_norm: inputs.query_norm.reshape(&[1, w]).unwrap(),
             key_norm: inputs.key_norm.reshape(&[1, w]).unwrap(),
             value_norm: empty(Element::f32(), &[0, w]),
+            sinks: empty(Element::f32(), &[0, heads]),
             amplitudes: f32_tensor(device, &[p], &vec![1.0; p]),
         }
     }
@@ -474,7 +477,7 @@ fn run_family(
                 let kernel = $module::native_for_device_with(
                     device,
                     $module::Elements { A: elements },
-                    specialization,
+                    &specialization.clone().with_static("SK", 0),
                 )
                 .map_err(|error| format!("prepare {}: {error}", stringify!($module)))?;
                 let [history_key, history_value] = &mut *history else {
@@ -489,6 +492,7 @@ fn run_family(
                         query_norm: &family.query_norm,
                         key_norm: &family.key_norm,
                         value_norm: &family.value_norm,
+                        sinks: &family.sinks,
                         rotary_components: &inputs.components,
                         rotary_frequencies: &inputs.frequencies,
                         rotary_amplitudes: &family.amplitudes,
@@ -513,7 +517,7 @@ fn run_family(
                 let kernel = $module::native_for_device_with(
                     device,
                     $module::Elements { A: elements },
-                    specialization,
+                    &specialization.clone().with_static("SK", 0),
                 )
                 .map_err(|error| format!("prepare {}: {error}", stringify!($module)))?;
                 let [key_codes, key_coefficients, value_codes, value_coefficients] = &mut *history
@@ -529,6 +533,7 @@ fn run_family(
                         query_norm: &family.query_norm,
                         key_norm: &family.key_norm,
                         value_norm: &family.value_norm,
+                        sinks: &family.sinks,
                         rotary_components: &inputs.components,
                         rotary_frequencies: &inputs.frequencies,
                         rotary_amplitudes: &family.amplitudes,

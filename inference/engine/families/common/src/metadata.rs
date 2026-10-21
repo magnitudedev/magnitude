@@ -191,6 +191,23 @@ impl<'a> Metadata<'a> {
         self.required(key, value)
     }
 
+    /// A nonnegative integer per layer, stated once for all layers or as an
+    /// array with one entry per layer.
+    pub fn uniform_or_layer_counts(&self, key: &str, layers: u64) -> Result<Vec<u64>, HeaderError> {
+        let value = self.typed(
+            key,
+            "a nonnegative integer or one per layer",
+            |value| match value {
+                Value::Array(values) if values.len() as u64 == layers => {
+                    values.iter().map(Element::unsigned).collect()
+                }
+                Value::Array(_) => None,
+                value => value.unsigned().map(|value| vec![value; layers as usize]),
+            },
+        )?;
+        self.required(key, value)
+    }
+
     /// One flag per layer.
     pub fn optional_flags(&self, key: &str, layers: u64) -> Result<Option<Vec<bool>>, HeaderError> {
         self.typed(key, "one flag per layer", |value| match value {

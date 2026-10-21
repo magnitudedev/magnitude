@@ -344,6 +344,8 @@ impl<'a> QualificationView<'a> {
                     inject: &rows.inject(device, 1, "attention_output", &label)?,
                     gated: &gated,
                     output_weight: &output,
+                    // The gated delta binds no second-level scale.
+                    output_scale: &semantic_zeros(device, Element::f32(), &[0], "attention_output", &label)?,
                     output_bound: &any_row_bound(device, &kernels.output, "OB", "attention_output", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("attention_output", &label, error))?
@@ -1288,6 +1290,7 @@ fn qualify_short_conv(
             inject: &semantic_zeros(device, Element::f32(), &[1, 0], "attention_output", &label)?,
             gated: &gated,
             output_weight: &output,
+            output_scale: &absent_scale,
             output_bound: &any_row_bound(device, &kernels.output, "OB", "attention_output", &label)?,
         })
         .map_err(|error| qualification_dynamic("attention_output", &label, error))?
@@ -1310,6 +1313,8 @@ fn qualify_state_space(
     let shape = binding.shape;
     let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, entry, &label);
     let f32 = Element::f32();
+    // A unit accumulator scale of the port's extent (absent at 0).
+    let scale = |extent| semantic_ones(device, f32, &[extent], entry, &label);
     let norm = zeros(binding.norm, &[shape.hidden])?;
     let projection_weight = zeros(
         binding.projection,
@@ -1374,6 +1379,10 @@ fn qualify_state_space(
             value_weight: &empty,
             epsilon: 1.0e-5,
             project_mode: 0,
+            query_scale: &scale(binding.scales.projection)?,
+            gate_scale: &scale(0)?,
+            key_scale: &scale(0)?,
+            value_scale: &scale(0)?,
             query_bound: &any_row_bound(device, &kernels.project, "QB", "attention_project", &label)?,
             gate_bound: &any_row_bound(device, &kernels.project, "GB", "attention_project", &label)?,
             key_bound: &any_row_bound(device, &kernels.project, "KB", "attention_project", &label)?,
@@ -1424,6 +1433,7 @@ fn qualify_state_space(
             inject: &semantic_zeros(device, Element::f32(), &[1, 0], "attention_output", &label)?,
             gated: &gated,
             output_weight: &output,
+            output_scale: &scale(binding.scales.output)?,
             output_bound: &any_row_bound(device, &kernels.output, "OB", "attention_output", &label)?,
         })
         .map_err(|error| qualification_dynamic("attention_output", &label, error))?

@@ -37,6 +37,14 @@
     "target": "88d7ce0b0fa385c5108866ce5d33690927531a37",
     "speculativeDraft": "4f5b414b9388a4543dcc4b24758e09d68140a6fe"
   },
+  "nemotron-3.5-bolt-74b-a9b": {
+    "target": "e0fecb69cb3e5e4c5e8a056fa2aec98c78e91246",
+    "speculativeDraft": "341de320b3c2802b22c1a633c97ce78d51512bc6"
+  },
+  "nemotron-3.5-super-vl-120b-a12b": {
+    "target": "75a5829055f69a0359085ae6bbd0a81b60bc05c6",
+    "speculativeDraft": "8602acac5a96c69bf094ce83d941341944b2789d"
+  },
   "qwen3.5-122b-a10b": { "target": "907becb33103ab66b23da06a2dc74a5fca0583bd" },
   "qwen3.5-4b": { "target": "86835bf9949e4d14d6860f7910b1340ad4f271a9", "speculativeDraft": "0094e74a88676605d53b79c7c3d26096335c9746" },
   "qwen3.5-9b": { "target": "9716a636ee4bddc3fed678220b7a33dd2a4160ae", "speculativeDraft": "58b69e4e18f40906a95320507b802899d50e5292" },

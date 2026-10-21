@@ -33,7 +33,7 @@ Click **Download** for the selected model. **My Models** shows downloaded models
 - **Stop model** unloads it without deleting the download. A later request can load it again.
 - **Remove** deletes the installed model files to recover disk space.
 
-Downloading and loading are different steps. A downloaded model uses disk space even while stopped; a loaded model also uses inference memory. Magnitude loads a model on demand when an agent requests it and unloads it when idle or memory is tight, so the first response after a while takes longer. Supported models use speculative decoding (MTP, DFlash, or DSpark) and prompt caching automatically.
+Downloading and loading are different steps. A downloaded model uses disk space even while stopped; a loaded model also uses inference memory. Magnitude loads a model on demand when an agent requests it and unloads it when idle or memory is tight, so the first response after a while takes longer. Supported models use speculative decoding (MTP, DFlash, DSpark, or LiLiCorr) and prompt caching automatically.
 
 Models are stored in `~/.magnitude/models`. To use another folder, see [Settings](/settings#model-storage).
 

@@ -32,9 +32,10 @@ pub use decoder::{
     ValueSource,
 };
 pub use draft::{
-    BlockAttention, BlockLayout, CandidateSelector, ConfidenceHead, DraftDefinition,
-    DraftEmbedding, DraftMethod, DraftVariant, DynamicConvolution, LayerConvolutions, MarkovHead,
-    TapPoint,
+    Affine, AffinePart, BlockAttention, BlockConvolutions, BlockLayout, CORRECTOR_FEATURES,
+    CandidateCorrector, CandidateSelector, CenteredNorm, ConfidenceHead, CorrectorLayer,
+    CorrectorSite, CorrectorWeight, DraftDefinition, DraftEmbedding, DraftMethod, DraftVariant,
+    DynamicConvolution, LayerConvolutions, MarkovHead, TapPoint,
 };
 pub use family::{FamilyError, FamilyInputAdapter, MarkerTokens, ModelFamily};
 pub use images::{
@@ -146,6 +147,15 @@ impl WeightDescriptor {
                 ImportTransform::Flatten => {
                     shape = vec![checked_product(&shape)?];
                 }
+                ImportTransform::DropUnitAxis => {
+                    if shape.len() < 2 || shape[0] != 1 {
+                        return Err(DefinitionError::new(format!(
+                            "{:?} has no outer unit axis to drop",
+                            self.name
+                        )));
+                    }
+                    shape.remove(0);
+                }
                 ImportTransform::ScaleByTensor { tensor } => {
                     if tensor.is_empty() || *tensor == self.name {
                         return Err(DefinitionError::new(format!(
@@ -198,6 +208,9 @@ pub enum ImportTransform {
     /// Read the stored tensor as one vector of all its elements in storage
     /// order (a parameter vector stored as `[1, n]` or `[groups, n/groups]`).
     Flatten,
+    /// Read the stored tensor without its outermost axis, of extent one (a
+    /// matrix stored with a trailing unit GGML dimension).
+    DropUnitAxis,
     /// Multiply every matrix of a stack (the whole tensor when it is not a
     /// stack) by the matching element of the stored F32 tensor `tensor`,
     /// shaped `[1]` or `[stack]`. A container format's second-level scale
@@ -289,7 +302,7 @@ impl std::hash::Hash for ImportTransform {
             Self::Rows(range) => (range.start, range.rows).hash(state),
             Self::PermuteRows { order } => order.hash(state),
             Self::Scale { factor } => factor.to_bits().hash(state),
-            Self::Flatten => {}
+            Self::Flatten | Self::DropUnitAxis => {}
             Self::ScaleByTensor { tensor } => tensor.hash(state),
             Self::Progressive { plane, depth } => {
                 plane.hash(state);
@@ -330,6 +343,8 @@ pub enum WeightScope {
     Draft,
     /// A sublayer of a draft component's layers.
     DraftSublayer(SublayerIndex),
+    /// One transformer layer of a draft's candidate corrector.
+    CorrectorLayer(u32),
 }
 
 /// Closed semantic role within a structural weight scope.
@@ -359,6 +374,8 @@ pub enum WeightKind {
     QueryNorm,
     KeyNorm,
     AttentionOutput,
+    /// An attention's per-head sink logits (`Attention::sinks`).
+    AttentionSinks,
     IndexerQuery,
     IndexerKey,
     IndexerQueryNorm,
@@ -430,7 +447,7 @@ pub enum WeightKind {
     MarkovProjection,
     ConfidenceWeight,
     ConfidenceBias,
-    /// DFlash2: a draft sublayer's convolution base `[2, kernel, hidden]`
+    /// A convolved draft sublayer's convolution base `[2, kernel, hidden]`
     /// and coefficient projection (scope `DraftSublayer`).
     ConvolutionBase,
     ConvolutionProjection,
@@ -438,6 +455,9 @@ pub enum WeightKind {
     SelectorHidden,
     SelectorPredecessor,
     SelectorSuccessor,
+    /// A LiLiCorr candidate corrector weight (scopes `Draft` and
+    /// `CorrectorLayer`).
+    Corrector(CorrectorWeight),
     /// A projector weight (scopes `Vision`, `VisionPatch`, `VisionBlock`,
     /// `VisionMerger`).
     Vision(VisionWeight),
@@ -794,6 +814,11 @@ impl ModelDefinition {
         }
         if let Some(vision) = &self.vision {
             vision.validate()?;
+            if vision.output_hidden != self.decoder.hidden {
+                return Err(DefinitionError::new(
+                    "image features must have the decoder's width",
+                ));
+            }
         }
         if let Some(draft) = &self.draft {
             draft.validate(&self.decoder, self.inputs.coordinate_axes)?;
@@ -909,6 +934,7 @@ mod tests {
                 scale: 0.5,
                 reads: HistoryReads::Visible,
                 media_rows: MediaRowAttention::Causal,
+                sinks: None,
                 output: weight(&format!("{name}.o"), &[4, 4]),
             })),
             output: OutputForm::Residual,

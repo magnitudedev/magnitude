@@ -112,26 +112,35 @@ impl<'a> Tensors<'a> {
     /// Binds the stored F32 `<stem>.scale` companion of `<stem>.weight`
     /// (NVFP4's per-tensor or per-matrix second-level scale), one value per
     /// matrix, and names it; `None` when the file stores none.
+    ///
+    /// A scaled weight may also store `<stem>.input_scale`, the activation
+    /// scale of kernels that quantize their inputs to FP4. Activations here
+    /// stay in the activation dtype, so the product needs only the weight's
+    /// scale (as in llama.cpp, which loads and never applies it): it is
+    /// checked and acknowledged, not applied.
     pub fn companion_scale(
         &mut self,
         weight: &str,
         matrices: u64,
     ) -> Result<Option<String>, HeaderError> {
-        let Some(scale) = weight
-            .strip_suffix(".weight")
-            .and_then(|stem| self.directory.tensor(&format!("{stem}.scale")))
-        else {
+        let Some(stem) = weight.strip_suffix(".weight") else {
             return Ok(None);
         };
-        if scale.encoding != Encoding::F32 || scale.shape != [matrices] {
-            return Err(HeaderError::CompanionScale {
-                name: scale.name.clone(),
-                matrices,
-                encoding: scale.encoding,
-                shape: scale.shape.clone(),
-            });
+        let Some(scale) = self.directory.tensor(&format!("{stem}.scale")) else {
+            return Ok(None);
+        };
+        let input = self.directory.tensor(&format!("{stem}.input_scale"));
+        for companion in std::iter::once(scale).chain(input) {
+            if companion.encoding != Encoding::F32 || companion.shape != [matrices] {
+                return Err(HeaderError::CompanionScale {
+                    name: companion.name.clone(),
+                    matrices,
+                    encoding: companion.encoding,
+                    shape: companion.shape.clone(),
+                });
+            }
+            self.bound.insert(companion.name.as_str());
         }
-        self.bound.insert(scale.name.as_str());
         Ok(Some(scale.name.clone()))
     }
 

@@ -129,6 +129,9 @@ pub(crate) fn apply(
                 bytes = permuted;
             }
             ImportTransform::Flatten => shape = vec![shape.iter().product()],
+            ImportTransform::DropUnitAxis => {
+                shape.remove(0);
+            }
             ImportTransform::Scale { factor } => {
                 let factor = *factor as f32;
                 for word in bytes.chunks_exact_mut(4) {
@@ -340,6 +343,14 @@ mod tests {
     fn flattening_keeps_bytes_and_second_level_scales_stay_apart_from_them() {
         let flat = descriptor(&[8], vec![ImportTransform::Flatten]);
         assert_eq!(admit(&flat, &[2, 4], Encoding::F32).unwrap(), [8]);
+        let table = descriptor(&[2, 4], vec![ImportTransform::DropUnitAxis]);
+        assert_eq!(admit(&table, &[1, 2, 4], Encoding::F32).unwrap(), [2, 4]);
+        assert!(admit(&table, &[2, 2, 4], Encoding::F32).is_err());
+        let values = f32s(&[1., 2., 3., 4., 5., 6., 7., 8.]);
+        assert_eq!(
+            apply(&table, &[1, 2, 4], Element::f32(), values.clone()).unwrap(),
+            values
+        );
         let scale = || ImportTransform::ScaleByTensor {
             tensor: "w.scale".into(),
         };

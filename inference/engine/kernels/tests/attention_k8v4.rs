@@ -225,6 +225,8 @@ struct Bound {
     query_norm: Tensor,
     key_norm: Tensor,
     value_norm: Tensor,
+    /// The case's sink logits (`[SK, heads]`).
+    sinks: Tensor,
     components: Tensor,
     frequencies: Tensor,
     amplitudes: Tensor,
@@ -345,6 +347,7 @@ impl Bound {
             query_norm: f32_tensor(device, &[1, w], &case.query_norm),
             key_norm: f32_tensor(device, &[1, w], &case.key_norm),
             value_norm: f32_tensor(device, &[0, w], &[]),
+            sinks: f32_tensor(device, &[case.sink_rows(), kv * g], &case.sinks),
             components: i32_tensor(device, &[p], &case.components),
             frequencies: f32_tensor(device, &[p], &case.frequencies),
             amplitudes: f32_tensor(device, &[p], &vec![1.0; p]),
@@ -406,6 +409,7 @@ macro_rules! args {
             query_norm: &$bound.query_norm,
             key_norm: &$bound.key_norm,
             value_norm: &$bound.value_norm,
+            sinks: &$bound.sinks,
             rotary_components: &$bound.components,
             rotary_frequencies: &$bound.frequencies,
             rotary_amplitudes: &$bound.amplitudes,
@@ -437,6 +441,7 @@ macro_rules! prefill_args {
             query_norm: &$bound.query_norm,
             key_norm: &$bound.key_norm,
             value_norm: &$bound.value_norm,
+            sinks: &$bound.sinks,
             rotary_components: &$bound.components,
             rotary_frequencies: &$bound.frequencies,
             rotary_amplitudes: &$bound.amplitudes,
@@ -910,7 +915,9 @@ fn specialization_on(
         .with_static("KC", geometry.w() as u64 * KEY_BITS as u64 / 32)
         .with_static("VC", geometry.w() as u64 * VALUE_BITS as u64 / 32)
         .with_static("KP", coefficient_elements(geometry.w()) as u64)
-        .with_static("VP", coefficient_elements(geometry.w()) as u64);
+        .with_static("VP", coefficient_elements(geometry.w()) as u64)
+        // No sinks unless a case's kernel names them.
+        .with_static("SK", 0);
     let base = if device.backend() == BackendName::Metal
         && params.iter().any(|(name, _)| *name == "TOKENS")
         && !params.iter().any(|(name, _)| *name == "HEAD_BAND")
@@ -945,10 +952,20 @@ fn decode_kernel(
     geometry: Geometry,
     params: &[(&'static str, u64)],
 ) -> seismic::NativeKernel<attention_decode_k8v4::Entry> {
+    decode_kernel_with_sinks(device, geometry, params, 0)
+}
+
+/// `decode_kernel` with `sinks` sink rows (`SK`).
+fn decode_kernel_with_sinks(
+    device: &Device,
+    geometry: Geometry,
+    params: &[(&'static str, u64)],
+    sinks: usize,
+) -> seismic::NativeKernel<attention_decode_k8v4::Entry> {
     attention_decode_k8v4::native_for_device_with(
         device,
         attention_decode_k8v4::Elements { A: Element::bf16() },
-        &specialization_on(device, geometry, params),
+        &specialization_on(device, geometry, params).with_static("SK", sinks as u64),
     )
     .unwrap()
 }
@@ -1006,10 +1023,20 @@ fn prefill_kernel(
     geometry: Geometry,
     params: &[(&'static str, u64)],
 ) -> seismic::NativeKernel<attention_prefill_k8v4::Entry> {
+    prefill_kernel_with_sinks(device, geometry, params, 0)
+}
+
+/// `prefill_kernel` with `sinks` sink rows (`SK`).
+fn prefill_kernel_with_sinks(
+    device: &Device,
+    geometry: Geometry,
+    params: &[(&'static str, u64)],
+    sinks: usize,
+) -> seismic::NativeKernel<attention_prefill_k8v4::Entry> {
     attention_prefill_k8v4::native_for_device_with(
         device,
         attention_prefill_k8v4::Elements { A: Element::bf16() },
-        &prefill_specialization(device, geometry, params),
+        &prefill_specialization(device, geometry, params).with_static("SK", sinks as u64),
     )
     .unwrap()
 }
@@ -1890,6 +1917,7 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
         tensor(DType::F32, vec![1, w], floats(&case.query_norm)),
         tensor(DType::F32, vec![1, w], floats(&case.key_norm)),
         tensor(DType::F32, vec![0, w], Vec::new()),
+        tensor(DType::F32, vec![case.sink_rows(), kv * g], floats(&case.sinks)),
         tensor(DType::I32, vec![p], ints(&case.components)),
         tensor(DType::F32, vec![p], floats(&case.frequencies)),
         tensor(DType::F32, vec![p], vec![1.0; p]),
@@ -1922,11 +1950,11 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     // the destinations.
     if entry == "attention_prefill_k8v4" {
         let tiles = history_tiles(&case.visible);
-        args.insert(14, tensor(DType::I32, vec![1, tiles.len()], ints(&tiles)));
+        args.insert(15, tensor(DType::I32, vec![1, tiles.len()], ints(&tiles)));
         // Its WorkList bitmap (none: B = 0) and block keys (BR = 1) precede
         // the tiles.
-        args.insert(14, tensor(DType::I32, vec![0, 1], Vec::new()));
-        args.insert(14, tensor(DType::U32, vec![m, 0], Vec::new()));
+        args.insert(15, tensor(DType::I32, vec![0, 1], Vec::new()));
+        args.insert(15, tensor(DType::U32, vec![m, 0], Vec::new()));
     }
     let outcome = interpreter.run(&args).unwrap();
     if let SourceTermination::Failed(failure) = outcome.termination() {
@@ -2021,6 +2049,72 @@ fn decode_matches_portable_body_on(device: &Device, encoded: &Encoded) {
             &bound,
             &expected,
         );
+    }
+}
+
+/// Nemotron 3.5 Bolt's draft attention: 2 kv heads of 16 query heads, 128
+/// columns.
+const BOLT_DRAFT: Geometry = Geometry {
+    kv: 2,
+    g: 16,
+    p: 32,
+    s: 64,
+};
+
+/// Per-head attention sinks over affine history: the portable bodies against
+/// the host model, then every decode and prefill configuration of each
+/// device against it, at the small geometries and at Bolt's draft geometry.
+#[test]
+fn sinks_decode_and_prefill_match_host_model() {
+    let decode = Encoded::new(Case::new(GROUPED, 64, 2, &decode_rows(5), 81).with_sinks(82));
+    check_host_model_against_portable_body("attention_decode_k8v4", &decode);
+    let prefill =
+        Encoded::new(Case::new(SMALL, 400, 2, &prefill_rows(20, 300), 83).with_sinks(84));
+    check_host_model_against_portable_body("attention_prefill_k8v4", &prefill);
+    let bolt_decode = Encoded::new(
+        Case::new(BOLT_DRAFT, 1100, 2, &decode_rows(1000), 85).with_sinks(86),
+    );
+    let bolt_prefill = Encoded::new(
+        Case::new(BOLT_DRAFT, 1200, 2, &prefill_rows(64, 1000), 87).with_sinks(88),
+    );
+    for device in k8v4_devices() {
+        let backend = device.backend();
+        for (geometry, encoded) in [(GROUPED, &decode), (BOLT_DRAFT, &bolt_decode)] {
+            let expected = encoded.expected();
+            for config in decode_configs(backend, geometry) {
+                let kernel = decode_kernel_with_sinks(&device, geometry, &config, 1);
+                let mut bound = Bound::new(&device, encoded);
+                let gated = kernel
+                    .call(args!(attention_decode_k8v4, bound, encoded.case))
+                    .unwrap()
+                    .value;
+                check(
+                    &format!("{backend:?} sinks decode W={} {config:?}", geometry.w()),
+                    encoded,
+                    &gated,
+                    &bound,
+                    &expected,
+                );
+            }
+        }
+        for (geometry, encoded) in [(SMALL, &prefill), (BOLT_DRAFT, &bolt_prefill)] {
+            let expected = encoded.expected();
+            for config in prefill_configs(backend, geometry) {
+                let kernel = prefill_kernel_with_sinks(&device, geometry, &config, 1);
+                let mut bound = Bound::new(&device, encoded);
+                let gated = kernel
+                    .call(prefill_args!(bound, encoded.case))
+                    .unwrap()
+                    .value;
+                check(
+                    &format!("{backend:?} sinks prefill W={} {config:?}", geometry.w()),
+                    encoded,
+                    &gated,
+                    &bound,
+                    &expected,
+                );
+            }
+        }
     }
 }
 
@@ -2453,6 +2547,8 @@ struct DenseHistory {
     _slabs: SlabTensor,
     key: Tensor,
     value: Tensor,
+    /// The dense entries' absent sinks (`[0, heads]`).
+    sinks: Tensor,
 }
 
 impl DenseHistory {
@@ -2492,6 +2588,13 @@ impl DenseHistory {
         Self {
             key: slabs.logical_region(0).unwrap(),
             value: slabs.logical_region(1).unwrap(),
+            sinks: Tensor::from_host(
+                device,
+                Element::f32(),
+                &[0, (kv * case.geometry.g) as u64],
+                &[],
+            )
+            .unwrap(),
             _slabs: slabs,
         }
     }
@@ -2508,6 +2611,7 @@ macro_rules! dense_args {
             query_norm: &$bound.query_norm,
             key_norm: &$bound.key_norm,
             value_norm: &$bound.value_norm,
+            sinks: &$dense.sinks,
             rotary_components: &$bound.components,
             rotary_frequencies: &$bound.frequencies,
             rotary_amplitudes: &$bound.amplitudes,
@@ -3097,7 +3201,8 @@ fn decode_timing_on(device: &Device) {
                     attention_decode::native_for_device_with(
                         device,
                         attention_decode::Elements { A: Element::bf16() },
-                        &dense_specialization(&specialization_on(device, geometry, &dense_config)),
+                        &dense_specialization(&specialization_on(device, geometry, &dense_config))
+                            .with_static("SK", 0),
                     )
                     .ok()
                 })
@@ -3331,7 +3436,8 @@ fn prefill_timing_on(device: &Device) {
                             _ => (name, value),
                         })
                         .collect::<Vec<_>>(),
-                ))),
+                )))
+                .with_static("SK", 0),
             )
             .unwrap();
             let dense_time = dense_kernel
@@ -3957,7 +4063,7 @@ fn append_specialization(specialization: &NativeSpecialization) -> NativeSpecial
     specialization
         .statics()
         .iter()
-        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U"))
+        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U" | "SK"))
         .fold(NativeSpecialization::new(), |spec, (name, value)| {
             spec.with_static(name, *value)
         })

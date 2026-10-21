@@ -20,6 +20,7 @@ typedef element::Act activation;
     device half *weight_factors [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_FACTORS)]],      \
     device float *token_scales [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_SCALES)]],         \
     device float *weight_scales [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_SCALES)]],       \
+    device const float *output_scale [[buffer(SEISMIC_BUFFER_OUTPUT_SCALE)]],           \
     device const float *output_bound [[buffer(SEISMIC_BUFFER_OUTPUT_BOUND)]],           \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
@@ -32,12 +33,15 @@ typedef element::Act activation;
     projection::Weights<packets::W0> w{output_weight, KERNEL_W0_LAYOUT(k), k}
 
 // The residual join: a plain residual, or the scatter into each
-// hyper-connection stream (`scatter`).
+// hyper-connection stream (`scatter`), after the weight's second-level
+// scale where it has one.
 typedef projection::OutputOf<activation, projection::AllRows, SEISMIC_DIM_SN, SEISMIC_DIM_IN != 0> output_join;
 #define ATTENTION_OUTPUT_EPILOGUE                                                       \
-    const output_join::type out = output_join::make(result, SEISMIC_RESULT_0_STRIDE_0,  \
-        SEISMIC_RESULT_0_STRIDE_1, hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, {}, \
-        inject, SEISMIC_INJECT_STRIDE_0, uint(SEISMIC_DIM_D))
+    const auto out = projection::scaling<(SEISMIC_DIM_OS != 0)>::wrap(                  \
+        output_join::make(result, SEISMIC_RESULT_0_STRIDE_0,                            \
+            SEISMIC_RESULT_0_STRIDE_1, hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, {}, \
+            inject, SEISMIC_INJECT_STRIDE_0, uint(SEISMIC_DIM_D)),                      \
+        projection::scale_factor(output_scale, SEISMIC_DIM_OS, 0, 0), 1.0f)
 
 // The GEMV of a launch that serves COUNT (ONE, SEVERAL) rows.
 #define ATTENTION_OUTPUT_GEMV(ROWS, LANES, COUNT)                                       \

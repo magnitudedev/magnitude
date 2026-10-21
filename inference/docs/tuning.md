@@ -33,7 +33,9 @@ Two descriptions of a unit must remain distinct:
   decode step at 4k and at 64k of history, with drafting as the load drafts (the drafter's
   launches and the target's verification at each width the load prepares). The load's graph
   supplies each unit's launches for every such term, with their rows, sequences and histories;
-  real weight rotations stand in where reuse would otherwise distort timing. Adversarial
+  real weight rotations stand in where reuse would otherwise distort timing, and a timed pass
+  occupies several times what the device's last-level cache holds, so that, as in a served step,
+  no call finds its bytes cached by an earlier one. Adversarial
   numerical cases do not count as serving traffic. A launch is demand of the kernel that serves
   it alone: where two kernels are alternatives for the same layers (the attention prefill that
   lists the history tiles its rows see, and the one that lists none), each takes only the

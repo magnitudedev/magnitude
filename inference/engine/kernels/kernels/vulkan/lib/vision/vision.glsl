@@ -82,7 +82,7 @@ struct vision_epilogue {
     int kind;
     int act;                // Linear: ELEMENT_* of A
     int y_kind;             // ELEMENT_* of y
-    int activation;         // Linear: 0, 1 tanh GELU, 2 erf GELU, 3 quick GELU
+    int activation;         // Linear: 0, 1 tanh GELU, 2 erf GELU, 3 quick GELU, 4 squared ReLU
     uint64_t y;
     uint64_t y0;            // row stride of y, in elements
     bool biased;
@@ -115,8 +115,16 @@ vision_epilogue vision_stem(uint64_t y, uint64_t y0, bool biased, uint64_t bias,
         columns, 0ul, 0ul, false, 0.0, 0.0, table, table_kind, indices, coefficients);
 }
 
+float vision_relu_squared(float value) {
+    const float positive = max(value, 0.0);
+    return positive * positive;
+}
+
 float vision_activate(int code, float value) {
-    return code == 1 ? vision_gelu_tanh(value) : code == 2 ? vision_gelu_erf(value) : vision_gelu_quick(value);
+    return code == 1 ? vision_gelu_tanh(value)
+         : code == 2 ? vision_gelu_erf(value)
+         : code == 3 ? vision_gelu_quick(value)
+                     : vision_relu_squared(value);
 }
 
 void vision_put(vision_epilogue out_, uint m, uint n, float value) {

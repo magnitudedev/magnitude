@@ -223,6 +223,10 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
                         ("GR", 0),
                         ("K", keys),
                         ("V", keys),
+                        ("QS", 0),
+                        ("GS", 0),
+                        ("KS", 0),
+                        ("VS", 0),
                     ])),
                 )
                 .unwrap()
@@ -235,6 +239,10 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
                     value_weight: &weights[2].tensor,
                     epsilon: EPSILON,
                     project_mode: 0,
+                    query_scale: &f32_tensor(&device, &[0], &[]),
+                    gate_scale: &f32_tensor(&device, &[0], &[]),
+                    key_scale: &f32_tensor(&device, &[0], &[]),
+                    value_scale: &f32_tensor(&device, &[0], &[]),
                     query_bound: &f32_tensor(&device, &[0], &[]),
                     gate_bound: &f32_tensor(&device, &[0], &[]),
                     key_bound: &f32_tensor(&device, &[0], &[]),
@@ -295,6 +303,7 @@ fn cuda_attention_output_matches_host_model() {
                         ("IN", 0),
                         ("Q", q),
                         ("W", w),
+                        ("OS", 0),
                     ])),
                 )
                 .unwrap()
@@ -303,12 +312,150 @@ fn cuda_attention_output_matches_host_model() {
                     inject: &no_inject(&device, hidden.extents()[0]),
                     gated: &gated_tensor,
                     output_weight: &output.tensor,
+                    output_scale: &f32_tensor(&device, &[0], &[]),
                     output_bound: &f32_tensor(&device, &[0], &[]),
                 })
                 .unwrap()
                 .value;
                 check(
                     &format!("attention output {format:?} M={m} {mapping:?}"),
+                    &read_f32(&result),
+                    &expected,
+                    &tolerance,
+                );
+            }
+        }
+    }
+}
+
+/// The state-space mixer's projections under their weights' second-level
+/// scales (Nemotron 3.5's NVFP4 `ssm_in` / `ssm_out` `.scale`):
+/// `attention_project`'s query segment alone (QS = 1) and `attention_output`
+/// (OS = 1) multiply their F32 accumulators by the scale before rounding.
+#[test]
+fn cuda_scaled_state_space_projections_match_host_model() {
+    let Some(device) = cuda() else { return };
+    /// A second-level scale that is not a power of two.
+    const SCALE: f32 = 0.412_5;
+    let factor = f64::from(SCALE);
+    let mut rng = Rng(61);
+    let (d, columns, heads, width) = (512usize, 320usize, 4usize, 128usize);
+    let k = heads * width;
+    let none = f32_tensor(&device, &[0], &[]);
+    let scale = f32_tensor(&device, &[1], &[SCALE]);
+    for format in [Format::Nvfp4, Format::Q4K] {
+        let projection = weight(&device, format, columns, d, &mut rng);
+        // The other segments read zero rows of the projection weight.
+        let empty = projection.tensor.slice_leading(0, 0).unwrap();
+        let output = weight(&device, format, d, k, &mut rng);
+        for m in ROWS {
+            let hidden_values: Vec<f32> = (0..m * d).map(|_| rng.uniform(-3.0, 3.0)).collect();
+            let norm_values: Vec<f32> = (0..d).map(|_| rng.uniform(0.25, 1.25)).collect();
+            let gated_values: Vec<f32> =
+                (0..m * k).map(|_| bf16_round(rng.uniform(-1.0, 1.0))).collect();
+            let normed = normalized(&hidden_values, &norm_values, m, d);
+            let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
+            let norm = f32_tensor(&device, &[d as u64], &norm_values);
+            let gated = bf16_tensor(&device, &[m as u64, heads as u64, width as u64], &gated_values);
+            for &mapping in mappings(m) {
+                let (x, slack) = operand_rows(&normed, d, mapping);
+                let (values, tolerance) =
+                    rounded_segment(&x, &slack, &projection, m, columns, d, mapping);
+                let projected = attention_project::native_for_device_with(
+                    &device,
+                    attention_project::Elements {
+                        NW: Element::f32(),
+                        QW: format.resident(),
+                        GW: format.resident(),
+                        KW: format.resident(),
+                        VW: format.resident(),
+                        A: Element::bf16(),
+                    },
+                    &mapping.projection_params(statics_specialization(&[
+                        ("D", d),
+                        ("PT", 1),
+                        ("NM", d),
+                        ("Q", columns),
+                        ("GR", 0),
+                        ("K", 0),
+                        ("V", 0),
+                        ("QS", 1),
+                        ("GS", 0),
+                        ("KS", 0),
+                        ("VS", 0),
+                    ])),
+                )
+                .unwrap()
+                .call(attention_project::Args {
+                    hidden: &hidden,
+                    input_norm: &norm,
+                    query_weight: &projection.tensor,
+                    gate_weight: &empty,
+                    key_weight: &empty,
+                    value_weight: &empty,
+                    epsilon: EPSILON,
+                    project_mode: 0,
+                    query_scale: &scale,
+                    gate_scale: &none,
+                    key_scale: &none,
+                    value_scale: &none,
+                    query_bound: &none,
+                    gate_bound: &none,
+                    key_bound: &none,
+                    value_bound: &none,
+                })
+                .unwrap()
+                .r0;
+                check(
+                    &format!("scaled attention project {format:?} M={m} {mapping:?}"),
+                    &read_bf16(&projected),
+                    &values.iter().map(|value| factor * value).collect::<Vec<_>>(),
+                    &tolerance
+                        .iter()
+                        .map(|tolerance| factor * tolerance + 1e-6)
+                        .collect::<Vec<_>>(),
+                );
+
+                let (x, _) = operand_rows(&gated_values, k, mapping);
+                let (projected, magnitude) = project(&x, &output.values, m, d, k);
+                let dequant = dequant_bound(&x, &output.values, m, d, k, mapping);
+                let expected: Vec<f64> = (0..m * d)
+                    .map(|i| f64::from(hidden_values[i]) + factor * projected[i])
+                    .collect();
+                let tolerance: Vec<f64> = (0..m * d)
+                    .map(|i| {
+                        factor * (projected[i].abs() / 256.0 + magnitude[i] * 2e-5 + dequant[i])
+                            + 1e-6
+                    })
+                    .collect();
+                let result = attention_output::native_for_device_with(
+                    &device,
+                    attention_output::Elements {
+                        A: Element::bf16(),
+                        OW: format.resident(),
+                    },
+                    &mapping.projection_params(statics_specialization(&[
+                        ("D", d),
+                        ("SN", 1),
+                        ("IN", 0),
+                        ("Q", heads),
+                        ("W", width),
+                        ("OS", 1),
+                    ])),
+                )
+                .unwrap()
+                .call(attention_output::Args {
+                    hidden: &hidden,
+                    inject: &no_inject(&device, hidden.extents()[0]),
+                    gated: &gated,
+                    output_weight: &output.tensor,
+                    output_scale: &scale,
+                    output_bound: &none,
+                })
+                .unwrap()
+                .value;
+                check(
+                    &format!("scaled attention output {format:?} M={m} {mapping:?}"),
                     &read_f32(&result),
                     &expected,
                     &tolerance,
@@ -411,6 +558,7 @@ fn cuda_projection_block_timings() {
                     ("IN", 0),
                     ("Q", nv),
                     ("W", w),
+                    ("OS", 0),
                 ])),
             )
             .unwrap();
@@ -422,6 +570,7 @@ fn cuda_projection_block_timings() {
                     inject: &inject,
                     gated: &gated,
                     output_weight: weight,
+                    output_scale: &no_bound,
                     output_bound: &no_bound,
                 })
                 .collect();

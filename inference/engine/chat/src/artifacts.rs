@@ -143,8 +143,9 @@ impl Profile {
                 false,
             ),
             // Tekken pieces: case-split letter runs and single digits.
-            // llama.cpp reads this name with its Llama 3 expression instead.
-            ("gpt2", Some("pixtral")) => byte_level(
+            // llama.cpp reads `pixtral` with its Llama 3 expression instead,
+            // and `tekken` with this one.
+            ("gpt2", Some("pixtral" | "tekken")) => byte_level(
                 &[(
                     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
                     Isolated,

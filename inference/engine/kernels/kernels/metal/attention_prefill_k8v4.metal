@@ -8,6 +8,7 @@
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
+#define ATTENTION_SINKS (SEISMIC_DIM_SK != 0)
 #define PREFILL_HEADS_PER_GROUP SEISMIC_TUNE_HEADS
 #define PREFILL_DIRECT SEISMIC_TUNE_DIRECT
 #define PREFILL_COISSUE SEISMIC_TUNE_COISSUE
@@ -27,6 +28,11 @@
         reinterpret_cast<device const int2 *>(worklist),                                                   \
         reinterpret_cast<device const uint *>((worklist) + ulong(PREFILL_LIST_TILES) * PREFILL_LIST_CAPACITY * 2), \
         uint(SEISMIC_DIM_B), int(SEISMIC_DIM_BR), PREFILL_LIST_CAPACITY}
+// The statistics scratch: the query tiles' partition counts, then the split
+// records' (maximum, denominator) (one scratch, as Metal binds at most 31
+// buffers).
+#define PREFILL_COUNTS(scratch) reinterpret_cast<device uint *>(scratch)
+#define PREFILL_STATISTICS(scratch) ((scratch) + PREFILL_LIST_TILES)
 
 
 // The launches over affine K8/V4 history (bodies in lib/attention/attention.h):
@@ -137,6 +143,7 @@ kernel void attention_prefill_k8v4_decode(
 kernel void attention_prefill_k8v4_attend(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
     device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
+    device const float *sinks [[buffer(SEISMIC_BUFFER_SINKS)]],
     device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
     device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
     device const int *tiles [[buffer(SEISMIC_BUFFER_HISTORY_TILES)]],
@@ -149,8 +156,7 @@ kernel void attention_prefill_k8v4_attend(
     device const half *keys [[buffer(SEISMIC_BUFFER_SCRATCH_KEYS)]],
     device const half *values [[buffer(SEISMIC_BUFFER_SCRATCH_VALUES)]],
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
-    device float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
-    device uint *counts [[buffer(SEISMIC_BUFFER_SCRATCH_COUNTS)]],
+    device float *scratch [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
     device const uint *selection [[buffer(SEISMIC_BUFFER_SELECTION)]],
     device int *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -179,20 +185,20 @@ kernel void attention_prefill_k8v4_attend(
         ulong(SEISMIC_PARAM_SLAB_ROWS)};
 #endif
     attention::prefill_attend<SEISMIC_TUNE_QT>(history,
-        query, gate, visible, fresh, result, queries, keys, values, partials, statistics, counts,
-        SEISMIC_DIM_M, SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
+        query, gate, visible, fresh, result, queries, keys, values, partials, PREFILL_STATISTICS(scratch),
+        PREFILL_COUNTS(scratch), SEISMIC_DIM_M, SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
         SEISMIC_PARAM_GATE_FUNCTION != 0, shared, exchange, group, groups, thread_index, simd, lane,
-        PREFILL_WORKLIST(selection, worklist));
+        PREFILL_WORKLIST(selection, worklist), sinks);
 }
 
 kernel void attention_prefill_k8v4_fold(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
     device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
+    device const float *sinks [[buffer(SEISMIC_BUFFER_SINKS)]],
     device const int *tiles [[buffer(SEISMIC_BUFFER_HISTORY_TILES)]],
     device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
-    device const float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
-    device const uint *counts [[buffer(SEISMIC_BUFFER_SCRATCH_COUNTS)]],
+    device float *scratch [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint column [[thread_index_in_threadgroup]]) {
@@ -206,18 +212,19 @@ kernel void attention_prefill_k8v4_fold(
         attention::decoded_history::of(window,
             attention::held_tiles{tiles, window.words[attention::history_window::TILES]}, round,
             uint(SEISMIC_PARAM_SLAB_ROWS)).held(),
-        round, query, gate, result, partials, statistics, counts, SEISMIC_DIM_M, group.x, group.y, column,
-        SEISMIC_PARAM_GATE_FUNCTION != 0);
+        round, query, gate, result, partials, PREFILL_STATISTICS(scratch), PREFILL_COUNTS(scratch), SEISMIC_DIM_M,
+        group.x, group.y, column,
+        SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
 #endif
 }
 
 kernel void attention_prefill_k8v4_merge(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
     device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
+    device const float *sinks [[buffer(SEISMIC_BUFFER_SINKS)]],
     device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
-    device const float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
-    device const uint *counts [[buffer(SEISMIC_BUFFER_SCRATCH_COUNTS)]],
+    device float *scratch [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint column [[thread_index_in_threadgroup]]) {
@@ -229,8 +236,9 @@ kernel void attention_prefill_k8v4_merge(
     if (window.rounds(window.words[attention::history_window::TILES]) > 1)
         return;
 #endif
-    attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, result, partials, statistics, counts,
-        SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0);
+    attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, result, partials, PREFILL_STATISTICS(scratch),
+        PREFILL_COUNTS(scratch),
+        SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
 }
 
 // The WorkList's list launch (B > 0): each query tile's read key tiles

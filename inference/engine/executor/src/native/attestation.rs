@@ -13,7 +13,9 @@ use crate::{
 };
 use magnitude_family_contracts::{ProgressivePlane, SublayerIndex, WeightScope};
 use magnitude_kernels::{
-    attention_append_dense, cluster_token_rows, draft_convolve_input, draft_convolve_residual,
+    attention_append_dense, cluster_token_rows, corrector_attention, corrector_factors,
+    corrector_features, corrector_nodes, corrector_path, corrector_rows, draft_convolve_input,
+    draft_convolve_residual,
     draft_gated_rows, draft_path_step, draft_top_k, feature_rows, import_dense, indexer_select,
     ngram_gate, ngram_inject, ngram_rows, packing_bound, place_logits_rows, post_norm_residual,
     project_rows, readout_project_rows, repack_weight, repeat_rows, selection_notice, stored_rows,
@@ -296,7 +298,9 @@ pub(crate) struct AttestedDraft {
     /// Widens a device-conditioned entry's target features to F32.
     pub widen: NativeKernel<widen_rows::Entry>,
     pub markov: Option<MarkovKernels>,
-    pub dflash2: Option<super::AttestedDflash2>,
+    pub convolved: Option<super::AttestedConvolved>,
+    pub selector: Option<super::AttestedSelector>,
+    pub corrector: Option<super::AttestedCorrector>,
 }
 
 /// Every kernel of the projector's vision program.
@@ -947,16 +951,27 @@ impl AttestedPrograms {
             if draft.markov().is_some() {
                 bytes += bytes!(embedding_rows) + bytes!(dense_output);
             }
-            if let Some(binding) = draft.dflash2() {
-                let (projections, norms) = super::draft::dflash2_entries(draft, binding);
-                bytes += projections.len() as u128 * bytes!(project_rows)
-                    + norms.len() as u128 * bytes!(readout_features_rows)
-                    + bytes!(draft_convolve_input)
+            let (projections, norms) = super::draft::stage_entries(draft);
+            bytes += projections.len() as u128 * bytes!(project_rows)
+                + norms.len() as u128 * bytes!(readout_features_rows);
+            if draft.convolutions().is_some() {
+                bytes += bytes!(draft_convolve_input)
                     + bytes!(draft_convolve_residual)
-                    + bytes!(draft_gated_rows)
-                    + bytes!(draft_top_k)
-                    + 2 * bytes!(embedding_rows)
-                    + bytes!(draft_path_step);
+                    + bytes!(draft_gated_rows);
+            }
+            if draft.selector().is_some() {
+                bytes += bytes!(draft_top_k) + 2 * bytes!(embedding_rows) + bytes!(draft_path_step);
+            }
+            if let Some(corrector) = draft.corrector() {
+                bytes += bytes!(draft_top_k)
+                    + bytes!(corrector_features)
+                    + super::draft::corrector_rows_keys(corrector, draft.activation()).len()
+                        as u128
+                        * bytes!(corrector_rows)
+                    + bytes!(corrector_nodes)
+                    + bytes!(corrector_attention)
+                    + bytes!(corrector_factors)
+                    + bytes!(corrector_path);
             }
         }
         if let Some(vision) = plan.vision() {
@@ -1538,15 +1553,28 @@ impl AttestedPrograms {
                                 .ok_or_else(|| missing("draft_markov_stages", binding))
                         })
                         .transpose()?,
-                    dflash2: draft_plan
-                        .dflash2()
+                    convolved: draft_plan
+                        .convolutions()
                         .map(|binding| {
                             handles
-                                .dflash2
-                                .as_ref()
-                                .ok_or_else(|| missing("dflash2_stages", binding.selector))?
-                                .attest(draft_plan, binding)
-                                .map_err(|entry| missing("dflash2_stages", entry))
+                                .attest_convolved(draft_plan, binding)
+                                .map_err(|entry| missing("draft_convolved_stages", entry))
+                        })
+                        .transpose()?,
+                    selector: draft_plan
+                        .selector()
+                        .map(|binding| {
+                            handles
+                                .attest_selector(draft_plan, binding)
+                                .map_err(|entry| missing("draft_selector_stages", entry))
+                        })
+                        .transpose()?,
+                    corrector: draft_plan
+                        .corrector()
+                        .map(|binding| {
+                            handles
+                                .attest_corrector(draft_plan, binding)
+                                .map_err(|entry| missing("draft_corrector_stages", entry))
                         })
                         .transpose()?,
                 })
@@ -1891,16 +1919,27 @@ impl AttestedPrograms {
                 bytes += u128::from(markov.embedding.invocation_workspace_bytes())
                     + u128::from(markov.projection.invocation_workspace_bytes());
             }
-            if let Some(dflash2) = &draft.dflash2 {
-                charge!(dflash2.norms.values());
-                charge!(dflash2.projections.values());
-                bytes += u128::from(dflash2.convolve_input.invocation_workspace_bytes())
-                    + u128::from(dflash2.convolve_residual.invocation_workspace_bytes())
-                    + u128::from(dflash2.gated.invocation_workspace_bytes())
-                    + u128::from(dflash2.top_k.invocation_workspace_bytes())
-                    + u128::from(dflash2.predecessor.invocation_workspace_bytes())
-                    + u128::from(dflash2.successor.invocation_workspace_bytes())
-                    + u128::from(dflash2.path.invocation_workspace_bytes());
+            charge!(draft.norms.values());
+            charge!(draft.projections.values());
+            if let Some(convolved) = &draft.convolved {
+                bytes += u128::from(convolved.convolve_input.invocation_workspace_bytes())
+                    + u128::from(convolved.convolve_residual.invocation_workspace_bytes())
+                    + u128::from(convolved.gated.invocation_workspace_bytes());
+            }
+            if let Some(selector) = &draft.selector {
+                bytes += u128::from(selector.top_k.invocation_workspace_bytes())
+                    + u128::from(selector.predecessor.invocation_workspace_bytes())
+                    + u128::from(selector.successor.invocation_workspace_bytes())
+                    + u128::from(selector.path.invocation_workspace_bytes());
+            }
+            if let Some(corrector) = &draft.corrector {
+                charge!(corrector.rows.values());
+                bytes += u128::from(corrector.top_k.invocation_workspace_bytes())
+                    + u128::from(corrector.features.invocation_workspace_bytes())
+                    + u128::from(corrector.nodes.invocation_workspace_bytes())
+                    + u128::from(corrector.attention.invocation_workspace_bytes())
+                    + u128::from(corrector.factors.invocation_workspace_bytes())
+                    + u128::from(corrector.path.invocation_workspace_bytes());
             }
         }
         if let Some(vision) = &prepared.vision {
@@ -2548,8 +2587,8 @@ impl AttestedPrograms {
                 charge!(&markov.embedding);
                 charge!(&markov.projection);
             }
-            if let Some(dflash2) = &draft.dflash2 {
-                for layer in &dflash2.layers {
+            if let Some(convolved) = &draft.convolved {
+                for layer in &convolved.layers {
                     charge!(&layer.attention_norm);
                     charge!(&layer.attention_coefficients);
                     charge!(&layer.query);
@@ -2562,15 +2601,53 @@ impl AttestedPrograms {
                     charge!(&layer.up);
                     charge!(&layer.down);
                 }
-                charge!(&dflash2.features);
-                charge!(&dflash2.hidden);
-                charge!(&dflash2.convolve_input);
-                charge!(&dflash2.convolve_residual);
-                charge!(&dflash2.gated);
-                charge!(&dflash2.top_k);
-                charge!(&dflash2.predecessor);
-                charge!(&dflash2.successor);
-                charge!(&dflash2.path);
+                charge!(&convolved.convolve_input);
+                charge!(&convolved.convolve_residual);
+                charge!(&convolved.gated);
+            }
+            if let Some(selector) = &draft.selector {
+                charge!(&selector.features);
+                charge!(&selector.hidden);
+                charge!(&selector.top_k);
+                charge!(&selector.predecessor);
+                charge!(&selector.successor);
+                charge!(&selector.path);
+            }
+            if let Some(corrector) = &draft.corrector {
+                charge!(&corrector.pass_norm);
+                charge!(&corrector.anchor_rows);
+                charge!(&corrector.top_k);
+                charge!(&corrector.features);
+                charge!(&corrector.feature_down);
+                if let Some(token) = &corrector.token {
+                    charge!(token);
+                }
+                charge!(&corrector.pass);
+                charge!(&corrector.nodes);
+                charge!(&corrector.context);
+                charge!(&corrector.context_bias);
+                charge!(&corrector.anchor_norm);
+                charge!(&corrector.attention);
+                for layer in &corrector.layers {
+                    charge!(&layer.attention_norm);
+                    charge!(&layer.attention_input);
+                    charge!(&layer.attention_output);
+                    charge!(&layer.attention_residual);
+                    charge!(&layer.mlp_norm);
+                    charge!(&layer.up);
+                    charge!(&layer.activated);
+                    charge!(&layer.down);
+                    charge!(&layer.down_residual);
+                }
+                charge!(&corrector.output_norm);
+                charge!(&corrector.factors);
+                charge!(&corrector.factor_input);
+                charge!(&corrector.factor_activated);
+                charge!(&corrector.outgoing);
+                charge!(&corrector.incoming);
+                charge!(&corrector.anchor);
+                charge!(&corrector.unit);
+                charge!(&corrector.path);
             }
         }
         if let Some(vision) = &self.vision {

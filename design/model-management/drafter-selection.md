@@ -128,7 +128,7 @@ followed by its source label.
 
 ## Automatic choice
 
-Method order matches the speculation axis of the model radar: DFlash2, DSpark, DFlash, a separate MTP file, then
+Method order matches the speculation axis of the model radar: LiLiCorr, DFlash2, DSpark, DFlash, a separate MTP file, then
 built-in MTP heads. The first candidate that binds, in this order, is preselected:
 
 1. a separate drafter in the model's own repository or folder, any method, by method order, because it was

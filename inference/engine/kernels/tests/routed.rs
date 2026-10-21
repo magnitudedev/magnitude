@@ -125,6 +125,7 @@ fn pattern(count: usize, seed: u32, scale: f32) -> Vec<f32> {
 
 struct RouteCase {
     rows: usize,
+    experts: usize,
     residual: Vec<f32>,
     norm: Vec<f32>,
     router: Vec<f32>,
@@ -133,17 +134,19 @@ struct RouteCase {
 }
 
 impl RouteCase {
-    /// Router rows 5 and 21 are identical, so their probabilities tie
-    /// exactly and the higher expert must rank first. Residuals are positive
-    /// and the tied rows a positive constant, so the pair is always selected.
-    /// Rows 9 and 30 tie too, without being forced into the top K.
-    fn new(rows: usize, normalize: i32) -> Self {
-        let mut router = pattern(E * H, 7, 0.25);
+    /// Router rows 5 and `experts - 11` (21 at 32 experts) are identical, so
+    /// their probabilities tie exactly and the higher expert must rank
+    /// first. Residuals are positive and the tied rows a positive constant,
+    /// so the pair is always selected. Rows 9 and `experts - 2` tie too,
+    /// without being forced into the top K.
+    fn new(rows: usize, normalize: i32, experts: usize) -> Self {
+        let mut router = pattern(experts * H, 7, 0.25);
         router[5 * H..6 * H].fill(0.3);
-        router.copy_within(5 * H..6 * H, 21 * H);
-        router.copy_within(9 * H..10 * H, 30 * H);
+        router.copy_within(5 * H..6 * H, (experts - 11) * H);
+        router.copy_within(9 * H..10 * H, (experts - 2) * H);
         Self {
             rows,
+            experts,
             residual: pattern(rows * H, 3, 1.0)
                 .into_iter()
                 .map(|v| v + 1.5)
@@ -168,7 +171,7 @@ impl RouteCase {
             vec![
                 floats(&[rows, H], &self.residual),
                 floats(&[H], &self.norm),
-                floats(&[E, H], &self.router),
+                floats(&[self.experts, H], &self.router),
                 floats(&[H], &self.shared_router),
                 ints(&[rows, K], &vec![0; rows * K]),
                 floats(&[rows, K], &vec![0.0; rows * K]),
@@ -188,7 +191,7 @@ impl RouteCase {
 #[test]
 fn portable_route_ranks_by_probability_with_ties_to_the_higher_expert() {
     let module = module();
-    let case = RouteCase::new(3, 0);
+    let case = RouteCase::new(3, 0, E);
     let (_, _, routes, scores) = case.portable(&module, DType::F32);
     for row in 0..case.rows {
         let routes = &routes[row * K..(row + 1) * K];
@@ -219,7 +222,7 @@ fn portable_route_ranks_by_probability_with_ties_to_the_higher_expert() {
         assert_eq!(scores[five], scores[twenty_one]);
         assert_eq!(twenty_one, five + 1, "row {row}: {routes:?}");
     }
-    let (_, _, _, normalized_scores) = RouteCase::new(3, 1).portable(&module, DType::F32);
+    let (_, _, _, normalized_scores) = RouteCase::new(3, 1, E).portable(&module, DType::F32);
     for row in 0..3 {
         let total: f64 = normalized_scores[row * K..(row + 1) * K].iter().sum();
         assert!(
@@ -406,14 +409,24 @@ fn native_route_matches_portable_body_for_every_mapping() {
     }
 }
 
+/// Expert counts of the route checks: a multiple of 32, a small odd count
+/// (one partial lane run, every lane's single register) and Nemotron 3.5
+/// Bolt's smallest routed layer (240: lanes 16..31 exclude their last
+/// register).
+const ROUTE_EXPERTS: [usize; 3] = [E, 23, 240];
+
 fn native_route_matches_portable_body_for_every_mapping_on(device: &seismic::Device) {
     let module = module();
-    for (activation, element) in [
+    for (activation, element, experts) in [
         (DType::F32, seismic::Element::f32()),
         (DType::BF16, seismic::Element::bf16()),
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|(activation, element)| {
+        ROUTE_EXPERTS.map(|experts| (activation, element, experts))
+    }) {
         for (rows, normalize) in [(1usize, 1), (5, 0), (9, 1)] {
-            let case = RouteCase::new(rows, normalize);
+            let case = RouteCase::new(rows, normalize, experts);
             let (normalized, coefficient, routes, scores) = case.portable(&module, activation);
             for (simdgroups, split) in [8, 4, 2].into_iter().flat_map(|simdgroups| {
                 route_splits(&device)
@@ -423,7 +436,7 @@ fn native_route_matches_portable_body_for_every_mapping_on(device: &seismic::Dev
                 let specialization = specialization_on(
                     device,
                     &route_statics(
-                        &[("H", H as u64), ("E", E as u64), ("K", K as u64)],
+                        &[("H", H as u64), ("E", experts as u64), ("K", K as u64)],
                         H as u64,
                     ),
                     &route_mapping(&device, simdgroups, split),
@@ -446,7 +459,7 @@ fn native_route_matches_portable_body_for_every_mapping_on(device: &seismic::Dev
                     .call(routed_route::Args {
                         residual: &f32_tensor(&device, &[rows as u64, H as u64], &case.residual),
                         norm: &f32_tensor(&device, &[H as u64], &case.norm),
-                        router: &f32_tensor(&device, &[E as u64, H as u64], &case.router),
+                        router: &f32_tensor(&device, &[experts as u64, H as u64], &case.router),
                         shared_router: &f32_tensor(&device, &[H as u64], &case.shared_router),
                         routes: &mut native_routes,
                         scores: &mut native_scores,
@@ -454,8 +467,9 @@ fn native_route_matches_portable_body_for_every_mapping_on(device: &seismic::Dev
                         normalize,
                     })
                     .unwrap();
-                let label =
-                    format!("{activation:?} rows {rows} SIMDGROUPS {simdgroups} SPLIT {split}");
+                let label = format!(
+                    "{activation:?} E {experts} rows {rows} SIMDGROUPS {simdgroups} SPLIT {split}"
+                );
                 let expected_routes = routes.iter().map(|v| *v as i32).collect::<Vec<_>>();
                 assert_eq!(read_i32(&native_routes), expected_routes, "{label} routes");
                 assert_close(

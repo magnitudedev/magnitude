@@ -497,13 +497,50 @@ inline float2 grid_pair(uint2 point, uint signs, uint j) {
     return as_type<float2>(as_type<uint2>(magnitudes) ^ ((uint2(signs, signs >> 1) & 1u) << 31));
 }
 
+// Scale codes of a scales plane: `ScaleBytes` bytes of `FieldBits`-bit
+// codes per 256 values (a field a packet) under an f32 factor per 256.
+template <ulong ScaleBytes, uint FieldBits>
+struct PlaneScales {
+    // Block `block`'s scale code fields.
+    static uint2 fields(device const uchar *row, Rows16 layout, uint block) {
+        device const uchar *at = layout.scale_at(row, ScaleBytes * block);
+        return ScaleBytes == 8 ? uint2(*reinterpret_cast<device const packed_uint2 *>(at))
+                               : uint2(*reinterpret_cast<device const uint *>(at), 0u);
+    }
+    // The fields from the next packet's on.
+    static uint2 next(uint2 fields) {
+        return uint2((fields.x >> FieldBits) | (fields.y << (32u - FieldBits)), fields.y >> FieldBits);
+    }
+    // The scale code field of the block's packet `packet` (entries `e`).
+    template <typename E>
+    static uint field(uint2 fields, uint packet, E) {
+        uint bit = FieldBits * packet;
+        return (fields[bit >> 5] >> (bit & 31u)) & ((1u << FieldBits) - 1u);
+    }
+    static float factor(device const uchar *row, Rows16 layout, uint block) {
+        return *reinterpret_cast<device const float *>(layout.super_at(row, 4ul * block));
+    }
+};
+
+// Scale codes carried by sixteen-bit entries (iq2xxs): bit j of a packet's
+// 4-bit code is bit 15 of its entry j; an f16 d per 256, the factor d / 8.
+struct CarriedScales {
+    static uint2 fields(device const uchar *, Rows16, uint) { return uint2(0u); }
+    static uint2 next(uint2 fields) { return fields; }
+    static uint field(uint2, uint, uint2 e) {
+        return ((e.x >> 15) & 1u) | ((e.x >> 30) & 2u) | ((e.y >> 13) & 4u) | ((e.y >> 28) & 8u);
+    }
+    static float factor(device const uchar *row, Rows16 layout, uint block) {
+        return 0.125f * float(*reinterpret_cast<device const half *>(layout.super_at(row, 2ul * block)));
+    }
+};
+
 // iq2xs: sixteen-bit entries (a 9-bit index into the 512-point grid, then
 // the signs); a scale per 16 values, a byte of two scale codes a packet.
 struct Iq2XsGrid {
+    typedef PlaneScales<8, 8> scales;   // scale codes and factors
     static constant constexpr uint groups = 2;
     static constant constexpr ulong unit = 8;          // grids bytes a packet
-    static constant constexpr ulong scale_bytes = 8;   // scales bytes per 256 values
-    static constant constexpr uint field_bits = 8;     // scale code bits a packet
     typedef uint2 entries;
     static entries load(device const uchar *at) { return *reinterpret_cast<device const uint2 *>(at); }
     static uint entry(entries e, uint step) { return (e[step >> 1] >> (16u * (step & 1u))) & 0xffffu; }
@@ -514,10 +551,9 @@ struct Iq2XsGrid {
 // iq3xxs: three-byte entries (two 8-bit indices into the 256-point grid of
 // four values, then the signs); a scale per 32 values, a nibble a packet.
 struct Iq3XxsGrid {
+    typedef PlaneScales<4, 4> scales;
     static constant constexpr uint groups = 1;
     static constant constexpr ulong unit = 12;
-    static constant constexpr ulong scale_bytes = 4;
-    static constant constexpr uint field_bits = 4;
     typedef uint3 entries;
     static entries load(device const uchar *at) { return uint3(*reinterpret_cast<device const packed_uint3 *>(at)); }
     // Entry `step` at bit 24 * step of the packet's three words.
@@ -531,17 +567,18 @@ struct Iq3XxsGrid {
 };
 
 // iq2xxs: sixteen-bit entries (an 8-bit index into the 256-point grid, then
-// the signs); a scale per 32 values, a nibble a packet.
+// seven signs, then one bit of the packet's 4-bit scale code: bit j of the
+// code is bit 15 of entry j); a scale per 32 values under an f16 factor
+// d / 8 per 256 (the scale is d * (2 * code + 1) / 8). No scales plane.
 struct Iq2XxsGrid {
     static constant constexpr uint groups = 1;
     static constant constexpr ulong unit = 8;
-    static constant constexpr ulong scale_bytes = 4;
-    static constant constexpr uint field_bits = 4;
     typedef uint2 entries;
     static entries load(device const uchar *at) { return *reinterpret_cast<device const uint2 *>(at); }
     static uint entry(entries e, uint step) { return (e[step >> 1] >> (16u * (step & 1u))) & 0xffffu; }
     static uint2 point(uint entry) { return grids::iq2xxs[entry & 255u]; }
     static uint signs(uint entry) { return (entry >> 8) & 127u; }
+    typedef CarriedScales scales;
 };
 
 template <typename G>
@@ -558,10 +595,9 @@ struct Grid {
     static packet load(device const uchar *row, Rows16 layout, uint p) {
         packet k;
         k.entries = G::load(layout.at(row, layout.codes, G::unit, p));
-        uint block = p >> 3, bit = G::field_bits * (p & 7u);
-        uint field = (layout.scale_at(row, G::scale_bytes * block)[bit >> 3] >> (bit & 7u)) &
-                     ((1u << G::field_bits) - 1u);
-        k.scale = scales(*reinterpret_cast<device const float *>(layout.super_at(row, 4ul * block)), field);
+        uint block = p >> 3;
+        typedef typename G::scales S;
+        k.scale = scales(S::factor(row, layout, block), S::field(S::fields(row, layout, block), p & 7u, k.entries));
         return k;
     }
     static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
@@ -750,8 +786,8 @@ struct Block<Q6K> {
     }
 };
 
-// Grid codes: a block's scale code fields (8 or 4 bytes), the next packet's
-// lowest, and its factor.
+// Grid codes: a block's scale code fields (none when the entries carry
+// them), the next packet's lowest, and its factor.
 template <typename G>
 struct Block<Grid<G>> {
     static constant constexpr uint packets = 8;
@@ -759,26 +795,20 @@ struct Block<Grid<G>> {
         uint2 fields;
         float factor;
     };
-    static void advance(thread state &run) {
-        run.fields = uint2((run.fields.x >> G::field_bits) | (run.fields.y << (32u - G::field_bits)),
-                           run.fields.y >> G::field_bits);
-    }
     static state load(device const uchar *row, Rows16 layout, uint p) {
         uint block = p >> 3;
-        device const uchar *fields = layout.scale_at(row, G::scale_bytes * block);
         state run;
-        run.fields = G::scale_bytes == 8 ? uint2(*reinterpret_cast<device const packed_uint2 *>(fields))
-                                         : uint2(*reinterpret_cast<device const uint *>(fields), 0u);
-        run.factor = *reinterpret_cast<device const float *>(layout.super_at(row, 4ul * block));
+        run.fields = G::scales::fields(row, layout, block);
+        run.factor = G::scales::factor(row, layout, block);
         for (uint skipped = 0; skipped < (p & 7u); ++skipped)
-            advance(run);
+            run.fields = G::scales::next(run.fields);
         return run;
     }
     static typename Grid<G>::packet packet(device const uchar *row, Rows16 layout, uint p, uint, thread state &run) {
         typename Grid<G>::packet k;
         k.entries = G::load(layout.at(row, layout.codes, G::unit, p));
-        k.scale = Grid<G>::scales(run.factor, run.fields.x & ((1u << G::field_bits) - 1u));
-        advance(run);
+        k.scale = Grid<G>::scales(run.factor, G::scales::field(run.fields, 0u, k.entries));
+        run.fields = G::scales::next(run.fields);
         return k;
     }
 };
@@ -827,6 +857,10 @@ inline float value_at(thread const typename W::packet &k, uint i) {
         ELEMENT_CAT(P, _PLANE_SCALES_ROW_OFFSET), ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET),           \
         ELEMENT_CAT(P, _TILE_ROWS), 0, ELEMENT_CAT(P, _PLANE_SCALES_BYTES_PER_ROW),                   \
         ELEMENT_CAT(P, _PLANE_SUPERS_BYTES_PER_ROW) }
+#define PACKETS_ROWS16_CARRIED(P)                                                                    \
+    packets::Rows16 { ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _PLANE_GRIDS_ROW_OFFSET), 0, 0, \
+        ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET), \
+        ELEMENT_CAT(P, _TILE_ROWS), 0, 0, ELEMENT_CAT(P, _PLANE_SUPERS_BYTES_PER_ROW) }
 #define PACKETS_ROWS16_DENSE(E, k) packets::Rows16 { ulong(k) * E::bytes, 0, 0, 0, 0, 1, 0 }
 
 // Binds slot `SLOT` to the decoder type `TYPE`.
@@ -885,7 +919,7 @@ PACKETS_BIND(W0, packets::IQ3XXS)
 #define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W0)
 #elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_IQ2XXS)
 PACKETS_BIND(W0, packets::IQ2XXS)
-#define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W0)
+#define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_CARRIED(KERNEL_W0)
 #else
 #error "KERNEL_W0: unsupported weight representation"
 #endif
@@ -944,7 +978,7 @@ PACKETS_BIND(W1, packets::IQ3XXS)
 #define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W1)
 #elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_IQ2XXS)
 PACKETS_BIND(W1, packets::IQ2XXS)
-#define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W1)
+#define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_CARRIED(KERNEL_W1)
 #else
 #error "KERNEL_W1: unsupported weight representation"
 #endif
@@ -1003,7 +1037,7 @@ PACKETS_BIND(W2, packets::IQ3XXS)
 #define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W2)
 #elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_IQ2XXS)
 PACKETS_BIND(W2, packets::IQ2XXS)
-#define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W2)
+#define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_CARRIED(KERNEL_W2)
 #else
 #error "KERNEL_W2: unsupported weight representation"
 #endif
@@ -1062,7 +1096,7 @@ PACKETS_BIND(W3, packets::IQ3XXS)
 #define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W3)
 #elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_IQ2XXS)
 PACKETS_BIND(W3, packets::IQ2XXS)
-#define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W3)
+#define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_CARRIED(KERNEL_W3)
 #else
 #error "KERNEL_W3: unsupported weight representation"
 #endif

@@ -35,11 +35,18 @@ configured artifact; `Best known method` intentionally contains no links.
 | Qwen3.5 122B-A10B | MTP | None | — | — |
 | Nemotron 3 Super 120B-A12B | MTP | None | — | — |
 | Nemotron 3.5 Lightning 30B-A3B | DFlash | DFlash | Separate file, draft repo | [NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash.gguf](https://huggingface.co/magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash-GGUF/blob/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash.gguf) |
+| Nemotron 3.5 Bolt 74B-A9B | LiLiCorr | LiLiCorr | Separate file, draft repo | [NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr.gguf](https://huggingface.co/magnitudedev/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr-GGUF/blob/main/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr.gguf) |
+| Nemotron 3.5 Super VL 120B-A12B | LiLiCorr | LiLiCorr | Separate file, draft repo | [NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr.gguf](https://huggingface.co/magnitudedev/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr-GGUF/blob/main/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr.gguf) |
 | DeepSeek V4 Flash 284B-A13B | DSpark | DSpark | Separate file, target repo | [dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF/blob/main/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf) |
 | Nemotron 3 Ultra 550B-A55B | MTP | None | — | — |
 | GLM 5.2 753B-A40B | MTP | MTP | Embedded | [Target model](https://huggingface.co/unsloth/GLM-5.2-GGUF) |
 
 Update this table whenever a catalog model or its configured speculative method changes.
+
+The catalog's speculative methods are `mtp`, `dflash`, `dflash2`, `dspark` and `lilicorr`. A
+LiLiCorr draft is a convolved DFlash backbone whose proposals a candidate corrector selects
+(NVIDIA's Nemotron 3.5 Bolt and Super-VL drafters); like DFlash, DFlash2 and DSpark it is always
+a separate draft file, never embedded in the target.
 
 Gemma 4 QAT targets use the matching Google QAT assistant, packaged as a separate
 `gemma4-assistant` GGUF in its own draft repository. QAT and non-QAT assistants are distinct

@@ -216,6 +216,8 @@ pub(crate) struct RecurrentOutputCase {
     gated: Tensor,
     output: Tensor,
     bound: Tensor,
+    /// The absent operand of the output's scale port.
+    absent: Tensor,
 }
 
 impl RecurrentOutputTuning {
@@ -252,6 +254,7 @@ impl EntryTuning for RecurrentOutputTuning {
             ("IN", inject),
             ("Q", self.shape.value_heads),
             ("W", self.shape.width),
+            crate::operators::attention::UNSCALED_OUTPUT,
         ];
         statics.extend(packing_statics(
             inputs,
@@ -291,6 +294,7 @@ impl EntryTuning for RecurrentOutputTuning {
                         seed + 2,
                     )?,
                     bound: inputs.bound(scope, WeightKind::RecurrentOutput)?,
+                    absent: inputs.unit_scale(0)?,
                     output,
                 })
             })
@@ -303,6 +307,7 @@ impl EntryTuning for RecurrentOutputTuning {
             inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
+            output_scale: &case.absent,
             output_bound: &case.bound,
         }
     }

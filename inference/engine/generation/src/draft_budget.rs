@@ -1,5 +1,7 @@
 //! The proposal budget shared by sequential and block drafters.
 
+use magnitude_executor::draft_ladder;
+
 /// A round's proposal budget, excluding its anchor and target bonus token:
 /// the proposals the drafter generates and the prefix of them offered to
 /// verification.
@@ -28,6 +30,18 @@ impl DraftBudget {
             generated,
             verified,
         })
+    }
+
+    /// The proposals a round generates when it may produce at most `limit`:
+    /// the widest width of the budget's ladder ([`draft_ladder`], what a
+    /// load of this budget prepares) that fits, none when none does. Away
+    /// from a request's end that is the budget's own generated count.
+    pub fn generated_within(&self, limit: usize) -> usize {
+        draft_ladder(self.generated)
+            .into_iter()
+            .rev()
+            .find(|width| *width <= limit)
+            .unwrap_or(0)
     }
 
     /// Whether a method drafting at most `cap` proposals can serve this
@@ -80,5 +94,23 @@ mod tests {
         assert!(budget(3, 0).validate(3).is_err());
         // Fields are public and deserialized: the width bound holds here too.
         assert!(budget(256, 1).validate(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn a_round_near_the_end_drafts_the_widest_prepared_width_that_fits() {
+        let budget = DraftBudget::new(7, 7).unwrap();
+        // The ladder of 7 is 1, 3 and 7.
+        let widths = (0..=9)
+            .map(|limit| budget.generated_within(limit))
+            .collect::<Vec<_>>();
+        assert_eq!(widths, [0, 1, 1, 3, 3, 3, 3, 7, 7, 7]);
+        // A width off the power ladder is its own widest rung.
+        let budget = DraftBudget::new(5, 2).unwrap();
+        let widths = (0..=6)
+            .map(|limit| budget.generated_within(limit))
+            .collect::<Vec<_>>();
+        assert_eq!(widths, [0, 1, 1, 3, 3, 5, 5]);
+        // A budget drafting nothing never drafts.
+        assert_eq!(DraftBudget::new(0, 0).unwrap().generated_within(8), 0);
     }
 }

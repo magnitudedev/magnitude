@@ -195,7 +195,8 @@ native vision_norm for cpu from "cpu/vision_norm.rs":
 # clamped to [minimum, maximum] when NC = 1, then:
 #   activation 0, NG = 0: plus the NR residual rows (NR <= 1, F32), published
 #   to Y;
-#   activation 1 (tanh GELU), 2 (erf GELU), 3 (quick GELU): Y(act(A(value)));
+#   activation 1 (tanh GELU), 2 (erf GELU), 3 (quick GELU), 4 (squared
+#   ReLU): Y(act(A(value)));
 #   NG = 1 (activation 0): Y(A(value) * gate), the up half of a GLU whose
 #   gate projection published A(act(A(gate))).
 fn vision_linear[M, N, K, NB, NR, NG, NC](x: &tensor[M, K] A, weight: &tensor[N, K] W,
@@ -231,6 +232,9 @@ fn vision_linear[M, N, K, NB, NR, NG, NC](x: &tensor[M, K] A, weight: &tensor[N,
                 sum = 0.5 * a * (1.0 + probability[output])
             if activation == 3:
                 sum = a / (1.0 + exp(-1.702 * a))
+            if activation == 4:
+                let positive = max(a, 0.0)
+                sum = positive * positive
             for gated in 0..NG:
                 sum = a * f32(gate[gated, row, output])
             for residual_row in 0..NR:

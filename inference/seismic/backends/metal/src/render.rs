@@ -825,6 +825,12 @@ impl<'a> Renderer<'a> {
                             }
                             _ => format!("float({})", temps[recipe.ordinal(*from)]),
                         },
+                        DecodeStep::Constant { value, .. } => match value {
+                            seismic_lang::reference_math::ReferenceScalar::F32(bits) => {
+                                format!("as_type<float>({bits:#010x}u)")
+                            }
+                            other => unreachable!("a decode constant is f32, not {other:?}"),
+                        },
                         DecodeStep::Multiply { left, right, .. } => format!(
                             "f32_mul(float({}), float({}))",
                             temps[recipe.ordinal(*left)],

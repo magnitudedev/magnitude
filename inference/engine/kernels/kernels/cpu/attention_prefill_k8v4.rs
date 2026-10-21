@@ -156,6 +156,7 @@ fn attention_prefill_k8v4_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>
     );
     let (query, gate, result) = (cx.arg_query(), cx.arg_gate(), cx.result_0());
     let softplus = cx.arg_gate_function() != 0;
+    let sinks = cx.arg_sinks();
     for local in 0..g {
         let head = kv_head * g + local;
         let gates = if form.interleaved > 0 {
@@ -163,8 +164,12 @@ fn attention_prefill_k8v4_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>
         } else {
             gate.row([row, head, 0])
         };
+        let mut denominator = state.denominator[local];
+        if cx.dim_sk() == 1 {
+            denominator += attention::sink_weight(sinks.get([0, head]), state.maximum[local]);
+        }
         // SAFETY: each work item writes its own query heads of its row.
         let out = unsafe { result.row_mut([row, head, 0]) };
-        attention::gate_row::<E::A>(&state.accumulator[local * w..][..w], state.denominator[local], gates, softplus, out);
+        attention::gate_row::<E::A>(&state.accumulator[local * w..][..w], denominator, gates, softplus, out);
     }
 }

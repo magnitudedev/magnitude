@@ -3151,6 +3151,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
             head_norm: 1,
             value_norm: 0,
             projected_value: true,
+            sinks: 0,
         },
         scopes: Vec::new(),
         epsilon: 1.0e-5,

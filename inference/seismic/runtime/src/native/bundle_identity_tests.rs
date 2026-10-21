@@ -9,7 +9,7 @@
 //! admissible specialization: the MSL the Metal pipeline compiles, the CUDA
 //! source NVRTC compiles to PTX, and the GLSL the Vulkan pipeline compiles.
 
-use super::abi::{Dialect, MetalFeatures, render_source, vulkan::VulkanFeatures};
+use super::abi::{CudaFeatures, Dialect, MetalFeatures, render_source, vulkan::VulkanFeatures};
 use seismic_lang::bundle::{decode_checked_bundle, encode_checked_bundle};
 use seismic_lang::checked::{
     CheckedModule, ElementParameter, NativeImplementation, NativeSpecialization,
@@ -124,7 +124,7 @@ fn decoded_kernel_bundle_forms_identical_native_sources() {
             BackendName::Metal,
             Dialect::Metal(MetalFeatures { tensor_ops: true }),
         ),
-        (BackendName::Cuda, Dialect::Cuda),
+        (BackendName::Cuda, Dialect::Cuda(CudaFeatures::UNOPENED)),
         (BackendName::Vulkan, Dialect::Vulkan(VULKAN)),
     ];
     let mut compared = 0;

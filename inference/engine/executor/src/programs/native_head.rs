@@ -10,7 +10,7 @@
 //! drafts nothing: its entry pass ends once the attention has appended the
 //! rows' K/V history, the only thing a later draft reads of them.
 
-use super::{DeviceSubmission, HeadProgram};
+use super::{DeviceSubmission, HeadOutput, HeadProgram, SelectedRows};
 use crate::operators::streams::{
     StreamsGeometry,
     graph::{CheckedStreamsEntries, StreamsEntries, mix_site},
@@ -19,7 +19,7 @@ use crate::operators::{
     self, CausalHeadBlock, InputForm, Join, Mixer, SublayerInput, paired_block,
 };
 use crate::{
-    DeviceError, FeedForwardProgramSlot, GraphOutputTensor, HeadBinding, HeadLaunchCore,
+    DeviceError, FeedForwardProgramSlot, HeadBinding, HeadLaunchCore,
     InvariantError, ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead,
     ResidentOutput, ResidentWeight, ResourceLimits, SubmitError, ValidatedHeadLaunch,
     completion::CompletionWaiter,
@@ -1630,7 +1630,7 @@ impl NativeHeadProgram {
         core: &HeadLaunchCore,
         workspace: &mut NativeGraphWorkspaceLease,
         output: NativeGraphOutputLease,
-    ) -> Result<(seismic::NativeGraphCompletion, Option<GraphOutputTensor>), SubmitError> {
+    ) -> Result<(seismic::NativeGraphCompletion, HeadOutput), SubmitError> {
         let batch = core.batch();
         let entry = batch.upload();
         let chain = batch.chain().collect::<Vec<_>>();
@@ -1751,10 +1751,10 @@ impl NativeHeadProgram {
             .map_err(invalid)?;
         // A chained pass embeds the device's selection. One the device
         // does not hold embeds another row, and the target rejects the
-        // proposal that follows.
-        if graph.passes.len() > 1 {
-            self.graphs.embedding.read_selected();
-        }
+        // proposal that follows; observing the selections brings it for the
+        // rounds after.
+        let selected_rows = (graph.passes.len() > 1)
+            .then(|| SelectedRows::selections(self.graphs.embedding.read_selected()));
         active
             .write_input(
                 &graph.tokens,
@@ -1817,13 +1817,19 @@ impl NativeHeadProgram {
                     .ok_or_else(|| invalid("head graph omitted its selections"))
             })
             .transpose()?;
-        Ok((completion, selections))
+        Ok((
+            completion,
+            HeadOutput {
+                selections,
+                selected_rows,
+            },
+        ))
     }
 }
 
 impl HeadProgram for NativeHeadProgram {
     type Submission =
-        DeviceSubmission<HeadLaunchCore, NativeGraphWorkspaceLease, Option<GraphOutputTensor>>;
+        DeviceSubmission<HeadLaunchCore, NativeGraphWorkspaceLease, HeadOutput>;
 
     fn submit(
         &mut self,
@@ -1836,7 +1842,7 @@ impl HeadProgram for NativeHeadProgram {
                 None => Err(invalid("head graph output lease is absent")),
             }
         };
-        let (completion, selections) = match queued {
+        let (completion, output) = match queued {
             Ok(queued) => queued,
             Err(error) => return Err((error, launch)),
         };
@@ -1845,7 +1851,7 @@ impl HeadProgram for NativeHeadProgram {
             self.waiter.completion(vec![completion]),
             core,
             workspace,
-            selections,
+            output,
         ))
     }
 }

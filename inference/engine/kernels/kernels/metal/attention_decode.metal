@@ -4,6 +4,7 @@
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
+#define ATTENTION_SINKS (SEISMIC_DIM_SK != 0)
 #include "lib/attention/attention.h"
 
 // Keys each simdgroup loads before scoring them, so their loads are in flight
@@ -214,10 +215,12 @@ kernel void attention_decode_partial(
 }
 
 // L2: threadgroup (query head, row), one thread per column: the fixed-order
-// merge of the row's partitions and the output gate.
+// merge of the row's partitions (with the head's sink when SK = 1) and the
+// output gate.
 kernel void attention_decode_merge(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
     device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
+    device const float *sinks [[buffer(SEISMIC_BUFFER_SINKS)]],
     device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
     device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
     device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
@@ -231,5 +234,5 @@ kernel void attention_decode_merge(
     threadgroup float weights[2 * SEISMIC_TUNE_PARTS];
     attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_TOKENS>(query, gate, visible, fresh, result,
         partials, statistics, weights, SEISMIC_DIM_R, SEISMIC_DIM_M, group.x, group.y, group.z * 32 + lane, lane,
-        SEISMIC_PARAM_GATE_FUNCTION != 0);
+        SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
 }

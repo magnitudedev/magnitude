@@ -12,8 +12,13 @@
 //! bound and shape-checked in full but not emitted: its hidden input is the
 //! target's normalized final row, which the contract's head block does not
 //! express, and the catalog drafts these models with DFlash instead.
+//!
+//! A Nemotron Omni projector (`nemotron_omni`) adds image input
+//! ([`projector`], [`inputs`]).
 
 mod family;
+pub mod inputs;
+pub mod projector;
 
 pub use family::NemotronHFamily;
 
@@ -36,10 +41,6 @@ use std::{error, fmt};
 
 /// The GGUF architecture this family claims.
 pub const ARCHITECTURE: &str = "nemotron_h_moe";
-
-/// The layout a latent-expert artifact is refused as: users read "No kernels
-/// for the Nemotron-H latent MoE architecture".
-const LATENT_EXPERTS: &str = "Nemotron-H latent MoE";
 
 /// Every architecture metadata key the family reads. The rope keys are
 /// written by the converter but unused: every attention layer is NoPE.
@@ -67,6 +68,7 @@ const KNOWN_KEYS: &[&str] = &[
     "expert_used_count",
     "expert_group_count",
     "expert_group_used_count",
+    "expert_gating_func",
     "expert_feed_forward_length",
     "expert_shared_feed_forward_length",
     "expert_shared_count",
@@ -93,11 +95,8 @@ pub enum Error {
     UnboundWeights(Vec<String>),
     /// A layer sequence the family cannot form into blocks.
     Structure(String),
-    /// A projector given to this text-only family.
-    Projector,
-    /// Latent experts (`moe_latent_size`, the Super and Ultra layout), bound
-    /// and checked but refused until their kernels are ready.
-    LatentExperts,
+    /// A projector the family does not interpret.
+    Projector(String),
     /// The assembled definition failed contract validation.
     Definition(String),
 }
@@ -109,6 +108,7 @@ impl fmt::Display for Error {
             | Self::Metadata(message)
             | Self::Weight(message)
             | Self::Structure(message)
+            | Self::Projector(message)
             | Self::Definition(message) => formatter.write_str(message),
             Self::MissingMetadata(key) => write!(formatter, "missing metadata {key}"),
             Self::UnknownMetadata(keys) => write!(formatter, "unknown Nemotron-H metadata {keys:?}"),
@@ -116,10 +116,6 @@ impl fmt::Display for Error {
                 formatter,
                 "Nemotron-H artifact contains unbound weight roles {names:?}"
             ),
-            Self::Projector => formatter.write_str("Nemotron-H has no vision projector"),
-            Self::LatentExperts => {
-                formatter.write_str("Nemotron-H latent MoE experts are not supported yet")
-            }
         }
     }
 }
@@ -129,17 +125,10 @@ impl error::Error for Error {}
 impl Error {
     /// The unsupported features this error names; a header missing a key
     /// names it, one missing a weight the family needs, or whose values or
-    /// layers contradict each other, is `Unreadable`, and a projector given
-    /// to this text-only family does not fit it. Latent experts name the
-    /// layout that has no kernels yet.
+    /// layers contradict each other, is `Unreadable`, as is a projector the
+    /// family cannot interpret.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
-            Self::Projector => vec![UnsupportedReason::TargetMismatch {
-                detail: self.to_string(),
-            }],
-            Self::LatentExperts => vec![UnsupportedReason::Architecture {
-                architecture: LATENT_EXPERTS.into(),
-            }],
             Self::MissingMetadata(key) => {
                 vec![UnsupportedReason::MissingMetadata { key: key.clone() }]
             }
@@ -155,6 +144,7 @@ impl Error {
             | Self::Metadata(_)
             | Self::Weight(_)
             | Self::Structure(_)
+            | Self::Projector(_)
             | Self::Definition(_) => vec![UnsupportedReason::Unreadable],
         }
     }
@@ -247,10 +237,13 @@ struct StateSpaceGeometry {
     convolution_width: u64,
 }
 
+/// Routed-expert geometry. Each routed layer stores its own expert count
+/// (its router's rows), at most `count`; its selected count and expert width
+/// are per layer, uniform in Lightning and Super and heterogeneous in Bolt.
 struct Experts {
     count: u64,
-    selected: u64,
-    intermediate: u64,
+    selected: Vec<u64>,
+    intermediate: Vec<u64>,
     shared: Option<u64>,
     normalize: bool,
     scale: f64,
@@ -305,6 +298,7 @@ impl Geometry {
             scale: 1.0 / (width as f64).sqrt(),
             reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
+            sinks: None,
             output: binder.bind(
                 &format!("{prefix}attn_output.weight"),
                 &[hidden, query_rows],
@@ -333,7 +327,8 @@ impl Geometry {
             state: g.state,
             groups: g.groups,
             convolution_width: g.convolution_width,
-            projection: binder.bind(&format!("{prefix}ssm_in.weight"), &[projected, hidden])?,
+            projection: binder
+                .bind_scaled(&format!("{prefix}ssm_in.weight"), &[projected, hidden])?,
             convolution: binder.bind(
                 &format!("{prefix}ssm_conv1d.weight"),
                 &[channels, g.convolution_width],
@@ -356,7 +351,7 @@ impl Geometry {
                 vec![ImportTransform::Flatten],
             )?),
             norm_group,
-            output: binder.bind(&format!("{prefix}ssm_out.weight"), &[hidden, g.inner])?,
+            output: binder.bind_scaled(&format!("{prefix}ssm_out.weight"), &[hidden, g.inner])?,
         })))
     }
 
@@ -365,10 +360,11 @@ impl Geometry {
     fn feed_forward(
         &self,
         binder: &mut Tensors,
-        prefix: &str,
+        layer: u64,
         intermediate: u64,
     ) -> Result<Operator, Error> {
         let hidden = self.hidden;
+        let prefix = format!("blk.{layer}.");
         let router = format!("{prefix}ffn_gate_inp.weight");
         if !binder.contains(&router) {
             return Ok(Operator::DenseFfn(Box::new(DenseFfn {
@@ -385,10 +381,20 @@ impl Geometry {
         let e = self.experts.as_ref().ok_or_else(|| {
             metadata_error(format!("routed layer {prefix} without expert metadata"))
         })?;
-        if intermediate != e.intermediate {
+        let index = layer as usize;
+        if intermediate != e.intermediate[index] {
             return Err(Error::Structure(format!(
-                "routed layer {prefix} declares width {intermediate}, experts have {}",
-                e.intermediate
+                "routed layer {layer} declares width {intermediate}, its experts have {}",
+                e.intermediate[index]
+            )));
+        }
+        let experts = binder.rows(&router)?;
+        let selected = e.selected[index];
+        if experts > e.count || selected == 0 || selected > experts {
+            return Err(Error::Structure(format!(
+                "routed layer {layer} selects {selected} of {experts} experts, \
+                 with at most {} declared",
+                e.count
             )));
         }
         let expert_hidden = e.latent.unwrap_or(hidden);
@@ -424,15 +430,15 @@ impl Geometry {
             })
             .transpose()?;
         Ok(Operator::RoutedFfn(Box::new(RoutedFfn {
-            experts: e.count,
-            selected: e.selected,
+            experts,
+            selected,
             intermediate,
             router: Router {
-                weight: binder.bind(&router, &[e.count, hidden])?,
+                weight: binder.bind(&router, &[experts, hidden])?,
                 input: RouterInput::Operator,
                 score: ScoreFunction::Sigmoid,
                 selection: ExpertSelection::TopK {
-                    bias: Some(binder.bind(&format!("{prefix}exp_probs_b.bias"), &[e.count])?),
+                    bias: Some(binder.bind(&format!("{prefix}exp_probs_b.bias"), &[experts])?),
                 },
                 // The released model divides by `sum + 1e-20` (llama.cpp
                 // clamps the sum at 6.1e-5 instead); the model definition
@@ -448,12 +454,12 @@ impl Geometry {
                 activation: ActivationFunction::ReluSquared,
                 up: binder.bind_scaled(
                     &format!("{prefix}ffn_up_exps.weight"),
-                    &[e.count, intermediate, expert_hidden],
+                    &[experts, intermediate, expert_hidden],
                 )?,
             },
             expert_down: binder.bind_scaled(
                 &format!("{prefix}ffn_down_exps.weight"),
-                &[e.count, expert_hidden, intermediate],
+                &[experts, expert_hidden, intermediate],
             )?,
             expert_scale: None,
             latent,
@@ -472,7 +478,7 @@ impl Geometry {
             LayerKind::StateSpace => self.state_space(binder, &prefix)?,
             LayerKind::Attention { kv_heads } => self.attention(binder, &prefix, kv_heads)?,
             LayerKind::FeedForward { intermediate } => {
-                self.feed_forward(binder, &prefix, intermediate)?
+                self.feed_forward(binder, layer, intermediate)?
             }
         };
         Ok(Sublayer {
@@ -510,9 +516,6 @@ pub fn inspect_components(
     identity: PackageIdentity,
 ) -> Result<ModelDefinition, Error> {
     recognize(directory)?;
-    if projector.is_some() {
-        return Err(Error::Projector);
-    }
     let m = Metadata::new(directory, ARCHITECTURE, KNOWN_KEYS)?;
     let block_count = m.integer("block_count")?;
     let head_layers = m.optional_count("nextn_predict_layers")?.unwrap_or(0);
@@ -561,10 +564,18 @@ pub fn inspect_components(
                     ));
                 }
             };
+            // llama.cpp's gating enumeration: 1 softmax, 2 sigmoid. Absent,
+            // the architecture's sigmoid applies.
+            if m.optional_count("expert_gating_func")?.is_some_and(|gating| gating != 2) {
+                return Err(metadata_error(
+                    "Nemotron-H experts are gated only by a sigmoid",
+                ));
+            }
             Some(Experts {
                 count: m.integer("expert_count")?,
-                selected: m.integer("expert_used_count")?,
-                intermediate: m.integer("expert_feed_forward_length")?,
+                selected: m.uniform_or_layer_counts("expert_used_count", block_count)?,
+                intermediate: m
+                    .uniform_or_layer_counts("expert_feed_forward_length", block_count)?,
                 shared,
                 normalize: m.flag("expert_weights_norm")?,
                 scale: m.number("expert_weights_scale")?,
@@ -672,23 +683,17 @@ pub fn inspect_components(
         head.validate(&decoder, inputs.coordinate_axes)?;
     }
     binder.finish()?;
+    let vision = projector.map(projector::describe_projector).transpose()?;
     let definition = ModelDefinition {
         family: FamilyId(ARCHITECTURE.into()),
         artifact_identity: identity,
         inputs,
         decoder,
         head: None,
-        vision: None,
+        vision,
         draft: None,
     };
     definition.validate()?;
-    if geometry
-        .experts
-        .as_ref()
-        .is_some_and(|experts| experts.latent.is_some())
-    {
-        return Err(Error::LatentExperts);
-    }
     Ok(definition)
 }
 
@@ -733,7 +738,7 @@ fn head_block(
                 },
                 Sublayer {
                     input: InputNorm::Rms(feed_forward_norm),
-                    op: geometry.feed_forward(binder, &prefix, intermediate)?,
+                    op: geometry.feed_forward(binder, layer, intermediate)?,
                     output: OutputForm::Residual,
                 },
             ],

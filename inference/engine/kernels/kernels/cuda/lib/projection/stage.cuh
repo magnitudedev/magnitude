@@ -32,6 +32,11 @@ template <class E, class Rows> struct Plain {
         static_assert(!STAGED, "a GEMV reads staged rows");
         return *reinterpret_cast<const u32 *>(x + (rows(m) * stride + k) * 2);
     }
+    // The operand bits of x[m, k .. k + 7], k a multiple of 8 (`gemv_rows`).
+    __device__ __forceinline__ uint4 octet(const float *, u32 m, u64 k) const {
+        static_assert(!STAGED, "a GEMV reads staged rows");
+        return *reinterpret_cast<const uint4 *>(x + (rows(m) * stride + k) * 2);
+    }
 };
 
 // A scalar source with independent row and column strides. It publishes

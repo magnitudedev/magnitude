@@ -6,9 +6,9 @@
 use super::native_draft::{NativeDraftProgram, PreparedDraftGraphs};
 use super::native_head::{NativeHeadProgram, PreparedHeadGraphs};
 use super::native_shared_head::{NativeSharedHeadProgram, PreparedSharedHeadGraphs};
-use super::{DeviceSubmission, HeadProgram};
+use super::{DeviceSubmission, HeadOutput, HeadProgram};
 use crate::{
-    GraphOutputTensor, HeadLaunchCore, NativeGraphWorkspaceLease, SubmitError, ValidatedHeadLaunch,
+    HeadLaunchCore, NativeGraphWorkspaceLease, SubmitError, ValidatedHeadLaunch,
 };
 use seismic::NativeGraphFamily;
 use std::rc::Rc;
@@ -72,7 +72,7 @@ impl NativeDrafterProgram {
 
 impl HeadProgram for NativeDrafterProgram {
     type Submission =
-        DeviceSubmission<HeadLaunchCore, NativeGraphWorkspaceLease, Option<GraphOutputTensor>>;
+        DeviceSubmission<HeadLaunchCore, NativeGraphWorkspaceLease, HeadOutput>;
 
     fn submit(
         &mut self,

@@ -10,9 +10,9 @@
 //     staged F32 tiles, each invocation 8 outputs in ascending-K FMAs.
 //   Logits are [M, E + 1]: column E is the shared-expert gate.
 //   routed_route_select (one subgroup per row): the softmax over every
-//     expert (E / 32 experts per lane), K rounds of subgroup argmax (ties to the
-//     higher expert index), the optional renormalization and the shared-expert
-//     coefficient from column E.
+//     expert (ceil(E / 32) experts per lane), K rounds of subgroup argmax
+//     (ties to the higher expert index), the optional renormalization and
+//     the shared-expert coefficient from column E.
 // Every logit accumulates over the hidden axis in the same order for every
 // expert, so experts with equal router rows tie exactly.
 #define KERNEL_W0 SEISMIC_ROUTER
@@ -283,7 +283,10 @@ bool route_precedes(float probability, int expert, float best, int best_expert) 
     return probability > best || (probability == best && expert > best_expert);
 }
 
-#define ROUTE_PER_LANE (ROUTE_E / 32u)
+// Lane `lane` holds experts lane + 32 i, ceil(E / 32) registers; when E is
+// not a multiple of 32 the last register of lanes at or past E % 32 is
+// excluded (never read, summed or selected).
+#define ROUTE_PER_LANE ((ROUTE_E + 31u) / 32u)
 
 void routed_route_select() {
     const uint lane = SEISMIC_LANE;
@@ -292,22 +295,26 @@ void routed_route_select() {
         return;
     const uint64_t routes = SEISMIC_PTR(SEISMIC_BUFFER_ROUTES);
     const uint64_t scores = SEISMIC_PTR(SEISMIC_BUFFER_SCORES);
-    // Lane `lane` holds experts lane + 32 i.
+    // ROUTE_PER_LANE when 32 divides E (a constant).
+    const uint held = ROUTE_E / 32u + ((ROUTE_E % 32u) != 0u && lane < ROUTE_E % 32u ? 1u : 0u);
     float probability[ROUTE_PER_LANE];
     float maximum = -uintBitsToFloat(0x7f800000u);
     [[unroll]] for (uint i = 0u; i < ROUTE_PER_LANE; ++i) {
-        probability[i] = element_f32_at(route_logit(row, lane + 32u * i));
+        probability[i] = i < held ? element_f32_at(route_logit(row, lane + 32u * i)) : -uintBitsToFloat(0x7f800000u);
         maximum = max(maximum, probability[i]);
     }
     maximum = seismic_subgroup_max(maximum);
     float total = 0.0;
     [[unroll]] for (uint i = 0u; i < ROUTE_PER_LANE; ++i) {
-        probability[i] = exp(probability[i] - maximum);
-        total += probability[i];
+        if (i < held) {
+            probability[i] = exp(probability[i] - maximum);
+            total += probability[i];
+        }
     }
     total = seismic_subgroup_sum_f32(total);
     [[unroll]] for (uint i = 0u; i < ROUTE_PER_LANE; ++i)
-        probability[i] = seismic_div_rn(probability[i], total);
+        if (i < held)
+            probability[i] = seismic_div_rn(probability[i], total);
 
     float chosen[ROUTE_K];
     for (uint rank = 0u; rank < ROUTE_K; ++rank) {
@@ -315,7 +322,7 @@ void routed_route_select() {
         int best_expert = -1;
         [[unroll]] for (uint i = 0u; i < ROUTE_PER_LANE; ++i) {
             const int expert = int(lane + 32u * i);
-            if (route_precedes(probability[i], expert, best, best_expert)) {
+            if (i < held && route_precedes(probability[i], expert, best, best_expert)) {
                 best = probability[i];
                 best_expert = expert;
             }

@@ -68,6 +68,10 @@ pub(super) fn read_component<B: PhysicalDialect>(
             DecodeStep::ConvertToF32 { from, .. } => {
                 builder.cast(get(*from), ValueType::Scalar(DType::F32))
             }
+            DecodeStep::Constant { value, .. } => builder.constant(
+                super::ops::ConstantValue::from_scalar(*value),
+                ValueType::Scalar(value.dtype()),
+            ),
             DecodeStep::Multiply { left, right, .. } => {
                 builder.binary(BinaryOp::Mul, get(*left), get(*right))
             }

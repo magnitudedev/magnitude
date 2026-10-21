@@ -532,8 +532,9 @@ impl MethodState for DrafterState {
         else {
             return Propose::Tokens(Vec::new());
         };
-        // A round drafts its whole generated width or nothing. Launch costs
-        // depend on the history the round reads, the target's position.
+        // A round drafts a prepared width that fits what the request can
+        // still produce, or nothing. Launch costs depend on the history the
+        // round reads, the target's position.
         let position = self
             .round_state()
             .target_position()
@@ -541,7 +542,7 @@ impl MethodState for DrafterState {
         let generated = match (&mut self.control, self.generated) {
             (_, Some(generated)) => generated,
             (Some(control), None) => control.generate(selects.len(), position),
-            (None, None) => self.budget.generated,
+            (None, None) => self.budget.generated_within(selects.len()),
         };
         self.generated = Some(generated);
         if generated == 0 || generated > selects.len() {

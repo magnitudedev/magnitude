@@ -11312,6 +11312,20 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "LiLiCorr"
+                ]
+              }
+            }
           }
         ],
         "description": "Native algorithm used by a speculative decoding stage.\n\nMethod and artifact packaging are intentionally independent. The enclosing speculative bundle\ndeclares whether the selected method is embedded in the target or supplied by a separate draft\npackage."

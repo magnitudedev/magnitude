@@ -92,15 +92,16 @@ pub use operators::routed::{
     Expansion, GeneralRoutedBinding, GeneralRoutedScales, GeneralRoutedShape,
 };
 pub use operators::short_conv::{ShortConvBinding, ShortConvShape};
-pub use operators::state_space::{StateSpaceBinding, StateSpaceShape};
+pub use operators::state_space::{StateSpaceBinding, StateSpaceScales, StateSpaceShape};
 pub use operators::vision::{VisionEntry, VisionKernel};
 pub use planning::{
     ArtifactComponent, ArtifactComponentKind, AssessmentFit, AssessmentFitVerdict,
     AssessmentGraphResourceBounds, AssessmentHeaderBounds, AssessmentMemoryBounds,
     AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding, AttentionShape, BackendPlan,
-    CONVERSATION_CHECKPOINTS, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding,
-    DenseBranchBinding,
-    DenseScales, DeviceProcessBytes, Dflash2Binding, DraftBlockBinding, DraftProgramPlan,
+    CONVERSATION_CHECKPOINTS, CapabilityPlan, ComponentPlan, ComponentSelection, ConvolutionBinding,
+    ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding, DenseBinding,
+    DenseBranchBinding, DenseScales, DeviceProcessBytes, DraftBlockBinding, DraftProgramPlan,
+    DraftWidths,
     EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding,
     FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, HostProcessBytes,
     HostTablePlan, ImportProgramSlot, MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding,

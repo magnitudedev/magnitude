@@ -547,10 +547,9 @@ pub(crate) fn is_fixed_dense_role(kind: WeightKind) -> bool {
             | WeightKind::RouterSelectionBias
             | WeightKind::ExpertScale
             | WeightKind::SharedRouter
-            | WeightKind::ConfidenceWeight
-            | WeightKind::ConfidenceBias
             | WeightKind::ConvolutionBase
-    )
+            | WeightKind::AttentionSinks
+    ) || matches!(kind, WeightKind::Corrector(weight) if draft::corrector_reads_f32(weight))
 }
 
 /// The dense element a role becomes resident in.
@@ -969,12 +968,14 @@ pub(crate) fn slot_matches(paired: &PairedBlock, slot: &crate::TargetBlockProgra
 
 /// The program slot of a paired block's mixer in a decoder serving
 /// `context` tokens; `lookup` resolves the planned element of a role in the
-/// mixer sublayer's scope.
+/// mixer sublayer's scope, `scalable` that of a projection bound with an
+/// accumulator-scale port.
 pub(crate) fn mixer_slot(
     paired: &PairedBlock,
     hidden: u64,
     context: u64,
     lookup: impl Fn(WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightKind) -> Result<crate::ScalableWeight, PlanError>,
     activation: Element,
     history: magnitude_state::KvCodec,
 ) -> Result<crate::MixerProgramSlot, PlanError> {
@@ -994,7 +995,7 @@ pub(crate) fn mixer_slot(
             Slot::Recurrent(gated_delta::binding(operator, lookup, activation)?)
         }
         Mixer::StateSpace(operator) => {
-            Slot::StateSpace(state_space::binding(operator, hidden, lookup, activation)?)
+            Slot::StateSpace(state_space::binding(operator, hidden, lookup, scalable, activation)?)
         }
         Mixer::ShortConv(operator) => {
             Slot::ShortConv(short_conv::binding(operator, hidden, lookup, activation)?)

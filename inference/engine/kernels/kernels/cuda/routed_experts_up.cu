@@ -11,8 +11,9 @@
 #define KERNEL_W1 SEISMIC_EXPERT_DOWN
 #include "lib/routed/routed.cuh"
 
-using GShape = projection::GemmShape<32, 2, 4, 3>;
 using element::Act;
+// The declared shared bytes of both launches (`routed.seismic`).
+constexpr int SHARED = 3 * (32 * 144 + 10240) + 4096;
 
 // Convert each semantic normalized row once; all routed groups reuse it.
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_UP_STAGE
@@ -43,7 +44,7 @@ __global__ void routed_experts_up_expand(SEISMIC_KERNEL_PARAMS) {
         return;
     const int *order = ROUTED_BLOCK_ORDER(block);
     const projection::u32 live = routed::block_rows(order, SEISMIC_ORDER_STRIDE_1, (projection::u32)SEISMIC_DIM_T);
-    if ((projection::u64)blockIdx.y * GShape::BM >= live)
+    if ((projection::u64)blockIdx.y * routed::TILE_M >= live)
         return;
     const projection::u64 rows = block * SEISMIC_DIM_T;
     const auto epi = projection::scaling<true>::wrap(
@@ -54,7 +55,7 @@ __global__ void routed_experts_up_expand(SEISMIC_KERNEL_PARAMS) {
     const routed::GroupedRows source{OPERAND == 1 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
                                      OPERAND == 1 ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0, order,
                                      SEISMIC_ORDER_STRIDE_1};
-    projection::gemm_segment<GShape, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_H,
+    routed::routed_gemm<SHARED, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_H,
                                      blockIdx.x, SEISMIC_DIM_F,
                                      KERNEL_W0_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert),
                                      projection::NoWeight{}, epi);
@@ -72,14 +73,14 @@ __global__ void routed_experts_up_down(SEISMIC_KERNEL_PARAMS) {
         return;
     const projection::u32 live =
         routed::block_rows(ROUTED_BLOCK_ORDER(block), SEISMIC_ORDER_STRIDE_1, (projection::u32)SEISMIC_DIM_T);
-    if ((projection::u64)blockIdx.y * GShape::BM >= live)
+    if ((projection::u64)blockIdx.y * routed::TILE_M >= live)
         return;
     const projection::u64 rows = block * SEISMIC_DIM_T;
     const projection::Store<Act> epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + block * SEISMIC_RESULT_0_STRIDE_0 * 2,
                                      SEISMIC_RESULT_0_STRIDE_1, 0};
     const projection::ActivationRows source{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + rows * SEISMIC_DIM_F * 2,
                                             SEISMIC_DIM_F};
-    projection::gemm_segment<GShape, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_F,
+    routed::routed_gemm<SHARED, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_F,
                                      blockIdx.x, SEISMIC_DIM_H,
                                      KERNEL_W1_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), expert),
                                      projection::NoWeight{}, epi);

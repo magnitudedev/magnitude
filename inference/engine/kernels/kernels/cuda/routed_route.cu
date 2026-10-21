@@ -128,7 +128,13 @@ struct RoutedSelection {
 // reads: the planes may have been written by other blocks of this launch).
 __device__ __forceinline__ void routed_select_row(const float *logits, unsigned long long plane, unsigned long long parts,
     const RoutedSelection &out, unsigned long long row, unsigned lane) {
-    constexpr unsigned PER_LANE = SEISMIC_DIM_E / 32;
+    // Lane `lane` holds experts lane + 32 i, ceil(E / 32) registers; when E
+    // is not a multiple of 32 the last register of lanes at or past E % 32 is
+    // excluded (never read, summed or selected). `held` is PER_LANE when 32
+    // divides E.
+    constexpr unsigned PER_LANE = (static_cast<unsigned>(SEISMIC_DIM_E) + 31) / 32;
+    constexpr unsigned REMAINDER = static_cast<unsigned>(SEISMIC_DIM_E) % 32;
+    const unsigned held = static_cast<unsigned>(SEISMIC_DIM_E) / 32 + (REMAINDER != 0 && lane < REMAINDER ? 1u : 0u);
     const float negative_infinity = -__int_as_float(0x7f800000);
     const float *values = logits + routed_logit_index(row, 0);
     const auto logit = [&](unsigned long long expert) {
@@ -137,25 +143,27 @@ __device__ __forceinline__ void routed_select_row(const float *logits, unsigned 
             sum = seismic_add_rn(sum, __ldcg(values + p * plane + expert));
         return sum;
     };
-    // Lane `lane` holds experts lane + 32 i.
     float probability[PER_LANE];
     float maximum = negative_infinity;
 #pragma unroll
     for (unsigned i = 0; i < PER_LANE; ++i) {
-        probability[i] = logit(lane + 32 * i);
+        probability[i] = i < held ? logit(lane + 32 * i) : negative_infinity;
         maximum = fmaxf(maximum, probability[i]);
     }
     maximum = seismic_warp_max_f32(maximum);
     float total = 0.0f;
 #pragma unroll
     for (unsigned i = 0; i < PER_LANE; ++i) {
-        probability[i] = expf(probability[i] - maximum);
-        total = seismic_add_rn(total, probability[i]);
+        if (i < held) {
+            probability[i] = expf(probability[i] - maximum);
+            total = seismic_add_rn(total, probability[i]);
+        }
     }
     total = seismic_warp_sum_f32(total);
 #pragma unroll
     for (unsigned i = 0; i < PER_LANE; ++i)
-        probability[i] = probability[i] / total;
+        if (i < held)
+            probability[i] = probability[i] / total;
 
     float chosen[SEISMIC_DIM_K];
     for (unsigned rank = 0; rank < SEISMIC_DIM_K; ++rank) {
@@ -164,7 +172,7 @@ __device__ __forceinline__ void routed_select_row(const float *logits, unsigned 
 #pragma unroll
         for (unsigned i = 0; i < PER_LANE; ++i) {
             const int expert = static_cast<int>(lane + 32 * i);
-            if (routed_precedes(probability[i], expert, best, best_expert)) {
+            if (i < held && routed_precedes(probability[i], expert, best, best_expert)) {
                 best = probability[i];
                 best_expert = expert;
             }

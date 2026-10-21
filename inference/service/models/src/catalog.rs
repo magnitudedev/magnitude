@@ -171,6 +171,8 @@ enum CatalogSpeculativeMethod {
     DFlash2,
     #[serde(rename = "dspark")]
     DSpark,
+    #[serde(rename = "lilicorr")]
+    LiLiCorr,
 }
 
 impl From<CatalogSpeculativeMethod> for SpeculativeMethod {
@@ -180,6 +182,7 @@ impl From<CatalogSpeculativeMethod> for SpeculativeMethod {
             CatalogSpeculativeMethod::DFlash => Self::DFlash,
             CatalogSpeculativeMethod::DFlash2 => Self::DFlash2,
             CatalogSpeculativeMethod::DSpark => Self::DSpark,
+            CatalogSpeculativeMethod::LiLiCorr => Self::LiLiCorr,
         }
     }
 }
@@ -355,7 +358,8 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                         (
                             CatalogSpeculativeMethod::DFlash
                                 | CatalogSpeculativeMethod::DFlash2
-                                | CatalogSpeculativeMethod::DSpark,
+                                | CatalogSpeculativeMethod::DSpark
+                                | CatalogSpeculativeMethod::LiLiCorr,
                             CatalogSpeculativeDraftSource::Embedded
                         )
                     ) || match &speculative.draft {

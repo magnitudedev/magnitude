@@ -419,6 +419,7 @@ impl Geometry {
             scale: 1.0 / (width as f64).sqrt(),
             reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
+            sinks: None,
             output: weight("attn_output.weight", &[hidden, product(&[heads, width])?])?,
         })
     }

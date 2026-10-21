@@ -1692,10 +1692,11 @@ impl Format for Q8 {
 /// A vector-coded representation (the GGUF IQ grids: registry `iq2xs`,
 /// `iq3xxs`, `iq2xxs`). Per storage group of 256 values: 32 entries, each coding eight
 /// values through a grid (`GridSpec::codes`), one 4-bit scale code `s` per
-/// `GridSpec::GROUP` values, and one f32 factor. A value is
+/// `GridSpec::GROUP` values, and one factor. A value is
 /// `(factor * (2 s + 1)) * code`, the scale and the value each rounded once
 /// as the registry's decode rounds them. Rows are `rows16`: the entries,
-/// the scale codes, then the factors of each storage group.
+/// the scale codes (unless the entries carry them), then the factors of
+/// each storage group.
 pub trait GridSpec: Copy + Send + Sync + 'static {
     const NAME: &'static str;
     const ROWS8_NAME: &'static str;
@@ -1703,6 +1704,10 @@ pub trait GridSpec: Copy + Send + Sync + 'static {
     const ENTRY_BYTES: usize;
     /// Values sharing one scale code: 16 or 32.
     const GROUP: usize;
+    /// Whether the entries carry the scale codes (bit `j` of a group's code
+    /// at bit 15 of its entry `j`) and the factor is an f16 `d` scaled by
+    /// 2^-3; otherwise a scales plane and an f32 factor.
+    const CARRIED: bool = false;
     /// The codes of packet `local` (values `32 local ..`) of a storage
     /// group's `entries`.
     fn codes(entries: &[u8], local: usize) -> [i8; PACKET];
@@ -1778,7 +1783,8 @@ impl GridSpec for Iq3XxsGrid {
 }
 
 /// Registry `iq2xxs`: sixteen-bit entries (an 8-bit index into the 256-point
-/// grid, then 7 sign bits), a scale per 32 values.
+/// grid, then 7 sign bits, then a bit of the group's scale code), a scale
+/// per 32 values.
 #[derive(Clone, Copy, Debug)]
 pub struct Iq2XxsGrid;
 
@@ -1787,6 +1793,7 @@ impl GridSpec for Iq2XxsGrid {
     const ROWS8_NAME: &'static str = "iq2xxs@rows8";
     const ENTRY_BYTES: usize = 64;
     const GROUP: usize = 32;
+    const CARRIED: bool = true;
 
     #[inline(always)]
     fn codes(entries: &[u8], local: usize) -> [i8; PACKET] {
@@ -1806,7 +1813,8 @@ impl GridSpec for Iq2XxsGrid {
 pub struct Grid<G: GridSpec>(G);
 
 impl<G: GridSpec> Grid<G> {
-    const SCALE_BYTES: usize = 256 / G::GROUP / 2;
+    const SCALE_BYTES: usize = if G::CARRIED { 0 } else { 256 / G::GROUP / 2 };
+    const FACTOR_BYTES: usize = if G::CARRIED { 2 } else { 4 };
 
     /// Packet `p`'s codes and scale codes `2 s + 1` (one per `GROUP`
     /// values, in order), and its storage group's factor.
@@ -1821,6 +1829,15 @@ impl<G: GridSpec> Grid<G> {
             std::slice::from_raw_parts(geometry.group(row, Plane::Codes, block), G::ENTRY_BYTES)
         };
         let codes = G::codes(entries, local);
+        let supers = geometry.group(row, Plane::Supers, block);
+        if G::CARRIED {
+            // The packet is one group: its four entries' sixteenth bits.
+            let code = (0..4).fold(0, |code, e| {
+                code | (i32::from(entries[2 * (4 * local + e) + 1] >> 7) << e)
+            });
+            let d = f16_to_f32(unsafe { read::<u16>(supers) });
+            return (codes, [2 * code + 1; 2], d * 0.125);
+        }
         let scales = unsafe {
             std::slice::from_raw_parts(geometry.group(row, Plane::Scales, block), Self::SCALE_BYTES)
         };
@@ -1828,7 +1845,7 @@ impl<G: GridSpec> Grid<G> {
             let n = (32 * local + 16 * half) / G::GROUP;
             2 * i32::from((scales[n / 2] >> (4 * (n % 2))) & 15) + 1
         });
-        let factor = f32::from_bits(unsafe { read(geometry.group(row, Plane::Supers, block)) });
+        let factor = f32::from_bits(unsafe { read(supers) });
         (codes, local_scales, factor)
     }
 }
@@ -1838,15 +1855,21 @@ impl<G: GridSpec> Format for Grid<G> {
     const DENSE_BYTES: usize = 0;
 
     fn geometry(k: usize, _dense_stride: usize) -> RowGeometry {
-        let planes = [G::ENTRY_BYTES, Self::SCALE_BYTES, 4];
-        let ([codes, scales, supers, _], stride) = rows16(k, 256, &planes);
+        let (codes, scales, supers, stride) = if G::CARRIED {
+            let ([codes, supers, _, _], stride) = rows16(k, 256, &[G::ENTRY_BYTES, Self::FACTOR_BYTES]);
+            (codes, 0, supers, stride)
+        } else {
+            let ([codes, scales, supers, _], stride) =
+                rows16(k, 256, &[G::ENTRY_BYTES, Self::SCALE_BYTES, Self::FACTOR_BYTES]);
+            (codes, scales, supers, stride)
+        };
         RowGeometry {
             stride,
             codes,
             high: 0,
             scales,
             supers,
-            groups: [G::ENTRY_BYTES, 0, Self::SCALE_BYTES, 4],
+            groups: [G::ENTRY_BYTES, 0, Self::SCALE_BYTES, Self::FACTOR_BYTES],
             base: 0,
             matrix_rows: 0,
             rows8: false,

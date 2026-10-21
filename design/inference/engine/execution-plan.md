@@ -427,8 +427,10 @@ to the same checked graph topology and resource plan used for execution. Linear
 projection stages use cooperative subgroup reductions for the smallest row classes and subgroup
 matrix operations above them. A projection entry that reads packed weights has one
 accumulator-scale port per weight, whose static extent is 0 (absent, compiled out) or the extent of
-the weight's resident second-level scale: per tensor for dense feed-forward, latent, post-norm and
-vocabulary projections, per expert for up-only routed experts; a routed down weight's per-expert
+the weight's resident second-level scale: per tensor for dense feed-forward, latent, post-norm,
+state-space input and output, and vocabulary projections, per expert for up-only routed experts
+(attention, gated-delta and short-convolution operators bind their projection entries' ports
+absent); a routed down weight's per-expert
 scales join the selection's per-expert output scales in the combine weights. Blocks share a sealed
 graph and a specialization only when their scale extents agree. A decode projection, normalization prologue
 included, is one launch: each workgroup reduces its few rows' norms while staging them. Larger classes
@@ -497,7 +499,7 @@ position that sees exactly the request's accepted target rows of every stored do
 nowhere. Its decoder-block entries are prepared by binding beside the target's; its graph family,
 bound constants and class workspace are charged in header assessment. Such a head plans no head
 state store.
-A separate draft (DFlash, DSpark, DFlash2) conditions on target taps instead of the final features. A
+A separate draft (DFlash, DSpark, DFlash2, LiLiCorr) conditions on target taps instead of the final features. A
 tapped block's workflow rounds the residual entering it, entering its feed-forward, or leaving it
 (the exit tap is the last block's output) into that tap's column block of a draft-input buffer
 the bound target workflows own (charged with their bound constants); the
@@ -523,13 +525,22 @@ logit scale or softcap. A draft-declared softcap is applied in the readout epilo
 before its own selection bias; absent metadata preserves raw logits. DSpark then chains its slots through the Markov bias.
 Its fixed service confidence threshold is zero, so confidence cannot decline a
 proposal; preparation and graph formation omit confidence evaluation and the
-normalized features used only by that evaluation. DFlash2 runs every block-pass sublayer unfused:
+normalized features used only by that evaluation, and the load neither imports nor charges the
+confidence head's weights, whatever their stored encoding. A convolved backbone (DFlash2's and
+LiLiCorr's) runs every block-pass sublayer unfused:
 the normed rows project to per-row coefficients of a grouped causal convolution that restarts at
 each slot's block, its first half feeds the operator's plain projections and its second half
-convolves the operator's output before the residual add; its proposing rows keep their top-k
+convolves the operator's output before the residual add; every projection binds its weight's
+planned second-level scale. DSpark's Markov projection binds its planned scale the same way.
+DFlash2's proposing rows keep their top-k
 logits, and one ordered step per proposal selects each slot's candidate from the predecessor and
-successor codebooks, the anchor preceding the first. Its proposals are that greedy path for
-greedy and sampled requests alike (the target's verification decides acceptance). Context
+successor codebooks, the anchor preceding the first. LiLiCorr projects every mask row of every
+slot (slot-major) whatever the proposal count, keeps each row's top-k logits, forms the block's
+candidate nodes, runs the corrector's layers over them, and walks the factored lattice from each
+slot's anchor state (the fused conditioning row of its last entry row, normed and projected) to
+select the first proposals. Both proposals are that greedy path for
+greedy and sampled requests alike (the target's verification decides acceptance). Attention
+sinks bind as a per-head logit row of the dense and affine history entries alike. Context
 injection is the same for every variant. A draft graph class records its physical
 proposal count; the selected class computes exactly that block size. Verification may
 consume a shorter prefix independently. Graphs are prepared before readiness, never
@@ -538,7 +549,8 @@ Unequal physical block widths form separate execution groups because padding can
 change noncausal predictions. Block rows append nowhere.
 The planned separate-draft method records the sorted, distinct positive generated
 proposal counts its configured policy may choose. Only those physical block
-sizes are prepared: one for a fixed width, and for the adaptive default every
+sizes are prepared: up to the policy's widest width (a fixed budget's generated
+count, or the adaptive default's proposal cap), that width and every narrower
 width whose verification fills a launch row class; verification
 prefix choices add no block graph classes. A short output grant selects an
 eligible configured action or plain decoding, never an unprepared physical size.
@@ -681,8 +693,12 @@ rows or its image's, so no image row reads a padding row; padding inputs are zer
 features are the image's leading cell rows. The tower is one program of vision operators the projector description
 composes (patch stem, row norms, projections with their epilogues, attention with optional rotary,
 cell pooling or concatenation). A tower post-norm applies per patch before concatenation;
-a projection norm then applies over the complete concatenated cell. Learned position tables
-do not imply rotary attention. A form a backend's operators do not run is refused when the program is
+a projection norm then applies over the complete concatenated cell, with or without the
+post-norm. Learned position tables do not imply rotary attention. A stem's learned register
+rows lead each image's tower rows: they enter the stem as zero pixels with no position blend,
+receive their table rows before the first block, and every attention reads them with the
+image's rows; the merger reads only the patch rows after them. Classes count patch rows; a
+class's tower rows are its register rows and then its patch rows. A form a backend's operators do not run is refused when the program is
 prepared, never approximated. Seismic's recurrent workflow derives
 the exact window and delta state contracts from its checked entries. Each recurrent block binds
 the store's bank slabs and, per run, bank tables for its exact active request slots: each entry

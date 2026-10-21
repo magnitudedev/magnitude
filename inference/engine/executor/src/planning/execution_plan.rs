@@ -361,10 +361,12 @@ impl ExecutionPlanner {
             PlannedMethod::Mtp {
                 greedy_proposals,
                 sampled_proposals,
+                ..
             } => {
                 if greedy_proposals == 0
                     || sampled_proposals == 0
                     || greedy_proposals.max(sampled_proposals) > MAX_DRAFT_PROPOSALS
+                    || method.widest() > greedy_proposals.max(sampled_proposals)
                 {
                     return Err(PlanError::Unsupported("MTP proposal width"));
                 }
@@ -372,16 +374,12 @@ impl ExecutionPlanner {
             }
             // One block pass drafts every proposal, so the width is bounded
             // by the draft's block, not by sealed chains.
-            PlannedMethod::DFlash {
-                proposals,
-                generated,
-                ..
-            } => {
+            PlannedMethod::DFlash { proposals, .. } => {
                 let block = definition.draft.as_ref().map_or(
                     0,
                     magnitude_family_contracts::DraftDefinition::max_proposals,
                 );
-                if proposals == 0 || u64::from(proposals) > block || generated > proposals {
+                if proposals == 0 || u64::from(proposals) > block || method.widest() > proposals {
                     return Err(PlanError::Unsupported("DFlash proposal width"));
                 }
                 Some(proposals)

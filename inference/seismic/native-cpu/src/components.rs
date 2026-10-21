@@ -522,11 +522,19 @@ mod tests {
                     }
                 }
                 // Random entries and scale codes; a small f32 factor per block.
-                "iq2xs@rows16" | "iq3xxs@rows16" | "iq2xxs@rows16" => {
+                "iq2xs@rows16" | "iq3xxs@rows16" => {
                     for block in 0..k.div_ceil(256) {
                         let at = base + geometry.supers + 4 * block;
                         data[at..at + 4]
                             .copy_from_slice(&(0.0004 * (block % 3 + 1) as f32).to_le_bytes());
+                    }
+                }
+                // Random entries carrying their scale codes; a small f16 d per
+                // block (f16 0.0032 ..= 0.0128, scaled by 2^-3).
+                "iq2xxs@rows16" => {
+                    for block in 0..k.div_ceil(256) {
+                        let at = base + geometry.supers + 2 * block;
+                        data[at..at + 2].copy_from_slice(&(0x1A8F_u16 + 0x400 * (block % 3) as u16).to_le_bytes());
                     }
                 }
                 other => panic!("no generator for {other}"),

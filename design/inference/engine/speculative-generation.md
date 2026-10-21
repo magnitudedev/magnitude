@@ -307,9 +307,11 @@ holds, or all a draft head chains. An explicit width alone is that fixed width.
 
 ### Fixed
 
-Every round takes one configured budget. A round whose grant cannot hold the
-generated count runs plain; it does not invent a smaller block. The load prepares
-exactly that generated count.
+Every round takes one configured budget, whose generated count is its widest
+width. The load prepares the adaptive candidate widths up to that count (see
+**Widths** below), and a round whose grant cannot hold the generated count, near
+the end of a request, takes the widest of them that fits and verifies at most
+that many. Only a grant holding no candidate runs plain.
 
 ### Adaptive
 

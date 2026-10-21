@@ -310,6 +310,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
         inject: &no_inject(&device, hidden.extents()[0]),
         gated: &gated,
         output_weight: &output,
+        output_scale: &f32_tensor(device, &[0], &[]),
         output_bound: &f32_tensor(device, &[0], &[]),
     })
     .unwrap()

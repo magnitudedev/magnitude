@@ -80,11 +80,12 @@
 #elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_XXS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2XXS)
 // block_iq2_xxs: d (f16) | eight u32 pairs, one per 32 values: four 8-bit
 // grid indices of eight values, then four 7-bit sign groups and the 4-bit
-// scale. The resident entries are two bytes, the factor d / 8.
+// scale. The resident entries are two bytes, bit j of the scale in entry
+// j's SEISMIC_ELEMENT_U_PLANE_GRIDS_CARRIED_BIT; the resident factor is d
+// itself (its 1/8 is the recipe's).
 #define REPACK_GRID 1
 #define REPACK_IQ2XXS 1
 #define REPACK_GRID_BYTES 2u
-#define REPACK_GRID_FACTOR 0.125
 #define REPACK_GRID_AUX(b) (6u + 8u * (b))
 #else
 #error "repack_weight binding is not a registered GGUF-to-resident conversion"
@@ -231,7 +232,7 @@ uint repack_word(uint64_t gp, uint offset) {
 #if defined(REPACK_GRID)
 // Resident vector-code entry `e` (values 8e .. 8e + 7) of the source block:
 // the grid indices, then the seven signs (registry `gguf_iq2_xs`,
-// `gguf_iq3_xxs`, `gguf_iq2_xxs`).
+// `gguf_iq3_xxs`, `gguf_iq2_xxs`; iq2xxs then a scale code bit).
 uint repack_grid_entry(uint64_t gp, uint e) {
 #if defined(REPACK_IQ3XXS)
     // Entry e's two grid bytes are 2 e and 2 e + 1 past the scale.
@@ -240,8 +241,9 @@ uint repack_grid_entry(uint64_t gp, uint e) {
         | (((repack_word(gp, REPACK_GRID_AUX(block)) >> (7u * group)) & 127u) << 16);
 #elif defined(REPACK_IQ2XXS)
     const uint block = e / 4u, group = e % 4u;
-    return repack_byte(gp, 2u + 8u * block + group)
-        | (((repack_word(gp, REPACK_GRID_AUX(block)) >> (7u * group)) & 127u) << 8);
+    const uint aux = repack_word(gp, REPACK_GRID_AUX(block));
+    return repack_byte(gp, 2u + 8u * block + group) | (((aux >> (7u * group)) & 127u) << 8)
+        | (((aux >> (28u + group)) & 1u) << SEISMIC_ELEMENT_U_PLANE_GRIDS_CARRIED_BIT);
 #else
     return repack_byte(gp, 2u + 2u * e) | (repack_byte(gp, 3u + 2u * e) << 8);
 #endif
@@ -353,7 +355,7 @@ void repack_write_supers(uint64_t gp, uint64_t to) {
     element_u16_put(to, repack_byte(gp, 108u) | (repack_byte(gp, 109u) << 8));
 #elif defined(REPACK_IQ3S)
     element_u16_put(to, repack_byte(gp, 0u) | (repack_byte(gp, 1u) << 8));
-#elif defined(REPACK_Q8)
+#elif defined(REPACK_Q8) || defined(REPACK_IQ2XXS)
     element_u16_put(to, repack_byte(gp, 0u) | (repack_byte(gp, 1u) << 8));
 #elif defined(REPACK_GRID)
     // d widened and scaled by a power of two, exactly.

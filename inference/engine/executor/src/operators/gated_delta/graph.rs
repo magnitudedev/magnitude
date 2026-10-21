@@ -485,6 +485,8 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
         }
     };
     let inject = join.inject(graph, block.rows, constants)?;
+    // The gated delta binds no second-level scale (`UNSCALED_OUTPUT`).
+    let unscaled = GraphConstant::absent(graph, constants)?.tensor().clone();
     let output = graph
         .enqueue(
             kernels.output,
@@ -495,6 +497,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                 join.dimensions()[1],
                 ("Q", block.value_heads),
                 ("W", block.width),
+                crate::operators::attention::UNSCALED_OUTPUT,
                 ("OB", output_bound.extent),
             ],
             attention_output::WorkflowArgs {
@@ -502,6 +505,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                 inject: (&inject).into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight).into(),
+                output_scale: (&unscaled).into(),
                 output_bound: (&output_bound.tensor).into(),
             },
         )?

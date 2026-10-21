@@ -305,6 +305,8 @@ pub(crate) struct AttentionWeights {
     pub value: Option<WorkflowTensor>,
     pub query_norm: Option<WorkflowTensor>,
     pub key_norm: Option<WorkflowTensor>,
+    /// The per-head sink logits (`[heads]`), when the operator has sinks.
+    pub sinks: Option<WorkflowTensor>,
     pub output: Option<WorkflowTensor>,
     /// The sublayer's post-norm weight, when its tail is a post-norm.
     pub post_norm: Option<WorkflowTensor>,
@@ -704,6 +706,7 @@ pub(crate) fn attention_weights(
         query_norm: present(needs_output && shape.head_norm > 0, WeightKind::QueryNorm)?,
         // A Shared layer projects no keys, so it has no key norm.
         key_norm: present(shape.head_norm > 0 && shape.fresh > 0, WeightKind::KeyNorm)?,
+        sinks: present(needs_output && shape.sinks > 0, WeightKind::AttentionSinks)?,
         output: present(needs_output, WeightKind::AttentionOutput)?,
         post_norm: present(post_norm, WeightKind::PostNorm)?,
         bounds,
@@ -751,6 +754,8 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         }
         false => (bounds.query.clone(), bounds.gate.clone()),
     };
+    // Attention binds no second-level scale (`operators::attention::UNSCALED_PROJECT`).
+    let unscaled = GraphConstant::absent(graph, constants)?.tensor().clone();
     let projected = graph.enqueue(
         kernels.project,
         &[
@@ -760,6 +765,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 shape.project_dimensions(rows)
             }
             .as_slice(),
+            operators::attention::UNSCALED_PROJECT.as_slice(),
             bounds.project_dimensions(block.inject_only).as_slice(),
             &input.form.dimensions(shape.hidden),
         ]
@@ -781,6 +787,10 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
             value_weight: segment(&weights.value, &empty_weight),
             epsilon: block.epsilon,
             project_mode: 0,
+            query_scale: (&unscaled).into(),
+            gate_scale: (&unscaled).into(),
+            key_scale: (&unscaled).into(),
+            value_scale: (&unscaled).into(),
             query_bound: (&query_bound.tensor).into(),
             gate_bound: (&gate_bound.tensor).into(),
             key_bound: (&bounds.key.tensor).into(),
@@ -824,6 +834,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 entries.project,
                 &[
                     indexer_project_dimensions(shape.hidden, binding, rows).as_slice(),
+                    operators::attention::UNSCALED_PROJECT.as_slice(),
                     &[
                         ("QB", bounds.indexer_query.extent),
                         ("GB", 0),
@@ -837,6 +848,10 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                     hidden: input.rows.into(),
                     input_norm: (&input_norm).into(),
                     query_weight: (&indexer.query).into(),
+                    query_scale: (&absent).into(),
+                    gate_scale: (&absent).into(),
+                    key_scale: (&absent).into(),
+                    value_scale: (&absent).into(),
                     query_bound: (&bounds.indexer_query.tensor).into(),
                     gate_bound: (&absent).into(),
                     key_bound: (&bounds.indexer_key.tensor).into(),
@@ -864,6 +879,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         graph,
         kernels.history,
         (&weights.query_norm, &weights.key_norm),
+        &weights.sinks,
         constants,
         &projected,
         &block,
@@ -893,6 +909,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                             injected,
                             ("Q", heads),
                             ("W", width),
+                            operators::attention::UNSCALED_OUTPUT,
                         ]
                         .as_slice(),
                         bounds.output_dimensions().as_slice(),
@@ -903,6 +920,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                         inject: (&inject).into(),
                         gated: (&attended).into(),
                         output_weight: output_weight.into(),
+                        output_scale: (&unscaled).into(),
                         output_bound: (&bounds.output.tensor).into(),
                     },
                 )?
@@ -955,12 +973,15 @@ pub(crate) struct ProjectedRows {
 
 /// The history codec's fused attention entry over projected rows: head
 /// norms, rotary, K/V append at the rows' destinations and attention over
-/// the visible spans and fresh rows. Its rotary table and unit norm row join
+/// the visible spans and fresh rows, with the operator's per-head `sinks`.
+/// Its rotary table and unit norm row join
 /// `constants`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     history: AttentionHistoryEntries<'a, G>,
     (query_norm, key_norm): (&Option<WorkflowTensor>, &Option<WorkflowTensor>),
+    sinks: &Option<WorkflowTensor>,
     constants: &mut Vec<GraphConstant>,
     projected: &ProjectedRows,
     block: &AttentionBlock<'_>,
@@ -991,6 +1012,15 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     if let AttentionHistoryEntries::AffineK8V4 { codec, .. } = &history {
         dimensions.extend(affine_dimensions(*codec)?);
     }
+    // The sink rows: the operator's, or none (an injection attends nothing
+    // and binds none).
+    let sinks = match sinks {
+        Some(sinks) => sinks.reshape(&[shape.sinks, shape.heads()]),
+        None if shape.sinks == 0 || block.inject_only => GraphConstant::absent(graph, constants)?
+            .tensor()
+            .reshape(&[0, shape.heads()]),
+        None => return Err("attention sink weights are absent".into()),
+    };
     let input = |graph: &mut G, name: &str| match &history {
         AttentionHistoryEntries::Dense { decode, .. } => {
             graph.input_for(*decode, name, &dimensions)
@@ -1133,6 +1163,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                         query_norm: (&query_norm).into(),
                         key_norm: (&key_norm).into(),
                         value_norm: (&value_norm).into(),
+                        sinks: (&sinks).into(),
                         rotary_components: components.port().tensor().into(),
                         rotary_frequencies: frequencies.port().tensor().into(),
                         rotary_amplitudes: amplitudes.port().tensor().into(),
@@ -1158,7 +1189,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                 return Err("attention history planes disagree with the entry".into());
             };
             let append_dimensions = dimensions.iter().copied()
-                .filter(|(name, _)| !matches!(*name, "R" | "G" | "I" | "U")).collect::<Vec<_>>();
+                .filter(|(name, _)| !matches!(*name, "R" | "G" | "I" | "U" | "SK")).collect::<Vec<_>>();
             graph.enqueue(*$kernel, &append_dimensions, $module::WorkflowArgs {
                 key: (&key).into(), value: (&value).into(),
                 key_norm: (&key_norm).into(), value_norm: (&value_norm).into(),

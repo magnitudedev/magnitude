@@ -2361,8 +2361,10 @@ impl GatheredTable {
             .clone())
     }
 
-    /// The directory of a read of rows the device selected: empty of a table
-    /// held whole, a streamed table's directory of every row's slot.
+    /// The directory of a read of rows the device selected whose misses its
+    /// reader handles (`ResidentTable::read_selected`, or a stored table's
+    /// fill): empty of a table held whole, a streamed table's directory of
+    /// every row's slot.
     pub(crate) fn selected<G: GraphDraft>(
         &mut self,
         graph: &mut G,

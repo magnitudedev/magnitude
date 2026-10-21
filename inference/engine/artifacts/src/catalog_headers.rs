@@ -79,11 +79,11 @@ impl ArtifactHeader {
     }
 }
 
-/// The artifacts outside the catalog whose headers tests read: a Qwen3.8 27B
-/// DSpark draft, the Qwen3.6 27B target the Qwen3.6 27B DFlash draft's
-/// publication binds to, bartowski's Gemma 4 E2B Q4_K_M (which keeps the
-/// sharing layers' projections the catalog's file omits) and ggml-org's
-/// Nemotron 3.5 Super VL Q4_0 (which states only `layer_norm_epsilon`).
+/// The artifacts outside the catalog whose headers tests read: the Qwen3.8
+/// 27B and Nemotron 3.5 Bolt and Super VL DSpark drafts, the Qwen3.6 27B
+/// target the Qwen3.6 27B DFlash draft's publication binds to and
+/// bartowski's Gemma 4 E2B Q4_K_M (which keeps the sharing layers'
+/// projections the catalog's file omits).
 pub fn artifacts() -> Vec<ArtifactHeader> {
     [
         (
@@ -91,6 +91,18 @@ pub fn artifacts() -> Vec<ArtifactHeader> {
             "magnitudedev/Qwen3.8-27B-DSpark-GGUF",
             "8741336fde55cf8fb01e0dd004a75b688aa0ed71",
             "Qwen3.8-27B-DSpark-Q8_0.gguf",
+        ),
+        (
+            "nemotron-3.5-bolt-74b-a9b__draft-dspark",
+            "magnitudedev/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-DSpark-GGUF",
+            "ca4ba8b87c9db0250c831e0f661c70ba5885d303",
+            "dspark-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-NVFP4.gguf",
+        ),
+        (
+            "nemotron-3.5-super-vl-120b-a12b__draft-dspark",
+            "magnitudedev/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-DSpark-GGUF",
+            "1e4dc982ea54dc02c678d9e4943ed77152778d26",
+            "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-DSpark-Q8_0.gguf",
         ),
         (
             "qwen3.6-27b__target-gguf:q4",
@@ -103,12 +115,6 @@ pub fn artifacts() -> Vec<ArtifactHeader> {
             "bartowski/google_gemma-4-E2B-it-GGUF",
             "81012ba3538e061d5ee003f11f25335b17f82e2d",
             "google_gemma-4-E2B-it-Q4_K_M.gguf",
-        ),
-        (
-            "nemotron-3.5-super-vl-120b-a12b__target-gguf:q4_0",
-            "ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF",
-            "2950ece63f57a4a20d5bd0e5861e11f612f1a8da",
-            "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-Q4_0.gguf",
         ),
     ]
     .into_iter()

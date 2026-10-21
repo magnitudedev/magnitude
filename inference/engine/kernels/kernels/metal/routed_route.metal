@@ -11,7 +11,7 @@
 //     8x8 F32 simdgroup matrices over staged tiles.
 //   Logits are [M, E + 1]: column E is the shared-expert gate.
 //   routed_route_select (one simdgroup per row): the softmax over every expert
-//     (E / 32 experts per lane), K rounds of simdgroup argmax (ties to the
+//     (ceil(E / 32) experts per lane), K rounds of simdgroup argmax (ties to the
 //     higher expert index), the optional renormalization and the
 //     shared-expert coefficient from column E.
 // Every logit accumulates over the hidden axis in the same order for every

@@ -388,6 +388,41 @@ fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
     }
 }
 
+/// The Nemotron 3.5 Bolt and Super-VL drafts at their exact headers, each
+/// read against its own target: LiLiCorr (Bolt with attention sinks,
+/// Super-VL with its own NVFP4 projection) and DSpark (Bolt with an NVFP4
+/// Markov projection). Every graph class of their backbones, corrector and
+/// Markov head plans and charges on every backend.
+const NEMOTRON_DRAFTS: [(&str, DraftHeader); 4] = [
+    (
+        "nemotron-3.5-bolt-74b-a9b__target-gguf:iq2-qat",
+        DraftHeader::Catalog("nemotron-3.5-bolt-74b-a9b__draft"),
+    ),
+    (
+        "nemotron-3.5-bolt-74b-a9b__target-gguf:iq2-qat",
+        DraftHeader::Artifact("nemotron-3.5-bolt-74b-a9b__draft-dspark"),
+    ),
+    (
+        "nemotron-3.5-super-vl-120b-a12b__target-gguf:q4",
+        DraftHeader::Catalog("nemotron-3.5-super-vl-120b-a12b__draft"),
+    ),
+    (
+        "nemotron-3.5-super-vl-120b-a12b__target-gguf:q4",
+        DraftHeader::Artifact("nemotron-3.5-super-vl-120b-a12b__draft-dspark"),
+    ),
+];
+
+#[test]
+fn nemotron_drafts_plan_and_charge_every_graph_class() {
+    for (target, draft) in NEMOTRON_DRAFTS {
+        plan_and_charge_separate_draft(
+            (target, &headers::catalog(target)),
+            (draft.name(), &draft.directory()),
+            &NemotronHFamily,
+        );
+    }
+}
+
 /// A separate draft read against its target admits, prepares only its
 /// load's generated width, and derives its memory terms, state plan and
 /// graph bounds on every backend.
@@ -456,8 +491,7 @@ fn plan_and_charge_separate_draft(
         }
         let method = PlannedMethod::DFlash {
             proposals,
-            generated: proposals,
-            ladder: false,
+            widths: crate::DraftWidths::Adaptive,
         };
         for backend in BackendName::ALL {
             let context = format!("{draft_file} {}", backend.as_str());

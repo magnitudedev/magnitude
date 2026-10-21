@@ -330,6 +330,7 @@ pub(crate) fn declared_model(
                 scale: 1.0 / (c.head_width as f64).sqrt(),
                 reads: HistoryReads::Visible,
                 media_rows: MediaRowAttention::Causal,
+                sinks: None,
                 output: tensor(
                     name("attn_output"),
                     vec![c.hidden, c.heads * c.head_width],

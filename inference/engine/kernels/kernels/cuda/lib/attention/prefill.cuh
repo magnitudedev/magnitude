@@ -666,7 +666,7 @@ struct PrefillRows {
             }
             return;
         }
-        const float whole = fmaxf(denominator, 1e-30f);
+        const float whole = normalizer(in, query_head, maximum, denominator);
         const u64 out_at = static_cast<u64>(token) * SEISMIC_RESULT_0_STRIDE_0 +
                            static_cast<u64>(query_head) * SEISMIC_RESULT_0_STRIDE_1;
 #pragma unroll
@@ -1493,14 +1493,16 @@ __device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &
          token < min(static_cast<long long>(tile + 1) * QT, rows_total); ++token) {
         const u64 slot = static_cast<u64>(token) * heads + query_head;
         float denominator, accumulated;
-        merge(split.statistics + slot * 2, static_cast<u64>(rows_total) * heads * 2,
-              split.partials + slot * W + column, static_cast<u64>(rows_total) * heads * W, count,
-              denominator, accumulated);
+        const float maximum =
+            merge(split.statistics + slot * 2, static_cast<u64>(rows_total) * heads * 2,
+                  split.partials + slot * W + column, static_cast<u64>(rows_total) * heads * W, count,
+                  denominator, accumulated);
         element::put<Act>(gated,
                           static_cast<u64>(token) * SEISMIC_RESULT_0_STRIDE_0 +
                               static_cast<u64>(query_head) * SEISMIC_RESULT_0_STRIDE_1 +
                               static_cast<u64>(column) * SEISMIC_RESULT_0_STRIDE_2,
-                          attention::gated(in, token, query_head, column, accumulated / fmaxf(denominator, 1e-30f)));
+                          attention::gated(in, token, query_head, column,
+                                           accumulated / normalizer(in, query_head, maximum, denominator)));
     }
 }
 

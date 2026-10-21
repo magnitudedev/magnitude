@@ -1,5 +1,5 @@
-//! The separate draft (DFlash, DSpark, DFlash2; plan §3.8) forms this executor runs,
-//! and the roles of a draft's weights.
+//! The separate draft (DFlash, DSpark, DFlash2, LiLiCorr; plan §3.8) forms this
+//! executor runs, and the roles of a draft's weights.
 //!
 //! The draft's fusion (its projection of the concatenated target taps and the
 //! norm the context K/V projections read) lives with the target: every target
@@ -9,9 +9,9 @@
 use super::{FeedForward, Mixer, PairedBlock, paired_block, role, sublayer_weights};
 use crate::error::PlanError;
 use magnitude_family_contracts::{
-    AttentionGate, Block, DraftDefinition, DraftEmbedding, DraftMethod, HeadHistory, KeyValue,
-    ModelDefinition, OutputForm, SublayerIndex, TapPoint, ValueSource, WeightDescriptor,
-    WeightKind, WeightRole, WeightScope,
+    AffinePart, AttentionGate, Block, CorrectorSite, CorrectorWeight, DraftDefinition,
+    DraftEmbedding, DraftMethod, HeadHistory, KeyValue, ModelDefinition, OutputForm,
+    SublayerIndex, TapPoint, ValueSource, WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
 
 /// The draft weights a target step reads: the fusion projection and the
@@ -60,7 +60,9 @@ pub(crate) fn draft_weights(
         role(WeightScope::Draft, WeightKind::OutputNorm),
         &draft.output_norm.weight,
     ));
-    if let DraftMethod::DSpark { markov, confidence } = &draft.method {
+    // DSpark's confidence head is never evaluated (the service threshold is
+    // zero), so no entry reads its weights and they are not imported.
+    if let DraftMethod::DSpark { markov, .. } = &draft.method {
         weights.push((
             role(WeightScope::Draft, WeightKind::MarkovEmbedding),
             &markov.embedding,
@@ -69,22 +71,9 @@ pub(crate) fn draft_weights(
             role(WeightScope::Draft, WeightKind::MarkovProjection),
             &markov.projection,
         ));
-        weights.push((
-            role(WeightScope::Draft, WeightKind::ConfidenceWeight),
-            &confidence.weight,
-        ));
-        weights.push((
-            role(WeightScope::Draft, WeightKind::ConfidenceBias),
-            &confidence.bias,
-        ));
     }
-    if let DraftMethod::DFlash2 {
-        convolutions,
-        selector,
-        ..
-    } = &draft.method
-    {
-        for (block, layer) in convolutions.iter().enumerate() {
+    if let Some(convolutions) = &draft.convolutions {
+        for (block, layer) in convolutions.layers.iter().enumerate() {
             let block =
                 u32::try_from(block).map_err(|_| PlanError::Arithmetic("draft block index"))?;
             for (sublayer, convolution) in [(0, &layer.attention), (1, &layer.feed_forward)] {
@@ -96,6 +85,11 @@ pub(crate) fn draft_weights(
                 ));
             }
         }
+    }
+    if let DraftMethod::LiLiCorr { corrector } = &draft.method {
+        weights.extend(corrector.weights());
+    }
+    if let DraftMethod::DFlash2 { selector } = &draft.method {
         weights.push((
             role(WeightScope::Draft, WeightKind::SelectorHidden),
             &selector.hidden,
@@ -184,9 +178,9 @@ pub(crate) fn admit(definition: &ModelDefinition) -> Result<(), PlanError> {
         {
             return Err(PlanError::Unsupported("draft layer form"));
         }
-        // DFlash2 runs its layers unfused: plain query, key and value
-        // projections of the convolved rows.
-        if matches!(draft.method, DraftMethod::DFlash2 { .. })
+        // A convolved backbone runs its layers unfused: plain query, key and
+        // value projections of the convolved rows.
+        if draft.convolutions.is_some()
             && (!matches!(attention.gate, AttentionGate::None)
                 || !matches!(
                     attention.key_value,
@@ -197,7 +191,7 @@ pub(crate) fn admit(definition: &ModelDefinition) -> Result<(), PlanError> {
                 ))
         {
             return Err(PlanError::Unsupported(
-                "a DFlash2 draft layer other than ungated attention with projected values",
+                "a convolved draft layer other than ungated attention with projected values",
             ));
         }
         if [
@@ -213,5 +207,43 @@ pub(crate) fn admit(definition: &ModelDefinition) -> Result<(), PlanError> {
             ));
         }
     }
+    if let DraftMethod::LiLiCorr { corrector } = &draft.method {
+        // The corrector's norms read the draft's one epsilon.
+        if corrector
+            .layers
+            .iter()
+            .flat_map(|layer| [&layer.attention_norm, &layer.mlp_norm])
+            .chain([&corrector.output_norm, &corrector.anchor_norm])
+            .any(|norm| norm.epsilon != epsilon)
+        {
+            return Err(PlanError::Unsupported(
+                "normalization epsilons differing within a draft",
+            ));
+        }
+        // Its nodes attend one block through its corrector attention.
+        if corrector.width % corrector.heads != 0 {
+            return Err(PlanError::Topology("corrector heads do not divide its width"));
+        }
+    }
     Ok(())
+}
+
+/// Whether the corrector entries read `weight` as F32 (`corrector.seismic`):
+/// biases, the feature norm and projection, the slot and rank embeddings and
+/// the attention bias. Its other matrices are projections and its norms
+/// norm weights, resident like any draft's.
+pub(crate) fn corrector_reads_f32(weight: CorrectorWeight) -> bool {
+    match weight {
+        CorrectorWeight::Affine { site, part } => {
+            part == AffinePart::Bias || site == CorrectorSite::FeatureUp
+        }
+        CorrectorWeight::FeatureNorm(_)
+        | CorrectorWeight::SlotEmbedding
+        | CorrectorWeight::RankEmbedding
+        | CorrectorWeight::AttentionBias => true,
+        CorrectorWeight::OutputNorm
+        | CorrectorWeight::AnchorNorm
+        | CorrectorWeight::AttentionNorm
+        | CorrectorWeight::MlpNorm => false,
+    }
 }

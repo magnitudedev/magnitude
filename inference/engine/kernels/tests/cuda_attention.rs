@@ -21,6 +21,7 @@ fn cuda_decode(
         device,
         attention_decode::Elements { A: Element::bf16() },
         &qwen_form(statics(geometry), geometry)
+            .with_static("SK", 0)
             .with_param("PARTS", parts)
             .with_param("WARPS", warps)
             .with_param("SLICES", slices)
@@ -41,6 +42,7 @@ fn cuda_prefill(
         device,
         attention_prefill::Elements { A: Element::bf16() },
         &visible_prefill(device, qwen_form(statics(geometry), geometry))
+            .with_static("SK", 0)
             .with_param("WARPS", warps)
             .with_param("SPLIT_GROUPS", split_groups)
             .with_param("STAGES", 2)

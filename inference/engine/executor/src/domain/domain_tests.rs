@@ -362,7 +362,7 @@ impl<L, W, O> ProgramSubmission for PendingSubmission<L, W, O> {
 type HeadTestWork = PendingSubmission<
     crate::HeadLaunchCore,
     (NativeGraphWorkspaceLease, Option<NativeGraphOutputLease>),
-    Option<crate::GraphOutputTensor>,
+    crate::programs::HeadOutput,
 >;
 
 enum ControlledHeadSubmission {
@@ -1060,6 +1060,7 @@ fn vision_definition() -> ModelDefinition {
                 sampling: PositionSampling::AlignedCorners { side: 4 },
             },
             norm: None,
+            registers: None,
         },
         window: None,
         blocks: Vec::new(),
@@ -1447,7 +1448,10 @@ fn target_with_pending_priming(
         completion: PendingCompletion(control.clone()),
         core,
         workspace: (workspace, output),
-        output: None,
+        output: crate::programs::HeadOutput {
+            selections: None,
+            selected_rows: None,
+        },
     });
     assert!(flight.work.priming.is_none());
     flight.work.priming = Some(PrimingFlight {

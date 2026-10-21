@@ -21,7 +21,8 @@ pub(crate) use attestation::{
 };
 use draft::DraftKernels;
 pub(crate) use draft::{
-    AttestedDflash2, Dflash2Kernels, Dflash2Projections, DraftBlockKernels, MarkovKernels,
+    AttestedConvolved, AttestedCorrector, AttestedSelector, ConvolvedKernels, CorrectorKernels,
+    DraftBlockKernels, MarkovKernels, SelectorKernels,
 };
 use glue::GlueKernels;
 use head::HeadKernels;
@@ -349,6 +350,7 @@ mod qualification_tests {
             .with_static("IN", 0)
             .with_static("Q", binding.value_heads)
             .with_static("W", binding.width)
+            .with_static("OS", 0)
             .with_static("OB", 0);
         attention_output::native_for_device_with(
             &device,

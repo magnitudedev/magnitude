@@ -1283,17 +1283,31 @@ fn mtp_and_external_drafters_share_independent_generation_and_verification_budge
     }
 }
 
+/// Near the end of a request a fixed budget drafts the widest width of its
+/// prepared ladder that still fits, and verifies all of it.
 #[test]
-fn fixed_draft_uses_plain_for_a_tail_smaller_than_its_prepared_shape() {
+fn fixed_draft_fits_its_tail_to_a_prepared_width() {
     for generation in drafters(&[1, 2], 3) {
+        // The prompt's closing chunk generates one token and the first round
+        // four, leaving three of eight: two proposals fit, and the ladder of
+        // three prepares one.
         let (mut generation, operation) = drafting(generation);
         reconcile_head(&mut generation, &operation, &[(11, 0), (12, 0), (13, 0)]);
         let (mut generation, _) =
             resolve(start(generation, 4), &[11, 12, 13, 20], Some(feature(2)));
         generation.take(4).unwrap();
+        let (mut generation, operations) = draft(generation, 4);
+        assert_eq!(head_parts(&operations[0]).3.len(), 1);
+        reconcile_head(&mut generation, &operations[0], &[(21, 0)]);
         let round = start(generation, 4);
-        assert_eq!(round.round_forward().kind, WorkKind::Decode);
-        assert_eq!(round.round_forward().tokens, [TokenId(20)]);
+        assert_eq!(round.round_forward().kind, WorkKind::Verify);
+        assert_eq!(round.round_forward().tokens, [TokenId(20), TokenId(21)]);
+        // The verification commits its proposal and the target's bonus.
+        let (generation, _) = resolve(round, &[21, 22], Some(feature(3)));
+        assert_eq!(
+            generation.generated(),
+            [10, 11, 12, 13, 20, 21, 22].map(TokenId)
+        );
     }
 }
 
@@ -1930,7 +1944,7 @@ fn adaptive_drafting_stops_where_no_draft_is_accepted() {
 }
 
 /// Near the end of a request an adaptive round drafts the widest width that
-/// still fits, where a fixed budget drafts nothing.
+/// still fits.
 #[test]
 fn adaptive_drafting_fits_the_tokens_a_request_has_left() {
     // The prompt's closing chunk generates one token and the first round

@@ -1,4 +1,5 @@
-//! A separate draft component (DFlash, DSpark; plan §3.8).
+//! A separate draft component (DFlash, DSpark, DFlash2, LiLiCorr; plan
+//! §3.8).
 //!
 //! The draft is a small decoder conditioned on the target's residual stream.
 //! For every token the target commits, the residuals entering the tapped
@@ -8,12 +9,14 @@
 //! A draft pass then runs one block `[anchor, mask, …]` through the draft
 //! layers over that history and the block (all of it, or its rows up to the
 //! reading row, per layer's [`BlockAttention`]), and reads the block's slots
-//! out through an owned or target-shared vocabulary projection.
+//! out through an owned or target-shared vocabulary projection. Its
+//! [`DraftMethod`] turns the slots' logits into proposals.
 
 use crate::decoder::{self, Context};
 use crate::{
     Block, Decoder, DefinitionError, KeyValue, Operator, ResidualForm, RmsNorm, SublayerIndex,
-    TokenId, WeightDescriptor, checked_product, expect_shape,
+    TokenId, WeightDescriptor, WeightKind, WeightRole, WeightScope, checked_product,
+    expect_shape,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -81,8 +84,9 @@ pub struct ConfidenceHead {
     pub bias: WeightDescriptor,
 }
 
-/// One grouped dynamic causal convolution of DFlash2, applied around a draft
-/// sublayer over the rows of one block. The sublayer's normed input rows
+/// One grouped dynamic causal convolution of a convolved draft backbone
+/// (DFlash2's), applied around a draft sublayer over the rows of one block.
+/// The sublayer's normed input rows
 /// `x` project to per-row coefficients `dynamic = projection · x`, viewed
 /// `[2, kernel, groups]`; half `h` of the convolution of rows `y` is
 /// `out[r, c] = Σ_{o < kernel, o ≤ r} (base[h, o, c] + dynamic[r, h, o, c / group]) · y[r − o, c]`
@@ -97,12 +101,380 @@ pub struct DynamicConvolution {
     pub projection: WeightDescriptor,
 }
 
-/// A DFlash2 draft layer's convolutions: around its attention and around its
-/// feed-forward.
+/// A convolved draft layer's convolutions: around its attention and around
+/// its feed-forward.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayerConvolutions {
     pub attention: DynamicConvolution,
     pub feed_forward: DynamicConvolution,
+}
+
+/// A convolved draft backbone (DFlash2's): every draft sublayer is wrapped in
+/// a grouped dynamic causal convolution over its block. It is a property of
+/// the draft's layers, independent of how proposals are read out.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BlockConvolutions {
+    /// Convolution taps.
+    pub kernel: u64,
+    /// Channels per coefficient group.
+    pub group: u64,
+    /// One per draft layer.
+    pub layers: Vec<LayerConvolutions>,
+}
+
+/// A linear map with a bias: `y = weight · x + bias`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Affine {
+    /// `[outputs, inputs]`.
+    pub weight: WeightDescriptor,
+    /// `[outputs]`.
+    pub bias: WeightDescriptor,
+}
+
+impl Affine {
+    fn validate(&self, outputs: u64, inputs: u64, role: &str) -> Result<(), DefinitionError> {
+        expect_shape(&self.weight, &[outputs, inputs], role)?;
+        expect_shape(&self.bias, &[outputs], role)
+    }
+}
+
+/// A centered (layer) norm with a stored multiplier and bias.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CenteredNorm {
+    pub weight: WeightDescriptor,
+    pub bias: WeightDescriptor,
+    pub epsilon: f64,
+}
+
+/// Per-candidate features a corrector reads, in order: the candidate's log
+/// probability under the slot's full softmax, its probability, its log
+/// probability less the slot's best, its rank over `top_k − 1` (0 when
+/// `top_k` is 1), and whether it is the slot's best (1 or 0).
+pub const CORRECTOR_FEATURES: u64 = 5;
+
+/// One pre-norm transformer layer of a candidate corrector over a block's
+/// candidate nodes: RMS-normed nodes project to heads' queries, keys and
+/// values (`attention_input` rows: every query, then every key, then every
+/// value, head-major), attend every node of the block with the per-head
+/// additive `CandidateCorrector::attention_bias`, and project back into the
+/// residual; then an RMS-normed `down · silu(up · x)` joins the residual.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CorrectorLayer {
+    pub attention_norm: RmsNorm,
+    /// `[3·width, width]`.
+    pub attention_input: Affine,
+    /// `[width, width]`.
+    pub attention_output: Affine,
+    pub mlp_norm: RmsNorm,
+    /// `[mlp, width]`.
+    pub up: Affine,
+    /// `[width, mlp]`.
+    pub down: Affine,
+}
+
+/// LiLiCorr's candidate corrector over a block's `slots` proposing rows.
+///
+/// Each slot keeps its `top_k` highest draft logits as candidates, in
+/// descending logit order (rank 0 the best). Candidate `k` of slot `j` is
+/// node `j·top_k + k` of its block; its row is the sum of its token's
+/// projected embedding (`token`, or the raw embedding row when absent), the
+/// slot's projected output-normed hidden row (`pass`), its projected
+/// [`CORRECTOR_FEATURES`] (`feature_down · silu(feature_up ·
+/// feature_norm(features))`), and the slot and rank embeddings. The nodes run
+/// the corrector layers, then `output_norm`. The block's anchor state is the
+/// anchor-normed `context` projection of the fused target feature that
+/// selected the anchor (the draft's fusion-normed context row). Each node's
+/// factor is `silu(factor_input · [x ; a ; x ∘ a])` for its output-normed row
+/// `x` and the anchor state `a`; its outgoing and incoming vectors are the
+/// unit-normalized (`vector_epsilon`) `outgoing` and `incoming` maps of the
+/// factor, and the anchor's is the unit-normalized `anchor` map of `a`.
+///
+/// Candidate `c` of slot 0 scores `logit_scale · incoming(0, c) · anchor`;
+/// candidate `c` of slot `j > 0` following candidate `p` of slot `j − 1`
+/// scores `logit_scale · incoming(j, c) · outgoing(j − 1, p)`. Proposals walk
+/// the slots greedily: each slot selects its best-scoring candidate (the
+/// first on ties) after the previous slot's selection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CandidateCorrector {
+    /// The corrector's node width.
+    pub width: u64,
+    pub top_k: u64,
+    pub heads: u64,
+    /// The width of the outgoing, incoming and anchor vectors.
+    pub factor: u64,
+    /// `[width, hidden]`; absent when `width` is the draft's hidden width and
+    /// embedding rows enter the nodes directly.
+    pub token: Option<Affine>,
+    /// `[width, hidden]`.
+    pub pass: Affine,
+    /// `[width, hidden]`.
+    pub context: Affine,
+    /// Over [`CORRECTOR_FEATURES`] values.
+    pub feature_norm: CenteredNorm,
+    /// `[width, CORRECTOR_FEATURES]`.
+    pub feature_up: Affine,
+    /// `[width, width]`.
+    pub feature_down: Affine,
+    /// `[slots, width]`.
+    pub slot_embedding: WeightDescriptor,
+    /// `[top_k, width]`.
+    pub rank_embedding: WeightDescriptor,
+    /// `[heads, slots·top_k, slots·top_k]`: head `h`'s additive bias of query
+    /// node `q` attending key node `k`.
+    pub attention_bias: WeightDescriptor,
+    pub layers: Vec<CorrectorLayer>,
+    pub output_norm: RmsNorm,
+    pub anchor_norm: RmsNorm,
+    /// `[width, 3·width]`.
+    pub factor_input: Affine,
+    /// `[factor, width]` each.
+    pub outgoing: Affine,
+    pub incoming: Affine,
+    pub anchor: Affine,
+    pub vector_epsilon: f64,
+    /// A positive multiplier on every score; it does not change a selection.
+    pub logit_scale: f64,
+}
+
+/// A site of a corrector's affine maps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CorrectorSite {
+    Token,
+    Pass,
+    Context,
+    FeatureUp,
+    FeatureDown,
+    FactorInput,
+    Outgoing,
+    Incoming,
+    Anchor,
+    /// A corrector layer's (scope `CorrectorLayer`).
+    AttentionInput,
+    AttentionOutput,
+    Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AffinePart {
+    Weight,
+    Bias,
+}
+
+/// The semantic role of a corrector weight within its scope (`Draft`, or
+/// `CorrectorLayer(layer)` for a layer's maps and norms).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CorrectorWeight {
+    Affine {
+        site: CorrectorSite,
+        part: AffinePart,
+    },
+    FeatureNorm(AffinePart),
+    SlotEmbedding,
+    RankEmbedding,
+    AttentionBias,
+    OutputNorm,
+    AnchorNorm,
+    /// A corrector layer's.
+    AttentionNorm,
+    MlpNorm,
+}
+
+impl CandidateCorrector {
+    /// Every corrector weight with its role, in model order.
+    pub fn weights(&self) -> Vec<(WeightRole, &WeightDescriptor)> {
+        fn role(scope: WeightScope, weight: CorrectorWeight) -> WeightRole {
+            WeightRole {
+                scope,
+                kind: WeightKind::Corrector(weight),
+            }
+        }
+        fn affine<'a>(
+            out: &mut Vec<(WeightRole, &'a WeightDescriptor)>,
+            scope: WeightScope,
+            site: CorrectorSite,
+            map: &'a Affine,
+        ) {
+            for (part, weight) in [(AffinePart::Weight, &map.weight), (AffinePart::Bias, &map.bias)] {
+                out.push((role(scope, CorrectorWeight::Affine { site, part }), weight));
+            }
+        }
+        let mut out = Vec::new();
+        let draft = WeightScope::Draft;
+        if let Some(token) = &self.token {
+            affine(&mut out, draft, CorrectorSite::Token, token);
+        }
+        affine(&mut out, draft, CorrectorSite::Pass, &self.pass);
+        affine(&mut out, draft, CorrectorSite::Context, &self.context);
+        out.push((
+            role(draft, CorrectorWeight::FeatureNorm(AffinePart::Weight)),
+            &self.feature_norm.weight,
+        ));
+        out.push((
+            role(draft, CorrectorWeight::FeatureNorm(AffinePart::Bias)),
+            &self.feature_norm.bias,
+        ));
+        affine(&mut out, draft, CorrectorSite::FeatureUp, &self.feature_up);
+        affine(&mut out, draft, CorrectorSite::FeatureDown, &self.feature_down);
+        out.push((
+            role(draft, CorrectorWeight::SlotEmbedding),
+            &self.slot_embedding,
+        ));
+        out.push((
+            role(draft, CorrectorWeight::RankEmbedding),
+            &self.rank_embedding,
+        ));
+        out.push((
+            role(draft, CorrectorWeight::AttentionBias),
+            &self.attention_bias,
+        ));
+        for (index, layer) in self.layers.iter().enumerate() {
+            let scope =
+                WeightScope::CorrectorLayer(u32::try_from(index).expect("corrector layers fit u32"));
+            out.push((
+                role(scope, CorrectorWeight::AttentionNorm),
+                &layer.attention_norm.weight,
+            ));
+            affine(
+                &mut out,
+                scope,
+                CorrectorSite::AttentionInput,
+                &layer.attention_input,
+            );
+            affine(
+                &mut out,
+                scope,
+                CorrectorSite::AttentionOutput,
+                &layer.attention_output,
+            );
+            out.push((role(scope, CorrectorWeight::MlpNorm), &layer.mlp_norm.weight));
+            affine(&mut out, scope, CorrectorSite::Up, &layer.up);
+            affine(&mut out, scope, CorrectorSite::Down, &layer.down);
+        }
+        out.push((
+            role(draft, CorrectorWeight::OutputNorm),
+            &self.output_norm.weight,
+        ));
+        out.push((
+            role(draft, CorrectorWeight::AnchorNorm),
+            &self.anchor_norm.weight,
+        ));
+        affine(&mut out, draft, CorrectorSite::FactorInput, &self.factor_input);
+        affine(&mut out, draft, CorrectorSite::Outgoing, &self.outgoing);
+        affine(&mut out, draft, CorrectorSite::Incoming, &self.incoming);
+        affine(&mut out, draft, CorrectorSite::Anchor, &self.anchor);
+        out
+    }
+
+    /// Candidate nodes of one block.
+    pub fn nodes(&self, slots: u64) -> Result<u64, DefinitionError> {
+        checked_product(&[slots, self.top_k])
+    }
+
+    /// The width of the corrector layers' feed-forward.
+    pub fn mlp(&self) -> u64 {
+        self.layers
+            .first()
+            .and_then(|layer| layer.up.weight.shape.first().copied())
+            .unwrap_or(0)
+    }
+
+    fn validate(&self, hidden: u64, vocabulary: u64, slots: u64) -> Result<(), DefinitionError> {
+        let width = self.width;
+        if width == 0
+            || self.heads == 0
+            || !width.is_multiple_of(self.heads)
+            || self.factor == 0
+            || self.top_k == 0
+            || self.top_k > vocabulary
+            || slots == 0
+            || self.layers.is_empty()
+        {
+            return Err(DefinitionError::new("draft corrector geometry"));
+        }
+        if !self.vector_epsilon.is_finite()
+            || self.vector_epsilon <= 0.0
+            || !self.logit_scale.is_finite()
+            || self.logit_scale <= 0.0
+            || !self.feature_norm.epsilon.is_finite()
+            || self.feature_norm.epsilon <= 0.0
+        {
+            return Err(DefinitionError::new("draft corrector scales"));
+        }
+        match &self.token {
+            Some(token) => token.validate(width, hidden, "draft corrector token projection")?,
+            None if width == hidden => {}
+            None => {
+                return Err(DefinitionError::new(
+                    "a draft corrector narrower than the draft projects its token embeddings",
+                ));
+            }
+        }
+        self.pass.validate(width, hidden, "draft corrector pass projection")?;
+        self.context
+            .validate(width, hidden, "draft corrector context projection")?;
+        expect_shape(
+            &self.feature_norm.weight,
+            &[CORRECTOR_FEATURES],
+            "draft corrector feature norm",
+        )?;
+        expect_shape(
+            &self.feature_norm.bias,
+            &[CORRECTOR_FEATURES],
+            "draft corrector feature norm",
+        )?;
+        self.feature_up
+            .validate(width, CORRECTOR_FEATURES, "draft corrector feature projection")?;
+        self.feature_down
+            .validate(width, width, "draft corrector feature projection")?;
+        expect_shape(
+            &self.slot_embedding,
+            &[slots, width],
+            "draft corrector slot embedding",
+        )?;
+        expect_shape(
+            &self.rank_embedding,
+            &[self.top_k, width],
+            "draft corrector rank embedding",
+        )?;
+        let nodes = self.nodes(slots)?;
+        expect_shape(
+            &self.attention_bias,
+            &[self.heads, nodes, nodes],
+            "draft corrector attention bias",
+        )?;
+        let mlp = self.mlp();
+        if mlp == 0 {
+            return Err(DefinitionError::new("draft corrector feed-forward width"));
+        }
+        let joined = checked_product(&[3, width])?;
+        for layer in &self.layers {
+            decoder::validate_rms(&layer.attention_norm, width, "draft corrector layer norm")?;
+            layer
+                .attention_input
+                .validate(joined, width, "draft corrector attention input")?;
+            layer
+                .attention_output
+                .validate(width, width, "draft corrector attention output")?;
+            decoder::validate_rms(&layer.mlp_norm, width, "draft corrector layer norm")?;
+            layer.up.validate(mlp, width, "draft corrector up projection")?;
+            layer
+                .down
+                .validate(width, mlp, "draft corrector down projection")?;
+        }
+        decoder::validate_rms(&self.output_norm, width, "draft corrector output norm")?;
+        decoder::validate_rms(&self.anchor_norm, width, "draft corrector anchor norm")?;
+        self.factor_input
+            .validate(width, joined, "draft corrector factor input")?;
+        for (map, role) in [
+            (&self.outgoing, "draft corrector outgoing head"),
+            (&self.incoming, "draft corrector incoming head"),
+            (&self.anchor, "draft corrector anchor head"),
+        ] {
+            map.validate(self.factor, width, role)?;
+        }
+        Ok(())
+    }
 }
 
 /// DFlash2's ordered candidate path. Each proposing row keeps its `top_k`
@@ -132,17 +504,11 @@ pub enum DraftMethod {
         markov: MarkovHead,
         confidence: ConfidenceHead,
     },
-    /// Every draft sublayer is wrapped in a grouped dynamic causal
-    /// convolution over its block, and proposals follow an ordered
-    /// candidate path.
-    DFlash2 {
-        /// Convolution taps (`kernel`) and channels per coefficient group.
-        kernel: u64,
-        group: u64,
-        /// One per draft layer.
-        convolutions: Vec<LayerConvolutions>,
-        selector: CandidateSelector,
-    },
+    /// Proposals follow an ordered candidate path over a convolved backbone.
+    DFlash2 { selector: CandidateSelector },
+    /// Proposals walk the candidate lattice a corrector scores over every
+    /// mask slot of the block (LiLiCorr).
+    LiLiCorr { corrector: Box<CandidateCorrector> },
 }
 
 /// The separate-draft method a draft's definition implements.
@@ -151,6 +517,7 @@ pub enum DraftVariant {
     DFlash,
     DSpark,
     DFlash2,
+    LiLiCorr,
 }
 
 impl fmt::Display for DraftVariant {
@@ -159,6 +526,7 @@ impl fmt::Display for DraftVariant {
             Self::DFlash => "DFlash",
             Self::DSpark => "DSpark",
             Self::DFlash2 => "DFlash2",
+            Self::LiLiCorr => "LiLiCorr",
         })
     }
 }
@@ -169,6 +537,7 @@ impl DraftMethod {
             Self::DFlash => DraftVariant::DFlash,
             Self::DSpark { .. } => DraftVariant::DSpark,
             Self::DFlash2 { .. } => DraftVariant::DFlash2,
+            Self::LiLiCorr { .. } => DraftVariant::LiLiCorr,
         }
     }
 }
@@ -192,6 +561,9 @@ pub struct DraftDefinition {
     pub blocks: Vec<Block>,
     /// One per draft layer: how its block rows attend the block.
     pub block_attention: Vec<BlockAttention>,
+    /// The convolutions wrapping every draft sublayer of a convolved
+    /// backbone.
+    pub convolutions: Option<BlockConvolutions>,
     pub output_norm: RmsNorm,
     /// Explicit draft projection softcap, before any Markov/selector bias.
     /// An absent value preserves raw logits even if the target has a softcap.
@@ -215,8 +587,13 @@ impl DraftDefinition {
     /// Rows of the block a pass drafting `proposals` tokens runs: through its
     /// last proposing row, as serving engines size the block to the verify
     /// window. A causal layer's rows do not read later rows, so only the
-    /// bidirectional layers see fewer mask rows than in training.
+    /// bidirectional layers see fewer mask rows than in training. A
+    /// corrector scores every mask slot together, so its block is always
+    /// whole.
     pub fn block_rows(&self, proposals: u64) -> u64 {
+        if matches!(self.method, DraftMethod::LiLiCorr { .. }) {
+            return self.block_size;
+        }
         (self.proposal_row(proposals.max(1) - 1) + 1).clamp(2, self.block_size)
     }
 
@@ -328,41 +705,16 @@ impl DraftDefinition {
                 expect_shape(&confidence.weight, &[joined], "draft confidence weight")?;
                 expect_shape(&confidence.bias, &[1], "draft confidence bias")?;
             }
-            DraftMethod::DFlash2 {
-                kernel,
-                group,
-                convolutions,
-                selector,
-            } => {
+            DraftMethod::DFlash2 { selector } => {
                 if self.layout != BlockLayout::MaskSlots {
                     return Err(DefinitionError::new(
                         "a DFlash2 draft proposes from its mask slots",
                     ));
                 }
-                if *kernel == 0 || *group == 0 || !hidden.is_multiple_of(*group) {
+                if self.convolutions.is_none() {
                     return Err(DefinitionError::new(
-                        "draft convolution groups do not divide the hidden width",
+                        "a DFlash2 draft convolves its layers",
                     ));
-                }
-                if convolutions.len() != self.blocks.len() {
-                    return Err(DefinitionError::new(
-                        "a DFlash2 draft convolves every draft layer",
-                    ));
-                }
-                let coefficients = checked_product(&[2, *kernel, hidden / *group])?;
-                for layer in convolutions {
-                    for convolution in [&layer.attention, &layer.feed_forward] {
-                        expect_shape(
-                            &convolution.base,
-                            &[2, *kernel, hidden],
-                            "draft convolution base",
-                        )?;
-                        expect_shape(
-                            &convolution.projection,
-                            &[coefficients, hidden],
-                            "draft convolution projection",
-                        )?;
-                    }
                 }
                 if selector.rank == 0 || selector.top_k == 0 || selector.top_k > decoder.vocabulary
                 {
@@ -380,6 +732,46 @@ impl DraftDefinition {
                     "draft predecessor codebook",
                 )?;
                 expect_shape(&selector.successor, &codebook, "draft successor codebook")?;
+            }
+            DraftMethod::LiLiCorr { corrector } => {
+                if self.layout != BlockLayout::MaskSlots {
+                    return Err(DefinitionError::new(
+                        "a LiLiCorr draft proposes from its mask slots",
+                    ));
+                }
+                corrector.validate(hidden, decoder.vocabulary, self.max_proposals())?;
+            }
+        }
+        if let Some(convolutions) = &self.convolutions {
+            let BlockConvolutions {
+                kernel,
+                group,
+                layers,
+            } = convolutions;
+            if *kernel == 0 || *group == 0 || !hidden.is_multiple_of(*group) {
+                return Err(DefinitionError::new(
+                    "draft convolution groups do not divide the hidden width",
+                ));
+            }
+            if layers.len() != self.blocks.len() {
+                return Err(DefinitionError::new(
+                    "a convolved draft convolves every draft layer",
+                ));
+            }
+            let coefficients = checked_product(&[2, *kernel, hidden / *group])?;
+            for layer in layers {
+                for convolution in [&layer.attention, &layer.feed_forward] {
+                    expect_shape(
+                        &convolution.base,
+                        &[2, *kernel, hidden],
+                        "draft convolution base",
+                    )?;
+                    expect_shape(
+                        &convolution.projection,
+                        &[coefficients, hidden],
+                        "draft convolution projection",
+                    )?;
+                }
             }
         }
         Ok(())

@@ -261,6 +261,7 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
                 sampling: PositionSampling::AlignedCorners { side: table_side },
             },
             norm: None,
+            registers: None,
         },
         window: None,
         blocks,

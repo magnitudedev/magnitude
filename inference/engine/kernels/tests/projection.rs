@@ -321,6 +321,11 @@ fn absent_bound(device: &Device) -> Tensor {
     f32_tensor(device, &[0], &[])
 }
 
+/// An absent accumulator-scale port (static extent 0).
+fn no_scale(device: &Device) -> Tensor {
+    f32_tensor(device, &[0], &[])
+}
+
 impl Weight {
     /// The packing bound operand of this weight on `device` and its extent,
     /// as loading makes it: on Metal, `packing_bound` of a resident weight
@@ -1134,6 +1139,8 @@ fn attention_output_specialization_on(
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
+    // The weight's scale port: absent unless `statics` names it.
+    let scale = static_or_absent(statics, "OS");
     // The CPU form's statics: the gated heads and width.
     if is_cpu(device) {
         return statics
@@ -1141,7 +1148,8 @@ fn attention_output_specialization_on(
             .filter(|(name, _)| matches!(*name, "Q" | "W"))
             .fold(specialization_on(device, statics, mapping), |spec, (name, value)| {
                 spec.with_static(*name, *value as u64)
-            });
+            })
+            .with_static("OS", scale);
     }
     let specialization = scoped_projection_specialization_on(
         device,
@@ -1153,7 +1161,8 @@ fn attention_output_specialization_on(
             gemm: 4,
         },
         true,
-    );
+    )
+    .with_static("OS", scale);
     let specialization = with_absent_bounds(device, specialization, &["OB"]);
     let specialization = with_tall(device, specialization, 7, mapping.tall);
     let specialization = with_gemv_rows(
@@ -1220,13 +1229,23 @@ fn attention_project_specialization_on(
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
-    // The CPU form's one static: the row width its `[M, PT * D]` input
+    // The segments' scale ports: absent unless `statics` names them.
+    let scaled = |specialization: NativeSpecialization| {
+        ["QS", "GS", "KS", "VS"]
+            .into_iter()
+            .fold(specialization, |specialization, name| {
+                specialization.with_static(name, static_or_absent(statics, name))
+            })
+    };
+    // The CPU form's other static: the row width its `[M, PT * D]` input
     // does not name alone.
     if is_cpu(device) {
-        return specialization_on(device, statics, mapping)
-            .with_static("D", row_width(statics) as u64);
+        return scaled(
+            specialization_on(device, statics, mapping)
+                .with_static("D", row_width(statics) as u64),
+        );
     }
-    with_gemv_rows(
+    scaled(with_gemv_rows(
         device,
         segmented_projection_specialization_on(
             device,
@@ -1236,7 +1255,15 @@ fn attention_project_specialization_on(
         ),
         ATTENTION_PROJECT_GEMV_ROWS_LAUNCH,
         mapping,
-    )
+    ))
+}
+
+/// The value `statics` gives the scale port static `name`, else 0 (absent).
+fn static_or_absent(statics: &[(&str, usize)], name: &str) -> u64 {
+    statics
+        .iter()
+        .find(|(static_name, _)| *static_name == name)
+        .map_or(0, |(_, value)| *value as u64)
 }
 
 fn dense_expand_specialization_on(
@@ -2161,6 +2188,10 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                 value_weight: &weights[2].tensor(&device),
                 epsilon: 1e-6,
                 project_mode,
+                query_scale: &no_scale(&device),
+                gate_scale: &no_scale(&device),
+                key_scale: &no_scale(&device),
+                value_scale: &no_scale(&device),
                 query_bound: &absent_bound(&device),
                 gate_bound: &absent_bound(&device),
                 key_bound: &absent_bound(&device),
@@ -2192,6 +2223,7 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                 inject: &no_inject(&device, rows as u64),
                 gated: &act_tensor(&device, act, &[rows, heads, width], &gated),
                 output_weight: &out_weight.tensor(&device),
+                output_scale: &no_scale(&device),
                 output_bound: &absent_bound(&device),
             })
             .unwrap()
@@ -3004,6 +3036,10 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                 value_weight: &project_weights[2].tensor(&device),
                 epsilon: 1e-6,
                 project_mode,
+                query_scale: &no_scale(&device),
+                gate_scale: &no_scale(&device),
+                key_scale: &no_scale(&device),
+                value_scale: &no_scale(&device),
                 query_bound: &absent_bound(&device),
                 gate_bound: &absent_bound(&device),
                 key_bound: &absent_bound(&device),
@@ -3045,6 +3081,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                 inject: &no_inject(&device, rows as u64),
                 gated: &act_tensor(&device, act, &[rows, heads, width], &gated),
                 output_weight: &weight.tensor(&device),
+                output_scale: &no_scale(&device),
                 output_bound: &bound,
             })
             .unwrap()
@@ -3540,6 +3577,10 @@ fn packed_timing() {
                     value_weight: value,
                     epsilon: 1e-6,
                     project_mode: 0,
+                    query_scale: &absent_scale,
+                    gate_scale: &absent_scale,
+                    key_scale: &absent_scale,
+                    value_scale: &absent_scale,
                     query_bound: &absent_scale,
                     gate_bound: &absent_scale,
                     key_bound: &absent_scale,
@@ -3591,6 +3632,7 @@ fn packed_timing() {
             )
             .unwrap();
             let inject = no_inject(&device, hidden.extents()[0]);
+            let unscaled = no_scale(&device);
             let rotation = weights
                 .iter()
                 .map(|weight| attention_output::Args {
@@ -3598,6 +3640,7 @@ fn packed_timing() {
                     inject: &inject,
                     gated: &gated,
                     output_weight: weight,
+                    output_scale: &unscaled,
                     output_bound: &bound,
                 })
                 .collect();
@@ -4462,6 +4505,7 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
                         inject: &no_inject(&device, rows as u64),
                         gated: &act_tensor(&device, act, &[rows, nv, w], gated),
                         output_weight: &out_weight.tensor(&device),
+                        output_scale: &no_scale(&device),
                         output_bound: &absent_bound(&device),
                     })
                     .unwrap()
@@ -4480,7 +4524,8 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
                         floats(&[rows, 0], &[]),
                         activations(act, &[rows, nv, w], &gated),
                         Input::Data(out_weight.oracle()),
-                        // No packing bound.
+                        // No scale, no packing bound.
+                        floats(&[0], &[]),
                         floats(&[0], &[]),
                     ],
                 );
@@ -4649,6 +4694,10 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     value_weight: &weights[2].tensor(&device),
                     epsilon: 1e-6,
                     project_mode,
+                    query_scale: &no_scale(&device),
+                    gate_scale: &no_scale(&device),
+                    key_scale: &no_scale(&device),
+                    value_scale: &no_scale(&device),
                     query_bound: &absent_bound(&device),
                     gate_bound: &absent_bound(&device),
                     key_bound: &absent_bound(&device),
@@ -4707,7 +4756,11 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     Input::Data(weights[2].oracle()),
                     Input::F32(1e-6),
                     Input::I32(0),
-                    // No packing bounds.
+                    // No scales, no packing bounds.
+                    floats(&[0], &[]),
+                    floats(&[0], &[]),
+                    floats(&[0], &[]),
+                    floats(&[0], &[]),
                     floats(&[0], &[]),
                     floats(&[0], &[]),
                     floats(&[0], &[]),
@@ -4797,6 +4850,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                         inject: &no_inject(&device, rows as u64),
                         gated: &act_tensor(&device, act, &[rows, q, w], gated),
                         output_weight: &out_weight.tensor(&device),
+                        output_scale: &no_scale(&device),
                         output_bound: &absent_bound(&device),
                     })
                     .unwrap()
@@ -4834,7 +4888,8 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                             floats(&[rows, 0], &[]),
                             activations(act, &[rows, q, w], &gated),
                             Input::Data(out_weight.oracle()),
-                            // No packing bound.
+                            // No scale, no packing bound.
+                            floats(&[0], &[]),
                             floats(&[0], &[]),
                         ],
                     );
@@ -4855,6 +4910,285 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                         &bound,
                     );
                 }
+            }
+        }
+    }
+}
+
+/// The state-space mixer's projections under their weights' second-level
+/// scales (Nemotron 3.5's NVFP4 `ssm_in` / `ssm_out` `.scale`):
+/// `attention_project`'s query segment alone (QS = 1) and `attention_output`
+/// (OS = 1) multiply their F32 accumulators by the scale before rounding,
+/// against the portable bodies and the host reference at every launch class,
+/// and on Metal in the PACK form too. One test per backend; CUDA's is
+/// `cuda_projection_blocks.rs`'.
+#[test]
+fn cpu_scaled_state_space_projections_match_the_host() {
+    scaled_state_space_projections_on_backend(BackendName::Cpu);
+}
+
+#[test]
+fn metal_scaled_state_space_projections_match_the_host() {
+    scaled_state_space_projections_on_backend(BackendName::Metal);
+}
+
+#[test]
+fn vulkan_scaled_state_space_projections_match_the_host() {
+    scaled_state_space_projections_on_backend(BackendName::Vulkan);
+}
+
+fn scaled_state_space_projections_on_backend(backend: BackendName) {
+    if let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == backend)
+    {
+        scaled_state_space_projections_on(&device);
+    }
+}
+
+fn scaled_state_space_projections_on(device: &Device) {
+    /// A second-level scale that is not a power of two.
+    const SCALE: f32 = 0.412_5;
+    let module = module();
+    let act = Act::Bf16;
+    // A projection row of 320 columns over a 256-wide residual; an output
+    // projection of 4 heads of 64 channels back to it.
+    let (d, columns, heads, width) = (256usize, 320usize, 4usize, 64usize);
+    let k = heads * width;
+    let norm = norm_values(d, 17);
+    let rows_classes = [1usize, 2, 8, 17, 64, 128];
+    let mappings = [MAPPINGS[0], MAPPINGS[2]];
+    let metal = device.backend() == BackendName::Metal;
+    for repr in [Repr::Nvfp4, Repr::Q4k] {
+        let projection = weight(repr, columns, d, 301, 1.0);
+        let output = weight(repr, d, k, 302, 1.0);
+        let project = |hidden: &[f32], rows: usize, mapping: Mapping, pack: Option<Pack>| {
+            let specialization = attention_project_specialization_on(
+                device,
+                &[("D", d), ("Q", columns), ("GR", 0), ("K", 0), ("V", 0), ("QS", 1)],
+                mapping,
+            );
+            let weight = projection.tensor(device);
+            let empty = weight.slice_leading(0, 0).unwrap();
+            let out = attention_project::native_for_device_with(
+                device,
+                attention_project::Elements {
+                    NW: Element::bf16(),
+                    QW: repr.resident(device),
+                    GW: repr.resident(device),
+                    KW: repr.resident(device),
+                    VW: repr.resident(device),
+                    A: act.element(),
+                },
+                &match pack {
+                    Some(pack) => with_pack(specialization, ATTENTION_PROJECT_PACKED_LAUNCH, pack),
+                    None => specialization,
+                },
+            )
+            .unwrap()
+            .call(attention_project::Args {
+                hidden: &f32_tensor(device, &[rows, d], hidden),
+                input_norm: &bf16_norm(device, &norm),
+                query_weight: &weight,
+                gate_weight: &empty,
+                key_weight: &empty,
+                value_weight: &empty,
+                epsilon: 1e-6,
+                project_mode: 0,
+                query_scale: &f32_tensor(device, &[1], &[SCALE]),
+                gate_scale: &no_scale(device),
+                key_scale: &no_scale(device),
+                value_scale: &no_scale(device),
+                query_bound: &absent_bound(device),
+                gate_bound: &absent_bound(device),
+                key_bound: &absent_bound(device),
+                value_bound: &absent_bound(device),
+            })
+            .unwrap();
+            read_act(act, &out.r0)
+        };
+        let output_native =
+            |hidden: &[f32], gated: &[f32], rows: usize, mapping: Mapping, pack: Option<Pack>| {
+                let specialization = attention_output_specialization_on(
+                    device,
+                    &[("D", d), ("Q", heads), ("W", width), ("OS", 1)],
+                    mapping,
+                );
+                let out = attention_output::native_for_device_with(
+                    device,
+                    attention_output::Elements {
+                        OW: repr.resident(device),
+                        A: act.element(),
+                    },
+                    &match pack {
+                        Some(pack) => {
+                            with_pack(specialization, ATTENTION_OUTPUT_PACKED_LAUNCH, pack)
+                        }
+                        None => specialization,
+                    },
+                )
+                .unwrap()
+                .call(attention_output::Args {
+                    hidden: &f32_tensor(device, &[rows, d], hidden),
+                    inject: &no_inject(device, rows as u64),
+                    gated: &act_tensor(device, act, &[rows, heads, width], gated),
+                    output_weight: &output.tensor(device),
+                    output_scale: &f32_tensor(device, &[1], &[SCALE]),
+                    output_bound: &absent_bound(device),
+                })
+                .unwrap()
+                .value;
+                read_f32(&out)
+            };
+        // The scaled accumulators rounded to A, and their bounds.
+        let project_reference = |hidden: &[f32], rows: usize| {
+            let (mut expected, mut bound) = (Vec::new(), Vec::new());
+            for r in 0..rows {
+                let (x, slack) = rms_row(act, &hidden[r * d..(r + 1) * d], &norm, 1e-6);
+                for n in 0..columns {
+                    let (acc, magnitude) = dot(&x, projection.row(n));
+                    expected.push(act.round(SCALE * acc));
+                    bound.push(
+                        rounded_bound(act, SCALE * acc, SCALE * magnitude)
+                            + SCALE * slack_dot(&slack, projection.row(n)),
+                    );
+                }
+            }
+            (expected, bound)
+        };
+        let output_reference = |hidden: &[f32], gated: &[f32], rows: usize| {
+            let (mut expected, mut bound) = (Vec::new(), Vec::new());
+            for r in 0..rows {
+                for n in 0..d {
+                    let (acc, magnitude) = dot(&gated[r * k..(r + 1) * k], output.row(n));
+                    expected.push(hidden[r * d + n] + act.round(SCALE * acc));
+                    bound.push(rounded_bound(act, SCALE * acc, SCALE * magnitude));
+                }
+            }
+            (expected, bound)
+        };
+        let case = |rows: usize| {
+            let mut rng = Rng::new(rows as u64 + 303);
+            let hidden = (0..rows * d)
+                .map(|_| rng.symmetric() * 2.0)
+                .collect::<Vec<_>>();
+            let gated = (0..rows * k)
+                .map(|_| act.round(rng.symmetric()))
+                .collect::<Vec<_>>();
+            (hidden, gated)
+        };
+
+        // The portable bodies scale as the natives do.
+        let rows = 2;
+        let (hidden, gated) = case(rows);
+        let projected = interpret(
+            &module,
+            "attention_project",
+            &[
+                ("NW", registry::dense(DType::BF16)),
+                ("QW", repr.storage()),
+                ("GW", registry::dense(DType::BF16)),
+                ("KW", registry::dense(DType::BF16)),
+                ("VW", registry::dense(DType::BF16)),
+                ("A", registry::dense(DType::BF16)),
+            ],
+            vec![
+                floats(&[rows, d], &hidden),
+                activations(Act::Bf16, &[d], &norm),
+                Input::Data(projection.oracle()),
+                activations(Act::Bf16, &[0, d], &[]),
+                activations(Act::Bf16, &[0, d], &[]),
+                activations(Act::Bf16, &[0, d], &[]),
+                Input::F32(1e-6),
+                Input::I32(0),
+                // The query segment's scale; no other scale or bound.
+                floats(&[1], &[SCALE]),
+                floats(&[0], &[]),
+                floats(&[0], &[]),
+                floats(&[0], &[]),
+                floats(&[0], &[]),
+                floats(&[0], &[]),
+                floats(&[0], &[]),
+                floats(&[0], &[]),
+            ],
+        );
+        let outputted = interpret(
+            &module,
+            "attention_output",
+            &[("OW", repr.storage()), ("A", registry::dense(DType::BF16))],
+            vec![
+                floats(&[rows, d], &hidden),
+                floats(&[rows, 0], &[]),
+                activations(act, &[rows, heads, width], &gated),
+                Input::Data(output.oracle()),
+                floats(&[1], &[SCALE]),
+                // No packing bound.
+                floats(&[0], &[]),
+            ],
+        );
+        let (_, project_bound) = under(rows, || project_reference(&hidden, rows));
+        let (_, output_bound) = under(rows, || output_reference(&hidden, &gated, rows));
+        assert_within(
+            &format!("scaled attention_project portable {repr:?}"),
+            &project(&hidden, rows, MAPPINGS[0], None),
+            &result(&projected, 0),
+            &project_bound,
+        );
+        assert_within(
+            &format!("scaled attention_output portable {repr:?}"),
+            &output_native(&hidden, &gated, rows, MAPPINGS[0], None),
+            &result(&outputted, 0),
+            &output_bound,
+        );
+
+        // Every launch class against the host reference.
+        for rows in rows_classes {
+            let (hidden, gated) = case(rows);
+            let (project_expected, project_bound) =
+                under(rows, || project_reference(&hidden, rows));
+            let (output_expected, output_bound) =
+                under(rows, || output_reference(&hidden, &gated, rows));
+            for mapping in mappings {
+                assert_within(
+                    &format!("scaled attention_project {repr:?} M {rows} {mapping:?}"),
+                    &project(&hidden, rows, mapping, None),
+                    &project_expected,
+                    &project_bound,
+                );
+                assert_within(
+                    &format!("scaled attention_output {repr:?} M {rows} {mapping:?}"),
+                    &output_native(&hidden, &gated, rows, mapping, None),
+                    &output_expected,
+                    &output_bound,
+                );
+            }
+            // The PACK form rounds its operand: within the packed error of the
+            // scaled projection.
+            if metal && rows > 64 {
+                let wide = |values: &[f32]| values.iter().map(|v| f64::from(*v)).collect::<Vec<_>>();
+                let packed = project(&hidden, rows, pack_mapping(), Some(PACK_DEFAULT));
+                let (relative, worst) =
+                    relative_difference(&wide(&project_expected), &wide(&packed));
+                assert!(
+                    relative <= 2e-2 && worst <= 0.2,
+                    "packed scaled attention_project {repr:?} M {rows}: {relative:.2e}, {worst:.2e}"
+                );
+                let projection_only = |values: &[f32]| {
+                    values
+                        .iter()
+                        .zip(&hidden)
+                        .map(|(value, hidden)| f64::from(value - hidden))
+                        .collect::<Vec<_>>()
+                };
+                let packed = output_native(&hidden, &gated, rows, pack_mapping(), Some(PACK_DEFAULT));
+                let (relative, worst) = relative_difference(
+                    &projection_only(&output_expected),
+                    &projection_only(&packed),
+                );
+                assert!(
+                    relative <= 2e-2 && worst <= 0.2,
+                    "packed scaled attention_output {repr:?} M {rows}: {relative:.2e}, {worst:.2e}"
+                );
             }
         }
     }
@@ -5868,6 +6202,7 @@ fn timing_on(device: &Device) {
                         inject: &inject,
                         gated: &gated,
                         output_weight: weight,
+                        output_scale: &no_bound,
                         output_bound: &no_bound,
                     })
                     .collect();
@@ -5956,6 +6291,10 @@ fn timing_on(device: &Device) {
                         value_weight: &set[2],
                         epsilon: 1e-6,
                         project_mode: 0,
+                        query_scale: &no_bound,
+                        gate_scale: &no_bound,
+                        key_scale: &no_bound,
+                        value_scale: &no_bound,
                         query_bound: &no_bound,
                         gate_bound: &no_bound,
                         key_bound: &no_bound,
@@ -6016,6 +6355,7 @@ fn timing_on(device: &Device) {
                         inject: &inject,
                         gated: &gated,
                         output_weight: weight,
+                        output_scale: &no_bound,
                         output_bound: &no_bound,
                     })
                     .collect();
@@ -6625,6 +6965,10 @@ fn metal_absent_query_projection_preserves_key_value() {
                     value_weight: &value,
                     epsilon: 1e-6,
                     project_mode: if absent { 0 } else { 1 },
+                    query_scale: &no_scale(&device),
+                    gate_scale: &no_scale(&device),
+                    key_scale: &no_scale(&device),
+                    value_scale: &no_scale(&device),
                     query_bound: &absent_bound(&device),
                     gate_bound: &absent_bound(&device),
                     key_bound: &absent_bound(&device),
@@ -6698,6 +7042,7 @@ fn metal_attention_output_matrix_matches_host() {
                             inject: &no_inject(&device, rows as u64),
                             gated: &act_tensor(&device, act, &[rows, q, w], &gated),
                             output_weight: &weights.tensor(&device),
+                            output_scale: &no_scale(&device),
                             output_bound: &absent_bound(&device),
                         })
                         .unwrap()

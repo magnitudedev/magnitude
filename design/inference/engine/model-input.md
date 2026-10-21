@@ -34,6 +34,13 @@ text resumes beyond its largest coordinate. Its SigLIP tower uses learned fracti
 position buckets and full attention without rotary; per-patch normalization precedes
 2×2 concatenation and a second normalization over each concatenated cell. Intra-tower
 16× compression is a different graph and is rejected rather than executed as 4×.
+The Nemotron Omni (`nemotron_omni`) processor resizes each image to one tile of between the
+projector's minimum and maximum patch counts, as the released processor computes it, and the
+Nemotron-H adapter expands each image between `<img>` and `</img>` to one `<image>` row per 2×2
+cell, every row at its absolute position. Its C-RADIO tower samples the learned square position
+grid as the cropped position embedding (bilinear, half-pixel, to a square of the grid's longer
+side, then the grid's top-left rows and columns); its class and register rows are a projector
+fact, so the adapter computes positions for patch rows only.
 The adapter is configured with tokenizer-derived family marker identities before it prepares a
 request; the model definition and media alone cannot identify those tokens.
 For text-only input, the same closed contract records the family-supplied coordinates directly;
@@ -121,6 +128,25 @@ architecture alone does not establish a drafter transform. An optional `output.w
 (and its encoding-required scale) declares an owned projection over the full target
 vocabulary and hidden width. Absence shares the target projection; equal dimensions
 do not establish training compatibility between those projections.
+
+How a drafter's layers compute and how its proposals are read out are independent
+draft facts. A convolved backbone (block convolutions: taps, group width and every
+layer's coefficient projection and base) wraps each draft sublayer; it is declared by
+its weights and keys, never inferred from the readout method, and DFlash2's selector
+and LiLiCorr's corrector both read through it. Per-head attention sinks are a general
+attention capability: a layer's `attn_sinks` vector adds one logit per query head to
+its softmax denominator only, under every history codec. Proposal readout is exactly
+one of DFlash (the proposing rows' own selection), DSpark (Markov chain), DFlash2
+(candidate selector) or LiLiCorr (candidate corrector); nonzero selector keys without
+their weights, or two readouts, are refused. A LiLiCorr corrector always scores every
+mask slot of the whole block: each mask row's top-k candidates become nodes (token
+embedding, the mask row's output-normed pass row, the candidate's softmax features,
+slot and rank embeddings), its layers attend every node of the block with a learned
+per-head bias, and the anchor state is the fused context feature of the row that
+selected the anchor. Proposals are the greedy walk of the factored candidate lattice;
+the corrector's positive logit scale never changes a selection. The candidates' token
+table is read by rows the corrector selects, through a streamed table's directory, and
+the rows it missed are brought for later rounds ([residency](residency.md)).
 
 Prediction heads declare their residual form and the conditioning they chain: either
 normalized readout features or raw residual streams before the final readout mix.

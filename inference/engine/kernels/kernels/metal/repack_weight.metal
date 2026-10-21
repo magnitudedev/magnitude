@@ -20,6 +20,10 @@
 #error "repack_weight writes packet, rows16, mma16 or rows32 storage"
 #endif
 
+#if defined(SEISMIC_ELEMENT_U_PLANE_RECORDS)
+#error "repack_weight does not write mma16 records (CUDA's iq2xxs storage)"
+#endif
+
 #if defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q3_K) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q6K)
 #define REPACK_Q3K 1
 #define REPACK_CODE_BITS 6u
@@ -98,10 +102,11 @@
 #elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_XXS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2XXS)
 // block_iq2_xxs: d (f16) | eight u32 pairs, one per 32 values: four 8-bit
 // grid indices of eight values, then four 7-bit sign groups and the 4-bit
-// scale. The resident factor is d / 8.
+// scale. The resident factor is d itself (its 1/8 is the recipe's); row
+// layouts carry the scale in the entries (bit j of it in entry j's
+// SEISMIC_ELEMENT_U_PLANE_GRIDS_CARRIED_BIT).
 #define REPACK_GRID 1
 #define REPACK_IQ2XXS 1
-#define REPACK_GRID_FACTOR 0.125f
 #define REPACK_CODE_BITS 2u
 #define REPACK_GRID_AUX(b) (6u + 8u * (b))
 #else
@@ -197,7 +202,11 @@ inline uint grid_entry(device const uchar *in, uint e) {
     return uint(in[2 + 8 * block + 2 * group]) | (uint(in[3 + 8 * block + 2 * group]) << 8) |
            (((signs >> (7 * group)) & 127u) << 16);
 #elif defined(REPACK_IQ2XXS)
-    return uint(in[2 + 8 * block + group]) | (((signs >> (7 * group)) & 127u) << 8);
+    uint entry = uint(in[2 + 8 * block + group]) | (((signs >> (7 * group)) & 127u) << 8);
+#if defined(SEISMIC_ELEMENT_U_PLANE_GRIDS_CARRIED_BIT)
+    entry |= ((signs >> (28u + group)) & 1u) << SEISMIC_ELEMENT_U_PLANE_GRIDS_CARRIED_BIT;
+#endif
+    return entry;
 #else
     return uint(in[2 + 2 * e]) | (uint(in[3 + 2 * e]) << 8);
 #endif
@@ -331,7 +340,7 @@ inline void write_supers(device const uchar *in, device uchar *out) {
     reinterpret_cast<device ushort *>(out)[0] = ushort(uint(in[108]) | (uint(in[109]) << 8));
 #elif defined(REPACK_IQ3S)
     reinterpret_cast<device ushort *>(out)[0] = ushort(uint(in[0]) | (uint(in[1]) << 8));
-#elif defined(REPACK_Q8)
+#elif defined(REPACK_Q8) || defined(REPACK_IQ2XXS)
     reinterpret_cast<device ushort *>(out)[0] = ushort(uint(in[0]) | (uint(in[1]) << 8));
 #elif defined(REPACK_GRID)
     // d widened and scaled by a power of two, exactly.

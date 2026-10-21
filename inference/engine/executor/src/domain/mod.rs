@@ -11,14 +11,14 @@ use crate::platform::{DomainReading, DomainRole};
 use crate::programs::ProgramSubmission;
 use crate::programs::graph::readout;
 use crate::{
-    AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader,
-    ExecutionPlan, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GraphOutputTensor,
-    GroupKey, HeadConditioning, HeadLaunchInputs, ImageRef, NativeGraphOutputLease,
-    NativeGraphWorkspaceLease, Operation, Outcome, PoolClass, Priming, ProgramIdentity, RequestId,
-    ResidentHead, ResidentVision, ResourceDomain, ResourceDomainId, ResourceKind, RowResult,
-    SelectSpec, Selected, StateLaunchInputs, StateWork, TargetLaunchInputs, TargetTokens, TokenId,
-    ValidatedHeadLaunch, ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch,
-    VisionLaunchInputs, WorkKind,
+    AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader, ExecutionPlan,
+    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GroupKey, HeadConditioning,
+    HeadLaunchInputs, ImageRef, NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation,
+    Outcome, PoolClass, Priming, ProgramIdentity, RequestId, ResidentHead, ResidentVision,
+    ResourceDomain, ResourceDomainId, ResourceKind, RowResult, SelectSpec, Selected,
+    StateLaunchInputs, StateWork, TargetLaunchInputs, TargetTokens, TokenId, ValidatedHeadLaunch,
+    ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchInputs,
+    WorkKind,
 };
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::{

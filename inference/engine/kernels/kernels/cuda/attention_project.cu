@@ -11,7 +11,12 @@ SEISMIC_PROGRAMMATIC_DEPENDENCY
 
 using Pro = projection::Input<ELEMENT_OF(SEISMIC_INPUT_NORM), projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
 using Source = projection::GemvSource<Pro>;
-using Out = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
+// A segment's result, after its weight's second-level scale where any
+// segment has a scale port (an absent port's factor is 1).
+using Store = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
+using Scaling = projection::scaling<(SEISMIC_DIM_QS != 0 || SEISMIC_DIM_GS != 0 || SEISMIC_DIM_KS != 0 ||
+                                     SEISMIC_DIM_VS != 0)>;
+using Out = Scaling::type<Store>;
 
 #define PROLOGUE                                                                                          \
     Pro {                                                                                                 \
@@ -40,12 +45,19 @@ struct Segments {
             KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_KEY_WEIGHT)),                                          \
             KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_WEIGHT)),                                        \
         {                                                                                                 \
-            Out{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, 0},                       \
-                Out{SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER), SEISMIC_RESULT_1_STRIDE_0, 0},                   \
-                Out{SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER), SEISMIC_RESULT_2_STRIDE_0, 0},                   \
-                Out{SEISMIC_PTR(SEISMIC_RESULT_3_BUFFER), SEISMIC_RESULT_3_STRIDE_0, 0},                   \
+            SEGMENT_OUT(SEISMIC_RESULT_0_BUFFER, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_BUFFER_QUERY_SCALE,     \
+                        SEISMIC_DIM_QS),                                                                  \
+                SEGMENT_OUT(SEISMIC_RESULT_1_BUFFER, SEISMIC_RESULT_1_STRIDE_0, SEISMIC_BUFFER_GATE_SCALE, \
+                            SEISMIC_DIM_GS),                                                              \
+                SEGMENT_OUT(SEISMIC_RESULT_2_BUFFER, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_BUFFER_KEY_SCALE,  \
+                            SEISMIC_DIM_KS),                                                              \
+                SEGMENT_OUT(SEISMIC_RESULT_3_BUFFER, SEISMIC_RESULT_3_STRIDE_0, SEISMIC_BUFFER_VALUE_SCALE, \
+                            SEISMIC_DIM_VS),                                                              \
         }                                                                                                 \
     }
+#define SEGMENT_OUT(RESULT, STRIDE, SCALE, EXTENT)                                                        \
+    Scaling::wrap(Store{SEISMIC_PTR(RESULT), STRIDE, 0}, projection::scale_factor(SEISMIC_PTR(SCALE), EXTENT, 0, 0), \
+                  1.0f)
 
 __device__ __forceinline__ void project_zero(const Out &out, unsigned M, unsigned long long columns,
                                               unsigned row_start, unsigned row_count,
@@ -66,7 +78,10 @@ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row
                                              unsigned M, unsigned long long D, const Segments &s,
                                              unsigned project_mode) {
     using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
-    __shared__ projection::GemvShared<Shape, Source::type> shared;
+    __shared__ projection::GemvShared<
+        Shape, Source::type,
+        projection::gemv_staging<Shape, packets::W0, packets::W1, packets::W2, packets::W3>(SEISMIC_DIM_D / 64)>
+        shared;
     const unsigned long long kblocks = D / 64;
     unsigned long long group = Shape::tile_group();
     const unsigned long long groups[4] = {

@@ -745,7 +745,10 @@ The same logical interface exposes the quantization group, interpreted code
 bounds, bias presence, and coefficient factorization used by a checked fold.
 For a hierarchical coefficient, `scale_factor` and `bias_factor` are the
 existing converted super-coefficient temporaries, before coefficient codes and
-bias sign. The i32 `scale_code` and `bias_code` roles select the owned interpreted coefficient-code temporaries; direct coefficients use one (absent bias uses zero), and neither role requires an integer weight code. `coefficient_code_max` comes from that coefficient's owned integer
+bias sign. A representation may scale its coefficients by a registered exact
+power of two after that product (`iq2xxs` stores its f16 block scale d and
+decodes `d * code * 2^-3`); the factor role stays the stored factor, so a fold
+over it applies the representation's exponent. The i32 `scale_code` and `bias_code` roles select the owned interpreted coefficient-code temporaries; direct coefficients use one (absent bias uses zero), and neither role requires an integer weight code. `coefficient_code_max` comes from that coefficient's owned integer
 interpretation. Direct coefficients expose their own value with multiplier one.
 These roles describe the registered representation, not PACK availability or a
 numerical permission. Their constant results require no physical field read.
