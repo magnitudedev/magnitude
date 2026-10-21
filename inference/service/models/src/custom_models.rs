@@ -2793,6 +2793,38 @@ mod tests {
         assert!(fs::symlink_metadata(&blob).unwrap().file_type().is_symlink());
     }
 
+    /// A configuration whose rescan failed is not applied, so sending it again rescans rather than
+    /// finding nothing changed while its locations were never scanned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_configuration_whose_rescan_failed_rescans_when_sent_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("model.gguf"), "model");
+        let hub = fixture.store.join("hub");
+        fs::create_dir_all(&hub).unwrap();
+        fs::set_permissions(&hub, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&hub).is_ok() {
+            // Running as a user that reads everything (root): the rescan can't be made to fail.
+            fs::set_permissions(&hub, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let configuration = roots(vec![root(ModelRootKind::Folder, &folder)]);
+
+        assert!(
+            fixture
+                .local
+                .configure(configuration.clone())
+                .await
+                .is_err()
+        );
+        fs::set_permissions(&hub, fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.local.configure(configuration).await.unwrap();
+
+        assert_eq!(fixture.local.list_local().await.unwrap().models.len(), 1);
+    }
+
     /// A model Ollama 0.40 stores for its MLX runner, one safetensors blob per tensor, can't be
     /// read in place, so it is listed under "can't run" by its Ollama name with the format as its
     /// reason, beside the store's GGUF pulls.

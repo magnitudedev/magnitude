@@ -826,30 +826,41 @@ impl ManagedModelStore {
     }
 
     /// Applies a whole configuration and rescans when it differs from the current one. Applying
-    /// the same configuration again does nothing.
+    /// the same configuration again does nothing. A configuration whose rescan fails is not
+    /// applied, so sending it again rescans again.
     pub(crate) async fn configure_local_models(
         &self,
         configuration: LocalModelsConfiguration,
     ) -> Result<bool, InventoryError> {
         validate_local_models(&configuration)?;
-        let (changed, roots) = {
+        let (previous, roots) = {
             let mut current = self.local_models.write().map_err(|_| {
                 InventoryError::Internal("local-models configuration lock poisoned".to_owned())
             })?;
-            let changed = *current != configuration;
+            if *current == configuration {
+                return Ok(false);
+            }
             let roots = configuration
                 .roots
                 .iter()
                 .filter(|root| !current.roots.contains(root))
                 .map(|root| canonical_or_self(&root.path))
                 .collect::<BTreeSet<_>>();
-            *current = configuration;
-            (changed, roots)
+            (
+                std::mem::replace(&mut *current, configuration.clone()),
+                roots,
+            )
         };
-        if changed {
-            self.rescan_model_roots(roots).await?;
+        if let Err(error) = self.rescan_model_roots(roots).await {
+            let mut current = self.local_models.write().map_err(|_| {
+                InventoryError::Internal("local-models configuration lock poisoned".to_owned())
+            })?;
+            if *current == configuration {
+                *current = previous;
+            }
+            return Err(error);
         }
-        Ok(changed)
+        Ok(true)
     }
 
     async fn reconcile_model_inventory(
