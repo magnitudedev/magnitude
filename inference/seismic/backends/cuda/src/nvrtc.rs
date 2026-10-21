@@ -310,11 +310,36 @@ impl std::fmt::Display for Formation {
 /// MMA on sm_120 and sm_121). The CUBIN runs on that architecture alone, as
 /// every formation's does.
 fn target(architecture: u32) -> String {
-    if architecture >= 90 {
+    if architecture_specific(architecture) {
         format!("sm_{architecture}a")
     } else {
         format!("sm_{architecture}")
     }
+}
+
+/// Whether the target of `sm_<architecture>` is its architecture-specific
+/// feature set ([`target`]).
+fn architecture_specific(architecture: u32) -> bool {
+    architecture >= 90
+}
+
+/// The macros the device compilation of `sm_<architecture>`'s target
+/// predefines, with their values: `__CUDA_ARCH__`, and for an
+/// architecture-specific target also `__CUDA_ARCH_SPECIFIC__` and
+/// `__CUDA_ARCH_FAMILY_SPECIFIC__`, each the same value.
+pub const ARCHITECTURE_MACROS: [&str; 3] = [
+    "__CUDA_ARCH__",
+    "__CUDA_ARCH_SPECIFIC__",
+    "__CUDA_ARCH_FAMILY_SPECIFIC__",
+];
+
+/// [`ARCHITECTURE_MACROS`] as `sm_<architecture>`'s target defines them.
+pub fn architecture_macros(architecture: u32) -> Vec<(&'static str, u32)> {
+    let defined = if architecture_specific(architecture) { 3 } else { 1 };
+    ARCHITECTURE_MACROS[..defined]
+        .iter()
+        .map(|&name| (name, architecture * 10))
+        .collect()
 }
 
 /// A CUBIN and the formation that produced it.
@@ -513,6 +538,24 @@ mod tests {
 
     fn installation_root() -> PathBuf {
         std::env::temp_dir().join("seismic-nvrtc-installation")
+    }
+
+    /// An architecture-specific target also predefines the specific and
+    /// family macros, each `__CUDA_ARCH__`'s value (as `nvcc -arch=sm_121a`
+    /// compiles device code); an earlier architecture's only `__CUDA_ARCH__`.
+    #[test]
+    fn the_architecture_macros_are_those_of_the_formation_target() {
+        assert_eq!(target(86), "sm_86");
+        assert_eq!(architecture_macros(86), [("__CUDA_ARCH__", 860)]);
+        assert_eq!(target(121), "sm_121a");
+        assert_eq!(
+            architecture_macros(121),
+            [
+                ("__CUDA_ARCH__", 1210),
+                ("__CUDA_ARCH_SPECIFIC__", 1210),
+                ("__CUDA_ARCH_FAMILY_SPECIFIC__", 1210),
+            ]
+        );
     }
 
     #[test]

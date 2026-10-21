@@ -38,8 +38,9 @@
 //!
 //! Vulkan skeletons are preprocessed by glslang, the toolchain itself; CUDA
 //! and Metal skeletons by `clang -E`. Their conditions may read no
-//! toolchain-predefined macro except `__CUDA_ARCH__`, which the CUDA skeleton
-//! defines for the configuration's architecture.
+//! toolchain-predefined macro except the architecture macros, which the CUDA
+//! skeleton defines as the configuration's formation target does
+//! (`seismic_cuda::nvrtc::architecture_macros`).
 //!
 //! The search decides what to form; the caller's [`Forming`] forms it, each
 //! [`Formation`] identified by everything it reads.
@@ -1033,7 +1034,10 @@ impl<'m> Subject<'m> {
     fn skeletons(&self, row: &Row) -> Vec<Skeleton> {
         let preamble = match row.configuration {
             Configuration::Cuda { architecture } => {
-                format!("#define __CUDA_ARCH__ {}\n", architecture * 10)
+                seismic_cuda::nvrtc::architecture_macros(architecture)
+                    .into_iter()
+                    .map(|(name, value)| format!("#define {name} {value}\n"))
+                    .collect()
             }
             Configuration::Vulkan(_) | Configuration::Metal { .. } => String::new(),
         };
@@ -1601,7 +1605,7 @@ fn evaluate_chunk(subject: &Subject<'_>, rows: &[Row]) -> Result<Evaluation, Cov
         for text in &texts {
             let unknown = predefined(text)
                 .into_iter()
-                .filter(|name| name != "__CUDA_ARCH__")
+                .filter(|name| !seismic_cuda::nvrtc::ARCHITECTURE_MACROS.contains(&name.as_str()))
                 .collect::<Vec<_>>();
             if !unknown.is_empty() {
                 return Err(CoverageError::Skeleton(format!(
