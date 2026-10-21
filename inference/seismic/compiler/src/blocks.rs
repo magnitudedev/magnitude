@@ -69,11 +69,15 @@ impl FreeRanges {
 }
 
 /// The size of a new block for an allocation of `bytes`: double the largest
-/// block (64 MiB first) up to `cap`, in whole `granularity` units; an
-/// allocation larger than that gets a block of its own size rounded up to
-/// the granularity. When `room` is given and the doubled block does not fit
-/// it, the block is the allocation's own size: a device near its limit holds
-/// no free block space it was not asked for, so its usage stays with its
+/// block (64 MiB first) up to `cap`, in whole `granularity` units. An
+/// allocation of more than half that block gets a block of its own size
+/// rounded up to the granularity: a block shares its space so many smaller
+/// allocations cost one driver allocation, and what such an allocation
+/// would leave free fits no allocation its size, so a run of them (a
+/// model's expert stacks) would hold most of a block each in tails nothing
+/// takes. When `room` is given and the doubled block does not fit it, the
+/// block is the allocation's own size: a device near its limit holds no
+/// free block space it was not asked for, so its usage stays with its
 /// claims and clear of the planning reserve. An allocation that needs more
 /// than the room is a capacity shortfall.
 pub fn block_bytes(
@@ -84,10 +88,10 @@ pub fn block_bytes(
     granularity: u64,
 ) -> Result<u64, ExecutionError> {
     let needed = bytes.next_multiple_of(granularity);
-    let size = largest
+    let doubled = largest
         .map_or(FIRST_BLOCK_BYTES, |largest| largest * 2)
-        .min(cap)
-        .max(needed);
+        .min(cap);
+    let size = if needed > doubled / 2 { needed } else { doubled };
     match room {
         Some(room) if needed > room => Err(ExecutionError::AllocationCapacity {
             required: needed.into(),
@@ -156,5 +160,26 @@ mod tests {
             block_bytes(Some(512 * MIB), cap, 401 * MIB, Some(400 * MIB), g),
             Err(ExecutionError::AllocationCapacity { available, .. }) if available == 400 * MIB
         ));
+    }
+
+    /// An allocation of more than half the block it would open takes a
+    /// block of its own size: its tail would fit nothing its size. Half or
+    /// less shares the doubled block.
+    #[test]
+    fn an_allocation_beyond_half_a_new_block_takes_its_own_size() {
+        let cap = 1024 * MIB;
+        let g = 2 * MIB;
+        assert_eq!(
+            block_bytes(Some(512 * MIB), cap, 756 * MIB + 1, None, g).unwrap(),
+            758 * MIB
+        );
+        assert_eq!(
+            block_bytes(Some(512 * MIB), cap, 512 * MIB, None, g).unwrap(),
+            cap
+        );
+        assert_eq!(
+            block_bytes(None, cap, 40 * MIB, None, g).unwrap(),
+            40 * MIB
+        );
     }
 }
