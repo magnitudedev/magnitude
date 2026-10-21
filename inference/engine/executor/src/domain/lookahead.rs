@@ -569,8 +569,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
 impl<F: ProgramFamily> StateBindings<F> {
     /// Record the selections of a finished flight for the lookahead it feeds.
-    /// The predecessor finished at `completed`: the queued step's selections
-    /// are known, and the device runs it from then on.
+    /// The predecessor's service ended at `completed`, its results read: the
+    /// queued step's selections are known, and its service runs from then on.
     pub(super) fn predecessor_selected(
         &mut self,
         flight: u64,

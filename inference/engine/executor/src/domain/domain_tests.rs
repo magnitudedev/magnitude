@@ -669,6 +669,40 @@ fn a_launch_that_discards_its_requests_lookahead_is_charged_the_wait() {
     );
 }
 
+/// A queued step's service starts where its predecessor's ends, once the
+/// predecessor's results are read: pipelined flights charge the time they
+/// overlap once, so a chain's durations add up to no more than its span.
+#[test]
+fn a_queued_step_is_charged_from_where_its_predecessor_ends() {
+    let Some((mut domain, mut bindings)) = fixture_with(None, true, true) else {
+        return;
+    };
+    let request = RequestId(73);
+    open(&mut domain, &mut bindings, request);
+    domain.plan_successors(vec![prefill(request, 1)]);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
+    let began = flight.work.runnable;
+    let (first, bindings) = finish_one(&mut domain, flight);
+    let first_duration = first.physical_duration();
+    assert!(bindings.lookahead.is_some(), "the next chunk is queued");
+    domain
+        .reconcile(first, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 1)]);
+    assert_eq!(
+        flight.work.runnable,
+        began + first_duration,
+        "the claimed step starts where its predecessor ends"
+    );
+    let (second, _) = finish_one(&mut domain, flight);
+    let span = began.elapsed();
+    assert!(
+        first_duration + second.physical_duration() <= span,
+        "{first_duration:?} + {:?} exceeds the chain's span {span:?}",
+        second.physical_duration()
+    );
+}
+
 /// Growth changes bindings: every entry that can grow resolves a queued
 /// lookahead first, then commits the slab.
 #[test]

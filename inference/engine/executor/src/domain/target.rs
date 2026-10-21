@@ -544,7 +544,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         let finish_started = Instant::now();
-        let physical_duration = flight.runnable.elapsed();
+        let physical_duration = finish_started.saturating_duration_since(flight.runnable);
         if std::env::var_os("MAGNITUDE_TRACE_FLIGHTS").is_some() {
             eprintln!(
                 "flight target duration_ms={:.3} requests={:?}",
@@ -593,7 +593,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.selection_read = Some(Instant::now());
             decode_selected(&bytes)?
         };
-        bindings.predecessor_selected(flight.id, &selected, finish_started);
         let mut physical = vec![RowResult::default(); batch.actual_rows()];
         for (projected_index, &output_index) in output
             .as_ref()
@@ -751,13 +750,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 "a drafter entry's chunk is absent from its flight",
             ));
         }
+        let finished = Instant::now();
         let timing = TargetHostTiming {
             launch: commits.first.saturating_duration_since(flight.started),
             encode: commits.last.saturating_duration_since(commits.first),
             selection_to_commit: flight
                 .previous_selection
                 .map(|read| commits.first.saturating_duration_since(read)),
-            finish: finish_started.elapsed(),
+            finish: finished.saturating_duration_since(finish_started),
         };
         if self.trace_host_steps {
             eprintln!(
@@ -776,6 +776,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         for item in &mut pending {
             item.physical_duration += timing.finish;
         }
+        // The queued step's service starts where this flight's ends, so the
+        // finish is charged once: a backend whose reads queue behind the
+        // queued step waits in it for that step's device work.
+        bindings.predecessor_selected(flight.id, &selected, finished);
         self.target_timing = Some(timing);
         self.begin_host_turn(pending.iter().map(|item| item.request));
         Ok(pending)
