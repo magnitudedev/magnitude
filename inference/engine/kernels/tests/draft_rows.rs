@@ -98,12 +98,14 @@ impl TableForm {
 }
 
 /// A `[rows, columns]` embedding table of `form` with values of magnitude
-/// about `scale`, in the device's resident form (a GGUF table through the
-/// device repack, as loading places it), and its logical values (the host
-/// reference decode of the registry's conversion).
+/// about `scale`, in `layout` (a GGUF table through the device repack, as
+/// loading places it: the resident layout, or a streamed table's `rows16`),
+/// and its logical values (the host reference decode of the registry's
+/// conversion).
 fn table_weight(
     device: &Device,
     form: TableForm,
+    layout: Layout,
     rows: usize,
     columns: usize,
     scale: f32,
@@ -153,7 +155,7 @@ fn table_weight(
         device,
         repack_weight::Elements {
             E: external,
-            U: Element::stored(resident, resident_layout(device)).unwrap(),
+            U: Element::stored(resident, layout).unwrap(),
         },
         &repack_weight::native_implementation(device)
             .unwrap()
@@ -639,7 +641,8 @@ fn draft_rows_preserve_distinct_f32_streams() {
 
 /// Every table form at the widths of real draft heads (Qwen3.5 0.8B: 1024,
 /// Gemma 4 E2B: 1536): decode rows and a prompt class, tokens spread over a
-/// table whose rows are not a whole number of any tile.
+/// table whose rows are not a whole number of any tile, held whole (the
+/// resident layout) and streamed (`rows16` slots).
 #[test]
 fn draft_rows_match_the_host_model_over_every_table_form() {
     let catalog = seismic::Devices::discover(&[]).unwrap();
@@ -652,10 +655,14 @@ fn draft_rows_match_the_host_model_over_every_table_form() {
         let Ok(device) = catalog.open_backend(backend) else {
             continue;
         };
-        for form in TableForm::ALL {
-            for width in [1024, 1536] {
-                for rows in [1, 3, 17] {
-                    draft_rows_match_with_table(&device, form, width, 37, rows);
+        let mut layouts = vec![resident_layout(&device), Layout::Rows16];
+        layouts.dedup();
+        for layout in layouts {
+            for form in TableForm::ALL {
+                for width in [1024, 1536] {
+                    for rows in [1, 3, 17] {
+                        draft_rows_match_with_table(&device, form, layout, width, 37, rows);
+                    }
                 }
             }
         }
@@ -665,6 +672,7 @@ fn draft_rows_match_the_host_model_over_every_table_form() {
 fn draft_rows_match_with_table(
     device: &Device,
     form: TableForm,
+    layout: Layout,
     width: usize,
     vocabulary: usize,
     rows: usize,
@@ -683,7 +691,8 @@ fn draft_rows_match_with_table(
         statics = statics.with_param("INT8", 0);
     }
     let mut random = Random(width as u64 * 131 + rows as u64 * 7 + form as u64);
-    let (table, table_values) = table_weight(device, form, vocabulary, width, 1.0, &mut random);
+    let (table, table_values) =
+        table_weight(device, form, layout, vocabulary, width, 1.0, &mut random);
     let kernel = draft_rows::native_for_device_with(
         device,
         draft_rows::Elements {
@@ -760,7 +769,7 @@ fn draft_rows_match_with_table(
         .collect::<Vec<_>>();
     assert!(
         failures.is_empty(),
-        "{:?} table {form:?} width {width} rows {rows}: {} of {} outside tolerance; first {:?}",
+        "{:?} table {form:?} in {layout:?} width {width} rows {rows}: {} of {} outside tolerance; first {:?}",
         device.backend(),
         failures.len(),
         expected.len(),

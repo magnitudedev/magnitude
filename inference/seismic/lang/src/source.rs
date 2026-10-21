@@ -48,6 +48,10 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
         include_str!("../native-library/cuda/grids.cuh"),
     ),
     (
+        "rows16.cuh",
+        include_str!("../native-library/cuda/rows16.cuh"),
+    ),
+    (
         "element.glsl",
         include_str!("../native-library/vulkan/element.glsl"),
     ),

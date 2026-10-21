@@ -1225,6 +1225,64 @@ fn cuda_embedding_rows_decode_table_rows() {
     }
 }
 
+/// A streamed table's rows16 slots gather every row exactly as the table's
+/// mma16 rows held whole do: every value, and with `normalize` every row's
+/// RMS inverse, bit for bit.
+#[test]
+fn cuda_embedding_rows_of_rows16_slots_equal_the_mma16_table() {
+    let Some(device) = cuda() else { return };
+    let mut rng = Rng(9);
+    let (v, d) = (40, 512);
+    let shape = [v as u64, d as u64];
+    let tokens_values = [0, 39, 17, 16, 15, 3, 8];
+    let rows = tokens_values
+        .iter()
+        .flat_map(|token| [*token, 0])
+        .collect::<Vec<_>>();
+    let tokens = i32_tensor(&device, &[tokens_values.len() as u64, 2], &rows);
+    let direct = i32_tensor(&device, &[0, 1], &[]);
+    for format in Format::ALL {
+        let mut external = Vec::new();
+        for _ in 0..v * d / format.block_values() {
+            external.extend(format.block(&mut rng));
+        }
+        let source = Element::named(format.external()).unwrap();
+        let read = |layout: Layout, normalize: i32| {
+            let element = Element::stored(format.representation(), layout).unwrap();
+            let bytes = element
+                .repack_host(source, &shape, &external)
+                .expect("registered GGUF conversion");
+            let table = Tensor::from_host(&device, element, &shape, &bytes).unwrap();
+            let out = embedding_rows::native_for_device_with(
+                &device,
+                embedding_rows::Elements {
+                    EW: element,
+                    A: Element::bf16(),
+                },
+                &NativeSpecialization::new().with_static("D", d as u64),
+            )
+            .unwrap()
+            .call(embedding_rows::Args {
+                table: &table,
+                tokens: &tokens,
+                directory: &direct,
+                scale: 0.75,
+                normalize,
+                epsilon: 1e-6,
+            })
+            .unwrap();
+            (out.r0.read_to_host().unwrap(), out.r1.read_to_host().unwrap())
+        };
+        for normalize in [0, 1] {
+            assert_eq!(
+                read(Layout::Rows16, normalize),
+                read(Layout::Mma16, normalize),
+                "{format:?} normalize {normalize}"
+            );
+        }
+    }
+}
+
 /// A read through a directory reads each selected row's slot (row 0 for a
 /// row without one and for a failed selection), exactly as a direct read of
 /// that slot does (`projection.rs` covers the rows16 backends).

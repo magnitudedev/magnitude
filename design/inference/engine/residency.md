@@ -117,8 +117,7 @@ the whole table's bit for bit.
   - another role of its component reads the same stored tensor (a tied output projection reads
     every row);
   - it has no more than 16,384 rows;
-  - its rows are not whole tiles of the backend's row-gathering layout that lays out the fewest
-    rows together;
+  - its rows are not whole tiles of `rows16`;
   - its rows do not reach the device as stored (the host prepares them, or a second-level scale
     accompanies them).
 
@@ -126,9 +125,11 @@ the whole table's bit for bit.
 - **A streamed device table** is one resident weight: its slots, a directory and staging for the
   rows one step brings, all charged to the weight. Its plan's shape is its slots'. Every program
   that reads the table (the target, an executed drafter, a head) shares it through the residency
-  cache. An imported table has slots for 16,384 rows; a row reaches a slot the first time a step
-  names it, read from the artifact and converted by the weight's own import entry, queued ahead of
-  that step.
+  cache. An imported table has slots for 16,384 rows in `rows16`, one row to a slot on every
+  backend (every native backend's gathers read `rows16` besides its resident layout), so the
+  slots hold 16,384 distinct rows whatever the resident layout's tiles; a row reaches a slot the
+  first time a step names it, read from the artifact and converted by the weight's own import
+  entry, queued ahead of that step.
 - **The directory's form** is the plan's, from the table's rows and slots alone: dense (`[rows, 1]`,
   every row's slot or −1) when the rows are at most 16 times the slots, else hashed (`[buckets, 2]`
   of (row, slot), buckets the least power of two at least twice the slots, murmur3 `fmix32` of the
@@ -181,7 +182,8 @@ the whole table's bit for bit.
   never one the current step names. A directory change that follows a queued read of selected rows
   waits for the fill it belongs to.
 - **Rows at load.** Before readiness the slots are filled, most valuable first: the rows steps
-  named when the table was last served, then the table's first rows. Load waits for their
+  named when the table was last served, then the table's first rows. Replacement turns from the
+  last slot toward the first, so it reaches the least valuable of them first. Load waits for their
   conversion. The rows steps name are kept in a file beside the kernel cache after the table's
   first 256 steps and when the engine releases it. A stored table is seeded with the kept rows
   only: n-gram rows have no order of value without them.

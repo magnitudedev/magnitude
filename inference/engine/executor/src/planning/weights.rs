@@ -2057,14 +2057,13 @@ struct ResidentForm {
 }
 
 /// The layout of a streamed table's slots where whole resident weights use
-/// `layout`: the layout the backend's row-gathering kernels read that lays
-/// out the fewest rows together, so that a slot holds as few rows beyond the
-/// one a step names as the backend allows. Metal's gather reads `rows16`,
-/// one row to a tile, besides its `rows32`.
+/// `layout`: `rows16`, one row to a tile, which every native backend's
+/// row-gathering kernels read besides its resident layout, so that a slot
+/// holds the one row a step names and no other.
 pub fn streamed_layout(layout: Layout) -> Layout {
     match layout {
-        Layout::Rows32 => Layout::Rows16,
-        layout => layout,
+        Layout::Packet => Layout::Packet,
+        Layout::Rows16 | Layout::Rows8 | Layout::Mma16 | Layout::Rows32 => Layout::Rows16,
     }
 }
 

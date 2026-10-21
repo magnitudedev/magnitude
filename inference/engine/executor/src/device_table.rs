@@ -702,31 +702,32 @@ mod tests {
         assert_eq!(table.streamed_bytes(), 8 * 4 + 12);
 
         // A step's rows gather by slot. An absent row replaces a row no
-        // step named, once however often the step names it.
-        assert_eq!(table.indices(&[6, 1, 6]).unwrap(), [0, 1, 0]);
-        assert_eq!(directory(streamed), [-1, 1, 2, 3, -1, -1, 0, -1]);
-        assert_eq!(slot(streamed, 0), row(6));
+        // step named, once however often the step names it: the clock
+        // reaches the last of the first rows, the least valuable, first.
+        assert_eq!(table.indices(&[6, 1, 6]).unwrap(), [3, 1, 3]);
+        assert_eq!(directory(streamed), [0, 1, 2, -1, -1, -1, 3, -1]);
+        assert_eq!(slot(streamed, 3), row(6));
 
         // The row a step named (1) is passed over. More rows than the
-        // staging holds fill adjacent slots together.
-        assert_eq!(table.indices(&[4, 5]).unwrap(), [2, 3]);
-        assert_eq!(directory(streamed), [-1, 1, -1, -1, 2, 3, 0, -1]);
-        assert_eq!(slot(streamed, 2), row(4));
-        assert_eq!(slot(streamed, 3), row(5));
+        // staging holds are brought together.
+        assert_eq!(table.indices(&[4, 5]).unwrap(), [0, 2]);
+        assert_eq!(directory(streamed), [-1, 1, -1, -1, 0, 2, 3, -1]);
+        assert_eq!(slot(streamed, 0), row(4));
+        assert_eq!(slot(streamed, 2), row(5));
 
         // Every row was named since the clock last passed: it passes them
         // all once, and replaces the first it meets again that this step
         // does not name.
-        assert_eq!(table.indices(&[1, 7]).unwrap(), [1, 0]);
-        assert_eq!(directory(streamed), [-1, 1, -1, -1, 2, 3, -1, 0]);
+        assert_eq!(table.indices(&[1, 7]).unwrap(), [1, 3]);
+        assert_eq!(directory(streamed), [-1, 1, -1, -1, 0, 2, -1, 3]);
 
         // A step that names more rows than there are slots, or a row
         // outside the table, changes nothing.
         assert!(table.indices(&[0, 1, 2, 3, 4]).is_err());
         assert!(table.indices(&[8]).is_err());
         assert!(table.indices(&[-1]).is_err());
-        assert_eq!(directory(streamed), [-1, 1, -1, -1, 2, 3, -1, 0]);
-        assert_eq!(table.indices(&[7, 4, 5, 1]).unwrap(), [0, 2, 3, 1]);
+        assert_eq!(directory(streamed), [-1, 1, -1, -1, 0, 2, -1, 3]);
+        assert_eq!(table.indices(&[7, 4, 5, 1]).unwrap(), [3, 0, 2, 1]);
     }
 
     #[test]
@@ -754,8 +755,8 @@ mod tests {
         // The read selected rows 1 (held) and 5 and 6 (missed): the missed
         // rows take tiles no step named, never the one the read held.
         read.observe(&[1, 5, 6, 5]).unwrap();
-        assert_eq!(directory(streamed), [-1, 1, -1, 3, -1, 0, 2, -1]);
-        assert_eq!(slot(streamed, 0), row(5));
+        assert_eq!(directory(streamed), [0, 1, -1, -1, -1, 2, 3, -1]);
+        assert_eq!(slot(streamed, 2), row(5));
         assert!(!read.found(5));
         let next = table.read_selected();
         assert!(next.found(1) && next.found(5) && next.found(6));

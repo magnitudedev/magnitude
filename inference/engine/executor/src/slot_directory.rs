@@ -132,7 +132,9 @@ pub(crate) struct SlotDirectory {
     /// Per tile of slots, whether its tile was used since the clock last
     /// passed it.
     used: Vec<bool>,
-    /// The tile of slots the clock looks at next.
+    /// The tile of slots the clock looks at next. The clock turns from the
+    /// last tile of slots toward the first, so that of slots filled in order
+    /// of value, first to last, it reaches the least valuable first.
     hand: usize,
 }
 
@@ -159,7 +161,7 @@ impl SlotDirectory {
             entries,
             tile: vec![None; slot_tiles],
             used: vec![false; slot_tiles],
-            hand: 0,
+            hand: slot_tiles.saturating_sub(1),
         }
     }
 
@@ -334,9 +336,10 @@ impl SlotDirectory {
     /// twice, the first time taking from each its use; `None` when it finds
     /// none, as of a directory without slots.
     pub fn free(&mut self, kept: impl Fn(usize) -> bool) -> Option<(usize, Option<u64>)> {
-        for _ in 0..2 * self.tile.len() {
+        let tiles = self.tile.len();
+        for _ in 0..2 * tiles {
             let slot_tile = self.hand;
-            self.hand = (self.hand + 1) % self.tile.len();
+            self.hand = (self.hand + tiles - 1) % tiles;
             if kept(slot_tile) || std::mem::take(&mut self.used[slot_tile]) {
                 continue;
             }
@@ -346,19 +349,21 @@ impl SlotDirectory {
     }
 
     /// The first of `count` adjacent tiles of slots, each released: the
-    /// clock's next ones. `None` of a directory with fewer.
+    /// clock's next ones, the tiles that end at the hand. `None` of a
+    /// directory with fewer.
     pub fn free_adjacent(&mut self, count: usize) -> Option<usize> {
-        if count > self.tile.len() {
+        let tiles = self.tile.len();
+        if count > tiles {
             return None;
         }
-        if self.hand + count > self.tile.len() {
-            self.hand = 0;
+        if self.hand + 1 < count {
+            self.hand = tiles - 1;
         }
-        let first = self.hand;
+        let first = self.hand + 1 - count;
         for slot_tile in first..first + count {
             self.release(slot_tile);
         }
-        self.hand = (first + count) % self.tile.len();
+        self.hand = (first + tiles - 1) % tiles;
         Some(first)
     }
 }
@@ -379,25 +384,26 @@ mod tests {
         let mut directory = SlotDirectory::new(8, 3, 1, DirectoryForm::Dense);
         assert_eq!(directory.slot(5), None);
         assert_eq!(directory.slot(8), None);
-        for (row, slot) in [(5, 0), (6, 1), (7, 2)] {
+        // The clock turns from the last slot toward the first.
+        for (row, slot) in [(5, 2), (6, 1), (7, 0)] {
             assert_eq!(directory.free(|_| false), Some((slot, None)));
             directory.hold(row, slot, true);
         }
         assert_eq!(
             directory.take_changes(),
-            [(5, [0i32, 1, 2].map(i32::to_le_bytes).concat())]
+            [(5, [2i32, 1, 0].map(i32::to_le_bytes).concat())]
         );
         assert!(directory.take_changes().is_empty());
         // Every row was used: the clock passes them all once, then takes
-        // the first. A row used again in between is passed again.
-        assert_eq!(directory.free(|_| false), Some((0, Some(5))));
+        // the last. A row used again in between is passed again.
+        assert_eq!(directory.free(|_| false), Some((2, Some(5))));
         assert_eq!(directory.slot(5), None);
-        directory.hold(1, 0, true);
+        directory.hold(1, 2, true);
         assert_eq!(directory.use_slot(6), Some(1));
-        assert_eq!(directory.free(|_| false), Some((2, Some(7))));
-        directory.hold(2, 2, false);
+        assert_eq!(directory.free(|_| false), Some((0, Some(7))));
+        directory.hold(2, 0, false);
         // A kept slot is never taken, and nothing is when all are kept.
-        assert_eq!(directory.free(|slot| slot == 0), Some((1, Some(6))));
+        assert_eq!(directory.free(|slot| slot == 2), Some((1, Some(6))));
         assert_eq!(directory.free(|_| true), None);
         assert_eq!(
             SlotDirectory::new(8, 0, 1, DirectoryForm::Dense).free(|_| false),
@@ -424,12 +430,12 @@ mod tests {
     fn adjacent_slots_are_the_clocks_next_ones() {
         let mut directory = SlotDirectory::new(8, 4, 1, DirectoryForm::Dense);
         assert_eq!(directory.free_adjacent(5), None);
-        assert_eq!(directory.free_adjacent(3), Some(0));
+        assert_eq!(directory.free_adjacent(3), Some(1));
         directory.hold(4, 1, true);
-        // Two more do not fit before the end: the clock starts over, and
-        // the row there leaves its slot.
-        assert_eq!(directory.free_adjacent(2), Some(0));
+        // Two more do not fit before the first slot: the clock starts over
+        // at the last, and the rows there leave their slots.
         assert_eq!(directory.free_adjacent(2), Some(2));
+        assert_eq!(directory.free_adjacent(2), Some(0));
         assert_eq!(directory.slot(4), None);
     }
 

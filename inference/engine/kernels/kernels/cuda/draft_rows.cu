@@ -1,9 +1,24 @@
 // Decode forms a joined input inside each output group. Prefill forms each
 // row/stream once, then uses the shared tiled projection to reuse weights.
+// A streamed table's slots are rows16 rows (<seismic/rows16.cuh>), a table
+// held whole is mma16; both give every value the same bits.
+#if defined(SEISMIC_TABLE_KIND_PACKED) && defined(SEISMIC_TABLE_LAYOUT_ROWS16)
+#define ROWS16_T SEISMIC_TABLE
+#else
 #define KERNEL_W0 SEISMIC_TABLE
+#endif
 #define KERNEL_W1 SEISMIC_COMBINE
 #include "lib/projection/projection.cuh"
 #include "lib/core/gathered.cuh"
+#include <seismic/rows16.cuh>
+
+#if defined(ROWS16_T)
+typedef rows16::T DraftTable;
+#define DRAFT_TABLE_AT(pointer) ROWS16_T_AT(pointer)
+#else
+typedef packets::W0 DraftTable;
+#define DRAFT_TABLE_AT(pointer) KERNEL_W0_AT(pointer)
+#endif
 
 namespace {
 
@@ -17,14 +32,14 @@ constexpr unsigned DRAFT_ROWS_PER_WARP = 4;
 } // namespace
 
 struct DraftInput {
-    packets::W0 table;
+    DraftTable table;
     const unsigned char *table_bytes, *conditioning, *embedding_norm, *hidden_norm;
     u64 table_row_stride, table_column_stride;
     u64 conditioning_row_stride, conditioning_column_stride;
     u64 embedding_norm_stride, hidden_norm_stride;
 };
 
-#define DRAFT_INPUT DraftInput{KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_TABLE)), \
+#define DRAFT_INPUT DraftInput{DRAFT_TABLE_AT(SEISMIC_PTR(SEISMIC_BUFFER_TABLE)), \
     SEISMIC_PTR(SEISMIC_BUFFER_TABLE), SEISMIC_PTR(SEISMIC_BUFFER_CONDITIONING), \
     SEISMIC_PTR(SEISMIC_BUFFER_EMBEDDING_NORM), SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN_NORM), \
     SEISMIC_TABLE_STRIDE_0, SEISMIC_TABLE_STRIDE_1, SEISMIC_CONDITIONING_STRIDE_0, \
@@ -42,9 +57,17 @@ __device__ __forceinline__ void draft_join(const DraftInput &input, u64 token, u
     for (u64 item = threadIdx.x; item < D / 64 * 4; item += blockDim.x) {
         const u64 kb = item / 4;
         const u32 t = (u32)(item % 4);
-        float values[16];
-        packets::row_values16(table, token, kb, t, values);
         const u32 offsets[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
+        float values[16];
+#if defined(ROWS16_T)
+#pragma unroll
+        for (int s = 0; s < 4; ++s)
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                values[4 * s + j] = table.value(token, kb * 64 + 16 * s + offsets[j]);
+#else
+        packets::row_values16(table, token, kb, t, values);
+#endif
 #pragma unroll
         for (int s = 0; s < 4; ++s)
 #pragma unroll
