@@ -1027,9 +1027,6 @@ impl ResourcePlanner {
         let history_bound =
             usize::try_from(capacity_bytes.domain_bytes / checkpoint_history_row_bytes.max(1))
                 .unwrap_or(usize::MAX);
-        if checkpoint_history_row_bytes != 0 && history_bound < context {
-            return Err("one context exceeds the device domain's history capacity".into());
-        }
         // A request needs at least one history row and one recurrent bank.
         // This is an address-space ceiling from physical bytes, never an
         // admission policy; each actual row and bank is claimed on demand.
@@ -1050,9 +1047,11 @@ impl ResourcePlanner {
                 .checked_add(retention_entries)
                 .ok_or("retained numerical capacity overflow")?,
         };
-        // The history reservation (graphs are sealed over it): a context for
-        // every bank owner, but never more rows than the device's stable
-        // domain capacity could ever back.
+        // The history reservation (graphs are sealed over it): as many rows
+        // as the device's stable domain capacity could ever back, and at
+        // least one context. A context whose history the domain cannot back
+        // is not refused here: whether the model fits is the assessment's
+        // verdict at its fit depth, and each row is claimed on demand.
         let history_rows = history_bound.max(context);
         let bank_count = bank_capacity
             .storage_total()
