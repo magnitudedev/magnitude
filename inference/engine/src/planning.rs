@@ -10,7 +10,7 @@
 use crate::options::{DraftPolicy, ExecutionManifest, ResolvedMethod, ResolvedModelPolicy};
 use magnitude_batching::MAX_CLASS_ROWS;
 use magnitude_executor::{
-    image_cell_limit, platform::SelectedDevice, BackendPlan, ComponentSelection,
+    image_cell_limit, max_image_cells, platform::SelectedDevice, BackendPlan, ComponentSelection,
     ExecutionPlanDraft, ExecutionPlanner, PlanError, PlannedMethod, ResourceLimits,
 };
 use magnitude_scheduler::ServiceLimits;
@@ -125,8 +125,12 @@ fn planner_inputs(
             },
         },
     };
-    let image_cells = image_cell_limit(&manifest.definition, manifest.service.launch_rows())
-        .map_err(ExecutionPlanningError::Plan)?;
+    let image_cells = image_cell_limit(
+        &manifest.definition,
+        manifest.service.launch_rows(),
+        max_image_cells(backend),
+    )
+    .map_err(ExecutionPlanningError::Plan)?;
     let limits = resource_limits(&manifest.service, &manifest.model, image_cells, backend)?;
     Ok((selection, method, limits))
 }

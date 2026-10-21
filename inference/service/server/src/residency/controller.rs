@@ -742,6 +742,7 @@ impl EngineResidency {
                 ReadinessMismatch::Package { .. } => "worker_package_mismatch",
                 ReadinessMismatch::TemplateFingerprint { .. } => "worker_template_mismatch",
                 ReadinessMismatch::Modalities { .. } => "worker_modalities_mismatch",
+                ReadinessMismatch::ImageCells { .. } => "worker_image_cells_mismatch",
             };
             ModelOperationFailure::new(code, mismatch.to_string(), false)
         })?;

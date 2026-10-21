@@ -28,10 +28,10 @@ pub use programs::{
     TargetProgramPlan, VisionProgramPlan,
 };
 pub use resources::{
-    GraphSlots, HistoryStorePlan, LayerHistory, MAX_IMAGE_CELLS, NativeGraphCharge, ResourceBytes,
+    CPU_IMAGE_CELLS, GraphSlots, HistoryStorePlan, LayerHistory, MAX_IMAGE_CELLS, NativeGraphCharge, ResourceBytes,
     ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
     StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations, image_cell_limit,
-    reads_decoded_history,
+    max_image_cells, reads_decoded_history,
 };
 pub use weights::{
     AttentionBinding, AttentionShape, DenseBinding, DenseBranchBinding, DenseScales,

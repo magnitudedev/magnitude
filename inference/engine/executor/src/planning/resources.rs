@@ -40,19 +40,39 @@ pub struct ResourceLimits {
     pub lookahead: bool,
 }
 
-/// The most merged cells one image encodes, whatever its model declares:
-/// about 4.2 MP at Qwen3-VL's 32-pixel cells. A larger image is resized
-/// down to it.
+/// The most merged cells one image encodes, whatever its model declares and
+/// whatever its device: about 4.2 MP at Qwen3-VL's 32-pixel cells. A larger
+/// image is resized down to it.
 pub const MAX_IMAGE_CELLS: usize = 4096;
 
+/// The most merged cells one image encodes on the CPU backend. An image is
+/// one launch, and a CPU launch completes during its submission, so nothing
+/// (a cancellation, a stop, an admission, a status request) is applied until
+/// the whole tower has run. On a 4-vCPU x86 host Qwen3.5 0.8B's tower encodes
+/// 64 cells in ~4 s, 256 in ~17 s, 1024 in ~130 s and 4000 in ~45 min. A
+/// larger image is resized down to it: about 0.26 MP at Qwen3-VL's 32-pixel
+/// cells.
+pub const CPU_IMAGE_CELLS: usize = 256;
+
+/// The most merged cells one image encodes on `backend`, whatever its model
+/// declares.
+pub const fn max_image_cells(backend: BackendName) -> usize {
+    match backend {
+        BackendName::Cpu => CPU_IMAGE_CELLS,
+        _ => MAX_IMAGE_CELLS,
+    }
+}
+
 /// The most merged cells one image of `definition` encodes in a load whose
-/// launches carry `launch_rows` rows: the declared resize's bound within
-/// [`MAX_IMAGE_CELLS`]. Prefill places an image's features across launches,
-/// unless its rows attend each other in the decoder: such an image is one
-/// launch. Zero without vision.
+/// launches carry `launch_rows` rows and whose device encodes at most
+/// `device_cells` ([`max_image_cells`]): the declared resize's bound within
+/// `device_cells`. Prefill places an image's features across launches, unless
+/// its rows attend each other in the decoder: such an image is one launch.
+/// Zero without vision.
 pub fn image_cell_limit(
     definition: &ModelDefinition,
     launch_rows: usize,
+    device_cells: usize,
 ) -> Result<usize, crate::PlanError> {
     let Some(vision) = &definition.vision else {
         return Ok(0);
@@ -68,7 +88,7 @@ pub fn image_cell_limit(
                 if attention.media_rows == magnitude_family_contracts::MediaRowAttention::Bidirectional
         )
     });
-    let limit = declared.min(MAX_IMAGE_CELLS);
+    let limit = declared.min(device_cells);
     let limit = if bidirectional {
         limit.min(launch_rows)
     } else {
