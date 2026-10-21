@@ -80,6 +80,13 @@ impl DeviceLock {
         self.share_of(guard)
     }
 
+    /// Share the device once no measurement job holds it, without preempting one: for work that
+    /// would rather wait for a job, bounded by its hang deadline, than end it.
+    pub async fn share_after_measurement(&self) -> DeviceShare {
+        let guard = Arc::clone(&self.lock).read_owned().await;
+        self.share_of(guard)
+    }
+
     fn share_of(&self, guard: OwnedRwLockReadGuard<()>) -> DeviceShare {
         DeviceShare {
             guard: Some(guard),

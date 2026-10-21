@@ -12,7 +12,6 @@ use magnitude_service_models::{
     HuggingFaceDiscovery, InventoryConfig, ManagedModelDownloads, ModelDomainResolver,
     managed_model_services,
 };
-use magnitude_service_server::assessment::ManagedModelAssessments;
 use magnitude_service_server::assessment::assessor::{EngineHeaderVerdicts, ModelAssessor};
 use magnitude_service_server::assessment::candidates::{
     ManagedModelCandidates, engine_architectures,
@@ -21,6 +20,7 @@ use magnitude_service_server::assessment::environment::{
     AssessmentEnvironment, assessment_structure,
 };
 use magnitude_service_server::assessment::measurement::{self, ServiceMachine};
+use magnitude_service_server::assessment::{HostDevice, ManagedModelAssessments};
 use magnitude_service_server::build_identity;
 use magnitude_service_server::configurations::ResolvedConfigurations;
 use magnitude_service_server::device_lock::DeviceLock;
@@ -194,6 +194,10 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     .context("failed to establish the assessment environment")?,
             );
             let device = DeviceLock::default();
+            let host = HostDevice::new(
+                &device,
+                structure.selected.info.backend() == seismic::BackendName::Cpu,
+            );
             let measurement = measurement::start(
                 Arc::new(ServiceMachine::new(
                     structure,
@@ -203,6 +207,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 )),
                 stored,
                 device.clone(),
+                host.settled(),
             );
             let model_downloads = Arc::new(
                 ManagedModelDownloads::open(inventory.clone())
@@ -253,6 +258,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 architectures.clone(),
                 model_services.catalog.clone(),
                 model_services.local.clone(),
+                host.clone(),
             );
             candidates.start_enrichment(model_variants.clone());
             let assessments = ManagedModelAssessments::start(
@@ -260,6 +266,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 model_services.catalog.clone(),
                 model_services.local.clone(),
                 measurement,
+                host,
             );
             instances.attach_assessments(assessments.clone());
             let mut state = AppState::new()

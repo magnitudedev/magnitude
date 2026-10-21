@@ -29,13 +29,13 @@ use crate::residency::worker::{JobWorker, KILL_REAP};
 use crate::worker_process::WorkerLauncher;
 
 /// How long a job may go without reporting before it is killed as hung. A job reports each point
-/// before it starts it, so this bounds its start and each point, never the job: the job has no
-/// budget, and each point stops when its median is resolved, after as long as its device takes.
-/// Whole cold jobs take 7.2 to 10.6 s on a GB10, an RTX 3090 or an M4 Pro, while one point, a
-/// 512-row projection on an idle 4-vCPU EPYC 7763's CPU, took 330 s (eight samples of a 33 s
-/// call), and a CPU of fewer cores or one the service shares takes several times that. Nothing
-/// waits on a job (a load preempts it), so the bound is generous: it only ends a hang.
-pub const HANG_DEADLINE: Duration = Duration::from_secs(30 * 60);
+/// before it starts it, so this bounds its start and each point, never the job. A point samples
+/// for at most its budget (`magnitude_executor::assessment::SAMPLING_SECONDS`, 2 s of device
+/// time) and one more sample, with a lead before and after: under 7 s where its longest sample
+/// is the 1.5 s of a 4-vCPU EPYC 7763 CPU's composition chain run, and 3 s where its first point
+/// waits for every kernel's compile on a GPU. Two minutes is 17 times the slowest of these: a
+/// CPU of that speed or slower, or a hang, is ended; nothing waits on a job (a load preempts it).
+pub const HANG_DEADLINE: Duration = Duration::from_secs(2 * 60);
 
 /// How long a job's process is waited for once it reported or was killed: a reported job's own
 /// exit ([`GRACEFUL_EXIT`]), then the kill's reap ([`KILL_REAP`]), the two waits its retirement
@@ -225,14 +225,17 @@ impl JobProcess for JobWorker {
 }
 
 /// Start owning the measurement job of `machine` on `device`, from `stored`, what was stored of
-/// it at start. The returned status is the job's, from [`MeasurementStatus::stored`] on.
+/// it at start, each job starting only once `settled` holds (the assessment pool's work on the
+/// device is done, [`crate::assessment::HostDevice`]). The returned status is the job's, from
+/// [`MeasurementStatus::stored`] on.
 pub fn start<M: MeasuredMachine>(
     machine: Arc<M>,
     stored: M::Stored,
     device: DeviceLock,
+    settled: watch::Receiver<bool>,
 ) -> watch::Receiver<MeasurementStatus<M::Stored>> {
     let (status, receiver) = watch::channel(MeasurementStatus::stored(stored));
-    tokio::spawn(run(machine, device, status, HANG_DEADLINE));
+    tokio::spawn(run(machine, device, settled, status, HANG_DEADLINE));
     receiver
 }
 
@@ -251,19 +254,23 @@ async fn read_stored<M: MeasuredMachine>(machine: &Arc<M>) -> Option<M::Stored> 
 
 /// Run jobs until what assessment reads is stored: the executor's fixed cost points, whatever
 /// the models assessed. Each job runs only with the device to itself, deferring while residency
-/// shares it until a share ends ([`DeviceLock::released`]), preempted when residency wants it
-/// back, and retried after a failure with a backoff that doubles. A preempted job is no
+/// shares it until a share ends ([`DeviceLock::released`]) and while `settled` does not hold,
+/// preempted when residency wants it back, and retried after a failure with a backoff that
+/// doubles. A preempted job is no
 /// failure: the next resumes from what it stored. The hardware and driver identities are the
 /// inventory's revision, fixed for the service's life, so the backoff is this process's and a
 /// changed identity is the next process's discovery, starting anew.
 async fn run<M: MeasuredMachine>(
     machine: Arc<M>,
     device: DeviceLock,
+    mut settled: watch::Receiver<bool>,
     status: watch::Sender<MeasurementStatus<M::Stored>>,
     deadline: Duration,
 ) {
     let mut backoff = FIRST_RETRY;
     while status.borrow().measurements.pending() {
+        // A pool that is gone has no work left on the device.
+        let _ = settled.wait_for(|settled| *settled).await;
         // Every share's end wakes this, after its release: a failed try is always followed by
         // the end of a share it saw.
         let exclusive = loop {
@@ -587,7 +594,7 @@ mod tests {
     async fn a_job_that_never_answers_is_killed_at_its_deadline() {
         let (silent, retired, _open) = job(Vec::new());
         let machine = ScriptedMachine::new(vec![silent], Vec::new());
-        let mut status = start(machine.clone(), PENDING, DeviceLock::default());
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
         status
             .wait_for(|status| status.state == MeasurementState::Measuring)
             .await
@@ -614,7 +621,7 @@ mod tests {
     async fn a_job_is_killed_only_once_it_is_silent_for_its_deadline() {
         let (running, retired, frames) = job(Vec::new());
         let machine = ScriptedMachine::new(vec![running], Vec::new());
-        let mut status = start(machine.clone(), PENDING, DeviceLock::default());
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
         status
             .wait_for(|status| status.state == MeasurementState::Measuring)
             .await
@@ -646,7 +653,7 @@ mod tests {
         let (silent, _, _open) = job(Vec::new());
         let (finishing, _, _finished) = job(vec![JobFrame::Finished(Ok(Vec::new()))]);
         let machine = ScriptedMachine::new(vec![silent, finishing], vec![PENDING, COMPLETE]);
-        let mut status = start(machine.clone(), PENDING, DeviceLock::default());
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled());
         status
             .wait_for(|status| matches!(status.state, MeasurementState::Failed { .. }))
             .await
@@ -674,7 +681,7 @@ mod tests {
         };
         let (reported, retired, _open) = job(vec![JobFrame::Finished(Ok(vec![failure]))]);
         let machine = ScriptedMachine::new(vec![reported], vec![COMPLETE]);
-        let mut status = start(machine, PENDING, DeviceLock::default());
+        let mut status = start(machine, PENDING, DeviceLock::default(), settled());
         let measured = status
             .wait_for(|status| status.state == MeasurementState::Measured)
             .await
@@ -695,12 +702,36 @@ mod tests {
         let machine = ScriptedMachine::new(vec![reported], vec![COMPLETE]);
         let device = DeviceLock::default();
         let resident = device.try_share().unwrap();
-        let mut status = start(machine.clone(), PENDING, device);
+        let mut status = start(machine.clone(), PENDING, device, settled());
         tokio::time::sleep(FIRST_RETRY * 3).await;
         settle().await;
         assert_eq!(machine.started.load(Ordering::SeqCst), 0);
         assert_eq!(status.borrow().state, MeasurementState::Unmeasured);
         drop(resident);
+        status
+            .wait_for(|status| status.state == MeasurementState::Measured)
+            .await
+            .unwrap();
+        assert_eq!(machine.started.load(Ordering::SeqCst), 1);
+    }
+
+    /// An assessment pool that is settled for good.
+    fn settled() -> watch::Receiver<bool> {
+        watch::channel(true).1
+    }
+
+    /// The job never starts while the assessment pool works the device, and starts once it
+    /// settles.
+    #[tokio::test(start_paused = true)]
+    async fn the_job_defers_while_the_assessment_pool_works() {
+        let (reported, _, _open) = job(vec![JobFrame::Finished(Ok(Vec::new()))]);
+        let machine = ScriptedMachine::new(vec![reported], vec![COMPLETE]);
+        let (settling, settled) = watch::channel(false);
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default(), settled);
+        tokio::time::sleep(FIRST_RETRY * 3).await;
+        settle().await;
+        assert_eq!(machine.started.load(Ordering::SeqCst), 0);
+        settling.send_replace(true);
         status
             .wait_for(|status| status.state == MeasurementState::Measured)
             .await
@@ -735,7 +766,7 @@ mod tests {
         let (finishing, _, _finished) = job(vec![JobFrame::Finished(Ok(Vec::new()))]);
         let machine = ScriptedMachine::new(vec![running, finishing], vec![COMPLETE]);
         let device = DeviceLock::default();
-        let mut status = start(machine.clone(), PENDING, device.clone());
+        let mut status = start(machine.clone(), PENDING, device.clone(), settled());
         status
             .wait_for(|status| status.state == MeasurementState::Measuring)
             .await
@@ -771,7 +802,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_start_with_everything_stored_runs_no_job() {
         let machine = ScriptedMachine::new(Vec::new(), Vec::new());
-        let status = start(machine.clone(), COMPLETE, DeviceLock::default());
+        let status = start(machine.clone(), COMPLETE, DeviceLock::default(), settled());
         settle().await;
         assert_eq!(status.borrow().state, MeasurementState::Measured);
         assert_eq!(machine.started.load(Ordering::SeqCst), 0);

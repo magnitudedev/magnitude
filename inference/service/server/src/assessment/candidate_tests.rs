@@ -1228,6 +1228,7 @@ async fn fixture_from(
         super::engine_architectures(),
         Arc::new(StubCatalog),
         Arc::new(StubLocal(custom)),
+        crate::assessment::HostDevice::new(&crate::device_lock::DeviceLock::default(), false),
     );
     Fixture {
         _directory: directory,
@@ -3896,6 +3897,7 @@ async fn live_fixture_reaching(
         super::engine_architectures(),
         services.catalog.clone(),
         services.local.clone(),
+        crate::assessment::HostDevice::new(&crate::device_lock::DeviceLock::default(), false),
     );
     hub.unreachable.store(!live_hub.reachable, Ordering::SeqCst);
     candidates.start_enrichment(resolver.clone());

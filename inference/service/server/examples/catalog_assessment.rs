@@ -25,12 +25,13 @@ use magnitude_service_models::{
     InventoryConfig, ManagedModelDownloads, ModelDomainResolver, load_release_catalog,
     managed_model_services,
 };
-use magnitude_service_server::assessment::ManagedModelAssessments;
 use magnitude_service_server::assessment::assessor::ModelAssessor;
 use magnitude_service_server::assessment::environment::{
     AssessmentEnvironment, assessment_structure,
 };
 use magnitude_service_server::assessment::measurement::MeasurementStatus;
+use magnitude_service_server::assessment::{HostDevice, ManagedModelAssessments};
+use magnitude_service_server::device_lock::DeviceLock;
 use magnitude_service_server::model_store::{ServedStore, open_served_store};
 use serde_json::json;
 
@@ -133,6 +134,7 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
         services.catalog.clone(),
         services.local.clone(),
         status,
+        HostDevice::new(&DeviceLock::default(), false),
     );
     let pool_started = Instant::now();
     let snapshot = loop {
