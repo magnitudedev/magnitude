@@ -420,6 +420,8 @@ fn routed_expert_weights_are_packed_and_routes_are_discrete() {
             ("expert_up", "packed"),
             ("shared_gate", "packed"),
             ("shared_up", "f32"),
+            ("gate_scale", "f32"),
+            ("up_scale", "f32"),
         ]
     );
     assert_eq!(coded(&analysis, "expert_gate"), Q4K_CODES);
