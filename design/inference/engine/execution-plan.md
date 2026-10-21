@@ -427,10 +427,11 @@ to the same checked graph topology and resource plan used for execution. Linear
 projection stages use cooperative subgroup reductions for the smallest row classes and subgroup
 matrix operations above them. A projection entry that reads packed weights has one
 accumulator-scale port per weight, whose static extent is 0 (absent, compiled out) or the extent of
-the weight's resident second-level scale: per tensor for dense feed-forward, latent, post-norm,
-state-space input and output, and vocabulary projections, per expert for up-only routed experts
-(attention, gated-delta and short-convolution operators bind their projection entries' ports
-absent); a routed down weight's per-expert
+the weight's resident second-level scale: per tensor for attention (every segment, the indexer's
+included), dense feed-forward, latent, post-norm, per-layer, state-space, short-convolution and
+gated-delta output, draft and vocabulary projections, per expert for up-only routed experts. An
+entry without a port for a weight (the router, the gated delta's input projection) is refused a
+scaled one at plan time; a routed down weight's per-expert
 scales join the selection's per-expert output scales in the combine weights. Blocks share a sealed
 graph and a specialization only when their scale extents agree. A decode projection, normalization prologue
 included, is one launch: each workgroup reduces its few rows' norms while staging them. Larger classes

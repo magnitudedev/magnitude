@@ -11,7 +11,7 @@
 use crate::operators::{Join, SublayerInput};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{PackingBound, WeightPort, weight};
+use crate::programs::native_target_graph::{PackingBound, WeightPort, packed_weight, weight};
 use crate::{
     ModelLoadPlan, RecurrentBinding, StateResourcePlan,
     native::{RecurrentKernels, RecurrentStepKernels},
@@ -259,7 +259,14 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
         )),
         false => None,
     };
-    let output_bound = bound(graph, WeightKind::RecurrentOutput)?;
+    let output = packed_weight(
+        graph,
+        load,
+        scope,
+        WeightKind::RecurrentOutput,
+        weights,
+        constants,
+    )?;
     // A mix site's partials have no input norm: the port is empty.
     let input_norm = if input.form.normalized {
         weight(graph, load, scope, WeightKind::InputNorm, weights)?
@@ -286,7 +293,6 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
     let rate = weight(graph, load, scope, WeightKind::RecurrentDecay, weights)?;
     let time_bias = weight(graph, load, scope, WeightKind::RecurrentTimeBias, weights)?;
     let recurrent_norm = weight(graph, load, scope, WeightKind::RecurrentNorm, weights)?;
-    let output_weight = weight(graph, load, scope, WeightKind::RecurrentOutput, weights)?;
 
     let (
         RecurrentStatePorts {
@@ -485,8 +491,6 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
         }
     };
     let inject = join.inject(graph, block.rows, constants)?;
-    // The gated delta binds no second-level scale (`UNSCALED_OUTPUT`).
-    let unscaled = GraphConstant::absent(graph, constants)?.tensor().clone();
     let output = graph
         .enqueue(
             kernels.output,
@@ -497,16 +501,16 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                 join.dimensions()[1],
                 ("Q", block.value_heads),
                 ("W", block.width),
-                crate::operators::attention::UNSCALED_OUTPUT,
-                ("OB", output_bound.extent),
+                ("OS", output.operands.scale.extent),
+                ("OB", output.operands.bound.extent),
             ],
             attention_output::WorkflowArgs {
                 hidden: residual.into(),
                 inject: (&inject).into(),
                 gated: (&gated).into(),
-                output_weight: (&output_weight).into(),
-                output_scale: (&unscaled).into(),
-                output_bound: (&output_bound.tensor).into(),
+                output_weight: (&output.weight).into(),
+                output_scale: (&output.operands.scale.tensor).into(),
+                output_bound: (&output.operands.bound.tensor).into(),
             },
         )?
         .value;

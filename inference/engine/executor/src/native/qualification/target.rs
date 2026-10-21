@@ -344,8 +344,7 @@ impl<'a> QualificationView<'a> {
                     inject: &rows.inject(device, 1, "attention_output", &label)?,
                     gated: &gated,
                     output_weight: &output,
-                    // The gated delta binds no second-level scale.
-                    output_scale: &semantic_zeros(device, Element::f32(), &[0], "attention_output", &label)?,
+                    output_scale: &unit_scale(device, &kernels.output, "OS", "attention_output", &label)?,
                     output_bound: &any_row_bound(device, &kernels.output, "OB", "attention_output", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("attention_output", &label, error))?
@@ -467,7 +466,6 @@ impl<'a> QualificationView<'a> {
                         &hidden_residual,
                         &product,
                         &down,
-                        binding.scales.down,
                         norm,
                         &label,
                     )?
@@ -887,7 +885,6 @@ fn qualify_parallel(
 ) -> Result<(), CatalogFailure> {
     qualify_general_routed(device, binding.routed, &kernels.routed)?;
     let label = format!("{binding:?}");
-    let absent_scale = semantic_zeros(device, Element::f32(), &[0], "parallel", "scale")?;
     let hidden = binding.hidden;
     let dense = binding.dense;
     let zeros = |element: Element, extents: &[u64], entry: &'static str| {
@@ -905,8 +902,8 @@ fn qualify_parallel(
             out_rows: &out_rows,
             eps: 1.0e-5,
             activation: 0,
-            gate_scale: &absent_scale,
-            up_scale: &absent_scale,
+            gate_scale: &unit_scale(device, &kernels.expand, "GS", "dense_expand", &label)?,
+            up_scale: &unit_scale(device, &kernels.expand, "US", "dense_expand", &label)?,
             gate_bound: &any_row_bound(device, &kernels.expand, "GB", "dense_expand", &label)?,
             up_bound: &any_row_bound(device, &kernels.expand, "UB", "dense_expand", &label)?,
         })
@@ -917,7 +914,7 @@ fn qualify_parallel(
         .call(project_rows::Args {
             source: &product,
             weight: &zeros(dense.down, &[hidden, features], "project_rows")?,
-            weight_scale: &absent_scale,
+            weight_scale: &unit_scale(device, &kernels.down, "WS", "project_rows", &label)?,
             weight_bound: &any_row_bound(device, &kernels.down, "WB", "project_rows", &label)?,
         })
         .map_err(|error| qualification_dynamic("project_rows", &label, error))?
@@ -1220,7 +1217,6 @@ fn qualify_short_conv(
 ) -> Result<(), CatalogFailure> {
     let label = format!("{binding:?}");
     let entry = "target_short_conv";
-    let absent_scale = semantic_zeros(device, Element::f32(), &[0], entry, &label)?;
     let shape = binding.shape;
     let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, entry, &label);
     let norm = zeros(binding.norm, &[shape.hidden])?;
@@ -1260,9 +1256,9 @@ fn qualify_short_conv(
             c_weight: &output_gate,
             x_weight: &value,
             eps: 1.0e-5,
-            b_scale: &absent_scale,
-            c_scale: &absent_scale,
-            x_scale: &absent_scale,
+            b_scale: &unit_scale(device, &kernels.project, "BS", entry, &label)?,
+            c_scale: &unit_scale(device, &kernels.project, "CS", entry, &label)?,
+            x_scale: &unit_scale(device, &kernels.project, "XS", entry, &label)?,
         })
         .map_err(|error| qualification_dynamic("short_conv_project", &label, error))?
         .value;
@@ -1290,7 +1286,7 @@ fn qualify_short_conv(
             inject: &semantic_zeros(device, Element::f32(), &[1, 0], "attention_output", &label)?,
             gated: &gated,
             output_weight: &output,
-            output_scale: &absent_scale,
+            output_scale: &unit_scale(device, &kernels.output, "OS", "attention_output", &label)?,
             output_bound: &any_row_bound(device, &kernels.output, "OB", "attention_output", &label)?,
         })
         .map_err(|error| qualification_dynamic("attention_output", &label, error))?
@@ -1452,7 +1448,6 @@ impl QualificationView<'_> {
         hidden_values: &[f32],
     ) -> Result<(), CatalogFailure> {
         let hidden = self.geometry.hidden;
-        let absent_scale = semantic_zeros(device, Element::f32(), &[0], "per_layer", "scale")?;
         if let (Some(binding), Some(kernels), Some(entry)) = (
             self.plan.target().per_layer(),
             &self.programs.target.per_layer,
@@ -1486,7 +1481,7 @@ impl QualificationView<'_> {
                         .reshape(&[1, hidden])
                         .map_err(|error| qualification_dynamic("project_rows", &label, error))?,
                     weight: &projection,
-                    weight_scale: &absent_scale,
+                    weight_scale: &unit_scale(device, &kernels.project, "WS", "project_rows", &label)?,
                     weight_bound: &any_row_bound(device, &kernels.project, "WB", "project_rows", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("project_rows", &label, error))?
@@ -1587,7 +1582,7 @@ impl QualificationView<'_> {
                     inputs: &inputs,
                     layer: 0,
                     activation: 1,
-                    gate_scale: &absent_scale,
+                    gate_scale: &unit_scale(device, &kernels.gate, "GS", "per_layer_gate", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("per_layer_gate", &label, error))?
                 .value;
@@ -1604,7 +1599,6 @@ impl QualificationView<'_> {
                 hidden_residual,
                 &gated,
                 &projection,
-                0,
                 norm,
                 &label,
             )?;

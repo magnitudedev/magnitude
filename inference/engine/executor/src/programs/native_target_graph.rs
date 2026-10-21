@@ -1456,7 +1456,7 @@ impl PreparedTargetGraphs {
                     .per_layer_entries
                     .iter()
                     .map(|(rows, graph)| {
-                        let absent_scale = seismic::Tensor::from_host(
+                        let absent = seismic::Tensor::from_host(
                             &weights.projection.tensor().device(),
                             Element::f32(),
                             &[0],
@@ -1466,8 +1466,15 @@ impl PreparedTargetGraphs {
                         let mut fixed = vec![
                             (&graph.ports.projection, weights.projection.tensor()),
                             (&graph.ports.norm, weights.norm.tensor()),
-                            (&graph.ports.absent_scale, &absent_scale),
+                            (&graph.ports.absent, &absent),
                         ];
+                        if let Some(port) = &graph.ports.projection_scale {
+                            let scale = weights
+                                .projection
+                                .scale()
+                                .ok_or("the per-layer projection has no second-level scale")?;
+                            fixed.push((port, scale));
+                        }
                         if let Some(port) = &graph.ports.projection_bound {
                             let bound = weights
                                 .projection
@@ -2465,24 +2472,82 @@ pub(crate) fn weight<G: GraphDraft>(
     .map(|port| port.tensor().clone())
 }
 
-/// A projection weight and the tensor its entry's accumulator-scale port
-/// binds: its resident second-level scale, else the graph's absent operand
-/// (`GraphConstant::absent`: zero extent, never read), and that port's
-/// static extent.
+/// A projection weight and its second-level scale.
 pub(crate) struct ScaledWeight {
     pub weight: WorkflowTensor,
-    pub scale: WorkflowTensor,
+    pub scale: WeightScale,
+}
+
+/// A weight's second-level scale as an entry's accumulator-scale port binds
+/// it (`[S] f32`): its resident scale and the S values it holds (1 per
+/// tensor), or the graph's absent operand at S = 0 where the weight has
+/// none (`GraphConstant::absent`: never read).
+#[derive(Clone)]
+pub(crate) struct WeightScale {
+    pub tensor: WorkflowTensor,
     pub extent: u64,
 }
 
-impl ScaledWeight {
-    /// A weight bound with the absent scale `absent` (zero extent).
-    pub(crate) fn unscaled(weight: WorkflowTensor, absent: WorkflowTensor) -> Self {
-        Self {
-            weight,
-            scale: absent,
+impl WeightScale {
+    /// The second-level scale of the planned weight of `role`.
+    pub(crate) fn planned<G: GraphDraft>(
+        graph: &mut G,
+        load: &ModelLoadPlan,
+        role: WeightRole,
+        ports: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Self, GraphError> {
+        let (port, extent) = weight_scale_port(graph, load, role, ports, constants)?;
+        Ok(Self {
+            tensor: port.tensor().clone(),
+            extent,
+        })
+    }
+
+    /// No scale: the graph's absent operand.
+    pub(crate) fn absent<G: GraphDraft>(
+        graph: &mut G,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Self, GraphError> {
+        Ok(Self {
+            tensor: GraphConstant::absent(graph, constants)?.tensor().clone(),
             extent: 0,
-        }
+        })
+    }
+}
+
+/// The operands a projection entry binds beside a weight's values: its
+/// second-level scale and its packing bound.
+#[derive(Clone)]
+pub(crate) struct WeightOperands {
+    pub scale: WeightScale,
+    pub bound: PackingBound,
+}
+
+impl WeightOperands {
+    /// The operands of the planned weight of `role`.
+    pub(crate) fn planned<G: GraphDraft>(
+        graph: &mut G,
+        load: &ModelLoadPlan,
+        role: WeightRole,
+        ports: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Self, GraphError> {
+        Ok(Self {
+            scale: WeightScale::planned(graph, load, role, ports, constants)?,
+            bound: PackingBound::planned(graph, load, role, ports, constants)?,
+        })
+    }
+
+    /// Neither: an absent segment's.
+    pub(crate) fn absent<G: GraphDraft>(
+        graph: &mut G,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Self, GraphError> {
+        Ok(Self {
+            scale: WeightScale::absent(graph, constants)?,
+            bound: PackingBound::absent(graph, constants)?,
+        })
     }
 }
 
@@ -2533,11 +2598,11 @@ impl PackingBound {
     }
 }
 
-/// A projection weight an entry with a packed form binds: its scaled operand
-/// and its packing bound.
+/// A projection weight an entry with a packed form binds: its values and
+/// their operands (second-level scale and packing bound).
 pub(crate) struct PackedWeight {
-    pub scaled: ScaledWeight,
-    pub bound: PackingBound,
+    pub weight: WorkflowTensor,
+    pub operands: WeightOperands,
 }
 
 /// Register one scope-owned readout representation and its scale lifetime.
@@ -2599,16 +2664,17 @@ pub(crate) fn scaled_weight<G: GraphDraft>(
     ports: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<ScaledWeight, GraphError> {
-    let (weight, scale, extent) = scaled_weight_ports(graph, load, scope, kind, ports, constants)?;
+    let role = WeightRole { scope, kind };
     Ok(ScaledWeight {
-        weight: weight.tensor().clone(),
-        scale: scale.tensor().clone(),
-        extent,
+        weight: weight_port(graph, load, role, WeightPart::Values, ports)?
+            .tensor()
+            .clone(),
+        scale: WeightScale::planned(graph, load, role, ports, constants)?,
     })
 }
 
-/// [`scaled_weight`] of an entry with a packed form, with the weight's
-/// packing bound.
+/// The weight of an entry with a packed form: its values, second-level scale
+/// and packing bound.
 pub(crate) fn packed_weight<G: GraphDraft>(
     graph: &mut G,
     load: &ModelLoadPlan,
@@ -2617,9 +2683,12 @@ pub(crate) fn packed_weight<G: GraphDraft>(
     ports: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<PackedWeight, GraphError> {
+    let role = WeightRole { scope, kind };
     Ok(PackedWeight {
-        scaled: scaled_weight(graph, load, scope, kind, ports, constants)?,
-        bound: PackingBound::planned(graph, load, WeightRole { scope, kind }, ports, constants)?,
+        weight: weight_port(graph, load, role, WeightPart::Values, ports)?
+            .tensor()
+            .clone(),
+        operands: WeightOperands::planned(graph, load, role, ports, constants)?,
     })
 }
 

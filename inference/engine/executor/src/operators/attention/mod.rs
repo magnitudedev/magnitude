@@ -5,7 +5,7 @@
 pub(crate) mod graph;
 
 use super::{PlanError, WeightPush, tail};
-use crate::{AttentionBinding, AttentionShape, SelectionBinding, SelectionShape};
+use crate::{AttentionBinding, AttentionShape, ScalableWeight, SelectionBinding, SelectionShape};
 use magnitude_family_contracts::{
     Attention, AttentionGate, Decoder, GateFunction, GateGranularity, HeadNorm, HistoryDomain,
     HistoryReads, KeyValue, MediaRowAttention, Operator, OutputForm, Rotary, RotaryPair, ValueNorm,
@@ -13,14 +13,6 @@ use magnitude_family_contracts::{
 };
 use magnitude_state::KvCodec;
 use seismic::Element;
-
-/// The accumulator-scale extents of `attention_project` and
-/// `attention_output` bound with every scale port absent. Attention, the
-/// gated delta, the short convolution and draft heads bind these entries so
-/// (a scaled weight of theirs is refused at plan time:
-/// `PlanError::UnportedScale`); only the state-space mixer binds its scales.
-pub(crate) const UNSCALED_PROJECT: [(&str, u64); 4] = [("QS", 0), ("GS", 0), ("KS", 0), ("VS", 0)];
-pub(crate) const UNSCALED_OUTPUT: (&str, u64) = ("OS", 0);
 
 /// The attention forms the attention entries implement: any output gate,
 /// query and key norms both present or both absent, projected values or
@@ -381,18 +373,22 @@ pub(super) fn binding(
     hidden: u64,
     context: u64,
     lookup: impl Fn(WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightKind) -> Result<ScalableWeight, PlanError>,
     activation: Element,
     history: KvCodec,
 ) -> Result<AttentionBinding, PlanError> {
     let shape = shape(hidden, attention)?;
-    let query = lookup(query_kind(attention))?;
-    let segment = |present: bool, kind| if present { lookup(kind) } else { Ok(query) };
+    // Every projection binds its second-level scale at its accumulator-scale
+    // port (`attention_project`'s QS, GS, KS, VS, `attention_output`'s OS).
+    let projection = |kind| scalable(kind).map(|weight| weight.element);
+    let query = projection(query_kind(attention))?;
+    let segment = |present: bool, kind| if present { projection(kind) } else { Ok(query) };
     let selection = selection_shape(&attention.reads, context)
         .map(|shape| {
             Ok::<_, PlanError>(SelectionBinding {
                 shape,
-                query: lookup(WeightKind::IndexerQuery)?,
-                key: lookup(WeightKind::IndexerKey)?,
+                query: projection(WeightKind::IndexerQuery)?,
+                key: projection(WeightKind::IndexerKey)?,
             })
         })
         .transpose()?;
@@ -405,7 +401,7 @@ pub(super) fn binding(
         gate: segment(shape.gate_rows() > 0, WeightKind::AttentionGate)?,
         key: segment(shape.key_rows() > 0, WeightKind::Key)?,
         value: segment(shape.value_rows() > 0, WeightKind::Value)?,
-        output: lookup(WeightKind::AttentionOutput)?,
+        output: projection(WeightKind::AttentionOutput)?,
         activation,
         history: history
             .spec(

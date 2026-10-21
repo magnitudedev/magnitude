@@ -25,7 +25,7 @@ use crate::{
     completion::CompletionWaiter,
     native::{AttestedFeedForward, AttestedHead, AttestedHeadBlock},
     operators::attention::graph::{
-        self as attention_graph, AttentionBlock, AttentionBounds, AttentionGraphEntries,
+        self as attention_graph, AttentionBlock, AttentionGraphEntries, AttentionOperands,
         CheckedAttentionEntries, attention_weights,
     },
     operators::dense_ffn::graph::{
@@ -41,7 +41,7 @@ use crate::{
             CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
             distinct_storage_bytes,
         },
-        native_target_graph::{GatheredTable, PackingBound, WeightPart, WeightPort},
+        native_target_graph::{GatheredTable, WeightPart, WeightPort, packed_weight},
     },
 };
 use magnitude_batching::{TargetBatchUpload, row_class};
@@ -526,7 +526,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     // and binds none of the weights after it.
     let inject_only = class.steps == 0;
     let mut constants = Vec::new();
-    let bounds = AttentionBounds::planned(
+    let operands = AttentionOperands::planned(
         &mut graph,
         load,
         attention_scope,
@@ -543,7 +543,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         form,
         !inject_only,
         false,
-        bounds,
+        operands,
         |kind| {
             planned_weight(
                 &mut graph,
@@ -845,9 +845,6 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
             (HeadFeedForwardEntries::Dense(entries), FeedForwardProgramSlot::Dense(_)) => {
                 graph.set_class_scope((pass == 0).then_some("head-entry-dense"));
                 let feedforward_norm = weight!(feed_forward_scope, WeightKind::InputNorm);
-                let gate_weight = weight!(feed_forward_scope, WeightKind::DenseGate);
-                let up_weight = weight!(feed_forward_scope, WeightKind::DenseUp);
-                let down_weight = weight!(feed_forward_scope, WeightKind::DenseDown);
                 let dense_rows = GraphConstant::identity_for_class(
                     &mut graph,
                     rows,
@@ -859,51 +856,46 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 else {
                     return Err("draft head dense entries without a dense feed-forward".into());
                 };
-                let absent_scale = GraphConstant::absent(&mut graph, &mut constants)?
-                    .tensor()
-                    .clone();
-                let mut bound = |kind| {
-                    PackingBound::planned(
+                let mut packed = |kind| {
+                    packed_weight(
                         &mut graph,
                         load,
-                        WeightRole {
-                            scope: feed_forward_scope,
-                            kind,
-                        },
+                        feed_forward_scope,
+                        kind,
                         &mut weights,
                         &mut constants,
                     )
                 };
-                let gate_bound = bound(WeightKind::DenseGate)?;
-                let up_bound = bound(WeightKind::DenseUp)?;
-                let down_bound = bound(WeightKind::DenseDown)?;
+                let gate = packed(WeightKind::DenseGate)?;
+                let up = packed(WeightKind::DenseUp)?;
+                let down = packed(WeightKind::DenseDown)?;
                 let product = graph
                     .enqueue(
                         entries.expand,
                         &[
                             dense_dims.as_slice(),
                             &[
-                                ("GS", 0),
-                                ("US", 0),
-                                ("GB", gate_bound.extent),
-                                ("UB", up_bound.extent),
+                                ("GS", gate.operands.scale.extent),
+                                ("US", up.operands.scale.extent),
+                                ("GB", gate.operands.bound.extent),
+                                ("UB", up.operands.bound.extent),
                             ],
                         ]
                         .concat(),
                         dense_expand::WorkflowArgs {
                             residual: (&attended).into(),
                             norm: (&feedforward_norm).into(),
-                            gate_weight: (&gate_weight).into(),
-                            up_weight: (&up_weight).into(),
+                            gate_weight: (&gate.weight).into(),
+                            up_weight: (&up.weight).into(),
                             out_rows: dense_rows.port().tensor().into(),
                             eps: epsilon,
                             activation: operators::dense_ffn::activation_code(
                                 dense_operator.up.activation(),
                             ),
-                            gate_scale: (&absent_scale).into(),
-                            up_scale: (&absent_scale).into(),
-                            gate_bound: (&gate_bound.tensor).into(),
-                            up_bound: (&up_bound.tensor).into(),
+                            gate_scale: (&gate.operands.scale.tensor).into(),
+                            up_scale: (&up.operands.scale.tensor).into(),
+                            gate_bound: (&gate.operands.bound.tensor).into(),
+                            up_bound: (&up.operands.bound.tensor).into(),
                         },
                     )?
                     .value;
@@ -915,16 +907,16 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         dense_output,
                         &[
                             dense_dims.as_slice(),
-                            &[("DS", 0), ("DB", down_bound.extent)],
+                            &[("DS", down.operands.scale.extent), ("DB", down.operands.bound.extent)],
                         ]
                         .concat(),
                         dense_output::WorkflowArgs {
                             residual: (&attended).into(),
                             product: (&product).into(),
-                            down_weight: (&down_weight).into(),
+                            down_weight: (&down.weight).into(),
                             out_rows: dense_rows.port().tensor().into(),
-                            down_scale: (&absent_scale).into(),
-                            down_bound: (&down_bound.tensor).into(),
+                            down_scale: (&down.operands.scale.tensor).into(),
+                            down_bound: (&down.operands.bound.tensor).into(),
                         },
                     )?
                     .value;

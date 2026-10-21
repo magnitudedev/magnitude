@@ -373,25 +373,25 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                             &[
                                 dimensions.as_slice(),
                                 &[
-                                    ("GS", gate.scaled.extent),
-                                    ("US", up.scaled.extent),
-                                    ("GB", gate.bound.extent),
-                                    ("UB", up.bound.extent),
+                                    ("GS", gate.operands.scale.extent),
+                                    ("US", up.operands.scale.extent),
+                                    ("GB", gate.operands.bound.extent),
+                                    ("UB", up.operands.bound.extent),
                                 ],
                             ]
                             .concat(),
                             dense_expand::WorkflowArgs {
                                 residual: residual.into(),
                                 norm: (&norm).into(),
-                                gate_weight: (&gate.scaled.weight).into(),
-                                up_weight: (&up.scaled.weight).into(),
+                                gate_weight: (&gate.weight).into(),
+                                up_weight: (&up.weight).into(),
                                 out_rows: (&row_table()?).into(),
                                 eps: epsilon,
                                 activation,
-                                gate_scale: (&gate.scaled.scale).into(),
-                                up_scale: (&up.scaled.scale).into(),
-                                gate_bound: (&gate.bound.tensor).into(),
-                                up_bound: (&up.bound.tensor).into(),
+                                gate_scale: (&gate.operands.scale.tensor).into(),
+                                up_scale: (&up.operands.scale.tensor).into(),
+                                gate_bound: (&gate.operands.bound.tensor).into(),
+                                up_bound: (&up.operands.bound.tensor).into(),
                             },
                         )?
                         .value
@@ -400,7 +400,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     graph
                         .enqueue(
                             entry,
-                            &[dimensions.as_slice(), &[("US", up.extent)]].concat(),
+                            &[dimensions.as_slice(), &[("US", up.scale.extent)]].concat(),
                             dense_up::WorkflowArgs {
                                 residual: residual.into(),
                                 norm: (&norm).into(),
@@ -408,7 +408,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                                 out_rows: (&row_table()?).into(),
                                 eps: epsilon,
                                 activation,
-                                up_scale: (&up.scale).into(),
+                                up_scale: (&up.scale.tensor).into(),
                             },                        )?
                         .value
                 }
@@ -419,16 +419,16 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     output,
                     &[
                         dimensions.as_slice(),
-                        &[("DS", down.scaled.extent), ("DB", down.bound.extent)],
+                        &[("DS", down.operands.scale.extent), ("DB", down.operands.bound.extent)],
                     ]
                     .concat(),
                     dense_output::WorkflowArgs {
                         residual: (&root).into(),
                         product: (&product).into(),
-                        down_weight: (&down.scaled.weight).into(),
+                        down_weight: (&down.weight).into(),
                         out_rows: (&row_table()?).into(),
-                        down_scale: (&down.scaled.scale).into(),
-                        down_bound: (&down.bound.tensor).into(),
+                        down_scale: (&down.operands.scale.tensor).into(),
+                        down_bound: (&down.operands.bound.tensor).into(),
                     },
                 )?
                 .value
@@ -472,14 +472,14 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         ("M", rows),
                         ("K", shape.hidden),
                         ("N", shape.expert_hidden),
-                        ("WS", down.scaled.extent),
-                        ("WB", down.bound.extent),
+                        ("WS", down.operands.scale.extent),
+                        ("WB", down.operands.bound.extent),
                     ],
                     project_rows::WorkflowArgs {
                         source: (&normalized).into(),
-                        weight: (&down.scaled.weight).into(),
-                        weight_scale: (&down.scaled.scale).into(),
-                        weight_bound: (&down.bound.tensor).into(),
+                        weight: (&down.weight).into(),
+                        weight_scale: (&down.operands.scale.tensor).into(),
+                        weight_bound: (&down.operands.bound.tensor).into(),
                     },
                 )?
                 .value;
@@ -639,16 +639,16 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         ("O", rows),
                         ("H", shape.hidden),
                         ("F", shape.expert_hidden),
-                        ("DS", up.scaled.extent),
-                        ("DB", up.bound.extent),
+                        ("DS", up.operands.scale.extent),
+                        ("DB", up.operands.bound.extent),
                     ],
                     dense_output::WorkflowArgs {
                         residual: (&base).into(),
                         product: (&routed).into(),
-                        down_weight: (&up.scaled.weight).into(),
+                        down_weight: (&up.weight).into(),
                         out_rows: (&row_table()?).into(),
-                        down_scale: (&up.scaled.scale).into(),
-                        down_bound: (&up.bound.tensor).into(),
+                        down_scale: (&up.operands.scale.tensor).into(),
+                        down_bound: (&up.operands.bound.tensor).into(),
                     },
                 )?
                 .value;

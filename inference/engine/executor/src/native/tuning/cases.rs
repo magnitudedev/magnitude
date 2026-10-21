@@ -55,6 +55,23 @@ pub(crate) fn scale_extent(
     }
 }
 
+/// The scale statics of a projection entry's weights: each named scale's
+/// extent `scopes` share (`scale_extent`; 0 for a weight the entry does not
+/// read, `None`).
+pub(crate) fn scale_statics(
+    inputs: &ModelInputs<'_>,
+    scopes: &[WeightScope],
+    scales: &[(&'static str, Option<WeightKind>)],
+) -> Result<Vec<(&'static str, u64)>, String> {
+    scales
+        .iter()
+        .map(|&(name, kind)| match kind {
+            Some(kind) => Ok((name, scale_extent(inputs, scopes, kind)?)),
+            None => Ok((name, 0)),
+        })
+        .collect()
+}
+
 /// The packing statics of a projection entry's weights: each named bound's
 /// port extent `scopes` share (`WeightPlan::bound`; 0 for a weight the
 /// entry does not read, `None`), and the `RESIDUE` parameter fixed at 1

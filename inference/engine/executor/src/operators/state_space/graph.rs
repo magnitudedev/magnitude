@@ -135,7 +135,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
             &[
                 shape.project_dimensions(block.rows).as_slice(),
                 &[
-                    ("QS", projection_weight.extent),
+                    ("QS", projection_weight.scale.extent),
                     ("GS", 0),
                     ("KS", 0),
                     ("VS", 0),
@@ -156,7 +156,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                 value_weight: (&empty).into(),
                 epsilon: block.epsilon,
                 project_mode: 0,
-                query_scale: (&projection_weight.scale).into(),
+                query_scale: (&projection_weight.scale.tensor).into(),
                 gate_scale: (&absent.tensor).into(),
                 key_scale: (&absent.tensor).into(),
                 value_scale: (&absent.tensor).into(),
@@ -231,7 +231,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
             kernels.output,
             &[
                 shape.output_dimensions(block.rows).as_slice(),
-                &[("OS", output_weight.extent), ("OB", output_bound.extent)],
+                &[("OS", output_weight.scale.extent), ("OB", output_bound.extent)],
             ]
             .concat(),
             attention_output::WorkflowArgs {
@@ -239,7 +239,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                 inject: (&inject).into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight.weight).into(),
-                output_scale: (&output_weight.scale).into(),
+                output_scale: (&output_weight.scale.tensor).into(),
                 output_bound: (&output_bound.tensor).into(),
             },
         )?
@@ -581,6 +581,12 @@ mod tests {
             name if name.ends_with("_exps") => Some(vec![32]),
             name if name.ends_with("_shexp") || name.contains("ffn_latent") => Some(vec![1]),
             name if name.ends_with(".ssm_in") || name.ends_with(".ssm_out") => Some(vec![1]),
+            name if [".attn_q", ".attn_k", ".attn_v", ".attn_output"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix)) =>
+            {
+                Some(vec![1])
+            }
             "output" => Some(vec![1]),
             _ => None,
         }
@@ -656,6 +662,14 @@ mod tests {
                     extent(mixer_scope(block), WeightKind::RecurrentOutput),
                     (1, Some(4))
                 );
+            }
+            for kind in [
+                WeightKind::Query,
+                WeightKind::Key,
+                WeightKind::Value,
+                WeightKind::AttentionOutput,
+            ] {
+                assert_eq!(extent(mixer_scope(2), kind), (1, Some(4)));
             }
             assert_eq!(extent(plain, WeightKind::Router), (0, None));
             let scale_bytes = load
@@ -764,44 +778,28 @@ mod tests {
     }
 
     /// A scaled weight whose entry has no accumulator-scale port (the
-    /// attention projections, the router) is refused at plan time.
+    /// router's) is refused at plan time.
     #[test]
     fn a_scaled_weight_without_a_scale_port_is_refused_at_plan_time() {
-        for (name, role) in [
-            (
-                "blk.3.attn_q",
-                WeightRole {
-                    scope: WeightScope::TargetSublayer(SublayerIndex {
-                        block: 2,
-                        sublayer: 0,
-                    }),
-                    kind: WeightKind::Query,
-                },
-            ),
-            (
-                "blk.4.ffn_gate_inp",
-                WeightRole {
-                    scope: feed_forward_scope(2),
-                    kind: WeightKind::Router,
-                },
-            ),
-        ] {
-            let (definition, manifest) = hybrid_stored(|stored| (stored == name).then(|| vec![1]));
-            let load = ModelLoadPlan::derive(
-                &manifest,
-                &definition,
-                ComponentSelection {
-                    head: false,
-                    vision: false,
-                },
-                resident_layout(ExecutionPath::Native, BackendName::Metal),
-            )
-            .unwrap();
-            assert_eq!(
-                load.program_plan(&definition, KvCodec::Dense).unwrap_err(),
-                PlanError::UnportedScale(role)
-            );
-        }
+        let (definition, manifest) =
+            hybrid_stored(|stored| (stored == "blk.4.ffn_gate_inp").then(|| vec![1]));
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            resident_layout(ExecutionPath::Native, BackendName::Metal),
+        )
+        .unwrap();
+        assert_eq!(
+            load.program_plan(&definition, KvCodec::Dense).unwrap_err(),
+            PlanError::UnportedScale(WeightRole {
+                scope: feed_forward_scope(2),
+                kind: WeightKind::Router,
+            })
+        );
     }
 
     /// A scale that is not one F32 value, or one per matrix, is refused

@@ -9,11 +9,11 @@ use crate::operators::Join;
 use crate::operators::gated_delta::graph::RecurrentControlPorts;
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{PackingBound, WeightPort, weight};
+use crate::programs::native_target_graph::{WeightPort, packed_weight, scaled_weight, weight};
 use crate::{
     ModelLoadPlan, ShortConvBinding, ShortConvShape, StateResourcePlan, native::ShortConvKernels,
 };
-use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
+use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project, short_conv_rows};
 use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
@@ -89,26 +89,22 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
     block: ShortConvBlock,
 ) -> Result<(WorkflowTensor, NativePort, RecurrentControlPorts), GraphError> {
     let shape = block.shape;
-    // The weights have no second-level scales: their scale ports bind the
-    // absent operand.
-    let weight_scale = &GraphConstant::absent(graph, constants)?.tensor().clone();
-    let output_bound = PackingBound::planned(
+    let mut scaled =
+        |graph: &mut G, kind| scaled_weight(graph, load, scope, kind, weights, constants);
+    let input_gate = scaled(graph, WeightKind::ShortConvInputGate)?;
+    let output_gate = scaled(graph, WeightKind::ShortConvOutputGate)?;
+    let value = scaled(graph, WeightKind::ShortConvValue)?;
+    let output = packed_weight(
         graph,
         load,
-        WeightRole {
-            scope,
-            kind: WeightKind::RecurrentOutput,
-        },
+        scope,
+        WeightKind::RecurrentOutput,
         weights,
         constants,
     )?;
     let mut weight = |graph: &mut G, kind| weight(graph, load, scope, kind, weights);
     let input_norm = weight(graph, WeightKind::InputNorm)?;
-    let input_gate = weight(graph, WeightKind::ShortConvInputGate)?;
-    let output_gate = weight(graph, WeightKind::ShortConvOutputGate)?;
-    let value = weight(graph, WeightKind::ShortConvValue)?;
     let convolution = weight(graph, WeightKind::RecurrentConvolution)?;
-    let output_weight = weight(graph, WeightKind::RecurrentOutput)?;
 
     let store = state.target_state();
     let banks = u64::try_from(
@@ -138,19 +134,23 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
             kernels.project,
             &[
                 shape.project_dimensions(block.rows).as_slice(),
-                &[("BS", 0), ("CS", 0), ("XS", 0)],
+                &[
+                    ("BS", input_gate.scale.extent),
+                    ("CS", output_gate.scale.extent),
+                    ("XS", value.scale.extent),
+                ],
             ]
             .concat(),
             short_conv_project::WorkflowArgs {
                 residual: hidden.into(),
                 norm: (&input_norm).into(),
-                b_weight: (&input_gate).into(),
-                c_weight: (&output_gate).into(),
-                x_weight: (&value).into(),
+                b_weight: (&input_gate.weight).into(),
+                c_weight: (&output_gate.weight).into(),
+                x_weight: (&value.weight).into(),
                 eps: block.epsilon,
-                b_scale: weight_scale.into(),
-                c_scale: weight_scale.into(),
-                x_scale: weight_scale.into(),
+                b_scale: (&input_gate.scale.tensor).into(),
+                c_scale: (&output_gate.scale.tensor).into(),
+                x_scale: (&value.scale.tensor).into(),
             },
         )?
         .value;
@@ -183,16 +183,14 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
     // One output head of every channel.
     let gated = gated.reshape(&[block.rows, 1, shape.channels]);
     let inject = join.inject(graph, block.rows, constants)?;
-    // The short convolution binds no second-level scale (`UNSCALED_OUTPUT`).
-    let unscaled = GraphConstant::absent(graph, constants)?.tensor().clone();
     let output = graph
         .enqueue(
             kernels.output,
             &[
                 shape.output_dimensions(block.rows).as_slice(),
                 &[
-                    crate::operators::attention::UNSCALED_OUTPUT,
-                    ("OB", output_bound.extent),
+                    ("OS", output.operands.scale.extent),
+                    ("OB", output.operands.bound.extent),
                 ],
             ]
             .concat(),
@@ -200,9 +198,9 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
                 hidden: hidden.into(),
                 inject: (&inject).into(),
                 gated: (&gated).into(),
-                output_weight: (&output_weight).into(),
-                output_scale: (&unscaled).into(),
-                output_bound: (&output_bound.tensor).into(),
+                output_weight: (&output.weight).into(),
+                output_scale: (&output.operands.scale.tensor).into(),
+                output_bound: (&output.operands.bound.tensor).into(),
             },
         )?
         .value;

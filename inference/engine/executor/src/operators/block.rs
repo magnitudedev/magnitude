@@ -5,7 +5,7 @@
 //! the mixer, the feed-forward and the per-layer input in order.
 
 use super::attention::graph::{
-    AttentionBlock, AttentionBounds, AttentionGraphEntries, CheckedAttentionEntries,
+    AttentionBlock, AttentionGraphEntries, AttentionOperands, CheckedAttentionEntries,
     HistoryTilesPort, IndexerControlPorts, IndexerStatePorts, SelectionBlock, attention,
     attention_weights,
 };
@@ -42,7 +42,9 @@ use super::{
 use crate::native::{AttestedFeedForward, AttestedMixer, OutputScales};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{PackingBound, WeightPort, activation, weight};
+use crate::programs::native_target_graph::{
+    WeightPort, activation, packed_weight, scaled_weight, weight,
+};
 use crate::{
     FeedForwardProgramSlot, GeneralRoutedShape, MixerProgramSlot, ModelLoadPlan, NGramBinding,
     PerLayerBinding, ShortConvShape, StateResourcePlan, StateSpaceShape,
@@ -406,7 +408,7 @@ impl BlockSublayers<'_> {
                 let shape = attention_operator::shape(geometry.hidden, operator)
                     .map_err(|error| error.to_string())?;
                 let post_norm_epsilon = post_norm_epsilon(paired.mixer_output);
-                let bounds = AttentionBounds::planned(
+                let operands = AttentionOperands::planned(
                     graph, load, scope, operator, &shape, true, weights, constants,
                 )?;
                 let attention_weights = attention_weights(
@@ -415,7 +417,7 @@ impl BlockSublayers<'_> {
                     form,
                     true,
                     post_norm_epsilon.is_some(),
-                    bounds,
+                    operands,
                     |kind| weight(graph, load, scope, kind, weights),
                 )?;
                 // The block reads its history domain's slab tensor, a Shared
@@ -712,21 +714,19 @@ impl BlockSublayers<'_> {
             (Some(sublayer), Some((entries, binding))) => {
                 let scope = self.scope(2)?;
                 let per_layer_weights = PerLayerWeights {
-                    gate: weight(graph, load, scope, WeightKind::PerLayerGate, weights)?,
-                    projection: weight(
+                    gate: scaled_weight(
+                        graph,
+                        load,
+                        scope,
+                        WeightKind::PerLayerGate,
+                        weights,
+                        constants,
+                    )?,
+                    projection: packed_weight(
                         graph,
                         load,
                         scope,
                         WeightKind::PerLayerProjection,
-                        weights,
-                    )?,
-                    projection_bound: PackingBound::planned(
-                        graph,
-                        load,
-                        magnitude_family_contracts::WeightRole {
-                            scope,
-                            kind: WeightKind::PerLayerProjection,
-                        },
                         weights,
                         constants,
                     )?,
@@ -739,12 +739,10 @@ impl BlockSublayers<'_> {
                     "M",
                 )?;
                 let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
-                let absent_scale = GraphConstant::absent(graph, constants)?.tensor().clone();
                 let advanced = per_layer_graph(
                     graph,
                     entries,
                     &per_layer_weights,
-                    &absent_scale,
                     &residual,
                     rows_port.tensor(),
                     out_rows.port().tensor(),

@@ -28,8 +28,8 @@ use crate::{
     completion::CompletionWaiter,
     native::AttestedDraft,
     operators::attention::graph::{
-        self as attention_graph, attention_weights, AttentionBlock, AttentionBounds,
-        AttentionControlPorts, AttentionGraphEntries, AttentionHistoryEntries, AttentionWeights,
+        self as attention_graph, attention_weights, AttentionBlock, AttentionControlPorts,
+        AttentionOperands, AttentionGraphEntries, AttentionHistoryEntries, AttentionWeights,
         CheckedAttentionEntries, ProjectedRows,
     },
     operators::dense_ffn::graph::{self as dense_graph, CheckedDenseEntries, DenseGraphEntries},
@@ -41,7 +41,8 @@ use crate::{
             ConstantTensors, GraphConstant,
         },
         native_target_graph::{
-            weight, weight_scale_port, GatheredTable, PackingBound, RowDirectory, WeightPort,
+            weight, weight_scale_port, GatheredTable, PackingBound, RowDirectory, WeightOperands,
+            WeightPort,
         },
     },
     DeviceError, DraftProgramPlan, HeadLaunchCore, InvariantError,
@@ -1072,7 +1073,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         let shape =
             operators::attention::shape(hidden, attention).map_err(|error| error.to_string())?;
         let scope = draft_sublayer(index, 0)?;
-        let bounds = AttentionBounds::planned(
+        let operands = AttentionOperands::planned(
             &mut graph,
             load,
             scope,
@@ -1088,7 +1089,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             InputForm::SINGLE,
             class.slots > 0,
             false,
-            bounds,
+            operands,
             |kind| match kind {
                 WeightKind::InputNorm => Ok(fusion_norm.clone()),
                 kind => weight(&mut graph, load, scope, kind, &mut weights),
@@ -1135,7 +1136,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         .enumerate()
         .find_map(|(index, layer)| layer.as_ref().map(|layer| (index, layer)))
         .ok_or("a draft has no injected layers")?;
-    let first_bounds = first_weights.bounds.project_dimensions(true);
+    let first_operands = first_weights.operands.project_dimensions(true);
     // Only the injection pass follows the entry rows: its rows are a
     // topology's class dimension (`certify_draft_family`).
     graph.set_class_scope(Some(INJECTION));
@@ -1160,8 +1161,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 first_shape
                     .key_value_dimensions(class.entry_rows)
                     .as_slice(),
-                operators::attention::UNSCALED_PROJECT.as_slice(),
-                first_bounds.as_slice(),
+                first_operands.as_slice(),
                 &InputForm::SINGLE.dimensions(first_shape.hidden),
             ]
             .concat(),
@@ -1344,7 +1344,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             sinks: injection_weights.sinks.clone(),
             output: injection_weights.output.clone(),
             post_norm: None,
-            bounds: injection_weights.bounds.clone(),
+            operands: injection_weights.operands.clone(),
             indexer: None,
         };
         let join = Join::single(None);
@@ -1736,21 +1736,15 @@ fn dense_intermediate(draft: &DraftDefinition, index: usize) -> Result<u64, Stri
     }
 }
 
-/// One `project_rows` of `rows` rows through `weight`, the planned weight of
-/// `role`, binding its planned per-tensor scale and its packing `bound`.
-#[allow(clippy::too_many_arguments)]
+/// One `project_rows` of `rows` rows through `weight`, binding its planned
+/// scale and packing bound (`operands`).
 fn project_planned<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     entry: G::Binding<'a, project_rows::Entry>,
-    load: &ModelLoadPlan,
-    weights: &mut Vec<(WeightPort, NativePort)>,
-    constants: &mut Vec<GraphConstant>,
-    role: WeightRole,
-    (weight, bound): (&WorkflowTensor, &PackingBound),
+    (weight, operands): (&WorkflowTensor, &WeightOperands),
     source: seismic::WorkflowTensorRef<'_>,
     (rows, inputs, outputs): (u64, u64, u64),
 ) -> Result<WorkflowTensor, GraphError> {
-    let (scale, extent) = weight_scale_port(graph, load, role, weights, constants)?;
     graph
         .enqueue(
             entry,
@@ -1758,14 +1752,14 @@ fn project_planned<'a, G: GraphDraft + 'a>(
                 ("M", rows),
                 ("K", inputs),
                 ("N", outputs),
-                ("WS", extent),
-                ("WB", bound.extent),
+                ("WS", operands.scale.extent),
+                ("WB", operands.bound.extent),
             ],
             project_rows::WorkflowArgs {
                 source,
                 weight: weight.into(),
-                weight_scale: scale.tensor().into(),
-                weight_bound: (&bound.tensor).into(),
+                weight_scale: (&operands.scale.tensor).into(),
+                weight_bound: (&operands.bound.tensor).into(),
             },
         )
         .map(|projected| projected.value)
@@ -1784,20 +1778,10 @@ fn project_role<'a, G: GraphDraft + 'a>(
     source: seismic::WorkflowTensorRef<'_>,
     dims: (u64, u64, u64),
 ) -> Result<WorkflowTensor, GraphError> {
-    let role = WeightRole { scope, kind };
     let weight_tensor = weight(graph, load, scope, kind, weights)?;
-    let bound = PackingBound::planned(graph, load, role, weights, constants)?;
-    project_planned(
-        graph,
-        entry,
-        load,
-        weights,
-        constants,
-        role,
-        (&weight_tensor, &bound),
-        source,
-        dims,
-    )
+    let operands =
+        WeightOperands::planned(graph, load, WeightRole { scope, kind }, weights, constants)?;
+    project_planned(graph, entry, (&weight_tensor, &operands), source, dims)
 }
 
 /// One convolved draft layer of the block pass and what it reads.
@@ -1864,31 +1848,14 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
     ];
     let block = u32::try_from(layer.block_rows).map_err(|_| "draft block exceeds u32")?;
     // A projection of the block rows binds its weight's planned scale and
-    // packing bound: the attention's through its loaded weights, the rest
-    // loading theirs.
-    let attention_scope = draft_sublayer(layer.index, 0)?;
+    // packing bound: the attention's through its loaded weights and
+    // operands, the rest loading theirs.
     let project_attention = |graph: &mut G,
-                             weights: &mut Vec<(WeightPort, NativePort)>,
-                             constants: &mut Vec<GraphConstant>,
                              entry: G::Binding<'a, project_rows::Entry>,
-                             kind: WeightKind,
-                             operand: (&WorkflowTensor, &PackingBound),
+                             operand: (&WorkflowTensor, &WeightOperands),
                              source: seismic::WorkflowTensorRef<'_>,
                              (inputs, outputs): (u64, u64)| {
-        project_planned(
-            graph,
-            entry,
-            load,
-            weights,
-            constants,
-            WeightRole {
-                scope: attention_scope,
-                kind,
-            },
-            operand,
-            source,
-            (rows, inputs, outputs),
-        )
+        project_planned(graph, entry, operand, source, (rows, inputs, outputs))
     };
     let project = |graph: &mut G,
                    weights: &mut Vec<(WeightPort, NativePort)>,
@@ -2002,31 +1969,22 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
     };
     let query = project_attention(
         graph,
-        weights,
-        constants,
         entries.query,
-        WeightKind::Query,
-        (&attention.query, &attention.bounds.query),
+        (&attention.query, &attention.operands.query),
         (&convolved).into(),
         (hidden, heads * width),
     )?;
     let key = project_attention(
         graph,
-        weights,
-        constants,
         entries.key,
-        WeightKind::Key,
-        (key_weight, &attention.bounds.key),
+        (key_weight, &attention.operands.key),
         (&convolved).into(),
         (hidden, key_width),
     )?;
     let value = project_attention(
         graph,
-        weights,
-        constants,
         entries.value,
-        WeightKind::Value,
-        (value_weight, &attention.bounds.value),
+        (value_weight, &attention.operands.value),
         (&convolved).into(),
         (hidden, key_width),
     )?;
@@ -2066,16 +2024,13 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
     let attended = attended.ok_or("draft block attention result is absent")?;
     let output = project_attention(
         graph,
-        weights,
-        constants,
         entries.output,
-        WeightKind::AttentionOutput,
         (
             attention
                 .output
                 .as_ref()
                 .ok_or("draft block output weight is absent")?,
-            &attention.bounds.output,
+            &attention.operands.output,
         ),
         (&attended.reshape(&[rows, heads * width])).into(),
         (heads * width, hidden),
@@ -2243,7 +2198,7 @@ fn selector_path<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
-    let hidden_bound = PackingBound::planned(
+    let hidden_operands = WeightOperands::planned(
         graph,
         load,
         WeightRole {
@@ -2253,25 +2208,13 @@ fn selector_path<'a, G: GraphDraft + 'a>(
         weights,
         constants,
     )?;
-    let absent_scale = GraphConstant::absent(graph, constants)?.tensor().clone();
-    let projected = graph
-        .enqueue(
-            entries.hidden,
-            &[
-                ("M", outputs),
-                ("K", hidden),
-                ("N", rank),
-                ("WS", 0),
-                ("WB", hidden_bound.extent),
-            ],
-            project_rows::WorkflowArgs {
-                source: (&features).into(),
-                weight: (&selector_hidden).into(),
-                weight_scale: (&absent_scale).into(),
-                weight_bound: (&hidden_bound.tensor).into(),
-            },
-        )?
-        .value;
+    let projected = project_planned(
+        graph,
+        entries.hidden,
+        (&selector_hidden, &hidden_operands),
+        (&features).into(),
+        (outputs, hidden, rank),
+    )?;
     let successors = graph
         .enqueue(
             entries.successor,

@@ -328,25 +328,29 @@ fn cuda_attention_output_matches_host_model() {
     }
 }
 
-/// The state-space mixer's projections under their weights' second-level
-/// scales (Nemotron 3.5's NVFP4 `ssm_in` / `ssm_out` `.scale`):
-/// `attention_project`'s query segment alone (QS = 1) and `attention_output`
-/// (OS = 1) multiply their F32 accumulators by the scale before rounding.
+/// Projections under their weights' second-level scales (Nemotron's NVFP4
+/// `.scale`s): every segment of `attention_project` (QS = GS = KS = VS = 1,
+/// one scale each) and `attention_output` (OS = 1) multiply their F32
+/// accumulators by their scale before rounding.
 #[test]
-fn cuda_scaled_state_space_projections_match_host_model() {
+fn cuda_scaled_projections_match_host_model() {
     let Some(device) = cuda() else { return };
-    /// A second-level scale that is not a power of two.
+    /// The segments' second-level scales, query, gate, key, value: none a
+    /// power of two, each distinct, so a scale bound to the wrong segment
+    /// fails.
+    const SCALES: [f32; 4] = [0.412_5, 0.731_2, 1.368_8, 0.207_5];
+    /// The output projection's.
     const SCALE: f32 = 0.412_5;
     let factor = f64::from(SCALE);
     let mut rng = Rng(61);
-    let (d, columns, heads, width) = (512usize, 320usize, 4usize, 128usize);
+    let (d, heads, width) = (512usize, 4usize, 128usize);
+    let segments = [192usize, 64, 128, 128];
     let k = heads * width;
     let none = f32_tensor(&device, &[0], &[]);
+    let scales = SCALES.map(|scale| f32_tensor(&device, &[1], &[scale]));
     let scale = f32_tensor(&device, &[1], &[SCALE]);
     for format in [Format::Nvfp4, Format::Q4K] {
-        let projection = weight(&device, format, columns, d, &mut rng);
-        // The other segments read zero rows of the projection weight.
-        let empty = projection.tensor.slice_leading(0, 0).unwrap();
+        let projections = segments.map(|rows| weight(&device, format, rows, d, &mut rng));
         let output = weight(&device, format, d, k, &mut rng);
         for m in ROWS {
             let hidden_values: Vec<f32> = (0..m * d).map(|_| rng.uniform(-3.0, 3.0)).collect();
@@ -359,8 +363,6 @@ fn cuda_scaled_state_space_projections_match_host_model() {
             let gated = bf16_tensor(&device, &[m as u64, heads as u64, width as u64], &gated_values);
             for &mapping in mappings(m) {
                 let (x, slack) = operand_rows(&normed, d, mapping);
-                let (values, tolerance) =
-                    rounded_segment(&x, &slack, &projection, m, columns, d, mapping);
                 let projected = attention_project::native_for_device_with(
                     &device,
                     attention_project::Elements {
@@ -375,46 +377,60 @@ fn cuda_scaled_state_space_projections_match_host_model() {
                         ("D", d),
                         ("PT", 1),
                         ("NM", d),
-                        ("Q", columns),
-                        ("GR", 0),
-                        ("K", 0),
-                        ("V", 0),
+                        ("Q", segments[0]),
+                        ("GR", segments[1]),
+                        ("K", segments[2]),
+                        ("V", segments[3]),
                         ("QS", 1),
-                        ("GS", 0),
-                        ("KS", 0),
-                        ("VS", 0),
+                        ("GS", 1),
+                        ("KS", 1),
+                        ("VS", 1),
                     ])),
                 )
                 .unwrap()
                 .call(attention_project::Args {
                     hidden: &hidden,
                     input_norm: &norm,
-                    query_weight: &projection.tensor,
-                    gate_weight: &empty,
-                    key_weight: &empty,
-                    value_weight: &empty,
+                    query_weight: &projections[0].tensor,
+                    gate_weight: &projections[1].tensor,
+                    key_weight: &projections[2].tensor,
+                    value_weight: &projections[3].tensor,
                     epsilon: EPSILON,
                     project_mode: 0,
-                    query_scale: &scale,
-                    gate_scale: &none,
-                    key_scale: &none,
-                    value_scale: &none,
+                    query_scale: &scales[0],
+                    gate_scale: &scales[1],
+                    key_scale: &scales[2],
+                    value_scale: &scales[3],
                     query_bound: &none,
                     gate_bound: &none,
                     key_bound: &none,
                     value_bound: &none,
                 })
-                .unwrap()
-                .r0;
-                check(
-                    &format!("scaled attention project {format:?} M={m} {mapping:?}"),
-                    &read_bf16(&projected),
-                    &values.iter().map(|value| factor * value).collect::<Vec<_>>(),
-                    &tolerance
-                        .iter()
-                        .map(|tolerance| factor * tolerance + 1e-6)
-                        .collect::<Vec<_>>(),
-                );
+                .unwrap();
+                let outputs = [&projected.r0, &projected.r1, &projected.r2, &projected.r3];
+                for (segment, projected) in outputs.into_iter().enumerate() {
+                    let segment_factor = f64::from(SCALES[segment]);
+                    let (values, tolerance) = rounded_segment(
+                        &x,
+                        &slack,
+                        &projections[segment],
+                        m,
+                        segments[segment],
+                        d,
+                        mapping,
+                    );
+                    check(
+                        &format!(
+                            "scaled attention project {format:?} M={m} {mapping:?} segment {segment}"
+                        ),
+                        &read_bf16(projected),
+                        &values.iter().map(|value| segment_factor * value).collect::<Vec<_>>(),
+                        &tolerance
+                            .iter()
+                            .map(|tolerance| segment_factor * tolerance + 1e-6)
+                            .collect::<Vec<_>>(),
+                    );
+                }
 
                 let (x, _) = operand_rows(&gated_values, k, mapping);
                 let (projected, magnitude) = project(&x, &output.values, m, d, k);

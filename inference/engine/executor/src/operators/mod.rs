@@ -889,11 +889,13 @@ fn admit_shared_head(head: &SharedHead) -> Result<(), PlanError> {
 
 /// The attention binding of a block whose mixer must be attention (a draft
 /// head's or a separate draft's); `lookup` resolves the planned element of a
-/// role in the mixer sublayer's scope.
+/// role in the mixer sublayer's scope, `scalable` that of a projection bound
+/// with an accumulator-scale port.
 pub(crate) fn attention_slot(
     paired: &PairedBlock,
     hidden: u64,
     lookup: impl Fn(WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightKind) -> Result<crate::ScalableWeight, PlanError>,
     activation: Element,
     history: magnitude_state::KvCodec,
 ) -> Result<crate::AttentionBinding, PlanError> {
@@ -912,6 +914,7 @@ pub(crate) fn attention_slot(
         hidden,
         0,
         lookup,
+        scalable,
         activation,
         history,
     )
@@ -988,17 +991,18 @@ pub(crate) fn mixer_slot(
             hidden,
             context,
             lookup,
+            &scalable,
             activation,
             history,
         )?),
         Mixer::GatedDelta(operator) => {
-            Slot::Recurrent(gated_delta::binding(operator, lookup, activation)?)
+            Slot::Recurrent(gated_delta::binding(operator, lookup, &scalable, activation)?)
         }
         Mixer::StateSpace(operator) => {
             Slot::StateSpace(state_space::binding(operator, hidden, lookup, scalable, activation)?)
         }
         Mixer::ShortConv(operator) => {
-            Slot::ShortConv(short_conv::binding(operator, hidden, lookup, activation)?)
+            Slot::ShortConv(short_conv::binding(operator, hidden, lookup, &scalable, activation)?)
         }
     })
 }
@@ -1050,6 +1054,7 @@ pub(crate) fn feed_forward_slot(
                 sublayer.output,
                 hidden,
                 &lookup,
+                &scalable,
                 activation,
             )?)
         }

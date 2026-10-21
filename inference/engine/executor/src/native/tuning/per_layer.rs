@@ -2,7 +2,7 @@
 //! gate projection of the block's residual rows, its activation, and the
 //! product with the layer's slice of the per-layer inputs.
 
-use super::cases::projection_shape;
+use super::cases::{projection_shape, scale_extent};
 use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
 use crate::PerLayerBinding;
 use magnitude_family_contracts::{Operator, WeightKind, WeightScope};
@@ -23,7 +23,7 @@ pub(crate) struct PerLayerGateCase {
     inputs: Tensor,
     layer: i32,
     activation: i32,
-    absent_scale: Tensor,
+    gate_scale: Tensor,
 }
 
 impl PerLayerGateTuning {
@@ -61,7 +61,10 @@ impl EntryTuning for PerLayerGateTuning {
             ("D", b.hidden),
             ("L", b.layers),
             ("P", b.width),
-            ("GS", 0),
+            (
+                "GS",
+                scale_extent(inputs, &self.scopes, WeightKind::PerLayerGate)?,
+            ),
         ])
     }
 
@@ -95,7 +98,8 @@ impl EntryTuning for PerLayerGateTuning {
                     gate: inputs.weight(scope, WeightKind::PerLayerGate)?,
                     layer,
                     activation,
-                    absent_scale: inputs.activation(Element::f32(), &[0], 0)?,
+                    gate_scale: inputs
+                        .unit_scale(inputs.scale_extent(scope, WeightKind::PerLayerGate)?)?,
                 })
             })
             .collect()
@@ -108,7 +112,7 @@ impl EntryTuning for PerLayerGateTuning {
             inputs: &case.inputs,
             layer: case.layer,
             activation: case.activation,
-            gate_scale: &case.absent_scale,
+            gate_scale: &case.gate_scale,
         }
     }
 

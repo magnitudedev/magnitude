@@ -651,6 +651,7 @@ pub(super) fn derive_program_plan(
                             entry,
                             decoder.hidden,
                             |kind| lookup(target, scope, kind),
+                            |kind| planned_scalable(target, scope, kind),
                             active_element,
                         )
                     })
@@ -712,11 +713,13 @@ pub(super) fn derive_program_plan(
                 width: entry.width,
                 table_source: table.source,
                 table: table.resident,
-                projection: lookup(
+                // `project_rows` binds the projection's scale (WS).
+                projection: planned_scalable(
                     target,
                     WeightScope::Target,
                     WeightKind::PerLayerModelProjection,
-                )?,
+                )?
+                .element,
                 norm: lookup(
                     target,
                     WeightScope::Target,
@@ -807,6 +810,7 @@ pub(super) fn derive_program_plan(
                     &paired,
                     decoder.hidden,
                     |kind| lookup(weights, mixer, kind),
+                    |kind| planned_scalable(weights, mixer, kind),
                     active_element,
                     KvCodec::Dense,
                 )?;
@@ -843,11 +847,7 @@ pub(super) fn derive_program_plan(
                         decoder.hidden,
                         feed_forward,
                         |scope, kind| lookup(weights, scope, kind),
-                        // Head graphs bind no scale ports.
-                        |scope, kind| {
-                            lookup(weights, scope, kind)
-                                .map(|element| ScalableWeight { element, scale: 0 })
-                        },
+                        |scope, kind| planned_scalable(weights, scope, kind),
                         active_element,
                     )?,
                     output_norm: if streams.is_some() {
@@ -1004,6 +1004,7 @@ fn draft_program_plan(
             &paired,
             hidden,
             |kind| lookup(weights, mixer, kind),
+            |kind| planned_scalable(weights, mixer, kind),
             activation,
             KvCodec::Dense,
         )?;
@@ -1108,7 +1109,9 @@ fn draft_program_plan(
             .transpose()?,
         selector: match &draft.method {
             DraftMethod::DFlash2 { selector } => Some(SelectorBinding {
-                hidden: lookup(weights, WeightScope::Draft, WeightKind::SelectorHidden)?,
+                // `project_rows` binds the projection's scale (WS).
+                hidden: planned_scalable(weights, WeightScope::Draft, WeightKind::SelectorHidden)?
+                    .element,
                 predecessor: lookup(weights, WeightScope::Draft, WeightKind::SelectorPredecessor)?,
                 successor: lookup(weights, WeightScope::Draft, WeightKind::SelectorSuccessor)?,
                 rank: selector.rank,

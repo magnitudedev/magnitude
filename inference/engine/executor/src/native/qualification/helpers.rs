@@ -181,8 +181,7 @@ pub(super) fn qualify_attention(
     let block_slots = semantic_i32(device, &[0, 1], &[], ENTRY, label)?;
     let selection = Tensor::from_host(device, Element::u32(), &[1, 0], &[])
         .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
-    // Attention binds no second-level scale.
-    let absent_scale = zeros(Element::f32(), &[0])?;
+    let scale = |name| unit_scale(device, &kernels.project, name, ENTRY, label);
     let projected = kernels
         .project
         .call(attention_project::Args {
@@ -194,10 +193,10 @@ pub(super) fn qualify_attention(
             value_weight: &value,
             epsilon: 1.0e-5,
             project_mode: 0,
-            query_scale: &absent_scale,
-            gate_scale: &absent_scale,
-            key_scale: &absent_scale,
-            value_scale: &absent_scale,
+            query_scale: &scale("QS")?,
+            gate_scale: &scale("GS")?,
+            key_scale: &scale("KS")?,
+            value_scale: &scale("VS")?,
             query_bound: &any_row_bound(device, &kernels.project, "QB", ENTRY, label)?,
             gate_bound: &any_row_bound(device, &kernels.project, "GB", ENTRY, label)?,
             key_bound: &any_row_bound(device, &kernels.project, "KB", ENTRY, label)?,
@@ -325,7 +324,7 @@ pub(super) fn qualify_attention(
                         inject: &inject,
                         gated,
                         output_weight: &output,
-                        output_scale: &absent_scale,
+                        output_scale: &unit_scale(device, output_kernel, "OS", ENTRY, label)?,
                         output_bound: &any_row_bound(device, output_kernel, "OB", ENTRY, label)?,
                     })
                     .map_err(|e| qualification_dynamic("attention_output", label, e))?
@@ -335,7 +334,7 @@ pub(super) fn qualify_attention(
                 let source = gated
                     .reshape(&[1, heads * width])
                     .map_err(|e| qualification_dynamic("project_rows", label, e))?;
-                qualify_post_norm(device, tail, &residual, &source, &output, 0, norm, label)?
+                qualify_post_norm(device, tail, &residual, &source, &output, norm, label)?
             }
             _ => {
                 return Err(qualification_dynamic(
@@ -359,24 +358,16 @@ pub(super) fn qualify_post_norm(
     residual: &Tensor,
     source: &Tensor,
     weight: &Tensor,
-    weight_scale: u64,
     norm: Element,
     label: &str,
 ) -> Result<Tensor, CatalogFailure> {
     let hidden = residual.extents()[1];
-    let weight_scale = semantic_ones(
-        device,
-        Element::f32(),
-        &[weight_scale],
-        "project_rows",
-        label,
-    )?;
     let projected = kernels
         .project
         .call(project_rows::Args {
             source,
             weight,
-            weight_scale: &weight_scale,
+            weight_scale: &unit_scale(device, &kernels.project, "WS", "project_rows", label)?,
             weight_bound: &any_row_bound(device, &kernels.project, "WB", "project_rows", label)?,
         })
         .map_err(|e| qualification_dynamic("project_rows", label, e))?
@@ -466,6 +457,20 @@ pub(super) fn any_row_bound<E: seismic::Entry>(
     let extent = kernel.specialization().static_value(name).unwrap_or(0);
     let count = usize::try_from(extent).map_err(|error| qualification_dynamic(entry, bindings, error))?;
     semantic_f32(device, &[extent], &vec![32.0 * 128.0 * 128.0; count], entry, bindings)
+}
+
+/// A unit accumulator scale for `kernel`'s scale port whose static is
+/// `name`: ones at its static extent (0, absent, where the native has no
+/// such static), which leave whatever a qualification binds unscaled.
+pub(super) fn unit_scale<E: seismic::Entry>(
+    device: &Device,
+    kernel: &NativeKernel<E>,
+    name: &str,
+    entry: &'static str,
+    bindings: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let extent = kernel.specialization().static_value(name).unwrap_or(0);
+    semantic_ones(device, Element::f32(), &[extent], entry, bindings)
 }
 
 pub(super) fn semantic_f32(

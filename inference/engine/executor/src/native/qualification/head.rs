@@ -4,7 +4,6 @@ use crate::ReadoutHead;
 
 impl<'a> QualificationView<'a> {
     pub(super) fn qualify_head(&self, device: &Device) -> Result<(), CatalogFailure> {
-        let absent_scale = semantic_zeros(device, Element::f32(), &[0], "head", "scale")?;
         let (Some(head_plan), Some(head)) = (self.plan.head(), self.programs.head.as_ref()) else {
             return Ok(());
         };
@@ -117,8 +116,20 @@ impl<'a> QualificationView<'a> {
                             out_rows: &out_rows,
                             eps: 1.0e-5,
                             activation: 0,
-                            gate_scale: &absent_scale,
-                            up_scale: &absent_scale,
+                            gate_scale: &unit_scale(
+                                device,
+                                &kernels.expand,
+                                "GS",
+                                "dense_expand",
+                                &label,
+                            )?,
+                            up_scale: &unit_scale(
+                                device,
+                                &kernels.expand,
+                                "US",
+                                "dense_expand",
+                                &label,
+                            )?,
                             gate_bound: &any_row_bound(
                                 device,
                                 &kernels.expand,
@@ -149,7 +160,7 @@ impl<'a> QualificationView<'a> {
                             product: &product,
                             down_weight: &down,
                             out_rows: &out_rows,
-                            down_scale: &absent_scale,
+                            down_scale: &unit_scale(device, output, "DS", "dense_output", &label)?,
                             down_bound: &any_row_bound(
                                 device,
                                 output,

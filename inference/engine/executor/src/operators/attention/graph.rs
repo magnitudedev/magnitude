@@ -16,7 +16,7 @@
 use crate::operators::output::{CheckedPostNormEntries, PostNormShape, TailEntries, post_norm};
 use crate::operators::{self, InputForm, Join, SublayerInput};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
-use crate::programs::native_target_graph::{PackedWeight, PackingBound, ScaledWeight, WeightPort};
+use crate::programs::native_target_graph::{PackedWeight, WeightOperands, WeightPort};
 use crate::{AttentionBinding, AttentionShape, SelectionShape, SublayerTail};
 use crate::{
     native::{AttentionHistoryKernels, AttentionKernels, SelectedPrefillKernel},
@@ -310,26 +310,26 @@ pub(crate) struct AttentionWeights {
     pub output: Option<WorkflowTensor>,
     /// The sublayer's post-norm weight, when its tail is a post-norm.
     pub post_norm: Option<WorkflowTensor>,
-    /// The projections' packing bounds.
-    pub bounds: AttentionBounds,
+    /// The projections' scales and packing bounds.
+    pub operands: AttentionOperands,
     pub indexer: Option<IndexerWeights>,
 }
 
-/// The packing bounds of an attention block's projections, in the order of
-/// `attention_project`'s and `attention_output`'s bound ports.
+/// The scales and packing bounds of an attention block's projections, in
+/// the order of `attention_project`'s and `attention_output`'s ports.
 #[derive(Clone)]
-pub(crate) struct AttentionBounds {
-    pub query: PackingBound,
-    pub gate: PackingBound,
-    pub key: PackingBound,
-    pub value: PackingBound,
-    pub output: PackingBound,
-    pub indexer_query: PackingBound,
-    pub indexer_key: PackingBound,
+pub(crate) struct AttentionOperands {
+    pub query: WeightOperands,
+    pub gate: WeightOperands,
+    pub key: WeightOperands,
+    pub value: WeightOperands,
+    pub output: WeightOperands,
+    pub indexer_query: WeightOperands,
+    pub indexer_key: WeightOperands,
 }
 
-impl AttentionBounds {
-    /// The packing bounds of the block's weights at `scope` its graph reads
+impl AttentionOperands {
+    /// The operands of the block's weights at `scope` its graph reads
     /// (`attention_weights`): the query, gate and output's only where it
     /// attends (`attends`), and none of an absent segment's.
     #[allow(clippy::too_many_arguments)]
@@ -343,50 +343,66 @@ impl AttentionBounds {
         ports: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<Self, GraphError> {
-        let mut bound = |graph: &mut G, read: bool, kind| match read {
+        let mut operands = |graph: &mut G, read: bool, kind| match read {
             true => {
-                PackingBound::planned(graph, load, WeightRole { scope, kind }, ports, constants)
+                WeightOperands::planned(graph, load, WeightRole { scope, kind }, ports, constants)
             }
-            false => PackingBound::absent(graph, constants),
+            false => WeightOperands::absent(graph, constants),
         };
+        let selected = attends && matches!(operator.reads, HistoryReads::Selected { .. });
         Ok(Self {
-            indexer_query: bound(
-                graph,
-                attends && matches!(operator.reads, HistoryReads::Selected { .. }),
-                WeightKind::IndexerQuery,
-            )?,
-            indexer_key: bound(
-                graph,
-                attends && matches!(operator.reads, HistoryReads::Selected { .. }),
-                WeightKind::IndexerKey,
-            )?,
-            query: bound(graph, attends, operators::attention::query_kind(operator))?,
-            gate: bound(
+            indexer_query: operands(graph, selected, WeightKind::IndexerQuery)?,
+            indexer_key: operands(graph, selected, WeightKind::IndexerKey)?,
+            query: operands(graph, attends, operators::attention::query_kind(operator))?,
+            gate: operands(
                 graph,
                 attends && shape.gate_rows() > 0,
                 WeightKind::AttentionGate,
             )?,
-            key: bound(graph, shape.key_rows() > 0, WeightKind::Key)?,
-            value: bound(graph, shape.value_rows() > 0, WeightKind::Value)?,
-            output: bound(graph, attends, WeightKind::AttentionOutput)?,
+            key: operands(graph, shape.key_rows() > 0, WeightKind::Key)?,
+            value: operands(graph, shape.value_rows() > 0, WeightKind::Value)?,
+            output: operands(graph, attends, WeightKind::AttentionOutput)?,
         })
     }
 
-    /// The projection's bound dimensions, in `attention_project`'s order: a
-    /// history injection (`inject_only`) projects only keys and values.
-    pub(crate) fn project_dimensions(&self, inject_only: bool) -> [(&'static str, u64); 4] {
-        let attended = |bound: &PackingBound| if inject_only { 0 } else { bound.extent };
+    /// The projection's scale and bound dimensions, in `attention_project`'s
+    /// order: a history injection (`inject_only`) projects only keys and
+    /// values.
+    pub(crate) fn project_dimensions(&self, inject_only: bool) -> [(&'static str, u64); 8] {
+        let attended = |extent: u64| if inject_only { 0 } else { extent };
         [
-            ("QB", attended(&self.query)),
-            ("GB", attended(&self.gate)),
-            ("KB", self.key.extent),
-            ("VB", self.value.extent),
+            ("QS", attended(self.query.scale.extent)),
+            ("GS", attended(self.gate.scale.extent)),
+            ("KS", self.key.scale.extent),
+            ("VS", self.value.scale.extent),
+            ("QB", attended(self.query.bound.extent)),
+            ("GB", attended(self.gate.bound.extent)),
+            ("KB", self.key.bound.extent),
+            ("VB", self.value.bound.extent),
         ]
     }
 
-    /// The output projection's bound dimension.
-    pub(crate) fn output_dimensions(&self) -> [(&'static str, u64); 1] {
-        [("OB", self.output.extent)]
+    /// The indexer projection's scale and bound dimensions, in
+    /// `attention_project`'s order (no gate or value segments).
+    pub(crate) fn indexer_dimensions(&self) -> [(&'static str, u64); 8] {
+        [
+            ("QS", self.indexer_query.scale.extent),
+            ("GS", 0),
+            ("KS", self.indexer_key.scale.extent),
+            ("VS", 0),
+            ("QB", self.indexer_query.bound.extent),
+            ("GB", 0),
+            ("KB", self.indexer_key.bound.extent),
+            ("VB", 0),
+        ]
+    }
+
+    /// The output projection's scale and bound dimensions.
+    pub(crate) fn output_dimensions(&self) -> [(&'static str, u64); 2] {
+        [
+            ("OS", self.output.scale.extent),
+            ("OB", self.output.bound.extent),
+        ]
     }
 }
 
@@ -686,14 +702,14 @@ pub(crate) fn history_tile_bytes(visible: &[u8], tiles: usize) -> Option<Vec<u8>
 }
 
 /// The block's attention weights in the order and presence its operator's
-/// form, input form, sublayer tail and packing bounds define.
+/// form, input form, sublayer tail and projection operands define.
 pub(crate) fn attention_weights(
     shape: &AttentionShape,
     operator: &Attention,
     form: InputForm,
     needs_output: bool,
     post_norm: bool,
-    bounds: AttentionBounds,
+    operands: AttentionOperands,
     mut weight: impl FnMut(WeightKind) -> Result<WorkflowTensor, GraphError>,
 ) -> Result<AttentionWeights, GraphError> {
     let mut present = |present: bool, kind| present.then(|| weight(kind)).transpose();
@@ -709,7 +725,7 @@ pub(crate) fn attention_weights(
         sinks: present(needs_output && shape.sinks > 0, WeightKind::AttentionSinks)?,
         output: present(needs_output, WeightKind::AttentionOutput)?,
         post_norm: present(post_norm, WeightKind::PostNorm)?,
-        bounds,
+        operands,
         indexer: match operator.reads {
             HistoryReads::Visible => None,
             HistoryReads::Selected { .. } => Some(IndexerWeights {
@@ -745,17 +761,15 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
         .as_ref()
         .map(|gate| gate.slice_leading(0, 0))
         .unwrap_or_else(|| empty_weight.clone());
-    let bounds = &weights.bounds;
-    // A history injection reads neither the query's nor the gate's bound.
-    let (query_bound, gate_bound) = match block.inject_only {
+    let operands = &weights.operands;
+    // A history injection reads neither the query's nor the gate's operands.
+    let (query, gate) = match block.inject_only {
         true => {
-            let absent = PackingBound::absent(graph, constants)?;
+            let absent = WeightOperands::absent(graph, constants)?;
             (absent.clone(), absent)
         }
-        false => (bounds.query.clone(), bounds.gate.clone()),
+        false => (operands.query.clone(), operands.gate.clone()),
     };
-    // Attention binds no second-level scale (`operators::attention::UNSCALED_PROJECT`).
-    let unscaled = GraphConstant::absent(graph, constants)?.tensor().clone();
     let projected = graph.enqueue(
         kernels.project,
         &[
@@ -765,8 +779,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 shape.project_dimensions(rows)
             }
             .as_slice(),
-            operators::attention::UNSCALED_PROJECT.as_slice(),
-            bounds.project_dimensions(block.inject_only).as_slice(),
+            operands.project_dimensions(block.inject_only).as_slice(),
             &input.form.dimensions(shape.hidden),
         ]
         .concat(),
@@ -787,14 +800,14 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
             value_weight: segment(&weights.value, &empty_weight),
             epsilon: block.epsilon,
             project_mode: 0,
-            query_scale: (&unscaled).into(),
-            gate_scale: (&unscaled).into(),
-            key_scale: (&unscaled).into(),
-            value_scale: (&unscaled).into(),
-            query_bound: (&query_bound.tensor).into(),
-            gate_bound: (&gate_bound.tensor).into(),
-            key_bound: (&bounds.key.tensor).into(),
-            value_bound: (&bounds.value.tensor).into(),
+            query_scale: (&query.scale.tensor).into(),
+            gate_scale: (&gate.scale.tensor).into(),
+            key_scale: (&operands.key.scale.tensor).into(),
+            value_scale: (&operands.value.scale.tensor).into(),
+            query_bound: (&query.bound.tensor).into(),
+            gate_bound: (&gate.bound.tensor).into(),
+            key_bound: (&operands.key.bound.tensor).into(),
+            value_bound: (&operands.value.bound.tensor).into(),
         },
     )?;
     // The mix entries read the projection per head.
@@ -834,13 +847,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                 entries.project,
                 &[
                     indexer_project_dimensions(shape.hidden, binding, rows).as_slice(),
-                    operators::attention::UNSCALED_PROJECT.as_slice(),
-                    &[
-                        ("QB", bounds.indexer_query.extent),
-                        ("GB", 0),
-                        ("KB", bounds.indexer_key.extent),
-                        ("VB", 0),
-                    ],
+                    operands.indexer_dimensions().as_slice(),
                     &input.form.dimensions(shape.hidden),
                 ]
                 .concat(),
@@ -848,13 +855,13 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                     hidden: input.rows.into(),
                     input_norm: (&input_norm).into(),
                     query_weight: (&indexer.query).into(),
-                    query_scale: (&absent).into(),
+                    query_scale: (&operands.indexer_query.scale.tensor).into(),
                     gate_scale: (&absent).into(),
-                    key_scale: (&absent).into(),
+                    key_scale: (&operands.indexer_key.scale.tensor).into(),
                     value_scale: (&absent).into(),
-                    query_bound: (&bounds.indexer_query.tensor).into(),
+                    query_bound: (&operands.indexer_query.bound.tensor).into(),
                     gate_bound: (&absent).into(),
-                    key_bound: (&bounds.indexer_key.tensor).into(),
+                    key_bound: (&operands.indexer_key.bound.tensor).into(),
                     value_bound: (&absent).into(),
                     gate_weight: (&empty).into(),
                     key_weight: (&indexer.key).into(),
@@ -909,10 +916,9 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                             injected,
                             ("Q", heads),
                             ("W", width),
-                            operators::attention::UNSCALED_OUTPUT,
                         ]
                         .as_slice(),
-                        bounds.output_dimensions().as_slice(),
+                        operands.output_dimensions().as_slice(),
                     ]
                     .concat(),
                     attention_output::WorkflowArgs {
@@ -920,23 +926,22 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                         inject: (&inject).into(),
                         gated: (&attended).into(),
                         output_weight: output_weight.into(),
-                        output_scale: (&unscaled).into(),
-                        output_bound: (&bounds.output.tensor).into(),
+                        output_scale: (&operands.output.scale.tensor).into(),
+                        output_bound: (&operands.output.bound.tensor).into(),
                     },
                 )?
                 .value
         }
         (TailEntries::PostNorm(entries), Some(norm)) => {
             let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
-            let absent = GraphConstant::absent(graph, constants)?.tensor().clone();
             let mixed = post_norm(
                 graph,
                 entries,
                 residual,
                 (&attended.reshape(&[rows, heads * width])).into(),
                 &PackedWeight {
-                    scaled: ScaledWeight::unscaled(output_weight.clone(), absent),
-                    bound: bounds.output.clone(),
+                    weight: output_weight.clone(),
+                    operands: operands.output.clone(),
                 },
                 norm,
                 out_rows.port().tensor(),

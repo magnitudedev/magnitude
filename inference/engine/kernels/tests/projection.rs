@@ -4915,61 +4915,83 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
     }
 }
 
-/// The state-space mixer's projections under their weights' second-level
-/// scales (Nemotron 3.5's NVFP4 `ssm_in` / `ssm_out` `.scale`):
-/// `attention_project`'s query segment alone (QS = 1) and `attention_output`
-/// (OS = 1) multiply their F32 accumulators by the scale before rounding,
-/// against the portable bodies and the host reference at every launch class,
-/// and on Metal in the PACK form too. One test per backend; CUDA's is
-/// `cuda_projection_blocks.rs`'.
+/// Projections under their weights' second-level scales (Nemotron's NVFP4
+/// `.scale`s): every segment of `attention_project` (QS = GS = KS = VS = 1,
+/// one scale each) and `attention_output` (OS = 1) multiply their F32
+/// accumulators by their scale before rounding, against the portable bodies
+/// and the host reference at every launch class, and on Metal in the PACK
+/// form too. One test per backend; CUDA's is `cuda_projection_blocks.rs`'.
 #[test]
-fn cpu_scaled_state_space_projections_match_the_host() {
-    scaled_state_space_projections_on_backend(BackendName::Cpu);
+fn cpu_scaled_projections_match_the_host() {
+    scaled_projections_on_backend(BackendName::Cpu);
 }
 
 #[test]
-fn metal_scaled_state_space_projections_match_the_host() {
-    scaled_state_space_projections_on_backend(BackendName::Metal);
+fn metal_scaled_projections_match_the_host() {
+    scaled_projections_on_backend(BackendName::Metal);
 }
 
 #[test]
-fn vulkan_scaled_state_space_projections_match_the_host() {
-    scaled_state_space_projections_on_backend(BackendName::Vulkan);
+fn vulkan_scaled_projections_match_the_host() {
+    scaled_projections_on_backend(BackendName::Vulkan);
 }
 
-fn scaled_state_space_projections_on_backend(backend: BackendName) {
+fn scaled_projections_on_backend(backend: BackendName) {
     if let Some(device) = devices()
         .into_iter()
         .find(|device| device.backend() == backend)
     {
-        scaled_state_space_projections_on(&device);
+        scaled_projections_on(&device);
     }
 }
 
-fn scaled_state_space_projections_on(device: &Device) {
-    /// A second-level scale that is not a power of two.
+fn scaled_projections_on(device: &Device) {
+    /// The segments' second-level scales, query, gate, key, value: none a
+    /// power of two, each distinct, so a scale bound to the wrong segment
+    /// fails.
+    const SCALES: [f32; 4] = [0.412_5, 0.731_2, 1.368_8, 0.207_5];
+    /// The output projection's.
     const SCALE: f32 = 0.412_5;
     let module = module();
     let act = Act::Bf16;
-    // A projection row of 320 columns over a 256-wide residual; an output
-    // projection of 4 heads of 64 channels back to it.
-    let (d, columns, heads, width) = (256usize, 320usize, 4usize, 64usize);
+    // Query, gate, key and value segments of 128, 64, 64 and 64 rows over a
+    // 256-wide residual; an output projection of 4 heads of 64 channels
+    // back to it.
+    let (d, heads, width) = (256usize, 4usize, 64usize);
+    let segments = [128usize, 64, 64, 64];
     let k = heads * width;
     let norm = norm_values(d, 17);
     let rows_classes = [1usize, 2, 8, 17, 64, 128];
     let mappings = [MAPPINGS[0], MAPPINGS[2]];
     let metal = device.backend() == BackendName::Metal;
     for repr in [Repr::Nvfp4, Repr::Q4k] {
-        let projection = weight(repr, columns, d, 301, 1.0);
+        let projections = [301, 311, 312, 313]
+            .into_iter()
+            .zip(segments)
+            .map(|(seed, rows)| weight(repr, rows, d, seed, 1.0))
+            .collect::<Vec<_>>();
         let output = weight(repr, d, k, 302, 1.0);
         let project = |hidden: &[f32], rows: usize, mapping: Mapping, pack: Option<Pack>| {
             let specialization = attention_project_specialization_on(
                 device,
-                &[("D", d), ("Q", columns), ("GR", 0), ("K", 0), ("V", 0), ("QS", 1)],
+                &[
+                    ("D", d),
+                    ("Q", segments[0]),
+                    ("GR", segments[1]),
+                    ("K", segments[2]),
+                    ("V", segments[3]),
+                    ("QS", 1),
+                    ("GS", 1),
+                    ("KS", 1),
+                    ("VS", 1),
+                ],
                 mapping,
             );
-            let weight = projection.tensor(device);
-            let empty = weight.slice_leading(0, 0).unwrap();
+            let weights = projections
+                .iter()
+                .map(|projection| projection.tensor(device))
+                .collect::<Vec<_>>();
+            let scales = SCALES.map(|scale| f32_tensor(device, &[1], &[scale]));
             let out = attention_project::native_for_device_with(
                 device,
                 attention_project::Elements {
@@ -4989,23 +5011,23 @@ fn scaled_state_space_projections_on(device: &Device) {
             .call(attention_project::Args {
                 hidden: &f32_tensor(device, &[rows, d], hidden),
                 input_norm: &bf16_norm(device, &norm),
-                query_weight: &weight,
-                gate_weight: &empty,
-                key_weight: &empty,
-                value_weight: &empty,
+                query_weight: &weights[0],
+                gate_weight: &weights[1],
+                key_weight: &weights[2],
+                value_weight: &weights[3],
                 epsilon: 1e-6,
                 project_mode: 0,
-                query_scale: &f32_tensor(device, &[1], &[SCALE]),
-                gate_scale: &no_scale(device),
-                key_scale: &no_scale(device),
-                value_scale: &no_scale(device),
+                query_scale: &scales[0],
+                gate_scale: &scales[1],
+                key_scale: &scales[2],
+                value_scale: &scales[3],
                 query_bound: &absent_bound(device),
                 gate_bound: &absent_bound(device),
                 key_bound: &absent_bound(device),
                 value_bound: &absent_bound(device),
             })
             .unwrap();
-            read_act(act, &out.r0)
+            [&out.r0, &out.r1, &out.r2, &out.r3].map(|segment| read_act(act, segment))
         };
         let output_native =
             |hidden: &[f32], gated: &[f32], rows: usize, mapping: Mapping, pack: Option<Pack>| {
@@ -5040,21 +5062,24 @@ fn scaled_state_space_projections_on(device: &Device) {
                 .value;
                 read_f32(&out)
             };
-        // The scaled accumulators rounded to A, and their bounds.
+        // Each segment's scaled accumulators rounded to A, and their bounds.
         let project_reference = |hidden: &[f32], rows: usize| {
-            let (mut expected, mut bound) = (Vec::new(), Vec::new());
-            for r in 0..rows {
-                let (x, slack) = rms_row(act, &hidden[r * d..(r + 1) * d], &norm, 1e-6);
-                for n in 0..columns {
-                    let (acc, magnitude) = dot(&x, projection.row(n));
-                    expected.push(act.round(SCALE * acc));
-                    bound.push(
-                        rounded_bound(act, SCALE * acc, SCALE * magnitude)
-                            + SCALE * slack_dot(&slack, projection.row(n)),
-                    );
+            std::array::from_fn::<_, 4, _>(|segment| {
+                let (projection, scale) = (&projections[segment], SCALES[segment]);
+                let (mut expected, mut bound) = (Vec::new(), Vec::new());
+                for r in 0..rows {
+                    let (x, slack) = rms_row(act, &hidden[r * d..(r + 1) * d], &norm, 1e-6);
+                    for n in 0..segments[segment] {
+                        let (acc, magnitude) = dot(&x, projection.row(n));
+                        expected.push(act.round(scale * acc));
+                        bound.push(
+                            rounded_bound(act, scale * acc, scale * magnitude)
+                                + scale * slack_dot(&slack, projection.row(n)),
+                        );
+                    }
                 }
-            }
-            (expected, bound)
+                (expected, bound)
+            })
         };
         let output_reference = |hidden: &[f32], gated: &[f32], rows: usize| {
             let (mut expected, mut bound) = (Vec::new(), Vec::new());
@@ -5087,30 +5112,22 @@ fn scaled_state_space_projections_on(device: &Device) {
             &[
                 ("NW", registry::dense(DType::BF16)),
                 ("QW", repr.storage()),
-                ("GW", registry::dense(DType::BF16)),
-                ("KW", registry::dense(DType::BF16)),
-                ("VW", registry::dense(DType::BF16)),
+                ("GW", repr.storage()),
+                ("KW", repr.storage()),
+                ("VW", repr.storage()),
                 ("A", registry::dense(DType::BF16)),
             ],
-            vec![
+            [
                 floats(&[rows, d], &hidden),
                 activations(Act::Bf16, &[d], &norm),
-                Input::Data(projection.oracle()),
-                activations(Act::Bf16, &[0, d], &[]),
-                activations(Act::Bf16, &[0, d], &[]),
-                activations(Act::Bf16, &[0, d], &[]),
-                Input::F32(1e-6),
-                Input::I32(0),
-                // The query segment's scale; no other scale or bound.
-                floats(&[1], &[SCALE]),
-                floats(&[0], &[]),
-                floats(&[0], &[]),
-                floats(&[0], &[]),
-                floats(&[0], &[]),
-                floats(&[0], &[]),
-                floats(&[0], &[]),
-                floats(&[0], &[]),
-            ],
+            ]
+            .into_iter()
+            .chain(projections.iter().map(|projection| Input::Data(projection.oracle())))
+            .chain([Input::F32(1e-6), Input::I32(0)])
+            // Every segment's scale; no bound.
+            .chain(SCALES.map(|scale| floats(&[1], &[scale])))
+            .chain((0..4).map(|_| floats(&[0], &[])))
+            .collect(),
         );
         let outputted = interpret(
             &module,
@@ -5126,14 +5143,17 @@ fn scaled_state_space_projections_on(device: &Device) {
                 floats(&[0], &[]),
             ],
         );
-        let (_, project_bound) = under(rows, || project_reference(&hidden, rows));
+        let project_reference_at = under(rows, || project_reference(&hidden, rows));
         let (_, output_bound) = under(rows, || output_reference(&hidden, &gated, rows));
-        assert_within(
-            &format!("scaled attention_project portable {repr:?}"),
-            &project(&hidden, rows, MAPPINGS[0], None),
-            &result(&projected, 0),
-            &project_bound,
-        );
+        let projected_native = project(&hidden, rows, MAPPINGS[0], None);
+        for (segment, (_, project_bound)) in project_reference_at.iter().enumerate() {
+            assert_within(
+                &format!("scaled attention_project portable {repr:?} segment {segment}"),
+                &projected_native[segment],
+                &result(&projected, segment),
+                project_bound,
+            );
+        }
         assert_within(
             &format!("scaled attention_output portable {repr:?}"),
             &output_native(&hidden, &gated, rows, MAPPINGS[0], None),
@@ -5144,17 +5164,21 @@ fn scaled_state_space_projections_on(device: &Device) {
         // Every launch class against the host reference.
         for rows in rows_classes {
             let (hidden, gated) = case(rows);
-            let (project_expected, project_bound) =
-                under(rows, || project_reference(&hidden, rows));
+            let project_expected = under(rows, || project_reference(&hidden, rows));
             let (output_expected, output_bound) =
                 under(rows, || output_reference(&hidden, &gated, rows));
             for mapping in mappings {
-                assert_within(
-                    &format!("scaled attention_project {repr:?} M {rows} {mapping:?}"),
-                    &project(&hidden, rows, mapping, None),
-                    &project_expected,
-                    &project_bound,
-                );
+                let projected = project(&hidden, rows, mapping, None);
+                for (segment, (expected, bound)) in project_expected.iter().enumerate() {
+                    assert_within(
+                        &format!(
+                            "scaled attention_project {repr:?} M {rows} {mapping:?} segment {segment}"
+                        ),
+                        &projected[segment],
+                        expected,
+                        bound,
+                    );
+                }
                 assert_within(
                     &format!("scaled attention_output {repr:?} M {rows} {mapping:?}"),
                     &output_native(&hidden, &gated, rows, mapping, None),
@@ -5167,12 +5191,15 @@ fn scaled_state_space_projections_on(device: &Device) {
             if metal && rows > 64 {
                 let wide = |values: &[f32]| values.iter().map(|v| f64::from(*v)).collect::<Vec<_>>();
                 let packed = project(&hidden, rows, pack_mapping(), Some(PACK_DEFAULT));
-                let (relative, worst) =
-                    relative_difference(&wide(&project_expected), &wide(&packed));
-                assert!(
-                    relative <= 2e-2 && worst <= 0.2,
-                    "packed scaled attention_project {repr:?} M {rows}: {relative:.2e}, {worst:.2e}"
-                );
+                for (segment, (expected, _)) in project_expected.iter().enumerate() {
+                    let (relative, worst) =
+                        relative_difference(&wide(expected), &wide(&packed[segment]));
+                    assert!(
+                        relative <= 2e-2 && worst <= 0.2,
+                        "packed scaled attention_project {repr:?} M {rows} segment {segment}: \
+                         {relative:.2e}, {worst:.2e}"
+                    );
+                }
                 let projection_only = |values: &[f32]| {
                     values
                         .iter()

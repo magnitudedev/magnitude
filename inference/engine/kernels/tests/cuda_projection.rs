@@ -132,7 +132,7 @@ fn output_kernel(
             DW: format.resident(),
             A: Element::bf16(),
         },
-        &mapping.projection_params(
+        &mapping.dense_pair_params(
             NativeSpecialization::new()
                 .with_static("H", h as u64)
                 .with_static("F", f as u64)
@@ -674,7 +674,7 @@ fn cuda_dense_weights_match_host_model() {
             let result = dense_output::native_for_device_with(
                 &device,
                 dense_output::Elements { DW: bf16, A: bf16 },
-                &mapping.projection_params(statics.with_static("DS", 0)),
+                &mapping.dense_pair_params(statics.with_static("DS", 0)),
             )
             .unwrap()
             .call(dense_output::Args {
