@@ -20,7 +20,7 @@ use magnitude_executor::UnpreparedUnits;
 
 use super::ResidencyWorker;
 use super::controller::GRACEFUL_EXIT;
-use crate::device_lock::DeviceShare;
+use crate::device_lock::DeviceHold;
 use crate::worker_process::{BlockingChild, BlockingProcess, WorkerLauncher, WorkerRole};
 
 /// The most recent worker diagnostics kept for failure reports.
@@ -68,13 +68,13 @@ fn log_exit(pid: u32, status: ExitStatus) {
     }
 }
 
-/// A worker process, and the device share of the load or optimization that started it: the
-/// device is shared until the process is proven retired.
+/// A worker process, and the device hold of the load or optimization that started it: the
+/// device is held until the process is proven retired.
 enum ProcessState {
     Owned {
         process: BlockingProcess,
         /// Held, never read: dropping it with the owner releases the device.
-        _device: Arc<DeviceShare>,
+        _device: DeviceHold,
     },
     Retired(ExitStatus),
 }
@@ -125,7 +125,7 @@ impl EngineWorker {
     /// Spawn an `inference-worker` process for the load or optimization holding `device`.
     pub fn spawn(
         launcher: &WorkerLauncher,
-        device: Arc<DeviceShare>,
+        device: DeviceHold,
     ) -> anyhow::Result<SpawnedWorker> {
         let command = launcher.command(WorkerRole::Inference)?;
         let BlockingChild {
@@ -539,7 +539,7 @@ mod tests {
         let worker = EngineWorker {
             process: Mutex::new(ProcessState::Owned {
                 process,
-                _device: Arc::new(device.try_share().unwrap()),
+                _device: DeviceHold::Share(Arc::new(device.try_share().unwrap())),
             }),
             client: OnceLock::new(),
             diagnostics: Arc::new(Mutex::new(DiagnosticTail::default())),
@@ -547,14 +547,14 @@ mod tests {
         assert_eq!(worker.pid(), Some(pid));
         assert!(worker.try_wait().unwrap().is_none());
         // The device is shared while the worker runs and released once it is proven retired.
-        assert!(device.try_measure().is_none());
+        assert!(device.try_job().is_none());
         worker.shutdown();
         let status = worker
             .try_wait()
             .unwrap()
             .expect("unready shutdown terminates");
         assert_eq!(worker.pid(), None);
-        assert!(device.try_measure().is_some());
+        assert!(device.try_job().is_some());
         assert_eq!(worker.retire().unwrap(), status);
     }
 }

@@ -1,10 +1,11 @@
 //! Post-install kernel tuning: after a catalog download, one inference worker runs the model's
 //! Prepare on the device a load would select, so the first load finds every tuning record in the
 //! kernel cache and is one worker, as any later load. The job resolves and previews exactly as a
-//! load does, shares the device against the measurement job as a load does
-//! ([`crate::device_lock`]), and never imports the model. A load of the same bundle stops it; the
-//! records it published stand, and the load has its own Prepare search the units the job had not
-//! reached.
+//! load does and never imports the model. It runs only with the device to itself
+//! ([`crate::device_lock`]): a search beside a resident or loading model would take the memory
+//! that model's verdict promised its requests. It is skipped while residency holds the device,
+//! and any load preempts it; the records it published stand, and a load of the model has its own
+//! Prepare search the units the job had not reached.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -20,16 +21,13 @@ use magnitude_service_models::{ServableModelBundleKey, servable_model_bundle_key
 use super::controller::{ResidencyEnvironment, load_plan, preview};
 use super::worker::EngineWorker;
 use super::{ModelOperationFailure, ResidencyWorker as _};
+use crate::device_lock::DeviceHold;
 
 /// The running preparation jobs, one per bundle.
 #[derive(Clone, Default)]
-pub(crate) struct PreparationJobs(Arc<Mutex<HashMap<ServableModelBundleKey, PreparationJob>>>);
-
-#[derive(Default)]
-struct PreparationJob {
-    stopped: bool,
-    worker: Option<Arc<EngineWorker>>,
-}
+pub(crate) struct PreparationJobs(
+    Arc<Mutex<HashMap<ServableModelBundleKey, Option<Arc<EngineWorker>>>>>,
+);
 
 /// A registered job; dropping it unregisters the job.
 struct PreparationGuard {
@@ -44,48 +42,21 @@ impl PreparationJobs {
         if jobs.contains_key(&key) {
             return None;
         }
-        jobs.insert(key.clone(), PreparationJob::default());
+        jobs.insert(key.clone(), None);
         Some(PreparationGuard {
             jobs: self.clone(),
             key,
         })
     }
-
-    /// Stop the job preparing `key`, if any, and prove its worker has exited.
-    pub(crate) fn stop(&self, key: &ServableModelBundleKey) {
-        let worker = {
-            let mut jobs = self.0.lock().expect("preparation job lock");
-            let Some(job) = jobs.get_mut(key) else {
-                return;
-            };
-            job.stopped = true;
-            job.worker.take()
-        };
-        if let Some(worker) = worker {
-            worker.terminate("preparation_stopped", "a load of the model takes over its tuning");
-        }
-    }
 }
 
 impl PreparationGuard {
-    /// Hand the job its worker; `false` when the job was already stopped.
-    fn attach(&self, worker: Arc<EngineWorker>) -> bool {
+    /// Hand the job its worker, which ends with the job.
+    fn attach(&self, worker: Arc<EngineWorker>) {
         let mut jobs = self.jobs.0.lock().expect("preparation job lock");
-        let job = jobs.get_mut(&self.key).expect("a guarded job is registered");
-        if job.stopped {
-            return false;
-        }
-        job.worker = Some(worker);
-        true
-    }
-
-    fn stopped(&self) -> bool {
-        self.jobs
-            .0
-            .lock()
-            .expect("preparation job lock")
-            .get(&self.key)
-            .is_some_and(|job| job.stopped)
+        *jobs
+            .get_mut(&self.key)
+            .expect("a guarded job is registered") = Some(worker);
     }
 }
 
@@ -93,13 +64,14 @@ impl PreparationGuard {
 /// (cancel, remove) must terminate it rather than wait for the last reference to drop.
 impl Drop for PreparationGuard {
     fn drop(&mut self) {
-        let job = self
+        let worker = self
             .jobs
             .0
             .lock()
             .expect("preparation job lock")
-            .remove(&self.key);
-        if let Some(worker) = job.and_then(|job| job.worker) {
+            .remove(&self.key)
+            .flatten();
+        if let Some(worker) = worker {
             worker.terminate("preparation_ended", "the installation's optimization ended");
         }
     }
@@ -150,17 +122,19 @@ async fn prepare(
     };
     let device = load_plan(&preview)?.device;
     progress(CatalogOptimizationProgress::preparing(Some(device.clone())));
-    let share = Arc::new(environment.device.share().await);
-    let spawned = EngineWorker::spawn(&environment.launcher, share).map_err(|error| {
-        ModelOperationFailure::new("worker_spawn_failed", format!("{error:#}"), true)
-    })?;
+    let Some(hold) = environment.device.job_unless_resident().await else {
+        return Ok(Preparation::Skipped("a model holds the device"));
+    };
+    let mut preemption = hold.preemption();
+    let spawned =
+        EngineWorker::spawn(&environment.launcher, DeviceHold::Job(hold)).map_err(|error| {
+            ModelOperationFailure::new("worker_spawn_failed", format!("{error:#}"), true)
+        })?;
     let worker = Arc::clone(&spawned.worker);
-    if !job.attach(Arc::clone(&worker)) {
-        return Ok(Preparation::Skipped("a load of the model stopped it"));
-    }
+    job.attach(Arc::clone(&worker));
     let mut manifest = resolved.manifest.clone();
     manifest.device = DeviceRequest::Selector(preview.device);
-    let prepared = crate::spawn_blocking_traced(move || {
+    let mut preparing = crate::spawn_blocking_traced(move || {
         let mut progression = OptimizationProgression::new(device);
         magnitude_engine::worker::prepare(
             &manifest,
@@ -171,9 +145,17 @@ async fn prepare(
                 }
             },
         )
-    })
-    .await
-    .map_err(|error| {
+    });
+    // A load wanting the device preempts the job: its worker is killed, and the load proceeds
+    // once it is proven retired.
+    let (prepared, preempted) = tokio::select! {
+        prepared = &mut preparing => (prepared, false),
+        () = preemption.preempted() => {
+            worker.terminate("preparation_preempted", "a load takes the device");
+            (preparing.await, true)
+        }
+    };
+    let prepared = prepared.map_err(|error| {
         ModelOperationFailure::new(
             "worker_exited",
             format!("worker preparation task failed: {error}"),
@@ -185,8 +167,8 @@ async fn prepare(
         Ok(WorkerPreparation::Unshared) => {
             Ok(Preparation::Skipped("the configuration names no kernel cache"))
         }
-        Ok(WorkerPreparation::Incomplete(_)) | Err(_) if job.stopped() => {
-            Ok(Preparation::Skipped("a load of the model stopped it"))
+        Ok(WorkerPreparation::Incomplete(_)) | Err(_) if preempted => {
+            Ok(Preparation::Skipped("a load preempted it"))
         }
         Ok(WorkerPreparation::Incomplete(error)) | Err(error) => Err(ModelOperationFailure::new(
             "model_optimization_failed",

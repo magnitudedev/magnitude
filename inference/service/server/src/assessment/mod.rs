@@ -1121,9 +1121,9 @@ mod tests {
         let device = DeviceLock::default();
         let share = HostDevice::new(&device, true).share().await;
         assert!(share.is_some());
-        assert!(device.try_measure().is_none());
+        assert!(device.try_job().is_none());
         drop(share);
-        let mut job = device.try_measure().unwrap();
+        let mut job = device.try_job().unwrap();
         let host = HostDevice::new(&device, true);
         let waiting = tokio::spawn(async move { host.share().await.is_some() });
         tokio::select! {
@@ -1134,7 +1134,7 @@ mod tests {
         drop(job);
         assert!(waiting.await.unwrap());
         assert!(HostDevice::new(&device, false).share().await.is_none());
-        assert!(device.try_measure().is_some());
+        assert!(device.try_job().is_some());
     }
 
     /// The pool settles for the job once every slice is read and no entry is assessing; a GPU's

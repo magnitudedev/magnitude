@@ -2,13 +2,13 @@
 //! kernels, which can fault or hang in a driver, and a native submission cannot be cancelled once
 //! started; so the service never measures in its own process and nothing waits on a measurement.
 //! The job is a mode of the inference worker, run only with the device to itself
-//! ([`DeviceLock::try_measure`]) and held to a hard deadline on its silence: a job that reports
+//! ([`DeviceLock::job`]) and held to a hard deadline on its silence: a job that reports
 //! nothing for [`HANG_DEADLINE`] is hung, and it is killed and waited for a bounded time on a
-//! detached task. A load or catalog optimization wanting the device
-//! preempts it: the job is killed at once, its attempts are released rather than counted, and the
-//! next job resumes from what is stored. Its state moves `Unmeasured → Measuring → Measured |
-//! Failed { retry_at }` (a preempted job back to `Unmeasured`), and what it stores reaches the
-//! assessment pool, which re-finishes every assessed model under it.
+//! detached task. A load wanting the device preempts it: the job is killed at once, its attempts
+//! are released rather than counted, and the next job resumes from what is stored. Its state
+//! moves `Unmeasured → Measuring → Measured | Failed { retry_at }` (a preempted job back to
+//! `Unmeasured`), and what it stores reaches the assessment pool, which re-finishes every
+//! assessed model under it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,7 @@ use seismic::PointKey;
 use seismic::measure::Record;
 use tokio::sync::{mpsc, watch};
 
-use crate::device_lock::{DeviceLock, DeviceMeasurement};
+use crate::device_lock::{DeviceJob, DeviceLock};
 use crate::residency::controller::GRACEFUL_EXIT;
 use crate::residency::worker::{JobWorker, KILL_REAP};
 use crate::worker_process::WorkerLauncher;
@@ -254,9 +254,9 @@ async fn read_stored<M: MeasuredMachine>(machine: &Arc<M>) -> Option<M::Stored> 
 
 /// Run jobs until what assessment reads is stored: the executor's fixed cost points, whatever
 /// the models assessed. Each job runs only with the device to itself, deferring while residency
-/// shares it until a share ends ([`DeviceLock::released`]) and while `settled` does not hold,
-/// preempted when residency wants it back, and retried after a failure with a backoff that
-/// doubles. A preempted job is no
+/// shares it or a catalog optimization holds it ([`DeviceLock::job`]) and while `settled` does
+/// not hold, preempted when residency wants it back, and retried after a failure with a backoff
+/// that doubles. A preempted job is no
 /// failure: the next resumes from what it stored. The hardware and driver identities are the
 /// inventory's revision, fixed for the service's life, so the backoff is this process's and a
 /// changed identity is the next process's discovery, starting anew.
@@ -271,14 +271,7 @@ async fn run<M: MeasuredMachine>(
     while status.borrow().measurements.pending() {
         // A pool that is gone has no work left on the device.
         let _ = settled.wait_for(|settled| *settled).await;
-        // Every share's end wakes this, after its release: a failed try is always followed by
-        // the end of a share it saw.
-        let exclusive = loop {
-            if let Some(exclusive) = device.try_measure() {
-                break exclusive;
-            }
-            device.released().await;
-        };
+        let exclusive = device.job().await;
         status.send_modify(|status| status.state = MeasurementState::Measuring);
         let started = tokio::time::Instant::now();
         let outcome = match run_job(&machine, exclusive, deadline).await {
@@ -345,7 +338,7 @@ enum JobEnd {
 /// against a point.
 async fn run_job<M: MeasuredMachine>(
     machine: &Arc<M>,
-    mut exclusive: DeviceMeasurement,
+    mut exclusive: DeviceJob,
     deadline: Duration,
 ) -> JobEnd {
     let started = {
