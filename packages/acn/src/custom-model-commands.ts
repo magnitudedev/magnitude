@@ -687,7 +687,7 @@ export const CustomModelCommandsLive: Layer.Layer<
       })),
       () => configured?._tag === "Reference" ? Option.some<DrafterCandidate>({
         category: "Other", reference: configured.reference,
-        ...drafterReferenceNaming(configured.reference, catalogModels), sizeBytes: 0,
+        ...drafterReferenceNaming(configured.reference, catalogModels, Option.some(configured.method)), sizeBytes: 0,
         lineage: "None", verdict: { _tag: "None" }, automatic: false, onThisComputer: false, method: Option.some(configured.method),
       }) : Option.none(),
     )
@@ -1135,7 +1135,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         })),
         () => configured?._tag === "Reference" ? Option.some<DrafterCandidate>({
           category: "Other", reference: configured.reference,
-          ...drafterReferenceNaming(configured.reference, sourceState.catalogModels), sizeBytes: 0,
+          ...drafterReferenceNaming(configured.reference, sourceState.catalogModels, Option.some(configured.method)), sizeBytes: 0,
           lineage: "None", verdict: { _tag: "None" }, automatic: false, onThisComputer: false, method: Option.some(configured.method),
         }) : Option.none(),
       )

@@ -1233,9 +1233,7 @@ pub struct CatalogMissingComponent {
     pub download_bytes: u64,
 }
 
-/// A catalog model's state here. `drafter_withheld`: it serves, and is assessed, without its
-/// catalog drafter, which it doesn't fit with: it loads when it fits without it, and otherwise is
-/// refused with its own shortfall. `stored_components`: the parts
+/// A catalog model's state here. `stored_components`: the parts
 /// Magnitude stores for a model whose weights are only in another app's location (its projector
 /// package and drafter), which Remove deletes while the found weights stay and keep serving.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1250,19 +1248,23 @@ pub enum CatalogModelState {
         update_state: CatalogModelUpdate,
         missing_components: Vec<CatalogMissingComponent>,
         stored_components: Vec<CatalogComponent>,
-        drafter_withheld: bool,
     },
 }
 
-/// A catalog variant and its state on this computer. `aliases` are the `hf:` IDs its target's
-/// files found in an external location (a Hugging Face cache) would have as custom models, which
-/// clients resolve to this model, so references made before the file was attributed keep working.
+/// A catalog variant and its state on this computer. `desired`: the model installing it fetches
+/// and serves here. `drafter_withheld`: it fits this computer only without its catalog drafter (or
+/// not at all), so it is fetched, served and assessed without it, installed or not: it loads when
+/// it fits without it, and otherwise is refused with its own shortfall. `aliases` are the `hf:` IDs
+/// its target's files found in an external location (a Hugging Face cache) would have as custom
+/// models, which clients resolve to this model, so references made before the file was attributed
+/// keep working.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CatalogModel {
     pub id: ModelId,
     pub desired: ReadyModel,
+    pub drafter_withheld: bool,
     pub display_name: String,
     pub variant_label: String,
     pub description: String,

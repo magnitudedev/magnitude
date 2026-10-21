@@ -200,10 +200,9 @@ impl ManagedCatalogInstallations {
         id: &ModelId,
     ) -> Result<CatalogInstallationAdmission, InventoryError> {
         let _mutation = self.mutations.lock().await;
-        let definition = self.resolver.catalog_definition(id)?;
-        reject_unavailable(id, definition)?;
+        reject_unavailable(id, self.resolver.catalog_definition(id)?)?;
         self.reject_active(id).await?;
-        let bundle = definition.configuration.bundle.clone();
+        let bundle = self.resolver.desired_catalog_configuration(id)?.bundle;
         let requested = RequestedDownload::CatalogModel { model: id.clone() };
         self.admit(id, bundle, requested).await
     }

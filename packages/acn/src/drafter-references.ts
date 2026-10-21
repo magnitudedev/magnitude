@@ -39,16 +39,19 @@ export interface DrafterNaming {
 const fileName = (path: string): string => path.split(/[\\/]/).at(-1) ?? path
 
 /**
- * The name and label of the drafter a catalog model ships, such as "Magnitude DFlash for Qwen3.5 4B"
- * and "Trained for Qwen3.5 4B": the same form ICN gives a catalog drafter candidate.
+ * The name and label of the drafter a catalog model ships, binding with `method`, such as
+ * "Magnitude DFlash for Qwen3.5 4B" and "Trained for Qwen3.5 4B": the same form ICN gives a catalog
+ * drafter candidate. The method is the drafter's own, never the catalog model's served one, which
+ * has none when the model fits this computer only without its drafter.
  */
 export const catalogDrafterNaming = (
   catalog: readonly CatalogModelSource[],
   modelId: string,
+  method: Option.Option<SpeculativeMethod>,
 ): Option.Option<DrafterNaming> => Option.map(
   Option.fromNullable(catalog.find(({ id }) => id === modelId)),
   ({ source }) => ({
-    name: catalogDrafterName(source.displayName, source.desired.speculativeMethod),
+    name: catalogDrafterName(source.displayName, method),
     label: `Trained for ${source.displayName}`,
   }),
 )
@@ -60,9 +63,10 @@ export const catalogDrafterNaming = (
 export const drafterReferenceNaming = (
   reference: DrafterReference,
   catalog: readonly CatalogModelSource[],
+  method: Option.Option<SpeculativeMethod>,
 ): DrafterNaming => {
   switch (reference._tag) {
-    case "Catalog": return Option.getOrElse(catalogDrafterNaming(catalog, reference.modelId), () => ({
+    case "Catalog": return Option.getOrElse(catalogDrafterNaming(catalog, reference.modelId, method), () => ({
       name: "Magnitude drafter",
       label: "Trained by Magnitude",
     }))
@@ -84,7 +88,7 @@ export const productDrafterCandidate = (
   reference: candidate.reference,
   ...Option.getOrElse(
     candidate.reference._tag === "Catalog"
-      ? catalogDrafterNaming(catalog, candidate.reference.modelId)
+      ? catalogDrafterNaming(catalog, candidate.reference.modelId, candidate.method)
       : Option.none<DrafterNaming>(),
     (): DrafterNaming => ({ name: candidate.name, label: candidate.label }),
   ),
