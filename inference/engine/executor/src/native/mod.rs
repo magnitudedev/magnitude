@@ -12,7 +12,7 @@ mod target;
 mod tuning;
 mod vision;
 
-pub(crate) use attestation::AttestedImport;
+pub(crate) use attestation::{AttestedImport, AttestedLanding};
 pub use attestation::AttestedPrograms;
 pub(crate) use attestation::{
     AttestedDraft, AttestedFeedForward, AttestedHead, AttestedHeadBlock, AttestedMixer,

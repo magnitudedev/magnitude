@@ -2777,6 +2777,17 @@ impl NativeGraphMetadata {
             .map_err(NativeGraphMetadataError::Workflow)
     }
 
+    /// `NativeGraph::store`.
+    pub fn store(
+        &mut self,
+        result: &WorkflowTensor,
+        port: &NativePort,
+    ) -> Result<(), NativeGraphMetadataError> {
+        self.inner
+            .store(result.inner, port.inner)
+            .map_err(NativeGraphMetadataError::Workflow)
+    }
+
     /// The host heap of the plan this exact topology seals to, from the
     /// lengths its entries' schemas and declarations fix.
     pub fn plan_heap(&self) -> HostHeap {
@@ -2905,6 +2916,13 @@ impl NativeGraph {
     /// storage so releasing a scratch slot does not reclaim a retained output.
     pub fn export(&mut self, result: &WorkflowTensor) -> Result<(), WorkflowError> {
         self.inner.export(result.inner)
+    }
+
+    /// Write the node result `result` into the tensor each run binds to the
+    /// external port `port`, which describes exactly that result, instead of
+    /// into graph storage.
+    pub fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), WorkflowError> {
+        self.inner.store(result.inner, port.inner)
     }
 
     pub fn seal(self) -> Result<NativeGraphPlan, CallError> {

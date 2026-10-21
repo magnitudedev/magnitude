@@ -10,7 +10,8 @@
 //! drafts nothing: its entry pass ends once the attention has appended the
 //! rows' K/V history, the only thing a later draft reads of them.
 
-use super::{DeviceSubmission, HeadOutput, HeadProgram, SelectedRows};
+use super::{DeviceSubmission, HeadOutput, HeadProgram};
+use crate::device_table::SelectedRead;
 use crate::operators::streams::{
     StreamsGeometry,
     graph::{CheckedStreamsEntries, StreamsEntries, mix_site},
@@ -23,7 +24,7 @@ use crate::{
     InvariantError, ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead,
     ResidentOutput, ResidentWeight, ResourceLimits, SubmitError, ValidatedHeadLaunch,
     completion::CompletionWaiter,
-    native::{AttestedFeedForward, AttestedHead, AttestedHeadBlock},
+    native::{AttestedFeedForward, AttestedHead, AttestedHeadBlock, AttestedLanding},
     operators::attention::graph::{
         self as attention_graph, AttentionBlock, AttentionGraphEntries, AttentionOperands,
         CheckedAttentionEntries, attention_weights,
@@ -41,7 +42,10 @@ use crate::{
             CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
             distinct_storage_bytes,
         },
-        native_target_graph::{GatheredTable, WeightPart, WeightPort, packed_weight},
+        native_target_graph::{
+            CheckedLandingEntries, GatheredTable, LandedReadPorts, LandingEntries, TARGET_TABLE,
+            WeightPart, WeightPort, packed_weight,
+        },
     },
 };
 use magnitude_batching::{TargetBatchUpload, row_class};
@@ -211,9 +215,15 @@ struct PassPorts {
     /// The head's history planes, in plane-descriptor order.
     planes: Vec<NativePort>,
     selection: Option<SelectionPorts>,
+    /// A chained pass's landed read of the tokens it embeds, of a table
+    /// with landing slots.
+    landed: Option<LandedReadPorts>,
 }
 
 struct HeadGraphEntries<'a, G: GraphDraft + 'a> {
+    /// The landing entries of the token table's landed reads, when it has
+    /// landing slots.
+    landing: Option<LandingEntries<'a, G>>,
     streams: Option<StreamsEntries<'a, G>>,
     gather: G::Binding<'a, feature_rows::Entry>,
     input: G::Binding<'a, draft_rows::Entry>,
@@ -233,8 +243,13 @@ enum HeadFeedForwardEntries<'a, G: GraphDraft + 'a> {
 }
 
 impl<'a> HeadGraphEntries<'a, NativeGraph> {
-    fn prepared(block: &'a AttestedHeadBlock, head: &'a AttestedHead) -> Result<Self, String> {
+    fn prepared(
+        block: &'a AttestedHeadBlock,
+        head: &'a AttestedHead,
+        landing: Option<&'a AttestedLanding>,
+    ) -> Result<Self, String> {
         Ok(Self {
+            landing: landing.map(LandingEntries::native),
             streams: block.streams.as_ref().map(Into::into),
             gather: &block.gather,
             input: &block.input,
@@ -262,6 +277,7 @@ impl<'a> HeadGraphEntries<'a, NativeGraph> {
 }
 
 struct CheckedHeadEntries {
+    landing: Option<CheckedLandingEntries>,
     streams: Option<CheckedStreamsEntries>,
     gather: [(&'static str, Element); 1],
     copy: [(&'static str, Element); 1],
@@ -279,8 +295,9 @@ enum CheckedHeadFeedForwardEntries {
 }
 
 impl CheckedHeadEntries {
-    fn new(binding: HeadBinding, backend: BackendName) -> Result<Self, String> {
+    fn new(binding: HeadBinding, backend: BackendName, load: &ModelLoadPlan) -> Result<Self, String> {
         Ok(Self {
+            landing: CheckedLandingEntries::of(load, TARGET_TABLE)?,
             streams: binding.streams.map(CheckedStreamsEntries::new),
             gather: [("A", binding.conditioning)],
             copy: [("A", binding.conditioning)],
@@ -318,6 +335,7 @@ impl CheckedHeadEntries {
 
     fn entries(&self) -> Result<HeadGraphEntries<'_, NativeGraphMetadata>, String> {
         Ok(HeadGraphEntries {
+            landing: self.landing.as_ref().map(CheckedLandingEntries::entries),
             streams: self.streams.as_ref().map(CheckedStreamsEntries::entries),
             gather: &self.gather,
             input: &self.input,
@@ -678,10 +696,10 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         } else {
             class.slots
         };
-        let input = match &previous {
+        let (input, landed) = match &previous {
             None => {
                 let directory = table.by_rows(&mut graph, &mut constants)?;
-                graph
+                let input = graph
                     .enqueue(
                         entries.input,
                         &[
@@ -708,7 +726,8 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                             epsilon,
                         },
                     )?
-                    .value
+                    .value;
+                (input, None)
             }
             Some(features) => {
                 let selected = selections
@@ -716,30 +735,42 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                     .ok_or_else(|| "chained pass without selections".to_owned())?
                     .tensor()
                     .slice_leading((pass - 1) * class.slots, pass * class.slots);
-                let directory = table.selected(&mut graph, load, &mut weights, &mut constants)?;
-                graph
-                    .enqueue(
-                        entries.input,
-                        &[
-                            ("M", rows),
-                            ("V", table.rows),
-                            ("D", hidden),
-                            ("S", stream_count),
-                            ("R", directory.shape[0]),
-                            ("F", directory.shape[1]),
-                        ],
-                        draft_rows::WorkflowArgs {
-                            tokens: (&selected).into(),
-                            directory: (&directory.tensor).into(),
-                            table: (&table.table).into(),
-                            conditioning: features.into(),
-                            embedding_norm: (&embedding_norm).into(),
-                            hidden_norm: (&hidden_norm).into(),
-                            combine: (&combine).into(),
-                            epsilon,
-                        },
-                    )?
-                    .value
+                let (gathered, table_rows) = (table.table.clone(), table.rows);
+                table.read_selected(
+                    &mut graph,
+                    load,
+                    &mut weights,
+                    &mut constants,
+                    entries.landing,
+                    (&selected).into(),
+                    rows,
+                    None,
+                    |graph, directory| {
+                        Ok(graph
+                            .enqueue(
+                                entries.input,
+                                &[
+                                    ("M", rows),
+                                    ("V", table_rows),
+                                    ("D", hidden),
+                                    ("S", stream_count),
+                                    ("R", directory.shape[0]),
+                                    ("F", directory.shape[1]),
+                                ],
+                                draft_rows::WorkflowArgs {
+                                    tokens: (&selected).into(),
+                                    directory: (&directory.tensor).into(),
+                                    table: (&gathered).into(),
+                                    conditioning: features.into(),
+                                    embedding_norm: (&embedding_norm).into(),
+                                    hidden_norm: (&hidden_norm).into(),
+                                    combine: (&combine).into(),
+                                    epsilon,
+                                },
+                            )?
+                            .value)
+                    },
+                )?
             }
         };
         let attention_site = match (streams, entries.streams) {
@@ -819,6 +850,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                     destinations: controls.destinations,
                     planes: state.planes,
                     selection: None,
+                    landed,
                 }],
                 constants,
                 weights,
@@ -1099,6 +1131,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
             destinations: controls.destinations,
             planes: state.planes,
             selection,
+            landed,
         });
         if pass == 0 {
             entry_features = Some(features.clone());
@@ -1151,7 +1184,7 @@ fn certify_head_family(
     ),
     GraphError,
 > {
-    let checked = CheckedHeadEntries::new(binding, backend)?;
+    let checked = CheckedHeadEntries::new(binding, backend, load)?;
     let mut family = CheckedGraphFamilyResources::new();
     let mut layouts = BTreeMap::new();
     // Every field but the entry row count fixes the graph's structure; the
@@ -1275,7 +1308,7 @@ pub(crate) fn verify_head_family_certificates(
     classes: &[HeadGraphClass],
 ) -> Result<(), GraphError> {
     let (_, layouts) = certify_head_family(backend, load, geometry, head, binding, classes)?;
-    let checked = CheckedHeadEntries::new(binding, backend)?;
+    let checked = CheckedHeadEntries::new(binding, backend, load)?;
     for &class in classes {
         let exact = head_graph_draft(
             NativeGraphMetadata::new(backend),
@@ -1307,9 +1340,12 @@ impl PreparedHeadGraphs {
         )
     }
 
+    /// `landing`: the landing entries of the token table, when it has
+    /// landing slots.
     pub(crate) fn prepare(
         target_device: &Device,
         kernels: &AttestedHead,
+        landing: Option<&AttestedLanding>,
         load: &ModelLoadPlan,
         geometry: &Decoder,
         head: CausalHeadBlock<'_>,
@@ -1338,6 +1374,7 @@ impl PreparedHeadGraphs {
             let graph = Self::prepare_class(
                 target_device,
                 kernels,
+                landing,
                 load,
                 geometry,
                 head,
@@ -1364,9 +1401,11 @@ impl PreparedHeadGraphs {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_class(
         target_device: &Device,
         kernels: &AttestedHead,
+        landing: Option<&AttestedLanding>,
         load: &ModelLoadPlan,
         geometry: &Decoder,
         head: CausalHeadBlock<'_>,
@@ -1379,7 +1418,7 @@ impl PreparedHeadGraphs {
             .ok_or_else(|| invalid("attested head block is absent"))?;
         head_graph_topology(
             target_device.native_graph_with_layout(layout),
-            HeadGraphEntries::prepared(block, kernels).map_err(invalid)?,
+            HeadGraphEntries::prepared(block, kernels, landing).map_err(invalid)?,
             load,
             geometry,
             head,
@@ -1741,12 +1780,15 @@ impl NativeHeadProgram {
             .embedding
             .indices(entry.tokens)
             .map_err(invalid)?;
-        // A chained pass embeds the device's selection. One the device
-        // does not hold embeds another row, and the target rejects the
-        // proposal that follows; observing the selections brings it for the
-        // rounds after.
-        let selected_rows = (graph.passes.len() > 1)
-            .then(|| SelectedRows::selections(self.graphs.embedding.read_selected()));
+        // A chained pass embeds the device's selection, a landed read of a
+        // table with landing slots.
+        let landed = graph
+            .passes
+            .iter()
+            .filter_map(|pass| pass.landed.as_ref())
+            .map(|ports| ports.queue(&self.graphs.embedding, &mut bindings))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(invalid)?;
         active
             .write_input(
                 &graph.tokens,
@@ -1801,6 +1843,7 @@ impl NativeHeadProgram {
             .attach(bindings, outputs)
             .and_then(|ready| ready.submit())
             .map_err(device)?;
+        let landed_reads = landed.into_iter().map(SelectedRead::submitted).collect();
         let owner = output.publish(outputs);
         let selections = (steps > 0)
             .then(|| {
@@ -1813,7 +1856,7 @@ impl NativeHeadProgram {
             completion,
             HeadOutput {
                 selections,
-                selected_rows,
+                landed_reads,
             },
         ))
     }

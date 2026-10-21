@@ -989,6 +989,10 @@ impl<'a> Preparation<'a> {
                 },
             )?,
             conditioning_overlay: fixed!(self.spec, conditioning_overlay, "fixed"),
+            selection_notice: match plan.notices_selection() {
+                true => fixed!(self.spec, selection_notice, "fixed"),
+                false => None,
+            },
             feature_copy: fixed!(
                 self.spec,
                 feature_copy,
@@ -2063,27 +2067,17 @@ impl<'a> Preparation<'a> {
             ],
             ngram_inject::native_entry_with(ngram_inject::Elements { NW: binding.norm }),
         )?;
-        let notice = self
-            .spec
-            .fixed("fixed", &[], selection_notice::native_entry())?;
-        Ok(match (rows, stored, key, value, gate, inject, notice) {
-            (
-                Some(rows),
-                Some(stored),
-                Some(key),
-                Some(value),
-                Some(gate),
-                Some(inject),
-                Some(notice),
-            ) => Some(NGramKernels {
-                rows,
-                stored,
-                key,
-                value,
-                gate,
-                inject,
-                notice,
-            }),
+        Ok(match (rows, stored, key, value, gate, inject) {
+            (Some(rows), Some(stored), Some(key), Some(value), Some(gate), Some(inject)) => {
+                Some(NGramKernels {
+                    rows,
+                    stored,
+                    key,
+                    value,
+                    gate,
+                    inject,
+                })
+            }
             _ => None,
         })
     }

@@ -145,9 +145,8 @@ right. Its tentative rows are indistinguishable from another history's in every 
 (a blocked last page, rows in place, growth), so it lives only until the next operation that
 uses the binding right: a matching submission claims it, and every other such operation orphans
 it on entry, before asking any layout question. A lookahead that embeds a device-selected row of
-a streamed table ([residency](residency.md)) is queued before the host knows whether the device
-holds that row. One whose row the device did not hold is not the continuation: no submission
-claims it, it is orphaned, and the step is submitted again with the row brought. Growth has no
+a streamed table reads that row whether or not the device held it when it was queued (a landed
+read, [residency](residency.md)): the row is never a reason to orphan it. Growth has no
 blocked outcome: it succeeds or
 returns a memory deficit. Reservation recomputes its row requirements after
 provisioning relocates shared tails, so availability is checked against the new

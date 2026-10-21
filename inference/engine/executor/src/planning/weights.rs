@@ -55,6 +55,14 @@ pub struct StreamedRows {
     /// tiles pass through, as stored. 0 of a table whose rows the host
     /// writes into their slots (`TableFill::Stored`).
     pub staging_rows: u64,
+    /// The landing slots, the last rows of `shape`'s slots: where a read of
+    /// rows the device selects finds each row it names that the other slots
+    /// do not hold, landed by the host as stored (`landing_bytes`) and
+    /// converted ahead of the read. The most rows one such read of the load
+    /// names (`ModelLoadPlan::with_selected_reads`); 0 of a load without
+    /// one, and of a stored table, whose filler writes every row a read
+    /// names into its slots.
+    pub landing_rows: u64,
     /// How readers find a row's slot.
     pub directory: DirectoryForm,
     pub fill: TableFill,
@@ -147,6 +155,20 @@ impl WeightPlan {
         )
     }
 
+    /// Whether the weight is an imported table whose landing slots hold the
+    /// rows a read of rows the device selects names that its other slots do
+    /// not (`StreamedRows::landing_rows`).
+    pub fn lands_selected_rows(&self) -> bool {
+        matches!(
+            self.streamed,
+            Some(StreamedRows {
+                fill: TableFill::Imported,
+                landing_rows: 1..,
+                ..
+            })
+        )
+    }
+
     /// The source code depth retained by a progressive placement.
     pub(crate) fn progressive_depth(&self) -> Option<ProgressiveCodeDepth> {
         match self.descriptor.transforms[..] {
@@ -173,9 +195,10 @@ impl WeightPlan {
         match self.streamed {
             Some(StreamedRows {
                 table_rows,
+                landing_rows,
                 fill: TableFill::Imported,
                 ..
-            }) => self.source_bytes / self.shape[0] * table_rows,
+            }) => self.source_bytes / (self.shape[0] - landing_rows) * table_rows,
             Some(StreamedRows {
                 table_rows,
                 fill: TableFill::Stored { .. },
@@ -199,31 +222,39 @@ impl WeightPlan {
         })
     }
 
-    /// The device allocations a streamed table holds beside its slots: the
-    /// directory and the staging its tiles pass through, as stored. `[0, 0]`
-    /// for a weight held whole.
-    pub fn streamed_bytes(&self) -> Result<[u64; 2], String> {
+    /// The allocations a streamed table holds beside its slots: the
+    /// directory, the staging its tiles pass through and the landing staging
+    /// its landing slots are converted from, both as stored, and the notice a
+    /// selected read's step copies its `[rows, 2]` selection into. Zeros for
+    /// a weight held whole.
+    pub fn streamed_bytes(&self) -> Result<[u64; 4], String> {
         let Some(streamed) = self.streamed else {
-            return Ok([0, 0]);
+            return Ok([0; 4]);
         };
-        let mut staging = self.shape.clone();
-        staging[0] = streamed.staging_rows;
+        let rows = |rows| {
+            let mut shape = self.shape.clone();
+            shape[0] = rows;
+            shape
+        };
         Ok([
             representation_bytes(Element::i32(), &self.directory_shape())?,
-            representation_bytes(self.upload, &staging)?,
+            representation_bytes(self.upload, &rows(streamed.staging_rows))?,
+            representation_bytes(self.upload, &rows(streamed.landing_rows))?,
+            representation_bytes(Element::i32(), &[streamed.landing_rows, 2])?,
         ])
     }
 
     /// Every resident byte of the weight: its representation, its scale, its
-    /// packing bound and a streamed table's directory and staging.
+    /// packing bound and what a streamed table holds beside its slots.
     pub fn storage_bytes(&self) -> Result<u64, String> {
-        let [directory, staging] = self.streamed_bytes()?;
-        self.resident_bytes
-            .checked_add(self.scale.as_ref().map_or(0, |scale| scale.resident_bytes))
-            .and_then(|bytes| bytes.checked_add(self.bound.checked_mul(4)?))
-            .and_then(|bytes| bytes.checked_add(directory))
-            .and_then(|bytes| bytes.checked_add(staging))
-            .ok_or_else(|| "resident weight byte count overflows".into())
+        let overflow = || "resident weight byte count overflows".to_owned();
+        let scale = self.scale.as_ref().map_or(0, |scale| scale.resident_bytes);
+        let bound = self.bound.checked_mul(4).ok_or_else(overflow)?;
+        [scale, bound]
+            .into_iter()
+            .chain(self.streamed_bytes()?)
+            .try_fold(self.resident_bytes, u64::checked_add)
+            .ok_or_else(overflow)
     }
 
     /// The extent of the weight's accumulator-scale port: 0 without a
@@ -1317,6 +1348,41 @@ impl ModelLoadPlan {
         Ok(self)
     }
 
+    /// The load of `limits` drafting by `method`: every imported streamed
+    /// table holds landing slots after its slots for the most rows one of
+    /// its reads of rows the device selects names (`StreamedRows::
+    /// landing_rows`), whole tiles of them.
+    pub fn with_selected_reads(
+        mut self,
+        definition: &ModelDefinition,
+        method: super::PlannedMethod,
+        limits: super::ResourceLimits,
+    ) -> Result<Self, String> {
+        let rows = selected_read_rows(definition, method, limits)?;
+        let tables = self
+            .target
+            .iter_mut()
+            .chain(self.head.iter_mut().flatten())
+            .filter(|weight| {
+                matches!(
+                    weight.streamed,
+                    Some(StreamedRows {
+                        fill: TableFill::Imported,
+                        ..
+                    })
+                )
+            });
+        for weight in tables {
+            let streamed = weight.streamed.as_mut().expect("an imported streamed table");
+            let tile = weight.resident.tile_rows();
+            let landing = rows.div_ceil(tile) * tile;
+            weight.shape[0] = weight.shape[0] - streamed.landing_rows + landing;
+            streamed.landing_rows = landing;
+            weight.resident_bytes = representation_bytes(weight.resident, &weight.shape)?;
+        }
+        Ok(self)
+    }
+
     /// Commit completed physical choices before resource admission. A scope
     /// in which any reader selected a class is stored as its views: they are
     /// placed, and its packed projection is planned and not placed
@@ -1694,11 +1760,41 @@ fn push_gathered_table(
         // The largest step any backend admits, each row of which may bring
         // its tile.
         staging_rows: slots.min(magnitude_batching::MAX_CLASS_ROWS as u64 * tile),
+        landing_rows: 0,
         directory: DirectoryForm::of(table_rows, slots),
         fill: TableFill::Imported,
     });
     out.push(streamed);
     Ok(())
+}
+
+/// The most table rows one read of rows the device selects names in a load
+/// of `limits` drafting by `method`: a target step of selected tokens, in
+/// the row class of the selection bound; an MTP head's chained pass, a
+/// token per slot of a drafting class; a LiLiCorr corrector, its `top_k`
+/// candidates of every mask row of every slot of a drafting class.
+fn selected_read_rows(
+    definition: &ModelDefinition,
+    method: super::PlannedMethod,
+    limits: super::ResourceLimits,
+) -> Result<u64, String> {
+    let class = |rows: usize| {
+        magnitude_batching::row_class(rows)
+            .map(|class| class as u64)
+            .ok_or_else(|| format!("{rows} selected rows have no row class"))
+    };
+    let target = class(limits.max_selected_rows)?;
+    let drafter = match (method, &definition.draft) {
+        (super::PlannedMethod::Mtp { .. }, _) => class(limits.max_drafting_slots)?,
+        (super::PlannedMethod::DFlash { .. }, Some(draft)) => match &draft.method {
+            magnitude_family_contracts::DraftMethod::LiLiCorr { corrector } => {
+                class(limits.max_drafting_slots)? * draft.max_proposals() * corrector.top_k
+            }
+            _ => 0,
+        },
+        _ => 0,
+    };
+    Ok(target.max(drafter))
 }
 
 /// The slots of an n-gram table: the rows its hit rate plateaus at (2.9 M,
@@ -1767,6 +1863,7 @@ fn push_stored_table(
         streamed: Some(StreamedRows {
             table_rows,
             staging_rows: 0,
+            landing_rows: 0,
             directory: DirectoryForm::of(table_rows, slots),
             fill: TableFill::Stored { decoded },
         }),

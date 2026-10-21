@@ -217,7 +217,6 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
         &mut table,
         load,
         weights,
-        constants,
         &table_rows,
         rows * heads,
     )?;

@@ -1,15 +1,15 @@
 //! The hyper-connection streams' entries (`stream_mix_down`, its exit form,
 //! `stream_mix_up`, `repeat_rows`) and the n-gram input's (`ngram_rows`,
 //! `stored_rows`, its key and value projections, `ngram_gate`,
-//! `ngram_inject`, `selection_notice`), each run once at the model's
-//! geometry on one row with weights chosen so the result is known.
+//! `ngram_inject`), each run once at the model's geometry on one row with
+//! weights chosen so the result is known.
 
 use super::super::*;
 use super::*;
 use magnitude_family_contracts::{NGramHash, Operator, SublayerIndex, WeightKind, WeightScope};
 use magnitude_kernels::{
-    ngram_gate, ngram_inject, ngram_rows, repeat_rows, selection_notice, stored_rows,
-    stream_mix_down, stream_mix_up,
+    ngram_gate, ngram_inject, ngram_rows, repeat_rows, stored_rows, stream_mix_down,
+    stream_mix_up,
 };
 
 /// Values agree with an expectation within this relative error: an entry
@@ -362,28 +362,6 @@ impl<'a> QualificationView<'a> {
             .map_err(|error| qualification_dynamic("ngram_inject", label, error))?
             .value;
         require_f32_values(&injected, &streams_values, "ngram_inject", label)?;
-
-        let mut notice = zeros(Element::i32(), &[1, 2])?;
-        kernels
-            .notice
-            .call(selection_notice::Args {
-                selection: &tokens,
-                notice: &mut notice,
-            })
-            .map_err(|error| qualification_dynamic("selection_notice", label, error))?;
-        if notice
-            .read_to_host()
-            .map_err(|error| qualification_dynamic("selection_notice", label, error))?
-            != tokens
-                .read_to_host()
-                .map_err(|error| qualification_dynamic("selection_notice", label, error))?
-        {
-            return Err(qualification_dynamic(
-                "selection_notice",
-                label,
-                "the notice differs from the selection",
-            ));
-        }
         Ok(())
     }
 }

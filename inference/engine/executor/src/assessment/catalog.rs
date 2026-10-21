@@ -145,7 +145,9 @@ fn every_admitted_catalog_target_derives_complete_terms() {
         };
         for backend in BackendName::ALL {
             let layout = resident_layout(ExecutionPath::Native, backend);
-            let load = match ModelLoadPlan::derive(&manifest, &definition, selection, layout) {
+            let load = match ModelLoadPlan::derive(&manifest, &definition, selection, layout)
+                .and_then(|load| load.with_selected_reads(&definition, PlannedMethod::Plain, LIMITS))
+            {
                 Ok(load) => load,
                 // A target that must serve derives its load on every
                 // backend; another may lack a resident form.
@@ -497,6 +499,7 @@ fn plan_and_charge_separate_draft(
             let context = format!("{draft_file} {}", backend.as_str());
             let layout = resident_layout(ExecutionPath::Native, backend);
             let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout)
+                .and_then(|load| load.with_selected_reads(&definition, method, LIMITS))
                 .unwrap_or_else(|error| panic!("{context}: {error}"));
             let terms = AssessmentMemoryTerms::derive(
                 &definition,

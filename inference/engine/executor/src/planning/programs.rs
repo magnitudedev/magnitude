@@ -455,6 +455,9 @@ impl StateProgramPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgramPlan {
     imports: Vec<ImportProgramSlot>,
+    /// Whether a read of rows the device selects copies its selection for
+    /// the host (`selection_notice`).
+    notices_selection: bool,
     target: TargetProgramPlan,
     head: Option<HeadProgramPlan>,
     shared_head: Option<SharedHeadProgramPlan>,
@@ -468,6 +471,7 @@ impl ProgramPlan {
     pub(crate) fn new(
         definition: &ModelDefinition,
         imports: Vec<ImportProgramSlot>,
+        notices_selection: bool,
         target: TargetProgramPlan,
         head: Option<HeadProgramPlan>,
         shared_head: Option<SharedHeadProgramPlan>,
@@ -521,6 +525,7 @@ impl ProgramPlan {
         }
         Ok(Self {
             imports,
+            notices_selection,
             target,
             head,
             shared_head,
@@ -532,6 +537,13 @@ impl ProgramPlan {
 
     pub fn imports(&self) -> &[ImportProgramSlot] {
         &self.imports
+    }
+
+    /// Whether a read of rows the device selects copies its selection for
+    /// the host (`selection_notice`): the load holds a table the host fills
+    /// for such reads.
+    pub fn notices_selection(&self) -> bool {
+        self.notices_selection
     }
 
     pub fn target(&self) -> &TargetProgramPlan {
@@ -592,6 +604,13 @@ pub(super) fn derive_program_plan(
             imports.push(slot);
         }
     }
+    // A read of rows the device selects copies its selection for the host
+    // when the host fills a table for it: a stored table's slots, or an
+    // imported table's landing slots.
+    let notices_selection = target
+        .iter()
+        .chain(head.unwrap_or_default())
+        .any(|weight| weight.stored_in_slots() || weight.lands_selected_rows());
     let activation = activation_dtype(definition.decoder.activation_dtype);
     let active_element = Element::dense(activation);
     let embedding = EmbeddingBinding {
@@ -902,6 +921,7 @@ pub(super) fn derive_program_plan(
     ProgramPlan::new(
         definition,
         imports,
+        notices_selection,
         target_program,
         head_program,
         shared_head_program,

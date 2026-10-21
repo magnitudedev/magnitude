@@ -497,7 +497,7 @@ impl ProgramFamily for TestFamily {
                     first: now,
                     last: now,
                 },
-                selected_rows: None,
+                landed_reads: Vec::new(),
                 stored_reads: STORED_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut())),
             },
         ))
@@ -1450,7 +1450,7 @@ fn target_with_pending_priming(
         workspace: (workspace, output),
         output: crate::programs::HeadOutput {
             selections: None,
-            selected_rows: None,
+            landed_reads: Vec::new(),
         },
     });
     assert!(flight.work.priming.is_none());

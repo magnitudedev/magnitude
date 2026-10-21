@@ -169,11 +169,6 @@ impl SlotDirectory {
         self.tile_rows
     }
 
-    /// Tiles of slots.
-    pub fn slot_tiles(&self) -> usize {
-        self.tile.len()
-    }
-
     /// Whether `row` is a row of the table.
     pub fn has_row(&self, row: u64) -> bool {
         row < self.rows
@@ -415,7 +410,6 @@ mod tests {
     fn tiles_of_several_rows_hold_and_release_together() {
         for form in [DirectoryForm::Dense, DirectoryForm::Hashed] {
             let mut directory = SlotDirectory::new(8, 4, 2, form);
-            assert_eq!(directory.slot_tiles(), 2);
             directory.hold(6, 1, false);
             assert_eq!(directory.slot(6), Some(2));
             assert_eq!(directory.slot(7), Some(3));

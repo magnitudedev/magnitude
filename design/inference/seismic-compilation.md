@@ -403,7 +403,13 @@ physical launch classes before the engine becomes ready. Workflow families may b
 execution arena: a device runs one submission at a time in order, so graphs that keep no value in
 workspace between runs share it; a family with a prewritten port owns its workspace. Request-dependent external state and resident tensors
 are joined to checked ports while constructing an owned run, before submission. A submitted run
-does not discover an absent tensor, incompatible shape, representation, or alias.
+does not discover an absent tensor, incompatible shape, representation, or alias. A node's result
+may be stored into an external port (`NativeGraph::store`) whose descriptor is exactly the
+result's: the run writes it into the tensor bound to that port, which the graph places no storage
+for, so an entry that returns its result writes a tensor the graph does not own (an import
+converting rows into a resident table's slots). Each such port takes one result, and a stored
+result is not exported. Nodes run in their enqueue order on every backend, so a later node reads
+what an earlier one stored through any port that views the same tensor.
 The checked entry is also the source of tensor-port and result-leaf extents for
 metadata-only planning; the representation registry supplies canonical storage
 bytes. Such tensor facts alone do not establish a graph storage bound or backend

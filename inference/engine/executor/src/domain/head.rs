@@ -739,10 +739,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 requests
             );
         }
-        let (core, output) = completed.into_parts();
+        let (core, mut output) = completed.into_parts();
+        // The rows the step's landed reads landed take slots of their own:
+        // later rounds find them there.
+        output.complete_landed_reads().map_err(DomainError::Submit)?;
         let HeadOutput {
             selections,
-            selected_rows,
+            landed_reads: _,
         } = output;
         let slots = core.batch().actual_slots();
         if slots != requests.len() {
@@ -764,17 +767,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Err(DomainError::invariant(
                 "head selections differ from the batch's steps and slots",
             ));
-        }
-        // The table rows the step's device work selected reach the table:
-        // later rounds find the ones this round missed.
-        if let Some(rows) = &selected_rows {
-            let tokens = (0..steps)
-                .flat_map(|step| (0..slots).map(move |slot| step * slot_class + slot))
-                .map(|index| selected[index])
-                .filter(|selected| selected.status == 0)
-                .map(|selected| selected.token)
-                .collect::<Vec<_>>();
-            rows.observe(&tokens).map_err(DomainError::Submit)?;
         }
         let passes = core.batch().passes();
         if std::env::var_os("MAGNITUDE_TRACE_DRAFT").is_some() {

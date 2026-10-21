@@ -122,8 +122,9 @@ the whole table's bit for bit.
     accompanies them).
 
   Otherwise it is held whole, as planned for any weight.
-- **A streamed device table** is one resident weight: its slots, a directory and staging for the
-  rows one step brings, all charged to the weight. Its plan's shape is its slots'. Every program
+- **A streamed device table** is one resident weight: its slots and landing slots, a directory,
+  staging for the rows one step brings, and its landing staging and notice, all charged to the
+  weight. Its plan's shape is its slots' and landing slots'. Every program
   that reads the table (the target, an executed drafter, a head) shares it through the residency
   cache. An imported table has slots for 16,384 rows in `rows16`, one row to a slot on every
   backend (every native backend's gathers read `rows16` besides its resident layout), so the
@@ -170,17 +171,34 @@ the whole table's bit for bit.
   as a whole table's step is given the rows, under the empty directory. A step whose rows the
   device selected reads a streamed table through its directory, in the reader's own address
   calculation: no entry runs before the reader and no reader knows a table is streamed.
-- **A device-selected row an imported table does not hold** is a miss: the target's lookahead is orphaned
-  and resubmitted with the row brought ([state transactions](state-transactions.md)); a
-  head's chained proposal, or a LiLiCorr corrector's candidate, embeds another row, and target
-  verification rejects what follows. A drafter step's selected rows are observed when it completes
-  (`SelectedRead::observe`): the held ones are served as a step's named rows are, and the tiles of
-  the missed ones are brought, as a step's absent rows are, into slots no step named since the
-  replacement last passed them, never the current step's nor one the selection holds. Later rounds
-  find them, and the kept rows seed them the next time.
+- **A device-selected row is never a miss.** A read of rows its own device work selected (a
+  target step's tokens, the lookahead's, a head's chained token, a LiLiCorr corrector's
+  candidates) reads exactly the rows a whole table holds: it is a landed read
+  (`DeviceTable::read_selected`, `landed_read`). An imported table holds, after its slots,
+  landing slots for the most rows one such read of the load names
+  (`ModelLoadPlan::with_selected_reads`: the selection bound's row class, a drafting class's
+  slots, or its slots' mask rows' `top_k` candidates), and keeps its directory, a landing staging
+  and a notice in host-shared storage. Ahead of its reader the read's step copies its selection
+  into the notice (`selection_notice`), signals, and waits at the table's gate; behind the gate
+  the weight's own import entry converts the landing staging into the landing slots, its result
+  written into them (seismic stored results), then the reader reads, then the step signals its
+  read. The table's filler thread takes the reads in queue order: once the read before has read
+  and the read's notice arrived, it lands each selected row the slots do not hold for it into the
+  landing staging, as stored, points its directory entry at its landing slot, publishes the
+  directory and opens the gate. Once the step completed, the rows it landed are brought into
+  slots of their own as a step's absent rows are (`SubmittedRead::complete`); a read that could
+  not land its rows fails the step's sequences (`TableReadError`). A read queued but never
+  submitted is abandoned, before any read queued after it is submitted: the filler signals its
+  read itself. No read finds another row, and a lookahead is never orphaned for a row.
+- **The directory has one writer, the filler**, which publishes before each gate it opens, while
+  no read is between its gate and its read signal; a hashed directory is rebuilt then too. A row
+  the owner brings for host steps is held at once when no read queued before it is unfilled, else
+  it is pending until the first read queued after its conversion, and the replacement passes
+  pending slots; a row the owner replaces leaves the directory at the next fill, and its slot is
+  overwritten only by device work queued after every read the filler pointed at it. The owner
+  never waits for the device but to reuse its staging.
 - **Replacement** takes the slot of a row no step named since the replacement last passed it,
-  never one the current step names. A directory change that follows a queued read of selected rows
-  waits for the fill it belongs to.
+  never one the current step names nor a pending or landing slot.
 - **Rows at load.** Before readiness the slots are filled, most valuable first: the rows steps
   named when the table was last served, then the table's first rows. Replacement turns from the
   last slot toward the first, so it reaches the least valuable of them first. Load waits for their

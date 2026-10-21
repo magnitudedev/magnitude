@@ -322,6 +322,7 @@ impl ExecutionPlanner {
         }
         let layout = super::resident_layout(path, backend);
         let load = ModelLoadPlan::derive(manifest, definition, selection, layout)
+            .and_then(|load| load.with_selected_reads(definition, method, limits))
             .map_err(PlanError::InvalidDefinition)?;
         // The head in progressive planes, where the backend reads them.
         let load = if path == ExecutionPath::Native

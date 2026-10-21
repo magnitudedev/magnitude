@@ -5,7 +5,7 @@
 //! path, and owns the sole cache of resulting device tensors.
 
 use crate::device_table::{
-    DeviceTable, KeptRows, ResidentTable, TileRun, TileSource, TilesBrought,
+    DeviceTable, KeptRows, ResidentTable, StoredRows, TileRun, TileSource, TilesBrought,
 };
 use crate::domain::ClaimRefusal;
 use crate::programs::ProgramSubmission;
@@ -373,6 +373,17 @@ impl TileSource for TileImport {
                 .map_err(|error| format!("streamed table rows: {error}"))
         }))
     }
+
+    fn rows(&self) -> Arc<dyn StoredRows> {
+        Arc::new(self.table.clone())
+    }
+}
+
+impl StoredRows for crate::host_tables::HostTable {
+    fn read(&self, first: u64, out: &mut [u8]) -> Result<(), String> {
+        self.gather_run(first, out)
+            .map_err(|error| format!("streamed table rows: {error}"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -615,7 +626,8 @@ impl ResidencyStore {
             table.source(),
             streamed.table_rows,
             &plan.shape[1..],
-            plan.shape[0],
+            plan.shape[0] - streamed.landing_rows,
+            streamed.landing_rows,
             streamed.staging_rows,
             streamed.directory,
             Box::new(TileImport {

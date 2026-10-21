@@ -22,11 +22,12 @@
 //! Selections are step-major: proposal `k` of slot `s` is result row
 //! `k · slots + s`.
 
-use super::{DeviceSubmission, HeadOutput, HeadProgram, SelectedRows};
+use super::{DeviceSubmission, HeadOutput, HeadProgram};
+use crate::device_table::SelectedRead;
 use crate::operators::{self, InputForm, Join, Mixer, SublayerInput};
 use crate::{
     completion::CompletionWaiter,
-    native::AttestedDraft,
+    native::{AttestedDraft, AttestedLanding},
     operators::attention::graph::{
         self as attention_graph, attention_weights, AttentionBlock, AttentionControlPorts,
         AttentionOperands, AttentionGraphEntries, AttentionHistoryEntries, AttentionWeights,
@@ -41,8 +42,8 @@ use crate::{
             ConstantTensors, GraphConstant,
         },
         native_target_graph::{
-            weight, weight_scale_port, GatheredTable, PackingBound, RowDirectory, WeightOperands,
-            WeightPort,
+            weight, weight_scale_port, CheckedLandingEntries, GatheredTable, LandedReadPorts,
+            LandingEntries, PackingBound, RowDirectory, WeightOperands, WeightPort,
         },
     },
     DeviceError, DraftProgramPlan, HeadLaunchCore, InvariantError,
@@ -225,6 +226,18 @@ pub(crate) fn draft_graph_classes(
     Ok(classes)
 }
 
+/// The token table the draft's block embeds tokens of: the target's, or the
+/// draft's own.
+pub(crate) fn token_table(draft: &DraftDefinition) -> WeightRole {
+    WeightRole {
+        scope: match &draft.embedding {
+            DraftEmbedding::Target => WeightScope::Target,
+            DraftEmbedding::Own(_) => WeightScope::Draft,
+        },
+        kind: WeightKind::Embedding,
+    }
+}
+
 /// Every class's fixed geometry: the draft, each layer's history rows and
 /// slab rows, the block pass's visible spans, and the proposals drafted.
 pub(crate) struct DraftGeometry<'d> {
@@ -276,6 +289,9 @@ impl<'d> DraftGeometry<'d> {
 pub(crate) struct DraftGraphEntries<'a, G: GraphDraft + 'a> {
     pub layers: Vec<DraftLayerEntries<'a, G>>,
     pub embedding: G::Binding<'a, embedding_rows::Entry>,
+    /// The landing entries of the block's token table, when it has landing
+    /// slots.
+    pub landing: Option<LandingEntries<'a, G>>,
     pub head: readout::ProjectionEntries<'a, G>,
     pub shape: G::Binding<'a, shape_rows::Entry>,
     pub sample: G::Binding<'a, sample_rows::Entry>,
@@ -369,8 +385,9 @@ pub(crate) struct MarkovEntries<'a, G: GraphDraft + 'a> {
 }
 
 impl<'a> DraftGraphEntries<'a, NativeGraph> {
-    fn prepared(draft: &'a AttestedDraft) -> Self {
+    fn prepared(draft: &'a AttestedDraft, landing: Option<&'a AttestedLanding>) -> Self {
         Self {
+            landing: landing.map(LandingEntries::native),
             layers: draft
                 .blocks
                 .iter()
@@ -470,6 +487,7 @@ struct CheckedDraftEntries {
         CheckedDenseEntries,
     )>,
     embedding: [(&'static str, Element); 2],
+    landing: Option<CheckedLandingEntries>,
     head: readout::CheckedProjectionEntries,
     selection: [(&'static str, Element); 0],
     widen: [(&'static str, Element); 1],
@@ -718,9 +736,11 @@ struct CheckedMarkovEntries {
 }
 
 impl CheckedDraftEntries {
-    fn new(plan: &DraftProgramPlan) -> Self {
+    /// `landing`: of the block's token table, when it has landing slots.
+    fn new(plan: &DraftProgramPlan, landing: Option<CheckedLandingEntries>) -> Self {
         let activation = plan.activation();
         Self {
+            landing,
             layers: plan
                 .blocks()
                 .iter()
@@ -771,6 +791,7 @@ impl CheckedDraftEntries {
                 })
                 .collect::<Result<Vec<_>, String>>()?,
             embedding: &self.embedding[..],
+            landing: self.landing.as_ref().map(CheckedLandingEntries::entries),
             head: self.head.entries(),
             shape: &self.selection[..],
             sample: &self.selection[..],
@@ -828,7 +849,10 @@ fn certify_draft_family(
     ),
     GraphError,
 > {
-    let checked = CheckedDraftEntries::new(plan);
+    let checked = CheckedDraftEntries::new(
+        plan,
+        CheckedLandingEntries::of(load, token_table(geometry.draft))?,
+    );
     let mut groups: BTreeMap<(u64, u64, bool, bool, bool, RowForm), Vec<DraftGraphClass>> =
         BTreeMap::new();
     for &class in classes {
@@ -909,7 +933,10 @@ pub(crate) fn verify_draft_family_certificates(
     classes: &[DraftGraphClass],
 ) -> Result<(), GraphError> {
     let (resources, layouts) = certify_draft_family(backend, load, plan, geometry, classes)?;
-    let checked = CheckedDraftEntries::new(plan);
+    let checked = CheckedDraftEntries::new(
+        plan,
+        CheckedLandingEntries::of(load, token_table(geometry.draft))?,
+    );
     let mut exact = CheckedGraphFamilyResources::new();
     for &class in classes {
         let parts = draft_graph(
@@ -969,10 +996,9 @@ struct BlockPorts {
     /// A corrector's: each slot's last entry row, whose conditioning row is
     /// the fused feature that selected its anchor.
     anchor_rows: Option<NativePort>,
-    /// A corrector's candidates `[slots · mask_rows, top_k, 2]` (token,
-    /// status), exported: the block's token-table rows its device work
-    /// selects, which the host observes (`SelectedRows`).
-    candidates: Option<WorkflowTensor>,
+    /// A corrector's landed read of its candidates' token-table rows, of a
+    /// table with landing slots.
+    landed: Option<LandedReadPorts>,
     /// Weights whose rows are vocabulary entries of the readout (the target's
     /// projection, DSpark's Markov projection), bound to their leading
     /// `readout_vocabulary` rows.
@@ -1242,10 +1268,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     let mut table = GatheredTable::of(
         &mut graph,
         load,
-        match &draft.embedding {
-            DraftEmbedding::Target => WeightScope::Target,
-            DraftEmbedding::Own(_) => WeightScope::Draft,
-        },
+        token_table(draft).scope,
         WeightKind::Embedding,
         &mut weights,
     )?;
@@ -1490,7 +1513,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     )?;
     let mut selections = Vec::new();
     let mut anchor_rows = None;
-    let mut candidates = None;
+    let mut landed = None;
     let anchors = match (&draft.method, &entries.markov) {
         (DraftMethod::DFlash, None) => {
             let mut all = result.tensor().slice_leading(0, outputs);
@@ -1669,10 +1692,11 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         (DraftMethod::LiLiCorr { .. }, None) => {
             let (corrector, stages) =
                 corrector.ok_or("a LiLiCorr draft graph has no corrector entries")?;
-            let (rows, selected) = correct_candidates(
+            let (rows, read) = correct_candidates(
                 &mut graph,
                 stages,
                 entries.embedding,
+                entries.landing,
                 load,
                 &mut weights,
                 &mut constants,
@@ -1697,9 +1721,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                     epsilon,
                 },
             )?;
-            graph.export(&selected)?;
             anchor_rows = Some(rows);
-            candidates = Some(selected);
+            landed = read;
             None
         }
         _ => return Err("draft method and entries disagree".into()),
@@ -1717,7 +1740,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             selections,
             anchors,
             anchor_rows,
-            candidates,
+            landed,
             leading,
             readout_vocabulary,
         }),
@@ -2325,17 +2348,19 @@ fn corrector_affine(site: CorrectorSite, part: AffinePart) -> WeightKind {
 /// anchor state from the fused feature that selected its anchor; the
 /// factored outgoing, incoming and anchor vectors; and the walk selecting
 /// each slot's first `proposals` tokens. Returns the anchor rows' input port
-/// and the candidates, which the candidates' embeddings gather through the
-/// table's directory: rows the device selects, which the host observes.
+/// and, of a token table with landing slots, the landed read of the
+/// candidates' embeddings (rows the device selects).
+#[allow(clippy::too_many_arguments)]
 fn correct_candidates<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     entries: &CorrectorEntries<'a, G>,
     embedding: G::Binding<'a, embedding_rows::Entry>,
+    landing: Option<LandingEntries<'a, G>>,
     load: &ModelLoadPlan,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     path: CorrectorPath<'_>,
-) -> Result<(NativePort, WorkflowTensor), GraphError> {
+) -> Result<(NativePort, Option<LandedReadPorts>), GraphError> {
     let corrector = path.corrector;
     let (slots, mask_rows, hidden, epsilon) = (path.slots, path.mask_rows, path.hidden, path.epsilon);
     let (width, top_k, heads, factor) = (
@@ -2525,25 +2550,38 @@ fn correct_candidates<'a, G: GraphDraft + 'a>(
         (node_rows, width, width),
     )?;
 
-    // The candidates' token rows: their embeddings, projected into the
+    // The candidates' token rows (rows the device selects, a landed read of
+    // a table with landing slots): their embeddings, projected into the
     // corrector width unless it is the draft's.
-    let directory = path.table.selected(graph, load, weights, constants)?;
-    let embedded = graph.enqueue(
-        embedding,
-        &[
-            ("M", node_rows),
-            ("V", path.table.rows),
-            ("D", hidden),
-            ("R", directory.shape[0]),
-            ("F", directory.shape[1]),
-        ],
-        embedding_rows::WorkflowArgs {
-            table: (&path.table.table).into(),
-            tokens: (&candidates).into(),
-            directory: (&directory.tensor).into(),
-            scale: path.embedding_scale,
-            normalize: 0,
-            epsilon,
+    let (gathered, table_rows) = (path.table.table.clone(), path.table.rows);
+    let (embedded, landed) = path.table.read_selected(
+        graph,
+        load,
+        weights,
+        constants,
+        landing,
+        (&candidates).into(),
+        node_rows,
+        None,
+        |graph, directory| {
+            Ok(graph.enqueue(
+                embedding,
+                &[
+                    ("M", node_rows),
+                    ("V", table_rows),
+                    ("D", hidden),
+                    ("R", directory.shape[0]),
+                    ("F", directory.shape[1]),
+                ],
+                embedding_rows::WorkflowArgs {
+                    table: (&gathered).into(),
+                    tokens: (&candidates).into(),
+                    directory: (&directory.tensor).into(),
+                    scale: path.embedding_scale,
+                    normalize: 0,
+                    epsilon,
+                },
+            )?)
         },
     )?;
     let (token, token_bias, token_biases) = match &entries.token {
@@ -2972,7 +3010,7 @@ fn correct_candidates<'a, G: GraphDraft + 'a>(
             selection: (&mut selection).into(),
         },
     )?;
-    Ok((anchor_rows, candidates))
+    Ok((anchor_rows, landed))
 }
 
 type PreparedDraftGraph = DraftGraphParts<NativeGraphPlan>;
@@ -3003,10 +3041,12 @@ impl PreparedDraftGraphs {
 
     /// Every class's graph, sealed into the layout its topology is certified
     /// into (`certify_draft_family`), so a load holds what its assessment
-    /// charged.
+    /// charged. `landing`: of the block's token table, when it has landing
+    /// slots.
     pub(crate) fn prepare(
         target_device: &Device,
         draft: &AttestedDraft,
+        landing: Option<&AttestedLanding>,
         load: &ModelLoadPlan,
         plan: &DraftProgramPlan,
         geometry: &DraftGeometry<'_>,
@@ -3022,7 +3062,7 @@ impl PreparedDraftGraphs {
                 |error: GraphError| invalid(format!("draft graph class {class:?}: {error}"));
             let parts = draft_graph(
                 target_device.native_graph_with_layout(&layouts[&class]),
-                DraftGraphEntries::prepared(draft),
+                DraftGraphEntries::prepared(draft, landing),
                 load,
                 geometry,
                 class,
@@ -3571,12 +3611,15 @@ impl NativeDraftProgram {
                     .map_err(device)?;
             }
         }
-        // A corrector's candidates are table rows the device selects.
-        let candidates = graph
+        // A corrector's candidates are table rows the device selects, a
+        // landed read of a table with landing slots.
+        let landed = graph
             .block
             .as_ref()
-            .and_then(|block| block.candidates.as_ref())
-            .map(|candidates| (candidates, self.graphs.embedding.read_selected()));
+            .and_then(|block| block.landed.as_ref())
+            .map(|ports| ports.queue(&self.graphs.embedding, &mut bindings))
+            .transpose()
+            .map_err(invalid)?;
         let mut output = output;
         let outputs = output
             .activate(&graph.plan)
@@ -3593,19 +3636,11 @@ impl NativeDraftProgram {
                     .ok_or_else(|| invalid("draft graph omitted its selections"))
             })
             .transpose()?;
-        let selected_rows = candidates
-            .map(|(candidates, read)| {
-                owner
-                    .tensor(candidates)
-                    .map(|rows| SelectedRows::exported(read, rows))
-                    .ok_or_else(|| invalid("draft graph omitted its candidates"))
-            })
-            .transpose()?;
         Ok((
             completion,
             HeadOutput {
                 selections,
-                selected_rows,
+                landed_reads: landed.into_iter().map(SelectedRead::submitted).collect(),
             },
         ))
     }

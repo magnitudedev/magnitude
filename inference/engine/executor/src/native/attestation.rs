@@ -7,6 +7,7 @@ use super::*;
 use crate::SublayerTail;
 use crate::operators::gated_delta::graph::StepForm;
 use crate::operators::routed::fused_graph::DecodeForm;
+use crate::programs::native_target_graph::TARGET_TABLE;
 use crate::{
     ExecutionPlanDraft, FeedForwardProgramSlot, HeadBinding, ImportProgramSlot, MixerProgramSlot,
     PlanError, PlannedDevice, ProgramPlan, ReadoutHead,
@@ -59,6 +60,9 @@ pub struct AttestedPrograms {
     pub(super) vision: Option<AttestedVision>,
     pub(super) state: AttestedState,
     pub(super) imports: Vec<(ImportProgramSlot, AttestedImport)>,
+    /// The copy of a read's selected rows for the host
+    /// (`ProgramPlan::notices_selection`).
+    pub(super) notice: Option<NativeKernel<selection_notice::Entry>>,
     invocation_workspace_bytes: u64,
     target_graphs: Option<std::sync::Arc<crate::PreparedTargetGraphs>>,
     target_readout_graphs: Option<std::sync::Arc<crate::PreparedTargetReadoutGraphs>>,
@@ -316,6 +320,16 @@ pub(crate) struct AttestedState {
     pub conditioning: Option<NativeKernel<conditioning_overlay::Entry>>,
 }
 
+/// The entries a read of rows the device selects from an imported streamed
+/// table runs around its reader (`GatheredTable::read_selected`): the copy
+/// of its selection for the host, and the table weight's own import, which
+/// converts the rows the host landed into the table's landing slots.
+#[derive(Clone)]
+pub(crate) struct AttestedLanding {
+    pub notice: NativeKernel<selection_notice::Entry>,
+    pub import: AttestedImport,
+}
+
 /// The entries that make a weight resident: its import, and for a repacked
 /// weight with a packing bound (`WeightPlan::bound`) the entry that makes
 /// the bound from the imported weight.
@@ -445,9 +459,15 @@ impl AttestedPrograms {
             )?;
             let classes =
                 crate::programs::native_shared_head::shared_head_graph_classes(limits, proposals)?;
+            let landing = self.landing(load, TARGET_TABLE)?;
             self.drafter_graphs = Some(crate::PreparedDrafterGraphs::SharedHead(Rc::new(
                 crate::programs::native_shared_head::PreparedSharedHeadGraphs::prepare(
-                    device, handles, load, &geometry, classes,
+                    device,
+                    handles,
+                    landing.as_ref(),
+                    load,
+                    &geometry,
+                    classes,
                 )
                 .map_err(|error| error.to_string())?,
             )));
@@ -489,10 +509,12 @@ impl AttestedPrograms {
                 state.span_limit(),
                 proposals,
             )?;
+            let landing = self.landing(load, TARGET_TABLE)?;
             self.drafter_graphs = Some(crate::PreparedDrafterGraphs::Head(Rc::new(
                 crate::programs::native_head::PreparedHeadGraphs::prepare(
                     device,
                     handles,
+                    landing.as_ref(),
                     load,
                     &definition.decoder,
                     head,
@@ -513,10 +535,12 @@ impl AttestedPrograms {
                 &method.block_widths(),
                 draft,
             )?;
+            let landing = self.landing(load, crate::programs::native_draft::token_table(draft))?;
             self.drafter_graphs = Some(crate::PreparedDrafterGraphs::Draft(Rc::new(
                 crate::programs::native_draft::PreparedDraftGraphs::prepare(
                     device,
                     handles,
+                    landing.as_ref(),
                     load,
                     programs.draft().ok_or("draft graphs require a draft program")?,
                     &geometry,
@@ -592,9 +616,12 @@ impl AttestedPrograms {
         limits: crate::ResourceLimits,
         workers: &seismic::Workers,
     ) -> Result<crate::PreparedTargetGraphs, String> {
+        let landing = self.landing(load, TARGET_TABLE)?;
         crate::programs::native_target_graph::PreparedTargetGraphs::prepare(
             device,
             &self.target,
+            self.notice.as_ref(),
+            landing.as_ref(),
             load,
             geometry,
             state,
@@ -682,6 +709,9 @@ impl AttestedPrograms {
         }
         bytes += bytes!(conditioning_overlay) + bytes!(feature_copy);
         bytes += bytes!(shape_rows) + bytes!(sample_rows);
+        if plan.notices_selection() {
+            bytes += bytes!(selection_notice);
+        }
         let target = plan.target();
         bytes += bytes!(embedding_rows);
         // The decoder blocks of a draft head reading target history are
@@ -830,7 +860,6 @@ impl AttestedPrograms {
             if charged_ngrams.insert(binding) {
                 bytes += bytes!(ngram_rows)
                     + bytes!(stored_rows)
-                    + bytes!(selection_notice)
                     + 2 * bytes!(project_rows)
                     + bytes!(ngram_gate)
                     + bytes!(ngram_inject);
@@ -1686,6 +1715,7 @@ impl AttestedPrograms {
             vision,
             state,
             imports,
+            notice: prepared.glue.selection_notice.clone(),
             invocation_workspace_bytes,
             target_graphs: None,
             target_readout_graphs: None,
@@ -1775,8 +1805,7 @@ impl AttestedPrograms {
                 + u128::from(handles.key.invocation_workspace_bytes())
                 + u128::from(handles.value.invocation_workspace_bytes())
                 + u128::from(handles.gate.invocation_workspace_bytes())
-                + u128::from(handles.inject.invocation_workspace_bytes())
-                + u128::from(handles.notice.invocation_workspace_bytes());
+                + u128::from(handles.inject.invocation_workspace_bytes());
         }
         for handles in prepared.target.streams.values() {
             bytes += u128::from(handles.down.invocation_workspace_bytes())
@@ -1962,6 +1991,9 @@ impl AttestedPrograms {
             bytes += u128::from(handle.invocation_workspace_bytes());
         }
         if let Some(handle) = &prepared.glue.conditioning_overlay {
+            bytes += u128::from(handle.invocation_workspace_bytes());
+        }
+        if let Some(handle) = &prepared.glue.selection_notice {
             bytes += u128::from(handle.invocation_workspace_bytes());
         }
         for handle in [
@@ -2255,6 +2287,31 @@ impl AttestedPrograms {
             .find(|(slot, _)| *slot == requested)
             .map(|(_, handle)| handle.clone())
             .ok_or_else(|| CatalogError::native(self.backend, missing("weight_import", requested)))
+    }
+
+    /// The landing entries of the gathered table `role` of `load`; `None`
+    /// of a table without landing slots (`WeightPlan::lands_selected_rows`).
+    pub(crate) fn landing(
+        &self,
+        load: &crate::ModelLoadPlan,
+        role: magnitude_family_contracts::WeightRole,
+    ) -> Result<Option<AttestedLanding>, String> {
+        let plan = load
+            .weights()
+            .find(|weight| weight.role == role)
+            .ok_or_else(|| format!("gathered table {role:?} is not planned"))?;
+        if !plan.lands_selected_rows() {
+            return Ok(None);
+        }
+        Ok(Some(AttestedLanding {
+            notice: self
+                .notice
+                .clone()
+                .ok_or("a table with landing slots without the selection notice")?,
+            import: self
+                .import_entry(plan)
+                .map_err(|error| error.to_string())?,
+        }))
     }
 
     /// Bind one already planned semantic weight to its exact import entry.

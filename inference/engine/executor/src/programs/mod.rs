@@ -31,7 +31,7 @@ pub use submission::{
 };
 
 use crate::{
-    DeviceError, GraphOutputTensor, HeadLaunchCore, ImportLaunchCore, InvariantError,
+    GraphOutputTensor, HeadLaunchCore, ImportLaunchCore, InvariantError,
     ResidentWeightSlot, StateLaunchCore, SubmitError, TargetLaunchCore, ValidatedHeadLaunch,
     ValidatedImportLaunch, ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch,
     VisionLaunchCore,
@@ -56,73 +56,25 @@ pub struct HeadOutput {
     /// The step's selections, `[steps, slot class, 2]` (token, status) rows
     /// in step-major order; absent for a causal-only head.
     pub selections: Option<GraphOutputTensor>,
-    /// The step's read of table rows its device work selected, which the
-    /// host observes once the step completed.
-    pub selected_rows: Option<SelectedRows>,
+    /// The step's landed reads of table rows its device work selected
+    /// (`DeviceTable::read_selected`), completed once the step completed.
+    pub landed_reads: Vec<crate::device_table::SubmittedRead>,
 }
 
-/// A head step's read of table rows its device work selected
-/// (`ResidentTable::read_selected`), and where the host finds those rows.
-pub struct SelectedRows {
-    read: crate::device_table::SelectedRead,
-    rows: SelectedRowsSource,
-}
-
-enum SelectedRowsSource {
-    /// The step's selected tokens: a chained pass embeds each one.
-    Selections,
-    /// `[.., 2]` i32 rows the step exported, the first column a token (a
-    /// corrector's candidates).
-    Exported(GraphOutputTensor),
-}
-
-impl SelectedRows {
-    /// A read of the tokens the step selects.
-    pub(crate) fn selections(read: crate::device_table::SelectedRead) -> Self {
-        Self {
-            read,
-            rows: SelectedRowsSource::Selections,
-        }
-    }
-
-    /// A read of the tokens of the step's exported `rows`.
-    pub(crate) fn exported(
-        read: crate::device_table::SelectedRead,
-        rows: GraphOutputTensor,
-    ) -> Self {
-        Self {
-            read,
-            rows: SelectedRowsSource::Exported(rows),
-        }
-    }
-
-    /// Observe the rows the read selected once the step completed
-    /// (`SelectedRead::observe`): `selected`, the step's selected tokens, or
-    /// the tokens of its exported rows.
-    pub fn observe(&self, selected: &[crate::TokenId]) -> Result<(), SubmitError> {
-        let invalid = |detail: String| {
-            SubmitError::Invariant(InvariantError {
-                context: "selected table rows",
-                detail,
-            })
-        };
-        let rows = match &self.rows {
-            SelectedRowsSource::Selections => {
-                selected.iter().map(|token| u64::from(token.0)).collect()
-            }
-            SelectedRowsSource::Exported(rows) => rows
-                .tensor()
-                .read_to_host()
-                .map_err(|error| SubmitError::Device(DeviceError::Transfer(error.to_string())))?
-                .chunks_exact(8)
-                .map(|row| {
-                    let token = i32::from_le_bytes(row[0..4].try_into().expect("four token bytes"));
-                    u64::try_from(token)
-                        .map_err(|_| invalid(format!("selected row {token} is negative")))
+impl HeadOutput {
+    /// The step completed: its landed reads bring the rows they landed into
+    /// slots of their own (`SubmittedRead::complete`). Fails when one could
+    /// not land its rows: the step read other rows.
+    pub fn complete_landed_reads(&mut self) -> Result<(), SubmitError> {
+        std::mem::take(&mut self.landed_reads)
+            .into_iter()
+            .try_for_each(crate::device_table::SubmittedRead::complete)
+            .map_err(|detail| {
+                SubmitError::Invariant(InvariantError {
+                    context: "landed table rows",
+                    detail,
                 })
-                .collect::<Result<Vec<_>, _>>()?,
-        };
-        self.read.observe(&rows).map_err(invalid)
+            })
     }
 }
 pub type CompletedVisionWork = CompletedWork<VisionLaunchCore, GraphOutputTensor>;
