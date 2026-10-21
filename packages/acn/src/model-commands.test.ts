@@ -296,6 +296,69 @@ it("reports whether a catalog sync installs, updates, or finds the model current
   expect(await Effect.runPromise(sync("Installed", "Current"))).toBe("AlreadyCurrent")
 })
 
+/** `catalog pull` and the desktop's Download agree: ACN refuses a catalog model that doesn't fit before anything downloads (QA mac-m4). */
+it("refuses to download a catalog model that does not fit, and still updates an installed one or starts an unassessed one", async () => {
+  const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
+  const { ModelIdSchema, ModelVersionNotRunnable } = await import("@magnitudedev/acn-protocol")
+  const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+  const { ModelSlotController } = await import("./model-slot-controller")
+  const { LocalModelRemovals } = await import("./local-model-removals")
+  const deficitBytes = 5_600_000_000
+  const doesNotFit = { _tag: "Assessed", assessment: { _tag: "DoesNotFit", deficitBytes } }
+  const installed = {
+    _tag: "Installed",
+    installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/models/m.gguf", ownership: "Managed" },
+    residencyState: { _tag: "Unloaded" },
+  }
+  const catalogModel = (modelId: string, servingState: unknown, acquisitionState: unknown) =>
+    ({ _tag: "Catalog", modelId, catalogData: { aliases: [] }, servingState, acquisitionState })
+  const installs: string[] = []
+  const sync = (model: string) => Effect.gen(function* () {
+    const commands = yield* ModelCommands
+    return (yield* commands.sync(Schema.decodeUnknownSync(ModelIdSchema)(model))).outcome
+  }).pipe(
+    Effect.either,
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
+    Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, { state: Effect.succeed({
+      models: [
+        catalogModel("too-large:gguf:q4", doesNotFit, { _tag: "NotInstalled" }),
+        catalogModel("too-large-partial:gguf:q4", doesNotFit, { _tag: "InstallFailed", failure: {} }),
+        catalogModel("installed-too-large:gguf:q4", doesNotFit, { ...installed, _tag: "UpdateAvailable" }),
+        catalogModel("assessing:gguf:q4", { _tag: "Assessing", profile: {} }, { _tag: "NotInstalled" }),
+        catalogModel("fits:gguf:q4", { _tag: "Assessed", assessment: { _tag: "Fits" } }, { _tag: "NotInstalled" }),
+      ],
+      unsupported: [],
+      hidden: [],
+    }) } as never),
+    Effect.provideService(IcnInstances, { get: Effect.succeed({ revision: 1, instances: [] }) } as never),
+    Effect.provideService(IcnClient, {
+      catalog: { installCatalogModel: ({ path }: { path: { model_id: string } }) => Effect.sync(() => {
+        installs.push(path.model_id)
+        return { _tag: "Admitted", operationId: "op" }
+      }) },
+    } as never),
+    Effect.provideService(IcnCatalog, {
+      get: Effect.succeed({ revision: 1, state: { models: [{ id: "installed-too-large:gguf:q4", localState: { _tag: "Installed" } }] } }),
+      refresh: Effect.void,
+    } as never),
+    Effect.provideService(IcnCatalogInstallations, { refresh: Effect.void } as never),
+    Effect.provideService(ModelSlotController, {} as never),
+    Effect.provideService(LocalModelRemovals, { forget: () => Effect.void } as never),
+  )
+
+  for (const model of ["too-large:gguf:q4", "too-large-partial:gguf:q4"]) {
+    const refused = await Effect.runPromise(sync(model))
+    expect(refused._tag === "Left" && refused.left).toBeInstanceOf(ModelVersionNotRunnable)
+    expect(refused).toMatchObject({ _tag: "Left", left: { reference: model, version: model, verdict: { _tag: "DoesNotFit", deficitBytes } } })
+  }
+  expect(installs).toEqual([])
+  expect(await Effect.runPromise(sync("installed-too-large:gguf:q4"))).toMatchObject({ _tag: "Right", right: "Updating" })
+  expect(await Effect.runPromise(sync("assessing:gguf:q4"))).toMatchObject({ _tag: "Right", right: "Installing" })
+  expect(await Effect.runPromise(sync("fits:gguf:q4"))).toMatchObject({ _tag: "Right", right: "Installing" })
+  expect(installs).toEqual(["installed-too-large:gguf:q4", "assessing:gguf:q4", "fits:gguf:q4"])
+})
+
 it("downloads only the named component of a catalog model and refuses custom models", async () => {
   const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
   const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")

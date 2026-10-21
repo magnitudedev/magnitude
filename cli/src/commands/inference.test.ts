@@ -36,7 +36,7 @@ import {
 import { registerInferenceCommands } from "./inference"
 import type { CliModelsClient } from "./inference-client"
 import { parseDrafterArgument, parsePullReference } from "./model-references"
-import { asJson, jsonDocument, runCommand } from "./output"
+import { asJson, jsonDocument, renderCommandError, runCommand } from "./output"
 import { findModel } from "./model-format"
 import {
   addModelFolder,
@@ -526,6 +526,19 @@ describe("pull and model mutations", () => {
     const result = await run(pull(client, "qwen-test:gguf:q4", pullReference("qwen-test:gguf:q4"), drafterArgument("auto")))
     expect(models.syncLocalModel).toHaveBeenCalledWith({ modelId: "qwen-test:gguf:q4" })
     expect(result).toMatchObject({ _tag: "Right", right: { _tag: "Catalog", outcome: "Installing" } })
+  })
+
+  it("passes on the service's refusal of a catalog model that doesn't fit, which can't be forced", async () => {
+    const modelId = "qwen-test:gguf:q4"
+    const { client } = fakeClient({
+      syncLocalModel: () => Effect.fail(new ModelVersionNotRunnable({
+        reference: modelId, version: modelId, verdict: { _tag: "DoesNotFit", deficitBytes: 6 * 1024 ** 3 },
+      })),
+    })
+    const refused = await run(pull(client, modelId, pullReference(modelId), drafterArgument("auto")))
+    expect(refused._tag === "Left" && refused.left).toBeInstanceOf(ModelVersionNotRunnable)
+    expect(refused._tag === "Left" && renderCommandError(refused.left, false))
+      .toBe(`${modelId} needs 6 GB more memory than this computer can provide.\n`)
   })
 
   it("resolves a drafter reference against the chosen version before adding", async () => {

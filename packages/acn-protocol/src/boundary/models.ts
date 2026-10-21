@@ -80,10 +80,11 @@ const SetFavorite = Rpc.make("SetModelFavorite", {
   error: ModelPreferenceMutationFailed,
 }).pipe(replaySafe)
 
+/** A catalog model not yet on this computer that needs more memory than it can provide is refused (ModelVersionNotRunnable). */
 const SyncLocalModel = Rpc.make("SyncLocalModel", {
   payload: Schema.Struct({ modelId: ModelIdSchema }),
   success: Schema.Struct({ outcome: LocalModelSyncOutcomeSchema }),
-  error: LocalInferenceError,
+  error: Schema.Union(LocalInferenceError, ModelVersionNotRunnable),
 }).pipe(atMostOnce)
 
 /** Fetches only one component a catalog model lacks (see CatalogMissingComponent); false when it is already here. */
