@@ -35,6 +35,3 @@ compilation still precedes production planning. Workflow binding closes the
 whole graph before allocation; admission then reserves the graph atomically,
 rolls the full transaction back on failure, and retains every lease and access
 permit through native completion.
-
-See the [durable compilation architecture](../../design/inference/seismic-compilation.md)
-for the subsystem contracts, ownership, and qualification boundaries.

@@ -26,7 +26,7 @@ import {
 import { Schema, Struct } from "effect"
 
 /*
- * `--json` documents carry the product facts the text form shows (design/cli/command-surface.md),
+ * `--json` documents carry the product facts the text form shows,
  * never the service's internal identities: assessment and environment IDs, memory-domain,
  * accelerator and device identities, managed paths and file ownership, or raw ranking inputs.
  * Catalog documents also carry no acquisition or residency state. These schemas mirror the

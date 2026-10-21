@@ -23,7 +23,7 @@ Research also considered ASUS Ascent GX10, Framework Desktop and GMKtec EVO-X2. 
 - Targeted desktop TypeScript check: no TypeScript errors or diagnostics in the changed files. The patched compiler exits 2 because of existing Effect warnings/messages elsewhere (including `main.ts`, SDK client and storage); this is not recorded as a clean zero-exit type-check.
 - Full desktop suite: 180 passed, 5 skipped, one unrelated `shell-env.test.ts` process-timing failure (`ENOENT` for its temporary PID file). Its complete seven-test file passed in isolation. An earlier concurrent run had the same class of shell timing failure. Hardware tests passed in both runs.
 - Browser acceptance: all eight actual hardware cards load their images without horizontal card overflow. Inspected light mode at 800 and 1600 pixels and dark mode at 800 and 1120 pixels, including the two-GPU and shared-memory layouts. Temporary browser viewport was restored.
-- `git diff --check` and design-document applicability check passed.
+- `git diff --check` passed.
 
 Actual Windows/Linux machines were not available for an end-to-end native observation; Windows SMBIOS behavior is covered by bounded parser fixtures and Linux public-DMI reading is reviewed code. No benchmark, latency claim, or live verification on those operating systems is implied.
 

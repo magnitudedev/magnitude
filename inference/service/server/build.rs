@@ -13,7 +13,7 @@ fn main() {
     );
     emit("SERVICE_RUSTC_VERSION", &rustc_version());
     // The installation layout keeps runtime-loaded libraries (NVRTC) in `runtime/` beside `bin/`.
-    // Apple executables own no libraries and carry no rpath (design/release/platform-contracts.md).
+    // Apple executables own no libraries and carry no rpath.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../runtime");
     }

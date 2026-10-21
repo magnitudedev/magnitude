@@ -4,8 +4,6 @@ Speculative decoding drafts tokens cheaply and verifies them with the target mod
 drafter, its acceptance rate is the drafter's property; the engine's job is to make everything
 else free. Three guarantees do that, for every speculative method (an embedded MTP head, a
 separate drafter such as DFlash, a drafter that reads the target's history) and on every device.
-The governing contract is
-[speculative generation](../../../design/inference/engine/speculative-generation.md).
 
 ## The three guarantees
 

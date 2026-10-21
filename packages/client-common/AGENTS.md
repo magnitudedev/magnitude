@@ -32,8 +32,8 @@ These follow directly from the principles above — declarative first, imperativ
 **3. `useAtomMount`** — Effect-scoped side effect with `Effect.addFinalizer`. The only sanctioned pattern when a side effect is inherent: no declarative mechanism exists, and no single user action is the sole trigger (state comes from server, timers, agent activity, or multiple sources).
 
 This decision applies to component-owned effects. A connection- or registry-lifetime resource owned
-by a client service is acquired by that service's `Layer.scoped`, as defined in
-`design/patterns/client-di.md`; React must not mount it to manufacture service lifetime.
+by a client service is acquired by that service's `Layer.scoped`; React must not mount it to
+manufacture service lifetime.
 
 **Decision:** Can output be `f(inputs)` with platform sync? → Declarative. Is a user action the sole trigger? → Event-source. Otherwise → `useAtomMount`.
 
@@ -114,7 +114,7 @@ registry, or per-domain invalidation wiring.
 
 ### Services
 
-A client service (Tag + `Layer.scoped`, see `design/patterns/client-di.md`) exists when a domain has
+A client service (Tag + `Layer.scoped`) exists when a domain has
 connection-lifetime state, a resident resource (a keyed watch), reusable operations with
 dependencies, or a stateful client-owned use case. Services expose read-only atoms and Effects;
 hooks project them (`client.runtime.atom(Tag)`), never construct them. Sessions, projects, provider

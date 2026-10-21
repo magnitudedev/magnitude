@@ -28,7 +28,6 @@
     "cache:clear:all": "bun run scripts/clear-derived-cache.ts all",
     "cache:clear:assessments": "bun run scripts/clear-derived-cache.ts assessments",
     "onboarding:reset": "bun run scripts/reset-onboarding.ts",
-    "design-docs": "bun run scripts/design-docs.ts",
     "session": "bun run --cwd evals session",
     "tbench": "bun run evals/tbench/cli.ts",
     "dash": "bun run --cwd packages/tracing dashboard",
