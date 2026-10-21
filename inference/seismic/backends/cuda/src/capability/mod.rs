@@ -71,7 +71,7 @@ pub enum CudaIntrinsic {
 }
 
 /// The namespace names of the two CUDA capability families of the language
-/// contract (`design/inference/seismic-language-and-capabilities.md`).
+/// contract.
 pub const SUBGROUP: &str = "subgroup";
 pub const MATRIX: &str = "matrix";
 

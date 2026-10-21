@@ -189,8 +189,7 @@ pub struct HostProcessBytes {
 }
 
 /// The measured host cost of a load's worker on one backend. Every cost is
-/// a measurement of real loads on that backend (`design/inference/engine/memory.md`,
-/// "Host memory of a load"), not a margin: what a worker holds beyond its
+/// a measurement of real loads on that backend, not a margin: what a worker holds beyond its
 /// planned holdings, apportioned to the counts that drive it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HostProcessCosts {

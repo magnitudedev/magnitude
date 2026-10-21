@@ -272,7 +272,7 @@ random noise, or only prompt logits cannot discharge these obligations.
 Whole-model checks use rendered chat fixtures and sane independent references, retain the full
 quality distribution, and distinguish default-relative movement from added reference loss.
 Changing a KV codec has its own model-quality obligation: matching a compressed canonical kernel
-does not establish that the compression itself is suitable. The [evaluation contract](../../design/inference/evaluation.md)
+does not establish that the compression itself is suitable. `inference/evaluation`
 owns these measurements; empirical results and implementation status are recorded separately
 from this intended design.
 
@@ -283,6 +283,5 @@ not a second admission threshold or a general correctness proof. Large departure
 an intentional approximation or a defect; small departures do not prove correctness.
 
 Compiler-generated alternatives require an established whole-entry numerical relation to the
-portable source. Passing native tuning samples cannot grant that applicability. The governing
-[numerical contract](../../design/inference/seismic-numerical-precision.md) keeps compiler proof,
-native empirical admission and model-quality evidence distinct.
+portable source. Passing native tuning samples cannot grant that applicability. Compiler proof, native empirical admission
+and model-quality evidence stay distinct.

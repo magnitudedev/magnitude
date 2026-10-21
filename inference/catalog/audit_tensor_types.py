@@ -62,7 +62,7 @@ GGML_TYPES = {
     42: "Q2_0",
 }
 
-# Encoding::TryFrom in inference-v4/engine/src/weights/gguf.rs at audit time.
+# Encodings accepted by the engine's GGUF reader at audit time.
 ENGINE_ENCODINGS = {"F32", "F16", "Q8_0", "Q4_K", "Q5_K", "Q6_K", "IQ4_XS"}
 SHARD = re.compile(r"^(.*)-(\d{5})-of-(\d{5})(\.gguf)$", re.IGNORECASE)
 

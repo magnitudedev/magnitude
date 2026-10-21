@@ -62,7 +62,7 @@ cd packages/agent && bunx --bun vitest        # watch mode
 
 ## Model Evaluation
 
-Model quality and speed are measured only through `inference/evaluation` (`design/inference/evaluation.md`). The only model input is a fixture (a chat conversation) rendered by the engine's own chat template. Never feed a model raw text, token lists or random tokens, and never judge quality against a reference that fails its sanity gate.
+Model quality and speed are measured only through `inference/evaluation`. The only model input is a fixture (a chat conversation) rendered by the engine's own chat template. Never feed a model raw text, token lists or random tokens, and never judge quality against a reference that fails its sanity gate.
 
 ## Type Checking
 
@@ -71,19 +71,6 @@ Run targeted type checks per package — do not run project-wide `tsc -b`
 ##  Project Documents
 
 When significant bug is being reported or a large spec is being created, place under `bugs/YY-MM-DD/` or `specs/YY-MM-DD/`.
-
-## Design Documents
-
-`design/` contains the durable source of truth for architecture and behavior. Follow `design/AGENTS.md`: use `bun design-docs` to find applicable documents, preserve their guarantees, and update them and their applicability whenever the design or ownership changes.
-
-```bash
-bun design-docs inference/engine/scheduler/src/worker.rs
-bun design-docs --changed --explain
-```
-
-## Info Docs
-
-Use `info/` for concise, high-level Markdown documents for humans and LLMs. These docs should describe architecture, systems, expected behavior, and durable project context without depending on brittle file names or code snippets unless they are highly relevant.
 
 ## Motel Tracing
 

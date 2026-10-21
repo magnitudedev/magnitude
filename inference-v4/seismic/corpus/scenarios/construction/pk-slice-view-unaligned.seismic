@@ -1,5 +1,0 @@
-# origin: C11:pk_slice_view_unaligned
-# invoke: q4g64[128]=zero
-fn probe(w: &tensor[128] q4g64) -> f32:
-    let v = w[1:65]
-    return v[0]

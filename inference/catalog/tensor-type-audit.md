@@ -41,7 +41,7 @@ The complete observed type set is:
 
 `BF16, F16, F32, I32, IQ3_S, IQ4_NL, IQ4_XS, MXFP4, NVFP4, Q1_0, Q3_K, Q4_0, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0`.
 
-The current inference-v4 GGUF reader accepts `F32`, `F16`, `Q8_0`, `Q4_K`,
+The engine's GGUF reader at audit time accepted `F32`, `F16`, `Q8_0`, `Q4_K`,
 `Q5_K`, `Q6_K`, and `IQ4_XS`. D11 therefore has eleven concrete gaps:
 
 | Missing type | Locked-artifact evidence |

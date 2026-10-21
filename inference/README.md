@@ -8,9 +8,7 @@ residency, and worker supervision.
 
 Start with the [architecture overview](docs/overview.md), then the
 [engine](docs/engine/overview.md), [Seismic](docs/seismic/overview.md), and
-[distribution](docs/distribution.md) contracts. The frozen previous implementation
-is under `../old-inference/`; its behavior and independent V3 numerical fixtures
-remain preservation references.
+[distribution](docs/distribution.md) contracts.
 
 ## Layout
 

@@ -1,5 +1,0 @@
-# origin: C11:s_f32_of_index
-# cell: quantity-to-float/sl
-# invoke: index:7
-fn probe(i: index[100]) -> f32:
-    return f32(i)

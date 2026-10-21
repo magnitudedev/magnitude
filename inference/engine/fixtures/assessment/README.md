@@ -1,7 +1,7 @@
 # Assessment fixtures
 
 Real GGUF headers with the verdict the engine gives each one. The engine and the service both
-test against this set (see `design/model-management/assessment-and-ranking.md`, Engine boundary).
+test against this set.
 When a change adds support for something a fixture uses, the same change flips that fixture's
 expected verdict.
 
@@ -32,8 +32,7 @@ files only, so such a header serves the service's tests alone; `ollama-qwen3.6-3
 ## Weight samples
 
 `weight-samples/<repository file name without .gguf>.json` is one real file's weight sample, as the
-service's `WeightSample` serializes it (tensor name to its first 64 values; see weight lineage in
-`design/model-management/drafter-selection.md`), for the service's weight-lineage tests. To add one,
+service's `WeightSample` serializes it (tensor name to its first 64 values), for the service's weight-lineage tests. To add one,
 run `python3 -I fetch_weight_sample.py SOURCE NAME`, where `SOURCE` is `hf:REPO@REVISION:PATH`,
 `ollama:MODEL@sha256:DIGEST` or a local path; it reads the header and then only the sampled values,
 with ranged GETs. Sources (`ollama-qwen3.6-35b-a3b` is the blob named above):
