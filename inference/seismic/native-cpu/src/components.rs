@@ -140,7 +140,7 @@ impl WeightKernels {
 }
 
 macro_rules! tier_components {
-    ($module:ident, $tier:ident, $features:literal, $mode:expr) => {
+    ($module:ident, $tier:ident, $features:literal) => {
         pub(crate) mod $module {
             use super::*;
 
@@ -205,7 +205,7 @@ macro_rules! tier_components {
                 out: *mut f32,
             ) {
                 let x = unsafe { std::slice::from_raw_parts(x, crate::quant::blocks(k)) };
-                let result = unsafe { weights::dot_q8_rows::<W, R, $mode>(rows, geometry, x, k) };
+                let result = unsafe { weights::dot_q8_rows::<W, R, { Tier::$tier.quantized_dots() }>(rows, geometry, x, k) };
                 unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, R) };
             }
 
@@ -230,7 +230,7 @@ macro_rules! tier_components {
                     for r in 0..8 {
                         let row = unsafe { rows.add(r * geometry.stride) };
                         let products = unsafe {
-                            W::dot_q8_four::<$mode>(row, &resolved[r], b, k, activations)
+                            W::dot_q8_four::<{ Tier::$tier.quantized_dots() }>(row, &resolved[r], b, k, activations)
                         };
                         for m in 0..4 {
                             accumulators[m][r] += products[m];
@@ -298,30 +298,27 @@ macro_rules! tier_components {
 }
 
 #[cfg(target_arch = "x86_64")]
-tier_components!(x86v2, X86V2, "sse3,ssse3,sse4.1,sse4.2,popcnt", 0);
+tier_components!(x86v2, X86V2, "sse3,ssse3,sse4.1,sse4.2,popcnt");
 #[cfg(target_arch = "x86_64")]
 tier_components!(
     x86v3,
     X86V3,
-    "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe",
-    1
+    "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe"
 );
 #[cfg(target_arch = "x86_64")]
 tier_components!(
     x86v4,
     X86V4,
-    "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe,avx512f,avx512cd,avx512bw,avx512dq,avx512vl",
-    1
+    "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe,avx512f,avx512cd,avx512bw,avx512dq,avx512vl"
 );
 #[cfg(target_arch = "x86_64")]
 tier_components!(
     x86v4vnni,
     X86V4Vnni,
-    "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe,avx512f,avx512cd,avx512bw,avx512dq,avx512vl,avx512vnni",
-    2
+    "sse3,ssse3,sse4.1,sse4.2,popcnt,avx,avx2,fma,f16c,bmi1,bmi2,lzcnt,movbe,avx512f,avx512cd,avx512bw,avx512dq,avx512vl,avx512vnni"
 );
 #[cfg(target_arch = "aarch64")]
-tier_components!(neon, Neon, "neon", 0);
+tier_components!(neon, Neon, "neon");
 
 /// Every tier's component table of this architecture.
 #[cfg(target_arch = "x86_64")]
