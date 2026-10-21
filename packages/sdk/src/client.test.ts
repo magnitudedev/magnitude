@@ -442,7 +442,7 @@ describe("MagnitudeClient", () => {
         yield* joinAdvancing(yield* Effect.fork(client.models.stop({})));
         expect((yield* client.connection.state)._tag).toBe("Ready");
         expect(busy.health).toHaveLength(3);
-      }).pipe(Effect.provide(live), Effect.provide(TestContext.TestContext))
+      }).pipe(Effect.provide(live.pipe(Layer.provideMerge(TestContext.TestContext))))
     );
   });
 
@@ -464,7 +464,7 @@ describe("MagnitudeClient", () => {
           expect(result.left).toMatchObject({ message: "Magnitude service health timed out" });
         }
         expect(hung.health).toHaveLength(3);
-      }).pipe(Effect.provide(live), Effect.provide(TestContext.TestContext))
+      }).pipe(Effect.provide(live.pipe(Layer.provideMerge(TestContext.TestContext))))
     );
   });
 
