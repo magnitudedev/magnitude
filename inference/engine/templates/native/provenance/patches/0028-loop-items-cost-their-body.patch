@@ -1,0 +1,94 @@
+--- a/common/jinja/runtime.cpp
++++ b/common/jinja/runtime.cpp
+@@ -82,7 +82,7 @@ value statement::execute(context & ctx) {
+ 
+ value identifier::execute_impl(context & ctx) {
+     auto it = ctx.get_val(val);
+-    auto builtins = global_builtins();
++    const auto & builtins = global_builtins();
+     if (!it->is_undefined()) {
+         if (ctx.is_get_stats) {
+             value_t::stats_t::mark_used(it);
+@@ -305,7 +305,7 @@ static value try_builtin_func(context & ctx, const std::string & name, value & i
+         value_t::stats_t::mark_used(input);
+         input->stats.ops.insert(name);
+     }
+-    auto builtins = input->get_builtins();
++    const auto & builtins = input->get_builtins();
+     auto it = builtins.find(name);
+     if (it != builtins.end()) {
+         JJ_DEBUG("Binding built-in '%s'", name.c_str());
+@@ -541,8 +541,6 @@ value for_statement::execute_impl(context & ctx) {
+ 
+     std::vector<value> filtered_items;
+     for (size_t i = 0; i < items.size(); ++i) {
+-        context loop_scope(scope);
+-
+         value current = items[i];
+ 
+         std::function<void(context&)> scope_update_fn = [](context &) { /* no-op */};
+@@ -588,6 +586,7 @@ value for_statement::execute_impl(context & ctx) {
+         }
+ 
+         if (select_expr && test_expr) {
++            context loop_scope(scope);
+             scope_update_fn(loop_scope);
+             value test_val = test_expr->execute(loop_scope);
+             if (!test_val->as_bool()) {
+--- a/common/jinja/string.cpp
++++ b/common/jinja/string.cpp
+@@ -61,6 +61,32 @@ size_t string::length() const {
+     return len;
+ }
+ 
++bool string::equals(const string & other) const noexcept {
++    if (length() != other.length()) {
++        return false;
++    }
++    size_t i = 0, j = 0, a = 0, b = 0;
++    while (i < parts.size() && j < other.parts.size()) {
++        const std::string & x = parts[i].val;
++        const std::string & y = other.parts[j].val;
++        const size_t n = std::min(x.size() - a, y.size() - b);
++        if (x.compare(a, n, y, b, n) != 0) {
++            return false;
++        }
++        a += n;
++        b += n;
++        if (a == x.size()) {
++            ++i;
++            a = 0;
++        }
++        if (b == y.size()) {
++            ++j;
++            b = 0;
++        }
++    }
++    return true;
++}
++
+ void string::hash_update(hasher & hash) const noexcept {
+     for (const auto & part : parts) {
+         hash.update(part.val.data(), part.val.length());
+--- a/common/jinja/string.h
++++ b/common/jinja/string.h
+@@ -39,6 +39,8 @@ struct string {
+ 
+     std::string str() const;
+     size_t length() const;
++    // whether both concatenate to the same text, without materializing either
++    bool equals(const string & other) const noexcept;
+     void hash_update(hasher & hash) const noexcept;
+     bool all_parts_are_input() const;
+     bool is_uppercase() const;
+--- a/common/jinja/value.h
++++ b/common/jinja/value.h
+@@ -317,7 +317,7 @@ struct value_string_t : public value_t {
+     }
+ protected:
+     virtual bool equivalent(const value_t & other) const override {
+-        return typeid(*this) == typeid(other) && val_str.str() == other.val_str.str();
++        return typeid(*this) == typeid(other) && val_str.equals(other.val_str);
+     }
+ };
+ using value_string = std::shared_ptr<value_string_t>;
