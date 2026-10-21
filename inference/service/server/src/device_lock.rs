@@ -4,7 +4,7 @@
 //! itself: a search beside a resident model would take the memory that model's verdict promised
 //! its requests, and would time kernels against its serving. A job never queues ahead of a load
 //! as a waiting writer would: it tries to take the device and waits for a release to try again,
-//! and an optimization is skipped while residency holds the device. A share wanted while a job
+//! so a job deferred by a resident model runs once the device is free. A share wanted while a job
 //! holds the device preempts the job: its owner kills it at once, so a load waits only for that
 //! bounded kill.
 
@@ -144,8 +144,8 @@ impl DeviceLock {
             })
     }
 
-    /// Take the device for a job once nothing holds it, trying again after each release: the
-    /// measurement job defers this way while a model is resident or loading.
+    /// Take the device for a job once nothing holds it, trying again after each release: a job
+    /// defers this way while a model is resident or loading, or another job holds the device.
     pub async fn job(&self) -> DeviceJob {
         let mut released = self.released.subscribe();
         loop {
@@ -157,31 +157,11 @@ impl DeviceLock {
             let _ = released.changed().await;
         }
     }
-
-    /// Take the device for a job unless residency holds it: `None` while a model is resident
-    /// or loading. Another job holding the device is waited out.
-    pub async fn job_unless_resident(&self) -> Option<DeviceJob> {
-        let mut released = self.released.subscribe();
-        loop {
-            if let Some(job) = self.try_job() {
-                return Some(job);
-            }
-            // The take failed with no job holding the device: residency shares it.
-            if Arc::clone(&self.lock).try_read_owned().is_ok() {
-                return None;
-            }
-            let _ = released.changed().await;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    /// Longer than any take that does not wait.
-    const TRY: Duration = Duration::from_secs(5);
 
     /// A job excludes shares and shares exclude a job; a share ending lets a waiting job take
     /// the device.
@@ -221,34 +201,20 @@ mod tests {
         drop(share);
     }
 
-    /// An optimization never runs beside a resident or loading model: while residency shares
-    /// the device it is skipped, not queued behind the share.
-    #[tokio::test]
-    async fn a_job_unless_resident_is_refused_while_residency_shares_the_device() {
-        let lock = DeviceLock::default();
-        let share = lock.try_share().unwrap();
-        let refused = tokio::time::timeout(TRY, lock.job_unless_resident())
-            .await
-            .expect("the job never waits behind a resident model");
-        assert!(refused.is_none());
-        drop(share);
-        assert!(lock.job_unless_resident().await.is_some());
-    }
-
     /// Another job holding the device is waited out, and the preemption a worker's owner keeps
     /// apart from its hold fires when a share is wanted.
     #[tokio::test]
-    async fn a_job_unless_resident_waits_out_another_job_and_is_preempted_by_a_load() {
+    async fn a_job_waits_out_another_job_and_is_preempted_by_a_load() {
         let lock = DeviceLock::default();
         let measuring = lock.try_job().unwrap();
         let waiting = tokio::spawn({
             let lock = lock.clone();
-            async move { lock.job_unless_resident().await }
+            async move { lock.job().await }
         });
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
         drop(measuring);
-        let job = waiting.await.unwrap().expect("no model holds the device");
+        let job = waiting.await.unwrap();
         let mut preemption = job.preemption();
         let hold = DeviceHold::Job(job);
         let load = tokio::spawn({

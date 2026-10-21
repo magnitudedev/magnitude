@@ -156,6 +156,14 @@ impl ModelInstances {
         }
     }
 
+    /// The residency loads `target` unless it is resident, and the load's Prepare searches what
+    /// its bundle's catalog optimization would: one waiting for the device ends without running.
+    /// Marked before the residency releases another model, whose release frees the device.
+    fn requested(&self, target: &ResolvedResidencyTarget) {
+        self.preparations
+            .loading(&servable_model_bundle_key_for_bundle(&target.configuration.bundle));
+    }
+
     /// A fresh memory observation from the resident worker, when one is resident.
     pub async fn resident_memory(&self) -> Option<MemoryObservation> {
         self.supervisor.observe_resident().await
@@ -179,6 +187,7 @@ impl ModelInstances {
     pub async fn ensure_resident(&self, model_id: &str) -> Result<ModelInstance, InventoryError> {
         let target = self.target(model_id)?;
         self.admit(&target).await?;
+        self.requested(&target);
         match self
             .residency
             .acquire(target, ResidencyAcquisition::Warm)
@@ -197,6 +206,7 @@ impl ModelInstances {
     ) -> Result<ResidencyLease<ResidentEngine>, InventoryError> {
         let target = self.target(model_id)?;
         self.admit(&target).await?;
+        self.requested(&target);
         match self
             .residency
             .acquire(
@@ -301,7 +311,7 @@ impl CatalogModelOptimizer for ModelInstances {
     fn optimize_catalog_model(
         &self,
         model_id: ModelId,
-        progress: Box<dyn Fn(CatalogOptimizationProgress) + Send + Sync>,
+        progress: Box<dyn Fn(Option<CatalogOptimizationProgress>) + Send + Sync>,
     ) -> BoxFuture<'static, ()> {
         let environment = Arc::clone(&self.environment);
         let preparations = self.preparations.clone();

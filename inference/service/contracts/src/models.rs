@@ -2632,13 +2632,14 @@ pub struct CatalogInstallationsInvalidation {
 }
 
 /// Tunes a freshly installed catalog model's kernels for the device a load would select, so its
-/// first load does not. Reports progress until it finishes; dropping the future stops the job.
-/// A failure is the optimizer's to log: the model is installed either way.
+/// first load does not. Reports progress until it finishes, and `None` while the job waits for
+/// the device, when nothing optimizes; dropping the future stops the job. A failure is the
+/// optimizer's to log: the model is installed either way.
 pub trait CatalogModelOptimizer: Send + Sync + 'static {
     fn optimize_catalog_model(
         &self,
         model_id: ModelId,
-        progress: Box<dyn Fn(CatalogOptimizationProgress) + Send + Sync>,
+        progress: Box<dyn Fn(Option<CatalogOptimizationProgress>) + Send + Sync>,
     ) -> BoxFuture<'static, ()>;
 }
 

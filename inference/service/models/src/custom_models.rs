@@ -3992,7 +3992,7 @@ mod tests {
         fn optimize_catalog_model(
             &self,
             _model_id: ModelId,
-            _progress: Box<dyn Fn(magnitude_service_contracts::models::CatalogOptimizationProgress) + Send + Sync>,
+            _progress: Box<dyn Fn(Option<magnitude_service_contracts::models::CatalogOptimizationProgress>) + Send + Sync>,
         ) -> futures_util::future::BoxFuture<'static, ()> {
             Box::pin(async {})
         }
@@ -5373,6 +5373,127 @@ mod tests {
                 .hidden,
             [found_id]
         );
+    }
+
+    /// An optimizer whose job waits for the device and never gets it, as beside a resident model.
+    struct WaitingOptimizer {
+        waiting: Arc<std::sync::atomic::AtomicBool>,
+        stopped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// Sets its flag once dropped: the job's future was dropped, so the job stopped.
+    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl magnitude_service_contracts::models::CatalogModelOptimizer for WaitingOptimizer {
+        fn optimize_catalog_model(
+            &self,
+            _model_id: ModelId,
+            progress: Box<dyn Fn(Option<magnitude_service_contracts::models::CatalogOptimizationProgress>) + Send + Sync>,
+        ) -> futures_util::future::BoxFuture<'static, ()> {
+            let waiting = Arc::clone(&self.waiting);
+            let stopped = SetOnDrop(Arc::clone(&self.stopped));
+            Box::pin(async move {
+                let _stopped = stopped;
+                progress(None);
+                waiting.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            })
+        }
+    }
+
+    /// QA optimization-memory: an optimization deferred while another model is resident waits
+    /// for the device without gating the model. Meanwhile the installation reads as completed
+    /// (the model is installed and loadable), never as an optimization stuck preparing, and
+    /// removing the model stops the waiting job.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_optimization_waiting_for_the_device_reads_completed_and_ends_with_removal() {
+        use magnitude_service_contracts::models::{
+            CatalogInstallationAdmission, CatalogInstallationOperationState,
+            CatalogInstallations as _, InstalledModelPackages as _,
+        };
+
+        let fixture = Fixture::new().await;
+        let cache = fixture.root.join("hf");
+        let commit = "a".repeat(40);
+        let bytes = model_bytes("model");
+        publish_hf_cache(
+            &cache,
+            "owner/Model-GGUF",
+            &commit,
+            &[("Model-Q4_K_M.gguf", bytes.clone())],
+        );
+        let shown = roots(vec![root(ModelRootKind::HuggingFaceCache, &cache)]);
+        fixture.apply(shown.clone()).await;
+        let found = fixture.inventory().list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        let found_id = ModelId::hugging_face(
+            &HuggingFaceRepositoryId::new("owner/Model-GGUF").unwrap(),
+            &HuggingFaceArtifactSelector::new("Model-Q4_K_M.gguf").unwrap(),
+        );
+        let catalog = vec![catalog_definition(found)];
+        let model_id = catalog_id(&catalog[0]);
+        let (endpoint, _requests) = serve_metadata_only(
+            "owner/Model-GGUF",
+            commit,
+            vec![("Model-Q4_K_M.gguf", bytes)],
+        );
+        let fixture = fixture.restart_with_hub(endpoint, catalog.clone()).await;
+        fixture
+            .apply(LocalModelsConfiguration {
+                hidden: vec![found_id],
+                ..shown
+            })
+            .await;
+
+        let downloads = Arc::new(
+            crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
+                .await
+                .unwrap(),
+        );
+        let waiting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
+            fixture.resolver.clone(),
+            downloads,
+            Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
+            Arc::new(WaitingOptimizer {
+                waiting: Arc::clone(&waiting),
+                stopped: Arc::clone(&stopped),
+            }),
+        );
+        let CatalogInstallationAdmission::Admitted { .. } =
+            installations.install(&model_id).await.unwrap()
+        else {
+            panic!("the installation is admitted");
+        };
+        for _ in 0..200 {
+            if waiting.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(waiting.load(Ordering::SeqCst), "the download completes and its optimization waits");
+        let operations = installations
+            .list_catalog_installations()
+            .await
+            .unwrap()
+            .operations;
+        assert!(
+            matches!(operations.as_slice(), [operation]
+                if operation.state == CatalogInstallationOperationState::Completed),
+            "nothing optimizes while the job waits for the device: {operations:?}"
+        );
+        assert!(!stopped.load(Ordering::SeqCst));
+
+        installations.remove(&model_id).await.unwrap();
+        assert!(stopped.load(Ordering::SeqCst), "removal stops the waiting optimization");
     }
 
     #[tokio::test]

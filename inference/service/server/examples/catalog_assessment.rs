@@ -43,7 +43,7 @@ impl CatalogModelOptimizer for NoCatalogEffects {
     fn optimize_catalog_model(
         &self,
         _model_id: ModelId,
-        _progress: Box<dyn Fn(CatalogOptimizationProgress) + Send + Sync>,
+        _progress: Box<dyn Fn(Option<CatalogOptimizationProgress>) + Send + Sync>,
     ) -> BoxFuture<'static, ()> {
         Box::pin(async {})
     }
