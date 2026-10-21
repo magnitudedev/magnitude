@@ -4932,6 +4932,79 @@ mod tests {
         );
     }
 
+    /// QA linux-arm64 / mac-m1: once the store was scanned again (a drafter change, a restart),
+    /// `catalog remove` of a stored target with its projector deleted the projector's own package
+    /// first, which unlinked the target's projector file, then failed with "model not found:
+    /// package_…" and left the weights. Remove deletes the whole target in one call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_stored_target_with_its_projector_after_a_rescan_removes_everything() {
+        use magnitude_service_contracts::models::{
+            CatalogInstallationRemoval, InstalledModelPackages as _,
+        };
+
+        let fixture = Fixture::new().await;
+        let projector = gguf_bytes(
+            &[
+                ("general.architecture", Meta::Str("clip")),
+                ("general.name", Meta::Str("projector")),
+            ],
+            &["v.patch_embd.weight"],
+        );
+        let (weights, projector) = (model_bytes("model"), projector);
+        let reclaimed_bytes = (weights.len() + projector.len()) as u64;
+        publish_managed(
+            &fixture.store,
+            "owner/Model-GGUF",
+            &"a".repeat(40),
+            &[("Model-Q4_K_M.gguf", weights), ("mmproj-F16.gguf", projector)],
+        );
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        let target = fixture.inventory().list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        let projector_package = crate::inventory::catalog_projector_package(&target).unwrap();
+        let catalog = vec![catalog_definition(target.clone())];
+        let model_id = catalog_id(&catalog[0]);
+        let fixture = fixture.restart(catalog).await;
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        let listed = fixture
+            .inventory()
+            .list_installed()
+            .await
+            .unwrap()
+            .packages
+            .into_iter()
+            .map(|installed| installed.package.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            listed,
+            BTreeSet::from([target.id.clone(), projector_package.id]),
+            "the scan lists the target and, from the same file, its projector package"
+        );
+
+        let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
+            fixture.resolver.clone(),
+            Arc::new(
+                crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
+                    .await
+                    .unwrap(),
+            ),
+            Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
+            Arc::new(NoOptimizer),
+        );
+        let removed = installations.remove(&model_id).await.unwrap();
+
+        assert_eq!(
+            removed,
+            CatalogInstallationRemoval::Removed {
+                reclaimed_bytes,
+                kept_components: Vec::new(),
+            }
+        );
+        fixture.inventory().ensure_installed_model_inventory().await.unwrap();
+        assert!(fixture.inventory().list_installed().await.unwrap().packages.is_empty());
+    }
+
     /// Hiding changes only what is shown: installing a catalog model whose target is exactly a
     /// hidden found copy copies that copy's bytes into Magnitude's store instead of downloading
     /// them, needs no further download, and leaves the copy's files where they are.

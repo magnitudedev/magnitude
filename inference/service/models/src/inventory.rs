@@ -155,6 +155,16 @@ impl InstalledPackageSnapshot {
         }
     }
 
+    /// The snapshot files Magnitude's copies of `package_id` are made of, each by repository,
+    /// commit and path.
+    fn managed_entries(&self, package_id: &ModelPackageId) -> BTreeSet<(String, String, PathBuf)> {
+        self.records
+            .values()
+            .filter(|record| &record.installed.package.id == package_id)
+            .flat_map(occurrence_entries)
+            .collect()
+    }
+
     /// Whether deleting Magnitude's copies of `package_id` would unlink a snapshot file that a
     /// Magnitude package outside `removing` is served from too. Two packages can name the same
     /// file in one snapshot (a target with its projector, and the same weights found on their own
@@ -164,47 +174,77 @@ impl InstalledPackageSnapshot {
         package_id: &ModelPackageId,
         removing: &BTreeSet<ModelPackageId>,
     ) -> bool {
-        let entries = |record: &InstalledPackageRecord| -> Vec<(String, String, PathBuf)> {
-            let (
-                ModelPackageInstallationOrigin::Magnitude,
-                ModelLocation::MagnitudeCache { components, .. },
-                ModelSource::HuggingFace {
-                    repository, commit, ..
-                },
-            ) = (
-                record.installed.origin,
-                &record.model.location,
-                &record.model.source,
-            )
-            else {
-                return Vec::new();
-            };
-            components
-                .iter()
-                .map(|component| {
-                    (
-                        repository.to_lowercase(),
-                        commit.clone(),
-                        component.path.clone(),
-                    )
-                })
-                .collect()
-        };
-        let removed = self
-            .records
-            .values()
-            .filter(|record| &record.installed.package.id == package_id)
-            .flat_map(entries)
-            .collect::<BTreeSet<_>>();
+        let removed = self.managed_entries(package_id);
         self.records
             .values()
             .filter(|record| {
                 &record.installed.package.id != package_id
                     && !removing.contains(&record.installed.package.id)
             })
-            .flat_map(entries)
+            .flat_map(occurrence_entries)
             .any(|entry| removed.contains(&entry))
     }
+
+    /// `removing` without the packages whose every snapshot file the others in it hold (the
+    /// projector package of a target stored with its projector, say): deleting those deletes the
+    /// files, so such a package goes with them rather than separately.
+    pub(crate) fn without_contained_managed_packages(
+        &self,
+        removing: &[ModelPackageId],
+    ) -> Vec<ModelPackageId> {
+        let mut largest_first = removing
+            .iter()
+            .map(|package_id| (package_id, self.managed_entries(package_id)))
+            .collect::<Vec<_>>();
+        largest_first.sort_by(|(left_id, left), (right_id, right)| {
+            right
+                .len()
+                .cmp(&left.len())
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let mut deleted = BTreeSet::new();
+        let mut kept = BTreeSet::new();
+        for (package_id, entries) in largest_first {
+            if entries.is_empty() || !entries.is_subset(&deleted) {
+                deleted.extend(entries);
+                kept.insert(package_id);
+            }
+        }
+        removing
+            .iter()
+            .filter(|package_id| kept.contains(package_id))
+            .cloned()
+            .collect()
+    }
+}
+
+/// The snapshot files of a Magnitude occurrence, each by repository, commit and path; none for an
+/// occurrence elsewhere.
+fn occurrence_entries(record: &InstalledPackageRecord) -> Vec<(String, String, PathBuf)> {
+    let (
+        ModelPackageInstallationOrigin::Magnitude,
+        ModelLocation::MagnitudeCache { components, .. },
+        ModelSource::HuggingFace {
+            repository, commit, ..
+        },
+    ) = (
+        record.installed.origin,
+        &record.model.location,
+        &record.model.source,
+    )
+    else {
+        return Vec::new();
+    };
+    components
+        .iter()
+        .map(|component| {
+            (
+                repository.to_lowercase(),
+                commit.clone(),
+                component.path.clone(),
+            )
+        })
+        .collect()
 }
 
 /// Which occurrence of the same content represents it: the managed store, then the Hugging Face
