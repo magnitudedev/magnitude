@@ -1644,7 +1644,12 @@ fn largest_plane(layout: KvCodec, depth: u64) -> Result<u64, ExecutorCostsError>
 
 /// The slab store of one sequence's `layout` history at `depth` tokens, as
 /// the engine's geometry rule lays out a store of its `depth` + 1 rows: its
-/// rows per slab, regions, slab layout and slabs.
+/// rows per slab, regions, slab layout and slabs. A slab holds no more
+/// pages than the rows take: the rule's slabs fill a byte target that a
+/// shallow history reads a small part of, and every argument set of a
+/// rotation holds a store of its own, so a rotation of many shallow sets
+/// would allocate many times the bytes it spans (625 sets of 64 MiB, 41 GB,
+/// for the 1.7 MB a 4-vCPU EPYC's dense history reads at depth 420).
 fn history_store(
     layout: KvCodec,
     depth: u64,
@@ -1656,7 +1661,8 @@ fn history_store(
         0,
     )
     .map_err(ExecutorCostsError)?;
-    let rows_per_slab = geometry.slab_rows as u64;
+    let page_rows = geometry.page_rows as u64;
+    let rows_per_slab = (geometry.slab_rows as u64).min(rows.next_multiple_of(page_rows));
     let regions = planes(layout)?
         .into_iter()
         .map(|(element, width)| SlabRegion {

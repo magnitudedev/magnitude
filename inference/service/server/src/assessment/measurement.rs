@@ -2,8 +2,9 @@
 //! kernels, which can fault or hang in a driver, and a native submission cannot be cancelled once
 //! started; so the service never measures in its own process and nothing waits on a measurement.
 //! The job is a mode of the inference worker, run only with the device to itself
-//! ([`DeviceLock::try_measure`]) and held to a hard deadline, after which it is killed and waited
-//! for a bounded time on a detached task. A load or catalog optimization wanting the device
+//! ([`DeviceLock::try_measure`]) and held to a hard deadline on its silence: a job that reports
+//! nothing for [`HANG_DEADLINE`] is hung, and it is killed and waited for a bounded time on a
+//! detached task. A load or catalog optimization wanting the device
 //! preempts it: the job is killed at once, its attempts are released rather than counted, and the
 //! next job resumes from what is stored. Its state moves `Unmeasured → Measuring → Measured |
 //! Failed { retry_at }` (a preempted job back to `Unmeasured`), and what it stores reaches the
@@ -27,16 +28,14 @@ use crate::residency::controller::GRACEFUL_EXIT;
 use crate::residency::worker::{JobWorker, KILL_REAP};
 use crate::worker_process::WorkerLauncher;
 
-/// The slowest cold job measured: 10.65 s, every resident weight format on a GB10 through
-/// NVIDIA's Vulkan driver, with an empty kernel cache and the driver's shader cache off
-/// (2026-10-20, run 20261020T204050Z-merge-kernels-gb10-46655c). The same machine's CUDA job
-/// took 7.2 s, an RTX 3090's 8.7 s through Vulkan and 7.8 s through CUDA, and an M4 Pro's 7.3 s.
-const SLOWEST_COLD_JOB: Duration = Duration::from_millis(10_648);
-
-/// How long a job may run before it is killed as hung: twice the slowest cold job measured.
-/// The job itself has no budget: each point stops when its median is resolved. A load never
-/// waits on it: a load preempts a running job.
-pub const JOB_DEADLINE: Duration = SLOWEST_COLD_JOB.saturating_mul(2);
+/// How long a job may go without reporting before it is killed as hung. A job reports each point
+/// before it starts it, so this bounds its start and each point, never the job: the job has no
+/// budget, and each point stops when its median is resolved, after as long as its device takes.
+/// Whole cold jobs take 7.2 to 10.6 s on a GB10, an RTX 3090 or an M4 Pro, while one point, a
+/// 512-row projection on an idle 4-vCPU EPYC 7763's CPU, took 330 s (eight samples of a 33 s
+/// call), and a CPU of fewer cores or one the service shares takes several times that. Nothing
+/// waits on a job (a load preempts it), so the bound is generous: it only ends a hang.
+pub const HANG_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// How long a job's process is waited for once it reported or was killed: a reported job's own
 /// exit ([`GRACEFUL_EXIT`]), then the kill's reap ([`KILL_REAP`]), the two waits its retirement
@@ -44,10 +43,10 @@ pub const JOB_DEADLINE: Duration = SLOWEST_COLD_JOB.saturating_mul(2);
 /// is not proven gone.
 const EXIT_WAIT: Duration = GRACEFUL_EXIT.saturating_add(KILL_REAP);
 
-/// The first retry's delay after a failed job: twice [`JOB_DEADLINE`], so a job that fails
-/// every time occupies the device at most a third of the time. Each further failure doubles it,
-/// up to [`LAST_RETRY`].
-const FIRST_RETRY: Duration = JOB_DEADLINE.saturating_mul(2);
+/// The first retry's delay after a failed job. A retry waits at least twice as long as the failed
+/// job ran, so a job that fails every time occupies the device at most a third of the time, and
+/// each further failure doubles the delay, up to [`LAST_RETRY`].
+const FIRST_RETRY: Duration = Duration::from_secs(40);
 /// The longest retry delay: a failure is retried at least hourly while the service runs.
 const LAST_RETRY: Duration = Duration::from_secs(60 * 60);
 
@@ -233,7 +232,7 @@ pub fn start<M: MeasuredMachine>(
     device: DeviceLock,
 ) -> watch::Receiver<MeasurementStatus<M::Stored>> {
     let (status, receiver) = watch::channel(MeasurementStatus::stored(stored));
-    tokio::spawn(run(machine, device, status, JOB_DEADLINE));
+    tokio::spawn(run(machine, device, status, HANG_DEADLINE));
     receiver
 }
 
@@ -274,6 +273,7 @@ async fn run<M: MeasuredMachine>(
             device.released().await;
         };
         status.send_modify(|status| status.state = MeasurementState::Measuring);
+        let started = tokio::time::Instant::now();
         let outcome = match run_job(&machine, exclusive, deadline).await {
             JobEnd::Ended(outcome) => outcome,
             JobEnd::Preempted => {
@@ -298,27 +298,29 @@ async fn run<M: MeasuredMachine>(
                     measurements,
                 });
             }
-            _ => retry(&status, &mut backoff).await,
+            _ => retry(&status, &mut backoff, started.elapsed()).await,
         }
     }
     // The last state stands for as long as anything reads it.
     status.closed().await;
 }
 
-/// Report the job failed with what is stored unchanged, and wait out the backoff, which then
-/// doubles.
+/// Report the job, which ran for `ran`, failed with what is stored unchanged, and wait out the
+/// backoff, at least twice `ran` and at most [`LAST_RETRY`], which then doubles.
 async fn retry<S: StoredRecords>(
     status: &watch::Sender<MeasurementStatus<S>>,
     backoff: &mut Duration,
+    ran: Duration,
 ) {
-    let retry_at = std::time::SystemTime::now() + *backoff;
+    let delay = (*backoff).max(ran.saturating_mul(2)).min(LAST_RETRY);
+    let retry_at = std::time::SystemTime::now() + delay;
     status.send_modify(|status| {
         status.state = MeasurementState::Failed {
             retry_at: epoch_millis(retry_at),
         }
     });
-    tokio::time::sleep(*backoff).await;
-    *backoff = backoff.saturating_mul(2).min(LAST_RETRY);
+    tokio::time::sleep(delay).await;
+    *backoff = delay.saturating_mul(2).min(LAST_RETRY);
 }
 
 /// How one job ended.
@@ -329,10 +331,11 @@ enum JobEnd {
     Preempted,
 }
 
-/// One job held to `deadline` on `exclusive`: its frames are read until it
-/// reports its outcome, or until residency wants the device, which kills it at once; its process
-/// is then retired, waiting at most [`EXIT_WAIT`] on a detached task, and the device released. A
-/// preempted job's attempts are then released, so preemption never counts against a point.
+/// One job on `exclusive`, killed as hung once it reports nothing for `deadline`: its frames are
+/// read until it reports its outcome, or until residency wants the device, which kills it at
+/// once; its process is then retired, waiting at most [`EXIT_WAIT`] on a detached task, and the
+/// device released. A preempted job's attempts are then released, so preemption never counts
+/// against a point.
 async fn run_job<M: MeasuredMachine>(
     machine: &Arc<M>,
     mut exclusive: DeviceMeasurement,
@@ -354,19 +357,32 @@ async fn run_job<M: MeasuredMachine>(
         Err(error) => return JobEnd::Ended(Err(JobLost(format!("starting the job: {error}")))),
     };
     let started = tokio::time::Instant::now();
-    let end = started + deadline;
+    // Each report moves the deadline: a job is hung only once it is silent for `deadline`.
+    let mut silent_until = started + deadline;
     // Every point the job reported attempting: those a preempted job's markers may count.
     let mut attempted = Vec::new();
     let outcome = loop {
         tokio::select! {
-            frame = frames.recv() => match frame {
-                Some(JobFrame::Attempting(key)) => attempted.push(key),
-                Some(JobFrame::Recorded(key, record)) => log_record(&key, &record),
-                Some(JobFrame::Finished(outcome)) => break Some(outcome),
-                None => break Some(Err(JobLost("the job's reader ended".into()))),
-            },
-            () = tokio::time::sleep_until(end) => {
-                break Some(Err(JobLost(format!("the job did not finish within {deadline:?}"))));
+            frame = frames.recv() => {
+                silent_until = tokio::time::Instant::now() + deadline;
+                match frame {
+                    Some(JobFrame::Attempting(key)) => {
+                        tracing::info!(
+                            elapsed_ms = u64::try_from(started.elapsed().as_millis())
+                                .unwrap_or(u64::MAX),
+                            configuration = ?key.configuration,
+                            point = ?key.point,
+                            "measurement attempting"
+                        );
+                        attempted.push(key);
+                    }
+                    Some(JobFrame::Recorded(key, record)) => log_record(&key, &record),
+                    Some(JobFrame::Finished(outcome)) => break Some(outcome),
+                    None => break Some(Err(JobLost("the job's reader ended".into()))),
+                }
+            }
+            () = tokio::time::sleep_until(silent_until) => {
+                break Some(Err(JobLost(format!("the job reported nothing for {deadline:?}"))));
             }
             () = exclusive.preempted() => break None,
         }
@@ -576,7 +592,7 @@ mod tests {
             .wait_for(|status| status.state == MeasurementState::Measuring)
             .await
             .unwrap();
-        tokio::time::sleep(JOB_DEADLINE - Duration::from_secs(1)).await;
+        tokio::time::sleep(HANG_DEADLINE - Duration::from_secs(1)).await;
         settle().await;
         assert_eq!(*retired.lock().unwrap(), None, "killed before its deadline");
         let failed = status
@@ -590,6 +606,63 @@ mod tests {
             Some(false),
             "an unreported job is killed"
         );
+    }
+
+    /// A job that keeps reporting is never killed, however long it runs past the deadline: only
+    /// its silence is bounded. Silent for the deadline after its last report, it is killed.
+    #[tokio::test(start_paused = true)]
+    async fn a_job_is_killed_only_once_it_is_silent_for_its_deadline() {
+        let (running, retired, frames) = job(Vec::new());
+        let machine = ScriptedMachine::new(vec![running], Vec::new());
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default());
+        status
+            .wait_for(|status| status.state == MeasurementState::Measuring)
+            .await
+            .unwrap();
+        for point in 0..4 {
+            tokio::time::sleep(HANG_DEADLINE - Duration::from_secs(1)).await;
+            frames
+                .send(JobFrame::Attempting(key(&point.to_string())))
+                .await
+                .unwrap();
+            settle().await;
+        }
+        assert_eq!(status.borrow().state, MeasurementState::Measuring);
+        assert_eq!(*retired.lock().unwrap(), None, "a reporting job was killed");
+        tokio::time::sleep(HANG_DEADLINE - Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(*retired.lock().unwrap(), None, "killed before its deadline");
+        status
+            .wait_for(|status| matches!(status.state, MeasurementState::Failed { .. }))
+            .await
+            .unwrap();
+        assert_eq!(retirement(&retired), Some(false), "a silent job is killed");
+    }
+
+    /// A failed job is retried after at least twice as long as it ran, so a job that fails every
+    /// time occupies the device at most a third of the time.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_job_is_retried_after_twice_its_running_time() {
+        let (silent, _, _open) = job(Vec::new());
+        let (finishing, _, _finished) = job(vec![JobFrame::Finished(Ok(Vec::new()))]);
+        let machine = ScriptedMachine::new(vec![silent, finishing], vec![PENDING, COMPLETE]);
+        let mut status = start(machine.clone(), PENDING, DeviceLock::default());
+        status
+            .wait_for(|status| matches!(status.state, MeasurementState::Failed { .. }))
+            .await
+            .unwrap();
+        tokio::time::sleep(HANG_DEADLINE * 2 - Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(
+            machine.started.load(Ordering::SeqCst),
+            1,
+            "retried too soon"
+        );
+        status
+            .wait_for(|status| status.state == MeasurementState::Measured)
+            .await
+            .unwrap();
+        assert_eq!(machine.started.load(Ordering::SeqCst), 2);
     }
 
     /// A job ending with a failed point still publishes what it stored, and its reported
@@ -671,7 +744,7 @@ mod tests {
         let asked = tokio::time::Instant::now();
         let share = device.share().await;
         assert!(
-            asked.elapsed() < JOB_DEADLINE,
+            asked.elapsed() < HANG_DEADLINE,
             "the load waited for the job's deadline"
         );
         assert_eq!(retirement(&retired), Some(false), "the job is killed");
