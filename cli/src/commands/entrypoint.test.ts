@@ -86,6 +86,21 @@ describe("headless CLI entrypoint", () => {
       await expect(stat(profile)).rejects.toMatchObject({ code: "ENOENT" })
     } finally { await rm(root, { recursive: true, force: true }) }
   })
+  it.skipIf(process.platform === "win32").each([["--version"], ["docs"], ["status"]])(
+    "%j ends quietly and successfully when its reader closes stdout early",
+    async (...args) => {
+      const root = await mkdtemp(join(tmpdir(), "mag-closed-output-"))
+      try {
+        const reader = Bun.spawn(["bash", "-c", '"$@" | true; exit "${PIPESTATUS[0]}"', "closed-output",
+          Bun.which("bun")!, fileURLToPath(new URL("../index.ts", import.meta.url)), ...args], {
+          stdin: "ignore", stdout: "pipe", stderr: "pipe",
+          env: { ...globalThis.process.env, MAGNITUDE_DEV_DATA_DIR: join(root, "absent") },
+        })
+        const [code, stderr] = await Promise.all([reader.exited, new Response(reader.stderr).text()])
+        expect({ code, stderr }).toEqual({ code: 0, stderr: "" })
+      } finally { await rm(root, { recursive: true, force: true }) }
+    },
+  )
   it("prints only the version", async () => {
     const result = await invoke(["--version"])
     expect(result.code).toBe(0)

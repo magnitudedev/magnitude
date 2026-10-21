@@ -9,6 +9,9 @@ import { registerConnectionsCommand } from "./commands/connections"
 import { registerHuggingFaceCommand } from "./commands/hugging-face-account"
 import { registerServerCommand } from "./commands/server"
 import { admitsPkexecCommand } from "./startup/pkexec-admission"
+import { ignoreClosedOutput } from "./startup/closed-output"
+
+ignoreClosedOutput(process.stdout)
 
 if (!admitsPkexecCommand(process.argv.slice(2), process.getuid?.(), process.env)) {
   process.stderr.write("Under pkexec, Magnitude runs only its update installer and server removal.\n")
