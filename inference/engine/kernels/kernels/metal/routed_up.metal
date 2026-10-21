@@ -29,10 +29,10 @@ kernel void routed_up(
         SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H));
     const auto up = routed::weights<packets::W0>(expert_up, KERNEL_W0_LAYOUT(SEISMIC_DIM_H),
         routed::expert_row(expert, SEISMIC_DIM_F), SEISMIC_DIM_H);
-    const auto out = projection::scaling<true>::wrap(
+    const auto out = projection::scaling<(SEISMIC_DIM_US != 0)>::wrap(
         projection::Activated<A>{product + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * A::bytes,
             0, SEISMIC_RESULT_0_STRIDE_2, int(SEISMIC_PARAM_ACTIVATION)},
-        projection::scale_factor(up_scale, SEISMIC_DIM_E, SEISMIC_UP_SCALE_STRIDE_0, expert), 1.0f);
+        projection::scale_factor(up_scale, SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, expert), 1.0f);
     projection::gemv_runtime<packets::W0, ROWS, 1, LANES>(in, out, up, 1, SEISMIC_DIM_F, SEISMIC_DIM_H, tile,
         shared, simdgroups, sg, lane);
 }

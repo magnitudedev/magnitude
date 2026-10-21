@@ -2,7 +2,8 @@
 // `routed_gate_up_stage` stages each normalized row as F32 in scratch, one
 // work item per row. `routed_gate_up_rows`: work item (x, y) owns feature
 // block x of ROWS features of choice y = (m, k), whose expert gate/up rows it
-// expands against row m: A(A(act(A(gate))) * A(up)).
+// expands against row m: A(A(act(A(gs * gate))) * A(us * up)), the scales the
+// choice's expert's, 1 where a port is absent.
 
 use lib::projection::projection;
 use lib::routed::routed;
@@ -37,7 +38,9 @@ fn routed_gate_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
     let q8 = (cx.param_int8() == 1).then(|| unsafe {
         &cx.scratch_quantized().slice::<seismic::cpu::quant::Q8Block>(0, m * blocks)[row * blocks..(row + 1) * blocks]
     });
-    let first = routed::expert_row(cx.arg_routes().get([row, slot]), f) + rows.start;
+    let expert = cx.arg_routes().get([row, slot]);
+    let first = routed::expert_row(expert, f) + rows.start;
+    let (gate_scale, up_scale) = (cx.arg_gate_scale(), cx.arg_up_scale());
     // SAFETY: each work item writes its own features of its own choice.
     let out = unsafe { cx.result_0().span_mut([row, slot, rows.start], rows.len()) };
     routed::glu_into::<E::A>(
@@ -47,6 +50,10 @@ fn routed_gate_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
         &staged[row * h..(row + 1) * h],
         q8,
         cx.arg_activation(),
+        (
+            routed::scale_factor(cx.dim_gs(), |e| gate_scale.get([e]), expert),
+            routed::scale_factor(cx.dim_us(), |e| up_scale.get([e]), expert),
+        ),
         out,
     );
 }

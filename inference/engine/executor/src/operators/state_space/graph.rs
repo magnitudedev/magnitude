@@ -255,7 +255,7 @@ mod tests {
         PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner, resident_layout,
         source_element,
     };
-    use crate::{DenseScales, GeneralRoutedScales, PlanError, StateSpaceScales};
+    use crate::{DenseScales, ExpertScales, GeneralRoutedScales, PlanError, StateSpaceScales};
     use magnitude_artifacts::{
         ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
         gguf::{Encoding, TensorDescriptor},
@@ -715,8 +715,11 @@ mod tests {
             assert_eq!(
                 latent_binding.scales,
                 GeneralRoutedScales {
-                    expert_up: 32,
-                    expert_down: 32,
+                    experts: ExpertScales {
+                        gate: 0,
+                        up: 32,
+                        down: 32,
+                    },
                     shared: DenseScales {
                         gate: 0,
                         up: 1,

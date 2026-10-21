@@ -39,10 +39,10 @@ kernel void routed_experts_up_expand(
         uint(SEISMIC_DIM_H), order + block * SEISMIC_ORDER_STRIDE_0, SEISMIC_ORDER_STRIDE_1};
     const auto up = routed::weights<packets::W0>(expert_up, KERNEL_W0_LAYOUT(SEISMIC_DIM_H),
         routed::expert_row(ulong(expert), SEISMIC_DIM_F), SEISMIC_DIM_H);
-    const auto out = projection::scaling<true>::wrap(
+    const auto out = projection::scaling<(SEISMIC_DIM_US != 0)>::wrap(
         projection::Activated<A>{product + block * SEISMIC_DIM_T * SEISMIC_DIM_F * A::bytes,
             SEISMIC_DIM_F, 1, int(SEISMIC_PARAM_ACTIVATION)},
-        projection::scale_factor(up_scale, SEISMIC_DIM_E, SEISMIC_UP_SCALE_STRIDE_0, ulong(expert)), 1.0f);
+        projection::scale_factor(up_scale, SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, ulong(expert)), 1.0f);
     const uint live = routed::block_rows(order + block * SEISMIC_ORDER_STRIDE_0, SEISMIC_ORDER_STRIDE_1,
         uint(SEISMIC_DIM_T));
     routed::expert_plain<packets::W0, BM, BN>(in, out, up, live, uint(SEISMIC_DIM_T), uint(SEISMIC_DIM_F),

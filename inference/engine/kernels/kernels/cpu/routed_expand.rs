@@ -3,7 +3,9 @@
 // work item per row. `routed_expand_rows`: work item (x, y) owns feature
 // block x of ROWS features; y < M * K is choice (m, k), whose expert gate/up
 // rows it expands against row m, and y = M * K is the shared expert, whose
-// rows it expands against every row. Each product is A(silu(gate) * up).
+// rows it expands against every row. Each product is
+// A(silu(gs * gate) * (us * up)): a choice's scales its expert's, 1 where a
+// port is absent and for the shared expert.
 
 use lib::projection::projection;
 use lib::routed::routed;
@@ -59,7 +61,9 @@ fn routed_expand_rows<L: Isa, E: Elements>(
             return;
         }
         let (row, slot) = (choice / k, choice % k);
-        let first = routed::expert_row(cx.arg_routes().get([row, slot]), f) + rows.start;
+        let expert = cx.arg_routes().get([row, slot]);
+        let first = routed::expert_row(expert, f) + rows.start;
+        let (gate_scale, up_scale) = (cx.arg_gate_scale(), cx.arg_up_scale());
         // SAFETY: each work item writes its own features of its own choice.
         let out = unsafe { cx.result_0().span_mut([row, slot, rows.start], rows.len()) };
         let x = &staged[row * h..(row + 1) * h];
@@ -70,6 +74,10 @@ fn routed_expand_rows<L: Isa, E: Elements>(
             first,
             x,
             q8,
+            (
+                routed::scale_factor(cx.dim_gs(), |e| gate_scale.get([e]), expert),
+                routed::scale_factor(cx.dim_us(), |e| up_scale.get([e]), expert),
+            ),
             out,
         );
         return;
@@ -89,6 +97,8 @@ fn routed_expand_rows<L: Isa, E: Elements>(
             rows.start,
             &staged[row * h..(row + 1) * h],
             q8,
+            // The shared expert binds no per-expert scale.
+            (1.0, 1.0),
             out,
         );
     }

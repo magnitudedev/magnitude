@@ -1,7 +1,9 @@
 // Decode expansion of gated experts (M <= 8); the CUDA form of
 // `metal/routed_gate_up.metal`. Block row y = choice (m, k): the K1 paired
 // GEMV over expert routes[m, k]'s gate/up rows for one activation row, with
-// the activation-generic GLU epilogue.
+// the activation-generic GLU epilogue on the accumulators scaled by the
+// expert's gate/up second-level scales where those ports are present (static
+// GS, US).
 #define KERNEL_W0 SEISMIC_EXPERT_GATE
 #define KERNEL_W1 SEISMIC_EXPERT_UP
 #include "lib/routed/routed.cuh"
@@ -22,8 +24,13 @@ __global__ void routed_gate_up(SEISMIC_KERNEL_PARAMS) {
     const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;
     const projection::u64 expert = (projection::u64)routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];
     const Pro pro{normalized + m * SEISMIC_NORMALIZED_STRIDE_0 * 2, SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}};
-    const Epi epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * 2,
-                  0, (int)SEISMIC_PARAM_ACTIVATION};
+    const auto epi = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
+        Epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * 2,
+            0, (int)SEISMIC_PARAM_ACTIVATION},
+        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS,
+                                 SEISMIC_GATE_SCALE_STRIDE_0, expert),
+        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US,
+                                 SEISMIC_UP_SCALE_STRIDE_0, expert));
     projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
                                     KERNEL_W0_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert),
                                     KERNEL_W1_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert), epi);

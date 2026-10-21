@@ -9,6 +9,9 @@
 //   (`routed::expert_choices`), so each chosen expert streams once. A GEMV
 //   row's result does not depend on the other rows, so every choice gets its
 //   one-row bits.
+// A choice's gate/up accumulators carry its expert's second-level scales
+// (`gate_scale`, `up_scale`, static GS, US) before SiLU . mul where those
+// ports are present; the shared expert's none.
 #define KERNEL_W0 SEISMIC_EXPERT_GATE
 #define KERNEL_W1 SEISMIC_EXPERT_UP
 #define KERNEL_W2 SEISMIC_SHARED_GATE
@@ -19,6 +22,16 @@ SEISMIC_PROGRAMMATIC_DEPENDENCY
 
 using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
 using Epi = projection::SiluMul<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
+
+// Expert `expert`'s gate/up scales around a choice's epilogue (a macro: the
+// buffers are kernel parameters).
+#define EXPERT_SCALED(epi, expert)                                                                          \
+    projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(                                      \
+        (epi),                                                                                              \
+        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS,                    \
+                                 SEISMIC_GATE_SCALE_STRIDE_0, (expert)),                                    \
+        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US,                      \
+                                 SEISMIC_UP_SCALE_STRIDE_0, (expert)))
 
 #ifdef SEISMIC_FORMING_ROUTED_EXPAND
 template <int TPW, int KSPLIT>
@@ -45,7 +58,7 @@ __global__ void routed_expand(SEISMIC_KERNEL_PARAMS) {
         projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
                                 KERNEL_W0_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert),
                                 KERNEL_W1_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert),
-                                epi);
+                                EXPERT_SCALED(epi, expert));
         return;
     }
 
@@ -104,7 +117,8 @@ __global__ void routed_expand_gathered(SEISMIC_KERNEL_PARAMS) {
                                         group, SEISMIC_DIM_F,
                                         KERNEL_W0_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert),
                                         KERNEL_W1_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert),
-                                        ChoiceEpi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), products_at});
+                                        EXPERT_SCALED((ChoiceEpi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), products_at}),
+                                                      expert));
         return;
     }
 

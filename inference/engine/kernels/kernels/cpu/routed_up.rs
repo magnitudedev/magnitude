@@ -2,7 +2,8 @@
 // `routed_up_stage` stages each normalized row as F32 in scratch, one work
 // item per row. `routed_up_rows`: work item (x, y) owns feature block x of
 // ROWS features of choice y = (m, k), whose expert up rows it projects
-// against row m: A(act(A(up_scale[e] * up))).
+// against row m: A(act(A(us * up))), `us` the choice's expert's scale, 1
+// where the port is absent.
 
 use lib::projection::projection;
 use lib::routed::routed;
@@ -39,7 +40,8 @@ fn routed_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 
     });
     let expert = cx.arg_routes().get([row, slot]);
     let first = routed::expert_row(expert, f) + rows.start;
-    let scale = cx.arg_up_scale().get([usize::try_from(expert).expect("a routed expert is non-negative")]);
+    let up_scale = cx.arg_up_scale();
+    let scale = routed::scale_factor(cx.dim_us(), |e| up_scale.get([e]), expert);
     // SAFETY: each work item writes its own features of its own choice.
     let out = unsafe { cx.result_0().span_mut([row, slot, rows.start], rows.len()) };
     routed::activated_into::<E::A>(

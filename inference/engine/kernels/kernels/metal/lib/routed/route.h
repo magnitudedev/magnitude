@@ -1,7 +1,8 @@
 // The decode routing of the `routed_route` contract, shared by the
 // `routed_route` and `routed_route_shared` entries: both bind its parameters
 // (`residual`, `norm`, `router`, `shared_router`, `routes`, `scores`, `eps`,
-// `normalize`), results (`normalized`, `coefficient`), scratch (`logits`,
+// `normalize`, `expert_scale` of static extent ES), results (`normalized`,
+// `coefficient`), scratch (`logits`,
 // `arrivals`) and SIMDGROUPS under the same names. The includer defines
 // KERNEL_W0 as the router.
 //   decode_rows: a threadgroup's router input over the decode rows (M <= 8),
@@ -39,13 +40,14 @@ inline bool precedes(float probability, int expert, float best, int best_expert)
 // experts lane + 32 i, ceil(E / 32) registers; when E is not a multiple of
 // 32 the last register of lanes at or past E % 32 is excluded: never read,
 // summed or selected), K rounds of simdgroup argmax (ties to the higher expert index), the
-// optional renormalization and the shared-expert coefficient from column E.
+// optional renormalization, the winner's `expert_scale` where the port is
+// present (static ES) and the shared-expert coefficient from column E.
 // Every register array is indexed by unrolled loops only: a dynamically
 // indexed one lives in stack memory, and its K dependent rounds then dominate
 // the routing.
 template <typename Logit>
-inline void select_row(ulong row, Logit logit, device int *routes, device float *scores,
-    device float *coefficient, constant ulong *seismic_words, uint lane) {
+inline void select_row(ulong row, Logit logit, device const float *expert_scale, device int *routes,
+    device float *scores, device float *coefficient, constant ulong *seismic_words, uint lane) {
     constexpr uint per_lane = (uint(SEISMIC_DIM_E) + 31) / 32;
     constexpr uint K = SEISMIC_DIM_K;
     // The lane's experts: per_lane when 32 divides E (a constant).
@@ -105,9 +107,12 @@ inline void select_row(ulong row, Logit logit, device int *routes, device float 
         PROJECTION_UNROLL
         for (uint slot = 0; slot < K; ++slot) {
             const float probability = chosen[K - 1 - slot];
-            routes[row * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1] = winners[K - 1 - slot];
-            scores[row * SEISMIC_SCORES_STRIDE_0 + slot * SEISMIC_SCORES_STRIDE_1] =
-                SEISMIC_PARAM_NORMALIZE != 0 ? probability / denominator : probability;
+            const int winner = winners[K - 1 - slot];
+            routes[row * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1] = winner;
+            float score = SEISMIC_PARAM_NORMALIZE != 0 ? probability / denominator : probability;
+            if (SEISMIC_DIM_ES != 0)
+                score *= expert_scale[ulong(winner) * SEISMIC_EXPERT_SCALE_STRIDE_0];
+            scores[row * SEISMIC_SCORES_STRIDE_0 + slot * SEISMIC_SCORES_STRIDE_1] = score;
         }
         coefficient[row * SEISMIC_RESULT_1_STRIDE_0] =
             1.0f / (1.0f + metal::exp(-logit(logit_index(row, SEISMIC_DIM_E))));
@@ -142,9 +147,9 @@ inline RouteRows decode_rows(device const float *residual, device const uchar *n
 // Router threadgroup `group` (< route_groups) over the decode rows `in`.
 // Every thread calls it; `last` is one threadgroup word.
 inline void route_group(thread const RouteRows &in, device const uchar *router,
-    device const float *shared_router, device int *routes, device float *scores, device uchar *normalized,
-    device float *coefficient, arrive::coherent_device<float> logits, device atomic_uint *arrivals,
-    constant ulong *seismic_words,
+    device const float *shared_router, device const float *expert_scale, device int *routes, device float *scores,
+    device uchar *normalized, device float *coefficient, arrive::coherent_device<float> logits,
+    device atomic_uint *arrivals, constant ulong *seismic_words,
     threadgroup uchar *shared, threadgroup uint *last, uint group, uint tid, uint simd, uint lane) {
     const uint rows = uint(SEISMIC_DIM_M);
     const uint k = uint(SEISMIC_DIM_H);
@@ -170,5 +175,6 @@ inline void route_group(thread const RouteRows &in, device const uchar *router,
     if (!arrive::last(arrivals, route_groups, last, tid))
         return;
     for (uint row = simd; row < rows; row += SEISMIC_TUNE_SIMDGROUPS)
-        select_row(row, [&](ulong at) { return logits[at]; }, routes, scores, coefficient, seismic_words, lane);
+        select_row(row, [&](ulong at) { return logits[at]; }, expert_scale, routes, scores, coefficient, seismic_words,
+            lane);
 }

@@ -429,10 +429,13 @@ matrix operations above them. A projection entry that reads packed weights has o
 accumulator-scale port per weight, whose static extent is 0 (absent, compiled out) or the extent of
 the weight's resident second-level scale: per tensor for attention (every segment, the indexer's
 included), dense feed-forward, latent, post-norm, per-layer, state-space, short-convolution and
-gated-delta output, draft and vocabulary projections, per expert for up-only routed experts. An
-entry without a port for a weight (the router, the gated delta's input projection) is refused a
-scaled one at plan time; a routed down weight's per-expert
-scales join the selection's per-expert output scales in the combine weights. Blocks share a sealed
+gated-delta output, draft and vocabulary projections, per expert (E values, indexed by the
+expert a choice or block routes to) for every routed expert weight, fused and general forms alike:
+the gate and up scales on the expansions' accumulators, the down scale folded into the route's or
+selection's combine weights, where a stored per-expert output scale would otherwise sit (an
+operator with both is refused). An entry without a port for a weight (the router, the gated
+delta's input projection, the fused form's shared expert) is refused a scaled one at plan time;
+an absent scale is the absent operand, never a tensor of ones. Blocks share a sealed
 graph and a specialization only when their scale extents agree. A decode projection, normalization prologue
 included, is one launch: each workgroup reduces its few rows' norms while staging them. Larger classes
 normalize once per row into entry scratch, never per output tile. A monolithic entry that recomputes normalization,

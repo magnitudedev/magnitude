@@ -25,6 +25,7 @@ kernel void routed_route_shared(
     device const uchar *shared_up [[buffer(SEISMIC_BUFFER_SHARED_UP)]],
     device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
     device float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
+    device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],
     device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     device float *coefficient [[buffer(SEISMIC_RESULT_1_BUFFER)]],
     device uchar *shared_product [[buffer(SEISMIC_RESULT_2_BUFFER)]],
@@ -41,8 +42,8 @@ kernel void routed_route_shared(
     threadgroup uint last;
     const RouteRows in = decode_rows(residual, norm, parts, inverses, seismic_words, simd, lane, tid);
     if (group < route_groups) {
-        route_group(in, router, shared_router, routes, scores, normalized, coefficient, logits, arrivals,
-            seismic_words, shared, &last, group, tid, simd, lane);
+        route_group(in, router, shared_router, expert_scale, routes, scores, normalized, coefficient, logits,
+            arrivals, seismic_words, shared, &last, group, tid, simd, lane);
         return;
     }
     const uint k = uint(SEISMIC_DIM_H);

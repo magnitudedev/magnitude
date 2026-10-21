@@ -11,8 +11,9 @@
 //   Logits are [M, E + 1]: column E is the shared-expert gate.
 //   routed_route_select (one subgroup per row): the softmax over every
 //     expert (ceil(E / 32) experts per lane), K rounds of subgroup argmax
-//     (ties to the higher expert index), the optional renormalization and
-//     the shared-expert coefficient from column E.
+//     (ties to the higher expert index), the optional renormalization, each
+//     score times its expert's `expert_scale` entry where that port is
+//     present (static ES), and the shared-expert coefficient from column E.
 // Every logit accumulates over the hidden axis in the same order for every
 // expert, so experts with equal router rows tie exactly.
 #define KERNEL_W0 SEISMIC_ROUTER
@@ -317,6 +318,7 @@ void routed_route_select() {
             probability[i] = seismic_div_rn(probability[i], total);
 
     float chosen[ROUTE_K];
+    int winners[ROUTE_K];
     for (uint rank = 0u; rank < ROUTE_K; ++rank) {
         float best = -uintBitsToFloat(0x7f800000u);
         int best_expert = -1;
@@ -333,22 +335,27 @@ void routed_route_select() {
             if (winner >= 0 && uint(winner) == lane + 32u * i)
                 probability[i] = -uintBitsToFloat(0x7f800000u);
         chosen[rank] = winner_probability;
+        winners[rank] = winner;
         if (lane == 0u) {
             const uint64_t slot = uint64_t(ROUTE_K - 1u - rank);
             element_i32_put(routes + (row * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1) * 4ul, winner);
-            element_f32_put(scores + (row * SEISMIC_SCORES_STRIDE_0 + slot * SEISMIC_SCORES_STRIDE_1) * 4ul,
-                winner_probability);
         }
     }
-    if (SEISMIC_PARAM_NORMALIZE != 0ul) {
-        // The slot-order sum: slot s holds rank K - 1 - s.
-        float denominator = 0.0;
+    // Slot s holds rank K - 1 - s; the renormalization divides by the
+    // slot-order sum, then each score is multiplied by its expert's scale.
+    float denominator = 0.0;
+    if (SEISMIC_PARAM_NORMALIZE != 0ul)
         for (uint slot = 0u; slot < ROUTE_K; ++slot)
             denominator += chosen[ROUTE_K - 1u - slot];
-        if (lane == 0u) {
-            for (uint slot = 0u; slot < ROUTE_K; ++slot)
-                element_f32_put(scores + (row * SEISMIC_SCORES_STRIDE_0 + uint64_t(slot) * SEISMIC_SCORES_STRIDE_1) * 4ul,
-                    seismic_div_rn(chosen[ROUTE_K - 1u - slot], denominator));
+    if (lane == 0u) {
+        for (uint slot = 0u; slot < ROUTE_K; ++slot) {
+            const uint rank = ROUTE_K - 1u - slot;
+            float score = SEISMIC_PARAM_NORMALIZE != 0ul ? seismic_div_rn(chosen[rank], denominator) : chosen[rank];
+            if (SEISMIC_DIM_ES != 0ul)
+                score = seismic_mul_rn(score, element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE)
+                    + uint64_t(winners[rank]) * SEISMIC_EXPERT_SCALE_STRIDE_0 * 4ul));
+            element_f32_put(scores + (row * SEISMIC_SCORES_STRIDE_0 + uint64_t(slot) * SEISMIC_SCORES_STRIDE_1) * 4ul,
+                score);
         }
     }
     if (lane == 0u)

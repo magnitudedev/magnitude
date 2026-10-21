@@ -313,11 +313,12 @@ extern "C" __global__ void routed_select_select(SEISMIC_KERNEL_PARAMS) {
         const float scale = __uint_as_float(static_cast<unsigned>(SEISMIC_PARAM_SCALE));
         const float epsilon = __uint_as_float(static_cast<unsigned>(SEISMIC_PARAM_NORMALIZATION_EPSILON));
         for (unsigned slot = 0; slot < SEISMIC_DIM_K; ++slot) {
-            const float weight = select::normalized(normalization, chosen[slot], denominator, epsilon);
+            float weight = seismic_mul_rn(select::normalized(normalization, chosen[slot], denominator, epsilon), scale);
+            if (SEISMIC_DIM_ES != 0)
+                weight = seismic_mul_rn(
+                    weight, expert_scale[static_cast<unsigned long long>(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0]);
             routes[row * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1] = winners[slot];
-            weights[row * SEISMIC_WEIGHTS_STRIDE_0 + slot * SEISMIC_WEIGHTS_STRIDE_1] = seismic_mul_rn(
-                seismic_mul_rn(weight, scale),
-                expert_scale[static_cast<unsigned long long>(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0]);
+            weights[row * SEISMIC_WEIGHTS_STRIDE_0 + slot * SEISMIC_WEIGHTS_STRIDE_1] = weight;
         }
     }
 }

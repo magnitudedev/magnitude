@@ -1033,7 +1033,7 @@ pub(crate) fn feed_forward_slot(
             activation,
         )?),
         FeedForward::Routed(operator) => {
-            Slot::Routed(routed::fused_binding(operator, hidden, local, activation)?)
+            Slot::Routed(routed::fused_binding(operator, hidden, local, local_scalable, activation)?)
         }
         FeedForward::GeneralRouted(operator) => Slot::GeneralRouted(routed::binding(
             operator,

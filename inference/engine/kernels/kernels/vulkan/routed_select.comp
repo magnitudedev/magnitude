@@ -304,13 +304,15 @@ void routed_select_select() {
         const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
         const float epsilon = element_word_f32(SEISMIC_PARAM_NORMALIZATION_EPSILON);
         for (uint slot = 0u; slot < SELECT_K; ++slot) {
-            const float weight = select_normalized(normalization, chosen[slot], denominator, epsilon);
+            float weight = select_normalized(normalization, chosen[slot], denominator, epsilon) * scale;
+            if (SEISMIC_DIM_ES != 0ul)
+                weight = weight * element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE)
+                    + uint64_t(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0 * 4ul);
             element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
                 + (row * SEISMIC_ROUTES_STRIDE_0 + uint64_t(slot) * SEISMIC_ROUTES_STRIDE_1) * 4ul, winners[slot]);
             element_f32_put(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHTS)
                     + (row * SEISMIC_WEIGHTS_STRIDE_0 + uint64_t(slot) * SEISMIC_WEIGHTS_STRIDE_1) * 4ul,
-                weight * scale * element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE)
-                    + uint64_t(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0 * 4ul));
+                weight);
         }
     }
 }

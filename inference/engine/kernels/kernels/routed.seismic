@@ -7,6 +7,19 @@
 # are divided by their slot-order sum. The shared expert's coefficient is
 # sigmoid(normalized . shared_router).
 #
+# Per-expert scale ports (every routed entry; `dense_rows.seismic` defines
+# the convention): a stacked expert weight's second-level scales (NVFP4
+# `.scale`, one F32 per expert matrix) are `[S] f32`, S static on every
+# backend: 0 is no scale (the port is never read and the natives compile the
+# scaling out), else the layer's expert count, indexed by expert (an entry
+# whose E counts the layer's experts constrains S to it; the projections' E
+# may count qualification's one expert instead).
+#   - `expert_scale` (ES): each choice's combine weight is multiplied by its
+#     expert's, after the normalization (the down weight's scale, folded
+#     into the weight; the general form's stored output scales the same).
+#   - `gate_scale` (GS), `up_scale` (US): the expansions' F32 accumulators,
+#     as `scale_rows` scales a dense one: A(A(act(A(gs * gate))) * A(us * up)).
+#
 # Decode (and small row classes): route -> expand -> output; on a backend
 # that declares `routed_route_shared`, route_shared -> gate_up -> output.
 # Prefill: route -> group -> experts, the shared gate/up as a dense expansion,
@@ -14,11 +27,11 @@
 # activation dtype) before it is weighted; weighted choices accumulate in
 # slot order, then the shared expert, then the residual.
 
-fn routed_route[M, H, PT, NM, E, K](residual: &tensor[M, PT * H] f32, norm: &tensor[NM] NW,
+fn routed_route[M, H, PT, NM, E, K, ES](residual: &tensor[M, PT * H] f32, norm: &tensor[NM] NW,
     router: &tensor[E, H] RW, shared_router: &tensor[H] f32,
     routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
-    eps: f32, normalize: i32) -> (tensor[M, H] A, tensor[M] f32)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)):
+    eps: f32, normalize: i32, expert_scale: &tensor[ES] f32) -> (tensor[M, H] A, tensor[M] f32)
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E):
     let mut normalized = tensor[M, H] A
     let mut logits = tensor[M, E] f32
     let mut coefficient = tensor[M] f32
@@ -48,6 +61,9 @@ fn routed_route[M, H, PT, NM, E, K](residual: &tensor[M, PT * H] f32, norm: &ten
             let denominator = reduce(f32(scores[row]), 0, sum)
             for choice in 0..K:
                 scores[row, choice] = scores[row, choice] / denominator
+        if ES > 0:
+            for choice in 0..K:
+                scores[row, choice] = scores[row, choice] * expert_scale[routes[row, choice]]
         let gate = reduce(f32(normalized[row]) * f32(shared_router), 0, sum)
         coefficient[row] = 1.0 / (1.0 + exp(-gate))
     return (normalized, coefficient)
@@ -69,7 +85,7 @@ fn routed_route[M, H, PT, NM, E, K](residual: &tensor[M, PT * H] f32, norm: &ten
 # (CUDA: the GEMV normalizes on the fly; scalar FMAs over shared tiles, 256
 # threads; a separate selection launch.)
 native routed_route for metal from "metal/routed_route.metal":
-    static (H, PT, NM, E, K)
+    static (H, PT, NM, E, K, ES)
     params (SIMDGROUPS in [8, 16, 4, 2])
     where H % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
@@ -95,7 +111,7 @@ native routed_route for metal from "metal/routed_route.metal":
 # logit summation order, so it is arithmetic). (Metal: F32 simdgroup
 # matrices, unsplit.)
 native routed_route for cuda from "cuda/routed_route.cu":
-    static (H, PT, NM, E, K)
+    static (H, PT, NM, E, K, ES)
     params (SIMDGROUPS in [8, 4, 2], arithmetic SPLIT in [8, 4, 16])
     where H % 32 == 0 and E <= 1024
     scratch logits bytes (SPLIT * M * (E + 1) * 4)
@@ -119,7 +135,7 @@ native routed_route for cuda from "cuda/routed_route.cu":
 # larger classes stage the normalized rows once, then a 32 x 32 F32 tile
 # GEMM; selection with one subgroup per row. SIMDGROUPS never changes bits.
 native routed_route for vulkan from "vulkan/routed_route.comp":
-    static (H, PT, NM, E, K)
+    static (H, PT, NM, E, K, ES)
     params (SIMDGROUPS in [8, 4, 2])
     where H % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
@@ -165,12 +181,13 @@ native routed_route for cpu from "cpu/routed_route.rs":
 # this entry expands it in the router's launch and the choices alone with
 # `routed_gate_up` (SiLU); the others run `routed_route`, then
 # `routed_expand`.
-fn routed_route_shared[M, H, PT, NM, E, K, S](residual: &tensor[M, PT * H] f32,
+fn routed_route_shared[M, H, PT, NM, E, K, S, ES](residual: &tensor[M, PT * H] f32,
     norm: &tensor[NM] NW, router: &tensor[E, H] RW, shared_router: &tensor[H] f32,
     shared_gate: &tensor[S, H] SGW, shared_up: &tensor[S, H] SUW,
     routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
-    eps: f32, normalize: i32) -> (tensor[M, H] A, tensor[M] f32, tensor[M, S] A)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)):
+    eps: f32, normalize: i32, expert_scale: &tensor[ES] f32)
+    -> (tensor[M, H] A, tensor[M] f32, tensor[M, S] A)
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E):
     let mut normalized = tensor[M, H] A
     let mut logits = tensor[M, E] f32
     let mut coefficient = tensor[M] f32
@@ -201,6 +218,9 @@ fn routed_route_shared[M, H, PT, NM, E, K, S](residual: &tensor[M, PT * H] f32,
             let denominator = reduce(f32(scores[row]), 0, sum)
             for choice in 0..K:
                 scores[row, choice] = scores[row, choice] / denominator
+        if ES > 0:
+            for choice in 0..K:
+                scores[row, choice] = scores[row, choice] * expert_scale[routes[row, choice]]
         let shared_logit = reduce(f32(normalized[row]) * f32(shared_router), 0, sum)
         coefficient[row] = 1.0 / (1.0 + exp(-shared_logit))
         for feature in 0..S:
@@ -222,7 +242,7 @@ fn routed_route_shared[M, H, PT, NM, E, K, S](residual: &tensor[M, PT * H] f32,
 # arithmetic), SIMDGROUPS x 32 / LANES lane groups. For equal LANES,
 # `shared_product` carries `routed_expand`'s bits.
 native routed_route_shared for metal from "metal/routed_route_shared.metal":
-    static (H, PT, NM, E, K, S)
+    static (H, PT, NM, E, K, S, ES)
     params (SIMDGROUPS in [8, 16, 4, 2], ROWS in [1, 2, 4], arithmetic LANES in [32, 16])
     where H % 32 == 0 and E <= 1024
     scratch logits bytes (M * (E + 1) * 4)
@@ -234,22 +254,33 @@ native routed_route_shared for metal from "metal/routed_route_shared.metal":
 
 
 # Decode expansion (M <= 8): each choice's expert gate/up and the shared
-# expert's gate/up, each with SiLU . mul.
-fn routed_expand[M, H, E, K, F, S](normalized: &tensor[M, H] A,
+# expert's gate/up, each with SiLU . mul; the choices' accumulators carry
+# their experts' `gate_scale` and `up_scale`.
+fn routed_expand[M, H, E, K, F, S, GS, US](normalized: &tensor[M, H] A,
     routes: &tensor[M, K] i32, expert_gate: &tensor[E, F, H] EGW,
     expert_up: &tensor[E, F, H] EUW, shared_gate: &tensor[S, H] SGW,
-    shared_up: &tensor[S, H] SUW) -> (tensor[M, K, F] A, tensor[M, S] A):
+    shared_up: &tensor[S, H] SUW, gate_scale: &tensor[GS] f32,
+    up_scale: &tensor[US] f32) -> (tensor[M, K, F] A, tensor[M, S] A)
+    where GS >= 0 and US >= 0:
     let mut expert_product = tensor[M, K, F] A
     let mut shared_product = tensor[M, S] A
     for row in 0..M:
         for choice in 0..K:
             let expert = routes[row, choice]
+            let mut gate_factor = f32(1.0)
+            let mut up_factor = f32(1.0)
+            if GS > 0:
+                gate_factor = gate_scale[expert]
+            if US > 0:
+                up_factor = up_scale[expert]
             for feature in 0..F:
                 let mut gate = f32(0.0)
                 let mut up = f32(0.0)
                 for source in 0..H:
                     gate = fma(f32(normalized[row, source]), f32(expert_gate[expert, feature, source]), gate)
                     up = fma(f32(normalized[row, source]), f32(expert_up[expert, feature, source]), up)
+                gate = gate * gate_factor
+                up = up * up_factor
                 expert_product[row, choice, feature] = (gate / (1.0 + exp(-gate))) * up
         for feature in 0..S:
             let mut gate = f32(0.0)
@@ -265,7 +296,7 @@ fn routed_expand[M, H, E, K, F, S](normalized: &tensor[M, H] A,
 # row y < M * K is choice (m, k), row M * K the shared expert. (CUDA: the mma16
 # swap-AB GEMV, TPW tiles per warp group, KSPLIT-way K split.)
 native routed_expand for metal from "metal/routed_expand.metal":
-    static (H, K, F, S)
+    static (H, K, F, S, GS, US)
     launch routed_expand:
         params (SIMDGROUPS in [2, 4, 8, 16], code ROWS in [1, 2, 4], code arithmetic LANES in [32, 16])
         threadgroups (ceil_div(max(F, S), SIMDGROUPS * ROWS * 32 / LANES), M * K + 1, 1)
@@ -280,7 +311,7 @@ native routed_expand for metal from "metal/routed_expand.metal":
 # Both forms share TPW and KSPLIT, so a choice's product has its one-row bits
 # in either. (Metal: the rows16 GEMV.)
 native routed_expand for cuda from "cuda/routed_expand.cu":
-    static (H, K, F, S)
+    static (H, K, F, S, GS, US)
     params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
     launch routed_expand when M == 1:
         reads (TPW, KSPLIT)
@@ -294,7 +325,7 @@ native routed_expand for cuda from "cuda/routed_expand.cu":
 # Vulkan: the Metal form; decode lane groups are whole subgroups. One launch
 # per activation-row bound of the shared expert's GEMV (see `dense_expand`).
 native routed_expand for vulkan from "vulkan/routed_expand.comp":
-    static (H, K, F, S)
+    static (H, K, F, S, GS, US)
     params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
     let GEMV_GROUPS = ceil_div(max(F, S), SIMDGROUPS * ROWS)
     let GEMV_GROUPS_Y = M * K + 1
@@ -513,10 +544,12 @@ native routed_group for cpu from "cpu/routed_group.rs":
 # (`activation`: 0 SiLU, 1 GELU-tanh), then down. Rows of unused blocks and
 # padding rows carry no contract; the combine reads only the positions
 # `inverse` names.
-fn routed_experts[M, H, E, F, B, T](normalized: &tensor[M, H] A,
+fn routed_experts[M, H, E, F, B, T, GS, US](normalized: &tensor[M, H] A,
     order: &tensor[B, T] i32, blocks: &tensor[B] i32,
     expert_gate: &tensor[E, F, H] EGW, expert_up: &tensor[E, F, H] EUW,
-    expert_down: &tensor[E, H, F] EDW, activation: i32) -> tensor[B, T, H] A:
+    expert_down: &tensor[E, H, F] EDW, activation: i32, gate_scale: &tensor[GS] f32,
+    up_scale: &tensor[US] f32) -> tensor[B, T, H] A
+    where GS >= 0 and US >= 0:
     let mut output = tensor[B, T, H] A
     let mut product = tensor[F] A
     for block in 0..B:
@@ -526,12 +559,20 @@ fn routed_experts[M, H, E, F, B, T](normalized: &tensor[M, H] A,
             for column in 0..H:
                 output[block, lane, column] = 0.0
             if expert >= 0 and row >= 0:
+                let mut gate_factor = f32(1.0)
+                let mut up_factor = f32(1.0)
+                if GS > 0:
+                    gate_factor = gate_scale[expert]
+                if US > 0:
+                    up_factor = up_scale[expert]
                 for feature in 0..F:
                     let mut gate = f32(0.0)
                     let mut up = f32(0.0)
                     for source in 0..H:
                         gate = fma(f32(normalized[row, source]), f32(expert_gate[expert, feature, source]), gate)
                         up = fma(f32(normalized[row, source]), f32(expert_up[expert, feature, source]), up)
+                    gate = gate * gate_factor
+                    up = up * up_factor
                     let mut activated = gate / (1.0 + exp(-gate))
                     if activation == 1:
                         let u = 0.7978845608028654 * (gate + 0.044715 * (gate * gate * gate))
@@ -548,7 +589,7 @@ fn routed_experts[M, H, E, F, B, T](normalized: &tensor[M, H] A,
 # block's live rows. Metal: TILE_M x TILE_N simdgroup-matrix tiles. (CUDA:
 # fixed 32 x 128 mma.sync tiles, 3 cp.async stages.)
 native routed_experts for metal from "metal/routed_experts.metal":
-    static (H, F)
+    static (H, F, GS, US)
     params (TILE_M in [32, 64], TILE_N in [128, 64])
     scratch product bytes (B * T * F * 2)
     launch routed_experts_expand:
@@ -561,7 +602,7 @@ native routed_experts for metal from "metal/routed_experts.metal":
 # CUDA: 32-row x 128-column block tiles over mma16 weights. (Metal: tunable
 # simdgroup-matrix tiles.)
 native routed_experts for cuda from "cuda/routed_experts.cu":
-    static (H, F)
+    static (H, F, GS, US)
     params (code arithmetic OPERAND in [0, 1])
     scratch staged bytes (M * H * 2) when OPERAND == 1
     scratch product bytes (B * T * F * 2)
@@ -583,7 +624,7 @@ native routed_experts for cuda from "cuda/routed_experts.cu":
 # Vulkan: the Metal form on the projection library's GEMM (paired gate/up
 # tiles, then the down tiles).
 native routed_experts for vulkan from "vulkan/routed_experts.comp":
-    static (H, F)
+    static (H, F, GS, US)
     params (TILE_M in [32, 64], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
     where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch product bytes (B * T * F * 2)
@@ -759,17 +800,18 @@ native routed_combine for cpu from "cpu/routed_combine.rs":
 #   K - 1 - r (ascending slot order, as `routed_route`).
 #   weight w = s[winner] (unbiased), normalized over the slot-order sum d by
 #   `normalization`: 0 none, 1 w / d, 2 w / (d + eps), 3 w / max(d, eps)
-#   (llama.cpp's clamp, eps 2^-14), then w * scale * expert_scale[winner]
-#   (`expert_scale`: per-expert output scales folded into the combine
-#   weight; ones when absent).
+#   (llama.cpp's clamp, eps 2^-14), then w * scale, times expert_scale[winner]
+#   where the port is present (ES = E: per-expert output scales, stored or
+#   the down weight's second-level scales, folded into the combine weight).
 # The logits read `router_input` = A(rms(residual) * router_norm); the
 # experts read `normalized` = A(rms(residual) * norm) (the same inverse;
 # one tensor bound to both norms when the router reads the sublayer input).
-fn routed_select[M, H, E, K](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
+fn routed_select[M, H, E, K, ES](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
     router_norm: &tensor[H] RNW, router: &tensor[E, H] RW, bias: &tensor[E] f32,
-    expert_scale: &tensor[E] f32, routes: &mut tensor[M, K] i32,
+    expert_scale: &tensor[ES] f32, routes: &mut tensor[M, K] i32,
     weights: &mut tensor[M, K] f32, epsilon: f32, score: i32, normalization: i32,
-    normalization_epsilon: f32, scale: f32) -> tensor[M, H] A:
+    normalization_epsilon: f32, scale: f32) -> tensor[M, H] A
+    where ES >= 0 and (ES == 0 or ES == E):
     let mut normalized = tensor[M, H] A
     let mut router_input = tensor[M, H] A
     let mut logits = tensor[M, E] f32
@@ -816,7 +858,10 @@ fn routed_select[M, H, E, K](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
                 w = w / (denominator + normalization_epsilon)
             if normalization == 3:
                 w = w / max(denominator, normalization_epsilon)
-            weights[row, choice] = w * scale * expert_scale[routes[row, choice]]
+            w = w * scale
+            if ES > 0:
+                w = w * expert_scale[routes[row, choice]]
+            weights[row, choice] = w
     return normalized
 
 # All backends: the `routed_route` launch structure over E logit columns:
@@ -831,7 +876,7 @@ fn routed_select[M, H, E, K](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
 # Metal's GEMV is `routed_route`'s (`metal/lib/routed/router.h`): the K1 GEMV
 # body over the router input each threadgroup stages.
 native routed_select for metal from "metal/routed_select.metal":
-    static (H, E, K)
+    static (H, E, K, ES)
     params (SIMDGROUPS in [8, 16, 4, 2])
     where H % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (M * E * 4)
@@ -855,7 +900,7 @@ native routed_select for metal from "metal/routed_select.metal":
 # hidden axis into SPLIT partial planes that the selection sums in order
 # (SPLIT is arithmetic).
 native routed_select for cuda from "cuda/routed_select.cu":
-    static (H, E, K)
+    static (H, E, K, ES)
     params (SIMDGROUPS in [8, 4, 2], arithmetic SPLIT in [8, 4, 16])
     where H % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (SPLIT * M * E * 4)
@@ -874,7 +919,7 @@ native routed_select for cuda from "cuda/routed_select.cu":
         threads_per_threadgroup (256, 1, 1)
 
 native routed_select for vulkan from "vulkan/routed_select.comp":
-    static (H, E, K)
+    static (H, E, K, ES)
     params (SIMDGROUPS in [8, 4, 2])
     where H % 32 == 0 and E <= 1024 and K <= E
     scratch logits bytes (M * E * 4)
@@ -916,15 +961,23 @@ native routed_select for cpu from "cpu/routed_select.rs":
 
 
 # Decode expansion (M <= 8), gated experts: per choice, the GLU of the
-# expert's gate and up projections, A(A(act(A(gate))) * A(up)) (`activation`:
-# 0 SiLU, 1 GELU-tanh).
-fn routed_gate_up[M, H, E, K, F](normalized: &tensor[M, H] A,
+# expert's gate and up projections, A(A(act(A(gs * gate))) * A(us * up))
+# (`activation`: 0 SiLU, 1 GELU-tanh; the scales the choice's expert's).
+fn routed_gate_up[M, H, E, K, F, GS, US](normalized: &tensor[M, H] A,
     routes: &tensor[M, K] i32, expert_gate: &tensor[E, F, H] EGW,
-    expert_up: &tensor[E, F, H] EUW, activation: i32) -> tensor[M, K, F] A:
+    expert_up: &tensor[E, F, H] EUW, activation: i32, gate_scale: &tensor[GS] f32,
+    up_scale: &tensor[US] f32) -> tensor[M, K, F] A
+    where GS >= 0 and US >= 0:
     let mut product = tensor[M, K, F] A
     for row in 0..M:
         for choice in 0..K:
             let expert = routes[row, choice]
+            let mut gate_factor = f32(1.0)
+            let mut up_factor = f32(1.0)
+            if GS > 0:
+                gate_factor = gate_scale[expert]
+            if US > 0:
+                up_factor = up_scale[expert]
             let mut gate = tensor[1, F] A
             let mut up = tensor[1, F] A
             let mut activated = tensor[1, F] A
@@ -934,8 +987,8 @@ fn routed_gate_up[M, H, E, K, F](normalized: &tensor[M, H] A,
                 for source in 0..H:
                     g = fma(f32(normalized[row, source]), f32(expert_gate[expert, feature, source]), g)
                     u = fma(f32(normalized[row, source]), f32(expert_up[expert, feature, source]), u)
-                gate[0, feature] = g
-                up[0, feature] = u
+                gate[0, feature] = g * gate_factor
+                up[0, feature] = u * up_factor
             activate(gate, activated, activation)
             for feature in 0..F:
                 product[row, choice, feature] = f32(activated[0, feature]) * f32(up[0, feature])
@@ -943,23 +996,26 @@ fn routed_gate_up[M, H, E, K, F](normalized: &tensor[M, H] A,
 
 
 # Decode expansion (M <= 8), up-only experts: per choice,
-# A(act(A(up_scale[e] * up))) (`activation`: 2 ReLU²). `up_scale` is each
-# expert's second-level up-weight scale on the F32 accumulator (NVFP4
-# `.scale`; ones otherwise).
-fn routed_up[M, H, E, K, F](normalized: &tensor[M, H] A,
+# A(act(A(us * up))) (`activation`: 2 ReLU²; `us` the choice's expert's
+# `up_scale`).
+fn routed_up[M, H, E, K, F, US](normalized: &tensor[M, H] A,
     routes: &tensor[M, K] i32, expert_up: &tensor[E, F, H] EUW,
-    up_scale: &tensor[E] f32, activation: i32) -> tensor[M, K, F] A:
+    up_scale: &tensor[US] f32, activation: i32) -> tensor[M, K, F] A
+    where US >= 0:
     let mut product = tensor[M, K, F] A
     for row in 0..M:
         for choice in 0..K:
             let expert = routes[row, choice]
+            let mut up_factor = f32(1.0)
+            if US > 0:
+                up_factor = up_scale[expert]
             let mut up = tensor[1, F] A
             let mut activated = tensor[1, F] A
             for feature in 0..F:
                 let mut u = f32(0.0)
                 for source in 0..H:
                     u = fma(f32(normalized[row, source]), f32(expert_up[expert, feature, source]), u)
-                up[0, feature] = u * up_scale[expert]
+                up[0, feature] = u * up_factor
             activate(up, activated, activation)
             for feature in 0..F:
                 product[row, choice, feature] = activated[0, feature]
@@ -993,13 +1049,14 @@ fn routed_down[M, H, E, K, F](base: &tensor[M, H] f32,
     return value
 
 
-# Prefill, up-only experts: per grouped block, A(act(A(up_scale[e] * up)))
-# then the down projection (`routed_experts` is the gated form; `up_scale`
-# as `routed_up`).
-fn routed_experts_up[M, H, E, F, B, T](normalized: &tensor[M, H] A,
+# Prefill, up-only experts: per grouped block, A(act(A(us * up))) then the
+# down projection (`routed_experts` is the gated form; `us` the block's
+# expert's `up_scale`).
+fn routed_experts_up[M, H, E, F, B, T, US](normalized: &tensor[M, H] A,
     order: &tensor[B, T] i32, blocks: &tensor[B] i32,
     expert_up: &tensor[E, F, H] EUW, expert_down: &tensor[E, H, F] EDW,
-    up_scale: &tensor[E] f32, activation: i32) -> tensor[B, T, H] A:
+    up_scale: &tensor[US] f32, activation: i32) -> tensor[B, T, H] A
+    where US >= 0:
     let mut output = tensor[B, T, H] A
     let mut up = tensor[1, F] A
     let mut activated = tensor[1, F] A
@@ -1010,11 +1067,14 @@ fn routed_experts_up[M, H, E, F, B, T](normalized: &tensor[M, H] A,
             for column in 0..H:
                 output[block, lane, column] = 0.0
             if expert >= 0 and row >= 0:
+                let mut up_factor = f32(1.0)
+                if US > 0:
+                    up_factor = up_scale[expert]
                 for feature in 0..F:
                     let mut u = f32(0.0)
                     for source in 0..H:
                         u = fma(f32(normalized[row, source]), f32(expert_up[expert, feature, source]), u)
-                    up[0, feature] = u * up_scale[expert]
+                    up[0, feature] = u * up_factor
                 activate(up, activated, activation)
                 for column in 0..H:
                     let mut projected = f32(0.0)
@@ -1052,7 +1112,7 @@ fn routed_scatter[M, H, K, B, T](base: &tensor[M, H] f32,
 # whole-subgroup lane groups. CPU: the normalized rows staged once as F32;
 # work item (x, y) expands ROWS features of choice y.
 native routed_gate_up for metal from "metal/routed_gate_up.metal":
-    static (H, K, F)
+    static (H, K, F, GS, US)
     launch routed_gate_up:
         params (SIMDGROUPS in [2, 4, 8, 16], code ROWS in [1, 2, 4], code arithmetic LANES in [32, 16])
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)
@@ -1060,7 +1120,7 @@ native routed_gate_up for metal from "metal/routed_gate_up.metal":
         shared_bytes (min(ceil_div(H, 32), 448) * 64)
 
 native routed_gate_up for cuda from "cuda/routed_gate_up.cu":
-    static (H, K, F)
+    static (H, K, F, GS, US)
     where H % 64 == 0
     launch routed_gate_up:
         params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
@@ -1068,7 +1128,7 @@ native routed_gate_up for cuda from "cuda/routed_gate_up.cu":
         threads_per_threadgroup (128, 1, 1)
 
 native routed_gate_up for vulkan from "vulkan/routed_gate_up.comp":
-    static (H, K, F)
+    static (H, K, F, GS, US)
     params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
     launch routed_gate_up:
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
@@ -1087,7 +1147,7 @@ native routed_gate_up for cpu from "cpu/routed_gate_up.rs":
         threads_per_threadgroup (1, 1, 1)
 
 native routed_up for metal from "metal/routed_up.metal":
-    static (H, K, F)
+    static (H, K, F, US)
     launch routed_up:
         params (SIMDGROUPS in [2, 4, 8, 16], code ROWS in [1, 2, 4], code arithmetic LANES in [32, 16])
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), M * K, 1)
@@ -1095,7 +1155,7 @@ native routed_up for metal from "metal/routed_up.metal":
         shared_bytes (min(ceil_div(H, 32), 448) * 64)
 
 native routed_up for cuda from "cuda/routed_up.cu":
-    static (H, K, F)
+    static (H, K, F, US)
     where H % 64 == 0
     launch routed_up:
         params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
@@ -1103,7 +1163,7 @@ native routed_up for cuda from "cuda/routed_up.cu":
         threads_per_threadgroup (128, 1, 1)
 
 native routed_up for vulkan from "vulkan/routed_up.comp":
-    static (H, K, F)
+    static (H, K, F, US)
     params (SIMDGROUPS in [2, 4, 8], ROWS in [1, 2, 4])
     launch routed_up:
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
@@ -1172,7 +1232,7 @@ native routed_down for cpu from "cpu/routed_down.rs":
 # weight (Metal TILE_M x TILE_N simdgroup-matrix tiles; CUDA 32 x 128
 # mma.sync tiles; Vulkan the Metal form; CPU ROWS features per work item).
 native routed_experts_up for metal from "metal/routed_experts_up.metal":
-    static (H, F)
+    static (H, F, US)
     params (TILE_M in [32, 64], TILE_N in [128, 64])
     scratch product bytes (B * T * F * 2)
     launch routed_experts_up_expand:
@@ -1183,7 +1243,7 @@ native routed_experts_up for metal from "metal/routed_experts_up.metal":
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
 
 native routed_experts_up for cuda from "cuda/routed_experts_up.cu":
-    static (H, F)
+    static (H, F, US)
     params (code arithmetic OPERAND in [0, 1])
     where H % 64 == 0 and F % 64 == 0
     scratch staged bytes (M * H * 2) when OPERAND == 1
@@ -1204,7 +1264,7 @@ native routed_experts_up for cuda from "cuda/routed_experts_up.cu":
         shared_bytes (3 * (32 * 144 + 10240) + 4096)
 
 native routed_experts_up for vulkan from "vulkan/routed_experts_up.comp":
-    static (H, F)
+    static (H, F, US)
     params (TILE_M in [32, 64], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
     where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch product bytes (B * T * F * 2)

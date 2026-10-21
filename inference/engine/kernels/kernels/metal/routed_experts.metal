@@ -7,7 +7,9 @@
 // L1 (`routed_experts_expand`): K1 paired projection of the block's
 // expert gate/up rows with a row-gather A loader (tile row t reads normalized
 // row order[b, t]; padding rows read zeros) and the activation-generic GLU
-// epilogue (`activation`) into the `product` scratch [B * T, F].
+// epilogue (`activation`), the accumulators scaled by the expert's
+// `gate_scale`/`up_scale` where those ports are present (static GS, US),
+// into the `product` scratch [B * T, F].
 // L2 (`routed_experts_down`): K1 projection of the block's products
 // against the expert's down rows, published in A.
 
@@ -22,6 +24,8 @@ kernel void routed_experts_expand(
     device const int *blocks [[buffer(SEISMIC_BUFFER_BLOCKS)]],
     device const uchar *expert_gate [[buffer(SEISMIC_BUFFER_EXPERT_GATE)]],
     device const uchar *expert_up [[buffer(SEISMIC_BUFFER_EXPERT_UP)]],
+    device const float *gate_scale [[buffer(SEISMIC_BUFFER_GATE_SCALE)]],
+    device const float *up_scale [[buffer(SEISMIC_BUFFER_UP_SCALE)]],
     device uchar *product [[buffer(SEISMIC_BUFFER_SCRATCH_PRODUCT)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint2 group [[threadgroup_position_in_grid]],
@@ -43,8 +47,11 @@ kernel void routed_experts_expand(
         routed::expert_row(ulong(expert), SEISMIC_DIM_F), SEISMIC_DIM_H);
     const auto up = routed::weights<packets::W1>(expert_up, KERNEL_W1_LAYOUT(SEISMIC_DIM_H),
         routed::expert_row(ulong(expert), SEISMIC_DIM_F), SEISMIC_DIM_H);
-    const projection::Glu<A> out{product + block * SEISMIC_DIM_T * SEISMIC_DIM_F * A::bytes,
-        SEISMIC_DIM_F, 1, int(SEISMIC_PARAM_ACTIVATION)};
+    const auto out = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
+        projection::Glu<A>{product + block * SEISMIC_DIM_T * SEISMIC_DIM_F * A::bytes,
+            SEISMIC_DIM_F, 1, int(SEISMIC_PARAM_ACTIVATION)},
+        projection::scale_factor(gate_scale, SEISMIC_DIM_GS, SEISMIC_GATE_SCALE_STRIDE_0, ulong(expert)),
+        projection::scale_factor(up_scale, SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, ulong(expert)));
     const uint live = routed::block_rows(order + block * SEISMIC_ORDER_STRIDE_0, SEISMIC_ORDER_STRIDE_1,
         uint(SEISMIC_DIM_T));
     routed::expert_paired<packets::W0, packets::W1, BM, BN>(in, out, gate, up, live, uint(SEISMIC_DIM_T),

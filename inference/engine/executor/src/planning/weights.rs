@@ -609,6 +609,8 @@ pub struct RoutedBinding {
     pub shared_up: Element,
     pub shared_down: Element,
     pub activation: Element,
+    /// The experts' per-expert scale ports (the shared expert binds none).
+    pub scales: crate::ExpertScales,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

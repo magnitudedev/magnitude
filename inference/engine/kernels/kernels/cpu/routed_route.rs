@@ -4,8 +4,8 @@
 // row. `routed_route_logits` gives each work item ROWS router rows, which it
 // projects against every normalized row into the `logits` scratch [M, E].
 // `routed_route_select` routes one row per work item: the softmax, the top-K
-// selection, the optional renormalization and the shared-expert coefficient
-// sigmoid(normalized . shared_router).
+// selection, the optional renormalization, each winner's `expert_scale` and
+// the shared-expert coefficient sigmoid(normalized . shared_router).
 
 use lib::core::{activation, reduce};
 use lib::projection::projection;
@@ -51,7 +51,15 @@ fn routed_route_select<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
     };
     // SAFETY: each work item writes its own row of the routes and scores.
     let (routes, scores) = unsafe { (cx.arg_routes().row_mut([row, 0]), cx.arg_scores().row_mut([row, 0])) };
-    routed::select(logits, seismic::cpu::tensor::floats(shared, e), cx.arg_normalize() != 0, routes, scores);
+    let expert_scale = cx.arg_expert_scale();
+    routed::select(
+        logits,
+        seismic::cpu::tensor::floats(shared, e),
+        cx.arg_normalize() != 0,
+        (cx.dim_es(), |expert| expert_scale.get([expert])),
+        routes,
+        scores,
+    );
     let gate = reduce::dot(normalized, cx.arg_shared_router().row([0]));
     // SAFETY: each work item writes its own row's coefficient.
     unsafe { cx.result_1().set([row], activation::sigmoid(gate)) };

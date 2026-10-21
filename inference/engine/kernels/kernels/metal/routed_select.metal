@@ -236,10 +236,11 @@ kernel void routed_select_select(
         const float epsilon = as_type<float>(uint(SEISMIC_PARAM_NORMALIZATION_EPSILON));
         PROJECTION_UNROLL
         for (uint slot = 0; slot < SEISMIC_DIM_K; ++slot) {
-            const float weight = select::normalized(normalization, chosen[slot], denominator, epsilon);
+            float weight = select::normalized(normalization, chosen[slot], denominator, epsilon) * scale;
+            if (SEISMIC_DIM_ES != 0)
+                weight *= expert_scale[ulong(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0];
             routes[row * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1] = winners[slot];
-            weights[row * SEISMIC_WEIGHTS_STRIDE_0 + slot * SEISMIC_WEIGHTS_STRIDE_1] =
-                weight * scale * expert_scale[ulong(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0];
+            weights[row * SEISMIC_WEIGHTS_STRIDE_0 + slot * SEISMIC_WEIGHTS_STRIDE_1] = weight;
         }
     }
 }

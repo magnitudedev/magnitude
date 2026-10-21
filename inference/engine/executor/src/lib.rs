@@ -89,7 +89,7 @@ pub use operation::{
     ResourceDomainId, RowResult, Sampling, SelectSpec, Selected, Shaping, TokenId, WorkKind,
 };
 pub use operators::routed::{
-    Expansion, GeneralRoutedBinding, GeneralRoutedScales, GeneralRoutedShape,
+    Expansion, ExpertScales, GeneralRoutedBinding, GeneralRoutedScales, GeneralRoutedShape,
 };
 pub use operators::short_conv::{ShortConvBinding, ShortConvShape};
 pub use operators::state_space::{StateSpaceBinding, StateSpaceScales, StateSpaceShape};

@@ -71,6 +71,8 @@ fn routed_combine_shared<L: Isa, E: Elements>(
             &staged[row * h..(row + 1) * h],
             q8,
             functions::SILU,
+            // The shared expert binds no per-expert scale.
+            (1.0, 1.0),
             out,
         );
     }

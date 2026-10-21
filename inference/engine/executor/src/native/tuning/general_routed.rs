@@ -6,7 +6,10 @@
 //! the fused cases' synthetic tables. The shared expert and latent
 //! projections are the dense cases over their own weight kinds.
 
-use super::routed::{RoutedShape, decode_points, group, grouped_points, routes};
+use super::cases::scale_extent;
+use super::routed::{
+    ExpansionScales, RoutedShape, decode_points, group, grouped_points, routes,
+};
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
 };
@@ -79,9 +82,11 @@ impl EntryTuning for RoutedSelectTuning {
         )
     }
 
-    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        let [_, statics @ ..] = self.binding.shape.select_dimensions(0);
-        Ok(statics.to_vec())
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        let shape = self.binding.shape;
+        let [_, statics @ ..] = shape.select_dimensions(0);
+        let down = scale_extent(inputs, &self.scopes, WeightKind::ExpertDown)?;
+        Ok([statics.as_slice(), &[("ES", shape.expert_scale_extent(down))]].concat())
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -123,7 +128,7 @@ impl EntryTuning for RoutedSelectTuning {
                     expert_scale: if shape.expert_scale {
                         inputs.weight(scope, WeightKind::ExpertScale)?
                     } else {
-                        inputs.f32s(&[shape.experts], &vec![1.0; experts])?
+                        inputs.unit_scale(inputs.scale_extent(scope, WeightKind::ExpertDown)?)?
                     },
                     routes: inputs.state(routes, 0..rows)?,
                     weights: inputs.state(weights, 0..rows)?,
@@ -176,16 +181,10 @@ pub(crate) struct RoutedExpandDecodeCase {
     routes: Tensor,
     expert_gate: Option<Tensor>,
     expert_up: Tensor,
-    up_scale: Tensor,
+    scales: ExpansionScales,
     activation: i32,
 }
 
-/// Unit accumulator scales for up-only experts (`routed_up` /
-/// `routed_experts_up`; NVFP4's stored scales are refused at plan time).
-fn unit_up_scales(inputs: &mut TuningInputs<'_, '_>, experts: u64) -> Result<Tensor, BuildError> {
-    let count = usize::try_from(experts).map_err(|_| "expert count exceeds host")?;
-    inputs.f32s(&[experts], &vec![1.0; count])
-}
 
 impl RoutedExpandDecodeTuning {
     fn cases(
@@ -212,16 +211,18 @@ impl RoutedExpandDecodeTuning {
                         None
                     },
                     expert_up: inputs.weight(scope, WeightKind::ExpertUp)?,
-                    up_scale: unit_up_scales(inputs, shape.experts)?,
+                    scales: ExpansionScales::at(inputs, scope, shape.experts_expansion.gated)?,
                     activation: shape.experts_expansion.activation,
                 })
             })
             .collect()
     }
 
-    fn statics(&self) -> Vec<(&'static str, u64)> {
-        let [_, statics @ ..] = self.binding.shape.expert_dimensions(0);
-        statics.to_vec()
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        let shape = self.binding.shape;
+        let [_, statics @ ..] = shape.expert_dimensions(0);
+        let scales = ExpansionScales::statics(inputs, &self.scopes, shape.experts_expansion.gated)?;
+        Ok([statics.as_slice(), &scales].concat())
     }
 }
 
@@ -251,8 +252,8 @@ impl EntryTuning for RoutedGateUpTuning {
         )
     }
 
-    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        Ok(self.0.statics())
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        self.0.statics(inputs)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -277,6 +278,8 @@ impl EntryTuning for RoutedGateUpTuning {
                 .expect("a gated expansion case binds the gate weight"),
             expert_up: &case.expert_up,
             activation: case.activation,
+            gate_scale: &case.scales.gate,
+            up_scale: &case.scales.up,
         }
     }
 
@@ -300,8 +303,8 @@ impl EntryTuning for RoutedUpTuning {
         format!("EUW={},A={}", b.expert_up.name(), b.activation.name())
     }
 
-    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        Ok(self.0.statics())
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        self.0.statics(inputs)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -321,7 +324,7 @@ impl EntryTuning for RoutedUpTuning {
             normalized: &case.normalized,
             routes: &case.routes,
             expert_up: &case.expert_up,
-            up_scale: &case.up_scale,
+            up_scale: &case.scales.up,
             activation: case.activation,
         }
     }
@@ -442,7 +445,7 @@ pub(crate) struct RoutedExpertTilesCase {
     expert_gate: Option<Tensor>,
     expert_up: Tensor,
     expert_down: Tensor,
-    up_scale: Tensor,
+    scales: ExpansionScales,
     activation: i32,
 }
 
@@ -475,20 +478,26 @@ impl RoutedExpertTilesTuning {
                     },
                     expert_up: inputs.weight(scope, WeightKind::ExpertUp)?,
                     expert_down: inputs.weight(scope, WeightKind::ExpertDown)?,
-                    up_scale: unit_up_scales(inputs, shape.experts)?,
+                    scales: ExpansionScales::at(inputs, scope, shape.experts_expansion.gated)?,
                     activation: shape.experts_expansion.activation,
                 })
             })
             .collect()
     }
 
-    fn statics(&self) -> Vec<(&'static str, u64)> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.binding.shape;
-        vec![
+        let mut statics = vec![
             ("H", shape.expert_hidden),
             ("E", shape.experts),
             ("F", shape.intermediate),
-        ]
+        ];
+        statics.extend(ExpansionScales::statics(
+            inputs,
+            &self.scopes,
+            shape.experts_expansion.gated,
+        )?);
+        Ok(statics)
     }
 }
 
@@ -519,8 +528,8 @@ impl EntryTuning for RoutedGatedTilesTuning {
         )
     }
 
-    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        Ok(self.0.statics())
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        self.0.statics(inputs)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -547,6 +556,8 @@ impl EntryTuning for RoutedGatedTilesTuning {
             expert_up: &case.expert_up,
             expert_down: &case.expert_down,
             activation: case.activation,
+            gate_scale: &case.scales.gate,
+            up_scale: &case.scales.up,
         }
     }
 
@@ -576,8 +587,8 @@ impl EntryTuning for RoutedUpTilesTuning {
         )
     }
 
-    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        Ok(self.0.statics())
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        self.0.statics(inputs)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -599,7 +610,7 @@ impl EntryTuning for RoutedUpTilesTuning {
             blocks: &case.blocks,
             expert_up: &case.expert_up,
             expert_down: &case.expert_down,
-            up_scale: &case.up_scale,
+            up_scale: &case.scales.up,
             activation: case.activation,
         }
     }

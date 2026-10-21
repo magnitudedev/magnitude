@@ -1,8 +1,10 @@
 // Grouped expert projections; the CUDA form of `metal/routed_experts.metal`.
 //   expand  block (column block, row tile, b): paired gate/up GEMM of expert
 //           blocks[b] over the block's rows (tile row t reads normalized row
-//           order[b, t]) with the activation-generic GLU (`activation`)
-//           into `product` [B * T, F];
+//           order[b, t]) with the activation-generic GLU (`activation`) on
+//           the accumulators scaled by the expert's `gate_scale`/`up_scale`
+//           where those ports are present (static GS, US), into `product`
+//           [B * T, F];
 //   down    block (column block, row tile, b): down GEMM of expert blocks[b]
 //           into the result [B, T, H].
 // Both GEMMs run over the block's live rows only (the rows before its first
@@ -52,8 +54,13 @@ __global__ void routed_experts_expand(SEISMIC_KERNEL_PARAMS) {
     if ((projection::u64)blockIdx.y * routed::TILE_M >= live)
         return;
     const projection::u64 rows = block * SEISMIC_DIM_T;
-    const projection::Glu<typename Operands::Storage, Act> epi{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + rows * SEISMIC_DIM_F * 2,
-                                   SEISMIC_DIM_F, (int)SEISMIC_PARAM_ACTIVATION};
+    const auto epi = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
+        projection::Glu<typename Operands::Storage, Act>{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + rows * SEISMIC_DIM_F * 2,
+                                                         SEISMIC_DIM_F, (int)SEISMIC_PARAM_ACTIVATION},
+        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, SEISMIC_GATE_SCALE_STRIDE_0,
+                                 (projection::u64)expert),
+        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0,
+                                 (projection::u64)expert));
     const routed::GroupedRows source{OPERAND == 1 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
                                      OPERAND == 1 ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0, order,
                                      SEISMIC_ORDER_STRIDE_1};

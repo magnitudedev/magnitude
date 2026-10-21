@@ -66,6 +66,7 @@ kernel void routed_route_gemv(
     device const float *shared_router [[buffer(SEISMIC_BUFFER_SHARED_ROUTER)]],
     device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
     device float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
+    device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],
     device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     device float *coefficient [[buffer(SEISMIC_RESULT_1_BUFFER)]],
     arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
@@ -80,8 +81,8 @@ kernel void routed_route_gemv(
     threadgroup float inverses[8];
     threadgroup uint last;
     const RouteRows in = decode_rows(residual, norm, parts, inverses, seismic_words, simd, lane, tid);
-    route_group(in, router, shared_router, routes, scores, normalized, coefficient, logits, arrivals, seismic_words,
-        shared, &last, group, tid, simd, lane);
+    route_group(in, router, shared_router, expert_scale, routes, scores, normalized, coefficient, logits, arrivals,
+        seismic_words, shared, &last, group, tid, simd, lane);
 }
 
 // Rows and logit columns per GEMM threadgroup, and hidden coordinates per
@@ -171,6 +172,7 @@ kernel void routed_route_gemm(
 kernel void routed_route_select(
     device int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
     device float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
+    device const float *expert_scale [[buffer(SEISMIC_BUFFER_EXPERT_SCALE)]],
     device float *coefficient [[buffer(SEISMIC_RESULT_1_BUFFER)]],
     device const float *logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -180,5 +182,6 @@ kernel void routed_route_select(
     const ulong row = ulong(group) * route_simdgroups + simd;
     if (row >= SEISMIC_DIM_M)
         return;
-    select_row(row, [&](ulong at) { return logits[at]; }, routes, scores, coefficient, seismic_words, lane);
+    select_row(row, [&](ulong at) { return logits[at]; }, expert_scale, routes, scores, coefficient, seismic_words,
+        lane);
 }

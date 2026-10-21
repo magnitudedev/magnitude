@@ -730,10 +730,14 @@ fn real_26b_grouped_physical_f16_operands() {
             &NativeSpecialization::new()
                 .with_static("H", h as u64)
                 .with_static("F", f as u64)
+                .with_static("GS", 0)
+                .with_static("US", 0)
                 .with_param("OPERAND", operand),
         )
         .unwrap()
     };
+    // The GGUF's experts are unscaled: the scale ports are absent.
+    let unscaled = Tensor::zeros(&device, Element::f32(), &[0]).unwrap();
     let args = || magnitude_kernels::routed_experts::Args {
         normalized: &input,
         order: &order,
@@ -742,6 +746,8 @@ fn real_26b_grouped_physical_f16_operands() {
         expert_up: &up,
         expert_down: &down,
         activation: 1,
+        gate_scale: &unscaled,
+        up_scale: &unscaled,
     };
     let baseline = form(0);
     let physical = form(1);

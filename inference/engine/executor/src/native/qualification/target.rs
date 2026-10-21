@@ -751,6 +751,7 @@ pub(super) fn qualify_routed(
                     scores,
                     eps: 1.0e-5,
                     normalize: 1,
+                    expert_scale: &unit_scale(device, &kernels.route, "ES", "routed_route", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("routed_route", &label, error))
         };
@@ -767,6 +768,8 @@ pub(super) fn qualify_routed(
                             expert_up: &expert_up,
                             shared_gate: &shared_gate,
                             shared_up: &shared_up,
+                            gate_scale: &unit_scale(device, expand, "GS", "routed_expand", &label)?,
+                            up_scale: &unit_scale(device, expand, "US", "routed_expand", &label)?,
                         })
                         .map_err(|error| qualification_dynamic("routed_expand", &label, error))?;
                     (expanded.r0, expanded.r1, routed.r1)
@@ -784,6 +787,7 @@ pub(super) fn qualify_routed(
                             scores: &mut scores,
                             eps: 1.0e-5,
                             normalize: 1,
+                            expert_scale: &unit_scale(device, route, "ES", "routed_route_shared", &label)?,
                         })
                         .map_err(|error| {
                             qualification_dynamic("routed_route_shared", &label, error)
@@ -795,6 +799,8 @@ pub(super) fn qualify_routed(
                             expert_gate: &expert_gate,
                             expert_up: &expert_up,
                             activation: 0,
+                            gate_scale: &unit_scale(device, choices, "GS", "routed_gate_up", &label)?,
+                            up_scale: &unit_scale(device, choices, "US", "routed_gate_up", &label)?,
                         })
                         .map_err(|error| qualification_dynamic("routed_gate_up", &label, error))?
                         .value;
@@ -844,6 +850,8 @@ pub(super) fn qualify_routed(
                     expert_up: &expert_up,
                     expert_down: &expert_down,
                     activation: 0,
+                    gate_scale: &unit_scale(device, &kernels.experts, "GS", "routed_experts", &label)?,
+                    up_scale: &unit_scale(device, &kernels.experts, "US", "routed_experts", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("routed_experts", &label, error))?
                 .value;
@@ -967,9 +975,6 @@ fn qualify_general_routed(
     let router_norm = zeros(binding.router_norm, &[h])?;
     let router = zeros(binding.router, &[e, h])?;
     let bias = zeros(Element::f32(), &[e])?;
-    let expert_scale = zeros(Element::f32(), &[e])?;
-    // One qualified expert: the up scales follow the expert weights.
-    let up_scale = zeros(Element::f32(), &[1])?;
     let expert_gate = binding
         .expert_gate
         .map(|gate| zeros(gate, &[1, f, x]))
@@ -1061,7 +1066,7 @@ fn qualify_general_routed(
                 router_norm: &router_norm,
                 router: &router,
                 bias: &bias,
-                expert_scale: &expert_scale,
+                expert_scale: &unit_scale(device, &kernels.select, "ES", "routed_select", &label)?,
                 routes: &mut routes,
                 weights: &mut weights,
                 epsilon: 1.0e-5,
@@ -1099,6 +1104,8 @@ fn qualify_general_routed(
                             expert_gate: expert_gate.as_ref().unwrap_or(&expert_up),
                             expert_up: &expert_up,
                             activation: shape.experts_expansion.activation,
+                            gate_scale: &unit_scale(device, decode, "GS", "routed_gate_up", &label)?,
+                            up_scale: &unit_scale(device, decode, "US", "routed_gate_up", &label)?,
                         })
                         .map_err(failed!("routed_gate_up"))?
                         .value
@@ -1109,7 +1116,7 @@ fn qualify_general_routed(
                             normalized: &input,
                             routes: &first,
                             expert_up: &expert_up,
-                            up_scale: &up_scale,
+                            up_scale: &unit_scale(device, decode, "US", "routed_up", &label)?,
                             activation: shape.experts_expansion.activation,
                         })
                         .map_err(failed!("routed_up"))?
@@ -1154,6 +1161,8 @@ fn qualify_general_routed(
                             expert_up: &expert_up,
                             expert_down: &expert_down,
                             activation: shape.experts_expansion.activation,
+                            gate_scale: &unit_scale(device, grouped, "GS", "routed_experts", &label)?,
+                            up_scale: &unit_scale(device, grouped, "US", "routed_experts", &label)?,
                         })
                         .map_err(failed!("routed_experts"))?
                         .value
@@ -1166,7 +1175,7 @@ fn qualify_general_routed(
                             blocks: &block_experts,
                             expert_up: &expert_up,
                             expert_down: &expert_down,
-                            up_scale: &up_scale,
+                            up_scale: &unit_scale(device, grouped, "US", "routed_experts_up", &label)?,
                             activation: shape.experts_expansion.activation,
                         })
                         .map_err(failed!("routed_experts_up"))?

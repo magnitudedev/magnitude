@@ -2504,6 +2504,27 @@ impl WeightScale {
         })
     }
 
+    /// The per-expert second-level scales of the stacked expert weight of
+    /// `role` (a routed entry's per-expert scale port: E values), or the
+    /// absent operand where it has none.
+    pub(crate) fn per_expert<G: GraphDraft>(
+        graph: &mut G,
+        load: &ModelLoadPlan,
+        role: WeightRole,
+        ports: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Self, GraphError> {
+        match planned_scale_extent(load, role)? {
+            0 => Self::absent(graph, constants),
+            extent => Ok(Self {
+                tensor: weight_port(graph, load, role, WeightPart::Scale, ports)?
+                    .tensor()
+                    .clone(),
+                extent,
+            }),
+        }
+    }
+
     /// No scale: the graph's absent operand.
     pub(crate) fn absent<G: GraphDraft>(
         graph: &mut G,
@@ -2723,23 +2744,6 @@ pub(crate) fn weight_scale_port<G: GraphDraft>(
         _ => return Err(format!("{role:?} has a per-matrix scale at a per-tensor port").into()),
     };
     Ok((scale, extent))
-}
-
-/// The port of a weight's resident second-level scale (`[1] f32`, or
-/// `[E] f32` for a stacked expert weight), or `None` when it has none.
-pub(crate) fn resident_scale<G: GraphDraft>(
-    graph: &mut G,
-    load: &ModelLoadPlan,
-    scope: WeightScope,
-    kind: WeightKind,
-    ports: &mut Vec<(WeightPort, NativePort)>,
-) -> Result<Option<WorkflowTensor>, GraphError> {
-    let role = WeightRole { scope, kind };
-    match planned_scale_extent(load, role)? {
-        0 => Ok(None),
-        _ => weight_port(graph, load, role, WeightPart::Scale, ports)
-            .map(|port| Some(port.tensor().clone())),
-    }
 }
 
 fn planned_scale_extent(load: &ModelLoadPlan, role: WeightRole) -> Result<u64, String> {
