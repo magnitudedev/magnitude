@@ -107,7 +107,7 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
                 } else {
                     mapping
                 };
-                let (x, slack) = operand_rows(&normed, h, path);
+                let (x, slack) = operand_rows(&normed, h, path, formats[0]);
                 let mut expected = vec![0.0; m * width];
                 let mut tolerance = vec![0.0; m * width];
                 for (weight, (offset, n)) in
@@ -199,7 +199,7 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
             let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
             let norm = f32_tensor(&device, &[d as u64], &norm_values);
             for &mapping in mappings(m) {
-                let (x, slack) = operand_rows(&normed, d, mapping);
+                let (x, slack) = operand_rows(&normed, d, mapping, Some(formats[0]));
                 let expected: Vec<(Vec<f64>, Vec<f64>)> = weights
                     .iter()
                     .zip([query, keys, keys])
@@ -282,7 +282,7 @@ fn cuda_attention_output_matches_host_model() {
             let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
             for &mapping in mappings(m) {
                 // The heads are exact input, so the INT8 emulation is exact too.
-                let (x, _) = operand_rows(&gated_values, q * w, mapping);
+                let (x, _) = operand_rows(&gated_values, q * w, mapping, Some(format));
                 let (projected, magnitude) = project(&x, &output.values, m, d, q * w);
                 let expected: Vec<f64> = (0..m * d)
                     .map(|i| f64::from(hidden_values[i]) + projected[i])
@@ -349,7 +349,7 @@ fn cuda_scaled_projections_match_host_model() {
     let none = f32_tensor(&device, &[0], &[]);
     let scales = SCALES.map(|scale| f32_tensor(&device, &[1], &[scale]));
     let scale = f32_tensor(&device, &[1], &[SCALE]);
-    for format in [Format::Nvfp4, Format::Q4K] {
+    for format in [Format::Nvfp4, Format::Nvfp4A4, Format::Q4K] {
         let projections = segments.map(|rows| weight(&device, format, rows, d, &mut rng));
         let output = weight(&device, format, d, k, &mut rng);
         for m in ROWS {
@@ -362,7 +362,7 @@ fn cuda_scaled_projections_match_host_model() {
             let norm = f32_tensor(&device, &[d as u64], &norm_values);
             let gated = bf16_tensor(&device, &[m as u64, heads as u64, width as u64], &gated_values);
             for &mapping in mappings(m) {
-                let (x, slack) = operand_rows(&normed, d, mapping);
+                let (x, slack) = operand_rows(&normed, d, mapping, Some(format));
                 let projected = attention_project::native_for_device_with(
                     &device,
                     attention_project::Elements {
@@ -432,7 +432,7 @@ fn cuda_scaled_projections_match_host_model() {
                     );
                 }
 
-                let (x, _) = operand_rows(&gated_values, k, mapping);
+                let (x, _) = operand_rows(&gated_values, k, mapping, Some(format));
                 let (projected, magnitude) = project(&x, &output.values, m, d, k);
                 let dequant = dequant_bound(&x, &output.values, m, d, k, mapping);
                 let expected: Vec<f64> = (0..m * d)

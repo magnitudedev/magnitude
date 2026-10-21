@@ -1291,20 +1291,26 @@ fn validate_elements(
     info: &crate::checked::EntryInfo,
     supplied: &ElementBindings,
 ) -> Result<BTreeMap<String, RepresentationId>, SourceDiagnostic> {
+    let error = |message: String| {
+        SourceDiagnostic::new(
+            &module.sources.files()[0],
+            crate::span::Span::default(),
+            crate::checked::DiagnosticRule::Type,
+            message,
+        )
+    };
     let expected: BTreeSet<_> = info.element_parameters.iter().cloned().collect();
     let actual: BTreeSet<_> = supplied.iter().map(|(name, _)| name.to_owned()).collect();
     if expected != actual {
         let missing: Vec<_> = expected.difference(&actual).cloned().collect();
         let extra: Vec<_> = actual.difference(&expected).cloned().collect();
-        return Err(SourceDiagnostic::new(
-            &module.sources.files()[0],
-            crate::span::Span::default(),
-            crate::checked::DiagnosticRule::Type,
-            format!(
-                "element bindings do not match the entry parameters; missing: {missing:?}; extra: {extra:?}"
-            ),
-        ));
+        return Err(error(format!(
+            "element bindings do not match the entry parameters; missing: {missing:?}; extra: {extra:?}"
+        )));
     }
+    info.element_domain
+        .hold(supplied)
+        .map_err(|violation| error(format!("entry `{}`: {violation}", info.name)))?;
     Ok(supplied
         .iter()
         .map(|(name, representation)| (name.to_owned(), representation))
@@ -3506,6 +3512,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             PrimitiveId::RepresentationConvert(_) => {
                 panic!("representation conversion is resolved during entry construction")
             }
+            PrimitiveId::Operands => {
+                panic!("an operand recipe is resolved to its constant during entry construction")
+            }
             PrimitiveId::SliceView { .. } | PrimitiveId::Transpose | PrimitiveId::Reshape => {
                 panic!("view primitives require their structural transform")
             }
@@ -4307,6 +4316,19 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 }
             }
         }
+        if matches!(primitive, PrimitiveId::Operands) {
+            let SemanticType::Tensor(tensor) = &self.values[inputs[0].index()].ty else {
+                unreachable!("checked operand recipe input is a tensor")
+            };
+            let code = crate::registry::representation_info(tensor.representation)
+                .operands
+                .code();
+            return Ok(self.scalar_constant(
+                region,
+                i64::try_from(code).expect("an operand recipe code is small"),
+                expression.span,
+            ));
+        }
         if matches!(primitive, PrimitiveId::RepresentationConvert(_)) {
             let [input] = inputs.as_slice() else {
                 panic!("checked representation conversion has wrong arity")
@@ -4491,6 +4513,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             | PrimitiveId::Transpose
             | PrimitiveId::Reshape
             | PrimitiveId::Extent { .. }
+            | PrimitiveId::Operands
             | PrimitiveId::Atomic { .. }
             | PrimitiveId::Reduce {
                 op: crate::intrinsics::ReduceOp::Sum,
@@ -4600,6 +4623,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             }
             PrimitiveId::Atomic { .. } => {
                 panic!("checked atomic primitive bypassed its authority-bearing node")
+            }
+            PrimitiveId::Operands => {
+                unreachable!("an operand recipe returned its constant above")
             }
             PrimitiveId::Constant(_)
             | PrimitiveId::Symbolic(_)

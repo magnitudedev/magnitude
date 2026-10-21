@@ -39,7 +39,7 @@ fn group_rms[M, H, S](x: &tensor[M, S, H] f32, norm: &tensor[S, H] T,
 fn stream_mix_down[M, H, S, LR, C](hidden: &tensor[M, S, H] f32, norm: &tensor[S, H] NW,
     down_weight: &tensor[LR, S * H] DW, inject_weight: &tensor[C * S, S * H] IW, epsilon: f32)
     -> (tensor[M, LR] A, tensor[M, C * S] f32, tensor[M, S] f32)
-    where S >= 1 and LR >= 1 and C >= 0 and C <= 1:
+    where S >= 1 and LR >= 1 and C >= 0 and C <= 1 and operands(DW) == 0 and operands(IW) == 0:
     let mut normalized = tensor[M, S * H] A
     let mut inverse = tensor[M, S] f32
     let mut low_sum = tensor[M, LR] f32
@@ -65,7 +65,7 @@ fn stream_mix_down[M, H, S, LR, C](hidden: &tensor[M, S, H] f32, norm: &tensor[S
 # inverses).
 fn stream_mix_up[M, H, S, LR](low: &tensor[M, LR] A, up_weight: &tensor[S * H, LR] UW,
     hidden: &tensor[M, S, H] f32, inverse: &tensor[M, S] f32, norm: &tensor[S, H] NW)
-    -> tensor[M, S * H] f32 where S >= 1 and LR >= 1:
+    -> tensor[M, S * H] f32 where S >= 1 and LR >= 1 and operands(UW) == 0:
     # The rows are dense activations: staging them in A (an exact copy)
     # states that domain (`project_rows`).
     let mut rows = tensor[M, LR] A

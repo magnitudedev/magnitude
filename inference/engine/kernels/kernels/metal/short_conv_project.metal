@@ -9,6 +9,12 @@
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
+// The rows the three weights take (the normalized rows, or NVFP4 operands):
+// the GEMV and batched row classes form them while staging, the normalize
+// launch into the GEMM's scratch.
+constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4,
+    packets::W2_OPERANDS_NVFP4>::NVFP4;
+typedef projection::operands<NVFP4> Operands;
 
 #define SHORT_CONV_PROJECT_ARGUMENTS                                                    \
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],                   \
@@ -53,8 +59,9 @@ kernel void short_conv_project_gemv(SHORT_CONV_PROJECT_ARGUMENTS,
     const uint per_tile = simdgroups * ROWS * (32u / LANES);
     const uint segment = (channels + per_tile - 1u) / per_tile;
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    const auto x = projection::shared_norm(in, squares);
+    const auto x = Operands::rows(projection::shared_norm(in, squares), rows, hidden, globals, simdgroups, sg, lane);
     if (tile < segment) {
         PROJECTION_FOR_ROWS(rows,
             projection::gemv_paired_runtime<packets::W0, packets::W1, ROWS, MAXM, LANES>(
@@ -80,8 +87,9 @@ kernel void short_conv_project_batch(SHORT_CONV_PROJECT_ARGUMENTS,
     const uint per_tile = simdgroups * BATCH_ROWS * 8u;
     const uint segment = (channels + per_tile - 1u) / per_tile;
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    const auto x = projection::shared_norm(in, squares);
+    const auto x = Operands::rows(projection::shared_norm(in, squares), rows, hidden, globals, simdgroups, sg, lane);
     if (tile < segment)
         projection::gemv_batch_paired_runtime<packets::W0, packets::W1, BATCH_ROWS>(x, u, b_rows, x_rows, rows,
             channels, hidden, tile, shared, simdgroups, sg, lane);
@@ -97,7 +105,7 @@ kernel void short_conv_project_normalize(SHORT_CONV_PROJECT_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
     SHORT_CONV_PROJECT_OPERANDS;
-    projection::device_normalize<256>(in, item, normalized, hidden, norms, thread_index);
+    Operands::normalize<256>(in, item, normalized, hidden, norms, thread_index);
 }
 #endif
 

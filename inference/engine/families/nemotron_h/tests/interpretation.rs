@@ -76,7 +76,7 @@ fn scale_tensor(weight: &WeightDescriptor) -> Option<&str> {
         .transforms
         .iter()
         .find_map(|transform| match transform {
-            ImportTransform::ScaleByTensor { tensor } => Some(tensor.as_str()),
+            ImportTransform::ScaleByTensor { tensor, .. } => Some(tensor.as_str()),
             _ => None,
         })
 }

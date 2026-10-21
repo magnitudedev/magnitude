@@ -72,7 +72,8 @@
 // The kind of each representation, by the name the ABI gives it
 // (`SEISMIC_REPRESENTATION_<NAME>`, which a tensor's prefix `<T>()` expands
 // to without pasting, so a preprocessor condition can test it), and the row
-// geometry of each, by its pasted ABI name (`<T>_REPRESENTATION`).
+// geometry of each, by its pasted ABI name (`<T>_REPRESENTATION`). A packed
+// tensor in its packet layout has no rows, so its prefix names no kind here.
 #define SEISMIC_REPRESENTATION_Q4K PACKETS_Q4K
 #define SEISMIC_REPRESENTATION_Q5K PACKETS_Q5K
 #define SEISMIC_REPRESENTATION_Q6K PACKETS_Q6K
@@ -142,15 +143,18 @@
 #define PACKETS_ROWS_(T) PACKETS_CAT(PACKETS_ROWS_OF_, T##_REPRESENTATION)(T)
 #define PACKETS_STACKED_ROWS_(T) PACKETS_CAT(PACKETS_STACKED_ROWS_OF_, T##_REPRESENTATION)(T)
 
-// Slot bindings.
+// Slot bindings. A slot whose representation has no packet kind is
+// rejected and holds no kind, so later conditions stay evaluable.
 #if defined(KERNEL_W0)
 #define PACKETS_W0 KERNEL_W0()
 #if PACKETS_W0 == 0
 #error "weight slot W0 binds a representation without a packet kind"
-#endif
+#define PACKETS_W0_BIT 0
+#else
 #define PACKETS_W0_ROWS PACKETS_ROWS(KERNEL_W0)
 #define PACKETS_W0_STACKED_ROWS PACKETS_STACKED_ROWS(KERNEL_W0)
 #define PACKETS_W0_BIT PACKETS_BIT(PACKETS_W0)
+#endif
 #else
 #define PACKETS_W0_BIT 0
 #endif
@@ -158,10 +162,12 @@
 #define PACKETS_W1 KERNEL_W1()
 #if PACKETS_W1 == 0
 #error "weight slot W1 binds a representation without a packet kind"
-#endif
+#define PACKETS_W1_BIT 0
+#else
 #define PACKETS_W1_ROWS PACKETS_ROWS(KERNEL_W1)
 #define PACKETS_W1_STACKED_ROWS PACKETS_STACKED_ROWS(KERNEL_W1)
 #define PACKETS_W1_BIT PACKETS_BIT(PACKETS_W1)
+#endif
 #else
 #define PACKETS_W1_BIT 0
 #endif
@@ -169,10 +175,12 @@
 #define PACKETS_W2 KERNEL_W2()
 #if PACKETS_W2 == 0
 #error "weight slot W2 binds a representation without a packet kind"
-#endif
+#define PACKETS_W2_BIT 0
+#else
 #define PACKETS_W2_ROWS PACKETS_ROWS(KERNEL_W2)
 #define PACKETS_W2_STACKED_ROWS PACKETS_STACKED_ROWS(KERNEL_W2)
 #define PACKETS_W2_BIT PACKETS_BIT(PACKETS_W2)
+#endif
 #else
 #define PACKETS_W2_BIT 0
 #endif
@@ -180,10 +188,12 @@
 #define PACKETS_W3 KERNEL_W3()
 #if PACKETS_W3 == 0
 #error "weight slot W3 binds a representation without a packet kind"
-#endif
+#define PACKETS_W3_BIT 0
+#else
 #define PACKETS_W3_ROWS PACKETS_ROWS(KERNEL_W3)
 #define PACKETS_W3_STACKED_ROWS PACKETS_STACKED_ROWS(KERNEL_W3)
 #define PACKETS_W3_BIT PACKETS_BIT(PACKETS_W3)
+#endif
 #else
 #define PACKETS_W3_BIT 0
 #endif

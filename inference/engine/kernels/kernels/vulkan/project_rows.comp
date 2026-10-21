@@ -22,11 +22,31 @@
 #else
 #error "project_rows requires a dense published element"
 #endif
+// The weight's operand rows (the source rows, or NVFP4 operands): the GEMV
+// forms them while staging, the stage launch into the scratch the GEMM reads.
+#if defined(SEISMIC_WEIGHT_OPERANDS_NVFP4)
+#define PROJECT_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define PROJECT_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
 
 
+// The source rows as the weight's operands.
 projection_prologue project_rows_input() {
+    return projection_operands(projection_plain(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SOURCE),
+        SEISMIC_SOURCE_STRIDE_0, SEISMIC_SOURCE_STRIDE_1, uint(SEISMIC_DIM_K), 0ul), PROJECT_OPERANDS);
+}
+
+// The rows the GEMM reads: the source rows, or the operands the stage launch
+// formed.
+projection_prologue project_rows_rows() {
+#if defined(SEISMIC_WEIGHT_OPERANDS_NVFP4)
+    return projection_plain(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED), SEISMIC_DIM_K, 1ul,
+        uint(SEISMIC_DIM_K), 0ul);
+#else
     return projection_plain(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SOURCE), SEISMIC_SOURCE_STRIDE_0,
         SEISMIC_SOURCE_STRIDE_1, uint(SEISMIC_DIM_K), 0ul);
+#endif
 }
 
 projection_epilogue project_rows_output() {
@@ -53,15 +73,21 @@ void project_rows_gemv2() { project_rows_gemv_bounded(2u); }
 void project_rows_gemv4() { project_rows_gemv_bounded(4u); }
 void project_rows_gemv8() { project_rows_gemv_bounded(8u); }
 
+// The source rows as NVFP4 operands into `staged`, one row a workgroup.
+void project_rows_stage() {
+    projection_stage(project_rows_input(), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED),
+        uint(SEISMIC_DIM_K));
+}
+
 void project_rows_gemm() {
     const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_N);
 #if SEISMIC_TUNE_SPLIT == 1
     projection_gemm(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        project_rows_input(), project_rows_output(), project_rows_weight(), m, n, uint(SEISMIC_DIM_K),
+        project_rows_rows(), project_rows_output(), project_rows_weight(), m, n, uint(SEISMIC_DIM_K),
         gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
 #else
     projection_gemm_part(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        project_rows_input(), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), project_rows_weight(), m, n,
+        project_rows_rows(), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), project_rows_weight(), m, n,
         uint(SEISMIC_DIM_K), SEISMIC_TUNE_SPLIT, gl_WorkGroupID.z, gl_WorkGroupID.y, gl_WorkGroupID.x);
 #endif
 }

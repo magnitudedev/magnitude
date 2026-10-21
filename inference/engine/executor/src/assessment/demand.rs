@@ -15,7 +15,7 @@
 //! their arithmetic per state element is the kernels', which no plan
 //! states.
 
-use super::launches::{Declarations, Kernel, Launches};
+use super::launches::{operand_recipe, Declarations, Kernel, Launches};
 use super::AssessmentError;
 use crate::operators::attention::graph::selected_segments;
 use crate::operators::gated_delta::graph::StepForm;
@@ -30,7 +30,7 @@ use magnitude_family_contracts::{
 };
 use magnitude_kernels as kernels;
 use magnitude_state::{HistoryDomainLayout, HistoryEncoding, KvCodec, LayerRef, ModelStateLayout};
-use seismic::Element;
+use seismic::{Element, OperandRecipe};
 use std::collections::HashMap;
 
 /// History one call reads for each token of context.
@@ -333,19 +333,26 @@ fn join(parts: impl IntoIterator<Item = Work>) -> Result<Work, AssessmentError> 
 /// The step as it accumulates.
 struct Step<'a> {
     declarations: &'a Declarations,
-    /// Each entry's launches, resolved once.
-    resolved: HashMap<&'static str, Launches>,
+    /// Each entry's launches at each operand recipe, resolved once.
+    resolved: HashMap<(&'static str, OperandRecipe), Launches>,
     calls: Vec<Call>,
+}
+
+/// The operand recipe of the weights `work` reads, whole or as experts.
+fn work_recipe(work: &Work) -> OperandRecipe {
+    let experts = work.experts.iter().flat_map(|experts| &experts.slab_bytes);
+    operand_recipe(work.weights.iter().chain(experts).map(|bytes| bytes.format))
 }
 
 impl Step<'_> {
     /// One call of `kernel` doing `work`.
     fn call(&mut self, kernel: Kernel, work: Work) -> Result<(), AssessmentError> {
-        let launches = match self.resolved.get(kernel.name()) {
+        let key = (kernel.name(), work_recipe(&work));
+        let launches = match self.resolved.get(&key) {
             Some(launches) => launches.clone(),
             None => {
-                let launches = self.declarations.launches(kernel, &[])?;
-                self.resolved.insert(kernel.name(), launches.clone());
+                let launches = self.declarations.launches(kernel, key.1, &[])?;
+                self.resolved.insert(key, launches.clone());
                 launches
             }
         };
@@ -360,7 +367,7 @@ impl Step<'_> {
         dimensions: &[(&'static str, u64)],
         work: Work,
     ) -> Result<(), AssessmentError> {
-        let launches = self.declarations.launches(kernel, dimensions)?;
+        let launches = self.declarations.launches(kernel, work_recipe(&work), dimensions)?;
         self.calls.push(Call { launches, work });
         Ok(())
     }

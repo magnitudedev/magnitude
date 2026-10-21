@@ -96,12 +96,7 @@ struct GatheredRows {
 // warp copy reads 64 contiguous bytes of a row (`gemm_load_codes_span`).
 // The spanned layout must fit the declared shared bytes (`DECLARED`), else
 // the 3-stage single k-block pipeline runs.
-template <bool C, class A, class B> struct Pick {
-    using Type = A;
-};
-template <class A, class B> struct Pick<false, A, B> {
-    using Type = B;
-};
+using projection::Pick;
 template <class W> __device__ constexpr bool narrow_rows() { return W::CHUNKS < 64; }
 template <class WA, class WB, int DECLARED> struct RoutedShape {
     using Spanned = projection::GemmShape<32, 1, 8, 4, false, 1, 2>;

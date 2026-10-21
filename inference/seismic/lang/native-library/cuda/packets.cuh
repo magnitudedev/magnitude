@@ -843,9 +843,11 @@ struct UE4M3Scale {
     }
     // The four scales of k-block q of row half r, `decode`'s values: the
     // fields without their sign bits are E4M3 (0x7f NaN), converted two at a
-    // time to f16 (exact) and halved there (exact: the least is 2^-9).
+    // time to f16 (exact) and halved there (exact: the least is 2^-9) where
+    // the device converts E4M3 (sm_89 on), one `decode` each before.
     __device__ static __forceinline__ void kblock(const Block &block, int r, int q, float (&scale)[4]) {
         const u32 fields = word_of(block.packed[r], q) & 0x7F7F7F7Fu;
+#if __CUDA_ARCH__ >= 890
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             u32 pair;
@@ -855,6 +857,11 @@ struct UE4M3Scale {
             scale[2 * h] = values.x;
             scale[2 * h + 1] = values.y;
         }
+#else
+#pragma unroll
+        for (int group = 0; group < 4; ++group)
+            scale[group] = decode((fields >> (8 * group)) & 0xFFu);
+#endif
     }
     __device__ static __forceinline__ float read(const u8 *supers, u64 group) { return decode(supers[group]); }
     static constexpr int SUPER_WORDS = 4;
@@ -887,8 +894,11 @@ template <class S> struct KblockScales<S, decltype((void)&S::kblock)> {
 // partial and its missing k-blocks are not fetched. `SCALED` selects the
 // scaled GEMM (projection.cuh `gemm_tile_half`): the table values are exact
 // operands and group scales multiply F32 partial products. iq4g32 keeps the
-// dequantized GEMM its Qwen results were qualified with.
-template <class C, class S, bool WHOLE, bool SCALED> struct Coded4 {
+// dequantized GEMM its Qwen results were qualified with. `OPERANDS` states
+// that products over the weights take NVFP4 operand rows (the W4A4 element
+// of nvfp4g16's storage): the same weights, whose rows no other form
+// (activation quantization) re-forms.
+template <class C, class S, bool WHOLE, bool SCALED, bool OPERANDS = false> struct Coded4 {
     const u8 *base;
     u64 stride;
     CodePlane low;
@@ -899,6 +909,7 @@ template <class C, class S, bool WHOLE, bool SCALED> struct Coded4 {
     static constexpr bool BIAS = false;
     static constexpr bool DENSE = false;
     static constexpr bool SCALED_GEMM = SCALED;
+    static constexpr bool NVFP4_OPERANDS = OPERANDS;
     struct Raw {
         uint4 low;
     };
@@ -1006,7 +1017,17 @@ typedef Coded4<LinearCodes, F16Scale, false, true> Q4G32S;
 // IQ4_NL blocks of a row whose width is not a multiple of 256 (iq4g32s).
 typedef Coded4<Iq4Codes, F16Scale, false, true> IQ4G32S;
 typedef Coded4<E2M1Codes, E8M0Scale, false, true> MXFP4;
-typedef Coded4<E2M1Codes, UE4M3Scale, false, true> NVFP4;
+// nvfp4g16's elements: W4A16, and with NVFP4 operand rows W4A4.
+template <bool OPERANDS> using Nvfp4Of = Coded4<E2M1Codes, UE4M3Scale, false, true, OPERANDS>;
+typedef Nvfp4Of<false> NVFP4;
+
+// Whether products over weights W take NVFP4 operand rows.
+template <class W, class = void> struct nvfp4_operands {
+    static constexpr bool value = false;
+};
+template <class W> struct nvfp4_operands<W, decltype(void(W::NVFP4_OPERANDS))> {
+    static constexpr bool value = W::NVFP4_OPERANDS;
+};
 
 // ---------------------------------------------------------------------------
 // Vector-coded weights (the registry's grid codes: iq2xs, iq3xxs, iq2xxs). An
@@ -2048,8 +2069,8 @@ namespace packets { typedef IQ4G32S W0; }
 namespace packets { typedef MXFP4 W0; }
 #define KERNEL_W0_AT(pointer) PACKETS_MAKE_C4(MXFP4, KERNEL_W0, pointer)
 #elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_NVFP4G16)
-namespace packets { typedef NVFP4 W0; }
-#define KERNEL_W0_AT(pointer) PACKETS_MAKE_C4(NVFP4, KERNEL_W0, pointer)
+namespace packets { typedef Nvfp4Of<ELEMENT_HAS(KERNEL_W0, _OPERANDS_NVFP4)> W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_C4(W0, KERNEL_W0, pointer)
 #elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q5G32S)
 namespace packets { typedef Q5G32<false> W0; }
 #define KERNEL_W0_AT(pointer) PACKETS_MAKE_Q5(false, KERNEL_W0, pointer)
@@ -2073,6 +2094,9 @@ namespace packets { typedef IQ2XXS W0; }
 #else
 #define KERNEL_W0_MATRIX(pointer, index) KERNEL_W0_AT(PACKETS_PACKED_MATRIX(KERNEL_W0, pointer, index))
 #endif
+// The slot's operand recipe (`operands(W)`): whether products over it take
+// NVFP4 operand rows.
+namespace packets { constexpr bool W0_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W0, _OPERANDS_NVFP4); }
 #endif
 
 #if defined(KERNEL_W1)
@@ -2106,8 +2130,8 @@ namespace packets { typedef IQ4G32S W1; }
 namespace packets { typedef MXFP4 W1; }
 #define KERNEL_W1_AT(pointer) PACKETS_MAKE_C4(MXFP4, KERNEL_W1, pointer)
 #elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_NVFP4G16)
-namespace packets { typedef NVFP4 W1; }
-#define KERNEL_W1_AT(pointer) PACKETS_MAKE_C4(NVFP4, KERNEL_W1, pointer)
+namespace packets { typedef Nvfp4Of<ELEMENT_HAS(KERNEL_W1, _OPERANDS_NVFP4)> W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_C4(W1, KERNEL_W1, pointer)
 #elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q5G32S)
 namespace packets { typedef Q5G32<false> W1; }
 #define KERNEL_W1_AT(pointer) PACKETS_MAKE_Q5(false, KERNEL_W1, pointer)
@@ -2131,6 +2155,7 @@ namespace packets { typedef IQ2XXS W1; }
 #else
 #define KERNEL_W1_MATRIX(pointer, index) KERNEL_W1_AT(PACKETS_PACKED_MATRIX(KERNEL_W1, pointer, index))
 #endif
+namespace packets { constexpr bool W1_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W1, _OPERANDS_NVFP4); }
 #endif
 
 #if defined(KERNEL_W2)
@@ -2164,8 +2189,8 @@ namespace packets { typedef IQ4G32S W2; }
 namespace packets { typedef MXFP4 W2; }
 #define KERNEL_W2_AT(pointer) PACKETS_MAKE_C4(MXFP4, KERNEL_W2, pointer)
 #elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_NVFP4G16)
-namespace packets { typedef NVFP4 W2; }
-#define KERNEL_W2_AT(pointer) PACKETS_MAKE_C4(NVFP4, KERNEL_W2, pointer)
+namespace packets { typedef Nvfp4Of<ELEMENT_HAS(KERNEL_W2, _OPERANDS_NVFP4)> W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_C4(W2, KERNEL_W2, pointer)
 #elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q5G32S)
 namespace packets { typedef Q5G32<false> W2; }
 #define KERNEL_W2_AT(pointer) PACKETS_MAKE_Q5(false, KERNEL_W2, pointer)
@@ -2189,6 +2214,7 @@ namespace packets { typedef IQ2XXS W2; }
 #else
 #define KERNEL_W2_MATRIX(pointer, index) KERNEL_W2_AT(PACKETS_PACKED_MATRIX(KERNEL_W2, pointer, index))
 #endif
+namespace packets { constexpr bool W2_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W2, _OPERANDS_NVFP4); }
 #endif
 
 #if defined(KERNEL_W3)
@@ -2222,8 +2248,8 @@ namespace packets { typedef IQ4G32S W3; }
 namespace packets { typedef MXFP4 W3; }
 #define KERNEL_W3_AT(pointer) PACKETS_MAKE_C4(MXFP4, KERNEL_W3, pointer)
 #elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_NVFP4G16)
-namespace packets { typedef NVFP4 W3; }
-#define KERNEL_W3_AT(pointer) PACKETS_MAKE_C4(NVFP4, KERNEL_W3, pointer)
+namespace packets { typedef Nvfp4Of<ELEMENT_HAS(KERNEL_W3, _OPERANDS_NVFP4)> W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_C4(W3, KERNEL_W3, pointer)
 #elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q5G32S)
 namespace packets { typedef Q5G32<false> W3; }
 #define KERNEL_W3_AT(pointer) PACKETS_MAKE_Q5(false, KERNEL_W3, pointer)
@@ -2247,4 +2273,5 @@ namespace packets { typedef IQ2XXS W3; }
 #else
 #define KERNEL_W3_MATRIX(pointer, index) KERNEL_W3_AT(PACKETS_PACKED_MATRIX(KERNEL_W3, pointer, index))
 #endif
+namespace packets { constexpr bool W3_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W3, _OPERANDS_NVFP4); }
 #endif

@@ -14,11 +14,32 @@
 #else
 #error "dense_output requires a bf16 or f16 activation"
 #endif
+// The down weight's operand rows (the product rows, or NVFP4 operands): the
+// GEMV forms them while staging, the stage launch into the scratch the GEMM
+// reads.
+#if defined(SEISMIC_DOWN_WEIGHT_OPERANDS_NVFP4)
+#define DENSE_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define DENSE_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
 
 
+// The product rows as the down weight's operands.
 projection_prologue dense_output_input() {
+    return projection_operands(projection_plain(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT),
+        SEISMIC_PRODUCT_STRIDE_0, SEISMIC_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_F), 0ul), DENSE_OPERANDS);
+}
+
+// The rows the GEMM reads: the product rows, or the operands the stage
+// launch formed.
+projection_prologue dense_output_rows() {
+#if defined(SEISMIC_DOWN_WEIGHT_OPERANDS_NVFP4)
+    return projection_plain(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED), SEISMIC_DIM_F, 1ul,
+        uint(SEISMIC_DIM_F), 0ul);
+#else
     return projection_plain(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT), SEISMIC_PRODUCT_STRIDE_0,
         SEISMIC_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_F), 0ul);
+#endif
 }
 
 projection_epilogue dense_output_output() {
@@ -46,15 +67,21 @@ void dense_output_gemv2() { dense_output_gemv_bounded(2u); }
 void dense_output_gemv4() { dense_output_gemv_bounded(4u); }
 void dense_output_gemv8() { dense_output_gemv_bounded(8u); }
 
+// The product rows as NVFP4 operands into `staged`, one row a workgroup.
+void dense_output_stage() {
+    projection_stage(dense_output_input(), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED),
+        uint(SEISMIC_DIM_F));
+}
+
 void dense_output_gemm() {
     const uint m = uint(SEISMIC_DIM_O), n = uint(SEISMIC_DIM_H), k = uint(SEISMIC_DIM_F);
 #if SEISMIC_TUNE_SPLIT == 1
     projection_gemm(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        dense_output_input(), dense_output_output(),
+        dense_output_rows(), dense_output_output(),
         dense_output_down(), m, n, k, gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
 #else
     projection_gemm_part(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        dense_output_input(),
+        dense_output_rows(),
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), dense_output_down(), m, n, k, SEISMIC_TUNE_SPLIT,
         gl_WorkGroupID.z, gl_WorkGroupID.y, gl_WorkGroupID.x);
 #endif

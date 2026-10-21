@@ -688,6 +688,146 @@ inline SharedNorm<In> shared_norm(In in, threadgroup const float *squares) {
 }
 
 // ---------------------------------------------------------------------------
+// The operand rows of a product (the portable `operand_rows`): its
+// prologue's rows as they are, or, when its weights take NVFP4 operands
+// (`operands<packets::Wn_OPERANDS_NVFP4>`), as NVFP4 operands (stage.h).
+//
+// `rows` is the GEMV row classes' (M <= 16; every thread of the threadgroup
+// calls it): after the squares pass (whose
+// barrier it issues) simdgroup m % simdgroups reduces row m's largest
+// magnitude over its `columns` into `globals` (PROJECTION_OPERANDS_SHARED,
+// one float a row when NVFP4), which the opening barrier of the GEMV body
+// publishes to its staging. `normalize` is a normalizing threadgroup's
+// (`device_normalize`, one norm group per row): the row's largest magnitude
+// under its inverse, reduced across the threadgroup through `partials`,
+// then the row formed.
+#define PROJECTION_OPERANDS_SHARED(name, NVFP4) threadgroup float name[(NVFP4) ? 16 : 1]
+
+template <bool NVFP4>
+struct operands;
+template <>
+struct operands<false> {
+    template <typename In>
+    static In rows(In in, uint, uint, threadgroup float *, uint, uint, uint) {
+        return in;
+    }
+    template <typename In>
+    static In lone_row(In in, uint, uint) {
+        return in;
+    }
+    template <uint THREADS, typename Order, typename In>
+    static void normalize(thread const In &in, uint item, device uchar *x, uint columns,
+        threadgroup float *partials, uint thread_index) {
+        device_normalize<THREADS, Order>(in, item, x, columns, partials, thread_index);
+    }
+    template <uint THREADS, typename In>
+    static void normalize(thread const In &in, uint item, device uchar *x, uint columns,
+        threadgroup float *partials, uint thread_index) {
+        normalize<THREADS, RowOrder<typename In::activation>>(in, item, x, columns, partials, thread_index);
+    }
+};
+template <>
+struct operands<true> {
+    template <typename In>
+    static Nvfp4Rows<In, RowGlobals> rows(In in, uint m_rows, uint columns, threadgroup float *globals,
+        uint simdgroups, uint sg, uint lane) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint m = sg; m < m_rows; m += simdgroups) {
+            float amax = 0.0f;
+            for (uint k = 8u * lane; k < columns; k += 256u) {
+                float4 even, odd;
+                in.load8(m, k, 0.0f, even, odd);
+                amax = metal::max(amax, nvfp4::magnitude(even, odd));
+            }
+            amax = simd_max(amax);
+            if (lane == 0)
+                globals[m] = nvfp4::global_scale(amax);
+        }
+        return Nvfp4Rows<In, RowGlobals>{in, {globals}};
+    }
+    // Row 0 of `in` (`columns` values) as one simdgroup forms it alone: its
+    // largest magnitude reduced across the simdgroup, without a barrier
+    // (the decode down projections, `routed::project_channels`).
+    template <typename In>
+    static Nvfp4Rows<In, OneGlobal> lone_row(In in, uint columns, uint lane) {
+        float amax = 0.0f;
+        for (uint k = 8u * lane; k < columns; k += 256u) {
+            float4 even, odd;
+            in.load8(0, k, 0.0f, even, odd);
+            amax = metal::max(amax, nvfp4::magnitude(even, odd));
+        }
+        return Nvfp4Rows<In, OneGlobal>{in, {nvfp4::global_scale(simd_max(amax))}};
+    }
+    template <uint THREADS, typename In>
+    static void normalize(thread const In &in, uint item, device uchar *x, uint columns,
+        threadgroup float *partials, uint thread_index) {
+        normalize<THREADS, RowOrder<typename In::activation>>(in, item, x, columns, partials, thread_index);
+    }
+    template <uint THREADS, typename Order, typename In>
+    static void normalize(thread const In &in, uint item, device uchar *x, uint columns,
+        threadgroup float *partials, uint thread_index) {
+        const float inverse = normalization_inverse<THREADS>(in, item, 0, partials, thread_index);
+        form_row<THREADS, Order>(in, item, inverse, x, columns, partials, thread_index);
+    }
+    // A plain operand's row m formed into x (a stage launch's threadgroup).
+    template <uint THREADS, typename In>
+    static void form(thread const In &in, uint m, device uchar *x, uint columns, threadgroup float *partials,
+        uint thread_index) {
+        form_row<THREADS, RowOrder<typename In::activation>>(in, m, 0.0f, x, columns, partials, thread_index);
+    }
+    // The A row at `row` (`columns` values) formed in place: each thread
+    // reads and rewrites whole 16-value blocks, so no thread reads a value
+    // another has rewritten (the grouped expert products a down projection
+    // takes).
+    template <uint THREADS, typename A>
+    static void form_in_place(device uchar *row, uint columns, threadgroup float *partials, uint thread_index) {
+        const Plain<A, AllRows> in{row, 0, 1, columns, {}};
+        const float amax = row_maximum<THREADS>(in, 0, 0.0f, partials, thread_index);
+        const Nvfp4Rows<Plain<A, AllRows>, OneGlobal> formed{in, {nvfp4::global_scale(amax)}};
+        device typename A::storage *values = reinterpret_cast<device typename A::storage *>(row);
+        for (uint block = 16u * thread_index; block < columns; block += 16u * THREADS) {
+            float4 even[2], odd[2];
+            formed.load8(0, block, 0.0f, even[0], odd[0]);
+            formed.load8(0, block + 8u, 0.0f, even[1], odd[1]);
+            for (uint j = 0; j < 16u && block + j < columns; ++j)
+                values[block + j] = A::store((j & 1u) ? odd[j >> 3][(j & 7u) >> 1] : even[j >> 3][(j & 7u) >> 1]);
+        }
+    }
+
+private:
+    // Row m's largest magnitude under its norm inverse, reduced across the
+    // threadgroup through `partials` (whose previous contents every thread
+    // has read: a normalization's square sums).
+    template <uint THREADS, typename In>
+    static float row_maximum(thread const In &in, uint m, float inverse, threadgroup float *partials,
+        uint thread_index) {
+        static_assert(THREADS % 32u == 0 && THREADS / 32u <= 32u, "whole simdgroups, one partial each");
+        float amax = 0.0f;
+        for (uint k = 8u * thread_index; k < in.width(); k += 8u * THREADS) {
+            float4 even, odd;
+            in.load8(m, k, inverse, even, odd);
+            amax = metal::max(amax, nvfp4::magnitude(even, odd));
+        }
+        amax = simd_max(amax);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (thread_index % 32u == 0)
+            partials[thread_index / 32u] = amax;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 0; s < THREADS / 32u; ++s)
+            amax = metal::max(amax, partials[s]);
+        return amax;
+    }
+    // Row m under its norm inverse, formed into x.
+    template <uint THREADS, typename Order, typename In>
+    static void form_row(thread const In &in, uint m, float inverse, device uchar *x, uint columns,
+        threadgroup float *partials, uint thread_index) {
+        const float amax = row_maximum<THREADS>(in, m, inverse, partials, thread_index);
+        const Nvfp4Rows<In, OneGlobal> formed{in, {nvfp4::global_scale(amax)}};
+        device_normalize_with<THREADS, Order>(formed, m, 0, inverse, x, columns, thread_index);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // GEMV.
 //
 // Each weight is decoded once to F32 (`fma(scale, code, bias)`, one rounding,

@@ -15,6 +15,12 @@
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
+// The rows every weight takes (the normalized rows, or NVFP4 operands): the
+// GEMV row classes form them while staging, the normalize launch into the
+// scratch every other form reads.
+constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4,
+    packets::W2_OPERANDS_NVFP4, packets::W3_OPERANDS_NVFP4>::NVFP4;
+typedef projection::operands<NVFP4> Operands;
 
 // The slot of each row, resolved once per threadgroup before the projection
 // so the epilogue's window reads do not wait on the slot tables: `lo` < 0 on
@@ -169,8 +175,9 @@ struct ConvolvedChannel {
     uint per = simdgroups * ROWS * (32u / LANES);                                       \
     uint rows = uint(SEISMIC_DIM_M);                                                    \
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                         \
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
-    const auto x = projection::shared_norm(in, squares);                                \
+    const auto x = Operands::rows(projection::shared_norm(in, squares), rows, k, globals, simdgroups, sg, lane); \
     uint t0 = (qkv_rows + per - 1) / per, t1 = (gate_rows + per - 1) / per;             \
     uint t2 = (head_rows + per - 1) / per;                                              \
     if (tile < t0 && sg + 1 == simdgroups)                                              \
@@ -233,26 +240,12 @@ kernel void gated_delta_project_convolved_gemv_pair(RECURRENT_PROJECT_ARGUMENTS,
 kernel void gated_delta_project_convolved_normalize(RECURRENT_PROJECT_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
-    threadgroup float norms[8];
+    PROJECTION_NORMALIZE_SHARED(norms);
     projection::InputOf<activation, norm_element, projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type
         in{hidden, SEISMIC_HIDDEN_STRIDE_0,
         SEISMIC_HIDDEN_STRIDE_1, input_norm, SEISMIC_INPUT_NORM_STRIDE_0,
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), uint(SEISMIC_DIM_H), {}};
-    // Preserve the small-row prologue's fixed eight-part reduction tree.
-    const uint sg = thread_index / 32u, lane = thread_index % 32u;
-    const float partial = simd_sum(in.squares(item, 0, sg, lane));
-    if (lane == 0)
-        norms[sg] = partial;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inverse = metal::rsqrt(projection::sum_parts<8>(norms) / float(SEISMIC_DIM_H) + in.epsilon());
-    device activation::storage *row = reinterpret_cast<device activation::storage *>(normalized)
-        + ulong(item) * SEISMIC_DIM_H;
-    for (uint k = 8u * thread_index; k < SEISMIC_DIM_H; k += 8u * 256u) {
-        float4 even, odd;
-        in.load8(item, k, inverse, even, odd);
-        for (uint j = 0; j < 8u && k + j < SEISMIC_DIM_H; ++j)
-            row[k + j] = activation::store((j & 1u) ? odd[j >> 1] : even[j >> 1]);
-    }
+    Operands::normalize<256>(in, item, normalized, uint(SEISMIC_DIM_H), norms, thread_index);
 }
 #endif
 

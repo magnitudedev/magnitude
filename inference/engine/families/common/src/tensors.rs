@@ -4,7 +4,9 @@
 
 use crate::HeaderError;
 use magnitude_artifacts::gguf::{Directory, Encoding, TensorDescriptor};
-use magnitude_family_contracts::{checked_product, ImportTransform, WeightDescriptor};
+use magnitude_family_contracts::{
+    checked_product, ImportTransform, ScaledActivations, WeightDescriptor,
+};
 use std::collections::HashSet;
 
 pub struct Tensors<'a> {
@@ -102,27 +104,26 @@ impl<'a> Tensors<'a> {
             _ => 1,
         };
         if let Some(scale) = self.companion_scale(name, matrices)? {
-            weight
-                .transforms
-                .push(ImportTransform::ScaleByTensor { tensor: scale });
+            weight.transforms.push(scale);
         }
         Ok(weight)
     }
 
     /// Binds the stored F32 `<stem>.scale` companion of `<stem>.weight`
     /// (NVFP4's per-tensor or per-matrix second-level scale), one value per
-    /// matrix, and names it; `None` when the file stores none.
+    /// matrix, as the weight's `ScaleByTensor`; `None` when the file stores
+    /// none.
     ///
-    /// A scaled weight may also store `<stem>.input_scale`, the activation
-    /// scale of kernels that quantize their inputs to FP4. Activations here
-    /// stay in the activation dtype, so the product needs only the weight's
-    /// scale (as in llama.cpp, which loads and never applies it): it is
-    /// checked and acknowledged, not applied.
+    /// A scaled weight whose producer calibrated it for FP4 activations
+    /// (W4A4) also stores `<stem>.input_scale`, its static activation scale:
+    /// its products take NVFP4 operands. The operand recipe scales each row
+    /// by its own power of two, so the stored value is checked and
+    /// acknowledged, not applied.
     pub fn companion_scale(
         &mut self,
         weight: &str,
         matrices: u64,
-    ) -> Result<Option<String>, HeaderError> {
+    ) -> Result<Option<ImportTransform>, HeaderError> {
         let Some(stem) = weight.strip_suffix(".weight") else {
             return Ok(None);
         };
@@ -141,7 +142,13 @@ impl<'a> Tensors<'a> {
             }
             self.bound.insert(companion.name.as_str());
         }
-        Ok(Some(scale.name.clone()))
+        Ok(Some(ImportTransform::ScaleByTensor {
+            tensor: scale.name.clone(),
+            activations: match input {
+                Some(_) => ScaledActivations::Nvfp4,
+                None => ScaledActivations::Rounded,
+            },
+        }))
     }
 
     /// The stored tensors bound by no role, in directory order.

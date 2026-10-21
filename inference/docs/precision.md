@@ -215,6 +215,51 @@ The language declares computation and representation semantics, not precision pe
 claims about how a native kernel accumulates. Reordering, packing and narrower arithmetic face
 the same measured rule. There are no `numerics`, `error_class` or `deviates` declarations.
 
+## NVFP4 operands
+
+NVFP4 weights come in two recipes, as their producer calibrated them: W4A16 multiplies the
+rounded activation, and W4A4 takes the activation rows as NVFP4 too, so the same function runs
+on FP4 tensor operations where a device has them and on ordinary arithmetic elsewhere. NVIDIA
+names them `W4A16_NVFP4` and `NVFP4`; a GGUF of the second also stores each weight's static
+activation scale `<stem>.input_scale`, which the family binder reads as the weight's recipe
+(`ScaledActivations`). Running a W4A16 checkpoint as W4A4 costs it: Lightning NVFP4 (W4A16)
+lost about six times its Q4 variant's KL on prose.
+
+This is computation semantics, not a tuning choice. One NVFP4 storage has an element of each
+recipe, `nvfp4g16` and `nvfp4g16a4` (likewise `nvfp4_e2m1_block16`), with the same bytes,
+decode and conversions; the registry gives each element its operand recipe (`operands(W)`:
+NVFP4 rows for the W4A4 elements, the rows as they are for every other), and every portable
+product reads its rows through `operand_rows` (`seismic-std`'s `operand_rows.seismic`).
+Natives implement the same recipe, so a W4A4 weight is W4A4 on every device, and the faster
+forms tuning compares against it start from the same operand rows.
+
+Each row x, already rounded to the activation element A, becomes q · g · s:
+
+- g, the row's global scale, is the least power of two with 6 · 448 · g ≥ amax|x| (6 is E2M1's
+  largest value, 448 UE4M3's), within F32's normal binades;
+- s, each 16-value block's scale, is the UE4M3 value nearest amax|block| / (6g), ties to even;
+- q, each value's code, is the E2M1 value nearest x / (g · s), ties to even, saturating at 6,
+  with x's sign, and zero where s is.
+
+Because g is a power of two, g · s and q · g · s are exact in F32 and q · g · s has at most six
+significant bits, so the operand row is exact in BF16 and needs no per-row factor in a
+product's epilogue. Every rounding takes the exact quotient to nearest. The portable body
+writes them as F32 divisions, which round onto both grids exactly as the exact quotient does:
+for a grid midpoint t and a divisor d with 2^k ≤ d < 2^(k+1), any dividend other than t · d
+differs from it by at least ulp(t) · 2^k, so its quotient lies more than half an ulp of t
+away from t. Devices whose division is not correctly rounded (Metal, Vulkan) decide each
+rounding without one: every grid point and midpoint times its divisor is exact in F32, so
+the dividend compared against it decides the exact quotient.
+
+Rows are formed where a product's operands are staged: a GEMV threadgroup forms its rows while
+staging them (one more pass for each row's largest magnitude), a staging or normalizing launch
+writes formed rows into the scratch a GEMM reads, and a product row an expert's down projection
+reads is formed in place. Weights that share one staged operand share a recipe; a native refuses
+a binding that would mix them, and the router, stream-mix and drafter-combine projections, whose
+checkpoints keep those weights in BF16, refuse W4A4 weights rather than form rows for them.
+The stored `input_scale` marks the recipe and is not applied: each row's global scale is the
+row's own power of two.
+
 ## Evidence and boundaries
 
 Development evaluation measures the four relations together: scaling at fixed structure;

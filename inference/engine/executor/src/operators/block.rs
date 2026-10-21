@@ -321,7 +321,6 @@ impl BlockSublayers<'_> {
         sublayer: u32,
         hidden: &WorkflowTensor,
         weights: &mut Vec<(WeightPort, NativePort)>,
-        constants: &mut Vec<GraphConstant>,
     ) -> Result<(WorkflowTensor, InputForm, Join), GraphError> {
         match source {
             SublayerSource::Norm(_) => {
@@ -390,15 +389,8 @@ impl BlockSublayers<'_> {
         let epsilon = paired.epsilon() as f32;
         let component_index = bank_component_index(&geometry.blocks, block_index)
             .map_err(|error| error.to_string())?;
-        let (input_rows, form, join) = self.read(
-            graph,
-            paired.mixer_input,
-            streams,
-            0,
-            hidden,
-            weights,
-            constants,
-        )?;
+        let (input_rows, form, join) =
+            self.read(graph, paired.mixer_input, streams, 0, hidden, weights)?;
         let input = SublayerInput {
             rows: &input_rows,
             form,
@@ -604,10 +596,9 @@ impl BlockSublayers<'_> {
         // A mix site's sublayer reads its partials; the others read `mixed`.
         let read = |graph: &mut G,
                     weights: &mut Vec<(WeightPort, NativePort)>,
-                    constants: &mut Vec<GraphConstant>,
                     source: Option<SublayerSource<'_>>| {
             let source = source.ok_or("a routed feed-forward without its input source")?;
-            self.read(graph, source, streams, 1, &mixed, weights, constants)
+            self.read(graph, source, streams, 1, &mixed, weights)
         };
         Ok(match (paired.feed_forward, entries) {
             (None, None) => mixed,
@@ -632,7 +623,7 @@ impl BlockSublayers<'_> {
                     )?
                 }
                 (FeedForward::Routed(shape), FeedForwardEntries::Routed(entries)) => {
-                    let (input_rows, form, join) = read(graph, weights, constants, sublayer.input)?;
+                    let (input_rows, form, join) = read(graph, weights, sublayer.input)?;
                     routed_graph::routed(
                         graph,
                         entries,

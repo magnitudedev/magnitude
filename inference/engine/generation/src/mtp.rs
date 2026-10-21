@@ -701,7 +701,13 @@ impl MethodState for DrafterState {
         Ok(())
     }
 
-    fn timed(&mut self, launch: TimedLaunch, duration: Duration, sequences: usize, rows: usize) {
+    fn timed(
+        &mut self,
+        launch: TimedLaunch,
+        duration: Option<Duration>,
+        sequences: usize,
+        rows: usize,
+    ) {
         if let Some(control) = &mut self.control {
             control.timed(launch, duration, sequences, rows);
         }

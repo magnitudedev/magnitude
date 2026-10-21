@@ -317,8 +317,9 @@ pub fn inspect_components(
     };
     let context_limit = m.integer("context_length")?;
     let mut tensors = Tensors::new(directory);
+    // A weight stored with an NVFP4 second-level scale is scaled by it.
     let mut tensor = |name: &str, shape: &[u64]| -> Result<WeightDescriptor, Error> {
-        Ok(tensors.bind(name, shape)?)
+        Ok(tensors.bind_scaled(name, shape)?)
     };
     let embedding = tensor("token_embd.weight", &[vocabulary, hidden])?;
     let ngram_table = tensor(

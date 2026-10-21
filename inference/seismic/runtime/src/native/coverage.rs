@@ -22,8 +22,10 @@
 //! layout, and gives each weight its own. So a weight slot (an element
 //! parameter the entry reads, other than a conversion target, which its
 //! source chooses) that takes one of them must take every one: the base
-//! configuration with only that slot changed to it must be implemented. A
-//! representation it is not implemented at is reported as untaken.
+//! configuration with that slot changed to it, and the slots the entry's
+//! element predicates tie to its operand recipe, must be implemented. A
+//! representation it is not implemented at is reported as untaken. Every
+//! change of a binding the search makes carries those tied slots with it.
 //!
 //! A `form` tuning parameter selects a structurally different algorithm,
 //! which a kernel may take without a preprocessor group (a template chosen
@@ -50,8 +52,8 @@ pub use seismic_native_target::{ProgramEntry, ProgramSource};
 use super::abi::{self, Dialect, render_source};
 use super::plan::{self, LaunchVariant};
 use seismic_lang::checked::{
-    CheckedModule, ElementDomain, ElementTarget, EntryInfo, NativeImplementation, NativeParameter,
-    NativeSpecialization,
+    CheckedModule, ElementDomain, ElementTarget, ElementTerm, EntryInfo, NativeImplementation,
+    NativeParameter, NativeSpecialization,
 };
 use seismic_lang::entry::ElementBindings;
 use seismic_lang::ids::{EntryId, RepresentationId};
@@ -915,6 +917,48 @@ impl<'m> Subject<'m> {
             .clone()
     }
 
+    /// `bindings` with `parameter` bound to `representation`, and every
+    /// parameter the entry's element predicates declare shares its operand
+    /// recipe (`operands(P) == operands(Q)`) and holds another bound to it
+    /// too: one choice of the search, the smallest change that keeps those
+    /// predicates.
+    fn rebind(
+        &self,
+        bindings: &ElementBindings,
+        parameter: &str,
+        representation: RepresentationId,
+    ) -> ElementBindings {
+        let recipe = |representation| registry::representation_info(representation).operands;
+        let mut tied = vec![parameter.to_owned()];
+        let mut index = 0;
+        while let Some(current) = tied.get(index).cloned() {
+            for predicate in self.info.element_domain.predicates() {
+                let (ElementTerm::Operands(left), ElementTerm::Operands(right)) =
+                    (&predicate.left, &predicate.right)
+                else {
+                    continue;
+                };
+                if !predicate.equal {
+                    continue;
+                }
+                for (from, to) in [(left, right), (right, left)] {
+                    if *from == current && !tied.contains(to) {
+                        tied.push(to.clone());
+                    }
+                }
+            }
+            index += 1;
+        }
+        tied.iter().fold(bindings.clone(), |bindings, name| {
+            let held = bindings.get(name);
+            if name == parameter || held.is_some_and(|held| recipe(held) != recipe(representation)) {
+                bindings.bind(name, representation)
+            } else {
+                bindings
+            }
+        })
+    }
+
     fn admits(&self, bindings: &ElementBindings) -> bool {
         let key = format!("{bindings:?}");
         if let Some(admitted) = self
@@ -1458,7 +1502,7 @@ fn row_variations(
             if row.bindings.get(parameter) == Some(*representation) {
                 continue;
             }
-            let bindings = row.bindings.clone().bind(parameter, *representation);
+            let bindings = subject.rebind(&row.bindings, parameter, *representation);
             if subject.admits(&bindings) {
                 rows.push(Row {
                     bindings,
@@ -1822,7 +1866,7 @@ fn untaken_at(
                 registry::representation_info(**representation).layout == layout
             })
             .map(|representation| Row {
-                bindings: base.bindings.clone().bind(parameter, *representation),
+                bindings: subject.rebind(&base.bindings, parameter, *representation),
                 ..base.clone()
             })
             .filter(|row| subject.admits(&row.bindings))
@@ -2097,11 +2141,11 @@ fn binding_pairs(subject: &Subject<'_>, row: &Row, seen: &mut BTreeSet<String>) 
                         continue;
                     }
                     let candidate = Row {
-                        bindings: row
-                            .bindings
-                            .clone()
-                            .bind(parameter, *representation)
-                            .bind(other, *other_representation),
+                        bindings: subject.rebind(
+                            &subject.rebind(&row.bindings, parameter, *representation),
+                            other,
+                            *other_representation,
+                        ),
                         ..row.clone()
                     };
                     if seen.insert(candidate.key()) && subject.admits(&candidate.bindings) {

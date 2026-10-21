@@ -25,6 +25,14 @@
 #else
 #error "short_conv_project requires a dense norm"
 #endif
+// The rows the three weights take (the normalized rows, or NVFP4 operands):
+// the GEMV forms them while staging, the stage launch into the GEMM's
+// scratch.
+#if defined(SEISMIC_B_WEIGHT_OPERANDS_NVFP4)
+#define CONV_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define CONV_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
 
 
 
@@ -33,9 +41,9 @@
 #define CONV_CH uint(SEISMIC_DIM_CH)
 
 projection_prologue short_conv_project_input() {
-    return projection_rms(CONV_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL), SEISMIC_RESIDUAL_STRIDE_0,
-        SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0, CONV_NORM,
-        element_word_f32(SEISMIC_PARAM_EPS), CONV_H, 0ul);
+    return projection_operands(projection_rms(CONV_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL),
+        SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0,
+        CONV_NORM, element_word_f32(SEISMIC_PARAM_EPS), CONV_H, 0ul), CONV_OPERANDS);
 }
 
 projection_epilogue short_conv_project_u() {

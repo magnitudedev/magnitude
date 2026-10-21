@@ -20,14 +20,20 @@ using element::Act;
 // The declared shared bytes of the two launches (`routed.seismic`).
 constexpr int EXPAND_SHARED = 3 * (32 * 144 + 2 * 10240) + 2 * 4096;
 constexpr int DOWN_SHARED = 3 * (32 * 144 + 10240) + 4096;
+// Whether the gate and up weights take their rows as NVFP4 operands (the
+// down weight's are formed by the quantize launch).
+constexpr bool EXPAND_NVFP4 =
+    projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4>::NVFP4;
 
-
-// Convert each semantic normalized row once; all routed groups reuse it.
+// Form each normalized row once, as the expansion's operands; all routed
+// groups reuse it.
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_STAGE
 template <unsigned OPERAND>
 __global__ void routed_experts_stage(SEISMIC_KERNEL_PARAMS) {
-    using Operands = typename projection::GemmOperands<OPERAND>::type;
-    const projection::Plain<Act, projection::AllRows> source{SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED), SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}};
+    using Operands = projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1>;
+    using Raw = projection::Plain<Act, projection::AllRows>;
+    const projection::Operands<EXPAND_NVFP4, Raw> source{
+        Raw{SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED), SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}}};
     projection::materialize_operand_row<Operands>(source, blockIdx.x, SEISMIC_DIM_H,
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED));
 }
@@ -43,7 +49,7 @@ __global__ void routed_experts_stage(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_EXPAND
 template <unsigned OPERAND>
 __global__ void routed_experts_expand(SEISMIC_KERNEL_PARAMS) {
-    using Operands = typename projection::GemmOperands<OPERAND>::type;
+    using Operands = projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1>;
     extern __shared__ uint4 dynamic_shared[];
     const projection::u64 block = blockIdx.z;
     const int expert = ROUTED_BLOCK_EXPERT(block);
@@ -61,8 +67,9 @@ __global__ void routed_experts_expand(SEISMIC_KERNEL_PARAMS) {
                                  (projection::u64)expert),
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0,
                                  (projection::u64)expert));
-    const routed::GroupedRows source{OPERAND == 1 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
-                                     OPERAND == 1 ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0, order,
+    constexpr bool STAGED = OPERAND == 1 || EXPAND_NVFP4;
+    const routed::GroupedRows source{STAGED ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
+                                     STAGED ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0, order,
                                      SEISMIC_ORDER_STRIDE_1};
     routed::routed_gemm<EXPAND_SHARED, Operands>(
         reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_H, blockIdx.x, SEISMIC_DIM_F,
@@ -71,10 +78,25 @@ __global__ void routed_experts_expand(SEISMIC_KERNEL_PARAMS) {
 }
 #endif
 
+// Each live product row in place as the down GEMM's NVFP4 operands: one
+// block per row of the [B * T, F] product.
+#ifdef SEISMIC_FORMING_ROUTED_EXPERTS_QUANTIZE
+template <unsigned OPERAND>
+__global__ void routed_experts_quantize(SEISMIC_KERNEL_PARAMS) {
+    const projection::u64 block = blockIdx.x / SEISMIC_DIM_T, lane = blockIdx.x % SEISMIC_DIM_T;
+    if (ROUTED_BLOCK_EXPERT(block) < 0 || ROUTED_BLOCK_ORDER(block)[lane * SEISMIC_ORDER_STRIDE_1] < 0)
+        return;
+    // The product the expand stored, as the down GEMM's operands.
+    projection::form_operands_in_place<projection::GemmOperandsOf<OPERAND, packets::W2>,
+                                       typename projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1>::Storage,
+                                       SEISMIC_DIM_F, 256>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT), blockIdx.x);
+}
+#endif
+
 #ifdef SEISMIC_FORMING_ROUTED_EXPERTS_DOWN
 template <unsigned OPERAND>
 __global__ void routed_experts_down(SEISMIC_KERNEL_PARAMS) {
-    using Operands = typename projection::GemmOperands<OPERAND>::type;
+    using Operands = projection::GemmOperandsOf<OPERAND, packets::W2>;
     extern __shared__ uint4 dynamic_shared[];
     const projection::u64 block = blockIdx.z;
     const int expert = ROUTED_BLOCK_EXPERT(block);

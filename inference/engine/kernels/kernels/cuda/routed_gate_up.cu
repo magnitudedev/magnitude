@@ -8,22 +8,31 @@
 #define KERNEL_W1 SEISMIC_EXPERT_UP
 #include "lib/routed/routed.cuh"
 
-using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
+// A block's one row, read in place unless the experts take it as NVFP4
+// operands, which the block forms in its shared memory.
+using Raw = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
+using Pro = projection::Operands<
+    projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4>::NVFP4, Raw>;
+using Source = projection::GemvSource<Pro>;
 using Epi = projection::Glu<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP
 template <int TPW, int KSPLIT>
 __global__ void routed_gate_up(SEISMIC_KERNEL_PARAMS) {
     using Shape = projection::GemvShape<4, TPW, KSPLIT, 1>;
-    __shared__ projection::GemvShared<Shape, Pro> shared;
+    __shared__ projection::GemvShared<Shape, Source::type> shared;
+    extern __shared__ uint4 dynamic_shared[];
     const projection::u8 *normalized = SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED);
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
+    const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;
+    // Block-collective: before any warp leaves.
+    const Source::type pro = Source::make(
+        Pro{Raw{normalized + m * SEISMIC_NORMALIZED_STRIDE_0 * 2, SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}}},
+        reinterpret_cast<projection::u8 *>(dynamic_shared), 1u, SEISMIC_DIM_H, nullptr);
     const projection::u64 group = Shape::tile_group();
     if (group >= projection::gemv_groups<Shape>(SEISMIC_DIM_F))
         return;
-    const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;
     const projection::u64 expert = (projection::u64)routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];
-    const Pro pro{normalized + m * SEISMIC_NORMALIZED_STRIDE_0 * 2, SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}};
     const auto epi = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
         Epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * 2,
             0, (int)SEISMIC_PARAM_ACTIVATION},

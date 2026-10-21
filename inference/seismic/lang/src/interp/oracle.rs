@@ -850,6 +850,7 @@ impl Interpreter<'_> {
             | PrimitiveId::SliceView { .. }
             | PrimitiveId::ElementRead { .. }
             | PrimitiveId::Extent { .. }
+            | PrimitiveId::Operands
             | PrimitiveId::Atomic { .. }
             | PrimitiveId::Reduce { .. } => {
                 unreachable!("structural primitive survived semantic canonicalization")
@@ -1684,6 +1685,7 @@ fn apply_scalar_primitive(
         | PrimitiveId::QuantizedComponentRead { .. }
         | PrimitiveId::ElementRead { .. }
         | PrimitiveId::Extent { .. }
+        | PrimitiveId::Operands
         | PrimitiveId::Atomic { .. }
         | PrimitiveId::Reduce { .. } => {
             unreachable!("non-scalar primitive occurs in a checked elementwise node")

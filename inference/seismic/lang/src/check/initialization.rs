@@ -1003,6 +1003,8 @@ impl Initialization<'_, '_> {
                     },
                     PrimitiveId::TensorAlloc => self.result(world, &expression.ty, false),
                     PrimitiveId::Fill(_) => self.result(world, &expression.ty, true),
+                    // A constant of the bound representation, unknown here.
+                    PrimitiveId::Operands => self.expression_result(world, expression),
                     PrimitiveId::Extent { axis } => {
                         let extent = match values.first() {
                             Some(Value::Tensor(place)) => place.axes.get(*axis as usize).copied(),

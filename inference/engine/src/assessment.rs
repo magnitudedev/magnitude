@@ -41,7 +41,7 @@ use magnitude_executor::{
     resident_element, resident_layout, source_element, ExecutionPath, ExecutionPlanDraft,
     KernelCache,
 };
-use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily};
+use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily, ScaledActivations};
 use magnitude_scheduler::ServiceLimits;
 use seismic::{DType, DeviceTopology, Devices, Layout, Status};
 use std::collections::BTreeMap;
@@ -1039,9 +1039,15 @@ fn unsupported_weights<'a>(
         let width = tensor.shape.last().copied().unwrap_or(1);
         let imported = source_element(tensor.encoding, width).is_some()
             && match residency {
-                Residency::Packed => {
-                    resident_element(tensor.encoding, width, DType::F32, layout).is_some()
-                }
+                // Every encoding with a resident element has a W4A16 one.
+                Residency::Packed => resident_element(
+                    tensor.encoding,
+                    ScaledActivations::Rounded,
+                    width,
+                    DType::F32,
+                    layout,
+                )
+                .is_some(),
                 Residency::Dequantized => true,
             };
         if !imported {

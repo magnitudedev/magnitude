@@ -15,8 +15,8 @@ use super::AssessmentError;
 use crate::{ModelLoadPlan, ProgramPlan, TuningLimits};
 use magnitude_family_contracts::ModelDefinition;
 use seismic::{
-    BackendName, CheckedBundleError, Entry, KernelRequest, NativeImplementation,
-    NativeSpecialization,
+    BackendName, CheckedBundleError, Element, Entry, KernelRequest, NativeImplementation,
+    NativeSpecialization, OperandRecipe,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -30,7 +30,11 @@ const ROW_DIMENSIONS: [&str; 2] = ["M", "O"];
 #[derive(Clone, Copy)]
 pub struct Kernel {
     name: &'static str,
-    implementation: fn(BackendName) -> Result<Option<NativeImplementation>, CheckedBundleError>,
+    /// The entry's declaration on a backend at a request's elements.
+    implementation: fn(
+        BackendName,
+        &[(&str, Element)],
+    ) -> Result<Option<&'static NativeImplementation>, CheckedBundleError>,
 }
 
 impl Kernel {
@@ -38,7 +42,7 @@ impl Kernel {
     pub fn of<E: Entry>() -> Self {
         Self {
             name: E::NAME,
-            implementation: seismic::generated::native_implementation_for_backend::<E>,
+            implementation: seismic::generated::native_implementation_at::<E>,
         }
     }
 
@@ -70,7 +74,7 @@ fn launch_error(message: impl Into<String>) -> AssessmentError {
 /// default specialization at the statics the load prepares it with.
 #[derive(Clone, Debug)]
 struct Prepared {
-    implementation: NativeImplementation,
+    implementation: &'static NativeImplementation,
     specialization: NativeSpecialization,
 }
 
@@ -117,22 +121,30 @@ impl Declarations {
         self.backend
     }
 
-    /// Every specialization of `kernel` the load prepares.
-    fn prepared(&self, kernel: Kernel) -> Result<Vec<Prepared>, AssessmentError> {
-        let implementation = (kernel.implementation)(self.backend)
-            .map_err(|error| launch_error(format!("`{}`: {error}", kernel.name)))?
-            .ok_or_else(|| {
-                launch_error(format!(
-                    "`{}` has no native implementation for {}",
-                    kernel.name,
-                    self.backend.as_str()
-                ))
-            })?;
+    /// Every specialization of `kernel` the load prepares at operand recipe
+    /// `recipe`, each at its request's elements.
+    fn prepared(&self, kernel: Kernel, recipe: OperandRecipe) -> Result<Vec<Prepared>, AssessmentError> {
         let prepared = self
             .requests
             .iter()
-            .filter(|request| request.entry == kernel.name)
+            .filter(|request| {
+                request.entry == kernel.name && operand_recipe(request.elements.values().copied()) == recipe
+            })
             .map(|request| {
+                let elements = request
+                    .elements
+                    .iter()
+                    .map(|(name, element)| (name.as_str(), *element))
+                    .collect::<Vec<_>>();
+                let implementation = (kernel.implementation)(self.backend, &elements)
+                    .map_err(|error| launch_error(format!("`{}`: {error}", kernel.name)))?
+                    .ok_or_else(|| {
+                        launch_error(format!(
+                            "`{}` has no native implementation for {}",
+                            kernel.name,
+                            self.backend.as_str()
+                        ))
+                    })?;
                 let statics = request
                     .statics
                     .iter()
@@ -143,14 +155,14 @@ impl Declarations {
                     .default_specialization(&statics)
                     .map_err(|error| launch_error(format!("{request}: {error}")))?;
                 Ok(Prepared {
-                    implementation: implementation.clone(),
+                    implementation,
                     specialization,
                 })
             })
             .collect::<Result<Vec<_>, AssessmentError>>()?;
         if prepared.is_empty() {
             return Err(launch_error(format!(
-                "the load prepares no `{}` on {}",
+                "the load prepares no `{}` at {recipe:?} operands on {}",
                 kernel.name,
                 self.backend.as_str()
             )));
@@ -158,18 +170,36 @@ impl Declarations {
         Ok(prepared)
     }
 
-    /// The launches of a call of `kernel` stating `dimensions`, at any row
-    /// count.
+    /// The launches of a call of `kernel` at operand recipe `recipe` (its
+    /// weights', `operand_recipe`) stating `dimensions`, at any row count.
     pub fn launches(
         &self,
         kernel: Kernel,
+        recipe: OperandRecipe,
         dimensions: &[(&'static str, u64)],
     ) -> Result<Launches, AssessmentError> {
         Ok(Launches {
             kernel,
-            prepared: self.prepared(kernel)?,
+            prepared: self.prepared(kernel, recipe)?,
+            recipe,
             dimensions: dimensions.to_vec(),
         })
+    }
+}
+
+/// The operand recipe of products over `elements`: NVFP4 rows where any of
+/// them takes them (weights that share rows share their recipe), else the
+/// rounded rows. Element bindings change a declaration only through its
+/// `operands(W)`, so the recipe is what makes an entry's prepared
+/// specializations launch differently.
+pub fn operand_recipe(elements: impl IntoIterator<Item = Element>) -> OperandRecipe {
+    if elements
+        .into_iter()
+        .any(|element| element.operand_recipe() == OperandRecipe::Nvfp4Rows)
+    {
+        OperandRecipe::Nvfp4Rows
+    } else {
+        OperandRecipe::Rounded
     }
 }
 
@@ -178,12 +208,13 @@ impl Declarations {
 pub struct Launches {
     kernel: Kernel,
     prepared: Vec<Prepared>,
+    recipe: OperandRecipe,
     dimensions: Vec<(&'static str, u64)>,
 }
 
 impl PartialEq for Launches {
     fn eq(&self, other: &Self) -> bool {
-        self.kernel == other.kernel && self.dimensions == other.dimensions
+        self.kernel == other.kernel && self.recipe == other.recipe && self.dimensions == other.dimensions
     }
 }
 

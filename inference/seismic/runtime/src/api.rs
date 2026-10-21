@@ -468,6 +468,12 @@ pub mod device {
         pub fn info(&self) -> &Executor {
             &self.info
         }
+        /// Graphs recorded for this device's submissions so far: a
+        /// submission during which the count grew recorded one on the host,
+        /// so its duration is not its launches' alone.
+        pub fn recorded_graphs(&self) -> u64 {
+            self.native.recorded_graphs()
+        }
         /// The topology revision this device was opened in; its identifiers
         /// are the ones this device's charges and limits name.
         pub fn topology(&self) -> &Arc<DeviceTopology> {

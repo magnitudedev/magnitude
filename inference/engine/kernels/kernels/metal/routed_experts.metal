@@ -18,8 +18,38 @@
 #define KERNEL_W2 SEISMIC_EXPERT_DOWN
 #include "lib/routed/routed.h"
 
+// The rows the gate/up weights take (the normalized rows, or NVFP4 operands
+// that `routed_experts_stage` forms into `staged`), and the product rows the
+// down weights take (NVFP4 operands `routed_experts_quantize` forms in
+// place).
+constant constexpr bool EXPANSION_NVFP4 =
+    projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4>::NVFP4;
+constant constexpr bool DOWN_NVFP4 = projection::OperandRecipe<packets::W2_OPERANDS_NVFP4>::NVFP4;
+
+kernel void routed_experts_stage(
+    device const uchar *normalized [[buffer(SEISMIC_BUFFER_NORMALIZED)]],
+    device uchar *staged [[buffer(SEISMIC_BUFFER_SCRATCH_STAGED)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint item [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    PROJECTION_NORMALIZE_SHARED(maxima);
+    projection::operands<true>::form<256>(routed::activation(normalized, SEISMIC_NORMALIZED_STRIDE_0,
+        SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H)), item, staged, uint(SEISMIC_DIM_H), maxima, thread_index);
+}
+
+kernel void routed_experts_quantize(
+    device uchar *product [[buffer(SEISMIC_BUFFER_SCRATCH_PRODUCT)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint item [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    PROJECTION_NORMALIZE_SHARED(maxima);
+    projection::operands<true>::form_in_place<256, routed::Act>(
+        product + ulong(item) * SEISMIC_DIM_F * routed::Act::bytes, uint(SEISMIC_DIM_F), maxima, thread_index);
+}
+
 kernel void routed_experts_expand(
     device const uchar *normalized [[buffer(SEISMIC_BUFFER_NORMALIZED)]],
+    device const uchar *staged [[buffer(SEISMIC_BUFFER_SCRATCH_STAGED)]],
     device const int *order [[buffer(SEISMIC_BUFFER_ORDER)]],
     device const int *blocks [[buffer(SEISMIC_BUFFER_BLOCKS)]],
     device const uchar *expert_gate [[buffer(SEISMIC_BUFFER_EXPERT_GATE)]],
@@ -41,7 +71,8 @@ kernel void routed_experts_expand(
     const uint tm = uint(group.y % subtiles);
     const int expert = blocks[block * SEISMIC_BLOCKS_STRIDE_0];
     if (expert < 0) return;
-    const routed::Grouped in{normalized, SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1,
+    const routed::Grouped in{EXPANSION_NVFP4 ? staged : normalized,
+        EXPANSION_NVFP4 ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0, EXPANSION_NVFP4 ? 1 : SEISMIC_NORMALIZED_STRIDE_1,
         uint(SEISMIC_DIM_H), order + block * SEISMIC_ORDER_STRIDE_0, SEISMIC_ORDER_STRIDE_1};
     const auto gate = routed::weights<packets::W0>(expert_gate, KERNEL_W0_LAYOUT(SEISMIC_DIM_H),
         routed::expert_row(ulong(expert), SEISMIC_DIM_F), SEISMIC_DIM_H);

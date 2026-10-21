@@ -15,6 +15,8 @@ use seismic_lang::{
     types::DType,
 };
 
+mod operands;
+
 const H: usize = 64;
 const E: usize = 32;
 const K: usize = 4;
@@ -1108,6 +1110,38 @@ struct Routed {
     /// the absent ports).
     gate_scale: Vec<f32>,
     up_scale: Vec<f32>,
+    /// Whether the expert and shared gate/up and down weights take their
+    /// rows as NVFP4 operands (`operands::operand_rows`).
+    nvfp4: Nvfp4Weights,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Nvfp4Weights {
+    expert_gate_up: bool,
+    expert_down: bool,
+    shared_gate_up: bool,
+    shared_down: bool,
+}
+
+impl Nvfp4Weights {
+    /// The recipes of weights of the representations (expert gate, up and
+    /// down; shared gate, up and down) as the registry gives them.
+    fn of(representations: [&str; 6]) -> Self {
+        let nvfp4 = |name: &str| {
+            registry::representation_info(registry::representation(name).unwrap()).operands
+                == registry::OperandRecipe::Nvfp4Rows
+        };
+        let pair = |gate: &str, up: &str| {
+            assert_eq!(nvfp4(gate), nvfp4(up), "a gate and its up share their operands");
+            nvfp4(gate)
+        };
+        Self {
+            expert_gate_up: pair(representations[0], representations[1]),
+            expert_down: nvfp4(representations[2]),
+            shared_gate_up: pair(representations[3], representations[4]),
+            shared_down: nvfp4(representations[5]),
+        }
+    }
 }
 
 /// `accumulator` times expert `expert`'s factor in `scales` (unchanged when
@@ -1159,23 +1193,34 @@ impl Routed {
         let mut expert = vec![0.0; routing.rows * k * f];
         let mut shared = vec![0.0; routing.rows * s];
         for m in 0..routing.rows {
-            let x = &routing.normalized[m * h..(m + 1) * h];
+            let normalized = &routing.normalized[m * h..(m + 1) * h];
+            let x = operands::operand_rows(normalized, h, self.nvfp4.expert_gate_up);
             for choice in 0..k {
                 let e = routing.routes[m * k + choice] as usize;
                 for feature in 0..f {
                     let row = (e * f + feature) * h;
-                    let gate = scaled(&self.gate_scale, e, dot(x, &self.expert_gate[row..row + h]));
-                    let up = scaled(&self.up_scale, e, dot(x, &self.expert_up[row..row + h]));
+                    let gate = scaled(&self.gate_scale, e, dot(&x, &self.expert_gate[row..row + h]));
+                    let up = scaled(&self.up_scale, e, dot(&x, &self.expert_up[row..row + h]));
                     expert[(m * k + choice) * f + feature] = round(silu(gate) * up);
                 }
             }
+            let x = operands::operand_rows(normalized, h, self.nvfp4.shared_gate_up);
             for feature in 0..s {
-                let gate = dot(x, &self.shared_gate[feature * h..(feature + 1) * h]);
-                let up = dot(x, &self.shared_up[feature * h..(feature + 1) * h]);
+                let gate = dot(&x, &self.shared_gate[feature * h..(feature + 1) * h]);
+                let up = dot(&x, &self.shared_up[feature * h..(feature + 1) * h]);
                 shared[m * s + feature] = round(silu(gate) * up);
             }
         }
         (expert, shared)
+    }
+
+    /// Each choice's product row and each shared product row as its down
+    /// projection takes it.
+    fn down_rows(&self, expert: &[f32], shared: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        (
+            operands::operand_rows(expert, self.features, self.nvfp4.expert_down),
+            operands::operand_rows(shared, self.shared, self.nvfp4.shared_down),
+        )
     }
 
     fn output(
@@ -1186,6 +1231,7 @@ impl Routed {
         round: fn(f32) -> f32,
     ) -> Vec<f32> {
         let (h, k, f, s) = (self.hidden, self.choices, self.features, self.shared);
+        let (expert, shared) = &self.down_rows(expert, shared);
         let mut value = vec![0.0; routing.rows * h];
         for m in 0..routing.rows {
             for column in 0..h {
@@ -1214,6 +1260,7 @@ impl Routed {
     /// path, so each contributes one bf16 ulp at its weight.
     fn publication_slack(&self, routing: &Routing, expert: &[f32], shared: &[f32]) -> Vec<f32> {
         let (h, k, f, s) = (self.hidden, self.choices, self.features, self.shared);
+        let (expert, shared) = &self.down_rows(expert, shared);
         let mut slack = vec![0.0; routing.rows * h];
         for m in 0..routing.rows {
             for column in 0..h {
@@ -1331,6 +1378,7 @@ fn host_reference_matches_portable_decode_body() {
         shared_down: block.shared_down.clone(),
         gate_scale: Vec::new(),
         up_scale: Vec::new(),
+        nvfp4: Nvfp4Weights::default(),
     };
     let routing = Routing {
         rows: block.rows,
@@ -1659,6 +1707,8 @@ enum Experts {
     Coded,
     /// Gate and up nvfp4g16, down q5g32s (Q5_0).
     Fp4,
+    /// Fp4 calibrated for FP4 activations: gate and up nvfp4g16a4.
+    Fp4A4,
     /// Vector codes: gate and down iq2xs (IQ2_XS), up iq3xxs (IQ3_XXS).
     Grid,
     /// Nemotron 3.5 Bolt's vector codes: every expert and shared weight
@@ -1702,24 +1752,20 @@ impl PackedBlock {
             Self::SHARED as u64,
         );
         // The representations of gate, up and down.
+        let representations = match experts {
+            Experts::Packed => ["q4k", "q4k", "q5k"],
+            Experts::Iq4 => ["iq4g32"; 3],
+            Experts::Iq4Blocks => ["iq4g32s"; 3],
+            Experts::Bf16 => ["bf16"; 3],
+            Experts::Coded => ["q4g32s", "mxfp4g32", "q5g32"],
+            Experts::Fp4 => ["nvfp4g16", "nvfp4g16", "q5g32s"],
+            Experts::Fp4A4 => ["nvfp4g16a4", "nvfp4g16a4", "q5g32s"],
+            Experts::Grid => ["iq2xs", "iq3xxs", "iq2xs"],
+            Experts::Iq2Xxs => ["iq2xxs"; 3],
+        };
         let expert_weight = |which: usize, shape: &[u64], seed: u32| match experts {
-            Experts::Packed => packed_weight(device, ["q4k", "q4k", "q5k"][which], shape, seed),
-            Experts::Iq4 => packed_weight(device, "iq4g32", shape, seed),
-            Experts::Iq4Blocks => packed_weight(device, "iq4g32s", shape, seed),
             Experts::Bf16 => bf16_weight(device, shape, seed),
-            Experts::Coded => {
-                packed_weight(device, ["q4g32s", "mxfp4g32", "q5g32"][which], shape, seed)
-            }
-            Experts::Fp4 => packed_weight(
-                device,
-                ["nvfp4g16", "nvfp4g16", "q5g32s"][which],
-                shape,
-                seed,
-            ),
-            Experts::Grid => {
-                packed_weight(device, ["iq2xs", "iq3xxs", "iq2xs"][which], shape, seed)
-            }
-            Experts::Iq2Xxs => packed_weight(device, "iq2xxs", shape, seed),
+            _ => packed_weight(device, representations[which], shape, seed),
         };
         let (expert_gate, gate) = expert_weight(0, &[e, f, h], 41);
         let (expert_up, up) = expert_weight(1, &[e, f, h], 42);
@@ -1745,6 +1791,14 @@ impl PackedBlock {
                 shared_down: sdown,
                 gate_scale: Vec::new(),
                 up_scale: Vec::new(),
+                nvfp4: Nvfp4Weights::of([
+                    representations[0],
+                    representations[1],
+                    representations[2],
+                    shared,
+                    shared,
+                    shared,
+                ]),
             },
             expert_gate,
             expert_up,
@@ -2034,7 +2088,7 @@ fn native_decode_expand_and_output_match_reference_with_iq2_xxs_experts() {
 #[test]
 fn native_decode_expand_and_output_match_reference_with_coded_experts() {
     for device in devices() {
-        for experts in [Experts::Coded, Experts::Fp4, Experts::Grid] {
+        for experts in [Experts::Coded, Experts::Fp4, Experts::Fp4A4, Experts::Grid] {
             native_decode_expand_and_output_match_reference_rows(
                 &device,
                 PackedBlock::new(&device, experts),
@@ -2455,18 +2509,20 @@ fn native_grouped_prefill_matches_reference() {
 #[test]
 fn native_routed_experts_match_reference_with_nvfp4_experts() {
     for device in devices() {
-        native_decode_expand_and_output_match_reference_rows(
-            &device,
-            PackedBlock::new(&device, Experts::Fp4).scaled(),
-            false,
-            &[1, 3, 8],
-            decode_mappings(&device),
-        );
-        for block in [
-            PackedBlock::new(&device, Experts::Fp4),
-            PackedBlock::new(&device, Experts::Fp4).scaled(),
-        ] {
-            native_grouped_prefill_matches_reference_on(&device, block, false, 0);
+        for experts in [Experts::Fp4, Experts::Fp4A4] {
+            native_decode_expand_and_output_match_reference_rows(
+                &device,
+                PackedBlock::new(&device, experts).scaled(),
+                false,
+                &[1, 3, 8],
+                decode_mappings(&device),
+            );
+            for block in [
+                PackedBlock::new(&device, experts),
+                PackedBlock::new(&device, experts).scaled(),
+            ] {
+                native_grouped_prefill_matches_reference_on(&device, block, false, 0);
+            }
         }
     }
 }
@@ -2789,6 +2845,7 @@ impl Qwen35b {
                 shared_down: sdown,
                 gate_scale: Vec::new(),
                 up_scale: Vec::new(),
+                nvfp4: Nvfp4Weights::of(["q4k", "q4k", "q5k", "q8g32s", "q8g32s", "q8g32s"]),
             },
             slot,
             norm: pattern(h, 11, 0.5)

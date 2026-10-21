@@ -1227,7 +1227,63 @@ impl Repr {
     }
 }
 
+/// How a matrix product over a weight element takes its activation operands
+/// (docs/precision.md, "NVFP4 operands"). It is the weight's, as its
+/// producer calibrated it: NVFP4 weights are W4A16 or W4A4 (NVIDIA's
+/// `W4A16_NVFP4` and `NVFP4`), one storage with two elements, so every
+/// backend computes the element's one recipe and FP4 tensor operations
+/// compute W4A4 natively.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OperandRecipe {
+    /// The activation element as it is rounded to `A`.
+    Rounded,
+    /// Each row in 16-value blocks of E2M1 codes with UE4M3 block scales
+    /// under the row's power-of-two global scale.
+    Nvfp4Rows,
+}
+
+impl OperandRecipe {
+    /// Every recipe, in order of its code.
+    pub const ALL: [Self; 2] = [Self::Rounded, Self::Nvfp4Rows];
+
+    /// The recipe as native declarations and sources read it
+    /// (`operands(W)`): 0 rounded, 1 NVFP4 rows.
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::Rounded => 0,
+            Self::Nvfp4Rows => 1,
+        }
+    }
+
+    /// What names an element of this recipe after its storage: nothing for
+    /// the rounded activation, `a4` for NVFP4 rows (`nvfp4g16a4`).
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            Self::Rounded => "",
+            Self::Nvfp4Rows => "a4",
+        }
+    }
+}
+
 impl Repr {
+    /// The operand recipes of this representation's elements: every
+    /// representation multiplies the rounded activation, and NVFP4 (E2M1
+    /// codes in 16-value groups under UE4M3 scales) also has its W4A4
+    /// element, whose activation side is the same format.
+    pub(crate) fn operand_recipes(&self) -> &'static [OperandRecipe] {
+        match (self.float_code, &self.coefficients, self.group) {
+            (
+                Some(FloatCodeFormat::E2M1),
+                Coefficients::BlockFloat {
+                    format: FloatCodeFormat::UE4M3,
+                    ..
+                },
+                16,
+            ) => &[OperandRecipe::Rounded, OperandRecipe::Nvfp4Rows],
+            _ => &[OperandRecipe::Rounded],
+        }
+    }
+
     pub(crate) fn storage_group(&self) -> u32 {
         match self.coefficients {
             Coefficients::Direct { packet_group, .. } => packet_group,

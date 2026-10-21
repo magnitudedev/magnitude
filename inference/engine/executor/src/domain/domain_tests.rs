@@ -470,6 +470,9 @@ impl ProgramFamily for TestFamily {
     fn head_is_bound(&self) -> bool {
         false
     }
+    fn recorded_graphs(&self) -> u64 {
+        0
+    }
     fn vision_is_bound(&self) -> bool {
         false
     }
@@ -936,6 +939,7 @@ fn pending_head_and_vision_device_failures_consume_the_bindings() {
         steps: 0,
         submission: PendingFailureSubmission::<CompletedHeadWork>::new(head_control.clone()).into(),
         started: Instant::now(),
+        recorded_graphs: 0,
         launch_trace: None,
         bindings,
     };
@@ -955,6 +959,7 @@ fn pending_head_and_vision_device_failures_consume_the_bindings() {
         image: ImageRef::new(vision_domain.resource_identity().clone(), 1).unwrap(),
         submission: PendingFailureSubmission::<CompletedVisionWork>::new(vision_control.clone()),
         started: Instant::now(),
+        recorded_graphs: 0,
         bindings,
     };
     assert!(!vision.completion().is_complete());
@@ -989,6 +994,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             committed_rows: 0,
             kind: WorkKind::Decode,
             physical_duration: Duration::ZERO,
+            replayed: true,
             image: None,
         })
         .unwrap();
@@ -1016,6 +1022,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             committed_rows: 0,
             kind: WorkKind::Prefill,
             physical_duration: Duration::ZERO,
+            replayed: true,
             image: Some(image),
         })
         .unwrap();
@@ -1202,6 +1209,7 @@ fn reconcile_encode<F: ProgramFamily>(
                 committed_rows: 0,
                 kind: WorkKind::Prefill,
                 physical_duration: Duration::ZERO,
+                replayed: true,
                 image: Some(image),
             },
             PhysicalDecision { accepted_rows: 0 },

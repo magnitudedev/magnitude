@@ -156,7 +156,7 @@ impl WeightDescriptor {
                     }
                     shape.remove(0);
                 }
-                ImportTransform::ScaleByTensor { tensor } => {
+                ImportTransform::ScaleByTensor { tensor, .. } => {
                     if tensor.is_empty() || *tensor == self.name {
                         return Err(DefinitionError::new(format!(
                             "scale tensor of {:?} must name another stored tensor",
@@ -215,8 +215,12 @@ pub enum ImportTransform {
     /// stack) by the matching element of the stored F32 tensor `tensor`,
     /// shaped `[1]` or `[stack]`. A container format's second-level scale
     /// (NVFP4) stays a separate factor of the resident weight, so it is exact
-    /// for block encodings too.
-    ScaleByTensor { tensor: String },
+    /// for block encodings too. `activations` is how the weight's producer
+    /// calibrated its products' activations.
+    ScaleByTensor {
+        tensor: String,
+        activations: ScaledActivations,
+    },
     /// One plane of a symmetric 32-value code matrix (the last
     /// transform; `ProgressivePlane`).
     Progressive {
@@ -244,6 +248,18 @@ impl ProgressiveCodeDepth {
     pub const fn coarse_bits(self) -> u8 {
         self.bits() / 2
     }
+}
+
+/// The activations a second-level-scaled (NVFP4) weight's products take, as
+/// its producer calibrated them: NVIDIA's `W4A16_NVFP4` stores the weight
+/// and its scale, its `NVFP4` (W4A4) also the activation scale
+/// `<stem>.input_scale` (docs/precision.md, "NVFP4 operands").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ScaledActivations {
+    /// The activation as it is rounded (W4A16).
+    Rounded,
+    /// The activation's rows as NVFP4 operands (W4A4).
+    Nvfp4,
 }
 
 /// The progressive placement of a matrix `[rows, columns]`: its
@@ -303,7 +319,13 @@ impl std::hash::Hash for ImportTransform {
             Self::PermuteRows { order } => order.hash(state),
             Self::Scale { factor } => factor.to_bits().hash(state),
             Self::Flatten | Self::DropUnitAxis => {}
-            Self::ScaleByTensor { tensor } => tensor.hash(state),
+            Self::ScaleByTensor {
+                tensor,
+                activations,
+            } => {
+                tensor.hash(state);
+                activations.hash(state);
+            }
             Self::Progressive { plane, depth } => {
                 plane.hash(state);
                 depth.hash(state);
@@ -1367,6 +1389,7 @@ mod tests {
             shape: vec![2, 4, 8],
             transforms: vec![ImportTransform::ScaleByTensor {
                 tensor: "experts.scale".into(),
+                activations: ScaledActivations::Rounded,
             }],
         };
         assert_eq!(scaled.transformed_shape(&[2, 4, 8]).unwrap(), [2, 4, 8]);

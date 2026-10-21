@@ -366,6 +366,11 @@ where
 }
 
 impl AttestedPrograms {
+    /// Graphs the programs' device has recorded for submissions so far.
+    pub(crate) fn recorded_graphs(&self) -> u64 {
+        self.owner.device().recorded_graphs()
+    }
+
     pub fn readout_choices(&self) -> &[crate::ReadoutClassChoice] {
         &self.readout_choices
     }

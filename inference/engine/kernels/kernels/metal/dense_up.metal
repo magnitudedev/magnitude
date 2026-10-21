@@ -6,6 +6,11 @@
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
+// The up weight's operand rows (the normalized rows, or NVFP4 operands):
+// the GEMV row classes form them while staging, the normalize launch into
+// the GEMM's scratch.
+constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
+typedef projection::operands<NVFP4> Operands;
 
 #define DENSE_UP_ARGUMENTS                                                              \
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],                   \
@@ -38,8 +43,10 @@ kernel void dense_up_gemv(DENSE_UP_ARGUMENTS,
     DENSE_UP_OPERANDS;
     uint rows = uint(SEISMIC_DIM_O);
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    const auto x = projection::shared_norm(in, squares);
+    const auto x = Operands::rows(projection::shared_norm(in, squares), rows, uint(SEISMIC_DIM_H), globals,
+        simdgroups, sg, lane);
     PROJECTION_FOR_ROWS(rows,
         projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
             x, out, up, rows, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared, simdgroups, sg, lane));
@@ -56,8 +63,10 @@ kernel void dense_up_batch(DENSE_UP_ARGUMENTS,
     uint lane [[thread_index_in_simdgroup]]) {
     DENSE_UP_OPERANDS;
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);
     projection::threadgroup_squares_runtime(in, uint(SEISMIC_DIM_O), squares, simdgroups, sg, lane);
-    const auto x = projection::shared_norm(in, squares);
+    const auto x = Operands::rows(projection::shared_norm(in, squares), uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H),
+        globals, simdgroups, sg, lane);
     projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(x, out, up, uint(SEISMIC_DIM_O),
         uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared, simdgroups, sg, lane);
 }
@@ -69,7 +78,7 @@ kernel void dense_up_normalize(DENSE_UP_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
     DENSE_UP_OPERANDS;
-    projection::device_normalize<256>(in, item, normalized, uint(SEISMIC_DIM_H), norms, thread_index);
+    Operands::normalize<256>(in, item, normalized, uint(SEISMIC_DIM_H), norms, thread_index);
 }
 #endif
 

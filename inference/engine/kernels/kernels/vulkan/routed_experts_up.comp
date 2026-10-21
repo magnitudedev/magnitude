@@ -23,11 +23,26 @@
 #else
 #error "routed_experts_up requires a bf16 or f16 activation"
 #endif
+// The rows the up weights take (the normalized rows, or NVFP4 operands that
+// `routed_experts_up_stage` forms into `staged`), and the product rows the
+// down weights take (NVFP4 operands `routed_experts_up_quantize` forms in
+// place).
 
 #define EXPERTS_TM SEISMIC_TUNE_TILE_M
 #define EXPERTS_TN SEISMIC_TUNE_TILE_N
 #define EXPERTS_WM SEISMIC_TUNE_SUB_M
 #define EXPERTS_WN SEISMIC_TUNE_SUB_N
+
+void routed_experts_up_stage() {
+    projection_stage(projection_operands(projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
+        SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H), 0ul),
+        PROJECTION_OPERANDS_NVFP4), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED), uint(SEISMIC_DIM_H));
+}
+
+void routed_experts_up_quantize() {
+    projection_form_in_place(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT)
+        + uint64_t(gl_WorkGroupID.x) * SEISMIC_DIM_F * uint64_t(ELEMENT_BYTES(ROUTED_ACT)), uint(SEISMIC_DIM_F));
+}
 
 void routed_experts_up_expand() {
     const uint64_t tile_rows = SEISMIC_DIM_T;
@@ -39,8 +54,13 @@ void routed_experts_up_expand() {
         return;
     const uint hidden = uint(SEISMIC_DIM_H);
     const uint64_t order = SEISMIC_PTR(SEISMIC_BUFFER_ORDER) + block * SEISMIC_ORDER_STRIDE_0 * 4ul;
+#if defined(SEISMIC_EXPERT_UP_OPERANDS_NVFP4)
+    const projection_prologue x = projection_grouped(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED),
+        SEISMIC_DIM_H, 1ul, hidden, order, SEISMIC_ORDER_STRIDE_1);
+#else
     const projection_prologue x = projection_grouped(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
         SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, order, SEISMIC_ORDER_STRIDE_1);
+#endif
     const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), PACKETS_W0_STACKED_ROWS,
         routed_expert_row(uint64_t(expert), SEISMIC_DIM_F), hidden);
     const projection_epilogue out_ = projection_scaled(projection_activated(ROUTED_ACT,

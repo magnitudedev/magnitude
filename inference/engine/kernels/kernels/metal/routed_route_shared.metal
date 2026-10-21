@@ -15,6 +15,10 @@
 // The shared rows run `routed_expand`'s paired GEMV, which packs 16-bit
 // activations (`lib/routed/routed.h`); F32 activations take `routed_route`.
 static_assert(element::Act::bytes == 2, "routed_route_shared requires a bf16 or f16 activation element");
+// The rows the shared gate/up weights take (the normalized rows, or NVFP4
+// operands), formed while the shared GEMV stages them.
+constant constexpr bool SHARED_NVFP4 =
+    projection::OperandRecipe<packets::W1_OPERANDS_NVFP4, packets::W2_OPERANDS_NVFP4>::NVFP4;
 
 kernel void routed_route_shared(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
@@ -51,8 +55,10 @@ kernel void routed_route_shared(
     const projection::Weights<packets::W2> up{shared_up, KERNEL_W2_LAYOUT(k), k, nullptr};
     const projection::SiluMul<Act> out{shared_product, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1};
     const uint rows = uint(SEISMIC_DIM_M);
+    PROJECTION_OPERANDS_SHARED(globals, SHARED_NVFP4);
+    const auto x = projection::operands<SHARED_NVFP4>::rows(in, rows, k, globals, SEISMIC_TUNE_SIMDGROUPS, simd, lane);
     PROJECTION_FOR_ROWS(rows,
-        (projection::gemv_paired_runtime<packets::W1, packets::W2, SEISMIC_TUNE_ROWS, MAXM, SEISMIC_TUNE_LANES>(in,
+        (projection::gemv_paired_runtime<packets::W1, packets::W2, SEISMIC_TUNE_ROWS, MAXM, SEISMIC_TUNE_LANES>(x,
             out, gate, up, rows, SEISMIC_DIM_S, k, group - route_groups, shared, SEISMIC_TUNE_SIMDGROUPS, simd,
             lane)));
 }

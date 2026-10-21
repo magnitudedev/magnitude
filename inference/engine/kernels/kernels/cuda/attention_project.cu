@@ -9,7 +9,11 @@
 
 SEISMIC_PROGRAMMATIC_DEPENDENCY
 
-using Pro = projection::Input<ELEMENT_OF(SEISMIC_INPUT_NORM), projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
+using Raw = projection::Input<ELEMENT_OF(SEISMIC_INPUT_NORM), projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
+using Pro = projection::Operands<
+    projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4, packets::W2_OPERANDS_NVFP4,
+                              packets::W3_OPERANDS_NVFP4>::NVFP4,
+    Raw>;
 using Source = projection::GemvSource<Pro>;
 // A segment's result, after its weight's second-level scale where any
 // segment has a scale port (an absent port's factor is 1).
@@ -20,9 +24,11 @@ using Out = Scaling::type<Store>;
 
 #define PROLOGUE                                                                                          \
     Pro {                                                                                                 \
-        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0,      \
-            SEISMIC_PTR(SEISMIC_BUFFER_INPUT_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON),      \
-            SEISMIC_DIM_D, projection::AllRows{}                                                                  \
+        Raw {                                                                                             \
+            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0,  \
+                SEISMIC_PTR(SEISMIC_BUFFER_INPUT_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON),  \
+                SEISMIC_DIM_D, projection::AllRows{}                                                      \
+        }                                                                                                 \
     }
 #define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
 #define GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
@@ -173,7 +179,7 @@ template <unsigned INT8, unsigned OPERAND>
 __global__ void attention_project_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
     constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
-    using Operands = typename projection::GemmOperands<OPERAND>::type;
+    using Operands = projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>;
     projection::stage_projection_row<S8, Operands>(PROLOGUE, blockIdx.x, SEISMIC_DIM_M, SEISMIC_DIM_D, STAGING, GROUPS);
 }
 #endif
@@ -201,7 +207,7 @@ __global__ void attention_project_gemv16(SEISMIC_KERNEL_PARAMS) {
 template <unsigned INT8, unsigned OPERAND>
 __global__ void attention_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
-    project_gemm<projection::SmallGemm, S8, typename projection::GemmOperands<OPERAND>::type>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
+    project_gemm<projection::SmallGemm, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
                                              SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
 }
 #endif
@@ -210,7 +216,7 @@ __global__ void attention_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
 template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void attention_project_gemm(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
-    project_gemm<projection::LargeGemm<ROTATE>, S8, typename projection::GemmOperands<OPERAND>::type>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
+    project_gemm<projection::LargeGemm<ROTATE>, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
                                                        SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
 }
 #endif

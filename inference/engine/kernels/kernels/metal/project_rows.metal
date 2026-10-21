@@ -6,9 +6,15 @@
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_ELEMENT_Y) published;
+// The weight's operand rows (the source rows, or NVFP4 operands): the GEMV
+// row classes form them while staging, the stage launch into the scratch
+// every other form reads.
+constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
+typedef projection::operands<NVFP4> Operands;
 
 #define PROJECT_ROWS_ARGUMENTS                                                          \
     device const uchar *source [[buffer(SEISMIC_BUFFER_SOURCE)]],                       \
+    device uchar *staged [[buffer(SEISMIC_BUFFER_SCRATCH_STAGED)]],                     \
     device const uchar *weight [[buffer(SEISMIC_BUFFER_WEIGHT)]],                       \
     device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],                 \
@@ -23,10 +29,14 @@ typedef ELEMENT_OF(SEISMIC_ELEMENT_Y) published;
     device const float *weight_bound [[buffer(SEISMIC_BUFFER_WEIGHT_BOUND)]],           \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
+// `raw` is the source rows; `in` the rows every form past the GEMV reads.
 #define PROJECT_ROWS_OPERANDS                                                           \
     const uint k = uint(SEISMIC_DIM_K);                                                 \
-    projection::Plain<activation, projection::AllRows> in{source, SEISMIC_SOURCE_STRIDE_0, \
+    const projection::Plain<activation, projection::AllRows> raw{source, SEISMIC_SOURCE_STRIDE_0, \
         SEISMIC_SOURCE_STRIDE_1, k, {}};                                                \
+    const projection::Plain<activation, projection::AllRows> in = NVFP4                 \
+        ? projection::Plain<activation, projection::AllRows>{staged, k, 1, k, {}}       \
+        : raw;                                                                          \
     const auto out = projection::scaling<(SEISMIC_DIM_WS != 0)>::wrap(                  \
         projection::Store<published>{result, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0}, \
         projection::scale_factor(weight_scale, SEISMIC_DIM_WS, 0, 0), 1.0f);            \
@@ -42,9 +52,22 @@ kernel void project_rows_gemv(PROJECT_ROWS_ARGUMENTS,
     uint lane [[thread_index_in_simdgroup]]) {
     PROJECT_ROWS_OPERANDS;
     uint rows = uint(SEISMIC_DIM_M);
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);
+    const auto x = Operands::rows(raw, rows, k, globals, simdgroups, sg, lane);
     PROJECTION_FOR_ROWS(rows,
         projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
-            in, out, w, rows, uint(SEISMIC_DIM_N), k, tile, shared, simdgroups, sg, lane));
+            x, out, w, rows, uint(SEISMIC_DIM_N), k, tile, shared, simdgroups, sg, lane));
+}
+#endif
+
+// The source rows as NVFP4 operands into `staged`, one row a threadgroup.
+#ifdef SEISMIC_FORMING_PROJECT_ROWS_STAGE
+kernel void project_rows_stage(PROJECT_ROWS_ARGUMENTS,
+    uint item [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    PROJECTION_NORMALIZE_SHARED(maxima);
+    PROJECT_ROWS_OPERANDS;
+    projection::operands<true>::form<256>(raw, item, staged, k, maxima, thread_index);
 }
 #endif
 

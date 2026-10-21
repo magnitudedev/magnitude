@@ -2459,7 +2459,7 @@ impl<F: ProgramFamily> Service<F> {
             record.add_physical_duration(item.physical_duration());
             let state = match state {
                 Membership::Started(mut started) if !ended(started.generation()) => {
-                    started.timed(TimedLaunch::Target, item.physical_duration(), sequences, rows);
+                    started.timed(TimedLaunch::Target, item.launch_duration(), sequences, rows);
                     match reconcile_forward(started, &mut self.domain, request, item) {
                         Ok((generation, effects)) => {
                             followups.extend(effects.operations);
@@ -2561,7 +2561,7 @@ impl<F: ProgramFamily> Service<F> {
                 } else {
                     TimedLaunch::Draft
                 };
-                generation.timed(launch, item.physical_duration(), sequences, rows);
+                generation.timed(launch, item.launch_duration(), sequences, rows);
             }
             let transition = match generation.prepare_method_transition(operation, item.outcome()) {
                 Ok(transition) => transition,

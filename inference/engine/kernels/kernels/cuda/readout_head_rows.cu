@@ -9,16 +9,19 @@
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.cuh"
 
-using Pro = projection::Input<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
+using Raw = projection::Input<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
+using Pro = projection::Operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4, Raw>;
 using Source = projection::GemvSource<Pro>;
 using Scaling = projection::scaling<(SEISMIC_DIM_WS != 0)>;
 using Epi = Scaling::type<projection::Logits>;
 
-#define PROLOGUE                                                                                              \
-    Pro {                                                                                                     \
-        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0,          \
-            SEISMIC_PTR(SEISMIC_BUFFER_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON), SEISMIC_DIM_D, \
-            projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))}             \
+#define PROLOGUE                                                                                                  \
+    Pro {                                                                                                         \
+        Raw {                                                                                                     \
+            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0,          \
+                SEISMIC_PTR(SEISMIC_BUFFER_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON), SEISMIC_DIM_D, \
+                projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))}     \
+        }                                                                                                         \
     }
 #define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
 #define HEAD KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT))
@@ -54,7 +57,7 @@ __device__ __forceinline__ void head_gemm(const projection::u8 *staged, unsigned
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_STAGE
 template <unsigned OPERAND>
 __global__ void readout_head_rows_stage(SEISMIC_KERNEL_PARAMS) {
-    projection::stage_projection_row<false, typename projection::GemmOperands<OPERAND>::type>(PROLOGUE, blockIdx.x, SEISMIC_DIM_O, SEISMIC_DIM_D, STAGING, nullptr);
+    projection::stage_projection_row<false, projection::GemmOperandsOf<OPERAND, packets::W0>>(PROLOGUE, blockIdx.x, SEISMIC_DIM_O, SEISMIC_DIM_D, STAGING, nullptr);
 }
 #endif
 
@@ -77,14 +80,14 @@ __global__ void readout_head_rows_gemv16(SEISMIC_KERNEL_PARAMS) {
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMM_SMALL
 template <unsigned OPERAND>
 __global__ void readout_head_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
-    head_gemm<projection::SmallGemm, typename projection::GemmOperands<OPERAND>::type>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
+    head_gemm<projection::SmallGemm, projection::GemmOperandsOf<OPERAND, packets::W0>>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMM
 template <unsigned OPERAND, unsigned ROTATE>
 __global__ void readout_head_rows_gemm(SEISMIC_KERNEL_PARAMS) {
-    head_gemm<projection::LargeGemm<ROTATE>, typename projection::GemmOperands<OPERAND>::type>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD,
+    head_gemm<projection::LargeGemm<ROTATE>, projection::GemmOperandsOf<OPERAND, packets::W0>>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD,
                                              EPILOGUE);
 }
 #endif

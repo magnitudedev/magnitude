@@ -5,6 +5,11 @@
 #define KERNEL_W0 SEISMIC_EXPERT_UP
 #include "lib/routed/routed.h"
 
+// The up weight's operand row (the normalized row, or NVFP4 operands),
+// formed while the GEMV stages it.
+constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
+typedef projection::operands<NVFP4> Operands;
+
 #ifdef SEISMIC_FORMING_ROUTED_UP
 template <uint ROWS, uint LANES>
 kernel void routed_up(
@@ -33,7 +38,9 @@ kernel void routed_up(
         projection::Activated<A>{product + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * A::bytes,
             0, SEISMIC_RESULT_0_STRIDE_2, int(SEISMIC_PARAM_ACTIVATION)},
         projection::scale_factor(up_scale, SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, expert), 1.0f);
-    projection::gemv_runtime<packets::W0, ROWS, 1, LANES>(in, out, up, 1, SEISMIC_DIM_F, SEISMIC_DIM_H, tile,
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);
+    const auto x = Operands::rows(in, 1u, uint(SEISMIC_DIM_H), globals, simdgroups, sg, lane);
+    projection::gemv_runtime<packets::W0, ROWS, 1, LANES>(x, out, up, 1, SEISMIC_DIM_F, SEISMIC_DIM_H, tile,
         shared, simdgroups, sg, lane);
 }
 #endif

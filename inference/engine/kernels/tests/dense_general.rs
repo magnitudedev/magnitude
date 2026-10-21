@@ -221,14 +221,15 @@ const fn scoped(name: &'static str, launch: usize, value: u64) -> Param {
 }
 
 /// The declaration indices of an entry's tuned launches: Metal's GEMV,
-/// batched GEMV and GEMM, CUDA's two GEMV bands and large-band GEMM; `split`
-/// for a SPLIT parameter.
+/// batched GEMV and GEMM, CUDA's two GEMV bands (`None`: the entry declares
+/// its KSPLIT for every launch) and large-band GEMM; `split` for a SPLIT
+/// parameter.
 #[derive(Clone, Copy)]
 struct Launches {
     metal_gemv: usize,
     metal_batch: usize,
     metal_gemm: usize,
-    cuda_gemv: [usize; 2],
+    cuda_gemv: Option<[usize; 2]>,
     cuda_gemm: usize,
     split: bool,
 }
@@ -279,12 +280,15 @@ fn mappings(device: &seismic::Device, launches: Launches) -> Vec<Mapping> {
         seismic::BackendName::Cuda => [(0, 4, 2), (1, 2, 1), (0, 4, 4)]
             .into_iter()
             .map(|(int8, ksplit, rotate)| Mapping {
-                params: vec![
-                    entry("INT8", int8),
-                    scoped("KSPLIT", launches.cuda_gemv[0], ksplit),
-                    scoped("KSPLIT", launches.cuda_gemv[1], ksplit),
-                    scoped("ROTATE", launches.cuda_gemm, rotate),
-                ],
+                params: [entry("INT8", int8), scoped("ROTATE", launches.cuda_gemm, rotate)]
+                    .into_iter()
+                    .chain(match launches.cuda_gemv {
+                        Some([first, second]) => {
+                            vec![scoped("KSPLIT", first, ksplit), scoped("KSPLIT", second, ksplit)]
+                        }
+                        None => vec![entry("KSPLIT", ksplit)],
+                    })
+                    .collect(),
                 int8: int8 == 1,
             })
             .collect(),
@@ -378,11 +382,12 @@ fn project_rows_specialization(
         .with_param("TALL", 0)
         .with_param("PACK", 0)
         .with_param("RESIDUE", 1)
-        .with_launch_param(7, "TALL_M", 128)
-        .with_launch_param(7, "TALL_K", 64)
-        .with_launch_param(7, "STAGERS", 2)
-        .with_launch_param(10, "PACK_TOKENS", 4)
-        .with_launch_param(10, "WEIGHTS_AHEAD", 0)
+        .with_launch_param(2, "BATCH_PARTS", 2)
+        .with_launch_param(8, "TALL_M", 128)
+        .with_launch_param(8, "TALL_K", 64)
+        .with_launch_param(8, "STAGERS", 2)
+        .with_launch_param(11, "PACK_TOKENS", 4)
+        .with_launch_param(11, "WEIGHTS_AHEAD", 0)
 }
 
 /// Row classes: Metal GEMV / batched GEMV / small GEMM / GEMM, CUDA GEMV /
@@ -794,9 +799,9 @@ fn portable_entries_match_host_reference() {
 fn native_project_rows_matches_host_reference() {
     let launches = Launches {
         metal_gemv: 0,
-        metal_batch: 1,
-        metal_gemm: 4,
-        cuda_gemv: [1, 2],
+        metal_batch: 2,
+        metal_gemm: 5,
+        cuda_gemv: Some([1, 2]),
         cuda_gemm: 4,
         split: true,
     };
@@ -887,7 +892,7 @@ fn native_dense_up_matches_host_reference() {
         metal_gemv: 1,
         metal_batch: 2,
         metal_gemm: 4,
-        cuda_gemv: [1, 2],
+        cuda_gemv: None,
         cuda_gemm: 4,
         split: false,
     };
@@ -966,7 +971,7 @@ fn native_short_conv_project_matches_host_reference() {
         metal_gemv: 1,
         metal_batch: 2,
         metal_gemm: 4,
-        cuda_gemv: [1, 2],
+        cuda_gemv: Some([1, 2]),
         cuda_gemm: 4,
         split: false,
     };
@@ -1046,7 +1051,7 @@ fn native_per_layer_gate_matches_host_reference() {
         metal_gemv: 1,
         metal_batch: 2,
         metal_gemm: 4,
-        cuda_gemv: [1, 2],
+        cuda_gemv: Some([1, 2]),
         cuda_gemm: 4,
         split: false,
     };

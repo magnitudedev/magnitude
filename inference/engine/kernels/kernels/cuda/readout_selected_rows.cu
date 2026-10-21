@@ -7,19 +7,15 @@
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.cuh"
 
+// The weight's operand rows of the final RMS rows, as A, into scratch.
 extern "C" __global__ void readout_selected_rows_stage(SEISMIC_KERNEL_PARAMS) {
-    using Pro = projection::Input<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
-    __shared__ float factors[1];
-    __shared__ float scratch[32];
-    const unsigned row = blockIdx.x;
-    const Pro pro{reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0,
-                  SEISMIC_PTR(SEISMIC_BUFFER_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON), SEISMIC_DIM_D,
-                  projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))}};
-    pro.prepare_row(factors, row, scratch);
-    __syncthreads();
-    projection::u8 *features = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_FEATURES);
-    for (projection::u64 k = threadIdx.x; k < SEISMIC_DIM_D; k += blockDim.x)
-        element::put<element::Act>(features, row * SEISMIC_DIM_D + k, pro.value(factors, row, k));
+    using Raw = projection::Input<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
+    using Pro = projection::Operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4, Raw>;
+    const Pro pro{Raw{reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0,
+                      SEISMIC_PTR(SEISMIC_BUFFER_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON),
+                      SEISMIC_DIM_D,
+                      projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))}}};
+    projection::form_row(pro, blockIdx.x, SEISMIC_DIM_D, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_FEATURES));
 }
 
 extern "C" __global__ void readout_selected_rows_logits(SEISMIC_KERNEL_PARAMS) {

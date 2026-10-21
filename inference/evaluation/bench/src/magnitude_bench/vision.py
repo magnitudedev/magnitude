@@ -43,7 +43,10 @@ async def run(args):
                 drafting=drafting,
                 vision=True,
                 magnitude=MagnitudeOptions(
-                    binary=args.binary, kernel_cache_root=args.cache, tuning_seconds=10
+                    binary=args.binary,
+                    device=args.magnitude_device,
+                    kernel_cache_root=args.cache,
+                    tuning_seconds=10,
                 ),
             )
             adapter = Native(target, artifact, acquisition, store, options)
@@ -102,6 +105,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--cache", type=Path, required=True)
+    parser.add_argument("--magnitude-device", default=MagnitudeOptions().device)
     raise SystemExit(asyncio.run(run(parser.parse_args())))
 
 

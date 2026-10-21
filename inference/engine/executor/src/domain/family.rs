@@ -36,6 +36,9 @@ pub trait ProgramFamily: 'static {
     fn vision_is_bound(&self) -> bool;
     fn state_is_bound(&self) -> bool;
     fn unbind_optional(&mut self);
+    /// Graphs the device has recorded for submissions so far
+    /// (`seismic::Device::recorded_graphs`).
+    fn recorded_graphs(&self) -> u64;
 
     /// Physical target tensors held by the bound family. Test families with
     /// no resident model have no target charge.
@@ -167,6 +170,9 @@ impl ProgramFamily for NativeFamily {
     }
     fn head_is_bound(&self) -> bool {
         self.head.is_some()
+    }
+    fn recorded_graphs(&self) -> u64 {
+        self.programs.recorded_graphs()
     }
     fn vision_is_bound(&self) -> bool {
         self.vision.is_some()

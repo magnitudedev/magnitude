@@ -19,7 +19,7 @@ fn dense_bytes(name: &str, values: &[f32]) -> Vec<u8> {
 }
 
 /// GGUF sources and their resident representations.
-const FORMATS: [(&str, &str); 17] = [
+const FORMATS: [(&str, &str); 18] = [
     ("gguf_iq4_nl_block", "iq4g32s"),
     ("gguf_iq2_xs", "iq2xs"),
     ("gguf_iq3_xxs", "iq3xxs"),
@@ -37,6 +37,7 @@ const FORMATS: [(&str, &str); 17] = [
     ("gguf_q5_1", "q5g32"),
     ("gguf_mxfp4", "mxfp4g32"),
     ("gguf_nvfp4", "nvfp4g16"),
+    ("gguf_nvfp4", "nvfp4g16a4"),
 ];
 
 /// ggml's `dequantize_row_q3_K` for one 110-byte block, in its operation
@@ -401,6 +402,8 @@ fn own_representation_imports_match_llama_cpp_dequantization() {
         ("gguf_q5_1", "q5g32", 24, 32, 0x63c4_5260_7d3e_19d9),
         ("gguf_mxfp4", "mxfp4g32", 17, 32, 0xd827_1dd4_f8ce_c325),
         ("gguf_nvfp4", "nvfp4g16", 36, 64, 0xa417_0901_6b8f_6325),
+        // W4A4's element: the same storage, so the same bytes.
+        ("gguf_nvfp4", "nvfp4g16a4", 36, 64, 0xa417_0901_6b8f_6325),
     ] {
         let blocks = 64u64;
         let mut bytes = golden_bytes(blocks * block_bytes as u64, 12345);
@@ -570,6 +573,8 @@ fn cuda_dense_import_matches_host_for_all_nine_pairs() {
 #[cfg(target_os = "macos")]
 #[test]
 fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() {
+    // Metal's repack writes every storage of these layouts but CUDA's
+    // `records`.
     repack_matches_the_registered_conversion(
         &device(seismic::BackendName::Metal).unwrap(),
         &[
@@ -577,6 +582,7 @@ fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() 
             seismic::Layout::Mma16,
             seismic::Layout::Rows32,
         ],
+        false,
     );
 }
 
@@ -586,6 +592,7 @@ fn cuda_repack_matches_the_registered_conversion_for_every_format_and_layout() {
         repack_matches_the_registered_conversion(
             &device,
             &[seismic::Layout::Rows16, seismic::Layout::Mma16],
+            true,
         );
     }
 }
@@ -603,6 +610,7 @@ fn cpu_repack_matches_the_registered_conversion_for_every_format() {
     repack_matches_the_registered_conversion(
         &device(seismic::BackendName::Cpu).unwrap(),
         &[seismic::Layout::Rows16, seismic::Layout::Rows8],
+        false,
     );
 }
 
@@ -610,7 +618,7 @@ fn cpu_repack_matches_the_registered_conversion_for_every_format() {
 #[test]
 fn vulkan_repack_matches_the_registered_conversion_for_every_format() {
     if let Some(device) = device(seismic::BackendName::Vulkan) {
-        repack_matches_the_registered_conversion(&device, &[seismic::Layout::Rows16]);
+        repack_matches_the_registered_conversion(&device, &[seismic::Layout::Rows16], false);
     }
 }
 
@@ -655,12 +663,24 @@ fn dense_import_matches_host_for_all_nine_pairs(device: &seismic::Device) {
     }
 }
 
+/// Whether `element`'s storage holds whole `records` (CUDA's iq2xxs mma16).
+fn has_records(element: seismic::Element) -> bool {
+    use seismic_lang::registry::{self, RepresentationKind, RowPlaneContent};
+    let info = registry::representation_info(registry::representation(element.name()).unwrap());
+    matches!(&info.kind, RepresentationKind::PackedRows(rows)
+        if rows.planes.iter().any(|plane| matches!(plane.content, RowPlaneContent::Records { .. })))
+}
+
 /// K8: the native repack of every (format, layout) conversion equals the
 /// registry's host reference byte for byte, and its storage decodes to the
 /// source's values. Shapes cover a row count off the 16-row tile, several
 /// matrices, a packing axis with an odd number of q8 packets (mma16 pads
 /// rows to whole 64-column k-blocks) and a partial trailing packet.
-fn repack_matches_the_registered_conversion(device: &seismic::Device, layouts: &[seismic::Layout]) {
+fn repack_matches_the_registered_conversion(
+    device: &seismic::Device,
+    layouts: &[seismic::Layout],
+    records: bool,
+) {
     let device = device.clone();
     for (source_name, resident) in FORMATS {
         let source_element = seismic::Element::named(source_name).unwrap();
@@ -679,6 +699,9 @@ fn repack_matches_the_registered_conversion(device: &seismic::Device, layouts: &
                 .unwrap();
             for &layout in layouts {
                 let destination = seismic::Element::stored(resident, layout).unwrap();
+                if !records && has_records(destination) {
+                    continue;
+                }
                 let native = repack_weight::native_for_device_with(
                     &device,
                     repack_weight::Elements {

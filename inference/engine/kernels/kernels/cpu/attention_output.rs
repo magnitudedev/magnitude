@@ -35,6 +35,7 @@ fn attention_output_stage<L: Isa, E: Elements>(
         };
         projection::quantize(staged, q8);
     }
+    projection::operand_row(&[&cx.arg_output_weight()], staged);
 }
 
 fn attention_output_rows<L: Isa, E: Elements>(

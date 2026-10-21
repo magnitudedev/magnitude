@@ -29,6 +29,10 @@ fn short_conv_project_normalize<L: Isa, E: Elements>(
         };
         projection::quantize(normalized, q8);
     }
+    projection::operand_row(
+        &[&cx.arg_b_weight(), &cx.arg_x_weight(), &cx.arg_c_weight()],
+        normalized,
+    );
 }
 
 fn short_conv_project_rows<L: Isa, E: Elements>(

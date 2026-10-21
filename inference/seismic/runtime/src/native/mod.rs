@@ -148,6 +148,17 @@ pub(crate) struct NativeQueue {
     vulkan_replays: vulkan::VulkanReplays,
 }
 
+impl NativeQueue {
+    /// Graphs the device has recorded for submissions so far: a submission
+    /// during which it grew paid a recording, not only its launches.
+    pub(crate) fn recorded_graphs(&self) -> u64 {
+        let recorded = self.cuda_replays.recorded();
+        #[cfg(not(target_os = "macos"))]
+        let recorded = recorded + self.vulkan_replays.recorded();
+        recorded
+    }
+}
+
 /// Bytes charged to a scratch buffer that is empty or inactive: it keeps
 /// its ABI slot.
 const MINIMUM_SCRATCH_BYTES: u64 = 1;
@@ -1300,7 +1311,7 @@ impl NativePrepared {
     ) -> Result<Arc<Self>, PrepareError> {
         let backend = backend_name(&device.kind);
         let name = entry_name(module, entry);
-        let implementation = on_device(device, implementation);
+        let implementation = on_device(device, implementation).at_elements(&bindings);
         let scoped = implementation.launch_scoped();
         if scoped && !matches!(backend, BackendName::Metal | BackendName::Cuda) {
             return Err(preparation(format!(

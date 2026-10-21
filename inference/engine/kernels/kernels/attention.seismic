@@ -121,11 +121,15 @@ native attention_output for metal from "metal/attention_output.metal":
     scratch weight_factors bytes (D * (Q * W / 32) * 4) when M > 64 and PACK == 1
     scratch token_scales bytes (ceil_div(M, 128) * 128 * 4) when M > 64 and PACK == 1
     scratch weight_scales bytes (D * 4) when M > 64 and PACK == 1
+    scratch staged bytes (M * Q * W * 2) when M >= BATCH_FROM and operands(OW) == 1
     launch attention_output_gemv when M < 2:
         params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32, 8])
         threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch attention_output_stage when M >= BATCH_FROM and operands(OW) == 1:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch attention_output_batch when M >= BATCH_FROM and M <= 16:
         params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4], code arithmetic BATCH_PARTS in [2, 4, 1])
         threadgroups (ceil_div(ceil_div(D, 8) * BATCH_PARTS, BATCH_SIMDGROUPS), 1, 1)
@@ -186,10 +190,10 @@ native attention_output for cuda from "cuda/attention_output.cu":
     static (D, SN, IN, Q, W, OS)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
     where Q * W > 0 and Q * W % 64 == 0 and (OPERAND == 0 or INT8 == 0)
-    scratch staged bytes (M * Q * W * (1 + OPERAND)) when M > 16 and (INT8 == 1 or OPERAND == 1)
+    scratch staged bytes (M * Q * W * max(1 + OPERAND, 2 * operands(OW))) when (M > 1 and operands(OW) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1))
     scratch groups bytes (M * Q * W / 4) when INT8 == 1 and M > 16
     scratch partials bytes (2 * M * D * 4) when M > 16 and M <= 128
-    launch attention_output_stage when M > 16 and (INT8 == 1 or OPERAND == 1):
+    launch attention_output_stage when (M > 1 and operands(OW) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1)):
         reads (INT8, OPERAND)
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -197,6 +201,7 @@ native attention_output for cuda from "cuda/attention_output.cu":
         params (code arithmetic KSPLIT in [4, 2, 8])
         threadgroups (ceil_div(ceil_div(D, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+        shared_bytes (operands(OW) * (1 - min(1, M - 1)) * Q * W * 2)
     launch attention_output_gemv16 when M > 8 and M <= 16:
         params (code arithmetic KSPLIT in [4, 2, 8])
         threadgroups (ceil_div(ceil_div(D, 16), 8 / KSPLIT), 1, 1)
@@ -217,7 +222,9 @@ native attention_output for cuda from "cuda/attention_output.cu":
         threads_per_threadgroup (256, 1, 1)
 
 # Vulkan: the K1 projection (see `attention_project`): GEMV to 8 rows,
-# GEMM beyond with SPLIT-way split-K summed in order by `finalize`.
+# GEMM beyond with SPLIT-way split-K summed in order by `finalize`. Over
+# NVFP4 output weights the stage launch forms the gated rows' operands into
+# `staged`, which the GEMM reads.
 native attention_output for vulkan from "vulkan/attention_output.comp":
     static (D, SN, IN, Q, W, OS)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
@@ -225,9 +232,14 @@ native attention_output for vulkan from "vulkan/attention_output.comp":
             arithmetic SPLIT in [1, 2, 4])
     let GEMV_GROUPS = ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
-    let GEMV_SHARED = 256 + min(8 * ceil_div(Q * W, 32), 288) * 72
+    let GEMV_SHARED = 256 + 32 * operands(OW) + min(8 * ceil_div(Q * W, 32), 288) * 72
     where Q * W > 0 and SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch partials bytes (SPLIT * M * D * 4) when M > 8 and SPLIT > 1
+    scratch staged bytes (M * Q * W * 2) when M > 8 and operands(OW) == 1
+    launch attention_output_stage when M > 8 and operands(OW) == 1:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
     launch attention_output_gemv1 when M <= 1:
         threadgroups (GEMV_GROUPS, 1, 1)
         threads_per_threadgroup (GEMV_THREADS, 1, 1)
@@ -325,7 +337,7 @@ fn attention_project[M, D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB](
     key_scale: &tensor[KS] f32, value_scale: &tensor[VS] f32, query_bound: &tensor[QB] f32,
     gate_bound: &tensor[GB] f32, key_bound: &tensor[KB] f32, value_bound: &tensor[VB] f32)
     -> (tensor[M, Q] A, tensor[M, GR] A, tensor[M, K] A, tensor[M, V] A)
-    where Q >= 0 and GR >= 0 and K >= 0 and V >= 0 and QS >= 0 and QS <= 1 and GS >= 0 and GS <= 1 and KS >= 0 and KS <= 1 and VS >= 0 and VS <= 1 and QB >= 0 and GB >= 0 and KB >= 0 and VB >= 0 and (QB == 0 or D % QB == 0) and (GB == 0 or D % GB == 0) and (KB == 0 or D % KB == 0) and (VB == 0 or D % VB == 0) and NM >= 0 and ((NM == D and PT == 1) or (NM == 0 and PT >= 1)):
+    where Q >= 0 and GR >= 0 and K >= 0 and V >= 0 and QS >= 0 and QS <= 1 and GS >= 0 and GS <= 1 and KS >= 0 and KS <= 1 and VS >= 0 and VS <= 1 and QB >= 0 and GB >= 0 and KB >= 0 and VB >= 0 and (QB == 0 or D % QB == 0) and (GB == 0 or D % GB == 0) and (KB == 0 or D % KB == 0) and (VB == 0 or D % VB == 0) and NM >= 0 and ((NM == D and PT == 1) or (NM == 0 and PT >= 1)) and operands(QW) == operands(GW) and operands(QW) == operands(KW) and operands(QW) == operands(VW):
     let mut normalized = tensor[M, D] A
     let mut query = tensor[M, Q] A
     let mut gate = tensor[M, GR] A
@@ -491,7 +503,7 @@ native attention_project for vulkan from "vulkan/attention_project.comp":
             TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
     let GEMV_GROUPS = ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
-    let GEMV_SHARED = 256 + min(8 * ceil_div(D, 32), 288) * 72
+    let GEMV_SHARED = 256 + 32 * operands(QW) + min(8 * ceil_div(D, 32), 288) * 72
     where D > 0 and SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch normalized bytes (M * D * 2) when M > 8
     launch attention_project_stage when M > 8:

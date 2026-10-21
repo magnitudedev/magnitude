@@ -408,6 +408,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let launch_trace = self.trace_target_submission(operations);
         let started = Instant::now();
+        let recorded_graphs = self.family.recorded_graphs();
         let submission = match self.family.submit_target(launch) {
             Ok(submission) => submission,
             Err((error, launch)) => {
@@ -426,6 +427,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             runnable,
             launch_trace,
             started,
+            recorded_graphs,
             previous_selection: self.selection_read.take(),
             id: self.flight_id(),
             continuation: None,
@@ -545,6 +547,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let finish_started = Instant::now();
         let physical_duration = flight.runnable.elapsed();
+        let replayed = self.family.recorded_graphs() == flight.recorded_graphs;
         if std::env::var_os("MAGNITUDE_TRACE_FLIGHTS").is_some() {
             eprintln!(
                 "flight target duration_ms={:.3} requests={:?}",
@@ -745,6 +748,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 committed_rows,
                 kind,
                 physical_duration,
+                replayed,
                 image: None,
             });
         }

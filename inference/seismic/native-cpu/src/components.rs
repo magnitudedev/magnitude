@@ -605,7 +605,15 @@ mod tests {
         let mut bytes = first.clone();
         bytes.extend_from_slice(&second);
         let view = unsafe {
-            crate::Weights::from_tensor(bytes.as_ptr(), &[2, 5, k as u64], &[8, 1, 1], kernels)
+            crate::Weights::from_tensor(
+                bytes.as_ptr(),
+                &[2, 5, k as u64],
+                &[8, 1, 1],
+                crate::WeightOperand {
+                    kernels,
+                    nvfp4_operands: false,
+                },
+            )
         };
         for row in 0..10 {
             let (source, geometry, local) = if row < 5 {

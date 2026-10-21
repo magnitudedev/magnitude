@@ -253,6 +253,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None
         };
         let started = Instant::now();
+        let recorded_graphs = self.family.recorded_graphs();
         let submission = match self.family.submit_head(launch) {
             Ok(submission) => submission,
             Err((error, launch)) => {
@@ -265,6 +266,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let requests = metadata.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
         Ok(HeadFlight {
             started: self.service_start(&requests, started),
+            recorded_graphs,
             requests: metadata,
             steps,
             submission,
@@ -326,6 +328,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         };
         let started = Instant::now();
+        let recorded_graphs = self.family.recorded_graphs();
         let submission = match self.family.submit_head(launch) {
             Ok(submission) => submission,
             Err((error, launch)) => {
@@ -339,6 +342,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let requests = metadata.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
         Ok(HeadFlight {
             started: self.service_start(&requests, started),
+            recorded_graphs,
             requests: metadata,
             steps,
             submission,
@@ -692,6 +696,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             steps,
             submission,
             started,
+            recorded_graphs,
             launch_trace,
             bindings,
         } = flight;
@@ -832,6 +837,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     committed_rows: rows,
                     kind: WorkKind::Decode,
                     physical_duration: Duration::ZERO,
+                    replayed: false,
                     image: None,
                 },
             )
@@ -839,8 +845,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // Include the existing selection read and host materialization in
         // completed service; request timing must not omit width-dependent work.
         let duration = started.elapsed();
+        let replayed = self.family.recorded_graphs() == recorded_graphs;
         for item in &mut pending {
             item.physical_duration = duration;
+            item.replayed = replayed;
         }
         self.begin_host_turn(pending.iter().map(|item| item.request));
         Ok((pending, bindings))

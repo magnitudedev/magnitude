@@ -62,6 +62,13 @@ pub(crate) struct VulkanReplays {
     costs: Arc<LaunchCosts<LaunchKind>>,
 }
 
+impl VulkanReplays {
+    /// Graphs recorded so far.
+    pub(crate) fn recorded(&self) -> u64 {
+        self.graphs.recorded()
+    }
+}
+
 /// One sealed submission's launches (the non-empty ones, in order) divided
 /// into consecutive parts, recorded as one graph with a segment per part;
 /// `measured` says whether every launch had a measured time when the parts

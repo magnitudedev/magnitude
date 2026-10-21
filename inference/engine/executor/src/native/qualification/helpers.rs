@@ -944,10 +944,11 @@ mod tests {
     fn every_packed_representation_has_a_unit_fixture() {
         let representations = [
             "q8g32s", "q4k", "q5k", "q6k", "iq4g32", "q4g32s", "q5g32s", "q5g32", "mxfp4g32",
-            "nvfp4g16", "iq2xs", "iq3xxs", "iq2xxs",
+            "nvfp4g16", "nvfp4g16a4", "iq2xs", "iq3xxs", "iq2xxs",
         ];
         for representation in representations {
-            let (source, packet) = pattern_source(representation)
+            let stored = Element::stored(representation, Layout::Packet).unwrap();
+            let (source, packet) = pattern_source(stored.representation())
                 .unwrap_or_else(|| panic!("{representation} has no fixture"));
             // Whole 256-value GGUF blocks where the source has them.
             let columns = if source.logical_group() == Some(256) {

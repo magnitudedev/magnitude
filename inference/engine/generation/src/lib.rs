@@ -926,7 +926,7 @@ impl Generation {
     pub fn timed(
         &mut self,
         launch: TimedLaunch,
-        duration: std::time::Duration,
+        duration: Option<std::time::Duration>,
         sequences: usize,
         rows: usize,
     ) {
@@ -1228,7 +1228,7 @@ impl StartedRound {
     pub fn timed(
         &mut self,
         launch: TimedLaunch,
-        duration: std::time::Duration,
+        duration: Option<std::time::Duration>,
         sequences: usize,
         rows: usize,
     ) {

@@ -29,6 +29,7 @@ fn routed_experts_up_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
         };
         projection::quantize(staged, q8);
     }
+    projection::operand_row(&[&cx.arg_expert_up()], staged);
 }
 
 fn routed_experts_up_expand<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
@@ -69,15 +70,18 @@ fn routed_experts_up_quantize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, g
         return;
     }
     let row = block * t + lane;
-    let blocks = seismic::cpu::quant::blocks(f);
     // SAFETY: the expand launch wrote this product row; this work item owns
-    // its quantized row.
-    let product = unsafe { cx.scratch_product().slice::<f32>(4 * row * f, f) };
-    let q8 = unsafe {
-        cx.scratch_product_q8()
-            .slice_mut::<seismic::cpu::quant::Q8Block>(row * blocks * projection::Q8_BYTES, blocks)
-    };
-    projection::quantize(product, q8);
+    // it and its quantized row.
+    let product = unsafe { cx.scratch_product().slice_mut::<f32>(4 * row * f, f) };
+    if cx.param_int8() == 1 {
+        let blocks = seismic::cpu::quant::blocks(f);
+        let q8 = unsafe {
+            cx.scratch_product_q8()
+                .slice_mut::<seismic::cpu::quant::Q8Block>(row * blocks * projection::Q8_BYTES, blocks)
+        };
+        projection::quantize(product, q8);
+    }
+    projection::operand_row(&[&cx.arg_expert_down()], product);
 }
 
 fn routed_experts_up_down<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {

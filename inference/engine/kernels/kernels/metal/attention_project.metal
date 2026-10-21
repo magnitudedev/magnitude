@@ -10,6 +10,12 @@
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
+// The rows every weight takes (the normalized rows, or NVFP4 operands): the
+// GEMV and batched row classes form them while staging, the stage launches
+// into the scratch every other form reads.
+constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4,
+    packets::W2_OPERANDS_NVFP4, packets::W3_OPERANDS_NVFP4>::NVFP4;
+typedef projection::operands<NVFP4> Operands;
 
 #define ATTENTION_PROJECT_ARGUMENTS                                                     \
     device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],                       \
@@ -96,8 +102,9 @@ inline void attention_project_zero_tile(Output out, uint rows, uint columns,
         return;                                                                         \
     }                                                                                   \
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                         \
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
-    const auto x = projection::shared_norm(in, squares);                                \
+    const auto x = Operands::rows(projection::shared_norm(in, squares), rows, k, globals, simdgroups, sg, lane); \
     if (tile < t0) {                                                                    \
         PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>( \
             x, query_out, query_w, rows, query_rows, k, tile, shared, simdgroups, sg, lane)); \
@@ -174,8 +181,9 @@ kernel void attention_project_batch(ATTENTION_PROJECT_ARGUMENTS,
         return;
     }
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    const auto x = projection::shared_norm(in, squares);
+    const auto x = Operands::rows(projection::shared_norm(in, squares), rows, k, globals, simdgroups, sg, lane);
     if (tile < t0)
         projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(x, query_out, query_w, rows, query_rows, k,
             tile, shared, simdgroups, sg, lane);
@@ -197,7 +205,7 @@ kernel void attention_project_stage(ATTENTION_PROJECT_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
     ATTENTION_PROJECT_OPERANDS;
-    projection::device_normalize<256>(in, item, normalized, k, norms, thread_index);
+    Operands::normalize<256>(in, item, normalized, k, norms, thread_index);
 }
 #endif
 
@@ -265,8 +273,7 @@ kernel void attention_project_stage_tall(ATTENTION_PROJECT_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
     ATTENTION_PROJECT_OPERANDS;
-    projection::device_normalize<256, projection::TallOrder<activation>>(in, item, normalized, k, norms,
-        thread_index);
+    Operands::normalize<256, projection::TallOrder<activation>>(in, item, normalized, k, norms, thread_index);
 }
 #endif
 

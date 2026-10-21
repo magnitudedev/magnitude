@@ -25,6 +25,7 @@ fn dense_up_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
         };
         projection::quantize(normalized, q8);
     }
+    projection::operand_row(&[&cx.arg_up_weight()], normalized);
 }
 
 fn dense_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {

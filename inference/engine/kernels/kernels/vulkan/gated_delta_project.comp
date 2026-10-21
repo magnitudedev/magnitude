@@ -22,6 +22,13 @@
 #else
 #error "gated_delta_project requires a dense input_norm"
 #endif
+// The rows every weight takes (the normalized rows, or NVFP4 operands): the
+// GEMV forms them while staging, the stage launch into the GEMM's scratch.
+#if defined(SEISMIC_QKV_WEIGHT_OPERANDS_NVFP4)
+#define PROJECT_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define PROJECT_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
 
 
 
@@ -35,9 +42,10 @@
 #define PROJECT_HEAD_ROWS uint(SEISMIC_DIM_NV)
 
 projection_prologue recurrent_project_input() {
-    return projection_input(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), SEISMIC_HIDDEN_STRIDE_0,
-        SEISMIC_HIDDEN_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_INPUT_NORM), SEISMIC_INPUT_NORM_STRIDE_0, PROJECT_NORM,
-        element_word_f32(SEISMIC_PARAM_EPSILON), PROJECT_K, 0ul, uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT));
+    return projection_operands(projection_input(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
+        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_INPUT_NORM),
+        SEISMIC_INPUT_NORM_STRIDE_0, PROJECT_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), PROJECT_K, 0ul,
+        uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT)), PROJECT_OPERANDS);
 }
 
 // Every segment writes its columns of the one result row.

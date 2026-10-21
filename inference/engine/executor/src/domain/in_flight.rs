@@ -46,6 +46,9 @@ pub struct VisionFlight<F: ProgramFamily = NativeFamily> {
     pub(super) image: ImageRef,
     pub(super) submission: F::VisionSubmission,
     pub(super) started: Instant,
+    /// The device's recorded graph count at submission: the flight paid a
+    /// recording if it grew before the flight finished.
+    pub(super) recorded_graphs: u64,
     pub(super) bindings: StateBindings<F>,
 }
 
@@ -62,6 +65,9 @@ pub struct HeadFlight<F: ProgramFamily = NativeFamily> {
     pub(super) steps: usize,
     pub(super) submission: F::HeadSubmission,
     pub(super) started: Instant,
+    /// The device's recorded graph count at submission: the flight paid a
+    /// recording if it grew before the flight finished.
+    pub(super) recorded_graphs: u64,
     /// Optional one-flight launch attribution for diagnosing a proposing head.
     pub(super) launch_trace: Option<seismic::SubmissionTrace>,
     pub(super) bindings: StateBindings<F>,
@@ -101,6 +107,9 @@ pub(super) struct TargetWork<F: ProgramFamily> {
     /// Optional attribution for one prefill flight selected by diagnostics.
     pub(super) launch_trace: Option<seismic::SubmissionTrace>,
     pub(super) started: Instant,
+    /// The device's recorded graph count at submission: the flight paid a
+    /// recording if it grew before the flight finished.
+    pub(super) recorded_graphs: u64,
     /// When the device could begin this step: its submission, or for a step
     /// queued behind its predecessor (lookahead), the predecessor's
     /// completion. The step's physical duration is measured from here, so

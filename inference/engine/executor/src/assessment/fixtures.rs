@@ -4,6 +4,7 @@
 
 use crate::source_element;
 use magnitude_artifacts::gguf::Encoding;
+use magnitude_family_contracts::ScaledActivations;
 
 /// The encodings the synthetic costs measure: every one the fixtures and
 /// the catalog's models hold.
@@ -45,8 +46,18 @@ pub(crate) fn costs() -> super::ExecutorCosts {
         .into_iter()
         .flat_map(|backend| {
             let layout = crate::resident_layout(crate::ExecutionPath::Native, backend);
-            FORMATS.iter().filter_map(move |encoding| {
-                crate::resident_element(*encoding, 4096, seismic::DType::BF16, layout)
+            FORMATS.iter().flat_map(move |encoding| {
+                [ScaledActivations::Rounded, ScaledActivations::Nvfp4]
+                    .into_iter()
+                    .filter_map(move |activations| {
+                        crate::resident_element(
+                            *encoding,
+                            activations,
+                            4096,
+                            seismic::DType::BF16,
+                            layout,
+                        )
+                    })
             })
         })
         .chain([seismic::Element::bf16(), seismic::Element::f32()])

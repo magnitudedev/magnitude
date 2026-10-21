@@ -202,7 +202,7 @@ native vision_norm for cpu from "cpu/vision_norm.rs":
 fn vision_linear[M, N, K, NB, NR, NG, NC](x: &tensor[M, K] A, weight: &tensor[N, K] W,
     bias: &tensor[NB, N] B, residual: &tensor[NR, M, N] f32, gate: &tensor[NG, M, N] A,
     minimum: &tensor[NC] f32, maximum: &tensor[NC] f32, activation: i32) -> tensor[M, N] Y
-    where NB >= 0 and NR >= 0 and NG >= 0 and NC >= 0:
+    where NB >= 0 and NR >= 0 and NG >= 0 and NC >= 0 and operands(W) == 0:
     let mut value = tensor[M, N] f32
     parallel for row in 0..M:
         parallel for output in 0..N:

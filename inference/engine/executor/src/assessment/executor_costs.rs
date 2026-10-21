@@ -68,7 +68,7 @@ use super::AssessmentError;
 use crate::{resident_element, resident_elements, resident_layout, ExecutionPath};
 use magnitude_artifacts::gguf::Encoding;
 use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
-use magnitude_family_contracts::Rotary;
+use magnitude_family_contracts::{Rotary, ScaledActivations};
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, conditioning_overlay, dense_expand, dense_output,
 };
@@ -99,6 +99,7 @@ const FEATURES: u64 = 16384;
 fn chain_element(backend: seismic::BackendName) -> Option<Element> {
     resident_element(
         CHAIN_FORMAT,
+        ScaledActivations::Rounded,
         HIDDEN,
         DType::BF16,
         resident_layout(ExecutionPath::Native, backend),
@@ -1912,7 +1913,7 @@ impl AttendCase {
 }
 
 /// The statics of the reference attention: one row that appends its own
-/// key and value, no gate and no head norms, and `layout`'s planes.
+/// key and value, no gate, head norms or sinks, and `layout`'s planes.
 fn attention_values(layout: KvCodec) -> Result<Vec<(&'static str, u64)>, ExecutorCostsError> {
     let mut values = vec![
         ("KV", KV_HEADS),
@@ -1924,6 +1925,7 @@ fn attention_values(layout: KvCodec) -> Result<Vec<(&'static str, u64)>, Executo
         ("F", 1),
         ("N", 0),
         ("NV", 0),
+        ("SK", 0),
     ];
     // An affine layout's statics are its planes' widths.
     if let [key_codes, key_coefficients, value_codes, value_coefficients] = planes(layout)?[..] {
@@ -2960,6 +2962,27 @@ mod tests {
         }
     }
 
+    /// Every program of the walk gives each static its entry declares on
+    /// every backend, so no figure goes unmeasured for want of one.
+    #[test]
+    fn every_walk_program_gives_its_statics_on_every_backend() {
+        for backend in seismic::BackendName::ALL {
+            let programs =
+                ProgramSet::new(&measured_formats(backend), chain_element(backend).unwrap(), 1 << 34)
+                    .unwrap();
+            let mut statics = vec![
+                programs.output.statics(backend),
+                programs.dense.statics(backend),
+                programs.affine.statics(backend),
+                programs.copy.statics(backend),
+            ];
+            statics.extend(programs.expands.iter().map(|(_, _, expand)| expand.statics(backend)));
+            for given in statics {
+                given.unwrap_or_else(|error| panic!("{backend:?}: {}", error.0));
+            }
+        }
+    }
+
     /// The measured formats hold the activation dtype's and the chain's,
     /// and every element a weight can be resident as, each once.
     #[test]
@@ -2969,9 +2992,13 @@ mod tests {
             let layout = resident_layout(ExecutionPath::Native, backend);
             for dense in [DType::BF16, DType::F16, DType::F32] {
                 for encoding in Encoding::ALL {
-                    for width in [HIDDEN, HIDDEN + 32] {
-                        if let Some(element) = resident_element(encoding, width, dense, layout) {
-                            assert!(formats.contains(&element), "{backend:?} {element:?}");
+                    for activations in [ScaledActivations::Rounded, ScaledActivations::Nvfp4] {
+                        for width in [HIDDEN, HIDDEN + 32] {
+                            if let Some(element) =
+                                resident_element(encoding, activations, width, dense, layout)
+                            {
+                                assert!(formats.contains(&element), "{backend:?} {element:?}");
+                            }
                         }
                     }
                 }

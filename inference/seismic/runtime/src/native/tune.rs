@@ -3642,6 +3642,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     ))
                 })?,
         );
+        implementation = implementation.at_elements(&bindings);
         fix(&mut implementation, statics.params())?;
         widen(&mut implementation, domains)?;
         // Every configuration formed is this one entry at these bindings.
@@ -8634,10 +8635,18 @@ mod tests {
             .find(|entry| entry.name == "dense_output")
             .expect("the dense rows declare dense_output")
             .id;
+        // Formed as a load forms it: bf16 rows over packed weights in
+        // Metal's resident layout.
+        let bindings = ElementBindings::new()
+            .bind("A", seismic_lang::registry::dense(seismic_lang::types::DType::BF16))
+            .bind(
+                "DW",
+                seismic_lang::registry::storage("q4k", seismic_lang::registry::Layout::Rows32).unwrap(),
+            );
         let implementation = module
             .native_implementation(entry, BackendName::Metal)
             .unwrap()
-            .clone();
+            .at_elements(&bindings);
         let statics = NativeSpecialization::new()
             .with_static("H", 1024)
             .with_static("F", 4096)

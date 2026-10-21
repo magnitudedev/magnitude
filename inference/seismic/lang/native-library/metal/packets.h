@@ -923,6 +923,9 @@ PACKETS_BIND(W0, packets::IQ2XXS)
 #else
 #error "KERNEL_W0: unsupported weight representation"
 #endif
+// The slot's operand recipe (`operands(W)`): whether products over it take
+// NVFP4 operand rows.
+namespace packets { constant constexpr bool W0_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W0, _OPERANDS_NVFP4); }
 #endif
 
 #if defined(KERNEL_W1)
@@ -982,6 +985,7 @@ PACKETS_BIND(W1, packets::IQ2XXS)
 #else
 #error "KERNEL_W1: unsupported weight representation"
 #endif
+namespace packets { constant constexpr bool W1_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W1, _OPERANDS_NVFP4); }
 #endif
 
 #if defined(KERNEL_W2)
@@ -1041,6 +1045,7 @@ PACKETS_BIND(W2, packets::IQ2XXS)
 #else
 #error "KERNEL_W2: unsupported weight representation"
 #endif
+namespace packets { constant constexpr bool W2_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W2, _OPERANDS_NVFP4); }
 #endif
 
 #if defined(KERNEL_W3)
@@ -1100,4 +1105,5 @@ PACKETS_BIND(W3, packets::IQ2XXS)
 #else
 #error "KERNEL_W3: unsupported weight representation"
 #endif
+namespace packets { constant constexpr bool W3_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W3, _OPERANDS_NVFP4); }
 #endif

@@ -11,7 +11,8 @@ use magnitude_artifacts::{
 };
 use magnitude_family_contracts::{
     ActivationDType, HeadComponent, ImportTransform, ModelDefinition, ProgressiveCodeDepth,
-    ProgressivePlane, VisionDescription, WeightDescriptor, WeightKind, WeightRole, WeightScope,
+    ProgressivePlane, ScaledActivations, VisionDescription, WeightDescriptor, WeightKind,
+    WeightRole, WeightScope,
 };
 use magnitude_state::KvCodec;
 use seismic::{BackendName, DType, Element, Layout};
@@ -1635,14 +1636,20 @@ fn host_table(
     };
     let source = source_element(stored.encoding, width)
         .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
-    let resident = resident_element(stored.encoding, width, form.activation, form.layout)
-        .ok_or_else(|| {
-            format!(
-                "{:?} has no resident form in the `{}` layout",
-                stored.encoding,
-                form.layout.as_str()
-            )
-        })?;
+    let resident = resident_element(
+        stored.encoding,
+        crate::import_transforms::scaled_activations(descriptor),
+        width,
+        form.activation,
+        form.layout,
+    )
+    .ok_or_else(|| {
+        format!(
+            "{:?} has no resident form in the `{}` layout",
+            stored.encoding,
+            form.layout.as_str()
+        )
+    })?;
     let bytes = representation_bytes(source, &stored.shape)?;
     if bytes != stored.nbytes {
         return Err(format!(
@@ -1936,15 +1943,20 @@ fn push_weight(
         (WeightKind::Vision(_), None) => (Element::f32(), Element::dense(form.activation)),
         _ => (
             source,
-            resident_element(stored.encoding, width, dense_resident, form.layout).ok_or_else(
-                || {
-                    format!(
-                        "{:?} has no resident form in the `{}` layout",
-                        stored.encoding,
-                        form.layout.as_str()
-                    )
-                },
-            )?,
+            resident_element(
+                stored.encoding,
+                crate::import_transforms::scaled_activations(descriptor),
+                width,
+                dense_resident,
+                form.layout,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "{:?} has no resident form in the `{}` layout",
+                    stored.encoding,
+                    form.layout.as_str()
+                )
+            })?,
         ),
     };
     let source_bytes = representation_bytes(source, &stored.shape)?;
@@ -2223,49 +2235,61 @@ pub fn source_element(encoding: Encoding, width: u64) -> Option<Element> {
 /// super-scale times an int8 sixteen-value sub-block scale times a code in
 /// [-32, 31]), IQ4_NL into iq4g32 (same table) or, read as single blocks
 /// (`source_element`), into iq4g32s. NVFP4's per-tensor F32 `.scale` is a
-/// separate tensor; its representation holds the block values. `width` is
-/// the stored rows' width, as `source_element` takes it.
+/// separate tensor; its representation holds the block values, in the
+/// element of the activations its producer calibrated it for
+/// (`ScaledActivations`): W4A16's `nvfp4g16`, W4A4's `nvfp4g16a4`. Only
+/// NVFP4 weights take NVFP4 operands. `width` is the stored rows' width, as
+/// `source_element` takes it.
 pub fn resident_element(
     encoding: Encoding,
+    activations: ScaledActivations,
     width: u64,
     dense: DType,
     layout: Layout,
 ) -> Option<Element> {
-    let representation = match encoding {
-        Encoding::F32 | Encoding::F16 | Encoding::BF16 => return Some(Element::dense(dense)),
-        Encoding::Iq4Nl if source_element(encoding, width)?.name() == "gguf_iq4_nl_block" => {
+    let representation = match (encoding, activations) {
+        (Encoding::Nvfp4, ScaledActivations::Nvfp4) => "nvfp4g16a4",
+        (_, ScaledActivations::Nvfp4) => return None,
+        (Encoding::F32 | Encoding::F16 | Encoding::BF16, _) => {
+            return Some(Element::dense(dense));
+        }
+        (Encoding::Iq4Nl, _)
+            if source_element(encoding, width)?.name() == "gguf_iq4_nl_block" =>
+        {
             "iq4g32s"
         }
-        Encoding::Q8_0 => "q8g32s",
-        Encoding::Q3K | Encoding::Iq3S | Encoding::Q6K => "q6k",
-        Encoding::Q4K => "q4k",
-        Encoding::Q5K => "q5k",
-        Encoding::Iq2Xxs => "iq2xxs",
-        Encoding::Iq2Xs => "iq2xs",
-        Encoding::Iq3Xxs => "iq3xxs",
-        Encoding::Iq4Nl | Encoding::Iq4Xs => "iq4g32",
-        Encoding::Q4_0 => "q4g32s",
-        Encoding::Q5_0 => "q5g32s",
-        Encoding::Q5_1 => "q5g32",
-        Encoding::Mxfp4 => "mxfp4g32",
-        Encoding::Nvfp4 => "nvfp4g16",
+        (Encoding::Q8_0, _) => "q8g32s",
+        (Encoding::Q3K | Encoding::Iq3S | Encoding::Q6K, _) => "q6k",
+        (Encoding::Q4K, _) => "q4k",
+        (Encoding::Q5K, _) => "q5k",
+        (Encoding::Iq2Xxs, _) => "iq2xxs",
+        (Encoding::Iq2Xs, _) => "iq2xs",
+        (Encoding::Iq3Xxs, _) => "iq3xxs",
+        (Encoding::Iq4Nl | Encoding::Iq4Xs, _) => "iq4g32",
+        (Encoding::Q4_0, _) => "q4g32s",
+        (Encoding::Q5_0, _) => "q5g32s",
+        (Encoding::Q5_1, _) => "q5g32",
+        (Encoding::Mxfp4, _) => "mxfp4g32",
+        (Encoding::Nvfp4, _) => "nvfp4g16",
         _ => return None,
     };
     Element::stored(representation, layout)
 }
 
 /// Every element a weight can be resident as in `layout`: the image of
-/// [`resident_element`] over every encoding and dense dtype, and both
-/// IQ4_NL sources (rows whose width is a multiple of 256, and rows whose
-/// width is not), each once, in a fixed order.
+/// [`resident_element`] over every encoding, activations and dense dtype,
+/// and both IQ4_NL sources (rows whose width is a multiple of 256, and rows
+/// whose width is not), each once, in a fixed order.
 pub fn resident_elements(layout: Layout) -> Vec<Element> {
     let mut elements = Vec::new();
     for dense in [DType::BF16, DType::F16, DType::F32] {
         for encoding in Encoding::ALL {
-            for width in [256, 32] {
-                match resident_element(encoding, width, dense, layout) {
-                    Some(element) if !elements.contains(&element) => elements.push(element),
-                    _ => {}
+            for activations in [ScaledActivations::Rounded, ScaledActivations::Nvfp4] {
+                for width in [256, 32] {
+                    match resident_element(encoding, activations, width, dense, layout) {
+                        Some(element) if !elements.contains(&element) => elements.push(element),
+                        _ => {}
+                    }
                 }
             }
         }
@@ -2373,20 +2397,46 @@ mod representation_byte_tests {
             (Encoding::Nvfp4, "nvfp4g16"),
         ] {
             for layout in Layout::ALL {
-                let element = resident_element(encoding, 2560, DType::BF16, layout).unwrap();
+                let element =
+                    resident_element(encoding, ScaledActivations::Rounded, 2560, DType::BF16, layout)
+                        .unwrap();
                 assert_eq!(
                     (element.representation(), element.layout()),
                     (representation, layout)
                 );
+                // Only NVFP4 weights take NVFP4 operands: W4A4's element
+                // is nvfp4g16's storage.
+                let w4a4 =
+                    resident_element(encoding, ScaledActivations::Nvfp4, 2560, DType::BF16, layout);
+                match encoding {
+                    Encoding::Nvfp4 => {
+                        let w4a4 = w4a4.unwrap();
+                        assert_eq!(w4a4, Element::stored("nvfp4g16a4", layout).unwrap());
+                        assert_eq!((w4a4.representation(), w4a4.layout()), (representation, layout));
+                    }
+                    _ => assert_eq!(w4a4, None),
+                }
             }
         }
         assert_eq!(
-            resident_element(Encoding::F16, 2560, DType::BF16, Layout::Rows16),
+            resident_element(
+                Encoding::F16,
+                ScaledActivations::Rounded,
+                2560,
+                DType::BF16,
+                Layout::Rows16
+            ),
             Some(Element::bf16())
         );
         for encoding in [Encoding::Q1_0, Encoding::I32] {
             assert_eq!(
-                resident_element(encoding, 2560, DType::BF16, Layout::Rows16),
+                resident_element(
+                    encoding,
+                    ScaledActivations::Rounded,
+                    2560,
+                    DType::BF16,
+                    Layout::Rows16
+                ),
                 None
             );
         }
@@ -2410,8 +2460,14 @@ mod representation_byte_tests {
                 2 * width / 32 * 18
             );
             for layout in Layout::ALL {
-                let element =
-                    resident_element(Encoding::Iq4Nl, width, DType::BF16, layout).unwrap();
+                let element = resident_element(
+                    Encoding::Iq4Nl,
+                    ScaledActivations::Rounded,
+                    width,
+                    DType::BF16,
+                    layout,
+                )
+                .unwrap();
                 assert_eq!(
                     (element.representation(), element.layout()),
                     (representation, layout)

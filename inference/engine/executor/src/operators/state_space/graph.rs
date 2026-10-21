@@ -266,6 +266,7 @@ mod tests {
         HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics,
         KeyValue, LatentExperts, MediaRowAttention, ModelDefinition, Operator, OutputForm,
         ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput,
+        ScaledActivations,
         ScoreFunction, SharedExpert, SharedExpertGate, StateSpace, Sublayer, SublayerIndex,
         ValueNorm, ValueSource, WeightDescriptor, WeightKind, WeightRole, WeightScope,
     };
@@ -315,7 +316,10 @@ mod tests {
                     stored(scale_name.clone(), scale, Encoding::F32);
                     descriptor
                         .transforms
-                        .push(ImportTransform::ScaleByTensor { tensor: scale_name });
+                        .push(ImportTransform::ScaleByTensor {
+                            tensor: scale_name,
+                            activations: ScaledActivations::Rounded,
+                        });
                 }
                 None if shape.len() > 1 => stored(name, shape, Encoding::BF16),
                 None => stored(name, shape, Encoding::F32),

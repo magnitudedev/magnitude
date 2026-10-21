@@ -4,6 +4,10 @@
 #include "lib/projection/projection.h"
 
 typedef element::Act activation;
+// The weight's operand row (the feature row, or NVFP4 operands), formed
+// while the GEMV stages it.
+constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
+typedef projection::operands<NVFP4> Operands;
 
 #define PROJECT_ROWS_ARGUMENTS \
     device const uchar *features [[buffer(SEISMIC_BUFFER_FEATURES)]], \
@@ -43,7 +47,9 @@ kernel void readout_project_rows_gemv(PROJECT_ROWS_ARGUMENTS,
             SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,
             as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))},
         projection::scale_factor(weight_scale, SEISMIC_DIM_WS, 0, 0), 1.0f);
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);
+    const auto x = Operands::rows(in, 1u, d, globals, simdgroups, sg, lane);
     projection::gemv_runtime<packets::W0, ROWS, 1, LANES>(
-        in, out, w, 1u, SEISMIC_DIM_I == 1 ? 1u : uint(SEISMIC_DIM_S), d, SEISMIC_DIM_I == 1 ? 0u : tile.x, shared, simdgroups, sg, lane);
+        x, out, w, 1u, SEISMIC_DIM_I == 1 ? 1u : uint(SEISMIC_DIM_S), d, SEISMIC_DIM_I == 1 ? 0u : tile.x, shared, simdgroups, sg, lane);
 }
 #endif

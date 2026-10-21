@@ -9,15 +9,21 @@
 
 SEISMIC_PROGRAMMATIC_DEPENDENCY
 
-using Pro = projection::Input<ELEMENT_OF(SEISMIC_INPUT_NORM), projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
+using Raw = projection::Input<ELEMENT_OF(SEISMIC_INPUT_NORM), projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
+using Pro = projection::Operands<
+    projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4, packets::W2_OPERANDS_NVFP4,
+                              packets::W3_OPERANDS_NVFP4>::NVFP4,
+    Raw>;
 using Source = projection::GemvSource<Pro>;
 using Out = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 
 #define PROLOGUE                                                                                          \
     Pro {                                                                                                 \
-        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0,      \
-            SEISMIC_PTR(SEISMIC_BUFFER_INPUT_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON),      \
-            SEISMIC_DIM_H, projection::AllRows{}                                                                  \
+        Raw {                                                                                             \
+            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0,  \
+                SEISMIC_PTR(SEISMIC_BUFFER_INPUT_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON),  \
+                SEISMIC_DIM_H, projection::AllRows{}                                                      \
+        }                                                                                                 \
     }
 #define QKV_ROWS ((2 * SEISMIC_DIM_NK + SEISMIC_DIM_NV) * SEISMIC_DIM_W)
 #define Z_ROWS (SEISMIC_DIM_NV * SEISMIC_DIM_W)
@@ -109,7 +115,7 @@ template <unsigned INT8, unsigned OPERAND>
 __global__ void gated_delta_project_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
-    using Operands = typename projection::GemmOperands<OPERAND>::type;
+    using Operands = projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>;
     projection::stage_projection_row<S8, Operands>(PROLOGUE, blockIdx.x, SEISMIC_DIM_M, SEISMIC_DIM_H, STAGING, GROUPS);
 }
 #endif
@@ -141,7 +147,7 @@ __global__ void gated_delta_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
     const unsigned long long rows[4] = SEGMENT_ROWS;
     const Out out[4] = SEGMENT_OUT;
-    project_gemm<projection::SmallGemm, S8, typename projection::GemmOperands<OPERAND>::type>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS,
+    project_gemm<projection::SmallGemm, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS,
                                             out);
 }
 #endif
@@ -152,7 +158,7 @@ __global__ void gated_delta_project_gemm(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
     const unsigned long long rows[4] = SEGMENT_ROWS;
     const Out out[4] = SEGMENT_OUT;
-    project_gemm<projection::LargeGemm<ROTATE>, S8, typename projection::GemmOperands<OPERAND>::type>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows,
+    project_gemm<projection::LargeGemm<ROTATE>, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1, packets::W2, packets::W3>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows,
                                                        WEIGHTS, out);
 }
 #endif

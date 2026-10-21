@@ -5,16 +5,20 @@
 #define KERNEL_W1 SEISMIC_UP_WEIGHT
 #include "lib/projection/projection.cuh"
 
-using Pro = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;
+using Raw = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;
+using Pro = projection::Operands<
+    projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4>::NVFP4, Raw>;
 using Source = projection::GemvSource<Pro>;
 using Scaling = projection::scaling<(SEISMIC_DIM_GS != 0 || SEISMIC_DIM_US != 0)>;
 using Epi = Scaling::type<projection::Glu<ELEMENT_OF(SEISMIC_ELEMENT_A)>>;
 
-#define PROLOGUE                                                                                          \
-    Pro {                                                                                                 \
-        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)), SEISMIC_RESIDUAL_STRIDE_0,  \
-            SEISMIC_PTR(SEISMIC_BUFFER_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPS), SEISMIC_DIM_H, \
-            projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))}  \
+#define PROLOGUE                                                                                              \
+    Pro {                                                                                                     \
+        Raw {                                                                                                 \
+            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)), SEISMIC_RESIDUAL_STRIDE_0,  \
+                SEISMIC_PTR(SEISMIC_BUFFER_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPS), SEISMIC_DIM_H, \
+                projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))}  \
+        }                                                                                                     \
     }
 #define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
 #define GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
@@ -56,7 +60,7 @@ __device__ __forceinline__ void expand_gemm(const projection::u8 *staged, const 
 template <unsigned INT8, unsigned OPERAND>
 __global__ void dense_expand_stage(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1>;
-    using Operands = typename projection::GemmOperands<OPERAND>::type;
+    using Operands = projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1>;
     projection::stage_projection_row<S8, Operands>(PROLOGUE, blockIdx.x, SEISMIC_DIM_O, SEISMIC_DIM_H, STAGING, GROUPS);
 }
 #endif
@@ -84,7 +88,7 @@ __global__ void dense_expand_gemv16(SEISMIC_KERNEL_PARAMS) {
 template <unsigned INT8, unsigned OPERAND>
 __global__ void dense_expand_gemm_small(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1>;
-    expand_gemm<projection::SmallGemm, S8, typename projection::GemmOperands<OPERAND>::type>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, GATE,
+    expand_gemm<projection::SmallGemm, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, GATE,
                                            UP, EPILOGUE);
 }
 #endif
@@ -93,7 +97,7 @@ __global__ void dense_expand_gemm_small(SEISMIC_KERNEL_PARAMS) {
 template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void dense_expand_gemm(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1>;
-    expand_gemm<projection::LargeGemm<ROTATE>, S8, typename projection::GemmOperands<OPERAND>::type>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H,
+    expand_gemm<projection::LargeGemm<ROTATE>, S8, projection::GemmOperandsOf<OPERAND, packets::W0, packets::W1>>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H,
                                                       SEISMIC_DIM_F, GATE, UP, EPILOGUE);
 }
 #endif

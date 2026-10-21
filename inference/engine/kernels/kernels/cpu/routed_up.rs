@@ -23,6 +23,7 @@ fn routed_up_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64;
         };
         projection::quantize(staged, q8);
     }
+    projection::operand_row(&[&cx.arg_expert_up()], staged);
 }
 
 fn routed_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {

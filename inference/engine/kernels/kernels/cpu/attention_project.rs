@@ -39,6 +39,15 @@ fn attention_project_normalize<L: Isa, E: Elements>(
         };
         projection::quantize(normalized, q8);
     }
+    projection::operand_row(
+        &[
+            &cx.arg_query_weight(),
+            &cx.arg_gate_weight(),
+            &cx.arg_key_weight(),
+            &cx.arg_value_weight(),
+        ],
+        normalized,
+    );
 }
 
 fn attention_project_rows<L: Isa, E: Elements>(

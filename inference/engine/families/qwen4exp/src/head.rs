@@ -58,7 +58,7 @@ pub fn inspect_head(draft: &Directory, target: &ModelDefinition) -> Result<Head,
     let prefix = format!("blk.{}.", target.decoder.blocks.len());
     let mut tensors = Tensors::new(draft);
     let head = prediction_head(&m, target, HeadComponent::Draft, &mut |name, shape| {
-        Ok(tensors.bind(&format!("{prefix}{name}"), shape)?)
+        Ok(tensors.bind_scaled(&format!("{prefix}{name}"), shape)?)
     })?;
     tensors.finish()?;
     Ok(head)

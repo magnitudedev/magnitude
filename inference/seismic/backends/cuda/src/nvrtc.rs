@@ -295,12 +295,25 @@ impl std::fmt::Display for Formation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "nvrtc {}.{};sm_{};{}",
+            "nvrtc {}.{};{};{}",
             self.release.0,
             self.release.1,
-            self.architecture,
+            target(self.architecture),
             self.options.join(" ")
         )
+    }
+}
+
+/// The NVRTC target of `sm_<architecture>`: from compute capability 9.0 its
+/// architecture-specific feature set (`sm_<architecture>a`), so a kernel may
+/// use every instruction of the device it is compiled for (FP4 block-scaled
+/// MMA on sm_120 and sm_121). The CUBIN runs on that architecture alone, as
+/// every formation's does.
+fn target(architecture: u32) -> String {
+    if architecture >= 90 {
+        format!("sm_{architecture}a")
+    } else {
+        format!("sm_{architecture}")
     }
 }
 
@@ -426,7 +439,7 @@ impl Nvrtc {
                 "add name expression",
             )?;
         }
-        let arch = CString::new(format!("-arch=sm_{architecture}")).expect("no NUL");
+        let arch = CString::new(format!("-arch={}", target(architecture))).expect("no NUL");
         let fixed = COMPILE_OPTIONS
             .iter()
             .map(|option| CString::new(*option).expect("no NUL"))

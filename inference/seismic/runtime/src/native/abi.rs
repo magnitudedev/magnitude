@@ -690,14 +690,26 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
     // own table's names; and as `SEISMIC_REPRESENTATION_<NAME>` through the
     // tensor's prefix (`<prefix>()`), which reaches it by expansion alone, so
     // a library can evaluate it in `#if` (glslang pastes no tokens there).
+    // `<prefix>()` names the representation whose rows a library addresses:
+    // a packed tensor in its packet layout has no rows (no `_ROW_STRIDE_BYTES`),
+    // so it names `SEISMIC_REPRESENTATION_<NAME>_PACKET` instead.
+    let name = native_macro(info.representation);
+    let rows = match info.kind {
+        registry::RepresentationKind::Packed(_) => format!("{name}_PACKET"),
+        _ => name.clone(),
+    };
     out.push_str(&format!(
-        "#define {prefix}_REPRESENTATION_{name} 1\n#define {prefix}_REPRESENTATION {name}\n#define {prefix}() SEISMIC_REPRESENTATION_{name}\n",
-        name = native_macro(info.representation)
+        "#define {prefix}_REPRESENTATION_{name} 1\n#define {prefix}_REPRESENTATION {name}\n#define {prefix}() SEISMIC_REPRESENTATION_{rows}\n"
     ));
     out.push_str(&format!(
         "#define {prefix}_DECODED_{} 1\n",
         native_macro(info.decoded.name())
     ));
+    // The operand recipe of products over the representation, as
+    // `operands(W)` gives it to declarations.
+    if info.operands == registry::OperandRecipe::Nvfp4Rows {
+        out.push_str(&format!("#define {prefix}_OPERANDS_NVFP4 1\n"));
+    }
     match &info.kind {
         registry::RepresentationKind::Dense(dtype) => {
             out.push_str(&format!("#define {prefix}_KIND_DENSE 1\n"));

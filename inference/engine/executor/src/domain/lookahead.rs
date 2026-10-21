@@ -504,6 +504,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             };
         let launch_trace = self.trace_target_submission(&predicted);
         let started = Instant::now();
+        let recorded_graphs = self.family.recorded_graphs();
         let submission = self
             .family
             .submit_target(launch)
@@ -537,6 +538,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             submission,
             priming: None,
             started,
+            recorded_graphs,
             runnable: started,
             previous_selection: None,
             id,

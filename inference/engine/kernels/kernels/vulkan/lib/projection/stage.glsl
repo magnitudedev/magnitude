@@ -12,6 +12,13 @@ uint projection_row(uint64_t table, uint m) {
 #define PROJECTION_GROUPED 2
 #define PROJECTION_SUMMED 3
 
+// The operand recipe of the weights a prologue's rows feed (the portable
+// `operand_rows`): the rows as they are, or as NVFP4 operands. An entry reads
+// its weights' recipe from the ABI by name (`defined(<W>_OPERANDS_NVFP4)`,
+// see <seismic/element.glsl>).
+#define PROJECTION_OPERANDS_ROUNDED 0
+#define PROJECTION_OPERANDS_NVFP4 1
+
 struct projection_prologue {
     int kind;
     int act;            // ELEMENT_* of the activation A (bf16 or f16)
@@ -26,18 +33,19 @@ struct projection_prologue {
     int norm_kind;      // ELEMENT_* of the norm
     float eps;
     uint parts;         // Summed: the parts of a row, `columns` wide each
+    int operands;       // PROJECTION_OPERANDS_*: how the GEMV staging and the stage launches form the rows
 };
 
 projection_prologue projection_plain(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint columns,
     uint64_t rows) {
     return projection_prologue(PROJECTION_PLAIN, act, x, stride0, stride1, columns, rows, 1ul, 0ul, 0ul,
-        ELEMENT_F32, 0.0, 1u);
+        ELEMENT_F32, 0.0, 1u, PROJECTION_OPERANDS_ROUNDED);
 }
 
 projection_prologue projection_rms(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint64_t norm,
     uint64_t norm_stride, const int norm_kind, float eps, uint columns, uint64_t rows) {
     return projection_prologue(PROJECTION_RMS, act, x, stride0, stride1, columns, rows, 1ul, norm, norm_stride,
-        norm_kind, eps, 1u);
+        norm_kind, eps, 1u, PROJECTION_OPERANDS_ROUNDED);
 }
 
 // The sum in part order of the `parts` parts of an F32 row, a hyper-connection
@@ -46,7 +54,7 @@ projection_prologue projection_rms(const int act, uint64_t x, uint64_t stride0, 
 projection_prologue projection_summed(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint columns,
     uint64_t rows, uint parts) {
     return projection_prologue(PROJECTION_SUMMED, act, x, stride0, stride1, columns, rows, 1ul, 0ul, 0ul,
-        ELEMENT_F32, 0.0, parts);
+        ELEMENT_F32, 0.0, parts, PROJECTION_OPERANDS_ROUNDED);
 }
 
 // An entry's input prologue (`form_input`) by its norm's extent `norm_extent`:
@@ -63,7 +71,16 @@ projection_prologue projection_input(const int act, uint64_t x, uint64_t stride0
 projection_prologue projection_grouped(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint columns,
     uint64_t order, uint64_t order_stride) {
     return projection_prologue(PROJECTION_GROUPED, act, x, stride0, stride1, columns, order, order_stride, 0ul,
-        0ul, ELEMENT_F32, 0.0, 1u);
+        0ul, ELEMENT_F32, 0.0, 1u, PROJECTION_OPERANDS_ROUNDED);
+}
+
+// The prologue's rows as the operands of weights of recipe `operands`
+// (PROJECTION_OPERANDS_*), which the GEMV staging and the stage launches
+// form (`projection_operand_load8`); the GEMM bodies read rows as they are,
+// so a GEMM over NVFP4 weights reads the rows a stage launch formed.
+projection_prologue projection_operands(projection_prologue in_, const int operands) {
+    in_.operands = operands;
+    return in_;
 }
 
 // Element k of a Summed row m: the sum in part order of its parts.
@@ -179,3 +196,98 @@ float projection_rms_squares(projection_prologue in_, uint m, uint part, uint la
     return sum;
 }
 
+// ---------------------------------------------------------------------------
+// NVFP4 operands (docs/precision.md, "NVFP4 operands"; the portable
+// `nvfp4_row`): a product over NVFP4 weights takes each row x as q * g * s,
+// g the row's global scale (the least power of two with 2688 g >= amax|x|),
+// s a 16-value block's UE4M3 scale (nearest amax|block| / (6 g)) and q the
+// E2M1 code nearest x / (g s), saturating at 6, every rounding to nearest
+// even. The portable body divides with F32's correctly rounded quotient,
+// which rounds onto each grid as the exact quotient does; GLSL's division is
+// not correctly rounded, so every rounding here is decided without one:
+// each grid point or midpoint times its divisor is exact in F32, and the
+// dividend against it decides the exact quotient. Rows are finite.
+
+// 2^(e - 127) for a biased exponent e in 1 .. 254.
+float nvfp4_power(uint e) { return uintBitsToFloat(e << 23); }
+
+// The global scale of a row whose largest magnitude is amax: the binade of
+// an approximate amax / 2688, corrected by one exact comparison. A finite
+// row's g is at most 2^117, so its inverse is normal.
+float nvfp4_global_scale(float amax) {
+    const uint bits = floatBitsToUint(amax * (1.0 / 2688.0));
+    const uint near = clamp((bits >> 23) + ((bits & 0x7fffffu) != 0u ? 1u : 0u), 1u, 254u);
+    if (near > 1u && 2688.0 * nvfp4_power(near - 1u) >= amax)
+        return nvfp4_power(near - 1u);
+    if (near < 254u && 2688.0 * nvfp4_power(near) < amax)
+        return nvfp4_power(near + 1u);
+    return nvfp4_power(near);
+}
+
+// g s for a block whose largest magnitude is block_max: s is the UE4M3
+// value (exponent bias 7, three mantissa bits, subnormal quantum 2^-9)
+// nearest w / 6 for w = block_max / g (exact: g is a power of two). The
+// quantum is that of an approximate w / 6's binade (both binades' grids
+// hold the boundary, the nearest value to any quotient that rounds across
+// it); t = w / quantum is exact, and the approximate index t / 6 is
+// corrected against its exact midpoints 6 index +- 3. A finite row's w is
+// at most 2688, so s is at most 448.
+float nvfp4_scale(float block_max, float g) {
+    const float w = block_max * nvfp4_power(254u - (floatBitsToUint(g) >> 23));
+    const uint exponent = max((floatBitsToUint(w * (1.0 / 6.0)) >> 23) & 255u, 121u);
+    const float t = w * nvfp4_power(257u - exponent);
+    const int near = int(roundEven(t * (1.0 / 6.0)));
+    const bool odd = (near & 1) != 0;
+    const float above = float(6 * near + 3), below = float(6 * near - 3);
+    const int index = (t > above || (t == above && odd)) ? near + 1
+        : (t < below || (t == below && odd))             ? near - 1
+                                                         : near;
+    return g * (float(index) * nvfp4_power(exponent - 3u));
+}
+
+// x's E2M1 code nearest x / d, saturating at 6, times d: each threshold
+// times d is exact, so |x| against it decides the exact quotient (ties to
+// the even code). A zero d gives (positive) zero.
+float nvfp4_value(float x, float d) {
+    if (d == 0.0)
+        return 0.0;
+    const float a = abs(x);
+    const float m = a <= 0.25 * d ? 0.0
+        : a < 0.75 * d            ? 0.5
+        : a <= 1.25 * d           ? 1.0
+        : a < 1.75 * d            ? 1.5
+        : a <= 2.5 * d            ? 2.0
+        : a < 3.5 * d             ? 3.0
+        : a <= 5.0 * d            ? 4.0
+                                  : 6.0;
+    return (x < 0.0 ? -m : m) * d;
+}
+
+vec4 nvfp4_values(vec4 x, float d) {
+    return vec4(nvfp4_value(x.x, d), nvfp4_value(x.y, d), nvfp4_value(x.z, d), nvfp4_value(x.w, d));
+}
+
+float nvfp4_magnitude(vec4 even, vec4 odd) {
+    const vec4 m = max(abs(even), abs(odd));
+    return max(max(m.x, m.y), max(m.z, m.w));
+}
+
+// x[m, k..k+8) as the operands the prologue's recipe forms, given the norm
+// inverse of row m and, for NVFP4 operands, its global scale g: the 16-value
+// block that holds k formed under g (K's tail past `columns` is zero, as
+// `projection_load8` loads it).
+void projection_operand_load8(projection_prologue in_, uint m, uint k, float inverse, float g, out vec4 even,
+    out vec4 odd) {
+    if (in_.operands == PROJECTION_OPERANDS_ROUNDED) {
+        projection_load8(in_, m, k, inverse, even, odd);
+        return;
+    }
+    const uint block = k & ~15u;
+    vec4 e0, o0, e1, o1;
+    projection_load8(in_, m, block, inverse, e0, o0);
+    projection_load8(in_, m, block + 8u, inverse, e1, o1);
+    const float d = nvfp4_scale(max(nvfp4_magnitude(e0, o0), nvfp4_magnitude(e1, o1)), g);
+    const bool upper = (k & 8u) != 0u;
+    even = nvfp4_values(upper ? e1 : e0, d);
+    odd = nvfp4_values(upper ? o1 : o0, d);
+}

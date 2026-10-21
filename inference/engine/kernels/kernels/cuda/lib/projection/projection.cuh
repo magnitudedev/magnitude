@@ -81,16 +81,35 @@ struct SemanticGemmOperands {
     using Operand = Op;
     static constexpr bool EXACT_CODES = true;
     static constexpr bool MATERIALIZE = false;
+    static constexpr bool FP4 = false;
 };
 struct F16GemmOperands {
     using Storage = element::F16;
     using Operand = packets::OpF16;
     static constexpr bool EXACT_CODES = false;
     static constexpr bool MATERIALIZE = true;
+    static constexpr bool FP4 = false;
+};
+// NVFP4 operand rows staged packed (`PackedRows`) and multiplied with NVFP4
+// weights on FP4 tensor operations (`FP4_MMA`, `gemm_multiply_fp4`). Every
+// product is exact, as the 16-bit operands' are; the row's global scale
+// multiplies its sums at publication.
+struct Fp4GemmOperands {
+    using Storage = Act;
+    static constexpr bool MATERIALIZE = true;
+    static constexpr bool FP4 = true;
 };
 template <unsigned Representation> struct GemmOperands;
 template <> struct GemmOperands<0> { using type = SemanticGemmOperands; };
 template <> struct GemmOperands<1> { using type = F16GemmOperands; };
+
+// A when C, else B.
+template <bool C, class A, class B> struct Pick {
+    using Type = A;
+};
+template <class A, class B> struct Pick<false, A, B> {
+    using Type = B;
+};
 
 
 // The largest row count the GEMV serves; larger counts run the GEMM.
@@ -137,6 +156,13 @@ template <int N> __device__ __forceinline__ int locate_segment(u64 &index, const
 }
 
 #include "stage.cuh"
+
+// The operands of a GEMM over weights W: FP4 tensor operations where the
+// weights take NVFP4 operand rows and the device has them, else
+// `OPERAND`'s.
+template <unsigned OPERAND, class... W>
+using GemmOperandsOf = typename Pick<FP4_MMA && (packets::nvfp4_operands<W>::value && ...), Fp4GemmOperands,
+                                     typename GemmOperands<OPERAND>::type>::Type;
 
 // ---------------------------------------------------------------------------
 // Epilogues: called once per (m, n) with the F32 projection (and, paired, the
@@ -1626,6 +1652,113 @@ __device__ __forceinline__ void gemm_multiply(float (&acc)[2][Shape::NJ][Shape::
     }
 }
 
+// D += A B over one 64-value k-block on FP4 tensor operations (`FP4_MMA`):
+// `a` the A fragment of E2M1 codes (rows g, g + 8 of registers 0, 1 and 2,
+// 3; values 8t .. 8t + 7 in registers 0 and 1, 32 + 8t .. in 2 and 3), `b`
+// the B fragment (column g, values 8t .. 8t + 7, then 32 + 8t ..), `sa` the
+// four UE4M3 scales of row g (lane t = 0) or g + 8 (t = 1), `sb` column g's
+// (t = 0).
+__device__ __forceinline__ void mma_fp4(float (&d)[4], const u32 (&a)[4], const u32 (&b)[2], u32 sa, u32 sb) {
+#if PROJECTION_FP4_MMA
+    asm volatile("mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X.f32.e2m1.e2m1.f32."
+                 "ue4m3 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, %10, {0, 0}, %11, {0, 0};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sa), "r"(sb));
+#endif
+}
+
+// acc[mi][h] += x . w over a staged k-block of NVFP4 weight tile `chunk`
+// (rows row0 .. row0 + 15 of the block tile, their scale records at
+// `records`) on FP4 tensor operations. The B fragment of 8-row half h is
+// gathered from the tile's mma16 chunks: its register r holds values
+// 8t .. 8t + 7 of 32r .. 32r + 31, half t % 2 of k16 step s = 2r + t / 2,
+// whose byte tt is lane (g, tt)'s step-s word's nibbles 2 (t % 2) + h and
+// 2 (t % 2) + h + 4 (registry `PackedRowLayout::code_bit`).
+template <class Shape, int RECORD>
+__device__ __forceinline__ void gemm_tile_fp4(float acc[Shape::MI][2][4], const u8 *chunk, const u8 *records, u32 row0,
+                                              u64 kblock, const u32 (&a)[Shape::MI][4], const u32 (&sa)[Shape::MI]) {
+    const u32 lane = threadIdx.x % 32;
+    const u32 g = lane / 4, t = lane % 4;
+    u32 words[2][4];
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+#pragma unroll
+        for (int tt = 0; tt < 4; ++tt)
+            words[r][tt] = *reinterpret_cast<const u32 *>(chunk + (g * 4 + tt) * 16 + 4 * (2 * r + t / 2));
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const u32 p = 4 * (2 * (t % 2) + h);
+        u32 b[2] = {0u, 0u};
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+#pragma unroll
+            for (int tt = 0; tt < 4; ++tt)
+                b[r] |= (((words[r][tt] >> p) & 0xFu) | ((words[r][tt] >> (p + 12)) & 0xF0u)) << (8 * tt);
+        const u32 sb = *reinterpret_cast<const u32 *>(records + (row0 + h * 8 + g) * RECORD + (kblock % 4) * 4);
+#pragma unroll
+        for (int mi = 0; mi < Shape::MI; ++mi)
+            mma_fp4(acc[mi][h], a[mi], b, sa[mi], sb);
+    }
+}
+
+// One warp's multiply of the share's staged k-block `index` (in stage
+// `stage`) on FP4 tensor operations: the A fragments and row scales of its
+// packed activation rows (`gemm_segment` stages a row's 32 code bytes and 4
+// scale fields of a k-block at its 16-bit row's place), then each weight
+// tile's halves (`gemm_tile_fp4`).
+template <class Shape, class Weights>
+__device__ __forceinline__ void gemm_multiply_fp4(float (&acc)[2][Shape::NJ][Shape::MI][2][4],
+                                                  const Weights &weights, int stage, u64 index, u32 warp, u32 lane) {
+    static_assert(Same<decltype(weights.wa), packets::Nvfp4Of<true>>::value &&
+                      (!Weights::PAIR || Same<decltype(weights.wb), packets::Nvfp4Of<true>>::value),
+                  "FP4 tensor operations multiply W4A4 NVFP4 weights");
+    constexpr int PITCH = Shape::template A_PITCH<false>;
+    constexpr int MI = Shape::MI;
+    constexpr int NJ = Shape::NJ;
+    const u32 wm = warp % Shape::WM;
+    const u32 wn = warp / Shape::WM;
+    const u32 g = lane / 4, t = lane % 4;
+    const u8 *base = weights.stage(stage);
+    const u64 kb = weights.kbegin + index;
+    u32 a[MI][4], sa[MI];
+#pragma unroll
+    for (int mi = 0; mi < MI; ++mi) {
+        const u8 *row = base + (wm * (MI * 16) + mi * 16 + g) * PITCH;
+        const u8 *row8 = row + 8 * PITCH;
+        a[mi][0] = *reinterpret_cast<const u32 *>(row + 4 * t);
+        a[mi][1] = *reinterpret_cast<const u32 *>(row8 + 4 * t);
+        a[mi][2] = *reinterpret_cast<const u32 *>(row + 16 + 4 * t);
+        a[mi][3] = *reinterpret_cast<const u32 *>(row8 + 16 + 4 * t);
+        sa[mi] = *reinterpret_cast<const u32 *>((t == 1 ? row8 : row) + 32);
+    }
+#pragma unroll
+    for (int j = 0; j < NJ; ++j) {
+        const u32 row0 = (wn * NJ + j) * 16;
+        gemm_tile_fp4<Shape, Weights::RECORD_A>(acc[0][j], weights.codes(stage, 0, wn * NJ + j), weights.records(kb, 0),
+                                                row0, kb, a, sa);
+        if constexpr (Weights::PAIR)
+            gemm_tile_fp4<Shape, Weights::RECORD_B>(acc[1][j], weights.codes(stage, 1, wn * NJ + j),
+                                                    weights.records(kb, 1), row0, kb, a, sa);
+    }
+}
+
+// An epilogue over the sums of packed NVFP4 operand rows: each row's sums
+// times its global scale (exact, a power of two), then `epi`.
+template <class Rows, class Epi> struct RowGlobal {
+    Rows rows;
+    u64 K;
+    Epi epi;
+    __device__ __forceinline__ float global(u32 m) const { return PackedRows::global(rows.row(m), K); }
+    __device__ __forceinline__ void operator()(u32 m, u64 n, float a, float b) const {
+        const float g = global(m);
+        epi(m, n, __fmul_rn(a, g), __fmul_rn(b, g));
+    }
+    __device__ __forceinline__ void pair(u32 m, u64 n, float a0, float a1, float b0, float b1) const {
+        const float g = global(m);
+        epilogue_pair(epi, m, n, __fmul_rn(a0, g), __fmul_rn(a1, g), __fmul_rn(b0, g), __fmul_rn(b1, g), 0);
+    }
+};
+
 // One GEMM block over segment-local block column `nblock` (tiles
 // [8 * nblock, 8 * nblock + 8)), activation rows [BM * gemm_band(), ...) of
 // `source` (the A-typed input [M, K], staged or in place) and K share `part`
@@ -1670,18 +1803,54 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
         valid[i] = row < M;
         chunk[i] = source.row(valid[i] ? row : 0) + (c % 8) * 16;
     }
+    // Packed NVFP4 operand rows (`Fp4GemmOperands`) stage a row's 32 code
+    // bytes of a k-block (two pieces) and its 4 scale fields (a third) at the
+    // 16-bit row's place; a loader's pieces too keep their rows.
+    constexpr int PIECES = Operands::FP4 ? (Shape::BM * 3 + LOADERS - 1) / LOADERS : 1;
+    const u8 *piece[PIECES];
+    int place[PIECES];
+    bool present[PIECES];
+#pragma unroll
+    for (int i = 0; i < PIECES; ++i) {
+        const int c = (int)loader + i * LOADERS;
+        const u64 row = m0 + c / 3;
+        present[i] = Operands::FP4 && c < Shape::BM * 3 && row < M;
+        piece[i] = source.row(present[i] ? row : 0) + (c % 3 < 2 ? 16 * (c % 3) : PackedRows::scales(K));
+        place[i] = (c / 3) * PITCH + 16 * (c % 3);
+    }
+    // Stage k-block `kb`'s activation rows into stage `base`.
+    auto load_rows = [&](u8 *base, u64 kb) {
+        if constexpr (Operands::FP4) {
+#pragma unroll
+            for (int i = 0; i < PIECES; ++i) {
+                const int c = (int)loader + i * LOADERS;
+                if (c >= Shape::BM * 3)
+                    continue;
+                if (c % 3 < 2)
+                    seismic_cp_async_16_zfill(base + place[i], piece[i] + kb * 32, present[i] ? 16u : 0u);
+                else
+                    cp_async_4_zfill(base + place[i], piece[i] + kb * 4, present[i] ? 4u : 0u);
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < CHUNKS; ++i) {
+                const int c = (int)loader + i * LOADERS;
+                seismic_cp_async_16_zfill(base + (c / 8) * PITCH + (c % 8) * 16, chunk[i] + kb * 128,
+                                          valid[i] ? 16u : 0u);
+            }
+        }
+    };
+    auto multiply = [&](float (&acc)[2][NJ][MI][2][4], int stage, u64 index) {
+        if constexpr (Operands::FP4)
+            gemm_multiply_fp4<Shape>(acc, weights, stage, index, warp, lane);
+        else
+            gemm_multiply<Shape, Operands>(acc, weights, stage, index, warp, lane);
+    };
     // `index` counts k-blocks of this share.
     auto load = [&](int stage, u64 index) {
         if (threadIdx.x / LOADERS != index % Shape::ROTATE)
             return;
-        const u64 kb = kbegin + index;
-        u8 *base = weights.stage(stage);
-#pragma unroll
-        for (int i = 0; i < CHUNKS; ++i) {
-            const int c = (int)loader + i * LOADERS;
-            seismic_cp_async_16_zfill(base + (c / 8) * PITCH + (c % 8) * 16, chunk[i] + kb * 128,
-                                      valid[i] ? 16u : 0u);
-        }
+        load_rows(weights.stage(stage), kbegin + index);
         weights.template load<LOADERS>(stage, index, loader);
     };
 
@@ -1713,7 +1882,7 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
                 load((int)(next % Shape::STAGES), next);
             seismic_cp_async_commit();
             if (active)
-                gemm_multiply<Shape, Operands>(acc, weights, (int)(kb % Shape::STAGES), kb, warp, lane);
+                multiply(acc, (int)(kb % Shape::STAGES), kb);
         }
     } else {
         // Spans of SPAN k-blocks rotate through STAGES / SPAN span slots: the
@@ -1724,15 +1893,8 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
         auto load_span = [&](int slot, u64 span) {
             const u64 index = span * SPAN;
             const u64 count = min((u64)SPAN, kblocks - index);
-            for (u64 d = 0; d < count; ++d) {
-                u8 *base = weights.stage(slot * SPAN + (int)d);
-#pragma unroll
-                for (int i = 0; i < CHUNKS; ++i) {
-                    const int c = (int)loader + i * LOADERS;
-                    seismic_cp_async_16_zfill(base + (c / 8) * PITCH + (c % 8) * 16,
-                                              chunk[i] + (kbegin + index + d) * 128, valid[i] ? 16u : 0u);
-                }
-            }
+            for (u64 d = 0; d < count; ++d)
+                load_rows(weights.stage(slot * SPAN + (int)d), kbegin + index + d);
             weights.template load_span<LOADERS, SPAN>(slot * SPAN, index, count, loader);
         };
 #pragma unroll
@@ -1753,12 +1915,15 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
                 for (int d = 0; d < SPAN; ++d) {
                     const u64 kb = span * SPAN + d;
                     if (kb < kblocks)
-                        gemm_multiply<Shape, Operands>(acc, weights, (int)(span % SLOTS) * SPAN + d, kb, warp, lane);
+                        multiply(acc, (int)(span % SLOTS) * SPAN + d, kb);
                 }
         }
     }
     seismic_cp_async_wait<0>();
-    gemm_publish(acc, m0 + wm * (MI * 16), tile0 + wn * NJ, M, rows, epi);
+    if constexpr (Operands::FP4)
+        gemm_publish(acc, m0 + wm * (MI * 16), tile0 + wn * NJ, M, rows, RowGlobal<Rows, Epi>{source, K, epi});
+    else
+        gemm_publish(acc, m0 + wm * (MI * 16), tile0 + wn * NJ, M, rows, epi);
 }
 
 // The INT8 candidate's GEMM: the same block tiling and pipeline over s8
@@ -1946,15 +2111,35 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const QuantizedRows 
 // admitted S8 activations, or a separately admitted materialized F16 operand
 // view. The common producer owns the selected representation and its group
 // metadata. S8 multiplies packed codes, so dense weights retain the semantic
-// path rather than silently quantizing their activations.
-template <class... W> constexpr bool quantizable = (!W::DENSE && ...);
+// path rather than silently quantizing their activations, and weights that
+// take NVFP4 operand rows keep the rows their recipe defines.
+template <class... W>
+constexpr bool quantizable = ((!W::DENSE && !packets::nvfp4_operands<W>::value) && ...);
 
 // A selected materialized operand view owns its storage even when its type
 // equals semantic Act. Its producer must write every row; in-place eligibility
 // of the semantic source cannot turn that write into a no-op.
+// FP4 tensor operations' views are packed rows at the 16-bit rows' pitch.
 template <class Operands, class Pro>
 __device__ __forceinline__ void materialize_operand_row(const Pro &pro, u32 m, u64 K, u8 *staged) {
-    form_row<typename Operands::Storage>(pro, m, K, staged);
+    if constexpr (Operands::FP4)
+        form_packed_row(pro, m, K, staged + m * K * 2);
+    else
+        form_row<typename Operands::Storage>(pro, m, K, staged);
+}
+
+// Row m of the K-wide rows of element E at `rows` as NVFP4 operands in place
+// (a product the next GEMM takes as `Operands`), by THREADS threads: packed
+// for FP4 tensor operations, else as `Operands::Storage` values, each
+// 16-value block read by the thread that rewrites it.
+template <class Operands, class E, u64 K, int THREADS>
+__device__ __forceinline__ void form_operands_in_place(u8 *rows, u32 m) {
+    using Raw = Plain<E, AllRows>;
+    const Nvfp4Rows<Raw> pro{Raw{rows, K, AllRows{}}};
+    if constexpr (Operands::FP4)
+        form_packed_row<(K / 16 + THREADS - 1) / THREADS>(pro, m, K, rows + m * K * 2);
+    else
+        form_row<typename Operands::Storage>(pro, m, K, rows);
 }
 
 // One producer contract for every row schedule. GEMV retains semantic Act;

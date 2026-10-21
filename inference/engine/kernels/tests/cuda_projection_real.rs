@@ -145,7 +145,7 @@ impl Gguf {
             Format::Q5_0 => 22,
             Format::Q5_1 => 24,
             Format::Mxfp4 => 17,
-            Format::Nvfp4 => 36,
+            Format::Nvfp4 | Format::Nvfp4A4 => 36,
             Format::Iq2Xs => 74,
             Format::Iq3Xxs => 98,
             Format::Iq2Xxs => 66,
@@ -313,7 +313,7 @@ fn real_4b_projections_match_their_operand_emulation() {
                 let reference: Vec<f64> =
                     (0..o * f).map(|i| silu(g_exact[i]) * u_exact[i]).collect();
                 for &mapping in mappings(o) {
-                    let (x, _) = operand_rows(&exact, h, mapping);
+                    let (x, _) = operand_rows(&exact, h, mapping, Some(gate_format));
                     let (g, _) = project(&x, &gate.values, o, f, h);
                     let (u, _) = project(&x, &up.values, o, f, h);
                     // The operand path and the epilogue's bf16 roundings.

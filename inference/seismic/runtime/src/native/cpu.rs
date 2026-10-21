@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use seismic_compiler::errors::ExecutionError;
 use seismic_cpu::{NativeStep, NativeSteps};
-use seismic_native_cpu::{Tier, WeightKernels};
+use seismic_native_cpu::{Tier, WeightOperand};
 
 use super::trace::host_seconds;
 use super::timeline::{TimelineKind, TimelineNode};
@@ -74,11 +74,12 @@ impl CpuNativeKernels {
 /// same layout as the GPU argument words.
 pub struct CpuInvocation<'a> {
     pub(crate) buffers: &'a [*mut u8],
-    /// Registry name of each buffer's representation; scratch is `"bytes"`.
+    /// Registry storage name of each buffer (`registry::storage_of`); scratch
+    /// is `"bytes"`.
     pub(crate) representations: &'a [&'static str],
     /// The components of each buffer's representation on the call's tier,
-    /// for buffers of a weight representation.
-    pub(crate) weights: &'a [Option<&'static WeightKernels>],
+    /// with its operand recipe, for buffers of a weight representation.
+    pub(crate) weights: &'a [Option<WeightOperand>],
     pub(crate) words: &'a [u64],
     /// Values of the declared tuning parameters, in declaration order.
     pub(crate) params: &'a [u64],
@@ -100,7 +101,7 @@ impl CpuInvocation<'_> {
         self.representations[index]
     }
     /// The components of buffer `index`, a weight operand.
-    pub fn weights(&self, index: usize) -> &'static WeightKernels {
+    pub fn weights(&self, index: usize) -> WeightOperand {
         self.weights[index].unwrap_or_else(|| {
             panic!(
                 "buffer {index} (`{}`) is not bound to a weight representation",
@@ -199,11 +200,17 @@ pub(super) fn run(
 ) -> (Result<(), ExecutionError>, (f64, f64)) {
     let executor = opened.executor();
     let mut pointers = Vec::new();
+    let mut storages = Vec::new();
     let mut weights = Vec::new();
-    let calls = calls(list, &mut pointers, &mut weights);
+    let calls = calls(list, &mut pointers, &mut storages, &mut weights);
+    let tables = Tables {
+        pointers: &pointers,
+        storages: &storages,
+        weights: &weights,
+    };
     let now = host_seconds();
     if !list.has_timelines() {
-        return match steps(&calls, &pointers, &weights, executor.workers()) {
+        return match steps(&calls, tables, executor.workers()) {
             Ok(steps) if steps.is_empty() => (Ok(()), (now, now)),
             Ok(steps) => executor.run_native(&Steps { steps, repetitions }, host_seconds),
             Err(error) => (Err(error), (now, now)),
@@ -219,7 +226,7 @@ pub(super) fn run(
             if operations.is_empty() && boundary < calls.len() {
                 continue;
             }
-            match steps(&calls[first..boundary], &pointers, &weights, executor.workers()) {
+            match steps(&calls[first..boundary], tables, executor.workers()) {
                 Ok(steps) if steps.is_empty() => {}
                 Ok(steps) => {
                     let (outcome, (_, finished)) = executor.run_native(
@@ -252,15 +259,27 @@ pub(super) fn run(
 }
 
 /// One call of a submission: its dispatch, the range of its buffers in the
-/// address and weight tables, and its scalar-result storage.
+/// [`Tables`], and its scalar-result storage.
 type Call<'l> = (Dispatch<'l>, std::ops::Range<usize>, *mut u64);
 
-/// Every call of `list`, appending the calls' buffer addresses to `pointers`
-/// and their resolved weight components to `weights`.
+/// The per-buffer tables of a submission's calls.
+#[derive(Clone, Copy)]
+struct Tables<'a> {
+    pointers: &'a [*mut u8],
+    /// Each buffer's storage name (`registry::storage_of`): what the CPU
+    /// components and conversions read, the same for every operand recipe.
+    storages: &'a [&'static str],
+    weights: &'a [Option<WeightOperand>],
+}
+
+/// Every call of `list`, appending the calls' buffer addresses to
+/// `pointers`, their storage names to `storages` and their resolved weight
+/// components to `weights`.
 fn calls<'l>(
     list: &'l impl DispatchList,
     pointers: &mut Vec<*mut u8>,
-    weights: &mut Vec<Option<&'static WeightKernels>>,
+    storages: &mut Vec<&'static str>,
+    weights: &mut Vec<Option<WeightOperand>>,
 ) -> Vec<Call<'l>> {
     type Cpu = seismic_cpu::Cpu;
     type Executor = seismic_cpu::Executor;
@@ -279,9 +298,29 @@ fn calls<'l>(
             // allocations (checked when the views were formed).
             unsafe { base.add(*offset as usize) }
         }));
-        weights.extend(dispatch.representations.iter().map(|representation| {
-            seismic_native_cpu::components::resolve(route.tier, representation)
-        }));
+        for representation in dispatch.representations {
+            // Scratch (`"bytes"`) is no registered element.
+            let element = seismic_lang::registry::representation(representation);
+            let storage = element.map_or(*representation, |element| {
+                seismic_lang::registry::representation_info(
+                    seismic_lang::registry::storage_of(element),
+                )
+                .name
+            });
+            storages.push(storage);
+            weights.push(
+                seismic_native_cpu::components::resolve(route.tier, storage).map(|kernels| {
+                    let info = seismic_lang::registry::representation_info(
+                        element.expect("a resolved weight representation is registered"),
+                    );
+                    WeightOperand {
+                        kernels,
+                        nvfp4_operands: info.operands
+                            == seismic_lang::registry::OperandRecipe::Nvfp4Rows,
+                    }
+                }),
+            );
+        }
         let scalars = typed_buffer::<Cpu, Executor>(&dispatch.kernel.scalars)
             .data_pointer()
             .cast::<u64>();
@@ -293,8 +332,7 @@ fn calls<'l>(
 /// The active launches of `calls` on a pool of `participants`.
 fn steps<'a>(
     calls: &'a [Call<'_>],
-    pointers: &'a [*mut u8],
-    weights: &'a [Option<&'static WeightKernels>],
+    tables: Tables<'a>,
     participants: usize,
 ) -> Result<Vec<Step<'a>>, ExecutionError> {
     let mut steps = Vec::new();
@@ -318,9 +356,9 @@ fn steps<'a>(
             steps.push(Step {
                 function: *function,
                 invocation: CpuInvocation {
-                    buffers: &pointers[range.clone()],
-                    representations: dispatch.representations,
-                    weights: &weights[range.clone()],
+                    buffers: &tables.pointers[range.clone()],
+                    representations: &tables.storages[range.clone()],
+                    weights: &tables.weights[range.clone()],
                     words: dispatch.words,
                     params: &route.params,
                     scalar_results: *scalars,

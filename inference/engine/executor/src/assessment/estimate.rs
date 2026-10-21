@@ -302,7 +302,11 @@ mod tests {
         )
         .unwrap();
         let launches = declarations
-            .launches(Kernel::of::<magnitude_kernels::dense_expand::Entry>(), &[])
+            .launches(
+                Kernel::of::<magnitude_kernels::dense_expand::Entry>(),
+                seismic::OperandRecipe::Rounded,
+                &[],
+            )
             .unwrap();
         DecodeDemand {
             calls: vec![Call { launches, work }],

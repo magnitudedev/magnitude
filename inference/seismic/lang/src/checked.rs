@@ -323,10 +323,7 @@ impl std::error::Error for SourceError {}
 /// constructor of a [`CheckedModule`].
 pub fn check_source(sources: SourceSet) -> Result<CheckedModule, SourceError> {
     let sources = sources.canonicalized().map_err(SourceError::new)?;
-    internals::check(sources).map(|inner| CheckedModule {
-        inner: Arc::new(inner),
-        assets: Default::default(),
-    })
+    internals::check(sources).map(CheckedModule::decoded)
 }
 
 /// An opaque checked semantic object: source semantics, types, effects,
@@ -337,6 +334,20 @@ pub fn check_source(sources: SourceSet) -> Result<CheckedModule, SourceError> {
 pub struct CheckedModule {
     inner: Arc<internals::Module>,
     pub(crate) assets: std::collections::BTreeMap<(EntryId, BackendName), String>,
+    /// Each native implementation's declarations at element bindings, one
+    /// per combination of the operand recipes it reads, formed when first
+    /// asked for (`native_implementation_at`).
+    bound: Arc<[std::sync::OnceLock<BoundImplementation>]>,
+}
+
+/// A native implementation's declarations at element bindings: one per
+/// combination of the operand recipes of the elements it reads with
+/// `operands(W)` (digit i of a slot's index in base
+/// `OperandRecipe::ALL.len()`, the code of `reads[i]`).
+#[derive(Debug)]
+struct BoundImplementation {
+    reads: Vec<String>,
+    slots: Vec<std::sync::OnceLock<NativeImplementation>>,
 }
 
 impl CheckedModule {
@@ -369,6 +380,47 @@ impl CheckedModule {
             .native_implementations
             .iter()
             .find(|native| native.entry == entry && native.backend == backend)
+    }
+
+    /// The native implementation of an entry for a backend at element
+    /// bindings `bindings`, every `operands(W)` substituted: formed once per
+    /// combination of the operand recipes it reads, and shared by every
+    /// caller after.
+    pub fn native_implementation_at(
+        &self,
+        entry: EntryId,
+        backend: BackendName,
+        bindings: &ElementBindings,
+    ) -> Option<&NativeImplementation> {
+        let index = self
+            .inner
+            .native_implementations
+            .iter()
+            .position(|native| native.entry == entry && native.backend == backend)?;
+        let native = &self.inner.native_implementations[index];
+        let bound = self.bound[index].get_or_init(|| {
+            let reads = std::cell::RefCell::new(std::collections::BTreeSet::new());
+            native.at_codes(&|element: &str| {
+                reads.borrow_mut().insert(element.to_owned());
+                0
+            });
+            let reads = reads.into_inner().into_iter().collect::<Vec<_>>();
+            let slots = (0..RECIPES.pow(reads.len() as u32))
+                .map(|_| std::sync::OnceLock::new())
+                .collect();
+            BoundImplementation { reads, slots }
+        });
+        if bound.reads.is_empty() {
+            return Some(native);
+        }
+        const RECIPES: usize = registry::OperandRecipe::ALL.len();
+        let slot = bound.reads.iter().fold(0usize, |slot, element| {
+            let representation = bindings
+                .get(element)
+                .unwrap_or_else(|| panic!("element parameter `{element}` is bound"));
+            slot * RECIPES + registry::representation_info(representation).operands.code() as usize
+        });
+        Some(bound.slots[slot].get_or_init(|| native.at_elements(bindings)))
     }
 
     /// Builds the monomorphized semantics of one entry under one set of
@@ -420,9 +472,15 @@ impl CheckedModule {
     /// produced, decoded and structurally validated by
     /// [`crate::bundle::decode_checked_bundle`].
     pub(crate) fn decoded(inner: internals::Module) -> Self {
+        let bound = inner
+            .native_implementations
+            .iter()
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
         Self {
             inner: Arc::new(inner),
             assets: Default::default(),
+            bound,
         }
     }
 }
@@ -453,6 +511,7 @@ pub struct EntryInfo {
 pub struct ElementDomain {
     parameters: Vec<ElementParameter>,
     conversions: Vec<ElementConversion>,
+    predicates: Vec<ElementPredicate>,
 }
 
 /// One element parameter and every use the entry makes of it.
@@ -489,6 +548,53 @@ pub enum ElementTarget {
     Concrete(RepresentationId),
 }
 
+/// A `where` conjunct over the elements' operand recipes
+/// (`operands(QW) == operands(KW)`, `operands(RW) == 0`): decided when the
+/// elements are bound, so a binding outside it is not an entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElementPredicate {
+    /// `==` when true, `!=` when false.
+    pub equal: bool,
+    pub left: ElementTerm,
+    pub right: ElementTerm,
+}
+
+/// A term of an [`ElementPredicate`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ElementTerm {
+    /// The operand recipe code of the representation the element parameter
+    /// is bound to.
+    Operands(String),
+    Constant(u64),
+}
+
+impl ElementTerm {
+    fn value(&self, bound: impl Fn(&str) -> RepresentationId) -> u64 {
+        match self {
+            Self::Operands(parameter) => registry::representation_info(bound(parameter))
+                .operands
+                .code(),
+            Self::Constant(value) => *value,
+        }
+    }
+}
+
+impl std::fmt::Display for ElementTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Operands(parameter) => write!(f, "operands({parameter})"),
+            Self::Constant(value) => write!(f, "{value}"),
+        }
+    }
+}
+
+impl std::fmt::Display for ElementPredicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let comparison = if self.equal { "==" } else { "!=" };
+        write!(f, "{} {comparison} {}", self.left, self.right)
+    }
+}
+
 /// Element bindings outside an entry's [`ElementDomain`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ElementBindingError {
@@ -506,6 +612,9 @@ pub enum ElementBindingError {
     NoConversion {
         source: RepresentationId,
         target: RepresentationId,
+    },
+    Excluded {
+        predicate: ElementPredicate,
     },
 }
 
@@ -535,6 +644,9 @@ impl std::fmt::Display for ElementBindingError {
                 name(source),
                 name(target)
             ),
+            Self::Excluded { predicate } => {
+                write!(f, "the bindings do not hold `where {predicate}`")
+            }
         }
     }
 }
@@ -577,10 +689,12 @@ impl ElementDomain {
     pub(crate) fn new(
         parameters: Vec<ElementParameter>,
         conversions: Vec<ElementConversion>,
+        predicates: Vec<ElementPredicate>,
     ) -> Self {
         Self {
             parameters,
             conversions,
+            predicates,
         }
     }
 
@@ -592,9 +706,13 @@ impl ElementDomain {
         &self.conversions
     }
 
-    /// Whether parameter names are unique and every conversion names its own
-    /// parameters, as the checker constructs every domain. A decoded domain
-    /// is used only once this holds.
+    pub fn predicates(&self) -> &[ElementPredicate] {
+        &self.predicates
+    }
+
+    /// Whether parameter names are unique and every conversion and predicate
+    /// names its own parameters, as the checker constructs every domain. A
+    /// decoded domain is used only once this holds.
     pub(crate) fn well_formed(&self) -> bool {
         let named = |name: &str| {
             self.parameters
@@ -611,10 +729,19 @@ impl ElementDomain {
                         ElementTarget::Concrete(_) => true,
                     }
             })
+            && self.predicates.iter().all(|predicate| {
+                [&predicate.left, &predicate.right]
+                    .into_iter()
+                    .all(|term| match term {
+                        ElementTerm::Operands(name) => named(name),
+                        ElementTerm::Constant(_) => true,
+                    })
+            })
     }
 
     /// Decides whether `bindings` bind exactly this domain's parameters to
-    /// admissible representations with every required conversion registered.
+    /// admissible representations with every required conversion registered
+    /// and every element predicate holding.
     pub fn admit(&self, bindings: &ElementBindings) -> Result<(), ElementBindingError> {
         for parameter in &self.parameters {
             if bindings.get(&parameter.name).is_none() {
@@ -657,6 +784,24 @@ impl ElementDomain {
             };
             if registry::representation_conversion(source, target).is_none() {
                 return Err(ElementBindingError::NoConversion { source, target });
+            }
+        }
+        self.hold(bindings)
+    }
+
+    /// Decides whether this domain's element predicates hold at `bindings`,
+    /// which bind every parameter.
+    pub fn hold(&self, bindings: &ElementBindings) -> Result<(), ElementBindingError> {
+        let bound = |name: &str| {
+            bindings
+                .get(name)
+                .expect("an element predicate names a bound parameter")
+        };
+        for predicate in &self.predicates {
+            if (predicate.left.value(bound) == predicate.right.value(bound)) != predicate.equal {
+                return Err(ElementBindingError::Excluded {
+                    predicate: predicate.clone(),
+                });
             }
         }
         Ok(())
@@ -720,6 +865,53 @@ pub struct NativeRepeat {
 }
 
 impl NativeImplementation {
+    /// The implementation as formed at `bindings`: every `operands(W)` is
+    /// the operand recipe code of the representation `W` is bound to. The
+    /// checker admits `operands` only over the entry's element parameters,
+    /// and a formation binds every one of them.
+    pub fn at_elements(&self, bindings: &ElementBindings) -> Self {
+        self.at_codes(&|element: &str| {
+            let representation = bindings
+                .get(element)
+                .unwrap_or_else(|| panic!("element parameter `{element}` is bound"));
+            registry::representation_info(representation).operands.code()
+        })
+    }
+
+    /// The implementation with every `operands(W)` replaced by `code(W)`.
+    fn at_codes(&self, code: &impl Fn(&str) -> u64) -> Self {
+        let expression = |expression: &NativeNatExpr| expression.at_elements(&code);
+        let condition = |condition: &NativeCondition| condition.at_elements(&code);
+        Self {
+            constraint: self.constraint.as_ref().map(condition),
+            scratch: self
+                .scratch
+                .iter()
+                .map(|scratch| NativeScratch {
+                    bytes: expression(&scratch.bytes),
+                    when: scratch.when.as_ref().map(condition),
+                    ..scratch.clone()
+                })
+                .collect(),
+            launches: self
+                .launches
+                .iter()
+                .map(|launch| NativeLaunch {
+                    when: launch.when.as_ref().map(condition),
+                    groups: launch.groups.each_ref().map(expression),
+                    group_extent: launch.group_extent.each_ref().map(expression),
+                    shared_bytes: expression(&launch.shared_bytes),
+                    ..launch.clone()
+                })
+                .collect(),
+            repeat: self.repeat.as_ref().map(|repeat| NativeRepeat {
+                count: expression(&repeat.count),
+                ..repeat.clone()
+            }),
+            ..self.clone()
+        }
+    }
+
     /// The launch ordinals of one call in dispatch order when its repeat
     /// block runs `rounds` times.
     pub fn dispatch_order(&self, rounds: u64) -> impl Iterator<Item = usize> + '_ {
@@ -901,6 +1093,12 @@ pub enum NativeNatExpr {
     Constant(u64),
     Dimension(String),
     Parameter(String),
+    /// `operands(W)`: the operand recipe code
+    /// ([`crate::registry::OperandRecipe::code`]) of the representation
+    /// element parameter `W` is bound to. It has a value only in an
+    /// implementation instantiated at its bindings
+    /// ([`NativeImplementation::at_elements`]).
+    Operands(String),
     Add(Box<Self>, Box<Self>),
     Sub(Box<Self>, Box<Self>),
     Mul(Box<Self>, Box<Self>),
@@ -943,6 +1141,25 @@ impl std::fmt::Display for NativeEvalError {
 }
 
 impl NativeNatExpr {
+    /// The expression with every `operands(W)` replaced by `code(W)`.
+    fn at_elements(&self, code: &impl Fn(&str) -> u64) -> Self {
+        let binary = |left: &Self, right: &Self, make: fn(Box<Self>, Box<Self>) -> Self| {
+            make(Box::new(left.at_elements(code)), Box::new(right.at_elements(code)))
+        };
+        match self {
+            Self::Operands(element) => Self::Constant(code(element)),
+            Self::Constant(_) | Self::Dimension(_) | Self::Parameter(_) => self.clone(),
+            Self::Add(left, right) => binary(left, right, Self::Add),
+            Self::Sub(left, right) => binary(left, right, Self::Sub),
+            Self::Mul(left, right) => binary(left, right, Self::Mul),
+            Self::Div(left, right) => binary(left, right, Self::Div),
+            Self::Rem(left, right) => binary(left, right, Self::Rem),
+            Self::CeilDiv(left, right) => binary(left, right, Self::CeilDiv),
+            Self::Min(left, right) => binary(left, right, Self::Min),
+            Self::Max(left, right) => binary(left, right, Self::Max),
+        }
+    }
+
     /// Evaluate with `dimension` and `parameter` supplying named values.
     pub fn evaluate(
         &self,
@@ -962,6 +1179,7 @@ impl NativeNatExpr {
             Self::Parameter(name) => {
                 parameter(name).ok_or_else(|| NativeEvalError::Unbound(name.clone()))
             }
+            Self::Operands(element) => Err(NativeEvalError::Unbound(format!("operands({element})"))),
             Self::Add(left, right) => binary(left, right, u64::checked_add),
             Self::Sub(left, right) => binary(left, right, u64::checked_sub),
             Self::Mul(left, right) => binary(left, right, u64::checked_mul),
@@ -998,6 +1216,7 @@ impl NativeNatExpr {
             Self::Constant(value) => Some((*value, *value)),
             Self::Dimension(name) => dimension(name),
             Self::Parameter(name) => parameter(name),
+            Self::Operands(_) => None,
             Self::Add(left, right) => {
                 let ((a, b), (c, d)) = operands(left, right)?;
                 Some((a + c, b.checked_add(d)?))
@@ -1036,7 +1255,7 @@ impl NativeNatExpr {
     /// Every dimension name the expression reads.
     pub fn dimensions(&self, out: &mut Vec<String>) {
         match self {
-            Self::Constant(_) | Self::Parameter(_) => {}
+            Self::Constant(_) | Self::Parameter(_) | Self::Operands(_) => {}
             Self::Dimension(name) => {
                 if !out.contains(name) {
                     out.push(name.clone());
@@ -1059,7 +1278,7 @@ impl NativeNatExpr {
     /// Every tuning parameter name the expression reads.
     pub fn parameters(&self, out: &mut Vec<String>) {
         match self {
-            Self::Constant(_) | Self::Dimension(_) => {}
+            Self::Constant(_) | Self::Dimension(_) | Self::Operands(_) => {}
             Self::Parameter(name) => {
                 if !out.contains(name) {
                     out.push(name.clone());
@@ -1085,7 +1304,7 @@ impl NativeNatExpr {
             Self::Constant(value) => {
                 out.insert(*value);
             }
-            Self::Dimension(_) | Self::Parameter(_) => {}
+            Self::Dimension(_) | Self::Parameter(_) | Self::Operands(_) => {}
             Self::Add(left, right)
             | Self::Sub(left, right)
             | Self::Mul(left, right)
@@ -1102,6 +1321,29 @@ impl NativeNatExpr {
 }
 
 impl NativeCondition {
+    /// The condition with every `operands(W)` replaced by `code(W)`.
+    fn at_elements(&self, code: &impl Fn(&str) -> u64) -> Self {
+        match self {
+            Self::Compare {
+                comparison,
+                left,
+                right,
+            } => Self::Compare {
+                comparison: *comparison,
+                left: left.at_elements(code),
+                right: right.at_elements(code),
+            },
+            Self::And(left, right) => Self::And(
+                Box::new(left.at_elements(code)),
+                Box::new(right.at_elements(code)),
+            ),
+            Self::Or(left, right) => Self::Or(
+                Box::new(left.at_elements(code)),
+                Box::new(right.at_elements(code)),
+            ),
+        }
+    }
+
     /// The top-level `and` operands, in order.
     pub fn conjuncts<'c>(&'c self, out: &mut Vec<&'c Self>) {
         match self {
@@ -3633,6 +3875,7 @@ mod diagnostic_tests {
                 source: "T".into(),
                 target: ElementTarget::Concrete(q4k),
             }],
+            Vec::new(),
         );
         let f32 = registry::dense(DType::F32);
         assert_eq!(
@@ -3673,6 +3916,48 @@ mod diagnostic_tests {
                 source: f32,
                 target: q4k
             })
+        );
+    }
+
+    #[test]
+    fn element_predicates_decide_the_bound_operand_recipes() {
+        let parameter = |name: &str| ElementParameter {
+            name: name.into(),
+            uses: ElementUses {
+                decoded_read: true,
+                ..ElementUses::default()
+            },
+        };
+        let operands = |name: &str| ElementTerm::Operands(name.into());
+        let shared = ElementPredicate {
+            equal: true,
+            left: operands("Q"),
+            right: operands("K"),
+        };
+        let rounded = ElementPredicate {
+            equal: true,
+            left: operands("R"),
+            right: ElementTerm::Constant(0),
+        };
+        let domain = ElementDomain::new(
+            vec![parameter("Q"), parameter("K"), parameter("R")],
+            Vec::new(),
+            vec![shared.clone(), rounded.clone()],
+        );
+        assert!(domain.well_formed());
+        let w4a16 = registry::representation("nvfp4g16").unwrap();
+        let w4a4 = registry::representation("nvfp4g16a4").unwrap();
+        let bf16 = registry::dense(DType::BF16);
+        let bind = |q, k, r| ElementBindings::new().bind("Q", q).bind("K", k).bind("R", r);
+        assert_eq!(domain.admit(&bind(w4a4, w4a4, w4a16)), Ok(()));
+        assert_eq!(domain.admit(&bind(w4a16, bf16, bf16)), Ok(()));
+        assert_eq!(
+            domain.admit(&bind(w4a4, bf16, bf16)),
+            Err(ElementBindingError::Excluded { predicate: shared })
+        );
+        assert_eq!(
+            domain.admit(&bind(bf16, bf16, w4a4)),
+            Err(ElementBindingError::Excluded { predicate: rounded })
         );
     }
 }

@@ -12,6 +12,14 @@
 #define KERNEL_W3 SEISMIC_SHARED_UP
 #include "lib/routed/routed.h"
 
+// The rows the experts' and the shared expert's weights take (the
+// normalized rows, or NVFP4 operands), each pair's own, formed while its
+// GEMV stages them.
+constant constexpr bool EXPERT_NVFP4 =
+    projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4>::NVFP4;
+constant constexpr bool SHARED_NVFP4 =
+    projection::OperandRecipe<packets::W2_OPERANDS_NVFP4, packets::W3_OPERANDS_NVFP4>::NVFP4;
+
 #ifdef SEISMIC_FORMING_ROUTED_EXPAND
 template <uint ROWS, uint LANES>
 kernel void routed_expand(
@@ -55,7 +63,10 @@ kernel void routed_expand(
                 0, SEISMIC_RESULT_0_STRIDE_2},
             projection::scale_factor(gate_scale, SEISMIC_DIM_GS, SEISMIC_GATE_SCALE_STRIDE_0, expert),
             projection::scale_factor(up_scale, SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, expert));
-        projection::gemv_paired_runtime<packets::W0, packets::W1, R, 1, L>(in, out, gate, up, 1,
+        PROJECTION_OPERANDS_SHARED(globals, EXPERT_NVFP4);
+        const auto x = projection::operands<EXPERT_NVFP4>::rows(in, 1u, uint(SEISMIC_DIM_H), globals, simdgroups,
+            sg, lane);
+        projection::gemv_paired_runtime<packets::W0, packets::W1, R, 1, L>(x, out, gate, up, 1,
             SEISMIC_DIM_F, SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane);
         return;
     }
@@ -70,8 +81,11 @@ kernel void routed_expand(
     const projection::SiluMul<A> out{shared_product, SEISMIC_RESULT_1_STRIDE_0,
         SEISMIC_RESULT_1_STRIDE_1};
     const uint rows = uint(SEISMIC_DIM_M);
+    PROJECTION_OPERANDS_SHARED(globals, SHARED_NVFP4);
+    const auto x = projection::operands<SHARED_NVFP4>::rows(in, rows, uint(SEISMIC_DIM_H), globals, simdgroups, sg,
+        lane);
     PROJECTION_FOR_ROWS(rows,
-        (projection::gemv_paired_runtime<packets::W2, packets::W3, R, MAXM, L>(in, out, gate, up, rows,
+        (projection::gemv_paired_runtime<packets::W2, packets::W3, R, MAXM, L>(x, out, gate, up, rows,
             SEISMIC_DIM_S, SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane)));
 }
 #endif

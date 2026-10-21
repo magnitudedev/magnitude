@@ -30,6 +30,9 @@ pub(crate) trait RecordedGraph {
 
 pub(crate) struct Replays<G> {
     entries: Mutex<ReplayEntries<G>>,
+    /// Graphs recorded so far: a submission that recorded one paid its
+    /// recording on the host before its launches ran.
+    recorded: std::sync::atomic::AtomicU64,
 }
 
 impl<G> Default for Replays<G> {
@@ -39,6 +42,7 @@ impl<G> Default for Replays<G> {
                 clock: 0,
                 graphs: HashMap::new(),
             }),
+            recorded: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -54,6 +58,13 @@ struct Replay<G> {
     graph: G,
     /// The plans the graph's kernels belong to, kept loaded while it lives.
     _retained: Arc<dyn Any + Send + Sync>,
+}
+
+impl<G> Replays<G> {
+    /// Graphs recorded so far.
+    pub(crate) fn recorded(&self) -> u64 {
+        self.recorded.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl<G: RecordedGraph> Replays<G> {
@@ -84,6 +95,8 @@ impl<G: RecordedGraph> Replays<G> {
                 entries.graphs.remove(&oldest);
             }
             let graph = record()?;
+            self.recorded
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Drop the least recently replayed graphs until the new one fits
             // the device memory graphs may hold.
             let mut held = entries

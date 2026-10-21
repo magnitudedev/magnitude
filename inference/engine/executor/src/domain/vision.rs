@@ -23,6 +23,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         )
         .map_err(|(_, error)| SubmitFailure::Failed(DomainError::Invariant(error)))?;
         let started = Instant::now();
+        let recorded_graphs = self.family.recorded_graphs();
         // An encoder launch is no round's: the host turn before it ends.
         self.host_turn = None;
         let submission = self
@@ -34,6 +35,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             image,
             submission,
             started,
+            recorded_graphs,
             bindings,
         })
     }
@@ -98,10 +100,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             image,
             submission,
             started,
+            recorded_graphs,
             bindings,
         } = flight;
         let completed = submission.finish().map_err(DomainError::Device)?;
         let duration = started.elapsed();
+        let replayed = self.family.recorded_graphs() == recorded_graphs;
         let (core, output) = completed.into_parts();
         let patch_rows = core.batch().patch_rows();
         let merge = usize::try_from(
@@ -134,6 +138,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             committed_rows: 0,
             kind: WorkKind::Prefill,
             physical_duration: duration,
+            replayed,
             image: Some(image),
         };
         Ok((pending, bindings))

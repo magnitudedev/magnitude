@@ -310,6 +310,9 @@ pub struct PendingOperationOutcome {
     committed_rows: usize,
     kind: WorkKind,
     physical_duration: Duration,
+    /// Whether the work replayed recorded graphs only: one that recorded a
+    /// graph paid that recording on the host within its duration.
+    replayed: bool,
     image: Option<ImageRef>,
 }
 
@@ -328,6 +331,10 @@ impl PendingOperationOutcome {
     }
     pub fn physical_duration(&self) -> Duration {
         self.physical_duration
+    }
+    /// What the launches took, when the work replayed recorded graphs only.
+    pub fn launch_duration(&self) -> Option<Duration> {
+        self.replayed.then_some(self.physical_duration)
     }
 }
 

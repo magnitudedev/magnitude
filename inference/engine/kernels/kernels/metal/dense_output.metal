@@ -5,10 +5,16 @@
 #include "lib/projection/packing.h"
 
 typedef element::Act activation;
+// The down weight's operand rows (the product rows, or NVFP4 operands): the
+// GEMV row classes form them while staging, the stage launch into the
+// scratch every other form reads.
+constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
+typedef projection::operands<NVFP4> Operands;
 
 #define DENSE_OUTPUT_ARGUMENTS                                                          \
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],                   \
     device const uchar *product [[buffer(SEISMIC_BUFFER_PRODUCT)]],                     \
+    device uchar *staged [[buffer(SEISMIC_BUFFER_SCRATCH_STAGED)]],                     \
     device const uchar *down_weight [[buffer(SEISMIC_BUFFER_DOWN_WEIGHT)]],             \
     device const int *out_rows [[buffer(SEISMIC_BUFFER_OUT_ROWS)]],                     \
     device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
@@ -29,9 +35,13 @@ typedef element::Act activation;
     device const float *down_bound [[buffer(SEISMIC_BUFFER_DOWN_BOUND)]],               \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
+// `raw` is the product rows; `in` the rows every form past the GEMV reads.
 #define DENSE_OUTPUT_OPERANDS                                                         \
-    projection::Plain<activation, projection::AllRows> in{product, SEISMIC_PRODUCT_STRIDE_0, \
+    const projection::Plain<activation, projection::AllRows> raw{product, SEISMIC_PRODUCT_STRIDE_0, \
         SEISMIC_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_F), {}};                             \
+    const projection::Plain<activation, projection::AllRows> in = NVFP4                 \
+        ? projection::Plain<activation, projection::AllRows>{staged, SEISMIC_DIM_F, 1, uint(SEISMIC_DIM_F), {}} \
+        : raw;                                                                          \
     const auto out = projection::scaling<(SEISMIC_DIM_DS != 0)>::wrap(                  \
         projection::Residual<activation, projection::SelectedRows>{result,              \
             SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, residual, SEISMIC_RESIDUAL_STRIDE_0, \
@@ -43,15 +53,17 @@ typedef element::Act activation;
 #define DENSE_OUTPUT_GEMV(ROWS, LANES, TILED, COUNT)                                    \
     DENSE_OUTPUT_OPERANDS;                                                              \
     uint rows = uint(SEISMIC_DIM_O);                                                    \
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                         \
+    const auto x = Operands::rows(raw, rows, uint(SEISMIC_DIM_F), globals, simdgroups, sg, lane); \
     if (TILED == 1 && projection::gemv_tile_row_serves(w, rows)) {                      \
         PROJECTION_FOR_##COUNT##_TILE_ROWS(rows,                                        \
             projection::gemv_tile_row<packets::W0, packets::W0, false, ROWS, MAXM, LANES>( \
-                in, out, w, w, rows, uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane)); \
+                x, out, w, w, rows, uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane)); \
         return;                                                                         \
     }                                                                                   \
     PROJECTION_FOR_##COUNT##_ROWS(rows,                                                 \
         projection::gemv_form<packets::W0, packets::W0, false, ROWS, MAXM, LANES, (TILED == 2)>( \
-            in, out, w, w, rows, uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane))
+            x, out, w, w, rows, uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), tile, shared, simdgroups, sg, lane))
 
 // One row.
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV
@@ -89,6 +101,17 @@ kernel void dense_output_gemv_pair(DENSE_OUTPUT_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     DENSE_OUTPUT_GEMV(ROWS, LANES, TILED, PAIR);
+}
+#endif
+
+// The product rows as NVFP4 operands into `staged`, one row a threadgroup.
+#ifdef SEISMIC_FORMING_DENSE_OUTPUT_STAGE
+kernel void dense_output_stage(DENSE_OUTPUT_ARGUMENTS,
+    uint item [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    PROJECTION_NORMALIZE_SHARED(maxima);
+    DENSE_OUTPUT_OPERANDS;
+    projection::operands<true>::form<256>(raw, item, staged, uint(SEISMIC_DIM_F), maxima, thread_index);
 }
 #endif
 

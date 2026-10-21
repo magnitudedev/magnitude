@@ -53,5 +53,6 @@
     "speculativeDraft": "4f5e4df8dc4520256bdc0bc8752c7010bbfb1eec"
   },
   "qwen3.8-27b": { "target": "27af057ecb382ddfea5d12837360a8980560e3ed", "speculativeDraft": "ead2a051a43bf91e8982e00d2c060efb3b984cb5" },
-  "qwen3.8-flash-next": { "target": "766911a6b7369840a91dbcd95f9f997acaab6cd6", "speculativeDraft": "766911a6b7369840a91dbcd95f9f997acaab6cd6" }
+  "qwen3.8-flash-next": { "target": "766911a6b7369840a91dbcd95f9f997acaab6cd6", "speculativeDraft": "766911a6b7369840a91dbcd95f9f997acaab6cd6" },
+  "qwen3.8-flash-next-nvfp4": { "target": "1589f6e77f502705acac9d00c7ca627f3f098dbb", "speculativeDraft": "766911a6b7369840a91dbcd95f9f997acaab6cd6" }
 }

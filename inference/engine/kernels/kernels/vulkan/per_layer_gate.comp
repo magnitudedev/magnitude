@@ -1,4 +1,5 @@
-// per_layer_gate: `stage` rounds the F32 hidden rows to A in scratch; the
+// per_layer_gate: `stage` rounds the F32 hidden rows to A in scratch (as the
+// gate weight's operand rows: NVFP4 operands over NVFP4 gate rows); the
 // projection launches project them through the gate rows with the
 // activated-product epilogue A(A(act(A(gate))) * inputs[m, layer, p]). The
 // Vulkan form of `metal/per_layer_gate.metal`.
@@ -37,10 +38,18 @@ projection_weights per_layer_gate_weight() {
 }
 
 void per_layer_gate_stage() {
+#if defined(SEISMIC_GATE_WEIGHT_OPERANDS_NVFP4)
+    // The hidden rows rounded to A (one part, no norm) as the gate weight's
+    // NVFP4 operands.
+    projection_stage(projection_operands(projection_summed(GATE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
+        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, GATE_D, 0ul, 1u), PROJECTION_OPERANDS_NVFP4),
+        gl_WorkGroupID.x, GATE_ROUNDED, GATE_D);
+#else
     const uint64_t m = gl_WorkGroupID.x;
     for (uint i = gl_LocalInvocationID.x; i < GATE_D; i += 256u)
         element_put(GATE_ACT, GATE_ROUNDED, m * SEISMIC_DIM_D + i, element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)
             + (m * SEISMIC_HIDDEN_STRIDE_0 + uint64_t(i) * SEISMIC_HIDDEN_STRIDE_1) * 4ul));
+#endif
 }
 
 // The GEMV with the activation-row bound `maxm` (`projection_gemv`: one bound

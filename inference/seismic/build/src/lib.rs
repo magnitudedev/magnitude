@@ -968,6 +968,9 @@ mod internals {
                 "{prefix}_DECODED_{}",
                 native_macro(representation.decoded.name())
             ));
+            if representation.operands == registry::OperandRecipe::Nvfp4Rows {
+                symbols.insert(format!("{prefix}_OPERANDS_NVFP4"));
+            }
             symbols.insert(format!("{prefix}_PACKET_SIZE"));
             symbols.insert(format!("{prefix}_PACKET_ALIGNMENT"));
             symbols.insert(format!("{prefix}_LOGICAL_GROUP"));

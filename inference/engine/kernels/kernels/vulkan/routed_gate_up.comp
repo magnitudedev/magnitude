@@ -17,6 +17,13 @@
 #else
 #error "routed_gate_up requires a bf16 or f16 activation"
 #endif
+// The row both weights take (the normalized row, or NVFP4 operands), formed
+// while the GEMV stages it.
+#if defined(SEISMIC_EXPERT_GATE_OPERANDS_NVFP4)
+#define ROUTED_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define ROUTED_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
 
 void routed_gate_up() {
     const uint rows_per_tile = SEISMIC_SUBGROUPS * SEISMIC_TUNE_ROWS;
@@ -27,9 +34,9 @@ void routed_gate_up() {
     const uint64_t m = gl_WorkGroupID.y / SEISMIC_DIM_K, k = gl_WorkGroupID.y % SEISMIC_DIM_K;
     const uint64_t expert = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
         + (m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1) * 4ul));
-    const projection_prologue x = projection_plain(ROUTED_ACT,
+    const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT,
         SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED) + m * SEISMIC_NORMALIZED_STRIDE_0 * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
-        SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul);
+        SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul), ROUTED_OPERANDS);
     const projection_weights gate = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), PACKETS_W0_STACKED_ROWS,
         routed_expert_row(expert, SEISMIC_DIM_F), hidden);
     const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), PACKETS_W1_STACKED_ROWS,

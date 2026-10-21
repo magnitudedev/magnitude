@@ -287,9 +287,15 @@ class Adapter:
                 log,
             )
 
+            # Sampling ends when the launch ends, at a sample boundary. Cancellation is
+            # not the stop signal: one delivered during an allocation request can be
+            # absorbed by the HTTP client, which left a sampler (and its launch) running
+            # after the launch's last request.
+            ended = asyncio.Event()
+
             async def sample():
                 sample_index = 0
-                while True:
+                while not ended.is_set():
                     if reason := running.violation():
                         running.retired = reason
                         self.store.event(
@@ -331,7 +337,8 @@ class Adapter:
                                     },
                                 )
                     sample_index += 1
-                    await asyncio.sleep(0.25)
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(ended.wait(), 0.25)
 
             sampling = asyncio.create_task(sample())
             try:
@@ -375,9 +382,8 @@ class Adapter:
                 )
                 yield running
             finally:
-                sampling.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await sampling
+                ended.set()
+                await sampling
                 await stop(process)
                 self.store.event(
                     "stopped", target=self.target.id, label=label, peak_rss_bytes=running.peak_bytes

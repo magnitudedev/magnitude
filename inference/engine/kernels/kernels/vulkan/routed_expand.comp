@@ -22,6 +22,19 @@
 #else
 #error "routed_expand requires a bf16 or f16 activation"
 #endif
+// The rows the experts' and the shared expert's weights take (the
+// normalized rows, or NVFP4 operands), each pair's own, formed while its
+// GEMV stages them.
+#if defined(SEISMIC_EXPERT_GATE_OPERANDS_NVFP4)
+#define EXPERT_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define EXPERT_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
+#if defined(SEISMIC_SHARED_GATE_OPERANDS_NVFP4)
+#define SHARED_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define SHARED_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
 
 
 
@@ -42,9 +55,9 @@ void routed_expand_bounded(const uint maxm) {
         const uint64_t m = gl_WorkGroupID.y / SEISMIC_DIM_K, k = gl_WorkGroupID.y % SEISMIC_DIM_K;
         const uint64_t expert = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
             + (m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1) * 4ul));
-        const projection_prologue x = projection_plain(ROUTED_ACT,
+        const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT,
             normalized + m * SEISMIC_NORMALIZED_STRIDE_0 * uint64_t(ELEMENT_BYTES(ROUTED_ACT)), SEISMIC_NORMALIZED_STRIDE_0,
-            SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul);
+            SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul), EXPERT_OPERANDS);
         const projection_weights gate = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), PACKETS_W0_STACKED_ROWS,
             routed_expert_row(expert, SEISMIC_DIM_F), hidden);
         const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), PACKETS_W1_STACKED_ROWS,
@@ -62,8 +75,8 @@ void routed_expand_bounded(const uint maxm) {
 
     if (uint64_t(tile) * rows_per_tile >= SEISMIC_DIM_S)
         return;
-    const projection_prologue x = projection_plain(ROUTED_ACT, normalized, SEISMIC_NORMALIZED_STRIDE_0,
-        SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul);
+    const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT, normalized,
+        SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul), SHARED_OPERANDS);
     const projection_weights gate = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE), PACKETS_W2_ROWS, 0ul, hidden);
     const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP), PACKETS_W3_ROWS, 0ul, hidden);
     const projection_epilogue out_ = projection_silu_mul(ROUTED_ACT, SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER),

@@ -23,13 +23,21 @@
 #else
 #error "dense_expand requires a dense norm"
 #endif
+// The rows both weights take (the normalized rows, or NVFP4 operands): the
+// GEMV forms them while staging, the stage launch into the GEMM's scratch.
+#if defined(SEISMIC_GATE_WEIGHT_OPERANDS_NVFP4)
+#define DENSE_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define DENSE_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
 
 
 
 projection_prologue dense_expand_input() {
-    return projection_rms(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL), SEISMIC_RESIDUAL_STRIDE_0,
+    return projection_operands(projection_rms(DENSE_ACT, SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL), SEISMIC_RESIDUAL_STRIDE_0,
         SEISMIC_RESIDUAL_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0, DENSE_NORM,
-        element_word_f32(SEISMIC_PARAM_EPS), uint(SEISMIC_DIM_H), SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS));
+        element_word_f32(SEISMIC_PARAM_EPS), uint(SEISMIC_DIM_H), SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS)),
+        DENSE_OPERANDS);
 }
 
 projection_epilogue dense_expand_output() {

@@ -30,6 +30,7 @@ fn dense_output_stage<L: Isa, E: Elements>(
         };
         projection::quantize(staged, q8);
     }
+    projection::operand_row(&[&cx.arg_down_weight()], staged);
 }
 
 fn dense_output_rows<L: Isa, E: Elements>(

@@ -212,7 +212,7 @@ fn adaptive_on(
             run.milliseconds += seconds * 1000.0;
             controller.timed(
                 TimedLaunch::Draft,
-                Duration::from_secs_f64(seconds * slowdown),
+                Some(Duration::from_secs_f64(seconds * slowdown)),
                 1,
                 generated + 1,
             );
@@ -224,7 +224,7 @@ fn adaptive_on(
         run.milliseconds += seconds * 1000.0;
         controller.timed(
             TimedLaunch::Target,
-            Duration::from_secs_f64(seconds * slowdown),
+            Some(Duration::from_secs_f64(seconds * slowdown)),
             1,
             verified + 1,
         );
@@ -417,6 +417,41 @@ fn a_launch_that_proves_slow_is_not_taken_again() {
 }
 
 #[test]
+fn a_launch_not_measured_here_costs_no_more_than_a_larger_one_proven_here() {
+    use super::{Durations, LaunchCosts, RoundCosts};
+    let load = DraftLoad::default();
+    {
+        let mut costs = load.costs.lock().unwrap();
+        // A held-up first duration of width 3 at a short context.
+        let mut short = LaunchCosts::default();
+        short.draft.insert(3, Durations(vec![(1, 0.0795)]));
+        costs.insert((512, 1), short);
+        // Width 7 proven at the request's context.
+        let mut long = LaunchCosts::default();
+        long.draft
+            .insert(7, Durations(vec![(2, 0.0099), (3, 0.0099), (4, 0.0099)]));
+        costs.insert((4096, 1), long);
+    }
+    let costs = RoundCosts::of(&load, 4096, 1, None);
+    assert_eq!(costs.draft(3), 0.0099);
+}
+
+#[test]
+fn a_launch_that_recorded_its_graph_prices_nothing() {
+    let drafted = |duration: Option<Duration>| {
+        let mut controller = DraftController::new(7, Arc::new(DraftLoad::default()));
+        let generated = controller.generate(7, CONTEXT);
+        assert!(generated > 0);
+        controller.timed(TimedLaunch::Draft, duration, 1, generated + 1);
+        controller.measured().draft.contains_key(&generated)
+    };
+    // A drafter launch that recorded its graph measured that recording; one
+    // that replayed it measured itself.
+    assert!(!drafted(None));
+    assert!(drafted(Some(Duration::from_millis(9))));
+}
+
+#[test]
 fn requests_sharing_a_launch_give_its_rows_to_the_proposals_most_often_right() {
     let load = Arc::new(DraftLoad::default());
     let stream = Stream::of(&[(64, PERFECT), (64, UNPREDICTABLE)]);
@@ -427,7 +462,7 @@ fn requests_sharing_a_launch_give_its_rows_to_the_proposals_most_often_right() {
         let seconds = (LONG.verify)(rows) / 1000.0;
         measuring.timed(
             TimedLaunch::Target,
-            Duration::from_secs_f64(seconds),
+            Some(Duration::from_secs_f64(seconds)),
             2,
             rows,
         );
@@ -763,13 +798,13 @@ fn pipelined(
             match reported {
                 Reported::Whole => {
                     if entry > 0.0 {
-                        controller.timed(TimedLaunch::Entry, ms(entry), 1, held);
+                        controller.timed(TimedLaunch::Entry, Some(ms(entry)), 1, held);
                     }
-                    controller.timed(TimedLaunch::Draft, ms(draft), 1, generated + 1);
+                    controller.timed(TimedLaunch::Draft, Some(ms(draft)), 1, generated + 1);
                 }
                 Reported::WithoutSwitch => {
                     let launch = (machine.costs.draft)(generated);
-                    controller.timed(TimedLaunch::Draft, ms(launch), 1, generated + 1);
+                    controller.timed(TimedLaunch::Draft, Some(ms(launch)), 1, generated + 1);
                 }
             }
             held = 0;
@@ -787,7 +822,7 @@ fn pipelined(
         if reported == Reported::WithoutSwitch {
             target = (machine.costs.verify)(verified + 1);
         }
-        controller.timed(TimedLaunch::Target, ms(target), 1, verified + 1);
+        controller.timed(TimedLaunch::Target, Some(ms(target)), 1, verified + 1);
         drafted_before = Some(generated > 0);
         let accepted = stream.right(position).min(verified);
         let committed = (position + 1..=position + accepted + 1)

@@ -25,6 +25,7 @@ fn per_layer_gate_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: 
         };
         projection::quantize(staged, q8);
     }
+    projection::operand_row(&[&cx.arg_gate_weight()], staged);
 }
 
 fn per_layer_gate_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {

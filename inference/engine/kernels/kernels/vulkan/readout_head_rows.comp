@@ -22,15 +22,22 @@
 #else
 #error "readout_head_rows requires a dense norm"
 #endif
+// The weight's operand rows (the normalized rows, or NVFP4 operands): the
+// GEMV forms them while staging, the stage launch into the GEMM's scratch.
+#if defined(SEISMIC_WEIGHT_OPERANDS_NVFP4)
+#define HEAD_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define HEAD_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
 
 
 #define HEAD_K uint(SEISMIC_DIM_D)
 
 projection_prologue head_rows_input() {
-    return projection_input(HEAD_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), SEISMIC_HIDDEN_STRIDE_0,
-        SEISMIC_HIDDEN_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0, HEAD_NORM,
-        element_word_f32(SEISMIC_PARAM_EPSILON), HEAD_K, SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS), uint(SEISMIC_DIM_NM),
-        uint(SEISMIC_DIM_PT));
+    return projection_operands(projection_input(HEAD_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
+        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0,
+        HEAD_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), HEAD_K, SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS),
+        uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT)), HEAD_OPERANDS);
 }
 
 projection_epilogue head_rows_output() {

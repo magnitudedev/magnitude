@@ -2,7 +2,7 @@
 //! and explicit target coverage. One flat global namespace.
 
 use super::ir::{DefKind, Ownership, Predicate, WhereConjunct};
-use crate::checked::DiagnosticRule;
+use crate::checked::{DiagnosticRule, ElementPredicate, ElementTerm};
 use crate::expr::{AnyExpr, BoolExpr, CmpOp, ExprArena, IntExpr, SymbolId};
 use crate::ids::{CapabilityId, FamilyId, FunctionId, ProgramId};
 use crate::registry::{self, BackendName};
@@ -45,6 +45,7 @@ pub(crate) struct Sig {
     pub params: Vec<SigParam>,
     pub result: ValueType,
     pub predicates: Vec<WhereConjunct>,
+    pub element_predicates: Vec<ElementPredicate>,
     pub arena: ExprArena,
 }
 
@@ -57,6 +58,7 @@ pub(crate) struct BodySig {
     pub params: Vec<SigParam>,
     pub result: ValueType,
     pub predicates: Vec<WhereConjunct>,
+    pub element_predicates: Vec<ElementPredicate>,
 }
 
 impl BodySig {
@@ -150,6 +152,7 @@ impl Sig {
                 params,
                 result,
                 predicates,
+                element_predicates: self.element_predicates.clone(),
             },
             arena,
         )
@@ -829,12 +832,16 @@ fn shape_bool(
     }
 }
 
+/// The shape conjuncts of a `where` clause into `out`, and its comparisons
+/// of element operand recipes into `elements`.
 fn predicates_of(
     e: &ast::Expr,
     shape_params: &[String],
     shape_symbols: &[SymbolId],
+    elem_params: &[String],
     arena: &mut ExprArena,
     out: &mut Vec<WhereConjunct>,
+    elements: &mut Vec<ElementPredicate>,
 ) -> Result<(), Diagnostic> {
     match &e.kind {
         A::Binary {
@@ -842,8 +849,20 @@ fn predicates_of(
             lhs,
             rhs,
         } => {
-            predicates_of(lhs, shape_params, shape_symbols, arena, out)?;
-            predicates_of(rhs, shape_params, shape_symbols, arena, out)
+            predicates_of(lhs, shape_params, shape_symbols, elem_params, arena, out, elements)?;
+            predicates_of(rhs, shape_params, shape_symbols, elem_params, arena, out, elements)
+        }
+        A::Binary {
+            op: op @ (BinaryOp::Eq | BinaryOp::Ne),
+            lhs,
+            rhs,
+        } if operands_call(lhs).is_some() || operands_call(rhs).is_some() => {
+            elements.push(ElementPredicate {
+                equal: matches!(op, BinaryOp::Eq),
+                left: element_term(lhs, elem_params)?,
+                right: element_term(rhs, elem_params)?,
+            });
+            Ok(())
         }
         A::Binary {
             op: BinaryOp::Or, ..
@@ -894,6 +913,41 @@ fn predicates_of(
             DiagnosticRule::Type,
             e.span,
             "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters",
+        )),
+    }
+}
+
+/// The argument of `operands(argument)`.
+fn operands_call(e: &ast::Expr) -> Option<&ast::Expr> {
+    match &e.kind {
+        A::Call {
+            callee,
+            bindings,
+            args,
+        } if matches!(&callee.kind, A::Name(name) if name.name == "operands")
+            && bindings.is_empty() =>
+        {
+            match args.as_slice() {
+                [arg] if arg.name.is_none() => Some(&arg.value),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A side of an element predicate: `operands(E)` of an element parameter, or
+/// a constant.
+fn element_term(e: &ast::Expr, elem_params: &[String]) -> Result<ElementTerm, Diagnostic> {
+    match (&e.kind, operands_call(e).map(|argument| &argument.kind)) {
+        (A::Int(value), _) => Ok(ElementTerm::Constant(*value)),
+        (_, Some(A::Name(name))) if elem_params.contains(&name.name) => {
+            Ok(ElementTerm::Operands(name.name.clone()))
+        }
+        _ => Err(Diagnostic::with_rule(
+            DiagnosticRule::Type,
+            e.span,
+            "an element predicate compares `operands` of element parameters and constants",
         )),
     }
 }
@@ -1028,13 +1082,16 @@ pub(crate) fn signature_of(
     };
     collect_body_element_parameters(body, &mut elem_params);
     let mut predicates = Vec::new();
+    let mut element_predicates = Vec::new();
     for e in s.predicates.iter().chain(extra_predicates) {
         predicates_of(
             e,
             &shape_params,
             &shape_symbols,
+            &elem_params,
             &mut arena,
             &mut predicates,
+            &mut element_predicates,
         )?;
     }
     let dimensions = shape_params
@@ -1059,6 +1116,7 @@ pub(crate) fn signature_of(
         params,
         result,
         predicates,
+        element_predicates,
         arena,
     })
 }

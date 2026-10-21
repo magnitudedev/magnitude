@@ -165,10 +165,10 @@ native project_rows for cuda from "cuda/project_rows.cu":
     static (K, N, WS)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
     where K % 64 == 0 and WS <= 1 and (OPERAND == 0 or INT8 == 0)
-    scratch staged bytes (M * K * (1 + OPERAND)) when M > 16 and (INT8 == 1 or OPERAND == 1)
+    scratch staged bytes (M * K * max(1 + OPERAND, 2 * operands(W))) when (M > 1 and operands(W) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1))
     scratch groups bytes (M * K / 4) when INT8 == 1 and M > 16
     scratch partials bytes (2 * M * N * 4) when M > 16 and M <= 128
-    launch project_rows_stage when M > 16 and (INT8 == 1 or OPERAND == 1):
+    launch project_rows_stage when (M > 1 and operands(W) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1)):
         reads (INT8, OPERAND)
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -176,6 +176,7 @@ native project_rows for cuda from "cuda/project_rows.cu":
         params (code arithmetic KSPLIT in [4, 2, 8])
         threadgroups (ceil_div(ceil_div(N, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+        shared_bytes (operands(W) * (1 - min(1, M - 1)) * K * 2)
     launch project_rows_gemv16 when M > 8 and M <= 16:
         params (code arithmetic KSPLIT in [4, 2, 8])
         threadgroups (ceil_div(ceil_div(N, 16), 8 / KSPLIT), 1, 1)
@@ -199,10 +200,10 @@ native dense_output for cuda from "cuda/dense_output.cu":
     static (H, F, DS)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1], code arithmetic KSPLIT in [4, 2, 8])
     where F % 64 == 0 and DS <= 1 and (OPERAND == 0 or INT8 == 0)
-    scratch staged bytes (O * F * (1 + OPERAND)) when O > 16 and (INT8 == 1 or OPERAND == 1)
+    scratch staged bytes (O * F * max(1 + OPERAND, 2 * operands(DW))) when (O > 1 and operands(DW) == 1) or (O > 16 and (INT8 == 1 or OPERAND == 1))
     scratch groups bytes (O * F / 4) when INT8 == 1 and O > 16
     scratch partials bytes (2 * O * H * 4) when O > 16 and O <= 128
-    launch dense_output_stage when O > 16 and (INT8 == 1 or OPERAND == 1):
+    launch dense_output_stage when (O > 1 and operands(DW) == 1) or (O > 16 and (INT8 == 1 or OPERAND == 1)):
         reads (INT8, OPERAND)
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -210,6 +211,7 @@ native dense_output for cuda from "cuda/dense_output.cu":
         reads (KSPLIT)
         threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+        shared_bytes (operands(DW) * (1 - min(1, O - 1)) * F * 2)
     launch dense_output_gemv16 when O > 8 and O <= 16:
         reads (KSPLIT)
         threadgroups (ceil_div(ceil_div(H, 16), 8 / KSPLIT), 1, 1)

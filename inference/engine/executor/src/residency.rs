@@ -878,6 +878,7 @@ impl ResidencyStore {
                 actual_source,
                 resident_element(
                     *encoding,
+                    crate::import_transforms::scaled_activations(descriptor),
                     shape.last().copied().unwrap_or(1),
                     target,
                     layout,
@@ -1551,6 +1552,7 @@ fn validate_dense(stored: &StoredTensor) -> Result<usize, WeightImportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magnitude_family_contracts::ScaledActivations;
 
     #[test]
     fn catalog_encoding_map_is_exact() {
@@ -1574,14 +1576,20 @@ mod tests {
         ] {
             assert!(source_element(encoding, 2560).is_some());
             for layout in seismic::Layout::ALL {
-                assert!(resident_element(encoding, 2560, DType::BF16, layout).is_some());
+                let rounded = ScaledActivations::Rounded;
+                assert!(resident_element(encoding, rounded, 2560, DType::BF16, layout).is_some());
             }
         }
         for encoding in [Encoding::Q1_0, Encoding::I32] {
             assert!(source_element(encoding, 2560).is_none());
-            assert!(
-                resident_element(encoding, 2560, DType::BF16, seismic::Layout::Rows16).is_none()
-            );
+            assert!(resident_element(
+                encoding,
+                ScaledActivations::Rounded,
+                2560,
+                DType::BF16,
+                seismic::Layout::Rows16
+            )
+            .is_none());
         }
     }
 

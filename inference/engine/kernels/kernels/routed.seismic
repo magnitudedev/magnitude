@@ -31,7 +31,7 @@ fn routed_route[M, H, PT, NM, E, K, ES](residual: &tensor[M, PT * H] f32, norm: 
     router: &tensor[E, H] RW, shared_router: &tensor[H] f32,
     routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
     eps: f32, normalize: i32, expert_scale: &tensor[ES] f32) -> (tensor[M, H] A, tensor[M] f32)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E):
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0:
     let mut normalized = tensor[M, H] A
     let mut logits = tensor[M, E] f32
     let mut coefficient = tensor[M] f32
@@ -187,7 +187,7 @@ fn routed_route_shared[M, H, PT, NM, E, K, S, ES](residual: &tensor[M, PT * H] f
     routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
     eps: f32, normalize: i32, expert_scale: &tensor[ES] f32)
     -> (tensor[M, H] A, tensor[M] f32, tensor[M, S] A)
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E):
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0 and operands(SGW) == operands(SUW):
     let mut normalized = tensor[M, H] A
     let mut logits = tensor[M, E] f32
     let mut coefficient = tensor[M] f32
@@ -223,12 +223,16 @@ fn routed_route_shared[M, H, PT, NM, E, K, S, ES](residual: &tensor[M, PT * H] f
                 scores[row, choice] = scores[row, choice] * expert_scale[routes[row, choice]]
         let shared_logit = reduce(f32(normalized[row]) * f32(shared_router), 0, sum)
         coefficient[row] = 1.0 / (1.0 + exp(-shared_logit))
+        let mut gate_row = tensor[H] f32
+        let mut up_row = tensor[H] f32
+        operand_row(normalized[row], operands(shared_gate), gate_row)
+        operand_row(normalized[row], operands(shared_up), up_row)
         for feature in 0..S:
             let mut gate = f32(0.0)
             let mut up = f32(0.0)
             for source in 0..H:
-                gate = fma(f32(normalized[row, source]), f32(shared_gate[feature, source]), gate)
-                up = fma(f32(normalized[row, source]), f32(shared_up[feature, source]), up)
+                gate = fma(gate_row[source], f32(shared_gate[feature, source]), gate)
+                up = fma(up_row[source], f32(shared_up[feature, source]), up)
             shared_product[row, feature] = (gate / (1.0 + exp(-gate))) * up
     return (normalized, coefficient, shared_product)
 
@@ -261,9 +265,17 @@ fn routed_expand[M, H, E, K, F, S, GS, US](normalized: &tensor[M, H] A,
     expert_up: &tensor[E, F, H] EUW, shared_gate: &tensor[S, H] SGW,
     shared_up: &tensor[S, H] SUW, gate_scale: &tensor[GS] f32,
     up_scale: &tensor[US] f32) -> (tensor[M, K, F] A, tensor[M, S] A)
-    where GS >= 0 and US >= 0:
+    where GS >= 0 and US >= 0 and operands(EGW) == operands(EUW) and operands(SGW) == operands(SUW):
     let mut expert_product = tensor[M, K, F] A
     let mut shared_product = tensor[M, S] A
+    let mut gate_rows = tensor[M, H] f32
+    let mut up_rows = tensor[M, H] f32
+    let mut shared_gate_rows = tensor[M, H] f32
+    let mut shared_up_rows = tensor[M, H] f32
+    operand_rows(normalized, operands(expert_gate), gate_rows)
+    operand_rows(normalized, operands(expert_up), up_rows)
+    operand_rows(normalized, operands(shared_gate), shared_gate_rows)
+    operand_rows(normalized, operands(shared_up), shared_up_rows)
     for row in 0..M:
         for choice in 0..K:
             let expert = routes[row, choice]
@@ -277,8 +289,8 @@ fn routed_expand[M, H, E, K, F, S, GS, US](normalized: &tensor[M, H] A,
                 let mut gate = f32(0.0)
                 let mut up = f32(0.0)
                 for source in 0..H:
-                    gate = fma(f32(normalized[row, source]), f32(expert_gate[expert, feature, source]), gate)
-                    up = fma(f32(normalized[row, source]), f32(expert_up[expert, feature, source]), up)
+                    gate = fma(gate_rows[row, source], f32(expert_gate[expert, feature, source]), gate)
+                    up = fma(up_rows[row, source], f32(expert_up[expert, feature, source]), up)
                 gate = gate * gate_factor
                 up = up * up_factor
                 expert_product[row, choice, feature] = (gate / (1.0 + exp(-gate))) * up
@@ -286,8 +298,8 @@ fn routed_expand[M, H, E, K, F, S, GS, US](normalized: &tensor[M, H] A,
             let mut gate = f32(0.0)
             let mut up = f32(0.0)
             for source in 0..H:
-                gate = fma(f32(normalized[row, source]), f32(shared_gate[feature, source]), gate)
-                up = fma(f32(normalized[row, source]), f32(shared_up[feature, source]), up)
+                gate = fma(shared_gate_rows[row, source], f32(shared_gate[feature, source]), gate)
+                up = fma(shared_up_rows[row, source], f32(shared_up[feature, source]), up)
             shared_product[row, feature] = (gate / (1.0 + exp(-gate))) * up
     return (expert_product, shared_product)
 
@@ -313,6 +325,10 @@ native routed_expand for metal from "metal/routed_expand.metal":
 native routed_expand for cuda from "cuda/routed_expand.cu":
     static (H, K, F, S, GS, US)
     params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+    scratch operands bytes (M * H * 2) when operands(EGW) + operands(SGW) > 0
+    launch routed_expand_stage when operands(EGW) + operands(SGW) > 0:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch routed_expand when M == 1:
         reads (TPW, KSPLIT)
         threadgroups (ceil_div(ceil_div(ceil_div(max(F, S), 16), TPW), 4 / KSPLIT), M * K + 1, 1)
@@ -330,7 +346,7 @@ native routed_expand for vulkan from "vulkan/routed_expand.comp":
     let GEMV_GROUPS = ceil_div(max(F, S), SIMDGROUPS * ROWS)
     let GEMV_GROUPS_Y = M * K + 1
     let GEMV_THREADS = 32 * SIMDGROUPS
-    let GEMV_SHARED = 256 + min(8 * ceil_div(H, 32), 288) * 72
+    let GEMV_SHARED = 256 + 32 * max(operands(EGW), operands(SGW)) + min(8 * ceil_div(H, 32), 288) * 72
     launch routed_expand1 when M <= 1:
         threadgroups (GEMV_GROUPS, GEMV_GROUPS_Y, 1)
         threads_per_threadgroup (GEMV_THREADS, 1, 1)
@@ -355,6 +371,7 @@ native routed_expand for cpu from "cpu/routed_expand.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
     scratch quantized bytes (M * ceil_div(H, 256) * 292)
     scratch staged bytes (M * H * 4)
+    scratch operands bytes (M * H * 4) when operands(EGW) + operands(SGW) > 0
     launch routed_expand_stage:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
@@ -380,10 +397,12 @@ fn routed_output[M, H, SN, IN, E, K, F, S](residual: &tensor[M, SN * H] f32,
     for row in 0..M:
         for choice in 0..K:
             let expert = routes[row, choice]
+            let mut down_row = tensor[F] f32
+            operand_row(expert_product[row, choice], operands(expert_down), down_row)
             for column in 0..H:
                 let mut projected = f32(0.0)
                 for feature in 0..F:
-                    projected = fma(f32(expert_product[row, choice, feature]), f32(expert_down[expert, column, feature]), projected)
+                    projected = fma(down_row[feature], f32(expert_down[expert, column, feature]), projected)
                 published[row, choice, column] = projected
         for column in 0..H:
             let mut selected = f32(0.0)
@@ -429,6 +448,11 @@ native routed_output for cuda from "cuda/routed_output.cu":
     params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
     scratch published bytes (M * (K + 1) * H * 4)
     scratch arrivals bytes (ceil_div(H, 16) * 4) sync
+    scratch expert_operands bytes (M * K * F * 2) when operands(EDW) == 1
+    scratch shared_operands bytes (M * S * 2) when operands(SDW) == 1
+    launch routed_output_stage when operands(EDW) + operands(SDW) > 0:
+        threadgroups (M * (K + 1), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch routed_output when M == 1:
         reads (TPW, KSPLIT)
         threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * (K + 1), 1)
@@ -448,7 +472,7 @@ native routed_output for vulkan from "vulkan/routed_output.comp":
     launch routed_output_project:
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M * (K + 1), 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + min(ceil_div(max(F, S), 32), 288) * 72)
+        shared_bytes (256 + 32 * max(operands(EDW), operands(SDW)) + min(ceil_div(max(F, S), 32), 288) * 72)
     launch routed_output_combine:
         threadgroups (ceil_div(H, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -549,9 +573,14 @@ fn routed_experts[M, H, E, F, B, T, GS, US](normalized: &tensor[M, H] A,
     expert_gate: &tensor[E, F, H] EGW, expert_up: &tensor[E, F, H] EUW,
     expert_down: &tensor[E, H, F] EDW, activation: i32, gate_scale: &tensor[GS] f32,
     up_scale: &tensor[US] f32) -> tensor[B, T, H] A
-    where GS >= 0 and US >= 0:
+    where GS >= 0 and US >= 0 and operands(EGW) == operands(EUW):
     let mut output = tensor[B, T, H] A
     let mut product = tensor[F] A
+    let mut gate_rows = tensor[M, H] f32
+    let mut up_rows = tensor[M, H] f32
+    let mut down_row = tensor[F] f32
+    operand_rows(normalized, operands(expert_gate), gate_rows)
+    operand_rows(normalized, operands(expert_up), up_rows)
     for block in 0..B:
         let expert = blocks[block]
         for lane in 0..T:
@@ -569,8 +598,8 @@ fn routed_experts[M, H, E, F, B, T, GS, US](normalized: &tensor[M, H] A,
                     let mut gate = f32(0.0)
                     let mut up = f32(0.0)
                     for source in 0..H:
-                        gate = fma(f32(normalized[row, source]), f32(expert_gate[expert, feature, source]), gate)
-                        up = fma(f32(normalized[row, source]), f32(expert_up[expert, feature, source]), up)
+                        gate = fma(gate_rows[row, source], f32(expert_gate[expert, feature, source]), gate)
+                        up = fma(up_rows[row, source], f32(expert_up[expert, feature, source]), up)
                     gate = gate * gate_factor
                     up = up * up_factor
                     let mut activated = gate / (1.0 + exp(-gate))
@@ -578,10 +607,11 @@ fn routed_experts[M, H, E, F, B, T, GS, US](normalized: &tensor[M, H] A,
                         let u = 0.7978845608028654 * (gate + 0.044715 * (gate * gate * gate))
                         activated = gate / (1.0 + exp(-2.0 * u))
                     product[feature] = activated * up
+                operand_row(product, operands(expert_down), down_row)
                 for column in 0..H:
                     let mut projected = f32(0.0)
                     for feature in 0..F:
-                        projected = fma(f32(product[feature]), f32(expert_down[expert, column, feature]), projected)
+                        projected = fma(down_row[feature], f32(expert_down[expert, column, feature]), projected)
                     output[block, lane, column] = projected
     return output
 
@@ -591,10 +621,17 @@ fn routed_experts[M, H, E, F, B, T, GS, US](normalized: &tensor[M, H] A,
 native routed_experts for metal from "metal/routed_experts.metal":
     static (H, F, GS, US)
     params (TILE_M in [32, 64], TILE_N in [128, 64])
+    scratch staged bytes (M * H * 2) when operands(EGW) + operands(EUW) > 0
     scratch product bytes (B * T * F * 2)
+    launch routed_experts_stage when operands(EGW) + operands(EUW) > 0:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch routed_experts_expand:
         threadgroups (ceil_div(F * 2, TILE_N), B * ceil_div(T, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+    launch routed_experts_quantize when operands(EDW) == 1:
+        threadgroups (B * T, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch routed_experts_down:
         threadgroups (ceil_div(H, TILE_N), B * ceil_div(T, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
@@ -604,9 +641,9 @@ native routed_experts for metal from "metal/routed_experts.metal":
 native routed_experts for cuda from "cuda/routed_experts.cu":
     static (H, F, GS, US)
     params (code arithmetic OPERAND in [0, 1])
-    scratch staged bytes (M * H * 2) when OPERAND == 1
+    scratch staged bytes (M * H * 2) when OPERAND == 1 or operands(EGW) + operands(EUW) > 0
     scratch product bytes (B * T * F * 2)
-    launch routed_experts_stage when OPERAND == 1:
+    launch routed_experts_stage when OPERAND == 1 or operands(EGW) + operands(EUW) > 0:
         reads (OPERAND)
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -615,6 +652,10 @@ native routed_experts for cuda from "cuda/routed_experts.cu":
         threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(T, 32), B)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (32 * 144 + 2 * 10240) + 2 * 4096)
+    launch routed_experts_quantize when operands(EDW) == 1:
+        reads (OPERAND)
+        threadgroups (B * T, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch routed_experts_down:
         reads (OPERAND)
         threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(T, 32), B)
@@ -622,16 +663,26 @@ native routed_experts for cuda from "cuda/routed_experts.cu":
         shared_bytes (3 * (32 * 144 + 10240) + 4096)
 
 # Vulkan: the Metal form on the projection library's GEMM (paired gate/up
-# tiles, then the down tiles).
+# tiles, then the down tiles; over NVFP4 weights the stage launch forms the
+# normalized rows' operands, the quantize launch the products' in place).
 native routed_experts for vulkan from "vulkan/routed_experts.comp":
     static (H, F, GS, US)
     params (TILE_M in [32, 64], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
     where SUB_M <= TILE_M and SUB_N <= TILE_N
+    scratch staged bytes (M * H * 2) when operands(EGW) + operands(EUW) > 0
     scratch product bytes (B * T * F * 2)
+    launch routed_experts_stage when operands(EGW) + operands(EUW) > 0:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
     launch routed_experts_expand:
         threadgroups (ceil_div(F * 2, TILE_N), B * ceil_div(T, TILE_M), 1)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
+    launch routed_experts_quantize when operands(EDW) == 1:
+        threadgroups (B * T, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
     launch routed_experts_down:
         threadgroups (ceil_div(H, TILE_N), B * ceil_div(T, TILE_M), 1)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
@@ -652,7 +703,7 @@ native routed_experts for cpu from "cpu/routed_experts.rs":
     launch routed_experts_expand:
         threadgroups (ceil_div(F, ROWS), B, 1)
         threads_per_threadgroup (1, 1, 1)
-    launch routed_experts_quantize when INT8 == 1:
+    launch routed_experts_quantize when INT8 == 1 or operands(EDW) == 1:
         threadgroups (B * T, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_down:
@@ -669,17 +720,21 @@ fn routed_combine[M, H, SN, IN, K, B, T, S](residual: &tensor[M, SN * H] f32,
     scores: &tensor[M, K] f32, normalized: &tensor[M, H] A,
     coefficient: &tensor[M] f32, shared_gate: &tensor[S, H] SGW,
     shared_up: &tensor[S, H] SUW, shared_down: &tensor[H, S] SDW)
-    -> tensor[M, SN * H] f32 where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)):
+    -> tensor[M, SN * H] f32 where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)) and operands(SGW) == 0 and operands(SUW) == 0 and operands(SDW) == 0:
     let mut shared_product = tensor[M, S] A
     let mut shared = tensor[M, H] A
     let mut value = tensor[M, SN * H] f32
+    let mut gate_rows = tensor[M, H] f32
+    let mut up_rows = tensor[M, H] f32
+    operand_rows(normalized, operands(shared_gate), gate_rows)
+    operand_rows(normalized, operands(shared_up), up_rows)
     for row in 0..M:
         for feature in 0..S:
             let mut gate = f32(0.0)
             let mut up = f32(0.0)
             for source in 0..H:
-                gate = fma(f32(normalized[row, source]), f32(shared_gate[feature, source]), gate)
-                up = fma(f32(normalized[row, source]), f32(shared_up[feature, source]), up)
+                gate = fma(gate_rows[row, source], f32(shared_gate[feature, source]), gate)
+                up = fma(up_rows[row, source], f32(shared_up[feature, source]), up)
             shared_product[row, feature] = (gate / (1.0 + exp(-gate))) * up
     linear(shared_product, shared_down, shared)
     for row in 0..M:
@@ -772,7 +827,7 @@ native routed_combine for cpu from "cpu/routed_combine.rs":
     launch routed_combine_shared:
         threadgroups (ceil_div(S, ROWS), 1, 1)
         threads_per_threadgroup (1, 1, 1)
-    launch routed_combine_quantize when INT8 == 1:
+    launch routed_combine_quantize when INT8 == 1 or operands(SDW) == 1:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_combine:
@@ -811,7 +866,7 @@ fn routed_select[M, H, E, K, ES](residual: &tensor[M, H] f32, norm: &tensor[H] N
     expert_scale: &tensor[ES] f32, routes: &mut tensor[M, K] i32,
     weights: &mut tensor[M, K] f32, epsilon: f32, score: i32, normalization: i32,
     normalization_epsilon: f32, scale: f32) -> tensor[M, H] A
-    where ES >= 0 and (ES == 0 or ES == E):
+    where ES >= 0 and (ES == 0 or ES == E) and operands(RW) == 0:
     let mut normalized = tensor[M, H] A
     let mut router_input = tensor[M, H] A
     let mut logits = tensor[M, E] f32
@@ -967,8 +1022,12 @@ fn routed_gate_up[M, H, E, K, F, GS, US](normalized: &tensor[M, H] A,
     routes: &tensor[M, K] i32, expert_gate: &tensor[E, F, H] EGW,
     expert_up: &tensor[E, F, H] EUW, activation: i32, gate_scale: &tensor[GS] f32,
     up_scale: &tensor[US] f32) -> tensor[M, K, F] A
-    where GS >= 0 and US >= 0:
+    where GS >= 0 and US >= 0 and operands(EGW) == operands(EUW):
     let mut product = tensor[M, K, F] A
+    let mut gate_rows = tensor[M, H] f32
+    let mut up_rows = tensor[M, H] f32
+    operand_rows(normalized, operands(expert_gate), gate_rows)
+    operand_rows(normalized, operands(expert_up), up_rows)
     for row in 0..M:
         for choice in 0..K:
             let expert = routes[row, choice]
@@ -985,8 +1044,8 @@ fn routed_gate_up[M, H, E, K, F, GS, US](normalized: &tensor[M, H] A,
                 let mut g = f32(0.0)
                 let mut u = f32(0.0)
                 for source in 0..H:
-                    g = fma(f32(normalized[row, source]), f32(expert_gate[expert, feature, source]), g)
-                    u = fma(f32(normalized[row, source]), f32(expert_up[expert, feature, source]), u)
+                    g = fma(gate_rows[row, source], f32(expert_gate[expert, feature, source]), g)
+                    u = fma(up_rows[row, source], f32(expert_up[expert, feature, source]), u)
                 gate[0, feature] = g * gate_factor
                 up[0, feature] = u * up_factor
             activate(gate, activated, activation)
@@ -1003,6 +1062,8 @@ fn routed_up[M, H, E, K, F, US](normalized: &tensor[M, H] A,
     up_scale: &tensor[US] f32, activation: i32) -> tensor[M, K, F] A
     where US >= 0:
     let mut product = tensor[M, K, F] A
+    let mut up_rows = tensor[M, H] f32
+    operand_rows(normalized, operands(expert_up), up_rows)
     for row in 0..M:
         for choice in 0..K:
             let expert = routes[row, choice]
@@ -1014,7 +1075,7 @@ fn routed_up[M, H, E, K, F, US](normalized: &tensor[M, H] A,
             for feature in 0..F:
                 let mut u = f32(0.0)
                 for source in 0..H:
-                    u = fma(f32(normalized[row, source]), f32(expert_up[expert, feature, source]), u)
+                    u = fma(up_rows[row, source], f32(expert_up[expert, feature, source]), u)
                 up[0, feature] = u * up_factor
             activate(up, activated, activation)
             for feature in 0..F:
@@ -1036,10 +1097,12 @@ fn routed_down[M, H, E, K, F](base: &tensor[M, H] f32,
     for row in 0..M:
         for choice in 0..K:
             let expert = routes[row, choice]
+            let mut down_row = tensor[F] f32
+            operand_row(product[row, choice], operands(expert_down), down_row)
             for column in 0..H:
                 let mut projected = f32(0.0)
                 for feature in 0..F:
-                    projected = fma(f32(product[row, choice, feature]), f32(expert_down[expert, column, feature]), projected)
+                    projected = fma(down_row[feature], f32(expert_down[expert, column, feature]), projected)
                 published[row, choice, column] = projected
         for column in 0..H:
             let mut selected = f32(0.0)
@@ -1060,6 +1123,9 @@ fn routed_experts_up[M, H, E, F, B, T, US](normalized: &tensor[M, H] A,
     let mut output = tensor[B, T, H] A
     let mut up = tensor[1, F] A
     let mut activated = tensor[1, F] A
+    let mut up_rows = tensor[M, H] f32
+    let mut down_row = tensor[F] f32
+    operand_rows(normalized, operands(expert_up), up_rows)
     for block in 0..B:
         let expert = blocks[block]
         for lane in 0..T:
@@ -1073,13 +1139,14 @@ fn routed_experts_up[M, H, E, F, B, T, US](normalized: &tensor[M, H] A,
                 for feature in 0..F:
                     let mut u = f32(0.0)
                     for source in 0..H:
-                        u = fma(f32(normalized[row, source]), f32(expert_up[expert, feature, source]), u)
+                        u = fma(up_rows[row, source], f32(expert_up[expert, feature, source]), u)
                     up[0, feature] = u * up_factor
                 activate(up, activated, activation)
+                operand_row(activated[0], operands(expert_down), down_row)
                 for column in 0..H:
                     let mut projected = f32(0.0)
                     for feature in 0..F:
-                        projected = fma(f32(activated[0, feature]), f32(expert_down[expert, column, feature]), projected)
+                        projected = fma(down_row[feature], f32(expert_down[expert, column, feature]), projected)
                     output[block, lane, column] = projected
     return output
 
@@ -1126,6 +1193,7 @@ native routed_gate_up for cuda from "cuda/routed_gate_up.cu":
         params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
         threadgroups (ceil_div(ceil_div(ceil_div(F, 16), TPW), 4 / KSPLIT), M * K, 1)
         threads_per_threadgroup (128, 1, 1)
+        shared_bytes (operands(EGW) * H * 2)
 
 native routed_gate_up for vulkan from "vulkan/routed_gate_up.comp":
     static (H, K, F, GS, US)
@@ -1133,7 +1201,7 @@ native routed_gate_up for vulkan from "vulkan/routed_gate_up.comp":
     launch routed_gate_up:
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + min(8 * ceil_div(H, 32), 288) * 72)
+        shared_bytes (256 + 32 * operands(EGW) + min(8 * ceil_div(H, 32), 288) * 72)
 
 native routed_gate_up for cpu from "cpu/routed_gate_up.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
@@ -1156,9 +1224,19 @@ native routed_up for metal from "metal/routed_up.metal":
 
 native routed_up for cuda from "cuda/routed_up.cu":
     static (H, K, F, US)
+    params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
     where H % 64 == 0
-    launch routed_up:
-        params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+    scratch operands bytes (M * H * 2) when M > 1 and operands(EUW) == 1
+    launch routed_up when M == 1:
+        reads (TPW, KSPLIT)
+        threadgroups (ceil_div(ceil_div(ceil_div(F, 16), TPW), 4 / KSPLIT), M * K, 1)
+        threads_per_threadgroup (128, 1, 1)
+        shared_bytes (operands(EUW) * H * 2)
+    launch routed_up_stage when M > 1 and operands(EUW) == 1:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch routed_up_gathered when M > 1:
+        reads (TPW, KSPLIT)
         threadgroups (ceil_div(ceil_div(ceil_div(F, 16), TPW), 4 / KSPLIT), M * K, 1)
         threads_per_threadgroup (128, 1, 1)
 
@@ -1168,7 +1246,7 @@ native routed_up for vulkan from "vulkan/routed_up.comp":
     launch routed_up:
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS), M * K, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + min(8 * ceil_div(H, 32), 288) * 72)
+        shared_bytes (256 + 32 * operands(EUW) + min(8 * ceil_div(H, 32), 288) * 72)
 
 native routed_up for cpu from "cpu/routed_up.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
@@ -1199,10 +1277,20 @@ native routed_down for metal from "metal/routed_down.metal":
 # `projected`, then the slot-order combine.
 native routed_down for cuda from "cuda/routed_down.cu":
     static (H, K, F)
+    params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
     where F % 64 == 0
     scratch projected bytes (M * K * H * 4)
-    launch routed_down:
-        params (code TPW in [1, 2], code arithmetic KSPLIT in [1, 2, 4])
+    scratch operands bytes (M * K * F * 2) when M > 1 and operands(EDW) == 1
+    launch routed_down when M == 1:
+        reads (TPW, KSPLIT)
+        threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * K, 1)
+        threads_per_threadgroup (128, 1, 1)
+        shared_bytes (operands(EDW) * F * 2)
+    launch routed_down_stage when M > 1 and operands(EDW) == 1:
+        threadgroups (M * K, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch routed_down_gathered when M > 1:
+        reads (TPW, KSPLIT)
         threadgroups (ceil_div(ceil_div(ceil_div(H, 16), TPW), 4 / KSPLIT), M * K, 1)
         threads_per_threadgroup (128, 1, 1)
     launch routed_down_combine:
@@ -1215,7 +1303,7 @@ native routed_down for vulkan from "vulkan/routed_down.comp":
     launch routed_down:
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
-        shared_bytes (256 + min(ceil_div(F, 32), 288) * 72)
+        shared_bytes (256 + 32 * operands(EDW) + min(ceil_div(F, 32), 288) * 72)
 
 native routed_down for cpu from "cpu/routed_down.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic form INT8 in [0, 1])
@@ -1234,10 +1322,17 @@ native routed_down for cpu from "cpu/routed_down.rs":
 native routed_experts_up for metal from "metal/routed_experts_up.metal":
     static (H, F, US)
     params (TILE_M in [32, 64], TILE_N in [128, 64])
+    scratch staged bytes (M * H * 2) when operands(EUW) == 1
     scratch product bytes (B * T * F * 2)
+    launch routed_experts_up_stage when operands(EUW) == 1:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch routed_experts_up_expand:
         threadgroups (ceil_div(F, TILE_N), B * ceil_div(T, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+    launch routed_experts_up_quantize when operands(EDW) == 1:
+        threadgroups (B * T, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch routed_experts_up_down:
         threadgroups (ceil_div(H, TILE_N), B * ceil_div(T, TILE_M), 1)
         threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
@@ -1246,9 +1341,9 @@ native routed_experts_up for cuda from "cuda/routed_experts_up.cu":
     static (H, F, US)
     params (code arithmetic OPERAND in [0, 1])
     where H % 64 == 0 and F % 64 == 0
-    scratch staged bytes (M * H * 2) when OPERAND == 1
+    scratch staged bytes (M * H * 2) when OPERAND == 1 or operands(EUW) == 1
     scratch product bytes (B * T * F * 2)
-    launch routed_experts_up_stage when OPERAND == 1:
+    launch routed_experts_up_stage when OPERAND == 1 or operands(EUW) == 1:
         reads (OPERAND)
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -1257,6 +1352,10 @@ native routed_experts_up for cuda from "cuda/routed_experts_up.cu":
         threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(T, 32), B)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (32 * 144 + 10240) + 4096)
+    launch routed_experts_up_quantize when operands(EDW) == 1:
+        reads (OPERAND)
+        threadgroups (B * T, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
     launch routed_experts_up_down:
         reads (OPERAND)
         threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(T, 32), B)
@@ -1267,11 +1366,20 @@ native routed_experts_up for vulkan from "vulkan/routed_experts_up.comp":
     static (H, F, US)
     params (TILE_M in [32, 64], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
     where SUB_M <= TILE_M and SUB_N <= TILE_N
+    scratch staged bytes (M * H * 2) when operands(EUW) == 1
     scratch product bytes (B * T * F * 2)
+    launch routed_experts_up_stage when operands(EUW) == 1:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
     launch routed_experts_up_expand:
         threadgroups (ceil_div(F, TILE_N), B * ceil_div(T, TILE_M), 1)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
         shared_bytes ((TILE_M + TILE_N) * 80)
+    launch routed_experts_up_quantize when operands(EDW) == 1:
+        threadgroups (B * T, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
     launch routed_experts_up_down:
         threadgroups (ceil_div(H, TILE_N), B * ceil_div(T, TILE_M), 1)
         threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
@@ -1289,7 +1397,7 @@ native routed_experts_up for cpu from "cpu/routed_experts_up.rs":
     launch routed_experts_up_expand:
         threadgroups (ceil_div(F, ROWS), B, 1)
         threads_per_threadgroup (1, 1, 1)
-    launch routed_experts_up_quantize when INT8 == 1:
+    launch routed_experts_up_quantize when INT8 == 1 or operands(EDW) == 1:
         threadgroups (B * T, 1, 1)
         threads_per_threadgroup (1, 1, 1)
     launch routed_experts_up_down:

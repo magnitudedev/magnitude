@@ -7,7 +7,7 @@ use magnitude_family_common::headers;
 use magnitude_family_contracts::{
     AttentionGate, BlockAttention, BlockLayout, DraftDefinition, DraftEmbedding, DraftMethod,
     DraftVariant, HeadNorm, HistoryDomain, ImportTransform, KeyValue, ModelDefinition, ModelFamily,
-    Operator, Rotary, SublayerIndex, TapPoint,
+    Operator, Rotary, ScaledActivations, SublayerIndex, TapPoint,
 };
 use magnitude_family_dflash::{inspect, recognize, recognizes, Error};
 use magnitude_family_lfm2::Lfm2Family;
@@ -244,7 +244,8 @@ fn nemotron_dflash_has_yarn_its_own_embedding_and_second_level_scales() {
     assert_eq!(
         draft.fusion.transforms,
         [ImportTransform::ScaleByTensor {
-            tensor: "fc.scale".into()
+            tensor: "fc.scale".into(),
+            activations: ScaledActivations::Rounded,
         }]
     );
     let Operator::Attention(attention) = &draft.blocks[0].sublayers[0].op else {
@@ -266,7 +267,8 @@ fn nemotron_dflash_has_yarn_its_own_embedding_and_second_level_scales() {
     assert_eq!(
         ffn.down.transforms,
         [ImportTransform::ScaleByTensor {
-            tensor: "blk.0.ffn_down.scale".into()
+            tensor: "blk.0.ffn_down.scale".into(),
+            activations: ScaledActivations::Rounded,
         }]
     );
 }

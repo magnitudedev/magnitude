@@ -1529,8 +1529,15 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                             true,
                             int8,
                         );
-                        let down_specialization =
-                            expert_specialization(device, &statics, &down, true, int8);
+                        // CUDA's one-row and gathered down launches read one
+                        // entry-wide configuration.
+                        let down_specialization = expert_specialization(
+                            device,
+                            &statics,
+                            &down,
+                            device.backend() != seismic::BackendName::Cuda,
+                            int8,
+                        );
                         let product = match &experts.gate {
                             Some(gate) => {
                                 routed_gate_up::native_for_device_with(
@@ -1559,7 +1566,15 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                                 routed_up::native_for_device_with(
                                     device,
                                     routed_up::Elements { A: bf16, EUW: bf16 },
-                                    &specialization,
+                                    // CUDA's one-row and gathered launches
+                                    // read one entry-wide configuration.
+                                    &expert_specialization(
+                                        device,
+                                        &[statics.as_slice(), &block.scale_statics()].concat(),
+                                        &mapping,
+                                        device.backend() != seismic::BackendName::Cuda,
+                                        int8,
+                                    ),
                                 )
                                 .unwrap()
                                 .call(routed_up::Args {

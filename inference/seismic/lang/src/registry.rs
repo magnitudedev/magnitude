@@ -12,7 +12,7 @@ use crate::types::DType;
 
 pub use crate::repr::{
     CodeInterpretation, DecodeComponent, DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFormat,
-    GRID_SIGN_BITS, GRID_VALUES, GridCodes, PlaneEncoding, PlaneField, PlaneSchema,
+    GRID_SIGN_BITS, GRID_VALUES, GridCodes, OperandRecipe, PlaneEncoding, PlaneField, PlaneSchema,
     QuantizedComponent,
 };
 
@@ -329,6 +329,9 @@ pub struct RepresentationInfo {
     pub decoded: DType,
     /// Whether the registry defines canonical logical writes/updates.
     pub access: RepresentationAccess,
+    /// How a matrix product over this representation takes its activation
+    /// operands.
+    pub operands: OperandRecipe,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1376,24 +1379,37 @@ pub(crate) fn deserialize_declared_name<'de, D: serde::Deserializer<'de>>(
     let name = <&'de str as serde::Deserialize>::deserialize(deserializer)?;
     declared_name(name).ok_or_else(|| D::Error::custom("name the registry does not declare"))
 }
-/// The registered conversion of external `source` into resident storage in
-/// `layout`: the resident form of an external representation for one layout.
-/// `None` for dense and packed sources, and for a layout the resident
-/// representation is not registered in. The table build asserts at most one
-/// conversion per (source, representation, layout).
-pub fn resident_conversion(
-    source: RepresentationId,
-    layout: Layout,
-) -> Option<&'static RepresentationConversion> {
-    internals::resident_conversion(source, layout)
+/// The element `storage` (a storage name such as `q4k`, or `nvfp4g16a4` for
+/// NVFP4's W4A4 element) in `layout`. Dense storage exists only in `packet`.
+pub fn storage(storage: &str, layout: Layout) -> Option<RepresentationId> {
+    representation(&stored_name(storage, layout))
 }
-/// The storage of packed representation `representation` (a representation
-/// name such as `q4k`) in `layout`. Dense storage exists only in `packet`.
-pub fn storage(representation: &str, layout: Layout) -> Option<RepresentationId> {
-    representations()
-        .iter()
-        .find(|info| info.representation == representation && info.layout == layout)
-        .map(|info| info.id)
+
+/// The element whose storage `id` is: `id`'s representation in its layout,
+/// multiplying the rounded activation. Storage (its bytes, decode and
+/// conversions) is the same for every operand recipe, so `id` itself unless
+/// it is a W4A4 element.
+pub fn storage_of(id: RepresentationId) -> RepresentationId {
+    let info = representation_info(id);
+    storage(info.representation, info.layout)
+        .expect("every element's representation has its rounded element in its layout")
+}
+
+/// The unique name of element `storage` in `layout`: the storage name, then
+/// `@layout` in a row layout.
+fn stored_name(storage: &str, layout: Layout) -> String {
+    match layout {
+        Layout::Packet => storage.to_owned(),
+        _ => format!("{storage}@{}", layout.as_str()),
+    }
+}
+
+/// The unique name of representation `representation`'s element of
+/// `operands` in `layout`: its storage name is the representation's with
+/// the recipe's suffix ([`storage`] finds it).
+fn element_name(representation: &str, operands: OperandRecipe, layout: Layout) -> &'static str {
+    let storage = format!("{representation}{}", operands.suffix());
+    Box::leak(stored_name(&storage, layout).into_boxed_str())
 }
 /// Canonical storage bytes of a contiguous tensor with `extents` in
 /// representation `id`: dense = elements × dtype bytes; packed and external =
@@ -1594,18 +1610,22 @@ pub(crate) mod internals {
                 kind: RepresentationKind::Dense(dtype),
                 decoded: dtype,
                 access: RepresentationAccess::ReadWrite,
+                operands: OperandRecipe::Rounded,
             });
         }
         for repr in REPRS {
-            representations.push(RepresentationInfo {
-                id: RepresentationId::new(representations.len() as u32),
-                name: repr.name,
-                representation: repr.name,
-                layout: Layout::Packet,
-                kind: RepresentationKind::Packed(packed_layout(repr)),
-                decoded: DType::F32,
-                access: RepresentationAccess::ReadOnly,
-            });
+            for &operands in repr.operand_recipes() {
+                representations.push(RepresentationInfo {
+                    id: RepresentationId::new(representations.len() as u32),
+                    name: element_name(repr.name, operands, Layout::Packet),
+                    representation: repr.name,
+                    layout: Layout::Packet,
+                    kind: RepresentationKind::Packed(packed_layout(repr)),
+                    decoded: DType::F32,
+                    access: RepresentationAccess::ReadOnly,
+                    operands,
+                });
+            }
         }
         // (external source, packet bytes, packet values, resident
         // representation). A source whose every value the resident
@@ -1654,6 +1674,8 @@ pub(crate) mod internals {
                 }),
                 decoded: DType::F32,
                 access: RepresentationAccess::ConversionSource,
+                // Never element-readable, so never a product's operand.
+                operands: OperandRecipe::Rounded,
             });
         }
         // Row layouts exist for every resident representation of an external
@@ -1670,17 +1692,18 @@ pub(crate) mod internals {
                 .find(|repr| repr.name == resident)
                 .expect("external conversion names a registered packed representation");
             for layout in [Layout::Rows16, Layout::Rows8, Layout::Mma16, Layout::Rows32] {
-                let name: &'static str =
-                    Box::leak(format!("{resident}@{}", layout.as_str()).into_boxed_str());
-                representations.push(RepresentationInfo {
-                    id: RepresentationId::new(representations.len() as u32),
-                    name,
-                    representation: repr.name,
-                    layout,
-                    kind: RepresentationKind::PackedRows(row_layout(repr, layout)),
-                    decoded: DType::F32,
-                    access: RepresentationAccess::ReadOnly,
-                });
+                for &operands in repr.operand_recipes() {
+                    representations.push(RepresentationInfo {
+                        id: RepresentationId::new(representations.len() as u32),
+                        name: element_name(resident, operands, layout),
+                        representation: repr.name,
+                        layout,
+                        kind: RepresentationKind::PackedRows(row_layout(repr, layout)),
+                        decoded: DType::F32,
+                        access: RepresentationAccess::ReadOnly,
+                        operands,
+                    });
+                }
             }
         }
         let mut conversions: Vec<RepresentationConversion> = Vec::new();
@@ -1722,10 +1745,7 @@ pub(crate) mod internals {
                 );
                 assert!(
                     conversions.iter().all(|conversion| {
-                        let existing = &representations[conversion.destination.index()];
-                        conversion.source != source
-                            || existing.representation != destination.representation
-                            || existing.layout != destination.layout
+                        conversion.source != source || conversion.destination != destination.id
                     }),
                     "external representation `{source_name}` has more than one conversion into `{}`",
                     destination.name
@@ -2972,15 +2992,6 @@ pub(crate) mod internals {
             .iter()
             .find(|conversion| conversion.source == source && conversion.destination == destination)
     }
-    pub(super) fn resident_conversion(
-        source: RepresentationId,
-        layout: Layout,
-    ) -> Option<&'static RepresentationConversion> {
-        tables().conversions.iter().find(|conversion| {
-            conversion.source == source
-                && representation_info(conversion.destination).layout == layout
-        })
-    }
     pub(super) fn representation_conversion_info(
         id: RepresentationConversionId,
     ) -> &'static RepresentationConversion {
@@ -3232,7 +3243,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_conversions_are_keyed_by_source_representation_and_layout() {
+    fn resident_conversions_are_keyed_by_source_and_destination() {
         let q4_k = representation("gguf_q4_k").unwrap();
         for (layout, name, kind) in [
             (Layout::Packet, "q4k", ConversionKind::Packet),
@@ -3243,28 +3254,46 @@ mod tests {
                 ConversionKind::RowTile { rows: 16 },
             ),
         ] {
-            let conversion = resident_conversion(q4_k, layout).unwrap();
-            assert_eq!(conversion.destination, representation(name).unwrap());
-            assert_eq!(storage("q4k", layout), Some(conversion.destination));
-            assert_eq!(conversion.kind, kind);
+            let destination = storage("q4k", layout).unwrap();
+            assert_eq!(destination, representation(name).unwrap());
+            assert_eq!(
+                representation_conversion(q4_k, destination).unwrap().kind,
+                kind
+            );
         }
+        // An external source converts into every element of its resident
+        // representation, each recipe in every layout, once; nothing else
+        // converts.
         for info in representations() {
-            for layout in Layout::ALL {
-                let conversion = resident_conversion(info.id, layout);
-                match info.kind {
-                    RepresentationKind::External(_) => {
-                        let conversion = conversion.unwrap();
-                        assert_eq!(conversion.source, info.id);
-                        assert_eq!(representation_info(conversion.destination).layout, layout);
-                        assert_eq!(
-                            representation_conversion(info.id, conversion.destination),
-                            Some(conversion)
-                        );
-                    }
-                    RepresentationKind::Dense(_)
-                    | RepresentationKind::Packed(_)
-                    | RepresentationKind::PackedRows(_) => assert_eq!(conversion, None),
-                }
+            let destinations = representations()
+                .iter()
+                .filter(|destination| representation_conversion(info.id, destination.id).is_some())
+                .collect::<Vec<_>>();
+            let RepresentationKind::External(_) = info.kind else {
+                assert!(destinations.is_empty(), "`{}`", info.name);
+                continue;
+            };
+            let resident = destinations[0].representation;
+            let elements = representations()
+                .iter()
+                .filter(|element| element.representation == resident)
+                .map(|element| element.id)
+                .collect::<Vec<_>>();
+            let destinations = destinations
+                .iter()
+                .map(|element| element.id)
+                .collect::<Vec<_>>();
+            assert_eq!(destinations, elements, "`{}`", info.name);
+        }
+        let nvfp4 = representation("gguf_nvfp4").unwrap();
+        for layout in Layout::ALL {
+            for (storage_name, operands) in [
+                ("nvfp4g16", OperandRecipe::Rounded),
+                ("nvfp4g16a4", OperandRecipe::Nvfp4Rows),
+            ] {
+                let element = storage(storage_name, layout).unwrap();
+                assert_eq!(representation_info(element).operands, operands);
+                assert!(representation_conversion(nvfp4, element).is_some());
             }
         }
         assert_eq!(storage("f32", Layout::Rows16), None);
@@ -3557,31 +3586,41 @@ mod tests {
                     .unwrap();
                     (converted, data.values().unwrap())
                 };
-                let packet = resident_conversion(source_info.id, Layout::Packet).unwrap();
-                let (packet_bytes, expected) = decode(packet);
-                for layout in [Layout::Rows16, Layout::Rows8, Layout::Mma16, Layout::Rows32] {
-                    let conversion = resident_conversion(source_info.id, layout).unwrap();
-                    let (converted, actual) = decode(conversion);
-                    let RepresentationKind::PackedRows(rows) =
-                        &representation_info(conversion.destination).kind
-                    else {
-                        unreachable!()
-                    };
-                    assert_eq!(rows.packets(&shape, &converted), packet_bytes);
-                    assert_eq!(rows.place(&shape, &packet_bytes), converted);
-                    assert_eq!(
-                        actual
-                            .iter()
-                            .map(|value| value.to_bits())
-                            .collect::<Vec<_>>(),
-                        expected
-                            .iter()
-                            .map(|value| value.to_bits())
-                            .collect::<Vec<_>>(),
-                        "{} -> {} over {shape:?}",
-                        source_info.name,
-                        representation_info(conversion.destination).name
-                    );
+                for packet in representations()
+                    .iter()
+                    .filter(|destination| destination.layout == Layout::Packet)
+                    .filter_map(|destination| representation_conversion(source_info.id, destination.id))
+                {
+                    let (packet_bytes, expected) = decode(packet);
+                    let element = representation_info(packet.destination).name;
+                    for layout in [Layout::Rows16, Layout::Rows8, Layout::Mma16, Layout::Rows32] {
+                        let conversion = representation_conversion(
+                            source_info.id,
+                            storage(element, layout).unwrap(),
+                        )
+                        .unwrap();
+                        let (converted, actual) = decode(conversion);
+                        let RepresentationKind::PackedRows(rows) =
+                            &representation_info(conversion.destination).kind
+                        else {
+                            unreachable!()
+                        };
+                        assert_eq!(rows.packets(&shape, &converted), packet_bytes);
+                        assert_eq!(rows.place(&shape, &packet_bytes), converted);
+                        assert_eq!(
+                            actual
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                            expected
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                            "{} -> {} over {shape:?}",
+                            source_info.name,
+                            representation_info(conversion.destination).name
+                        );
+                    }
                 }
             }
         }

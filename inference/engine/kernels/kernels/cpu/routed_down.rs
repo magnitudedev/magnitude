@@ -27,6 +27,7 @@ fn routed_down_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u6
             };
             projection::quantize(staged, q8);
         }
+        projection::operand_row(&[&cx.arg_expert_down()], staged);
     }
 }
 
