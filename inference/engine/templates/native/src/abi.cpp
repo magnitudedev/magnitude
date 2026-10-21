@@ -47,6 +47,7 @@ struct prepared_state {
     common_chat_parser_params parser;
     std::vector<std::string> diagnostics;
     std::set<subject_relaxation> relaxations;
+    uint64_t renders;
 };
 std::mutex mutex;
 uint64_t next_handle = 1;
@@ -78,6 +79,7 @@ int32_t guarded(templates_buffer * error, F && function) noexcept {
         std::lock_guard<std::mutex> lock(mutex);
         templates_native::diagnostics.clear();
         templates_native::relaxations.clear();
+        templates_native::renders = 0;
         try {
             function();
             return TEMPLATES_OK;
@@ -297,6 +299,7 @@ int32_t templates_request_create(uint64_t handle, const uint8_t * input, uint64_
         prepared->parser.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
         if (!prepared->parameters.parser.empty()) { prepared->parser.parser.load(prepared->parameters.parser); }
         prepared->diagnostics = templates_native::diagnostics;
+        prepared->renders = templates_native::renders;
         for (auto & recorded : templates_native::relaxations) {
             relaxations.insert({ recorded.tool, std::move(recorded.relaxation) });
         }
@@ -332,7 +335,7 @@ int32_t templates_request_describe(uint64_t handle, templates_buffer * output, t
             {"preserved_tokens", params.preserved_tokens}, {"additional_stops", params.additional_stops},
             {"supports_thinking", params.supports_thinking}, {"thinking_start", params.thinking_start_tag},
             {"thinking_ends", params.thinking_end_tags}, {"diagnostics", state.diagnostics},
-            {"relaxations", relaxations}}).dump());
+            {"relaxations", relaxations}, {"renders", state.renders}}).dump());
     });
 }
 

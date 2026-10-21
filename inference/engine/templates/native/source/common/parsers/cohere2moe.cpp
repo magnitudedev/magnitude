@@ -37,8 +37,9 @@ common_chat_params common_chat_params_init_cohere2moe(const common_chat_template
     // Stable prefix of the generation prompt that precedes the (forced) <|START_THINKING|> marker.
     const std::string GEN_PREFIX = TURN_START + CHATBOT;
 
-    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs);
-    data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs);
+    auto rendered           = common_chat_template_render_prompt(tmpl, inputs);
+    data.prompt             = std::move(rendered.prompt);
+    data.generation_prompt  = std::move(rendered.generation_prompt);
     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking  = true;
     data.thinking_start_tag = THINK_START;

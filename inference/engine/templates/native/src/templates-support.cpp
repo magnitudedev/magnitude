@@ -78,6 +78,7 @@ void templates_native::diagnostic(const char * format, ...) {
 }
 
 thread_local std::vector<templates_native::tool_relaxation> templates_native::relaxations;
+thread_local uint64_t templates_native::renders = 0;
 
 void templates_native::relax(const std::string & tool, const common_chat_schema & node, const std::string & keyword,
                              common_chat_schema_relaxation::reason_kind reason) {

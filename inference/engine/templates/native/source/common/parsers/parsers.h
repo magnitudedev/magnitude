@@ -31,8 +31,13 @@ std::string common_chat_template_direct_apply_impl(
     const std::optional<json> & tools_override = std::nullopt,
     const std::optional<json> & additional_context = std::nullopt);
 
-// the suffix a template appends when add_generation_prompt is set
-std::string common_chat_template_generation_prompt_impl(
+// the prompt a template renders, and its generation prompt: the suffix the template appends when
+// add_generation_prompt is set. The prompt is one of the generation prompt's two renders, rendered once.
+struct common_chat_rendered_prompt {
+    std::string prompt;
+    std::string generation_prompt;
+};
+common_chat_rendered_prompt common_chat_template_render_prompt(
     const common_chat_template & tmpl,
     const autoparser::generation_params & inputs,
     const std::optional<json> & messages_override = std::nullopt,

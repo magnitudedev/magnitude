@@ -104,10 +104,10 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     const std::string GEN_PROMPT   = "<｜Assistant｜>";
     const std::string TC_SEPARATOR = "\n\n";
 
-    data.prompt = common_chat_template_direct_apply_impl(
+    auto rendered = common_chat_template_render_prompt(
         tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
-    data.generation_prompt = common_chat_template_generation_prompt_impl(
-        tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
+    data.prompt = std::move(rendered.prompt);
+    data.generation_prompt = std::move(rendered.generation_prompt);
     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking  = true;
     data.thinking_start_tag = THINK_START;
