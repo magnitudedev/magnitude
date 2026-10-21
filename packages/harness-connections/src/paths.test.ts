@@ -13,6 +13,16 @@ import { harnessConnectionPaths, resolveHarnessConnectionPaths } from "./paths"
     expect(isolated.piSettings).toBe("/isolated/.pi/agent/settings.json")
   })
 
+it("finds Hermes's home where Hermes itself defaults it on each platform", () => {
+  expect(harnessConnectionPaths(undefined, {}, "darwin").hermes).toMatch(/\/\.hermes\/config\.yaml$/)
+  expect(harnessConnectionPaths(undefined, {}, "linux").skillInstallations["hermes-user"].skillFile).toMatch(/\/\.hermes\/skills\/magnitude\/SKILL\.md$/)
+  const windows = harnessConnectionPaths(undefined, { LOCALAPPDATA: "C:\\Users\\qa\\AppData\\Local" }, "win32")
+  expect(windows.hermes).toBe("C:\\Users\\qa\\AppData\\Local/hermes/config.yaml")
+  expect(windows.skillInstallations["hermes-user"].skillFile).toBe("C:\\Users\\qa\\AppData\\Local/hermes/skills/magnitude/SKILL.md")
+  expect(harnessConnectionPaths(undefined, { LOCALAPPDATA: "C:\\Local", HERMES_HOME: "D:\\hermes" }, "win32").hermes).toBe("D:\\hermes/config.yaml")
+  expect(harnessConnectionPaths("/isolated", { LOCALAPPDATA: "C:\\Local" }, "win32").hermes).toBe("/isolated/AppData/Local/hermes/config.yaml")
+})
+
 it("uses explicit harness config paths and agent directories", () => {
   const environment = { PI_CODING_AGENT_DIR: "/custom/agent", OPENCODE_CONFIG: "/custom/opencode.jsonc", OPENCLAW_CONFIG_PATH: "/custom/claw.json" }
   const paths = harnessConnectionPaths(undefined, environment)

@@ -97,7 +97,7 @@ const plan = (target: HarnessSetupTarget): SetupPlan => {
     }
     case "hermes": return {
       name: "Hermes",
-      files: [{ path: at(".hermes/config.yaml"), format: "yaml", purpose: "the Magnitude provider, default model, and reasoning setting",
+      files: [{ path: platform === "win32" ? "%LOCALAPPDATA%\\hermes\\config.yaml" : at(".hermes/config.yaml"), format: "yaml", purpose: "the Magnitude provider, default model, and reasoning setting",
         content: {
           providers: { magnitude: { ...hermesProviderConfig(endpoints.openai), api_key: apiKey } },
           model: { provider: "custom:magnitude", default: model.id },
