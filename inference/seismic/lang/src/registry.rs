@@ -715,6 +715,14 @@ pub struct PackedRowLayout {
     pub group_multiple: u32,
 }
 
+/// A part of a storage group's record in a `records` tile
+/// (`PackedRowLayout::record_byte`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Record {
+    Entries,
+    Factors,
+}
+
 /// Byte geometry of the rows of one row-layout tensor
 /// (`PackedRowLayout::geometry`): the row stride, and per row plane its
 /// offset within a row and its payload bytes.
@@ -754,9 +762,9 @@ pub enum RowPlaneContent {
     /// list order, per storage group.
     Groups { planes: Vec<u32> },
     /// `mma16` of a carried grid representation: the tile's whole storage
-    /// groups as records of its 16 rows (`record_bit`), the carried entries
-    /// in GEMV lane order followed by the `factors` packet planes. The only
-    /// plane of its layout.
+    /// groups as records of its 16 rows (`record_byte`), every group's
+    /// carried entries in GEMV lane order, then every group's `factors`
+    /// packet planes. The only plane of its layout.
     Records {
         bits: u32,
         carried: u32,
@@ -896,7 +904,8 @@ impl PackedRowLayout {
             RowPlaneContent::Grids { bits, .. } => (bits, true),
             RowPlaneContent::Records { bits, .. } => {
                 let entry = column % u64::from(self.packet.group) / u64::from(GRID_VALUES);
-                let byte = self.record_byte(geometry, row, column / u64::from(self.packet.group), |r| {
+                let packet = column / u64::from(self.packet.group);
+                let byte = self.record_byte(geometry, row, packet, Record::Entries, |r| {
                     let (q, e) = (entry / 8, entry % 8);
                     q / 2 * 512 + (4 * (r % 8) + e % 4) * 16 + (q % 2 * 2 + r / 8) * 4 + e / 4 * 2
                 });
@@ -950,22 +959,46 @@ impl PackedRowLayout {
         }
     }
 
-    /// The byte of a `records` plane (`mma16`, its layout's only plane) at
-    /// `within(r)` of the record of storage group `packet` of the tile of
-    /// stored row `row`, `r` the row within the tile. A tile's `V` is its 16
-    /// rows' bytes whole (alignment padding included: a record may straddle
-    /// two rows, whose bytes follow one another), laid out as `[storage group
-    /// p][record of 16 * bytes_per_group bytes]`. A record (of 256 values
-    /// of 16-bit entries, four a coefficient group) holds the 16 rows' entries
+    /// Bytes of one storage group's entries in a `records` tile: its 16 rows'
+    /// entries (the packet `words` plane). The tile's factors start past
+    /// every stored group's entries (`record_byte`).
+    pub fn record_entry_bytes(&self) -> u64 {
+        MMA_TILE_ROWS * u64::from(self.packet.planes[0].bytes_per_group)
+    }
+
+    /// The bytes of a `records` plane (`mma16`, its layout's only plane) of
+    /// the tile of stored row `row`, `r` the row within the tile: entry byte
+    /// `within(r)` of storage group `packet` (`Record::Entries`), or factor
+    /// byte `within(r)` of it (`Record::Factors`). A tile's `V` is its 16
+    /// rows' bytes whole (alignment padding included: its parts may straddle
+    /// rows, whose bytes follow one another), laid out as `[storage group
+    /// p][entries of record_entry_bytes]` for every stored group, then
+    /// `[storage group p][16 rows' factors]`, so each group's entries are
+    /// 1024 bytes on 128-byte lines of their own (`residency.md`). The entries are
     /// in GEMV lane order, `[half h][lane l = 4g + t][16 bytes]`: word `w` of
     /// a lane's 16 bytes is row `g + 8 (w % 2)` of k-block `2h + w / 2`, its
-    /// entries `t` (low half) and `4 + t` (high half). The rows' factor bytes
-    /// follow, `[g][row g, row g + 8]`: one 32-bit load of a lane gives both
-    /// of its rows' f16 factors.
-    fn record_byte(&self, geometry: &RowGeometry, row: u64, packet: u64, within: impl Fn(u64) -> u64) -> u64 {
+    /// entries `t` (low half) and `4 + t` (high half). A group's factors are
+    /// `[g][row g, row g + 8]`: one 32-bit load of a lane gives both of its
+    /// rows' f16 factors.
+    fn record_byte(
+        &self,
+        geometry: &RowGeometry,
+        row: u64,
+        packet: u64,
+        part: Record,
+        within: impl Fn(u64) -> u64,
+    ) -> u64 {
         let (tile, r) = (row / MMA_TILE_ROWS, row % MMA_TILE_ROWS);
-        let record = MMA_TILE_ROWS * u64::from(self.planes[0].bytes_per_group);
-        tile * MMA_TILE_ROWS * geometry.stride + packet * record + within(r)
+        let entries = self.record_entry_bytes();
+        let tile_base = tile * MMA_TILE_ROWS * geometry.stride;
+        match part {
+            Record::Entries => tile_base + packet * entries + within(r),
+            Record::Factors => {
+                let groups = geometry.bytes_per_row[0] / u64::from(self.planes[0].bytes_per_group);
+                let factors = MMA_TILE_ROWS * u64::from(self.planes[0].bytes_per_group) - entries;
+                tile_base + groups * entries + packet * factors + within(r)
+            }
+        }
     }
 
     /// Absolute bit holding bit `bit` of packet-form plane `plane` of packet
@@ -1041,9 +1074,8 @@ impl PackedRowLayout {
                     .iter()
                     .map(|member| u64::from(self.packet.planes[*member as usize].bytes_per_group))
                     .sum::<u64>();
-                let entry_bytes = MMA_TILE_ROWS * u64::from(self.packet.planes[0].bytes_per_group);
-                let byte = self.record_byte(geometry, row, packet, |r| {
-                    entry_bytes + (2 * (r % 8) + r / 8) * width + prefix + u64::from(bit / 8)
+                let byte = self.record_byte(geometry, row, packet, Record::Factors, |r| {
+                    (2 * (r % 8) + r / 8) * width + prefix + u64::from(bit / 8)
                 });
                 return byte * 8 + u64::from(bit % 8);
             }
@@ -3405,8 +3437,9 @@ mod tests {
     /// A carried grid representation's entries hold its coefficient codes
     /// (bit `j` of a group's code at bit 15 of the group's entry `j`); its
     /// row layouts have no `scales` plane, and its `mma16` tile is the
-    /// superblock records of its 16 rows, entries in GEMV lane order and
-    /// then the rows' f16 factors, over the tile's rows whole.
+    /// superblock records of its 16 rows over the tile's rows whole: every
+    /// group's entries in GEMV lane order, 1024 bytes apart, then every
+    /// group's rows' f16 factors.
     #[test]
     fn carried_grids_hold_their_scales_and_mma16_records_their_factors() {
         let plane_set = |name: &str| {
@@ -3431,23 +3464,24 @@ mod tests {
         let k = 512u64;
         let geometry = layout.geometry(k).unwrap();
         let stride = geometry.stride;
-        let record = 16 * 66;
+        let (entries, groups) = (16 * 64, k / 256);
         for row in 0..32u64 {
             let (tile, r) = (row / 16, row % 16);
             let (g, half) = (r % 8, r / 8);
             for column in (0..k).step_by(8) {
                 let (p, q, e) = (column / 256, column % 256 / 64, column % 64 / 8);
                 let lane = 4 * g + e % 4;
-                let v = p * record + q / 2 * 512 + lane * 16 + (q % 2 * 2 + half) * 4 + e / 4 * 2;
+                let v = p * entries + q / 2 * 512 + lane * 16 + (q % 2 * 2 + half) * 4 + e / 4 * 2;
                 assert_eq!(
                     layout.code_bit(&geometry, 0, row, column),
                     (tile * 16 * stride + v) * 8
                 );
             }
             for p in 0..k / 256 {
-                // Factor bit b of row r: word g of the record's factors.
+                // Factor bit b of row r: word g of group p's factors, past
+                // every group's entries.
                 for bit in 0..16u32 {
-                    let v = p * record + 1024 + 4 * g + 2 * half;
+                    let v = groups * entries + p * 32 + 4 * g + 2 * half;
                     assert_eq!(
                         layout.packet_bit(&geometry, row, p, 2, bit),
                         (tile * 16 * stride + v) * 8 + u64::from(bit)

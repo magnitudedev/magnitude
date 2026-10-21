@@ -1009,6 +1009,8 @@ mod internals {
                             "CODE_SHIFT",
                             "CODE_BITS",
                             "CARRIED_BIT",
+                            "ENTRY_BYTES",
+                            "FACTORS_OFFSET",
                         ] {
                             symbols.insert(format!("{plane_prefix}_{suffix}"));
                         }

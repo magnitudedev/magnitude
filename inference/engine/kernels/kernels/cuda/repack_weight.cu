@@ -444,8 +444,11 @@ __device__ __forceinline__ u8 *row_base(u8 *destination, const seismic_words_t &
 }
 
 #if defined(SEISMIC_ELEMENT_U_PLANE_RECORDS)
-// A tile's record of one storage group (its 16 rows' entries and factors).
+// A tile's record of one storage group (its 16 rows' entries and factors),
+// and its entries' bytes: every group's entries come first, then every
+// group's factors (the registry's `PackedRowLayout::record_byte`).
 #define RECORD_BYTES ((u64)TILE_ROWS * SEISMIC_ELEMENT_U_PLANE_RECORDS_BYTES_PER_GROUP)
+#define RECORD_ENTRY_BYTES ((u64)SEISMIC_ELEMENT_U_PLANE_RECORDS_ENTRY_BYTES)
 #endif
 
 #if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16)
@@ -534,11 +537,13 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
         const u32 step0 = (column0 % 64) / 16;
 #if defined(SEISMIC_ELEMENT_U_PLANE_RECORDS)
         // Records (the registry's `PackedRowLayout::record_byte`): the tile's
-        // 32 columns are group `within / 32` of the 16 rows' superblock
-        // record; lane `l` places entries 2 (l / 16), + 1 of row l % 16 at
-        // their GEMV lanes, the f16 factors follow the entries.
+        // 32 columns are sub-block `within / 32` of the 16 rows' entries of
+        // their group; lane `l` places entries 2 (l / 16), + 1 of row l % 16
+        // at their GEMV lanes, and the group's first tile the rows' f16
+        // factors in the group's factors past every group's entries.
         {
-            u8 *record = row_base(destination, seismic_words_value, b, row0) + column0 / GROUP * RECORD_BYTES;
+            u8 *tile = row_base(destination, seismic_words_value, b, row0);
+            u8 *record = tile + column0 / GROUP * RECORD_ENTRY_BYTES;
             const u32 r = lane % TILE_ROWS, group = within / 32, q = group / 2;
             const u64 n = row0 + r;
             const bool stored = n < SEISMIC_DIM_N;
@@ -548,11 +553,12 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
                                                     (q % 2 * 2 + r / 8) * 4 + group % 2 * 2) =
                     stored ? (unsigned short)carried_entry(in, 4 * group + j) : (unsigned short)0;
             if (within == 0 && lane < TILE_ROWS)
-                *reinterpret_cast<unsigned short *>(record + 1024 + 4 * (r % 8) + 2 * (r / 8)) =
+                *reinterpret_cast<unsigned short *>(tile + SEISMIC_RESULT_0_ROW_GROUPS * RECORD_ENTRY_BYTES +
+                                                    column0 / GROUP * (RECORD_BYTES - RECORD_ENTRY_BYTES) +
+                                                    4 * (r % 8) + 2 * (r / 8)) =
                     stored ? (unsigned short)(in[0] | (in[1] << 8)) : (unsigned short)0;
-            // The tile's bytes past its last record.
+            // The tile's bytes past its last factors.
             if (column0 + TILE_COLUMNS == stored_columns) {
-                u8 *tile = row_base(destination, seismic_words_value, b, row0);
                 for (u64 byte = SEISMIC_RESULT_0_ROW_GROUPS * RECORD_BYTES + lane;
                      byte < TILE_ROWS * SEISMIC_RESULT_0_ROW_STRIDE_BYTES; byte += TILE_COLUMNS)
                     tile[byte] = 0;

@@ -1310,9 +1310,10 @@ typedef Grid<Iq3XxsGrid> IQ3XXS;
 
 // iq2xxs, its `mma16` storage records (the registry's
 // `PackedRowLayout::record_byte`): a tile's rows hold one record per 256
-// columns, back to back over the 16 rows' bytes. A record is [half h][lane
-// l = 4g + t][16 bytes] of entries, then the 16 rows' f16 factors d as eight
-// words (word g: row g low, row g + 8 high). Word w of a lane's 16 bytes is
+// columns over the 16 rows' bytes, every record's entries first, 1024 bytes
+// each, then every record's factors, 32 bytes each. A record's entries are
+// [half h][lane l = 4g + t][16 bytes]; its factors are the 16 rows' f16 d as
+// eight words (word g: row g low, row g + 8 high). Word w of a lane's 16 bytes is
 // row g + 8 (w % 2) of k-block 2h + w / 2: its entries t (low half) and 4 + t
 // (high half), the two entries of each group the lane reads in the GEMV's
 // entry order (`projection::gemv_records_group`), so a lane loads exactly its
@@ -1322,18 +1323,23 @@ typedef Grid<Iq3XxsGrid> IQ3XXS;
 struct IQ2XXS {
     const u8 *base;
     u64 stride;
+    // Offset within a tile of its factors, past every group's entries.
+    u64 factors;
 
     static constexpr int GROUP = 32;
     static constexpr int GROUPS = 2;
     static constexpr bool BIAS = false;
     static constexpr bool DENSE = false;
     static constexpr bool SCALED_GEMM = true;
-    // Bytes of one record (16 rows of 66) and the offset of its factors.
-    static constexpr u64 RECORD = 1056;
-    static constexpr u64 FACTORS = 1024;
+    // Bytes of one group's entries (16 rows of 64) and of its factors.
+    static constexpr u64 ENTRIES = 1024;
+    static constexpr u64 FACTORS = 32;
 
-    __device__ __forceinline__ const u8 *record_at(u64 tile, u64 superblock) const {
-        return base + tile * 16 * stride + superblock * RECORD;
+    __device__ __forceinline__ const u8 *entries_at(u64 tile, u64 superblock) const {
+        return base + tile * 16 * stride + superblock * ENTRIES;
+    }
+    __device__ __forceinline__ const u8 *factors_at(u64 tile, u64 superblock) const {
+        return base + tile * 16 * stride + factors + superblock * FACTORS;
     }
 
     // ---- GEMV in records (`gemv_records_group`).
@@ -1344,12 +1350,12 @@ struct IQ2XXS {
         u32 factors;
     };
     __device__ __forceinline__ Record record(u64 tile, u64 superblock, u32 lane) const {
-        const u8 *at = record_at(tile, superblock);
+        const u8 *at = entries_at(tile, superblock);
         const uint4 low = seismic_ld_nc_na_v4(at + 16 * lane), high = seismic_ld_nc_na_v4(at + 512 + 16 * lane);
         Record record;
         record.w[0] = low.x, record.w[1] = low.y, record.w[2] = low.z, record.w[3] = low.w;
         record.w[4] = high.x, record.w[5] = high.y, record.w[6] = high.z, record.w[7] = high.w;
-        record.factors = seismic_ld_nc_u32(at + FACTORS + 4 * (lane / 4));
+        record.factors = seismic_ld_nc_u32(factors_at(tile, superblock) + 4 * (lane / 4));
         return record;
     }
     // The scales of the record's groups of the lane's rows, held as the
@@ -1473,7 +1479,7 @@ struct IQ2XXS {
     static constexpr int CHUNKS = 32;
     static constexpr int CHUNK_BYTES = 8;
     __device__ __forceinline__ const u8 *chunk_source(u64 tile, u64 kblock, u32 chunk) const {
-        return record_at(tile, kblock / 4) + kblock % 4 / 2 * 512 + chunk * 16 + kblock % 2 * 8;
+        return entries_at(tile, kblock / 4) + kblock % 4 / 2 * 512 + chunk * 16 + kblock % 2 * 8;
     }
     __device__ __forceinline__ Raw from_shared(const u8 *staged, u32 lane) const {
         Raw raw;
@@ -1492,7 +1498,7 @@ struct IQ2XXS {
     // A row's record word: its factors word (rows g, g + 8).
     static constexpr int SUPER_WORDS = 1;
     __device__ __forceinline__ const u8 *super_word(u64 row, u64 superblock, int) const {
-        return record_at(row / 16, superblock) + FACTORS + 4 * (row % 8);
+        return factors_at(row / 16, superblock) + 4 * (row % 8);
     }
     __device__ static __forceinline__ int word_kblock(int) { return 0; }
     // Row r's scale code of `group` from its four entries' carried bits in
@@ -1509,6 +1515,55 @@ struct IQ2XXS {
         const float d = seismic_f16_to_f32((u16)(words[0] >> (16 * (r / 8)))) * 0.125f;
         scale = d * (float)(2u * code + 1u);
         bias = 0.0f;
+    }
+
+    // ---- One row's values (`row_values16`), read by a lane alone: word r
+    // of the 16 bytes of lane `l` holding row g + 8 r's entries of k-block
+    // `kblock` (entries l % 4, low half, and 4 + l % 4, high half).
+    __device__ __forceinline__ u32 entry_word(u64 tile, u64 kblock, u32 lane, u32 r) const {
+        return seismic_ld_nc_u32(entries_at(tile, kblock / 4) + kblock % 4 / 2 * 512 + 16 * lane +
+                                 4 * (kblock % 2 * 2 + r));
+    }
+    // Rows g, g + 8 of k-block `kblock`: entries 2i, 2i + 1 in word i, as
+    // `raw` gathers them from the quad.
+    __device__ __forceinline__ Raw fetch(u64 tile, u64 kblock, u32 lane) const {
+        Raw raw;
+        const u32 quad = lane & ~3u;
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            u32 e[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                e[j] = entry_word(tile, kblock, quad + (u32)j, (u32)r);
+            u32 *row = r == 0 ? raw.g : raw.g8;
+            row[0] = prmt(e[0], e[1], 0x5410u);
+            row[1] = prmt(e[2], e[3], 0x5410u);
+            row[2] = prmt(e[0], e[1], 0x7632u);
+            row[3] = prmt(e[2], e[3], 0x7632u);
+        }
+        raw.t = lane % 4;
+        return raw;
+    }
+    // Group `group` of k-block `kblock` of stored row `row`: (d / 8) (2s + 1),
+    // s's bit j at bit 15 of the group's entry j.
+    __device__ __forceinline__ void coefficient(u64 row, u64 kblock, int group, float &scale, float &bias) const {
+        const u64 tile = row / 16;
+        const u32 g = (u32)(row % 8), r = (u32)(row % 16 / 8);
+        u32 s = 0;
+#pragma unroll
+        for (u32 j = 0; j < 4; ++j)
+            s |= ((entry_word(tile, kblock, 4 * g + j, r) >> (15 + 16 * group)) & 1u) << j;
+        const u32 d = seismic_ld_nc_u32(factors_at(tile, kblock / 4) + 4 * g);
+        scale = seismic_f16_to_f32((u16)(d >> (16 * r))) * 0.125f * (float)(2u * s + 1u);
+        bias = 0.0f;
+    }
+    __device__ __forceinline__ u32 code(const Raw &raw, int step, u32 slot) const {
+        u32 low, high;
+        Grid<Iq2XxsGrid>::slots(raw, step, low, high);
+        return ((slot < 4 ? low : high) >> (8 * (slot % 4))) & 0xFFu;
+    }
+    __device__ static __forceinline__ float apply(u32 code, float scale, float) {
+        return (float)(int)(signed char)code * scale;
     }
 };
 
@@ -1926,7 +1981,9 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
     }
 
 #define PACKETS_MAKE_RECORDS(TYPE, P, pointer)                                                           \
-    packets::TYPE { (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES) }
+    packets::TYPE {                                                                                      \
+        (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES), ELEMENT_CAT(P, _PLANE_RECORDS_FACTORS_OFFSET) \
+    }
 #define PACKETS_MAKE_GRID(TYPE, P, pointer)                                                              \
     packets::TYPE {                                                                                      \
         (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES), PACKETS_PLANE(P, GRIDS),                \

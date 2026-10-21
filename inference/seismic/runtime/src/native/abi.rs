@@ -737,6 +737,15 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
                     registry::RowPlaneContent::Grids { bits, .. }
                     | registry::RowPlaneContent::Records { bits, .. } => {
                         out.push_str(&format!("#define {plane_prefix}_CODE_BITS {bits}\n"));
+                        // A records tile's factors follow every group's
+                        // entries (`PackedRowLayout::record_byte`).
+                        if matches!(plane.content, registry::RowPlaneContent::Records { .. }) {
+                            out.push_str(&format!(
+                                "#define {plane_prefix}_ENTRY_BYTES {}\n#define {plane_prefix}_FACTORS_OFFSET ({prefix}_ROW_GROUPS * {})\n",
+                                rows.record_entry_bytes(),
+                                rows.record_entry_bytes()
+                            ));
+                        }
                         // The entry bit carrying the coefficient codes.
                         if let Some((_, carried)) = rows.carried() {
                             out.push_str(&format!(

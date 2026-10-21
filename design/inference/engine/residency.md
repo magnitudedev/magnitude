@@ -56,10 +56,13 @@ F32 factor scaled by a power of two, exactly. `iq2xxs` instead keeps the f16 blo
 stored and applies its 1/8 in the decode, and its row layouts store no scales plane: the 16-bit
 entries leave their top bit free, so bit j of a 32-value sub-block's scale code rides in bit 15 of
 the sub-block's entry j. Its resident row then reads 66 bytes per 256 values, as GGUF does.
-CUDA's `mma16` holds an `iq2xxs` row tile as one `records` plane: per 256 columns a 1056-byte
-record of the tile's 16 rows, 1024 bytes of entries in the order one warp's lanes load them (two
-16-byte loads a lane) and 32 bytes of the rows' f16 scales, so a single-row product reads each
-record once with whole-sector loads. A second-level
+CUDA's `mma16` holds an `iq2xxs` row tile as one `records` plane: per 256 columns a record of
+the tile's 16 rows, 1024 bytes of entries in the order one warp's lanes load them (two 16-byte
+loads a lane) and 32 bytes of the rows' f16 scales. The tile holds every record's entries first
+and then every record's scales, so each record's entries are whole 128-byte lines and a
+single-row product reads them with whole-line loads (measured on GB10 against entries and scales
+interleaved per record, Nemotron 3.5 Bolt decode: the shared expert's up 29.3 -> 28.3 us and down
+26.5 -> 25.5 us, each routed expert GEMV 0.6 to 1.5 us faster). A second-level
 scale (NVFP4's per-tensor or per-expert F32 `.scale`) is a separate stored tensor, not part of the
 representation: the weight's bytes import as stored, and the scale becomes resident beside it as
 one F32 value per matrix (a stored single value repeats per matrix of a stack), keyed and charged
