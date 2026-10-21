@@ -94,6 +94,15 @@ describe("removing by origin", () => {
     })
     expect(removalConfirmation(addedModel, false).description).not.toContain("another location")
   })
+  it("says removing an added model whose download was cancelled forgets it, never that it can be downloaded again", () => {
+    const cancelled = customModel(added, { acquisitionState: { _tag: "NotInstalled" }, servingState: { _tag: "Assessing", profile: { contextLength: 100_000 } }, storageBytes: 0 })
+    expect(removalKind(cancelled)).toBe("delete")
+    expect(removalConfirmation(cancelled, false)).toEqual({
+      title: "Remove Qwen3.6 35B A3B Uncensored (Q4_K_P) from Magnitude?",
+      description: "Anything Magnitude downloaded for it so far is deleted. You can add it again from Hugging Face.",
+      confirmLabel: "Remove",
+    })
+  })
   it("tells an imported file how to add it again, without doubled punctuation", () => {
     const confirmation = removalConfirmation(customModel(imported), false)
     expect(confirmation.description).toBe("The file stays where it is. You can add it again with Add GGUF file…")
