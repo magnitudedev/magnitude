@@ -2088,7 +2088,14 @@ impl NativeImplementation {
             parameter.values = vec![value];
         }
         let parameter = |parameter: &str| (launch.is_none() && parameter == name).then_some(value);
-        self.search(&[], &parameter, &|statics| {
+        // The statics are searched under the parameter domains a
+        // configuration holding the value can have: those it alone narrows,
+        // at no statics (`RESIDUE == 2` needs `PACK == 1`, which needs
+        // `D % 256 == 0`). Every assignment those domains refute admits no
+        // such configuration, so the first assignment found is the same,
+        // and none is searched for a value no configuration holds.
+        let narrowed = holding.narrowed(&NativeSpecialization::new())?;
+        narrowed.search(&[], &parameter, &|statics| {
             let mut found = None;
             if self.infallible(statics) {
                 holding
@@ -3159,6 +3166,34 @@ mod native_tests {
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
         assert!(native.search_form(None, "WIDE", 1).is_none());
+    }
+
+    /// A form value that constrains the statics only through another
+    /// parameter it implies is searched under that implication: the statics
+    /// it refutes are never walked, and a value no configuration holds is
+    /// refuted before any statics are.
+    #[test]
+    fn a_form_is_searched_under_the_parameters_it_implies() {
+        let declaration = |condition: &str| {
+            format!(
+                "native scale for metal from \"scale.metal\":\n    static (N)\n    params (form RESIDUE in [1, 2], form PACK in [0, 1], ROWS in [8, 4])\n    where N >= 2 and (RESIDUE == 1 or PACK == 1) and (PACK == 0 or ({condition}))\n    launch scale:\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+            )
+        };
+        let module = check_source(source(&declaration("N % 256 == 0 and ROWS == 4"))).unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        let packed = native.search_form(None, "RESIDUE", 2).unwrap();
+        assert_eq!(packed.static_value("N"), Some(256));
+        assert_eq!(
+            (packed.param("PACK"), packed.param("ROWS")),
+            (Some(1), Some(4))
+        );
+        let module = check_source(source(&declaration("N < 1"))).unwrap();
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .unwrap();
+        assert!(native.search_form(None, "RESIDUE", 2).is_none());
     }
 
     /// Over ranges of the names it reads, a condition is decided only where
