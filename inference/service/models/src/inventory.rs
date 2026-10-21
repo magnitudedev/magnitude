@@ -34,6 +34,8 @@ use crate::store_fs::ensure_store_layout;
 
 /// The failure code of a model whose files are in a format the engine can't read.
 pub(crate) const UNSUPPORTED_FORMAT_CODE: &str = "unsupported_format";
+/// The failure code of a found model whose file can't be opened.
+const UNREADABLE_CODE: &str = "unreadable";
 const MAX_SCAN_ENTRIES: usize = 100_000;
 const MAX_SCAN_DEPTH: usize = 8;
 const BACKGROUND_RECONCILIATION_RETRY_DELAY: std::time::Duration =
@@ -2125,11 +2127,27 @@ fn reuse_metadata(
 }
 
 /// A candidate whose files are in a format the engine can't read is incompatible as found; its
-/// files are never opened.
+/// files are never opened. One whose primary file can't be opened, such as a link to a removed
+/// drive, is listed as unreadable, whatever an earlier inspection of the same content found.
 fn enrich_candidate(
     candidate: &ArtifactCandidate,
     cache: &ModelCache,
 ) -> Result<InventoryModel, InventoryError> {
+    if let Err(error) = fs::File::open(&candidate.primary) {
+        return Ok(unavailable_model(
+            candidate.id.clone(),
+            candidate.content_id.clone(),
+            candidate.created,
+            candidate.ready_at,
+            candidate.source.clone(),
+            candidate.location.clone(),
+            &candidate.primary,
+            candidate.deletable,
+            UNREADABLE_CODE,
+            format!("{} can't be read: {error}", candidate.primary.display()),
+            false,
+        ));
+    }
     if let Some(detail) = &candidate.unsupported_format {
         return Ok(unavailable_model(
             candidate.id.clone(),
@@ -2786,16 +2804,19 @@ fn artifact_observation_key(
     let mut digest = Sha256::new();
     digest.update(b"magnitude-filesystem-observation-v1\0");
     for path in paths {
-        let metadata = path.metadata().map_err(io_error)?;
-        if !metadata.is_file() {
-            return Err(InventoryError::Io(format!(
-                "model component is not a regular file: {}",
-                path.display()
-            )));
-        }
+        let identity = match path.metadata() {
+            Ok(metadata) if metadata.is_file() => file_identity(&path, &metadata),
+            Ok(_) => {
+                return Err(InventoryError::Io(format!(
+                    "model component is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            Err(error) => broken_link_identity(&path).ok_or_else(|| io_error(error))?,
+        };
         digest.update(path.to_string_lossy().as_bytes());
         digest.update(b"\0");
-        digest.update(file_identity(&path, &metadata).as_bytes());
+        digest.update(identity.as_bytes());
         digest.update(b"\0");
     }
     Ok(format!("sha256:{:x}", digest.finalize()))
@@ -2806,6 +2827,16 @@ fn model_observation_key(
     model: &InventoryModel,
 ) -> Result<String, InventoryError> {
     artifact_observation_key(inventory_root, &model.source, &model.location)
+}
+
+/// A component that is a link whose target can't be read is still on disk, as the link, and is
+/// observed by where it points; its model is listed as unreadable.
+fn broken_link_identity(path: &Path) -> Option<String> {
+    let target = fs::read_link(path).ok()?;
+    let mut digest = Sha256::new();
+    digest.update(b"broken-link\0");
+    digest.update(target.to_string_lossy().as_bytes());
+    Some(format!("{:x}", digest.finalize()))
 }
 
 fn file_identity(path: &Path, metadata: &fs::Metadata) -> String {

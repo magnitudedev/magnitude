@@ -390,11 +390,10 @@ struct OllamaPull {
 /// `manifests/<registry>/<namespace>/<model>/<tag>`, and newer releases also to
 /// `manifests-v2/<registry>/<namespace>/<model>/<tag>`, often as a symlink to the manifest stored as
 /// a blob, naming Ollama's own registry `ollama.com` rather than `registry.ollama.ai`. A manifest is
-/// read only when it resolves inside the root. The same model in both trees is one pull, the
+/// read through links wherever they lead. The same model in both trees is one pull, the
 /// manifest whose blobs are all present when only one is complete. A manifest directory that can't
 /// be read is recorded in `unreadable`, and every other pull is still listed.
 fn ollama_pulls(root: &Path, unreadable: &mut UnreadableDirectories) -> Vec<OllamaPull> {
-    let contained = canonical_or_self(root);
     let mut pulls = BTreeMap::<String, OllamaPull>::new();
     for tree in OLLAMA_MANIFEST_TREES {
         for registry in readable_entries(&root.join(tree), unreadable) {
@@ -404,7 +403,7 @@ fn ollama_pulls(root: &Path, unreadable: &mut UnreadableDirectories) -> Vec<Olla
                 for model in readable_entries(&namespace.path(), unreadable) {
                     let model_name = model.file_name().to_string_lossy().into_owned();
                     for tag in readable_entries(&model.path(), unreadable) {
-                        let Some(manifest) = read_ollama_manifest(root, &contained, &tag.path())
+                        let Some(manifest) = read_ollama_manifest(root, &tag.path())
                         else {
                             continue;
                         };
@@ -436,13 +435,8 @@ fn ollama_pulls(root: &Path, unreadable: &mut UnreadableDirectories) -> Vec<Olla
 /// The manifest a tag names, read only when it resolves inside the root. A manifest list names one
 /// manifest per runner format, stored as a blob only for the format Ollama pulled; it resolves to
 /// its GGUF manifest when that is on disk, and otherwise to the one that is.
-fn read_ollama_manifest(root: &Path, contained: &Path, tag: &Path) -> Option<OllamaManifest> {
-    let read = |path: &Path| {
-        fs::canonicalize(path)
-            .ok()
-            .filter(|path| path.starts_with(contained))
-            .and_then(|path| read_bounded_json(&path, MAX_OLLAMA_MANIFEST_BYTES))
-    };
+fn read_ollama_manifest(root: &Path, tag: &Path) -> Option<OllamaManifest> {
+    let read = |path: &Path| read_bounded_json(path, MAX_OLLAMA_MANIFEST_BYTES);
     let document = read(tag)?;
     if document.get("mediaType").and_then(|value| value.as_str())
         != Some(OLLAMA_MANIFEST_LIST_MEDIA_TYPE)
@@ -607,14 +601,27 @@ fn ollama_name(registry: &str, namespace: &str, model: &str, tag: &str) -> Strin
     }
 }
 
+/// A layer's blob once it is on disk, read through any link wherever it leads: people move
+/// Ollama's storage to another drive by linking a blob, the blobs folder or the whole store. A
+/// blob still being pulled has a different size, or exists only as `-partial` files.
 fn ollama_blob(root: &Path, layer: &OllamaLayer) -> Option<(PathBuf, String)> {
     let hex = sha256_hex(&layer.digest)?;
     let relative = PathBuf::from("blobs").join(format!("sha256-{hex}"));
-    // A blob still being pulled has a different size, or exists only as `-partial` files.
     fs::metadata(root.join(&relative))
         .ok()
         .filter(|metadata| metadata.is_file() && metadata.len() == layer.size)?;
     Some((relative, hex.to_owned()))
+}
+
+/// A layer's blob that is a link whose target can't be read, such as a file on a drive that was
+/// removed. Its model is listed as unreadable rather than left out as if never pulled.
+fn ollama_broken_link(root: &Path, layer: &OllamaLayer) -> Option<(PathBuf, String)> {
+    let hex = sha256_hex(&layer.digest)?;
+    let relative = PathBuf::from("blobs").join(format!("sha256-{hex}"));
+    let path = root.join(&relative);
+    (fs::metadata(&path).is_err()
+        && fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()))
+    .then(|| (relative, hex.to_owned()))
 }
 
 /// What a manifest holds once every blob it names for the model is on disk.
@@ -657,7 +664,8 @@ fn ollama_components(root: &Path, manifest: &OllamaManifest) -> Option<Vec<Model
             .find(|layer| layer.media_type == media_type)
     };
     let model_layer = layer(OLLAMA_MODEL_MEDIA_TYPE)?;
-    let (model_path, model_hex) = ollama_blob(root, model_layer)?;
+    let (model_path, model_hex) =
+        ollama_blob(root, model_layer).or_else(|| ollama_broken_link(root, model_layer))?;
     let mut components = vec![ModelComponent {
         path: model_path.clone(),
         role: ComponentRole::Weights,
@@ -1204,19 +1212,20 @@ mod tests {
         );
     }
 
+    /// A store moved to another drive by links is read through them, manifests included.
     #[test]
-    fn ollama_ignores_a_v2_manifest_resolving_outside_the_root() {
+    fn ollama_reads_a_v2_manifest_linked_outside_the_root() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("ollama");
         let outside = temporary.path().join("outside.json");
         fs::write(&outside, manifest(&root, b"elsewhere", 9)).unwrap();
         symlink(
             &outside,
-            manifest_path(&root, "manifests-v2", "ollama.com", "library/escape/latest"),
+            manifest_path(&root, "manifests-v2", "ollama.com", "library/moved/latest"),
         )
         .unwrap();
 
-        assert!(names(&root).is_empty());
+        assert_eq!(names(&root), ["moved:latest"]);
     }
 
     #[test]

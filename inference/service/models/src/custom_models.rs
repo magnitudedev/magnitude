@@ -2595,6 +2595,204 @@ mod tests {
         );
     }
 
+    /// The Ollama model named `name`, as the inventory publishes it.
+    async fn ollama_inventory_model(
+        fixture: &Fixture,
+        name: &str,
+    ) -> magnitude_service_contracts::InventoryModel {
+        fixture
+            .inventory()
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|model| {
+                matches!(
+                    &model.location,
+                    ModelLocation::External {
+                        origin: ExternalOrigin::Ollama { name: found, .. },
+                        ..
+                    } if found == name
+                )
+            })
+            .expect("the Ollama model is published")
+    }
+
+    /// QA (Windows, main-qa 2026-10-20): an Ollama blob symlinked to a file on another drive made
+    /// every configuration change fail with "deletion is unsafe", hiding every Ollama model and
+    /// the folder just added. The link is followed: its model is listed and served through it, and
+    /// nothing Magnitude does to it touches the file it leads to.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ollama_blob_linked_to_another_drive_is_listed_and_served_through_its_link() {
+        let fixture = Fixture::new().await;
+        let ollama = fixture.root.join("ollama");
+        let llama = model_bytes("llama gguf");
+        write_ollama(
+            &ollama,
+            "registry.ollama.ai",
+            "library",
+            "llama3.2",
+            "1b",
+            &[("application/vnd.ollama.image.model", &llama)],
+        );
+        let linked = model_bytes("linked gguf");
+        write_ollama(
+            &ollama,
+            "registry.ollama.ai",
+            "library",
+            "linked",
+            "latest",
+            &[("application/vnd.ollama.image.model", &linked)],
+        );
+        let blob = ollama
+            .join("blobs")
+            .join(format!("sha256-{}", sha256(&linked)));
+        let elsewhere = fixture.root.join("other-drive/blob");
+        fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        fs::rename(&blob, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &blob).unwrap();
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("folder.gguf"), "folder");
+
+        fixture
+            .local
+            .configure(roots(vec![root(ModelRootKind::Ollama, &ollama)]))
+            .await
+            .unwrap();
+        let listed = fixture
+            .apply(roots(vec![
+                root(ModelRootKind::Ollama, &ollama),
+                root(ModelRootKind::Folder, &folder),
+            ]))
+            .await;
+
+        let mut names = listed
+            .models
+            .iter()
+            .map(|model| model.display_name.as_str())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["folder", "linked:latest", "llama3.2:1b"]);
+        assert!(
+            listed
+                .models
+                .iter()
+                .all(|model| matches!(model.state, CustomModelState::Ready { .. }))
+        );
+        let model = ollama_inventory_model(&fixture, "linked:latest").await;
+        let inventory = fixture.inventory();
+        let resolved = inventory.resolve_ready(&model.id).await.unwrap();
+        assert_eq!(resolved.components[0].path, blob);
+        assert!(!inventory.plan_delete(&model.id).await.unwrap().supported);
+        assert!(inventory.delete(&model.id).await.is_err());
+        assert!(fs::symlink_metadata(&blob).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(&elsewhere).unwrap(), linked);
+    }
+
+    /// People move Ollama's storage by linking its whole blobs folder to another drive. A store a
+    /// newer Ollama wrote, whose tags link to manifests kept as blobs, is then read through both
+    /// links.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ollama_store_whose_blobs_folder_is_linked_elsewhere_is_listed() {
+        let fixture = Fixture::new().await;
+        let ollama = fixture.root.join("ollama");
+        let qwen = model_bytes("qwen moved blobs");
+        let document = write_ollama(
+            &ollama,
+            "registry.ollama.ai",
+            "library",
+            "qwen3.5",
+            "0.8b",
+            &[("application/vnd.ollama.image.model", &qwen)],
+        );
+        fs::remove_dir_all(ollama.join("manifests")).unwrap();
+        write_ollama_v2(&ollama, "ollama.com", "library/qwen3.5/0.8b", &document);
+        let elsewhere = fixture.root.join("other-drive/blobs");
+        fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        fs::rename(ollama.join("blobs"), &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, ollama.join("blobs")).unwrap();
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Ollama, &ollama)]))
+            .await;
+
+        assert_eq!(
+            listed
+                .models
+                .iter()
+                .map(|model| model.display_name.as_str())
+                .collect::<Vec<_>>(),
+            ["qwen3.5:0.8b"]
+        );
+        assert!(matches!(
+            listed.models[0].state,
+            CustomModelState::Ready { .. }
+        ));
+        let model = ollama_inventory_model(&fixture, "qwen3.5:0.8b").await;
+        fixture.inventory().resolve_ready(&model.id).await.unwrap();
+    }
+
+    /// An Ollama blob linked to a file that is gone, such as one on a drive that was removed, lists
+    /// its model as unreadable; every other model is still listed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ollama_blob_linked_to_a_missing_file_is_unreadable_and_hides_no_other_model() {
+        let fixture = Fixture::new().await;
+        let ollama = fixture.root.join("ollama");
+        let llama = model_bytes("llama gguf");
+        write_ollama(
+            &ollama,
+            "registry.ollama.ai",
+            "library",
+            "llama3.2",
+            "1b",
+            &[("application/vnd.ollama.image.model", &llama)],
+        );
+        let linked = model_bytes("linked gguf");
+        write_ollama(
+            &ollama,
+            "registry.ollama.ai",
+            "library",
+            "linked",
+            "latest",
+            &[("application/vnd.ollama.image.model", &linked)],
+        );
+        let blob = ollama
+            .join("blobs")
+            .join(format!("sha256-{}", sha256(&linked)));
+        let elsewhere = fixture.root.join("other-drive/blob");
+        fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        fs::rename(&blob, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &blob).unwrap();
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("folder.gguf"), "folder");
+        let configuration = roots(vec![
+            root(ModelRootKind::Ollama, &ollama),
+            root(ModelRootKind::Folder, &folder),
+        ]);
+        assert_eq!(fixture.apply(configuration).await.models.len(), 3);
+
+        fs::remove_file(&elsewhere).unwrap();
+        let listed = fixture.local.refresh_local().await.unwrap();
+
+        let mut names = listed
+            .models
+            .iter()
+            .map(|model| model.display_name.as_str())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["folder", "llama3.2:1b"]);
+        assert_eq!(listed.unsupported.len(), 1);
+        assert_eq!(listed.unsupported[0].display_name, "linked:latest");
+        assert_eq!(
+            listed.unsupported[0].reasons,
+            [UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)]
+        );
+        assert!(fs::symlink_metadata(&blob).unwrap().file_type().is_symlink());
+    }
+
     /// A model Ollama 0.40 stores for its MLX runner, one safetensors blob per tensor, can't be
     /// read in place, so it is listed under "can't run" by its Ollama name with the format as its
     /// reason, beside the store's GGUF pulls.

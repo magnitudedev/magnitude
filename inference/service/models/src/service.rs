@@ -171,6 +171,8 @@ fn ensure_deletable_status(model: &InventoryModel) -> Result<(), InventoryError>
 /// The files a model is served from, each contained in the root its location scans. Imported
 /// files are named one by one by the user's declaration, so a link there may point anywhere; a
 /// file found in a user folder or LM Studio's folder lies there itself or as a link to anywhere.
+/// Ollama's files are the blobs its manifests name, read through whatever links lead to them, as
+/// people move Ollama's storage to another drive by linking a blob, its blobs folder or the store.
 pub(crate) fn resolve_components(
     root: &Path,
     model: &InventoryModel,
@@ -210,6 +212,14 @@ pub(crate) fn resolve_components(
             },
             _,
         ) => (root.clone(), Some(root.clone()), LinkedFiles::Anywhere),
+        (
+            ModelLocation::External {
+                origin: ExternalOrigin::Ollama { .. },
+                root,
+                ..
+            },
+            _,
+        ) => (root.clone(), None, LinkedFiles::Anywhere),
         (ModelLocation::Directory { root, .. } | ModelLocation::External { root, .. }, _) => {
             (root.clone(), Some(root.clone()), LinkedFiles::WithinRoot)
         }
@@ -238,21 +248,19 @@ pub(crate) fn resolve_components(
                 ModelLocation::File { path, .. } => path.clone(),
                 _ => base.join(&component.path),
             };
-            let canonical = path.canonicalize().map_err(io_error)?;
-            let contained = match (linked_files, path.parent(), path.file_name()) {
-                (LinkedFiles::Anywhere, Some(parent), Some(name)) => {
-                    parent.canonicalize().map_err(io_error)?.join(name)
+            if let Some(containment) = &canonical_containment {
+                let contained = match (linked_files, path.parent(), path.file_name()) {
+                    (LinkedFiles::Anywhere, Some(parent), Some(name)) => {
+                        parent.canonicalize().map_err(io_error)?.join(name)
+                    }
+                    _ => path.canonicalize().map_err(io_error)?,
+                };
+                if !contained.starts_with(containment) {
+                    return Err(InventoryError::DeletionUnsafe(format!(
+                        "model component escaped its source root: {}",
+                        path.display()
+                    )));
                 }
-                _ => canonical,
-            };
-            if canonical_containment
-                .as_ref()
-                .is_some_and(|containment| !contained.starts_with(containment))
-            {
-                return Err(InventoryError::DeletionUnsafe(format!(
-                    "model component escaped its source root: {}",
-                    path.display()
-                )));
             }
             Ok(ResolvedComponent {
                 path,
