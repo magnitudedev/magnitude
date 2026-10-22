@@ -95,7 +95,7 @@ export function useI18n() {
     if (typeof window !== "undefined") window.dispatchEvent(new Event(changeEvent))
   }, [instance])
 
-  const translate = useCallback((key: MessageKey) => t(key), [t])
+  const translate = useCallback((key: MessageKey, options?: { count?: number }) => t(key, options), [t])
   return { language, setLanguage, t: translate }
 }
 
