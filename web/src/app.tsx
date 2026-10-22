@@ -909,7 +909,7 @@ function NavigationDrawer({ page, navigate, onClose }: { page: ApplicationPage; 
     <aside aria-label={t("navigation")} className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-6 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">
       <div className="mb-6 flex h-10 items-center justify-between px-4">
         <span className="flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude</span>
-        <button type="button" autoFocus className="inline-flex size-10 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" aria-label="Close navigation" onClick={onClose}><XIcon className="size-5" /></button>
+        <button type="button" autoFocus className="inline-flex size-10 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" aria-label={t("closeNavigation")} onClick={onClose}><XIcon className="size-5" /></button>
       </div>
       <Navigation page={page} navigate={navigate} onNavigate={onClose} />
     </aside>
