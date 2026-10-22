@@ -811,6 +811,7 @@ function SettingsPage() {
   </>
 }
 export function App() {
+  const { t } = useI18n()
   const session = useSession()
   const observation = useServiceObservation()
   const page = useAtomValue(session.page)
