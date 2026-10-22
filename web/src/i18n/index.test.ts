@@ -79,6 +79,24 @@ describe("react-i18next locale resources", () => {
     }
   })
 
+  test("pluralizes the model search placeholder with each locale's rules", () => {
+    const cases = [
+      ["en", 1, "Search 1 model…"],
+      ["en", 3, "Search 3 models…"],
+      ["en", 39, "Search 39 models…"],
+      ["es", 1, "Buscar 1 modelo…"],
+      ["es", 3, "Buscar 3 modelos…"],
+      ["uk", 1, "Шукати 1 модель…"],
+      ["uk", 3, "Шукати 3 моделі…"],
+      ["uk", 5, "Шукати 5 моделей…"],
+      ["uk", 39, "Шукати 39 моделей…"],
+      ["zh-CN", 3, "搜索 3 个模型…"],
+    ] as const
+    for (const [language, count, expected] of cases) {
+      expect(i18n.t("searchModelsPlaceholder", { lng: language, count })).toBe(expected)
+    }
+  })
+
   test("does not configure any RTL locale", () => {
     expect(i18n.options.supportedLngs).toEqual(expect.arrayContaining([...LANGUAGES]))
     expect(LANGUAGES).not.toContain("ur" as never)
