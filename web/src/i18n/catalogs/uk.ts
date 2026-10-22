@@ -652,4 +652,4 @@ export const uk = {
   noModelsDownloaded: "Моделі ще не завантажено. Знайдіть модель у розділі «Огляд».",
   couldNotCheckAvailableModels: "Не вдалося перевірити доступні моделі",
   restartServerToApply: "{{reason}} Перезапустіть сервер Magnitude, щоб застосувати зміни.",
-} satisfies typeof en
+} satisfies { [K in keyof typeof en]: string }
