@@ -4,8 +4,6 @@ import { useCallback, useEffect } from "react"
 import { en } from "./catalogs/en"
 import { es } from "./catalogs/es"
 import { zhCN } from "./catalogs/zh-CN"
-import { hi } from "./catalogs/hi"
-import { bn } from "./catalogs/bn"
 import { fr } from "./catalogs/fr"
 import { de } from "./catalogs/de"
 import { ja } from "./catalogs/ja"
@@ -13,7 +11,7 @@ import { pt } from "./catalogs/pt"
 import { it } from "./catalogs/it"
 import { uk } from "./catalogs/uk"
 
-export const LANGUAGES = ["en", "es", "zh-CN", "hi", "bn", "fr", "de", "ja", "pt", "it", "uk"] as const
+export const LANGUAGES = ["en", "es", "zh-CN", "fr", "de", "ja", "pt", "it", "uk"] as const
 export type Language = typeof LANGUAGES[number]
 export type MessageKey = keyof typeof en
 export const STORAGE_KEY = "magnitude.language"
@@ -23,8 +21,6 @@ const resources = {
   en: { translation: en },
   es: { translation: es },
   "zh-CN": { translation: zhCN },
-  hi: { translation: hi },
-  bn: { translation: bn },
   fr: { translation: fr },
   de: { translation: de },
   ja: { translation: ja },
