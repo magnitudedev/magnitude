@@ -288,6 +288,7 @@ function LabOption({ lab }: { lab: ModelLab | null }) {
   return <span className="flex items-center gap-2">{lab ? <LabLogo lab={lab} className="size-4" /> : <BuildingsIcon aria-hidden="true" className="size-4 text-slate-500" />}{lab ? lab.name : "Any lab"}</span>
 }
 function Models({ page }: { page: "discover" | "catalog" | "models" }) {
+  const { t } = useI18n()
   const installedOnly = page === "models"
   const discover = page === "discover"
   const catalog = useCatalogModels()
