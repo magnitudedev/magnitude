@@ -605,7 +605,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
                     }
                 } else {
                     attention_store_gated(query, ATTENTION_GATE_BUFFER, gated, out_token, out_head, column,
-                        seismic_div_rn(value, max(row_denominator, 1e-30)));
+                        attention_attended(value, row_maximum, row_denominator, out_head));
                 }
 #endif
             }
@@ -629,7 +629,7 @@ void prefill_merge(prefill_scratch scratch_planes) {
     const uint64_t rows = SEISMIC_DIM_M;
     for (uint64_t row = uint64_t(tile) * PREFILL_QT; row < min(uint64_t(tile + 1u) * PREFILL_QT, rows); ++row) {
         const float attended = attention_merge(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
-            SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), row * heads + head, rows * heads, count, column);
+            SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS), row * heads + head, rows * heads, count, column, head);
         attention_store_gated(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), row,
             head, column, attended);
     }
@@ -646,7 +646,7 @@ void prefill_decode_merge() {
     const uint column = gl_LocalInvocationIndex;
     const float attended = attention_merge(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS),
-        (row * ATTENTION_KV * ATTENTION_G + head) * PREFILL_PARTS, 1ul, PREFILL_PARTS, column);
+        (row * ATTENTION_KV * ATTENTION_G + head) * PREFILL_PARTS, 1ul, PREFILL_PARTS, column, head);
     attention_store_gated(ATTENTION_QUERY_BUFFER, ATTENTION_GATE_BUFFER, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), row,
         head, column, attended);
 }

@@ -153,15 +153,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .position(|predicted| predicted.request() == operation.request())?;
             let mut expected = lookahead.predicted[slot].clone();
             if lookahead.selected_tokens {
+                // Every table row the queued step read for this token is the
+                // token's (a landed read, `DeviceTable::read_selected`). A
+                // slot whose rows could not be read is claimed all the same:
+                // its sequence fails when the step finishes, and the others
+                // continue (`finish_target_work`).
                 let choice = selected.get(slot).filter(|choice| choice.status == 0)?;
-                // A queued step that read a table row the device did not
-                // hold for this token is not the continuation. (A slot whose
-                // stored rows could not be read is claimed all the same: its
-                // sequence fails when the step finishes, and the others
-                // continue, `finish_target_work`.)
-                if !lookahead.flight.submission.output().found_selected(choice.token.0) {
-                    return None;
-                }
                 if let Operation::Forward { tokens, .. } = &mut expected {
                     tokens[0] = choice.token;
                 }
@@ -507,6 +504,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             };
         let launch_trace = self.trace_target_submission(&predicted);
         let started = Instant::now();
+        let recorded_graphs = self.family.recorded_graphs();
         let submission = self
             .family
             .submit_target(launch)
@@ -540,6 +538,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             submission,
             priming: None,
             started,
+            recorded_graphs,
             runnable: started,
             previous_selection: None,
             id,

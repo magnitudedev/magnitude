@@ -1,0 +1,56 @@
+# The activation rows a matrix product over a weight multiplies: `recipe` is the weight's
+# `operands(weight)`. A product over NVFP4 weights takes each row as NVFP4 itself (W4A4,
+# docs/precision.md, "NVFP4 operands"); every other product takes the row as it is.
+fn operand_rows[M, K](x: &tensor[M, K] T, recipe: i32, y: &mut tensor[M, K] V):
+    parallel for row in 0..M:
+        operand_row(x[row], recipe, y[row])
+
+# One row of `operand_rows`.
+fn operand_row[K](x: &tensor[K] T, recipe: i32, y: &mut tensor[K] V):
+    if recipe == 1:
+        nvfp4_row(x, y)
+    else:
+        parallel for k in 0..K:
+            y[k] = x[k]
+
+# A row x as NVFP4 operands, published as y = round(q * g * s): the row's global scale g is
+# the least power of two at or above amax(|x|) / (6 * 448) (6 is E2M1's largest value, 448
+# UE4M3's); each 16-value block's scale s is amax(|block|) / (6 * g) rounded to nearest even
+# onto UE4M3, at most 448; each value's code q is x / (g * s) rounded to nearest even onto
+# E2M1, saturating at 6 (zero where s is). g * s and q * g * s are exact in F32, and q * g * s
+# has at most six significant bits. Each rounded quotient equals the exact quotient rounded
+# (docs/precision.md): no F32 quotient lands on a midpoint of either grid, or on a power of
+# two, that the exact quotient is not at.
+fn nvfp4_row[K](x: &tensor[K] T, y: &mut tensor[K] V):
+    let mut amax = f32(0.0)
+    for k in 0..K:
+        amax = max(amax, abs(f32(x[k])))
+    let g = nvfp4_global(amax)
+    parallel for k in 0..K:
+        let first = k - k % 16
+        let mut block = f32(0.0)
+        for i in 0..16:
+            if first + i < K:
+                block = max(block, abs(f32(x[first + i])))
+        let d = g * ue4m3(block / (6.0 * g))
+        y[k] = select(d == 0.0, 0.0, e2m1(f32(x[k]) / d) * d)
+
+# The least power of two at or above amax / 2688, within F32's normal binades.
+fn nvfp4_global(amax: f32) -> f32:
+    let bits = bitcast_u32(amax / 2688.0)
+    let exponent = (bits >> 23) + select((bits & 8388607) != 0, 1, 0)
+    return bitcast_f32(min(max(exponent, 1), 254) << 23)
+
+# v >= 0 rounded to nearest even onto UE4M3 (E4M3 without its sign: exponent bias 7, three
+# mantissa bits, subnormal quantum 2^-9), saturating at 448.
+fn ue4m3(v: f32) -> f32:
+    let exponent = max((bitcast_u32(v) >> 23) & 255, 121)
+    let quantum = bitcast_f32((exponent - 3) << 23)
+    return min(rint(v / quantum) * quantum, 448.0)
+
+# v rounded to nearest even onto E2M1's magnitudes 0, 0.5, 1, 1.5, 2, 3, 4 and 6, saturating
+# at 6, with v's sign; NaN stays NaN.
+fn e2m1(v: f32) -> f32:
+    let a = abs(v)
+    let m = select(a <= 0.25, 0.0, select(a < 0.75, 0.5, select(a <= 1.25, 1.0, select(a < 1.75, 1.5, select(a <= 2.5, 2.0, select(a < 3.5, 3.0, select(a <= 5.0, 4.0, select(a > 5.0, 6.0, a))))))))
+    return select(v < 0.0, -m, m)

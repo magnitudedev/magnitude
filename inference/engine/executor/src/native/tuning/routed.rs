@@ -11,6 +11,7 @@
 //! Route and group write their tables through `&mut` parameters; each
 //! argument set owns those tables as case state.
 
+use super::cases::scale_extent;
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
     served_row_points,
@@ -153,6 +154,8 @@ pub(crate) struct RoutedRouteCase {
     scores: CaseState,
     epsilon: f32,
     normalize: i32,
+    /// The down weight's per-expert scales the scores fold in (ES).
+    expert_scale: Tensor,
 }
 
 impl RoutedRouteTuning {
@@ -204,6 +207,7 @@ impl EntryTuning for RoutedRouteTuning {
             ("K", shape.selected),
             ("PT", parts),
             ("NM", norm),
+            ("ES", scale_extent(inputs, &self.scopes, WeightKind::ExpertDown)?),
         ])
     }
 
@@ -242,6 +246,8 @@ impl EntryTuning for RoutedRouteTuning {
                     scores: inputs.state(scores, 0..rows)?,
                     epsilon: self.epsilon,
                     normalize,
+                    expert_scale: inputs
+                        .unit_scale(inputs.scale_extent(scope, WeightKind::ExpertDown)?)?,
                 })
             })
             .collect()
@@ -257,6 +263,7 @@ impl EntryTuning for RoutedRouteTuning {
             scores: case.scores.tensor_mut(),
             eps: case.epsilon,
             normalize: case.normalize,
+            expert_scale: &case.expert_scale,
         }
     }
 
@@ -313,6 +320,7 @@ impl EntryTuning for RoutedRouteSharedTuning {
             ("S", shape.shared),
             ("PT", parts),
             ("NM", norm),
+            ("ES", scale_extent(inputs, &self.route.scopes, WeightKind::ExpertDown)?),
         ])
     }
 
@@ -353,6 +361,7 @@ impl EntryTuning for RoutedRouteSharedTuning {
             scores: route.scores.tensor_mut(),
             eps: route.epsilon,
             normalize: route.normalize,
+            expert_scale: &route.expert_scale,
         }
     }
 
@@ -450,6 +459,44 @@ impl EntryTuning for RoutedGroupTuning {
     generated_entry!(routed_group);
 }
 
+/// Unit per-expert gate and up scale operands of an expansion at their
+/// planned extents (the gate's absent for up-only experts).
+pub(super) struct ExpansionScales {
+    pub(super) gate: Tensor,
+    pub(super) up: Tensor,
+}
+
+impl ExpansionScales {
+    pub(super) fn at(
+        inputs: &TuningInputs<'_, '_>,
+        scope: WeightScope,
+        gated: bool,
+    ) -> Result<Self, BuildError> {
+        let gate = match gated {
+            true => inputs.scale_extent(scope, WeightKind::ExpertGate)?,
+            false => 0,
+        };
+        Ok(Self {
+            gate: inputs.unit_scale(gate)?,
+            up: inputs.unit_scale(inputs.scale_extent(scope, WeightKind::ExpertUp)?)?,
+        })
+    }
+
+    /// The statics of the gate and up scales `scopes` share: GS (gated
+    /// experts only) and US.
+    pub(super) fn statics(
+        inputs: &ModelInputs<'_>,
+        scopes: &[WeightScope],
+        gated: bool,
+    ) -> Result<Vec<(&'static str, u64)>, String> {
+        let up = ("US", scale_extent(inputs, scopes, WeightKind::ExpertUp)?);
+        Ok(match gated {
+            true => vec![("GS", scale_extent(inputs, scopes, WeightKind::ExpertGate)?), up],
+            false => vec![up],
+        })
+    }
+}
+
 /// `routed_expand`: the selected experts' and the shared expert's
 /// gate/up with SiLU·mul (decode rows).
 #[derive(Clone)]
@@ -470,6 +517,8 @@ pub(crate) struct RoutedExpandCase {
     expert_up: Tensor,
     shared_gate: Tensor,
     shared_up: Tensor,
+    /// The experts' gate and up scales.
+    scales: ExpansionScales,
 }
 
 impl RoutedExpandTuning {
@@ -503,14 +552,16 @@ impl EntryTuning for RoutedExpandTuning {
         )
     }
 
-    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
-        Ok(vec![
+        let mut statics = vec![
             ("H", shape.hidden),
             ("K", shape.selected),
             ("F", shape.features),
             ("S", shape.shared),
-        ])
+        ];
+        statics.extend(ExpansionScales::statics(inputs, &self.scopes, true)?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -539,6 +590,7 @@ impl EntryTuning for RoutedExpandTuning {
                     expert_up: inputs.weight(scope, WeightKind::ExpertUp)?,
                     shared_gate: inputs.weight(scope, WeightKind::SharedGate)?,
                     shared_up: inputs.weight(scope, WeightKind::SharedUp)?,
+                    scales: ExpansionScales::at(inputs, scope, true)?,
                 })
             })
             .collect()
@@ -552,6 +604,8 @@ impl EntryTuning for RoutedExpandTuning {
             expert_up: &case.expert_up,
             shared_gate: &case.shared_gate,
             shared_up: &case.shared_up,
+            gate_scale: &case.scales.gate,
+            up_scale: &case.scales.up,
         }
     }
 
@@ -574,6 +628,8 @@ pub(crate) struct RoutedChoicesCase {
     routes: Tensor,
     expert_gate: Tensor,
     expert_up: Tensor,
+    /// The experts' gate and up scales.
+    scales: ExpansionScales,
 }
 
 impl EntryTuning for RoutedChoicesTuning {
@@ -593,13 +649,15 @@ impl EntryTuning for RoutedChoicesTuning {
         )
     }
 
-    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
-        Ok(vec![
+        let mut statics = vec![
             ("H", shape.hidden),
             ("K", shape.selected),
             ("F", shape.features),
-        ])
+        ];
+        statics.extend(ExpansionScales::statics(inputs, &self.scopes, true)?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -626,6 +684,7 @@ impl EntryTuning for RoutedChoicesTuning {
                         .i32s(&[point.rows, shape.selected], &routes(point.rows, shape))?,
                     expert_gate: inputs.weight(scope, WeightKind::ExpertGate)?,
                     expert_up: inputs.weight(scope, WeightKind::ExpertUp)?,
+                    scales: ExpansionScales::at(inputs, scope, true)?,
                 })
             })
             .collect()
@@ -639,6 +698,8 @@ impl EntryTuning for RoutedChoicesTuning {
             expert_up: &case.expert_up,
             // SiLU: the fused Qwen form's experts.
             activation: 0,
+            gate_scale: &case.scales.gate,
+            up_scale: &case.scales.up,
         }
     }
 
@@ -790,6 +851,8 @@ pub(crate) struct RoutedExpertsCase {
     expert_gate: Tensor,
     expert_up: Tensor,
     expert_down: Tensor,
+    /// The experts' gate and up scales.
+    scales: ExpansionScales,
 }
 
 impl RoutedExpertsTuning {
@@ -821,8 +884,10 @@ impl EntryTuning for RoutedExpertsTuning {
         )
     }
 
-    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        Ok(vec![("H", self.shape.hidden), ("F", self.shape.features)])
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        let mut statics = vec![("H", self.shape.hidden), ("F", self.shape.features)];
+        statics.extend(ExpansionScales::statics(inputs, &self.scopes, true)?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -852,6 +917,7 @@ impl EntryTuning for RoutedExpertsTuning {
                     expert_gate: inputs.weight(scope, WeightKind::ExpertGate)?,
                     expert_up: inputs.weight(scope, WeightKind::ExpertUp)?,
                     expert_down: inputs.weight(scope, WeightKind::ExpertDown)?,
+                    scales: ExpansionScales::at(inputs, scope, true)?,
                 })
             })
             .collect()
@@ -866,6 +932,8 @@ impl EntryTuning for RoutedExpertsTuning {
             expert_up: &case.expert_up,
             expert_down: &case.expert_down,
             activation: 0,
+            gate_scale: &case.scales.gate,
+            up_scale: &case.scales.up,
         }
     }
 

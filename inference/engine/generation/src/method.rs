@@ -214,9 +214,15 @@ pub trait MethodState {
     ) -> Result<MethodEffects, String>;
     /// Consume the outcome of the exact operation `propose` returned.
     fn reconcile(&mut self, operation: &Operation, outcome: Outcome) -> Result<(), String>;
-    /// A launch carrying this request's work finished in `duration`: `rows`
-    /// rows of `sequences` requests.
-    fn timed(&mut self, _launch: TimedLaunch, _duration: Duration, _sequences: usize, _rows: usize) {
+    /// A launch carrying this request's work finished: `rows` rows of
+    /// `sequences` requests, in `duration` when it replayed its graph.
+    fn timed(
+        &mut self,
+        _launch: TimedLaunch,
+        _duration: Option<Duration>,
+        _sequences: usize,
+        _rows: usize,
+    ) {
     }
     /// The drafted block this request's next target round verifies, when
     /// the method chooses how much of it to verify.

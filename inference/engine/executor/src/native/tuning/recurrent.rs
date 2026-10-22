@@ -10,7 +10,7 @@
 //! slot reads, the bank it publishes to), filled with pseudo-random state; the
 //! published bank is the case state restored before each validation run.
 
-use super::cases::{packing_statics, projection_shape};
+use super::cases::{packing_statics, projection_shape, scale_extent};
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
     served_row_points,
@@ -215,6 +215,7 @@ pub(crate) struct RecurrentOutputCase {
     inject: Tensor,
     gated: Tensor,
     output: Tensor,
+    scale: Tensor,
     bound: Tensor,
 }
 
@@ -252,6 +253,10 @@ impl EntryTuning for RecurrentOutputTuning {
             ("IN", inject),
             ("Q", self.shape.value_heads),
             ("W", self.shape.width),
+            (
+                "OS",
+                scale_extent(inputs, &self.shape.scopes, WeightKind::RecurrentOutput)?,
+            ),
         ];
         statics.extend(packing_statics(
             inputs,
@@ -290,6 +295,8 @@ impl EntryTuning for RecurrentOutputTuning {
                         &[point.rows, self.shape.value_heads, self.shape.width],
                         seed + 2,
                     )?,
+                    scale: inputs
+                        .unit_scale(inputs.scale_extent(scope, WeightKind::RecurrentOutput)?)?,
                     bound: inputs.bound(scope, WeightKind::RecurrentOutput)?,
                     output,
                 })
@@ -303,6 +310,7 @@ impl EntryTuning for RecurrentOutputTuning {
             inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
+            output_scale: &case.scale,
             output_bound: &case.bound,
         }
     }

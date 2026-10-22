@@ -8,6 +8,9 @@
 #define KERNEL_W2 SEISMIC_KEY_WEIGHT
 #define KERNEL_W3 SEISMIC_VALUE_WEIGHT
 #include "lib/core/activation.glsl"
+#if SEISMIC_STATIC_QS != 0 || SEISMIC_STATIC_GS != 0 || SEISMIC_STATIC_KS != 0 || SEISMIC_STATIC_VS != 0
+#define PROJECTION_SCALED
+#endif
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
 #define PROJECT_ACT ELEMENT_ACT
@@ -23,6 +26,13 @@
 #else
 #error "attention_project requires a dense input_norm"
 #endif
+// The rows every weight takes (the normalized rows, or NVFP4 operands): the
+// GEMV forms them while staging, the stage launch into the GEMM's scratch.
+#if defined(SEISMIC_QUERY_WEIGHT_OPERANDS_NVFP4)
+#define PROJECT_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define PROJECT_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
 
 
 
@@ -37,9 +47,10 @@
 #define PROJECT_VALUE_ROWS uint(SEISMIC_DIM_V)
 
 projection_prologue attention_project_input() {
-    return projection_input(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), SEISMIC_HIDDEN_STRIDE_0,
-        SEISMIC_HIDDEN_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_INPUT_NORM), SEISMIC_INPUT_NORM_STRIDE_0, PROJECT_NORM,
-        element_word_f32(SEISMIC_PARAM_EPSILON), PROJECT_K, 0ul, uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT));
+    return projection_operands(projection_input(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
+        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_INPUT_NORM),
+        SEISMIC_INPUT_NORM_STRIDE_0, PROJECT_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), PROJECT_K, 0ul,
+        uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT)), PROJECT_OPERANDS);
 }
 
 projection_weights attention_project_query() {
@@ -55,21 +66,27 @@ projection_weights attention_project_value() {
     return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_WEIGHT), PACKETS_W3_ROWS, PROJECT_K, 0ul, 1ul);
 }
 
+// Each segment's result, after its weight's second-level scale where it has
+// one (an absent port's factor is 1).
 projection_epilogue attention_project_query_out() {
-    return projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
-        SEISMIC_RESULT_0_STRIDE_1, 0ul);
+    return projection_scaled(projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0ul),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_SCALE), SEISMIC_DIM_QS, 0ul, 0ul), 1.0);
 }
 projection_epilogue attention_project_gate_out() {
-    return projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER), SEISMIC_RESULT_1_STRIDE_0,
-        SEISMIC_RESULT_1_STRIDE_1, 0ul);
+    return projection_scaled(projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER),
+        SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1, 0ul),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, 0ul, 0ul), 1.0);
 }
 projection_epilogue attention_project_key_out() {
-    return projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER), SEISMIC_RESULT_2_STRIDE_0,
-        SEISMIC_RESULT_2_STRIDE_1, 0ul);
+    return projection_scaled(projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER),
+        SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, 0ul),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_KEY_SCALE), SEISMIC_DIM_KS, 0ul, 0ul), 1.0);
 }
 projection_epilogue attention_project_value_out() {
-    return projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_3_BUFFER), SEISMIC_RESULT_3_STRIDE_0,
-        SEISMIC_RESULT_3_STRIDE_1, 0ul);
+    return projection_scaled(projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_3_BUFFER),
+        SEISMIC_RESULT_3_STRIDE_0, SEISMIC_RESULT_3_STRIDE_1, 0ul),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_SCALE), SEISMIC_DIM_VS, 0ul, 0ul), 1.0);
 }
 
 void attention_project_zero_tile(projection_epilogue out_, uint rows, uint columns,

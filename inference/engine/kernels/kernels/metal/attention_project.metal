@@ -10,6 +10,12 @@
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
+// The rows every weight takes (the normalized rows, or NVFP4 operands): the
+// GEMV and batched row classes form them while staging, the stage launches
+// into the scratch every other form reads.
+constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4,
+    packets::W2_OPERANDS_NVFP4, packets::W3_OPERANDS_NVFP4>::NVFP4;
+typedef projection::operands<NVFP4> Operands;
 
 #define ATTENTION_PROJECT_ARGUMENTS                                                     \
     device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],                       \
@@ -28,6 +34,10 @@ typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
     device half *weight_factors [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_FACTORS)]],      \
     device float *token_scales [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_SCALES)]],         \
     device float *weight_scales [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_SCALES)]],       \
+    device const float *query_scale [[buffer(SEISMIC_BUFFER_QUERY_SCALE)]],             \
+    device const float *gate_scale [[buffer(SEISMIC_BUFFER_GATE_SCALE)]],               \
+    device const float *key_scale [[buffer(SEISMIC_BUFFER_KEY_SCALE)]],                 \
+    device const float *value_scale [[buffer(SEISMIC_BUFFER_VALUE_SCALE)]],             \
     device const float *query_bound [[buffer(SEISMIC_BUFFER_QUERY_BOUND)]],             \
     device const float *gate_bound [[buffer(SEISMIC_BUFFER_GATE_BOUND)]],               \
     device const float *key_bound [[buffer(SEISMIC_BUFFER_KEY_BOUND)]],                 \
@@ -48,14 +58,20 @@ typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
     projection::Weights<packets::W1> gate_w{gate_weight, KERNEL_W1_LAYOUT(k), k};       \
     projection::Weights<packets::W2> key_w{key_weight, KERNEL_W2_LAYOUT(k), k};         \
     projection::Weights<packets::W3> value_w{value_weight, KERNEL_W3_LAYOUT(k), k};     \
-    projection::Store<activation> query_out{query, SEISMIC_RESULT_0_STRIDE_0,           \
-        SEISMIC_RESULT_0_STRIDE_1, 0};                                                  \
-    projection::Store<activation> gate_out{gate, SEISMIC_RESULT_1_STRIDE_0,             \
-        SEISMIC_RESULT_1_STRIDE_1, 0};                                                  \
-    projection::Store<activation> key_out{key, SEISMIC_RESULT_2_STRIDE_0,               \
-        SEISMIC_RESULT_2_STRIDE_1, 0};                                                  \
-    projection::Store<activation> value_out{value, SEISMIC_RESULT_3_STRIDE_0,           \
-        SEISMIC_RESULT_3_STRIDE_1, 0}
+    const auto query_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_QS, query_scale,        \
+        (projection::Store<activation>{query, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0})); \
+    const auto gate_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_GS, gate_scale,          \
+        (projection::Store<activation>{gate, SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1, 0})); \
+    const auto key_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_KS, key_scale,            \
+        (projection::Store<activation>{key, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, 0})); \
+    const auto value_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_VS, value_scale,        \
+        (projection::Store<activation>{value, SEISMIC_RESULT_3_STRIDE_0, SEISMIC_RESULT_3_STRIDE_1, 0}))
+
+// A segment's result after its weight's second-level scale, where the
+// segment's scale port (static extent EXTENT) is present.
+#define ATTENTION_PROJECT_SCALED(EXTENT, SCALE, STORE)                                  \
+    projection::scaling<(EXTENT != 0)>::wrap(STORE,                                     \
+        projection::scale_factor(SCALE, EXTENT, 0, 0), 1.0f)
 
 template <typename Output>
 inline void attention_project_zero_tile(Output out, uint rows, uint columns,
@@ -86,8 +102,9 @@ inline void attention_project_zero_tile(Output out, uint rows, uint columns,
         return;                                                                         \
     }                                                                                   \
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                         \
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
-    const auto x = projection::shared_norm(in, squares);                                \
+    const auto x = Operands::rows(projection::shared_norm(in, squares), rows, k, globals, simdgroups, sg, lane); \
     if (tile < t0) {                                                                    \
         PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>( \
             x, query_out, query_w, rows, query_rows, k, tile, shared, simdgroups, sg, lane)); \
@@ -164,8 +181,9 @@ kernel void attention_project_batch(ATTENTION_PROJECT_ARGUMENTS,
         return;
     }
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    const auto x = projection::shared_norm(in, squares);
+    const auto x = Operands::rows(projection::shared_norm(in, squares), rows, k, globals, simdgroups, sg, lane);
     if (tile < t0)
         projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(x, query_out, query_w, rows, query_rows, k,
             tile, shared, simdgroups, sg, lane);
@@ -187,7 +205,7 @@ kernel void attention_project_stage(ATTENTION_PROJECT_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
     ATTENTION_PROJECT_OPERANDS;
-    projection::device_normalize<256>(in, item, normalized, k, norms, thread_index);
+    Operands::normalize<256>(in, item, normalized, k, norms, thread_index);
 }
 #endif
 
@@ -255,8 +273,7 @@ kernel void attention_project_stage_tall(ATTENTION_PROJECT_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
     ATTENTION_PROJECT_OPERANDS;
-    projection::device_normalize<256, projection::TallOrder<activation>>(in, item, normalized, k, norms,
-        thread_index);
+    Operands::normalize<256, projection::TallOrder<activation>>(in, item, normalized, k, norms, thread_index);
 }
 #endif
 

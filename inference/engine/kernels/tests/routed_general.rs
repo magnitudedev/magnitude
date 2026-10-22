@@ -276,7 +276,7 @@ struct Routing {
 
 const CLAMP: f32 = 6.103_515_6e-5;
 
-const ROUTINGS: [Routing; 5] = [
+const ROUTINGS: [Routing; 7] = [
     Routing {
         name: "lfm2-moe",
         hidden: 2048,
@@ -337,6 +337,34 @@ const ROUTINGS: [Routing; 5] = [
         expert_scales: false,
         router_norm: false,
     },
+    // Nemotron 3.5 Bolt's smallest routed layer: E = 240 is not a multiple
+    // of 32 (lanes 16..31 exclude their last register).
+    Routing {
+        name: "nemotron-bolt-240",
+        hidden: 4096,
+        experts: 240,
+        selected: 9,
+        score: 1,
+        normalization: 3,
+        scale: 5.0,
+        biased: true,
+        expert_scales: false,
+        router_norm: false,
+    },
+    // A small odd expert count under softmax, whose maximum and sum must
+    // skip the excluded registers: one partial lane run.
+    Routing {
+        name: "odd-softmax-23",
+        hidden: 512,
+        experts: 23,
+        selected: 5,
+        score: 0,
+        normalization: 1,
+        scale: 1.0,
+        biased: false,
+        expert_scales: true,
+        router_norm: true,
+    },
 ];
 
 struct SelectCase {
@@ -382,10 +410,11 @@ impl SelectCase {
             bias[5] = 1.0;
             bias[21] = 1.0;
         }
+        // Per-expert combine scales (ES = E), or the absent port.
         let expert_scale = if routing.expert_scales {
             pattern(e, 19, 0.5).iter().map(|v| v + 1.0).collect()
         } else {
-            vec![1.0; e]
+            Vec::new()
         };
         Self {
             rows,
@@ -423,7 +452,7 @@ fn portable_select(
             floats(DType::F32, &[h], &case.router_norm),
             floats(router, &[e, h], &stored(router, &case.router)),
             floats(DType::F32, &[e], &case.bias),
-            floats(DType::F32, &[e], &case.expert_scale),
+            floats(DType::F32, &[case.expert_scale.len()], &case.expert_scale),
             ints(&[m, k], &vec![-7; m * k]),
             floats(DType::F32, &[m, k], &vec![-7.0; m * k]),
             Input::F32(1e-6),
@@ -517,7 +546,7 @@ fn host_select(routing: &Routing, case: &SelectCase) -> Selection {
             let expert = routes[row * k + slot] as usize;
             weights[row * k + slot] = weights[row * k + slot] / divisor
                 * f64::from(routing.scale)
-                * f64::from(case.expert_scale[expert]);
+                * case.expert_scale.get(expert).map_or(1.0, |scale| f64::from(*scale));
         }
         ranked.extend(row_ranked);
     }
@@ -637,7 +666,11 @@ fn native_select_matches_host_reference_at_catalog_shapes() {
                         RW: seismic::Element::f32(),
                         A: seismic::Element::bf16(),
                     },
-                    &specialization(&device, &[("H", h), ("E", e), ("K", k)], &mapping),
+                    &specialization(
+                        &device,
+                        &[("H", h), ("E", e), ("K", k), ("ES", case.expert_scale.len())],
+                        &mapping,
+                    ),
                 )
                 .unwrap();
                 let mut routes = i32_tensor(&device, &[rows, k], &vec![-7; rows * k]);
@@ -649,7 +682,12 @@ fn native_select_matches_host_reference_at_catalog_shapes() {
                         router_norm: &tensor(&device, DType::F32, &[h], &case.router_norm),
                         router: &tensor(&device, DType::F32, &[e, h], &case.router),
                         bias: &tensor(&device, DType::F32, &[e], &case.bias),
-                        expert_scale: &tensor(&device, DType::F32, &[e], &case.expert_scale),
+                        expert_scale: &tensor(
+                            &device,
+                            DType::F32,
+                            &[case.expert_scale.len()],
+                            &case.expert_scale,
+                        ),
                         routes: &mut routes,
                         weights: &mut weights,
                         epsilon: 1e-6,
@@ -827,18 +865,23 @@ fn dot(x: &[f32], w: &[f32]) -> f32 {
 /// [E, F, H] beside the up rows), or up-only with each expert's
 /// second-level up scale [E] on the accumulator (NVFP4 `.scale`).
 enum Expansion {
+    /// The gate weight [E, F, H].
     Gated(Vec<f32>),
-    Up(Vec<f32>),
+    Up,
 }
 
-/// Dense BF16 expert weights: up [E, F, H], down [E, H, F] and the
-/// expansion's gate or scales.
+/// Dense BF16 expert weights: up [E, F, H], down [E, H, F], the
+/// expansion's gate, and the expansions' per-expert second-level scales.
 struct ExpertBlock {
     shape: ExpertShape,
     experts: usize,
     expansion: Expansion,
     up: Vec<f32>,
     down: Vec<f32>,
+    /// The gate's per-expert scales (GS = E; empty, absent, for up-only
+    /// experts) and the up weight's (US = E).
+    gate_scale: Vec<f32>,
+    up_scale: Vec<f32>,
 }
 
 impl ExpertBlock {
@@ -851,16 +894,17 @@ impl ExpertBlock {
                 .map(registry::bf16_round)
                 .collect::<Vec<_>>()
         };
-        // Up scales in [0.5, 2), as Lightning's per-expert `ffn_up_exps.scale`.
-        let expansion = if shape.gated {
-            Expansion::Gated(weights(31))
+        // Scales in [0.5, 2), as NVFP4's per-expert `ffn_up_exps.scale`.
+        let scales = |seed| {
+            pattern(experts, seed, 0.75)
+                .iter()
+                .map(|v| v + 1.25)
+                .collect::<Vec<_>>()
+        };
+        let (expansion, gate_scale) = if shape.gated {
+            (Expansion::Gated(weights(31)), scales(53))
         } else {
-            Expansion::Up(
-                pattern(experts, 59, 0.75)
-                    .iter()
-                    .map(|v| v + 1.25)
-                    .collect(),
-            )
+            (Expansion::Up, Vec::new())
         };
         Self {
             shape,
@@ -868,11 +912,13 @@ impl ExpertBlock {
             expansion,
             up: weights(37),
             down: weights(41),
+            gate_scale,
+            up_scale: scales(59),
         }
     }
 
-    /// A(A(act(A(gate))) * A(up)) or A(act(A(scale[e] * up))) of one
-    /// normalized row.
+    /// A(A(act(A(gs[e] * gate))) * A(us[e] * up)) or A(act(A(us[e] * up)))
+    /// of one normalized row.
     fn product(&self, x: &[f32], expert: usize) -> Vec<f32> {
         let (h, f, function) = (
             self.shape.hidden,
@@ -882,19 +928,20 @@ impl ExpertBlock {
         (0..f)
             .map(|feature| {
                 let row = (expert * f + feature) * h;
-                let up = dot(x, &self.up[row..row + h]);
+                let up = self.up_scale[expert] * dot(x, &self.up[row..row + h]);
                 match &self.expansion {
                     Expansion::Gated(gate) => {
-                        let gate = registry::bf16_round(dot(x, &gate[row..row + h]));
+                        let gate = registry::bf16_round(
+                            self.gate_scale[expert] * dot(x, &gate[row..row + h]),
+                        );
                         registry::bf16_round(
                             registry::bf16_round(activate(function, gate))
                                 * registry::bf16_round(up),
                         )
                     }
-                    Expansion::Up(scales) => registry::bf16_round(activate(
-                        function,
-                        registry::bf16_round(scales[expert] * up),
-                    )),
+                    Expansion::Up => {
+                        registry::bf16_round(activate(function, registry::bf16_round(up)))
+                    }
                 }
             })
             .collect()
@@ -1147,6 +1194,7 @@ fn portable_expert_entries_match_host_reference() {
                 .collect::<Vec<_>>()
         };
 
+        let scale = |scales: &[f32]| floats(DType::F32, &[scales.len()], scales);
         let case = ExpertCase::new(&block, 3);
         let m = case.rows;
         let product = match &block.expansion {
@@ -1160,9 +1208,11 @@ fn portable_expert_entries_match_host_reference() {
                     weights(gate, f, h),
                     weights(&block.up, f, h),
                     Input::I32(shape.activation),
+                    scale(&block.gate_scale),
+                    scale(&block.up_scale),
                 ],
             ),
-            Expansion::Up(scales) => interpret(
+            Expansion::Up => interpret(
                 &module,
                 "routed_up",
                 &elements(&["A", "EUW"]),
@@ -1170,7 +1220,7 @@ fn portable_expert_entries_match_host_reference() {
                     bf16(&[m, h], &case.normalized),
                     ints(&[m, k], &case.routes),
                     weights(&block.up, f, h),
-                    floats(DType::F32, &[e], scales),
+                    scale(&block.up_scale),
                     Input::I32(shape.activation),
                 ],
             ),
@@ -1228,9 +1278,11 @@ fn portable_expert_entries_match_host_reference() {
                     weights(&block.up, f, h),
                     weights(&block.down, h, f),
                     Input::I32(shape.activation),
+                    scale(&block.gate_scale),
+                    scale(&block.up_scale),
                 ],
             ),
-            Expansion::Up(scales) => interpret(
+            Expansion::Up => interpret(
                 &module,
                 "routed_experts_up",
                 &elements(&["A", "EUW", "EDW"]),
@@ -1240,7 +1292,7 @@ fn portable_expert_entries_match_host_reference() {
                     ints(&[b], &table),
                     weights(&block.up, f, h),
                     weights(&block.down, h, f),
-                    floats(DType::F32, &[e], scales),
+                    scale(&block.up_scale),
                     Input::I32(shape.activation),
                 ],
             ),
@@ -1404,32 +1456,41 @@ fn expert_specialization(
     }
 }
 
-/// The device tensors of an `ExpertBlock` (`expansion`: the gate rows or
-/// the up scales).
+/// The device tensors of an `ExpertBlock` (`gate`: the gate rows of gated
+/// experts).
 struct DeviceExperts {
-    expansion: DeviceExpansion,
+    gate: Option<seismic::Tensor>,
     up: seismic::Tensor,
     down: seismic::Tensor,
-}
-
-enum DeviceExpansion {
-    Gated(seismic::Tensor),
-    Up(seismic::Tensor),
+    gate_scale: seismic::Tensor,
+    up_scale: seismic::Tensor,
 }
 
 impl DeviceExperts {
     fn new(device: &seismic::Device, block: &ExpertBlock) -> Self {
         let (h, f, e) = (block.shape.hidden, block.shape.features, block.experts);
-        let expansion = match &block.expansion {
-            Expansion::Gated(gate) => {
-                DeviceExpansion::Gated(tensor(device, DType::BF16, &[e, f, h], gate))
-            }
-            Expansion::Up(scales) => DeviceExpansion::Up(tensor(device, DType::F32, &[e], scales)),
-        };
+        let scale = |scales: &[f32]| tensor(device, DType::F32, &[scales.len()], scales);
         Self {
-            expansion,
+            gate: match &block.expansion {
+                Expansion::Gated(gate) => Some(tensor(device, DType::BF16, &[e, f, h], gate)),
+                Expansion::Up => None,
+            },
             up: tensor(device, DType::BF16, &[e, f, h], &block.up),
             down: tensor(device, DType::BF16, &[e, h, f], &block.down),
+            gate_scale: scale(&block.gate_scale),
+            up_scale: scale(&block.up_scale),
+        }
+    }
+}
+
+impl ExpertBlock {
+    /// The expansion entry's per-expert scale statics: GS and US for gated
+    /// experts, US for up-only ones.
+    fn scale_statics(&self) -> Vec<(&'static str, usize)> {
+        let up = ("US", self.up_scale.len());
+        match self.expansion {
+            Expansion::Gated(_) => vec![("GS", self.gate_scale.len()), up],
+            Expansion::Up => vec![up],
         }
     }
 }
@@ -1461,12 +1522,24 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                             device.backend(),
                             shape.name
                         );
-                        let specialization =
-                            expert_specialization(device, &statics, &mapping, true, int8);
-                        let down_specialization =
-                            expert_specialization(device, &statics, &down, true, int8);
-                        let product = match &experts.expansion {
-                            DeviceExpansion::Gated(gate) => {
+                        let specialization = expert_specialization(
+                            device,
+                            &[statics.as_slice(), &block.scale_statics()].concat(),
+                            &mapping,
+                            true,
+                            int8,
+                        );
+                        // CUDA's one-row and gathered down launches read one
+                        // entry-wide configuration.
+                        let down_specialization = expert_specialization(
+                            device,
+                            &statics,
+                            &down,
+                            device.backend() != seismic::BackendName::Cuda,
+                            int8,
+                        );
+                        let product = match &experts.gate {
+                            Some(gate) => {
                                 routed_gate_up::native_for_device_with(
                                     device,
                                     routed_gate_up::Elements {
@@ -1483,22 +1556,32 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                                     expert_gate: gate,
                                     expert_up: &experts.up,
                                     activation: shape.activation,
+                                    gate_scale: &experts.gate_scale,
+                                    up_scale: &experts.up_scale,
                                 })
                                 .unwrap()
                                 .value
                             }
-                            DeviceExpansion::Up(scales) => {
+                            None => {
                                 routed_up::native_for_device_with(
                                     device,
                                     routed_up::Elements { A: bf16, EUW: bf16 },
-                                    &specialization,
+                                    // CUDA's one-row and gathered launches
+                                    // read one entry-wide configuration.
+                                    &expert_specialization(
+                                        device,
+                                        &[statics.as_slice(), &block.scale_statics()].concat(),
+                                        &mapping,
+                                        device.backend() != seismic::BackendName::Cuda,
+                                        int8,
+                                    ),
                                 )
                                 .unwrap()
                                 .call(routed_up::Args {
                                     normalized: &normalized,
                                     routes: &routes,
                                     expert_up: &experts.up,
-                                    up_scale: scales,
+                                    up_scale: &experts.up_scale,
                                     activation: shape.activation,
                                 })
                                 .unwrap()
@@ -1611,10 +1694,21 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
             for mapping in grouped_mappings(device) {
                 for int8 in arithmetic_variants(device) {
                     let label = format!("{label} {mapping:?} INT8 {int8}");
-                    let specialization =
-                        expert_specialization(device, &[("H", h), ("F", f)], &mapping, false, int8);
-                    let grouped = match &experts.expansion {
-                        DeviceExpansion::Gated(gate) => {
+                    let specialization = expert_specialization(
+                        device,
+                        &[[("H", h), ("F", f)].as_slice(), &block.scale_statics()].concat(),
+                        &mapping,
+                        false,
+                        int8,
+                    );
+                    // CUDA's grouped experts also take their activation operand.
+                    let specialization = if device.backend() == seismic::BackendName::Cuda {
+                        specialization.with_param("OPERAND", 0)
+                    } else {
+                        specialization
+                    };
+                    let grouped = match &experts.gate {
+                        Some(gate) => {
                             routed_experts::native_for_device_with(
                                 device,
                                 routed_experts::Elements {
@@ -1634,11 +1728,13 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                                 expert_up: &experts.up,
                                 expert_down: &experts.down,
                                 activation: shape.activation,
+                                gate_scale: &experts.gate_scale,
+                                up_scale: &experts.up_scale,
                             })
                             .unwrap()
                             .value
                         }
-                        DeviceExpansion::Up(scales) => {
+                        None => {
                             routed_experts_up::native_for_device_with(
                                 device,
                                 routed_experts_up::Elements {
@@ -1655,7 +1751,7 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                                 blocks: &native_table,
                                 expert_up: &experts.up,
                                 expert_down: &experts.down,
-                                up_scale: scales,
+                                up_scale: &experts.up_scale,
                                 activation: shape.activation,
                             })
                             .unwrap()

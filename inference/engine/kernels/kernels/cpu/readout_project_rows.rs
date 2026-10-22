@@ -31,6 +31,7 @@ fn readout_project_rows_stage<L: Isa, E: Elements>(
         };
         projection::quantize(staged, q8);
     }
+    projection::operand_row(&[&cx.arg_weight()], staged);
 }
 
 fn readout_project_rows_rows<L: Isa, E: Elements>(

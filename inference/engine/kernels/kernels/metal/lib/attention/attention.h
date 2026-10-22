@@ -14,7 +14,9 @@
 // interleaved gate columns after each query head's W columns (0 or W),
 // ATTENTION_U separate gate values per query head (0, 1 or W), and whether
 // the layer has fresh rows (ATTENTION_FRESH), q/k norms (ATTENTION_NORM) and a
-// value norm (ATTENTION_VALUE_NORM).
+// value norm (ATTENTION_VALUE_NORM). An entry with attention sinks (SK = 1)
+// defines ATTENTION_SINKS to 1 and passes its `sinks` to the bodies that
+// normalize an output (`divisor`).
 //
 // Every dense operand is bound canonically (row-major, unit innermost stride),
 // so rows are addressed from their logical offsets. Activations are addressed
@@ -28,6 +30,10 @@
 #define ATTENTION_W (2 * SEISMIC_DIM_P + SEISMIC_DIM_S)
 #define ATTENTION_E (ATTENTION_W / 32)
 #define ATTENTION_LOG2E 1.4426950408889634f
+
+#ifndef ATTENTION_SINKS
+#define ATTENTION_SINKS 0
+#endif
 
 // Loops over register arrays (8x8 fragments, per-lane columns) must unroll
 // fully: a dynamically indexed array lives in stack memory, which costs the
@@ -170,13 +176,29 @@ inline void absorb_heads(thread const float (&q)[H][ATTENTION_E],
     }
 }
 
-// The fixed-order merge of `count` partial attention states for one column:
-// state p is slot first + p * stride, with its unnormalized output at
-// partials[slot * W + column] (relative to its maximum) and (maximum,
-// denominator) at statistics[slot * 2]. Empty states (denominator 0) are
-// skipped; a column with no state attends to zero.
+// The divisor of query head `head`'s unnormalized output, whose running
+// maximum is `maximum` and denominator `denominator` (both relative to the
+// exp2 domain of the scaled scores): max(denominator, 1e-30), and with
+// ATTENTION_SINKS the denominator first gains exp2(sink - maximum) for the
+// head's sink logit sinks[head] taken into that domain (times log2e). A head
+// that read no key (denominator 0, its output 0) keeps the divisor 1e-30 and
+// attends to zero: the guard is on the denominator, so an infinite maximum
+// never enters the arithmetic (fast math does not handle infinities). The
+// exponent is clamped below F32's overflow.
+inline float divisor(device const float *sinks, ulong head, float maximum, float denominator) {
+    if (ATTENTION_SINKS && denominator > 0.0f)
+        denominator += metal::fast::exp2(metal::min(metal::fma(sinks[head], ATTENTION_LOG2E, -maximum), 126.0f));
+    return metal::max(denominator, 1e-30f);
+}
+
+// The fixed-order merge of `count` partial attention states for one column
+// of query head `head`: state p is slot first + p * stride, with its
+// unnormalized output at partials[slot * W + column] (relative to its
+// maximum) and (maximum, denominator) at statistics[slot * 2]. Empty states
+// (denominator 0) are skipped; a column with no state attends to zero. The
+// merged state is normalized by `normalizer` (with the head's sink, if any).
 inline float merge(device const float *partials, device const float *statistics,
-    ulong first, ulong stride, uint count, uint column) {
+    ulong first, ulong stride, uint count, uint column, device const float *sinks, ulong head) {
     float maximum = -INFINITY;
     for (uint p = 0; p < count; ++p) {
         const ulong slot = first + p * stride;
@@ -194,7 +216,7 @@ inline float merge(device const float *partials, device const float *statistics,
             accumulated = metal::fma(partials[slot * ATTENTION_W + column], weight, accumulated);
         }
     }
-    return accumulated / metal::max(denominator, 1e-30f);
+    return accumulated / divisor(sinks, head, maximum, denominator);
 }
 
 // Columns of one query head's row: W query columns, then its interleaved
@@ -456,13 +478,14 @@ inline Scalar gate_output(device const Scalar *query, device const Scalar *gate,
 // partitions in partition order, then the gate. The partition weights
 // exp2(maximum_p - maximum) are formed once per threadgroup in `weights`
 // (2 * PARTS floats: weight, denominator); every lane then carries `merge`'s
-// ordered chains for its column, so the result is `merge`'s. A row that sees
-// no key attends to zero.
+// ordered chains for its column, so the result is `merge`'s (with the head's
+// sink, if any, against the merged maximum). A row that sees no key attends
+// to zero.
 template <uint SPAN, uint PARTS, uint TOKENS>
 inline void decode_output(device const Scalar *query, device const Scalar *gate, device const int *visible,
     device const int *fresh, device Scalar *result, device const float *partials,
     device const float *statistics, threadgroup float *weights, ulong spans, ulong rows, ulong head, ulong row,
-    uint column, uint lane, bool softplus) {
+    uint column, uint lane, bool softplus, device const float *sinks = nullptr) {
     constexpr uint W = ATTENTION_W;
     constexpr uint KV = SEISMIC_DIM_KV;
     constexpr uint G = ATTENTION_QUERY_GROUP;
@@ -506,7 +529,7 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
             }
         }
     }
-    const float attended = accumulated / metal::max(denominator, 1e-30f);
+    const float attended = accumulated / divisor(sinks, head, maximum, denominator);
     result[(row * KV * G + head) * W + column] = gate_output(query, gate, row, head, column, attended, softplus);
 }
 
@@ -1552,10 +1575,11 @@ struct prefill_fragments {
     }
 
     // A split tile stores (partial output, maximum, denominator) per row and
-    // partition; an unsplit one its gated output.
+    // partition; an unsplit one its gated output (with the head's sink, if
+    // any).
     static inline void store(device const Scalar *query, device const Scalar *gate, device Scalar *result,
         device float *partials, device float *statistics, ulong first_token, ulong M, uint head, uint partition,
-        uint active, uint window_first, bool softplus, thread prefill_fragments &self) {
+        uint active, uint window_first, bool softplus, device const float *sinks, thread prefill_fragments &self) {
         constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
         const ulong token = first_token + self.fm;
         if (token >= M)
@@ -1573,7 +1597,7 @@ struct prefill_fragments {
             }
             return;
         }
-        const float inverse = 1.0f / metal::max(self.denominator, 1e-30f);
+        const float inverse = 1.0f / divisor(sinks, head, self.maximum, self.denominator);
         ATTENTION_UNROLL
         for (uint d = 0; d < WB; ++d) {
             ATTENTION_UNROLL
@@ -1660,7 +1684,7 @@ struct prefill_tensors {
         float scale, bool softplus, threadgroup Operand *staged, threadgroup const prefill_interval *intervals,
         threadgroup float *exchange, uint kv_head, uint partition, uint active, uint tiles_lo, uint tiles_hi,
         device const Operand *query_rows, uint head, ulong first_token, bool computes, uint owner,
-        uint thread_index, uint lane) {
+        uint thread_index, uint lane, device const float *sinks) {
         constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
         q_tensor q(const_cast<device Operand *>(query_rows), q_extents(),
             metal::array<int32_t, 2>{1, int32_t(H * W)});
@@ -1800,7 +1824,7 @@ struct prefill_tensors {
                 }
                 continue;
             }
-            output_rows inverse = load_rows(exchange, lane, 1.0f / metal::max(denominator, 1e-30f));
+            output_rows inverse = load_rows(exchange, lane, 1.0f / divisor(sinks, head, maximum, denominator));
             ATTENTION_UNROLL
             for (uint16_t i = 0; i < output.get_capacity(); ++i) {
                 if (!output.is_valid_element(i))
@@ -1927,7 +1951,7 @@ struct prefill_direct {
         device const Operand *values, device float *partials, device float *statistics, ulong M, ulong R,
         float scale, bool softplus, threadgroup const prefill_interval *intervals,
         threadgroup const prefill_run *runs, uint kv_head, uint partition, device const Operand *query_rows,
-        uint head, ulong first_token) {
+        uint head, ulong first_token, device const float *sinks) {
         constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
         constexpr uint KV = SEISMIC_DIM_KV;
         score_op score;
@@ -2098,7 +2122,7 @@ struct prefill_direct {
                 const auto index = output.get_multidimensional_index(i);
                 const ulong row_token = first_token + index[1];
                 const uint column = window_first + index[0];
-                const float inverse = 1.0f / metal::max(denominator[slot(i)], 1e-30f);
+                const float inverse = 1.0f / divisor(sinks, head, maximum[slot(i)], denominator[slot(i)]);
                 if (row_token < M)
                     result[(row_token * H + head) * W + column] = gate_output(query, gate, row_token, head, column,
                         output[i] * inverse, softplus);
@@ -2128,7 +2152,8 @@ inline void prefill_windows(History history, device const Scalar *query, device 
     threadgroup typename History::Operand *staged, threadgroup const prefill_interval *intervals,
     uint kv_head, uint partition, uint active, uint tiles_lo, uint tiles_hi,
     device const typename History::Operand *query_rows, uint head, ulong first_token, bool computes,
-    uint thread_index, thread prefill_fragments<QT, History> &state, prefill_selection selection, uint tile) {
+    uint thread_index, thread prefill_fragments<QT, History> &state, prefill_selection selection, uint tile,
+    device const float *sinks) {
     typedef prefill_fragments<QT, History> Form;
     constexpr uint W = ATTENTION_W;
     constexpr uint KEYS = PREFILL_KEYS;
@@ -2207,7 +2232,7 @@ inline void prefill_windows(History history, device const Scalar *query, device 
         // Invalid rows keep running the later windows' barriers.
         if (computes)
             Form::store(query, gate, result, partials, statistics, first_token, M, head, partition, active,
-                window_first, softplus, state);
+                window_first, softplus, sinks, state);
     }
 }
 
@@ -2239,11 +2264,12 @@ struct prefill_owner {
     device float *partials, device float *statistics, ulong M, ulong R, float scale, bool softplus,        \
     threadgroup typename History::Operand *staged, threadgroup const prefill_interval *intervals,          \
     threadgroup float *exchange, uint tile, uint kv_head, uint head_group, uint partition, uint active,    \
-    uint tiles_lo, uint tiles_hi, uint thread_index, uint simd, uint lane, prefill_selection selection
+    uint tiles_lo, uint tiles_hi, uint thread_index, uint simd, uint lane, prefill_selection selection,      \
+    device const float *sinks
 #define PREFILL_OWNED_ARGUMENTS                                                                           \
     history, query, gate, visible, fresh, result, queries, keys, values, partials, statistics, M, R, scale, \
     softplus, staged, intervals, exchange, tile, kv_head, head_group, partition, stored, tiles_lo,         \
-    tiles_hi, thread_index, simd, lane, selection
+    tiles_hi, thread_index, simd, lane, selection, sinks
 
 template <uint QT, class History>
 inline void prefill_owned_fragments(PREFILL_OWNED_PARAMETERS) {
@@ -2254,7 +2280,7 @@ inline void prefill_owned_fragments(PREFILL_OWNED_PARAMETERS) {
     prefill_windows<QT, History>(history, query, gate, visible, fresh, result, keys, values, partials,
         statistics, M, R, scale, softplus, staged, intervals, kv_head, partition, active, tiles_lo, tiles_hi,
         queries + (own.first_token * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + own.head) * ATTENTION_W, own.head,
-        own.first_token, own.computes, thread_index, state, selection, tile);
+        own.first_token, own.computes, thread_index, state, selection, tile, sinks);
 }
 
 #if SEISMIC_HAS_TENSOR_OPS
@@ -2265,7 +2291,7 @@ inline void prefill_owned_tensors(PREFILL_OWNED_PARAMETERS) {
     Form::windows(history, query, gate, visible, fresh, result, keys, values, partials, statistics, M, R, scale,
         softplus, staged, intervals, exchange + own.owner * Form::EXCHANGE, kv_head, partition, active, tiles_lo,
         tiles_hi, queries + (own.first_token * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + own.head) * ATTENTION_W, own.head,
-        own.first_token, own.computes, own.owner, thread_index, lane);
+        own.first_token, own.computes, own.owner, thread_index, lane, sinks);
 }
 
 // The direct form's simdgroups past the owners have nothing to do.
@@ -2278,7 +2304,7 @@ inline void prefill_owned_direct(PREFILL_OWNED_PARAMETERS) {
     Form::windows(history, query, gate, visible, fresh, result, keys, values, partials, statistics, M, R, scale,
         softplus, intervals, reinterpret_cast<threadgroup const prefill_run *>(intervals + R + 1), kv_head,
         partition, queries + (own.first_token * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + own.head) * ATTENTION_W, own.head,
-        own.first_token);
+        own.first_token, sinks);
 }
 #endif
 
@@ -2522,7 +2548,7 @@ struct prefill_coissue {
         threadgroup const prefill_interval *intervals, threadgroup const prefill_run *runs,
         threadgroup pair *mine, threadgroup pair *other, threadgroup partial *ours,
         threadgroup const partial *theirs, threadgroup const uint *spin, uint kv_head, uint partition, uint window,
-        device const half *query_rows, uint head, ulong first_token, uint lane) {
+        device const half *query_rows, uint head, ulong first_token, uint lane, device const float *sinks) {
         constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
         constexpr ulong STRIDE = SEISMIC_DIM_KV * W;
         const uint column = window * C;
@@ -2677,7 +2703,7 @@ struct prefill_coissue {
                 continue;
             const ulong token = first_token + fn + e;
             if (runs[0].end <= 1) {
-                mine->inverse[fn + e] = 1.0f / metal::max(total, 1e-30f);
+                mine->inverse[fn + e] = 1.0f / divisor(sinks, head, maximum[e], total);
             } else if (token < M && window == 0) {
                 const ulong slot_index = (ulong(partition) * M + token) * H + head;
                 statistics[slot_index * 2] = maximum[e];
@@ -2837,7 +2863,7 @@ struct prefill_coissue {
         device const half *keys, device const half *values, device float *partials, device float *statistics,
         ulong M, ulong R, float scale, bool softplus, threadgroup const prefill_interval *intervals,
         threadgroup const prefill_run *runs, threadgroup uchar *exchange, uint tile, uint kv_head,
-        uint head_group, uint partition, uint simd, uint lane) {
+        uint head_group, uint partition, uint simd, uint lane, device const float *sinks) {
         const bool product = simd >= PAIRS;
         // The pair, its rows and its window; the rows' other pair is the
         // pair itself in a head of one window.
@@ -2856,7 +2882,7 @@ struct prefill_coissue {
             else
                 scores(history, visible, fresh, keys, values, statistics, M, R, scale, intervals, runs, mine, other,
                     scored + index, scored + (WINDOWS > 1 ? sibling(index) : index), spin, kv_head, partition,
-                    window, query_rows, own.head, own.first_token, lane);
+                    window, query_rows, own.head, own.first_token, lane, sinks);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (!own.computes)
@@ -2866,7 +2892,7 @@ struct prefill_coissue {
             if (!product)
                 recompute(history, query, gate, visible, fresh, result, keys, values, partials, statistics, M, R,
                     scale, softplus, intervals, runs, kv_head, partition, window, query_rows, own.head,
-                    own.first_token, lane);
+                    own.first_token, lane, sinks);
         } else if (product) {
             store(query, gate, result, partials, M, softplus, runs, mine, partition, window, own.head,
                 own.first_token, lane);
@@ -2884,7 +2910,7 @@ struct prefill_coissue {
         device const half *values, device float *partials, device float *statistics, ulong M, ulong R, float scale,
         bool softplus, threadgroup const prefill_interval *intervals, threadgroup const prefill_run *runs,
         uint kv_head, uint partition, uint window, device const half *query_rows, uint head, ulong first_token,
-        uint lane) {
+        uint lane, device const float *sinks) {
         typedef prefill_fragments<QT, History> Form;
         constexpr ulong STRIDE = SEISMIC_DIM_KV * W;
         static_assert(Form::WINDOW == C && Form::KEYS <= PREFILL_PAD, "one output window over padded operand rows");
@@ -2911,7 +2937,7 @@ struct prefill_coissue {
             }
         }
         Form::store(query, gate, result, partials, statistics, first_token, M, head, partition, uint(runs[0].end),
-            window * C, softplus, state);
+            window * C, softplus, sinks, state);
     }
 };
 
@@ -3047,7 +3073,9 @@ inline void prefill_list(device const int *visible, device const int *fresh, dev
 // partition stores its gated output directly; otherwise each partition
 // stores (partial output, maximum, denominator) and the merge launch
 // combines them. Operands (queries, staged tiles, probabilities) are the
-// history policy's. `exchange` is PREFILL_EXCHANGE memory.
+// history policy's. `exchange` is PREFILL_EXCHANGE memory. With
+// ATTENTION_SINKS a direct store divides by the head's sink as `divisor`
+// does (the split records stay unnormalized; the merge adds the sink).
 template <uint QT, class History>
 inline void prefill_attend(History history, device const Scalar *query, device const Scalar *gate,
     device const int *visible, device const int *fresh, device Scalar *result,
@@ -3055,7 +3083,7 @@ inline void prefill_attend(History history, device const Scalar *query, device c
     device const typename History::Operand *values, device float *partials,
     device float *statistics, device uint *counts, ulong M, ulong R, float scale, bool softplus,
     threadgroup uchar *shared, threadgroup float *exchange, uint3 group, uint3 groups, uint thread_index,
-    uint simd, uint lane, prefill_selection selection) {
+    uint simd, uint lane, prefill_selection selection, device const float *sinks = nullptr) {
     typedef typename History::Operand Operand;
     constexpr uint W = ATTENTION_W;
     constexpr uint KV = SEISMIC_DIM_KV;
@@ -3152,7 +3180,7 @@ inline void prefill_attend(History history, device const Scalar *query, device c
         Form::open(shared, thread_index);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         Form::attend(history, query, gate, visible, fresh, result, queries, keys, values, partials, statistics, M,
-            R, scale, softplus, intervals, runs, shared, tile, kv_head, head_group, partition, simd, lane);
+            R, scale, softplus, intervals, runs, shared, tile, kv_head, head_group, partition, simd, lane, sinks);
     } else {
 #if SEISMIC_HAS_TENSOR_OPS
         if constexpr (PREFILL_DIRECT != 0) {
@@ -3192,7 +3220,8 @@ inline void prefill_attend(History history, device const Scalar *query, device c
 template <uint QT>
 inline void prefill_fold(history_window window, prefill_held held, uint round, device const Scalar *query,
     device const Scalar *gate, device Scalar *result, device const float *partials, device const float *statistics,
-    device const uint *counts, ulong M, uint tile, ulong head, uint column, bool softplus) {
+    device const uint *counts, ulong M, uint tile, ulong head, uint column, bool softplus,
+    device const float *sinks = nullptr) {
     constexpr uint W = ATTENTION_W;
     constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
     // A call of one round stored its results in the attend launch.
@@ -3228,7 +3257,7 @@ inline void prefill_fold(history_window window, prefill_held held, uint round, d
         }
         if (held.last) {
             result[state * W + column] = gate_output(query, gate, row, head, column,
-                accumulated / metal::max(denominator, 1e-30f), softplus);
+                accumulated / divisor(sinks, head, maximum, denominator), softplus);
             continue;
         }
         window.kept[state * W + column] = accumulated;
@@ -3245,14 +3274,14 @@ inline void prefill_fold(history_window window, prefill_held held, uint round, d
 template <uint QT>
 inline void prefill_merge(device const Scalar *query, device const Scalar *gate, device Scalar *result,
     device const float *partials, device const float *statistics, device const uint *counts,
-    ulong M, uint tile, ulong head, uint column, bool softplus) {
+    ulong M, uint tile, ulong head, uint column, bool softplus, device const float *sinks = nullptr) {
     constexpr uint W = ATTENTION_W;
     constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
     const uint count = counts[tile];
     if (count <= 1)
         return;
     for (ulong row = ulong(tile) * QT; row < metal::min(ulong(tile + 1) * QT, M); ++row) {
-        const float attended = merge(partials, statistics, row * H + head, M * H, count, column);
+        const float attended = merge(partials, statistics, row * H + head, M * H, count, column, sinks, head);
         result[(row * H + head) * W + column] = gate_output(query, gate, row, head, column, attended, softplus);
     }
 }

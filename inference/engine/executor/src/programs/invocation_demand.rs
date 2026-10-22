@@ -223,6 +223,7 @@ mod tests {
         let method = PlannedMethod::Mtp {
             greedy_proposals: 3,
             sampled_proposals: 1,
+            widths: crate::DraftWidths::Adaptive,
         };
         let demand =
             GraphInvocationDemand::new(method, vec![term(Phase::Decode, 4096, Some(3))], None, 512);

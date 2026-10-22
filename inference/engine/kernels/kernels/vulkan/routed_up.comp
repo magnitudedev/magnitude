@@ -1,9 +1,12 @@
 // Decode expansion of up-only experts (M <= 8): workgroup row y = choice
 // (m, k), a K1 GEMV over the feature tile `x` of expert routes[m, k]'s up
-// rows with the Activated epilogue A(act(A(up))). The Vulkan form of
-// `metal/routed_up.metal`; lane groups are whole subgroups.
-// Every expert's up rows carry their `up_scale` entry.
+// rows with the Activated epilogue A(act(A(us * up))). The Vulkan form of
+// `metal/routed_up.metal`; lane groups are whole subgroups. `us` is the
+// choice's expert's `up_scale` entry where that port is present (static US),
+// else one.
+#if SEISMIC_STATIC_US != 0
 #define PROJECTION_SCALED
+#endif
 #define KERNEL_W0 SEISMIC_EXPERT_UP
 #include "lib/core/activation.glsl"
 #include "lib/routed/routed.glsl"
@@ -12,6 +15,13 @@
 #define ROUTED_ACT ELEMENT_ACT
 #else
 #error "routed_up requires a bf16 or f16 activation"
+#endif
+// The up weight's operand row (the normalized row, or NVFP4 operands),
+// formed while the GEMV stages it.
+#if defined(SEISMIC_EXPERT_UP_OPERANDS_NVFP4)
+#define ROUTED_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define ROUTED_OPERANDS PROJECTION_OPERANDS_ROUNDED
 #endif
 
 void routed_up() {
@@ -23,16 +33,16 @@ void routed_up() {
     const uint64_t m = gl_WorkGroupID.y / SEISMIC_DIM_K, k = gl_WorkGroupID.y % SEISMIC_DIM_K;
     const uint64_t expert = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
         + (m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1) * 4ul));
-    const projection_prologue x = projection_plain(ROUTED_ACT,
+    const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT,
         SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED) + m * SEISMIC_NORMALIZED_STRIDE_0 * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
-        SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul);
+        SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, 0ul), ROUTED_OPERANDS);
     const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), PACKETS_W0_STACKED_ROWS,
         routed_expert_row(expert, SEISMIC_DIM_F), hidden);
     const projection_epilogue out_ = projection_scaled(projection_activated(ROUTED_ACT,
             SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
                 + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
             0ul, SEISMIC_RESULT_0_STRIDE_2, int(SEISMIC_PARAM_ACTIVATION)),
-        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_E, SEISMIC_UP_SCALE_STRIDE_0, expert),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, expert),
         1.0);
     projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, 32u, 1u, PROJECTION_NORM_NONE, x, out_, up, up, 1u,
         uint(SEISMIC_DIM_F), hidden, tile);

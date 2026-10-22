@@ -3,7 +3,8 @@
 // `routed_experts_up_stage` stages each normalized row as F32 in scratch.
 // `routed_experts_up_expand`: work item (x, b) owns ROWS features of block b
 // and projects its expert's up rows against every live row of the block into
-// the `product` scratch [B * T, F], each A(act(A(up))) as F32.
+// the `product` scratch [B * T, F], each A(act(A(us * up))) as F32 (`us` the
+// block's expert's scale, 1 where the port is absent).
 // `routed_experts_up_down`: work item (x, b) owns ROWS output channels of
 // block b and projects its expert's down rows against every live row's
 // product, published in A. Blocks of expert -1 and padding rows carry no
@@ -28,6 +29,7 @@ fn routed_experts_up_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
         };
         projection::quantize(staged, q8);
     }
+    projection::operand_row(&[&cx.arg_expert_up()], staged);
 }
 
 fn routed_experts_up_expand<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
@@ -40,7 +42,8 @@ fn routed_experts_up_expand<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     let rows = projection::item_rows(group[0], cx.param_rows(), f);
     let first = routed::expert_row(expert, f) + rows.start;
     let (up, function) = (cx.arg_expert_up(), cx.arg_activation());
-    let scale = cx.arg_up_scale().get([expert as usize]);
+    let up_scale = cx.arg_up_scale();
+    let scale = routed::scale_factor(cx.dim_us(), |e| up_scale.get([e]), expert);
     let order = cx.arg_order().row([block, 0]);
     // SAFETY: the stage launch wrote every row before this launch.
     let staged = unsafe { cx.scratch_staged().slice::<f32>(0, m * h) };
@@ -67,15 +70,18 @@ fn routed_experts_up_quantize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, g
         return;
     }
     let row = block * t + lane;
-    let blocks = seismic::cpu::quant::blocks(f);
     // SAFETY: the expand launch wrote this product row; this work item owns
-    // its quantized row.
-    let product = unsafe { cx.scratch_product().slice::<f32>(4 * row * f, f) };
-    let q8 = unsafe {
-        cx.scratch_product_q8()
-            .slice_mut::<seismic::cpu::quant::Q8Block>(row * blocks * projection::Q8_BYTES, blocks)
-    };
-    projection::quantize(product, q8);
+    // it and its quantized row.
+    let product = unsafe { cx.scratch_product().slice_mut::<f32>(4 * row * f, f) };
+    if cx.param_int8() == 1 {
+        let blocks = seismic::cpu::quant::blocks(f);
+        let q8 = unsafe {
+            cx.scratch_product_q8()
+                .slice_mut::<seismic::cpu::quant::Q8Block>(row * blocks * projection::Q8_BYTES, blocks)
+        };
+        projection::quantize(product, q8);
+    }
+    projection::operand_row(&[&cx.arg_expert_down()], product);
 }
 
 fn routed_experts_up_down<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {

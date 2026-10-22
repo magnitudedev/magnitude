@@ -164,6 +164,8 @@ pub(super) fn qualify_attention(
     let query_norm = zeros(Element::f32(), &[shape.head_norm, width])?;
     let key_norm = zeros(Element::f32(), &[shape.head_norm, width])?;
     let value_norm = zeros(Element::f32(), &[shape.value_norm, width])?;
+    // The sink logits (zero rows without sinks).
+    let sinks = zeros(Element::f32(), &[shape.sinks, heads])?;
     let pairs = [shape.rotary_pairs];
     let rotary_components = zeros(Element::i32(), &pairs)?;
     let rotary_frequencies = zeros(Element::f32(), &pairs)?;
@@ -179,6 +181,7 @@ pub(super) fn qualify_attention(
     let block_slots = semantic_i32(device, &[0, 1], &[], ENTRY, label)?;
     let selection = Tensor::from_host(device, Element::u32(), &[1, 0], &[])
         .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
+    let scale = |name| unit_scale(device, &kernels.project, name, ENTRY, label);
     let projected = kernels
         .project
         .call(attention_project::Args {
@@ -190,6 +193,10 @@ pub(super) fn qualify_attention(
             value_weight: &value,
             epsilon: 1.0e-5,
             project_mode: 0,
+            query_scale: &scale("QS")?,
+            gate_scale: &scale("GS")?,
+            key_scale: &scale("KS")?,
+            value_scale: &scale("VS")?,
             query_bound: &any_row_bound(device, &kernels.project, "QB", ENTRY, label)?,
             gate_bound: &any_row_bound(device, &kernels.project, "GB", ENTRY, label)?,
             key_bound: &any_row_bound(device, &kernels.project, "KB", ENTRY, label)?,
@@ -245,6 +252,7 @@ pub(super) fn qualify_attention(
                     query_norm: &query_norm,
                     key_norm: &key_norm,
                     value_norm: &value_norm,
+                    sinks: &sinks,
                     rotary_components: &rotary_components,
                     rotary_frequencies: &rotary_frequencies,
                     rotary_amplitudes: &rotary_amplitudes,
@@ -316,6 +324,7 @@ pub(super) fn qualify_attention(
                         inject: &inject,
                         gated,
                         output_weight: &output,
+                        output_scale: &unit_scale(device, output_kernel, "OS", ENTRY, label)?,
                         output_bound: &any_row_bound(device, output_kernel, "OB", ENTRY, label)?,
                     })
                     .map_err(|e| qualification_dynamic("attention_output", label, e))?
@@ -325,7 +334,7 @@ pub(super) fn qualify_attention(
                 let source = gated
                     .reshape(&[1, heads * width])
                     .map_err(|e| qualification_dynamic("project_rows", label, e))?;
-                qualify_post_norm(device, tail, &residual, &source, &output, 0, norm, label)?
+                qualify_post_norm(device, tail, &residual, &source, &output, norm, label)?
             }
             _ => {
                 return Err(qualification_dynamic(
@@ -349,24 +358,16 @@ pub(super) fn qualify_post_norm(
     residual: &Tensor,
     source: &Tensor,
     weight: &Tensor,
-    weight_scale: u64,
     norm: Element,
     label: &str,
 ) -> Result<Tensor, CatalogFailure> {
     let hidden = residual.extents()[1];
-    let weight_scale = semantic_ones(
-        device,
-        Element::f32(),
-        &[weight_scale],
-        "project_rows",
-        label,
-    )?;
     let projected = kernels
         .project
         .call(project_rows::Args {
             source,
             weight,
-            weight_scale: &weight_scale,
+            weight_scale: &unit_scale(device, &kernels.project, "WS", "project_rows", label)?,
             weight_bound: &any_row_bound(device, &kernels.project, "WB", "project_rows", label)?,
         })
         .map_err(|e| qualification_dynamic("project_rows", label, e))?
@@ -456,6 +457,20 @@ pub(super) fn any_row_bound<E: seismic::Entry>(
     let extent = kernel.specialization().static_value(name).unwrap_or(0);
     let count = usize::try_from(extent).map_err(|error| qualification_dynamic(entry, bindings, error))?;
     semantic_f32(device, &[extent], &vec![32.0 * 128.0 * 128.0; count], entry, bindings)
+}
+
+/// A unit accumulator scale for `kernel`'s scale port whose static is
+/// `name`: ones at its static extent (0, absent, where the native has no
+/// such static), which leave whatever a qualification binds unscaled.
+pub(super) fn unit_scale<E: seismic::Entry>(
+    device: &Device,
+    kernel: &NativeKernel<E>,
+    name: &str,
+    entry: &'static str,
+    bindings: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let extent = kernel.specialization().static_value(name).unwrap_or(0);
+    semantic_ones(device, Element::f32(), &[extent], entry, bindings)
 }
 
 pub(super) fn semantic_f32(
@@ -929,10 +944,11 @@ mod tests {
     fn every_packed_representation_has_a_unit_fixture() {
         let representations = [
             "q8g32s", "q4k", "q5k", "q6k", "iq4g32", "q4g32s", "q5g32s", "q5g32", "mxfp4g32",
-            "nvfp4g16", "iq2xs", "iq3xxs", "iq2xxs",
+            "nvfp4g16", "nvfp4g16a4", "iq2xs", "iq3xxs", "iq2xxs",
         ];
         for representation in representations {
-            let (source, packet) = pattern_source(representation)
+            let stored = Element::stored(representation, Layout::Packet).unwrap();
+            let (source, packet) = pattern_source(stored.representation())
                 .unwrap_or_else(|| panic!("{representation} has no fixture"));
             // Whole 256-value GGUF blocks where the source has them.
             let columns = if source.logical_group() == Some(256) {

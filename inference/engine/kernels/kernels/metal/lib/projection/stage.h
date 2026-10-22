@@ -85,6 +85,7 @@ struct Plain {
     ulong stride0, stride1;
     uint columns;
     Rows rows;
+    uint width() const { return columns; }
     float value(uint m, uint k, float) const {
         return A::load(reinterpret_cast<device const typename A::storage *>(x)
             [ulong(rows.at(m)) * stride0 + ulong(k) * stride1]);
@@ -286,5 +287,131 @@ struct GroupRms {
     }
     void load8(uint m, uint k, float inverse, thread float4 &even, thread float4 &odd) const {
         Rms<A, N, Rows>{x, stride0, stride1, norm, norm_stride, eps, columns, rows}.load8(m, k, inverse, even, odd);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// NVFP4 operands (docs/precision.md, "NVFP4 operands"; the portable
+// `nvfp4_row`): a product over NVFP4 weights takes each row x as q * g * s,
+// g the row's global scale (the least power of two with 2688 g >= amax|x|),
+// s a 16-value block's UE4M3 scale (nearest amax|block| / (6 g)) and q the
+// E2M1 code nearest x / (g s), saturating at 6, every rounding to nearest
+// even. The portable body divides with F32's correctly rounded quotient,
+// which rounds onto each grid as the exact quotient does; Metal's division
+// is not correctly rounded, so every rounding here is decided without one:
+// each grid point or midpoint times its divisor is exact in F32, and the
+// dividend against it decides the exact quotient. Rows are finite.
+
+namespace nvfp4 {
+
+// 2^(e - 127) for a biased exponent e in 1 .. 254.
+inline float power(uint e) { return as_type<float>(e << 23); }
+
+// The global scale of a row whose largest magnitude is amax: the binade of
+// an approximate amax / 2688, corrected by one exact comparison. A finite
+// row's g is at most 2^117, so its inverse is normal.
+inline float global_scale(float amax) {
+    const uint bits = as_type<uint>(amax * (1.0f / 2688.0f));
+    const uint near = metal::clamp((bits >> 23) + ((bits & 0x7fffffu) != 0u ? 1u : 0u), 1u, 254u);
+    if (near > 1u && 2688.0f * power(near - 1u) >= amax)
+        return power(near - 1u);
+    if (near < 254u && 2688.0f * power(near) < amax)
+        return power(near + 1u);
+    return power(near);
+}
+
+// g s for a block whose largest magnitude is block_max: s is the UE4M3
+// value (exponent bias 7, three mantissa bits, subnormal quantum 2^-9)
+// nearest w / 6 for w = block_max / g (exact: g is a power of two). The
+// quantum is that of an approximate w / 6's binade (both binades' grids
+// hold the boundary, the nearest value to any quotient that rounds across
+// it); t = w / quantum is exact, and the approximate index t / 6 is
+// corrected against its exact midpoints 6 index +- 3. A finite row's w is
+// at most 2688, so s is at most 448.
+inline float scale(float block_max, float g) {
+    const float w = block_max * power(254u - (as_type<uint>(g) >> 23));
+    const uint exponent = metal::max((as_type<uint>(w * (1.0f / 6.0f)) >> 23) & 255u, 121u);
+    const float t = w * power(257u - exponent);
+    const int near = int(metal::rint(t * (1.0f / 6.0f)));
+    const bool odd = (near & 1) != 0;
+    const float above = float(6 * near + 3), below = float(6 * near - 3);
+    const int index = (t > above || (t == above && odd)) ? near + 1
+        : (t < below || (t == below && odd))             ? near - 1
+                                                         : near;
+    return g * (float(index) * power(exponent - 3u));
+}
+
+// x's E2M1 code nearest x / d, saturating at 6, times d: each threshold
+// times d is exact, so |x| against it decides the exact quotient (ties to
+// the even code). A zero d gives (positive) zero.
+inline float value(float x, float d) {
+    if (d == 0.0f)
+        return 0.0f;
+    const float a = metal::abs(x);
+    const float m = a <= 0.25f * d ? 0.0f
+        : a < 0.75f * d            ? 0.5f
+        : a <= 1.25f * d           ? 1.0f
+        : a < 1.75f * d            ? 1.5f
+        : a <= 2.5f * d            ? 2.0f
+        : a < 3.5f * d             ? 3.0f
+        : a <= 5.0f * d            ? 4.0f
+                                   : 6.0f;
+    return (x < 0.0f ? -m : m) * d;
+}
+
+inline float4 values(float4 x, float d) {
+    return float4(value(x.x, d), value(x.y, d), value(x.z, d), value(x.w, d));
+}
+
+inline float magnitude(float4 even, float4 odd) {
+    const float4 m = metal::max(metal::abs(even), metal::abs(odd));
+    return metal::max(metal::max(m.x, m.y), metal::max(m.z, m.w));
+}
+
+} // namespace nvfp4
+
+// The operand recipe of a product over the weights whose `operands(W)` are
+// `RECIPES`, which the rows they share all take: NVFP4 (1) or rounded A (0).
+template <bool... RECIPES>
+struct OperandRecipe {
+    static constant constexpr bool NVFP4 = (RECIPES || ...);
+    static_assert(NVFP4 == (RECIPES && ...), "weights that share rows share their operand recipe");
+};
+
+// Row m's global scale g from threadgroup memory (`globals[m]`, the GEMV
+// rows), or one row's held in a register (a normalizing threadgroup's).
+struct RowGlobals {
+    threadgroup const float *globals;
+    float at(uint m) const { return globals[m]; }
+};
+struct OneGlobal {
+    float g;
+    float at(uint) const { return g; }
+};
+
+// The rows of prologue `In` as NVFP4 operands: `load8` forms the 16-value
+// block that holds k (K's tail past `columns` is zero, as `In` loads it)
+// under its row's global scale.
+template <typename In, typename G>
+struct Nvfp4Rows {
+    typedef typename In::activation activation;
+    In in;
+    G globals;
+    uint width() const { return in.width(); }
+    void load8(uint m, uint k, float inverse, thread float4 &even, thread float4 &odd) const {
+        const uint block = k & ~15u;
+        float4 e0, o0, e1, o1;
+        in.load8(m, block, inverse, e0, o0);
+        in.load8(m, block + 8u, inverse, e1, o1);
+        const float d = nvfp4::scale(metal::max(nvfp4::magnitude(e0, o0), nvfp4::magnitude(e1, o1)), globals.at(m));
+        const bool upper = (k & 8u) != 0u;
+        even = nvfp4::values(upper ? e1 : e0, d);
+        odd = nvfp4::values(upper ? o1 : o0, d);
+    }
+    // `load8`'s values as A storage words (exact: q g s fits A).
+    uint4 words8(uint m, uint k) const {
+        float4 even, odd;
+        load8(m, k, 0.0f, even, odd);
+        return activation::pack8(even, odd);
     }
 };

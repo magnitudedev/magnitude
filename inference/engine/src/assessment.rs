@@ -41,7 +41,7 @@ use magnitude_executor::{
     resident_element, resident_layout, source_element, ExecutionPath, ExecutionPlanDraft,
     KernelCache,
 };
-use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily};
+use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily, ScaledActivations};
 use magnitude_scheduler::ServiceLimits;
 use seismic::{DType, DeviceTopology, Devices, Layout, Status};
 use std::collections::BTreeMap;
@@ -53,7 +53,7 @@ use std::sync::Arc;
 /// declares (`Auto` for a standalone package). Only their headers are read.
 /// `target` is the target GGUF or the first shard of a split GGUF (the other
 /// shards are found beside it by the split naming convention); `draft` is a
-/// separate drafter (DFlash, DSpark, DFlash2, a Gemma assistant or a
+/// separate drafter (DFlash, DSpark, DFlash2, LiLiCorr, a Gemma assistant or a
 /// prediction head). A drafter the method cannot draft with is `Rejected`
 /// and the target is assessed without it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,6 +182,7 @@ pub enum SpeculativeMethod {
     DFlash,
     DSpark,
     DFlash2,
+    LiLiCorr,
 }
 
 /// Whether the engine binds the package's drafter: none was declared or
@@ -664,6 +665,7 @@ impl Environment<'_> {
                 {
                     Some(DraftVariant::DSpark) => SpeculativeMethod::DSpark,
                     Some(DraftVariant::DFlash2) => SpeculativeMethod::DFlash2,
+                    Some(DraftVariant::LiLiCorr) => SpeculativeMethod::LiLiCorr,
                     Some(DraftVariant::DFlash) | None => SpeculativeMethod::DFlash,
                 }
             }
@@ -972,7 +974,10 @@ fn admit_drafter(
             }
             ModelMethod::Auto => Ok(DrafterAdmission::None),
             ModelMethod::Mtp => rejected("MTP was requested but the target has no draft head"),
-            ModelMethod::DFlash | ModelMethod::DSpark | ModelMethod::DFlash2 => {
+            ModelMethod::DFlash
+            | ModelMethod::DSpark
+            | ModelMethod::DFlash2
+            | ModelMethod::LiLiCorr => {
                 rejected("a separate-draft method was requested but the package has no draft")
             }
         };
@@ -1034,9 +1039,15 @@ fn unsupported_weights<'a>(
         let width = tensor.shape.last().copied().unwrap_or(1);
         let imported = source_element(tensor.encoding, width).is_some()
             && match residency {
-                Residency::Packed => {
-                    resident_element(tensor.encoding, width, DType::F32, layout).is_some()
-                }
+                // Every encoding with a resident element has a W4A16 one.
+                Residency::Packed => resident_element(
+                    tensor.encoding,
+                    ScaledActivations::Rounded,
+                    width,
+                    DType::F32,
+                    layout,
+                )
+                .is_some(),
                 Residency::Dequantized => true,
             };
         if !imported {

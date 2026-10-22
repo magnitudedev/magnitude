@@ -5,7 +5,7 @@
 pub(crate) mod graph;
 
 use super::{PlanError, WeightPush, tail};
-use crate::{AttentionBinding, AttentionShape, SelectionBinding, SelectionShape};
+use crate::{AttentionBinding, AttentionShape, ScalableWeight, SelectionBinding, SelectionShape};
 use magnitude_family_contracts::{
     Attention, AttentionGate, Decoder, GateFunction, GateGranularity, HeadNorm, HistoryDomain,
     HistoryReads, KeyValue, MediaRowAttention, Operator, OutputForm, Rotary, RotaryPair, ValueNorm,
@@ -205,6 +205,7 @@ pub(crate) fn shape(hidden: u64, attention: &Attention) -> Result<AttentionShape
         head_norm: u64::from(matches!(attention.query_norm, HeadNorm::Rms(_))),
         value_norm,
         projected_value,
+        sinks: u64::from(attention.sinks.is_some()),
     })
 }
 
@@ -302,6 +303,9 @@ pub(super) fn weights<'a>(attention: &'a Attention, push: &mut WeightPush<'_, 'a
         push(WeightKind::IndexerQueryNorm, &indexer.query_norm.weight);
         push(WeightKind::IndexerKeyNorm, &indexer.key_norm.weight);
     }
+    if let Some(sinks) = &attention.sinks {
+        push(WeightKind::AttentionSinks, sinks);
+    }
     push(WeightKind::AttentionOutput, &attention.output);
 }
 
@@ -369,18 +373,22 @@ pub(super) fn binding(
     hidden: u64,
     context: u64,
     lookup: impl Fn(WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightKind) -> Result<ScalableWeight, PlanError>,
     activation: Element,
     history: KvCodec,
 ) -> Result<AttentionBinding, PlanError> {
     let shape = shape(hidden, attention)?;
-    let query = lookup(query_kind(attention))?;
-    let segment = |present: bool, kind| if present { lookup(kind) } else { Ok(query) };
+    // Every projection binds its second-level scale at its accumulator-scale
+    // port (`attention_project`'s QS, GS, KS, VS, `attention_output`'s OS).
+    let projection = |kind| scalable(kind).map(|weight| weight.element);
+    let query = projection(query_kind(attention))?;
+    let segment = |present: bool, kind| if present { projection(kind) } else { Ok(query) };
     let selection = selection_shape(&attention.reads, context)
         .map(|shape| {
             Ok::<_, PlanError>(SelectionBinding {
                 shape,
-                query: lookup(WeightKind::IndexerQuery)?,
-                key: lookup(WeightKind::IndexerKey)?,
+                query: projection(WeightKind::IndexerQuery)?,
+                key: projection(WeightKind::IndexerKey)?,
             })
         })
         .transpose()?;
@@ -393,7 +401,7 @@ pub(super) fn binding(
         gate: segment(shape.gate_rows() > 0, WeightKind::AttentionGate)?,
         key: segment(shape.key_rows() > 0, WeightKind::Key)?,
         value: segment(shape.value_rows() > 0, WeightKind::Value)?,
-        output: lookup(WeightKind::AttentionOutput)?,
+        output: projection(WeightKind::AttentionOutput)?,
         activation,
         history: history
             .spec(
@@ -518,6 +526,7 @@ mod tests {
                             },
                         },
                         media_rows: MediaRowAttention::Causal,
+                        sinks: None,
                         output: tensor(name("attn_output"), vec![HIDDEN, HIDDEN]),
                     })),
                     output: OutputForm::Residual,

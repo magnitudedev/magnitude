@@ -317,6 +317,7 @@ fn speculative_method_name(method: &SpeculativeMethod) -> &'static str {
         SpeculativeMethod::DFlash => "dflash",
         SpeculativeMethod::DFlash2 => "dflash2",
         SpeculativeMethod::DSpark => "dspark",
+        SpeculativeMethod::LiLiCorr => "lilicorr",
     }
 }
 

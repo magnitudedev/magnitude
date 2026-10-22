@@ -8,6 +8,12 @@
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
+// The rows both weights take (the normalized rows, or NVFP4 operands): the
+// GEMV row classes form them while staging, the normalize launches into
+// the scratch every other form reads.
+constant constexpr bool NVFP4 =
+    projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4>::NVFP4;
+typedef projection::operands<NVFP4> Operands;
 
 #define DENSE_EXPAND_ARGUMENTS                                                          \
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],                   \
@@ -55,8 +61,10 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     DENSE_EXPAND_OPERANDS;                                                              \
     uint rows = uint(SEISMIC_DIM_O);                                                    \
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                         \
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
-    const auto x = projection::shared_norm(in, squares);                                \
+    const auto x = Operands::rows(projection::shared_norm(in, squares), rows, uint(SEISMIC_DIM_H), globals, \
+        simdgroups, sg, lane);                                                          \
     if (TILED == 1 && projection::gemv_tile_row_serves(gate, rows) && projection::gemv_tile_row_serves(up, rows)) { \
         PROJECTION_FOR_##COUNT##_TILE_ROWS(rows,                                        \
             projection::gemv_tile_row<packets::W0, packets::W1, true, ROWS, MAXM, LANES>( \
@@ -140,7 +148,7 @@ kernel void dense_expand_normalize(DENSE_EXPAND_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
     DENSE_EXPAND_OPERANDS;
-    projection::device_normalize<256>(in, item, normalized, uint(SEISMIC_DIM_H), norms, thread_index);
+    Operands::normalize<256>(in, item, normalized, uint(SEISMIC_DIM_H), norms, thread_index);
 }
 #endif
 
@@ -179,8 +187,8 @@ kernel void dense_expand_normalize_tall(DENSE_EXPAND_ARGUMENTS,
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
     DENSE_EXPAND_OPERANDS;
-    projection::device_normalize<256, projection::TallOrder<activation>>(in, item, normalized, uint(SEISMIC_DIM_H),
-        norms, thread_index);
+    Operands::normalize<256, projection::TallOrder<activation>>(in, item, normalized, uint(SEISMIC_DIM_H), norms,
+        thread_index);
 }
 #endif
 

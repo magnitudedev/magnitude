@@ -10,7 +10,7 @@ quality rating.
 For the methods Magnitude reports, use this rule of thumb for decode speed:
 
 ```text
-None (usually slowest) -> MTP -> DFlash -> DSpark (usually fastest)
+None (usually slowest) -> MTP -> DFlash -> DSpark -> LiLiCorr (usually fastest)
 ```
 
 This is a typical ordering, not a guarantee. Actual speed depends on the target and draft models,
@@ -38,6 +38,11 @@ evidence over the method name alone.
   head can also trim low-confidence suffix tokens before verification. This retains most of the
   parallel drafting speed while producing longer useful prefixes and avoiding wasted target
   verification, so DSpark is typically faster than DFlash.
+- **LiLiCorr**: Runs a DFlash-style parallel backbone with grouped causal convolutions, then a
+  lightweight candidate corrector considers every block position's top candidates together and
+  picks the most consistent path through them. Correcting the whole block jointly restores in-block
+  dependencies and yields longer accepted prefixes, so LiLiCorr is typically faster than DSpark on
+  the targets that ship a LiLiCorr drafter.
 
 ## What Magnitude handles
 

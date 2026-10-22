@@ -167,7 +167,7 @@ pub mod native_cpu {
 
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
-pub use seismic_lang::registry::{f16_bits, f16_to_f32, BackendName, Layout};
+pub use seismic_lang::registry::{f16_bits, f16_to_f32, BackendName, Layout, OperandRecipe};
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
 pub use seismic_native_cpu as cpu;
@@ -297,6 +297,12 @@ impl Device {
     }
     pub fn info(&self) -> &Executor {
         self.inner.info()
+    }
+    /// Graphs recorded for this device's submissions so far: a submission
+    /// during which the count grew recorded one on the host, so its duration
+    /// is not its launches' alone.
+    pub fn recorded_graphs(&self) -> u64 {
+        self.inner.recorded_graphs()
     }
     /// Complete capability summary acquired from this opened device.
     pub fn capabilities(&self) -> &[String] {
@@ -446,9 +452,15 @@ impl Element {
     pub fn named(name: &str) -> Option<Element> {
         seismic_lang::registry::representation(name).map(Element)
     }
-    /// Packed representation `representation` (`q4k`) in `layout`.
-    pub fn stored(representation: &str, layout: Layout) -> Option<Element> {
-        seismic_lang::registry::storage(representation, layout).map(Element)
+    /// The element of storage `storage` (`q4k`, `nvfp4g16a4` for NVFP4's W4A4
+    /// element) in `layout`.
+    pub fn stored(storage: &str, layout: Layout) -> Option<Element> {
+        seismic_lang::registry::storage(storage, layout).map(Element)
+    }
+    /// How products over this element take their activation operands
+    /// (`operands(W)`).
+    pub fn operand_recipe(&self) -> OperandRecipe {
+        seismic_lang::registry::representation_info(self.0).operands
     }
     /// Unique storage name.
     pub fn name(&self) -> &'static str {
@@ -2777,6 +2789,17 @@ impl NativeGraphMetadata {
             .map_err(NativeGraphMetadataError::Workflow)
     }
 
+    /// `NativeGraph::store`.
+    pub fn store(
+        &mut self,
+        result: &WorkflowTensor,
+        port: &NativePort,
+    ) -> Result<(), NativeGraphMetadataError> {
+        self.inner
+            .store(result.inner, port.inner)
+            .map_err(NativeGraphMetadataError::Workflow)
+    }
+
     /// The host heap of the plan this exact topology seals to, from the
     /// lengths its entries' schemas and declarations fix.
     pub fn plan_heap(&self) -> HostHeap {
@@ -2905,6 +2928,13 @@ impl NativeGraph {
     /// storage so releasing a scratch slot does not reclaim a retained output.
     pub fn export(&mut self, result: &WorkflowTensor) -> Result<(), WorkflowError> {
         self.inner.export(result.inner)
+    }
+
+    /// Write the node result `result` into the tensor each run binds to the
+    /// external port `port`, which describes exactly that result, instead of
+    /// into graph storage.
+    pub fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), WorkflowError> {
+        self.inner.store(result.inner, port.inner)
     }
 
     pub fn seal(self) -> Result<NativeGraphPlan, CallError> {
@@ -3497,9 +3527,12 @@ pub mod generated {
         checked: seismic_lang::checked::CheckedModule,
         /// A checked entry's semantics depend only on its entry identity and
         /// element bindings. Graph metadata asks for many port shapes under
-        /// the same binding, so retain a bounded set of these immutable
-        /// monomorphizations instead of rebuilding one per port and node.
-        logical_entries: std::sync::Mutex<std::collections::VecDeque<LogicalEntryCacheItem>>,
+        /// the same binding, so every immutable monomorphization the process
+        /// forms is retained instead of rebuilt per port and node: the set is
+        /// the bindings the process's models use (about 260 for the whole
+        /// catalog, some 45 MB), and assessing models in parallel touches
+        /// many of them at once.
+        logical_entries: std::sync::Mutex<Vec<LogicalEntryCacheItem>>,
     }
 
     struct LogicalEntryCacheItem {
@@ -3508,8 +3541,6 @@ pub mod generated {
         logical: Arc<seismic_lang::entry::LogicalEntry>,
         compiled_shapes: Arc<OnceLock<Arc<seismic_lang::entry::CompiledEntryShapes>>>,
     }
-
-    const LOGICAL_ENTRY_CACHE_CAPACITY: usize = 64;
 
     /// The compiled shapes every module of the process retains in its
     /// cache: each memoizes the shapes it has evaluated
@@ -3567,7 +3598,7 @@ pub mod generated {
         fn new(checked: seismic_lang::checked::CheckedModule) -> Self {
             Self {
                 checked,
-                logical_entries: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                logical_entries: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -3606,10 +3637,7 @@ pub mod generated {
             {
                 return Ok(item.logical.clone());
             }
-            if cache.len() == LOGICAL_ENTRY_CACHE_CAPACITY {
-                cache.pop_front();
-            }
-            cache.push_back(LogicalEntryCacheItem {
+            cache.push(LogicalEntryCacheItem {
                 entry,
                 bindings: bindings.clone(),
                 logical: logical.clone(),
@@ -3904,8 +3932,10 @@ pub mod generated {
     }
 
     /// The checked native implementation of an entry for a backend, without
-    /// opening a device. Metadata-only assessment can inspect the same
-    /// declaration that execution later prepares.
+    /// opening a device: its declaration-level facts (statics, parameters,
+    /// constraint, whether one is declared). Its launches and scratch read
+    /// the bound elements' operand recipes (`operands(W)`), so evaluating
+    /// them takes [`native_implementation_at`].
     pub fn native_implementation_for_backend<E: Entry>(
         backend: BackendName,
     ) -> Result<Option<NativeImplementation>, CheckedBundleError> {
@@ -3915,6 +3945,22 @@ pub mod generated {
             .checked()
             .native_implementation(entry.id(), backend)
             .cloned())
+    }
+
+    /// The checked native implementation of an entry for a backend at
+    /// element bindings `elements`, every `operands(W)` substituted: the
+    /// declaration a request of these bindings prepares, evaluable without a
+    /// device. Metadata-only assessment inspects the same declaration that
+    /// execution later prepares.
+    pub fn native_implementation_at<E: Entry>(
+        backend: BackendName,
+        elements: &[(&str, Element)],
+    ) -> Result<Option<&'static NativeImplementation>, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        Ok(module
+            .checked()
+            .native_implementation_at(entry.id(), backend, &element_bindings(elements)))
     }
 
     /// Resolve one metadata graph call from one checked entry and one set of
@@ -3935,8 +3981,10 @@ pub mod generated {
     #[derive(Clone)]
     pub struct NativeGraphCheckedEntry {
         shapes: Arc<seismic_lang::entry::CompiledEntryShapes>,
-        /// The module's own declaration: bound for every node and port a
-        /// graph makes, so it is borrowed, never copied.
+        /// The module's declaration at these element bindings (its
+        /// `operands(W)` substituted, `native_implementation_at`): bound for
+        /// every node and port a graph makes, so it is borrowed, never
+        /// copied.
         implementation: &'static NativeImplementation,
         /// The lengths of the vectors a sealed node calling the entry holds.
         sealed_node: seismic_runtime::native::graph::SealedNodeShape,
@@ -3949,7 +3997,9 @@ pub mod generated {
         ) -> Result<Result<Self, String>, CheckedBundleError> {
             let module = E::module()?;
             let entry = E::resolve(module)?;
-            let Some(implementation) = module.checked().native_implementation(entry.id(), backend)
+            let bindings = element_bindings(elements);
+            let Some(implementation) =
+                module.checked().native_implementation_at(entry.id(), backend, &bindings)
             else {
                 return Ok(Err(format!(
                     "`{}` has no native implementation for `{}`",
@@ -3957,7 +4007,6 @@ pub mod generated {
                     backend.as_str()
                 )));
             };
-            let bindings = element_bindings(elements);
             let shapes = match module.compiled_entry_shapes(entry.id(), &bindings) {
                 Ok(shapes) => shapes,
                 Err(error) => return Ok(Err(error.to_string())),

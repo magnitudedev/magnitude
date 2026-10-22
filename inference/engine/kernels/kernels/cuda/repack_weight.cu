@@ -83,9 +83,10 @@
 #define REPACK_CODE_BITS 3u
 #define REPACK_GRID_AUX(b) (66u + 4u * (b))
 #elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_XXS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2XXS)
+// Scale codes carried in the entries' sixteenth bits (row layouts) and d
+// bit for bit.
 #define REPACK_GRID 1
 #define REPACK_IQ2XXS 1
-#define REPACK_GRID_FACTOR 0.125f
 #define REPACK_CODE_BITS 2u
 #define REPACK_GRID_AUX(b) (6u + 8u * (b))
 #else
@@ -187,6 +188,14 @@ __device__ __forceinline__ u32 grid_entry(const u8 *in, u32 e) {
 #else
     return (u32)in[2 + 2 * e] | ((u32)in[3 + 2 * e] << 8);
 #endif
+}
+#endif
+
+#if defined(REPACK_IQ2XXS)
+// Entry `e` as a carried row layout holds it: bit `e % 4` of its sub-block's
+// scale code (the top nibble of the sub-block's u32) at bit 15.
+__device__ __forceinline__ u32 carried_entry(const u8 *in, u32 e) {
+    return grid_entry(in, e) | (((u32)in[REPACK_GRID_AUX(e / 4) + 3] >> (4 + e % 4) & 1u) << 15);
 }
 #endif
 
@@ -308,6 +317,8 @@ __device__ __forceinline__ void write_supers(const u8 *in, u8 *out) {
 #elif defined(REPACK_IQ3S)
     reinterpret_cast<unsigned short *>(out)[0] = (unsigned short)(in[0] | (in[1] << 8));
 #elif defined(REPACK_Q8)
+    reinterpret_cast<unsigned short *>(out)[0] = (unsigned short)(in[0] | (in[1] << 8));
+#elif defined(REPACK_IQ2XXS)
     reinterpret_cast<unsigned short *>(out)[0] = (unsigned short)(in[0] | (in[1] << 8));
 #elif defined(REPACK_GRID)
     // d widened and scaled by a power of two, exactly.
@@ -432,6 +443,14 @@ __device__ __forceinline__ u8 *row_base(u8 *destination, const seismic_words_t &
                              SEISMIC_RESULT_0_ROW_STRIDE_BYTES;
 }
 
+#if defined(SEISMIC_ELEMENT_U_PLANE_RECORDS)
+// A tile's record of one storage group (its 16 rows' entries and factors),
+// and its entries' bytes: every group's entries come first, then every
+// group's factors (the registry's `PackedRowLayout::record_byte`).
+#define RECORD_BYTES ((u64)TILE_ROWS * SEISMIC_ELEMENT_U_PLANE_RECORDS_BYTES_PER_GROUP)
+#define RECORD_ENTRY_BYTES ((u64)SEISMIC_ELEMENT_U_PLANE_RECORDS_ENTRY_BYTES)
+#endif
+
 #if defined(SEISMIC_ELEMENT_U_LAYOUT_MMA16)
 // See `metal/repack_weight.metal` and the registry `PackedRowLayout::code_bit`.
 __device__ __forceinline__ u32 fragment_code(const u8 *source, const seismic_words_t &seismic_words_value, u64 b,
@@ -481,7 +500,12 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
         const u64 n = row0 + lane;
         const u8 *in = source_packet(source, seismic_words_value, b, n, column0 / GROUP);
         u8 *row = row_base(destination, seismic_words_value, b, n);
-#if defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
+#if defined(SEISMIC_ELEMENT_U_PLANE_GRIDS_CARRIED_BIT)
+        // The tile's four entries, each carrying a bit of the group's scale.
+        u32 *grids = reinterpret_cast<u32 *>(row + SEISMIC_RESULT_0_PLANE_GRIDS_ROW_OFFSET + column0 / 32 * 8);
+        for (u32 word = 0; word < 2; ++word)
+            grids[word] = carried_entry(in, within / 8 + 2 * word) | (carried_entry(in, within / 8 + 2 * word + 1) << 16);
+#elif defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
         // The tile's four grid entries, REPACK_CODE_BITS words.
         u32 *grids = reinterpret_cast<u32 *>(row + SEISMIC_RESULT_0_PLANE_GRIDS_ROW_OFFSET +
                                              column0 / 32 * 4 * REPACK_CODE_BITS);
@@ -511,7 +535,36 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
     {
         const u32 block = column0 / 64;
         const u32 step0 = (column0 % 64) / 16;
-#if defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
+#if defined(SEISMIC_ELEMENT_U_PLANE_RECORDS)
+        // Records (the registry's `PackedRowLayout::record_byte`): the tile's
+        // 32 columns are sub-block `within / 32` of the 16 rows' entries of
+        // their group; lane `l` places entries 2 (l / 16), + 1 of row l % 16
+        // at their GEMV lanes, and the group's first tile the rows' f16
+        // factors in the group's factors past every group's entries.
+        {
+            u8 *tile = row_base(destination, seismic_words_value, b, row0);
+            u8 *record = tile + column0 / GROUP * RECORD_ENTRY_BYTES;
+            const u32 r = lane % TILE_ROWS, group = within / 32, q = group / 2;
+            const u64 n = row0 + r;
+            const bool stored = n < SEISMIC_DIM_N;
+            const u8 *in = source_packet(source, seismic_words_value, b, stored ? n : 0, column0 / GROUP);
+            for (u32 j = 2 * (lane / TILE_ROWS); j < 2 * (lane / TILE_ROWS) + 2; ++j)
+                *reinterpret_cast<unsigned short *>(record + q / 2 * 512 + (4 * (r % 8) + j) * 16 +
+                                                    (q % 2 * 2 + r / 8) * 4 + group % 2 * 2) =
+                    stored ? (unsigned short)carried_entry(in, 4 * group + j) : (unsigned short)0;
+            if (within == 0 && lane < TILE_ROWS)
+                *reinterpret_cast<unsigned short *>(tile + SEISMIC_RESULT_0_ROW_GROUPS * RECORD_ENTRY_BYTES +
+                                                    column0 / GROUP * (RECORD_BYTES - RECORD_ENTRY_BYTES) +
+                                                    4 * (r % 8) + 2 * (r / 8)) =
+                    stored ? (unsigned short)(in[0] | (in[1] << 8)) : (unsigned short)0;
+            // The tile's bytes past its last factors.
+            if (column0 + TILE_COLUMNS == stored_columns) {
+                for (u64 byte = SEISMIC_RESULT_0_ROW_GROUPS * RECORD_BYTES + lane;
+                     byte < TILE_ROWS * SEISMIC_RESULT_0_ROW_STRIDE_BYTES; byte += TILE_COLUMNS)
+                    tile[byte] = 0;
+            }
+        }
+#elif defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
         // Grid entries stay whole: the tile sequence is [k-block][row][k-block
         // bytes]; row `lane`'s 32 columns (steps `step0`, `step0 + 1`) are
         // half of its k-block bytes.
@@ -581,6 +634,7 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
     }
 #endif
 
+#if !defined(SEISMIC_ELEMENT_U_PLANE_RECORDS)
     if (within == 0 && lane < rows) {
         const u64 n = row0 + lane;
         u8 *row = row_base(destination, seismic_words_value, b, n);
@@ -621,6 +675,7 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
                    SEISMIC_RESULT_0_ROW_STRIDE_BYTES - SEISMIC_RESULT_0_PLANE_SUPERS_ROW_OFFSET -
                        SEISMIC_RESULT_0_PLANE_SUPERS_BYTES_PER_ROW);
     }
+#endif
 }
 
 #endif

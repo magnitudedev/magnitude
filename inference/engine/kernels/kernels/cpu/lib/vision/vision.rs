@@ -122,13 +122,22 @@ pub fn gelu_quick(value: f32) -> f32 {
     value / (1.0 + (-1.702 * value).exp())
 }
 
-/// The activation of `vision_linear`'s code (1 tanh, 2 erf, 3 quick GELU).
+/// The squared ReLU: `max(x, 0)²`.
+#[inline(always)]
+pub fn relu_squared(value: f32) -> f32 {
+    let positive = value.max(0.0);
+    positive * positive
+}
+
+/// The activation of `vision_linear`'s code (1 tanh, 2 erf, 3 quick GELU,
+/// 4 squared ReLU).
 #[inline(always)]
 pub fn activate(code: i32, value: f32) -> f32 {
     match code {
         1 => gelu_tanh(value),
         2 => gelu_erf(value),
         3 => gelu_quick(value),
+        4 => relu_squared(value),
         _ => unreachable!("activation code {code}"),
     }
 }

@@ -408,6 +408,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let launch_trace = self.trace_target_submission(operations);
         let started = Instant::now();
+        let recorded_graphs = self.family.recorded_graphs();
         let submission = match self.family.submit_target(launch) {
             Ok(submission) => submission,
             Err((error, launch)) => {
@@ -426,6 +427,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             runnable,
             launch_trace,
             started,
+            recorded_graphs,
             previous_selection: self.selection_read.take(),
             id: self.flight_id(),
             continuation: None,
@@ -545,6 +547,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let finish_started = Instant::now();
         let physical_duration = finish_started.saturating_duration_since(flight.runnable);
+        let replayed = self.family.recorded_graphs() == flight.recorded_graphs;
         if std::env::var_os("MAGNITUDE_TRACE_FLIGHTS").is_some() {
             eprintln!(
                 "flight target duration_ms={:.3} requests={:?}",
@@ -556,12 +559,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     .collect::<Vec<_>>()
             );
         }
-        let (core, output) = completed.into_parts();
+        let (core, mut output) = completed.into_parts();
         // A sequence whose stored-table rows could not be read in this step
         // read other rows: it is poisoned, and this outcome and every later
-        // one of it fail. The step's other sequences are unaffected.
+        // one of it fail. The step's other sequences are unaffected. A
+        // landed read that could not land its rows fails every sequence.
+        let landing = output.complete_landed_reads();
         for (slot, (request, ..)) in flight.requests.iter().enumerate() {
-            if let Some(error) = output.table_read_failure(slot) {
+            if let Some(error) = output.table_read_failure(slot).or_else(|| landing.clone()) {
                 self.poisoned.entry(*request).or_insert(error);
             }
         }
@@ -570,7 +575,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             readout: output,
             commits,
             boundary,
-            selected_rows: _,
+            landed_reads: _,
             stored_reads: _,
         } = output;
         let batch = core.batch();
@@ -742,6 +747,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 committed_rows,
                 kind,
                 physical_duration,
+                replayed,
                 image: None,
             });
         }

@@ -83,6 +83,37 @@ struct GatheredRows {
     __device__ __forceinline__ u32 pair(const float *, u32 m, u64 k) const {
         return *reinterpret_cast<const u32 *>(x + (offsets[m] + k) * 2);
     }
+    __device__ __forceinline__ uint4 octet(const float *, u32 m, u64 k) const {
+        return *reinterpret_cast<const uint4 *>(x + (offsets[m] + k) * 2);
+    }
 };
+
+// The grouped expert GEMMs (`routed_experts`, `routed_experts_up`): block
+// tiles of 32 rows x 128 columns, one warp row (each weight tile is decoded
+// once per block: measured on GB10 with iq2xxs experts, 1.7x the rate of two
+// warp rows of four tiles). Weights whose rows hold fewer than 64 code bytes
+// per k-block (the 4- to 6-bit codes) stage k-blocks in spans of two, so each
+// warp copy reads 64 contiguous bytes of a row (`gemm_load_codes_span`).
+// The spanned layout must fit the declared shared bytes (`DECLARED`), else
+// the 3-stage single k-block pipeline runs.
+using projection::Pick;
+template <class W> __device__ constexpr bool narrow_rows() { return W::CHUNKS < 64; }
+template <class WA, class WB, int DECLARED> struct RoutedShape {
+    using Spanned = projection::GemmShape<32, 1, 8, 4, false, 1, 2>;
+    using Single = projection::GemmShape<32, 1, 8, 3>;
+    static constexpr bool SPANNED =
+        narrow_rows<WA>() && narrow_rows<WB>() && Spanned::template LAYOUT_BYTES<WA, WB, false> <= DECLARED;
+    using Type = typename Pick<SPANNED, Spanned, Single>::Type;
+};
+constexpr u32 TILE_M = 32;
+
+template <int DECLARED, class Operands, class Rows, class WA, class WB, class Epi>
+__device__ __forceinline__ void routed_gemm(u8 *shared, const Rows &source, u32 M,
+                                            u64 K, u64 nblock, u64 rows,
+                                            const WA &wa, const WB &wb, const Epi &epi) {
+    using Shape = typename RoutedShape<WA, WB, DECLARED>::Type;
+    static_assert(Shape::BM == TILE_M, "the declared row tiles");
+    projection::gemm_segment<Shape, Operands>(shared, source, M, K, nblock, rows, wa, wb, epi);
+}
 
 } // namespace routed

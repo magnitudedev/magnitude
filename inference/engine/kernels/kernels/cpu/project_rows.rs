@@ -21,6 +21,7 @@ fn project_rows_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
         };
         projection::quantize(staged, q8);
     }
+    projection::operand_row(&[&cx.arg_weight()], staged);
 }
 
 fn project_rows_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {

@@ -804,6 +804,7 @@ pub enum SpeculativeMethod {
     DFlash,
     DFlash2,
     DSpark,
+    LiLiCorr,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

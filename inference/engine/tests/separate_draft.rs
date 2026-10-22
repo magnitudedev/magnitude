@@ -1,4 +1,5 @@
-//! Real-device qualification of a separate draft (DFlash, DSpark, DFlash2):
+//! Real-device qualification of a separate draft (DFlash, DSpark, DFlash2,
+//! LiLiCorr):
 //! its state transactions (resume-state refusal while a draft transaction is
 //! in flight, resuming another request from that state, resuming the evicted
 //! source from it) reproduce its proposals exactly, and the header-only
@@ -6,7 +7,7 @@
 //! commits and bounds its graph holdings. Run on a host with a target and its
 //! draft:
 //! `MAGNITUDE_TEST_TARGET_GGUF=T.gguf MAGNITUDE_TEST_DRAFT_GGUF=D.gguf
-//! [MAGNITUDE_TEST_DRAFT_METHOD=dflash|dspark|dflash2]
+//! [MAGNITUDE_TEST_DRAFT_METHOD=dflash|dspark|dflash2|lilicorr]
 //! [MAGNITUDE_TEST_DRAFT_WIDTH=4] [MAGNITUDE_TEST_DRAFT_DENSE_KV=1] cargo test
 //! -p magnitude-engine --test separate_draft -- --ignored --nocapture`.
 
@@ -41,6 +42,7 @@ fn method() -> ModelMethod {
         Ok("dflash") => ModelMethod::DFlash,
         Ok("dspark") => ModelMethod::DSpark,
         Ok("dflash2") => ModelMethod::DFlash2,
+        Ok("lilicorr") => ModelMethod::LiLiCorr,
         Ok(other) => panic!("unknown draft method {other}"),
     }
 }

@@ -19,6 +19,7 @@
 
 pub(crate) mod graph;
 
+use crate::ScalableWeight;
 use crate::error::PlanError;
 use magnitude_family_contracts::StateSpace;
 use seismic::Element;
@@ -163,6 +164,16 @@ pub struct StateSpaceBinding {
     pub projection: Element,
     pub output: Element,
     pub activation: Element,
+    pub scales: StateSpaceScales,
+}
+
+/// The extents of a state-space layer's per-tensor accumulator-scale ports
+/// (`attention_project`'s query segment `QS`, `attention_output`'s `OS`): 1
+/// where the weight has a resident second-level scale, else 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StateSpaceScales {
+    pub projection: u64,
+    pub output: u64,
 }
 
 /// The state-space forms the entries implement: an output norm group of
@@ -208,19 +219,29 @@ pub(super) fn shape_key(space: &StateSpace) -> String {
 }
 
 /// The program binding of a state-space sublayer; `lookup` resolves the
-/// planned element of a role in its scope.
+/// planned element of a role in its scope, `scalable` that of a projection
+/// its entries bind with an accumulator-scale port.
 pub(super) fn binding(
     space: &StateSpace,
     hidden: u64,
     lookup: impl Fn(magnitude_family_contracts::WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(magnitude_family_contracts::WeightKind) -> Result<ScalableWeight, PlanError>,
     activation: Element,
 ) -> Result<StateSpaceBinding, PlanError> {
     use magnitude_family_contracts::WeightKind;
+    let (projection, output) = (
+        scalable(WeightKind::StateSpaceProjection)?,
+        scalable(WeightKind::RecurrentOutput)?,
+    );
     Ok(StateSpaceBinding {
         shape: StateSpaceShape::of(hidden, space)?,
         norm: lookup(WeightKind::InputNorm)?,
-        projection: lookup(WeightKind::StateSpaceProjection)?,
-        output: lookup(WeightKind::RecurrentOutput)?,
+        projection: projection.element,
+        output: output.element,
         activation,
+        scales: StateSpaceScales {
+            projection: projection.scale,
+            output: output.scale,
+        },
     })
 }

@@ -34,6 +34,12 @@ pub enum ImageResize {
     /// The cell grid closest to the image's aspect with at most `max_cells`
     /// cells (Muse Glimmer `smart_resize`).
     CellBudget { max_cells: usize },
+    /// One tile of between `min_patches` and `max_patches` patches, the
+    /// aspect kept (Nemotron Omni `_compute_target_patches`).
+    PatchBounds {
+        min_patches: usize,
+        max_patches: usize,
+    },
 }
 
 /// The separable, scale-aware (antialiasing) resampling filter.
@@ -77,6 +83,10 @@ impl ImageProcessorConfig {
                 } => min_pixels == 0 || min_pixels > max_pixels,
                 ImageResize::PatchBudget { max_patches } => max_patches == 0,
                 ImageResize::CellBudget { max_cells } => max_cells == 0,
+                ImageResize::PatchBounds {
+                    min_patches,
+                    max_patches,
+                } => min_patches == 0 || min_patches > max_patches,
             }
             || self.mean.iter().any(|value| !value.is_finite())
             || self
@@ -104,6 +114,10 @@ impl ImageProcessorConfig {
             ImageResize::CellBudget { max_cells } => {
                 (b"cell-budget:closest-aspect", [max_cells, 0])
             }
+            ImageResize::PatchBounds {
+                min_patches,
+                max_patches,
+            } => (b"patch-bounds:one-tile", [min_patches, max_patches]),
         };
         let resampling: &[u8] = match self.resampling {
             Resampling::Bicubic => b"bicubic:a=-0.5:scale-aware-antialias:rgb8",
@@ -187,6 +201,17 @@ impl ImageProcessor {
             ImageResize::CellBudget { max_cells } => {
                 cell_budget_size(height, width, cell, max_cells)
             }
+            ImageResize::PatchBounds {
+                min_patches,
+                max_patches,
+            } => patch_bounds_size(
+                height,
+                width,
+                self.config.patch,
+                self.config.merge,
+                min_patches,
+                max_patches,
+            ),
         }
     }
 
@@ -450,6 +475,69 @@ fn cell_budget_size(
             .ok_or_else(|| String::from("resized image extent overflows"))
     };
     Ok((side(best.0)?, side(best.1)?))
+}
+
+/// Nemotron Omni `_compute_target_patches` (image path), in f64 as the
+/// released processor computes it: each side's patch count rounded up (by
+/// Python's half-to-even `round(n + 0.5)`), scaled down into `max_patches`
+/// (the processor's per-image token budget), scaled up to `min_patches` when
+/// the budget exceeds it, then each side moved to a multiple of `merge`: up
+/// when the tile stays within the budget, down otherwise.
+fn patch_bounds_size(
+    height: usize,
+    width: usize,
+    patch: usize,
+    merge: usize,
+    min_patches: usize,
+    max_patches: usize,
+) -> Result<(usize, usize), String> {
+    let closest = |side: usize| (side as f64 / patch as f64 + 0.5).round_ties_even();
+    let (closest_height, closest_width) = (closest(height), closest(width));
+    let factor = (max_patches as f64 / (closest_height * closest_width))
+        .sqrt()
+        .min(1.0);
+    let mut rows = (factor * closest_height).floor() as usize;
+    let mut columns = (factor * closest_width).floor() as usize;
+    let patches = rows
+        .checked_mul(columns)
+        .ok_or("resized image extent overflows")?;
+    if max_patches > min_patches && patches < min_patches {
+        if patches == 0 {
+            return Err("image resizes to no patch".into());
+        }
+        let up = (min_patches as f64 / patches as f64).sqrt();
+        rows = (up * rows as f64).ceil() as usize;
+        columns = (up * columns as f64).ceil() as usize;
+    }
+    let fits = |rows: usize, columns: usize| {
+        rows.checked_mul(columns)
+            .is_some_and(|patches| patches <= max_patches)
+    };
+    let remainder = rows % merge;
+    if remainder != 0 {
+        rows = if fits(rows + merge - remainder, columns) {
+            rows + merge - remainder
+        } else {
+            merge.max(rows - remainder)
+        };
+    }
+    let remainder = columns % merge;
+    if remainder != 0 {
+        columns = if fits(rows, columns + merge - remainder) {
+            columns + merge - remainder
+        } else {
+            merge.max(columns - remainder)
+        };
+    }
+    if rows == 0 || columns == 0 || !fits(rows, columns) {
+        return Err("resized image is outside the patch bounds".into());
+    }
+    let side = |patches: usize| {
+        patches
+            .checked_mul(patch)
+            .ok_or_else(|| String::from("resized image extent overflows"))
+    };
+    Ok((side(rows)?, side(columns)?))
 }
 
 /// CPython's `hash((a, b))` of two small non-negative integers

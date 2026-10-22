@@ -72,7 +72,8 @@
 // The kind of each representation, by the name the ABI gives it
 // (`SEISMIC_REPRESENTATION_<NAME>`, which a tensor's prefix `<T>()` expands
 // to without pasting, so a preprocessor condition can test it), and the row
-// geometry of each, by its pasted ABI name (`<T>_REPRESENTATION`).
+// geometry of each, by its pasted ABI name (`<T>_REPRESENTATION`). A packed
+// tensor in its packet layout has no rows, so its prefix names no kind here.
 #define SEISMIC_REPRESENTATION_Q4K PACKETS_Q4K
 #define SEISMIC_REPRESENTATION_Q5K PACKETS_Q5K
 #define SEISMIC_REPRESENTATION_Q6K PACKETS_Q6K
@@ -103,7 +104,8 @@
 #define PACKETS_ROWS_OF_IQ2XS(T) PACKETS_ROWS_GRID(T)
 #define PACKETS_ROWS_OF_IQ3XXS(T) PACKETS_ROWS_GRID(T)
 #define PACKETS_ROWS_OF_IQ4G32S(T) PACKETS_ROWS_C4(T)
-#define PACKETS_ROWS_OF_IQ2XXS(T) PACKETS_ROWS_GRID(T)
+// iq2xxs: its entries carry the scale codes; no scales plane.
+#define PACKETS_ROWS_OF_IQ2XXS(T) packets_rows16(T##_ROW_STRIDE_BYTES, T##_PLANE_GRIDS_ROW_OFFSET, 0ul, 0ul, T##_PLANE_SUPERS_ROW_OFFSET)
 #define PACKETS_STACKED_ROWS_OF_Q4K(T) PACKETS_ROWS_OF_Q4K(T)
 #define PACKETS_STACKED_ROWS_OF_Q5K(T) PACKETS_ROWS_OF_Q5K(T)
 #define PACKETS_STACKED_ROWS_OF_Q6K(T) PACKETS_ROWS_OF_Q6K(T)
@@ -141,15 +143,18 @@
 #define PACKETS_ROWS_(T) PACKETS_CAT(PACKETS_ROWS_OF_, T##_REPRESENTATION)(T)
 #define PACKETS_STACKED_ROWS_(T) PACKETS_CAT(PACKETS_STACKED_ROWS_OF_, T##_REPRESENTATION)(T)
 
-// Slot bindings.
+// Slot bindings. A slot whose representation has no packet kind is
+// rejected and holds no kind, so later conditions stay evaluable.
 #if defined(KERNEL_W0)
 #define PACKETS_W0 KERNEL_W0()
 #if PACKETS_W0 == 0
 #error "weight slot W0 binds a representation without a packet kind"
-#endif
+#define PACKETS_W0_BIT 0
+#else
 #define PACKETS_W0_ROWS PACKETS_ROWS(KERNEL_W0)
 #define PACKETS_W0_STACKED_ROWS PACKETS_STACKED_ROWS(KERNEL_W0)
 #define PACKETS_W0_BIT PACKETS_BIT(PACKETS_W0)
+#endif
 #else
 #define PACKETS_W0_BIT 0
 #endif
@@ -157,10 +162,12 @@
 #define PACKETS_W1 KERNEL_W1()
 #if PACKETS_W1 == 0
 #error "weight slot W1 binds a representation without a packet kind"
-#endif
+#define PACKETS_W1_BIT 0
+#else
 #define PACKETS_W1_ROWS PACKETS_ROWS(KERNEL_W1)
 #define PACKETS_W1_STACKED_ROWS PACKETS_STACKED_ROWS(KERNEL_W1)
 #define PACKETS_W1_BIT PACKETS_BIT(PACKETS_W1)
+#endif
 #else
 #define PACKETS_W1_BIT 0
 #endif
@@ -168,10 +175,12 @@
 #define PACKETS_W2 KERNEL_W2()
 #if PACKETS_W2 == 0
 #error "weight slot W2 binds a representation without a packet kind"
-#endif
+#define PACKETS_W2_BIT 0
+#else
 #define PACKETS_W2_ROWS PACKETS_ROWS(KERNEL_W2)
 #define PACKETS_W2_STACKED_ROWS PACKETS_STACKED_ROWS(KERNEL_W2)
 #define PACKETS_W2_BIT PACKETS_BIT(PACKETS_W2)
+#endif
 #else
 #define PACKETS_W2_BIT 0
 #endif
@@ -179,10 +188,12 @@
 #define PACKETS_W3 KERNEL_W3()
 #if PACKETS_W3 == 0
 #error "weight slot W3 binds a representation without a packet kind"
-#endif
+#define PACKETS_W3_BIT 0
+#else
 #define PACKETS_W3_ROWS PACKETS_ROWS(KERNEL_W3)
 #define PACKETS_W3_STACKED_ROWS PACKETS_STACKED_ROWS(KERNEL_W3)
 #define PACKETS_W3_BIT PACKETS_BIT(PACKETS_W3)
+#endif
 #else
 #define PACKETS_W3_BIT 0
 #endif
@@ -345,12 +356,15 @@ float packets_ue4m3_half(uint raw) {
 // of the grids plane codes eight values: grid indices name their magnitudes
 // (<seismic/grids.glsl>), and seven sign bits, completed by an eighth of even
 // parity, their signs. Every 16 (iq2xs) or 32 (iq3xxs, iq2xxs) values have
-// an odd scale code 2s + 1 (a nibble of the scales plane) and every 256 one
-// f32 factor: value = factor * (2s + 1) * code, every product exact.
+// an odd scale code 2s + 1 and every 256 one factor: value = factor *
+// (2s + 1) * code, every product exact. iq2xs and iq3xxs keep s in the
+// scales plane under an f32 factor; iq2xxs carries s in its entries (bit j
+// of s is bit 15 of entry j) under an f16 d, the factor d / 8.
 
 // Entry `step` of a packet's entries: iq2xs sixteen-bit entries (a 9-bit
 // index into the 512-point grid, then the signs), iq2xxs sixteen-bit entries
-// (an 8-bit index into the 256-point grid, then the signs), iq3xxs
+// (an 8-bit index into the 256-point grid, then the signs, then a scale code
+// bit), iq3xxs
 // three-byte entries (two 8-bit indices into the 256-point grid of four
 // values, then the signs). Its grid point (lanes 0..3 in x, 4..7 in y) and
 // its sign bits.
@@ -513,7 +527,8 @@ packets_packet packets_load(const int kind, uint64_t row, packets_rows16 geometr
 #if PACKETS_ANY(PACKETS_GRID_KINDS)
     if (packets_grid(kind)) {
         // The packet's four entries (8 or 12 bytes), its scale code field
-        // (iq2xs: byte p, two codes; iq3xxs, iq2xxs: nibble p of the plane)
+        // (iq2xs: byte p, two codes; iq3xxs: nibble p of the plane; iq2xxs:
+        // its entries' top bits)
         // and its group's factor (eight packets a group). The field's byte
         // is addressed by `p` itself, never as its group and offset added
         // back together: NVIDIA's aarch64 compiler (GB10, driver 580) traps
@@ -529,9 +544,13 @@ packets_packet packets_load(const int kind, uint64_t row, packets_rows16 geometr
         }
 #endif
 #if PACKETS_HOLDS(PACKETS_IQ2XXS)
+        // iq2xxs carries its scale code in its entries: bit j of the code is
+        // bit 15 of entry j, under its block's f16 d, the factor d / 8.
         if (packets_is(kind, PACKETS_IQ2XXS)) {
-            packet.low = uvec4(element_uvec2_at(row + geometry.codes + 8ul * p), 0u, 0u);
-            field = (element_u8_at(row + geometry.scales + uint64_t(p >> 1)) >> (4u * (p & 1u))) & 15u;
+            const uvec2 entries = element_uvec2_at(row + geometry.codes + 8ul * p);
+            packet.low = uvec4(entries, 0u, 0u);
+            field = ((entries.x >> 15) & 1u) | ((entries.x >> 30) & 2u) | ((entries.y >> 13) & 4u)
+                | ((entries.y >> 28) & 8u);
         }
 #endif
 #if PACKETS_HOLDS(PACKETS_IQ3XXS)
@@ -541,7 +560,9 @@ packets_packet packets_load(const int kind, uint64_t row, packets_rows16 geometr
             field = (element_u8_at(row + geometry.scales + uint64_t(p >> 1)) >> (4u * (p & 1u))) & 15u;
         }
 #endif
-        const float factor = element_f32_at(row + geometry.supers + 4ul * uint64_t(p >> 3));
+        const float factor = packets_is(kind, PACKETS_IQ2XXS)
+            ? 0.125 * seismic_f16_to_f32(uint16_t(element_u16_at(row + geometry.supers + 2ul * uint64_t(p >> 3))))
+            : element_f32_at(row + geometry.supers + 4ul * uint64_t(p >> 3));
         packet.scale0 = factor * float(2u * (field & 15u) + 1u);
         packet.scale1 = factor * float(2u * (field >> 4) + 1u);
         return packet;

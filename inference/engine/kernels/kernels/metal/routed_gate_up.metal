@@ -1,10 +1,18 @@
 // Decode expansion of gated experts (M <= 8): threadgroup row y = choice
 // (m, k), a K1 paired GEMV over the feature tile `x` of expert routes[m, k]'s
-// gate and up rows with the activation-generic GLU epilogue.
+// gate and up rows with the activation-generic GLU epilogue, the accumulators
+// scaled by the expert's `gate_scale`/`up_scale` where those ports are
+// present (static GS, US).
 
 #define KERNEL_W0 SEISMIC_EXPERT_GATE
 #define KERNEL_W1 SEISMIC_EXPERT_UP
 #include "lib/routed/routed.h"
+
+// The row both weights take (the normalized row, or NVFP4 operands), formed
+// while the GEMV stages it.
+constant constexpr bool NVFP4 =
+    projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4>::NVFP4;
+typedef projection::operands<NVFP4> Operands;
 
 #ifdef SEISMIC_FORMING_ROUTED_GATE_UP
 template <uint ROWS, uint LANES>
@@ -13,6 +21,8 @@ kernel void routed_gate_up(
     device const int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
     device const uchar *expert_gate [[buffer(SEISMIC_BUFFER_EXPERT_GATE)]],
     device const uchar *expert_up [[buffer(SEISMIC_BUFFER_EXPERT_UP)]],
+    device const float *gate_scale [[buffer(SEISMIC_BUFFER_GATE_SCALE)]],
+    device const float *up_scale [[buffer(SEISMIC_BUFFER_UP_SCALE)]],
     device uchar *product [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],
@@ -32,9 +42,14 @@ kernel void routed_gate_up(
         routed::expert_row(expert, SEISMIC_DIM_F), SEISMIC_DIM_H);
     const auto up = routed::weights<packets::W1>(expert_up, KERNEL_W1_LAYOUT(SEISMIC_DIM_H),
         routed::expert_row(expert, SEISMIC_DIM_F), SEISMIC_DIM_H);
-    const projection::Glu<A> out{product + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * A::bytes,
-        0, SEISMIC_RESULT_0_STRIDE_2, int(SEISMIC_PARAM_ACTIVATION)};
-    projection::gemv_paired_runtime<packets::W0, packets::W1, ROWS, 1, LANES>(in, out, gate, up, 1,
+    const auto out = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
+        projection::Glu<A>{product + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * A::bytes,
+            0, SEISMIC_RESULT_0_STRIDE_2, int(SEISMIC_PARAM_ACTIVATION)},
+        projection::scale_factor(gate_scale, SEISMIC_DIM_GS, SEISMIC_GATE_SCALE_STRIDE_0, expert),
+        projection::scale_factor(up_scale, SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0, expert));
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);
+    const auto x = Operands::rows(in, 1u, uint(SEISMIC_DIM_H), globals, simdgroups, sg, lane);
+    projection::gemv_paired_runtime<packets::W0, packets::W1, ROWS, 1, LANES>(x, out, gate, up, 1,
         SEISMIC_DIM_F, SEISMIC_DIM_H, tile, shared, simdgroups, sg, lane);
 }
 #endif

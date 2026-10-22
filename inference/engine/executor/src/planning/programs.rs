@@ -20,9 +20,9 @@ use crate::operators::{
     self, CausalHeadBlock, attention_slot, dense_slot, feed_forward_slot, mixer_slot, paired_block,
 };
 use magnitude_family_contracts::{
-    DraftDefinition, DraftEmbedding, DraftMethod, ExitNorm, HistoryReads, ModelDefinition,
-    Operator, ProposalReadoutPolicy, SublayerIndex, TapPoint, TokenId, WeightKind, WeightRole,
-    WeightScope,
+    AffinePart, CandidateCorrector, CorrectorSite, CorrectorWeight, DraftDefinition,
+    DraftEmbedding, DraftMethod, ExitNorm, HistoryReads, ModelDefinition, Operator,
+    ProposalReadoutPolicy, SublayerIndex, TapPoint, TokenId, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_state::KvCodec;
 use seismic::{DType, Element};
@@ -232,20 +232,73 @@ pub struct SelectorBinding {
     pub top_k: u64,
 }
 
-/// DFlash2's block pass: every draft sublayer runs unfused (normed rows,
-/// half-0 convolution, plain projections, half-1 convolution plus the
-/// residual), so each layer's convolution coefficient projections bind here;
-/// the layers' own projection elements are their attention and dense
-/// bindings'.
+/// One convolved draft layer's unfused projections (`project_rows`, each
+/// with its accumulator scale) and norms: its attention's and its
+/// feed-forward's coefficient projections and norms, the attention's query,
+/// key, value and output, and the feed-forward's gate, up and down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ConvolvedLayerBinding {
+    pub attention_norm: Element,
+    pub attention_coefficients: ScalableWeight,
+    pub query: ScalableWeight,
+    pub key: ScalableWeight,
+    pub value: ScalableWeight,
+    pub output: ScalableWeight,
+    pub feed_forward_norm: Element,
+    pub feed_forward_coefficients: ScalableWeight,
+    pub gate: ScalableWeight,
+    pub up: ScalableWeight,
+    pub down: ScalableWeight,
+}
+
+/// A convolved backbone's block pass: every draft sublayer runs unfused
+/// (normed rows, half-0 convolution, plain projections, half-1 convolution
+/// plus the residual).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Dflash2Binding {
+pub struct ConvolutionBinding {
     /// Convolution taps and coefficient groups.
     pub kernel: u64,
     pub groups: u64,
-    /// Per draft layer, its attention's and its feed-forward's coefficient
-    /// projection elements.
-    pub convolutions: Vec<[Element; 2]>,
-    pub selector: SelectorBinding,
+    /// One per draft layer.
+    pub layers: Vec<ConvolvedLayerBinding>,
+}
+
+/// One corrector layer's norms and projections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CorrectorLayerBinding {
+    pub attention_norm: Element,
+    pub attention_input: ScalableWeight,
+    pub attention_output: ScalableWeight,
+    pub mlp_norm: Element,
+    pub up: ScalableWeight,
+    pub down: ScalableWeight,
+}
+
+/// LiLiCorr's candidate corrector: its geometry, its projections (each a
+/// `project_rows` with its accumulator scale) and its norms. Its biases,
+/// feature norm and projection, embeddings and attention bias are F32.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CorrectorBinding {
+    /// The block's mask slots (`J`), every one of which the corrector reads.
+    pub slots: u64,
+    pub width: u64,
+    pub top_k: u64,
+    pub heads: u64,
+    pub factor: u64,
+    pub mlp: u64,
+    /// The candidate embeddings' projection; none when the corrector is as
+    /// wide as the draft and reads them directly.
+    pub token: Option<ScalableWeight>,
+    pub pass: ScalableWeight,
+    pub context: ScalableWeight,
+    pub feature_down: ScalableWeight,
+    pub layers: Vec<CorrectorLayerBinding>,
+    pub output_norm: Element,
+    pub anchor_norm: Element,
+    pub factor_input: ScalableWeight,
+    pub outgoing: ScalableWeight,
+    pub incoming: ScalableWeight,
+    pub anchor: ScalableWeight,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,13 +311,35 @@ pub struct DraftProgramPlan {
     projection: ReadoutHead,
     projection_scope: WeightScope,
     markov: Option<MarkovBinding>,
-    dflash2: Option<Dflash2Binding>,
+    convolutions: Option<ConvolutionBinding>,
+    selector: Option<SelectorBinding>,
+    corrector: Option<CorrectorBinding>,
+    /// The draft's fusion norm, which the corrector's anchor state reads.
+    fusion_norm: Element,
+    /// The draft's (and its target's) hidden width.
+    hidden: u64,
     activation: Element,
 }
 
 impl DraftProgramPlan {
-    pub fn dflash2(&self) -> Option<&Dflash2Binding> {
-        self.dflash2.as_ref()
+    pub fn hidden(&self) -> u64 {
+        self.hidden
+    }
+
+    pub fn convolutions(&self) -> Option<&ConvolutionBinding> {
+        self.convolutions.as_ref()
+    }
+
+    pub fn selector(&self) -> Option<SelectorBinding> {
+        self.selector
+    }
+
+    pub fn corrector(&self) -> Option<&CorrectorBinding> {
+        self.corrector.as_ref()
+    }
+
+    pub fn fusion_norm(&self) -> Element {
+        self.fusion_norm
     }
 
     pub fn blocks(&self) -> &[DraftBlockBinding] {
@@ -380,6 +455,9 @@ impl StateProgramPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProgramPlan {
     imports: Vec<ImportProgramSlot>,
+    /// Whether a read of rows the device selects copies its selection for
+    /// the host (`selection_notice`).
+    notices_selection: bool,
     target: TargetProgramPlan,
     head: Option<HeadProgramPlan>,
     shared_head: Option<SharedHeadProgramPlan>,
@@ -393,6 +471,7 @@ impl ProgramPlan {
     pub(crate) fn new(
         definition: &ModelDefinition,
         imports: Vec<ImportProgramSlot>,
+        notices_selection: bool,
         target: TargetProgramPlan,
         head: Option<HeadProgramPlan>,
         shared_head: Option<SharedHeadProgramPlan>,
@@ -446,6 +525,7 @@ impl ProgramPlan {
         }
         Ok(Self {
             imports,
+            notices_selection,
             target,
             head,
             shared_head,
@@ -457,6 +537,13 @@ impl ProgramPlan {
 
     pub fn imports(&self) -> &[ImportProgramSlot] {
         &self.imports
+    }
+
+    /// Whether a read of rows the device selects copies its selection for
+    /// the host (`selection_notice`): the load holds a table the host fills
+    /// for such reads.
+    pub fn notices_selection(&self) -> bool {
+        self.notices_selection
     }
 
     pub fn target(&self) -> &TargetProgramPlan {
@@ -517,6 +604,13 @@ pub(super) fn derive_program_plan(
             imports.push(slot);
         }
     }
+    // A read of rows the device selects copies its selection for the host
+    // when the host fills a table for it: a stored table's slots, or an
+    // imported table's landing slots.
+    let notices_selection = target
+        .iter()
+        .chain(head.unwrap_or_default())
+        .any(|weight| weight.stored_in_slots() || weight.lands_selected_rows());
     let activation = activation_dtype(definition.decoder.activation_dtype);
     let active_element = Element::dense(activation);
     let embedding = EmbeddingBinding {
@@ -542,6 +636,7 @@ pub(super) fn derive_program_plan(
                     decoder.hidden,
                     decoder.context_limit,
                     |kind| lookup(target, mixer, kind),
+                    |kind| planned_scalable(target, mixer, kind),
                     active_element,
                     history,
                 )?,
@@ -575,6 +670,7 @@ pub(super) fn derive_program_plan(
                             entry,
                             decoder.hidden,
                             |kind| lookup(target, scope, kind),
+                            |kind| planned_scalable(target, scope, kind),
                             active_element,
                         )
                     })
@@ -636,11 +732,13 @@ pub(super) fn derive_program_plan(
                 width: entry.width,
                 table_source: table.source,
                 table: table.resident,
-                projection: lookup(
+                // `project_rows` binds the projection's scale (WS).
+                projection: planned_scalable(
                     target,
                     WeightScope::Target,
                     WeightKind::PerLayerModelProjection,
-                )?,
+                )?
+                .element,
                 norm: lookup(
                     target,
                     WeightScope::Target,
@@ -731,6 +829,7 @@ pub(super) fn derive_program_plan(
                     &paired,
                     decoder.hidden,
                     |kind| lookup(weights, mixer, kind),
+                    |kind| planned_scalable(weights, mixer, kind),
                     active_element,
                     KvCodec::Dense,
                 )?;
@@ -767,11 +866,7 @@ pub(super) fn derive_program_plan(
                         decoder.hidden,
                         feed_forward,
                         |scope, kind| lookup(weights, scope, kind),
-                        // Head graphs bind no scale ports.
-                        |scope, kind| {
-                            lookup(weights, scope, kind)
-                                .map(|element| ScalableWeight { element, scale: 0 })
-                        },
+                        |scope, kind| planned_scalable(weights, scope, kind),
                         active_element,
                     )?,
                     output_norm: if streams.is_some() {
@@ -826,6 +921,7 @@ pub(super) fn derive_program_plan(
     ProgramPlan::new(
         definition,
         imports,
+        notices_selection,
         target_program,
         head_program,
         shared_head_program,
@@ -861,6 +957,7 @@ fn shared_head_program_plan(
                 head.width,
                 0,
                 |kind| lookup(mixer, kind),
+                |kind| planned_scalable(weights, mixer, kind),
                 activation,
                 history,
             )?,
@@ -927,6 +1024,7 @@ fn draft_program_plan(
             &paired,
             hidden,
             |kind| lookup(weights, mixer, kind),
+            |kind| planned_scalable(weights, mixer, kind),
             activation,
             KvCodec::Dense,
         )?;
@@ -935,16 +1033,7 @@ fn draft_program_plan(
                 .feed_forward
                 .ok_or(PlanError::Unsupported("draft layer without feed-forward"))?,
             |kind| lookup(weights, feed_forward, kind),
-            // DFlash and DSpark layers run the dense feed-forward graph, whose
-            // entries bind scale ports; DFlash2 layers project through their
-            // own entries, which bind none.
-            |kind| match draft.method {
-                DraftMethod::DFlash2 { .. } => lookup(weights, feed_forward, kind)
-                    .map(|element| ScalableWeight { element, scale: 0 }),
-                DraftMethod::DFlash | DraftMethod::DSpark { .. } => {
-                    planned_scalable(weights, feed_forward, kind)
-                }
-            },
+            |kind| planned_scalable(weights, feed_forward, kind),
             activation,
         )?;
         blocks.push(DraftBlockBinding {
@@ -984,49 +1073,139 @@ fn draft_program_plan(
             WeightScope::Target
         },
         markov: match &draft.method {
-            DraftMethod::DFlash | DraftMethod::DFlash2 { .. } => None,
             DraftMethod::DSpark { markov, .. } => Some(MarkovBinding {
                 embedding: lookup(weights, WeightScope::Draft, WeightKind::MarkovEmbedding)?,
-                projection: lookup(weights, WeightScope::Draft, WeightKind::MarkovProjection)?,
+                // `dense_output` binds the projection's second-level scale
+                // (its DS port), so an NVFP4 projection is admitted.
+                projection: planned_scalable(weights, WeightScope::Draft, WeightKind::MarkovProjection)?
+                    .element,
                 rank: markov.rank,
             }),
+            _ => None,
         },
-        dflash2: match &draft.method {
-            DraftMethod::DFlash | DraftMethod::DSpark { .. } => None,
-            DraftMethod::DFlash2 {
-                kernel,
-                group,
-                convolutions,
-                selector,
-            } => Some(Dflash2Binding {
-                kernel: *kernel,
-                groups: hidden / *group,
-                convolutions: (0..convolutions.len())
-                    .map(|index| {
-                        let block = u32::try_from(index)
-                            .map_err(|_| PlanError::Arithmetic("draft block index exceeds u32"))?;
-                        let [attention, feed_forward] =
-                            paired_scopes(block, WeightScope::DraftSublayer);
-                        Ok([
-                            lookup(weights, attention, WeightKind::ConvolutionProjection)?,
-                            lookup(weights, feed_forward, WeightKind::ConvolutionProjection)?,
-                        ])
-                    })
-                    .collect::<Result<Vec<_>, PlanError>>()?,
-                selector: SelectorBinding {
-                    hidden: lookup(weights, WeightScope::Draft, WeightKind::SelectorHidden)?,
-                    predecessor: lookup(
-                        weights,
-                        WeightScope::Draft,
-                        WeightKind::SelectorPredecessor,
-                    )?,
-                    successor: lookup(weights, WeightScope::Draft, WeightKind::SelectorSuccessor)?,
-                    rank: selector.rank,
-                    top_k: selector.top_k,
-                },
+        convolutions: draft
+            .convolutions
+            .as_ref()
+            .map(|convolutions| {
+                Ok::<_, PlanError>(ConvolutionBinding {
+                    kernel: convolutions.kernel,
+                    groups: hidden / convolutions.group,
+                    layers: (0..convolutions.layers.len())
+                        .map(|index| {
+                            let block = u32::try_from(index).map_err(|_| {
+                                PlanError::Arithmetic("draft block index exceeds u32")
+                            })?;
+                            let [mixer, feed_forward] =
+                                paired_scopes(block, WeightScope::DraftSublayer);
+                            let projection =
+                                |scope, kind| planned_scalable(weights, scope, kind);
+                            Ok(ConvolvedLayerBinding {
+                                attention_norm: lookup(weights, mixer, WeightKind::InputNorm)?,
+                                attention_coefficients: projection(
+                                    mixer,
+                                    WeightKind::ConvolutionProjection,
+                                )?,
+                                query: projection(mixer, WeightKind::Query)?,
+                                key: projection(mixer, WeightKind::Key)?,
+                                value: projection(mixer, WeightKind::Value)?,
+                                output: projection(mixer, WeightKind::AttentionOutput)?,
+                                feed_forward_norm: lookup(
+                                    weights,
+                                    feed_forward,
+                                    WeightKind::InputNorm,
+                                )?,
+                                feed_forward_coefficients: projection(
+                                    feed_forward,
+                                    WeightKind::ConvolutionProjection,
+                                )?,
+                                gate: projection(feed_forward, WeightKind::DenseGate)?,
+                                up: projection(feed_forward, WeightKind::DenseUp)?,
+                                down: projection(feed_forward, WeightKind::DenseDown)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, PlanError>>()?,
+                })
+            })
+            .transpose()?,
+        selector: match &draft.method {
+            DraftMethod::DFlash2 { selector } => Some(SelectorBinding {
+                // `project_rows` binds the projection's scale (WS).
+                hidden: planned_scalable(weights, WeightScope::Draft, WeightKind::SelectorHidden)?
+                    .element,
+                predecessor: lookup(weights, WeightScope::Draft, WeightKind::SelectorPredecessor)?,
+                successor: lookup(weights, WeightScope::Draft, WeightKind::SelectorSuccessor)?,
+                rank: selector.rank,
+                top_k: selector.top_k,
             }),
+            _ => None,
         },
+        corrector: match &draft.method {
+            DraftMethod::LiLiCorr { corrector } => {
+                Some(corrector_binding(corrector, draft.max_proposals(), weights)?)
+            }
+            _ => None,
+        },
+        fusion_norm,
+        hidden,
         activation,
+    })
+}
+
+/// The corrector's planned projections and norms.
+fn corrector_binding(
+    corrector: &CandidateCorrector,
+    slots: u64,
+    weights: &[WeightPlan],
+) -> Result<CorrectorBinding, PlanError> {
+    let affine = |scope, site| {
+        planned_scalable(
+            weights,
+            scope,
+            WeightKind::Corrector(CorrectorWeight::Affine {
+                site,
+                part: AffinePart::Weight,
+            }),
+        )
+    };
+    let norm = |scope, weight| planned_element(weights, scope, WeightKind::Corrector(weight));
+    let draft = WeightScope::Draft;
+    Ok(CorrectorBinding {
+        slots,
+        width: corrector.width,
+        top_k: corrector.top_k,
+        heads: corrector.heads,
+        factor: corrector.factor,
+        mlp: corrector.mlp(),
+        token: corrector
+            .token
+            .as_ref()
+            .map(|_| affine(draft, CorrectorSite::Token))
+            .transpose()?,
+        pass: affine(draft, CorrectorSite::Pass)?,
+        context: affine(draft, CorrectorSite::Context)?,
+        feature_down: affine(draft, CorrectorSite::FeatureDown)?,
+        layers: (0..corrector.layers.len())
+            .map(|index| {
+                let scope = WeightScope::CorrectorLayer(
+                    u32::try_from(index)
+                        .map_err(|_| PlanError::Arithmetic("corrector layer index exceeds u32"))?,
+                );
+                Ok(CorrectorLayerBinding {
+                    attention_norm: norm(scope, CorrectorWeight::AttentionNorm)?,
+                    attention_input: affine(scope, CorrectorSite::AttentionInput)?,
+                    attention_output: affine(scope, CorrectorSite::AttentionOutput)?,
+                    mlp_norm: norm(scope, CorrectorWeight::MlpNorm)?,
+                    up: affine(scope, CorrectorSite::Up)?,
+                    down: affine(scope, CorrectorSite::Down)?,
+                })
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?,
+        output_norm: norm(draft, CorrectorWeight::OutputNorm)?,
+        anchor_norm: norm(draft, CorrectorWeight::AnchorNorm)?,
+        factor_input: affine(draft, CorrectorSite::FactorInput)?,
+        outgoing: affine(draft, CorrectorSite::Outgoing)?,
+        incoming: affine(draft, CorrectorSite::Incoming)?,
+        anchor: affine(draft, CorrectorSite::Anchor)?,
     })
 }
 

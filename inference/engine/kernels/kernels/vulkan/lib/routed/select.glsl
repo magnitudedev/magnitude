@@ -3,13 +3,17 @@
 // weights. The counterpart of `metal/lib/routed/select.h`,
 // `cuda/lib/routed/select.cuh` and `cpu/lib/routed/select.rs`.
 //
-// Lane `lane` holds experts lane + 32 i (i < SELECT_P = E / 32, which the
-// including entry defines). Top-K is one pass over a lane-local order: every
-// lane sorts its SELECT_P candidates once (an odd-even transposition network
-// over registers), then each of the K rounds is a single subgroup argmax over
-// the 32 lane heads (ties to the higher expert index) and one shift of the
-// winning lane's candidates. The winners are the portable body's K argmax
-// rounds in the same order. Scores use the bounded-error `exp`.
+// Lane `lane` holds experts lane + 32 i (i < SELECT_P = ceil(E / 32), with
+// E = SELECT_EXPERTS, both of which the including entry defines); when E is
+// not a multiple of 32, lanes at or past E % 32 hold SELECT_P - 1
+// (`select_candidates`) and their last register is an excluded entry
+// (ranked -inf, expert -1, as a popped one). Top-K is one pass over a
+// lane-local order: every lane sorts its SELECT_P candidates once (an
+// odd-even transposition network over registers), then each of the K rounds
+// is a single subgroup argmax over the 32 lane heads (ties to the higher
+// expert index) and one shift of the winning lane's candidates. The winners
+// are the portable body's K argmax rounds in the same order. Scores use the
+// bounded-error `exp`.
 //
 // This file is independent of any entry ABI.
 #include "../core/precise.glsl"
@@ -23,22 +27,33 @@
 #define SELECT_SUM_PLUS_EPSILON 2
 #define SELECT_CLAMPED_SUM 3
 
+// The experts lane `lane` holds: ceil(E / 32) on the first E % 32 lanes,
+// E / 32 on the others (every lane E / 32 when 32 divides E).
+uint select_candidates(const uint lane) {
+    return SELECT_EXPERTS / 32u + ((SELECT_EXPERTS % 32u) != 0u && lane < SELECT_EXPERTS % 32u ? 1u : 0u);
+}
+
 // Descending value, ties to the higher expert index.
 bool select_precedes(float value, int expert, float best, int best_expert) {
     return value > best || (value == best && expert > best_expert);
 }
 
-// The scores of this lane's experts from their logits (in place).
-void select_scores(const int function, inout float values[SELECT_P]) {
+// The scores of this lane's experts from their logits (in place); the
+// softmax runs over the `held` leading values only (the others are excluded
+// entries, whose scores are unused).
+void select_scores(const int function, inout float values[SELECT_P], const uint held) {
     if (function == SELECT_SOFTMAX) {
         float maximum = -uintBitsToFloat(0x7f800000u);
         [[unroll]] for (uint i = 0u; i < SELECT_P; ++i)
-            maximum = max(maximum, values[i]);
+            if (i < held)
+                maximum = max(maximum, values[i]);
         maximum = seismic_subgroup_max(maximum);
         float total = 0.0;
         [[unroll]] for (uint i = 0u; i < SELECT_P; ++i) {
-            values[i] = precise_exp(values[i] - maximum);
-            total += values[i];
+            if (i < held) {
+                values[i] = precise_exp(values[i] - maximum);
+                total += values[i];
+            }
         }
         total = seismic_subgroup_sum_f32(total);
         [[unroll]] for (uint i = 0u; i < SELECT_P; ++i)

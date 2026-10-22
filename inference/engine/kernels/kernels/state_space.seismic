@@ -168,7 +168,9 @@ native state_space_step for metal from "metal/state_space_step.metal":
         threadgroups (NH, P / ROWS, B + 1)
         threads_per_threadgroup (128, 1, 1)
 
-# CUDA: the Metal geometry, a block of four warps.
+# CUDA: the Metal geometry, a block of four warps. A programmatic launch: a
+# block reads its slot and state rows before waiting for its predecessor
+# (the input projection), so the state streams under the projection's tail.
 native state_space_step for cuda from "cuda/state_space_step.cu":
     static (NH, P, G, N, C)
     params (code ROWS in [32, 16, 64])

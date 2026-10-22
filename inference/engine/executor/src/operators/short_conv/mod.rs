@@ -129,21 +129,26 @@ pub(super) fn shape_key(conv: &ShortConv) -> String {
 }
 
 /// The program binding of a short-convolution sublayer; `lookup` resolves
-/// the planned element of a role in its scope.
+/// the planned element of a role in its scope, `scalable` that of a
+/// projection bound with an accumulator-scale port (every projection's).
 pub(super) fn binding(
     conv: &ShortConv,
     hidden: u64,
     lookup: impl Fn(magnitude_family_contracts::WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(
+        magnitude_family_contracts::WeightKind,
+    ) -> Result<crate::ScalableWeight, PlanError>,
     activation: Element,
 ) -> Result<ShortConvBinding, PlanError> {
     use magnitude_family_contracts::WeightKind;
+    let projection = |kind| scalable(kind).map(|weight| weight.element);
     Ok(ShortConvBinding {
         shape: ShortConvShape::of(hidden, conv)?,
         norm: lookup(WeightKind::InputNorm)?,
-        input_gate: lookup(WeightKind::ShortConvInputGate)?,
-        output_gate: lookup(WeightKind::ShortConvOutputGate)?,
-        value: lookup(WeightKind::ShortConvValue)?,
-        output: lookup(WeightKind::RecurrentOutput)?,
+        input_gate: projection(WeightKind::ShortConvInputGate)?,
+        output_gate: projection(WeightKind::ShortConvOutputGate)?,
+        value: projection(WeightKind::ShortConvValue)?,
+        output: projection(WeightKind::RecurrentOutput)?,
         activation,
     })
 }

@@ -14,9 +14,9 @@ use crate::operators::routed::graph::{
 };
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{PackingBound, WeightPort, weight};
+use crate::programs::native_target_graph::{WeightPort, packed_weight, weight};
 use crate::{GeneralRoutedShape, ModelLoadPlan, ParallelBinding};
-use magnitude_family_contracts::{SublayerIndex, WeightKind, WeightRole, WeightScope};
+use magnitude_family_contracts::{SublayerIndex, WeightKind, WeightScope};
 use magnitude_kernels::{dense_expand, moe_tail, project_rows};
 use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
@@ -98,9 +98,6 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
     let dimensions = dense_dimensions(load, dense_scope, rows)?;
     let [_, _, (_, hidden), (_, features)] = dimensions;
     let norm = weight(graph, load, dense_scope, WeightKind::InputNorm, weights)?;
-    let gate = weight(graph, load, dense_scope, WeightKind::DenseGate, weights)?;
-    let up = weight(graph, load, dense_scope, WeightKind::DenseUp, weights)?;
-    let down = weight(graph, load, dense_scope, WeightKind::DenseDown, weights)?;
     let dense_norm = weight(graph, load, dense_scope, WeightKind::PostNorm, weights)?;
     let routed_norm = weight(graph, load, routed_scope, WeightKind::PostNorm, weights)?;
     let tail_norm = weight(
@@ -111,42 +108,36 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
         weights,
     )?;
     let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
-    let absent_scale = GraphConstant::absent(graph, constants)?.tensor().clone();
-    let mut bound = |graph: &mut G, kind| {
-        let role = WeightRole {
-            scope: dense_scope,
-            kind,
-        };
-        PackingBound::planned(graph, load, role, weights, constants)
-    };
-    let gate_bound = bound(graph, WeightKind::DenseGate)?;
-    let up_bound = bound(graph, WeightKind::DenseUp)?;
-    let down_bound = bound(graph, WeightKind::DenseDown)?;
+    let mut packed =
+        |graph: &mut G, kind| packed_weight(graph, load, dense_scope, kind, weights, constants);
+    let gate = packed(graph, WeightKind::DenseGate)?;
+    let up = packed(graph, WeightKind::DenseUp)?;
+    let down = packed(graph, WeightKind::DenseDown)?;
     let product = graph
         .enqueue(
             entries.expand,
             &[
                 dimensions.as_slice(),
                 &[
-                    ("GS", 0),
-                    ("US", 0),
-                    ("GB", gate_bound.extent),
-                    ("UB", up_bound.extent),
+                    ("GS", gate.operands.scale.extent),
+                    ("US", up.operands.scale.extent),
+                    ("GB", gate.operands.bound.extent),
+                    ("UB", up.operands.bound.extent),
                 ],
             ]
             .concat(),
             dense_expand::WorkflowArgs {
                 residual: residual.into(),
                 norm: (&norm).into(),
-                gate_weight: (&gate).into(),
-                up_weight: (&up).into(),
+                gate_weight: (&gate.weight).into(),
+                up_weight: (&up.weight).into(),
                 out_rows: out_rows.port().tensor().into(),
                 eps: epsilon,
                 activation,
-                gate_scale: (&absent_scale).into(),
-                up_scale: (&absent_scale).into(),
-                gate_bound: (&gate_bound.tensor).into(),
-                up_bound: (&up_bound.tensor).into(),
+                gate_scale: (&gate.operands.scale.tensor).into(),
+                up_scale: (&up.operands.scale.tensor).into(),
+                gate_bound: (&gate.operands.bound.tensor).into(),
+                up_bound: (&up.operands.bound.tensor).into(),
             },
         )?
         .value;
@@ -157,14 +148,14 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
                 ("M", rows),
                 ("K", features),
                 ("N", hidden),
-                ("WS", 0),
-                ("WB", down_bound.extent),
+                ("WS", down.operands.scale.extent),
+                ("WB", down.operands.bound.extent),
             ],
             project_rows::WorkflowArgs {
                 source: (&product).into(),
-                weight: (&down).into(),
-                weight_scale: (&absent_scale).into(),
-                weight_bound: (&down_bound.tensor).into(),
+                weight: (&down.weight).into(),
+                weight_scale: (&down.operands.scale.tensor).into(),
+                weight_bound: (&down.operands.bound.tensor).into(),
             },
         )?
         .value;

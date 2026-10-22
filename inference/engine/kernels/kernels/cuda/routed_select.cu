@@ -1,8 +1,9 @@
 // General expert selection for M rows; the CUDA form of
 // `metal/routed_select.metal`, in four launches: `routed_select_stage`
 // (M > 8, one block per row) publishes the normalized rows and the router
-// input rows once; `routed_select_gemv` (M <= 8, one warp per logit column,
-// forming the router input on the fly and publishing the normalized rows) or
+// input rows once; `routed_select_gemv` (M <= 8, one warp per logit column
+// over the block's hidden share of SPLIT, whose router input rows the block
+// forms in shared memory, publishing the share's normalized rows) or
 // `routed_select_gemm` (32 rows x 32 columns x one hidden share of SPLIT per
 // block over shared tiles) forms the [M, E] logits as SPLIT partial planes;
 // `routed_select_select` (one warp per row) sums the planes, forms the
@@ -60,10 +61,21 @@ extern "C" __global__ void routed_select_stage(SEISMIC_KERNEL_PARAMS) {
     }
 }
 
-// M <= 8, one launch before the selection: the block computes its rows' RMS
-// inverses (in the stage launch's order), then each warp forms one logit
-// column, forming each router input element as it reads it; block 0
-// publishes the normalized rows.
+// The hidden coordinates of one share of SPLIT: whole 64-value packets of a
+// packed router, whole 32-value runs of a dense one.
+#if defined(SEISMIC_ROUTER_KIND_PACKED)
+constexpr unsigned SHARE_GRAIN = 64;
+#else
+constexpr unsigned SHARE_GRAIN = 32;
+#endif
+constexpr unsigned GEMV_SHARE = (static_cast<unsigned>(SEISMIC_DIM_H) / SHARE_GRAIN + SEISMIC_TUNE_SPLIT - 1) /
+                                SEISMIC_TUNE_SPLIT * SHARE_GRAIN;
+
+// M <= 8, one launch before the selection: block (x, z) computes its rows'
+// RMS inverses (in the stage launch's order), stages the router input rows of
+// hidden share z of SPLIT in shared memory, and forms the partial logits of
+// SIMDGROUPS logit columns over that share into plane z, one warp per column;
+// the blocks of x = 0 publish the share's normalized rows.
 extern "C" __global__ void routed_select_gemv(SEISMIC_KERNEL_PARAMS) {
     const float *residual = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL));
     const unsigned char *norm = SEISMIC_PTR(SEISMIC_BUFFER_NORM);
@@ -73,6 +85,7 @@ extern "C" __global__ void routed_select_gemv(SEISMIC_KERNEL_PARAMS) {
     float *logits = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
     __shared__ float parts[8][SELECT_WARPS];
     __shared__ float inverses[8];
+    __shared__ alignas(16) Act::storage staged[8][GEMV_SHARE];
     const unsigned thread = threadIdx.x, lane = thread % 32, warp = thread / 32;
     const unsigned rows = static_cast<unsigned>(SEISMIC_DIM_M);
     const float eps = __uint_as_float(static_cast<unsigned>(SEISMIC_PARAM_EPSILON));
@@ -95,15 +108,23 @@ extern "C" __global__ void routed_select_gemv(SEISMIC_KERNEL_PARAMS) {
         inverses[thread] = rsqrtf(seismic_add_rn(total / static_cast<float>(SEISMIC_DIM_H), eps));
     }
     __syncthreads();
-    if (blockIdx.x == 0) {
-        for (unsigned item = thread; item < rows * static_cast<unsigned>(SEISMIC_DIM_H); item += 32 * SEISMIC_TUNE_SIMDGROUPS) {
-            const unsigned long long row = item / SEISMIC_DIM_H, source = item % SEISMIC_DIM_H;
-            const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
+    const unsigned grains = static_cast<unsigned>(SEISMIC_DIM_H) / SHARE_GRAIN;
+    const unsigned share = blockIdx.z;
+    const unsigned kbegin = grains * share / SEISMIC_TUNE_SPLIT * SHARE_GRAIN;
+    const unsigned width = grains * (share + 1) / SEISMIC_TUNE_SPLIT * SHARE_GRAIN - kbegin;
+    for (unsigned item = thread; item < rows * width; item += 32 * SEISMIC_TUNE_SIMDGROUPS) {
+        const unsigned row = item / width, k = item % width;
+        const unsigned long long source = kbegin + k;
+        const float scaled =
+            seismic_mul_rn(residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1], inverses[row]);
+        staged[row][k] =
+            Act::store(seismic_mul_rn(scaled, element::at<RouterNorm>(router_norm, source * SEISMIC_ROUTER_NORM_STRIDE_0)));
+        if (blockIdx.x == 0)
             element::put<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
-                Act::round(seismic_mul_rn(seismic_mul_rn(value, inverses[row]),
-                    element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0))));
-        }
+                Act::round(seismic_mul_rn(scaled, element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0))));
     }
+    __syncthreads();
+    logits += static_cast<unsigned long long>(share) * SEISMIC_DIM_M * SEISMIC_DIM_E;
     const unsigned long long expert = static_cast<unsigned long long>(blockIdx.x) * SEISMIC_TUNE_SIMDGROUPS + warp;
     if (expert >= SEISMIC_DIM_E)
         return;
@@ -111,8 +132,8 @@ extern "C" __global__ void routed_select_gemv(SEISMIC_KERNEL_PARAMS) {
 #if defined(SEISMIC_ROUTER_KIND_PACKED)
     const auto router_rows = KERNEL_W0_AT(router);
     // One lane decodes a 16-value register chunk of an mma16 router row.
-    for (unsigned item = lane; item < SEISMIC_DIM_H / 64 * 4; item += 32) {
-        const unsigned long long kb = item / 4;
+    for (unsigned item = lane; item < width / 64 * 4; item += 32) {
+        const unsigned long long kb = kbegin / 64 + item / 4;
         const unsigned t = item % 4;
         const unsigned offsets[4] = {2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9};
         float values[16];
@@ -121,35 +142,28 @@ extern "C" __global__ void routed_select_gemv(SEISMIC_KERNEL_PARAMS) {
         for (unsigned s = 0; s < 4; ++s)
 #pragma unroll
             for (unsigned j = 0; j < 4; ++j) {
-                const unsigned long long source = 64 * kb + 16 * s + offsets[j];
-                const float scale = element::at<RouterNorm>(router_norm, source * SEISMIC_ROUTER_NORM_STRIDE_0);
+                const unsigned k = 64 * (item / 4) + 16 * s + offsets[j];
 #pragma unroll
                 for (unsigned row = 0; row < 8; ++row)
-                    if (row < rows) {
-                        const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
-                        sums[row] = seismic_fma_rn(Act::round(seismic_mul_rn(seismic_mul_rn(value, inverses[row]),
-                            scale)), values[4 * s + j], sums[row]);
-                    }
+                    if (row < rows)
+                        sums[row] = seismic_fma_rn(Act::load(staged[row][k]), values[4 * s + j], sums[row]);
             }
     }
 #else
-    // Dense lane l owns sources 4l + 128 i .. + 3.
-    for (unsigned base = 4 * lane; base < SEISMIC_DIM_H; base += 128) {
-        float weight[4], scale[4];
-#pragma unroll
-        for (unsigned j = 0; j < 4; ++j) {
-            weight[j] = element::at<Router>(router, expert * SEISMIC_ROUTER_STRIDE_0 + (base + j) * SEISMIC_ROUTER_STRIDE_1);
-            scale[j] = element::at<RouterNorm>(router_norm, (base + j) * SEISMIC_ROUTER_NORM_STRIDE_0);
-        }
+    // Dense lane l owns share sources 8l + 256 i .. + 7, one span of the
+    // canonical router row and of each staged row.
+#pragma unroll 4
+    for (unsigned base = 8 * lane; base < width; base += 256) {
+        float weight[8];
+        element::span<Router, 8, true>(router, expert * SEISMIC_ROUTER_STRIDE_0 + kbegin + base, weight);
 #pragma unroll
         for (unsigned row = 0; row < 8; ++row) {
             if (row < rows) {
+                float input[8];
+                element::span<Act, 8, false>(reinterpret_cast<const unsigned char *>(staged[row]), base, input);
 #pragma unroll
-                for (unsigned j = 0; j < 4; ++j) {
-                    const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + (base + j) * SEISMIC_RESIDUAL_STRIDE_1];
-                    sums[row] = seismic_fma_rn(Act::round(seismic_mul_rn(seismic_mul_rn(value, inverses[row]),
-                        scale[j])), weight[j], sums[row]);
-                }
+                for (unsigned j = 0; j < 8; ++j)
+                    sums[row] = seismic_fma_rn(input[j], weight[j], sums[row]);
             }
         }
     }
@@ -247,29 +261,35 @@ extern "C" __global__ void routed_select_select(SEISMIC_KERNEL_PARAMS) {
     int *routes = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
     float *weights = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHTS));
     const float *logits = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_LOGITS));
-    constexpr unsigned P = SEISMIC_DIM_E / 32;
+    constexpr unsigned P = (static_cast<unsigned>(SEISMIC_DIM_E) + 31) / 32;
     const unsigned lane = threadIdx.x % 32;
+    // P when 32 divides E (a constant: no excluded entries).
+    const unsigned held = select::candidates<static_cast<unsigned>(SEISMIC_DIM_E)>(lane);
     const unsigned long long row = static_cast<unsigned long long>(blockIdx.x) * SELECT_WARPS + threadIdx.x / 32;
     if (row >= SEISMIC_DIM_M)
         return;
-    // Logit column e: the sum of its partial planes in plane order (the GEMV
-    // forms plane 0 whole).
-    const unsigned long long parts = SEISMIC_DIM_M > 8 ? SEISMIC_TUNE_SPLIT : 1;
+    // Logit column e: the sum of its partial planes in plane order.
+    const unsigned long long parts = SEISMIC_TUNE_SPLIT;
     const unsigned long long plane = SEISMIC_DIM_M * SEISMIC_DIM_E;
     float score[P], ranked[P];
     int expert[P];
 #pragma unroll
     for (unsigned i = 0; i < P; ++i) {
-        expert[i] = static_cast<int>(lane + 32 * i);
-        float sum = logits[row * SEISMIC_DIM_E + lane + 32 * i];
-        for (unsigned long long p = 1; p < parts; ++p)
-            sum = seismic_add_rn(sum, logits[p * plane + row * SEISMIC_DIM_E + lane + 32 * i]);
+        expert[i] = i < held ? static_cast<int>(lane + 32 * i) : -1;
+        float sum = 0.0f;
+        if (i < held) {
+            sum = logits[row * SEISMIC_DIM_E + lane + 32 * i];
+            for (unsigned long long p = 1; p < parts; ++p)
+                sum = seismic_add_rn(sum, logits[p * plane + row * SEISMIC_DIM_E + lane + 32 * i]);
+        }
         score[i] = sum;
     }
-    select::scores<P>(static_cast<int>(SEISMIC_PARAM_SCORE), score);
+    select::scores<P>(static_cast<int>(SEISMIC_PARAM_SCORE), score, held);
 #pragma unroll
     for (unsigned i = 0; i < P; ++i)
-        ranked[i] = seismic_add_rn(score[i], bias[static_cast<unsigned long long>(expert[i]) * SEISMIC_BIAS_STRIDE_0]);
+        ranked[i] = i < held
+            ? seismic_add_rn(score[i], bias[static_cast<unsigned long long>(expert[i]) * SEISMIC_BIAS_STRIDE_0])
+            : -__int_as_float(0x7f800000);
     select::sort<P>(ranked, score, expert);
 
     float chosen[SEISMIC_DIM_K];
@@ -293,11 +313,12 @@ extern "C" __global__ void routed_select_select(SEISMIC_KERNEL_PARAMS) {
         const float scale = __uint_as_float(static_cast<unsigned>(SEISMIC_PARAM_SCALE));
         const float epsilon = __uint_as_float(static_cast<unsigned>(SEISMIC_PARAM_NORMALIZATION_EPSILON));
         for (unsigned slot = 0; slot < SEISMIC_DIM_K; ++slot) {
-            const float weight = select::normalized(normalization, chosen[slot], denominator, epsilon);
+            float weight = seismic_mul_rn(select::normalized(normalization, chosen[slot], denominator, epsilon), scale);
+            if (SEISMIC_DIM_ES != 0)
+                weight = seismic_mul_rn(
+                    weight, expert_scale[static_cast<unsigned long long>(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0]);
             routes[row * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1] = winners[slot];
-            weights[row * SEISMIC_WEIGHTS_STRIDE_0 + slot * SEISMIC_WEIGHTS_STRIDE_1] = seismic_mul_rn(
-                seismic_mul_rn(weight, scale),
-                expert_scale[static_cast<unsigned long long>(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0]);
+            weights[row * SEISMIC_WEIGHTS_STRIDE_0 + slot * SEISMIC_WEIGHTS_STRIDE_1] = weight;
         }
     }
 }

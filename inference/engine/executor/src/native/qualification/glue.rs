@@ -184,6 +184,37 @@ impl<'a> QualificationView<'a> {
         Ok(())
     }
 
+    /// The selection notice copies (token, status) rows as they are, of a
+    /// load that has one (`ProgramPlan::notices_selection`).
+    pub(super) fn qualify_selection_notice(&self, device: &Device) -> Result<(), CatalogFailure> {
+        let Some(notice) = &self.programs.notice else {
+            return Ok(());
+        };
+        let failure = |error: &dyn std::fmt::Display| {
+            qualification("selection_notice", "fixed", error.to_string())
+        };
+        let rows = [[7_i32, 0], [-1, 3]];
+        let bytes = rows
+            .iter()
+            .flatten()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let selection = Tensor::from_host(device, Element::i32(), &[2, 2], &bytes)
+            .map_err(|error| failure(&error))?;
+        let mut copied =
+            Tensor::zeros(device, Element::i32(), &[2, 2]).map_err(|error| failure(&error))?;
+        notice
+            .call(magnitude_kernels::selection_notice::Args {
+                selection: &selection,
+                notice: &mut copied,
+            })
+            .map_err(|error| failure(&error))?;
+        if copied.read_to_host().map_err(|error| failure(&error))? != bytes {
+            return Err(failure(&"the notice differs from the selection"));
+        }
+        Ok(())
+    }
+
     pub(super) fn qualify_copy_rows(
         &self,
         device: &Device,

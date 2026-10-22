@@ -183,24 +183,26 @@ kernel void routed_select_select(
     uint group [[threadgroup_position_in_grid]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint P = SEISMIC_DIM_E / 32;
+    constexpr uint P = (uint(SEISMIC_DIM_E) + 31) / 32;
     const ulong row = ulong(group) * select_simdgroups + simd;
     if (row >= SEISMIC_DIM_M)
         return;
     const int normalization = int(SEISMIC_PARAM_NORMALIZATION);
+    // P when 32 divides E (a constant: no excluded entries).
+    const uint held = select::candidates<uint(SEISMIC_DIM_E)>(lane);
     float score[P], ranked[P];
     int expert[P];
     // Every loop over a register array unrolls: a dynamically indexed array
     // lives in stack memory.
     PROJECTION_UNROLL
     for (uint i = 0; i < P; ++i) {
-        expert[i] = int(lane + 32 * i);
-        score[i] = logits[row * SEISMIC_DIM_E + lane + 32 * i];
+        expert[i] = i < held ? int(lane + 32 * i) : -1;
+        score[i] = i < held ? logits[row * SEISMIC_DIM_E + lane + 32 * i] : 0.0f;
     }
-    select::scores<P>(int(SEISMIC_PARAM_SCORE), score);
+    select::scores<P>(int(SEISMIC_PARAM_SCORE), score, held);
     PROJECTION_UNROLL
     for (uint i = 0; i < P; ++i)
-        ranked[i] = score[i] + bias[ulong(expert[i]) * SEISMIC_BIAS_STRIDE_0];
+        ranked[i] = i < held ? score[i] + bias[ulong(expert[i]) * SEISMIC_BIAS_STRIDE_0] : -INFINITY;
     select::sort<P>(ranked, score, expert);
 
     float chosen[SEISMIC_DIM_K];
@@ -234,10 +236,11 @@ kernel void routed_select_select(
         const float epsilon = as_type<float>(uint(SEISMIC_PARAM_NORMALIZATION_EPSILON));
         PROJECTION_UNROLL
         for (uint slot = 0; slot < SEISMIC_DIM_K; ++slot) {
-            const float weight = select::normalized(normalization, chosen[slot], denominator, epsilon);
+            float weight = select::normalized(normalization, chosen[slot], denominator, epsilon) * scale;
+            if (SEISMIC_DIM_ES != 0)
+                weight *= expert_scale[ulong(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0];
             routes[row * SEISMIC_ROUTES_STRIDE_0 + slot * SEISMIC_ROUTES_STRIDE_1] = winners[slot];
-            weights[row * SEISMIC_WEIGHTS_STRIDE_0 + slot * SEISMIC_WEIGHTS_STRIDE_1] =
-                weight * scale * expert_scale[ulong(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0];
+            weights[row * SEISMIC_WEIGHTS_STRIDE_0 + slot * SEISMIC_WEIGHTS_STRIDE_1] = weight;
         }
     }
 }

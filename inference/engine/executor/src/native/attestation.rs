@@ -7,13 +7,16 @@ use super::*;
 use crate::SublayerTail;
 use crate::operators::gated_delta::graph::StepForm;
 use crate::operators::routed::fused_graph::DecodeForm;
+use crate::programs::native_target_graph::TARGET_TABLE;
 use crate::{
     ExecutionPlanDraft, FeedForwardProgramSlot, HeadBinding, ImportProgramSlot, MixerProgramSlot,
     PlanError, PlannedDevice, ProgramPlan, ReadoutHead,
 };
 use magnitude_family_contracts::{ProgressivePlane, SublayerIndex, WeightScope};
 use magnitude_kernels::{
-    attention_append_dense, cluster_token_rows, draft_convolve_input, draft_convolve_residual,
+    attention_append_dense, cluster_token_rows, corrector_attention, corrector_factors,
+    corrector_features, corrector_nodes, corrector_path, corrector_rows, draft_convolve_input,
+    draft_convolve_residual,
     draft_gated_rows, draft_path_step, draft_top_k, feature_rows, import_dense, indexer_select,
     ngram_gate, ngram_inject, ngram_rows, packing_bound, place_logits_rows, post_norm_residual,
     project_rows, readout_project_rows, repack_weight, repeat_rows, selection_notice, stored_rows,
@@ -57,6 +60,9 @@ pub struct AttestedPrograms {
     pub(super) vision: Option<AttestedVision>,
     pub(super) state: AttestedState,
     pub(super) imports: Vec<(ImportProgramSlot, AttestedImport)>,
+    /// The copy of a read's selected rows for the host
+    /// (`ProgramPlan::notices_selection`).
+    pub(super) notice: Option<NativeKernel<selection_notice::Entry>>,
     invocation_workspace_bytes: u64,
     target_graphs: Option<std::sync::Arc<crate::PreparedTargetGraphs>>,
     target_readout_graphs: Option<std::sync::Arc<crate::PreparedTargetReadoutGraphs>>,
@@ -296,7 +302,9 @@ pub(crate) struct AttestedDraft {
     /// Widens a device-conditioned entry's target features to F32.
     pub widen: NativeKernel<widen_rows::Entry>,
     pub markov: Option<MarkovKernels>,
-    pub dflash2: Option<super::AttestedDflash2>,
+    pub convolved: Option<super::AttestedConvolved>,
+    pub selector: Option<super::AttestedSelector>,
+    pub corrector: Option<super::AttestedCorrector>,
 }
 
 /// Every kernel of the projector's vision program.
@@ -310,6 +318,16 @@ pub(crate) struct AttestedState {
     pub feature_copy: NativeKernel<feature_copy::Entry>,
     pub copies: Vec<(Element, NativeKernel<copy_rows::Entry>)>,
     pub conditioning: Option<NativeKernel<conditioning_overlay::Entry>>,
+}
+
+/// The entries a read of rows the device selects from an imported streamed
+/// table runs around its reader (`GatheredTable::read_selected`): the copy
+/// of its selection for the host, and the table weight's own import, which
+/// converts the rows the host landed into the table's landing slots.
+#[derive(Clone)]
+pub(crate) struct AttestedLanding {
+    pub notice: NativeKernel<selection_notice::Entry>,
+    pub import: AttestedImport,
 }
 
 /// The entries that make a weight resident: its import, and for a repacked
@@ -348,6 +366,11 @@ where
 }
 
 impl AttestedPrograms {
+    /// Graphs the programs' device has recorded for submissions so far.
+    pub(crate) fn recorded_graphs(&self) -> u64 {
+        self.owner.device().recorded_graphs()
+    }
+
     pub fn readout_choices(&self) -> &[crate::ReadoutClassChoice] {
         &self.readout_choices
     }
@@ -441,9 +464,15 @@ impl AttestedPrograms {
             )?;
             let classes =
                 crate::programs::native_shared_head::shared_head_graph_classes(limits, proposals)?;
+            let landing = self.landing(load, TARGET_TABLE)?;
             self.drafter_graphs = Some(crate::PreparedDrafterGraphs::SharedHead(Rc::new(
                 crate::programs::native_shared_head::PreparedSharedHeadGraphs::prepare(
-                    device, handles, load, &geometry, classes,
+                    device,
+                    handles,
+                    landing.as_ref(),
+                    load,
+                    &geometry,
+                    classes,
                 )
                 .map_err(|error| error.to_string())?,
             )));
@@ -485,10 +514,12 @@ impl AttestedPrograms {
                 state.span_limit(),
                 proposals,
             )?;
+            let landing = self.landing(load, TARGET_TABLE)?;
             self.drafter_graphs = Some(crate::PreparedDrafterGraphs::Head(Rc::new(
                 crate::programs::native_head::PreparedHeadGraphs::prepare(
                     device,
                     handles,
+                    landing.as_ref(),
                     load,
                     &definition.decoder,
                     head,
@@ -509,10 +540,12 @@ impl AttestedPrograms {
                 &method.block_widths(),
                 draft,
             )?;
+            let landing = self.landing(load, crate::programs::native_draft::token_table(draft))?;
             self.drafter_graphs = Some(crate::PreparedDrafterGraphs::Draft(Rc::new(
                 crate::programs::native_draft::PreparedDraftGraphs::prepare(
                     device,
                     handles,
+                    landing.as_ref(),
                     load,
                     programs.draft().ok_or("draft graphs require a draft program")?,
                     &geometry,
@@ -588,9 +621,12 @@ impl AttestedPrograms {
         limits: crate::ResourceLimits,
         workers: &seismic::Workers,
     ) -> Result<crate::PreparedTargetGraphs, String> {
+        let landing = self.landing(load, TARGET_TABLE)?;
         crate::programs::native_target_graph::PreparedTargetGraphs::prepare(
             device,
             &self.target,
+            self.notice.as_ref(),
+            landing.as_ref(),
             load,
             geometry,
             state,
@@ -678,6 +714,9 @@ impl AttestedPrograms {
         }
         bytes += bytes!(conditioning_overlay) + bytes!(feature_copy);
         bytes += bytes!(shape_rows) + bytes!(sample_rows);
+        if plan.notices_selection() {
+            bytes += bytes!(selection_notice);
+        }
         let target = plan.target();
         bytes += bytes!(embedding_rows);
         // The decoder blocks of a draft head reading target history are
@@ -826,7 +865,6 @@ impl AttestedPrograms {
             if charged_ngrams.insert(binding) {
                 bytes += bytes!(ngram_rows)
                     + bytes!(stored_rows)
-                    + bytes!(selection_notice)
                     + 2 * bytes!(project_rows)
                     + bytes!(ngram_gate)
                     + bytes!(ngram_inject);
@@ -947,16 +985,27 @@ impl AttestedPrograms {
             if draft.markov().is_some() {
                 bytes += bytes!(embedding_rows) + bytes!(dense_output);
             }
-            if let Some(binding) = draft.dflash2() {
-                let (projections, norms) = super::draft::dflash2_entries(draft, binding);
-                bytes += projections.len() as u128 * bytes!(project_rows)
-                    + norms.len() as u128 * bytes!(readout_features_rows)
-                    + bytes!(draft_convolve_input)
+            let (projections, norms) = super::draft::stage_entries(draft);
+            bytes += projections.len() as u128 * bytes!(project_rows)
+                + norms.len() as u128 * bytes!(readout_features_rows);
+            if draft.convolutions().is_some() {
+                bytes += bytes!(draft_convolve_input)
                     + bytes!(draft_convolve_residual)
-                    + bytes!(draft_gated_rows)
-                    + bytes!(draft_top_k)
-                    + 2 * bytes!(embedding_rows)
-                    + bytes!(draft_path_step);
+                    + bytes!(draft_gated_rows);
+            }
+            if draft.selector().is_some() {
+                bytes += bytes!(draft_top_k) + 2 * bytes!(embedding_rows) + bytes!(draft_path_step);
+            }
+            if let Some(corrector) = draft.corrector() {
+                bytes += bytes!(draft_top_k)
+                    + bytes!(corrector_features)
+                    + super::draft::corrector_rows_keys(corrector, draft.activation()).len()
+                        as u128
+                        * bytes!(corrector_rows)
+                    + bytes!(corrector_nodes)
+                    + bytes!(corrector_attention)
+                    + bytes!(corrector_factors)
+                    + bytes!(corrector_path);
             }
         }
         if let Some(vision) = plan.vision() {
@@ -1538,15 +1587,28 @@ impl AttestedPrograms {
                                 .ok_or_else(|| missing("draft_markov_stages", binding))
                         })
                         .transpose()?,
-                    dflash2: draft_plan
-                        .dflash2()
+                    convolved: draft_plan
+                        .convolutions()
                         .map(|binding| {
                             handles
-                                .dflash2
-                                .as_ref()
-                                .ok_or_else(|| missing("dflash2_stages", binding.selector))?
-                                .attest(draft_plan, binding)
-                                .map_err(|entry| missing("dflash2_stages", entry))
+                                .attest_convolved(draft_plan, binding)
+                                .map_err(|entry| missing("draft_convolved_stages", entry))
+                        })
+                        .transpose()?,
+                    selector: draft_plan
+                        .selector()
+                        .map(|binding| {
+                            handles
+                                .attest_selector(draft_plan, binding)
+                                .map_err(|entry| missing("draft_selector_stages", entry))
+                        })
+                        .transpose()?,
+                    corrector: draft_plan
+                        .corrector()
+                        .map(|binding| {
+                            handles
+                                .attest_corrector(draft_plan, binding)
+                                .map_err(|entry| missing("draft_corrector_stages", entry))
                         })
                         .transpose()?,
                 })
@@ -1658,6 +1720,7 @@ impl AttestedPrograms {
             vision,
             state,
             imports,
+            notice: prepared.glue.selection_notice.clone(),
             invocation_workspace_bytes,
             target_graphs: None,
             target_readout_graphs: None,
@@ -1747,8 +1810,7 @@ impl AttestedPrograms {
                 + u128::from(handles.key.invocation_workspace_bytes())
                 + u128::from(handles.value.invocation_workspace_bytes())
                 + u128::from(handles.gate.invocation_workspace_bytes())
-                + u128::from(handles.inject.invocation_workspace_bytes())
-                + u128::from(handles.notice.invocation_workspace_bytes());
+                + u128::from(handles.inject.invocation_workspace_bytes());
         }
         for handles in prepared.target.streams.values() {
             bytes += u128::from(handles.down.invocation_workspace_bytes())
@@ -1891,16 +1953,27 @@ impl AttestedPrograms {
                 bytes += u128::from(markov.embedding.invocation_workspace_bytes())
                     + u128::from(markov.projection.invocation_workspace_bytes());
             }
-            if let Some(dflash2) = &draft.dflash2 {
-                charge!(dflash2.norms.values());
-                charge!(dflash2.projections.values());
-                bytes += u128::from(dflash2.convolve_input.invocation_workspace_bytes())
-                    + u128::from(dflash2.convolve_residual.invocation_workspace_bytes())
-                    + u128::from(dflash2.gated.invocation_workspace_bytes())
-                    + u128::from(dflash2.top_k.invocation_workspace_bytes())
-                    + u128::from(dflash2.predecessor.invocation_workspace_bytes())
-                    + u128::from(dflash2.successor.invocation_workspace_bytes())
-                    + u128::from(dflash2.path.invocation_workspace_bytes());
+            charge!(draft.norms.values());
+            charge!(draft.projections.values());
+            if let Some(convolved) = &draft.convolved {
+                bytes += u128::from(convolved.convolve_input.invocation_workspace_bytes())
+                    + u128::from(convolved.convolve_residual.invocation_workspace_bytes())
+                    + u128::from(convolved.gated.invocation_workspace_bytes());
+            }
+            if let Some(selector) = &draft.selector {
+                bytes += u128::from(selector.top_k.invocation_workspace_bytes())
+                    + u128::from(selector.predecessor.invocation_workspace_bytes())
+                    + u128::from(selector.successor.invocation_workspace_bytes())
+                    + u128::from(selector.path.invocation_workspace_bytes());
+            }
+            if let Some(corrector) = &draft.corrector {
+                charge!(corrector.rows.values());
+                bytes += u128::from(corrector.top_k.invocation_workspace_bytes())
+                    + u128::from(corrector.features.invocation_workspace_bytes())
+                    + u128::from(corrector.nodes.invocation_workspace_bytes())
+                    + u128::from(corrector.attention.invocation_workspace_bytes())
+                    + u128::from(corrector.factors.invocation_workspace_bytes())
+                    + u128::from(corrector.path.invocation_workspace_bytes());
             }
         }
         if let Some(vision) = &prepared.vision {
@@ -1923,6 +1996,9 @@ impl AttestedPrograms {
             bytes += u128::from(handle.invocation_workspace_bytes());
         }
         if let Some(handle) = &prepared.glue.conditioning_overlay {
+            bytes += u128::from(handle.invocation_workspace_bytes());
+        }
+        if let Some(handle) = &prepared.glue.selection_notice {
             bytes += u128::from(handle.invocation_workspace_bytes());
         }
         for handle in [
@@ -2216,6 +2292,31 @@ impl AttestedPrograms {
             .find(|(slot, _)| *slot == requested)
             .map(|(_, handle)| handle.clone())
             .ok_or_else(|| CatalogError::native(self.backend, missing("weight_import", requested)))
+    }
+
+    /// The landing entries of the gathered table `role` of `load`; `None`
+    /// of a table without landing slots (`WeightPlan::lands_selected_rows`).
+    pub(crate) fn landing(
+        &self,
+        load: &crate::ModelLoadPlan,
+        role: magnitude_family_contracts::WeightRole,
+    ) -> Result<Option<AttestedLanding>, String> {
+        let plan = load
+            .weights()
+            .find(|weight| weight.role == role)
+            .ok_or_else(|| format!("gathered table {role:?} is not planned"))?;
+        if !plan.lands_selected_rows() {
+            return Ok(None);
+        }
+        Ok(Some(AttestedLanding {
+            notice: self
+                .notice
+                .clone()
+                .ok_or("a table with landing slots without the selection notice")?,
+            import: self
+                .import_entry(plan)
+                .map_err(|error| error.to_string())?,
+        }))
     }
 
     /// Bind one already planned semantic weight to its exact import entry.
@@ -2548,8 +2649,8 @@ impl AttestedPrograms {
                 charge!(&markov.embedding);
                 charge!(&markov.projection);
             }
-            if let Some(dflash2) = &draft.dflash2 {
-                for layer in &dflash2.layers {
+            if let Some(convolved) = &draft.convolved {
+                for layer in &convolved.layers {
                     charge!(&layer.attention_norm);
                     charge!(&layer.attention_coefficients);
                     charge!(&layer.query);
@@ -2562,15 +2663,53 @@ impl AttestedPrograms {
                     charge!(&layer.up);
                     charge!(&layer.down);
                 }
-                charge!(&dflash2.features);
-                charge!(&dflash2.hidden);
-                charge!(&dflash2.convolve_input);
-                charge!(&dflash2.convolve_residual);
-                charge!(&dflash2.gated);
-                charge!(&dflash2.top_k);
-                charge!(&dflash2.predecessor);
-                charge!(&dflash2.successor);
-                charge!(&dflash2.path);
+                charge!(&convolved.convolve_input);
+                charge!(&convolved.convolve_residual);
+                charge!(&convolved.gated);
+            }
+            if let Some(selector) = &draft.selector {
+                charge!(&selector.features);
+                charge!(&selector.hidden);
+                charge!(&selector.top_k);
+                charge!(&selector.predecessor);
+                charge!(&selector.successor);
+                charge!(&selector.path);
+            }
+            if let Some(corrector) = &draft.corrector {
+                charge!(&corrector.pass_norm);
+                charge!(&corrector.anchor_rows);
+                charge!(&corrector.top_k);
+                charge!(&corrector.features);
+                charge!(&corrector.feature_down);
+                if let Some(token) = &corrector.token {
+                    charge!(token);
+                }
+                charge!(&corrector.pass);
+                charge!(&corrector.nodes);
+                charge!(&corrector.context);
+                charge!(&corrector.context_bias);
+                charge!(&corrector.anchor_norm);
+                charge!(&corrector.attention);
+                for layer in &corrector.layers {
+                    charge!(&layer.attention_norm);
+                    charge!(&layer.attention_input);
+                    charge!(&layer.attention_output);
+                    charge!(&layer.attention_residual);
+                    charge!(&layer.mlp_norm);
+                    charge!(&layer.up);
+                    charge!(&layer.activated);
+                    charge!(&layer.down);
+                    charge!(&layer.down_residual);
+                }
+                charge!(&corrector.output_norm);
+                charge!(&corrector.factors);
+                charge!(&corrector.factor_input);
+                charge!(&corrector.factor_activated);
+                charge!(&corrector.outgoing);
+                charge!(&corrector.incoming);
+                charge!(&corrector.anchor);
+                charge!(&corrector.unit);
+                charge!(&corrector.path);
             }
         }
         if let Some(vision) = &self.vision {

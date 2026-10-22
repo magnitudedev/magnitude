@@ -60,20 +60,22 @@ pub(super) fn shape_key(sublayer: PerLayerSublayer<'_>) -> String {
 
 /// The program binding of a per-layer input sublayer over the decoder's
 /// per-layer `entry`; `lookup` resolves the planned element of a role in its
-/// scope.
+/// scope, `scalable` that of a projection bound with an accumulator-scale
+/// port (the gate's and the projection's).
 pub(crate) fn binding(
     sublayer: PerLayerSublayer<'_>,
     entry: &PerLayerEntry,
     hidden: u64,
     lookup: impl Fn(WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightKind) -> Result<crate::ScalableWeight, PlanError>,
     activation: Element,
 ) -> Result<PerLayerBinding, PlanError> {
     Ok(PerLayerBinding {
         hidden,
         layers: entry.layers,
         width: entry.width,
-        gate: lookup(WeightKind::PerLayerGate)?,
-        projection: lookup(WeightKind::PerLayerProjection)?,
+        gate: scalable(WeightKind::PerLayerGate)?.element,
+        projection: scalable(WeightKind::PerLayerProjection)?.element,
         activation,
         tail: tail(sublayer.output, &lookup)?,
     })

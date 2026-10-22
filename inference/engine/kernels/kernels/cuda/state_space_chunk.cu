@@ -37,7 +37,7 @@ __global__ void state_space_chunk_inputs(SEISMIC_KERNEL_PARAMS) {
     const u64 slot_index = versions::slot_index_of_row(in.slots, row, seismic_words_value);
     if (slot_index == SEISMIC_DIM_B)
         return;
-    const versions::Slot slot = versions::slot_of(in.slots, slot_index, seismic_words_value);
+    const Slot slot = bind(in, versions::slot_of(in.slots, slot_index, seismic_words_value));
     const int item = blockIdx.y * 256 + threadIdx.x;
     float *out = inputs + static_cast<u64>(row) * INPUT_WIDTH;
     if (item < 2 * G * N) {
@@ -148,7 +148,7 @@ __device__ __forceinline__ float reduce_scatter(float (&values)[32], int lane) {
 // state-space dual form and writes the piece's mixed outputs.
 template <int LANE_ROWS, int BLOCK_ROWS>
 __device__ __forceinline__ void advance_piece(const Operands &in, const float *inputs, const float *products,
-                                              const versions::Slot &slot, int piece, int local, int head,
+                                              const Slot &slot, int piece, int local, int head,
                                               int block_row0, int row0, Rows<LANE_ROWS> &rows,
                                               PieceShared<BLOCK_ROWS> &shared) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
@@ -263,7 +263,7 @@ __global__ void state_space_chunk_scan(SEISMIC_KERNEL_PARAMS) {
         zero_uncovered<LANE_ROWS>(in, head, row0);
         return;
     }
-    const versions::Slot slot = versions::slot_of(in.slots, blockIdx.z, seismic_words_value);
+    const Slot slot = bind(in, versions::slot_of(in.slots, blockIdx.z, seismic_words_value));
     Rows<LANE_ROWS> rows;
     load_version<LANE_ROWS>(in, slot, head, row0, threadIdx.x % 32, rows);
     publish_window(in, slot, head, blockIdx.y, gridDim.y);

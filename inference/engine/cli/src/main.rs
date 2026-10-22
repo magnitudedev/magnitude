@@ -58,7 +58,7 @@ struct Options {
 
 const USAGE: &str = "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
 [--draft DRAFT.gguf] [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
-[--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2] [--mtp-proposals N] [--draft-budget JSON|adaptive] \
+[--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2|lilicorr] [--mtp-proposals N] [--draft-budget JSON|adaptive] \
 [--kv-codec dense|affine-k8v4] [--numerical-profile JSON_FILE] [--lookahead on|off] [--telemetry URL] \
 [--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR] \
 [--tuning-budget SECONDS] [--fresh-tuning] [--tuning-trace FILE]";
@@ -134,6 +134,7 @@ fn parse() -> Result<Options, String> {
                     "dflash" => ModelMethod::DFlash,
                     "dspark" => ModelMethod::DSpark,
                     "dflash2" => ModelMethod::DFlash2,
+                    "lilicorr" => ModelMethod::LiLiCorr,
                     other => return Err(format!("unknown generation method: {other}")),
                 }
             }

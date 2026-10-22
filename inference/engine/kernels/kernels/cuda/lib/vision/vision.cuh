@@ -46,9 +46,18 @@ __device__ __forceinline__ float gelu_quick(float value) {
     return value / (1.0f + expf(-1.702f * value));
 }
 
-// The activation of `vision_linear`: 1 tanh GELU, 2 erf GELU, 3 quick GELU.
+__device__ __forceinline__ float relu_squared(float value) {
+    const float positive = fmaxf(value, 0.0f);
+    return __fmul_rn(positive, positive);
+}
+
+// The activation of `vision_linear`: 1 tanh GELU, 2 erf GELU, 3 quick GELU,
+// 4 squared ReLU.
 __device__ __forceinline__ float activate(int code, float value) {
-    return code == 1 ? gelu_tanh(value) : code == 2 ? gelu_erf(value) : gelu_quick(value);
+    return code == 1 ? gelu_tanh(value)
+         : code == 2 ? gelu_erf(value)
+         : code == 3 ? gelu_quick(value)
+                     : relu_squared(value);
 }
 
 // ---------------------------------------------------------------------------

@@ -116,6 +116,7 @@ pub(super) fn binding(
     output: &OutputForm,
     hidden: u64,
     lookup: impl Fn(WeightScope, WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightScope, WeightKind) -> Result<crate::ScalableWeight, PlanError>,
     activation: Element,
 ) -> Result<ParallelBinding, PlanError> {
     let [dense, routed] = DenseBesideRouted::scopes(sublayer);
@@ -144,18 +145,16 @@ pub(super) fn binding(
             features: branches.dense.intermediate,
             function: super::dense_ffn::activation_code(branches.dense.up.activation()),
             norm: lookup(dense, WeightKind::InputNorm)?,
-            gate: lookup(dense, WeightKind::DenseGate)?,
-            up: lookup(dense, WeightKind::DenseUp)?,
-            down: lookup(dense, WeightKind::DenseDown)?,
+            gate: scalable(dense, WeightKind::DenseGate)?.element,
+            up: scalable(dense, WeightKind::DenseUp)?.element,
+            down: scalable(dense, WeightKind::DenseDown)?.element,
             activation,
         },
-        // The parallel graph binds no scale ports: `lookup` refuses scaled
-        // weights.
         routed: routed::binding(
             branches.routed,
             hidden,
             |kind| lookup(routed, kind),
-            |kind| lookup(routed, kind).map(|element| crate::ScalableWeight { element, scale: 0 }),
+            |kind| scalable(routed, kind),
             activation,
         )?,
         norm,

@@ -33,7 +33,9 @@ use crate::{
 use magnitude_family_contracts::{
     Decoder, EmbeddingScale, ExitNorm, SublayerIndex, TapPoint, WeightKind, WeightRole, WeightScope,
 };
-use magnitude_kernels::{embedding_rows, selection_notice, stored_rows};
+use magnitude_kernels::{
+    embedding_rows, import_dense, repack_weight, selection_notice, stored_rows,
+};
 use magnitude_state::LayerRef;
 use seismic::{
     BackendName, BoundNativeGraphPlan, Device, Element, HostHeap, NativeGraphClassSlice,
@@ -954,9 +956,15 @@ impl PreparedTargetGraphs {
         .ok_or_else(|| "target binding charge overflows".into())
     }
 
+    /// `notice`: the selection notice of a load that has one; `landing`: the
+    /// landing entries of the target's token table, when it has landing
+    /// slots.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
         device: &Device,
         handles: &AttestedTarget,
+        notice: Option<&seismic::NativeKernel<selection_notice::Entry>>,
+        landing: Option<&crate::native::AttestedLanding>,
         load: &ModelLoadPlan,
         geometry: &Decoder,
         state: &StateResourcePlan,
@@ -1055,14 +1063,7 @@ impl PreparedTargetGraphs {
         let began_all = Instant::now();
         let mut sealed_graphs = 0usize;
         let notice = match notifies_selection(load) {
-            true => Some(
-                handles
-                    .blocks
-                    .iter()
-                    .find_map(|block| block.ngram.as_ref())
-                    .map(|ngram| &ngram.notice)
-                    .ok_or("a stored table without an n-gram input's kernels")?,
-            ),
+            true => Some(notice.ok_or("a stored table without the selection notice")?),
             false => None,
         };
         for &rows in &row_classes {
@@ -1072,6 +1073,7 @@ impl PreparedTargetGraphs {
                     device,
                     &handles.embedding,
                     notice,
+                    landing,
                     load,
                     geometry,
                     rows,
@@ -1456,7 +1458,7 @@ impl PreparedTargetGraphs {
                     .per_layer_entries
                     .iter()
                     .map(|(rows, graph)| {
-                        let absent_scale = seismic::Tensor::from_host(
+                        let absent = seismic::Tensor::from_host(
                             &weights.projection.tensor().device(),
                             Element::f32(),
                             &[0],
@@ -1466,8 +1468,15 @@ impl PreparedTargetGraphs {
                         let mut fixed = vec![
                             (&graph.ports.projection, weights.projection.tensor()),
                             (&graph.ports.norm, weights.norm.tensor()),
-                            (&graph.ports.absent_scale, &absent_scale),
+                            (&graph.ports.absent, &absent),
                         ];
+                        if let Some(port) = &graph.ports.projection_scale {
+                            let scale = weights
+                                .projection
+                                .scale()
+                                .ok_or("the per-layer projection has no second-level scale")?;
+                            fixed.push((port, scale));
+                        }
                         if let Some(port) = &graph.ports.projection_bound {
                             let bound = weights
                                 .projection
@@ -1907,6 +1916,9 @@ pub(crate) struct PreparedTargetEntryGraph {
     /// Of a step uploading the host's tokens in a model whose blocks read
     /// the step's token rows: where it keeps them.
     pub kept_tokens: Option<KeptTokens>,
+    /// Of a step reading selected tokens of a table with landing slots: its
+    /// landed read's ports.
+    pub landed: Option<LandedReadPorts>,
 }
 
 /// An entry graph's kept token rows (`keeps_token_rows`): the host's token
@@ -1934,6 +1946,7 @@ impl PreparedTargetEntryGraph {
         device: &Device,
         embedding: &seismic::NativeKernel<embedding_rows::Entry>,
         notice: Option<&seismic::NativeKernel<selection_notice::Entry>>,
+        landing: Option<&crate::native::AttestedLanding>,
         load: &ModelLoadPlan,
         geometry: &Decoder,
         rows: u64,
@@ -1944,6 +1957,7 @@ impl PreparedTargetEntryGraph {
             device.native_graph_with_layout(layout),
             embedding,
             notice,
+            landing.map(LandingEntries::native),
             keeps_token_rows(load),
             embedding_weight(load)?,
             geometry,
@@ -1959,9 +1973,16 @@ impl PreparedTargetEntryGraph {
             hidden: draft.hidden,
             notice: draft.notice,
             kept_tokens: draft.kept_tokens,
+            landed: draft.landed,
         })
     }
 }
+
+/// The target's token table, which the target and its draft heads embed.
+pub(crate) const TARGET_TABLE: WeightRole = WeightRole {
+    scope: WeightScope::Target,
+    kind: WeightKind::Embedding,
+};
 
 /// Whether the steps of `load` that read selected tokens notify the host of
 /// them (`EntryNotice`): its target has a stored table.
@@ -2014,6 +2035,7 @@ struct EntryGraphDraft<G> {
     hidden: WorkflowTensor,
     notice: Option<EntryNotice>,
     kept_tokens: Option<KeptTokens>,
+    landed: Option<LandedReadPorts>,
 }
 
 /// The entry graph: the step's token rows embedded. `notice` (of a model
@@ -2021,12 +2043,14 @@ struct EntryGraphDraft<G> {
 /// `keeps_tokens` (a model whose blocks read the step's token rows) the
 /// host's uploaded tokens are copied into the bound token rows
 /// (`kept_tokens`), so later graphs read a device tensor of the step's token
-/// rows whatever their source, as they read a selection.
+/// rows whatever their source, as they read a selection. Selected tokens of
+/// a table with landing slots are a landed read (`landed_read`, `landing`).
 #[allow(clippy::too_many_arguments)]
 fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     mut graph: G,
     embedding: G::Binding<'a, embedding_rows::Entry>,
     notice: Option<G::Binding<'a, selection_notice::Entry>>,
+    landing: Option<LandingEntries<'a, G>>,
     keeps_tokens: bool,
     weight: &crate::WeightPlan,
     geometry: &Decoder,
@@ -2104,18 +2128,37 @@ fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     };
     let directory = graph.port(Element::i32(), &[entries, fields])?;
     let (scale, normalize, epsilon) = embedding_transform(geometry);
-    let result = graph.enqueue::<embedding_rows::Entry>(
-        embedding,
-        &dimensions,
-        embedding_rows::WorkflowArgs {
-            table: table.tensor().into(),
-            tokens: tokens.tensor().into(),
-            directory: directory.tensor().into(),
-            scale,
-            normalize,
-            epsilon,
-        },
-    )?;
+    let embed = |graph: &mut G| {
+        graph.enqueue::<embedding_rows::Entry>(
+            embedding,
+            &dimensions,
+            embedding_rows::WorkflowArgs {
+                table: table.tensor().into(),
+                tokens: tokens.tensor().into(),
+                directory: directory.tensor().into(),
+                scale,
+                normalize,
+                epsilon,
+            },
+        )
+    };
+    let (result, landed) = match source {
+        EntryTokens::Selected if reads_landed(weight)? => {
+            let landing = landing
+                .ok_or_else(|| format!("a landed read of {:?} without its entries", weight.role))?;
+            let (result, ports) = landed_read(
+                &mut graph,
+                weight,
+                landing,
+                tokens.tensor().into(),
+                rows,
+                Some("M"),
+                embed,
+            )?;
+            (result, Some(ports))
+        }
+        _ => (embed(&mut graph)?, None),
+    };
     graph.export(&result.r1)?;
     Ok(EntryGraphDraft {
         graph,
@@ -2125,6 +2168,7 @@ fn entry_graph_topology<'a, G: GraphDraft + 'a>(
         hidden: result.r1,
         notice,
         kept_tokens,
+        landed,
     })
 }
 
@@ -2152,10 +2196,12 @@ pub(crate) fn checked_entry_graph_storage(
 ) -> Result<NativeGraphStorageBytes, GraphError> {
     let weight = embedding_weight(load)?;
     let elements = [("EW", weight.resident), ("A", activation(geometry))];
+    let landing = CheckedLandingEntries::of(load, TARGET_TABLE)?;
     let draft = entry_graph_topology(
         NativeGraphMetadata::new(backend),
         &elements,
         notifies_selection(load).then_some(&[][..]),
+        landing.as_ref().map(CheckedLandingEntries::entries),
         keeps_token_rows(load),
         weight,
         geometry,
@@ -2361,18 +2407,14 @@ impl GatheredTable {
             .clone())
     }
 
-    /// The directory of a read of rows the device selected: empty of a table
-    /// held whole, a streamed table's directory of every row's slot.
-    pub(crate) fn selected<G: GraphDraft>(
+    /// The table's directory of every row's slot, declared by the graph's
+    /// first read of it.
+    fn directory<G: GraphDraft>(
         &mut self,
         graph: &mut G,
         load: &ModelLoadPlan,
         ports: &mut Vec<(WeightPort, NativePort)>,
-        constants: &mut Vec<GraphConstant>,
     ) -> Result<RowDirectory, GraphError> {
-        if self.directory_shape[0] == 0 {
-            return self.by_rows(graph, constants);
-        }
         if let Some(directory) = &self.directory {
             return Ok(directory.clone());
         }
@@ -2386,6 +2428,281 @@ impl GatheredTable {
                 shape: self.directory_shape,
             })
             .clone())
+    }
+
+    /// A read of rows the device selected: `reader`, given the directory it
+    /// addresses the table through, enqueues it. A table held whole is read
+    /// under the empty directory. An imported streamed table is read through
+    /// its directory with the read landed (`DeviceTable::read_selected`):
+    /// ahead of the reader the step copies `selection` (`[rows, 2]`, the
+    /// selected rows) for the host and waits at the table's gate, then the
+    /// table weight's own import converts the landing staging into the
+    /// landing slots; after it the read signals. The landed read's ports,
+    /// which each run binds, are returned with the reader's value. `class`
+    /// names the graph-class dimension `rows` is, when the graph's classes
+    /// vary it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn read_selected<'a, G: GraphDraft + 'a, T>(
+        &mut self,
+        graph: &mut G,
+        load: &ModelLoadPlan,
+        ports: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+        landing: Option<LandingEntries<'a, G>>,
+        selection: seismic::WorkflowTensorRef<'_>,
+        rows: u64,
+        class: Option<&'static str>,
+        reader: impl FnOnce(&mut G, &RowDirectory) -> Result<T, GraphError>,
+    ) -> Result<(T, Option<LandedReadPorts>), GraphError> {
+        let plan = load
+            .weights()
+            .find(|plan| plan.role == self.role)
+            .ok_or_else(|| format!("missing planned weight {:?}", self.role))?;
+        if !reads_landed(plan)? {
+            let directory = self.by_rows(graph, constants)?;
+            return Ok((reader(graph, &directory)?, None));
+        }
+        let landing =
+            landing.ok_or_else(|| format!("a landed read of {:?} without its entries", self.role))?;
+        let directory = self.directory(graph, load, ports)?;
+        let (value, ports) = landed_read(graph, plan, landing, selection, rows, class, |graph| {
+            reader(graph, &directory)
+        })?;
+        Ok((value, Some(ports)))
+    }
+}
+
+/// Whether a read of rows the device selected from `plan`'s table is
+/// landed: a table held whole is read as it is, and an imported streamed
+/// table only through its landing slots.
+fn reads_landed(plan: &crate::WeightPlan) -> Result<bool, GraphError> {
+    match (plan.streamed.is_some(), plan.lands_selected_rows()) {
+        (false, _) => Ok(false),
+        (true, true) => Ok(true),
+        (true, false) => Err(format!(
+            "planned weight {:?} has no landing slots for a read of selected rows",
+            plan.role
+        )
+        .into()),
+    }
+}
+
+/// The read `reader` enqueues of `rows` rows the device selected
+/// (`selection`, `[rows, 2]`) from the imported table `plan`, landed
+/// (`DeviceTable::read_selected`): ahead of it the selection's copy for the
+/// host, its signal and the table's gate, then the table weight's own
+/// import of the landing staging into the landing slots; after it the
+/// read's signal. `class` names the graph-class dimension `rows` is, when
+/// the graph's classes vary it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn landed_read<'a, G: GraphDraft + 'a, T>(
+    graph: &mut G,
+    plan: &crate::WeightPlan,
+    landing: LandingEntries<'a, G>,
+    selection: seismic::WorkflowTensorRef<'_>,
+    rows: u64,
+    class: Option<&'static str>,
+    reader: impl FnOnce(&mut G) -> Result<T, GraphError>,
+) -> Result<(T, LandedReadPorts), GraphError> {
+    let port = |graph: &mut G, element, extents: &[u64], axis| match class {
+        Some(dimension) => graph.port_with_class_extent(element, extents, axis, dimension),
+        None => graph.port(element, extents),
+    };
+    let mut notice = port(graph, Element::i32(), &[rows, 2], 0)?;
+    graph.enqueue::<selection_notice::Entry>(
+        landing.notice,
+        &[("M", rows)],
+        selection_notice::WorkflowArgs {
+            selection,
+            notice: notice.tensor_mut().into(),
+        },
+    )?;
+    let noticed = graph.timeline(TimelineNode::Signal);
+    let gate = graph.timeline(TimelineNode::Wait);
+    // The import's `[B, N, K]` view of the landing rows.
+    let width = plan.shape[1];
+    let staging = port(graph, plan.upload, &[1, rows, width], 1)?;
+    let landed = port(graph, plan.resident, &[1, rows, width], 1)?;
+    let dimensions = [("B", 1), ("N", rows), ("K", width)];
+    let converted = match landing.import {
+        LandingImport::Dense(entry) => {
+            graph
+                .enqueue::<import_dense::Entry>(
+                    entry,
+                    &dimensions,
+                    import_dense::WorkflowArgs {
+                        source: staging.tensor().into(),
+                    },
+                )?
+                .value
+        }
+        LandingImport::Repack(entry) => {
+            graph
+                .enqueue::<repack_weight::Entry>(
+                    entry,
+                    &dimensions,
+                    repack_weight::WorkflowArgs {
+                        source: staging.tensor().into(),
+                    },
+                )?
+                .value
+        }
+    };
+    graph.store(&converted, &landed)?;
+    let value = reader(graph)?;
+    let read = graph.timeline(TimelineNode::Signal);
+    Ok((
+        value,
+        LandedReadPorts {
+            rows,
+            notice,
+            noticed,
+            gate,
+            staging,
+            landing: landed,
+            read,
+        },
+    ))
+}
+
+/// The entries of a landed read (`GatheredTable::read_selected`): the copy
+/// of its selection for the host, and its table weight's own import, which
+/// converts the rows the host landed as stored.
+pub(crate) struct LandingEntries<'a, G: GraphDraft + 'a> {
+    pub notice: G::Binding<'a, selection_notice::Entry>,
+    pub import: LandingImport<'a, G>,
+}
+
+pub(crate) enum LandingImport<'a, G: GraphDraft + 'a> {
+    Dense(G::Binding<'a, import_dense::Entry>),
+    Repack(G::Binding<'a, repack_weight::Entry>),
+}
+
+impl<'a, G: GraphDraft + 'a> Clone for LandingEntries<'a, G> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, G: GraphDraft + 'a> Copy for LandingEntries<'a, G> {}
+
+impl<'a, G: GraphDraft + 'a> Clone for LandingImport<'a, G> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, G: GraphDraft + 'a> Copy for LandingImport<'a, G> {}
+
+impl<'a> LandingEntries<'a, seismic::NativeGraph> {
+    /// The attested entries of a table's landed reads.
+    pub(crate) fn native(landing: &'a crate::native::AttestedLanding) -> Self {
+        Self {
+            notice: &landing.notice,
+            import: match &landing.import {
+                crate::native::AttestedImport::Dense(entry) => LandingImport::Dense(entry),
+                crate::native::AttestedImport::Repack { repack, .. } => {
+                    LandingImport::Repack(repack)
+                }
+            },
+        }
+    }
+}
+
+/// The checked entries of the landed reads of the table `role`, for the
+/// metadata graphs that certify a family's storage: `None` of a table
+/// without landing slots.
+pub(crate) struct CheckedLandingEntries {
+    import: crate::ImportProgramSlot,
+    elements: [(&'static str, Element); 2],
+}
+
+impl CheckedLandingEntries {
+    pub(crate) fn of(load: &ModelLoadPlan, role: WeightRole) -> Result<Option<Self>, String> {
+        let plan = load
+            .weights()
+            .find(|plan| plan.role == role)
+            .ok_or_else(|| format!("missing planned weight {role:?}"))?;
+        Ok(plan.lands_selected_rows().then(|| Self {
+            import: crate::ImportProgramSlot::of(plan),
+            elements: [("E", plan.upload), ("U", plan.resident)],
+        }))
+    }
+
+    pub(crate) fn entries(&self) -> LandingEntries<'_, NativeGraphMetadata> {
+        LandingEntries {
+            notice: &[],
+            import: match self.import {
+                crate::ImportProgramSlot::Dense { .. } => LandingImport::Dense(&self.elements[..]),
+                crate::ImportProgramSlot::Repack { .. } => {
+                    LandingImport::Repack(&self.elements[..])
+                }
+            },
+        }
+    }
+}
+
+/// The ports a landed read binds each run (`DeviceTable::read_selected`):
+/// the notice its step copies its selection into and the signal after it,
+/// the gate it waits at, the landing staging and landing slots its
+/// conversion reads and writes (`[1, rows, ..]`), and its read signal.
+#[derive(Clone)]
+pub(crate) struct LandedReadPorts {
+    /// The rows the read names (`DeviceTable::read_selected`).
+    pub rows: u64,
+    pub notice: NativePort,
+    pub noticed: NativeTimelinePort,
+    pub gate: NativeTimelinePort,
+    pub staging: NativePort,
+    pub landing: NativePort,
+    pub read: NativeTimelinePort,
+}
+
+impl LandedReadPorts {
+    /// Queue the read a run makes of `table` and bind its ports.
+    pub(crate) fn queue(
+        &self,
+        table: &crate::device_table::ResidentTable,
+        bindings: &mut seismic::NativeGraphBindings,
+    ) -> Result<crate::device_table::SelectedRead, String> {
+        let read = table
+            .device()
+            .ok_or("a landed read of a table held whole")?
+            .read_selected(self.rows)?;
+        self.bind(bindings, &read)?;
+        Ok(read)
+    }
+
+    fn bind(
+        &self,
+        bindings: &mut seismic::NativeGraphBindings,
+        read: &crate::device_table::SelectedRead,
+    ) -> Result<(), String> {
+        let text = |error: &dyn std::fmt::Display| format!("landed read: {error}");
+        // The import's view of a run of whole rows: one matrix of them.
+        let view = |tensor: &seismic::Tensor| {
+            let extents = std::iter::once(1)
+                .chain(tensor.extents().iter().copied())
+                .collect::<Vec<_>>();
+            tensor.reshape(&extents).map_err(|error| text(&error))
+        };
+        bindings.set(&self.notice, &read.notice).map_err(|error| text(&error))?;
+        bindings
+            .set(&self.staging, &view(&read.staging)?)
+            .map_err(|error| text(&error))?;
+        bindings
+            .set(&self.landing, &view(&read.landing)?)
+            .map_err(|error| text(&error))?;
+        for (port, timeline) in [
+            (self.noticed, &read.noticed),
+            (self.gate, &read.gate),
+            (self.read, &read.read),
+        ] {
+            bindings
+                .set_timeline(port, timeline, read.value)
+                .map_err(|error| text(&error))?;
+        }
+        Ok(())
     }
 }
 
@@ -2409,7 +2726,6 @@ pub(crate) fn stored_table_rows<'a, G: GraphDraft + 'a>(
     table: &mut GatheredTable,
     load: &ModelLoadPlan,
     ports: &mut Vec<(WeightPort, NativePort)>,
-    constants: &mut Vec<GraphConstant>,
     rows: &WorkflowTensor,
     count: u64,
 ) -> Result<(WorkflowTensor, StoredReadPorts), GraphError> {
@@ -2421,7 +2737,7 @@ pub(crate) fn stored_table_rows<'a, G: GraphDraft + 'a>(
         return Err(format!("planned weight {:?} is not a stored table", table.role).into());
     }
     let width = plan.shape[1];
-    let directory = table.selected(graph, load, ports, constants)?;
+    let directory = table.directory(graph, load, ports)?;
     let gate = graph.timeline(TimelineNode::Wait);
     let decoded = graph
         .enqueue(
@@ -2463,24 +2779,103 @@ pub(crate) fn weight<G: GraphDraft>(
     .map(|port| port.tensor().clone())
 }
 
-/// A projection weight and the tensor its entry's accumulator-scale port
-/// binds: its resident second-level scale, else the graph's absent operand
-/// (`GraphConstant::absent`: zero extent, never read), and that port's
-/// static extent.
+/// A projection weight and its second-level scale.
 pub(crate) struct ScaledWeight {
     pub weight: WorkflowTensor,
-    pub scale: WorkflowTensor,
+    pub scale: WeightScale,
+}
+
+/// A weight's second-level scale as an entry's accumulator-scale port binds
+/// it (`[S] f32`): its resident scale and the S values it holds (1 per
+/// tensor), or the graph's absent operand at S = 0 where the weight has
+/// none (`GraphConstant::absent`: never read).
+#[derive(Clone)]
+pub(crate) struct WeightScale {
+    pub tensor: WorkflowTensor,
     pub extent: u64,
 }
 
-impl ScaledWeight {
-    /// A weight bound with the absent scale `absent` (zero extent).
-    pub(crate) fn unscaled(weight: WorkflowTensor, absent: WorkflowTensor) -> Self {
-        Self {
-            weight,
-            scale: absent,
-            extent: 0,
+impl WeightScale {
+    /// The second-level scale of the planned weight of `role`.
+    pub(crate) fn planned<G: GraphDraft>(
+        graph: &mut G,
+        load: &ModelLoadPlan,
+        role: WeightRole,
+        ports: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Self, GraphError> {
+        let (port, extent) = weight_scale_port(graph, load, role, ports, constants)?;
+        Ok(Self {
+            tensor: port.tensor().clone(),
+            extent,
+        })
+    }
+
+    /// The per-expert second-level scales of the stacked expert weight of
+    /// `role` (a routed entry's per-expert scale port: E values), or the
+    /// absent operand where it has none.
+    pub(crate) fn per_expert<G: GraphDraft>(
+        graph: &mut G,
+        load: &ModelLoadPlan,
+        role: WeightRole,
+        ports: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Self, GraphError> {
+        match planned_scale_extent(load, role)? {
+            0 => Self::absent(graph, constants),
+            extent => Ok(Self {
+                tensor: weight_port(graph, load, role, WeightPart::Scale, ports)?
+                    .tensor()
+                    .clone(),
+                extent,
+            }),
         }
+    }
+
+    /// No scale: the graph's absent operand.
+    pub(crate) fn absent<G: GraphDraft>(
+        graph: &mut G,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Self, GraphError> {
+        Ok(Self {
+            tensor: GraphConstant::absent(graph, constants)?.tensor().clone(),
+            extent: 0,
+        })
+    }
+}
+
+/// The operands a projection entry binds beside a weight's values: its
+/// second-level scale and its packing bound.
+#[derive(Clone)]
+pub(crate) struct WeightOperands {
+    pub scale: WeightScale,
+    pub bound: PackingBound,
+}
+
+impl WeightOperands {
+    /// The operands of the planned weight of `role`.
+    pub(crate) fn planned<G: GraphDraft>(
+        graph: &mut G,
+        load: &ModelLoadPlan,
+        role: WeightRole,
+        ports: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Self, GraphError> {
+        Ok(Self {
+            scale: WeightScale::planned(graph, load, role, ports, constants)?,
+            bound: PackingBound::planned(graph, load, role, ports, constants)?,
+        })
+    }
+
+    /// Neither: an absent segment's.
+    pub(crate) fn absent<G: GraphDraft>(
+        graph: &mut G,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Self, GraphError> {
+        Ok(Self {
+            scale: WeightScale::absent(graph, constants)?,
+            bound: PackingBound::absent(graph, constants)?,
+        })
     }
 }
 
@@ -2531,11 +2926,11 @@ impl PackingBound {
     }
 }
 
-/// A projection weight an entry with a packed form binds: its scaled operand
-/// and its packing bound.
+/// A projection weight an entry with a packed form binds: its values and
+/// their operands (second-level scale and packing bound).
 pub(crate) struct PackedWeight {
-    pub scaled: ScaledWeight,
-    pub bound: PackingBound,
+    pub weight: WorkflowTensor,
+    pub operands: WeightOperands,
 }
 
 /// Register one scope-owned readout representation and its scale lifetime.
@@ -2597,16 +2992,17 @@ pub(crate) fn scaled_weight<G: GraphDraft>(
     ports: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<ScaledWeight, GraphError> {
-    let (weight, scale, extent) = scaled_weight_ports(graph, load, scope, kind, ports, constants)?;
+    let role = WeightRole { scope, kind };
     Ok(ScaledWeight {
-        weight: weight.tensor().clone(),
-        scale: scale.tensor().clone(),
-        extent,
+        weight: weight_port(graph, load, role, WeightPart::Values, ports)?
+            .tensor()
+            .clone(),
+        scale: WeightScale::planned(graph, load, role, ports, constants)?,
     })
 }
 
-/// [`scaled_weight`] of an entry with a packed form, with the weight's
-/// packing bound.
+/// The weight of an entry with a packed form: its values, second-level scale
+/// and packing bound.
 pub(crate) fn packed_weight<G: GraphDraft>(
     graph: &mut G,
     load: &ModelLoadPlan,
@@ -2615,9 +3011,12 @@ pub(crate) fn packed_weight<G: GraphDraft>(
     ports: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<PackedWeight, GraphError> {
+    let role = WeightRole { scope, kind };
     Ok(PackedWeight {
-        scaled: scaled_weight(graph, load, scope, kind, ports, constants)?,
-        bound: PackingBound::planned(graph, load, WeightRole { scope, kind }, ports, constants)?,
+        weight: weight_port(graph, load, role, WeightPart::Values, ports)?
+            .tensor()
+            .clone(),
+        operands: WeightOperands::planned(graph, load, role, ports, constants)?,
     })
 }
 
@@ -2652,23 +3051,6 @@ pub(crate) fn weight_scale_port<G: GraphDraft>(
         _ => return Err(format!("{role:?} has a per-matrix scale at a per-tensor port").into()),
     };
     Ok((scale, extent))
-}
-
-/// The port of a weight's resident second-level scale (`[1] f32`, or
-/// `[E] f32` for a stacked expert weight), or `None` when it has none.
-pub(crate) fn resident_scale<G: GraphDraft>(
-    graph: &mut G,
-    load: &ModelLoadPlan,
-    scope: WeightScope,
-    kind: WeightKind,
-    ports: &mut Vec<(WeightPort, NativePort)>,
-) -> Result<Option<WorkflowTensor>, GraphError> {
-    let role = WeightRole { scope, kind };
-    match planned_scale_extent(load, role)? {
-        0 => Ok(None),
-        _ => weight_port(graph, load, role, WeightPart::Scale, ports)
-            .map(|port| Some(port.tensor().clone())),
-    }
 }
 
 fn planned_scale_extent(load: &ModelLoadPlan, role: WeightRole) -> Result<u64, String> {
@@ -3200,6 +3582,7 @@ fn certify_target_family(
     let mut family = CheckedGraphFamilyResources::new();
     let mut entries = BTreeMap::new();
     let largest_rows = *row_classes.last().expect("row classes are nonempty");
+    let landing = CheckedLandingEntries::of(load, TARGET_TABLE)?;
     for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
         let weight = embedding_weight(load)?;
         let elements = [("EW", weight.resident), ("A", activation(geometry))];
@@ -3207,6 +3590,7 @@ fn certify_target_family(
             NativeGraphMetadata::new_template(backend),
             &elements,
             notifies_selection(load).then_some(&[][..]),
+            landing.as_ref().map(CheckedLandingEntries::entries),
             keeps_token_rows(load),
             weight,
             geometry,
@@ -3529,6 +3913,7 @@ mod resource_template_tests {
             },
             resident_layout(ExecutionPath::Native, backend),
         )
+        .and_then(|load| load.with_selected_reads(&definition, PlannedMethod::Plain, limits))
         .unwrap();
         let state = ResourcePlanner::state_plan(
             &definition,
@@ -3621,6 +4006,7 @@ mod resource_template_tests {
             },
             resident_layout(ExecutionPath::Native, backend),
         )
+        .and_then(|load| load.with_selected_reads(&definition, PlannedMethod::Plain, limits))
         .unwrap();
         let plan = load.program_plan(&definition, codec).unwrap();
         let index = plan
@@ -3827,6 +4213,9 @@ mod resource_template_tests {
                     },
                     resident_layout(ExecutionPath::Native, backend),
                 )
+                .and_then(|load| {
+                    load.with_selected_reads(&definition, PlannedMethod::Plain, limits)
+                })
                 .unwrap();
                 let state = ResourcePlanner::state_plan(
                     &definition,
@@ -3890,10 +4279,12 @@ mod resource_template_tests {
                     .map(|rows| rows as u64)
                 {
                     for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
+                        let landing = CheckedLandingEntries::of(&load, TARGET_TABLE).unwrap();
                         let graph = entry_graph_topology(
                             NativeGraphMetadata::new(backend),
                             &elements,
                             notifies_selection(&load).then_some(&[][..]),
+                            landing.as_ref().map(CheckedLandingEntries::entries),
                             keeps_token_rows(&load),
                             weight,
                             geometry,

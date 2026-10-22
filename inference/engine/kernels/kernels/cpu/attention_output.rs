@@ -2,8 +2,9 @@
 // `attention_output_stage` stages each row's Q gated heads as one F32 row of
 // Q * W values in scratch, one work item per row. `attention_output_rows`
 // gives each work item ROWS output weight rows, which it projects against
-// every staged row: result = the hidden row plus the projection published to
-// A, as the portable body adds it.
+// every staged row: result = the hidden row plus the projection (times the
+// weight's second-level scale, where it has one) published to A, as the
+// portable body adds it.
 
 use lib::core::activation;
 use lib::projection::projection;
@@ -34,6 +35,7 @@ fn attention_output_stage<L: Isa, E: Elements>(
         };
         projection::quantize(staged, q8);
     }
+    projection::operand_row(&[&cx.arg_output_weight()], staged);
 }
 
 fn attention_output_rows<L: Isa, E: Elements>(
@@ -50,6 +52,7 @@ fn attention_output_rows<L: Isa, E: Elements>(
     let rows = projection::item_rows(group[0], cx.param_rows(), d);
     let (hidden, result, inject) = (cx.arg_hidden(), cx.result_0(), cx.arg_inject());
     let (streams, injected) = (cx.dim_sn() as usize, cx.dim_in() != 0);
+    let output_scale = if cx.dim_os() == 0 { 1.0 } else { cx.arg_output_scale().get([0]) };
     // SAFETY: the stage launch wrote every row before this launch.
     let staged = unsafe { cx.scratch_staged().slice::<f32>(0, m * k) };
     let blocks = seismic::cpu::quant::blocks(k);
@@ -72,7 +75,7 @@ fn attention_output_rows<L: Isa, E: Elements>(
                 // SAFETY: each work item writes its own columns of every row.
                 let out = unsafe { result.span_mut([row, first], rows.len()) };
                 for ((target, hidden), projected) in out.iter_mut().zip(source).zip(projected) {
-                    let y = activation::publish::<E::A>(*projected);
+                    let y = activation::publish::<E::A>(output_scale * *projected);
                     *target = match factor {
                         None => hidden + y,
                         Some(factor) => hidden + y * factor,

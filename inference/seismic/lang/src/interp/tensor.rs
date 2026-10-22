@@ -436,6 +436,7 @@ fn decode(
             DecodeStep::ConvertToF32 { from, .. } => {
                 super::scalar::cast(DType::F32, temporaries[recipe.ordinal(*from)])
             }
+            DecodeStep::Constant { value, .. } => *value,
             DecodeStep::Multiply { left, right, .. } => super::scalar::binary(
                 crate::syntax::ast::BinaryOp::Mul,
                 temporaries[recipe.ordinal(*left)],

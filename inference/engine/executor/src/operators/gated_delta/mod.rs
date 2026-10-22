@@ -61,10 +61,13 @@ pub(super) fn shape_key(delta: &GatedDelta) -> String {
 }
 
 /// The program binding of a gated delta sublayer; `lookup` resolves the
-/// planned element of a role in its scope.
+/// planned element of a role in its scope, `scalable` that of a projection
+/// bound with an accumulator-scale port (the output's, `attention_output`;
+/// `gated_delta_project` has none, so its weights take `lookup`).
 pub(super) fn binding(
     delta: &GatedDelta,
     lookup: impl Fn(WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightKind) -> Result<crate::ScalableWeight, PlanError>,
     activation: Element,
 ) -> Result<RecurrentBinding, PlanError> {
     Ok(RecurrentBinding {
@@ -78,7 +81,7 @@ pub(super) fn binding(
         alpha: lookup(WeightKind::RecurrentAlpha)?,
         beta: lookup(WeightKind::RecurrentBeta)?,
         recurrent_norm: lookup(WeightKind::RecurrentNorm)?,
-        output: lookup(WeightKind::RecurrentOutput)?,
+        output: scalable(WeightKind::RecurrentOutput)?.element,
         activation,
     })
 }

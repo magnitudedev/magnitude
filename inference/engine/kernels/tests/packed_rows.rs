@@ -49,7 +49,7 @@ fn packed_stages_on(device: &seismic::Device) {
                     "H" | "D" | "W" | "NM" => 32,
                     "NK" | "NV" | "Q" | "PT" | "SN" => 1,
                     "IN" => 0,
-                    "QB" | "ZB" | "OB" => 0,
+                    "QB" | "ZB" | "OB" | "OS" => 0,
                     _ => panic!("unexpected static {name}"),
                 };
                 statics.with_static(name.clone(), value)
@@ -224,6 +224,7 @@ fn packed_stages_on(device: &seismic::Device) {
         inject: &no_inject(&device, hidden.extents()[0]),
         gated: &gated,
         output_weight: &zero_weight,
+        output_scale: &tensor(&device, &[0], &[]),
         output_bound: &tensor(&device, &[0], &[]),
     })
     .unwrap()

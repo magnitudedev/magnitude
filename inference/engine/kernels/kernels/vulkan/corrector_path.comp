@@ -1,0 +1,50 @@
+// corrector_path: one workgroup of 256 invocations per slot walks its
+// candidate lattice greedily for P mask rows: each candidate's score
+// incoming · (anchor, or the previous row's selected outgoing row) is reduced
+// over the workgroup in candidate order, and the first highest-scoring
+// candidate is selected. Mirrors `cpu/corrector_path.rs`.
+#include <seismic/element.glsl>
+#include "lib/core/reduce.glsl"
+
+// Shared: one partial per subgroup (reduce_group_sum at float 0).
+void corrector_path() {
+    const uint64_t candidates = SEISMIC_PTR(SEISMIC_BUFFER_CANDIDATES);
+    const uint64_t incoming = SEISMIC_PTR(SEISMIC_BUFFER_INCOMING);
+    const uint64_t outgoing = SEISMIC_PTR(SEISMIC_BUFFER_OUTGOING);
+    const uint64_t anchor = SEISMIC_PTR(SEISMIC_BUFFER_ANCHOR);
+    const uint64_t selection = SEISMIC_PTR(SEISMIC_BUFFER_SELECTION);
+    const uint64_t slot = gl_WorkGroupID.x;
+    const uint64_t lane = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
+    uint64_t previous = 0ul;
+    for (uint64_t step = 0ul; step < SEISMIC_DIM_P; ++step) {
+        // The other side of every score: the anchor (step 0) or the previous
+        // row's selected outgoing row.
+        const uint64_t other = step == 0ul
+            ? anchor + slot * SEISMIC_ANCHOR_STRIDE_0 * 4ul
+            : outgoing + (slot * SEISMIC_OUTGOING_STRIDE_0 + (step - 1ul) * SEISMIC_OUTGOING_STRIDE_1
+                + previous * SEISMIC_OUTGOING_STRIDE_2) * 4ul;
+        const uint64_t other_stride = step == 0ul ? SEISMIC_ANCHOR_STRIDE_1 : SEISMIC_OUTGOING_STRIDE_3;
+        float best = -uintBitsToFloat(0x7f800000u);
+        uint64_t chosen = 0ul;
+        for (uint64_t candidate = 0ul; candidate < SEISMIC_DIM_K; ++candidate) {
+            const uint64_t row = incoming + (slot * SEISMIC_INCOMING_STRIDE_0 + step * SEISMIC_INCOMING_STRIDE_1
+                + candidate * SEISMIC_INCOMING_STRIDE_2) * 4ul;
+            float partial = 0.0;
+            for (uint64_t f = lane; f < SEISMIC_DIM_F; f += threads)
+                partial = seismic_fma_rn(element_f32_at(row + f * SEISMIC_INCOMING_STRIDE_3 * 4ul),
+                    element_f32_at(other + f * other_stride * 4ul), partial);
+            const float score = reduce_group_sum(partial, 0u);
+            if (score > best) {
+                best = score;
+                chosen = candidate;
+            }
+        }
+        previous = chosen;
+        if (lane == 0ul) {
+            const uint64_t at = (step * SEISMIC_SELECTION_STRIDE_0 + slot * SEISMIC_SELECTION_STRIDE_1) * 4ul;
+            element_i32_put(selection + at, element_i32_at(candidates + (slot * SEISMIC_CANDIDATES_STRIDE_0
+                + step * SEISMIC_CANDIDATES_STRIDE_1 + chosen * SEISMIC_CANDIDATES_STRIDE_2) * 4ul));
+            element_i32_put(selection + at + SEISMIC_SELECTION_STRIDE_2 * 4ul, 0);
+        }
+    }
+}

@@ -26,10 +26,22 @@ typedef element::Act activation;
         projection::scale_factor(gate_scale, SEISMIC_DIM_GS, 0, 0), 1.0f);              \
     projection::Weights<packets::W0> w{gate_weight, KERNEL_W0_LAYOUT(k), k}
 
+// The gate weight's operand rows (the rounded rows, or NVFP4 operands),
+// which `stage` writes and every other launch reads.
+constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
+
 #ifdef SEISMIC_FORMING_PER_LAYER_GATE_STAGE
 kernel void per_layer_gate_stage(PER_LAYER_GATE_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
+    if constexpr (NVFP4) {
+        PROJECTION_NORMALIZE_SHARED(maxima);
+        // The hidden rows rounded to A (one part, no norm).
+        const projection::Summed<activation, activation, projection::AllRows, 1> source{hidden,
+            SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, nullptr, 0, 0.0f, uint(SEISMIC_DIM_D), {}};
+        projection::operands<true>::form<256>(source, item, rounded, uint(SEISMIC_DIM_D), maxima, thread_index);
+        return;
+    }
     device typename activation::storage *row =
         reinterpret_cast<device typename activation::storage *>(rounded) + ulong(item) * SEISMIC_DIM_D;
     for (uint i = thread_index; i < uint(SEISMIC_DIM_D); i += 256u)

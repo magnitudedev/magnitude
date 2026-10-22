@@ -1,0 +1,343 @@
+# LiLiCorr's candidate corrector (`CandidateCorrector`): the entries a
+# separate draft's corrector composes with the decoder's projection
+# (`project_rows`), norm (`readout_features_rows`), gather (`embedding_rows`)
+# and top-k (`draft_top_k`) entries. A block of a drafting slot has J mask
+# rows; each keeps its K best draft logits in descending order, and its
+# candidate k is node j * K + k of the block. Slot s's nodes are rows
+# (s * J + j) * K + k.
+#
+# Numerics: node rows and projections are F32; rows a projection reads are
+# rounded to the activation element A once.
+
+
+# Each proposing row's per-candidate features (its candidates' log
+# probability lp under the row's full softmax, probability exp(lp),
+# lp - lp of the best candidate, rank / (K - 1) (0 when K = 1) and whether it
+# is the best), layer-normed over the five with weight and bias, then
+# projected into the corrector width: silu(up · norm(features) + up_bias),
+# rounded to A. `unary` holds each row's K candidate logits in descending
+# order (`draft_top_k`).
+fn corrector_features[M, V, K, H](logits: &tensor[M, V] f32, unary: &tensor[M, K] f32,
+    norm_weight: &tensor[5] f32, norm_bias: &tensor[5] f32, up_weight: &tensor[H, 5] f32,
+    up_bias: &tensor[H] f32, epsilon: f32) -> tensor[M * K, H] A:
+    let mut result = tensor[M * K, H] A
+    parallel for row in 0..M:
+        let maximum = reduce(logits[row], 0, max)
+        let total = reduce(exp(logits[row] - maximum), 0, sum)
+        let normalizer = maximum + log(total)
+        parallel for rank in 0..K:
+            let mut features = tensor[5] f32
+            let lp = unary[row, rank] - normalizer
+            features[0] = lp
+            features[1] = exp(lp)
+            features[2] = unary[row, rank] - unary[row, 0]
+            features[3] = 0.0
+            if K > 1:
+                features[3] = f32(rank) / f32(K - 1)
+            features[4] = 0.0
+            if rank == 0:
+                features[4] = 1.0
+            let mean = reduce(features, 0, sum) / 5.0
+            let centered = features - mean
+            let inverse = rsqrt(reduce(centered * centered, 0, sum) / 5.0 + epsilon)
+            let normed = centered * inverse * norm_weight + norm_bias
+            parallel for column in 0..H:
+                let mut value = up_bias[column]
+                for feature in 0..5:
+                    value = fma(up_weight[column, feature], normed[feature], value)
+                result[row * K + rank, column] = value / (1.0 + exp(-value))
+    return result
+
+# GPU: one threadgroup of 256 threads per proposing row reduces its softmax
+# normalizer, then forms its K candidates' features and their H outputs.
+native corrector_features for metal from "metal/corrector_features.metal":
+    static (V, K, H)
+    launch corrector_features:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native corrector_features for cuda from "cuda/corrector_features.cu":
+    static (V, K, H)
+    launch corrector_features:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native corrector_features for vulkan from "vulkan/corrector_features.comp":
+    static (V, K, H)
+    launch corrector_features:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (K * 5 * 4 + 128)
+
+# CPU: one work item per proposing row.
+native corrector_features for cpu from "cpu/corrector_features.rs":
+    static (V, K, H)
+    launch corrector_features:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (H * 4)
+
+
+# One F32 row op after a projection, for each of the M rows of N values:
+#   form 0: values + bias, plus the R residual rows (R <= 1);
+#   form 1: silu(values + bias);
+#   form 2: (values + bias) / max(|values + bias|, epsilon), unit length.
+# The result is published to Y.
+fn corrector_rows[M, N, R](values: &tensor[M, N] f32, bias: &tensor[N] f32,
+    residual: &tensor[R, M, N] f32, form: i32, epsilon: f32) -> tensor[M, N] Y
+    where R >= 0:
+    let mut result = tensor[M, N] Y
+    parallel for row in 0..M:
+        let biased = values[row] + bias
+        let mut out = biased
+        if form == 1:
+            out = biased / (1.0 + exp(-biased))
+        if form == 2:
+            out = biased / max(sqrt(reduce(biased * biased, 0, sum)), epsilon)
+        for residual_row in 0..R:
+            out = out + residual[residual_row, row]
+        result[row] = out
+    return result
+
+# GPU: one threadgroup of 256 threads per row (the unit length's reduction).
+native corrector_rows for metal from "metal/corrector_rows.metal":
+    static (N, R)
+    where R <= 1
+    launch corrector_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native corrector_rows for cuda from "cuda/corrector_rows.cu":
+    static (N, R)
+    where R <= 1
+    launch corrector_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native corrector_rows for vulkan from "vulkan/corrector_rows.comp":
+    static (N, R)
+    where R <= 1
+    launch corrector_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+
+# CPU: one work item per row.
+native corrector_rows for cpu from "cpu/corrector_rows.rs":
+    static (N, R)
+    where R <= 1
+    launch corrector_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (N * 4)
+
+
+# The corrector's node rows of S slots (J mask rows of K candidates each):
+# node (s, j, k) sums its token row (plus the TB token bias rows, TB <= 1),
+# its proposing row's pass row and pass bias, its feature row and feature
+# bias, slot embedding row j and rank embedding row k.
+fn corrector_nodes[S, J, K, H, TB](token: &tensor[S, J, K, H] f32, token_bias: &tensor[TB, H] f32,
+    pass: &tensor[S, J, H] f32, pass_bias: &tensor[H] f32,
+    feature: &tensor[S, J, K, H] f32, feature_bias: &tensor[H] f32,
+    slot: &tensor[J, H] f32, rank: &tensor[K, H] f32) -> tensor[S, J, K, H] f32
+    where TB >= 0:
+    let mut result = tensor[S, J, K, H] f32
+    parallel for row in 0..S:
+        parallel for mask in 0..J:
+            parallel for candidate in 0..K:
+                let mut value = token[row, mask, candidate] + pass[row, mask] + pass_bias + feature[row, mask, candidate] + feature_bias + slot[mask] + rank[candidate]
+                for bias_row in 0..TB:
+                    value = value + token_bias[bias_row]
+                result[row, mask, candidate] = value
+    return result
+
+# GPU: one thread per element (Vulkan: a grid-stride loop, the x grid capped
+# at the 65535-group floor).
+native corrector_nodes for metal from "metal/corrector_nodes.metal":
+    static (J, K, H, TB)
+    where TB <= 1
+    launch corrector_nodes:
+        threadgroups (ceil_div(S * J * K * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native corrector_nodes for cuda from "cuda/corrector_nodes.cu":
+    static (J, K, H, TB)
+    where TB <= 1
+    launch corrector_nodes:
+        threadgroups (ceil_div(S * J * K * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native corrector_nodes for vulkan from "vulkan/corrector_nodes.comp":
+    static (J, K, H, TB)
+    where TB <= 1
+    launch corrector_nodes:
+        threadgroups (min(ceil_div(S * J * K * H, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per node row.
+native corrector_nodes for cpu from "cpu/corrector_nodes.rs":
+    static (J, K, H, TB)
+    where TB <= 1
+    launch corrector_nodes:
+        threadgroups (S * J * K, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+
+# Every node of a block attends every node of the block per head with an
+# additive bias. A node's projected row holds every query, then every key,
+# then every value, head-major ([3, NH, W]); with its input bias added, head
+# h's scores are q · k / sqrt(W) + bias[h, query, key]. The attended heads
+# are published to A, head-major.
+fn corrector_attention[S, N, NH, W](qkv: &tensor[S, N, 3, NH, W] f32,
+    input_bias: &tensor[3, NH, W] f32, bias: &tensor[NH, N, N] f32) -> tensor[S, N, NH, W] A:
+    let mut result = tensor[S, N, NH, W] A
+    let scale = rsqrt(f32(W))
+    parallel for block in 0..S:
+        parallel for query in 0..N:
+            parallel for head in 0..NH:
+                let q = qkv[block, query, 0, head] + input_bias[0, head]
+                let mut scores = tensor[N] f32
+                for key in 0..N:
+                    let k = qkv[block, key, 1, head] + input_bias[1, head]
+                    scores[key] = reduce(q * k, 0, sum) * scale + bias[head, query, key]
+                let maximum = reduce(scores, 0, max)
+                let weights = exp(scores - maximum)
+                let total = reduce(weights, 0, sum)
+                let mut out = tensor[W] f32
+                for column in 0..W:
+                    out[column] = 0.0
+                for key in 0..N:
+                    let v = qkv[block, key, 2, head] + input_bias[2, head]
+                    out = fma(weights[key], v, out)
+                result[block, query, head] = out / total
+    return result
+
+# GPU: one threadgroup of 256 threads per (node, head) scores the block's
+# keys, then accumulates the head's columns.
+native corrector_attention for metal from "metal/corrector_attention.metal":
+    static (N, NH, W)
+    launch corrector_attention:
+        threadgroups (S * N, NH, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (N * 4 + 64)
+
+native corrector_attention for cuda from "cuda/corrector_attention.cu":
+    static (N, NH, W)
+    launch corrector_attention:
+        threadgroups (S * N, NH, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (N * 4 + 64)
+
+native corrector_attention for vulkan from "vulkan/corrector_attention.comp":
+    static (N, NH, W)
+    launch corrector_attention:
+        threadgroups (S * N, NH, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (N * 4 + 128)
+
+# CPU: one work item per (node, head).
+native corrector_attention for cpu from "cpu/corrector_attention.rs":
+    static (N, NH, W)
+    launch corrector_attention:
+        threadgroups (S * N, NH, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((N + 2 * W) * 4)
+
+
+# A factor projection's input of every node: its output-normed row x and its
+# block's anchor state a, joined as [x ; a ; x · a] and rounded to A.
+fn corrector_factors[S, N, H](nodes: &tensor[S, N, H] A, anchor: &tensor[S, H] A)
+    -> tensor[S, N, 3, H] A:
+    let mut result = tensor[S, N, 3, H] A
+    parallel for block in 0..S:
+        parallel for node in 0..N:
+            let x = f32(nodes[block, node])
+            let a = f32(anchor[block])
+            result[block, node, 0] = x
+            result[block, node, 1] = a
+            result[block, node, 2] = x * a
+    return result
+
+# GPU: one thread per element of the joined rows (Vulkan: a grid-stride
+# loop, the x grid capped at the 65535-group floor).
+native corrector_factors for metal from "metal/corrector_factors.metal":
+    static (N, H)
+    launch corrector_factors:
+        threadgroups (ceil_div(S * N * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native corrector_factors for cuda from "cuda/corrector_factors.cu":
+    static (N, H)
+    launch corrector_factors:
+        threadgroups (ceil_div(S * N * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native corrector_factors for vulkan from "vulkan/corrector_factors.comp":
+    static (N, H)
+    launch corrector_factors:
+        threadgroups (min(ceil_div(S * N * H, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per node.
+native corrector_factors for cpu from "cpu/corrector_factors.rs":
+    static (N, H)
+    launch corrector_factors:
+        threadgroups (S * N, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (2 * H * 4)
+
+
+# The greedy walk of each slot's candidate lattice for its first P mask
+# rows: row 0 selects the candidate c maximizing incoming[c] · anchor, row
+# j > 0 the candidate c maximizing incoming[c] · outgoing[p] for row j − 1's
+# selection p (the first on ties). Proposal j of slot s is selection
+# [j, s]: (token, 0). The corrector's positive logit scale multiplies every
+# score and changes no selection.
+fn corrector_path[S, J, K, F, P](candidates: &tensor[S, J, K, 2] i32,
+    incoming: &tensor[S, J, K, F] f32, outgoing: &tensor[S, J, K, F] f32,
+    anchor: &tensor[S, F] f32, selection: &mut tensor[P, S, 2] i32)
+    where P >= 1 and P <= J:
+    parallel for block in 0..S:
+        let mut previous = i32(0)
+        for step in 0..P:
+            let mut best = -inf
+            let mut chosen = i32(0)
+            for candidate in 0..K:
+                let mut score = f32(0.0)
+                if step == 0:
+                    score = reduce(incoming[block, step, candidate] * anchor[block], 0, sum)
+                else:
+                    score = reduce(incoming[block, step, candidate] * outgoing[block, step - 1, previous], 0, sum)
+                if score > best:
+                    best = score
+                    chosen = i32(candidate)
+            previous = chosen
+            selection[step, block, 0] = candidates[block, step, chosen, 0]
+            selection[step, block, 1] = 0
+
+# GPU: one threadgroup of 256 threads per slot reduces each candidate's
+# score in order. CPU: one work item per slot.
+native corrector_path for metal from "metal/corrector_path.metal":
+    static (J, K, F)
+    launch corrector_path:
+        threadgroups (S, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native corrector_path for cuda from "cuda/corrector_path.cu":
+    static (J, K, F)
+    launch corrector_path:
+        threadgroups (S, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native corrector_path for vulkan from "vulkan/corrector_path.comp":
+    static (J, K, F)
+    launch corrector_path:
+        threadgroups (S, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+
+native corrector_path for cpu from "cpu/corrector_path.rs":
+    static (J, K, F)
+    launch corrector_path:
+        threadgroups (S, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

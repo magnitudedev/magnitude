@@ -9,7 +9,7 @@ use super::{
     },
     native_target_graph::{BoundTargetGraphs, EntryTokens, TokenRow},
 };
-use crate::device_table::SelectedRead;
+use crate::device_table::{SelectedRead, SubmittedRead};
 use crate::host_tables::HostTableError;
 use crate::stored_table::{NoticeStep, StepRows, StoredTable};
 use crate::operators::block::{BlockControlPorts, BlockStatePorts};
@@ -123,6 +123,10 @@ struct StepSubmitter {
     /// submission, then of the submitted runs.
     pending_reads: Vec<StoredRead>,
     reads: Vec<StoredRead>,
+    /// The landed reads of the runs queued since the last submission, then
+    /// of the submitted runs.
+    pending_landed: Vec<SelectedRead>,
+    landed: Vec<SubmittedRead>,
 }
 
 /// A run's read of a stored table: the table and the step it queued there.
@@ -149,6 +153,8 @@ impl StepSubmitter {
             completions: Vec::new(),
             pending_reads: Vec::new(),
             reads: Vec::new(),
+            pending_landed: Vec::new(),
+            landed: Vec::new(),
         }
     }
 
@@ -157,8 +163,14 @@ impl StepSubmitter {
         self.pending_reads.push(StoredRead { table, value });
     }
 
+    /// The next run queued makes the landed read `read`.
+    fn lands(&mut self, read: SelectedRead) {
+        self.pending_landed.push(read);
+    }
+
     /// After a failure, once the submitted runs completed: the stored-table
-    /// steps of runs never submitted read nothing.
+    /// steps and the landed reads (dropped unsubmitted) of runs never
+    /// submitted read nothing.
     fn abandon_unsubmitted(self) {
         for read in self.pending_reads {
             let _ = read.table.abandon(read.value);
@@ -185,6 +197,8 @@ impl StepSubmitter {
         if !sequence.is_empty() {
             self.completions.push(sequence.submit().map_err(device)?);
             self.reads.append(&mut self.pending_reads);
+            self.landed
+                .extend(self.pending_landed.drain(..).map(SelectedRead::submitted));
         }
         Ok(())
     }
@@ -254,23 +268,26 @@ pub struct TargetOutput {
     pub boundary: Option<crate::FeatureRef>,
     pub readout: Option<TargetReadoutGraphResult>,
     pub commits: CommitSpan,
-    /// The step's read of the table rows the device selected its tokens
-    /// for; `None` of a step of the host's tokens.
-    pub selected_rows: Option<SelectedRead>,
+    /// The step's landed reads of the table rows the device selected its
+    /// tokens for (`DeviceTable::read_selected`); none of a step of the
+    /// host's tokens or of a table held whole.
+    pub landed_reads: Vec<SubmittedRead>,
     /// The step's reads of stored tables (`StoredTable`).
     pub stored_reads: Vec<StoredRead>,
 }
 
 impl TargetOutput {
-    /// Whether a step queued ahead of the device's selection found every
-    /// device table row it read for `token`, the token then selected: a
-    /// token's embedding row is the token. (A stored table's rows are those
-    /// the host wrote before the step's gate opened, the selected token's;
-    /// a slot whose rows could not be read fails, `table_read_failure`.)
-    pub fn found_selected(&self, token: u32) -> bool {
-        self.selected_rows
-            .as_ref()
-            .is_none_or(|rows| rows.found(u64::from(token)))
+    /// The step completed: its landed reads bring the rows they landed into
+    /// slots of their own (`SubmittedRead::complete`). Why one could not
+    /// land its rows: every slot of the step then read other rows, and its
+    /// outputs are not to be used.
+    pub fn complete_landed_reads(&mut self) -> Option<crate::TableReadError> {
+        std::mem::take(&mut self.landed_reads)
+            .into_iter()
+            .map(SubmittedRead::complete)
+            .fold(None, |failure, outcome| {
+                failure.or(outcome.err().map(|detail| crate::TableReadError { detail }))
+            })
     }
 
     /// Why a stored table's rows batch slot `slot` named could not be read,
@@ -299,7 +316,7 @@ struct QueuedStep {
     readout: Option<TargetReadoutGraphResult>,
     commits: CommitSpan,
     completions: Vec<NativeGraphCompletion>,
-    selected_rows: Option<SelectedRead>,
+    landed_reads: Vec<SubmittedRead>,
     stored_reads: Vec<StoredRead>,
 }
 
@@ -921,11 +938,6 @@ impl NativeTargetProgram {
         graph_workspace: &mut TargetGraphWorkspaceLease,
         graph_outputs: &mut [TargetGraphOutputLease; 2],
     ) -> Result<QueuedStep, SubmitError> {
-        // Device-selected tokens name rows of the embedding table, which
-        // the device may not hold of a streamed one: the step's claim asks
-        // (`TargetOutput::found_selected`).
-        let selected_rows = matches!(state.tokens(), TargetTokens::Selected(_))
-            .then(|| self.graphs.embedding.read_selected());
         let mut submitter = StepSubmitter::new(&self.device);
         let queued = self
             .queue_graphs(
@@ -942,7 +954,7 @@ impl NativeTargetProgram {
                 readout,
                 commits,
                 completions: submitter.completions,
-                selected_rows,
+                landed_reads: submitter.landed,
                 stored_reads: submitter.reads,
             }),
             Err(error) => {
@@ -1025,6 +1037,13 @@ impl NativeTargetProgram {
                     .set_timeline(ports.signal, &step.timeline, step.value)
                     .map_err(device)?;
                 notice = Some(Arc::new(step));
+            }
+            // Selected tokens of a table with landing slots: a landed read.
+            if let Some(ports) = &entry.landed {
+                let read = ports
+                    .queue(&self.graphs.embedding, &mut bindings)
+                    .map_err(invalid)?;
+                submitter.lands(read);
             }
             let ready = active
                 .attach(
@@ -1674,7 +1693,7 @@ impl TargetProgram for NativeTargetProgram {
                 boundary,
                 readout: queued.readout,
                 commits: queued.commits,
-                selected_rows: queued.selected_rows,
+                landed_reads: queued.landed_reads,
                 stored_reads: queued.stored_reads,
             },
         ))

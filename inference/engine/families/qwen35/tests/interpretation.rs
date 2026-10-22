@@ -298,6 +298,7 @@ fn projector() -> Directory {
         scalar("clip.vision.patch_size", Scalar::Unsigned(2)),
         scalar("clip.vision.spatial_merge_size", Scalar::Unsigned(2)),
         scalar("clip.vision.image_size", Scalar::Unsigned(4)),
+        // Features of the decoder's width (`embedding_length`).
         scalar("clip.vision.projection_dim", Scalar::Unsigned(8)),
         scalar(
             "clip.vision.attention.layer_norm_epsilon",

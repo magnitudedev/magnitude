@@ -620,7 +620,20 @@ impl Lattice {
                             matches!(row_plane.content, RowPlaneContent::Codes { .. })
                         })
                     });
+                    // A carried grid layout's entries hold their indices and
+                    // signs below the carried bit, and one bit of a
+                    // coefficient code each above it.
+                    let carried = rows.and_then(|layout| layout.carried());
                     let runs = match rows {
+                        Some(_) if ordinal == 0 && carried.is_some() => vec![Run {
+                            first: 0,
+                            bits: carried.unwrap().1,
+                        }],
+                        Some(_) if carried.is_some_and(|(plane, _)| plane as usize == ordinal) => {
+                            (0..plane.entry_bits)
+                                .map(|first| Run { first, bits: 1 })
+                                .collect()
+                        }
                         Some(layout) if ordinal == 0 && sliced => {
                             let mut runs: Vec<Run> = layout
                                 .planes
@@ -630,7 +643,8 @@ impl Lattice {
                                         Some(Run { first: shift, bits })
                                     }
                                     RowPlaneContent::Grids { .. }
-                                    | RowPlaneContent::Groups { .. } => None,
+                                    | RowPlaneContent::Groups { .. }
+                                    | RowPlaneContent::Records { .. } => None,
                                 })
                                 .collect();
                             runs.sort_by_key(|run| run.first);

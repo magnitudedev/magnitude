@@ -27,7 +27,8 @@ pub(crate) mod vulkan;
 pub(crate) enum Dialect {
     /// MSL, with the device's feature macros.
     Metal(MetalFeatures),
-    Cuda,
+    /// CUDA C++, with the device's fact macros.
+    Cuda(CudaFeatures),
     /// GLSL 4.60 compute for Vulkan 1.3, with the device's feature macros.
     /// Vulkan is not built on macOS; its prefix still renders in tests there.
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
@@ -60,11 +61,38 @@ fn metal_header(features: MetalFeatures) -> String {
     header
 }
 
+/// The CUDA device facts a native source reads as `SEISMIC_<NAME>`, from the
+/// opened device's facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CudaFeatures {
+    /// Streaming multiprocessors (`SEISMIC_MULTIPROCESSORS`): a kernel that
+    /// states its grid sizes its blocks' residency to the waves they fill.
+    pub(crate) multiprocessors: u32,
+}
+
+impl CudaFeatures {
+    /// The facts a source renders at without an opened device (formation
+    /// coverage, a kernel's identity): a source reads the multiprocessor
+    /// count only as a constant, which no preprocessor group tests, so one
+    /// count renders every group the same way as any other.
+    pub(crate) const UNOPENED: Self = Self { multiprocessors: 48 };
+}
+
+/// The helpers and the device fact macros.
+fn cuda_header(features: CudaFeatures) -> String {
+    let mut header = String::from(CUDA_HELPERS);
+    header.push_str(&format!(
+        "#define SEISMIC_MULTIPROCESSORS {}\n",
+        features.multiprocessors
+    ));
+    header
+}
+
 /// A 64-bit constant in the dialect's syntax.
 fn literal(dialect: Dialect, value: u64) -> String {
     match dialect {
         Dialect::Metal(_) => format!("((ulong){value})"),
-        Dialect::Cuda => format!("((unsigned long long){value})"),
+        Dialect::Cuda(_) => format!("((unsigned long long){value})"),
         #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
         Dialect::Vulkan(_) => format!("uint64_t({value}ul)"),
     }
@@ -310,7 +338,7 @@ fn render_source_with(
     let geometry = static_geometry(logical, specialization);
     let mut prefix = match dialect {
         Dialect::Metal(features) => metal_header(features),
-        Dialect::Cuda => String::from(CUDA_HELPERS),
+        Dialect::Cuda(features) => cuda_header(features),
         #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
         Dialect::Vulkan(features) => vulkan::header(features),
     };
@@ -515,7 +543,7 @@ fn render_source_with(
         "#define SEISMIC_BUFFER_SCALAR_RESULTS {}\n",
         buffer + 1
     ));
-    if dialect == Dialect::Cuda {
+    if matches!(dialect, Dialect::Cuda(_)) {
         prefix.push_str(&format!(
             "struct seismic_words_t {{ unsigned long long w[{}]; }};\n#define seismic_words (seismic_words_value.w)\n",
             word.max(1)
@@ -662,14 +690,26 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
     // own table's names; and as `SEISMIC_REPRESENTATION_<NAME>` through the
     // tensor's prefix (`<prefix>()`), which reaches it by expansion alone, so
     // a library can evaluate it in `#if` (glslang pastes no tokens there).
+    // `<prefix>()` names the representation whose rows a library addresses:
+    // a packed tensor in its packet layout has no rows (no `_ROW_STRIDE_BYTES`),
+    // so it names `SEISMIC_REPRESENTATION_<NAME>_PACKET` instead.
+    let name = native_macro(info.representation);
+    let rows = match info.kind {
+        registry::RepresentationKind::Packed(_) => format!("{name}_PACKET"),
+        _ => name.clone(),
+    };
     out.push_str(&format!(
-        "#define {prefix}_REPRESENTATION_{name} 1\n#define {prefix}_REPRESENTATION {name}\n#define {prefix}() SEISMIC_REPRESENTATION_{name}\n",
-        name = native_macro(info.representation)
+        "#define {prefix}_REPRESENTATION_{name} 1\n#define {prefix}_REPRESENTATION {name}\n#define {prefix}() SEISMIC_REPRESENTATION_{rows}\n"
     ));
     out.push_str(&format!(
         "#define {prefix}_DECODED_{} 1\n",
         native_macro(info.decoded.name())
     ));
+    // The operand recipe of products over the representation, as
+    // `operands(W)` gives it to declarations.
+    if info.operands == registry::OperandRecipe::Nvfp4Rows {
+        out.push_str(&format!("#define {prefix}_OPERANDS_NVFP4 1\n"));
+    }
     match &info.kind {
         registry::RepresentationKind::Dense(dtype) => {
             out.push_str(&format!("#define {prefix}_KIND_DENSE 1\n"));
@@ -706,8 +746,24 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
                     registry::RowPlaneContent::Codes { shift, bits } => out.push_str(&format!(
                         "#define {plane_prefix}_CODE_SHIFT {shift}\n#define {plane_prefix}_CODE_BITS {bits}\n"
                     )),
-                    registry::RowPlaneContent::Grids { bits } => {
-                        out.push_str(&format!("#define {plane_prefix}_CODE_BITS {bits}\n"))
+                    registry::RowPlaneContent::Grids { bits, .. }
+                    | registry::RowPlaneContent::Records { bits, .. } => {
+                        out.push_str(&format!("#define {plane_prefix}_CODE_BITS {bits}\n"));
+                        // A records tile's factors follow every group's
+                        // entries (`PackedRowLayout::record_byte`).
+                        if matches!(plane.content, registry::RowPlaneContent::Records { .. }) {
+                            out.push_str(&format!(
+                                "#define {plane_prefix}_ENTRY_BYTES {}\n#define {plane_prefix}_FACTORS_OFFSET ({prefix}_ROW_GROUPS * {})\n",
+                                rows.record_entry_bytes(),
+                                rows.record_entry_bytes()
+                            ));
+                        }
+                        // The entry bit carrying the coefficient codes.
+                        if let Some((_, carried)) = rows.carried() {
+                            out.push_str(&format!(
+                                "#define {plane_prefix}_CARRIED_BIT {carried}\n"
+                            ));
+                        }
                     }
                     registry::RowPlaneContent::Groups { .. } => {}
                 }
@@ -965,7 +1021,7 @@ mod tests {
             assert!(source.contains(line), "missing {line:?}");
         }
         assert!(!source.contains("SEISMIC_X_PACKET_SIZE"));
-        let mma = render(Dialect::Cuda, "q8g32s@mma16");
+        let mma = render(CUDA, "q8g32s@mma16");
         assert!(mma.contains("#define SEISMIC_X_LAYOUT_MMA16 1\n"));
         assert!(mma.contains("#define SEISMIC_X_TILE_ROWS 16\n"));
         assert!(mma.contains("#define SEISMIC_X_MMA_KBLOCK 64\n"));
@@ -1101,7 +1157,7 @@ mod tests {
         assert!(source.contains("#define SEISMIC_RESULT_0_EXTENT_0 ((ulong)1)\n"));
         assert!(source.contains("#define SEISMIC_RESULT_0_STRIDE_0 ((ulong)1)\n"));
         let fixed = render_with(
-            Dialect::Cuda,
+            CUDA,
             "f32",
             NativeSpecialization::new()
                 .with_static("K", 64)
@@ -1313,10 +1369,13 @@ void probe() {
         }
     }
 
+    const CUDA: Dialect = Dialect::Cuda(CudaFeatures::UNOPENED);
+
     #[test]
     fn cuda_prefix_declares_kernel_parameters_and_helpers() {
-        let source = render(Dialect::Cuda, "f32");
+        let source = render(CUDA, "f32");
         assert!(source.contains("seismic_bf16_to_f32"));
+        assert!(source.contains("#define SEISMIC_MULTIPROCESSORS 48\n"));
         assert!(!source.contains("#include"));
         // Two dimensions, x (rank 2) and the result (rank 1): 2 + 4 + 2 words.
         assert!(source.contains("struct seismic_words_t { unsigned long long w[8]; };\n"));

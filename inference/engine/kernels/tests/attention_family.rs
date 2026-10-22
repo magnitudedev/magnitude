@@ -98,6 +98,8 @@ struct Case {
     query_norm: Vec<f32>,
     key_norm: Vec<f32>,
     value_norm: Vec<f32>,
+    /// One sink logit per query head (`SK = 1`), or none (`SK = 0`).
+    sinks: Vec<f32>,
     components: Vec<i32>,
     frequencies: Vec<f32>,
     amplitudes: Vec<f32>,
@@ -187,6 +189,7 @@ impl Case {
             query_norm: (0..w).map(|i| 0.6 + (i % 7) as f32 * 0.1).collect(),
             key_norm: (0..w).map(|i| 1.3 - (i % 5) as f32 * 0.1).collect(),
             value_norm: vec![1.0; w],
+            sinks: Vec::new(),
             // Three M-RoPE axes over the pairs (axis p % 3), a rotary base of
             // 1e6, and the amplitude on every pair.
             components: (0..form.p).map(|pair| (pair % 3) as i32).collect(),
@@ -209,6 +212,21 @@ impl Case {
             epsilon: 1.0e-6,
             scale,
         }
+    }
+
+    /// This case with one sink logit per query head: from well below to well
+    /// above the heads' scores, so some sinks dominate their softmax.
+    fn with_sinks(mut self, seed: u64) -> Self {
+        let mut noise = Noise(seed);
+        self.sinks = (0..self.form.heads())
+            .map(|_| noise.next() * 6.0 + 1.0)
+            .collect();
+        self
+    }
+
+    /// The sink rows (`SK`).
+    fn sink_rows(&self) -> usize {
+        usize::from(!self.sinks.is_empty())
     }
 
     /// The portable `head_rotary` (or `head_norm` with `rotate` false) of one
@@ -328,7 +346,12 @@ impl Case {
                     .iter()
                     .map(|score| (score - maximum).exp())
                     .collect::<Vec<_>>();
-                let denominator = weights.iter().sum::<f64>().max(1e-30);
+                // A sink's logit weighs in the denominator only.
+                let sink = self
+                    .sinks
+                    .get(head)
+                    .map_or(0.0, |sink| (f64::from(*sink) - maximum).exp());
+                let denominator = (weights.iter().sum::<f64>() + sink).max(1e-30);
                 for column in 0..w {
                     let attended = entries
                         .iter()
@@ -447,6 +470,7 @@ fn check_host_model(entry: &str, case: &Case) {
         tensor(DType::F32, vec![n, w], rows(&case.query_norm, n)),
         tensor(DType::F32, vec![n, w], rows(&case.key_norm, n)),
         tensor(DType::F32, vec![nv, w], rows(&case.value_norm, nv)),
+        tensor(DType::F32, vec![case.sink_rows(), heads], floats(&case.sinks)),
         tensor(DType::I32, vec![form.p], ints(&case.components)),
         tensor(DType::F32, vec![form.p], floats(&case.frequencies)),
         tensor(DType::F32, vec![form.p], floats(&case.amplitudes)),
@@ -465,10 +489,10 @@ fn check_host_model(entry: &str, case: &Case) {
     // (BR = 1) after the destinations.
     let prefill = entry == "attention_prefill";
     if prefill {
-        args.insert(14, tensor(DType::I32, vec![0, 1], Vec::new()));
-        args.insert(14, tensor(DType::U32, vec![m, 0], Vec::new()));
+        args.insert(15, tensor(DType::I32, vec![0, 1], Vec::new()));
+        args.insert(15, tensor(DType::U32, vec![m, 0], Vec::new()));
     }
-    let planes = if prefill { 16 } else { 14 };
+    let planes = if prefill { 17 } else { 15 };
     let outcome = interpreter.run(&args).unwrap();
     if let SourceTermination::Failed(failure) = outcome.termination() {
         panic!("{entry} portable body failed: {failure}");
@@ -580,6 +604,7 @@ struct Bound {
     query_norm: Tensor,
     key_norm: Tensor,
     value_norm: Tensor,
+    sinks: Tensor,
     components: Tensor,
     frequencies: Tensor,
     amplitudes: Tensor,
@@ -659,6 +684,7 @@ impl Bound {
             query_norm: norm(&case.query_norm, n),
             key_norm: norm(&case.key_norm, n),
             value_norm: norm(&case.value_norm, nv),
+            sinks: f32_tensor(device, &[case.sink_rows(), heads], &case.sinks),
             components: i32_tensor(device, &[form.p], &case.components),
             frequencies: f32_tensor(device, &[form.p], &case.frequencies),
             amplitudes: f32_tensor(device, &[form.p], &case.amplitudes),
@@ -675,8 +701,9 @@ impl Bound {
     }
 }
 
-/// The statics of `form` on `device` (CPU fixes only its declared ones).
-fn statics(device: &Device, form: Form) -> NativeSpecialization {
+/// The statics of `form` with `sinks` sink rows on `device` (CPU fixes only
+/// its declared ones).
+fn statics(device: &Device, form: Form, sinks: usize) -> NativeSpecialization {
     let common = [
         ("P", form.p),
         ("S", form.s),
@@ -685,6 +712,7 @@ fn statics(device: &Device, form: Form) -> NativeSpecialization {
         ("F", usize::from(form.fresh)),
         ("N", usize::from(form.norm)),
         ("NV", usize::from(form.value_norm)),
+        ("SK", sinks),
     ];
     let gpu = [("KV", form.kv), ("G", form.g)];
     let base = common
@@ -1005,6 +1033,7 @@ fn run(
                     query_norm: &bound.query_norm,
                     key_norm: &bound.key_norm,
                     value_norm: &bound.value_norm,
+                    sinks: &bound.sinks,
                     rotary_components: &bound.components,
                     rotary_frequencies: &bound.frequencies,
                     rotary_amplitudes: &bound.amplitudes,
@@ -1094,7 +1123,7 @@ fn check_natives(name: &str, decode: bool, case: &Case, rejections: &[BackendNam
         for config in configurations(&device, decode, case.form) {
             let specialization = config
                 .iter()
-                .fold(statics(&device, case.form), |s, (n, v)| {
+                .fold(statics(&device, case.form, case.sink_rows()), |s, (n, v)| {
                     s.with_param(*n, *v)
                 });
             let label = format!("{name} {:?} {config:?}", device.backend());
@@ -1373,6 +1402,50 @@ fn portable_cases() -> Vec<(&'static str, bool, Case, &'static [BackendName])> {
             Case::new(DRAFT, 64, block_rows(16, 23), 16, 1.0, 0.1767767, 19),
             &[],
         ),
+        // Sinks: a row without keys (the padding decode row) still attends
+        // to zero.
+        (
+            "qwen sinks decode",
+            true,
+            Case::new(
+                QWEN_SMALL,
+                64,
+                decode_rows(5),
+                16,
+                1.0,
+                1.0 / (32f32).sqrt(),
+                20,
+            )
+            .with_sinks(40),
+            &[],
+        ),
+        (
+            "draft sinks decode",
+            true,
+            Case::new(DRAFT, 48, block_rows(4, 21), 16, 1.0, 0.1767767, 21).with_sinks(41),
+            &[],
+        ),
+        (
+            "draft sinks prefill",
+            false,
+            Case::new(DRAFT, 64, block_rows(16, 23), 16, 1.0, 0.1767767, 22).with_sinks(42),
+            &[],
+        ),
+        (
+            "window sinks prefill",
+            false,
+            Case::new(
+                HEAD_SOFTPLUS,
+                160,
+                window_rows(20, 30, 8),
+                16,
+                1.3466,
+                0.125,
+                23,
+            )
+            .with_sinks(43),
+            &[],
+        ),
     ]
 }
 
@@ -1604,8 +1677,61 @@ fn wide_cases() -> Vec<(&'static str, bool, Case, &'static [BackendName])> {
             ),
             &[],
         ),
+        // Sinks over wide heads and split key partitions (the merges).
+        (
+            "wide g8 sinks decode",
+            true,
+            Case::new(WIDE_G8, 320, decode_rows(260), 128, 1.0, 1.0, 50).with_sinks(60),
+            &[],
+        ),
+        (
+            "wide g8 sinks long prefill",
+            false,
+            Case::new(
+                WIDE_G8,
+                700,
+                window_rows(20, 600, 1000),
+                128,
+                1.0,
+                0.0441942,
+                51,
+            )
+            .with_sinks(61),
+            &[],
+        ),
+        // A Nemotron 3.5 Bolt draft block: 32 query heads over 2 kv heads,
+        // whole blocks over a long history.
+        (
+            "bolt draft sinks decode",
+            true,
+            Case::new(BOLT_DRAFT, 700, block_rows(8, 600), 128, 1.0, 0.0883883, 52)
+                .with_sinks(62),
+            &[],
+        ),
+        (
+            "bolt draft sinks prefill",
+            false,
+            Case::new(BOLT_DRAFT, 700, block_rows(16, 600), 128, 1.0, 0.0883883, 53)
+                .with_sinks(63),
+            &[],
+        ),
     ]
 }
+
+/// A Nemotron 3.5 Bolt LiLiCorr draft layer: G = 16, W = 128, full rotation,
+/// q/k norms, ungated, with per-head sinks.
+const BOLT_DRAFT: Form = Form {
+    kv: 2,
+    g: 16,
+    p: 64,
+    s: 0,
+    interleaved: false,
+    separate: 0,
+    softplus: false,
+    fresh: true,
+    norm: true,
+    value_norm: false,
+};
 
 #[test]
 fn wide_natives_match_portable_body() {
@@ -1718,6 +1844,7 @@ fn time_decode(
             query_norm: &bound.query_norm,
             key_norm: &bound.key_norm,
             value_norm: &bound.value_norm,
+            sinks: &bound.sinks,
             rotary_components: &bound.components,
             rotary_frequencies: &bound.frequencies,
             rotary_amplitudes: &bound.amplitudes,
@@ -1759,7 +1886,7 @@ fn decode_timings() {
             for config in timing_configurations(&device, form) {
                 let specialization = config
                     .iter()
-                    .fold(statics(&device, form), |s, (n, v)| s.with_param(*n, *v));
+                    .fold(statics(&device, form, 0), |s, (n, v)| s.with_param(*n, *v));
                 if let Ok(micros) = time_decode(&device, &specialization, &case) {
                     if best.as_ref().is_none_or(|(fastest, _)| micros < *fastest) {
                         best = Some((micros, config));

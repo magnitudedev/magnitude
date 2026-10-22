@@ -217,7 +217,6 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
         &mut table,
         load,
         weights,
-        constants,
         &table_rows,
         rows * heads,
     )?;
@@ -241,14 +240,14 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
                     ("M", rows),
                     ("K", embedding),
                     ("N", outputs),
-                    ("WS", projection.scaled.extent),
-                    ("WB", projection.bound.extent),
+                    ("WS", projection.operands.scale.extent),
+                    ("WB", projection.operands.bound.extent),
                 ],
                 project_rows::WorkflowArgs {
                     source: (&decoded).into(),
-                    weight: (&projection.scaled.weight).into(),
-                    weight_bound: (&projection.bound.tensor).into(),
-                    weight_scale: (&projection.scaled.scale).into(),
+                    weight: (&projection.weight).into(),
+                    weight_bound: (&projection.operands.bound.tensor).into(),
+                    weight_scale: (&projection.operands.scale.tensor).into(),
                 },
             )
             .map(|result| result.value)

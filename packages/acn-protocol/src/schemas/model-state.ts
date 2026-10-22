@@ -838,6 +838,7 @@ export const SpeculativeMethodSchema = Schema.Union(
   Schema.TaggedStruct("DFlash", {}),
   Schema.TaggedStruct("DFlash2", {}),
   Schema.TaggedStruct("DSpark", {}),
+  Schema.TaggedStruct("LiLiCorr", {}),
 )
 export type SpeculativeMethod = typeof SpeculativeMethodSchema.Type
 

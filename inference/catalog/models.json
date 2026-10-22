@@ -103,6 +103,31 @@
       }
     },
     {
+      "id": "qwen3.8-flash-next-nvfp4",
+      "displayName": "Qwen3.8 Flash Next NVFP4",
+      "description": "NVIDIA's NVFP4 quantization of Qwen's next-generation MoE, with native FP4 experts and low active compute.",
+      "releaseDate": "2026-08-26",
+      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 180000000000, "activeParameters": 6000000000 },
+      "support": { "level": "supported" },
+      "repository": "magnitudedev/Qwen3.8-Flash-Next-NVFP4-GGUF",
+      "speculativeDecoding": {
+        "method": "mtp",
+        "draft": { "type": "file", "repository": "unsloth/Qwen3.8-Flash-Next-GGUF", "path": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" }
+      },
+      "variants": [{"variantId": "gguf:nvfp4", "format": "NVFP4", "path": "Qwen3.8-Flash-Next-NVFP4-00001-of-00003.gguf", "variantLabel": "NVFP4", "fidelityRank": 70, "quantizationAware": true}],
+      "projector": { "path": "mmproj-Qwen3.8-Flash-Next-NVFP4-BF16.gguf" },
+      "license": "nvidia-open-model-license",
+      "artificialAnalysis": {
+        "score": 39.8,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-09-29",
+          "url": "https://artificialanalysis.ai/models/qwen3-8-flash-next"
+        }
+      }
+    },
+    {
       "id": "qwen3.6-35b-a3b",
       "displayName": "Qwen3.6 35B-A3B",
       "description": "Efficient MoE coding model with a large knowledge footprint and low active compute.",
@@ -648,6 +673,70 @@
           "methodologyVersion": "4.3.2",
           "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/nemotron-3-5-lightning"
+        }
+      }
+    },
+    {
+      "id": "nemotron-3.5-bolt-74b-a9b",
+      "displayName": "Nemotron 3.5 Bolt 74B-A9B",
+      "description": "Compressed hybrid MoE vision model with 2-bit expert weights, sized for 24GB machines.",
+      "releaseDate": "2026-10-15",
+      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 74000000000, "activeParameters": 9000000000 },
+      "support": { "level": "supported" },
+      "repository": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
+      "projector": { "path": "mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf" },
+      "variants": [{"variantId": "gguf:iq2-qat", "format": "IQ2_XXS", "path": "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf", "variantLabel": "IQ2 QAT", "fidelityRank": 38, "quantizationAware": true}],
+      "speculativeDecoding": {
+        "method": "lilicorr",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr-GGUF",
+          "path": "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr.gguf"
+        }
+      },
+      "license": "openmdw-1.1",
+      "artificialAnalysis": {
+        "score": 19.0,
+        "provenance": {
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-10-15",
+          "methodology": "Scaled two measured anchors, Qwen3.6 35B-A3B (18.2) and Nemotron 3.5 Lightning (12.9), by the geometric mean of Nemotron 3.5 Bolt 74B-A9B 24GB benchmark ratios against each on the Intelligence Index components in NVIDIA's release comparison: GDPval-AA, Terminal-Bench, Humanity's Last Exam, AA-Omniscience accuracy and non-hallucination, SciCode and AA-LCR. The scaled estimates are approximately 19.5 and 18.5; their geometric mean rounds to 19.0. This is an estimated Intelligence Index, not a measured score.",
+          "evidenceUrls": [
+            "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
+            "https://artificialanalysis.ai/models/qwen3-6-35b-a3b",
+            "https://artificialanalysis.ai/models/nemotron-3-5-lightning"
+          ]
+        }
+      }
+    },
+    {
+      "id": "nemotron-3.5-super-vl-120b-a12b",
+      "displayName": "Nemotron 3.5 Super VL 120B-A12B",
+      "description": "Workstation-class hybrid MoE vision model for reasoning, coding, and agentic workflows.",
+      "releaseDate": "2026-10-15",
+      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 120000000000, "activeParameters": 12000000000 },
+      "support": { "level": "supported" },
+      "repository": "unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF",
+      "projector": { "path": "mmproj-BF16.gguf" },
+      "variants": [{"variantId": "gguf:nvfp4-qat", "format": "NVFP4", "path": "NVFP4/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-00001-of-00003.gguf", "variantLabel": "NVFP4 QAT", "fidelityRank": 60, "quantizationAware": true}, {"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+      "speculativeDecoding": {
+        "method": "lilicorr",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr-GGUF",
+          "path": "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr.gguf"
+        }
+      },
+      "license": "openmdw-1.1",
+      "artificialAnalysis": {
+        "score": 26.5,
+        "provenance": {
+          "kind": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-10-15",
+          "url": "https://artificialanalysis.ai/models/nemotron-3-5-super-vl"
         }
       }
     },

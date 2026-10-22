@@ -148,6 +148,7 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
         bias: Some(r.tensors.bind("v.patch_embd.bias", &[hidden])?),
         positions,
         norm: None,
+        registers: None,
     };
     let mut blocks = Vec::new();
     for layer in 0..depth {

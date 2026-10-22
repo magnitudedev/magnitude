@@ -52,14 +52,20 @@ kernel void routed_output(
             0, SEISMIC_EXPERT_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F));
         const auto down = routed::weights<packets::W0>(expert_down, KERNEL_W0_LAYOUT(SEISMIC_DIM_F),
             routed::expert_row(expert, SEISMIC_DIM_H), SEISMIC_DIM_F);
-        routed::project_channels<packets::W0, R, L, uint(SEISMIC_DIM_F)>(in, down, first, rows, projected[k],
+        // The down weights' operand rows (the product rows, or NVFP4
+        // operands), which each simdgroup forms alone.
+        const auto x = projection::operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4>::lone_row(
+            in, uint(SEISMIC_DIM_F), lane);
+        routed::project_channels<packets::W0, R, L, uint(SEISMIC_DIM_F)>(x, down, first, rows, projected[k],
             lane);
     } else {
         const auto in = routed::activation(shared_product + m * SEISMIC_SHARED_PRODUCT_STRIDE_0 * A::bytes, 0,
             SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S));
         const auto down = routed::weights<packets::W1>(shared_down, KERNEL_W1_LAYOUT(SEISMIC_DIM_S), 0,
             SEISMIC_DIM_S);
-        routed::project_channels<packets::W1, R, L, uint(SEISMIC_DIM_S)>(in, down, first, rows, projected[K],
+        const auto x = projection::operands<projection::OperandRecipe<packets::W1_OPERANDS_NVFP4>::NVFP4>::lone_row(
+            in, uint(SEISMIC_DIM_S), lane);
+        routed::project_channels<packets::W1, R, L, uint(SEISMIC_DIM_S)>(x, down, first, rows, projected[K],
             lane);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -39,6 +39,14 @@
 // ATTENTION_SOFTPLUS (the gate function is softplus rather than sigmoid).
 #define ATTENTION_QUERY_STRIDE (ATTENTION_W + ATTENTION_I)
 
+// Attention sinks (`sinks [SK, KV * G]`): an entry with the input defines
+// ATTENTION_SINKS (its SK = 1) and ATTENTION_SINK_BUFFER (its address) before
+// including this file; without them every sink site compiles away.
+#ifndef ATTENTION_SINKS
+#define ATTENTION_SINKS false
+#define ATTENTION_SINK_BUFFER 0ul
+#endif
+
 // E consecutive A elements from element `index` (aligned to E) as F32.
 void attention_load_row(uint64_t base, uint64_t index, out float x[ATTENTION_E]) {
     if (ELEMENT_ACT != ELEMENT_F32 && ATTENTION_E % 8u == 0u) {
@@ -272,12 +280,30 @@ void attention_keywise_accumulate(uint weights, uint key, float v[ATTENTION_E],
             result[g][i] = seismic_fma_rn(p[g], v[i], result[g][i]);
 }
 
+// One attended column of query head `head` (a global query head, kv head *
+// G + local): its unnormalized output `accumulated` over its softmax state's
+// `denominator`, both relative to the state's `maximum` in the exp2 domain of
+// the scores (scale * log2 e folded into the query). With sinks, the head's
+// sink logit s (natural-log domain of the scaled scores) adds exp(s - m) =
+// exp2(s log2 e - maximum) to the denominator; a head that read no key
+// (maximum -inf) attends to zero.
+float attention_attended(float accumulated, float maximum, float denominator, uint64_t head) {
+    if (ATTENTION_SINKS) {
+        if (maximum == -ATTENTION_INF)
+            return 0.0;
+        denominator += exp2(element_f32_at(ATTENTION_SINK_BUFFER + head * 4ul) * ATTENTION_LOG2E - maximum);
+    }
+    return seismic_div_rn(accumulated, max(denominator, 1e-30));
+}
+
 // The fixed-order merge of `count` partial attention states for one column:
 // state p is slot first + p * stride, with its unnormalized output at
 // partials[slot * W + column] (relative to its maximum) and (maximum,
 // denominator) at statistics[slot * 2]. Empty states (denominator 0) are
-// skipped; a column with no state attends to zero.
-float attention_merge(uint64_t partials, uint64_t statistics, uint64_t first, uint64_t stride, uint count, uint column) {
+// skipped; a column with no state attends to zero. With sinks, query head
+// `head`'s sink joins the denominator (`attention_sink_denominator`).
+float attention_merge(uint64_t partials, uint64_t statistics, uint64_t first, uint64_t stride, uint count, uint column,
+    uint64_t head) {
     float maximum = -ATTENTION_INF;
     for (uint p = 0u; p < count; ++p) {
         const uint64_t slot = first + p * stride;
@@ -295,7 +321,7 @@ float attention_merge(uint64_t partials, uint64_t statistics, uint64_t first, ui
             accumulated = seismic_fma_rn(element_f32_at(partials + (slot * ATTENTION_W + column) * 4ul), weight, accumulated);
         }
     }
-    return seismic_div_rn(accumulated, max(denominator, 1e-30));
+    return attention_attended(accumulated, maximum, denominator, head);
 }
 
 // Decode subgroups: subgroup sg holds the ATTENTION_HEADS query heads of
@@ -397,6 +423,6 @@ void attention_decode_gate(uint64_t query, uint64_t gate, uint64_t visible, uint
     const uint span_keys = attention_partition_span(total, span, parts);
     const uint used = (total + span_keys - 1u) / span_keys;
     const float attended = attention_merge(partials, statistics,
-        (row * ATTENTION_KV * ATTENTION_G + head) * parts, 1ul, used, column);
+        (row * ATTENTION_KV * ATTENTION_G + head) * parts, 1ul, used, column, head);
     attention_store_gated(query, gate, result, row, head, column, attended);
 }

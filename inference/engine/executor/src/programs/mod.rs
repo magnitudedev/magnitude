@@ -31,9 +31,10 @@ pub use submission::{
 };
 
 use crate::{
-    GraphOutputTensor, HeadLaunchCore, ImportLaunchCore, ResidentWeightSlot, StateLaunchCore,
-    SubmitError, TargetLaunchCore, ValidatedHeadLaunch, ValidatedImportLaunch,
-    ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchCore,
+    GraphOutputTensor, HeadLaunchCore, ImportLaunchCore, InvariantError,
+    ResidentWeightSlot, StateLaunchCore, SubmitError, TargetLaunchCore, ValidatedHeadLaunch,
+    ValidatedImportLaunch, ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch,
+    VisionLaunchCore,
 };
 
 /// Submit one ready native graph run and wait for its outcome. Programs
@@ -48,9 +49,34 @@ pub(crate) fn run_graph(
 }
 
 pub type CompletedTargetWork = CompletedWork<TargetLaunchCore, TargetOutput>;
-/// A head's selections, `[steps, slot class, 2]` (token, status) rows in
-/// step-major order; absent for a causal-only head.
-pub type CompletedHeadWork = CompletedWork<HeadLaunchCore, Option<GraphOutputTensor>>;
+pub type CompletedHeadWork = CompletedWork<HeadLaunchCore, HeadOutput>;
+
+/// What a head step leaves the host.
+pub struct HeadOutput {
+    /// The step's selections, `[steps, slot class, 2]` (token, status) rows
+    /// in step-major order; absent for a causal-only head.
+    pub selections: Option<GraphOutputTensor>,
+    /// The step's landed reads of table rows its device work selected
+    /// (`DeviceTable::read_selected`), completed once the step completed.
+    pub landed_reads: Vec<crate::device_table::SubmittedRead>,
+}
+
+impl HeadOutput {
+    /// The step completed: its landed reads bring the rows they landed into
+    /// slots of their own (`SubmittedRead::complete`). Fails when one could
+    /// not land its rows: the step read other rows.
+    pub fn complete_landed_reads(&mut self) -> Result<(), SubmitError> {
+        std::mem::take(&mut self.landed_reads)
+            .into_iter()
+            .try_for_each(crate::device_table::SubmittedRead::complete)
+            .map_err(|detail| {
+                SubmitError::Invariant(InvariantError {
+                    context: "landed table rows",
+                    detail,
+                })
+            })
+    }
+}
 pub type CompletedVisionWork = CompletedWork<VisionLaunchCore, GraphOutputTensor>;
 pub type CompletedStateWork = CompletedWork<StateLaunchCore, ()>;
 pub type CompletedImportWork = CompletedWork<ImportLaunchCore, ResidentWeightSlot>;

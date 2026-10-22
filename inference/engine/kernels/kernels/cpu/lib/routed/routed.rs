@@ -27,8 +27,10 @@ pub fn expert_row(expert: i32, rows: usize) -> usize {
 /// The expansion of weight rows `first..first + out.len()` (at most
 /// `projection::MAX_ROWS`) of a paired gate/up operand against the F32
 /// activation row `x` (or its quantized form `q8`):
-/// `out[i] = A(act(gate_i) * up_i)`, as published F32 (`functions` code
-/// `function`; SiLU for the Qwen entries).
+/// `out[i] = A(act(gate_scale * gate_i) * (up_scale * up_i))`, as published
+/// F32 (`functions` code `function`; SiLU for the Qwen entries; the scales:
+/// the expert's second-level scales on the accumulators, 1 where a port is
+/// absent, which leaves every bit as it is).
 #[inline(always)]
 pub fn expand<A: Dense>(
     gate: &Weights<'_>,
@@ -37,6 +39,7 @@ pub fn expand<A: Dense>(
     x: &[f32],
     q8: Option<&[Q8Block]>,
     function: i32,
+    (gate_scale, up_scale): (f32, f32),
     out: &mut [f32],
 ) {
     let mut up_sums = [0.0f32; projection::MAX_ROWS];
@@ -44,7 +47,9 @@ pub fn expand<A: Dense>(
     projection::project_arithmetic(gate, first, x, q8, out);
     projection::project_arithmetic(up, first, x, q8, up_sums);
     for (target, up) in out.iter_mut().zip(up_sums.iter()) {
-        *target = activation::publish::<A>(functions::activate(function, *target) * up);
+        *target = activation::publish::<A>(
+            functions::activate(function, gate_scale * *target) * (up_scale * up),
+        );
     }
 }
 
@@ -56,18 +61,20 @@ pub fn expand_into<A: Dense>(
     first: usize,
     x: &[f32],
     q8: Option<&[Q8Block]>,
+    scales: (f32, f32),
     out: &mut [A::Storage],
 ) {
     let mut values = [0.0f32; projection::MAX_ROWS];
     let values = &mut values[..out.len()];
-    expand::<A>(gate, up, first, x, q8, functions::SILU, values);
+    expand::<A>(gate, up, first, x, q8, functions::SILU, scales, values);
     activation::store::<A>(values, out);
 }
 
 /// The activation-generic GLU of weight rows `first..first + out.len()` of a
 /// paired gate/up operand against the F32 activation row `x` (or its
 /// quantized form `q8`), stored to a row span of `A` elements:
-/// `A(A(act(A(gate))) * A(up))` (`functions` code `function`).
+/// `A(A(act(A(gate_scale * gate))) * A(up_scale * up))` (`functions` code
+/// `function`; the scales as [`expand`]'s).
 #[inline(always)]
 pub fn glu_into<A: Dense>(
     gate: &Weights<'_>,
@@ -76,6 +83,7 @@ pub fn glu_into<A: Dense>(
     x: &[f32],
     q8: Option<&[Q8Block]>,
     function: i32,
+    (gate_scale, up_scale): (f32, f32),
     out: &mut [A::Storage],
 ) {
     let (mut gates, mut ups) = ([0.0f32; projection::MAX_ROWS], [0.0f32; projection::MAX_ROWS]);
@@ -83,8 +91,21 @@ pub fn glu_into<A: Dense>(
     projection::project_arithmetic(gate, first, x, q8, gates);
     projection::project_arithmetic(up, first, x, q8, ups);
     for ((target, gate), up) in out.iter_mut().zip(gates.iter()).zip(ups.iter()) {
-        let activated = activation::publish::<A>(functions::activate(function, activation::publish::<A>(*gate)));
-        *target = A::narrow(activated * activation::publish::<A>(*up));
+        let activated = activation::publish::<A>(functions::activate(
+            function,
+            activation::publish::<A>(gate_scale * *gate),
+        ));
+        *target = A::narrow(activated * activation::publish::<A>(up_scale * *up));
+    }
+}
+
+/// A per-expert scale port's factor for `expert`: 1 where the port is
+/// absent (`extent` 0), which leaves the accumulator's bits as they are.
+#[inline(always)]
+pub fn scale_factor(extent: u64, scale: impl Fn(usize) -> f32, expert: i32) -> f32 {
+    match extent {
+        0 => 1.0,
+        _ => scale(usize::try_from(expert).expect("a routed expert index is non-negative")),
     }
 }
 
@@ -120,13 +141,15 @@ pub fn block_rows(order: &[i32]) -> usize {
 /// The route of one row from its router logits: the softmax over every
 /// expert, then K rounds of the most probable remaining expert (ties to the
 /// higher index), rank r stored at slot K - 1 - r; with `normalize` the
-/// scores are divided by their slot-order sum. `probabilities` is E values of
-/// work space.
+/// scores are divided by their slot-order sum; then each score is multiplied
+/// by its expert's `expert_scale` factor ([`scale_factor`] over a port of
+/// `scales` values). `probabilities` is E values of work space.
 #[inline(always)]
 pub fn select(
     logits: &[f32],
     probabilities: &mut [f32],
     normalize: bool,
+    (scales, expert_scale): (u64, impl Fn(usize) -> f32),
     routes: &mut [i32],
     scores: &mut [f32],
 ) {
@@ -156,5 +179,8 @@ pub fn select(
         for score in scores.iter_mut() {
             *score /= denominator;
         }
+    }
+    for (score, expert) in scores.iter_mut().zip(routes.iter()) {
+        *score *= scale_factor(scales, &expert_scale, *expert);
     }
 }

@@ -12,6 +12,18 @@
 #else
 #error "routed_output requires a bf16 or f16 activation"
 #endif
+// The down weights' operand rows (the product rows, or NVFP4 operands), each
+// weight's own, which each (row, choice)'s GEMV forms while staging them.
+#if defined(SEISMIC_EXPERT_DOWN_OPERANDS_NVFP4)
+#define EXPERT_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define EXPERT_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
+#if defined(SEISMIC_SHARED_DOWN_OPERANDS_NVFP4)
+#define SHARED_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define SHARED_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
 
 
 
@@ -28,17 +40,18 @@ void routed_output_project() {
     if (choice < SEISMIC_DIM_K) {
         const uint64_t expert = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
             + (m * SEISMIC_ROUTES_STRIDE_0 + choice * SEISMIC_ROUTES_STRIDE_1) * 4ul));
-        const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_PRODUCT)
+        const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT,
+                SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_PRODUCT)
                 + (m * SEISMIC_EXPERT_PRODUCT_STRIDE_0 + choice * SEISMIC_EXPERT_PRODUCT_STRIDE_1) * uint64_t(bytes),
-            0ul, SEISMIC_EXPERT_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F), 0ul);
+            0ul, SEISMIC_EXPERT_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F), 0ul), EXPERT_OPERANDS);
         const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), PACKETS_W0_STACKED_ROWS,
             routed_expert_row(expert, SEISMIC_DIM_H), uint(SEISMIC_DIM_F));
         projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, OUTPUT_R, 32u, 1u, PROJECTION_NORM_NONE, x, down, down, 1u,
             hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
     } else {
-        const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SHARED_PRODUCT)
-                + m * SEISMIC_SHARED_PRODUCT_STRIDE_0 * uint64_t(bytes),
-            0ul, SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S), 0ul);
+        const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT,
+                SEISMIC_PTR(SEISMIC_BUFFER_SHARED_PRODUCT) + m * SEISMIC_SHARED_PRODUCT_STRIDE_0 * uint64_t(bytes),
+            0ul, SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S), 0ul), SHARED_OPERANDS);
         const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN), PACKETS_W1_ROWS, 0ul,
             uint(SEISMIC_DIM_S));
         projection_gemv_sums(PACKETS_W1, PACKETS_W1, false, OUTPUT_R, 32u, 1u, PROJECTION_NORM_NONE, x, down, down, 1u,

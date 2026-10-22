@@ -145,7 +145,7 @@ impl Gguf {
             Format::Q5_0 => 22,
             Format::Q5_1 => 24,
             Format::Mxfp4 => 17,
-            Format::Nvfp4 => 36,
+            Format::Nvfp4 | Format::Nvfp4A4 => 36,
             Format::Iq2Xs => 74,
             Format::Iq3Xxs => 98,
             Format::Iq2Xxs => 66,
@@ -313,7 +313,7 @@ fn real_4b_projections_match_their_operand_emulation() {
                 let reference: Vec<f64> =
                     (0..o * f).map(|i| silu(g_exact[i]) * u_exact[i]).collect();
                 for &mapping in mappings(o) {
-                    let (x, _) = operand_rows(&exact, h, mapping);
+                    let (x, _) = operand_rows(&exact, h, mapping, Some(gate_format));
                     let (g, _) = project(&x, &gate.values, o, f, h);
                     let (u, _) = project(&x, &up.values, o, f, h);
                     // The operand path and the epilogue's bf16 roundings.
@@ -730,10 +730,14 @@ fn real_26b_grouped_physical_f16_operands() {
             &NativeSpecialization::new()
                 .with_static("H", h as u64)
                 .with_static("F", f as u64)
+                .with_static("GS", 0)
+                .with_static("US", 0)
                 .with_param("OPERAND", operand),
         )
         .unwrap()
     };
+    // The GGUF's experts are unscaled: the scale ports are absent.
+    let unscaled = Tensor::zeros(&device, Element::f32(), &[0]).unwrap();
     let args = || magnitude_kernels::routed_experts::Args {
         normalized: &input,
         order: &order,
@@ -742,6 +746,8 @@ fn real_26b_grouped_physical_f16_operands() {
         expert_up: &up,
         expert_down: &down,
         activation: 1,
+        gate_scale: &unscaled,
+        up_scale: &unscaled,
     };
     let baseline = form(0);
     let physical = form(1);

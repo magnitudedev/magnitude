@@ -40,6 +40,7 @@ fn readout_selected_rows_normalize<L: Isa, E: Elements>(
         };
         projection::quantize(normalized, q8);
     }
+    projection::operand_row(&[&cx.arg_weight()], normalized);
 }
 
 fn readout_selected_rows_rows<L: Isa, E: Elements>(

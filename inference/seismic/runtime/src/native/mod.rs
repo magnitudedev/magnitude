@@ -30,7 +30,7 @@ mod graph_replays;
 mod handoff_tests;
 mod observation;
 pub mod plan;
-mod point;
+pub(crate) mod point;
 pub mod replay;
 pub mod sampling;
 pub mod search;
@@ -146,6 +146,17 @@ pub(crate) struct NativeQueue {
     /// only).
     #[cfg(not(target_os = "macos"))]
     vulkan_replays: vulkan::VulkanReplays,
+}
+
+impl NativeQueue {
+    /// Graphs the device has recorded for submissions so far: a submission
+    /// during which it grew paid a recording, not only its launches.
+    pub(crate) fn recorded_graphs(&self) -> u64 {
+        let recorded = self.cuda_replays.recorded();
+        #[cfg(not(target_os = "macos"))]
+        let recorded = recorded + self.vulkan_replays.recorded();
+        recorded
+    }
 }
 
 /// Bytes charged to a scratch buffer that is empty or inactive: it keeps
@@ -713,6 +724,14 @@ pub(crate) fn metal_dialect(opened: &crate::backends::MetalOpened) -> abi::Diale
     })
 }
 
+/// The dialect of an opened CUDA device's native sources: CUDA C++ with its
+/// fact macros.
+pub(crate) fn cuda_dialect(opened: &crate::backends::CudaOpened) -> abi::Dialect {
+    abi::Dialect::Cuda(abi::CudaFeatures {
+        multiprocessors: opened.device_description().facts().multiprocessors,
+    })
+}
+
 /// One launch's program with `variants` as its entries. Every variant of a
 /// launch shares its source, so tuning forms all of them in one compile and
 /// preparation's single variant is served from that program. Variants that
@@ -896,7 +915,7 @@ fn rendered_programs(
         OpenedKind::Metal(opened) => {
             Ok(programs(metal_dialect(opened), asset(BackendName::Metal)?))
         }
-        OpenedKind::Cuda(_) => Ok(programs(abi::Dialect::Cuda, asset(BackendName::Cuda)?)),
+        OpenedKind::Cuda(opened) => Ok(programs(cuda_dialect(opened), asset(BackendName::Cuda)?)),
         #[cfg(not(target_os = "macos"))]
         OpenedKind::Vulkan(opened) => {
             let geometry = vulkan_geometry(
@@ -987,7 +1006,7 @@ fn launch_programs(
     let dialect = match &device.kind {
         #[cfg(target_os = "macos")]
         OpenedKind::Metal(opened) => metal_dialect(opened),
-        OpenedKind::Cuda(_) => abi::Dialect::Cuda,
+        OpenedKind::Cuda(opened) => cuda_dialect(opened),
         _ => return Ok(None),
     };
     let logical = module
@@ -1334,7 +1353,7 @@ impl NativePrepared {
     ) -> Result<Arc<Self>, PrepareError> {
         let backend = backend_name(&device.kind);
         let name = entry_name(module, entry);
-        let implementation = on_device(device, implementation);
+        let implementation = on_device(device, implementation).at_elements(&bindings);
         let scoped = implementation.launch_scoped();
         if scoped && !matches!(backend, BackendName::Metal | BackendName::Cuda) {
             return Err(preparation(format!(

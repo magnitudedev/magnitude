@@ -344,13 +344,14 @@ pub(crate) fn engine_material(
                     SpeculativeMethod::DFlash => ModelMethod::DFlash,
                     SpeculativeMethod::DFlash2 => ModelMethod::DFlash2,
                     SpeculativeMethod::DSpark => ModelMethod::DSpark,
+                    SpeculativeMethod::LiLiCorr => ModelMethod::LiLiCorr,
                     SpeculativeMethod::Mtp => ModelMethod::Mtp,
                 };
                 (method, Some(draft_weights(draft)?))
             }
             (SpeculativeDraftSource::Embedded, _, _) => {
                 return Err(InventoryError::InvalidRequest(
-                    "an embedded draft is an MTP head; DFlash, DFlash2 and DSpark need a separate draft"
+                    "an embedded draft is an MTP head; DFlash, DFlash2, DSpark and LiLiCorr need a separate draft"
                         .to_owned(),
                 ));
             }
@@ -636,6 +637,7 @@ fn drafter_verdict(verdict: EngineDrafterVerdict) -> DrafterVerdict {
                 EngineSpeculativeMethod::DFlash => SpeculativeMethod::DFlash,
                 EngineSpeculativeMethod::DFlash2 => SpeculativeMethod::DFlash2,
                 EngineSpeculativeMethod::DSpark => SpeculativeMethod::DSpark,
+                EngineSpeculativeMethod::LiLiCorr => SpeculativeMethod::LiLiCorr,
             },
             memory_bytes,
         },
@@ -1043,6 +1045,7 @@ mod tests {
             (SpeculativeMethod::DFlash, ModelMethod::DFlash),
             (SpeculativeMethod::DFlash2, ModelMethod::DFlash2),
             (SpeculativeMethod::DSpark, ModelMethod::DSpark),
+            (SpeculativeMethod::LiLiCorr, ModelMethod::LiLiCorr),
             (SpeculativeMethod::Mtp, ModelMethod::Mtp),
         ] {
             let material = engine_material(&speculative(true, method)).unwrap();
@@ -1069,6 +1072,7 @@ mod tests {
             (false, SpeculativeMethod::DFlash),
             (false, SpeculativeMethod::DFlash2),
             (false, SpeculativeMethod::DSpark),
+            (false, SpeculativeMethod::LiLiCorr),
         ] {
             assert!(matches!(
                 engine_material(&speculative(draft, method)),

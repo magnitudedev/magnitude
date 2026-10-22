@@ -257,7 +257,8 @@ fn routed_prefill_timings() {
         .collect();
     let norm = bf16_tensor(&device, &[H], 3, 1.0);
     let bias = zeros(seismic::Element::f32(), &[E]);
-    let expert_scale = f32_tensor(&device, &[E], 4, 1.0);
+    // Unscaled experts: every per-expert scale port is absent.
+    let absent_scale = zeros(seismic::Element::f32(), &[0]);
     let measure = seismic::Strategy::Survey(seismic::SurveyPlan {
         samples: 9,
         min_sample_seconds: 0.002,
@@ -350,7 +351,7 @@ fn routed_prefill_timings() {
                         router_norm: &norm,
                         router: &layer.router,
                         bias: &bias,
-                        expert_scale: &expert_scale,
+                        expert_scale: &absent_scale,
                         routes: &mut input.routes,
                         weights: &mut input.weights,
                         epsilon: 1e-6,
@@ -373,7 +374,7 @@ fn routed_prefill_timings() {
                     RW: bf16,
                     A: bf16,
                 },
-                &statics(&[("H", H), ("E", E), ("K", K)]),
+                &statics(&[("H", H), ("E", E), ("K", K), ("ES", 0)]),
                 points,
                 loose.clone(),
                 measure.clone(),
@@ -461,6 +462,8 @@ fn routed_prefill_timings() {
                         expert_up: &layer.up,
                         expert_down: &layer.down,
                         activation: 1,
+                        gate_scale: &absent_scale,
+                        up_scale: &absent_scale,
                     })
                     .collect(),
                 initialize: None,
@@ -476,7 +479,7 @@ fn routed_prefill_timings() {
                     EUW: q4,
                     EDW: q4,
                 },
-                &statics(&[("H", H), ("F", F)]),
+                &statics(&[("H", H), ("F", F), ("GS", 0), ("US", 0)]),
                 points,
                 loose.clone(),
                 measure.clone(),

@@ -68,7 +68,7 @@ use super::AssessmentError;
 use crate::{resident_element, resident_elements, resident_layout, ExecutionPath};
 use magnitude_artifacts::gguf::Encoding;
 use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
-use magnitude_family_contracts::Rotary;
+use magnitude_family_contracts::{Rotary, ScaledActivations};
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, conditioning_overlay, dense_expand, dense_output,
 };
@@ -135,6 +135,7 @@ impl Sizes {
 fn chain_element(backend: seismic::BackendName) -> Option<Element> {
     resident_element(
         CHAIN_FORMAT,
+        ScaledActivations::Rounded,
         HIDDEN,
         DType::BF16,
         resident_layout(ExecutionPath::Native, backend),
@@ -1640,6 +1641,8 @@ struct AttendCase {
     key: Tensor,
     value: Tensor,
     norms: Tensor,
+    /// No sinks (`SK = 0`).
+    sinks: Tensor,
     rotary_components: Tensor,
     rotary_frequencies: Tensor,
     rotary_amplitudes: Tensor,
@@ -1854,6 +1857,7 @@ impl AttendCase {
         let key = zeros(Element::bf16(), &[1, 1, KV_HEADS * HEAD_WIDTH])?;
         let value = zeros(Element::bf16(), &[1, 1, KV_HEADS * HEAD_WIDTH])?;
         let norms = zeros(Element::f32(), &[0, HEAD_WIDTH])?;
+        let sinks = zeros(Element::f32(), &[0, heads])?;
         let rotary_components = host(Element::i32(), &[ROTARY_PAIRS], words(&components))?;
         let rotary_frequencies = host(
             Element::f32(),
@@ -1912,6 +1916,7 @@ impl AttendCase {
                     key: key.clone(),
                     value: value.clone(),
                     norms: norms.clone(),
+                    sinks: sinks.clone(),
                     rotary_components: rotary_components.clone(),
                     rotary_frequencies: rotary_frequencies.clone(),
                     rotary_amplitudes: rotary_amplitudes.clone(),
@@ -1939,6 +1944,7 @@ impl AttendCase {
             query_norm: &self.norms,
             key_norm: &self.norms,
             value_norm: &self.norms,
+            sinks: &self.sinks,
             rotary_components: &self.rotary_components,
             rotary_frequencies: &self.rotary_frequencies,
             rotary_amplitudes: &self.rotary_amplitudes,
@@ -1968,6 +1974,7 @@ impl AttendCase {
             query_norm: &self.norms,
             key_norm: &self.norms,
             value_norm: &self.norms,
+            sinks: &self.sinks,
             rotary_components: &self.rotary_components,
             rotary_frequencies: &self.rotary_frequencies,
             rotary_amplitudes: &self.rotary_amplitudes,
@@ -1988,7 +1995,7 @@ impl AttendCase {
 }
 
 /// The statics of the reference attention: one row that appends its own
-/// key and value, no gate and no head norms, and `layout`'s planes.
+/// key and value, no gate, head norms or sinks, and `layout`'s planes.
 fn attention_values(layout: KvCodec) -> Result<Vec<(&'static str, u64)>, ExecutorCostsError> {
     let mut values = vec![
         ("KV", KV_HEADS),
@@ -2000,6 +2007,7 @@ fn attention_values(layout: KvCodec) -> Result<Vec<(&'static str, u64)>, Executo
         ("F", 1),
         ("N", 0),
         ("NV", 0),
+        ("SK", 0),
     ];
     // An affine layout's statics are its planes' widths.
     if let [key_codes, key_coefficients, value_codes, value_coefficients] = planes(layout)?[..] {
@@ -2307,6 +2315,7 @@ fn composition_chain(
     let key = bind(&mut graph, &attend.key)?;
     let value = bind(&mut graph, &attend.value)?;
     let norms = bind(&mut graph, &attend.norms)?;
+    let sinks = bind(&mut graph, &attend.sinks)?;
     let components = bind(&mut graph, &attend.rotary_components)?;
     let frequencies = bind(&mut graph, &attend.rotary_frequencies)?;
     let amplitudes = bind(&mut graph, &attend.rotary_amplitudes)?;
@@ -2352,6 +2361,7 @@ fn composition_chain(
                     query_norm: norms.tensor().into(),
                     key_norm: norms.tensor().into(),
                     value_norm: norms.tensor().into(),
+                    sinks: sinks.tensor().into(),
                     rotary_components: components.tensor().into(),
                     rotary_frequencies: frequencies.tensor().into(),
                     rotary_amplitudes: amplitudes.tensor().into(),
@@ -3068,6 +3078,31 @@ mod tests {
         }
     }
 
+    /// Every program of the walk gives each static its entry declares on
+    /// every backend, so no figure goes unmeasured for want of one.
+    #[test]
+    fn every_walk_program_gives_its_statics_on_every_backend() {
+        for backend in seismic::BackendName::ALL {
+            let programs = ProgramSet::new(
+                Sizes::of(backend),
+                &measured_formats(backend),
+                chain_element(backend).unwrap(),
+                1 << 34,
+            )
+            .unwrap();
+            let mut statics = vec![
+                programs.output.statics(backend),
+                programs.dense.statics(backend),
+                programs.affine.statics(backend),
+                programs.copy.statics(backend),
+            ];
+            statics.extend(programs.expands.iter().map(|(_, _, expand)| expand.statics(backend)));
+            for given in statics {
+                given.unwrap_or_else(|error| panic!("{backend:?}: {}", error.0));
+            }
+        }
+    }
+
     /// A rotation spans four times the cache in at least two sets: a call
     /// never reads the bytes the call before it read.
     #[test]
@@ -3087,9 +3122,13 @@ mod tests {
             let layout = resident_layout(ExecutionPath::Native, backend);
             for dense in [DType::BF16, DType::F16, DType::F32] {
                 for encoding in Encoding::ALL {
-                    for width in [HIDDEN, HIDDEN + 32] {
-                        if let Some(element) = resident_element(encoding, width, dense, layout) {
-                            assert!(formats.contains(&element), "{backend:?} {element:?}");
+                    for activations in [ScaledActivations::Rounded, ScaledActivations::Nvfp4] {
+                        for width in [HIDDEN, HIDDEN + 32] {
+                            if let Some(element) =
+                                resident_element(encoding, activations, width, dense, layout)
+                            {
+                                assert!(formats.contains(&element), "{backend:?} {element:?}");
+                            }
                         }
                     }
                 }

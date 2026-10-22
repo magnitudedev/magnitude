@@ -19,7 +19,8 @@
 #include "lib/core/reduce.glsl"
 #include <seismic/packets.glsl>
 
-#define SELECT_P (uint(SEISMIC_DIM_E) / 32u)
+#define SELECT_EXPERTS uint(SEISMIC_DIM_E)
+#define SELECT_P ((uint(SEISMIC_DIM_E) + 31u) / 32u)
 #include "lib/routed/select.glsl"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16) \
@@ -268,16 +269,18 @@ void routed_select_select() {
     const uint64_t row = uint64_t(gl_WorkGroupID.x) * SEISMIC_SUBGROUPS + SEISMIC_SUBGROUP;
     if (row >= SEISMIC_DIM_M)
         return;
+    // SELECT_P when 32 divides E (a constant: no excluded entries).
+    const uint held = select_candidates(lane);
     float score[SELECT_P], ranked[SELECT_P];
     int expert[SELECT_P];
     [[unroll]] for (uint i = 0u; i < SELECT_P; ++i) {
-        expert[i] = int(lane + 32u * i);
-        score[i] = element_f32_at(select_logit(row, lane + 32u * i));
+        expert[i] = i < held ? int(lane + 32u * i) : -1;
+        score[i] = i < held ? element_f32_at(select_logit(row, lane + 32u * i)) : 0.0;
     }
-    select_scores(int(SEISMIC_PARAM_SCORE), score);
+    select_scores(int(SEISMIC_PARAM_SCORE), score, held);
     [[unroll]] for (uint i = 0u; i < SELECT_P; ++i)
-        ranked[i] = score[i] + element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_BIAS)
-            + uint64_t(expert[i]) * SEISMIC_BIAS_STRIDE_0 * 4ul);
+        ranked[i] = i < held ? score[i] + element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_BIAS)
+            + uint64_t(expert[i]) * SEISMIC_BIAS_STRIDE_0 * 4ul) : -uintBitsToFloat(0x7f800000u);
     select_sort(ranked, score, expert);
 
     float chosen[SELECT_K];
@@ -301,13 +304,15 @@ void routed_select_select() {
         const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
         const float epsilon = element_word_f32(SEISMIC_PARAM_NORMALIZATION_EPSILON);
         for (uint slot = 0u; slot < SELECT_K; ++slot) {
-            const float weight = select_normalized(normalization, chosen[slot], denominator, epsilon);
+            float weight = select_normalized(normalization, chosen[slot], denominator, epsilon) * scale;
+            if (SEISMIC_DIM_ES != 0ul)
+                weight = weight * element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE)
+                    + uint64_t(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0 * 4ul);
             element_i32_put(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
                 + (row * SEISMIC_ROUTES_STRIDE_0 + uint64_t(slot) * SEISMIC_ROUTES_STRIDE_1) * 4ul, winners[slot]);
             element_f32_put(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHTS)
                     + (row * SEISMIC_WEIGHTS_STRIDE_0 + uint64_t(slot) * SEISMIC_WEIGHTS_STRIDE_1) * 4ul,
-                weight * scale * element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE)
-                    + uint64_t(winners[slot]) * SEISMIC_EXPERT_SCALE_STRIDE_0 * 4ul));
+                weight);
         }
     }
 }

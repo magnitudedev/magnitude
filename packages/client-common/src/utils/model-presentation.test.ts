@@ -34,6 +34,7 @@ describe("model presentation", () => {
     expect(formatSpeculativeMethod({ _tag: "Mtp" })).toBe("MTP")
     expect(formatSpeculativeMethod({ _tag: "DFlash" })).toBe("DFlash")
     expect(formatSpeculativeMethod({ _tag: "DSpark" })).toBe("DSpark")
+    expect(formatSpeculativeMethod({ _tag: "LiLiCorr" })).toBe("LiLiCorr")
   })
 })
 

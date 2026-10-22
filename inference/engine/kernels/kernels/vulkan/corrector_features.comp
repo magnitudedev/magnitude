@@ -1,0 +1,73 @@
+// corrector_features: one workgroup of 256 invocations per proposing row
+// reduces the row's softmax normalizer (maximum, then the sum of exp(logit -
+// maximum)), forms its K candidates' five features and their layer norm (one
+// invocation per candidate), then publishes silu(up · normed + up_bias) for
+// every (candidate, column), rounded once to A. Mirrors
+// `cpu/corrector_features.rs`.
+#include "lib/core/activation.glsl"
+#include "lib/core/reduce.glsl"
+
+// Shared: one partial per subgroup (floats 0..32), then the K candidates'
+// five normed features from float 32.
+#define FEATURES_NORMED 32u
+
+void corrector_features() {
+    const uint64_t logits = SEISMIC_PTR(SEISMIC_BUFFER_LOGITS);
+    const uint64_t unary = SEISMIC_PTR(SEISMIC_BUFFER_UNARY);
+    const uint64_t norm_weight = SEISMIC_PTR(SEISMIC_BUFFER_NORM_WEIGHT);
+    const uint64_t norm_bias = SEISMIC_PTR(SEISMIC_BUFFER_NORM_BIAS);
+    const uint64_t up_weight = SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT);
+    const uint64_t up_bias = SEISMIC_PTR(SEISMIC_BUFFER_UP_BIAS);
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t row = gl_WorkGroupID.x;
+    const uint64_t count = SEISMIC_DIM_K, width = SEISMIC_DIM_H;
+    const uint64_t lane = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
+    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+
+    float local = -uintBitsToFloat(0x7f800000u);
+    for (uint64_t v = lane; v < SEISMIC_DIM_V; v += threads)
+        local = max(local, element_f32_at(logits + (row * SEISMIC_LOGITS_STRIDE_0 + v * SEISMIC_LOGITS_STRIDE_1) * 4ul));
+    const float maximum = reduce_group_max(local, 0u);
+    float partial = 0.0;
+    for (uint64_t v = lane; v < SEISMIC_DIM_V; v += threads)
+        partial += exp(element_f32_at(logits + (row * SEISMIC_LOGITS_STRIDE_0 + v * SEISMIC_LOGITS_STRIDE_1) * 4ul)
+            - maximum);
+    const float normalizer = maximum + log(reduce_group_sum(partial, 0u));
+
+    const float best = element_f32_at(unary + row * SEISMIC_UNARY_STRIDE_0 * 4ul);
+    for (uint64_t rank = lane; rank < count; rank += threads) {
+        const float logit = element_f32_at(unary + (row * SEISMIC_UNARY_STRIDE_0 + rank * SEISMIC_UNARY_STRIDE_1) * 4ul);
+        const float lp = logit - normalizer;
+        float features[5];
+        features[0] = lp;
+        features[1] = exp(lp);
+        features[2] = logit - best;
+        features[3] = count > 1ul ? seismic_div_rn(float(rank), float(count - 1ul)) : 0.0;
+        features[4] = rank == 0ul ? 1.0 : 0.0;
+        float sum = 0.0;
+        for (uint f = 0u; f < 5u; ++f)
+            sum += features[f];
+        const float mean = seismic_div_rn(sum, 5.0);
+        float squares = 0.0;
+        for (uint f = 0u; f < 5u; ++f)
+            squares += (features[f] - mean) * (features[f] - mean);
+        const float inverse = seismic_div_rn(1.0, seismic_sqrt_rn(seismic_div_rn(squares, 5.0) + epsilon));
+        for (uint f = 0u; f < 5u; ++f)
+            seismic_shared_f32[FEATURES_NORMED + uint(rank) * 5u + f] =
+                (features[f] - mean) * inverse * element_f32_at(norm_weight + uint64_t(f) * SEISMIC_NORM_WEIGHT_STRIDE_0 * 4ul)
+                + element_f32_at(norm_bias + uint64_t(f) * SEISMIC_NORM_BIAS_STRIDE_0 * 4ul);
+    }
+    barrier();
+
+    for (uint64_t index = lane; index < count * width; index += threads) {
+        const uint64_t rank = index / width, column = index % width;
+        float value = element_f32_at(up_bias + column * SEISMIC_UP_BIAS_STRIDE_0 * 4ul);
+        for (uint f = 0u; f < 5u; ++f)
+            value = seismic_fma_rn(
+                element_f32_at(up_weight + (column * SEISMIC_UP_WEIGHT_STRIDE_0 + uint64_t(f) * SEISMIC_UP_WEIGHT_STRIDE_1) * 4ul),
+                seismic_shared_f32[FEATURES_NORMED + uint(rank) * 5u + f], value);
+        element_put(ELEMENT_ACT, result,
+            (row * count + rank) * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
+            seismic_div_rn(value, 1.0 + exp(-value)));
+    }
+}

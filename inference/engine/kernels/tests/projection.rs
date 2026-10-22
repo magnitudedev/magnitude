@@ -5,7 +5,7 @@
 //! 8, 16, 64, 128}, across weight representations and mapping parameters.
 
 use magnitude_kernels::{
-    attention_output, attention_project, dense_expand, dense_output, embedding_rows,
+    attention_output, attention_project, dense_expand, dense_output, dense_up, embedding_rows,
     gated_delta_project, packing_bound, project_rows, readout_features_rows, readout_head_rows,
     readout_project_rows, readout_selected_rows,
 };
@@ -22,6 +22,7 @@ use seismic_lang::{
 };
 use timing_common::{Timed, measured};
 
+mod operands;
 mod timing_common;
 
 // ---------------------------------------------------------------------------
@@ -148,6 +149,8 @@ enum Repr {
     Q5g32,
     Mxfp4,
     Nvfp4,
+    /// NVFP4's W4A4 element: nvfp4g16's storage, NVFP4 operands.
+    Nvfp4A4,
     Iq2xs,
     Iq3xxs,
     Iq2xxs,
@@ -157,13 +160,14 @@ enum Repr {
 const GRID_REPRS: [Repr; 3] = [Repr::Iq2xs, Repr::Iq3xxs, Repr::Iq2xxs];
 
 /// The formats with a representation of their own, imported from GGUF.
-const GGUF_REPRS: [Repr; 6] = [
+const GGUF_REPRS: [Repr; 7] = [
     Repr::Q4g32s,
     Repr::Iq4g32s,
     Repr::Q5g32s,
     Repr::Q5g32,
     Repr::Mxfp4,
     Repr::Nvfp4,
+    Repr::Nvfp4A4,
 ];
 
 /// The iq4g32 code table (the registry's `iq4g32` interpretation).
@@ -186,6 +190,7 @@ impl Repr {
             Repr::Q5g32 => "q5g32",
             Repr::Mxfp4 => "mxfp4g32",
             Repr::Nvfp4 => "nvfp4g16",
+            Repr::Nvfp4A4 => "nvfp4g16a4",
             Repr::Iq2xs => "iq2xs",
             Repr::Iq3xxs => "iq3xxs",
             Repr::Iq2xxs => "iq2xxs",
@@ -200,7 +205,7 @@ impl Repr {
             Repr::Q5g32s => Some(("gguf_q5_0", 22, 32)),
             Repr::Q5g32 => Some(("gguf_q5_1", 24, 32)),
             Repr::Mxfp4 => Some(("gguf_mxfp4", 17, 32)),
-            Repr::Nvfp4 => Some(("gguf_nvfp4", 36, 64)),
+            Repr::Nvfp4 | Repr::Nvfp4A4 => Some(("gguf_nvfp4", 36, 64)),
             Repr::Iq2xs => Some(("gguf_iq2_xs", 74, 256)),
             Repr::Iq3xxs => Some(("gguf_iq3_xxs", 98, 256)),
             Repr::Iq2xxs => Some(("gguf_iq2_xxs", 66, 256)),
@@ -297,6 +302,7 @@ fn planes(repr: Repr, k: usize) -> Planes {
         | Repr::Q5g32
         | Repr::Mxfp4
         | Repr::Nvfp4
+        | Repr::Nvfp4A4
         | Repr::Iq2xs
         | Repr::Iq3xxs
         | Repr::Iq2xxs => {
@@ -321,7 +327,21 @@ fn absent_bound(device: &Device) -> Tensor {
     f32_tensor(device, &[0], &[])
 }
 
+/// An absent accumulator-scale port (static extent 0).
+fn no_scale(device: &Device) -> Tensor {
+    f32_tensor(device, &[0], &[])
+}
+
 impl Weight {
+    /// Rows `x` of `k` as products over this weight take them: as NVFP4
+    /// operands where the registry's recipe of its representation says so.
+    fn operand_rows(&self, x: &[f32]) -> Vec<f32> {
+        let representation = registry::representation(self.repr.name()).unwrap();
+        let nvfp4 = registry::representation_info(representation).operands
+            == registry::OperandRecipe::Nvfp4Rows;
+        operands::operand_rows(x, self.k, nvfp4)
+    }
+
     /// The packing bound operand of this weight on `device` and its extent,
     /// as loading makes it: on Metal, `packing_bound` of a resident weight
     /// with integer codes (one bound per run of the registry's code group);
@@ -512,6 +532,7 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
             | Repr::Q5g32
             | Repr::Mxfp4
             | Repr::Nvfp4
+            | Repr::Nvfp4A4
             | Repr::Iq2xs
             | Repr::Iq3xxs
             | Repr::Iq2xxs => {
@@ -553,7 +574,7 @@ fn gguf_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> 
             // E8M0: the power of two nearest factor / 6 (the E2M1 range).
             Repr::Mxfp4 => block[0] = (127.0 + (factor / 6.0).log2().round()) as u8,
             // UE4M3 exponent of factor / 6 (normal), random mantissas.
-            Repr::Nvfp4 => {
+            Repr::Nvfp4 | Repr::Nvfp4A4 => {
                 for field in &mut block[..4] {
                     let exponent = ((factor / 6.0).log2().floor() as i32 + 7).clamp(1, 14) as u8;
                     *field = (exponent << 3) | rng.below(8) as u8;
@@ -1031,9 +1052,9 @@ fn with_gemv_rows(
 
 /// The `gemv_rows` launches on Metal, each followed by its entry's last
 /// launch, `gemv_pair`.
-const DENSE_OUTPUT_GEMV_ROWS_LAUNCH: usize = 11;
+const DENSE_OUTPUT_GEMV_ROWS_LAUNCH: usize = 12;
 const DENSE_EXPAND_GEMV_ROWS_LAUNCH: usize = 10;
-const ATTENTION_OUTPUT_GEMV_ROWS_LAUNCH: usize = 8;
+const ATTENTION_OUTPUT_GEMV_ROWS_LAUNCH: usize = 9;
 const ATTENTION_PROJECT_GEMV_ROWS_LAUNCH: usize = 7;
 const READOUT_HEAD_GEMV_ROWS_LAUNCH: usize = 4;
 
@@ -1085,8 +1106,8 @@ fn dense_gemv_mapping(device: &Device, mapping: Mapping) -> Mapping {
 
 /// `dense_output`'s INT8 tile launch on Metal, and the dense entries' PACK
 /// tile launches.
-const DENSE_OUTPUT_INT8_LAUNCH: usize = 10;
-const DENSE_OUTPUT_PACKED_LAUNCH: usize = 15;
+const DENSE_OUTPUT_INT8_LAUNCH: usize = 11;
+const DENSE_OUTPUT_PACKED_LAUNCH: usize = 16;
 const DENSE_EXPAND_PACKED_LAUNCH: usize = 14;
 
 fn dense_output_specialization_on(
@@ -1101,14 +1122,14 @@ fn dense_output_specialization_on(
         mapping,
         ProjectionLaunches {
             gemv: 0,
-            batch: 1,
-            gemm: 4,
+            batch: 2,
+            gemm: 5,
         },
         true,
     )
     .with_static("DS", 0);
     let specialization = with_absent_bounds(device, specialization, &["DB"]);
-    let specialization = with_tall(device, specialization, 7, mapping.tall);
+    let specialization = with_tall(device, specialization, 8, mapping.tall);
     let specialization = with_gemv_rows(
         device,
         specialization,
@@ -1122,7 +1143,7 @@ fn dense_output_specialization_on(
             .with_launch_param(0, "TILED", mapping.tiled)
             .with_launch_param(DENSE_OUTPUT_GEMV_ROWS_LAUNCH, "TILED", mapping.tiled.min(1))
             .with_launch_param(DENSE_OUTPUT_GEMV_ROWS_LAUNCH + 1, "TILED", mapping.tiled)
-            .with_launch_param(1, "BATCH_PARTS", mapping.batch_parts)
+            .with_launch_param(2, "BATCH_PARTS", mapping.batch_parts)
             .with_launch_param(DENSE_OUTPUT_INT8_LAUNCH, "INT8_TILE", mapping.int8_tile)
     } else {
         specialization
@@ -1134,6 +1155,8 @@ fn attention_output_specialization_on(
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
+    // The weight's scale port: absent unless `statics` names it.
+    let scale = static_or_absent(statics, "OS");
     // The CPU form's statics: the gated heads and width.
     if is_cpu(device) {
         return statics
@@ -1141,7 +1164,8 @@ fn attention_output_specialization_on(
             .filter(|(name, _)| matches!(*name, "Q" | "W"))
             .fold(specialization_on(device, statics, mapping), |spec, (name, value)| {
                 spec.with_static(*name, *value as u64)
-            });
+            })
+            .with_static("OS", scale);
     }
     let specialization = scoped_projection_specialization_on(
         device,
@@ -1149,13 +1173,14 @@ fn attention_output_specialization_on(
         mapping,
         ProjectionLaunches {
             gemv: 0,
-            batch: 1,
-            gemm: 4,
+            batch: 2,
+            gemm: 5,
         },
         true,
-    );
+    )
+    .with_static("OS", scale);
     let specialization = with_absent_bounds(device, specialization, &["OB"]);
-    let specialization = with_tall(device, specialization, 7, mapping.tall);
+    let specialization = with_tall(device, specialization, 8, mapping.tall);
     let specialization = with_gemv_rows(
         device,
         specialization,
@@ -1166,7 +1191,7 @@ fn attention_output_specialization_on(
     if device.backend() == BackendName::Metal {
         with_pack(specialization, ATTENTION_OUTPUT_PACKED_LAUNCH, PACK_DEFAULT)
             .with_param("PACK", 0)
-            .with_launch_param(1, "BATCH_PARTS", mapping.batch_parts)
+            .with_launch_param(2, "BATCH_PARTS", mapping.batch_parts)
     } else {
         specialization
     }
@@ -1174,7 +1199,7 @@ fn attention_output_specialization_on(
 
 /// The PACK tile launches on Metal: `attention_output`'s, `attention_project`'s
 /// and `gated_delta_project`'s.
-const ATTENTION_OUTPUT_PACKED_LAUNCH: usize = 12;
+const ATTENTION_OUTPUT_PACKED_LAUNCH: usize = 13;
 const ATTENTION_PROJECT_PACKED_LAUNCH: usize = 11;
 const RECURRENT_PROJECT_PACKED_LAUNCH: usize = 9;
 
@@ -1220,13 +1245,23 @@ fn attention_project_specialization_on(
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
-    // The CPU form's one static: the row width its `[M, PT * D]` input
+    // The segments' scale ports: absent unless `statics` names them.
+    let scaled = |specialization: NativeSpecialization| {
+        ["QS", "GS", "KS", "VS"]
+            .into_iter()
+            .fold(specialization, |specialization, name| {
+                specialization.with_static(name, static_or_absent(statics, name))
+            })
+    };
+    // The CPU form's other static: the row width its `[M, PT * D]` input
     // does not name alone.
     if is_cpu(device) {
-        return specialization_on(device, statics, mapping)
-            .with_static("D", row_width(statics) as u64);
+        return scaled(
+            specialization_on(device, statics, mapping)
+                .with_static("D", row_width(statics) as u64),
+        );
     }
-    with_gemv_rows(
+    scaled(with_gemv_rows(
         device,
         segmented_projection_specialization_on(
             device,
@@ -1236,7 +1271,15 @@ fn attention_project_specialization_on(
         ),
         ATTENTION_PROJECT_GEMV_ROWS_LAUNCH,
         mapping,
-    )
+    ))
+}
+
+/// The value `statics` gives the scale port static `name`, else 0 (absent).
+fn static_or_absent(statics: &[(&str, usize)], name: &str) -> u64 {
+    statics
+        .iter()
+        .find(|(static_name, _)| *static_name == name)
+        .map_or(0, |(_, value)| *value as u64)
 }
 
 fn dense_expand_specialization_on(
@@ -1674,9 +1717,10 @@ fn dense_expand_reference(
     for row in out_rows {
         let source = *row as usize;
         let (x, slack) = rms_row(act, &residual[source * h..(source + 1) * h], norm, eps);
+        let (xg, xu) = (gate.operand_rows(&x), up.operand_rows(&x));
         for n in 0..f {
-            let (g, gm) = dot(&x, gate.row(n));
-            let (u, um) = dot(&x, up.row(n));
+            let (g, gm) = dot(&xg, gate.row(n));
+            let (u, um) = dot(&xu, up.row(n));
             let (g, u) = (act.round(g), act.round(u));
             let a = act.round(silu(g));
             let value = act.round(a * u);
@@ -2161,6 +2205,10 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                 value_weight: &weights[2].tensor(&device),
                 epsilon: 1e-6,
                 project_mode,
+                query_scale: &no_scale(&device),
+                gate_scale: &no_scale(&device),
+                key_scale: &no_scale(&device),
+                value_scale: &no_scale(&device),
                 query_bound: &absent_bound(&device),
                 gate_bound: &absent_bound(&device),
                 key_bound: &absent_bound(&device),
@@ -2192,6 +2240,7 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                 inject: &no_inject(&device, rows as u64),
                 gated: &act_tensor(&device, act, &[rows, heads, width], &gated),
                 output_weight: &out_weight.tensor(&device),
+                output_scale: &no_scale(&device),
                 output_bound: &absent_bound(&device),
             })
             .unwrap()
@@ -2467,8 +2516,8 @@ fn relative_difference(reference: &[f64], actual: &[f64]) -> (f64, f64) {
 }
 
 /// `project_rows`' launches on Metal: the tall tile and the PACK tile.
-const PROJECT_ROWS_TALL_LAUNCH: usize = 7;
-const PROJECT_ROWS_PACKED_LAUNCH: usize = 10;
+const PROJECT_ROWS_TALL_LAUNCH: usize = 8;
+const PROJECT_ROWS_PACKED_LAUNCH: usize = 11;
 
 /// `project_rows` (activation rows in, F32 rows out, no scale port) on Metal
 /// under `mapping`, with the PACK tile launch `pack` or in an exact form.
@@ -2491,8 +2540,8 @@ fn project_rows_native(
             mapping,
             ProjectionLaunches {
                 gemv: 0,
-                batch: 1,
-                gemm: 4,
+                batch: 2,
+                gemm: 5,
             },
             true,
         )
@@ -2512,7 +2561,7 @@ fn project_rows_native(
         pack.unwrap_or(PACK_DEFAULT),
     )
     .with_param("PACK", u64::from(pack.is_some()))
-    .with_launch_param(1, "BATCH_PARTS", mapping.batch_parts);
+    .with_launch_param(2, "BATCH_PARTS", mapping.batch_parts);
     let kernel = project_rows::native_for_device_with(
         device,
         project_rows::Elements {
@@ -3004,6 +3053,10 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                 value_weight: &project_weights[2].tensor(&device),
                 epsilon: 1e-6,
                 project_mode,
+                query_scale: &no_scale(&device),
+                gate_scale: &no_scale(&device),
+                key_scale: &no_scale(&device),
+                value_scale: &no_scale(&device),
                 query_bound: &absent_bound(&device),
                 gate_bound: &absent_bound(&device),
                 key_bound: &absent_bound(&device),
@@ -3045,6 +3098,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                 inject: &no_inject(&device, rows as u64),
                 gated: &act_tensor(&device, act, &[rows, heads, width], &gated),
                 output_weight: &weight.tensor(&device),
+                output_scale: &no_scale(&device),
                 output_bound: &bound,
             })
             .unwrap()
@@ -3297,8 +3351,8 @@ fn packed_timing() {
                             mapping,
                             ProjectionLaunches {
                                 gemv: 0,
-                                batch: 1,
-                                gemm: 4,
+                                batch: 2,
+                                gemm: 5,
                             },
                             true,
                         )
@@ -3311,7 +3365,7 @@ fn packed_timing() {
                     PACK_DEFAULT,
                 )
                 .with_param("PACK", 0)
-                .with_launch_param(1, "BATCH_PARTS", mapping.batch_parts)
+                .with_launch_param(2, "BATCH_PARTS", mapping.batch_parts)
             },
             &time,
         );
@@ -3540,6 +3594,10 @@ fn packed_timing() {
                     value_weight: value,
                     epsilon: 1e-6,
                     project_mode: 0,
+                    query_scale: &absent_scale,
+                    gate_scale: &absent_scale,
+                    key_scale: &absent_scale,
+                    value_scale: &absent_scale,
                     query_bound: &absent_scale,
                     gate_bound: &absent_scale,
                     key_bound: &absent_scale,
@@ -3591,6 +3649,7 @@ fn packed_timing() {
             )
             .unwrap();
             let inject = no_inject(&device, hidden.extents()[0]);
+            let unscaled = no_scale(&device);
             let rotation = weights
                 .iter()
                 .map(|weight| attention_output::Args {
@@ -3598,6 +3657,7 @@ fn packed_timing() {
                     inject: &inject,
                     gated: &gated,
                     output_weight: weight,
+                    output_scale: &unscaled,
                     output_bound: &bound,
                 })
                 .collect();
@@ -3685,8 +3745,9 @@ fn dense_output_reference(
     let mut expected = Vec::new();
     let mut bound = Vec::new();
     for (r, row) in out_rows.iter().enumerate() {
+        let x = down.operand_rows(&product[r * f..(r + 1) * f]);
         for n in 0..h {
-            let (acc, magnitude) = dot(&product[r * f..(r + 1) * f], down.row(n));
+            let (acc, magnitude) = dot(&x, down.row(n));
             expected.push(residual[*row as usize * h + n] + act.round(acc));
             bound.push(rounded_bound(act, acc, magnitude));
         }
@@ -3805,10 +3866,110 @@ fn dense_expand_gguf_formats_match_their_portable_body() {
             &[
                 (Repr::Q4g32s, Repr::Q4g32s),
                 (Repr::Iq4g32s, Repr::Q4g32s),
-                (Repr::Mxfp4, Repr::Nvfp4),
+                (Repr::Mxfp4, Repr::Q4g32s),
+                // Weights that share their rows share an operand recipe.
+                (Repr::Nvfp4, Repr::Nvfp4),
+                (Repr::Nvfp4A4, Repr::Nvfp4A4),
                 (Repr::Q5g32s, Repr::Q5g32),
             ],
         );
+    }
+}
+
+/// `dense_up` (Nemotron-H's ReLU² shared expert) over NVFP4 and Q4_0 weights
+/// at every row class, at each backend's declared default configuration,
+/// against its portable body.
+#[test]
+fn dense_up_gguf_formats_match_their_portable_body() {
+    let module = module();
+    let act = Act::Bf16;
+    let (h, f) = (256, 40);
+    for repr in [Repr::Nvfp4, Repr::Nvfp4A4, Repr::Q4g32s] {
+        let up = weight(repr, f, h, 21, 1.0);
+        let norm = norm_values(h, 5);
+        for outputs in [1usize, 2, 3, 6, 12, 18, 70] {
+            let rows = outputs + 2;
+            let out_rows = (0..outputs).map(|i| ((i * 5 + 1) % rows) as i32).collect::<Vec<_>>();
+            let mut rng = Rng::new(rows as u64 + 7);
+            let residual = (0..rows * h).map(|_| rng.symmetric() * 3.0).collect::<Vec<_>>();
+            let outcome = interpret(
+                &module,
+                "dense_up",
+                &[
+                    ("NW", registry::dense(DType::BF16)),
+                    ("UW", repr.storage()),
+                    ("A", registry::dense(DType::BF16)),
+                ],
+                vec![
+                    floats(&[rows, h], &residual),
+                    activations(Act::Bf16, &[h], &norm),
+                    Input::Data(up.oracle()),
+                    ints(&[outputs], &out_rows),
+                    Input::F32(1e-6),
+                    Input::I32(2),
+                    floats(&[0], &[]),
+                ],
+            );
+            let oracle = result(&outcome, 0);
+            // The host model's bound: reassociation, the rounding flips of
+            // the normalized rows, and one rounding of the product.
+            let mut bound = Vec::new();
+            for row in &out_rows {
+                let source = *row as usize;
+                let (x, slack) = rms_row(act, &residual[source * h..(source + 1) * h], &norm, 1e-6);
+                let x = up.operand_rows(&x);
+                for n in 0..f {
+                    let (u, magnitude) = dot(&x, up.row(n));
+                    let u = act.round(u);
+                    let error = reassociation_bound(magnitude) + u.abs() * act.ulp()
+                        + slack_dot(&slack, up.row(n));
+                    let value = act.round(u.max(0.0) * u.max(0.0));
+                    bound.push(1.2 * 2.0 * u.abs() * error + value.abs() * act.ulp() + 1e-6);
+                }
+            }
+            for device in devices() {
+                let implementation = dense_up::native_implementation(&device).unwrap().unwrap();
+                let statics = implementation.statics.iter().fold(
+                    NativeSpecialization::new(),
+                    |statics, name| {
+                        let value = match name.as_str() {
+                            "H" => h,
+                            "F" => f,
+                            "US" => 0,
+                            _ => panic!("unexpected static {name}"),
+                        };
+                        statics.with_static(name.clone(), value as u64)
+                    },
+                );
+                let native = dense_up::native_for_device_with(
+                    &device,
+                    dense_up::Elements {
+                        NW: Element::bf16(),
+                        UW: repr.resident(&device),
+                        A: act.element(),
+                    },
+                    &implementation.default_specialization(&statics).unwrap(),
+                )
+                .unwrap()
+                .call(dense_up::Args {
+                    residual: &f32_tensor(&device, &[rows, h], &residual),
+                    norm: &bf16_norm(&device, &norm),
+                    up_weight: &up.tensor(&device),
+                    out_rows: &i32_tensor(&device, &[outputs], &out_rows),
+                    eps: 1e-6,
+                    activation: 2,
+                    up_scale: &f32_tensor(&device, &[0], &[]),
+                })
+                .unwrap()
+                .value;
+                assert_within(
+                    &format!("dense_up {repr:?} {:?} rows {outputs}", device.backend()),
+                    &read_act(act, &native),
+                    &oracle,
+                    &bound,
+                );
+            }
+        }
     }
 }
 
@@ -4263,6 +4424,7 @@ fn recurrent_project_cases_on(device: &Device, cases: Cases) {
             for r in 0..rows {
                 let (x, slack) = rms_row(act, &hidden[r * h..(r + 1) * h], &norm, 1e-6);
                 for wt in &weights {
+                    let x = wt.operand_rows(&x);
                     for n in 0..wt.rows {
                         let (acc, magnitude) = dot(&x, wt.row(n));
                         expected.push(act.round(acc));
@@ -4435,7 +4597,7 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
                 let mut bound = Vec::new();
                 for r in 0..rows {
                     for n in 0..h {
-                        let (acc, magnitude) = dot(&gated[r * k..(r + 1) * k], out_weight.row(n));
+                        let (acc, magnitude) = dot(&out_weight.operand_rows(&gated[r * k..(r + 1) * k]), out_weight.row(n));
                         expected.push(hidden[r * h + n] + act.round(acc));
                         bound.push(rounded_bound(act, acc, magnitude));
                     }
@@ -4462,6 +4624,7 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
                         inject: &no_inject(&device, rows as u64),
                         gated: &act_tensor(&device, act, &[rows, nv, w], gated),
                         output_weight: &out_weight.tensor(&device),
+                        output_scale: &no_scale(&device),
                         output_bound: &absent_bound(&device),
                     })
                     .unwrap()
@@ -4480,7 +4643,8 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
                         floats(&[rows, 0], &[]),
                         activations(act, &[rows, nv, w], &gated),
                         Input::Data(out_weight.oracle()),
-                        // No packing bound.
+                        // No scale, no packing bound.
+                        floats(&[0], &[]),
                         floats(&[0], &[]),
                     ],
                 );
@@ -4649,6 +4813,10 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     value_weight: &weights[2].tensor(&device),
                     epsilon: 1e-6,
                     project_mode,
+                    query_scale: &no_scale(&device),
+                    gate_scale: &no_scale(&device),
+                    key_scale: &no_scale(&device),
+                    value_scale: &no_scale(&device),
                     query_bound: &absent_bound(&device),
                     gate_bound: &absent_bound(&device),
                     key_bound: &absent_bound(&device),
@@ -4670,6 +4838,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
             for r in 0..rows {
                 let (x, slack) = rms_row(act, &hidden[r * d..(r + 1) * d], &norm, 1e-6);
                 for (i, wt) in weights.iter().enumerate() {
+                    let x = wt.operand_rows(&x);
                     for n in 0..wt.rows {
                         let (acc, magnitude) = dot(&x, wt.row(n));
                         out[i].0.push(act.round(acc));
@@ -4707,7 +4876,11 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     Input::Data(weights[2].oracle()),
                     Input::F32(1e-6),
                     Input::I32(0),
-                    // No packing bounds.
+                    // No scales, no packing bounds.
+                    floats(&[0], &[]),
+                    floats(&[0], &[]),
+                    floats(&[0], &[]),
+                    floats(&[0], &[]),
                     floats(&[0], &[]),
                     floats(&[0], &[]),
                     floats(&[0], &[]),
@@ -4797,6 +4970,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                         inject: &no_inject(&device, rows as u64),
                         gated: &act_tensor(&device, act, &[rows, q, w], gated),
                         output_weight: &out_weight.tensor(&device),
+                        output_scale: &no_scale(&device),
                         output_bound: &absent_bound(&device),
                     })
                     .unwrap()
@@ -4808,7 +4982,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                 let mut bound = Vec::new();
                 for r in 0..rows {
                     for n in 0..d_out {
-                        let (acc, magnitude) = dot(&gated[r * k..(r + 1) * k], out_weight.row(n));
+                        let (acc, magnitude) = dot(&out_weight.operand_rows(&gated[r * k..(r + 1) * k]), out_weight.row(n));
                         expected.push(hidden[r * d_out + n] + act.round(acc));
                         bound.push(rounded_bound(act, acc, magnitude));
                     }
@@ -4834,7 +5008,8 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                             floats(&[rows, 0], &[]),
                             activations(act, &[rows, q, w], &gated),
                             Input::Data(out_weight.oracle()),
-                            // No packing bound.
+                            // No scale, no packing bound.
+                            floats(&[0], &[]),
                             floats(&[0], &[]),
                         ],
                     );
@@ -4855,6 +5030,313 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                         &bound,
                     );
                 }
+            }
+        }
+    }
+}
+
+/// Projections under their weights' second-level scales (Nemotron's NVFP4
+/// `.scale`s): every segment of `attention_project` (QS = GS = KS = VS = 1,
+/// one scale each) and `attention_output` (OS = 1) multiply their F32
+/// accumulators by their scale before rounding, against the portable bodies
+/// and the host reference at every launch class, and on Metal in the PACK
+/// form too. One test per backend; CUDA's is `cuda_projection_blocks.rs`'.
+#[test]
+fn cpu_scaled_projections_match_the_host() {
+    scaled_projections_on_backend(BackendName::Cpu);
+}
+
+#[test]
+fn metal_scaled_projections_match_the_host() {
+    scaled_projections_on_backend(BackendName::Metal);
+}
+
+#[test]
+fn vulkan_scaled_projections_match_the_host() {
+    scaled_projections_on_backend(BackendName::Vulkan);
+}
+
+fn scaled_projections_on_backend(backend: BackendName) {
+    if let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == backend)
+    {
+        scaled_projections_on(&device);
+    }
+}
+
+fn scaled_projections_on(device: &Device) {
+    /// The segments' second-level scales, query, gate, key, value: none a
+    /// power of two, each distinct, so a scale bound to the wrong segment
+    /// fails.
+    const SCALES: [f32; 4] = [0.412_5, 0.731_2, 1.368_8, 0.207_5];
+    /// The output projection's.
+    const SCALE: f32 = 0.412_5;
+    let module = module();
+    let act = Act::Bf16;
+    // Query, gate, key and value segments of 128, 64, 64 and 64 rows over a
+    // 256-wide residual; an output projection of 4 heads of 64 channels
+    // back to it.
+    let (d, heads, width) = (256usize, 4usize, 64usize);
+    let segments = [128usize, 64, 64, 64];
+    let k = heads * width;
+    let norm = norm_values(d, 17);
+    let rows_classes = [1usize, 2, 8, 17, 64, 128];
+    let mappings = [MAPPINGS[0], MAPPINGS[2]];
+    let metal = device.backend() == BackendName::Metal;
+    for repr in [Repr::Nvfp4, Repr::Nvfp4A4, Repr::Q4k] {
+        let projections = [301, 311, 312, 313]
+            .into_iter()
+            .zip(segments)
+            .map(|(seed, rows)| weight(repr, rows, d, seed, 1.0))
+            .collect::<Vec<_>>();
+        let output = weight(repr, d, k, 302, 1.0);
+        let project = |hidden: &[f32], rows: usize, mapping: Mapping, pack: Option<Pack>| {
+            let specialization = attention_project_specialization_on(
+                device,
+                &[
+                    ("D", d),
+                    ("Q", segments[0]),
+                    ("GR", segments[1]),
+                    ("K", segments[2]),
+                    ("V", segments[3]),
+                    ("QS", 1),
+                    ("GS", 1),
+                    ("KS", 1),
+                    ("VS", 1),
+                ],
+                mapping,
+            );
+            let weights = projections
+                .iter()
+                .map(|projection| projection.tensor(device))
+                .collect::<Vec<_>>();
+            let scales = SCALES.map(|scale| f32_tensor(device, &[1], &[scale]));
+            let out = attention_project::native_for_device_with(
+                device,
+                attention_project::Elements {
+                    NW: Element::bf16(),
+                    QW: repr.resident(device),
+                    GW: repr.resident(device),
+                    KW: repr.resident(device),
+                    VW: repr.resident(device),
+                    A: act.element(),
+                },
+                &match pack {
+                    Some(pack) => with_pack(specialization, ATTENTION_PROJECT_PACKED_LAUNCH, pack),
+                    None => specialization,
+                },
+            )
+            .unwrap()
+            .call(attention_project::Args {
+                hidden: &f32_tensor(device, &[rows, d], hidden),
+                input_norm: &bf16_norm(device, &norm),
+                query_weight: &weights[0],
+                gate_weight: &weights[1],
+                key_weight: &weights[2],
+                value_weight: &weights[3],
+                epsilon: 1e-6,
+                project_mode: 0,
+                query_scale: &scales[0],
+                gate_scale: &scales[1],
+                key_scale: &scales[2],
+                value_scale: &scales[3],
+                query_bound: &absent_bound(device),
+                gate_bound: &absent_bound(device),
+                key_bound: &absent_bound(device),
+                value_bound: &absent_bound(device),
+            })
+            .unwrap();
+            [&out.r0, &out.r1, &out.r2, &out.r3].map(|segment| read_act(act, segment))
+        };
+        let output_native =
+            |hidden: &[f32], gated: &[f32], rows: usize, mapping: Mapping, pack: Option<Pack>| {
+                let specialization = attention_output_specialization_on(
+                    device,
+                    &[("D", d), ("Q", heads), ("W", width), ("OS", 1)],
+                    mapping,
+                );
+                let out = attention_output::native_for_device_with(
+                    device,
+                    attention_output::Elements {
+                        OW: repr.resident(device),
+                        A: act.element(),
+                    },
+                    &match pack {
+                        Some(pack) => {
+                            with_pack(specialization, ATTENTION_OUTPUT_PACKED_LAUNCH, pack)
+                        }
+                        None => specialization,
+                    },
+                )
+                .unwrap()
+                .call(attention_output::Args {
+                    hidden: &f32_tensor(device, &[rows, d], hidden),
+                    inject: &no_inject(device, rows as u64),
+                    gated: &act_tensor(device, act, &[rows, heads, width], gated),
+                    output_weight: &output.tensor(device),
+                    output_scale: &f32_tensor(device, &[1], &[SCALE]),
+                    output_bound: &absent_bound(device),
+                })
+                .unwrap()
+                .value;
+                read_f32(&out)
+            };
+        // Each segment's scaled accumulators rounded to A, and their bounds.
+        let project_reference = |hidden: &[f32], rows: usize| {
+            std::array::from_fn::<_, 4, _>(|segment| {
+                let (projection, scale) = (&projections[segment], SCALES[segment]);
+                let (mut expected, mut bound) = (Vec::new(), Vec::new());
+                for r in 0..rows {
+                    let (x, slack) = rms_row(act, &hidden[r * d..(r + 1) * d], &norm, 1e-6);
+                    let x = projection.operand_rows(&x);
+                    for n in 0..segments[segment] {
+                        let (acc, magnitude) = dot(&x, projection.row(n));
+                        expected.push(act.round(scale * acc));
+                        bound.push(
+                            rounded_bound(act, scale * acc, scale * magnitude)
+                                + scale * slack_dot(&slack, projection.row(n)),
+                        );
+                    }
+                }
+                (expected, bound)
+            })
+        };
+        let output_reference = |hidden: &[f32], gated: &[f32], rows: usize| {
+            let (mut expected, mut bound) = (Vec::new(), Vec::new());
+            for r in 0..rows {
+                for n in 0..d {
+                    let (acc, magnitude) = dot(&output.operand_rows(&gated[r * k..(r + 1) * k]), output.row(n));
+                    expected.push(hidden[r * d + n] + act.round(SCALE * acc));
+                    bound.push(rounded_bound(act, SCALE * acc, SCALE * magnitude));
+                }
+            }
+            (expected, bound)
+        };
+        let case = |rows: usize| {
+            let mut rng = Rng::new(rows as u64 + 303);
+            let hidden = (0..rows * d)
+                .map(|_| rng.symmetric() * 2.0)
+                .collect::<Vec<_>>();
+            let gated = (0..rows * k)
+                .map(|_| act.round(rng.symmetric()))
+                .collect::<Vec<_>>();
+            (hidden, gated)
+        };
+
+        // The portable bodies scale as the natives do.
+        let rows = 2;
+        let (hidden, gated) = case(rows);
+        let projected = interpret(
+            &module,
+            "attention_project",
+            &[
+                ("NW", registry::dense(DType::BF16)),
+                ("QW", repr.storage()),
+                ("GW", repr.storage()),
+                ("KW", repr.storage()),
+                ("VW", repr.storage()),
+                ("A", registry::dense(DType::BF16)),
+            ],
+            [
+                floats(&[rows, d], &hidden),
+                activations(Act::Bf16, &[d], &norm),
+            ]
+            .into_iter()
+            .chain(projections.iter().map(|projection| Input::Data(projection.oracle())))
+            .chain([Input::F32(1e-6), Input::I32(0)])
+            // Every segment's scale; no bound.
+            .chain(SCALES.map(|scale| floats(&[1], &[scale])))
+            .chain((0..4).map(|_| floats(&[0], &[])))
+            .collect(),
+        );
+        let outputted = interpret(
+            &module,
+            "attention_output",
+            &[("OW", repr.storage()), ("A", registry::dense(DType::BF16))],
+            vec![
+                floats(&[rows, d], &hidden),
+                floats(&[rows, 0], &[]),
+                activations(act, &[rows, heads, width], &gated),
+                Input::Data(output.oracle()),
+                floats(&[1], &[SCALE]),
+                // No packing bound.
+                floats(&[0], &[]),
+            ],
+        );
+        let project_reference_at = under(rows, || project_reference(&hidden, rows));
+        let (_, output_bound) = under(rows, || output_reference(&hidden, &gated, rows));
+        let projected_native = project(&hidden, rows, MAPPINGS[0], None);
+        for (segment, (_, project_bound)) in project_reference_at.iter().enumerate() {
+            assert_within(
+                &format!("scaled attention_project portable {repr:?} segment {segment}"),
+                &projected_native[segment],
+                &result(&projected, segment),
+                project_bound,
+            );
+        }
+        assert_within(
+            &format!("scaled attention_output portable {repr:?}"),
+            &output_native(&hidden, &gated, rows, MAPPINGS[0], None),
+            &result(&outputted, 0),
+            &output_bound,
+        );
+
+        // Every launch class against the host reference.
+        for rows in rows_classes {
+            let (hidden, gated) = case(rows);
+            let project_expected = under(rows, || project_reference(&hidden, rows));
+            let (output_expected, output_bound) =
+                under(rows, || output_reference(&hidden, &gated, rows));
+            for mapping in mappings {
+                let projected = project(&hidden, rows, mapping, None);
+                for (segment, (expected, bound)) in project_expected.iter().enumerate() {
+                    assert_within(
+                        &format!(
+                            "scaled attention_project {repr:?} M {rows} {mapping:?} segment {segment}"
+                        ),
+                        &projected[segment],
+                        expected,
+                        bound,
+                    );
+                }
+                assert_within(
+                    &format!("scaled attention_output {repr:?} M {rows} {mapping:?}"),
+                    &output_native(&hidden, &gated, rows, mapping, None),
+                    &output_expected,
+                    &output_bound,
+                );
+            }
+            // The PACK form rounds its operand: within the packed error of the
+            // scaled projection.
+            if metal && rows > 64 {
+                let wide = |values: &[f32]| values.iter().map(|v| f64::from(*v)).collect::<Vec<_>>();
+                let packed = project(&hidden, rows, pack_mapping(), Some(PACK_DEFAULT));
+                for (segment, (expected, _)) in project_expected.iter().enumerate() {
+                    let (relative, worst) =
+                        relative_difference(&wide(expected), &wide(&packed[segment]));
+                    assert!(
+                        relative <= 2e-2 && worst <= 0.2,
+                        "packed scaled attention_project {repr:?} M {rows} segment {segment}: \
+                         {relative:.2e}, {worst:.2e}"
+                    );
+                }
+                let projection_only = |values: &[f32]| {
+                    values
+                        .iter()
+                        .zip(&hidden)
+                        .map(|(value, hidden)| f64::from(value - hidden))
+                        .collect::<Vec<_>>()
+                };
+                let packed = output_native(&hidden, &gated, rows, pack_mapping(), Some(PACK_DEFAULT));
+                let (relative, worst) = relative_difference(
+                    &projection_only(&output_expected),
+                    &projection_only(&packed),
+                );
+                assert!(
+                    relative <= 2e-2 && worst <= 0.2,
+                    "packed scaled attention_output {repr:?} M {rows}: {relative:.2e}, {worst:.2e}"
+                );
             }
         }
     }
@@ -5009,7 +5491,7 @@ fn head_logits_match_the_host(
         let mut expected = Vec::with_capacity(rows * v);
         for row in 0..rows {
             for column in 0..v {
-                expected.push(dot(&features[row * d..(row + 1) * d], head.row(column)));
+                expected.push(dot(&head.operand_rows(&features[row * d..(row + 1) * d]), head.row(column)));
             }
         }
         let values = expected.iter().map(|(value, _)| *value).collect::<Vec<_>>();
@@ -5106,6 +5588,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                 let (x, slack) = rms_row(act, &hidden[source * d..(source + 1) * d], &norm, 1e-6);
                 features.extend_from_slice(&x);
                 feature_bound.extend_from_slice(&slack);
+                let x = head.operand_rows(&x);
                 for n in 0..v {
                     let (acc, magnitude) = dot(&x, head.row(n));
                     logits.push(acc);
@@ -5868,6 +6351,7 @@ fn timing_on(device: &Device) {
                         inject: &inject,
                         gated: &gated,
                         output_weight: weight,
+                        output_scale: &no_bound,
                         output_bound: &no_bound,
                     })
                     .collect();
@@ -5956,6 +6440,10 @@ fn timing_on(device: &Device) {
                         value_weight: &set[2],
                         epsilon: 1e-6,
                         project_mode: 0,
+                        query_scale: &no_bound,
+                        gate_scale: &no_bound,
+                        key_scale: &no_bound,
+                        value_scale: &no_bound,
                         query_bound: &no_bound,
                         gate_bound: &no_bound,
                         key_bound: &no_bound,
@@ -6016,6 +6504,7 @@ fn timing_on(device: &Device) {
                         inject: &inject,
                         gated: &gated,
                         output_weight: weight,
+                        output_scale: &no_bound,
                         output_bound: &no_bound,
                     })
                     .collect();
@@ -6410,6 +6899,7 @@ fn metal_convolved_matrix_columns_match_host() {
                 for row in hidden.chunks_exact(h) {
                     let (x, slack) = rms_row(act, row, &norm, 1e-6);
                     for wt in &weights {
+                        let x = wt.operand_rows(&x);
                         for n in 0..wt.rows {
                             let (acc, magnitude) = dot(&x, wt.row(n));
                             expected.push(act.round(acc));
@@ -6625,6 +7115,10 @@ fn metal_absent_query_projection_preserves_key_value() {
                     value_weight: &value,
                     epsilon: 1e-6,
                     project_mode: if absent { 0 } else { 1 },
+                    query_scale: &no_scale(&device),
+                    gate_scale: &no_scale(&device),
+                    key_scale: &no_scale(&device),
+                    value_scale: &no_scale(&device),
                     query_bound: &absent_bound(&device),
                     gate_bound: &absent_bound(&device),
                     key_bound: &absent_bound(&device),
@@ -6666,7 +7160,7 @@ fn metal_attention_output_matrix_matches_host() {
                     let mut bound = Vec::new();
                     for r in 0..rows {
                         for n in 0..d {
-                            let (acc, magnitude) = dot(&gated[r * k..(r + 1) * k], weights.row(n));
+                            let (acc, magnitude) = dot(&weights.operand_rows(&gated[r * k..(r + 1) * k]), weights.row(n));
                             expected.push(hidden[r * d + n] + act.round(acc));
                             bound.push(rounded_bound(act, acc, magnitude));
                         }
@@ -6698,6 +7192,7 @@ fn metal_attention_output_matrix_matches_host() {
                             inject: &no_inject(&device, rows as u64),
                             gated: &act_tensor(&device, act, &[rows, q, w], &gated),
                             output_weight: &weights.tensor(&device),
+                            output_scale: &no_scale(&device),
                             output_bound: &absent_bound(&device),
                         })
                         .unwrap()
@@ -6815,7 +7310,7 @@ fn metal_q4_verify_rows_match_host() {
                 let mut bounds = Vec::new();
                 for m in 0..rows {
                     for n in 0..f {
-                        let (sum, magnitude) = dot(&source[m * h..(m + 1) * h], gate.row(n));
+                        let (sum, magnitude) = dot(&gate.operand_rows(&source[m * h..(m + 1) * h]), gate.row(n));
                         expected.push(sum);
                         bounds.push(reassociation_bound(magnitude) + 1e-7);
                     }
@@ -6872,14 +7367,14 @@ fn gemma_q4_verify_timing() {
                     mapping,
                     ProjectionLaunches {
                         gemv: 0,
-                        batch: 1,
-                        gemm: 4,
+                        batch: 2,
+                        gemm: 5,
                     },
                     true,
                 )
                 .with_static("WS", 0)
                 .with_static("WB", 0)
-                .with_launch_param(1, "BATCH_PARTS", parts);
+                .with_launch_param(2, "BATCH_PARTS", parts);
                 let specialization = with_pack(
                     with_tall(&device, specialization, PROJECT_ROWS_TALL_LAUNCH, None),
                     PROJECT_ROWS_PACKED_LAUNCH,

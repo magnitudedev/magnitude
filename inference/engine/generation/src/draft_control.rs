@@ -256,12 +256,13 @@ impl LaunchCosts {
 /// measurements prove, and at least what the same launch measured over no
 /// longer a history and among no more requests: neither makes it cheaper.
 ///
-/// A launch measured there fewer times than its cost needs costs no more
-/// than a larger launch proven there, nor than the same launch proven among
-/// as many requests over a shorter history times the ratio of the context
-/// classes (only its attention reads a longer history, and reads it at most
-/// that many times as long). One held-up duration would otherwise price it
-/// out of being taken, and so of ever being measured again.
+/// A launch not proven there (measured fewer times than its cost needs, or
+/// not at all) costs no more than a larger launch proven there, nor than the
+/// same launch proven among as many requests over a shorter history times
+/// the ratio of the context classes (only its attention reads a longer
+/// history, and reads it at most that many times as long). One held-up
+/// duration would otherwise price it out of being taken, and so of ever
+/// being measured again.
 struct RoundCosts {
     own: LaunchCosts,
     /// Measurements at no longer a context and of no more requests.
@@ -319,26 +320,25 @@ impl RoundCosts {
 
     fn seconds(&self, costs: fn(&LaunchCosts) -> &BTreeMap<usize, Durations>, size: usize) -> f64 {
         let own = costs(&self.own);
-        match own.get(&size) {
-            Some(durations) if durations.proven() => durations.cost(),
-            Some(durations) => {
-                let larger = own
-                    .range(size + 1..)
-                    .filter(|(_, larger)| larger.proven())
-                    .map(|(_, larger)| larger.cost());
-                let shorter = self.shorter.iter().filter_map(|(ratio, measured)| {
-                    costs(measured)
-                        .get(&size)
-                        .filter(|durations| durations.proven())
-                        .map(|durations| ratio * durations.cost())
-                });
-                larger.chain(shorter).fold(durations.cost(), f64::min)
-            }
+        let unproven = match own.get(&size) {
+            Some(durations) if durations.proven() => return durations.cost(),
+            Some(durations) => durations.cost(),
             None => std::iter::once(&self.own)
                 .chain(&self.lesser)
                 .map(|measured| LaunchCosts::at_least(costs(measured), size))
                 .fold(0.0, f64::max),
-        }
+        };
+        let larger = own
+            .range(size + 1..)
+            .filter(|(_, larger)| larger.proven())
+            .map(|(_, larger)| larger.cost());
+        let shorter = self.shorter.iter().filter_map(|(ratio, measured)| {
+            costs(measured)
+                .get(&size)
+                .filter(|durations| durations.proven())
+                .map(|durations| ratio * durations.cost())
+        });
+        larger.chain(shorter).fold(unproven, f64::min)
     }
 
     fn draft(&self, generated: usize) -> f64 {
@@ -544,8 +544,11 @@ pub struct DraftController {
     /// The launches this round's durations belong to.
     timing_draft: Option<usize>,
     timing_target: bool,
-    entered: f64,
-    drafter: Option<f64>,
+    /// What this round's entries took; `None` when one recorded its graph.
+    entered: Option<f64>,
+    /// This round's drafter launch, with what it took when it replayed its
+    /// graph.
+    drafter: Option<Option<f64>>,
     after_drafting: Option<bool>,
     chosen: Option<bool>,
     /// The length of this round's drafted block, until it is verified.
@@ -579,7 +582,7 @@ impl DraftController {
             kept: None,
             timing_draft: None,
             timing_target: false,
-            entered: 0.0,
+            entered: Some(0.0),
             drafter: None,
             after_drafting: None,
             chosen: None,
@@ -676,7 +679,7 @@ impl DraftController {
         self.context_class = position.max(1).next_power_of_two();
         // Entries before a round chooses are no round's: the prompt's, or
         // pairs held past their bound by rounds that drafted nothing.
-        self.entered = 0.0;
+        self.entered = Some(0.0);
         let costs = self.costs();
         let right = self.right();
         // The fastest pair. Of equal rates the narrowest.
@@ -887,18 +890,20 @@ impl DraftController {
     /// decode and the catch-up before the drafter proposes, the decode
     /// started again in the target's launch. That launch is measured without
     /// the switch's price, and the switch by what its round took beyond the
-    /// price of its launches.
+    /// price of its launches. A launch that recorded its graph (`duration`
+    /// `None`) measured that recording, not itself: it carries its round on
+    /// and prices nothing.
     pub fn timed(
         &mut self,
         launch: TimedLaunch,
-        duration: Duration,
+        duration: Option<Duration>,
         sequences: usize,
         rows: usize,
     ) {
-        let seconds = duration.as_secs_f64();
+        let seconds = duration.map(|duration| duration.as_secs_f64());
         let size = match launch {
             TimedLaunch::Entry => {
-                self.entered += seconds;
+                self.entered = self.entered.zip(seconds).map(|(entered, seconds)| entered + seconds);
                 return;
             }
             TimedLaunch::Draft => self.timing_draft.take(),
@@ -932,7 +937,9 @@ impl DraftController {
                 (paying == Switch::Leave && !launches.verify.contains_key(&size)).then_some(0.0)
             })
         };
-        let took = seconds + std::mem::take(&mut self.entered);
+        let took = seconds
+            .zip(self.entered.replace(0.0))
+            .map(|(seconds, entered)| seconds + entered);
         let round = {
             let mut rounds = self.load.rounds.lock().expect("draft load rounds");
             if launch == TimedLaunch::Target {
@@ -946,7 +953,7 @@ impl DraftController {
             .or_default();
         if launch == TimedLaunch::Draft {
             self.drafter = Some(took);
-            if let Some(paid) = paid(Switch::Enter, launches, size) {
+            if let (Some(took), Some(paid)) = (took, paid(Switch::Enter, launches, size)) {
                 LaunchCosts::record(&mut launches.draft, round, size, (took - paid).max(0.0));
             }
             return;
@@ -958,11 +965,17 @@ impl DraftController {
         } else {
             0
         };
-        if let (Some(switch), Some(steady)) = (switch, costs.steady(generated, size)) {
-            let round_took = took + drafter.unwrap_or(0.0);
+        // A launch that recorded its graph measured that, not itself.
+        let Some(took) = took else {
+            return;
+        };
+        let drafter_took = drafter.map_or(Some(0.0), |drafter| drafter);
+        if let (Some(switch), Some(steady), Some(drafter_took)) =
+            (switch, costs.steady(generated, size), drafter_took)
+        {
             launches
                 .switch_mut(switch)
-                .record(round, (round_took - steady).max(0.0));
+                .record(round, (took + drafter_took - steady).max(0.0));
         }
         let Some(paid) = paid(Switch::Leave, launches, size) else {
             return;

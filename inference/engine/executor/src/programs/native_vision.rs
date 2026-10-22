@@ -264,6 +264,8 @@ struct VisionGraphPorts {
     pixels: NativePort,
     indices: NativePort,
     coefficients: NativePort,
+    /// The register rows' blend of the register table.
+    register_blend: Option<(NativePort, NativePort)>,
     coordinates: Option<NativePort>,
     window_spans: Option<NativePort>,
     image_spans: Option<NativePort>,
@@ -278,11 +280,15 @@ struct Draft<'b, G: GraphDraft, B: VisionBindings<G>> {
     bindings: &'b B,
     load: &'b ModelLoadPlan,
     program: &'b VisionOps,
+    /// Tower rows: the register rows, then the class's patch rows.
     rows: u64,
+    /// The class's patch rows.
+    patches: u64,
     cells: u64,
     values: Vec<WorkflowTensor>,
     pixels: Option<NativePort>,
     indices: Option<(NativePort, NativePort)>,
+    register_blend: Option<(NativePort, NativePort)>,
     coordinates: Option<NativePort>,
     window_spans: Option<NativePort>,
     image_spans: Option<NativePort>,
@@ -353,12 +359,19 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
     }
 
     fn value(&self, value: VisionValue, extents: &[u64]) -> Result<WorkflowTensorView, GraphError> {
-        match value {
-            VisionValue::Result(index) => self
-                .values
+        let result = |index: usize| {
+            self.values
                 .get(index)
-                .map(|tensor| tensor.reshape(extents))
-                .ok_or_else(|| "a vision operand precedes its producer".into()),
+                .ok_or_else(|| GraphError::from("a vision operand precedes its producer"))
+        };
+        match value {
+            VisionValue::Result(index) => Ok(result(index)?.reshape(extents)),
+            VisionValue::PatchRows(index) => {
+                let registers = self.program.registers;
+                Ok(result(index)?
+                    .slice_leading(registers, registers + self.patches)
+                    .reshape(extents))
+            }
             VisionValue::Pixels => input_view(&self.pixels, extents),
         }
     }
@@ -366,7 +379,7 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
     /// The row width of a value.
     fn width(&self, value: VisionValue) -> Result<u64, GraphError> {
         match value {
-            VisionValue::Result(index) => self
+            VisionValue::Result(index) | VisionValue::PatchRows(index) => self
                 .program
                 .ops
                 .get(index)
@@ -386,6 +399,38 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
             return Err("the vision position table is not whole rows".into());
         }
         Ok(values / width)
+    }
+
+    /// `source` rows plus their blend of `table` rows (`vision_position`),
+    /// and the graph inputs of the blend's indices and coefficients.
+    fn blend(
+        &mut self,
+        kernel: &VisionKernel,
+        source: VisionValue,
+        table: WeightRole,
+    ) -> Result<(WorkflowTensor, (NativePort, NativePort)), GraphError> {
+        let (rows, h) = (self.rows, static_value(kernel, "H")?);
+        let l = self.table_rows(table, h)?;
+        let dims = [("M", rows), ("H", h), ("L", l)];
+        let binding = self.bindings.position(kernel)?;
+        let indices = self.graph.input_for(binding, "indices", &dims)?;
+        let coefficients = self.graph.input_for(binding, "coefficients", &dims)?;
+        let source = self.value(source, &[rows, h])?;
+        let table = self.weight(table, &[l, h])?;
+        let value = self
+            .graph
+            .enqueue::<vision_position::Entry>(
+                binding,
+                &dims,
+                vision_position::WorkflowArgs {
+                    source: (&source).into(),
+                    table: (&table).into(),
+                    indices: indices.tensor().into(),
+                    coefficients: coefficients.tensor().into(),
+                },
+            )?
+            .value;
+        Ok((value, (indices, coefficients)))
     }
 
     fn enqueue(
@@ -685,28 +730,13 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                     .value
             }
             VisionOperands::Position { source, table } => {
-                let h = statics("H")?;
-                let l = self.table_rows(*table, h)?;
-                let dims = [("M", rows), ("H", h), ("L", l)];
-                let binding = self.bindings.position(kernel)?;
-                let indices = self.graph.input_for(binding, "indices", &dims)?;
-                let coefficients = self.graph.input_for(binding, "coefficients", &dims)?;
-                let source = self.value(*source, &[rows, h])?;
-                let table = self.weight(*table, &[l, h])?;
-                let value = self
-                    .graph
-                    .enqueue::<vision_position::Entry>(
-                        binding,
-                        &dims,
-                        vision_position::WorkflowArgs {
-                            source: (&source).into(),
-                            table: (&table).into(),
-                            indices: indices.tensor().into(),
-                            coefficients: coefficients.tensor().into(),
-                        },
-                    )?
-                    .value;
-                self.indices = Some((indices, coefficients));
+                let (value, blend) = self.blend(kernel, *source, *table)?;
+                self.indices = Some(blend);
+                value
+            }
+            VisionOperands::Registers { source, table } => {
+                let (value, blend) = self.blend(kernel, *source, *table)?;
+                self.register_blend = Some(blend);
                 value
             }
             VisionOperands::PostNormResidual {
@@ -774,16 +804,25 @@ fn input_view(
         .ok_or_else(|| "a vision graph input is read before it is created".into())
 }
 
+/// The tower rows of a class of `patches` patch rows: the register rows,
+/// then the patches.
+fn tower_rows(program: &VisionOps, patches: u64) -> Result<u64, GraphError> {
+    patches
+        .checked_add(program.registers)
+        .ok_or_else(|| "vision tower rows overflow".into())
+}
+
 fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>>(
     mut graph: G,
     bindings: &B,
     load: &ModelLoadPlan,
     program: &VisionOps,
-    rows: u64,
+    patches: u64,
 ) -> Result<(G, VisionGraphPorts), GraphError> {
-    if rows == 0 || rows % program.cell_rows != 0 {
+    if patches == 0 || patches % program.cell_rows != 0 {
         return Err("the vision patch class is not a positive cell multiple".into());
     }
+    let rows = tower_rows(program, patches)?;
     let constants = Constant::of(program)?
         .into_iter()
         .map(|constant| Ok((constant, constant.draw(&mut graph, rows)?)))
@@ -794,10 +833,12 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>>(
         load,
         program,
         rows,
-        cells: rows / program.cell_rows,
+        patches,
+        cells: patches / program.cell_rows,
         values: Vec::with_capacity(program.ops.len()),
         pixels: None,
         indices: None,
+        register_blend: None,
         coordinates: None,
         window_spans: None,
         image_spans: None,
@@ -822,6 +863,7 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>>(
     if draft.coordinates.is_some() != program.coordinates
         || draft.window_spans.is_some() != program.windows
         || draft.order.is_some() != program.windows
+        || draft.register_blend.is_some() != (program.registers > 0)
     {
         return Err("the vision program's inputs disagree with its invocations".into());
     }
@@ -831,6 +873,7 @@ fn vision_graph_draft<G: GraphDraft, B: VisionBindings<G>>(
             pixels,
             indices,
             coefficients,
+            register_blend: draft.register_blend,
             coordinates: draft.coordinates,
             window_spans: draft.window_spans,
             image_spans: draft.image_spans,
@@ -860,7 +903,8 @@ pub(crate) fn checked_vision_family_resources(
     let (storage, _) = certify_vision_family(backend, load, &program, plan, &patch_rows)?;
     let constants = Constant::of(&program)?;
     let mut resources = CheckedGraphFamilyResources::new();
-    for &rows in &patch_rows {
+    for &patches in &patch_rows {
+        let rows = tower_rows(&program, patches)?;
         resources.include(
             storage,
             constants
@@ -900,23 +944,24 @@ fn certify_vision_family(
         program,
         largest,
     )?;
-    // Patch-row invocations read the class's patch rows; cell-row ones its
-    // cells. The norm's rows are its `C` (the stem's `C` is its channels).
-    // Each class has its own layout, so its outputs hold its own image's
-    // features rather than the largest class's; the family's storage is the
-    // largest of each part.
+    // Patch-row invocations read the class's tower rows (its register rows,
+    // then its patch rows); cell-row ones its cells. The norm's rows are its
+    // `C` (the stem's `C` is its channels). Each class has its own layout,
+    // so its outputs hold its own image's features rather than the largest
+    // class's; the family's storage is the largest of each part.
     let template = graph.seal_template()?;
     let layouts = patch_rows
         .iter()
-        .map(|&rows| {
-            template.certify(&[NativeGraphClassSlice::new()
+        .map(|&patches| {
+            let rows = tower_rows(program, patches)?;
+            Ok(template.certify(&[NativeGraphClassSlice::new()
                 .dimension("M", [rows])
                 .dimension("O", [rows])
                 .scoped(<vision_norm::Entry as seismic::Entry>::NAME, "C", [rows])
-                .scoped(CELLS, "M", [rows / cell])
-                .scoped(CELLS, "C", [rows / cell])])
+                .scoped(CELLS, "M", [patches / cell])
+                .scoped(CELLS, "C", [patches / cell])])?)
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, GraphError>>()?;
     let storage = layouts.iter().map(NativeGraphLayout::storage_bytes).fold(
         NativeGraphStorageBytes {
             workspace: 0,
@@ -990,6 +1035,13 @@ impl NativeVisionProgram {
         let spatial = input.spatial();
         let real = spatial.rows();
         let image_rows = i32::try_from(real).map_err(|_| invalid("vision rows exceed i32"))?;
+        let (prepared, bound) = self.graphs.class(rows)?;
+        // The tower's register rows lead: zero pixels, no position blend,
+        // and one register table row each.
+        let registers = usize::try_from(prepared.registers)
+            .map_err(|_| invalid("vision register rows exceed usize"))?;
+        let attended = i32::try_from(registers + real)
+            .map_err(|_| invalid("vision rows exceed i32"))?;
         // The class's rows past the image's are padding: zero inputs, read
         // by no image row (every span lies within the image), and dropped
         // from the published features.
@@ -997,20 +1049,31 @@ impl NativeVisionProgram {
             .checked_sub(real)
             .ok_or_else(|| invalid("vision image exceeds its class"))?;
         let indices = spatial.interpolation_indices();
-        let indices = (0..real)
-            .flat_map(|row| indices.iter().map(move |plane| plane[row]))
+        let indices = std::iter::repeat_n(0, registers * indices.len())
+            .chain((0..real).flat_map(|row| indices.iter().map(move |plane| plane[row])))
             .chain(std::iter::repeat_n(0, padding * indices.len()))
             .flat_map(i32::to_le_bytes)
             .collect::<Vec<_>>();
         let coefficients = spatial.interpolation_coefficients();
-        let coefficients = (0..real)
-            .flat_map(|row| coefficients.iter().map(move |plane| plane[row]))
+        let coefficients = std::iter::repeat_n(0.0, registers * coefficients.len())
+            .chain((0..real).flat_map(|row| coefficients.iter().map(move |plane| plane[row])))
             .chain(std::iter::repeat_n(0.0, padding * coefficients.len()))
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
+        // `attended` bounds the register rows.
+        let register_indices = (0..registers as i32)
+            .flat_map(|row| [row, 0, 0, 0])
+            .chain(std::iter::repeat_n(0, class * 4))
+            .flat_map(i32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let register_coefficients = std::iter::repeat_n([1.0f32, 0.0, 0.0, 0.0], registers)
+            .flatten()
+            .chain(std::iter::repeat_n(0.0, class * 4))
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
         let pairs = |pairs: &[[i32; 2]], pad: [i32; 2]| {
-            pairs
-                .iter()
+            std::iter::repeat_n(&[0, 0], registers)
+                .chain(pairs)
                 .chain(std::iter::repeat_n(&pad, padding))
                 .flatten()
                 .copied()
@@ -1019,10 +1082,10 @@ impl NativeVisionProgram {
         };
         let coordinates = pairs(spatial.attention_coordinates(), [0, 0]);
         // A padding row reads the last image row's window, so a tile's key
-        // walk stays within the image.
+        // walk stays within the image. (Windows take no register rows.)
         let windows = spatial.window_ranges();
         let window_spans = pairs(windows, windows.last().copied().unwrap_or([0, image_rows]));
-        let image_spans = std::iter::repeat_n([0, image_rows], class)
+        let image_spans = std::iter::repeat_n([0, attended], registers + class)
             .flatten()
             .flat_map(i32::to_le_bytes)
             .collect::<Vec<_>>();
@@ -1041,12 +1104,10 @@ impl NativeVisionProgram {
             .collect::<Vec<_>>();
         let pixels = input.pixels().data();
         let pixel_row = pixels.len() / real.max(1);
-        let pixels = pixels
-            .iter()
-            .copied()
+        let pixels = std::iter::repeat_n(0, registers * pixel_row)
+            .chain(pixels.iter().copied())
             .chain(std::iter::repeat_n(0, padding * pixel_row))
             .collect::<Vec<_>>();
-        let (prepared, bound) = self.graphs.class(rows)?;
         let output = output
             .take()
             .ok_or_else(|| invalid("vision graph output lease is absent"))?;
@@ -1060,6 +1121,8 @@ impl NativeVisionProgram {
                     pixels: &pixels,
                     indices: &indices,
                     coefficients: &coefficients,
+                    register_indices: &register_indices,
+                    register_coefficients: &register_coefficients,
                     coordinates: &coordinates,
                     window_spans: &window_spans,
                     image_spans: &image_spans,
@@ -1081,6 +1144,8 @@ pub struct PreparedVisionGraphs {
     device: Device,
     variants: Vec<PreparedVisionGraph>,
     family: NativeGraphFamily,
+    /// Register rows ahead of each image's patch rows.
+    registers: u64,
 }
 
 pub(crate) struct BoundVisionGraphs {
@@ -1094,6 +1159,8 @@ pub(crate) struct VisionGraphUploads<'a> {
     pub pixels: &'a [u8],
     pub indices: &'a [u8],
     pub coefficients: &'a [u8],
+    pub register_indices: &'a [u8],
+    pub register_coefficients: &'a [u8],
     pub coordinates: &'a [u8],
     pub window_spans: &'a [u8],
     pub image_spans: &'a [u8],
@@ -1155,6 +1222,7 @@ impl PreparedVisionGraphs {
             device: target_device.clone(),
             variants,
             family,
+            registers: program.registers,
         })
     }
 
@@ -1221,10 +1289,16 @@ impl PreparedVisionGraphs {
         let ports = &variant.ports;
         let bindings = bound.bindings();
         let mut active = slot.activate(&variant.plan).map_err(device)?;
+        let register_blend = ports.register_blend.as_ref();
         for (port, bytes) in [
             (Some(&ports.pixels), uploads.pixels),
             (Some(&ports.indices), uploads.indices),
             (Some(&ports.coefficients), uploads.coefficients),
+            (register_blend.map(|(indices, _)| indices), uploads.register_indices),
+            (
+                register_blend.map(|(_, coefficients)| coefficients),
+                uploads.register_coefficients,
+            ),
             (ports.coordinates.as_ref(), uploads.coordinates),
             (ports.window_spans.as_ref(), uploads.window_spans),
             (ports.image_spans.as_ref(), uploads.image_spans),

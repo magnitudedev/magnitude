@@ -10,7 +10,9 @@
 //! accumulator.
 
 use magnitude_artifacts::gguf::Encoding;
-use magnitude_family_contracts::{ImportTransform, ProgressiveCodeDepth, WeightDescriptor};
+use magnitude_family_contracts::{
+    ImportTransform, ProgressiveCodeDepth, ScaledActivations, WeightDescriptor,
+};
 use seismic::Element;
 
 /// Whether the importer can apply `descriptor`'s transforms to a tensor
@@ -40,7 +42,7 @@ pub(crate) fn admit(
                     descriptor.name
                 ));
             }
-            ImportTransform::ScaleByTensor { tensor }
+            ImportTransform::ScaleByTensor { tensor, .. }
                 if descriptor
                     .transforms
                     .iter()
@@ -129,6 +131,9 @@ pub(crate) fn apply(
                 bytes = permuted;
             }
             ImportTransform::Flatten => shape = vec![shape.iter().product()],
+            ImportTransform::DropUnitAxis => {
+                shape.remove(0);
+            }
             ImportTransform::Scale { factor } => {
                 let factor = *factor as f32;
                 for word in bytes.chunks_exact_mut(4) {
@@ -207,9 +212,22 @@ pub(crate) fn scale_tensor(descriptor: &WeightDescriptor) -> Option<&str> {
         .transforms
         .iter()
         .find_map(|transform| match transform {
-            ImportTransform::ScaleByTensor { tensor } => Some(tensor.as_str()),
+            ImportTransform::ScaleByTensor { tensor, .. } => Some(tensor.as_str()),
             _ => None,
         })
+}
+
+/// The activations `descriptor`'s products take: its second-level scale's,
+/// the rounded activation without one.
+pub(crate) fn scaled_activations(descriptor: &WeightDescriptor) -> ScaledActivations {
+    descriptor
+        .transforms
+        .iter()
+        .find_map(|transform| match transform {
+            ImportTransform::ScaleByTensor { activations, .. } => Some(*activations),
+            _ => None,
+        })
+        .unwrap_or(ScaledActivations::Rounded)
 }
 
 /// How a tensor's bytes divide into the rows its transforms address.
@@ -264,9 +282,15 @@ pub(crate) fn dequantize(
     bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
     let width = shape.last().copied().unwrap_or(1);
-    let packet =
-        crate::resident_element(encoding, width, seismic::DType::F32, seismic::Layout::Packet)
-            .ok_or_else(|| format!("{encoding:?} has no packet representation"))?;
+    // The values alone: the activations a product takes do not change them.
+    let packet = crate::resident_element(
+        encoding,
+        ScaledActivations::Rounded,
+        width,
+        seismic::DType::F32,
+        seismic::Layout::Packet,
+    )
+    .ok_or_else(|| format!("{encoding:?} has no packet representation"))?;
     let canonical = packet
         .repack_host(source, shape, bytes)
         .ok_or_else(|| format!("{encoding:?} has no conversion into {}", packet.name()))?;
@@ -340,8 +364,17 @@ mod tests {
     fn flattening_keeps_bytes_and_second_level_scales_stay_apart_from_them() {
         let flat = descriptor(&[8], vec![ImportTransform::Flatten]);
         assert_eq!(admit(&flat, &[2, 4], Encoding::F32).unwrap(), [8]);
+        let table = descriptor(&[2, 4], vec![ImportTransform::DropUnitAxis]);
+        assert_eq!(admit(&table, &[1, 2, 4], Encoding::F32).unwrap(), [2, 4]);
+        assert!(admit(&table, &[2, 2, 4], Encoding::F32).is_err());
+        let values = f32s(&[1., 2., 3., 4., 5., 6., 7., 8.]);
+        assert_eq!(
+            apply(&table, &[1, 2, 4], Element::f32(), values.clone()).unwrap(),
+            values
+        );
         let scale = || ImportTransform::ScaleByTensor {
             tensor: "w.scale".into(),
+            activations: ScaledActivations::Rounded,
         };
         let scaled = descriptor(&[2, 32], vec![scale()]);
         assert_eq!(admit(&scaled, &[2, 32], Encoding::Q8_0).unwrap(), [2, 32]);
@@ -358,6 +391,7 @@ mod tests {
                 scale(),
                 ImportTransform::ScaleByTensor {
                     tensor: "w.other".into(),
+                    activations: ScaledActivations::Rounded,
                 },
             ],
         );

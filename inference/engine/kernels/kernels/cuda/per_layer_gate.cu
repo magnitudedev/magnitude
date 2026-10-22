@@ -37,9 +37,11 @@ __device__ __forceinline__ void gate_gemv(const Pro &rounded, unsigned M, unsign
 template <unsigned INT8, unsigned OPERAND>
 __global__ void per_layer_gate_stage(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
-    using Operands = typename projection::GemmOperands<OPERAND>::type;
-    const projection::Strided<element::F32, projection::AllRows> source{
-        SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, projection::AllRows{}};
+    using Operands = projection::GemmOperandsOf<OPERAND, packets::W0>;
+    // Formed as the gate weight's operand rows.
+    using Raw = projection::Strided<element::F32, projection::AllRows>;
+    const projection::Operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4, Raw> source{
+        Raw{SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, projection::AllRows{}}};
     projection::stage_projection_row<S8, Operands>(source, blockIdx.x, SEISMIC_DIM_M, SEISMIC_DIM_D, STAGING, GROUPS);
 }
 #endif
@@ -65,7 +67,7 @@ __global__ void per_layer_gate_gemm_small(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
     if (column < projection::gemm_columns(SEISMIC_DIM_P))
-        projection::gemm_run<projection::SmallGemm, S8, typename projection::GemmOperands<OPERAND>::type>(reinterpret_cast<projection::u8 *>(dynamic_shared),
+        projection::gemm_run<projection::SmallGemm, S8, projection::GemmOperandsOf<OPERAND, packets::W0>>(reinterpret_cast<projection::u8 *>(dynamic_shared),
                                                         STAGING, SEISMIC_DIM_D, GROUPS,
                                                         (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, column,
                                                         SEISMIC_DIM_P, GATE, projection::NoWeight{}, EPILOGUE);
@@ -80,7 +82,7 @@ __global__ void per_layer_gate_gemm(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<Shape>();
     if (column < projection::gemm_columns(SEISMIC_DIM_P))
-        projection::gemm_run<Shape, S8, typename projection::GemmOperands<OPERAND>::type>(reinterpret_cast<projection::u8 *>(dynamic_shared), ROUNDED, SEISMIC_DIM_D,
+        projection::gemm_run<Shape, S8, projection::GemmOperandsOf<OPERAND, packets::W0>>(reinterpret_cast<projection::u8 *>(dynamic_shared), ROUNDED, SEISMIC_DIM_D,
                                            GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, column, SEISMIC_DIM_P,
                                            GATE, projection::NoWeight{}, EPILOGUE);
 }

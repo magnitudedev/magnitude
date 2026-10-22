@@ -300,6 +300,10 @@ pub struct Attention {
     pub reads: HistoryReads,
     /// Whether media rows of one span see each other.
     pub media_rows: MediaRowAttention,
+    /// Per-head attention sinks `[heads]`: query head `h`'s softmax gains
+    /// one logit `sinks[h]` (compared with the scaled scores) whose value is
+    /// zero, so its output is `Σ e^{s_k}·v_k / (e^{sinks[h]} + Σ e^{s_k})`.
+    pub sinks: Option<WeightDescriptor>,
     /// `[hidden, heads·W]`.
     pub output: WeightDescriptor,
 }
@@ -1497,6 +1501,9 @@ fn validate_attention(attention: &Attention, context: &Context) -> Result<(), De
     } = &attention.reads
     {
         validate_indexer(*block, *blocks, indexer, attention, hidden)?;
+    }
+    if let Some(sinks) = &attention.sinks {
+        expect_shape(sinks, &[attention.heads], "attention sinks")?;
     }
     expect_shape(&attention.output, &[hidden, head_rows], "attention output")
 }

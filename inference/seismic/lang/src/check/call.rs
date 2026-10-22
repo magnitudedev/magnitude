@@ -490,6 +490,28 @@ impl<'a> Checker<'a> {
                     span,
                 ))
             }
+            "operands" => {
+                if !positional(self, 1) {
+                    return None;
+                }
+                let base = self.expr_inner(&args[0].value, None, true)?;
+                if !matches!(base.ty, ValueType::Tensor(_)) {
+                    let shown = self.shown(&base.ty);
+                    self.error(
+                        DiagnosticRule::Type,
+                        base.span,
+                        format!("`operands` needs a tensor, found {shown}"),
+                    );
+                    return None;
+                }
+                Some(self.primitive_expr(
+                    PrimitiveId::Operands,
+                    vec![base],
+                    ValueType::Scalar(DType::I32),
+                    None,
+                    span,
+                ))
+            }
             "atomic" => self.atomic(args, span),
             _ => self.user_call(name, bindings, args, span),
         }

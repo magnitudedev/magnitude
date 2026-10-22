@@ -1005,7 +1005,8 @@ fn every_packed_representation_steps_each_plane_to_its_adjacent_decoded_level() 
     let mut samples = Samples(29);
     let mut representations = 0;
     for info in packed_storages() {
-        if info.layout != Layout::Packet {
+        // Each packet storage once: another recipe's element holds the same.
+        if info.layout != Layout::Packet || registry::storage_of(info.id) != info.id {
             continue;
         }
         representations += 1;

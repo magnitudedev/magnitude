@@ -43,6 +43,15 @@ pub use isa::{X86V2, X86V3, X86V4, X86V4Vnni};
 /// The version of this library, part of every CPU implementation digest.
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-4");
 
+/// A weight buffer's representation as a call reads it: its resolved
+/// components, and whether products over it take their activation rows as
+/// NVFP4 operands (the registry's operand recipe, `operands(W)`).
+#[derive(Clone, Copy, Debug)]
+pub struct WeightOperand {
+    pub kernels: &'static WeightKernels,
+    pub nvfp4_operands: bool,
+}
+
 /// A bound weight operand: a tensor of a weight representation whose rows
 /// are read through its resolved components.
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +61,7 @@ pub struct Weights<'a> {
     k: usize,
     geometry: RowGeometry,
     kernels: &'static WeightKernels,
+    nvfp4_operands: bool,
     life: std::marker::PhantomData<&'a u8>,
 }
 
@@ -70,16 +80,18 @@ impl<'a> Weights<'a> {
         rows: usize,
         k: usize,
         dense_stride: usize,
-        kernels: &'static WeightKernels,
+        operand: WeightOperand,
     ) -> Self {
         Self {
             base,
             rows,
             k,
-            geometry: kernels
+            geometry: operand
+                .kernels
                 .geometry(k, dense_stride)
                 .with_base(base, rows.max(1)),
-            kernels,
+            kernels: operand.kernels,
+            nvfp4_operands: operand.nvfp4_operands,
             life: std::marker::PhantomData,
         }
     }
@@ -94,8 +106,9 @@ impl<'a> Weights<'a> {
         base: *const u8,
         extents: &[u64],
         strides: &[u64],
-        kernels: &'static WeightKernels,
+        operand: WeightOperand,
     ) -> Self {
+        let kernels = operand.kernels;
         let rank = extents.len();
         assert!(rank >= 1, "a weight operand has a value axis");
         let k = extents[rank - 1] as usize;
@@ -121,7 +134,7 @@ impl<'a> Weights<'a> {
                 k * kernels.dense_bytes
             }
         };
-        let mut view = unsafe { Self::from_raw(base, rows.max(1), k, dense_stride, kernels) };
+        let mut view = unsafe { Self::from_raw(base, rows.max(1), k, dense_stride, operand) };
         view.geometry.matrix_rows = if rank >= 2 {
             extents[rank - 2] as usize
         } else {
@@ -137,6 +150,12 @@ impl<'a> Weights<'a> {
     /// Values per row.
     pub fn k(&self) -> usize {
         self.k
+    }
+
+    /// Whether a product over these weights takes its activation rows as
+    /// NVFP4 operands (`WeightOperand`).
+    pub fn nvfp4_operands(&self) -> bool {
+        self.nvfp4_operands
     }
 
     pub fn representation(&self) -> &'static str {

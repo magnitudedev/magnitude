@@ -143,13 +143,18 @@ fn attention_decode_merge<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group
     for head in 0..form.heads.queries() {
         let (kv_head, local) = (head / g, head % g);
         let item = |part: usize| (row * kv + kv_head) * parts + part;
-        let denominator = attention::merge(
+        let maximum = |part: usize| statistics[item(part) * 2 * g + local];
+        let mut denominator = attention::merge(
             parts,
-            |part| statistics[item(part) * 2 * g + local],
+            maximum,
             |part| statistics[item(part) * 2 * g + g + local],
             |part| &partials[(item(part) * g + local) * w..][..w],
             output,
         );
+        if cx.dim_sk() == 1 {
+            let overall = (0..parts).map(maximum).fold(f32::NEG_INFINITY, f32::max);
+            denominator += attention::sink_weight(cx.arg_sinks().get([0, head]), overall);
+        }
         // SAFETY: each work item writes its own row of the result.
         let out = unsafe { result.row_mut([row, head, 0]) };
         let gates = if form.interleaved > 0 {

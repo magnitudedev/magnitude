@@ -15,8 +15,16 @@
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)),    \
             element::word_f32(SEISMIC_PARAM_EPSILON),                                           \
             element::word_f32(SEISMIC_PARAM_SCALE),                                             \
-            SEISMIC_PARAM_GATE_FUNCTION != 0                                                    \
+            SEISMIC_PARAM_GATE_FUNCTION != 0, ATTENTION_SINKS_BUFFER                            \
     }
+// Sink logits [SK, KV * G]: the decode and prefill entries define
+// ATTENTION_SINKS (their SK), ATTENTION_SINKS_BUFFER and ATTENTION_SINK_AT
+// before including this file (their ABI names stay in those entries); other
+// includers have none.
+#ifndef ATTENTION_SINKS_BUFFER
+#define ATTENTION_SINKS_BUFFER nullptr
+#define ATTENTION_SINK_AT(query_head) 0
+#endif
 #define ATTENTION_QUERY_AT(row, query_head)                                              \
     (static_cast<attention::u64>(row) * SEISMIC_QUERY_STRIDE_0 +                         \
      static_cast<attention::u64>(query_head) * SEISMIC_QUERY_STRIDE_1)

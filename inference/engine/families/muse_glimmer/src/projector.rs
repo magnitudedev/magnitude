@@ -231,6 +231,7 @@ pub fn describe_projector(
                 sampling: PositionSampling::PixelCenters { side },
             },
             norm: Some(pre_norm),
+            registers: None,
         },
         window: Some(side),
         blocks,

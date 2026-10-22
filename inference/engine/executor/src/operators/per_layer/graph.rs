@@ -12,7 +12,7 @@
 use crate::native::{PerLayerEntryKernels, PerLayerKernels, TableConversion};
 use crate::operators::output::{CheckedPostNormEntries, PostNormEntries, PostNormShape, post_norm};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
-use crate::programs::native_target_graph::{PackedWeight, PackingBound, ScaledWeight};
+use crate::programs::native_target_graph::{PackedWeight, ScaledWeight};
 use crate::{PerLayerBinding, PerLayerEntryBinding, SublayerTail, WeightPlan};
 use magnitude_family_contracts::PerLayerEntry;
 use magnitude_kernels::{
@@ -108,7 +108,11 @@ pub(crate) struct PerLayerEntryPorts {
     pub rows: NativePort,
     pub projection: NativePort,
     pub norm: NativePort,
-    pub absent_scale: NativePort,
+    /// The operand an absent scale or bound port binds.
+    pub absent: NativePort,
+    /// The projection's second-level scale (`WeightPlan::scale_extent`),
+    /// where it has one.
+    pub projection_scale: Option<NativePort>,
     /// The projection's packing bound (`WeightPlan::bound`), where it has
     /// one.
     pub projection_bound: Option<NativePort>,
@@ -136,15 +140,19 @@ pub(crate) fn per_layer_entry<'a, G: GraphDraft + 'a>(
     rows: u64,
 ) -> Result<PerLayerEntryPorts, GraphError> {
     let channels = binding.layers * binding.width;
-    let bound_extent = projection.bound;
-    // The projection's packing bound where it has one; the absent operand
-    // binds its port where it has none.
-    let projection_bound = (bound_extent != 0)
-        .then(|| graph.port(Element::f32(), &[bound_extent]))
-        .transpose()?;
+    // The projection's scale and packing bound where it has them; the
+    // absent operand binds their ports where it has none.
+    let (scale_extent, bound_extent) = (projection.scale_extent(), projection.bound);
+    let mut operand = |extent: u64| {
+        (extent != 0)
+            .then(|| graph.port(Element::f32(), &[extent]))
+            .transpose()
+    };
+    let projection_scale = operand(scale_extent)?;
+    let projection_bound = operand(bound_extent)?;
     let projection = graph.port(projection.resident, &projection.shape)?;
     let norm = graph.port(norm.resident, &norm.shape)?;
-    let absent_scale = graph.port(Element::f32(), &[0])?;
+    let absent = graph.port(Element::f32(), &[0])?;
     let hidden = graph.port_with_class_extent(Element::f32(), &[rows, binding.hidden], 0, "M")?;
     let table_dimensions = [("B", 1), ("N", rows), ("K", channels)];
     let gathered = match entries.table {
@@ -168,14 +176,14 @@ pub(crate) fn per_layer_entry<'a, G: GraphDraft + 'a>(
                 ("M", rows),
                 ("K", binding.hidden),
                 ("N", channels),
-                ("WS", 0),
+                ("WS", scale_extent),
                 ("WB", bound_extent),
             ],
             project_rows::WorkflowArgs {
                 source: (&rounded.reshape(&[rows, binding.hidden])).into(),
                 weight: projection.tensor().into(),
-                weight_scale: absent_scale.tensor().into(),
-                weight_bound: projection_bound.as_ref().unwrap_or(&absent_scale).tensor().into(),
+                weight_scale: projection_scale.as_ref().unwrap_or(&absent).tensor().into(),
+                weight_bound: projection_bound.as_ref().unwrap_or(&absent).tensor().into(),
             },
         )?
         .value;
@@ -228,7 +236,8 @@ pub(crate) fn per_layer_entry<'a, G: GraphDraft + 'a>(
         rows: destination,
         projection,
         norm,
-        absent_scale,
+        absent,
+        projection_scale,
         projection_bound,
     })
 }
@@ -277,9 +286,8 @@ impl CheckedPerLayerEntries {
 
 /// The weight ports of a per-layer input sublayer.
 pub(crate) struct PerLayerWeights {
-    pub gate: WorkflowTensor,
-    pub projection: WorkflowTensor,
-    pub projection_bound: PackingBound,
+    pub gate: ScaledWeight,
+    pub projection: PackedWeight,
     pub post_norm: WorkflowTensor,
 }
 
@@ -291,7 +299,6 @@ pub(crate) fn per_layer<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     entries: PerLayerEntries<'a, G>,
     weights: &PerLayerWeights,
-    weight_scale: &WorkflowTensor,
     residual: &WorkflowTensor,
     inputs: &WorkflowTensor,
     out_rows: &WorkflowTensor,
@@ -310,15 +317,15 @@ pub(crate) fn per_layer<'a, G: GraphDraft + 'a>(
                 ("D", binding.hidden),
                 ("L", binding.layers),
                 ("P", binding.width),
-                ("GS", 0),
+                ("GS", weights.gate.scale.extent),
             ],
             per_layer_gate::WorkflowArgs {
                 hidden: residual.into(),
-                gate_weight: (&weights.gate).into(),
+                gate_weight: (&weights.gate.weight).into(),
                 inputs: (&inputs.reshape(&[rows, binding.layers, binding.width])).into(),
                 layer,
                 activation,
-                gate_scale: weight_scale.into(),
+                gate_scale: (&weights.gate.scale.tensor).into(),
             },        )?
         .value;
     post_norm(
@@ -326,10 +333,7 @@ pub(crate) fn per_layer<'a, G: GraphDraft + 'a>(
         entries.output,
         residual,
         (&gated).into(),
-        &PackedWeight {
-            scaled: ScaledWeight::unscaled(weights.projection.clone(), weight_scale.clone()),
-            bound: weights.projection_bound.clone(),
-        },
+        &weights.projection,
         &weights.post_norm,
         out_rows,
         PostNormShape {

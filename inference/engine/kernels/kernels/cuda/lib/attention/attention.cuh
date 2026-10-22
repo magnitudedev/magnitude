@@ -43,6 +43,13 @@ constexpr bool VALUE_NORM = SEISMIC_DIM_NV != 0;
 static_assert(I == 0 || I == W, "interleaved gates are one per column");
 static_assert(U == 0 || U == 1 || U == W, "separate gates are one per head or per column");
 static_assert(I == 0 || U == 0, "a head's gates are interleaved or separate");
+// Whether each query head's softmax has a sink logit (SK = 1; see
+// `normalizer`).
+#ifdef ATTENTION_SINKS
+constexpr bool SINKS = ATTENTION_SINKS != 0;
+#else
+constexpr bool SINKS = false;
+#endif
 
 struct Inputs {
     // The launch's argument words, read by the ABI stride macros.
@@ -64,6 +71,8 @@ struct Inputs {
     float epsilon;
     float scale;
     bool softplus;
+    // Sink logits [SK, KV * G] when SINKS; null otherwise.
+    const float *sinks;
 };
 
 // The entry's inputs, and their tensor addressing. Keys and values are [F, M,
@@ -79,7 +88,7 @@ struct Inputs {
         reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS)), \
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES)), \
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)), \
-        element::word_f32(SEISMIC_PARAM_EPSILON), 0.0f, false }
+        element::word_f32(SEISMIC_PARAM_EPSILON), 0.0f, false, nullptr }
 
 #define ATTENTION_KEY_AT(row, kv_head)                                                   \
     (static_cast<attention::u64>(row) * SEISMIC_KEY_STRIDE_1 +                           \
@@ -334,6 +343,23 @@ __device__ __forceinline__ float gated(const Inputs &in, u64 row, int query_head
         return attended;
     return in.softplus ? attended * (fmaxf(gate, 0.0f) + logf(1.0f + expf(-fabsf(gate))))
                        : attended / (1.0f + expf(-gate));
+}
+
+// What a query head's accumulator divides by: its softmax denominator
+// `denominator` relative to its maximum `maximum` (both of exp2-domain
+// scores), plus with SINKS the weight of the head's sink logit, whose value
+// is zero: exp(sink - m) for the natural-domain maximum m = maximum / log2(e),
+// i.e. exp2(sink * log2(e) - maximum). A head that read no key (maximum
+// -inf, accumulator 0) divides by infinity and stays exactly 0. Floored at
+// 1e-30 as the contract's.
+__device__ __forceinline__ float normalizer(const Inputs &in, int query_head, float maximum,
+                                            float denominator) {
+    if constexpr (SINKS) {
+        [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+        if (maximum == -__int_as_float(0x7f800000)) return __int_as_float(0x7f800000);
+        denominator += exp2f(in.sinks[ATTENTION_SINK_AT(query_head)] * LOG2E - maximum);
+    }
+    return fmaxf(denominator, 1e-30f);
 }
 
 

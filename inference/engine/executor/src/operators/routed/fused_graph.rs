@@ -13,12 +13,14 @@
 use crate::operators::{Join, SublayerInput};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{WeightPort, weight};
+use crate::programs::native_target_graph::{WeightPort, WeightScale, weight};
 use crate::{
     ModelLoadPlan, RoutedBinding,
     native::{RoutedDecodeKernels, RoutedKernels},
 };
-use magnitude_family_contracts::{RouteNormalization, RoutedFfn, WeightKind, WeightScope};
+use magnitude_family_contracts::{
+    RouteNormalization, RoutedFfn, WeightKind, WeightRole, WeightScope,
+};
 use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_output,
     routed_route, routed_route_shared,
@@ -284,6 +286,16 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     let shared_gate = weight(graph, load, scope, WeightKind::SharedGate, weights)?;
     let shared_up = weight(graph, load, scope, WeightKind::SharedUp, weights)?;
     let shared_down = weight(graph, load, scope, WeightKind::SharedDown, weights)?;
+    // The experts' per-expert scales, absent where they have none: the gate
+    // and up scales on the expansions' accumulators, the down scale folded
+    // into the route scores.
+    let role = |kind| WeightRole { scope, kind };
+    let gate_scale =
+        WeightScale::per_expert(graph, load, role(WeightKind::ExpertGate), weights, constants)?;
+    let up_scale = WeightScale::per_expert(graph, load, role(WeightKind::ExpertUp), weights, constants)?;
+    let expert_scale =
+        WeightScale::per_expert(graph, load, role(WeightKind::ExpertDown), weights, constants)?;
+    let expansion_scales = [("GS", gate_scale.extent), ("US", up_scale.extent)];
 
     let form = input.form.dimensions(hidden);
     let [streams, injected] = join.dimensions();
@@ -294,6 +306,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         ("K", shape.selected),
         form[0],
         form[1],
+        ("ES", expert_scale.extent),
     ];
     let experts_dims = [
         ("M", rows),
@@ -302,6 +315,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         ("K", shape.selected),
         ("F", shape.intermediate),
         ("S", shape.shared_intermediate),
+        expansion_scales[0],
+        expansion_scales[1],
     ];
     let output_dims = [
         ("M", rows),
@@ -332,6 +347,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                         scores: scores.tensor_mut().into(),
                         eps: epsilon,
                         normalize,
+                        expert_scale: (&expert_scale.tensor).into(),
                     },
                 )?;
                 let expanded = graph.enqueue(
@@ -344,6 +360,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                         expert_up: (&expert_up).into(),
                         shared_gate: (&shared_gate).into(),
                         shared_up: (&shared_up).into(),
+                        gate_scale: (&gate_scale.tensor).into(),
+                        up_scale: (&up_scale.tensor).into(),
                     },
                 )?;
                 (expanded.r0, expanded.r1, routed.r1)
@@ -362,6 +380,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                         ("S", shape.shared_intermediate),
                         form[0],
                         form[1],
+                        ("ES", expert_scale.extent),
                     ],
                     routed_route_shared::WorkflowArgs {
                         residual: input.rows.into(),
@@ -374,6 +393,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                         scores: scores.tensor_mut().into(),
                         eps: epsilon,
                         normalize,
+                        expert_scale: (&expert_scale.tensor).into(),
                     },
                 )?;
                 let expert_product = graph
@@ -385,6 +405,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             ("E", shape.count),
                             ("K", shape.selected),
                             ("F", shape.intermediate),
+                            expansion_scales[0],
+                            expansion_scales[1],
                         ],
                         routed_gate_up::WorkflowArgs {
                             normalized: (&routed.r0).into(),
@@ -393,6 +415,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             expert_up: (&expert_up).into(),
                             // SiLU: the fused Qwen form's experts.
                             activation: 0,
+                            gate_scale: (&gate_scale.tensor).into(),
+                            up_scale: (&up_scale.tensor).into(),
                         },
                     )?
                     .value;
@@ -431,6 +455,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             scores: scores.tensor_mut().into(),
             eps: epsilon,
             normalize,
+            expert_scale: (&expert_scale.tensor).into(),
         },
     )?;
     let (normalized, coefficient) = (routed.r0, routed.r1);
@@ -449,6 +474,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         ("F", shape.intermediate),
         ("B", blocks),
         ("T", TILE_ROWS),
+        expansion_scales[0],
+        expansion_scales[1],
     ];
     let combine_dims = [
         ("M", rows),
@@ -488,6 +515,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                 expert_down: (&expert_down).into(),
                 // SiLU: the fused Qwen form's experts.
                 activation: 0,
+                gate_scale: (&gate_scale.tensor).into(),
+                up_scale: (&up_scale.tensor).into(),
             },
         )?
         .value;

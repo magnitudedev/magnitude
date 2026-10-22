@@ -60,6 +60,8 @@ struct Case {
     destinations: Vec<i32>,
     history_key: Vec<f32>,
     history_value: Vec<f32>,
+    /// Each query head's sink logit, or none (`SK = 0`).
+    sinks: Vec<f32>,
     epsilon: f32,
     scale: f32,
 }
@@ -145,9 +147,25 @@ impl Case {
             destinations: rows.iter().map(|row| row.destination).collect(),
             history_key,
             history_value,
+            sinks: Vec::new(),
             epsilon: 1.0e-6,
             scale: 1.0 / (w as f32).sqrt(),
         }
+    }
+
+    /// The case with a sink logit per query head, drawn around and above
+    /// the heads' scores so some sinks dominate their softmax.
+    fn with_sinks(mut self, seed: u64) -> Self {
+        let mut noise = Noise(seed);
+        self.sinks = (0..self.geometry.kv * self.geometry.g)
+            .map(|_| noise.next() * 6.0 + 2.0)
+            .collect();
+        self
+    }
+
+    /// The sinks' rows (`SK`).
+    fn sink_rows(&self) -> usize {
+        usize::from(!self.sinks.is_empty())
     }
 
     fn prepare(&self, raw: &[f32], norm: &[f32], row: usize) -> Vec<f32> {
@@ -247,7 +265,12 @@ impl Case {
                     .iter()
                     .map(|score| (score - maximum).exp())
                     .collect::<Vec<_>>();
-                let denominator = weights.iter().sum::<f64>().max(1e-30);
+                // A sink's logit adds its weight to the denominator only.
+                let sink = self
+                    .sinks
+                    .get(head)
+                    .map_or(0.0, |sink| (f64::from(*sink) - maximum).exp());
+                let denominator = (weights.iter().sum::<f64>() + sink).max(1e-30);
                 for column in 0..w {
                     let attended = entries
                         .iter()

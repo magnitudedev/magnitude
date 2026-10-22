@@ -55,10 +55,6 @@ pub struct NGramKernels {
     pub value: NativeKernel<project_rows::Entry>,
     pub gate: NativeKernel<magnitude_kernels::ngram_gate::Entry>,
     pub inject: NativeKernel<magnitude_kernels::ngram_inject::Entry>,
-    /// The copy of a step's selected tokens where the host reads them
-    /// early, in the entry graph of a step that reads selected tokens: the
-    /// table's filler learns the rows it names from them.
-    pub notice: NativeKernel<magnitude_kernels::selection_notice::Entry>,
 }
 
 /// A decoder's hyper-connection streams (`operators::streams`): the

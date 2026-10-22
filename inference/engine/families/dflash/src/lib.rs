@@ -1,15 +1,20 @@
-//! DFlash, DSpark and DFlash2 draft components (GGUF architecture `dflash`,
-//! plan §3.8).
+//! DFlash, DSpark, DFlash2 and LiLiCorr draft components (GGUF architecture
+//! `dflash`, plan §3.8).
 //!
 //! A draft is a separate package component read against its target's
 //! definition: its taps name target layers, it has no vocabulary of its own
 //! (the target's embedding and vocabulary projection serve it, unless it
 //! ships its own embedding table), and its width is the target's. DSpark is
 //! the same architecture with a Markov bias and a confidence head, detected
-//! by `markov_w1.weight`. DFlash2 wraps every draft sublayer in a grouped
-//! dynamic causal convolution and selects an ordered candidate path, detected
-//! by its `selector_*` roles; the shared architecture label names none of
-//! them.
+//! by `markov_w1.weight`. A convolved backbone wraps every draft sublayer in
+//! a grouped dynamic causal convolution, declared by `conv_kernel_size` and
+//! `conv_group_size`. DFlash2 is a convolved backbone that selects an ordered
+//! candidate path, detected by its `selector_*` roles. LiLiCorr scores the
+//! block's candidate lattice with a corrector, declared by its `lilicorr.*`
+//! metadata; its layers are stored as `blk.N` beyond `block_count` and its
+//! feature projection as the block after them. The shared architecture label
+//! names none of them. Any draft layer may carry per-head attention sinks
+//! (`attn_sinks`).
 //!
 //! GGUF stores the draft's `attn_q`/`attn_k` rows in the half-split (NEOX)
 //! rotary layout, the engine's own, so rotary is a plain frequency table (YaRN
@@ -24,12 +29,13 @@ use magnitude_family_common::{
     architecture_keys, HeaderError, Metadata, Tensors,
 };
 use magnitude_family_contracts::{
-    checked_product, ActivationFunction, Attention, AttentionGate, Block, BlockAttention,
-    BlockLayout, CandidateSelector, ConfidenceHead, DefinitionError, DenseFfn, DraftDefinition,
-    DraftEmbedding, DraftMethod, DynamicConvolution, FamilyError, FeedForwardUp, HeadNorm,
-    HistoryDomain, HistoryReads, ImportTransform, InputNorm, KeyValue, LayerConvolutions,
-    MarkovHead, MediaRowAttention, ModelDefinition, Operator, OutputForm, RmsNorm, Rotary,
-    Sublayer, TapPoint, ValueNorm, ValueSource, WeightDescriptor,
+    checked_product, ActivationFunction, Affine, Attention, AttentionGate, Block, BlockAttention,
+    BlockConvolutions, BlockLayout, CandidateCorrector, CandidateSelector, CenteredNorm,
+    ConfidenceHead, CorrectorLayer, DefinitionError, DenseFfn, DraftDefinition, DraftEmbedding,
+    DraftMethod, DynamicConvolution, FamilyError, FeedForwardUp, HeadNorm, HistoryDomain,
+    HistoryReads, ImportTransform, InputNorm, KeyValue, LayerConvolutions, MarkovHead,
+    MediaRowAttention, ModelDefinition, Operator, OutputForm, RmsNorm, Rotary, Sublayer, TapPoint,
+    ValueNorm, ValueSource, WeightDescriptor, CORRECTOR_FEATURES,
 };
 use std::{error, fmt};
 
@@ -78,13 +84,47 @@ const ARRAY_KEYS: [&str; 3] = [
     "rope.dimension_sections",
 ];
 
+/// The LiLiCorr corrector's metadata namespace and its admitted keys.
+const LILICORR: &str = "lilicorr";
+const LILICORR_KEYS: [&str; 8] = [
+    "hidden_size",
+    "candidate_topk",
+    "num_heads",
+    "num_layers",
+    "factor_dim",
+    "mlp_hidden_size",
+    "vector_eps",
+    "logit_scale",
+];
+
+/// The corrector's feature norm epsilon: the reference implementation's
+/// layer norm default (PyTorch `nn.LayerNorm`, llama.cpp `ggml_norm` at
+/// 1e-5); the header does not carry it.
+const CORRECTOR_FEATURE_EPSILON: f64 = 1e-5;
+
+/// The corrector's draft-wide roles, stored as `lilicorr.<role>.<part>`.
+const LILICORR_ROLES: [&str; 12] = [
+    "token_proj",
+    "pass_hidden_proj",
+    "context_proj",
+    "slot_embedding",
+    "rank_embedding",
+    "attention_bias",
+    "output_norm",
+    "anchor_norm",
+    "factor_input_proj",
+    "out_head",
+    "in_head",
+    "anchor_out_head",
+];
+
 const MASK_TOKEN: &str = "tokenizer.ggml.mask_token_id";
 
 /// The declaration of the draft's block attention, which is never inferred.
 const CAUSALITY: &str = "dflash.attention.causal";
 
 /// Draft-wide roles. Reduced vocabulary (`d2t`) is not admitted.
-const GLOBAL_ROLES: [&str; 14] = [
+const GLOBAL_ROLES: [&str; 15] = [
     "output.weight",
     "output.scale",
     "fc.weight",
@@ -94,6 +134,7 @@ const GLOBAL_ROLES: [&str; 14] = [
     "token_embd.weight",
     "markov_w1.weight",
     "markov_w2.weight",
+    "markov_w2.scale",
     "conf_proj.weight",
     "conf_proj.bias",
     "selector_hidden.weight",
@@ -101,7 +142,9 @@ const GLOBAL_ROLES: [&str; 14] = [
     "selector_successor.weight",
 ];
 
-const BLOCK_ROLES: [&str; 13] = [
+/// Per-block roles, each stored as `blk.N.<role>.<part>` with a `weight`,
+/// an NVFP4 `scale` or (a corrector layer's) a `bias` part.
+const BLOCK_ROLES: [&str; 14] = [
     "attn_norm",
     "attn_q",
     "attn_k",
@@ -109,6 +152,7 @@ const BLOCK_ROLES: [&str; 13] = [
     "attn_q_norm",
     "attn_k_norm",
     "attn_output",
+    "attn_sinks",
     "ffn_norm",
     "ffn_gate",
     "ffn_up",
@@ -272,20 +316,34 @@ impl From<HeaderError> for Error {
     }
 }
 
-/// Whether `name` is a tensor role of a `dflash` draft.
+fn is_index(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether `name` is a tensor role of a `dflash` draft. Which roles a draft
+/// binds is decided when it is inspected; this admits role names only.
 fn known_role(name: &str) -> bool {
     if GLOBAL_ROLES.contains(&name) {
         return true;
     }
+    let part = |role: &str, roles: &[&str]| {
+        role.rsplit_once('.').is_some_and(|(role, suffix)| {
+            roles.contains(&role) && matches!(suffix, "weight" | "scale" | "bias")
+        })
+    };
+    if let Some(role) = name.strip_prefix("lilicorr.") {
+        return part(role, &LILICORR_ROLES)
+            || role
+                .strip_prefix("layers.")
+                .and_then(|rest| rest.split_once('.'))
+                .is_some_and(|(index, role)| {
+                    is_index(index) && matches!(role, "attn.in_proj.weight" | "attn.in_proj.bias")
+                });
+    }
     name.strip_prefix("blk.")
         .and_then(|rest| rest.split_once('.'))
         .is_some_and(|(index, role)| {
-            !index.is_empty()
-                && index.bytes().all(|byte| byte.is_ascii_digit())
-                && (BLOCK_PARAMETERS.contains(&role)
-                    || role.rsplit_once('.').is_some_and(|(role, suffix)| {
-                        BLOCK_ROLES.contains(&role) && matches!(suffix, "weight" | "scale")
-                    }))
+            is_index(index) && (BLOCK_PARAMETERS.contains(&role) || part(role, &BLOCK_ROLES))
         })
 }
 
@@ -307,6 +365,17 @@ pub fn recognize(directory: &Directory) -> Result<(), Error> {
         } else if key != "attention.causal"
             && matches!(entry.value, Value::Array(_)) != ARRAY_KEYS.contains(&key)
         {
+            return Err(Error::Metadata {
+                key: entry.name.clone(),
+                expected: "of its admitted arity",
+            });
+        }
+    }
+    // The corrector's keys are scalars of its own namespace.
+    for (key, entry) in architecture_keys(directory, LILICORR) {
+        if !LILICORR_KEYS.contains(&key) {
+            metadata.push(entry.name.clone());
+        } else if matches!(entry.value, Value::Array(_)) {
             return Err(Error::Metadata {
                 key: entry.name.clone(),
                 expected: "of its admitted arity",
@@ -485,6 +554,12 @@ pub fn inspect(
         .enumerate()
         .map(|(index, domain)| {
             let role = |role: &str| format!("blk.{index}.{role}.weight");
+            let sinks = role("attn_sinks");
+            let sinks = if binder.contains(&sinks) {
+                Some(bind_vector(&mut binder, &sinks, heads)?)
+            } else {
+                None
+            };
             let mut weight = |name: &str, shape: &[u64]| binder.bind_scaled(&role(name), shape);
             let attention = Attention {
                 heads,
@@ -504,6 +579,7 @@ pub fn inspect(
                 scale: 1.0 / (width as f64).sqrt(),
                 reads: HistoryReads::Visible,
                 media_rows: MediaRowAttention::Causal,
+                sinks,
                 output: weight("attn_output", &[hidden, query_rows])?,
             };
             let feed_forward = DenseFfn {
@@ -532,22 +608,60 @@ pub fn inspect(
         })
         .collect::<Result<Vec<_>, Error>>()?;
 
+    let convolutions = block_convolutions(&m, &mut binder, hidden, block_count)?;
     let dspark = binder.contains("markov_w1.weight");
     let dflash2 = binder.contains("selector_hidden.weight");
-    if dspark && dflash2 {
+    let lilicorr = directory
+        .metadata
+        .iter()
+        .any(|entry| entry.name.starts_with("lilicorr."));
+    if usize::from(dspark) + usize::from(dflash2) + usize::from(lilicorr) > 1 {
         return Err(Error::Geometry(
-            "a draft carries both DSpark and DFlash2 roles".into(),
+            "a draft carries the roles of more than one of DSpark, DFlash2 and LiLiCorr".into(),
+        ));
+    }
+    // A selector-less header may still declare an empty selector.
+    if !dflash2
+        && ["selector_rank", "selector_top_k"]
+            .into_iter()
+            .map(|key| m.optional_count(key))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|value| value.is_some_and(|value| value != 0))
+    {
+        return Err(Error::Geometry(
+            "candidate selector metadata without the selector roles".into(),
+        ));
+    }
+    if (dflash2 || lilicorr)
+        && (m.optional_flag("has_confidence_head")?.is_some()
+            || m.optional_flag("sample_from_anchor")? == Some(true))
+    {
+        return Err(Error::Geometry(
+            "DFlash2 and LiLiCorr drafts propose from their mask slots without a confidence head"
+                .into(),
         ));
     }
     let method = if dflash2 {
-        if m.optional_flag("has_confidence_head")?.is_some()
-            || m.optional_flag("sample_from_anchor")? == Some(true)
-        {
+        if convolutions.is_none() {
             return Err(Error::Geometry(
-                "DFlash2 drafts propose from their mask slots without a confidence head".into(),
+                "a DFlash2 draft convolves its layers".into(),
             ));
         }
-        dflash2_method(&m, &mut binder, hidden, decoder.vocabulary, block_count)?
+        DraftMethod::DFlash2 {
+            selector: candidate_selector(&m, &mut binder, hidden, decoder.vocabulary)?,
+        }
+    } else if lilicorr {
+        DraftMethod::LiLiCorr {
+            corrector: Box::new(candidate_corrector(
+                directory,
+                &mut binder,
+                hidden,
+                block_count,
+                block_size,
+                epsilon,
+            )?),
+        }
     } else if dspark {
         let rank = directory
             .tensor("markov_w1.weight")
@@ -578,20 +692,6 @@ pub fn inspect(
         }
         DraftMethod::DFlash
     };
-    if !dflash2
-        && [
-            "conv_kernel_size",
-            "conv_group_size",
-            "selector_rank",
-            "selector_top_k",
-        ]
-        .iter()
-        .any(|key| m.value(key).is_some())
-    {
-        return Err(Error::Geometry(
-            "convolution or selector metadata without the DFlash2 roles".into(),
-        ));
-    }
     // DSpark samples from the anchor unless the header says otherwise.
     let layout = if m.optional_flag("sample_from_anchor")?.unwrap_or(dspark) {
         BlockLayout::AnchorFirst
@@ -610,6 +710,7 @@ pub fn inspect(
         embedding_scale: m.optional_positive_number("embedding_scale")?.unwrap_or(1.0),
         blocks,
         block_attention,
+        convolutions,
         output_norm,
         logit_softcap: m.optional_number("final_logit_softcapping")?.filter(|cap| *cap != 0.0),
         block_size,
@@ -622,24 +723,32 @@ pub fn inspect(
     Ok(draft)
 }
 
-/// DFlash2's convolutions around every draft sublayer and its candidate
-/// selector.
-fn dflash2_method(
+/// A convolved backbone's convolutions around every draft sublayer, when the
+/// header declares them.
+fn block_convolutions(
     m: &Metadata<'_>,
     binder: &mut Tensors<'_>,
     hidden: u64,
-    vocabulary: u64,
     block_count: u64,
-) -> Result<DraftMethod, Error> {
-    let kernel = m.integer("conv_kernel_size")?;
-    let group = m.integer("conv_group_size")?;
+) -> Result<Option<BlockConvolutions>, Error> {
+    let (Some(kernel), Some(group)) = (
+        m.optional_integer("conv_kernel_size")?,
+        m.optional_integer("conv_group_size")?,
+    ) else {
+        if m.value("conv_kernel_size").is_some() || m.value("conv_group_size").is_some() {
+            return Err(Error::Geometry(
+                "a convolved draft declares both its kernel and its group".into(),
+            ));
+        }
+        return Ok(None);
+    };
     if kernel == 0 || group == 0 || !hidden.is_multiple_of(group) {
         return Err(Error::Geometry(
             "convolution groups must divide the hidden width".into(),
         ));
     }
     let coefficients = product(&[2, kernel, hidden / group])?;
-    let convolutions = (0..block_count)
+    let layers = (0..block_count)
         .map(|index| {
             let mut convolution = |name: &str| -> Result<DynamicConvolution, Error> {
                 Ok(DynamicConvolution {
@@ -659,24 +768,174 @@ fn dflash2_method(
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
+    Ok(Some(BlockConvolutions {
+        kernel,
+        group,
+        layers,
+    }))
+}
+
+/// DFlash2's candidate selector.
+fn candidate_selector(
+    m: &Metadata<'_>,
+    binder: &mut Tensors<'_>,
+    hidden: u64,
+    vocabulary: u64,
+) -> Result<CandidateSelector, Error> {
     let rank = m.integer("selector_rank")?;
     let top_k = m.integer("selector_top_k")?;
     if rank == 0 || top_k == 0 || top_k > vocabulary {
         return Err(Error::Geometry("candidate selector geometry".into()));
     }
     let codebook = [vocabulary, rank];
-    let selector = CandidateSelector {
+    Ok(CandidateSelector {
         rank,
         top_k,
         hidden: binder.bind_scaled("selector_hidden.weight", &[rank, hidden])?,
         predecessor: binder.bind_scaled("selector_predecessor.weight", &codebook)?,
         successor: binder.bind_scaled("selector_successor.weight", &codebook)?,
+    })
+}
+
+/// LiLiCorr's candidate corrector. Its layers are stored as the blocks after
+/// the draft's (`blk.{block_count + i}`, each layer's attention input
+/// projection as `lilicorr.layers.{i}.attn.in_proj`), its feature
+/// projection and norm as the block after them, and its other maps under
+/// `lilicorr.`. Matrices carry their NVFP4 second-level scale when the file
+/// stores one; biases, norms, embeddings and the attention bias are stored
+/// plainly.
+fn candidate_corrector(
+    directory: &Directory,
+    binder: &mut Tensors<'_>,
+    hidden: u64,
+    block_count: u64,
+    block_size: u64,
+    epsilon: f64,
+) -> Result<CandidateCorrector, Error> {
+    let m = Metadata::new(directory, LILICORR, &LILICORR_KEYS)?;
+    let width = m.integer("hidden_size")?;
+    let top_k = m.integer("candidate_topk")?;
+    let heads = m.integer("num_heads")?;
+    let layers = m.integer("num_layers")?;
+    let factor = m.integer("factor_dim")?;
+    let mlp = m.integer("mlp_hidden_size")?;
+    let vector_epsilon = m.positive_number("vector_eps")?;
+    let logit_scale = m.positive_number("logit_scale")?;
+    if width == 0
+        || top_k == 0
+        || heads == 0
+        || !width.is_multiple_of(heads)
+        || layers == 0
+        || factor == 0
+        || mlp == 0
+        || block_size < 2
+        || layers > directory.tensors.len() as u64
+    {
+        return Err(Error::Geometry("corrector geometry".into()));
+    }
+    let slots = block_size - 1;
+    let nodes = product(&[slots, top_k])?;
+    let affine = |binder: &mut Tensors<'_>,
+                      stem: &str,
+                      outputs: u64,
+                      inputs: u64|
+     -> Result<Affine, Error> {
+        Ok(Affine {
+            weight: binder.bind_scaled(&format!("{stem}.weight"), &[outputs, inputs])?,
+            bias: bind_vector(binder, &format!("{stem}.bias"), outputs)?,
+        })
     };
-    Ok(DraftMethod::DFlash2 {
-        kernel,
-        group,
-        convolutions,
-        selector,
+    let rms = |weight| RmsNorm { weight, epsilon };
+    let token = if binder.contains("lilicorr.token_proj.weight") {
+        Some(affine(binder, "lilicorr.token_proj", width, hidden)?)
+    } else {
+        None
+    };
+    let pass = affine(binder, "lilicorr.pass_hidden_proj", width, hidden)?;
+    let context = affine(binder, "lilicorr.context_proj", width, hidden)?;
+    let features = block_count + layers;
+    let feature_norm = CenteredNorm {
+        weight: bind_vector(
+            binder,
+            &format!("blk.{features}.ffn_norm.weight"),
+            CORRECTOR_FEATURES,
+        )?,
+        bias: bind_vector(
+            binder,
+            &format!("blk.{features}.ffn_norm.bias"),
+            CORRECTOR_FEATURES,
+        )?,
+        epsilon: CORRECTOR_FEATURE_EPSILON,
+    };
+    let feature_up = affine(
+        binder,
+        &format!("blk.{features}.ffn_up"),
+        width,
+        CORRECTOR_FEATURES,
+    )?;
+    let feature_down = affine(binder, &format!("blk.{features}.ffn_down"), width, width)?;
+    let slot_embedding = binder.bind("lilicorr.slot_embedding.weight", &[slots, width])?;
+    let rank_embedding = binder.bind("lilicorr.rank_embedding.weight", &[top_k, width])?;
+    let attention_bias = binder.bind("lilicorr.attention_bias.bias", &[heads, nodes, nodes])?;
+    let corrector_layers = (0..layers)
+        .map(|index| {
+            let block = block_count + index;
+            Ok(CorrectorLayer {
+                attention_norm: rms(bind_vector(
+                    binder,
+                    &format!("blk.{block}.attn_norm.weight"),
+                    width,
+                )?),
+                attention_input: affine(
+                    binder,
+                    &format!("lilicorr.layers.{index}.attn.in_proj"),
+                    product(&[3, width])?,
+                    width,
+                )?,
+                attention_output: affine(
+                    binder,
+                    &format!("blk.{block}.attn_output"),
+                    width,
+                    width,
+                )?,
+                mlp_norm: rms(bind_vector(
+                    binder,
+                    &format!("blk.{block}.ffn_norm.weight"),
+                    width,
+                )?),
+                up: affine(binder, &format!("blk.{block}.ffn_up"), mlp, width)?,
+                down: affine(binder, &format!("blk.{block}.ffn_down"), width, mlp)?,
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(CandidateCorrector {
+        width,
+        top_k,
+        heads,
+        factor,
+        token,
+        pass,
+        context,
+        feature_norm,
+        feature_up,
+        feature_down,
+        slot_embedding,
+        rank_embedding,
+        attention_bias,
+        layers: corrector_layers,
+        output_norm: rms(bind_vector(binder, "lilicorr.output_norm.weight", width)?),
+        anchor_norm: rms(bind_vector(binder, "lilicorr.anchor_norm.weight", width)?),
+        factor_input: affine(
+            binder,
+            "lilicorr.factor_input_proj",
+            width,
+            product(&[3, width])?,
+        )?,
+        outgoing: affine(binder, "lilicorr.out_head", factor, width)?,
+        incoming: affine(binder, "lilicorr.in_head", factor, width)?,
+        anchor: affine(binder, "lilicorr.anchor_out_head", factor, width)?,
+        vector_epsilon,
+        logit_scale,
     })
 }
 

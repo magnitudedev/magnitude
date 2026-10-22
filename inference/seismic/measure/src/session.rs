@@ -43,6 +43,36 @@
 //! ([`crate::statistics`]), and a counted session takes the count it was
 //! asked for ([`Counted`]).
 //!
+//! # What a pass reads
+//!
+//! A sample repeats passes of one work, so whatever a pass reads that fits
+//! the device's last-level cache is read from the cache from the second
+//! pass on. Served work never finds it there: a decode step streams every
+//! layer's weights and states once, and between two calls of one kernel
+//! everything else the step reads goes through the cache. Passes the cache
+//! holds time the work at the cache's bandwidth and not at memory's, and
+//! configurations that stream memory differently read alike: on a GB10
+//! (24 MiB of L2, 2026-10-16) a router GEMV's four-layer rotation read 12 to
+//! 20 µs per call, and a state-space step's three row mappings read within
+//! 1% of one another; with every pass reading four times the cache, the
+//! router read 22 to 35 µs and the step 44.5, 47.0 and 48.9 µs.
+//!
+//! So a sample shorter than `min_sample_seconds` alone repeats *cold*
+//! passes ([`Work::submit_cold`]): the work's calls, then its copies'
+//! (the same work over storage of its own, which the work's owner sizes to
+//! the cache), so that no call finds its bytes left by an earlier one.
+//! Calibration times a pass alone, behind a lead alone; a pass that covers
+//! `min_sample_seconds` by itself is the sample ([`Passes::Alone`]), behind
+//! a lead alone. Such a pass is long beside what a cache can give it: the
+//! most a warm cache saves a pass is reading what it holds once, which on
+//! the GB10 (273 GB/s) is 92 µs, under 5% of a 2 ms pass; copies would
+//! multiply its cost instead (a 60 s tuning budget on an M4 Pro measured 3
+//! configurations of a 64k-token attention prefill in 31 s with them, 8 in
+//! 12 s without, 2026-10-17). A shorter one is repeated cold, as many passes
+//! as cover the minimum ([`Passes::Cold`]), each sample behind a cold lead;
+//! the first, which follows the calibrating pass at once, follows a cold
+//! pass too where the work has copies.
+//!
 //! # One work alone
 //!
 //! A measurement of one work's own time ([`crate::measure`]) samples one
@@ -79,21 +109,33 @@ pub(crate) fn passes_covering(length: f64, pass_seconds: f64) -> usize {
     }
 }
 
+/// What one sample of a slot submits, behind a lead of one of the same
+/// (module documentation, "What a pass reads").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Passes {
+    /// One pass of the work alone: it covers `min_sample_seconds` by
+    /// itself, or reads no time.
+    Alone,
+    /// This many cold passes ([`Work::submit_cold`]): a pass alone is
+    /// shorter than `min_sample_seconds`.
+    Cold(usize),
+}
+
 /// One placed [`Work`] and what its session has sampled of it.
 pub struct Slot<W: Work> {
     work: W,
-    /// Passes over the work per sample; `None` until calibrated.
-    repetitions: Option<usize>,
-    pass_seconds: Option<f64>,
+    /// What a sample submits; `None` until calibrated.
+    passes: Option<Passes>,
+    /// Device seconds of one call, as the last submission read gave them.
+    call_seconds: Option<f64>,
     samples: Vec<f64>,
 }
 
-/// What one calibrating pass gave: its seconds per call and per pass, and
-/// the repetitions a sample covering the minimum device time takes.
+/// What one calibrating pass gave: its seconds per call, and what a sample
+/// covering the minimum device time submits.
 struct Calibration {
     per_call: f64,
-    pass_seconds: f64,
-    repetitions: usize,
+    passes: Passes,
 }
 
 /// A submitted sample of one slot.
@@ -116,10 +158,14 @@ impl<W: Work> PendingSample<W> {
 }
 
 /// A sample begun behind its lead: read already (an uncalibrated slot's
-/// calibrating pass, where that is the sample), or submitted.
+/// calibrating pass, where that is the sample), or submitted, behind a cold
+/// pass that evicts what the calibrating pass left cached where one ran.
 enum Begun<W: Work> {
     Read(f64),
-    Submitted(PendingSample<W>),
+    Submitted {
+        sample: PendingSample<W>,
+        evicting: Option<PendingSample<W>>,
+    },
 }
 
 /// What a slot sampled alone submits behind a sample before reading it.
@@ -160,8 +206,8 @@ impl<W: Work> Slot<W> {
     pub fn new(work: W) -> Self {
         Self {
             work,
-            repetitions: None,
-            pass_seconds: None,
+            passes: None,
+            call_seconds: None,
             samples: Vec::new(),
         }
     }
@@ -181,32 +227,51 @@ impl<W: Work> Slot<W> {
         &self.samples
     }
 
-    /// The passes a sample takes, once calibrated.
-    pub fn repetitions(&self) -> Option<usize> {
-        self.repetitions
+    /// What a sample submits, once calibrated.
+    pub fn passes(&self) -> Option<Passes> {
+        self.passes
     }
 
-    /// Submit `passes` passes over the work as one unit of device work.
-    fn submit_passes(
+    /// The calls a submission of `passes` makes.
+    fn calls(&self, passes: Passes) -> usize {
+        match passes {
+            Passes::Alone => self.work.calls_per_pass(),
+            Passes::Cold(passes) => passes * self.work.cold_calls_per_pass(),
+        }
+    }
+
+    /// Submit `passes` as one unit of device work.
+    fn submit(
         &self,
-        passes: usize,
+        passes: Passes,
         deadline: Deadline,
     ) -> Result<PendingSample<W>, WorkError<W::Error>> {
+        let calls = self.calls(passes);
         deadline.check(Duration::from_secs_f64(
-            self.pass_seconds.unwrap_or(0.) * passes as f64,
+            self.call_seconds.unwrap_or(0.) * calls as f64,
         ))?;
-        let pending = self.work.submit(passes)?;
-        Ok(PendingSample {
-            pending,
-            calls: passes * self.work.calls_per_pass(),
-        })
+        let pending = match passes {
+            Passes::Alone => self.work.submit(1)?,
+            Passes::Cold(passes) => self.work.submit_cold(passes)?,
+        };
+        Ok(PendingSample { pending, calls })
+    }
+
+    /// The lead of the slot's next sample: one pass of the form its samples
+    /// take; of an uncalibrated slot, a pass alone, which its calibrating
+    /// pass follows.
+    fn lead(&self, deadline: Deadline) -> Result<PendingSample<W>, WorkError<W::Error>> {
+        match self.passes {
+            Some(Passes::Cold(_)) => self.submit(Passes::Cold(1), deadline),
+            Some(Passes::Alone) | None => self.submit(Passes::Alone, deadline),
+        }
     }
 
     /// Calibrate the slot without sampling it: one pass behind its lead
-    /// gives the repetitions for which a sample covers at least
-    /// `min_sample_seconds` of device time.
+    /// gives what a sample covering at least `min_sample_seconds` of device
+    /// time submits.
     ///
-    /// The two sides of a comparison are sampled with the same repetitions
+    /// The two sides of a comparison are sampled with the same passes
     /// ([`sample`]). Every submission carries a fixed device cost besides
     /// its kernel's, which is a larger part of a sample of fewer
     /// repetitions, so sides calibrated apart read apart by more than
@@ -220,82 +285,97 @@ impl<W: Work> Slot<W> {
         &mut self,
         min_sample_seconds: f64,
         deadline: Deadline,
-    ) -> Result<usize, WorkError<W::Error>> {
-        let lead = self.submit_passes(1, deadline)?;
+    ) -> Result<Passes, WorkError<W::Error>> {
+        let lead = self.submit(Passes::Alone, deadline)?;
         let measured = self.calibrating_pass(min_sample_seconds, deadline);
         let calibration = behind(measured, lead.wait())?;
         Ok(self.calibrated(calibration))
     }
 
-    /// The calibrating pass, behind a lead its caller submitted: one pass,
-    /// whose time gives the repetitions for which a sample covers at least
-    /// `min_sample_seconds`.
+    /// The calibrating pass, behind a lead its caller submitted: one pass
+    /// alone, whose time gives what a sample covering `min_sample_seconds`
+    /// submits. A pass that covers it is a sample by itself: the most a
+    /// cache its lead left warm saves it is reading what the cache holds
+    /// once, beside a pass at least as long as the minimum. One shorter is
+    /// repeated cold, as many passes as cover it.
     fn calibrating_pass(
         &self,
         min_sample_seconds: f64,
         deadline: Deadline,
     ) -> Result<Calibration, WorkError<W::Error>> {
-        let per_call = self.submit_passes(1, deadline)?.seconds()?;
-        let pass_seconds = per_call * self.work.calls_per_pass() as f64;
-        Ok(Calibration {
-            per_call,
-            pass_seconds,
-            repetitions: passes_covering(min_sample_seconds, pass_seconds),
-        })
+        let per_call = self.submit(Passes::Alone, deadline)?.seconds()?;
+        let pass = per_call * self.work.calls_per_pass() as f64;
+        let passes = match passes_covering(min_sample_seconds, pass) {
+            1 => Passes::Alone,
+            _ => Passes::Cold(passes_covering(
+                min_sample_seconds,
+                per_call * self.work.cold_calls_per_pass() as f64,
+            )),
+        };
+        Ok(Calibration { per_call, passes })
     }
 
-    /// Record `calibration` as the slot's: its pass time and repetitions.
-    fn calibrated(&mut self, calibration: Calibration) -> usize {
-        self.pass_seconds = Some(calibration.pass_seconds);
-        self.repetitions = Some(calibration.repetitions);
-        calibration.repetitions
+    /// Record `calibration` as the slot's: its call time and passes.
+    fn calibrated(&mut self, calibration: Calibration) -> Passes {
+        self.call_seconds = Some(calibration.per_call);
+        self.passes = Some(calibration.passes);
+        calibration.passes
     }
 
-    /// Begin a sample behind `lead`, a pass of the work submitted before
-    /// it: the sample, and the repetitions it takes. An uncalibrated slot's
-    /// sample is first one pass, which gives its repetitions, and is the
-    /// sample itself when they are one; otherwise the sample follows it at
-    /// once.
+    /// Begin a sample behind `lead`, a pass submitted before it: the
+    /// sample, and the passes it takes. An uncalibrated slot's sample is
+    /// first one pass alone, which gives its passes, and is the sample
+    /// itself when they are [`Passes::Alone`]; otherwise the sample follows
+    /// it at once, behind a cold pass where the work has copies to evict
+    /// the bytes the calibrating pass left cached.
     fn begin(
         &mut self,
         lead: &PendingSample<W>,
         min_sample_seconds: f64,
         deadline: Deadline,
-    ) -> Result<(Begun<W>, usize), WorkError<W::Error>> {
-        if self.pass_seconds.is_none() {
-            // A challenger can inherit the incumbent's repetitions, but not
-            // its latency. Price the already submitted lead before
-            // admitting that first repeated batch.
-            self.pass_seconds = Some(lead.pending.seconds()?);
+    ) -> Result<(Begun<W>, Passes), WorkError<W::Error>> {
+        if self.call_seconds.is_none() {
+            // A challenger can inherit the incumbent's passes, but not its
+            // latency. Price the already submitted lead before admitting
+            // that first repeated batch.
+            self.call_seconds = Some(lead.pending.seconds()? / lead.calls as f64);
         }
-        let repetitions = match self.repetitions {
-            Some(repetitions) => repetitions,
+        let (passes, evicting) = match self.passes {
+            Some(passes) => (passes, None),
             None => {
                 let calibration = self.calibrating_pass(min_sample_seconds, deadline)?;
                 let pass = calibration.per_call;
-                let repetitions = self.calibrated(calibration);
-                if repetitions == 1 {
-                    return Ok((Begun::Read(pass), repetitions));
+                let passes = self.calibrated(calibration);
+                if passes == Passes::Alone {
+                    return Ok((Begun::Read(pass), passes));
                 }
-                // The calibrating pass just ran: it leads the sample.
-                repetitions
+                // The calibrating pass just ran, alone: it leads a sample of
+                // work without copies; copies run behind it first.
+                let evicting = (self.work.cold_calls_per_pass() > self.work.calls_per_pass())
+                    .then(|| self.submit(Passes::Cold(1), deadline))
+                    .transpose()?;
+                (passes, evicting)
             }
         };
-        let sample = self.submit_passes(repetitions, deadline)?;
-        Ok((Begun::Submitted(sample), repetitions))
+        let sample = match self.submit(passes, deadline) {
+            Ok(sample) => sample,
+            Err(error) => {
+                return behind(Err(error), evicting.map_or(Ok(()), PendingSample::wait));
+            }
+        };
+        Ok((Begun::Submitted { sample, evicting }, passes))
     }
 
     /// A begun sample's seconds per call, once it completes. A submitted
-    /// sample's also price the slot's pass.
+    /// sample's also price the slot's calls.
     fn read(&mut self, sample: Begun<W>) -> Result<f64, WorkError<W::Error>> {
         match sample {
             Begun::Read(seconds) => Ok(seconds),
-            Begun::Submitted(pending) => {
-                let seconds = pending.seconds()?;
-                // A pending sample already divides by repetitions and call
-                // count. Multiplying by the calls of a pass recovers one
-                // pass.
-                self.pass_seconds = Some(seconds * self.work.calls_per_pass() as f64);
+            Begun::Submitted { sample, evicting } => {
+                let seconds = sample.seconds();
+                let evicted = evicting.map_or(Ok(()), PendingSample::wait);
+                let seconds = behind(seconds.map_err(WorkError::from), evicted)?;
+                self.call_seconds = Some(seconds);
                 Ok(seconds)
             }
         }
@@ -308,7 +388,7 @@ impl<W: Work> Slot<W> {
         min_sample_seconds: f64,
         deadline: Deadline,
     ) -> Result<f64, WorkError<W::Error>> {
-        let lead = self.submit_passes(1, deadline)?;
+        let lead = self.lead(deadline)?;
         let measured = self
             .begin(&lead, min_sample_seconds, deadline)
             .and_then(|(sample, _)| self.read(sample));
@@ -326,24 +406,21 @@ impl<W: Work> Slot<W> {
         clock: Option<&Clock<W::Error>>,
         deadline: Deadline,
     ) -> Result<(), WorkError<W::Error>> {
-        let lead = self.submit_passes(1, deadline)?;
+        let lead = self.lead(deadline)?;
         let begun = self.begin(&lead, min_sample_seconds, deadline);
-        let (mut sample, repetitions) = behind(begun, lead.wait())?;
-        // The device seconds of one sample: its passes' calls, at a call's
-        // seconds.
-        let calls = (repetitions * self.work.calls_per_pass()) as f64;
+        let (mut sample, passes) = behind(begun, lead.wait())?;
+        // The calls of one sample, whose seconds each sample gives per call.
+        let calls = self.calls(passes) as f64;
         loop {
             // Submitted before the sample is read, so that the device goes
             // from the sample into it without a pause. The sample is
-            // expected to take as long as the last pass priced.
+            // expected to take as long as the slot's calls last priced.
             let spent = calls * self.samples.iter().sum::<f64>();
-            let expected = self.pass_seconds.unwrap_or(0.) * repetitions as f64;
+            let expected = self.call_seconds.unwrap_or(0.) * calls;
             let follow = match stopping.after(self.samples.len() + 1, spent + expected) {
-                After::Continues => self
-                    .submit_passes(repetitions, deadline)
-                    .map(Follow::Sample),
+                After::Continues => self.submit(passes, deadline).map(Follow::Sample),
                 After::Reads(resolution) => self
-                    .submit_passes(1, deadline)
+                    .lead(deadline)
                     .map(|lead| Follow::Lead(lead, resolution)),
                 After::Stops => Ok(Follow::Nothing),
             };
@@ -363,14 +440,20 @@ impl<W: Work> Slot<W> {
                 clock.followed(seconds);
             }
             sample = match follow {
-                Follow::Sample(next) => Begun::Submitted(next),
+                Follow::Sample(next) => Begun::Submitted {
+                    sample: next,
+                    evicting: None,
+                },
                 Follow::Lead(lead, resolution) => {
                     let spent = calls * self.samples.iter().sum::<f64>();
                     if resolution.stops(&self.samples, spent) {
                         return behind(Ok(()), lead.wait());
                     }
-                    let next = self.submit_passes(repetitions, deadline);
-                    Begun::Submitted(behind(next, lead.wait())?)
+                    let next = self.submit(passes, deadline);
+                    Begun::Submitted {
+                        sample: behind(next, lead.wait())?,
+                        evicting: None,
+                    }
                 }
                 Follow::Nothing => return Ok(()),
             };
@@ -393,7 +476,7 @@ impl<W: Work> Slot<W> {
             samples: self.samples.clone(),
             median,
             deviation,
-            repetitions: self.repetitions.unwrap_or(1) * self.work.calls_per_pass(),
+            repetitions: self.calls(self.passes.unwrap_or(Passes::Alone)),
             interval: error_rate.and_then(|rate| median_interval(&self.samples, rate)),
         }
     }
@@ -653,22 +736,19 @@ pub fn sample<S: Slotted>(
         if groups.is_empty() {
             return Ok(());
         }
-        // The slots of a group are sampled with the repetitions of its
-        // first, the choice the others are compared with.
+        // The slots of a group are sampled with the passes of its first,
+        // the choice the others are compared with.
         for group in groups.iter().filter(|group| group.len() > 1) {
             let first = group[0];
-            let repetitions = match slots[first].slot().repetitions {
-                Some(repetitions) => repetitions,
+            let passes = match slots[first].slot().passes {
+                Some(passes) => passes,
                 None => slots[first]
                     .slot_mut()
                     .calibrate(min_sample_seconds, deadline)
                     .map_err(|error| SlotFailure { slot: first, error })?,
             };
             for &slot in &group[1..] {
-                slots[slot]
-                    .slot_mut()
-                    .repetitions
-                    .get_or_insert(repetitions);
+                slots[slot].slot_mut().passes.get_or_insert(passes);
             }
         }
         let mut turns = (0..groups.len()).collect::<Vec<_>>();
@@ -695,11 +775,13 @@ mod tests {
     use std::rc::Rc;
 
     /// What the scripted works were asked, in order: each submission as
-    /// (work, passes), a gauge's work numbered its work's plus 100, and
-    /// each read and wait of a submission, by its place among them.
+    /// (work, passes), cold where its passes were, a gauge's work numbered
+    /// its work's plus 100, and each read and wait of a submission, by its
+    /// place among them.
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Event {
         Submitted(usize, usize),
+        SubmittedCold(usize, usize),
         Read(usize),
         Waited(usize),
     }
@@ -724,6 +806,8 @@ mod tests {
         id: usize,
         pass: f64,
         spread: f64,
+        /// Copies a cold pass runs after the work's own call.
+        copies: usize,
         log: Log,
     }
 
@@ -733,7 +817,25 @@ mod tests {
                 id,
                 pass,
                 spread: 0.,
+                copies: 0,
                 log: log.clone(),
+            }
+        }
+
+        /// A submission of `calls` calls, logged as `event`.
+        fn submitted(&self, calls: usize, event: Event) -> Read {
+            let submission = self
+                .log
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, Event::Submitted(..) | Event::SubmittedCold(..)))
+                .count();
+            self.log.borrow_mut().push(event);
+            let jitter = (submission * 7919 % 101) as f64 / 101.;
+            Read {
+                seconds: self.pass * calls as f64 * (1. + self.spread * jitter),
+                submission,
+                log: self.log.clone(),
             }
         }
     }
@@ -766,19 +868,22 @@ mod tests {
         type Pending = Read;
         type Clock = ();
         fn submit(&self, passes: usize) -> Result<Read, ()> {
-            let submission = submissions(&self.log).len();
-            self.log
-                .borrow_mut()
-                .push(Event::Submitted(self.id, passes));
-            let jitter = (submission * 7919 % 101) as f64 / 101.;
-            Ok(Read {
-                seconds: self.pass * passes as f64 * (1. + self.spread * jitter),
-                submission,
-                log: self.log.clone(),
-            })
+            Ok(self.submitted(passes, Event::Submitted(self.id, passes)))
         }
         fn calls_per_pass(&self) -> usize {
             1
+        }
+        fn submit_cold(&self, passes: usize) -> Result<Read, ()> {
+            if self.copies == 0 {
+                return Work::submit(self, passes);
+            }
+            Ok(self.submitted(
+                passes * self.cold_calls_per_pass(),
+                Event::SubmittedCold(self.id, passes),
+            ))
+        }
+        fn cold_calls_per_pass(&self) -> usize {
+            1 + self.copies
         }
         fn clock(&self) -> Option<()> {
             Some(())
@@ -947,7 +1052,9 @@ mod tests {
         assert_eq!(reading, samples.len());
         // The rule was read and continued before it stopped.
         assert!(samples.len() > fewest_bounding(RATE));
-        let repetitions = slot.repetitions().unwrap();
+        let Some(Passes::Cold(repetitions)) = slot.passes() else {
+            panic!("a pass shorter than the minimum sample is repeated");
+        };
         let mut expected = vec![(0, 1), (0, 1), (0, repetitions)];
         for count in 1..=samples.len() {
             if count >= fewest_bounding(RATE) && readings.contains(&count) {
@@ -963,6 +1070,58 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(submitted, expected);
         assert_eq!(clock.raises()[0].sample, Some(samples[0]));
+    }
+
+    /// A pass shorter than the minimum sample is sampled cold: calibrated
+    /// alone behind a lead alone, then repeated cold behind a cold pass
+    /// that evicts what calibration left cached, and every later sample
+    /// behind a cold lead. A pass that covers the minimum is the sample,
+    /// alone, and its copies never run.
+    #[test]
+    fn short_passes_are_sampled_cold_and_long_ones_alone() {
+        let log = Log::default();
+        let mut short = Slot::new(Scripted {
+            copies: 3,
+            ..Scripted::new(0, 1e-4, &log)
+        });
+        // A pass alone of 0.1 ms; a cold pass of four calls, 0.4 ms, five
+        // of which cover 2 ms. Seconds are per call.
+        for _ in 0..2 {
+            assert_eq!(short.sample(2e-3, Deadline::default()).unwrap(), 1e-4);
+        }
+        assert_eq!(short.passes(), Some(Passes::Cold(5)));
+        assert_eq!(short.calls(Passes::Cold(5)), 20);
+        let mut long = Slot::new(Scripted {
+            copies: 3,
+            ..Scripted::new(1, 3e-3, &log)
+        });
+        long.sample(2e-3, Deadline::default()).unwrap();
+        long.sample(2e-3, Deadline::default()).unwrap();
+        assert_eq!(long.passes(), Some(Passes::Alone));
+        let submitted = log
+            .borrow()
+            .iter()
+            .filter_map(|event| match *event {
+                Event::Submitted(work, passes) => Some((work, false, passes)),
+                Event::SubmittedCold(work, passes) => Some((work, true, passes)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            submitted,
+            [
+                (0, false, 1),
+                (0, false, 1),
+                (0, true, 1),
+                (0, true, 5),
+                (0, true, 1),
+                (0, true, 5),
+                (1, false, 1),
+                (1, false, 1),
+                (1, false, 1),
+                (1, false, 1),
+            ]
+        );
     }
 
     /// A work whose samples are long stops once they cover its budget,

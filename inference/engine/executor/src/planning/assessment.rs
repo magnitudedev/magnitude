@@ -1316,6 +1316,7 @@ mod tests {
         let method = PlannedMethod::Mtp {
             greedy_proposals: 1,
             sampled_proposals: 1,
+            widths: crate::DraftWidths::Adaptive,
         };
         let limits = crate::ResourceLimits {
             max_launch_rows: 256,
@@ -1654,6 +1655,7 @@ mod tests {
         let method = PlannedMethod::Mtp {
             greedy_proposals: 3,
             sampled_proposals: 3,
+            widths: crate::DraftWidths::Adaptive,
         };
         let state = crate::ResourcePlanner::state_plan(
             &definition,
@@ -1847,6 +1849,7 @@ mod tests {
         let method = PlannedMethod::Mtp {
             greedy_proposals: 3,
             sampled_proposals: 3,
+            widths: crate::DraftWidths::Adaptive,
         };
         let limits = fixture_limits(false);
         let state = crate::ResourcePlanner::state_plan(
@@ -1921,6 +1924,7 @@ mod tests {
             };
             definition.draft = Some(DraftDefinition {
                 method: DraftMethod::DFlash,
+                convolutions: None,
                 taps: vec![TapPoint::Exit],
                 fusion: WeightDescriptor::stored("draft_fusion", &[hidden, hidden]),
                 fusion_norm: norm("draft_fusion_norm"),
@@ -2024,8 +2028,7 @@ mod tests {
                 &load,
                 PlannedMethod::DFlash {
                     proposals: 1,
-                    generated: 1,
-                    ladder: false,
+                    widths: crate::DraftWidths::Adaptive,
                 },
                 KvCodec::Dense,
                 limits,
@@ -2332,6 +2335,7 @@ mod tests {
                     sampling: PositionSampling::AlignedCorners { side: 4 },
                 },
                 norm: None,
+                registers: None,
             },
             window: None,
             blocks: vec![VisionBlock {
@@ -2377,69 +2381,115 @@ mod tests {
                 output_norm: None,
             },
         };
-        let component = ArtifactComponent {
-            kind: ArtifactComponentKind::Projector,
-            identity: ArtifactIdentity([9; 32]),
+        // A C-RADIO-shaped tower: three register rows ahead of the patches
+        // (no patch bias), no rotary, and the projection's RMS norm over
+        // each concatenated cell before a squared-ReLU stage.
+        let mut radio = description.clone();
+        radio.stem = VisionStem::Patch {
+            frames: vec![stored("patch.0", &[128, 3, 2, 2])],
+            bias: None,
+            positions: VisionPositions {
+                table: stored("position", &[16, 128]),
+                sampling: PositionSampling::CroppedSquare { side: 4 },
+            },
+            norm: None,
+            registers: Some(stored("registers", &[3, 128])),
         };
-        let weights = description
-            .weights()
-            .into_iter()
-            .map(|(role, descriptor)| {
-                let bytes = descriptor.shape.iter().product::<u64>() * 4;
-                WeightPlan {
-                    role,
-                    component,
-                    source: f32,
-                    upload: f32,
-                    resident: f32,
-                    shape: descriptor.shape.clone(),
-                    descriptor: descriptor.clone(),
-                    source_bytes: bytes,
-                    resident_bytes: bytes,
-                    scale: None,
-                    bound: 0,
-                    streamed: None,
-                }
-            })
-            .collect();
-        let load = ModelLoadPlan {
-            residual_conditioning: None,
-            target: Vec::new(),
-            head: None,
-            vision: Some(weights),
-            host_tables: Vec::new(),
-            readout_candidates: Vec::new(),
-            readout_choices: Vec::new(),
-            unplaced_output: Vec::new(),
+        radio.blocks[0].attention.rotary_base = None;
+        radio.merger = VisionMerger {
+            norm: None,
+            reduction: CellReduction::Concatenate,
+            standardize: None,
+            projection_norm: Some(VisionNorm::Rms {
+                weight: Some(stored("mm.norm.weight", &[512])),
+                epsilon: 1e-5,
+            }),
+            stages: vec![
+                MergerStage {
+                    linear: VisionLinear {
+                        bias: None,
+                        ..linear("mm.1", 256, 512)
+                    },
+                    activation: Some(VisionActivation::ReluSquared),
+                },
+                MergerStage {
+                    linear: VisionLinear {
+                        bias: None,
+                        ..linear("mm.3", 128, 256)
+                    },
+                    activation: None,
+                },
+            ],
+            output_norm: None,
         };
-        let program = crate::operators::vision::vision_program(&description, &|_| Ok(f32)).unwrap();
-        let plan = VisionProgramPlan::new(program.kernels().into_iter().cloned().collect());
-        let resources = |classes: &[u64]| {
-            crate::programs::native_vision::checked_vision_family_resources(
+        radio.validate().unwrap();
+        for description in [description, radio] {
+            let component = ArtifactComponent {
+                kind: ArtifactComponentKind::Projector,
+                identity: ArtifactIdentity([9; 32]),
+            };
+            let weights = description
+                .weights()
+                .into_iter()
+                .map(|(role, descriptor)| {
+                    let bytes = descriptor.shape.iter().product::<u64>() * 4;
+                    WeightPlan {
+                        role,
+                        component,
+                        source: f32,
+                        upload: f32,
+                        resident: f32,
+                        shape: descriptor.shape.clone(),
+                        descriptor: descriptor.clone(),
+                        source_bytes: bytes,
+                        resident_bytes: bytes,
+                        scale: None,
+                        bound: 0,
+                        streamed: None,
+                    }
+                })
+                .collect();
+            let load = ModelLoadPlan {
+                residual_conditioning: None,
+                target: Vec::new(),
+                head: None,
+                vision: Some(weights),
+                host_tables: Vec::new(),
+                readout_candidates: Vec::new(),
+                readout_choices: Vec::new(),
+                unplaced_output: Vec::new(),
+            };
+            let program =
+                crate::operators::vision::vision_program(&description, &|_| Ok(f32)).unwrap();
+            assert_eq!(program.registers, description.stem.registers());
+            let plan = VisionProgramPlan::new(program.kernels().into_iter().cloned().collect());
+            let resources = |classes: &[u64]| {
+                crate::programs::native_vision::checked_vision_family_resources(
+                    BackendName::Cpu,
+                    &load,
+                    &description,
+                    &plan,
+                    classes.iter().copied(),
+                )
+                .unwrap()
+                .storage
+            };
+            let single = resources(&[4]);
+            let double = resources(&[8]);
+            let family = resources(&[4, 8]);
+            crate::programs::native_vision::verify_vision_family_certificates(
                 BackendName::Cpu,
                 &load,
                 &description,
                 &plan,
-                classes.iter().copied(),
+                &[4, 8],
             )
-            .unwrap()
-            .storage
-        };
-        let single = resources(&[4]);
-        let double = resources(&[8]);
-        let family = resources(&[4, 8]);
-        crate::programs::native_vision::verify_vision_family_certificates(
-            BackendName::Cpu,
-            &load,
-            &description,
-            &plan,
-            &[4, 8],
-        )
-        .unwrap();
-        assert_eq!(family.workspace, single.workspace.max(double.workspace));
-        assert_eq!(family.output, single.output.max(double.output));
-        assert_eq!(family.upload, single.upload.max(double.upload));
-        assert!(family.workspace > 0 && family.output > 0 && family.upload > 0);
+            .unwrap();
+            assert_eq!(family.workspace, single.workspace.max(double.workspace));
+            assert_eq!(family.output, single.output.max(double.output));
+            assert_eq!(family.upload, single.upload.max(double.upload));
+            assert!(family.workspace > 0 && family.output > 0 && family.upload > 0);
+        }
     }
 
     /// A load whose readout selected planes stores its packed output
@@ -2556,6 +2606,7 @@ mod tests {
                 PlannedMethod::Mtp {
                     greedy_proposals: 1,
                     sampled_proposals: 1,
+                    widths: crate::DraftWidths::Adaptive,
                 },
                 limits,
             )

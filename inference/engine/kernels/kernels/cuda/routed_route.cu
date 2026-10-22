@@ -121,14 +121,25 @@ struct RoutedSelection {
     float *coefficient;
     unsigned long long coefficient_row;
     bool normalize;
+    // The `expert_scale` port (static extent ES; read only where present).
+    const float *expert_scale;
+    unsigned long long expert_scale_stride;
 };
 
 // The selection of `row` by one warp over the logits scratch, its column e
 // the sum of its `parts` partial planes of `plane` logits in plane order (L2
-// reads: the planes may have been written by other blocks of this launch).
+// reads: the planes may have been written by other blocks of this launch);
+// each score optionally renormalized, then multiplied by its expert's
+// `expert_scale` where the port is present.
 __device__ __forceinline__ void routed_select_row(const float *logits, unsigned long long plane, unsigned long long parts,
     const RoutedSelection &out, unsigned long long row, unsigned lane) {
-    constexpr unsigned PER_LANE = SEISMIC_DIM_E / 32;
+    // Lane `lane` holds experts lane + 32 i, ceil(E / 32) registers; when E
+    // is not a multiple of 32 the last register of lanes at or past E % 32 is
+    // excluded (never read, summed or selected). `held` is PER_LANE when 32
+    // divides E.
+    constexpr unsigned PER_LANE = (static_cast<unsigned>(SEISMIC_DIM_E) + 31) / 32;
+    constexpr unsigned REMAINDER = static_cast<unsigned>(SEISMIC_DIM_E) % 32;
+    const unsigned held = static_cast<unsigned>(SEISMIC_DIM_E) / 32 + (REMAINDER != 0 && lane < REMAINDER ? 1u : 0u);
     const float negative_infinity = -__int_as_float(0x7f800000);
     const float *values = logits + routed_logit_index(row, 0);
     const auto logit = [&](unsigned long long expert) {
@@ -137,34 +148,37 @@ __device__ __forceinline__ void routed_select_row(const float *logits, unsigned 
             sum = seismic_add_rn(sum, __ldcg(values + p * plane + expert));
         return sum;
     };
-    // Lane `lane` holds experts lane + 32 i.
     float probability[PER_LANE];
     float maximum = negative_infinity;
 #pragma unroll
     for (unsigned i = 0; i < PER_LANE; ++i) {
-        probability[i] = logit(lane + 32 * i);
+        probability[i] = i < held ? logit(lane + 32 * i) : negative_infinity;
         maximum = fmaxf(maximum, probability[i]);
     }
     maximum = seismic_warp_max_f32(maximum);
     float total = 0.0f;
 #pragma unroll
     for (unsigned i = 0; i < PER_LANE; ++i) {
-        probability[i] = expf(probability[i] - maximum);
-        total = seismic_add_rn(total, probability[i]);
+        if (i < held) {
+            probability[i] = expf(probability[i] - maximum);
+            total = seismic_add_rn(total, probability[i]);
+        }
     }
     total = seismic_warp_sum_f32(total);
 #pragma unroll
     for (unsigned i = 0; i < PER_LANE; ++i)
-        probability[i] = probability[i] / total;
+        if (i < held)
+            probability[i] = probability[i] / total;
 
     float chosen[SEISMIC_DIM_K];
+    int winners[SEISMIC_DIM_K];
     for (unsigned rank = 0; rank < SEISMIC_DIM_K; ++rank) {
         float best = negative_infinity;
         int best_expert = -1;
 #pragma unroll
         for (unsigned i = 0; i < PER_LANE; ++i) {
             const int expert = static_cast<int>(lane + 32 * i);
-            if (routed_precedes(probability[i], expert, best, best_expert)) {
+            if (i < held && routed_precedes(probability[i], expert, best, best_expert)) {
                 best = probability[i];
                 best_expert = expert;
             }
@@ -176,21 +190,26 @@ __device__ __forceinline__ void routed_select_row(const float *logits, unsigned 
             if (winner >= 0 && static_cast<unsigned>(winner) == lane + 32 * i)
                 probability[i] = negative_infinity;
         chosen[rank] = winner_probability;
+        winners[rank] = winner;
         if (lane == 0) {
             const unsigned long long slot = SEISMIC_DIM_K - 1 - rank;
             out.routes[row * out.route_row + slot * out.route_slot] = winner;
-            out.scores[row * out.score_row + slot * out.score_slot] = winner_probability;
         }
     }
-    if (out.normalize) {
-        // The slot-order sum: slot s holds rank K - 1 - s.
-        float denominator = 0.0f;
+    // The slot-order sum: slot s holds rank K - 1 - s.
+    float denominator = 0.0f;
+    if (out.normalize)
         for (unsigned slot = 0; slot < SEISMIC_DIM_K; ++slot)
             denominator = seismic_add_rn(denominator, chosen[SEISMIC_DIM_K - 1 - slot]);
-        if (lane == 0)
-            for (unsigned slot = 0; slot < SEISMIC_DIM_K; ++slot)
-                out.scores[row * out.score_row + slot * out.score_slot] = chosen[SEISMIC_DIM_K - 1 - slot] / denominator;
-    }
+    if (lane == 0)
+        for (unsigned slot = 0; slot < SEISMIC_DIM_K; ++slot) {
+            const unsigned rank = SEISMIC_DIM_K - 1 - slot;
+            float score = out.normalize ? chosen[rank] / denominator : chosen[rank];
+            if (SEISMIC_DIM_ES != 0)
+                score = seismic_mul_rn(score,
+                    out.expert_scale[static_cast<unsigned long long>(winners[rank]) * out.expert_scale_stride]);
+            out.scores[row * out.score_row + slot * out.score_slot] = score;
+        }
 
     if (lane == 0)
         out.coefficient[row * out.coefficient_row] = 1.0f / (1.0f + expf(-logit(SEISMIC_DIM_E)));
@@ -202,7 +221,9 @@ __device__ __forceinline__ void routed_select_row(const float *logits, unsigned 
             SEISMIC_ROUTES_STRIDE_1, reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)),       \
             SEISMIC_SCORES_STRIDE_0, SEISMIC_SCORES_STRIDE_1,                                             \
             reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER)), SEISMIC_RESULT_1_STRIDE_0,   \
-            SEISMIC_PARAM_NORMALIZE != 0                                                                  \
+            SEISMIC_PARAM_NORMALIZE != 0,                                                                 \
+            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_SCALE)),                    \
+            SEISMIC_EXPERT_SCALE_STRIDE_0                                                                 \
     }
 
 // M <= 8, one launch: the block computes its rows' RMS inverses (in the

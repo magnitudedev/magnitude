@@ -5,11 +5,17 @@
 #include "lib/projection/packing.h"
 
 typedef element::Act activation;
+// The output weight's operand rows (the gated rows, or NVFP4 operands): the
+// GEMV row classes form them while staging, the stage launch into the
+// scratch every other form reads.
+constant constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4;
+typedef projection::operands<NVFP4> Operands;
 
 #define ATTENTION_OUTPUT_ARGUMENTS                                                      \
     device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],                       \
     device const float *inject [[buffer(SEISMIC_BUFFER_INJECT)]],                       \
     device const uchar *gated [[buffer(SEISMIC_BUFFER_GATED)]],                         \
+    device uchar *staged [[buffer(SEISMIC_BUFFER_SCRATCH_STAGED)]],                     \
     device const uchar *output_weight [[buffer(SEISMIC_BUFFER_OUTPUT_WEIGHT)]],         \
     device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],                 \
@@ -20,32 +26,42 @@ typedef element::Act activation;
     device half *weight_factors [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_FACTORS)]],      \
     device float *token_scales [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_SCALES)]],         \
     device float *weight_scales [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_SCALES)]],       \
+    device const float *output_scale [[buffer(SEISMIC_BUFFER_OUTPUT_SCALE)]],           \
     device const float *output_bound [[buffer(SEISMIC_BUFFER_OUTPUT_BOUND)]],           \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 // `gated` is [M, Q, W] and canonical, so a row is Q*W contiguous values.
+// `raw` is the gated rows; `in` the rows every form past the GEMV reads.
 #define ATTENTION_OUTPUT_OPERANDS                                                       \
     const uint k = uint(SEISMIC_DIM_Q * SEISMIC_DIM_W);                                 \
-    projection::Plain<activation, projection::AllRows> in{gated, SEISMIC_GATED_STRIDE_0, \
+    const projection::Plain<activation, projection::AllRows> raw{gated, SEISMIC_GATED_STRIDE_0, \
         SEISMIC_GATED_STRIDE_2, k, {}};                                                 \
+    const projection::Plain<activation, projection::AllRows> in = NVFP4                 \
+        ? projection::Plain<activation, projection::AllRows>{staged, k, 1, k, {}}       \
+        : raw;                                                                          \
     ATTENTION_OUTPUT_EPILOGUE;                                                          \
     projection::Weights<packets::W0> w{output_weight, KERNEL_W0_LAYOUT(k), k}
 
 // The residual join: a plain residual, or the scatter into each
-// hyper-connection stream (`scatter`).
+// hyper-connection stream (`scatter`), after the weight's second-level
+// scale where it has one.
 typedef projection::OutputOf<activation, projection::AllRows, SEISMIC_DIM_SN, SEISMIC_DIM_IN != 0> output_join;
 #define ATTENTION_OUTPUT_EPILOGUE                                                       \
-    const output_join::type out = output_join::make(result, SEISMIC_RESULT_0_STRIDE_0,  \
-        SEISMIC_RESULT_0_STRIDE_1, hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, {}, \
-        inject, SEISMIC_INJECT_STRIDE_0, uint(SEISMIC_DIM_D))
+    const auto out = projection::scaling<(SEISMIC_DIM_OS != 0)>::wrap(                  \
+        output_join::make(result, SEISMIC_RESULT_0_STRIDE_0,                            \
+            SEISMIC_RESULT_0_STRIDE_1, hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, {}, \
+            inject, SEISMIC_INJECT_STRIDE_0, uint(SEISMIC_DIM_D)),                      \
+        projection::scale_factor(output_scale, SEISMIC_DIM_OS, 0, 0), 1.0f)
 
 // The GEMV of a launch that serves COUNT (ONE, SEVERAL) rows.
 #define ATTENTION_OUTPUT_GEMV(ROWS, LANES, COUNT)                                       \
     ATTENTION_OUTPUT_OPERANDS;                                                          \
     uint rows = uint(SEISMIC_DIM_M);                                                    \
+    PROJECTION_OPERANDS_SHARED(globals, NVFP4);                                         \
+    const auto x = Operands::rows(raw, rows, k, globals, simdgroups, sg, lane);         \
     PROJECTION_FOR_##COUNT##_ROWS(rows,                                                 \
         projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(                       \
-            in, out, w, rows, uint(SEISMIC_DIM_D), k, tile, shared, simdgroups, sg, lane))
+            x, out, w, rows, uint(SEISMIC_DIM_D), k, tile, shared, simdgroups, sg, lane))
 
 // One row.
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV
@@ -83,6 +99,17 @@ kernel void attention_output_gemv_pair(ATTENTION_OUTPUT_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     ATTENTION_OUTPUT_GEMV(ROWS, LANES, PAIR);
+}
+#endif
+
+// The gated rows as NVFP4 operands into `staged`, one row a threadgroup.
+#ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_STAGE
+kernel void attention_output_stage(ATTENTION_OUTPUT_ARGUMENTS,
+    uint item [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    PROJECTION_NORMALIZE_SHARED(maxima);
+    ATTENTION_OUTPUT_OPERANDS;
+    projection::operands<true>::form<256>(raw, item, staged, k, maxima, thread_index);
 }
 #endif
 

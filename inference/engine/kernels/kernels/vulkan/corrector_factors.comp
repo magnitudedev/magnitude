@@ -1,0 +1,25 @@
+// corrector_factors: one invocation per element of a node row over a
+// grid-stride loop, which publishes x, the block's anchor a and x · a (each
+// rounded once to A) into the node's three joined rows. Mirrors
+// `cpu/corrector_factors.rs`.
+#include "lib/core/activation.glsl"
+
+void corrector_factors() {
+    const uint64_t nodes = SEISMIC_PTR(SEISMIC_BUFFER_NODES);
+    const uint64_t anchor = SEISMIC_PTR(SEISMIC_BUFFER_ANCHOR);
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t count = SEISMIC_DIM_N, width = SEISMIC_DIM_H;
+    const uint64_t total = SEISMIC_DIM_S * count * width;
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    for (uint64_t index = gl_GlobalInvocationID.x; index < total; index += step) {
+        const uint64_t column = index % width, node = index / width % count, block = index / (count * width);
+        const float x = element_at(ELEMENT_ACT, nodes,
+            block * SEISMIC_NODES_STRIDE_0 + node * SEISMIC_NODES_STRIDE_1 + column * SEISMIC_NODES_STRIDE_2);
+        const float a = element_at(ELEMENT_ACT, anchor, block * SEISMIC_ANCHOR_STRIDE_0 + column * SEISMIC_ANCHOR_STRIDE_1);
+        const uint64_t at = block * SEISMIC_RESULT_0_STRIDE_0 + node * SEISMIC_RESULT_0_STRIDE_1
+            + column * SEISMIC_RESULT_0_STRIDE_3;
+        element_put(ELEMENT_ACT, result, at, x);
+        element_put(ELEMENT_ACT, result, at + SEISMIC_RESULT_0_STRIDE_2, a);
+        element_put(ELEMENT_ACT, result, at + 2ul * SEISMIC_RESULT_0_STRIDE_2, x * a);
+    }
+}

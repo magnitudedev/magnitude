@@ -65,10 +65,16 @@ pub(crate) enum Coefficients {
     Hierarchical {
         factor_group: u32,
         factor_dtype: DType,
+        /// The coefficient is the factor times the code times
+        /// `2^factor_exponent` (an exact power-of-two scaling).
+        factor_exponent: i32,
         bits: u32,
         interpretation: CodeInterpretation,
         bias: bool,
         bias_sign: i32,
+        /// Row layouts carry the coefficient codes in the grid entries
+        /// (`GridCodes::carried_bits`) instead of a `scales` plane.
+        carried: bool,
     },
     /// One floating scale code shared by the representation group.
     BlockFloat {
@@ -171,6 +177,7 @@ pub(crate) enum Coefficient {
     },
     Product {
         factor: Plane,
+        exponent: i32,
         coefficients: Plane,
         field: u32,
         sign: i32,
@@ -259,6 +266,14 @@ impl GridCodes {
             "a grid entry is whole bytes holding its indices and signs"
         );
         self.entry_bits
+    }
+
+    /// The first entry bit past its indices and signs. A representation
+    /// whose coefficients are carried (`Coefficients::Hierarchical::carried`)
+    /// places, in its row layouts, bit `j` of a group's coefficient code at
+    /// this bit of the group's entry `j`; the packet form keeps it zero.
+    pub const fn carried_bit(&self) -> u32 {
+        self.indices() * self.index_bits + GRID_SIGN_BITS
     }
 
     /// The code of the value at `lane` (< `GRID_VALUES`) of `entry`.
@@ -430,6 +445,12 @@ pub enum DecodeStep {
     /// `into: f32 := from` converted by value (exact for every `i32` code
     /// and every `f16`/`bf16` coefficient).
     ConvertToF32 { into: DecodeTemp, from: DecodeTemp },
+    /// `into := value`, a constant of the representation (the power of two
+    /// a hierarchical factor is scaled by).
+    Constant {
+        into: DecodeTemp,
+        value: crate::reference_math::ReferenceScalar,
+    },
     /// `into: f32 := left * right`, rounded once.
     Multiply {
         into: DecodeTemp,
@@ -465,6 +486,7 @@ impl DecodeStep {
             | DecodeStep::InterpretGridCode { into, .. }
             | DecodeStep::DecodeFloatCode { into, .. }
             | DecodeStep::ConvertToF32 { into, .. }
+            | DecodeStep::Constant { into, .. }
             | DecodeStep::Multiply { into, .. }
             | DecodeStep::Negate { into, .. }
             | DecodeStep::MultiplyAdd { into, .. }
@@ -475,7 +497,9 @@ impl DecodeStep {
     /// The temporaries this step reads, in operand order.
     pub(crate) fn uses(&self) -> Vec<DecodeTemp> {
         match self {
-            DecodeStep::ReadPlaneField { .. } | DecodeStep::ReadPlaneLane { .. } => Vec::new(),
+            DecodeStep::ReadPlaneField { .. }
+            | DecodeStep::ReadPlaneLane { .. }
+            | DecodeStep::Constant { .. } => Vec::new(),
             DecodeStep::InterpretCode { raw, .. } => vec![*raw],
             DecodeStep::InterpretGridCode { raw, lane, .. } => vec![*raw, *lane],
             DecodeStep::DecodeFloatCode { raw, .. } => vec![*raw],
@@ -790,6 +814,12 @@ impl RecipeBuilder<'_> {
         into
     }
 
+    fn constant(&mut self, value: crate::reference_math::ReferenceScalar) -> DecodeTemp {
+        let into = self.temp(value.dtype());
+        self.steps.push(DecodeStep::Constant { into, value });
+        into
+    }
+
     fn multiply(&mut self, left: DecodeTemp, right: DecodeTemp) -> DecodeTemp {
         let into = self.temp(DType::F32);
         self.steps.push(DecodeStep::Multiply { into, left, right });
@@ -824,11 +854,13 @@ impl RecipeBuilder<'_> {
         into
     }
 
-    /// `factor_plane[value / factor_group] * decode(coefficients[field])`
-    /// in `f32`: one hierarchical coefficient before its sign.
+    /// `factor_plane[value / factor_group] * decode(coefficients[field]) *
+    /// 2^exponent` in `f32`: one hierarchical coefficient before its sign.
+    /// The power-of-two scaling is exact.
     fn hierarchical_coefficient(
         &mut self,
         factor_plane: PlaneField,
+        exponent: i32,
         field: u32,
         bits: u32,
         interpretation: CodeInterpretation,
@@ -838,7 +870,14 @@ impl RecipeBuilder<'_> {
         let converted = self.to_f32(code);
         let factor = self.read(factor_plane, 0);
         let factor = self.to_f32(factor);
-        (self.multiply(factor, converted), factor, code)
+        let mut product = self.multiply(factor, converted);
+        if exponent != 0 {
+            let power = self.constant(crate::reference_math::ReferenceScalar::F32(
+                2.0f32.powi(exponent).to_bits(),
+            ));
+            product = self.multiply(product, power);
+        }
+        (product, factor, code)
     }
 }
 
@@ -880,10 +919,12 @@ pub(crate) const REPRS: &[Repr] = &[
         coefficients: Coefficients::Hierarchical {
             factor_group: 256,
             factor_dtype: DType::F16,
+            factor_exponent: 0,
             bits: 6,
             interpretation: CodeInterpretation::Unsigned,
             bias: true,
             bias_sign: -1,
+            carried: false,
         },
     },
     Repr {
@@ -896,10 +937,12 @@ pub(crate) const REPRS: &[Repr] = &[
         coefficients: Coefficients::Hierarchical {
             factor_group: 256,
             factor_dtype: DType::F16,
+            factor_exponent: 0,
             bits: 6,
             interpretation: CodeInterpretation::Unsigned,
             bias: true,
             bias_sign: -1,
+            carried: false,
         },
     },
     Repr {
@@ -912,10 +955,12 @@ pub(crate) const REPRS: &[Repr] = &[
         coefficients: Coefficients::Hierarchical {
             factor_group: 256,
             factor_dtype: DType::F16,
+            factor_exponent: 0,
             bits: 8,
             interpretation: CodeInterpretation::TwosComplement,
             bias: false,
             bias_sign: 1,
+            carried: false,
         },
     },
     Repr {
@@ -1075,10 +1120,12 @@ pub(crate) const REPRS: &[Repr] = &[
         coefficients: Coefficients::Hierarchical {
             factor_group: 256,
             factor_dtype: DType::F32,
+            factor_exponent: 0,
             bits: 4,
             interpretation: CodeInterpretation::Table(&ODD_SCALES),
             bias: false,
             bias_sign: 1,
+            carried: false,
         },
     },
     // GGUF IQ3_XXS: vector codes of eight values (two 8-bit grid indices of
@@ -1094,15 +1141,19 @@ pub(crate) const REPRS: &[Repr] = &[
         coefficients: Coefficients::Hierarchical {
             factor_group: 256,
             factor_dtype: DType::F32,
+            factor_exponent: 0,
             bits: 4,
             interpretation: CodeInterpretation::Table(&ODD_SCALES),
             bias: false,
             bias_sign: 1,
+            carried: false,
         },
     },
     // GGUF IQ2_XXS: vector codes of eight values (an 8-bit grid index and 7
     // sign bits, in a 16-bit entry), an odd 4-bit scale `2 s + 1` per 32 and
-    // one f32 factor `d / 8` per 256: ggml's `d (0.5 + s) / 4` exactly.
+    // one f16 factor `d` per 256 scaled by 2^-3: ggml's `d (0.5 + s) / 4`
+    // exactly. Row layouts carry the scale codes in the entries' sixteenth
+    // bits, 66 bytes per 256 values as in GGUF.
     Repr {
         name: "iq2xxs",
         packing_axis: PackingAxisRule::Last,
@@ -1112,11 +1163,13 @@ pub(crate) const REPRS: &[Repr] = &[
         float_code: None,
         coefficients: Coefficients::Hierarchical {
             factor_group: 256,
-            factor_dtype: DType::F32,
+            factor_dtype: DType::F16,
+            factor_exponent: -3,
             bits: 4,
             interpretation: CodeInterpretation::Table(&ODD_SCALES),
             bias: false,
             bias_sign: 1,
+            carried: true,
         },
     },
 ];
@@ -1174,7 +1227,63 @@ impl Repr {
     }
 }
 
+/// How a matrix product over a weight element takes its activation operands
+/// (docs/precision.md, "NVFP4 operands"). It is the weight's, as its
+/// producer calibrated it: NVFP4 weights are W4A16 or W4A4 (NVIDIA's
+/// `W4A16_NVFP4` and `NVFP4`), one storage with two elements, so every
+/// backend computes the element's one recipe and FP4 tensor operations
+/// compute W4A4 natively.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OperandRecipe {
+    /// The activation element as it is rounded to `A`.
+    Rounded,
+    /// Each row in 16-value blocks of E2M1 codes with UE4M3 block scales
+    /// under the row's power-of-two global scale.
+    Nvfp4Rows,
+}
+
+impl OperandRecipe {
+    /// Every recipe, in order of its code.
+    pub const ALL: [Self; 2] = [Self::Rounded, Self::Nvfp4Rows];
+
+    /// The recipe as native declarations and sources read it
+    /// (`operands(W)`): 0 rounded, 1 NVFP4 rows.
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::Rounded => 0,
+            Self::Nvfp4Rows => 1,
+        }
+    }
+
+    /// What names an element of this recipe after its storage: nothing for
+    /// the rounded activation, `a4` for NVFP4 rows (`nvfp4g16a4`).
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            Self::Rounded => "",
+            Self::Nvfp4Rows => "a4",
+        }
+    }
+}
+
 impl Repr {
+    /// The operand recipes of this representation's elements: every
+    /// representation multiplies the rounded activation, and NVFP4 (E2M1
+    /// codes in 16-value groups under UE4M3 scales) also has its W4A4
+    /// element, whose activation side is the same format.
+    pub(crate) fn operand_recipes(&self) -> &'static [OperandRecipe] {
+        match (self.float_code, &self.coefficients, self.group) {
+            (
+                Some(FloatCodeFormat::E2M1),
+                Coefficients::BlockFloat {
+                    format: FloatCodeFormat::UE4M3,
+                    ..
+                },
+                16,
+            ) => &[OperandRecipe::Rounded, OperandRecipe::Nvfp4Rows],
+            _ => &[OperandRecipe::Rounded],
+        }
+    }
+
     pub(crate) fn storage_group(&self) -> u32 {
         match self.coefficients {
             Coefficients::Direct { packet_group, .. } => packet_group,
@@ -1309,8 +1418,9 @@ impl Repr {
     /// (a `cast` of a packed value). The recipe is the registry's single
     /// statement of the decode: `scale * code + bias` rounded once to `f32`,
     /// where a direct coefficient is the plane value and a hierarchical
-    /// coefficient is `factor * coefficient_code` (with the bias sign
-    /// applied), exactly as the reference interpreter evaluates it.
+    /// coefficient is `factor * coefficient_code * 2^factor_exponent` (with
+    /// the bias sign applied), exactly as the reference interpreter
+    /// evaluates it.
     pub(crate) fn decode_recipe_to(&self, output: DType) -> DecodeRecipe {
         let planes = self.plane_schemas();
         let mut recipe = RecipeBuilder {
@@ -1344,6 +1454,7 @@ impl Repr {
                     (scale, bias, scale, bias, 1)
                 }
                 Coefficients::Hierarchical {
+                    factor_exponent,
                     bits,
                     interpretation,
                     bias,
@@ -1352,6 +1463,7 @@ impl Repr {
                 } => {
                     let (scale, scale_factor, code) = recipe.hierarchical_coefficient(
                         PlaneField::ScaleFactor,
+                        *factor_exponent,
                         0,
                         *bits,
                         interpretation.clone(),
@@ -1361,6 +1473,7 @@ impl Repr {
                     let bias = if *bias {
                         let (product, factor, code) = recipe.hierarchical_coefficient(
                             PlaneField::BiasFactor,
+                            *factor_exponent,
                             1,
                             *bits,
                             interpretation.clone(),
@@ -1478,12 +1591,17 @@ impl Repr {
                     PlaneField::Scale
                 })?,
             }),
-            Coefficients::Hierarchical { bias_sign, .. } => Some(Coefficient::Product {
+            Coefficients::Hierarchical {
+                bias_sign,
+                factor_exponent,
+                ..
+            } => Some(Coefficient::Product {
                 factor: find(if bias {
                     PlaneField::BiasFactor
                 } else {
                     PlaneField::ScaleFactor
                 })?,
+                exponent: factor_exponent,
                 coefficients: find(PlaneField::Coefficients)?,
                 field: u32::from(bias),
                 sign: if bias { bias_sign } else { 1 },
@@ -1530,6 +1648,12 @@ mod tests {
                     f64::from(format.decode(get(&temporaries, *raw) as u32))
                 }
                 DecodeStep::ConvertToF32 { from, .. } => get(&temporaries, *from) as f32 as f64,
+                DecodeStep::Constant { value, .. } => match value {
+                    crate::reference_math::ReferenceScalar::F32(bits) => {
+                        f64::from(f32::from_bits(*bits))
+                    }
+                    other => panic!("the test evaluator has no {other:?} constant"),
+                },
                 DecodeStep::Multiply { left, right, .. } => {
                     (get(&temporaries, *left) * get(&temporaries, *right)) as f32 as f64
                 }
@@ -1625,6 +1749,7 @@ mod tests {
                         }
                         Some(Coefficient::Product {
                             factor,
+                            exponent,
                             coefficients,
                             field,
                             sign,
@@ -1634,8 +1759,8 @@ mod tests {
                                 flat / coefficients.group as usize * coefficients.fields as usize
                                     + field as usize,
                             );
-                            (plane_value(&factor, flat / factor.group as usize) * code)
-                                * sign as f32
+                            let factor = plane_value(&factor, flat / factor.group as usize);
+                            (factor * code * 2.0f32.powi(exponent)) * sign as f32
                         }
                     }
                 };
@@ -1715,6 +1840,9 @@ mod tests {
                         }
                         DecodeStep::ConvertToF32 { into, .. } => {
                             assert_eq!(recipe.dtype(*into), DType::F32);
+                        }
+                        DecodeStep::Constant { into, value } => {
+                            assert_eq!(recipe.dtype(*into), value.dtype());
                         }
                         DecodeStep::Multiply { into, left, right } => {
                             for temp in [into, left, right] {

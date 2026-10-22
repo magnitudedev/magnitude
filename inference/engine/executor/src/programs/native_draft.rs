@@ -1,4 +1,5 @@
-//! The native separate-draft program (DFlash, DSpark; plan §3.8). One sealed
+//! The native separate-draft program (DFlash, DSpark, DFlash2, LiLiCorr;
+//! plan §3.8). One sealed
 //! graph per class runs a draft transaction in one device submission:
 //!
 //! - **Injection.** For every draft layer, the layer's attention over the
@@ -21,14 +22,15 @@
 //! Selections are step-major: proposal `k` of slot `s` is result row
 //! `k · slots + s`.
 
-use super::{DeviceSubmission, HeadProgram};
+use super::{DeviceSubmission, HeadOutput, HeadProgram};
+use crate::device_table::SelectedRead;
 use crate::operators::{self, InputForm, Join, Mixer, SublayerInput};
 use crate::{
     completion::CompletionWaiter,
-    native::AttestedDraft,
+    native::{AttestedDraft, AttestedLanding},
     operators::attention::graph::{
-        self as attention_graph, attention_weights, AttentionBlock, AttentionBounds,
-        AttentionControlPorts, AttentionGraphEntries, AttentionHistoryEntries, AttentionWeights,
+        self as attention_graph, attention_weights, AttentionBlock, AttentionControlPorts,
+        AttentionOperands, AttentionGraphEntries, AttentionHistoryEntries, AttentionWeights,
         CheckedAttentionEntries, ProjectedRows,
     },
     operators::dense_ffn::graph::{self as dense_graph, CheckedDenseEntries, DenseGraphEntries},
@@ -40,20 +42,23 @@ use crate::{
             ConstantTensors, GraphConstant,
         },
         native_target_graph::{
-            weight, weight_scale_port, GatheredTable, PackingBound, RowDirectory, WeightPort,
+            weight, weight_scale_port, CheckedLandingEntries, GatheredTable, LandedReadPorts,
+            LandingEntries, PackingBound, RowDirectory, WeightOperands, WeightPort,
         },
     },
-    DeviceError, DraftProgramPlan, GraphOutputTensor, HeadLaunchCore, InvariantError,
+    DeviceError, DraftProgramPlan, HeadLaunchCore, InvariantError,
     ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead, ResidentOutput,
     ResidentWeight, ResourceLimits, StateStorePlan, SubmitError, ValidatedHeadLaunch,
 };
 use magnitude_batching::{row_class, TargetBatchUpload};
 use magnitude_family_contracts::{
-    ActivationDType, BlockAttention, DraftDefinition, DraftEmbedding, DraftMethod, HistoryDomain,
-    KeyValue, ModelDefinition, SublayerIndex, WeightKind, WeightRole, WeightScope,
+    ActivationDType, AffinePart, BlockAttention, CandidateCorrector, CorrectorSite,
+    CorrectorWeight, DraftDefinition, DraftEmbedding, DraftMethod, HistoryDomain, KeyValue,
+    ModelDefinition, SublayerIndex, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_kernels::{
-    dense_output, draft_convolve_input, draft_convolve_residual, draft_gated_rows, draft_path_step,
+    corrector_attention, corrector_factors, corrector_features, corrector_nodes, corrector_path,
+    corrector_rows, dense_output, draft_convolve_input, draft_convolve_residual, draft_gated_rows, draft_path_step,
     draft_top_k, embedding_rows, project_rows, readout_features_rows, sample_rows, shape_rows,
     widen_rows,
 };
@@ -221,6 +226,18 @@ pub(crate) fn draft_graph_classes(
     Ok(classes)
 }
 
+/// The token table the draft's block embeds tokens of: the target's, or the
+/// draft's own.
+pub(crate) fn token_table(draft: &DraftDefinition) -> WeightRole {
+    WeightRole {
+        scope: match &draft.embedding {
+            DraftEmbedding::Target => WeightScope::Target,
+            DraftEmbedding::Own(_) => WeightScope::Draft,
+        },
+        kind: WeightKind::Embedding,
+    }
+}
+
 /// Every class's fixed geometry: the draft, each layer's history rows and
 /// slab rows, the block pass's visible spans, and the proposals drafted.
 pub(crate) struct DraftGeometry<'d> {
@@ -272,30 +289,77 @@ impl<'d> DraftGeometry<'d> {
 pub(crate) struct DraftGraphEntries<'a, G: GraphDraft + 'a> {
     pub layers: Vec<DraftLayerEntries<'a, G>>,
     pub embedding: G::Binding<'a, embedding_rows::Entry>,
+    /// The landing entries of the block's token table, when it has landing
+    /// slots.
+    pub landing: Option<LandingEntries<'a, G>>,
     pub head: readout::ProjectionEntries<'a, G>,
     pub shape: G::Binding<'a, shape_rows::Entry>,
     pub sample: G::Binding<'a, sample_rows::Entry>,
     /// Widens a device-conditioned entry's target features to F32.
     pub widen: G::Binding<'a, widen_rows::Entry>,
     pub markov: Option<MarkovEntries<'a, G>>,
-    pub dflash2: Option<Dflash2Entries<'a, G>>,
+    pub convolved: Option<ConvolvedEntries<'a, G>>,
+    pub selector: Option<SelectorEntries<'a, G>>,
+    pub corrector: Option<CorrectorEntries<'a, G>>,
 }
 
-/// DFlash2's unfused layer entries and its candidate path.
-pub(crate) struct Dflash2Entries<'a, G: GraphDraft + 'a> {
-    pub layers: Vec<Dflash2LayerEntries<'a, G>>,
-    pub features: G::Binding<'a, readout_features_rows::Entry>,
-    pub hidden: G::Binding<'a, project_rows::Entry>,
+/// A convolved backbone's unfused layer entries.
+pub(crate) struct ConvolvedEntries<'a, G: GraphDraft + 'a> {
+    pub layers: Vec<ConvolvedLayerEntries<'a, G>>,
     pub convolve_input: G::Binding<'a, draft_convolve_input::Entry>,
     pub convolve_residual: G::Binding<'a, draft_convolve_residual::Entry>,
     pub gated: G::Binding<'a, draft_gated_rows::Entry>,
+}
+
+/// DFlash2's candidate path.
+pub(crate) struct SelectorEntries<'a, G: GraphDraft + 'a> {
+    pub features: G::Binding<'a, readout_features_rows::Entry>,
+    pub hidden: G::Binding<'a, project_rows::Entry>,
     pub top_k: G::Binding<'a, draft_top_k::Entry>,
     pub predecessor: G::Binding<'a, embedding_rows::Entry>,
     pub successor: G::Binding<'a, embedding_rows::Entry>,
     pub path: G::Binding<'a, draft_path_step::Entry>,
 }
 
-pub(crate) struct Dflash2LayerEntries<'a, G: GraphDraft + 'a> {
+/// LiLiCorr's corrector, in graph order (`AttestedCorrector`).
+pub(crate) struct CorrectorEntries<'a, G: GraphDraft + 'a> {
+    pub pass_norm: G::Binding<'a, readout_features_rows::Entry>,
+    pub anchor_rows: G::Binding<'a, readout_features_rows::Entry>,
+    pub top_k: G::Binding<'a, draft_top_k::Entry>,
+    pub features: G::Binding<'a, corrector_features::Entry>,
+    pub feature_down: G::Binding<'a, project_rows::Entry>,
+    pub token: Option<G::Binding<'a, project_rows::Entry>>,
+    pub pass: G::Binding<'a, project_rows::Entry>,
+    pub nodes: G::Binding<'a, corrector_nodes::Entry>,
+    pub context: G::Binding<'a, project_rows::Entry>,
+    pub context_bias: G::Binding<'a, corrector_rows::Entry>,
+    pub anchor_norm: G::Binding<'a, readout_features_rows::Entry>,
+    pub attention: G::Binding<'a, corrector_attention::Entry>,
+    pub layers: Vec<CorrectorLayerEntries<'a, G>>,
+    pub output_norm: G::Binding<'a, readout_features_rows::Entry>,
+    pub factors: G::Binding<'a, corrector_factors::Entry>,
+    pub factor_input: G::Binding<'a, project_rows::Entry>,
+    pub factor_activated: G::Binding<'a, corrector_rows::Entry>,
+    pub outgoing: G::Binding<'a, project_rows::Entry>,
+    pub incoming: G::Binding<'a, project_rows::Entry>,
+    pub anchor: G::Binding<'a, project_rows::Entry>,
+    pub unit: G::Binding<'a, corrector_rows::Entry>,
+    pub path: G::Binding<'a, corrector_path::Entry>,
+}
+
+pub(crate) struct CorrectorLayerEntries<'a, G: GraphDraft + 'a> {
+    pub attention_norm: G::Binding<'a, readout_features_rows::Entry>,
+    pub attention_input: G::Binding<'a, project_rows::Entry>,
+    pub attention_output: G::Binding<'a, project_rows::Entry>,
+    pub attention_residual: G::Binding<'a, corrector_rows::Entry>,
+    pub mlp_norm: G::Binding<'a, readout_features_rows::Entry>,
+    pub up: G::Binding<'a, project_rows::Entry>,
+    pub activated: G::Binding<'a, corrector_rows::Entry>,
+    pub down: G::Binding<'a, project_rows::Entry>,
+    pub down_residual: G::Binding<'a, corrector_rows::Entry>,
+}
+
+pub(crate) struct ConvolvedLayerEntries<'a, G: GraphDraft + 'a> {
     pub attention_norm: G::Binding<'a, readout_features_rows::Entry>,
     pub attention_coefficients: G::Binding<'a, project_rows::Entry>,
     pub query: G::Binding<'a, project_rows::Entry>,
@@ -321,8 +385,9 @@ pub(crate) struct MarkovEntries<'a, G: GraphDraft + 'a> {
 }
 
 impl<'a> DraftGraphEntries<'a, NativeGraph> {
-    fn prepared(draft: &'a AttestedDraft) -> Self {
+    fn prepared(draft: &'a AttestedDraft, landing: Option<&'a AttestedLanding>) -> Self {
         Self {
+            landing: landing.map(LandingEntries::native),
             layers: draft
                 .blocks
                 .iter()
@@ -341,11 +406,11 @@ impl<'a> DraftGraphEntries<'a, NativeGraph> {
                 embedding: &markov.embedding,
                 projection: &markov.projection,
             }),
-            dflash2: draft.dflash2.as_ref().map(|dflash2| Dflash2Entries {
-                layers: dflash2
+            convolved: draft.convolved.as_ref().map(|convolved| ConvolvedEntries {
+                layers: convolved
                     .layers
                     .iter()
-                    .map(|layer| Dflash2LayerEntries {
+                    .map(|layer| ConvolvedLayerEntries {
                         attention_norm: &layer.attention_norm,
                         attention_coefficients: &layer.attention_coefficients,
                         query: &layer.query,
@@ -359,15 +424,55 @@ impl<'a> DraftGraphEntries<'a, NativeGraph> {
                         down: &layer.down,
                     })
                     .collect(),
-                features: &dflash2.features,
-                hidden: &dflash2.hidden,
-                convolve_input: &dflash2.convolve_input,
-                convolve_residual: &dflash2.convolve_residual,
-                gated: &dflash2.gated,
-                top_k: &dflash2.top_k,
-                predecessor: &dflash2.predecessor,
-                successor: &dflash2.successor,
-                path: &dflash2.path,
+                convolve_input: &convolved.convolve_input,
+                convolve_residual: &convolved.convolve_residual,
+                gated: &convolved.gated,
+            }),
+            selector: draft.selector.as_ref().map(|selector| SelectorEntries {
+                features: &selector.features,
+                hidden: &selector.hidden,
+                top_k: &selector.top_k,
+                predecessor: &selector.predecessor,
+                successor: &selector.successor,
+                path: &selector.path,
+            }),
+            corrector: draft.corrector.as_ref().map(|corrector| CorrectorEntries {
+                pass_norm: &corrector.pass_norm,
+                anchor_rows: &corrector.anchor_rows,
+                top_k: &corrector.top_k,
+                features: &corrector.features,
+                feature_down: &corrector.feature_down,
+                token: corrector.token.as_ref(),
+                pass: &corrector.pass,
+                nodes: &corrector.nodes,
+                context: &corrector.context,
+                context_bias: &corrector.context_bias,
+                anchor_norm: &corrector.anchor_norm,
+                attention: &corrector.attention,
+                layers: corrector
+                    .layers
+                    .iter()
+                    .map(|layer| CorrectorLayerEntries {
+                        attention_norm: &layer.attention_norm,
+                        attention_input: &layer.attention_input,
+                        attention_output: &layer.attention_output,
+                        attention_residual: &layer.attention_residual,
+                        mlp_norm: &layer.mlp_norm,
+                        up: &layer.up,
+                        activated: &layer.activated,
+                        down: &layer.down,
+                        down_residual: &layer.down_residual,
+                    })
+                    .collect(),
+                output_norm: &corrector.output_norm,
+                factors: &corrector.factors,
+                factor_input: &corrector.factor_input,
+                factor_activated: &corrector.factor_activated,
+                outgoing: &corrector.outgoing,
+                incoming: &corrector.incoming,
+                anchor: &corrector.anchor,
+                unit: &corrector.unit,
+                path: &corrector.path,
             }),
         }
     }
@@ -382,82 +487,74 @@ struct CheckedDraftEntries {
         CheckedDenseEntries,
     )>,
     embedding: [(&'static str, Element); 2],
+    landing: Option<CheckedLandingEntries>,
     head: readout::CheckedProjectionEntries,
     selection: [(&'static str, Element); 0],
     widen: [(&'static str, Element); 1],
     markov: Option<CheckedMarkovEntries>,
-    dflash2: Option<CheckedDflash2Entries>,
+    convolved: Option<CheckedConvolvedEntries>,
+    selector: Option<CheckedSelectorEntries>,
+    corrector: Option<CheckedCorrectorEntries>,
 }
 
 type Assignments<const N: usize> = [(&'static str, Element); N];
 
-struct CheckedDflash2Entries {
-    layers: Vec<CheckedDflash2Layer>,
-    features: Assignments<2>,
-    hidden: Assignments<3>,
+/// A projection's element assignments: activation rows, weight, published.
+fn projected(activation: Element, weight: Element, output: Element) -> Assignments<3> {
+    [("A", activation), ("W", weight), ("Y", output)]
+}
+
+/// A norm's element assignments.
+fn normed(norm: Element, activation: Element) -> Assignments<2> {
+    [("NW", norm), ("A", activation)]
+}
+
+struct CheckedConvolvedEntries {
+    layers: Vec<CheckedConvolvedLayer>,
     activation: Assignments<1>,
     none: Assignments<0>,
-    predecessor: Assignments<2>,
-    successor: Assignments<2>,
 }
 
-struct CheckedDflash2Layer {
-    attention_norm: Assignments<2>,
-    attention_coefficients: Assignments<3>,
-    query: Assignments<3>,
-    key: Assignments<3>,
-    value: Assignments<3>,
-    output: Assignments<3>,
-    feed_forward_norm: Assignments<2>,
-    feed_forward_coefficients: Assignments<3>,
-    gate: Assignments<3>,
-    up: Assignments<3>,
-    down: Assignments<3>,
-}
-
-impl CheckedDflash2Entries {
-    fn new(plan: &DraftProgramPlan, binding: &crate::Dflash2Binding) -> Self {
-        let activation = plan.activation();
-        let projection =
-            |weight: Element, output: Element| [("A", activation), ("W", weight), ("Y", output)];
-        let (a, f32) = (activation, Element::f32());
+impl CheckedConvolvedEntries {
+    fn new(plan: &DraftProgramPlan, binding: &crate::ConvolutionBinding) -> Self {
+        let (a, f32) = (plan.activation(), Element::f32());
         Self {
-            layers: plan
-                .blocks()
+            layers: binding
+                .layers
                 .iter()
-                .zip(&binding.convolutions)
-                .map(|(block, [attention_coefficients, dense_coefficients])| {
-                    let (attention, dense) = (block.attention, block.feed_forward);
-                    CheckedDflash2Layer {
-                        attention_norm: [("NW", attention.norm), ("A", a)],
-                        attention_coefficients: projection(*attention_coefficients, f32),
-                        query: projection(attention.query, a),
-                        key: projection(attention.key, a),
-                        value: projection(attention.value, a),
-                        output: projection(attention.output, f32),
-                        feed_forward_norm: [("NW", dense.norm), ("A", a)],
-                        feed_forward_coefficients: projection(*dense_coefficients, f32),
-                        gate: projection(dense.gate, a),
-                        up: projection(dense.up, a),
-                        down: projection(dense.down, f32),
-                    }
+                .map(|layer| CheckedConvolvedLayer {
+                    attention_norm: normed(layer.attention_norm, a),
+                    attention_coefficients: projected(
+                        a,
+                        layer.attention_coefficients.element,
+                        f32,
+                    ),
+                    query: projected(a, layer.query.element, a),
+                    key: projected(a, layer.key.element, a),
+                    value: projected(a, layer.value.element, a),
+                    output: projected(a, layer.output.element, f32),
+                    feed_forward_norm: normed(layer.feed_forward_norm, a),
+                    feed_forward_coefficients: projected(
+                        a,
+                        layer.feed_forward_coefficients.element,
+                        f32,
+                    ),
+                    gate: projected(a, layer.gate.element, a),
+                    up: projected(a, layer.up.element, a),
+                    down: projected(a, layer.down.element, f32),
                 })
                 .collect(),
-            features: [("NW", plan.output_norm()), ("A", a)],
-            hidden: projection(binding.selector.hidden, a),
             activation: [("A", a)],
             none: [],
-            predecessor: [("EW", binding.selector.predecessor), ("A", a)],
-            successor: [("EW", binding.selector.successor), ("A", a)],
         }
     }
 
-    fn entries(&self) -> Dflash2Entries<'_, NativeGraphMetadata> {
-        Dflash2Entries {
+    fn entries(&self) -> ConvolvedEntries<'_, NativeGraphMetadata> {
+        ConvolvedEntries {
             layers: self
                 .layers
                 .iter()
-                .map(|layer| Dflash2LayerEntries {
+                .map(|layer| ConvolvedLayerEntries {
                     attention_norm: &layer.attention_norm[..],
                     attention_coefficients: &layer.attention_coefficients[..],
                     query: &layer.query[..],
@@ -471,11 +568,39 @@ impl CheckedDflash2Entries {
                     down: &layer.down[..],
                 })
                 .collect(),
-            features: &self.features[..],
-            hidden: &self.hidden[..],
             convolve_input: &self.activation[..],
             convolve_residual: &self.none[..],
             gated: &self.activation[..],
+        }
+    }
+}
+
+struct CheckedSelectorEntries {
+    features: Assignments<2>,
+    hidden: Assignments<3>,
+    activation: Assignments<1>,
+    none: Assignments<0>,
+    predecessor: Assignments<2>,
+    successor: Assignments<2>,
+}
+
+impl CheckedSelectorEntries {
+    fn new(plan: &DraftProgramPlan, binding: crate::SelectorBinding) -> Self {
+        let a = plan.activation();
+        Self {
+            features: normed(plan.output_norm(), a),
+            hidden: projected(a, binding.hidden, a),
+            activation: [("A", a)],
+            none: [],
+            predecessor: [("EW", binding.predecessor), ("A", a)],
+            successor: [("EW", binding.successor), ("A", a)],
+        }
+    }
+
+    fn entries(&self) -> SelectorEntries<'_, NativeGraphMetadata> {
+        SelectorEntries {
+            features: &self.features[..],
+            hidden: &self.hidden[..],
             top_k: &self.none[..],
             predecessor: &self.predecessor[..],
             successor: &self.successor[..],
@@ -484,15 +609,138 @@ impl CheckedDflash2Entries {
     }
 }
 
+struct CheckedCorrectorEntries {
+    pass_norm: Assignments<2>,
+    anchor_rows: Assignments<2>,
+    feature_down: Assignments<3>,
+    token: Option<Assignments<3>>,
+    pass: Assignments<3>,
+    context: Assignments<3>,
+    anchor_norm: Assignments<2>,
+    layers: Vec<CheckedCorrectorLayer>,
+    output_norm: Assignments<2>,
+    factor_input: Assignments<3>,
+    outgoing: Assignments<3>,
+    incoming: Assignments<3>,
+    anchor: Assignments<3>,
+    f32_rows: Assignments<1>,
+    activated_rows: Assignments<1>,
+    activation: Assignments<1>,
+    none: Assignments<0>,
+}
+
+struct CheckedCorrectorLayer {
+    attention_norm: Assignments<2>,
+    attention_input: Assignments<3>,
+    attention_output: Assignments<3>,
+    mlp_norm: Assignments<2>,
+    up: Assignments<3>,
+    down: Assignments<3>,
+}
+
+impl CheckedCorrectorEntries {
+    fn new(plan: &DraftProgramPlan, binding: &crate::CorrectorBinding) -> Self {
+        let (a, f32) = (plan.activation(), Element::f32());
+        let map = |weight: crate::ScalableWeight| projected(a, weight.element, f32);
+        Self {
+            pass_norm: normed(plan.output_norm(), a),
+            anchor_rows: normed(plan.fusion_norm(), a),
+            feature_down: map(binding.feature_down),
+            token: binding.token.map(map),
+            pass: map(binding.pass),
+            context: map(binding.context),
+            anchor_norm: normed(binding.anchor_norm, a),
+            layers: binding
+                .layers
+                .iter()
+                .map(|layer| CheckedCorrectorLayer {
+                    attention_norm: normed(layer.attention_norm, a),
+                    attention_input: map(layer.attention_input),
+                    attention_output: map(layer.attention_output),
+                    mlp_norm: normed(layer.mlp_norm, a),
+                    up: map(layer.up),
+                    down: map(layer.down),
+                })
+                .collect(),
+            output_norm: normed(binding.output_norm, a),
+            factor_input: map(binding.factor_input),
+            outgoing: map(binding.outgoing),
+            incoming: map(binding.incoming),
+            anchor: map(binding.anchor),
+            f32_rows: [("Y", f32)],
+            activated_rows: [("Y", a)],
+            activation: [("A", a)],
+            none: [],
+        }
+    }
+
+    fn entries(&self) -> CorrectorEntries<'_, NativeGraphMetadata> {
+        CorrectorEntries {
+            pass_norm: &self.pass_norm[..],
+            anchor_rows: &self.anchor_rows[..],
+            top_k: &self.none[..],
+            features: &self.activation[..],
+            feature_down: &self.feature_down[..],
+            token: self.token.as_ref().map(|token| &token[..]),
+            pass: &self.pass[..],
+            nodes: &self.none[..],
+            context: &self.context[..],
+            context_bias: &self.f32_rows[..],
+            anchor_norm: &self.anchor_norm[..],
+            attention: &self.activation[..],
+            layers: self
+                .layers
+                .iter()
+                .map(|layer| CorrectorLayerEntries {
+                    attention_norm: &layer.attention_norm[..],
+                    attention_input: &layer.attention_input[..],
+                    attention_output: &layer.attention_output[..],
+                    attention_residual: &self.f32_rows[..],
+                    mlp_norm: &layer.mlp_norm[..],
+                    up: &layer.up[..],
+                    activated: &self.activated_rows[..],
+                    down: &layer.down[..],
+                    down_residual: &self.f32_rows[..],
+                })
+                .collect(),
+            output_norm: &self.output_norm[..],
+            factors: &self.activation[..],
+            factor_input: &self.factor_input[..],
+            factor_activated: &self.activated_rows[..],
+            outgoing: &self.outgoing[..],
+            incoming: &self.incoming[..],
+            anchor: &self.anchor[..],
+            unit: &self.f32_rows[..],
+            path: &self.none[..],
+        }
+    }
+}
+
+struct CheckedConvolvedLayer {
+    attention_norm: Assignments<2>,
+    attention_coefficients: Assignments<3>,
+    query: Assignments<3>,
+    key: Assignments<3>,
+    value: Assignments<3>,
+    output: Assignments<3>,
+    feed_forward_norm: Assignments<2>,
+    feed_forward_coefficients: Assignments<3>,
+    gate: Assignments<3>,
+    up: Assignments<3>,
+    down: Assignments<3>,
+}
+
 struct CheckedMarkovEntries {
     embedding: [(&'static str, Element); 2],
     projection: [(&'static str, Element); 2],
 }
 
 impl CheckedDraftEntries {
-    fn new(plan: &DraftProgramPlan) -> Self {
+    /// `landing`: of the block's token table, when it has landing slots.
+    fn new(plan: &DraftProgramPlan, landing: Option<CheckedLandingEntries>) -> Self {
         let activation = plan.activation();
         Self {
+            landing,
             layers: plan
                 .blocks()
                 .iter()
@@ -517,9 +765,15 @@ impl CheckedDraftEntries {
                 embedding: [("EW", markov.embedding), ("A", activation)],
                 projection: [("DW", markov.projection), ("A", activation)],
             }),
-            dflash2: plan
-                .dflash2()
-                .map(|binding| CheckedDflash2Entries::new(plan, binding)),
+            convolved: plan
+                .convolutions()
+                .map(|binding| CheckedConvolvedEntries::new(plan, binding)),
+            selector: plan
+                .selector()
+                .map(|binding| CheckedSelectorEntries::new(plan, binding)),
+            corrector: plan
+                .corrector()
+                .map(|binding| CheckedCorrectorEntries::new(plan, binding)),
         }
     }
 
@@ -537,6 +791,7 @@ impl CheckedDraftEntries {
                 })
                 .collect::<Result<Vec<_>, String>>()?,
             embedding: &self.embedding[..],
+            landing: self.landing.as_ref().map(CheckedLandingEntries::entries),
             head: self.head.entries(),
             shape: &self.selection[..],
             sample: &self.selection[..],
@@ -545,7 +800,9 @@ impl CheckedDraftEntries {
                 embedding: &markov.embedding[..],
                 projection: &markov.projection[..],
             }),
-            dflash2: self.dflash2.as_ref().map(CheckedDflash2Entries::entries),
+            convolved: self.convolved.as_ref().map(CheckedConvolvedEntries::entries),
+            selector: self.selector.as_ref().map(CheckedSelectorEntries::entries),
+            corrector: self.corrector.as_ref().map(CheckedCorrectorEntries::entries),
         })
     }
 }
@@ -592,7 +849,10 @@ fn certify_draft_family(
     ),
     GraphError,
 > {
-    let checked = CheckedDraftEntries::new(plan);
+    let checked = CheckedDraftEntries::new(
+        plan,
+        CheckedLandingEntries::of(load, token_table(geometry.draft))?,
+    );
     let mut groups: BTreeMap<(u64, u64, bool, bool, bool, RowForm), Vec<DraftGraphClass>> =
         BTreeMap::new();
     for &class in classes {
@@ -673,7 +933,10 @@ pub(crate) fn verify_draft_family_certificates(
     classes: &[DraftGraphClass],
 ) -> Result<(), GraphError> {
     let (resources, layouts) = certify_draft_family(backend, load, plan, geometry, classes)?;
-    let checked = CheckedDraftEntries::new(plan);
+    let checked = CheckedDraftEntries::new(
+        plan,
+        CheckedLandingEntries::of(load, token_table(geometry.draft))?,
+    );
     let mut exact = CheckedGraphFamilyResources::new();
     for &class in classes {
         let parts = draft_graph(
@@ -720,13 +983,22 @@ struct LayerPorts {
 struct BlockPorts {
     /// `[slots · block, 2]` (token, status) rows.
     tokens: NativePort,
-    /// The block row of each proposal, step-major.
+    /// The block row of each projected row: each proposal's, step-major, or
+    /// (a corrector's) every mask row, slot-major.
     head_rows: NativePort,
     layers: Vec<LayerPorts>,
-    /// One selection for every proposal (DFlash), or one per step (DSpark).
+    /// One selection for every proposal (DFlash), or one per step (DSpark);
+    /// none when a selector or corrector selects.
     selections: Vec<SelectionPorts>,
-    /// DSpark: each slot's anchor, the token its first step conditions on.
+    /// DSpark and DFlash2: each slot's anchor, the token its first step
+    /// conditions on.
     anchors: Option<NativePort>,
+    /// A corrector's: each slot's last entry row, whose conditioning row is
+    /// the fused feature that selected its anchor.
+    anchor_rows: Option<NativePort>,
+    /// A corrector's landed read of its candidates' token-table rows, of a
+    /// table with landing slots.
+    landed: Option<LandedReadPorts>,
     /// Weights whose rows are vocabulary entries of the readout (the target's
     /// projection, DSpark's Markov projection), bound to their leading
     /// `readout_vocabulary` rows.
@@ -827,7 +1099,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         let shape =
             operators::attention::shape(hidden, attention).map_err(|error| error.to_string())?;
         let scope = draft_sublayer(index, 0)?;
-        let bounds = AttentionBounds::planned(
+        let operands = AttentionOperands::planned(
             &mut graph,
             load,
             scope,
@@ -843,7 +1115,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             InputForm::SINGLE,
             class.slots > 0,
             false,
-            bounds,
+            operands,
             |kind| match kind {
                 WeightKind::InputNorm => Ok(fusion_norm.clone()),
                 kind => weight(&mut graph, load, scope, kind, &mut weights),
@@ -890,7 +1162,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         .enumerate()
         .find_map(|(index, layer)| layer.as_ref().map(|layer| (index, layer)))
         .ok_or("a draft has no injected layers")?;
-    let first_bounds = first_weights.bounds.project_dimensions(true);
+    let first_operands = first_weights.operands.project_dimensions(true);
     // Only the injection pass follows the entry rows: its rows are a
     // topology's class dimension (`certify_draft_family`).
     graph.set_class_scope(Some(INJECTION));
@@ -915,7 +1187,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 first_shape
                     .key_value_dimensions(class.entry_rows)
                     .as_slice(),
-                first_bounds.as_slice(),
+                first_operands.as_slice(),
                 &InputForm::SINGLE.dimensions(first_shape.hidden),
             ]
             .concat(),
@@ -977,15 +1249,26 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     let proposals = class.proposals;
     let block_rows = draft.block_rows(proposals);
     let rows = slots * block_rows;
-    let outputs = proposals * slots;
+    let corrector = match (&draft.method, &entries.corrector) {
+        (DraftMethod::LiLiCorr { corrector }, Some(stages)) => Some((corrector.as_ref(), stages)),
+        (DraftMethod::LiLiCorr { .. }, None) | (_, Some(_)) => {
+            return Err("draft method and corrector entries disagree".into());
+        }
+        _ => None,
+    };
+    // The selections, step-major; a corrector projects every mask row of
+    // every slot (slot-major), the rest each proposing row.
+    let selected = proposals * slots;
+    let mask_rows = draft.max_proposals();
+    let outputs = match corrector {
+        Some(_) => slots * mask_rows,
+        None => selected,
+    };
     // The block's tokens are the host's (`BoundDraftGraphs::embedding`).
     let mut table = GatheredTable::of(
         &mut graph,
         load,
-        match &draft.embedding {
-            DraftEmbedding::Target => WeightScope::Target,
-            DraftEmbedding::Own(_) => WeightScope::Draft,
-        },
+        token_table(draft).scope,
         WeightKind::Embedding,
         &mut weights,
     )?;
@@ -1015,34 +1298,32 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         )?
         .r1;
     let mut layers = Vec::with_capacity(draft.blocks.len());
-    // DFlash2's unfused layers read their normed rows through the identity
-    // row map of the block rows.
-    let dflash2 = match (&draft.method, &entries.dflash2) {
-        (DraftMethod::DFlash2 { kernel, group, .. }, Some(dflash2)) => {
+    // A convolved backbone's unfused layers read their normed rows through
+    // the identity row map of the block rows.
+    let convolved = match (&draft.convolutions, &entries.convolved) {
+        (Some(convolutions), Some(stages)) => {
             let identity = GraphConstant::identity(&mut graph, rows)?;
             let rows_map = identity.port().tensor().clone();
             constants.push(identity);
-            Some((dflash2, *kernel, *group, rows_map))
+            Some((stages, convolutions.kernel, convolutions.group, rows_map))
         }
-        (DraftMethod::DFlash2 { .. }, None) | (_, Some(_)) => {
-            return Err("draft method and entries disagree".into());
-        }
-        (DraftMethod::DFlash | DraftMethod::DSpark { .. }, None) => None,
+        (None, None) => None,
+        _ => return Err("draft convolutions and entries disagree".into()),
     };
     for (index, (layer_weight, layer)) in layer_weights.iter().zip(&entries.layers).enumerate() {
         // A drafting class injects every layer.
         let (operator, shape, injection_weights) = layer_weight
             .as_ref()
             .ok_or("a drafting class skips a layer's injection")?;
-        if let Some((dflash2, kernel, group, rows_map)) = &dflash2 {
+        if let Some((stages, kernel, group, rows_map)) = &convolved {
             let ports;
-            (residual, ports) = dflash2_layer(
+            (residual, ports) = convolved_layer(
                 &mut graph,
-                Dflash2Layer {
-                    entries: &dflash2.layers[index],
-                    convolve_input: dflash2.convolve_input,
-                    convolve_residual: dflash2.convolve_residual,
-                    gated: dflash2.gated,
+                ConvolvedLayer {
+                    entries: &stages.layers[index],
+                    convolve_input: stages.convolve_input,
+                    convolve_residual: stages.convolve_residual,
+                    gated: stages.gated,
                     mix: layer.attention.history,
                     index,
                     operator,
@@ -1083,9 +1364,10 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             value: injection_weights.value.clone(),
             query_norm: injection_weights.query_norm.clone(),
             key_norm: injection_weights.key_norm.clone(),
+            sinks: injection_weights.sinks.clone(),
             output: injection_weights.output.clone(),
             post_norm: None,
-            bounds: injection_weights.bounds.clone(),
+            operands: injection_weights.operands.clone(),
             indexer: None,
         };
         let join = Join::single(None);
@@ -1227,9 +1509,11 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     let result = graph.local_for(
         entries.sample,
         "result",
-        &[("M", outputs), ("V", readout_vocabulary)],
+        &[("M", selected), ("V", readout_vocabulary)],
     )?;
     let mut selections = Vec::new();
+    let mut anchor_rows = None;
+    let mut landed = None;
     let anchors = match (&draft.method, &entries.markov) {
         (DraftMethod::DFlash, None) => {
             let mut all = result.tensor().slice_leading(0, outputs);
@@ -1289,6 +1573,17 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 &mut weights,
                 &mut constants,
             )?;
+            // An NVFP4 projection's second-level scale (absent otherwise).
+            let (markov_scale, markov_scale_extent) = weight_scale_port(
+                &mut graph,
+                load,
+                WeightRole {
+                    scope: WeightScope::Draft,
+                    kind: WeightKind::MarkovProjection,
+                },
+                &mut weights,
+                &mut constants,
+            )?;
             for step in 0..proposals {
                 let rows_of_step = GraphConstant::i32(
                     &mut graph,
@@ -1316,9 +1611,6 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                         },
                     )?
                     .r0;
-                let absent_scale = GraphConstant::absent(&mut graph, &mut constants)?
-                    .tensor()
-                    .clone();
                 let mut biased = graph
                     .enqueue(
                         chain.projection,
@@ -1327,7 +1619,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                             ("O", slots),
                             ("H", readout_vocabulary),
                             ("F", rank),
-                            ("DS", 0),
+                            ("DS", markov_scale_extent),
                             ("DB", markov_bound.extent),
                         ],
                         dense_output::WorkflowArgs {
@@ -1335,7 +1627,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                             product: (&memory).into(),
                             down_weight: (&markov_projection).into(),
                             out_rows: rows_of_step.port().tensor().into(),
-                            down_scale: (&absent_scale).into(),
+                            down_scale: markov_scale.tensor().into(),
                             down_bound: (&markov_bound.tensor).into(),
                         },
                     )?
@@ -1367,17 +1659,18 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             }
             Some(anchors)
         }
-        (DraftMethod::DFlash2 { selector, .. }, None) => {
-            let (path, ..) = dflash2
+        (DraftMethod::DFlash2 { selector }, None) => {
+            let stages = entries
+                .selector
                 .as_ref()
-                .ok_or("a DFlash2 draft graph has no DFlash2 entries")?;
-            Some(dflash2_path(
+                .ok_or("a DFlash2 draft graph has no selector entries")?;
+            Some(selector_path(
                 &mut graph,
-                path,
+                stages,
                 load,
                 &mut weights,
                 &mut constants,
-                Dflash2Path {
+                SelectorPath {
                     direct: &direct,
                     residual: &residual,
                     output_norm: &output_norm,
@@ -1396,6 +1689,42 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 },
             )?)
         }
+        (DraftMethod::LiLiCorr { .. }, None) => {
+            let (corrector, stages) =
+                corrector.ok_or("a LiLiCorr draft graph has no corrector entries")?;
+            let (rows, read) = correct_candidates(
+                &mut graph,
+                stages,
+                entries.embedding,
+                entries.landing,
+                load,
+                &mut weights,
+                &mut constants,
+                CorrectorPath {
+                    corrector,
+                    table: &mut table,
+                    conditioning: &conditioning_rows,
+                    entry_rows: class.entry_rows,
+                    fusion_norm: &fusion_norm,
+                    residual: &residual,
+                    output_norm: &output_norm,
+                    head_rows: head_rows.tensor(),
+                    logits: &logits,
+                    result: result.tensor(),
+                    rows,
+                    slots,
+                    mask_rows,
+                    proposals,
+                    readout_vocabulary,
+                    hidden,
+                    embedding_scale: draft.embedding_scale as f32,
+                    epsilon,
+                },
+            )?;
+            anchor_rows = Some(rows);
+            landed = read;
+            None
+        }
         _ => return Err("draft method and entries disagree".into()),
     };
     let output = result.tensor().clone();
@@ -1410,6 +1739,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             layers,
             selections,
             anchors,
+            anchor_rows,
+            landed,
             leading,
             readout_vocabulary,
         }),
@@ -1428,9 +1759,57 @@ fn dense_intermediate(draft: &DraftDefinition, index: usize) -> Result<u64, Stri
     }
 }
 
-/// One DFlash2 draft layer of the block pass and what it reads.
-struct Dflash2Layer<'a, 'o, G: GraphDraft + 'a> {
-    entries: &'o Dflash2LayerEntries<'a, G>,
+/// One `project_rows` of `rows` rows through `weight`, binding its planned
+/// scale and packing bound (`operands`).
+fn project_planned<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    entry: G::Binding<'a, project_rows::Entry>,
+    (weight, operands): (&WorkflowTensor, &WeightOperands),
+    source: seismic::WorkflowTensorRef<'_>,
+    (rows, inputs, outputs): (u64, u64, u64),
+) -> Result<WorkflowTensor, GraphError> {
+    graph
+        .enqueue(
+            entry,
+            &[
+                ("M", rows),
+                ("K", inputs),
+                ("N", outputs),
+                ("WS", operands.scale.extent),
+                ("WB", operands.bound.extent),
+            ],
+            project_rows::WorkflowArgs {
+                source,
+                weight: weight.into(),
+                weight_scale: (&operands.scale.tensor).into(),
+                weight_bound: (&operands.bound.tensor).into(),
+            },
+        )
+        .map(|projected| projected.value)
+}
+
+/// [`project_planned`] of the planned weight of `scope` and `kind`, loading
+/// its ports.
+#[allow(clippy::too_many_arguments)]
+fn project_role<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    entry: G::Binding<'a, project_rows::Entry>,
+    load: &ModelLoadPlan,
+    weights: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
+    (scope, kind): (WeightScope, WeightKind),
+    source: seismic::WorkflowTensorRef<'_>,
+    dims: (u64, u64, u64),
+) -> Result<WorkflowTensor, GraphError> {
+    let weight_tensor = weight(graph, load, scope, kind, weights)?;
+    let operands =
+        WeightOperands::planned(graph, load, WeightRole { scope, kind }, weights, constants)?;
+    project_planned(graph, entry, (&weight_tensor, &operands), source, dims)
+}
+
+/// One convolved draft layer of the block pass and what it reads.
+struct ConvolvedLayer<'a, 'o, G: GraphDraft + 'a> {
+    entries: &'o ConvolvedLayerEntries<'a, G>,
     convolve_input: G::Binding<'a, draft_convolve_input::Entry>,
     convolve_residual: G::Binding<'a, draft_convolve_residual::Entry>,
     gated: G::Binding<'a, draft_gated_rows::Entry>,
@@ -1458,30 +1837,30 @@ struct Dflash2Layer<'a, 'o, G: GraphDraft + 'a> {
     history: (u64, u32),
 }
 
-/// One DFlash2 layer over the block rows (upstream `Qwen3DFlashDecoderLayer`
-/// with its convolutions): for the attention and then the feed-forward, the
-/// normed rows project to their convolution coefficients, the half-0
-/// convolution feeds the operator's plain projections, and the half-1
-/// convolution of the operator's F32 output joins the residual. The
-/// attention appends nothing (its destinations are the block pass's −1) and
-/// reads the injected context and the whole fresh block.
+/// One convolved layer over the block rows (upstream
+/// `Qwen3DFlashDecoderLayer` with its convolutions): for the attention and
+/// then the feed-forward, the normed rows project to their convolution
+/// coefficients, the half-0 convolution feeds the operator's plain
+/// projections, and the half-1 convolution of the operator's F32 output
+/// joins the residual. The attention appends nothing (its destinations are
+/// the block pass's −1) and reads the injected context and the whole fresh
+/// block.
 #[allow(clippy::too_many_arguments)]
-fn dflash2_layer<'a, G: GraphDraft + 'a>(
+fn convolved_layer<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    layer: Dflash2Layer<'a, '_, G>,
+    layer: ConvolvedLayer<'a, '_, G>,
     load: &ModelLoadPlan,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     residual: &WorkflowTensor,
 ) -> Result<(WorkflowTensor, LayerPorts), GraphError> {
-    let Dflash2Layer {
+    let ConvolvedLayer {
         entries,
         rows,
         hidden,
         epsilon,
         ..
     } = layer;
-    let absent_scale = &GraphConstant::absent(graph, constants)?.tensor().clone();
     let groups = hidden / layer.group;
     let coefficients = 2 * layer.kernel * groups;
     let convolution_dims = [
@@ -1491,39 +1870,33 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
         ("K", layer.kernel),
     ];
     let block = u32::try_from(layer.block_rows).map_err(|_| "draft block exceeds u32")?;
-    // A projection binds the graph's absent scale and its weight's packing
-    // bound.
-    let project = |graph: &mut G,
-                   entry: G::Binding<'a, project_rows::Entry>,
-                   source: seismic::WorkflowTensorRef<'_>,
-                   weight: &WorkflowTensor,
-                   bound: &PackingBound,
-                   (inputs, outputs): (u64, u64)| {
-        graph
-            .enqueue(
-                entry,
-                &[
-                    ("M", rows),
-                    ("K", inputs),
-                    ("N", outputs),
-                    ("WS", 0),
-                    ("WB", bound.extent),
-                ],
-                project_rows::WorkflowArgs {
-                    source,
-                    weight: weight.into(),
-                    weight_scale: absent_scale.into(),
-                    weight_bound: (&bound.tensor).into(),
-                },
-            )
-            .map(|projected| projected.value)
+    // A projection of the block rows binds its weight's planned scale and
+    // packing bound: the attention's through its loaded weights and
+    // operands, the rest loading theirs.
+    let project_attention = |graph: &mut G,
+                             entry: G::Binding<'a, project_rows::Entry>,
+                             operand: (&WorkflowTensor, &WeightOperands),
+                             source: seismic::WorkflowTensorRef<'_>,
+                             (inputs, outputs): (u64, u64)| {
+        project_planned(graph, entry, operand, source, (rows, inputs, outputs))
     };
-    let bound = |graph: &mut G,
-                 weights: &mut Vec<(WeightPort, NativePort)>,
-                 constants: &mut Vec<GraphConstant>,
-                 scope: WeightScope,
-                 kind: WeightKind| {
-        PackingBound::planned(graph, load, WeightRole { scope, kind }, weights, constants)
+    let project = |graph: &mut G,
+                   weights: &mut Vec<(WeightPort, NativePort)>,
+                   constants: &mut Vec<GraphConstant>,
+                   entry: G::Binding<'a, project_rows::Entry>,
+                   role: (WeightScope, WeightKind),
+                   source: seismic::WorkflowTensorRef<'_>,
+                   (inputs, outputs): (u64, u64)| {
+        project_role(
+            graph,
+            entry,
+            load,
+            weights,
+            constants,
+            role,
+            source,
+            (rows, inputs, outputs),
+        )
     };
     // One sublayer's prologue: its normed rows, their coefficients and the
     // half-0 convolution the operator reads.
@@ -1537,13 +1910,6 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
         let scope = draft_sublayer(layer.index, sublayer)?;
         let norm = weight(graph, load, scope, WeightKind::InputNorm, weights)?;
         let base = weight(graph, load, scope, WeightKind::ConvolutionBase, weights)?;
-        let projection = weight(
-            graph,
-            load,
-            scope,
-            WeightKind::ConvolutionProjection,
-            weights,
-        )?;
         let normed = graph
             .enqueue(
                 norm_entry,
@@ -1562,19 +1928,13 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
                 },
             )?
             .value;
-        let projection_bound = bound(
+        let dynamic = project(
             graph,
             weights,
             constants,
-            scope,
-            WeightKind::ConvolutionProjection,
-        )?;
-        let dynamic = project(
-            graph,
             coefficient_entry,
+            (scope, WeightKind::ConvolutionProjection),
             (&normed).into(),
-            &projection,
-            &projection_bound,
             (hidden, coefficients),
         )?;
         let dynamic = dynamic.reshape(&[rows, 2, layer.kernel, groups]);
@@ -1628,36 +1988,34 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
     let key_width = shape.kv_heads * width;
     let attention = layer.attention_weights;
     let (Some(key_weight), Some(value_weight)) = (&attention.key, &attention.value) else {
-        return Err("a DFlash2 draft layer projects its keys and values".into());
+        return Err("a convolved draft layer projects its keys and values".into());
     };
-    let query = project(
+    let query = project_attention(
         graph,
         entries.query,
+        (&attention.query, &attention.operands.query),
         (&convolved).into(),
-        &attention.query,
-        &attention.bounds.query,
         (hidden, heads * width),
     )?;
-    let key = project(
+    let key = project_attention(
         graph,
         entries.key,
+        (key_weight, &attention.operands.key),
         (&convolved).into(),
-        key_weight,
-        &attention.bounds.key,
         (hidden, key_width),
     )?;
-    let value = project(
+    let value = project_attention(
         graph,
         entries.value,
+        (value_weight, &attention.operands.value),
         (&convolved).into(),
-        value_weight,
-        &attention.bounds.value,
         (hidden, key_width),
     )?;
     let (attended, state, controls) = attention_graph::mix(
         graph,
         layer.mix,
         (&attention.query_norm, &attention.key_norm),
+        &attention.sinks,
         constants,
         &ProjectedRows {
             query: query.reshape(&[rows, heads, width]),
@@ -1687,15 +2045,17 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
         None,
     )?;
     let attended = attended.ok_or("draft block attention result is absent")?;
-    let output = project(
+    let output = project_attention(
         graph,
         entries.output,
+        (
+            attention
+                .output
+                .as_ref()
+                .ok_or("draft block output weight is absent")?,
+            &attention.operands.output,
+        ),
         (&attended.reshape(&[rows, heads * width])).into(),
-        attention
-            .output
-            .as_ref()
-            .ok_or("draft block output weight is absent")?,
-        &attention.bounds.output,
         (heads * width, hidden),
     )?;
     let residual = finish(graph, residual, &output, (&dynamic, &base))?;
@@ -1712,26 +2072,23 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
         entries.feed_forward_coefficients,
     )?;
     let scope = draft_sublayer(layer.index, 1)?;
-    let gate_weight = weight(graph, load, scope, WeightKind::DenseGate, weights)?;
-    let up_weight = weight(graph, load, scope, WeightKind::DenseUp, weights)?;
-    let down_weight = weight(graph, load, scope, WeightKind::DenseDown, weights)?;
     let features = layer.intermediate;
-    let gate_bound = bound(graph, weights, constants, scope, WeightKind::DenseGate)?;
     let gate = project(
         graph,
+        weights,
+        constants,
         entries.gate,
+        (scope, WeightKind::DenseGate),
         (&convolved).into(),
-        &gate_weight,
-        &gate_bound,
         (hidden, features),
     )?;
-    let up_bound = bound(graph, weights, constants, scope, WeightKind::DenseUp)?;
     let up = project(
         graph,
+        weights,
+        constants,
         entries.up,
+        (scope, WeightKind::DenseUp),
         (&convolved).into(),
-        &up_weight,
-        &up_bound,
         (hidden, features),
     )?;
     let product = graph
@@ -1744,13 +2101,13 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
-    let down_bound = bound(graph, weights, constants, scope, WeightKind::DenseDown)?;
     let down = project(
         graph,
+        weights,
+        constants,
         entries.down,
+        (scope, WeightKind::DenseDown),
         (&product).into(),
-        &down_weight,
-        &down_bound,
         (features, hidden),
     )?;
     let residual = finish(graph, &residual, &down, (&dynamic, &base))?;
@@ -1764,7 +2121,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
 }
 
 /// The block pass's rows DFlash2's candidate path reads.
-struct Dflash2Path<'t> {
+struct SelectorPath<'t> {
     /// The empty directory the codebooks are read through.
     direct: &'t RowDirectory,
     residual: &'t WorkflowTensor,
@@ -1793,15 +2150,15 @@ struct Dflash2Path<'t> {
 /// codes; then per step, the predecessor code of the token each slot
 /// follows (its anchor, then its previous selection) and the step's
 /// selection. Returns the anchors' input port.
-fn dflash2_path<'a, G: GraphDraft + 'a>(
+fn selector_path<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    entries: &Dflash2Entries<'a, G>,
+    entries: &SelectorEntries<'a, G>,
     load: &ModelLoadPlan,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
-    path: Dflash2Path<'_>,
+    path: SelectorPath<'_>,
 ) -> Result<NativePort, GraphError> {
-    let Dflash2Path {
+    let SelectorPath {
         slots,
         rank,
         top_k,
@@ -1864,7 +2221,7 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
-    let hidden_bound = PackingBound::planned(
+    let hidden_operands = WeightOperands::planned(
         graph,
         load,
         WeightRole {
@@ -1874,25 +2231,13 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
         weights,
         constants,
     )?;
-    let absent_scale = GraphConstant::absent(graph, constants)?.tensor().clone();
-    let projected = graph
-        .enqueue(
-            entries.hidden,
-            &[
-                ("M", outputs),
-                ("K", hidden),
-                ("N", rank),
-                ("WS", 0),
-                ("WB", hidden_bound.extent),
-            ],
-            project_rows::WorkflowArgs {
-                source: (&features).into(),
-                weight: (&selector_hidden).into(),
-                weight_scale: (&absent_scale).into(),
-                weight_bound: (&hidden_bound.tensor).into(),
-            },
-        )?
-        .value;
+    let projected = project_planned(
+        graph,
+        entries.hidden,
+        (&selector_hidden, &hidden_operands),
+        (&features).into(),
+        (outputs, hidden, rank),
+    )?;
     let successors = graph
         .enqueue(
             entries.successor,
@@ -1958,6 +2303,716 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
     Ok(anchors)
 }
 
+/// The block pass's rows and tables LiLiCorr's corrector reads.
+struct CorrectorPath<'t> {
+    corrector: &'t CandidateCorrector,
+    /// The block's token table, which the candidates' embeddings gather.
+    table: &'t mut GatheredTable,
+    /// The entry rows' F32 conditioning `[entry_rows, hidden]`.
+    conditioning: &'t WorkflowTensor,
+    entry_rows: u64,
+    fusion_norm: &'t WorkflowTensor,
+    residual: &'t WorkflowTensor,
+    output_norm: &'t WorkflowTensor,
+    /// The block row of every mask row, slot-major.
+    head_rows: &'t WorkflowTensor,
+    /// The mask rows' readout logits `[slots · mask_rows, readout_vocabulary]`.
+    logits: &'t WorkflowTensor,
+    /// The selections `[proposals · slots, 2]`, step-major.
+    result: &'t WorkflowTensor,
+    rows: u64,
+    slots: u64,
+    mask_rows: u64,
+    proposals: u64,
+    readout_vocabulary: u64,
+    hidden: u64,
+    embedding_scale: f32,
+    epsilon: f32,
+}
+
+/// The weight kind of a corrector weight.
+fn corrector_weight(weight: CorrectorWeight) -> WeightKind {
+    WeightKind::Corrector(weight)
+}
+
+/// The weight kind of part `part` of the corrector's affine map at `site`.
+fn corrector_affine(site: CorrectorSite, part: AffinePart) -> WeightKind {
+    corrector_weight(CorrectorWeight::Affine { site, part })
+}
+
+/// LiLiCorr's candidate correction (upstream `build_lilicorr_scores` and
+/// its greedy walk): every mask row's top-k candidates; their nodes (the
+/// candidate's token embedding, the mask row's output-normed pass row, the
+/// candidate's softmax features, and slot and rank embeddings); the
+/// corrector's layers over each slot's nodes; its output norm; each slot's
+/// anchor state from the fused feature that selected its anchor; the
+/// factored outgoing, incoming and anchor vectors; and the walk selecting
+/// each slot's first `proposals` tokens. Returns the anchor rows' input port
+/// and, of a token table with landing slots, the landed read of the
+/// candidates' embeddings (rows the device selects).
+#[allow(clippy::too_many_arguments)]
+fn correct_candidates<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    entries: &CorrectorEntries<'a, G>,
+    embedding: G::Binding<'a, embedding_rows::Entry>,
+    landing: Option<LandingEntries<'a, G>>,
+    load: &ModelLoadPlan,
+    weights: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
+    path: CorrectorPath<'_>,
+) -> Result<(NativePort, Option<LandedReadPorts>), GraphError> {
+    let corrector = path.corrector;
+    let (slots, mask_rows, hidden, epsilon) = (path.slots, path.mask_rows, path.hidden, path.epsilon);
+    let (width, top_k, heads, factor) = (
+        corrector.width,
+        corrector.top_k,
+        corrector.heads,
+        corrector.factor,
+    );
+    let head_width = width / heads;
+    let mlp = corrector.mlp();
+    let outputs = slots * mask_rows;
+    // Each block's nodes, and every node of every block.
+    let nodes = mask_rows * top_k;
+    let node_rows = slots * nodes;
+    let draft = WeightScope::Draft;
+    let vector_epsilon = corrector.vector_epsilon as f32;
+    let load_weight = |graph: &mut G,
+                       weights: &mut Vec<(WeightPort, NativePort)>,
+                       scope: WeightScope,
+                       kind: WeightKind| weight(graph, load, scope, kind, weights);
+    let project = |graph: &mut G,
+                   weights: &mut Vec<(WeightPort, NativePort)>,
+                   constants: &mut Vec<GraphConstant>,
+                   entry: G::Binding<'a, project_rows::Entry>,
+                   (scope, site): (WeightScope, CorrectorSite),
+                   source: seismic::WorkflowTensorRef<'_>,
+                   dims: (u64, u64, u64)| {
+        project_role(
+            graph,
+            entry,
+            load,
+            weights,
+            constants,
+            (scope, corrector_affine(site, AffinePart::Weight)),
+            source,
+            dims,
+        )
+    };
+    // One F32 row op after a projection (`corrector_rows`): its map's bias,
+    // then the form's activation and the residual rows, if any.
+    let finish = |graph: &mut G,
+                  weights: &mut Vec<(WeightPort, NativePort)>,
+                  constants: &mut Vec<GraphConstant>,
+                  entry: G::Binding<'a, corrector_rows::Entry>,
+                  (scope, site): (WeightScope, CorrectorSite),
+                  values: &WorkflowTensor,
+                  residual: Option<&WorkflowTensor>,
+                  (form, epsilon): (i32, f32),
+                  (rows, columns): (u64, u64)| {
+        let bias = weight(
+            graph,
+            load,
+            scope,
+            corrector_affine(site, AffinePart::Bias),
+            weights,
+        )?;
+        let (residual, residual_rows) = match residual {
+            Some(residual) => (residual.reshape(&[1, rows, columns]), 1),
+            None => (
+                GraphConstant::absent(graph, constants)?
+                    .tensor()
+                    .reshape(&[0, rows, columns]),
+                0,
+            ),
+        };
+        graph
+            .enqueue(
+                entry,
+                &[("M", rows), ("N", columns), ("R", residual_rows)],
+                corrector_rows::WorkflowArgs {
+                    values: values.into(),
+                    bias: (&bias).into(),
+                    residual: (&residual).into(),
+                    form,
+                    epsilon,
+                },
+            )
+            .map(|finished| finished.value)
+    };
+    // An RMS norm of every row of `rows` (`[count, columns]` F32).
+    let norm = |graph: &mut G,
+                constants: &mut Vec<GraphConstant>,
+                entry: G::Binding<'a, readout_features_rows::Entry>,
+                rows: &WorkflowTensor,
+                weight: &WorkflowTensor,
+                (count, columns): (u64, u64),
+                epsilon: f32| {
+        let identity = GraphConstant::identity(graph, count)?;
+        let out_rows = identity.port().tensor().clone();
+        constants.push(identity);
+        graph
+            .enqueue(
+                entry,
+                &[
+                    ("M", count),
+                    ("O", count),
+                    ("D", columns),
+                    ("PT", 1),
+                    ("NM", columns),
+                ],
+                readout_features_rows::WorkflowArgs {
+                    hidden: (&rows.reshape(&[count, 1, columns])).into(),
+                    norm: weight.into(),
+                    out_rows: (&out_rows).into(),
+                    epsilon,
+                },
+            )
+            .map(|normed| normed.value)
+    };
+
+    // Every mask row's candidates, in descending logit order.
+    let top_k_dims = [
+        ("M", outputs),
+        ("V", path.readout_vocabulary),
+        ("K", top_k),
+    ];
+    let mut candidates = graph.local_for(entries.top_k, "candidates", &top_k_dims)?;
+    let mut unary = graph.local_for(entries.top_k, "unary", &top_k_dims)?;
+    graph.enqueue(
+        entries.top_k,
+        &top_k_dims,
+        draft_top_k::WorkflowArgs {
+            logits: path.logits.into(),
+            candidates: candidates.tensor_mut().into(),
+            unary: unary.tensor_mut().into(),
+        },
+    )?;
+    let candidates = candidates.tensor().clone();
+    let unary = unary.tensor().clone();
+
+    // The candidates' feature rows.
+    let feature_norm = (
+        load_weight(
+            graph,
+            weights,
+            draft,
+            corrector_weight(CorrectorWeight::FeatureNorm(AffinePart::Weight)),
+        )?,
+        load_weight(
+            graph,
+            weights,
+            draft,
+            corrector_weight(CorrectorWeight::FeatureNorm(AffinePart::Bias)),
+        )?,
+    );
+    let feature_up = (
+        load_weight(
+            graph,
+            weights,
+            draft,
+            corrector_affine(CorrectorSite::FeatureUp, AffinePart::Weight),
+        )?,
+        load_weight(
+            graph,
+            weights,
+            draft,
+            corrector_affine(CorrectorSite::FeatureUp, AffinePart::Bias),
+        )?,
+    );
+    let features = graph
+        .enqueue(
+            entries.features,
+            &[
+                ("M", outputs),
+                ("V", path.readout_vocabulary),
+                ("K", top_k),
+                ("H", width),
+            ],
+            corrector_features::WorkflowArgs {
+                logits: path.logits.into(),
+                unary: (&unary).into(),
+                norm_weight: (&feature_norm.0).into(),
+                norm_bias: (&feature_norm.1).into(),
+                up_weight: (&feature_up.0).into(),
+                up_bias: (&feature_up.1).into(),
+                epsilon: corrector.feature_norm.epsilon as f32,
+            },
+        )?
+        .value;
+    let feature = project(
+        graph,
+        weights,
+        constants,
+        entries.feature_down,
+        (draft, CorrectorSite::FeatureDown),
+        (&features).into(),
+        (node_rows, width, width),
+    )?;
+
+    // The candidates' token rows (rows the device selects, a landed read of
+    // a table with landing slots): their embeddings, projected into the
+    // corrector width unless it is the draft's.
+    let (gathered, table_rows) = (path.table.table.clone(), path.table.rows);
+    let (embedded, landed) = path.table.read_selected(
+        graph,
+        load,
+        weights,
+        constants,
+        landing,
+        (&candidates).into(),
+        node_rows,
+        None,
+        |graph, directory| {
+            Ok(graph.enqueue(
+                embedding,
+                &[
+                    ("M", node_rows),
+                    ("V", table_rows),
+                    ("D", hidden),
+                    ("R", directory.shape[0]),
+                    ("F", directory.shape[1]),
+                ],
+                embedding_rows::WorkflowArgs {
+                    table: (&gathered).into(),
+                    tokens: (&candidates).into(),
+                    directory: (&directory.tensor).into(),
+                    scale: path.embedding_scale,
+                    normalize: 0,
+                    epsilon,
+                },
+            )?)
+        },
+    )?;
+    let (token, token_bias, token_biases) = match &entries.token {
+        Some(entry) => {
+            let token = project(
+                graph,
+                weights,
+                constants,
+                *entry,
+                (draft, CorrectorSite::Token),
+                (&embedded.r0).into(),
+                (node_rows, hidden, width),
+            )?;
+            let bias = load_weight(
+                graph,
+                weights,
+                draft,
+                corrector_affine(CorrectorSite::Token, AffinePart::Bias),
+            )?;
+            (token, bias.reshape(&[1, width]), 1)
+        }
+        None => (
+            embedded.r1,
+            GraphConstant::absent(graph, constants)?
+                .tensor()
+                .reshape(&[0, width]),
+            0,
+        ),
+    };
+
+    // The mask rows' pass rows.
+    let pass_rows = graph
+        .enqueue(
+            entries.pass_norm,
+            &[
+                ("M", path.rows),
+                ("O", outputs),
+                ("D", hidden),
+                ("PT", 1),
+                ("NM", hidden),
+            ],
+            readout_features_rows::WorkflowArgs {
+                hidden: (&path.residual.reshape(&[path.rows, 1, hidden])).into(),
+                norm: path.output_norm.into(),
+                out_rows: path.head_rows.into(),
+                epsilon,
+            },
+        )?
+        .value;
+    let pass = project(
+        graph,
+        weights,
+        constants,
+        entries.pass,
+        (draft, CorrectorSite::Pass),
+        (&pass_rows).into(),
+        (outputs, hidden, width),
+    )?;
+
+    // The nodes.
+    let pass_bias = load_weight(
+        graph,
+        weights,
+        draft,
+        corrector_affine(CorrectorSite::Pass, AffinePart::Bias),
+    )?;
+    let feature_bias = load_weight(
+        graph,
+        weights,
+        draft,
+        corrector_affine(CorrectorSite::FeatureDown, AffinePart::Bias),
+    )?;
+    let slot_embedding = load_weight(
+        graph,
+        weights,
+        draft,
+        corrector_weight(CorrectorWeight::SlotEmbedding),
+    )?;
+    let rank_embedding = load_weight(
+        graph,
+        weights,
+        draft,
+        corrector_weight(CorrectorWeight::RankEmbedding),
+    )?;
+    let node_shape = [slots, mask_rows, top_k, width];
+    let mut stream = graph
+        .enqueue(
+            entries.nodes,
+            &[
+                ("S", slots),
+                ("J", mask_rows),
+                ("K", top_k),
+                ("H", width),
+                ("TB", token_biases),
+            ],
+            corrector_nodes::WorkflowArgs {
+                token: (&token.reshape(&node_shape)).into(),
+                token_bias: (&token_bias).into(),
+                pass: (&pass.reshape(&[slots, mask_rows, width])).into(),
+                pass_bias: (&pass_bias).into(),
+                feature: (&feature.reshape(&node_shape)).into(),
+                feature_bias: (&feature_bias).into(),
+                slot: (&slot_embedding).into(),
+                rank: (&rank_embedding).into(),
+            },
+        )?
+        .value;
+
+    // The corrector's layers.
+    let attention_bias = load_weight(
+        graph,
+        weights,
+        draft,
+        corrector_weight(CorrectorWeight::AttentionBias),
+    )?;
+    for (index, (layer, stages)) in corrector.layers.iter().zip(&entries.layers).enumerate() {
+        let scope = WeightScope::CorrectorLayer(
+            u32::try_from(index).map_err(|_| "corrector layer index exceeds u32")?,
+        );
+        let attention_norm = load_weight(
+            graph,
+            weights,
+            scope,
+            corrector_weight(CorrectorWeight::AttentionNorm),
+        )?;
+        let normed = norm(
+            graph,
+            constants,
+            stages.attention_norm,
+            &stream,
+            &attention_norm,
+            (node_rows, width),
+            layer.attention_norm.epsilon as f32,
+        )?;
+        let qkv = project(
+            graph,
+            weights,
+            constants,
+            stages.attention_input,
+            (scope, CorrectorSite::AttentionInput),
+            (&normed).into(),
+            (node_rows, width, 3 * width),
+        )?;
+        let input_bias = load_weight(
+            graph,
+            weights,
+            scope,
+            corrector_affine(CorrectorSite::AttentionInput, AffinePart::Bias),
+        )?;
+        let attended = graph
+            .enqueue(
+                entries.attention,
+                &[
+                    ("S", slots),
+                    ("N", nodes),
+                    ("NH", heads),
+                    ("W", head_width),
+                ],
+                corrector_attention::WorkflowArgs {
+                    qkv: (&qkv.reshape(&[slots, nodes, 3, heads, head_width])).into(),
+                    input_bias: (&input_bias.reshape(&[3, heads, head_width])).into(),
+                    bias: (&attention_bias).into(),
+                },
+            )?
+            .value;
+        let output = project(
+            graph,
+            weights,
+            constants,
+            stages.attention_output,
+            (scope, CorrectorSite::AttentionOutput),
+            (&attended.reshape(&[node_rows, width])).into(),
+            (node_rows, width, width),
+        )?;
+        stream = finish(
+            graph,
+            weights,
+            constants,
+            stages.attention_residual,
+            (scope, CorrectorSite::AttentionOutput),
+            &output,
+            Some(&stream),
+            (0, 0.0),
+            (node_rows, width),
+        )?;
+        let mlp_norm = load_weight(
+            graph,
+            weights,
+            scope,
+            corrector_weight(CorrectorWeight::MlpNorm),
+        )?;
+        let normed = norm(
+            graph,
+            constants,
+            stages.mlp_norm,
+            &stream,
+            &mlp_norm,
+            (node_rows, width),
+            layer.mlp_norm.epsilon as f32,
+        )?;
+        let up = project(
+            graph,
+            weights,
+            constants,
+            stages.up,
+            (scope, CorrectorSite::Up),
+            (&normed).into(),
+            (node_rows, width, mlp),
+        )?;
+        let activated = finish(
+            graph,
+            weights,
+            constants,
+            stages.activated,
+            (scope, CorrectorSite::Up),
+            &up,
+            None,
+            (1, 0.0),
+            (node_rows, mlp),
+        )?;
+        let down = project(
+            graph,
+            weights,
+            constants,
+            stages.down,
+            (scope, CorrectorSite::Down),
+            (&activated).into(),
+            (node_rows, mlp, width),
+        )?;
+        stream = finish(
+            graph,
+            weights,
+            constants,
+            stages.down_residual,
+            (scope, CorrectorSite::Down),
+            &down,
+            Some(&stream),
+            (0, 0.0),
+            (node_rows, width),
+        )?;
+    }
+    let output_norm = load_weight(
+        graph,
+        weights,
+        draft,
+        corrector_weight(CorrectorWeight::OutputNorm),
+    )?;
+    let normed = norm(
+        graph,
+        constants,
+        entries.output_norm,
+        &stream,
+        &output_norm,
+        (node_rows, width),
+        corrector.output_norm.epsilon as f32,
+    )?;
+
+    // Each slot's anchor state: the fused feature of its last entry row (the
+    // row that selected its anchor), its context projection and the anchor
+    // norm.
+    let anchor_dims = [
+        ("M", path.entry_rows),
+        ("O", slots),
+        ("D", hidden),
+        ("PT", 1),
+        ("NM", hidden),
+    ];
+    let anchor_rows = graph.input_for(entries.anchor_rows, "out_rows", &anchor_dims)?;
+    let fused = graph
+        .enqueue(
+            entries.anchor_rows,
+            &anchor_dims,
+            readout_features_rows::WorkflowArgs {
+                hidden: (&path
+                    .conditioning
+                    .reshape(&[path.entry_rows, 1, hidden]))
+                    .into(),
+                norm: path.fusion_norm.into(),
+                out_rows: anchor_rows.tensor().into(),
+                epsilon,
+            },
+        )?
+        .value;
+    let context = project(
+        graph,
+        weights,
+        constants,
+        entries.context,
+        (draft, CorrectorSite::Context),
+        (&fused).into(),
+        (slots, hidden, width),
+    )?;
+    let context = finish(
+        graph,
+        weights,
+        constants,
+        entries.context_bias,
+        (draft, CorrectorSite::Context),
+        &context,
+        None,
+        (0, 0.0),
+        (slots, width),
+    )?;
+    let anchor_norm = load_weight(
+        graph,
+        weights,
+        draft,
+        corrector_weight(CorrectorWeight::AnchorNorm),
+    )?;
+    let anchor_state = norm(
+        graph,
+        constants,
+        entries.anchor_norm,
+        &context,
+        &anchor_norm,
+        (slots, width),
+        corrector.anchor_norm.epsilon as f32,
+    )?;
+
+    // The factored vectors: each node's [x ; a ; x · a] through the factor
+    // input, then the unit-length outgoing and incoming heads; the anchor
+    // head of each slot's anchor state.
+    let joined = graph
+        .enqueue(
+            entries.factors,
+            &[("S", slots), ("N", nodes), ("H", width)],
+            corrector_factors::WorkflowArgs {
+                nodes: (&normed.reshape(&[slots, nodes, width])).into(),
+                anchor: (&anchor_state).into(),
+            },
+        )?
+        .value;
+    let factor_input = project(
+        graph,
+        weights,
+        constants,
+        entries.factor_input,
+        (draft, CorrectorSite::FactorInput),
+        (&joined.reshape(&[node_rows, 3 * width])).into(),
+        (node_rows, 3 * width, width),
+    )?;
+    let factored = finish(
+        graph,
+        weights,
+        constants,
+        entries.factor_activated,
+        (draft, CorrectorSite::FactorInput),
+        &factor_input,
+        None,
+        (1, 0.0),
+        (node_rows, width),
+    )?;
+    let head = |graph: &mut G,
+                    weights: &mut Vec<(WeightPort, NativePort)>,
+                    constants: &mut Vec<GraphConstant>,
+                    entry: G::Binding<'a, project_rows::Entry>,
+                    site: CorrectorSite,
+                    source: &WorkflowTensor,
+                    count: u64| {
+        let projected = project(
+            graph,
+            weights,
+            constants,
+            entry,
+            (draft, site),
+            source.into(),
+            (count, width, factor),
+        )?;
+        finish(
+            graph,
+            weights,
+            constants,
+            entries.unit,
+            (draft, site),
+            &projected,
+            None,
+            (2, vector_epsilon),
+            (count, factor),
+        )
+    };
+    let outgoing = head(
+        graph,
+        weights,
+        constants,
+        entries.outgoing,
+        CorrectorSite::Outgoing,
+        &factored,
+        node_rows,
+    )?;
+    let incoming = head(
+        graph,
+        weights,
+        constants,
+        entries.incoming,
+        CorrectorSite::Incoming,
+        &factored,
+        node_rows,
+    )?;
+    let anchor = head(
+        graph,
+        weights,
+        constants,
+        entries.anchor,
+        CorrectorSite::Anchor,
+        &anchor_state,
+        slots,
+    )?;
+
+    // The greedy walk of each slot's lattice.
+    let factor_shape = [slots, mask_rows, top_k, factor];
+    let mut selection = path.result.reshape(&[path.proposals, slots, 2]);
+    graph.enqueue(
+        entries.path,
+        &[
+            ("S", slots),
+            ("J", mask_rows),
+            ("K", top_k),
+            ("F", factor),
+            ("P", path.proposals),
+        ],
+        corrector_path::WorkflowArgs {
+            candidates: (&candidates.reshape(&[slots, mask_rows, top_k, 2])).into(),
+            incoming: (&incoming.reshape(&factor_shape)).into(),
+            outgoing: (&outgoing.reshape(&factor_shape)).into(),
+            anchor: (&anchor).into(),
+            selection: (&mut selection).into(),
+        },
+    )?;
+    Ok((anchor_rows, landed))
+}
+
 type PreparedDraftGraph = DraftGraphParts<NativeGraphPlan>;
 
 pub struct PreparedDraftGraphs {
@@ -1986,10 +3041,12 @@ impl PreparedDraftGraphs {
 
     /// Every class's graph, sealed into the layout its topology is certified
     /// into (`certify_draft_family`), so a load holds what its assessment
-    /// charged.
+    /// charged. `landing`: of the block's token table, when it has landing
+    /// slots.
     pub(crate) fn prepare(
         target_device: &Device,
         draft: &AttestedDraft,
+        landing: Option<&AttestedLanding>,
         load: &ModelLoadPlan,
         plan: &DraftProgramPlan,
         geometry: &DraftGeometry<'_>,
@@ -2005,7 +3062,7 @@ impl PreparedDraftGraphs {
                 |error: GraphError| invalid(format!("draft graph class {class:?}: {error}"));
             let parts = draft_graph(
                 target_device.native_graph_with_layout(&layouts[&class]),
-                DraftGraphEntries::prepared(draft),
+                DraftGraphEntries::prepared(draft, landing),
                 load,
                 geometry,
                 class,
@@ -2318,7 +3375,7 @@ impl NativeDraftProgram {
         core: &HeadLaunchCore,
         workspace: &mut NativeGraphWorkspaceLease,
         output: NativeGraphOutputLease,
-    ) -> Result<(seismic::NativeGraphCompletion, Option<GraphOutputTensor>), SubmitError> {
+    ) -> Result<(seismic::NativeGraphCompletion, HeadOutput), SubmitError> {
         let decoder = &self.definition.decoder;
         let draft = self
             .definition
@@ -2472,21 +3529,33 @@ impl NativeDraftProgram {
                     0
                 }
             };
-            let head_rows = (0..steps).flat_map(|step| (0..slots).map(move |slot| (step, slot)));
-            let rows = head_rows
-                .map(|(step, slot)| {
-                    let index = packed(step, slot);
-                    let output = *block
-                        .select_rows
-                        .get(index)
-                        .ok_or_else(|| invalid("draft selection is absent"))?;
-                    block
-                        .out_rows
-                        .get(output as usize)
-                        .copied()
-                        .ok_or_else(|| invalid("draft selection has no block row"))
-                })
-                .collect::<Result<Vec<i32>, SubmitError>>()?;
+            let slot_rows = draft.block_rows(steps as u64);
+            let rows = match &ports.anchor_rows {
+                // A corrector projects every mask row of every slot,
+                // slot-major.
+                Some(_) => (0..slots as u64)
+                    .flat_map(|slot| {
+                        (0..draft.max_proposals())
+                            .map(move |mask| slot * slot_rows + draft.proposal_row(mask))
+                    })
+                    .map(|row| i32::try_from(row).map_err(|_| invalid("draft row exceeds i32")))
+                    .collect::<Result<Vec<i32>, SubmitError>>()?,
+                None => (0..steps)
+                    .flat_map(|step| (0..slots).map(move |slot| (step, slot)))
+                    .map(|(step, slot)| {
+                        let index = packed(step, slot);
+                        let output = *block
+                            .select_rows
+                            .get(index)
+                            .ok_or_else(|| invalid("draft selection is absent"))?;
+                        block
+                            .out_rows
+                            .get(output as usize)
+                            .copied()
+                            .ok_or_else(|| invalid("draft selection has no block row"))
+                    })
+                    .collect::<Result<Vec<i32>, SubmitError>>()?,
+            };
             active
                 .write_input(&ports.head_rows, &i32_bytes(rows))
                 .map_err(device)?;
@@ -2525,7 +3594,32 @@ impl NativeDraftProgram {
                     .write_input(anchors, &i32_bytes(anchors_of))
                     .map_err(device)?;
             }
+            // Each slot's last entry row, whose conditioning selected its
+            // anchor; padding slots read row 0.
+            if let Some(anchor_rows) = &ports.anchor_rows {
+                let mut last = vec![0_i32; slots];
+                for (row, &slot) in entry.row_slots[..entry.actual_rows].iter().enumerate() {
+                    let slot = usize::try_from(slot)
+                        .map_err(|_| invalid("draft entry row has no slot"))?;
+                    *last
+                        .get_mut(slot)
+                        .ok_or_else(|| invalid("draft entry row's slot exceeds the class"))? =
+                        i32::try_from(row).map_err(|_| invalid("draft entry row exceeds i32"))?;
+                }
+                active
+                    .write_input(anchor_rows, &i32_bytes(last))
+                    .map_err(device)?;
+            }
         }
+        // A corrector's candidates are table rows the device selects, a
+        // landed read of a table with landing slots.
+        let landed = graph
+            .block
+            .as_ref()
+            .and_then(|block| block.landed.as_ref())
+            .map(|ports| ports.queue(&self.graphs.embedding, &mut bindings))
+            .transpose()
+            .map_err(invalid)?;
         let mut output = output;
         let outputs = output
             .activate(&graph.plan)
@@ -2542,7 +3636,13 @@ impl NativeDraftProgram {
                     .ok_or_else(|| invalid("draft graph omitted its selections"))
             })
             .transpose()?;
-        Ok((completion, selections))
+        Ok((
+            completion,
+            HeadOutput {
+                selections,
+                landed_reads: landed.into_iter().map(SelectedRead::submitted).collect(),
+            },
+        ))
     }
 }
 
@@ -2569,7 +3669,7 @@ fn write_controls(
 
 impl HeadProgram for NativeDraftProgram {
     type Submission =
-        DeviceSubmission<HeadLaunchCore, NativeGraphWorkspaceLease, Option<GraphOutputTensor>>;
+        DeviceSubmission<HeadLaunchCore, NativeGraphWorkspaceLease, HeadOutput>;
 
     fn submit(
         &mut self,
@@ -2582,7 +3682,7 @@ impl HeadProgram for NativeDraftProgram {
                 None => Err(invalid("draft graph output lease is absent")),
             }
         };
-        let (completion, selections) = match queued {
+        let (completion, output) = match queued {
             Ok(queued) => queued,
             Err(error) => return Err((error, launch)),
         };
@@ -2591,7 +3691,7 @@ impl HeadProgram for NativeDraftProgram {
             self.waiter.completion(vec![completion]),
             core,
             workspace,
-            selections,
+            output,
         ))
     }
 }

@@ -119,6 +119,17 @@ impl GeneralRoutedShape {
         })
     }
 
+    /// The extent of the combine's per-expert scale port (`routed_select`'s
+    /// ES) given the down weight's per-expert scale extent `down`: the stored
+    /// output scales' (E) where the operator has them, else `down` (plan
+    /// admission refuses both at once).
+    pub fn expert_scale_extent(&self, down: u64) -> u64 {
+        match self.expert_scale {
+            true => self.experts,
+            false => down,
+        }
+    }
+
     /// `routed_select`'s dimensions.
     pub fn select_dimensions(&self, rows: u64) -> [(&'static str, u64); 4] {
         [
@@ -163,17 +174,26 @@ pub struct GeneralRoutedBinding {
     pub scales: GeneralRoutedScales,
 }
 
+/// The extents of the routed entries' per-expert scale ports (`[S] f32`,
+/// `routed.seismic`): each stacked expert weight's resident second-level
+/// scales, E where it has them, else 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ExpertScales {
+    /// The gate and up weights': the expansions scale each expert's
+    /// accumulators (GS, US).
+    pub gate: u64,
+    pub up: u64,
+    /// The down weight's: the route folds it into each choice's combine
+    /// weight (ES), as it does stored per-expert output scales.
+    pub down: u64,
+}
+
 /// The extents of a general routed operator's accumulator-scale ports: its
 /// projection weights' resident second-level scales, 0 where a weight has
-/// none. Gated experts and the router bind no scale.
+/// none. The router binds no scale.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GeneralRoutedScales {
-    /// Up-only experts' up weight, per expert (E): `routed_up` and
-    /// `routed_experts_up` scale each expert's accumulator.
-    pub expert_up: u64,
-    /// The experts' down weight, per expert (E): `routed_select` folds it
-    /// into each choice's combine weight, as it does stored expert scales.
-    pub expert_down: u64,
+    pub experts: ExpertScales,
     /// The shared expert's dense entries.
     pub shared: DenseScales,
     /// A latent operator's `(down, up)` projections, per tensor.
@@ -292,13 +312,21 @@ pub(super) fn fused_shape_key(routed: &RoutedFfn) -> String {
 }
 
 /// The program binding of Qwen's fused form (`is_fused`); `lookup` resolves
-/// the planned element of a role in its scope.
+/// the planned element of a role in its scope that its entry binds without
+/// an accumulator-scale port (the shared expert's), `scalable` one it binds
+/// with one (the experts').
 pub(super) fn fused_binding(
     routed: &RoutedFfn,
     hidden: u64,
     lookup: impl Fn(WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightKind) -> Result<ScalableWeight, PlanError>,
     activation: Element,
 ) -> Result<RoutedBinding, PlanError> {
+    let (gate, up, down) = (
+        scalable(WeightKind::ExpertGate)?,
+        scalable(WeightKind::ExpertUp)?,
+        scalable(WeightKind::ExpertDown)?,
+    );
     Ok(RoutedBinding {
         hidden,
         experts: routed.experts,
@@ -314,13 +342,18 @@ pub(super) fn fused_binding(
         normalize_selected: routed.router.normalization == RouteNormalization::Sum,
         norm: lookup(WeightKind::InputNorm)?,
         router: lookup(WeightKind::Router)?,
-        expert_gate: lookup(WeightKind::ExpertGate)?,
-        expert_up: lookup(WeightKind::ExpertUp)?,
-        expert_down: lookup(WeightKind::ExpertDown)?,
+        expert_gate: gate.element,
+        expert_up: up.element,
+        expert_down: down.element,
         shared_gate: lookup(WeightKind::SharedGate)?,
         shared_up: lookup(WeightKind::SharedUp)?,
         shared_down: lookup(WeightKind::SharedDown)?,
         activation,
+        scales: ExpertScales {
+            gate: gate.scale,
+            up: up.scale,
+            down: down.scale,
+        },
     })
 }
 
@@ -337,24 +370,25 @@ pub(super) fn binding(
     let shape = GeneralRoutedShape::of(hidden, routed)?;
     let norm = lookup(WeightKind::InputNorm)?;
     let mut scales = GeneralRoutedScales::default();
-    // `routed_gate_up` and `routed_experts` have no scale ports.
-    let (expert_gate, expert_up) = if shape.experts_expansion.gated {
-        (
-            Some(lookup(WeightKind::ExpertGate)?),
-            lookup(WeightKind::ExpertUp)?,
-        )
-    } else {
-        let up = scalable(WeightKind::ExpertUp)?;
-        scales.expert_up = up.scale;
-        (None, up.element)
-    };
+    let expert_gate = shape
+        .experts_expansion
+        .gated
+        .then(|| scalable(WeightKind::ExpertGate))
+        .transpose()?;
+    let expert_up = scalable(WeightKind::ExpertUp)?;
     let expert_down = scalable(WeightKind::ExpertDown)?;
+    // The route's one per-expert scale port holds either.
     if expert_down.scale != 0 && shape.expert_scale {
         return Err(PlanError::Unsupported(
             "a scaled expert down weight beside stored per-expert output scales",
         ));
     }
-    scales.expert_down = expert_down.scale;
+    scales.experts = ExpertScales {
+        gate: expert_gate.map_or(0, |gate| gate.scale),
+        up: expert_up.scale,
+        down: expert_down.scale,
+    };
+    let (expert_gate, expert_up) = (expert_gate.map(|gate| gate.element), expert_up.element);
     let latent = if shape.latent {
         let (down, up) = (
             scalable(WeightKind::LatentDown)?,

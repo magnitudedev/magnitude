@@ -55,11 +55,18 @@ impl DenseCase {
     }
     /// Expected SiLU(gate) * up on `mapping`'s operand path and the
     /// per-element tolerance.
-    fn expand(&self, gate: &Weight, up: &Weight, mapping: Mapping) -> (Vec<f64>, Vec<f64>) {
+    fn expand(
+        &self,
+        gate: &Weight,
+        up: &Weight,
+        format: Option<Format>,
+        mapping: Mapping,
+    ) -> (Vec<f64>, Vec<f64>) {
         let (x, slack) = operand_rows(
             &normalized(&self.selected(), &self.norm, self.o, self.h),
             self.h,
             mapping,
+            format,
         );
         let (g, gm) = project(&x, &gate.values, self.o, self.f, self.h);
         let (u, um) = project(&x, &up.values, self.o, self.f, self.h);
@@ -132,7 +139,7 @@ fn output_kernel(
             DW: format.resident(),
             A: Element::bf16(),
         },
-        &mapping.projection_params(
+        &mapping.dense_pair_params(
             NativeSpecialization::new()
                 .with_static("H", h as u64)
                 .with_static("F", f as u64)
@@ -167,6 +174,7 @@ fn cuda_dense_expand_coded_matches_host_model() {
             Format::Q5_1,
             Format::Mxfp4,
             Format::Nvfp4,
+            Format::Nvfp4A4,
         ],
         17,
     );
@@ -186,7 +194,7 @@ fn dense_expand_cases(formats: &[Format], seed: u64) {
             let norm = f32_tensor(&device, &[h as u64], &case.norm);
             let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
             for &mapping in mappings(o) {
-                let (expected, tolerance) = case.expand(&gate, &up, mapping);
+                let (expected, tolerance) = case.expand(&gate, &up, Some(format), mapping);
                 let product = expand_kernel(&device, format, &case, mapping)
                     .call(dense_expand::Args {
                         residual: &residual,
@@ -234,6 +242,7 @@ fn cuda_dense_output_32_granular_k_matches_host_model() {
         Format::Q5_1,
         Format::Mxfp4,
         Format::Nvfp4,
+        Format::Nvfp4A4,
     ];
     for f in [704, 2112, 2688] {
         dense_output_cases(&device, &formats, 48, f, &mut rng);
@@ -256,7 +265,7 @@ fn dense_output_cases(device: &Device, formats: &[Format], h: usize, f: usize, r
             let out_rows = i32_tensor(&device, &[o as u64], &out_rows_values);
             for &mapping in mappings(o) {
                 // The product is exact input, so the INT8 emulation is exact too.
-                let (x, _) = operand_rows(&product_values, f, mapping);
+                let (x, _) = operand_rows(&product_values, f, mapping, Some(format));
                 let (projected, magnitude) = project(&x, &down.values, o, h, f);
                 let expected: Vec<f64> = (0..o * h)
                     .map(|i| {
@@ -343,7 +352,7 @@ fn cuda_gemm_row_bands_match_host_model() {
             let residual = f32_tensor(&device, &[case.m as u64, h as u64], &case.residual);
             let norm = f32_tensor(&device, &[h as u64], &case.norm);
             let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
-            let (expected, tolerance) = case.expand(&gate, &up, mapping);
+            let (expected, tolerance) = case.expand(&gate, &up, Some(format), mapping);
             let label = format!("expand {format:?} O={o}");
             let digests = rotations.map(|rotation| {
                 let product = expand_kernel(&device, format, &case, rotation)
@@ -377,7 +386,7 @@ fn cuda_gemm_row_bands_match_host_model() {
                 .map(|_| bf16_round(rng.uniform(-1.0, 1.0)))
                 .collect();
             let base: Vec<f32> = (0..m * f).map(|_| rng.uniform(-2.0, 2.0)).collect();
-            let (x, _) = operand_rows(&values, k, mapping);
+            let (x, _) = operand_rows(&values, k, mapping, Some(format));
             let (projected, magnitude) = project(&x, &down.values, o, f, k);
             let dequant = if format.scaled_gemm() {
                 vec![0.0; o * f]
@@ -622,7 +631,7 @@ fn cuda_dense_weights_match_host_model() {
                 .with_static("F", f as u64);
             // INT8 has no effect with dense weights: every mapping runs the
             // 16-bit path.
-            let (expected, tolerance) = case.expand(&gate, &up, Mapping { int8: 0, ..mapping });
+            let (expected, tolerance) = case.expand(&gate, &up, None, Mapping { int8: 0, ..mapping });
             let product = dense_expand::native_for_device_with(
                 &device,
                 dense_expand::Elements {
@@ -674,7 +683,7 @@ fn cuda_dense_weights_match_host_model() {
             let result = dense_output::native_for_device_with(
                 &device,
                 dense_output::Elements { DW: bf16, A: bf16 },
-                &mapping.projection_params(statics.with_static("DS", 0)),
+                &mapping.dense_pair_params(statics.with_static("DS", 0)),
             )
             .unwrap()
             .call(dense_output::Args {
@@ -809,12 +818,14 @@ fn head_expected(
     case: &DenseCase,
     weight: &Weight,
     v: usize,
+    format: Option<Format>,
     mapping: Mapping,
 ) -> (Vec<f64>, Vec<f64>) {
     let (x, slack) = operand_rows(
         &normalized(&case.selected(), &case.norm, case.o, case.h),
         case.h,
         mapping,
+        format,
     );
     let (logits, magnitude) = project(&x, &weight.values, case.o, v, case.h);
     let bound = slack_bound(&slack, &weight.values, case.o, v, case.h);
@@ -842,7 +853,7 @@ fn cuda_head_rows_match_host_model() {
             for &mapping in mappings(o) {
                 // The head's GEMMs are the 16-bit path.
                 let (expected, tolerance) =
-                    head_expected(&case, &head, v, Mapping { int8: 0, ..mapping });
+                    head_expected(&case, &head, v, Some(format), Mapping { int8: 0, ..mapping });
                 let logits = readout_head_rows::native_for_device_with(
                     &device,
                     readout_head_rows::Elements {
@@ -995,7 +1006,7 @@ fn cuda_features_and_selected_rows_match_host_model() {
         let head = weight(&device, format, v, d, &mut rng);
         for o in [1usize, 3, 9] {
             let case = DenseCase::new(o, d, v, &mut rng);
-            let (logits, tolerance) = head_expected(&case, &head, v, GEMV_MAPPINGS[0]);
+            let (logits, tolerance) = head_expected(&case, &head, v, Some(format), GEMV_MAPPINGS[0]);
             let hidden = f32_tensor(&device, &[case.m as u64, d as u64], &case.residual);
             let norm = f32_tensor(&device, &[d as u64], &case.norm);
             let out_rows = i32_tensor(&device, &[o as u64], &case.out_rows);
@@ -1107,7 +1118,7 @@ fn dense_expand_host_model_matches_portable_body() {
         let gate = weight(&device, format, f, h, &mut rng);
         let up = weight(&device, format, f, h, &mut rng);
         let case = DenseCase::new(o, h, f, &mut rng);
-        let (expected, tolerance) = case.expand(&gate, &up, GEMV_MAPPINGS[0]);
+        let (expected, tolerance) = case.expand(&gate, &up, Some(format), GEMV_MAPPINGS[0]);
         let storage = registry::storage(format.representation(), Layout::Mma16).unwrap();
         let logical = module
             .entry(
@@ -1221,6 +1232,64 @@ fn cuda_embedding_rows_decode_table_rows() {
                     "{format:?} row {row} col {column}"
                 );
             }
+        }
+    }
+}
+
+/// A streamed table's rows16 slots gather every row exactly as the table's
+/// mma16 rows held whole do: every value, and with `normalize` every row's
+/// RMS inverse, bit for bit.
+#[test]
+fn cuda_embedding_rows_of_rows16_slots_equal_the_mma16_table() {
+    let Some(device) = cuda() else { return };
+    let mut rng = Rng(9);
+    let (v, d) = (40, 512);
+    let shape = [v as u64, d as u64];
+    let tokens_values = [0, 39, 17, 16, 15, 3, 8];
+    let rows = tokens_values
+        .iter()
+        .flat_map(|token| [*token, 0])
+        .collect::<Vec<_>>();
+    let tokens = i32_tensor(&device, &[tokens_values.len() as u64, 2], &rows);
+    let direct = i32_tensor(&device, &[0, 1], &[]);
+    for format in Format::ALL {
+        let mut external = Vec::new();
+        for _ in 0..v * d / format.block_values() {
+            external.extend(format.block(&mut rng));
+        }
+        let source = Element::named(format.external()).unwrap();
+        let read = |layout: Layout, normalize: i32| {
+            let element = Element::stored(format.representation(), layout).unwrap();
+            let bytes = element
+                .repack_host(source, &shape, &external)
+                .expect("registered GGUF conversion");
+            let table = Tensor::from_host(&device, element, &shape, &bytes).unwrap();
+            let out = embedding_rows::native_for_device_with(
+                &device,
+                embedding_rows::Elements {
+                    EW: element,
+                    A: Element::bf16(),
+                },
+                &NativeSpecialization::new().with_static("D", d as u64),
+            )
+            .unwrap()
+            .call(embedding_rows::Args {
+                table: &table,
+                tokens: &tokens,
+                directory: &direct,
+                scale: 0.75,
+                normalize,
+                epsilon: 1e-6,
+            })
+            .unwrap();
+            (out.r0.read_to_host().unwrap(), out.r1.read_to_host().unwrap())
+        };
+        for normalize in [0, 1] {
+            assert_eq!(
+                read(Layout::Rows16, normalize),
+                read(Layout::Mma16, normalize),
+                "{format:?} normalize {normalize}"
+            );
         }
     }
 }

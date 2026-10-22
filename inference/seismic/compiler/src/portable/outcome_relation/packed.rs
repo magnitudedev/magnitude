@@ -69,6 +69,7 @@ impl Analysis<'_> {
                     &reference::scalar_recipe(ScalarOp::Cast(DType::F32), &[recipe.dtype(*from)]),
                     &[get(*from)],
                 )?,
+                DecodeStep::Constant { value, .. } => self.terms.scalar(*value),
                 DecodeStep::Multiply { left, right, .. } => self.total_recipe(
                     &reference::scalar_recipe(
                         ScalarOp::Binary(BinaryOp::Mul),

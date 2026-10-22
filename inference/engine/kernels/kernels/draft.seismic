@@ -10,7 +10,7 @@
 fn draft_rows[M, V, D, S, R, F](tokens: &tensor[M, 2] i32, directory: &tensor[R, F] i32,
     table: &tensor[V, D] EW, conditioning: &tensor[M, S * D] C, embedding_norm: &tensor[D] EN,
     hidden_norm: &tensor[S * D] HN, combine: &tensor[D, 2 * D] CW,
-    epsilon: f32) -> tensor[M, S * D] f32 where R >= 0 and F >= 1 and S >= 1:
+    epsilon: f32) -> tensor[M, S * D] f32 where R >= 0 and F >= 1 and S >= 1 and operands(CW) == 0:
     let mut embedded = tensor[M, D] A
     let mut normalized_embedding = tensor[M, D] A
     let mut joined = tensor[M * S, 2 * D] A
@@ -114,11 +114,11 @@ fn readout_project_rows[O, V, D, S, I, WS](features: &tensor[O, D] A,
     weight: &tensor[V, D] OW, token_rows: &tensor[O, I, S] i32,
     weight_scale: &tensor[WS] f32, softcap: f32) -> tensor[O, S] f32
     where S >= 1 and S <= V and I >= 0 and I <= 1 and WS >= 0 and WS <= 1:
-    # The feature rows are dense activations: staging them in A (an exact
-    # copy) states that domain, which the CUDA forms' A staging requires.
+    # The feature rows are dense activations: staging them in A, as the
+    # weight's operand rows (an exact copy unless the weight is NVFP4),
+    # states that domain, which the CUDA forms' A staging requires.
     let mut rows = tensor[O, D] A
-    parallel for row in 0..O:
-        rows[row] = features[row]
+    operand_rows(features, operands(weight), rows)
     let mut logits = tensor[O, S] f32
     parallel for row in 0..O:
         parallel for col in 0..S:
@@ -187,7 +187,7 @@ native readout_project_rows for vulkan from "vulkan/readout_project_rows.comp":
     launch readout_project_rows_gemv:
         threadgroups (S * I + (1 - I) * ceil_div(S, SIMDGROUPS * ROWS * 32 / LANES), O, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
-        shared_bytes (256 + min(ceil_div(D, 32), 288) * 72)
+        shared_bytes (256 + 32 * operands(OW) + min(ceil_div(D, 32), 288) * 72)
 
 native readout_project_rows for cpu from "cpu/readout_project_rows.rs":
     static (WS, I)

@@ -39,6 +39,15 @@ fn gated_delta_project_normalize<L: Isa, E: Elements>(
         };
         projection::quantize(normalized, q8);
     }
+    projection::operand_row(
+        &[
+            &cx.arg_qkv_weight(),
+            &cx.arg_gate_weight(),
+            &cx.arg_alpha_weight(),
+            &cx.arg_beta_weight(),
+        ],
+        normalized,
+    );
 }
 
 fn gated_delta_project_rows<L: Isa, E: Elements>(

@@ -43,10 +43,18 @@ fn gated_delta_project[M, H, PT, NM, NK, NV, W, QB, ZB](hidden: &tensor[M, PT * 
     beta_weight: &tensor[NV, H] BW, epsilon: f32, qkv_bound: &tensor[QB] f32,
     gate_bound: &tensor[ZB] f32)
     -> tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A
-    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and QB >= 0 and ZB >= 0 and (QB == 0 or H % QB == 0) and (ZB == 0 or H % ZB == 0):
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and QB >= 0 and ZB >= 0 and (QB == 0 or H % QB == 0) and (ZB == 0 or H % ZB == 0) and operands(QW) == operands(GW) and operands(QW) == operands(AW) and operands(QW) == operands(BW):
     let mut normalized = tensor[M, H] A
     form_input(hidden, input_norm, normalized, epsilon)
     let mut projection = tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A
+    let mut qkv_rows = tensor[M, H] f32
+    let mut gate_rows = tensor[M, H] f32
+    let mut alpha_rows = tensor[M, H] f32
+    let mut beta_rows = tensor[M, H] f32
+    operand_rows(normalized, operands(qkv_weight), qkv_rows)
+    operand_rows(normalized, operands(gate_weight), gate_rows)
+    operand_rows(normalized, operands(alpha_weight), alpha_rows)
+    operand_rows(normalized, operands(beta_weight), beta_rows)
     for row in 0..M:
         for column in 0..(2 * NK + NV) * W + NV * W + 2 * NV:
             projection[row, column] = 0.0
@@ -54,20 +62,19 @@ fn gated_delta_project[M, H, PT, NM, NK, NV, W, QB, ZB](hidden: &tensor[M, PT * 
         for output in 0..(2 * NK + NV) * W:
             let mut sum = f32(0.0)
             for source in 0..H:
-                sum = fma(f32(normalized[row, source]), f32(qkv_weight[output, source]), sum)
+                sum = fma(qkv_rows[row, source], f32(qkv_weight[output, source]), sum)
             projection[row, output] = sum
         for output in 0..NV * W:
             let mut sum = f32(0.0)
             for source in 0..H:
-                sum = fma(f32(normalized[row, source]), f32(gate_weight[output, source]), sum)
+                sum = fma(gate_rows[row, source], f32(gate_weight[output, source]), sum)
             projection[row, (2 * NK + NV) * W + output] = sum
         for output in 0..NV:
             let mut alpha = f32(0.0)
             let mut beta = f32(0.0)
             for source in 0..H:
-                let value = f32(normalized[row, source])
-                alpha = fma(value, f32(alpha_weight[output, source]), alpha)
-                beta = fma(value, f32(beta_weight[output, source]), beta)
+                alpha = fma(alpha_rows[row, source], f32(alpha_weight[output, source]), alpha)
+                beta = fma(beta_rows[row, source], f32(beta_weight[output, source]), beta)
             projection[row, (2 * NK + NV) * W + NV * W + output] = alpha
             projection[row, (2 * NK + NV) * W + NV * W + NV + output] = beta
     return projection
@@ -204,7 +211,7 @@ native gated_delta_project for vulkan from "vulkan/gated_delta_project.comp":
             TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
     let GEMV_GROUPS = ceil_div((2 * NK + NV) * W, SIMDGROUPS * ROWS * 32 / LANES) + ceil_div(NV * W, SIMDGROUPS * ROWS * 32 / LANES) + 2 * ceil_div(NV, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
-    let GEMV_SHARED = 256 + min(8 * ceil_div(H, 32), 288) * 72
+    let GEMV_SHARED = 256 + 32 * operands(QW) + min(8 * ceil_div(H, 32), 288) * 72
     where SUB_M <= TILE_M and SUB_N <= TILE_N
     scratch normalized bytes (M * H * 2) when M > 8
     launch gated_delta_project_stage when M > 8:

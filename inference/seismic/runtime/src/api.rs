@@ -468,6 +468,12 @@ pub mod device {
         pub fn info(&self) -> &Executor {
             &self.info
         }
+        /// Graphs recorded for this device's submissions so far: a
+        /// submission during which the count grew recorded one on the host,
+        /// so its duration is not its launches' alone.
+        pub fn recorded_graphs(&self) -> u64 {
+            self.native.recorded_graphs()
+        }
         /// The topology revision this device was opened in; its identifiers
         /// are the ones this device's charges and limits name.
         pub fn topology(&self) -> &Arc<DeviceTopology> {
@@ -539,8 +545,20 @@ pub mod device {
         /// Stable key of this device's model and configuration for native
         /// tuning records: its name and the backend facts that shape
         /// performance.
+        /// What decides how a configuration measures on this device: the
+        /// device, its backend's identity, and the bytes a cold pass of its
+        /// timing reads where it times cold passes
+        /// (`native::point::cold_bytes`).
         pub fn tuning_identity(&self) -> String {
-            format!("{};{}", self.info.name(), self.kind.tuning_identity())
+            let identity = format!("{};{}", self.info.name(), self.kind.tuning_identity());
+            match crate::native::point::cold_bytes(self) {
+                Some(cold) => format!("{identity};cold passes {cold} bytes"),
+                None => identity,
+            }
+        }
+        /// The device's last-level cache, where its backend reports it.
+        pub(crate) fn last_level_cache_bytes(&self) -> Option<u64> {
+            self.kind.last_level_cache_bytes()
         }
         /// Lend the device `workers` for the programs it forms off the
         /// calling thread, or take them back (none). The device starts no
@@ -779,6 +797,13 @@ pub mod tensor {
         regions: Vec<Option<Arc<TensorInner>>>,
     }
 
+    /// A tensor's elements on the host ([`TensorInner::image`]).
+    pub(crate) enum TensorImage {
+        Whole(Vec<u8>),
+        Committed(Vec<u8>),
+        Slabs(Vec<Option<Vec<u8>>>),
+    }
+
     /// Bytes of one leading-axis row of a canonical layout.
     fn leading_row_bytes(extents: &[u64], byte_len: u64) -> Result<u64, TensorError> {
         match extents.first() {
@@ -879,6 +904,118 @@ pub mod tensor {
 
         pub(crate) fn is_slabbed(&self) -> bool {
             self.slabs.is_some()
+        }
+
+        /// The device bytes the tensor's elements occupy: a slab view's
+        /// backed slabs, a reserved tensor's committed rows, otherwise its
+        /// byte length.
+        pub(crate) fn occupied_bytes(&self) -> u64 {
+            match &self.slabs {
+                Some(slabs) => slabs.regions.iter().flatten().map(|r| r.byte_len).sum(),
+                None if self.reserved => self.committed_rows() * (self.byte_len / self.extents[0]),
+                None => self.byte_len,
+            }
+        }
+
+        /// The bytes a device copy of the tensor is written from
+        /// ([`TensorInner::copy_of`]), in canonical layout: all of them, a
+        /// reserved tensor's committed rows (only they are backed), or each
+        /// backed slab's region of a slab view.
+        pub(crate) fn image(&self) -> Result<TensorImage, TensorError> {
+            if let Some(slabs) = &self.slabs {
+                return Ok(TensorImage::Slabs(
+                    slabs
+                        .regions
+                        .iter()
+                        .map(|region| region.as_ref().map(|r| r.read_to_host()).transpose())
+                        .collect::<Result<_, _>>()?,
+                ));
+            }
+            if self.reserved {
+                return Ok(TensorImage::Committed(
+                    self.slice_leading(0, self.committed_rows())?
+                        .read_to_host()?,
+                ));
+            }
+            Ok(TensorImage::Whole(self.read_to_host()?))
+        }
+
+        /// A tensor of this one's shape over storage of its own holding
+        /// `image` (this tensor's [`TensorInner::image`]): a call reads the
+        /// same values from it and shares no byte of storage with a call of
+        /// this one. A slab view's copy has its own slabs and address table.
+        pub(crate) fn copy_of(&self, image: &TensorImage) -> Result<Self, TensorError> {
+            let device = &self.device;
+            match (image, &self.slabs) {
+                (TensorImage::Whole(bytes), None) if !self.reserved => {
+                    Self::from_host(device, self.representation, &self.extents, bytes)
+                }
+                (TensorImage::Committed(bytes), None) if self.reserved => {
+                    let committed = self.committed_rows();
+                    let copy =
+                        Self::reserved(device, self.representation, &self.extents, committed)?;
+                    copy.slice_leading(0, committed)?.write_from_host(bytes)?;
+                    Ok(copy)
+                }
+                (TensorImage::Slabs(images), Some(slabs))
+                    if images.len() == slabs.regions.len() =>
+                {
+                    let dense_u32 = seismic_lang::registry::dense(seismic_lang::types::DType::U32);
+                    let table = Arc::new(Self::zeros(
+                        device,
+                        dense_u32,
+                        &[slabs.regions.len() as u64, 2],
+                    )?);
+                    let regions = slabs
+                        .regions
+                        .iter()
+                        .zip(images)
+                        .map(|(region, bytes)| match (region, bytes) {
+                            (Some(region), Some(bytes)) => {
+                                let copy = Self::from_host(
+                                    device,
+                                    region.representation,
+                                    &region.extents,
+                                    bytes,
+                                )?;
+                                copy.share_slab_access_with(&table);
+                                Ok(Some(Arc::new(copy)))
+                            }
+                            _ => Ok(None),
+                        })
+                        .collect::<Result<Vec<_>, TensorError>>()?;
+                    // An unbacked slot names the first backed slab, as a
+                    // slab store's table does.
+                    let stand_in = regions
+                        .iter()
+                        .flatten()
+                        .next()
+                        .map(|region| region.device_address())
+                        .unwrap_or(0);
+                    let words = regions
+                        .iter()
+                        .flat_map(|region| {
+                            region
+                                .as_ref()
+                                .map_or(stand_in, |region| region.device_address())
+                                .to_le_bytes()
+                        })
+                        .collect::<Vec<_>>();
+                    table.write_from_host(&words)?;
+                    Self::slabbed(
+                        &table,
+                        self.representation,
+                        slabs.rows_per_slab,
+                        self.extents[0],
+                        Self::new_slab_alias(),
+                        regions,
+                        Arc::new(AtomicUsize::new(0)),
+                    )
+                }
+                _ => Err(TensorError::SlabLayout(
+                    "a tensor image does not match the tensor".into(),
+                )),
+            }
         }
 
         pub fn canonical_layout(
@@ -1862,7 +1999,7 @@ pub mod kernel {
             &self,
             rotation: Vec<EncodedArgs>,
         ) -> Result<crate::native::KernelPoint, super::CallError> {
-            crate::native::KernelPoint::place(&self.inner, rotation, None)
+            crate::native::KernelPoint::place(&self.inner, rotation, Vec::new(), None)
         }
     }
 
@@ -2064,6 +2201,23 @@ pub mod kernel {
                 EncodedArgument::Tensor(tensor) => Some(tensor),
                 EncodedArgument::Scalar(_) => None,
             })
+        }
+        /// The same arguments with every tensor replaced by `map`'s.
+        pub(crate) fn map_tensors<E>(
+            &self,
+            mut map: impl FnMut(&Arc<TensorInner>) -> Result<Arc<TensorInner>, E>,
+        ) -> Result<Self, E> {
+            let arguments = self
+                .arguments
+                .iter()
+                .map(|argument| {
+                    Ok(match argument {
+                        EncodedArgument::Tensor(tensor) => EncodedArgument::Tensor(map(tensor)?),
+                        EncodedArgument::Scalar(value) => EncodedArgument::Scalar(value.clone()),
+                    })
+                })
+                .collect::<Result<_, E>>()?;
+            Ok(Self { arguments })
         }
     }
 

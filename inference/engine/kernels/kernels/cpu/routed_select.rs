@@ -8,7 +8,7 @@
 
 use lib::core::{activation, reduce};
 use lib::projection::projection;
-use lib::routed::select;
+use lib::routed::{routed, select};
 
 fn routed_select_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
@@ -67,7 +67,8 @@ fn routed_select_select<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: 
         (cx.arg_normalization(), cx.arg_normalization_epsilon(), cx.arg_scale());
     let expert_scale = cx.arg_expert_scale();
     for (weight, expert) in weights.iter_mut().zip(routes.iter()) {
-        *weight = select::normalized(normalization, *weight, denominator, epsilon) * scale
-            * expert_scale.get([*expert as usize]);
+        *weight = select::normalized(normalization, *weight, denominator, epsilon)
+            * scale
+            * routed::scale_factor(cx.dim_es(), |e| expert_scale.get([e]), *expert);
     }
 }

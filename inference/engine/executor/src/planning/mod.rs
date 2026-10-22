@@ -16,13 +16,16 @@ pub use assessment::{
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, CONVERSATION_CHECKPOINTS,
     DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes,
 };
-pub use capabilities::{CapabilityPlan, MAX_DRAFT_PROPOSALS, PlannedMethod, draft_ladder};
+pub use capabilities::{
+    CapabilityPlan, DraftWidths, MAX_DRAFT_PROPOSALS, PlannedMethod, draft_ladder,
+};
 pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, ComponentSelection};
 pub use execution_plan::{
     BackendPlan, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, PlannedDevice, ResolvedPolicy,
 };
 pub use programs::{
-    Dflash2Binding, DraftBlockBinding, DraftProgramPlan, FeedForwardProgramSlot, HeadProgramPlan,
+    ConvolutionBinding, ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding,
+    DraftBlockBinding, DraftProgramPlan, FeedForwardProgramSlot, HeadProgramPlan,
     ImportProgramSlot, MarkovBinding, MixerProgramSlot, ProgramPlan, SelectorBinding,
     SharedHeadProgramPlan, StateProgramPlan, TapProgramPlan, TargetBlockProgramSlot,
     TargetProgramPlan, VisionProgramPlan,
@@ -174,6 +177,7 @@ pub(crate) mod tests {
             scale: 1.0 / (WIDTH as f64).sqrt(),
             reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
+            sinks: None,
             output: descriptor("o", &[HIDDEN, 2 * WIDTH]),
         };
         let dense = DenseFfn {

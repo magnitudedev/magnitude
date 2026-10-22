@@ -11,7 +11,8 @@ catalog-headers = ["dep:serde_json"]
 [dependencies]
 magnitude-artifacts = { path = "../../artifacts" }
 magnitude-family-contracts = { path = "../contracts" }
-serde_json = { workspace = true, optional = true }
+# Header floats parse to the values GGUF stores, whatever else the build unifies.
+serde_json = { workspace = true, optional = true, features = ["float_roundtrip"] }
 
 [dev-dependencies]
 magnitude-family-common = { path = ".", features = ["catalog-headers"] }

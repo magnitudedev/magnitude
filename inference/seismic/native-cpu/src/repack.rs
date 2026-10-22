@@ -319,9 +319,9 @@ impl Conversion for GgufIq3Xxs {
 }
 
 /// GGUF iq2_xxs into iq2xxs: entry `e` (values `8 e ..`) is its sub-block's
-/// grid index `e % 4` and sign group `e % 4`, a sixteen-bit entry; each
-/// sub-block's 4-bit scale code moves; the f16 `d` becomes the f32 factor
-/// `d / 8`, exactly.
+/// grid index `e % 4` and sign group `e % 4`, a sixteen-bit entry carrying
+/// at bit 15 bit `e % 4` of its sub-block's 4-bit scale code; the f16 `d`
+/// moves bit for bit.
 struct GgufIq2Xxs;
 
 impl Conversion for GgufIq2Xxs {
@@ -331,27 +331,19 @@ impl Conversion for GgufIq2Xxs {
     const GROUP: usize = 256;
     const BITS: u32 = 0;
     const GRID_BYTES: usize = 64;
-    const SCALE_BYTES: usize = 4;
-    const SUPER_BYTES: usize = 4;
+    const SCALE_BYTES: usize = 0;
+    const SUPER_BYTES: usize = 2;
 
     fn grids(packet: &[u8], out: &mut [u8]) {
         for (entry, out) in out.chunks_exact_mut(2).enumerate() {
             let (block, group) = (entry / 4, entry % 4);
             let word = u32::from_le_bytes(packet[6 + 8 * block..10 + 8 * block].try_into().unwrap());
             out[0] = packet[2 + 8 * block + group];
-            out[1] = ((word >> (7 * group)) & 127) as u8;
-        }
-    }
-    fn scales(packet: &[u8], out: &mut [u8]) {
-        out.fill(0);
-        for block in 0..8 {
-            let scale = packet[9 + 8 * block] >> 4;
-            out[block / 2] |= scale << (4 * (block % 2));
+            out[1] = ((word >> (7 * group)) & 127) as u8 | (((word >> (28 + group)) & 1) << 7) as u8;
         }
     }
     fn supers(packet: &[u8], out: &mut [u8]) {
-        let d = f16_to_f32(u16::from_le_bytes([packet[0], packet[1]]));
-        out.copy_from_slice(&(d * 0.125).to_le_bytes());
+        out.copy_from_slice(&packet[..2]);
     }
 }
 
@@ -672,10 +664,10 @@ static CONVERSIONS: [RowConversion; 34] = [
     conversion::<GgufIq4NlBlock>("iq4g32s@rows8", true, &[16, 2]),
     conversion::<GgufIq2Xs>("iq2xs@rows16", false, &[64, 8, 4]),
     conversion::<GgufIq3Xxs>("iq3xxs@rows16", false, &[96, 4, 4]),
-    conversion::<GgufIq2Xxs>("iq2xxs@rows16", false, &[64, 4, 4]),
+    conversion::<GgufIq2Xxs>("iq2xxs@rows16", false, &[64, 2]),
     conversion::<GgufIq2Xs>("iq2xs@rows8", true, &[64, 8, 4]),
     conversion::<GgufIq3Xxs>("iq3xxs@rows8", true, &[96, 4, 4]),
-    conversion::<GgufIq2Xxs>("iq2xxs@rows8", true, &[64, 4, 4]),
+    conversion::<GgufIq2Xxs>("iq2xxs@rows8", true, &[64, 2]),
     conversion::<GgufQ4_0>("q4g32s@rows16", false, &[16, 2]),
     conversion::<GgufQ5<false>>("q5g32s@rows16", false, &[16, 4, 2]),
     conversion::<GgufQ5<true>>("q5g32@rows16", false, &[16, 4, 4]),

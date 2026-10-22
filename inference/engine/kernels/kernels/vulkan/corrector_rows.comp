@@ -1,0 +1,51 @@
+// corrector_rows: one workgroup of 256 invocations per row forms values +
+// bias, then by form the identity, silu or unit length (the length reduced
+// over the workgroup), plus the residual row when R = 1, published to Y.
+// Mirrors `cpu/corrector_rows.rs`.
+#include <seismic/element.glsl>
+#include "lib/core/reduce.glsl"
+
+#if defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F32)
+#define ROWS_Y ELEMENT_F32
+#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_BF16)
+#define ROWS_Y ELEMENT_BF16
+#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F16)
+#define ROWS_Y ELEMENT_F16
+#else
+#error "corrector_rows requires a dense published element"
+#endif
+
+float rows_biased(uint64_t values, uint64_t bias, uint64_t row, uint64_t column) {
+    return element_f32_at(values + (row * SEISMIC_VALUES_STRIDE_0 + column * SEISMIC_VALUES_STRIDE_1) * 4ul)
+        + element_f32_at(bias + column * SEISMIC_BIAS_STRIDE_0 * 4ul);
+}
+
+// Shared: one partial per subgroup (reduce_group_sum at float 0).
+void corrector_rows() {
+    const uint64_t values = SEISMIC_PTR(SEISMIC_BUFFER_VALUES);
+    const uint64_t bias = SEISMIC_PTR(SEISMIC_BUFFER_BIAS);
+    const uint64_t residual = SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL);
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t row = gl_WorkGroupID.x;
+    const uint64_t lane = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
+    const int form = int(SEISMIC_PARAM_FORM);
+    float length = 1.0;
+    if (form == 2) {
+        float partial = 0.0;
+        for (uint64_t column = lane; column < SEISMIC_DIM_N; column += threads) {
+            const float value = rows_biased(values, bias, row, column);
+            partial += value * value;
+        }
+        length = max(seismic_sqrt_rn(reduce_group_sum(partial, 0u)), element_word_f32(SEISMIC_PARAM_EPSILON));
+    }
+    for (uint64_t column = lane; column < SEISMIC_DIM_N; column += threads) {
+        float value = rows_biased(values, bias, row, column);
+        if (form == 1)
+            value = seismic_div_rn(value, 1.0 + exp(-value));
+        else if (form == 2)
+            value = seismic_div_rn(value, length);
+        if (SEISMIC_DIM_R == 1ul)
+            value += element_f32_at(residual + (row * SEISMIC_RESIDUAL_STRIDE_1 + column * SEISMIC_RESIDUAL_STRIDE_2) * 4ul);
+        element_put(ROWS_Y, result, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1, value);
+    }
+}

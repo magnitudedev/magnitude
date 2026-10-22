@@ -7,7 +7,7 @@ use magnitude_family_common::headers;
 use magnitude_family_contracts::{
     AttentionGate, BlockAttention, BlockLayout, DraftDefinition, DraftEmbedding, DraftMethod,
     DraftVariant, HeadNorm, HistoryDomain, ImportTransform, KeyValue, ModelDefinition, ModelFamily,
-    Operator, Rotary, SublayerIndex, TapPoint,
+    Operator, Rotary, ScaledActivations, SublayerIndex, TapPoint,
 };
 use magnitude_family_dflash::{inspect, recognize, recognizes, Error};
 use magnitude_family_lfm2::Lfm2Family;
@@ -244,7 +244,8 @@ fn nemotron_dflash_has_yarn_its_own_embedding_and_second_level_scales() {
     assert_eq!(
         draft.fusion.transforms,
         [ImportTransform::ScaleByTensor {
-            tensor: "fc.scale".into()
+            tensor: "fc.scale".into(),
+            activations: ScaledActivations::Rounded,
         }]
     );
     let Operator::Attention(attention) = &draft.blocks[0].sublayers[0].op else {
@@ -266,7 +267,8 @@ fn nemotron_dflash_has_yarn_its_own_embedding_and_second_level_scales() {
     assert_eq!(
         ffn.down.transforms,
         [ImportTransform::ScaleByTensor {
-            tensor: "blk.0.ffn_down.scale".into()
+            tensor: "blk.0.ffn_down.scale".into(),
+            activations: ScaledActivations::Rounded,
         }]
     );
 }
@@ -563,18 +565,13 @@ fn qwen38_dflash2_convolves_every_sublayer_and_selects_a_path() {
         draft.block_attention,
         vec![BlockAttention::Bidirectional; 5]
     );
-    let DraftMethod::DFlash2 {
-        kernel,
-        group,
-        convolutions,
-        selector,
-    } = &draft.method
-    else {
+    let DraftMethod::DFlash2 { selector } = &draft.method else {
         unreachable!()
     };
-    assert_eq!((*kernel, *group), (2, 16));
-    assert_eq!(convolutions.len(), 5);
-    for layer in convolutions {
+    let convolutions = draft.convolutions.as_ref().unwrap();
+    assert_eq!((convolutions.kernel, convolutions.group), (2, 16));
+    assert_eq!(convolutions.layers.len(), 5);
+    for layer in &convolutions.layers {
         for convolution in [&layer.attention, &layer.feed_forward] {
             assert_eq!(convolution.base.shape, [2, 2, 5120]);
             assert_eq!(convolution.projection.shape, [1280, 5120]);

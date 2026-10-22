@@ -44,6 +44,9 @@ pub(crate) trait GraphDraft: Sized {
         args: E::WorkflowArgs<'_>,
     ) -> Result<E::WorkflowResults, GraphError>;
     fn export(&mut self, result: &WorkflowTensor) -> Result<(), GraphError>;
+    /// Write the node result `result` into the tensor each run binds to the
+    /// external port `port`, which describes exactly that result.
+    fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), GraphError>;
     /// A timeline node after every node enqueued so far: a host gate or a
     /// signal to the host (`seismic::Timeline`).
     fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort;
@@ -91,6 +94,9 @@ impl GraphDraft for NativeGraph {
     }
     fn export(&mut self, result: &WorkflowTensor) -> Result<(), GraphError> {
         self.export(result).map_err(invalid)
+    }
+    fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), GraphError> {
+        self.store(result, port).map_err(invalid)
     }
     fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
         self.timeline(node)
@@ -145,6 +151,9 @@ impl GraphDraft for NativeGraphMetadata {
     }
     fn export(&mut self, result: &WorkflowTensor) -> Result<(), GraphError> {
         Ok(self.export(result)?)
+    }
+    fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), GraphError> {
+        Ok(self.store(result, port)?)
     }
     fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
         self.timeline(node)

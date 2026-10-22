@@ -344,6 +344,7 @@ impl<'a> QualificationView<'a> {
                     inject: &rows.inject(device, 1, "attention_output", &label)?,
                     gated: &gated,
                     output_weight: &output,
+                    output_scale: &unit_scale(device, &kernels.output, "OS", "attention_output", &label)?,
                     output_bound: &any_row_bound(device, &kernels.output, "OB", "attention_output", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("attention_output", &label, error))?
@@ -465,7 +466,6 @@ impl<'a> QualificationView<'a> {
                         &hidden_residual,
                         &product,
                         &down,
-                        binding.scales.down,
                         norm,
                         &label,
                     )?
@@ -751,6 +751,7 @@ pub(super) fn qualify_routed(
                     scores,
                     eps: 1.0e-5,
                     normalize: 1,
+                    expert_scale: &unit_scale(device, &kernels.route, "ES", "routed_route", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("routed_route", &label, error))
         };
@@ -767,6 +768,8 @@ pub(super) fn qualify_routed(
                             expert_up: &expert_up,
                             shared_gate: &shared_gate,
                             shared_up: &shared_up,
+                            gate_scale: &unit_scale(device, expand, "GS", "routed_expand", &label)?,
+                            up_scale: &unit_scale(device, expand, "US", "routed_expand", &label)?,
                         })
                         .map_err(|error| qualification_dynamic("routed_expand", &label, error))?;
                     (expanded.r0, expanded.r1, routed.r1)
@@ -784,6 +787,7 @@ pub(super) fn qualify_routed(
                             scores: &mut scores,
                             eps: 1.0e-5,
                             normalize: 1,
+                            expert_scale: &unit_scale(device, route, "ES", "routed_route_shared", &label)?,
                         })
                         .map_err(|error| {
                             qualification_dynamic("routed_route_shared", &label, error)
@@ -795,6 +799,8 @@ pub(super) fn qualify_routed(
                             expert_gate: &expert_gate,
                             expert_up: &expert_up,
                             activation: 0,
+                            gate_scale: &unit_scale(device, choices, "GS", "routed_gate_up", &label)?,
+                            up_scale: &unit_scale(device, choices, "US", "routed_gate_up", &label)?,
                         })
                         .map_err(|error| qualification_dynamic("routed_gate_up", &label, error))?
                         .value;
@@ -844,6 +850,8 @@ pub(super) fn qualify_routed(
                     expert_up: &expert_up,
                     expert_down: &expert_down,
                     activation: 0,
+                    gate_scale: &unit_scale(device, &kernels.experts, "GS", "routed_experts", &label)?,
+                    up_scale: &unit_scale(device, &kernels.experts, "US", "routed_experts", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("routed_experts", &label, error))?
                 .value;
@@ -885,7 +893,6 @@ fn qualify_parallel(
 ) -> Result<(), CatalogFailure> {
     qualify_general_routed(device, binding.routed, &kernels.routed)?;
     let label = format!("{binding:?}");
-    let absent_scale = semantic_zeros(device, Element::f32(), &[0], "parallel", "scale")?;
     let hidden = binding.hidden;
     let dense = binding.dense;
     let zeros = |element: Element, extents: &[u64], entry: &'static str| {
@@ -903,8 +910,8 @@ fn qualify_parallel(
             out_rows: &out_rows,
             eps: 1.0e-5,
             activation: 0,
-            gate_scale: &absent_scale,
-            up_scale: &absent_scale,
+            gate_scale: &unit_scale(device, &kernels.expand, "GS", "dense_expand", &label)?,
+            up_scale: &unit_scale(device, &kernels.expand, "US", "dense_expand", &label)?,
             gate_bound: &any_row_bound(device, &kernels.expand, "GB", "dense_expand", &label)?,
             up_bound: &any_row_bound(device, &kernels.expand, "UB", "dense_expand", &label)?,
         })
@@ -915,7 +922,7 @@ fn qualify_parallel(
         .call(project_rows::Args {
             source: &product,
             weight: &zeros(dense.down, &[hidden, features], "project_rows")?,
-            weight_scale: &absent_scale,
+            weight_scale: &unit_scale(device, &kernels.down, "WS", "project_rows", &label)?,
             weight_bound: &any_row_bound(device, &kernels.down, "WB", "project_rows", &label)?,
         })
         .map_err(|error| qualification_dynamic("project_rows", &label, error))?
@@ -968,9 +975,6 @@ fn qualify_general_routed(
     let router_norm = zeros(binding.router_norm, &[h])?;
     let router = zeros(binding.router, &[e, h])?;
     let bias = zeros(Element::f32(), &[e])?;
-    let expert_scale = zeros(Element::f32(), &[e])?;
-    // One qualified expert: the up scales follow the expert weights.
-    let up_scale = zeros(Element::f32(), &[1])?;
     let expert_gate = binding
         .expert_gate
         .map(|gate| zeros(gate, &[1, f, x]))
@@ -1062,7 +1066,7 @@ fn qualify_general_routed(
                 router_norm: &router_norm,
                 router: &router,
                 bias: &bias,
-                expert_scale: &expert_scale,
+                expert_scale: &unit_scale(device, &kernels.select, "ES", "routed_select", &label)?,
                 routes: &mut routes,
                 weights: &mut weights,
                 epsilon: 1.0e-5,
@@ -1100,6 +1104,8 @@ fn qualify_general_routed(
                             expert_gate: expert_gate.as_ref().unwrap_or(&expert_up),
                             expert_up: &expert_up,
                             activation: shape.experts_expansion.activation,
+                            gate_scale: &unit_scale(device, decode, "GS", "routed_gate_up", &label)?,
+                            up_scale: &unit_scale(device, decode, "US", "routed_gate_up", &label)?,
                         })
                         .map_err(failed!("routed_gate_up"))?
                         .value
@@ -1110,7 +1116,7 @@ fn qualify_general_routed(
                             normalized: &input,
                             routes: &first,
                             expert_up: &expert_up,
-                            up_scale: &up_scale,
+                            up_scale: &unit_scale(device, decode, "US", "routed_up", &label)?,
                             activation: shape.experts_expansion.activation,
                         })
                         .map_err(failed!("routed_up"))?
@@ -1155,6 +1161,8 @@ fn qualify_general_routed(
                             expert_up: &expert_up,
                             expert_down: &expert_down,
                             activation: shape.experts_expansion.activation,
+                            gate_scale: &unit_scale(device, grouped, "GS", "routed_experts", &label)?,
+                            up_scale: &unit_scale(device, grouped, "US", "routed_experts", &label)?,
                         })
                         .map_err(failed!("routed_experts"))?
                         .value
@@ -1167,7 +1175,7 @@ fn qualify_general_routed(
                             blocks: &block_experts,
                             expert_up: &expert_up,
                             expert_down: &expert_down,
-                            up_scale: &up_scale,
+                            up_scale: &unit_scale(device, grouped, "US", "routed_experts_up", &label)?,
                             activation: shape.experts_expansion.activation,
                         })
                         .map_err(failed!("routed_experts_up"))?
@@ -1218,7 +1226,6 @@ fn qualify_short_conv(
 ) -> Result<(), CatalogFailure> {
     let label = format!("{binding:?}");
     let entry = "target_short_conv";
-    let absent_scale = semantic_zeros(device, Element::f32(), &[0], entry, &label)?;
     let shape = binding.shape;
     let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, entry, &label);
     let norm = zeros(binding.norm, &[shape.hidden])?;
@@ -1258,9 +1265,9 @@ fn qualify_short_conv(
             c_weight: &output_gate,
             x_weight: &value,
             eps: 1.0e-5,
-            b_scale: &absent_scale,
-            c_scale: &absent_scale,
-            x_scale: &absent_scale,
+            b_scale: &unit_scale(device, &kernels.project, "BS", entry, &label)?,
+            c_scale: &unit_scale(device, &kernels.project, "CS", entry, &label)?,
+            x_scale: &unit_scale(device, &kernels.project, "XS", entry, &label)?,
         })
         .map_err(|error| qualification_dynamic("short_conv_project", &label, error))?
         .value;
@@ -1288,6 +1295,7 @@ fn qualify_short_conv(
             inject: &semantic_zeros(device, Element::f32(), &[1, 0], "attention_output", &label)?,
             gated: &gated,
             output_weight: &output,
+            output_scale: &unit_scale(device, &kernels.output, "OS", "attention_output", &label)?,
             output_bound: &any_row_bound(device, &kernels.output, "OB", "attention_output", &label)?,
         })
         .map_err(|error| qualification_dynamic("attention_output", &label, error))?
@@ -1310,6 +1318,8 @@ fn qualify_state_space(
     let shape = binding.shape;
     let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, entry, &label);
     let f32 = Element::f32();
+    // A unit accumulator scale of the port's extent (absent at 0).
+    let scale = |extent| semantic_ones(device, f32, &[extent], entry, &label);
     let norm = zeros(binding.norm, &[shape.hidden])?;
     let projection_weight = zeros(
         binding.projection,
@@ -1374,6 +1384,10 @@ fn qualify_state_space(
             value_weight: &empty,
             epsilon: 1.0e-5,
             project_mode: 0,
+            query_scale: &scale(binding.scales.projection)?,
+            gate_scale: &scale(0)?,
+            key_scale: &scale(0)?,
+            value_scale: &scale(0)?,
             query_bound: &any_row_bound(device, &kernels.project, "QB", "attention_project", &label)?,
             gate_bound: &any_row_bound(device, &kernels.project, "GB", "attention_project", &label)?,
             key_bound: &any_row_bound(device, &kernels.project, "KB", "attention_project", &label)?,
@@ -1424,6 +1438,7 @@ fn qualify_state_space(
             inject: &semantic_zeros(device, Element::f32(), &[1, 0], "attention_output", &label)?,
             gated: &gated,
             output_weight: &output,
+            output_scale: &scale(binding.scales.output)?,
             output_bound: &any_row_bound(device, &kernels.output, "OB", "attention_output", &label)?,
         })
         .map_err(|error| qualification_dynamic("attention_output", &label, error))?
@@ -1442,7 +1457,6 @@ impl QualificationView<'_> {
         hidden_values: &[f32],
     ) -> Result<(), CatalogFailure> {
         let hidden = self.geometry.hidden;
-        let absent_scale = semantic_zeros(device, Element::f32(), &[0], "per_layer", "scale")?;
         if let (Some(binding), Some(kernels), Some(entry)) = (
             self.plan.target().per_layer(),
             &self.programs.target.per_layer,
@@ -1476,7 +1490,7 @@ impl QualificationView<'_> {
                         .reshape(&[1, hidden])
                         .map_err(|error| qualification_dynamic("project_rows", &label, error))?,
                     weight: &projection,
-                    weight_scale: &absent_scale,
+                    weight_scale: &unit_scale(device, &kernels.project, "WS", "project_rows", &label)?,
                     weight_bound: &any_row_bound(device, &kernels.project, "WB", "project_rows", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("project_rows", &label, error))?
@@ -1577,7 +1591,7 @@ impl QualificationView<'_> {
                     inputs: &inputs,
                     layer: 0,
                     activation: 1,
-                    gate_scale: &absent_scale,
+                    gate_scale: &unit_scale(device, &kernels.gate, "GS", "per_layer_gate", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("per_layer_gate", &label, error))?
                 .value;
@@ -1594,7 +1608,6 @@ impl QualificationView<'_> {
                 hidden_residual,
                 &gated,
                 &projection,
-                0,
                 norm,
                 &label,
             )?;

@@ -37,8 +37,8 @@ model is best for every workload.
 - **Fidelity** describes how faithfully the local artifact is expected to preserve the source model
   after quantization. It does not mean factual accuracy and is separate from Intelligence.
 - **Acceleration** identifies the speculative-decoding method Magnitude has prepared for that
-  configuration. See `magnitude docs speculative-methods` for what `None`, `MTP`, `DFlash`, and
-  `DSpark` mean and how Magnitude sets them up.
+  configuration. See `magnitude docs speculative-methods` for what `None`, `MTP`, `DFlash`,
+  `DSpark`, and `LiLiCorr` mean and how Magnitude sets them up.
 - **Capabilities** identify supported features such as vision, tool use, structured output, and
   reasoning. These can matter more than a small speed or intelligence difference when the user has
   a specific task in mind.

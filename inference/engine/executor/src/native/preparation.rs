@@ -50,7 +50,9 @@ use magnitude_family_contracts::{
     InputNorm, ModelDefinition, SublayerIndex, WeightKind, WeightScope,
 };
 use magnitude_kernels::{
-    attention_append_dense, cluster_token_rows, conditioning_overlay, draft_convolve_input,
+    attention_append_dense, cluster_token_rows, conditioning_overlay, corrector_attention,
+    corrector_factors, corrector_features, corrector_nodes, corrector_path, corrector_rows,
+    draft_convolve_input,
     draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k, feature_copy,
     feature_rows, import_dense, moe_tail, ngram_gate, ngram_inject, ngram_rows, packing_bound,
     per_layer_inputs, place_logits_rows, post_norm_residual, repack_weight, repeat_rows,
@@ -987,6 +989,10 @@ impl<'a> Preparation<'a> {
                 },
             )?,
             conditioning_overlay: fixed!(self.spec, conditioning_overlay, "fixed"),
+            selection_notice: match plan.notices_selection() {
+                true => fixed!(self.spec, selection_notice, "fixed"),
+                false => None,
+            },
             feature_copy: fixed!(
                 self.spec,
                 feature_copy,
@@ -1388,17 +1394,6 @@ impl<'a> Preparation<'a> {
             });
         }
         Ok(())
-    }
-
-    /// `readout_features_rows` over one normalized row at this model's
-    /// width.
-    fn features(
-        &mut self,
-        bindings: &str,
-        norm: Element,
-        activation: Element,
-    ) -> Result<Option<NativeKernel<readout_features_rows::Entry>>, CatalogFailure> {
-        self.features_at(bindings, norm, activation, self.hidden, (1, self.hidden))
     }
 
     /// `readout_features_rows` over the target decoder's exit: the exit
@@ -2072,27 +2067,17 @@ impl<'a> Preparation<'a> {
             ],
             ngram_inject::native_entry_with(ngram_inject::Elements { NW: binding.norm }),
         )?;
-        let notice = self
-            .spec
-            .fixed("fixed", &[], selection_notice::native_entry())?;
-        Ok(match (rows, stored, key, value, gate, inject, notice) {
-            (
-                Some(rows),
-                Some(stored),
-                Some(key),
-                Some(value),
-                Some(gate),
-                Some(inject),
-                Some(notice),
-            ) => Some(NGramKernels {
-                rows,
-                stored,
-                key,
-                value,
-                gate,
-                inject,
-                notice,
-            }),
+        Ok(match (rows, stored, key, value, gate, inject) {
+            (Some(rows), Some(stored), Some(key), Some(value), Some(gate), Some(inject)) => {
+                Some(NGramKernels {
+                    rows,
+                    stored,
+                    key,
+                    value,
+                    gate,
+                    inject,
+                })
+            }
             _ => None,
         })
     }
@@ -3116,10 +3101,7 @@ impl<'a> Preparation<'a> {
                 }
             }
         };
-        let dflash2 = match draft_plan.dflash2() {
-            None => None,
-            Some(binding) => self.dflash2(draft_plan, binding)?,
-        };
+        self.draft_stages(draft_plan)?;
         let draft = self.draft_kernels();
         draft.embedding = embedding;
         draft.head = head;
@@ -3127,27 +3109,20 @@ impl<'a> Preparation<'a> {
         draft.sample = sample;
         draft.widen = widen;
         draft.markov = markov;
-        draft.dflash2 = dflash2;
         Ok(())
     }
 
-    /// DFlash2's block pass and candidate path: the layer and output norms
-    /// over rows, every unfused projection (per kind, weight and published
-    /// element, over every layer sharing it), the two convolution halves,
-    /// the gated product, the top-k, both codebook gathers and the path
-    /// step. `None` during a tuning count.
-    fn dflash2(
-        &mut self,
-        plan: &crate::DraftProgramPlan,
-        binding: &crate::Dflash2Binding,
-    ) -> Result<Option<Dflash2Kernels>, CatalogFailure> {
+    /// The unfused draft stages: every projection (per kind, weight and
+    /// published element, over every scope sharing it) and norm (per element
+    /// and width) of `super::draft::stage_entries`, then a convolved
+    /// backbone's convolution halves and gated product, DFlash2's top-k,
+    /// codebook gathers and path step, and LiLiCorr's corrector entries.
+    /// Leaves a stage absent during a tuning count.
+    fn draft_stages(&mut self, plan: &crate::DraftProgramPlan) -> Result<(), CatalogFailure> {
         let activation = plan.activation();
-        let selector = binding.selector;
-        let (projections, norm_elements) = super::draft::dflash2_entries(plan, binding);
-        let mut prepared = Dflash2Projections::new();
-        let mut complete = true;
+        let (projections, norm_keys) = super::draft::stage_entries(plan);
         for ((kind, weight, output), scopes) in projections {
-            match self.spec.tuned(
+            if let Some(kernel) = self.spec.tuned(
                 &mut self.tuning,
                 &ProjectRowsTuning {
                     weight,
@@ -3157,83 +3132,170 @@ impl<'a> Preparation<'a> {
                     scopes,
                 },
             )? {
-                Some(kernel) => {
-                    prepared.insert((kind, weight, output), kernel);
-                }
-                None => complete = false,
+                self.draft_kernels()
+                    .projections
+                    .insert((kind, weight, output), kernel);
             }
         }
-        let mut norms = HashMap::new();
-        for norm in norm_elements {
-            match self.features(&format!("dflash2 NW={}", norm.name()), norm, activation)? {
-                Some(kernel) => {
-                    norms.insert(norm, kernel);
-                }
-                None => complete = false,
+        for (norm, width) in norm_keys {
+            if let Some(kernel) = self.features_at(
+                &format!("draft NW={} D={width}", norm.name()),
+                norm,
+                activation,
+                width,
+                (1, width),
+            )? {
+                self.draft_kernels().norms.insert((norm, width), kernel);
             }
         }
         let bindings = format!("A={}", activation.name());
-        let convolve_input = fixed!(
+        if plan.convolutions().is_some() {
+            let convolve_input = fixed!(
+                self.spec,
+                draft_convolve_input,
+                bindings,
+                draft_convolve_input::Elements { A: activation }
+            );
+            let convolve_residual = fixed!(self.spec, draft_convolve_residual, "");
+            let gated = fixed!(
+                self.spec,
+                draft_gated_rows,
+                bindings,
+                draft_gated_rows::Elements { A: activation }
+            );
+            self.draft_kernels().convolved = match (convolve_input, convolve_residual, gated) {
+                (Some(convolve_input), Some(convolve_residual), Some(gated)) => {
+                    Some(ConvolvedKernels {
+                        convolve_input,
+                        convolve_residual,
+                        gated,
+                    })
+                }
+                _ => None,
+            };
+        }
+        if let Some(selector) = plan.selector() {
+            let top_k = fixed!(self.spec, draft_top_k, "");
+            let path = fixed!(
+                self.spec,
+                draft_path_step,
+                bindings,
+                draft_path_step::Elements { A: activation }
+            );
+            let codebook = |spec: &mut Specializer, table: Element| {
+                spec.fixed(
+                    &format!("selector EW={}", table.name()),
+                    &[("D", selector.rank)],
+                    embedding_rows::native_entry_with(embedding_rows::Elements {
+                        EW: table,
+                        A: activation,
+                    }),
+                )
+            };
+            let predecessor = codebook(&mut self.spec, selector.predecessor)?;
+            let successor = codebook(&mut self.spec, selector.successor)?;
+            self.draft_kernels().selector = match (top_k, path, predecessor, successor) {
+                (Some(top_k), Some(path), Some(predecessor), Some(successor)) => {
+                    Some(SelectorKernels {
+                        top_k,
+                        predecessor,
+                        successor,
+                        path,
+                    })
+                }
+                _ => None,
+            };
+        }
+        if let Some(corrector) = plan.corrector() {
+            let corrector = corrector.clone();
+            let kernels = self.corrector(&corrector, activation)?;
+            self.draft_kernels().corrector = kernels;
+        }
+        Ok(())
+    }
+
+    /// LiLiCorr's corrector entries beside its projections and norms, at its
+    /// geometry. `None` during a tuning count.
+    fn corrector(
+        &mut self,
+        binding: &crate::CorrectorBinding,
+        activation: Element,
+    ) -> Result<Option<CorrectorKernels>, CatalogFailure> {
+        let (width, top_k) = (binding.width, binding.top_k);
+        let slots = binding.slots;
+        let nodes = slots * top_k;
+        let bindings = format!("A={}", activation.name());
+        let top = fixed!(self.spec, draft_top_k, "");
+        let features = fixed!(
             self.spec,
-            draft_convolve_input,
+            corrector_features,
             bindings,
-            draft_convolve_input::Elements { A: activation }
+            corrector_features::Elements { A: activation },
+            statics & [("V", self.vocabulary), ("K", top_k), ("H", width)]
         );
-        let convolve_residual = fixed!(self.spec, draft_convolve_residual, "");
-        let gated = fixed!(
-            self.spec,
-            draft_gated_rows,
-            bindings,
-            draft_gated_rows::Elements { A: activation }
-        );
-        let top_k = fixed!(self.spec, draft_top_k, "");
-        let path = fixed!(
-            self.spec,
-            draft_path_step,
-            bindings,
-            draft_path_step::Elements { A: activation }
-        );
-        let codebook = |spec: &mut Specializer, table: Element| {
-            spec.fixed(
-                &format!("dflash2 EW={}", table.name()),
-                &[("D", selector.rank)],
-                embedding_rows::native_entry_with(embedding_rows::Elements {
-                    EW: table,
-                    A: activation,
-                }),
-            )
-        };
-        let predecessor = codebook(&mut self.spec, selector.predecessor)?;
-        let successor = codebook(&mut self.spec, selector.successor)?;
-        Ok(
-            match (
-                complete,
-                convolve_input,
-                convolve_residual,
-                gated,
-                top_k,
-                path,
-                predecessor,
-                successor,
+        let mut rows = HashMap::new();
+        let mut complete = true;
+        for key in super::draft::corrector_rows_keys(binding, activation) {
+            let (columns, residual, output) = key;
+            match fixed!(
+                self.spec,
+                corrector_rows,
+                format!("Y={}", output.name()),
+                corrector_rows::Elements { Y: output },
+                statics & [("N", columns), ("R", residual)]
             ) {
+                Some(kernel) => {
+                    rows.insert(key, kernel);
+                }
+                None => complete = false,
+            }
+        }
+        let node_rows = self.spec.fixed(
+            "",
+            &[
+                ("J", slots),
+                ("K", top_k),
+                ("H", width),
+                ("TB", u64::from(binding.token.is_some())),
+            ],
+            corrector_nodes::native_entry(),
+        )?;
+        let attention = fixed!(
+            self.spec,
+            corrector_attention,
+            bindings,
+            corrector_attention::Elements { A: activation },
+            statics & [("N", nodes), ("NH", binding.heads), ("W", width / binding.heads)]
+        );
+        let factors = fixed!(
+            self.spec,
+            corrector_factors,
+            bindings,
+            corrector_factors::Elements { A: activation },
+            statics & [("N", nodes), ("H", width)]
+        );
+        let path = self.spec.fixed(
+            "",
+            &[("J", slots), ("K", top_k), ("F", binding.factor)],
+            corrector_path::native_entry(),
+        )?;
+        Ok(
+            match (complete, top, features, node_rows, attention, factors, path) {
                 (
                     true,
-                    Some(convolve_input),
-                    Some(convolve_residual),
-                    Some(gated),
                     Some(top_k),
+                    Some(features),
+                    Some(nodes),
+                    Some(attention),
+                    Some(factors),
                     Some(path),
-                    Some(predecessor),
-                    Some(successor),
-                ) => Some(Dflash2Kernels {
-                    norms,
-                    projections: prepared,
-                    convolve_input,
-                    convolve_residual,
-                    gated,
+                ) => Some(CorrectorKernels {
                     top_k,
-                    predecessor,
-                    successor,
+                    features,
+                    rows,
+                    nodes,
+                    attention,
+                    factors,
                     path,
                 }),
                 _ => None,

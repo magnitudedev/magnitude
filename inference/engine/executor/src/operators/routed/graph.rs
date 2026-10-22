@@ -2,18 +2,19 @@
 //! expert's dense feed-forward onto the residual as the `base`, selection,
 //! an optional latent down projection, the experts (decode form up to
 //! [`DECODE_ROWS`](super::fused_graph::DECODE_ROWS) rows, grouped form beyond) summed onto the base, and an
-//! optional latent up projection. Row tables, the selection bias and scales
-//! a model lacks and a latent sum's zero base are graph constants.
+//! optional latent up projection. Row tables, the selection bias a model
+//! lacks and a latent sum's zero base are graph constants; a scale it lacks
+//! is the absent operand.
 
 use super::fused_graph::{TILE_ROWS, decodes, grouped_blocks};
 use crate::native::{DenseExpansionKernel, ExpertKernels, GeneralRoutedKernels};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{
-    PackedWeight, ScaledWeight, WeightPort, packed_weight, resident_scale, scaled_weight, weight,
+    PackedWeight, ScaledWeight, WeightPort, WeightScale, packed_weight, scaled_weight, weight,
 };
 use crate::{GeneralRoutedBinding, GeneralRoutedShape, ModelLoadPlan};
-use magnitude_family_contracts::{WeightKind, WeightScope};
+use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{
     dense_expand, dense_output, dense_up, project_rows, routed_down, routed_experts,
     routed_experts_up, routed_gate_up, routed_group, routed_scatter, routed_select, routed_up,
@@ -253,9 +254,17 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     };
     let expert_up = weight(graph, WeightKind::ExpertUp)?;
     let expert_down = weight(graph, WeightKind::ExpertDown)?;
-    // Per-expert scales of the stacked expert weights, when they have them.
-    let expert_up_scale = resident_scale(graph, load, scope, WeightKind::ExpertUp, weights)?;
-    let expert_down_scale = resident_scale(graph, load, scope, WeightKind::ExpertDown, weights)?;
+    // Per-expert scales of the stacked expert weights, absent where they
+    // have none.
+    let role = |kind| WeightRole { scope, kind };
+    let expert_gate_scale = match shape.experts_expansion.gated {
+        true => WeightScale::per_expert(graph, load, role(WeightKind::ExpertGate), weights, constants)?,
+        false => WeightScale::absent(graph, constants)?,
+    };
+    let expert_up_scale =
+        WeightScale::per_expert(graph, load, role(WeightKind::ExpertUp), weights, constants)?;
+    let expert_down_scale =
+        WeightScale::per_expert(graph, load, role(WeightKind::ExpertDown), weights, constants)?;
     let shared_weights = match shape.shared {
         Some((_, expansion)) => {
             let mut packed =
@@ -291,9 +300,9 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     } else {
         None
     };
-    // The selection bias a model lacks is zeros, absent expert scales ones.
-    // The down weight's per-expert second-level scales are the combine's
-    // expert scales (plan admission refuses both at once).
+    // The selection bias a model lacks is zeros. The combine's per-expert
+    // scales (ES) are the stored output scales or the down weight's
+    // second-level scales (plan admission refuses both at once), else absent.
     let experts = usize::try_from(shape.experts).map_err(|_| "expert count exceeds host")?;
     let bias = match bias {
         Some(bias) => bias,
@@ -304,31 +313,9 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
             tensor
         }
     };
-    let expert_scale = match (expert_scale, expert_down_scale) {
-        (Some(scale), None) | (None, Some(scale)) => scale,
-        (Some(_), Some(_)) => {
-            return Err("stored expert scales beside a scaled expert down weight".into());
-        }
-        (None, None) => {
-            let constant = GraphConstant::f32(graph, &vec![1.0; experts])?;
-            let tensor = constant.port().tensor().clone();
-            constants.push(constant);
-            tensor
-        }
-    };
-    // Up-only experts' accumulator scales: the up weight's per-expert
-    // second-level scales, else ones (gated experts bind none; plan
-    // admission refuses a scaled gated expert).
-    let up_scale = match (shape.experts_expansion.gated, expert_up_scale) {
-        (true, None) => None,
-        (true, Some(_)) => return Err("gated experts have no up scale port".into()),
-        (false, Some(scale)) => Some(scale),
-        (false, None) => {
-            let constant = GraphConstant::f32(graph, &vec![1.0; experts])?;
-            let tensor = constant.port().tensor().clone();
-            constants.push(constant);
-            Some(tensor)
-        }
+    let expert_scale = WeightScale {
+        extent: shape.expert_scale_extent(expert_down_scale.extent),
+        tensor: expert_scale.unwrap_or(expert_down_scale.tensor),
     };
     // The row table of the dense projections (shared expert, latent up): a
     // graph port only when one reads it (an unread port is unbound).
@@ -373,25 +360,25 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                             &[
                                 dimensions.as_slice(),
                                 &[
-                                    ("GS", gate.scaled.extent),
-                                    ("US", up.scaled.extent),
-                                    ("GB", gate.bound.extent),
-                                    ("UB", up.bound.extent),
+                                    ("GS", gate.operands.scale.extent),
+                                    ("US", up.operands.scale.extent),
+                                    ("GB", gate.operands.bound.extent),
+                                    ("UB", up.operands.bound.extent),
                                 ],
                             ]
                             .concat(),
                             dense_expand::WorkflowArgs {
                                 residual: residual.into(),
                                 norm: (&norm).into(),
-                                gate_weight: (&gate.scaled.weight).into(),
-                                up_weight: (&up.scaled.weight).into(),
+                                gate_weight: (&gate.weight).into(),
+                                up_weight: (&up.weight).into(),
                                 out_rows: (&row_table()?).into(),
                                 eps: epsilon,
                                 activation,
-                                gate_scale: (&gate.scaled.scale).into(),
-                                up_scale: (&up.scaled.scale).into(),
-                                gate_bound: (&gate.bound.tensor).into(),
-                                up_bound: (&up.bound.tensor).into(),
+                                gate_scale: (&gate.operands.scale.tensor).into(),
+                                up_scale: (&up.operands.scale.tensor).into(),
+                                gate_bound: (&gate.operands.bound.tensor).into(),
+                                up_bound: (&up.operands.bound.tensor).into(),
                             },
                         )?
                         .value
@@ -400,7 +387,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     graph
                         .enqueue(
                             entry,
-                            &[dimensions.as_slice(), &[("US", up.extent)]].concat(),
+                            &[dimensions.as_slice(), &[("US", up.scale.extent)]].concat(),
                             dense_up::WorkflowArgs {
                                 residual: residual.into(),
                                 norm: (&norm).into(),
@@ -408,7 +395,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                                 out_rows: (&row_table()?).into(),
                                 eps: epsilon,
                                 activation,
-                                up_scale: (&up.scale).into(),
+                                up_scale: (&up.scale.tensor).into(),
                             },                        )?
                         .value
                 }
@@ -419,16 +406,16 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     output,
                     &[
                         dimensions.as_slice(),
-                        &[("DS", down.scaled.extent), ("DB", down.bound.extent)],
+                        &[("DS", down.operands.scale.extent), ("DB", down.operands.bound.extent)],
                     ]
                     .concat(),
                     dense_output::WorkflowArgs {
                         residual: (&root).into(),
                         product: (&product).into(),
-                        down_weight: (&down.scaled.weight).into(),
+                        down_weight: (&down.weight).into(),
                         out_rows: (&row_table()?).into(),
-                        down_scale: (&down.scaled.scale).into(),
-                        down_bound: (&down.bound.tensor).into(),
+                        down_scale: (&down.operands.scale.tensor).into(),
+                        down_bound: (&down.operands.bound.tensor).into(),
                     },
                 )?
                 .value
@@ -438,19 +425,20 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     };
 
     let choices = shape.select_dimensions(rows);
-    let mut routes = graph.local_for(entries.select, "routes", &choices)?;
-    let mut route_weights = graph.local_for(entries.select, "weights", &choices)?;
+    let select_dimensions = [choices.as_slice(), &[("ES", expert_scale.extent)]].concat();
+    let mut routes = graph.local_for(entries.select, "routes", &select_dimensions)?;
+    let mut route_weights = graph.local_for(entries.select, "weights", &select_dimensions)?;
     let normalized = graph
         .enqueue(
             entries.select,
-            &choices,
+            &select_dimensions,
             routed_select::WorkflowArgs {
                 residual: residual.into(),
                 norm: (&norm).into(),
                 router_norm: (&router_norm).into(),
                 router: (&router).into(),
                 bias: (&bias).into(),
-                expert_scale: (&expert_scale).into(),
+                expert_scale: (&expert_scale.tensor).into(),
                 routes: routes.tensor_mut().into(),
                 weights: route_weights.tensor_mut().into(),
                 epsilon,
@@ -472,14 +460,14 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         ("M", rows),
                         ("K", shape.hidden),
                         ("N", shape.expert_hidden),
-                        ("WS", down.scaled.extent),
-                        ("WB", down.bound.extent),
+                        ("WS", down.operands.scale.extent),
+                        ("WB", down.operands.bound.extent),
                     ],
                     project_rows::WorkflowArgs {
                         source: (&normalized).into(),
-                        weight: (&down.scaled.weight).into(),
-                        weight_scale: (&down.scaled.scale).into(),
-                        weight_bound: (&down.bound.tensor).into(),
+                        weight: (&down.weight).into(),
+                        weight_scale: (&down.operands.scale.tensor).into(),
+                        weight_bound: (&down.operands.bound.tensor).into(),
                     },
                 )?
                 .value;
@@ -501,13 +489,22 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                 graph
                     .enqueue(
                         decode,
-                        &dimensions,
+                        &[
+                            dimensions.as_slice(),
+                            &[
+                                ("GS", expert_gate_scale.extent),
+                                ("US", expert_up_scale.extent),
+                            ],
+                        ]
+                        .concat(),
                         routed_gate_up::WorkflowArgs {
                             normalized: (&expert_input).into(),
                             routes: routes.tensor().into(),
                             expert_gate: gate.into(),
                             expert_up: (&expert_up).into(),
                             activation,
+                            gate_scale: (&expert_gate_scale.tensor).into(),
+                            up_scale: (&expert_up_scale.tensor).into(),
                         },                    )?
                     .value
             }
@@ -515,15 +512,12 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                 graph
                     .enqueue(
                         decode,
-                        &dimensions,
+                        &[dimensions.as_slice(), &[("US", expert_up_scale.extent)]].concat(),
                         routed_up::WorkflowArgs {
                             normalized: (&expert_input).into(),
                             routes: routes.tensor().into(),
                             expert_up: (&expert_up).into(),
-                            up_scale: up_scale
-                                .as_ref()
-                                .ok_or("up-only experts without up scales")?
-                                .into(),
+                            up_scale: (&expert_up_scale.tensor).into(),
                             activation,
                         },                    )?
                     .value
@@ -578,7 +572,14 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                 graph
                     .enqueue(
                         entry,
-                        &grouped,
+                        &[
+                            grouped.as_slice(),
+                            &[
+                                ("GS", expert_gate_scale.extent),
+                                ("US", expert_up_scale.extent),
+                            ],
+                        ]
+                        .concat(),
                         routed_experts::WorkflowArgs {
                             normalized: (&expert_input).into(),
                             order: order.tensor().into(),
@@ -587,6 +588,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                             expert_up: (&expert_up).into(),
                             expert_down: (&expert_down).into(),
                             activation,
+                            gate_scale: (&expert_gate_scale.tensor).into(),
+                            up_scale: (&expert_up_scale.tensor).into(),
                         },                    )?
                     .value
             }
@@ -594,17 +597,14 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                 graph
                     .enqueue(
                         entry,
-                        &grouped,
+                        &[grouped.as_slice(), &[("US", expert_up_scale.extent)]].concat(),
                         routed_experts_up::WorkflowArgs {
                             normalized: (&expert_input).into(),
                             order: order.tensor().into(),
                             blocks: block_experts.tensor().into(),
                             expert_up: (&expert_up).into(),
                             expert_down: (&expert_down).into(),
-                            up_scale: up_scale
-                                .as_ref()
-                                .ok_or("up-only experts without up scales")?
-                                .into(),
+                            up_scale: (&expert_up_scale.tensor).into(),
                             activation,
                         },                    )?
                     .value
@@ -639,16 +639,16 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         ("O", rows),
                         ("H", shape.hidden),
                         ("F", shape.expert_hidden),
-                        ("DS", up.scaled.extent),
-                        ("DB", up.bound.extent),
+                        ("DS", up.operands.scale.extent),
+                        ("DB", up.operands.bound.extent),
                     ],
                     dense_output::WorkflowArgs {
                         residual: (&base).into(),
                         product: (&routed).into(),
-                        down_weight: (&up.scaled.weight).into(),
+                        down_weight: (&up.weight).into(),
                         out_rows: (&row_table()?).into(),
-                        down_scale: (&up.scaled.scale).into(),
-                        down_bound: (&up.bound.tensor).into(),
+                        down_scale: (&up.operands.scale.tensor).into(),
+                        down_bound: (&up.operands.bound.tensor).into(),
                     },
                 )?
                 .value;

@@ -5,7 +5,7 @@
 //! path, and owns the sole cache of resulting device tensors.
 
 use crate::device_table::{
-    DeviceTable, KeptRows, ResidentTable, TileRun, TileSource, TilesBrought,
+    DeviceTable, KeptRows, ResidentTable, StoredRows, TileRun, TileSource, TilesBrought,
 };
 use crate::domain::ClaimRefusal;
 use crate::programs::ProgramSubmission;
@@ -373,6 +373,17 @@ impl TileSource for TileImport {
                 .map_err(|error| format!("streamed table rows: {error}"))
         }))
     }
+
+    fn rows(&self) -> Arc<dyn StoredRows> {
+        Arc::new(self.table.clone())
+    }
+}
+
+impl StoredRows for crate::host_tables::HostTable {
+    fn read(&self, first: u64, out: &mut [u8]) -> Result<(), String> {
+        self.gather_run(first, out)
+            .map_err(|error| format!("streamed table rows: {error}"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -615,7 +626,8 @@ impl ResidencyStore {
             table.source(),
             streamed.table_rows,
             &plan.shape[1..],
-            plan.shape[0],
+            plan.shape[0] - streamed.landing_rows,
+            streamed.landing_rows,
             streamed.staging_rows,
             streamed.directory,
             Box::new(TileImport {
@@ -866,6 +878,7 @@ impl ResidencyStore {
                 actual_source,
                 resident_element(
                     *encoding,
+                    crate::import_transforms::scaled_activations(descriptor),
                     shape.last().copied().unwrap_or(1),
                     target,
                     layout,
@@ -1539,6 +1552,7 @@ fn validate_dense(stored: &StoredTensor) -> Result<usize, WeightImportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magnitude_family_contracts::ScaledActivations;
 
     #[test]
     fn catalog_encoding_map_is_exact() {
@@ -1562,14 +1576,20 @@ mod tests {
         ] {
             assert!(source_element(encoding, 2560).is_some());
             for layout in seismic::Layout::ALL {
-                assert!(resident_element(encoding, 2560, DType::BF16, layout).is_some());
+                let rounded = ScaledActivations::Rounded;
+                assert!(resident_element(encoding, rounded, 2560, DType::BF16, layout).is_some());
             }
         }
         for encoding in [Encoding::Q1_0, Encoding::I32] {
             assert!(source_element(encoding, 2560).is_none());
-            assert!(
-                resident_element(encoding, 2560, DType::BF16, seismic::Layout::Rows16).is_none()
-            );
+            assert!(resident_element(
+                encoding,
+                ScaledActivations::Rounded,
+                2560,
+                DType::BF16,
+                seismic::Layout::Rows16
+            )
+            .is_none());
         }
     }
 

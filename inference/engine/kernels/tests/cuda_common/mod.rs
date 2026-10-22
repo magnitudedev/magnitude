@@ -45,6 +45,9 @@ pub enum Format {
     Q5_1,
     Mxfp4,
     Nvfp4,
+    /// GGUF NVFP4 calibrated for FP4 activations (W4A4): nvfp4g16's storage,
+    /// NVFP4 operands.
+    Nvfp4A4,
     /// GGUF IQ2_XS, IQ3_XXS and IQ2_XXS (vector codes, representations of
     /// their own).
     Iq2Xs,
@@ -53,7 +56,7 @@ pub enum Format {
 }
 
 impl Format {
-    pub const ALL: [Format; 13] = [
+    pub const ALL: [Format; 14] = [
         Format::Q4K,
         Format::Q5K,
         Format::Q6K,
@@ -64,6 +67,7 @@ impl Format {
         Format::Q5_1,
         Format::Mxfp4,
         Format::Nvfp4,
+        Format::Nvfp4A4,
         Format::Iq2Xs,
         Format::Iq3Xxs,
         Format::Iq2Xxs,
@@ -79,7 +83,7 @@ impl Format {
             Format::Q5_0 => "gguf_q5_0",
             Format::Q5_1 => "gguf_q5_1",
             Format::Mxfp4 => "gguf_mxfp4",
-            Format::Nvfp4 => "gguf_nvfp4",
+            Format::Nvfp4 | Format::Nvfp4A4 => "gguf_nvfp4",
             Format::Iq2Xs => "gguf_iq2_xs",
             Format::Iq3Xxs => "gguf_iq3_xxs",
             Format::Iq2Xxs => "gguf_iq2_xxs",
@@ -97,6 +101,7 @@ impl Format {
             Format::Q5_1 => "q5g32",
             Format::Mxfp4 => "mxfp4g32",
             Format::Nvfp4 => "nvfp4g16",
+            Format::Nvfp4A4 => "nvfp4g16a4",
             Format::Iq2Xs => "iq2xs",
             Format::Iq3Xxs => "iq3xxs",
             Format::Iq2Xxs => "iq2xxs",
@@ -113,6 +118,7 @@ impl Format {
                 | Format::Q5_1
                 | Format::Mxfp4
                 | Format::Nvfp4
+                | Format::Nvfp4A4
                 | Format::Iq2Xs
                 | Format::Iq3Xxs
                 | Format::Iq2Xxs
@@ -169,7 +175,7 @@ impl Format {
                 block.push(117 + (rng.next() % 3) as u8);
                 block.extend((0..16).map(|_| rng.byte()));
             }
-            Format::Nvfp4 => {
+            Format::Nvfp4 | Format::Nvfp4A4 => {
                 // UE4M3 subnormal and smallest-normal scales (<= 2^-5).
                 block.extend((0..4).map(|_| (rng.next() % 16) as u8));
                 block.extend((0..32).map(|_| rng.byte()));
@@ -198,7 +204,7 @@ impl Format {
     pub fn block_values(self) -> usize {
         match self {
             Format::Q8 | Format::Q4_0 | Format::Q5_0 | Format::Q5_1 | Format::Mxfp4 => 32,
-            Format::Nvfp4 => 64,
+            Format::Nvfp4 | Format::Nvfp4A4 => 64,
             _ => 256,
         }
     }
@@ -378,6 +384,17 @@ impl Mapping {
             .with_launch_param(2, "KSPLIT", self.ksplit)
             .with_launch_param(4, "ROTATE", self.rotate)
     }
+    /// [`Mapping::projection_params`] of the dense pair (`dense_up`,
+    /// `dense_output`), whose GEMV launches share one entry-wide KSPLIT.
+    pub fn dense_pair_params(
+        self,
+        spec: seismic::NativeSpecialization,
+    ) -> seismic::NativeSpecialization {
+        spec.with_param("INT8", self.int8)
+            .with_param("OPERAND", 0)
+            .with_param("KSPLIT", self.ksplit)
+            .with_launch_param(4, "ROTATE", self.rotate)
+    }
     /// Readout head GEMVs own KSPLIT on launches 1 and 2, its GEMM ROTATE.
     pub fn head_params(self, spec: seismic::NativeSpecialization) -> seismic::NativeSpecialization {
         spec.with_param("OPERAND", 0)
@@ -553,16 +570,29 @@ pub fn dequant_bound(
 }
 
 /// The activation rows (x holds rows of `k`) a mapping's operand path
-/// multiplies, and the slack of each (zero on the 16-bit path; half a
-/// quantization step on the INT8 path, where a tie resolved differently
-/// before quantization moves a value by up to one step).
-pub fn operand_rows(x: &[f32], k: usize, mapping: Mapping) -> (Vec<f32>, Vec<f32>) {
-    if mapping.quantizes(x.len() / k) {
+/// multiplies over weights of `format` (`None`: dense), and the slack of
+/// each: the recipe's rows of NVFP4 weights (`nvfp4_rows`), exact, which
+/// activation quantization never re-forms; half a quantization step on the
+/// INT8 path, where a tie resolved differently before quantization moves a
+/// value by up to one step; else the rows as they are, exact.
+pub fn operand_rows(
+    x: &[f32],
+    k: usize,
+    mapping: Mapping,
+    format: Option<Format>,
+) -> (Vec<f32>, Vec<f32>) {
+    if format == Some(Format::Nvfp4A4) {
+        (nvfp4_rows(x, k), vec![0.0; x.len()])
+    } else if mapping.quantizes(x.len() / k) {
         quantize(x, k)
     } else {
         (x.to_vec(), vec![0.0; x.len()])
     }
 }
+
+#[path = "../operands/mod.rs"]
+mod operands;
+pub use operands::nvfp4_rows;
 
 pub fn check(label: &str, actual: &[f32], expected: &[f64], tolerance: &[f64]) {
     assert_eq!(actual.len(), expected.len(), "{label}: length");

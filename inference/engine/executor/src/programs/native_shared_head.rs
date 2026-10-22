@@ -15,14 +15,15 @@
 //! ends. No pass writes history: the head keeps none.
 
 use super::native_draft::widen;
-use super::{DeviceSubmission, HeadProgram};
+use super::{DeviceSubmission, HeadOutput, HeadProgram};
+use crate::device_table::SelectedRead;
 use crate::operators::block::{
     BlockControlPorts, BlockLane, BlockStatePorts, BlockSublayers, CheckedFeedForwardEntries,
     CheckedMixerEntries, FeedForwardEntries, MixerEntries,
 };
 use crate::operators::{InputForm, SharedHead, paired_block};
 use crate::{
-    DeviceError, GraphOutputTensor, HeadLaunchCore, InvariantError, ModelLoadPlan,
+    DeviceError, HeadLaunchCore, InvariantError, ModelLoadPlan,
     NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead, ResidentWeight,
     ResourceLimits, SharedHeadProgramPlan, StateResourcePlan, SubmitError, ValidatedHeadLaunch,
     completion::CompletionWaiter,
@@ -35,7 +36,8 @@ use crate::{
             distinct_storage_bytes,
         },
         native_target_graph::{
-            GatheredTable, WeightPort, embedding_transform, packed_weight, projection_ports,
+            CheckedLandingEntries, GatheredTable, LandedReadPorts, LandingEntries, RowDirectory,
+            TARGET_TABLE, WeightPort, embedding_transform, packed_weight, projection_ports,
             scaled_weight_ports, weight,
         },
     },
@@ -184,6 +186,9 @@ impl<'a> SharedHeadGeometry<'a> {
 /// The kernel entries of a head graph: prepared kernels or checked bindings.
 /// A block's entries are taken once per pass.
 struct SharedHeadEntries<'a, 'e, G: GraphDraft + 'a> {
+    /// The landing entries of the token table's landed reads, when it has
+    /// landing slots.
+    landing: Option<LandingEntries<'a, G>>,
     embedding: G::Binding<'a, embedding_rows::Entry>,
     join: G::Binding<'a, tap_rows::Entry>,
     input: G::Binding<'a, project_rows::Entry>,
@@ -218,6 +223,9 @@ struct BlockPorts {
 struct PassPorts {
     blocks: Vec<BlockPorts>,
     selection: SelectionPorts,
+    /// A chained pass's landed read of the tokens it embeds, of a table
+    /// with landing slots.
+    landed: Option<LandedReadPorts>,
 }
 
 struct SharedHeadGraphParts<P> {
@@ -361,43 +369,56 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
     let mut chained: Option<WorkflowTensor> = None;
     for step in 0..class.steps {
         // The first pass embeds the host's rows, a chained pass the rows
-        // the device selected.
-        let selected;
-        let (tokens, directory): (seismic::WorkflowTensorRef<'_>, _) = match step {
-            0 => (
-                tokens.tensor().into(),
-                table.by_rows(&mut graph, &mut constants)?,
-            ),
+        // the device selected, a landed read of a table with landing slots.
+        let (gathered, table_rows) = (table.table.clone(), table.rows);
+        let embed = |graph: &mut G,
+                     tokens: seismic::WorkflowTensorRef<'_>,
+                     directory: &RowDirectory| {
+            Ok::<_, GraphError>(
+                graph
+                    .enqueue(
+                        entries.embedding,
+                        &[
+                            ("M", slots),
+                            ("V", table_rows),
+                            ("D", hidden),
+                            ("R", directory.shape[0]),
+                            ("F", directory.shape[1]),
+                        ],
+                        embedding_rows::WorkflowArgs {
+                            table: (&gathered).into(),
+                            tokens,
+                            directory: (&directory.tensor).into(),
+                            scale,
+                            normalize,
+                            epsilon: embedding_epsilon,
+                        },
+                    )?
+                    .r1,
+            )
+        };
+        let (embedded, landed) = match step {
+            0 => {
+                let directory = table.by_rows(&mut graph, &mut constants)?;
+                (embed(&mut graph, tokens.tensor().into(), &directory)?, None)
+            }
             _ => {
-                selected = selections
+                let selected = selections
                     .tensor()
                     .slice_leading((step - 1) * slots, step * slots);
-                (
+                table.read_selected(
+                    &mut graph,
+                    load,
+                    &mut weights,
+                    &mut constants,
+                    entries.landing,
                     (&selected).into(),
-                    table.selected(&mut graph, load, &mut weights, &mut constants)?,
-                )
+                    slots,
+                    None,
+                    |graph, directory| embed(graph, (&selected).into(), directory),
+                )?
             }
         };
-        let embedded = graph
-            .enqueue(
-                entries.embedding,
-                &[
-                    ("M", slots),
-                    ("V", table.rows),
-                    ("D", hidden),
-                    ("R", directory.shape[0]),
-                    ("F", directory.shape[1]),
-                ],
-                embedding_rows::WorkflowArgs {
-                    table: (&table.table).into(),
-                    tokens,
-                    directory: (&directory.tensor).into(),
-                    scale,
-                    normalize,
-                    epsilon: embedding_epsilon,
-                },
-            )?
-            .r1;
         let mut joined = graph.local_for(entries.join, "taps", &join_dims)?;
         graph.enqueue(
             entries.join,
@@ -427,14 +448,14 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                     ("M", slots),
                     ("K", 2 * hidden),
                     ("N", width),
-                    ("WS", input.scaled.extent),
-                    ("WB", input.bound.extent),
+                    ("WS", input.operands.scale.extent),
+                    ("WB", input.operands.bound.extent),
                 ],
                 project_rows::WorkflowArgs {
                     source: joined.tensor().into(),
-                    weight: (&input.scaled.weight).into(),
-                    weight_scale: (&input.scaled.scale).into(),
-                    weight_bound: (&input.bound.tensor).into(),
+                    weight: (&input.weight).into(),
+                    weight_scale: (&input.operands.scale.tensor).into(),
+                    weight_bound: (&input.operands.bound.tensor).into(),
                 },
             )?
             .value;
@@ -676,7 +697,11 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
             inputs,
             (&mut result).into(),
         )?;
-        passes.push(PassPorts { blocks, selection });
+        passes.push(PassPorts {
+            blocks,
+            selection,
+            landed,
+        });
         chained = if step + 1 < class.steps {
             let chain = chain
                 .as_ref()
@@ -689,14 +714,14 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                             ("M", slots),
                             ("K", width),
                             ("N", hidden),
-                            ("WS", chain.scaled.extent),
-                            ("WB", chain.bound.extent),
+                            ("WS", chain.operands.scale.extent),
+                            ("WB", chain.operands.bound.extent),
                         ],
                         project_rows::WorkflowArgs {
                             source: (&features).into(),
-                            weight: (&chain.scaled.weight).into(),
-                            weight_scale: (&chain.scaled.scale).into(),
-                            weight_bound: (&chain.bound.tensor).into(),
+                            weight: (&chain.weight).into(),
+                            weight_scale: (&chain.operands.scale.tensor).into(),
+                            weight_bound: (&chain.operands.bound.tensor).into(),
                         },
                     )?
                     .value,
@@ -787,6 +812,7 @@ pub(crate) fn checked_shared_head_family_storage(
     classes: impl IntoIterator<Item = SharedHeadGraphClass>,
 ) -> Result<CheckedGraphResources, GraphError> {
     let checked = CheckedSharedHeadEntries::new(geometry.plan, backend)?;
+    let landing = CheckedLandingEntries::of(load, TARGET_TABLE)?;
     let block = |index: usize| {
         checked
             .blocks
@@ -799,6 +825,7 @@ pub(crate) fn checked_shared_head_family_storage(
         let parts = shared_head_graph(
             NativeGraphMetadata::new(backend),
             SharedHeadEntries {
+                landing: landing.as_ref().map(CheckedLandingEntries::entries),
                 embedding: &checked.embedding[..],
                 join: &checked.join[..],
                 input: &checked.input[..],
@@ -863,9 +890,12 @@ impl PreparedSharedHeadGraphs {
         )
     }
 
+    /// `landing`: the landing entries of the token table, when it has
+    /// landing slots.
     pub(crate) fn prepare(
         target_device: &Device,
         kernels: &AttestedSharedHead,
+        landing: Option<&crate::native::AttestedLanding>,
         load: &ModelLoadPlan,
         geometry: &SharedHeadGeometry<'_>,
         classes: impl IntoIterator<Item = SharedHeadGraphClass>,
@@ -886,6 +916,7 @@ impl PreparedSharedHeadGraphs {
             let parts = shared_head_graph::<NativeGraph>(
                 target_device.native_graph(),
                 SharedHeadEntries {
+                    landing: landing.map(LandingEntries::native),
                     embedding: &kernels.embedding,
                     join: &kernels.join,
                     input: &kernels.input,
@@ -1132,7 +1163,7 @@ impl NativeSharedHeadProgram {
         core: &HeadLaunchCore,
         workspace: &mut NativeGraphWorkspaceLease,
         output: NativeGraphOutputLease,
-    ) -> Result<(seismic::NativeGraphCompletion, Option<GraphOutputTensor>), SubmitError> {
+    ) -> Result<(seismic::NativeGraphCompletion, HeadOutput), SubmitError> {
         let reads = core
             .target_reads()
             .ok_or_else(|| invalid("a head without a store reads target history"))?;
@@ -1204,12 +1235,15 @@ impl NativeSharedHeadProgram {
             })
             .collect::<Vec<_>>();
         let rows = self.graphs.embedding.indices(&tokens).map_err(invalid)?;
-        // A chained pass embeds the device's selection. One the device
-        // does not hold embeds another row, and the target rejects the
-        // proposal that follows.
-        if !chain.is_empty() {
-            self.graphs.embedding.read_selected();
-        }
+        // A chained pass embeds the device's selection, a landed read of a
+        // table with landing slots.
+        let landed = graph
+            .passes
+            .iter()
+            .filter_map(|pass| pass.landed.as_ref())
+            .map(|ports| ports.queue(&self.graphs.embedding, &mut bindings))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(invalid)?;
         active
             .write_input(
                 &graph.tokens,
@@ -1247,17 +1281,24 @@ impl NativeSharedHeadProgram {
             .attach(bindings, outputs)
             .and_then(|ready| ready.submit())
             .map_err(device)?;
+        let landed_reads = landed.into_iter().map(SelectedRead::submitted).collect();
         let owner = output.publish(outputs);
         let selections = owner
             .tensor(&graph.output)
             .ok_or_else(|| invalid("head graph omitted its selections"))?;
-        Ok((completion, Some(selections)))
+        Ok((
+            completion,
+            HeadOutput {
+                selections: Some(selections),
+                landed_reads,
+            },
+        ))
     }
 }
 
 impl HeadProgram for NativeSharedHeadProgram {
     type Submission =
-        DeviceSubmission<HeadLaunchCore, NativeGraphWorkspaceLease, Option<GraphOutputTensor>>;
+        DeviceSubmission<HeadLaunchCore, NativeGraphWorkspaceLease, HeadOutput>;
 
     fn submit(
         &mut self,
@@ -1270,7 +1311,7 @@ impl HeadProgram for NativeSharedHeadProgram {
                 None => Err(invalid("head graph output lease is absent")),
             }
         };
-        let (completion, selections) = match queued {
+        let (completion, output) = match queued {
             Ok(queued) => queued,
             Err(error) => return Err((error, launch)),
         };
@@ -1279,7 +1320,7 @@ impl HeadProgram for NativeSharedHeadProgram {
             self.waiter.completion(vec![completion]),
             core,
             workspace,
-            selections,
+            output,
         ))
     }
 }

@@ -43,7 +43,11 @@ kernel void routed_down(
         0, SEISMIC_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F));
     const auto down = routed::weights<packets::W0>(expert_down, KERNEL_W0_LAYOUT(SEISMIC_DIM_F),
         routed::expert_row(expert, SEISMIC_DIM_H), SEISMIC_DIM_F);
-    routed::project_channels<packets::W0, R, L, uint(SEISMIC_DIM_F)>(in, down, first, rows, projected[k], lane);
+    // The down weight's operand row (the product row, or NVFP4 operands),
+    // which this choice's simdgroup forms alone.
+    const auto x = projection::operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4>::lone_row(in,
+        uint(SEISMIC_DIM_F), lane);
+    routed::project_channels<packets::W0, R, L, uint(SEISMIC_DIM_F)>(x, down, first, rows, projected[k], lane);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint n = first + tid;

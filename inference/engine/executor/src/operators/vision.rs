@@ -41,7 +41,8 @@ pub struct VisionKernel {
     pub statics: Vec<(&'static str, u64)>,
 }
 
-/// How many rows an operand has: one per patch, or one per merged cell.
+/// How many rows an operand has: one per tower row (the image's patches,
+/// after the stem's register rows), or one per merged cell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VisionRows {
     Patches,
@@ -52,9 +53,13 @@ pub enum VisionRows {
 /// invocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VisionValue {
-    /// The prepared patch rows, `[M, frames · C · P · P]` F32.
+    /// The prepared patch rows, `[M, frames · C · P · P]` F32, after the
+    /// register rows' zero pixels.
     Pixels,
     Result(usize),
+    /// The patch rows of an earlier tower result: its rows after the
+    /// stem's register rows.
+    PatchRows(usize),
 }
 
 /// The operands of one invocation. Absent optional weights bind an empty
@@ -118,6 +123,13 @@ pub enum VisionOperands {
         source: VisionValue,
         table: WeightRole,
     },
+    /// The stem's register rows: the `vision_position` blend of the register
+    /// table into the leading rows (whose zero pixels the stem turned into
+    /// zero rows), one table row each with coefficient one.
+    Registers {
+        source: VisionValue,
+        table: WeightRole,
+    },
     PostNormResidual {
         residual: VisionValue,
         projected: VisionValue,
@@ -141,6 +153,8 @@ pub struct VisionProgram {
     pub ops: Vec<VisionOp>,
     /// Patch rows per merged cell.
     pub cell_rows: u64,
+    /// Register rows the tower holds ahead of each image's patch rows.
+    pub registers: u64,
     /// The width of one prepared patch row.
     pub pixel_width: u64,
     /// Whether the graph reads rotary coordinates, window spans and the
@@ -171,6 +185,7 @@ fn activation_code(activation: VisionActivation) -> i32 {
         VisionActivation::GeluTanh => 1,
         VisionActivation::GeluErf => 2,
         VisionActivation::GeluQuick => 3,
+        VisionActivation::ReluSquared => 4,
     }
 }
 
@@ -650,13 +665,24 @@ pub(crate) fn vision_program(
         .patch_row_width()
         .map_err(|_| PlanError::Arithmetic("vision patch row width overflows"))?;
     let table = role(vision, VisionWeight::Position);
+    let registers = description.stem.registers();
     let mut h = match &description.stem {
         VisionStem::Patch {
             frames,
             bias,
             positions: _,
             norm,
+            registers: register_table,
         } => {
+            // Register rows enter the stem as zero pixels with no position
+            // blend and receive their table rows after it: exact only for a
+            // stem without a bias (which would reach them) or a norm (which
+            // would precede their rows).
+            if register_table.is_some() && (bias.is_some() || norm.is_some()) {
+                return Err(unsupported(
+                    "vision register rows with a patch bias or stem norm",
+                ));
+            }
             let frame = role(WeightScope::VisionPatch(0), VisionWeight::PatchFrame);
             let next_frame = match frames.len() {
                 1 => None,
@@ -689,7 +715,7 @@ pub(crate) fn vision_program(
                     table,
                 },
             );
-            match norm {
+            let h = match norm {
                 None => h,
                 Some(norm) => b.norm(
                     h,
@@ -703,6 +729,20 @@ pub(crate) fn vision_program(
                     false,
                     false,
                 )?,
+            };
+            match register_table {
+                None => h,
+                Some(_) => {
+                    let table = role(vision, VisionWeight::Registers);
+                    let elements = vec![("PE", b.element(Some(table))?)];
+                    b.push(
+                        VisionEntry::Position,
+                        elements,
+                        vec![("H", hidden)],
+                        hidden,
+                        VisionOperands::Registers { source: h, table },
+                    )
+                }
             }
         }
         VisionStem::NormalizedPatch {
@@ -782,66 +822,96 @@ pub(crate) fn vision_program(
     if merger.standardize.is_some() && !matches!(merger.reduction, CellReduction::Average { .. }) {
         return Err(unsupported("vision standardization without a cell average"));
     }
+    if registers > 0 && windows {
+        return Err(unsupported("vision register rows with windowed attention"));
+    }
+    // The merger reads the tower's patch rows, past its register rows.
+    let patch_rows = |value: VisionValue| match value {
+        VisionValue::Result(index) if registers > 0 => VisionValue::PatchRows(index),
+        value => value,
+    };
     let mut x = match merger.reduction {
         CellReduction::Concatenate | CellReduction::Interleave => {
             let interleave = merger.reduction == CellReduction::Interleave;
-            // A tower post-norm precedes concatenation; the projector's norm
-            // then sees the complete cell. Keep the first result in F32 so
-            // the second norm reads the declared residual representation.
-            if let (Some(norm), Some(projection_norm)) = (&merger.norm, &merger.projection_norm) {
-                if windows || interleave {
-                    return Err(unsupported(
-                        "two merger norms require contiguous cell concatenation",
-                    ));
+            let contiguous = !windows && !interleave;
+            match (&merger.norm, &merger.projection_norm) {
+                // A tower post-norm precedes concatenation; the projector's
+                // norm then sees the complete cell. Keep the first result in
+                // F32 so the second norm reads the declared residual
+                // representation.
+                (Some(norm), Some(projection_norm)) => {
+                    if !contiguous {
+                        return Err(unsupported(
+                            "two merger norms require contiguous cell concatenation",
+                        ));
+                    }
+                    let normalized = b.norm(
+                        h,
+                        VisionRows::Patches,
+                        1,
+                        hidden,
+                        norm,
+                        vision,
+                        VisionNormSite::Merger,
+                        f32e,
+                        false,
+                        false,
+                    )?;
+                    b.norm(
+                        patch_rows(normalized),
+                        VisionRows::Cells,
+                        1,
+                        cell_rows * hidden,
+                        projection_norm,
+                        vision,
+                        VisionNormSite::MergerProjection,
+                        activation,
+                        false,
+                        false,
+                    )?
                 }
-                let normalized = b.norm(
-                    h,
-                    VisionRows::Patches,
-                    1,
-                    hidden,
-                    norm,
-                    vision,
-                    VisionNormSite::Merger,
-                    f32e,
-                    false,
-                    false,
-                )?;
-                b.norm(
-                    normalized,
+                // The projection norm alone over each contiguous cell.
+                (None, Some(norm)) if cell_rows > 1 && contiguous => b.norm(
+                    patch_rows(h),
                     VisionRows::Cells,
                     1,
                     cell_rows * hidden,
-                    projection_norm,
+                    norm,
                     vision,
                     VisionNormSite::MergerProjection,
                     activation,
                     false,
                     false,
-                )?
-            } else {
-                let (norm, site) = match (&merger.norm, &merger.projection_norm) {
-                    (Some(norm), None) => (norm, VisionNormSite::Merger),
-                    (None, Some(norm)) if cell_rows == 1 => {
-                        (norm, VisionNormSite::MergerProjection)
-                    }
-                    _ => {
-                        return Err(unsupported(
-                            "vision merger norms around a cell concatenation",
-                        ));
-                    }
-                };
-                b.norm(
-                    h,
+                )?,
+                (Some(norm), None) => b.norm(
+                    patch_rows(h),
                     VisionRows::Cells,
                     cell_rows,
                     hidden,
                     norm,
                     vision,
-                    site,
+                    VisionNormSite::Merger,
                     activation,
                     windows,
                     interleave,
-                )?
+                )?,
+                (None, Some(norm)) if cell_rows == 1 => b.norm(
+                    patch_rows(h),
+                    VisionRows::Cells,
+                    cell_rows,
+                    hidden,
+                    norm,
+                    vision,
+                    VisionNormSite::MergerProjection,
+                    activation,
+                    windows,
+                    interleave,
+                )?,
+                _ => {
+                    return Err(unsupported(
+                        "vision merger norms around a cell concatenation",
+                    ));
+                }
             }
         }
         CellReduction::Average { scale } => {
@@ -874,7 +944,7 @@ pub(crate) fn vision_program(
                 statics,
                 hidden,
                 VisionOperands::Pool {
-                    source: h,
+                    source: patch_rows(h),
                     standard,
                     weight: (1.0 / cell_rows as f64) as f32,
                     scale: scale as f32,
@@ -940,6 +1010,7 @@ pub(crate) fn vision_program(
     Ok(VisionProgram {
         ops: b.ops,
         cell_rows,
+        registers,
         pixel_width,
         coordinates: !description.blocks.is_empty(),
         windows,

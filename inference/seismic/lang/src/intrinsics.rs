@@ -295,6 +295,11 @@ pub enum PrimitiveId {
     Extent {
         axis: u32,
     },
+    /// `operands(w)`: the operand recipe code of `w`'s representation
+    /// ([`crate::registry::OperandRecipe::code`]), an `i32`. The entry
+    /// build replaces it by that constant once the elements are bound, so
+    /// no built entry contains it.
+    Operands,
     /// `atomic(add|max|min, place, value)`. Defined for f32, f16, bf16, i32,
     /// u32; bool is rejected because bool arithmetic is undefined.
     Atomic {
@@ -346,6 +351,7 @@ impl PrimitiveId {
                 format!("quantized.{}", component.name())
             }
             PrimitiveId::Extent { .. } => "tensor.extent".into(),
+            PrimitiveId::Operands => "tensor.operands".into(),
             PrimitiveId::Atomic { op, .. } => format!("atomic.{}", op.name()),
             PrimitiveId::Reduce { op, .. } => format!("reduce.{}", op.name()),
         }
@@ -829,7 +835,7 @@ pub(crate) fn primitive(id: &PrimitiveId) -> PrimitiveSignature {
             vec![TypePattern::TensorOf(ElemClass::Any)],
             TypeFunction::Fixed(ValueType::Scalar(component.dtype())),
         ),
-        PrimitiveId::Extent { .. } => sig(
+        PrimitiveId::Extent { .. } | PrimitiveId::Operands => sig(
             vec![TypePattern::TensorOf(ElemClass::Any)],
             TypeFunction::Fixed(ValueType::Scalar(DType::I32)),
         ),

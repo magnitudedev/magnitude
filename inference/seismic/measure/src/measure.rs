@@ -328,6 +328,12 @@ mod tests {
         fn calls_per_pass(&self) -> usize {
             1
         }
+        fn submit_cold(&self, passes: usize) -> Result<Done, &'static str> {
+            self.submit(passes)
+        }
+        fn cold_calls_per_pass(&self) -> usize {
+            1
+        }
         fn clock(&self) -> Option<()> {
             None
         }

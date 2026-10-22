@@ -94,6 +94,10 @@ const EMBEDDED: &[(&str, &str)] = &[
         include_str!("../lib/kernels/projection.seismic"),
     ),
     (
+        "std/kernels/operand_rows.seismic",
+        include_str!("../lib/kernels/operand_rows.seismic"),
+    ),
+    (
         "std/kernels/projection_add.seismic",
         include_str!("../lib/kernels/projection_add.seismic"),
     ),

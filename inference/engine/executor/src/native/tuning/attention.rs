@@ -14,7 +14,7 @@
 //! rows another point appends, so every configuration sees the same inputs
 //! whatever the point order.
 
-use super::cases::{packing_statics, projection_shape};
+use super::cases::{packing_statics, projection_shape, scale_extent, scale_statics};
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, across_sequences,
     history_placement, longest_history, row_points, served_row_points, with_contexts,
@@ -288,16 +288,56 @@ pub(crate) struct AttentionProjectCase {
     key: Tensor,
     value: Tensor,
     epsilon: f32,
-    /// The segments' packing bounds, query, gate, key, value.
+    /// The segments' scales, query, gate, key, value.
+    scales: [Tensor; 4],
+    /// The segments' packing bounds, in the same order.
     bounds: [Tensor; 4],
 }
 
+/// The unit scales of `attention_project`'s segments at `scope` (absent for
+/// a segment it does not read, `None`), at their planned extents.
+fn segment_scales(
+    inputs: &TuningInputs<'_, '_>,
+    scope: WeightScope,
+    kinds: [Option<WeightKind>; 4],
+) -> Result<[Tensor; 4], BuildError> {
+    let scale = |kind: Option<WeightKind>| match kind {
+        Some(kind) => inputs.unit_scale(inputs.scale_extent(scope, kind)?),
+        None => inputs.unit_scale(0),
+    };
+    Ok([
+        scale(kinds[0])?,
+        scale(kinds[1])?,
+        scale(kinds[2])?,
+        scale(kinds[3])?,
+    ])
+}
+
+/// The packing bounds of `attention_project`'s segments at `scope` (absent
+/// for a segment it does not read, `None`).
+fn segment_bounds(
+    inputs: &mut TuningInputs<'_, '_>,
+    scope: WeightScope,
+    kinds: [Option<WeightKind>; 4],
+) -> Result<[Tensor; 4], BuildError> {
+    let mut bound = |kind: Option<WeightKind>| match kind {
+        Some(kind) => inputs.bound(scope, kind),
+        None => inputs.unit_scale(0),
+    };
+    Ok([
+        bound(kinds[0])?,
+        bound(kinds[1])?,
+        bound(kinds[2])?,
+        bound(kinds[3])?,
+    ])
+}
+
 impl AttentionProjectTuning {
-    /// The segments' weight kinds whose packing bounds the projection binds,
-    /// in `attention_project`'s bound order; none for an absent segment (and
-    /// for the query and gate of a key-value-only projection), as the block's
-    /// graph binds them.
-    fn bound_kinds(&self, query: WeightKind) -> [Option<WeightKind>; 4] {
+    /// The segments' weight kinds whose scales and packing bounds the
+    /// projection binds, in `attention_project`'s order; none for an absent
+    /// segment (and for the query and gate of a key-value-only projection),
+    /// as the block's graph binds them.
+    fn operand_kinds(&self, query: WeightKind) -> [Option<WeightKind>; 4] {
         let shape = self.binding.shape;
         let projects = !self.binding.key_value_only;
         [
@@ -365,7 +405,12 @@ impl EntryTuning for AttentionProjectTuning {
             shape.project_dimensions(0)
         };
         let mut statics = statics.to_vec();
-        let [query, gate, key, value] = self.bound_kinds(query);
+        let [query, gate, key, value] = self.operand_kinds(query);
+        statics.extend(scale_statics(
+            inputs,
+            &self.scopes,
+            &[("QS", query), ("GS", gate), ("KS", key), ("VS", value)],
+        )?);
         statics.extend(packing_statics(
             inputs,
             &self.scopes,
@@ -432,19 +477,8 @@ impl EntryTuning for AttentionProjectTuning {
                         query
                     },
                     epsilon: self.epsilon,
-                    bounds: {
-                        let kinds = self.bound_kinds(query_kind);
-                        let mut bound = |kind: Option<WeightKind>| match kind {
-                            Some(kind) => inputs.bound(scope, kind),
-                            None => inputs.unit_scale(0),
-                        };
-                        [
-                            bound(kinds[0])?,
-                            bound(kinds[1])?,
-                            bound(kinds[2])?,
-                            bound(kinds[3])?,
-                        ]
-                    },
+                    scales: segment_scales(inputs, scope, self.operand_kinds(query_kind))?,
+                    bounds: segment_bounds(inputs, scope, self.operand_kinds(query_kind))?,
                 })
             })
             .collect()
@@ -460,6 +494,10 @@ impl EntryTuning for AttentionProjectTuning {
             value_weight: &case.value,
             epsilon: case.epsilon,
             project_mode: 0,
+            query_scale: &case.scales[0],
+            gate_scale: &case.scales[1],
+            key_scale: &case.scales[2],
+            value_scale: &case.scales[3],
             query_bound: &case.bounds[0],
             gate_bound: &case.bounds[1],
             key_bound: &case.bounds[2],
@@ -482,6 +520,15 @@ pub(crate) struct IndexerProjectTuning {
 }
 
 impl IndexerProjectTuning {
+    /// The indexer's segment weights in `attention_project`'s order: a query
+    /// and a key, no gate or value.
+    const OPERAND_KINDS: [Option<WeightKind>; 4] = [
+        Some(WeightKind::IndexerQuery),
+        None,
+        Some(WeightKind::IndexerKey),
+        None,
+    ];
+
     fn elements(&self) -> attention_project::Elements {
         let selection = self.selection;
         attention_project::Elements {
@@ -523,15 +570,16 @@ impl EntryTuning for IndexerProjectTuning {
         }
         let (parts, norm) = inputs.input_form(&self.scopes, hidden)?;
         let mut statics = [statics.as_slice(), &[("PT", parts), ("NM", norm)]].concat();
+        let [query, gate, key, value] = Self::OPERAND_KINDS;
+        statics.extend(scale_statics(
+            inputs,
+            &self.scopes,
+            &[("QS", query), ("GS", gate), ("KS", key), ("VS", value)],
+        )?);
         statics.extend(packing_statics(
             inputs,
             &self.scopes,
-            &[
-                ("QB", Some(WeightKind::IndexerQuery)),
-                ("GB", None),
-                ("KB", Some(WeightKind::IndexerKey)),
-                ("VB", None),
-            ],
+            &[("QB", query), ("GB", gate), ("KB", key), ("VB", value)],
         )?);
         Ok(statics)
     }
@@ -572,12 +620,8 @@ impl EntryTuning for IndexerProjectTuning {
                     )?,
                     query,
                     epsilon: self.epsilon,
-                    bounds: [
-                        inputs.bound(scope, WeightKind::IndexerQuery)?,
-                        inputs.unit_scale(0)?,
-                        inputs.bound(scope, WeightKind::IndexerKey)?,
-                        inputs.unit_scale(0)?,
-                    ],
+                    scales: segment_scales(inputs, scope, Self::OPERAND_KINDS)?,
+                    bounds: segment_bounds(inputs, scope, Self::OPERAND_KINDS)?,
                 })
             })
             .collect()
@@ -604,6 +648,7 @@ pub(crate) struct AttentionOutputCase {
     inject: Tensor,
     gated: Tensor,
     output: Tensor,
+    scale: Tensor,
     bound: Tensor,
 }
 
@@ -636,7 +681,15 @@ impl EntryTuning for AttentionOutputTuning {
         {
             return Err("the attention output projection disagrees with the binding".into());
         }
-        let mut statics = vec![("D", shape.hidden), ("Q", heads), ("W", shape.width)];
+        let mut statics = vec![
+            ("D", shape.hidden),
+            ("Q", heads),
+            ("W", shape.width),
+            (
+                "OS",
+                scale_extent(inputs, &self.scopes, WeightKind::AttentionOutput)?,
+            ),
+        ];
         statics.extend(packing_statics(
             inputs,
             &self.scopes,
@@ -676,6 +729,8 @@ impl EntryTuning for AttentionOutputTuning {
                         seed + 2,
                     )?,
                     output: inputs.weight(scope, WeightKind::AttentionOutput)?,
+                    scale: inputs
+                        .unit_scale(inputs.scale_extent(scope, WeightKind::AttentionOutput)?)?,
                     bound: inputs.bound(scope, WeightKind::AttentionOutput)?,
                 })
             })
@@ -688,6 +743,7 @@ impl EntryTuning for AttentionOutputTuning {
             inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
+            output_scale: &case.scale,
             output_bound: &case.bound,
         }
     }
@@ -850,6 +906,8 @@ pub(crate) struct AttentionMixCase<H> {
     query_norm: Tensor,
     key_norm: Tensor,
     value_norm: Tensor,
+    /// The layer's sink logits `[SK, heads]` (the dense entries').
+    sinks: Tensor,
     rotary_components: Tensor,
     rotary_frequencies: Tensor,
     rotary_amplitudes: Tensor,
@@ -1243,6 +1301,15 @@ impl AttentionMix {
                 } else {
                     head_norm(WeightKind::KeyNorm)?
                 };
+                // Sinks are the layers' own logits, or none.
+                let sinks = if shape.sinks > 0 {
+                    inputs
+                        .weight(scope, WeightKind::AttentionSinks)?
+                        .reshape(&[1, heads])
+                        .map_err(|error| error.to_string())?
+                } else {
+                    inputs.f32s(&[0, heads], &[])?
+                };
                 Ok(AttentionMixCase {
                     query_norm,
                     key_norm,
@@ -1250,6 +1317,7 @@ impl AttentionMix {
                         &[shape.value_norm, width],
                         &vec![1.0; (shape.value_norm * width) as usize],
                     )?,
+                    sinks,
                     query: inputs.activation(
                         self.activation,
                         &[rows, heads, width + shape.interleaved_gate],
@@ -1429,6 +1497,7 @@ macro_rules! mix_entry {
                     query_norm: &$case.query_norm,
                     key_norm: &$case.key_norm,
                     value_norm: &$case.value_norm,
+                    sinks: &$case.sinks,
                     rotary_components: &$case.rotary_components,
                     rotary_frequencies: &$case.rotary_frequencies,
                     rotary_amplitudes: &$case.rotary_amplitudes,
@@ -1581,6 +1650,7 @@ mod tests {
                         head_norm: 1,
                         value_norm: 0,
                         projected_value: true,
+                        sinks: 0,
                     },
                     scopes: Vec::new(),
                     epsilon: 1.0e-5,
@@ -1679,6 +1749,7 @@ mod tests {
                     head_norm: 1,
                     value_norm: 1,
                     projected_value: true,
+                    sinks: 0,
                 },
                 scopes: Vec::new(),
                 epsilon: 1.0e-6,
@@ -1762,6 +1833,7 @@ mod tests {
                         head_norm: 1,
                         value_norm: 0,
                         projected_value: true,
+                        sinks: 0,
                     },
                     scopes: Vec::new(),
                     epsilon: 1.0e-5,
@@ -1876,6 +1948,7 @@ mod tests {
                 head_norm: 1,
                 value_norm: 0,
                 projected_value: true,
+                sinks: 0,
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,
@@ -1998,6 +2071,7 @@ mod tests {
                 head_norm: 1,
                 value_norm: 0,
                 projected_value: true,
+                sinks: 0,
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,

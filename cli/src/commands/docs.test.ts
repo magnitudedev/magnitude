@@ -40,7 +40,7 @@ describe("Magnitude documentation", () => {
     if (result._tag === "Failure") return
     expect(result.output).toContain("# Speculative decoding methods")
     expect(result.output).toContain(
-      "None (usually slowest) -> MTP -> DFlash -> DSpark (usually fastest)",
+      "None (usually slowest) -> MTP -> DFlash -> DSpark -> LiLiCorr (usually fastest)",
     )
     expect(result.output).toContain("Magnitude then activates the method automatically")
     expect(result.output).toContain("typical ordering, not a guarantee")

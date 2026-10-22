@@ -4,6 +4,9 @@
 // GEMM class may split K.
 #define KERNEL_W0 SEISMIC_OUTPUT_WEIGHT
 #include "lib/core/activation.glsl"
+#if SEISMIC_STATIC_OS != 0
+#define PROJECTION_SCALED
+#endif
 #include "lib/projection/projection.glsl"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
@@ -11,21 +14,44 @@
 #else
 #error "attention_output requires a bf16 or f16 activation"
 #endif
+// The output weight's operand rows (the gated rows, or NVFP4 operands): the
+// GEMV forms them while staging, the stage launch into the scratch the GEMM
+// reads.
+#if defined(SEISMIC_OUTPUT_WEIGHT_OPERANDS_NVFP4)
+#define OUTPUT_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define OUTPUT_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
 
 
 #define OUTPUT_K uint(SEISMIC_DIM_Q * SEISMIC_DIM_W)
 
-// The gated heads [M, Q, W] are read as rows of Q * W (contiguous heads).
+// The gated heads [M, Q, W] are read as rows of Q * W (contiguous heads), as
+// the output weight's operands.
 projection_prologue attention_output_input() {
-    return projection_plain(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_GATED), SEISMIC_GATED_STRIDE_0,
-        SEISMIC_GATED_STRIDE_2, OUTPUT_K, 0ul);
+    return projection_operands(projection_plain(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_GATED),
+        SEISMIC_GATED_STRIDE_0, SEISMIC_GATED_STRIDE_2, OUTPUT_K, 0ul), OUTPUT_OPERANDS);
 }
 
+// The rows the GEMM reads: the gated rows, or the operands the stage launch
+// formed.
+projection_prologue attention_output_rows() {
+#if defined(SEISMIC_OUTPUT_WEIGHT_OPERANDS_NVFP4)
+    return projection_plain(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED), uint64_t(OUTPUT_K), 1ul,
+        OUTPUT_K, 0ul);
+#else
+    return projection_plain(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_GATED), SEISMIC_GATED_STRIDE_0,
+        SEISMIC_GATED_STRIDE_2, OUTPUT_K, 0ul);
+#endif
+}
+
+// The residual join after the weight's second-level scale, where it has one.
 projection_epilogue attention_output_output() {
-    return projection_output(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0,
-        SEISMIC_RESULT_0_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), SEISMIC_HIDDEN_STRIDE_0,
-        SEISMIC_HIDDEN_STRIDE_1, 0ul, SEISMIC_PTR(SEISMIC_BUFFER_INJECT), SEISMIC_INJECT_STRIDE_0,
-        uint(SEISMIC_DIM_IN), uint(SEISMIC_DIM_SN), uint(SEISMIC_DIM_D));
+    return projection_scaled(projection_output(OUTPUT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
+        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, 0ul, SEISMIC_PTR(SEISMIC_BUFFER_INJECT),
+        SEISMIC_INJECT_STRIDE_0, uint(SEISMIC_DIM_IN), uint(SEISMIC_DIM_SN), uint(SEISMIC_DIM_D)),
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_SCALE), SEISMIC_DIM_OS, 0ul, 0ul), 1.0);
 }
 
 projection_weights attention_output_weight() {
@@ -46,16 +72,22 @@ void attention_output_gemv2() { attention_output_gemv_bounded(2u); }
 void attention_output_gemv4() { attention_output_gemv_bounded(4u); }
 void attention_output_gemv8() { attention_output_gemv_bounded(8u); }
 
+// The gated rows as NVFP4 operands into `staged`, one row a workgroup.
+void attention_output_stage() {
+    projection_stage(attention_output_input(), gl_WorkGroupID.x, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED),
+        OUTPUT_K);
+}
+
 void attention_output_gemm() {
     const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_D);
 #if SEISMIC_TUNE_SPLIT == 1
     projection_gemm(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        attention_output_input(),
+        attention_output_rows(),
         attention_output_output(), attention_output_weight(), m, n, OUTPUT_K, gl_WorkGroupID.y, gl_WorkGroupID.x,
         0xffffffffu);
 #else
     projection_gemm_part(PACKETS_W0, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        attention_output_input(),
+        attention_output_rows(),
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), attention_output_weight(), m, n, OUTPUT_K, SEISMIC_TUNE_SPLIT,
         gl_WorkGroupID.z, gl_WorkGroupID.y, gl_WorkGroupID.x);
 #endif

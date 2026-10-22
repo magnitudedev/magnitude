@@ -579,6 +579,12 @@ mod internals {
                 .collect::<Vec<_>>();
             let actual = template.and_then(|at| {
                 let header = source[at + "template".len()..*kernel_at].trim();
+                // A CUDA kernel may declare its launch bounds between its
+                // template header and `__global__`.
+                let header = match (backend, header.rfind("__launch_bounds__")) {
+                    (BackendName::Cuda, Some(bounds)) if header.ends_with(')') => header[..bounds].trim_end(),
+                    _ => header,
+                };
                 let body = header.strip_prefix('<')?.strip_suffix('>')?;
                 if body.trim().is_empty() {
                     return Some(Vec::new());
@@ -798,6 +804,8 @@ mod internals {
                     "SEISMIC_SCALAR_RESULTS",
                     // Device library (`cuda_prelude.cuh`).
                     "SEISMIC_PROGRAMMATIC_DEPENDENCY",
+                    // Device facts.
+                    "SEISMIC_MULTIPROCESSORS",
                 ] {
                     symbols.insert(symbol.to_owned());
                 }
@@ -960,6 +968,9 @@ mod internals {
                 "{prefix}_DECODED_{}",
                 native_macro(representation.decoded.name())
             ));
+            if representation.operands == registry::OperandRecipe::Nvfp4Rows {
+                symbols.insert(format!("{prefix}_OPERANDS_NVFP4"));
+            }
             symbols.insert(format!("{prefix}_PACKET_SIZE"));
             symbols.insert(format!("{prefix}_PACKET_ALIGNMENT"));
             symbols.insert(format!("{prefix}_LOGICAL_GROUP"));
@@ -1000,6 +1011,9 @@ mod internals {
                             "BYTES_PER_GROUP",
                             "CODE_SHIFT",
                             "CODE_BITS",
+                            "CARRIED_BIT",
+                            "ENTRY_BYTES",
+                            "FACTORS_OFFSET",
                         ] {
                             symbols.insert(format!("{plane_prefix}_{suffix}"));
                         }

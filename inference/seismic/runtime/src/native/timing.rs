@@ -67,14 +67,16 @@ impl Slotted for PointTiming<'_> {
 }
 
 impl<'a> PointTiming<'a> {
-    /// Validate and place every call of `rotation`. Results of each argument
+    /// Validate and place every call of `rotation`, then of its cold
+    /// `copies` ([`super::point::cold_copies`]). Results of each argument
     /// set are allocated once and reused by every sample; scratch is the
     /// standalone arena.
     pub(crate) fn new(
         kernel: &Arc<NativePrepared>,
         rotation: Vec<EncodedArgs>,
+        copies: Vec<EncodedArgs>,
     ) -> Result<Self, CallError> {
-        Self::place(kernel, rotation, None)
+        Self::place(kernel, rotation, copies, None)
     }
 
     /// Place a configuration against a point's shared result storage
@@ -82,18 +84,20 @@ impl<'a> PointTiming<'a> {
     pub(crate) fn reusing_outputs(
         kernel: &Arc<NativePrepared>,
         rotation: Vec<EncodedArgs>,
+        copies: Vec<EncodedArgs>,
         outputs: &mut Vec<Vec<Arc<TensorInner>>>,
     ) -> Result<Self, CallError> {
-        Self::place(kernel, rotation, Some(outputs))
+        Self::place(kernel, rotation, copies, Some(outputs))
     }
 
     fn place(
         kernel: &Arc<NativePrepared>,
         rotation: Vec<EncodedArgs>,
+        copies: Vec<EncodedArgs>,
         outputs: Option<&mut Vec<Vec<Arc<TensorInner>>>>,
     ) -> Result<Self, CallError> {
         let began = Instant::now();
-        let point = KernelPoint::place(kernel, rotation, outputs)?;
+        let point = KernelPoint::place(kernel, rotation, copies, outputs)?;
         Ok(Self {
             slot: Slot::new(point),
             initialize: None,

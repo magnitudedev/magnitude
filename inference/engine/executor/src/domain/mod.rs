@@ -11,14 +11,14 @@ use crate::platform::{DomainReading, DomainRole};
 use crate::programs::ProgramSubmission;
 use crate::programs::graph::readout;
 use crate::{
-    AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader,
-    ExecutionPlan, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GraphOutputTensor,
-    GroupKey, HeadConditioning, HeadLaunchInputs, ImageRef, NativeGraphOutputLease,
-    NativeGraphWorkspaceLease, Operation, Outcome, PoolClass, Priming, ProgramIdentity, RequestId,
-    ResidentHead, ResidentVision, ResourceDomain, ResourceDomainId, ResourceKind, RowResult,
-    SelectSpec, Selected, StateLaunchInputs, StateWork, TargetLaunchInputs, TargetTokens, TokenId,
-    ValidatedHeadLaunch, ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch,
-    VisionLaunchInputs, WorkKind,
+    AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader, ExecutionPlan,
+    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GroupKey, HeadConditioning,
+    HeadLaunchInputs, ImageRef, NativeGraphOutputLease, NativeGraphWorkspaceLease, Operation,
+    Outcome, PoolClass, Priming, ProgramIdentity, RequestId, ResidentHead, ResidentVision,
+    ResourceDomain, ResourceDomainId, ResourceKind, RowResult, SelectSpec, Selected,
+    StateLaunchInputs, StateWork, TargetLaunchInputs, TargetTokens, TokenId, ValidatedHeadLaunch,
+    ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchInputs,
+    WorkKind,
 };
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::{
@@ -310,6 +310,9 @@ pub struct PendingOperationOutcome {
     committed_rows: usize,
     kind: WorkKind,
     physical_duration: Duration,
+    /// Whether the work replayed recorded graphs only: one that recorded a
+    /// graph paid that recording on the host within its duration.
+    replayed: bool,
     image: Option<ImageRef>,
 }
 
@@ -328,6 +331,10 @@ impl PendingOperationOutcome {
     }
     pub fn physical_duration(&self) -> Duration {
         self.physical_duration
+    }
+    /// What the launches took, when the work replayed recorded graphs only.
+    pub fn launch_duration(&self) -> Option<Duration> {
+        self.replayed.then_some(self.physical_duration)
     }
 }
 

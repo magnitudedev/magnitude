@@ -244,7 +244,7 @@ pub(crate) fn fill_constant_for(
 /// A registered element storage at the type level: the pair
 /// (representation, layout).
 pub trait Representation: 'static + Copy + fmt::Debug + Send + Sync + sealed::Sealed {
-    /// Registry name of the logical representation.
+    /// Registry storage name of the element (`registry::storage`).
     const NAME: &'static str;
     /// The storage layout (`Packet` for dense storage).
     const LAYOUT: registry::Layout;
@@ -378,11 +378,19 @@ representation!(IQ2XSRows32, "iq2xs", Rows32, F32, 3);
 representation!(IQ3XXSRows32, "iq3xxs", Rows32, F32, 3);
 representation!(IQ2XSMma16, "iq2xs", Mma16, F32, 3);
 representation!(IQ3XXSMma16, "iq3xxs", Mma16, F32, 3);
+// iq2xxs carries its scale codes in its entries: row layouts hold `grids`
+// and `supers`, and `mma16` one `records` plane.
 representation!(IQ2XXS, "iq2xxs", F32, 3);
-representation!(IQ2XXSRows16, "iq2xxs", Rows16, F32, 3);
-representation!(IQ2XXSRows8, "iq2xxs", Rows8, F32, 3);
-representation!(IQ2XXSRows32, "iq2xxs", Rows32, F32, 3);
-representation!(IQ2XXSMma16, "iq2xxs", Mma16, F32, 3);
+representation!(IQ2XXSRows16, "iq2xxs", Rows16, F32, 2);
+representation!(IQ2XXSRows8, "iq2xxs", Rows8, F32, 2);
+representation!(IQ2XXSRows32, "iq2xxs", Rows32, F32, 2);
+representation!(IQ2XXSMma16, "iq2xxs", Mma16, F32, 1);
+// NVFP4's W4A4 elements: nvfp4g16's storage, NVFP4 rows as operands.
+representation!(NVFP4G16A4, "nvfp4g16a4", F32, 2);
+representation!(NVFP4G16A4Rows16, "nvfp4g16a4", Rows16, F32, 2);
+representation!(NVFP4G16A4Rows8, "nvfp4g16a4", Rows8, F32, 2);
+representation!(NVFP4G16A4Mma16, "nvfp4g16a4", Mma16, F32, 2);
+representation!(NVFP4G16A4Rows32, "nvfp4g16a4", Rows32, F32, 2);
 
 /// Dispatches a runtime representation id into the typed world.
 pub trait RepresentationVisitor {
@@ -398,6 +406,20 @@ pub fn with_representation<V: RepresentationVisitor>(
     visitor: V,
 ) -> V::Output {
     let info = registry::representation_info(id);
+    if info.operands == registry::OperandRecipe::Nvfp4Rows {
+        return match (info.representation, info.layout) {
+            ("nvfp4g16", registry::Layout::Packet) => visitor.visit::<NVFP4G16A4>(),
+            ("nvfp4g16", registry::Layout::Rows16) => visitor.visit::<NVFP4G16A4Rows16>(),
+            ("nvfp4g16", registry::Layout::Rows8) => visitor.visit::<NVFP4G16A4Rows8>(),
+            ("nvfp4g16", registry::Layout::Mma16) => visitor.visit::<NVFP4G16A4Mma16>(),
+            ("nvfp4g16", registry::Layout::Rows32) => visitor.visit::<NVFP4G16A4Rows32>(),
+            (other, layout) => panic!(
+                "registry storage `{other}` of NVFP4 operands in layout `{}` has no type-level \
+                 marker",
+                layout.as_str()
+            ),
+        };
+    }
     match (info.representation, info.layout) {
         ("q4k", registry::Layout::Rows16) => return visitor.visit::<Q4KRows16>(),
         ("q5k", registry::Layout::Rows16) => return visitor.visit::<Q5KRows16>(),

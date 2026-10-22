@@ -541,6 +541,7 @@ fn attention(
             scale: 1.0,
             reads: HistoryReads::Visible,
             media_rows: geometry.media_rows,
+            sinks: None,
             output: b.bind(&format!("{p}attn_output.weight"), &[hidden, head_rows])?,
         })),
         output: OutputForm::PostNorm(

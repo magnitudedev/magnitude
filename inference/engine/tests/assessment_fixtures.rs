@@ -106,6 +106,7 @@ enum Bound {
     DFlash,
     DSpark,
     DFlash2,
+    LiLiCorr,
 }
 
 impl From<SpeculativeMethod> for Bound {
@@ -115,6 +116,7 @@ impl From<SpeculativeMethod> for Bound {
             SpeculativeMethod::DFlash => Self::DFlash,
             SpeculativeMethod::DSpark => Self::DSpark,
             SpeculativeMethod::DFlash2 => Self::DFlash2,
+            SpeculativeMethod::LiLiCorr => Self::LiLiCorr,
         }
     }
 }

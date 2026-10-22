@@ -16,12 +16,13 @@ from .base import Adapter, command
 # verbosity 4): the attention KV cache and, for hybrid models, the recurrent
 # state. Their sizes are what one slot of the configured context holds.
 STATE_BUFFER = re.compile(r"\b(KV|RS) buffer size = +([0-9.]+) MiB")
-#: Catalog drafting method → llama.cpp ``--spec-type``. DFlash2 drafters run on llama.cpp's
-#: DFlash implementation.
+#: Catalog drafting method → llama.cpp ``--spec-type``. DFlash2 and LiLiCorr drafters run on
+#: llama.cpp's DFlash implementation, which reads a LiLiCorr draft's corrector from its GGUF.
 SPECULATION = {
     "mtp": "draft-mtp",
     "dflash": "draft-dflash",
     "dflash2": "draft-dflash",
+    "lilicorr": "draft-dflash",
     "dspark": "draft-dspark",
 }
 

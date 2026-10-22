@@ -4,6 +4,7 @@
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
+#define ATTENTION_SINKS (SEISMIC_DIM_SK != 0)
 #define PREFILL_HEADS_PER_GROUP SEISMIC_TUNE_HEADS
 #define PREFILL_DIRECT SEISMIC_TUNE_DIRECT
 #define PREFILL_SELECTED (SEISMIC_DIM_B != 0)
@@ -62,6 +63,7 @@ kernel void attention_prefill_prepare(
 kernel void attention_prefill_attend(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
     device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
+    device const float *sinks [[buffer(SEISMIC_BUFFER_SINKS)]],
     device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
     device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
     device const ulong *history_key [[buffer(SEISMIC_BUFFER_HISTORY_KEY)]],
@@ -90,12 +92,13 @@ kernel void attention_prefill_attend(
         query, gate, visible, fresh, result, queries, keys, values, partials, statistics, counts,
         SEISMIC_DIM_M, SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
         SEISMIC_PARAM_GATE_FUNCTION != 0, shared, exchange, group, groups, thread_index, simd, lane,
-        PREFILL_WORKLIST(selection, worklist));
+        PREFILL_WORKLIST(selection, worklist), sinks);
 }
 
 kernel void attention_prefill_merge(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
     device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
+    device const float *sinks [[buffer(SEISMIC_BUFFER_SINKS)]],
     device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     device const float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
     device const float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
@@ -106,7 +109,7 @@ kernel void attention_prefill_merge(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
     attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, result, partials, statistics, counts,
-        SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0);
+        SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
 }
 
 // The WorkList's list launch (B > 0): each query tile's read key tiles

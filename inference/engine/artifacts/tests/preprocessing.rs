@@ -78,6 +78,52 @@ fn cell_budget_picks_the_closest_aspect_in_python_set_order() {
     }
 }
 
+/// Expected sizes from the released Nemotron 3.5 Omni processor
+/// (`NemotronH_Omni_Reasoning_V3ImageProcessor._compute_target_patches`,
+/// patch 16, pixel-shuffle factor 2, 1024 to 13312 patches), including its
+/// half-to-even `round(n + 0.5)` (48 pixels: 4 patches) and the scale-up to
+/// the minimum.
+#[test]
+fn patch_bounds_follow_the_nemotron_omni_tile() {
+    let value = configured(
+        16,
+        2,
+        ImageResize::PatchBounds {
+            min_patches: 1_024,
+            max_patches: 13_312,
+        },
+    );
+    for (source, expected) in [
+        ((512, 512), (512, 512)),
+        ((480, 640), (480, 640)),
+        ((48, 48), (512, 512)),
+        ((1000, 1010), (1024, 1024)),
+        ((3000, 4000), (1600, 2112)),
+        ((100, 1500), (160, 1888)),
+        ((1500, 100), (1888, 160)),
+        ((517, 803), (544, 832)),
+        ((20, 4000), (64, 5728)),
+        ((720, 1280), (736, 1280)),
+        ((2048, 2048), (1824, 1856)),
+        ((33, 47), (512, 512)),
+        ((1080, 1920), (1088, 1920)),
+        ((300, 200), (640, 448)),
+    ] {
+        assert_eq!(value.resized_size(source.0, source.1).unwrap(), expected, "{source:?}");
+    }
+    // A budget bounded to the minimum keeps the tile within it.
+    let bounded = configured(
+        16,
+        2,
+        ImageResize::PatchBounds {
+            min_patches: 512,
+            max_patches: 512,
+        },
+    );
+    let (height, width) = bounded.resized_size(3000, 4000).unwrap();
+    assert!((height / 16) * (width / 16) <= 512 && height % 32 == 0 && width % 32 == 0);
+}
+
 #[test]
 fn decode_normalize_and_patchify_follow_merged_block_order() {
     let mut source = RgbImage::new(4, 4);

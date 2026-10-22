@@ -40,6 +40,7 @@ fn routed_output_stage<L: Isa, E: Elements>(
             };
             projection::quantize(staged, q8);
         }
+        projection::operand_row(&[&cx.arg_expert_down()], staged);
     }
     // SAFETY: each work item writes its own row of the scratch.
     let staged = unsafe { cx.scratch_shared().slice_mut::<f32>(4 * row * s, s) };
@@ -56,6 +57,7 @@ fn routed_output_stage<L: Isa, E: Elements>(
         };
         projection::quantize(staged, q8);
     }
+    projection::operand_row(&[&cx.arg_shared_down()], staged);
 }
 
 fn routed_output_rows<L: Isa, E: Elements>(

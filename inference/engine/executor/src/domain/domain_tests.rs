@@ -362,7 +362,7 @@ impl<L, W, O> ProgramSubmission for PendingSubmission<L, W, O> {
 type HeadTestWork = PendingSubmission<
     crate::HeadLaunchCore,
     (NativeGraphWorkspaceLease, Option<NativeGraphOutputLease>),
-    Option<crate::GraphOutputTensor>,
+    crate::programs::HeadOutput,
 >;
 
 enum ControlledHeadSubmission {
@@ -470,6 +470,9 @@ impl ProgramFamily for TestFamily {
     fn head_is_bound(&self) -> bool {
         false
     }
+    fn recorded_graphs(&self) -> u64 {
+        0
+    }
     fn vision_is_bound(&self) -> bool {
         false
     }
@@ -497,7 +500,7 @@ impl ProgramFamily for TestFamily {
                     first: now,
                     last: now,
                 },
-                selected_rows: None,
+                landed_reads: Vec::new(),
                 stored_reads: STORED_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut())),
             },
         ))
@@ -970,6 +973,7 @@ fn pending_head_and_vision_device_failures_consume_the_bindings() {
         steps: 0,
         submission: PendingFailureSubmission::<CompletedHeadWork>::new(head_control.clone()).into(),
         started: Instant::now(),
+        recorded_graphs: 0,
         launch_trace: None,
         bindings,
     };
@@ -989,6 +993,7 @@ fn pending_head_and_vision_device_failures_consume_the_bindings() {
         image: ImageRef::new(vision_domain.resource_identity().clone(), 1).unwrap(),
         submission: PendingFailureSubmission::<CompletedVisionWork>::new(vision_control.clone()),
         started: Instant::now(),
+        recorded_graphs: 0,
         bindings,
     };
     assert!(!vision.completion().is_complete());
@@ -1023,6 +1028,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             committed_rows: 0,
             kind: WorkKind::Decode,
             physical_duration: Duration::ZERO,
+            replayed: true,
             image: None,
         })
         .unwrap();
@@ -1050,6 +1056,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             committed_rows: 0,
             kind: WorkKind::Prefill,
             physical_duration: Duration::ZERO,
+            replayed: true,
             image: Some(image),
         })
         .unwrap();
@@ -1094,6 +1101,7 @@ fn vision_definition() -> ModelDefinition {
                 sampling: PositionSampling::AlignedCorners { side: 4 },
             },
             norm: None,
+            registers: None,
         },
         window: None,
         blocks: Vec::new(),
@@ -1264,6 +1272,7 @@ fn reconcile_encode<F: ProgramFamily>(
                 committed_rows: 0,
                 kind: WorkKind::Prefill,
                 physical_duration: Duration::ZERO,
+                replayed: true,
                 image: Some(image),
             },
             PhysicalDecision { accepted_rows: 0 },
@@ -1510,7 +1519,10 @@ fn target_with_pending_priming(
         completion: PendingCompletion(control.clone()),
         core,
         workspace: (workspace, output),
-        output: None,
+        output: crate::programs::HeadOutput {
+            selections: None,
+            landed_reads: Vec::new(),
+        },
     });
     assert!(flight.work.priming.is_none());
     flight.work.priming = Some(PrimingFlight {

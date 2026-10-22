@@ -3,7 +3,7 @@
 //! projection (`attention_output` over one head of `channels`).
 //! `short_conv_rows` declares no parameters.
 
-use super::cases::{packing_statics, projection_shape};
+use super::cases::{packing_statics, projection_shape, scale_extent, scale_statics};
 use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
 use crate::ShortConvBinding;
 use magnitude_family_contracts::{WeightKind, WeightScope};
@@ -25,8 +25,17 @@ pub(crate) struct ShortConvProjectCase {
     output_gate: Tensor,
     value: Tensor,
     epsilon: f32,
-    absent_scale: Tensor,
+    /// The input gate's, output gate's and value's scales.
+    scales: [Tensor; 3],
 }
+
+/// The short convolution's projections, in `short_conv_project`'s order (its
+/// B, C and X weights).
+const PROJECTIONS: [WeightKind; 3] = [
+    WeightKind::ShortConvInputGate,
+    WeightKind::ShortConvOutputGate,
+    WeightKind::ShortConvValue,
+];
 
 impl ShortConvProjectTuning {
     fn elements(&self) -> short_conv_project::Elements {
@@ -63,11 +72,7 @@ impl EntryTuning for ShortConvProjectTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.binding.shape;
-        for kind in [
-            WeightKind::ShortConvInputGate,
-            WeightKind::ShortConvOutputGate,
-            WeightKind::ShortConvValue,
-        ] {
+        for kind in PROJECTIONS {
             if projection_shape(inputs, &self.scopes, kind)? != (shape.channels, shape.hidden) {
                 return Err(format!(
                     "the short convolution {kind:?} projection disagrees with the binding"
@@ -76,7 +81,12 @@ impl EntryTuning for ShortConvProjectTuning {
         }
         let [_, statics @ ..] = shape.project_dimensions(0);
         let mut statics = statics.to_vec();
-        statics.extend([("BS", 0), ("CS", 0), ("XS", 0)]);
+        let [b, c, x] = PROJECTIONS;
+        statics.extend(scale_statics(
+            inputs,
+            &self.scopes,
+            &[("BS", Some(b)), ("CS", Some(c)), ("XS", Some(x))],
+        )?);
         Ok(statics)
     }
 
@@ -105,7 +115,12 @@ impl EntryTuning for ShortConvProjectTuning {
                     output_gate: inputs.weight(scope, WeightKind::ShortConvOutputGate)?,
                     value: inputs.weight(scope, WeightKind::ShortConvValue)?,
                     epsilon: self.epsilon,
-                    absent_scale: inputs.activation(Element::f32(), &[0], 0)?,
+                    scales: {
+                        let scale =
+                            |kind| inputs.unit_scale(inputs.scale_extent(scope, kind)?);
+                        let [b, c, x] = PROJECTIONS;
+                        [scale(b)?, scale(c)?, scale(x)?]
+                    },
                 })
             })
             .collect()
@@ -119,9 +134,9 @@ impl EntryTuning for ShortConvProjectTuning {
             c_weight: &case.output_gate,
             x_weight: &case.value,
             eps: case.epsilon,
-            b_scale: &case.absent_scale,
-            c_scale: &case.absent_scale,
-            x_scale: &case.absent_scale,
+            b_scale: &case.scales[0],
+            c_scale: &case.scales[1],
+            x_scale: &case.scales[2],
         }
     }
 
@@ -141,6 +156,7 @@ pub(crate) struct ShortConvOutputCase {
     inject: Tensor,
     gated: Tensor,
     output: Tensor,
+    scale: Tensor,
     bound: Tensor,
 }
 
@@ -171,6 +187,10 @@ impl EntryTuning for ShortConvOutputTuning {
         }
         let [_, statics @ ..] = shape.output_dimensions(0);
         let mut statics = statics.to_vec();
+        statics.push((
+            "OS",
+            scale_extent(inputs, &self.scopes, WeightKind::RecurrentOutput)?,
+        ));
         statics.extend(packing_statics(
             inputs,
             &self.scopes,
@@ -207,6 +227,8 @@ impl EntryTuning for ShortConvOutputTuning {
                         seed + 2,
                     )?,
                     output: inputs.weight(scope, WeightKind::RecurrentOutput)?,
+                    scale: inputs
+                        .unit_scale(inputs.scale_extent(scope, WeightKind::RecurrentOutput)?)?,
                     bound: inputs.bound(scope, WeightKind::RecurrentOutput)?,
                 })
             })
@@ -219,6 +241,7 @@ impl EntryTuning for ShortConvOutputTuning {
             inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
+            output_scale: &case.scale,
             output_bound: &case.bound,
         }
     }

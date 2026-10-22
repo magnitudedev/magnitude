@@ -4,7 +4,9 @@
 
 use crate::HeaderError;
 use magnitude_artifacts::gguf::{Directory, Encoding, TensorDescriptor};
-use magnitude_family_contracts::{checked_product, ImportTransform, WeightDescriptor};
+use magnitude_family_contracts::{
+    checked_product, ImportTransform, ScaledActivations, WeightDescriptor,
+};
 use std::collections::HashSet;
 
 pub struct Tensors<'a> {
@@ -102,37 +104,51 @@ impl<'a> Tensors<'a> {
             _ => 1,
         };
         if let Some(scale) = self.companion_scale(name, matrices)? {
-            weight
-                .transforms
-                .push(ImportTransform::ScaleByTensor { tensor: scale });
+            weight.transforms.push(scale);
         }
         Ok(weight)
     }
 
     /// Binds the stored F32 `<stem>.scale` companion of `<stem>.weight`
     /// (NVFP4's per-tensor or per-matrix second-level scale), one value per
-    /// matrix, and names it; `None` when the file stores none.
+    /// matrix, as the weight's `ScaleByTensor`; `None` when the file stores
+    /// none.
+    ///
+    /// A scaled weight whose producer calibrated it for FP4 activations
+    /// (W4A4) also stores `<stem>.input_scale`, its static activation scale:
+    /// its products take NVFP4 operands. The operand recipe scales each row
+    /// by its own power of two, so the stored value is checked and
+    /// acknowledged, not applied.
     pub fn companion_scale(
         &mut self,
         weight: &str,
         matrices: u64,
-    ) -> Result<Option<String>, HeaderError> {
-        let Some(scale) = weight
-            .strip_suffix(".weight")
-            .and_then(|stem| self.directory.tensor(&format!("{stem}.scale")))
-        else {
+    ) -> Result<Option<ImportTransform>, HeaderError> {
+        let Some(stem) = weight.strip_suffix(".weight") else {
             return Ok(None);
         };
-        if scale.encoding != Encoding::F32 || scale.shape != [matrices] {
-            return Err(HeaderError::CompanionScale {
-                name: scale.name.clone(),
-                matrices,
-                encoding: scale.encoding,
-                shape: scale.shape.clone(),
-            });
+        let Some(scale) = self.directory.tensor(&format!("{stem}.scale")) else {
+            return Ok(None);
+        };
+        let input = self.directory.tensor(&format!("{stem}.input_scale"));
+        for companion in std::iter::once(scale).chain(input) {
+            if companion.encoding != Encoding::F32 || companion.shape != [matrices] {
+                return Err(HeaderError::CompanionScale {
+                    name: companion.name.clone(),
+                    matrices,
+                    encoding: companion.encoding,
+                    shape: companion.shape.clone(),
+                });
+            }
+            self.bound.insert(companion.name.as_str());
         }
-        self.bound.insert(scale.name.as_str());
-        Ok(Some(scale.name.clone()))
+        Ok(Some(ImportTransform::ScaleByTensor {
+            tensor: scale.name.clone(),
+            activations: match input {
+                Some(_) => ScaledActivations::Nvfp4,
+                None => ScaledActivations::Rounded,
+            },
+        }))
     }
 
     /// The stored tensors bound by no role, in directory order.

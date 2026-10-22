@@ -27,6 +27,8 @@ pub enum VisionActivation {
     GeluErf,
     /// `x σ(1.702 x)`.
     GeluQuick,
+    /// `max(x, 0)²`.
+    ReluSquared,
 }
 
 /// How an image is resized before it is cut into patches.
@@ -44,6 +46,10 @@ pub enum VisionResize {
     /// The grid of merged cells (patch · merge pixels) closest to the image's
     /// aspect with at most `max_cells` cells (Muse Glimmer).
     CellBudget { max_cells: u64 },
+    /// One tile of between `min_patches` and `max_patches` patches, the
+    /// aspect kept and each side a whole number of cells (Nemotron Omni's
+    /// dynamic resolution).
+    PatchBounds { min_patches: u64, max_patches: u64 },
 }
 
 impl VisionResize {
@@ -66,6 +72,7 @@ impl VisionResize {
             Self::PixelBounds { max_pixels, .. } => max_pixels / cell_pixels,
             Self::PatchBudget { max_patches } => max_patches / cell_rows,
             Self::CellBudget { max_cells } => max_cells,
+            Self::PatchBounds { max_patches, .. } => max_patches / cell_rows,
         })
     }
 
@@ -109,6 +116,16 @@ impl VisionResize {
             Self::CellBudget { max_cells } => Self::CellBudget {
                 max_cells: max_cells.min(cells),
             },
+            Self::PatchBounds {
+                min_patches,
+                max_patches,
+            } => {
+                let max_patches = max_patches.min(patches);
+                Self::PatchBounds {
+                    min_patches: min_patches.min(max_patches),
+                    max_patches,
+                }
+            }
         })
     }
 }
@@ -151,6 +168,11 @@ pub enum PositionSampling {
     /// Two tables `[2, length, H]`: row `column` of the first plus row `row`
     /// of the second (Gemma 4).
     Axes { length: u64 },
+    /// A square table of `side`² rows, bilinearly resampled (half-pixel
+    /// centres, edges clamped) to a square of the grid's longer side, whose
+    /// top-left rows and columns the grid takes (C-RADIO's cropped position
+    /// embedding).
+    CroppedSquare { side: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -166,7 +188,8 @@ impl VisionPositions {
         match self.sampling {
             PositionSampling::Buckets { side }
             | PositionSampling::AlignedCorners { side }
-            | PositionSampling::PixelCenters { side } => side * side,
+            | PositionSampling::PixelCenters { side }
+            | PositionSampling::CroppedSquare { side } => side * side,
             PositionSampling::Axes { length } => 2 * length,
         }
     }
@@ -175,7 +198,8 @@ impl VisionPositions {
         match self.sampling {
             PositionSampling::Buckets { side }
             | PositionSampling::AlignedCorners { side }
-            | PositionSampling::PixelCenters { side } => {
+            | PositionSampling::PixelCenters { side }
+            | PositionSampling::CroppedSquare { side } => {
                 if side == 0 {
                     return Err(DefinitionError::new("vision position table has no rows"));
                 }
@@ -320,6 +344,10 @@ pub enum VisionStem {
         bias: Option<WeightDescriptor>,
         positions: VisionPositions,
         norm: Option<VisionNorm>,
+        /// Learned rows `[R, H]` ahead of the image's patch rows (C-RADIO's
+        /// class and register tokens): every block attends over them with
+        /// the patches, and the merger reads only the patch rows.
+        registers: Option<WeightDescriptor>,
     },
     /// A norm of the flattened patch pixels, a linear to the tower width, a
     /// norm, the position table and a norm (Gemma 4 unified).
@@ -344,6 +372,17 @@ impl VisionStem {
     pub fn positions(&self) -> &VisionPositions {
         match self {
             Self::Patch { positions, .. } | Self::NormalizedPatch { positions, .. } => positions,
+        }
+    }
+
+    /// Learned rows the tower holds ahead of each image's patch rows.
+    pub fn registers(&self) -> u64 {
+        match self {
+            Self::Patch {
+                registers: Some(registers),
+                ..
+            } => registers.shape.first().copied().unwrap_or(0),
+            Self::Patch { .. } | Self::NormalizedPatch { .. } => 0,
         }
     }
 }
@@ -540,6 +579,8 @@ pub enum VisionWeight {
     /// The patch convolution's bias.
     PatchBias,
     Position,
+    /// The learned rows ahead of the patch rows.
+    Registers,
     Norm {
         site: VisionNormSite,
         part: NormPart,
@@ -621,6 +662,13 @@ impl VisionDescription {
             VisionResize::CellBudget { max_cells } => ImageResize::CellBudget {
                 max_cells: size(max_cells, "cell budget")?,
             },
+            VisionResize::PatchBounds {
+                min_patches,
+                max_patches,
+            } => ImageResize::PatchBounds {
+                min_patches: size(min_patches, "minimum patches")?,
+                max_patches: size(max_patches, "maximum patches")?,
+            },
         };
         let config = ImageProcessorConfig {
             resize,
@@ -660,6 +708,10 @@ impl VisionDescription {
                 } => min_pixels == 0 || min_pixels > max_pixels,
                 VisionResize::PatchBudget { max_patches } => max_patches == 0,
                 VisionResize::CellBudget { max_cells } => max_cells == 0,
+                VisionResize::PatchBounds {
+                    min_patches,
+                    max_patches,
+                } => min_patches == 0 || min_patches > max_patches,
             }
             || self.window == Some(0)
         {
@@ -673,6 +725,7 @@ impl VisionDescription {
                 bias,
                 positions,
                 norm,
+                registers,
             } => {
                 if frames.is_empty() || frames.len() > 2 {
                     return Err(DefinitionError::new(
@@ -692,6 +745,13 @@ impl VisionDescription {
                 positions.validate(hidden)?;
                 if let Some(norm) = norm {
                     norm.validate(hidden, "vision stem norm")?;
+                }
+                if let Some(registers) = registers {
+                    let rows = registers.shape.first().copied().unwrap_or(0);
+                    if rows == 0 {
+                        return Err(DefinitionError::new("vision register table has no rows"));
+                    }
+                    expect_shape(registers, &[rows, hidden], "vision register table")?;
                 }
             }
             VisionStem::NormalizedPatch {
@@ -830,6 +890,7 @@ impl VisionDescription {
                 bias,
                 positions,
                 norm,
+                registers,
             } => {
                 for (index, frame) in frames.iter().enumerate() {
                     out.push((
@@ -846,6 +907,9 @@ impl VisionDescription {
                 out.push((role(vision, VisionWeight::Position), &positions.table));
                 if let Some(norm) = norm {
                     norm.weights(vision, VisionNormSite::Stem, &mut out);
+                }
+                if let Some(registers) = registers {
+                    out.push((role(vision, VisionWeight::Registers), registers));
                 }
             }
             VisionStem::NormalizedPatch {
@@ -978,5 +1042,26 @@ mod tests {
             glimmer.bounded_to_cells(512, 14, 2).unwrap(),
             VisionResize::CellBudget { max_cells: 512 }
         );
+
+        let nemotron = VisionResize::PatchBounds {
+            min_patches: 1_024,
+            max_patches: 13_312,
+        };
+        assert_eq!(nemotron.max_cells(16, 2).unwrap(), 3_328);
+        assert_eq!(
+            nemotron.bounded_to_cells(2_048, 16, 2).unwrap(),
+            VisionResize::PatchBounds {
+                min_patches: 1_024,
+                max_patches: 8_192,
+            }
+        );
+        assert_eq!(
+            nemotron.bounded_to_cells(128, 16, 2).unwrap(),
+            VisionResize::PatchBounds {
+                min_patches: 512,
+                max_patches: 512,
+            }
+        );
+        assert_eq!(nemotron.bounded_to_cells(4_096, 16, 2).unwrap(), nemotron);
     }
 }

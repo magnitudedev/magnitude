@@ -80,6 +80,7 @@ pub enum ModelMethod {
     DFlash,
     DSpark,
     DFlash2,
+    LiLiCorr,
 }
 
 impl ModelMethod {
@@ -89,6 +90,7 @@ impl ModelMethod {
             Self::DFlash => Some(DraftVariant::DFlash),
             Self::DSpark => Some(DraftVariant::DSpark),
             Self::DFlash2 => Some(DraftVariant::DFlash2),
+            Self::LiLiCorr => Some(DraftVariant::LiLiCorr),
             Self::Auto | Self::Plain | Self::Mtp => None,
         }
     }
@@ -253,7 +255,8 @@ impl ModelPolicy {
             ModelMethod::Auto
             | ModelMethod::DFlash
             | ModelMethod::DSpark
-            | ModelMethod::DFlash2 => true,
+            | ModelMethod::DFlash2
+            | ModelMethod::LiLiCorr => true,
             ModelMethod::Mtp => definition.head.is_none(),
             ModelMethod::Plain => false,
         };
@@ -473,7 +476,10 @@ fn resolve_method(
     let head = definition.head.as_ref();
     let use_draft = match requested {
         ModelMethod::Auto => definition.draft.is_some(),
-        ModelMethod::DFlash | ModelMethod::DSpark | ModelMethod::DFlash2 => true,
+        ModelMethod::DFlash
+        | ModelMethod::DSpark
+        | ModelMethod::DFlash2
+        | ModelMethod::LiLiCorr => true,
         ModelMethod::Plain | ModelMethod::Mtp => false,
     };
     if use_draft {
@@ -509,9 +515,11 @@ fn resolve_method(
         // A head this executor does not run leaves the model plain, as
         // assessment reports by rejecting that head as the drafter.
         ModelMethod::Auto => magnitude_executor::head_admitted(definition),
-        ModelMethod::Plain | ModelMethod::DFlash | ModelMethod::DSpark | ModelMethod::DFlash2 => {
-            false
-        }
+        ModelMethod::Plain
+        | ModelMethod::DFlash
+        | ModelMethod::DSpark
+        | ModelMethod::DFlash2
+        | ModelMethod::LiLiCorr => false,
         ModelMethod::Mtp => true,
     };
     if !use_mtp {
@@ -602,6 +610,7 @@ pub(crate) mod tests {
             scale: 1.0 / 2f64.sqrt(),
             reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
+            sinks: None,
             output: weight(&format!("{p}o"), &[2, 2]),
         };
         let dense = DenseFfn {
@@ -780,6 +789,7 @@ pub(crate) mod tests {
                 ModelMethod::DFlash,
                 ModelMethod::DSpark,
                 ModelMethod::DFlash2,
+                ModelMethod::LiLiCorr,
             ] {
                 let policy = ModelPolicy {
                     method,
@@ -876,6 +886,7 @@ pub(crate) mod tests {
         ModelDefinition {
             draft: Some(DraftDefinition {
                 method,
+                convolutions: None,
                 taps: vec![TapPoint::Sublayer(SublayerIndex {
                     block: 0,
                     sublayer: 0,
@@ -939,7 +950,11 @@ pub(crate) mod tests {
                 .draft_policy,
             Some(DraftPolicy::Adaptive)
         );
-        for method in [ModelMethod::DSpark, ModelMethod::DFlash2] {
+        for method in [
+            ModelMethod::DSpark,
+            ModelMethod::DFlash2,
+            ModelMethod::LiLiCorr,
+        ] {
             let error = policy(method).resolve(&draft).unwrap_err();
             assert!(error.contains("the package's draft is DFlash"), "{error}");
         }

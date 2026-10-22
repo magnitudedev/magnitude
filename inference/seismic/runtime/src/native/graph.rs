@@ -208,12 +208,82 @@ struct NodeDraft {
     args: EncodedWorkflowArgs,
 }
 
+/// A node result a run writes into the tensor bound to an external port
+/// (`NativeGraphDraft::store`) rather than into graph storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Store {
+    result: WorkflowResultRef,
+    port: u32,
+}
+
+/// Record that `result`, a result of one of the `nodes` enqueued so far, is
+/// written into the tensor bound to the external port `port`: each such port
+/// takes one result, and each result goes to one port.
+fn add_store(
+    identity: u64,
+    ports: &[PortSpec],
+    nodes: usize,
+    stores: &mut Vec<Store>,
+    result: WorkflowResultRef,
+    port: NativePort,
+) -> Result<(), WorkflowError> {
+    let ordinal = port.reference.result;
+    if result.workflow != identity
+        || result.node == INPUT_NODE
+        || result.node as usize >= nodes
+        || port.reference.workflow != identity
+        || port.reference.node != INPUT_NODE
+    {
+        return Err(WorkflowError::CrossWorkflowResult);
+    }
+    if ports.get(ordinal as usize).is_none_or(|spec| spec.local)
+        || stores
+            .iter()
+            .any(|store| store.port == ordinal || store.result == result)
+    {
+        return Err(WorkflowError::NativePortMismatch {
+            port: ordinal as usize,
+        });
+    }
+    stores.push(Store {
+        result,
+        port: ordinal,
+    });
+    Ok(())
+}
+
+/// Every stored result is the exact tensor its port describes, and none is
+/// exported: the run's binding of the port is where it lives.
+fn validate_stores(
+    stores: &[Store],
+    ports: &[PortSpec],
+    results: &[Vec<Option<NativeTensorSpec>>],
+    exports: &[WorkflowResultRef],
+) -> Result<(), WorkflowError> {
+    for store in stores {
+        let port = &ports[store.port as usize];
+        let exact = result_spec(results, store.result).is_some_and(|result| {
+            result.representation == port.representation
+                && result.extents == port.extents
+                && result.strides == port.strides
+                && result.byte_len == port.byte_len
+        });
+        if !exact || exports.contains(&store.result) {
+            return Err(WorkflowError::NativePortMismatch {
+                port: store.port as usize,
+            });
+        }
+    }
+    Ok(())
+}
+
 pub struct NativeGraphDraft {
     identity: u64,
     device: Arc<DeviceInner>,
     ports: Vec<PortSpec>,
     nodes: Vec<NodeDraft>,
     exports: Vec<WorkflowResultRef>,
+    stores: Vec<Store>,
     layout: Option<Arc<NativeGraphLayout>>,
     /// Timeline nodes, each before the kernel node of its position.
     timelines: Vec<(usize, TimelineNode)>,
@@ -235,6 +305,7 @@ impl NativeGraphDraft {
             ports: Vec::new(),
             nodes: Vec::new(),
             exports: Vec::new(),
+            stores: Vec::new(),
             layout: None,
             timelines: Vec::new(),
         }
@@ -371,6 +442,20 @@ impl NativeGraphDraft {
         Ok(())
     }
 
+    /// Write the node result `result` into the tensor each run binds to the
+    /// external port `port`, which describes exactly that result, instead of
+    /// into graph storage: a node writes a tensor the graph does not own.
+    pub fn store(&mut self, result: WorkflowResultRef, port: NativePort) -> Result<(), WorkflowError> {
+        add_store(
+            self.identity,
+            &self.ports,
+            self.nodes.len(),
+            &mut self.stores,
+            result,
+            port,
+        )
+    }
+
     pub fn seal(mut self) -> Result<NativeGraphPlan, CallError> {
         if self.nodes.is_empty() {
             return Err(CallError::Workflow(WorkflowError::Empty));
@@ -379,6 +464,7 @@ impl NativeGraphDraft {
             self.ports.len(),
             self.nodes.iter().map(|node| &node.args),
             &self.exports,
+            &self.stores,
         )
         .map_err(CallError::Workflow)?;
         // A sealed plan's vectors hold exactly their lengths, so its host
@@ -412,12 +498,14 @@ impl NativeGraphDraft {
                 return Err(CallError::Workflow(WorkflowError::MissingProducerResult));
             }
         }
+        validate_stores(&self.stores, &self.ports, &results, &self.exports)
+            .map_err(CallError::Workflow)?;
         let storage = if let Some(layout) = &self.layout {
             layout
-                .storage_for(&self.ports, &planned, &results, &self.exports)
+                .storage_for(&self.ports, &planned, &results, &self.exports, &self.stores)
                 .map_err(CallError::Workflow)?
         } else {
-            plan_storage(&self.ports, &planned, &results, &self.exports)
+            plan_storage(&self.ports, &planned, &results, &self.exports, &self.stores)
         };
         self.timelines.shrink_to_fit();
         let mut executable = Executable {
@@ -461,6 +549,7 @@ pub struct NativeGraphMetadataDraft {
     shapes: Vec<SealedNodeShape>,
     results: Vec<Vec<Option<NativeTensorSpec>>>,
     exports: Vec<WorkflowResultRef>,
+    stores: Vec<Store>,
     timelines: Vec<(usize, TimelineNode)>,
 }
 
@@ -511,8 +600,9 @@ impl NativeGraphLayout {
         nodes: &[PlannedNode],
         results: &[Vec<Option<NativeTensorSpec>>],
         exports: &[WorkflowResultRef],
+        stores: &[Store],
     ) -> Result<StoragePlan, WorkflowError> {
-        let valid = storage_signature(ports, nodes, results, exports) == self.signature
+        let valid = storage_signature(ports, nodes, results, exports, stores) == self.signature
             && ports.len() == self.port_capacity.len()
             && ports
                 .iter()
@@ -555,6 +645,8 @@ struct StorageSignature {
     results: Vec<Vec<Option<RepresentationId>>>,
     edges: Vec<Vec<Option<(u32, u32)>>>,
     exports: Vec<(u32, u32)>,
+    /// Each stored result's (node, result, port).
+    stores: Vec<(u32, u32, u32)>,
 }
 
 fn storage_signature(
@@ -562,6 +654,7 @@ fn storage_signature(
     nodes: &[PlannedNode],
     results: &[Vec<Option<NativeTensorSpec>>],
     exports: &[WorkflowResultRef],
+    stores: &[Store],
 ) -> StorageSignature {
     StorageSignature {
         ports: ports
@@ -600,6 +693,10 @@ fn storage_signature(
             .iter()
             .map(|reference| (reference.node, reference.result))
             .collect(),
+        stores: stores
+            .iter()
+            .map(|store| (store.result.node, store.result.result, store.port))
+            .collect(),
     }
 }
 
@@ -619,6 +716,7 @@ impl NativeGraphMetadataDraft {
             shapes: Vec::new(),
             results: Vec::new(),
             exports: Vec::new(),
+            stores: Vec::new(),
             timelines: Vec::new(),
         }
     }
@@ -770,9 +868,27 @@ impl NativeGraphMetadataDraft {
         Ok(())
     }
 
+    /// `NativeGraphDraft::store`.
+    pub fn store(&mut self, result: WorkflowResultRef, port: NativePort) -> Result<(), WorkflowError> {
+        add_store(
+            self.identity,
+            &self.ports,
+            self.nodes.len(),
+            &mut self.stores,
+            result,
+            port,
+        )
+    }
+
     pub fn seal(self) -> Result<NativeGraphStorageBytes, WorkflowError> {
         self.validate_topology()?;
-        let storage = plan_storage(&self.ports, &self.nodes, &self.results, &self.exports);
+        let storage = plan_storage(
+            &self.ports,
+            &self.nodes,
+            &self.results,
+            &self.exports,
+            &self.stores,
+        );
         Ok(NativeGraphStorageBytes {
             workspace: storage.scratch_bytes,
             output: storage.output_bytes,
@@ -787,7 +903,13 @@ impl NativeGraphMetadataDraft {
         layout: &NativeGraphLayout,
     ) -> Result<NativeGraphStorageBytes, WorkflowError> {
         self.validate_topology()?;
-        let storage = layout.storage_for(&self.ports, &self.nodes, &self.results, &self.exports)?;
+        let storage = layout.storage_for(
+            &self.ports,
+            &self.nodes,
+            &self.results,
+            &self.exports,
+            &self.stores,
+        )?;
         Ok(NativeGraphStorageBytes {
             workspace: storage.scratch_bytes,
             output: storage.output_bytes,
@@ -805,13 +927,14 @@ impl NativeGraphMetadataDraft {
             self.ports.len(),
             self.nodes.iter().map(|node| &node.args),
             &self.exports,
+            &self.stores,
         )?;
         for reference in &self.exports {
             if reference.node != INPUT_NODE && result_spec(&self.results, *reference).is_none() {
                 return Err(WorkflowError::MissingProducerResult);
             }
         }
-        Ok(())
+        validate_stores(&self.stores, &self.ports, &self.results, &self.exports)
     }
 
     /// Place this validated topology once with every buffer at its supplied
@@ -879,6 +1002,7 @@ impl NativeGraphMetadataDraft {
             &nodes,
             &results,
             &self.exports,
+            &self.stores,
             self.plan_heap(),
             self.timelines.len(),
         ))
@@ -890,14 +1014,15 @@ fn make_layout(
     nodes: &[PlannedNode],
     results: &[Vec<Option<NativeTensorSpec>>],
     exports: &[WorkflowResultRef],
+    stores: &[Store],
     plan_heap: HostHeap,
     timelines: usize,
 ) -> NativeGraphLayout {
     NativeGraphLayout {
         plan_heap,
         timelines,
-        storage: plan_storage(ports, nodes, results, exports),
-        signature: storage_signature(ports, nodes, results, exports),
+        storage: plan_storage(ports, nodes, results, exports, stores),
+        signature: storage_signature(ports, nodes, results, exports, stores),
         port_capacity: ports.iter().map(|port| port.byte_len).collect(),
         result_capacity: results
             .iter()
@@ -1051,6 +1176,7 @@ fn validate_used_ports<'a>(
     port_count: usize,
     nodes: impl Iterator<Item = &'a EncodedWorkflowArgs>,
     exports: &[WorkflowResultRef],
+    stores: &[Store],
 ) -> Result<(), WorkflowError> {
     let mut used = vec![false; port_count];
     for node in nodes {
@@ -1066,6 +1192,9 @@ fn validate_used_ports<'a>(
         if reference.node == INPUT_NODE {
             used[reference.result as usize] = true;
         }
+    }
+    for store in stores {
+        used[store.port as usize] = true;
     }
     if let Some(port) = used.iter().position(|used| !used) {
         return Err(WorkflowError::NativePortUnbound { port });
@@ -1354,6 +1483,9 @@ impl Executable {
         for (ordinal, result) in shape.results.iter().enumerate() {
             let Some(spec) = result else { continue };
             let (region, offset) = storage.placements[node][ordinal].site();
+            if let Region::External(port) = region {
+                self.external_writes[port] = true;
+            }
             sites.push(Site { region, offset });
             representations
                 .push(seismic_lang::registry::representation_info(spec.representation).name);
@@ -1382,6 +1514,8 @@ enum Placement {
     Export(u64),
     /// A host-written input in the per-submission upload region.
     Upload(u64),
+    /// A stored result: the tensor bound to this external port.
+    Port(usize),
     Scalar,
 }
 
@@ -1391,6 +1525,7 @@ impl Placement {
             Self::Scratch(offset) => (Region::Workspace, offset),
             Self::Export(offset) => (Region::Outputs, offset),
             Self::Upload(offset) => (Region::Upload, offset),
+            Self::Port(port) => (Region::External(port), 0),
             Self::Scalar => unreachable!("a scalar result is never a graph buffer"),
         }
     }
@@ -1511,7 +1646,14 @@ fn plan_storage(
     nodes: &[PlannedNode],
     results: &[Vec<Option<NativeTensorSpec>>],
     exports: &[WorkflowResultRef],
+    stores: &[Store],
 ) -> StoragePlan {
+    let stored = |node: usize, ordinal: usize| {
+        stores
+            .iter()
+            .find(|store| store.result.node as usize == node && store.result.result as usize == ordinal)
+            .map(|store| store.port as usize)
+    };
     let mut last_use = results
         .iter()
         .enumerate()
@@ -1567,6 +1709,10 @@ fn plan_storage(
     for (node, row) in results.iter().enumerate() {
         for (ordinal, result) in row.iter().enumerate() {
             let Some(spec) = result else { continue };
+            // A stored result lives in its port's tensor (below).
+            if stored(node, ordinal).is_some() {
+                continue;
+            }
             let exported = exports
                 .iter()
                 .any(|item| item.node as usize == node && item.result as usize == ordinal);
@@ -1653,6 +1799,10 @@ fn plan_storage(
             }
             (StorageKey::NodeScratch(..), _) => unreachable!("node scratch is never exported"),
         }
+    }
+    for store in stores {
+        placements[store.result.node as usize][store.result.result as usize] =
+            Placement::Port(store.port as usize);
     }
     StoragePlan {
         port_placements,
@@ -2854,16 +3004,16 @@ mod layout_certificate_tests {
     #[test]
     fn dominating_layout_accepts_smaller_exact_graph_and_rejects_larger_one() {
         let (ports, nodes, results) = class(16);
-        let certified = make_layout(&ports, &nodes, &results, &[], HostHeap::default(), 0);
+        let certified = make_layout(&ports, &nodes, &results, &[], &[], HostHeap::default(), 0);
         let charge = certified.storage_bytes();
         let (ports, nodes, results) = class(8);
         let exact = certified
-            .storage_for(&ports, &nodes, &results, &[])
+            .storage_for(&ports, &nodes, &results, &[], &[])
             .unwrap();
         assert_eq!(exact.scratch_bytes, charge.workspace);
         let (ports, nodes, results) = class(32);
         assert!(matches!(
-            certified.storage_for(&ports, &nodes, &results, &[]),
+            certified.storage_for(&ports, &nodes, &results, &[], &[]),
             Err(WorkflowError::NativeGraphLayoutMismatch)
         ));
     }

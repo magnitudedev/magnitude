@@ -23,6 +23,13 @@
 #else
 #error "routed_down requires a dense published element"
 #endif
+// The down weight's operand row (the product row, or NVFP4 operands), which
+// each choice's GEMV forms while staging it.
+#if defined(SEISMIC_EXPERT_DOWN_OPERANDS_NVFP4)
+#define DOWN_OPERANDS PROJECTION_OPERANDS_NVFP4
+#else
+#define DOWN_OPERANDS PROJECTION_OPERANDS_ROUNDED
+#endif
 
 #define DOWN_R SEISMIC_TUNE_ROWS
 
@@ -39,9 +46,9 @@ void routed_down() {
     for (uint64_t k = 0ul; k < SEISMIC_DIM_K; ++k) {
         const uint64_t expert = uint64_t(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES)
             + (m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1) * 4ul));
-        const projection_prologue x = projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT)
+        const projection_prologue x = projection_operands(projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT)
                 + (m * SEISMIC_PRODUCT_STRIDE_0 + k * SEISMIC_PRODUCT_STRIDE_1) * uint64_t(bytes),
-            0ul, SEISMIC_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F), 0ul);
+            0ul, SEISMIC_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F), 0ul), DOWN_OPERANDS);
         const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), PACKETS_W0_STACKED_ROWS,
             routed_expert_row(expert, SEISMIC_DIM_H), uint(SEISMIC_DIM_F));
         projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, DOWN_R, 32u, 1u, PROJECTION_NORM_NONE, x, down, down, 1u,

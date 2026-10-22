@@ -1,3 +1,8 @@
+// Sink logits (SK): an unsplit tile's direct store and the split merge add
+// each head's sink to its denominator (`attention::normalizer`).
+#define ATTENTION_SINKS SEISMIC_DIM_SK
+#define ATTENTION_SINKS_BUFFER reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SINKS))
+#define ATTENTION_SINK_AT(query_head) (static_cast<attention::u64>(query_head) * SEISMIC_SINKS_STRIDE_1)
 #include "lib/attention/inputs.cuh"
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 #define ATTENTION_INTERLEAVED SEISMIC_DIM_I

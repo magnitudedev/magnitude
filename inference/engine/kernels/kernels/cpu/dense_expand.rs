@@ -39,6 +39,7 @@ fn dense_expand_normalize<L: Isa, E: Elements>(
         };
         projection::quantize(normalized, q8);
     }
+    projection::operand_row(&[&cx.arg_gate_weight(), &cx.arg_up_weight()], normalized);
 }
 
 fn dense_expand_rows<L: Isa, E: Elements>(
