@@ -574,8 +574,6 @@ const languageNames = {
   en: "English",
   es: "Español",
   "zh-CN": "简体中文",
-  hi: "हिन्दी",
-  bn: "বাংলা",
   fr: "Français",
   de: "Deutsch",
   ja: "日本語",
