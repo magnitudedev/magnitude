@@ -11,6 +11,7 @@ pub mod error;
 mod media;
 pub mod properties;
 pub mod responses;
+mod sampling;
 pub mod source;
 #[cfg(test)]
 mod tests;

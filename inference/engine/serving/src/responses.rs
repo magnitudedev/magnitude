@@ -19,7 +19,7 @@ use futures_util::StreamExt;
 use magnitude_chat::output::{Completion, Output, OutputEvent, Progress, Termination};
 use magnitude_chat::request::{
     AssistantTurn, Conversation, Entry, GenerationControls, OutputFormat, PromptCache,
-    SamplingControls, ToolCall, ToolDefinition, ToolExchange, ToolResultPart, Tools, UserPart,
+    ToolCall, ToolDefinition, ToolExchange, ToolResultPart, Tools, UserPart,
 };
 use magnitude_chat::schema::JsonSchema;
 use magnitude_chat::{ChatInput, EndOfGeneration, GenerationRequest, ReasoningIntent, ToolChoice};
@@ -36,6 +36,7 @@ use crate::chat::{
     progress_value,
 };
 use crate::error::{ApiError, ApiErrorBody, ErrorResponse, ServingError};
+use crate::sampling::{SamplingRequest, sampling};
 use crate::source::{GenerationEvent, GenerationStream, LoadProgress, ModelLoadProgress};
 use crate::{Serving, include_progress, media, unix_timestamp, with_request_id};
 
@@ -1143,7 +1144,12 @@ pub fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseRequest, A
                 .ok_or_else(|| ApiError::invalid("max_output_tokens must be positive"))
         })
         .transpose()?;
-    let sampling = openai_sampling(request.temperature, request.top_p, request.seed)?;
+    let sampling = sampling(SamplingRequest {
+        temperature: request.temperature,
+        top_p: request.top_p,
+        seed: request.seed,
+        ..SamplingRequest::default()
+    })?;
     Ok(AdaptedResponseRequest {
         model: request.model,
         request: GenerationRequest {
@@ -1164,55 +1170,6 @@ pub fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseRequest, A
             },
         },
         projection,
-    })
-}
-
-/// Responses sampling: OpenAI defaults.
-fn openai_sampling(
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    seed: Option<u32>,
-) -> Result<SamplingControls, ApiError> {
-    let temperature = temperature.unwrap_or(0.8);
-    let top_p = top_p.unwrap_or(0.95);
-    sampling(temperature, top_p, seed)
-}
-
-/// The seed a request samples with: the caller's, or a fresh one, so an
-/// identical request without a seed samples anew rather than repeating
-/// the same draws (and the same failure) on every retry.
-pub(crate) fn request_seed(seed: Option<u32>) -> u64 {
-    seed.map(u64::from).unwrap_or_else(|| {
-        use std::hash::{BuildHasher, Hasher};
-        std::collections::hash_map::RandomState::new().build_hasher().finish()
-    })
-}
-
-/// Validated temperature and top-p with identity shaping otherwise.
-pub(crate) fn sampling(
-    temperature: f32,
-    top_p: f32,
-    seed: Option<u32>,
-) -> Result<SamplingControls, ApiError> {
-    if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
-        return Err(ApiError::invalid(
-            "temperature must be finite and between 0 and 2",
-        ));
-    }
-    if !top_p.is_finite() || !(0.0..=1.0).contains(&top_p) || top_p == 0.0 {
-        return Err(ApiError::invalid(
-            "top_p must be finite, greater than 0 and at most 1",
-        ));
-    }
-    Ok(SamplingControls {
-        temperature,
-        top_p,
-        top_k: 0,
-        min_p: 0.0,
-        repetition_penalty: 1.0,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-        seed: request_seed(seed),
     })
 }
 

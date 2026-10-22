@@ -13,7 +13,9 @@ use magnitude_chat::output::{
     Completion, GenerationTimings, OutputEvent, Progress, Termination, TimingSnapshot, TokenUsage,
 };
 use magnitude_chat::reasoning::{EffortDomain, EffortMapping, ReasoningProfile};
-use magnitude_chat::request::{Entry, OutputFormat, PromptCache, ToolCall, UserPart};
+use magnitude_chat::request::{
+    Entry, OutputFormat, PromptCache, SamplingControls, ToolCall, UserPart,
+};
 use magnitude_chat::{ChatError, ChatInput, EndOfGeneration, GenerationRequest, ReasoningIntent, ToolChoice};
 use magnitude_engine::chat::{AppliedTemplate, ModelProperties};
 use magnitude_engine::error::RequestError;
@@ -1353,8 +1355,60 @@ fn preserves_model_defaults_when_optional_controls_are_omitted() {
     assert!(request.controls.stops.is_empty());
     assert_eq!(request.controls.prompt_cache, PromptCache::Allowed);
     assert_eq!(request.controls.end_of_generation, EndOfGeneration::Stop);
-    assert_eq!(request.controls.sampling.temperature, 0.8);
+    assert_eq!(request.controls.sampling.temperature, 1.0);
     assert_eq!(request.controls.sampling.top_p, 0.95);
+    assert_eq!(request.controls.sampling.top_k, 20);
+}
+
+// Every protocol samples with the same defaults, and each keeps the fields
+// its request sets.
+#[test]
+fn every_protocol_samples_with_the_same_defaults() {
+    let chat = |fields: Value| {
+        let mut body = json!({
+            "model": "test-model",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        body.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        chat_request(body).unwrap().controls.sampling
+    };
+    let responses = |fields: Value| {
+        let mut body = json!({ "model": "test-model", "input": "hello" });
+        body.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        responses::adapt(serde_json::from_value(body).unwrap())
+            .unwrap()
+            .request
+            .controls
+            .sampling
+    };
+    let anthropic = |fields: Value| {
+        let mut body = json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        body.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        anthropic::adapt(serde_json::from_value(body).unwrap())
+            .unwrap()
+            .request
+            .controls
+            .sampling
+    };
+    for sampled in [
+        &chat as &dyn Fn(Value) -> SamplingControls,
+        &responses,
+        &anthropic,
+    ] {
+        let defaults = sampled(json!({}));
+        assert_eq!(
+            (defaults.temperature, defaults.top_p, defaults.top_k),
+            (1.0, 0.95, 20)
+        );
+        let set = sampled(json!({ "temperature": 0.5, "top_p": 0.75 }));
+        assert_eq!((set.temperature, set.top_p, set.top_k), (0.5, 0.75, 20));
+    }
+    assert_eq!(chat(json!({ "top_k": 5 })).top_k, 5);
+    assert_eq!(anthropic(json!({ "top_k": 5 })).top_k, 5);
 }
 
 // Without a caller seed, identical requests sample anew instead of repeating

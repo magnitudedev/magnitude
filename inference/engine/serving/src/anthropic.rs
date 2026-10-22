@@ -25,6 +25,7 @@ use utoipa::ToSchema;
 
 use crate::chat::{ReasoningEffortRequest, admitted, collect, ended_without_outcome};
 use crate::error::{ApiError, ServingError, insert_retry_after};
+use crate::sampling::{SamplingRequest, sampling};
 use crate::source::{GenerationEvent, GenerationStream};
 use crate::{Serving, media};
 
@@ -267,11 +268,6 @@ pub fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
     })?;
     let max_tokens = NonZeroU32::new(request.max_tokens)
         .ok_or_else(|| ApiError::invalid("max_tokens must be greater than zero"))?;
-    if request.top_k.is_some() {
-        return Err(ApiError::invalid(
-            "top_k is not supported by this local runtime",
-        ));
-    }
     if request
         .metadata
         .as_ref()
@@ -282,11 +278,13 @@ pub fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
     for stop in &request.stop_sequences {
         crate::chat::require_non_empty(stop, "stop sequence")?;
     }
-    let sampling = crate::responses::sampling(
-        request.temperature.unwrap_or(1.0),
-        request.top_p.unwrap_or(1.0),
-        request.seed,
-    )?;
+    let sampling = sampling(SamplingRequest {
+        temperature: request.temperature,
+        top_p: request.top_p,
+        top_k: request.top_k,
+        seed: request.seed,
+        ..SamplingRequest::default()
+    })?;
     Ok(AdaptedRequest {
         model: adapted.model,
         request: GenerationRequest {

@@ -31,14 +31,12 @@ use utoipa::openapi::schema::AnyOfBuilder;
 use utoipa::{PartialSchema, ToSchema};
 
 use crate::error::{ApiError, ApiErrorBody, ErrorResponse, ServingError};
+use crate::sampling::{SamplingRequest, sampling};
 use crate::source::{
     GenerationEvent, GenerationStream, LoadProgress, ModelLoadProgress, ModelLoadStage,
 };
 use magnitude_engine::chat::AppliedTemplate;
 use crate::{Serving, include_progress, media, unix_timestamp, with_request_id};
-
-const DEFAULT_TEMPERATURE: f32 = 0.8;
-const DEFAULT_TOP_P: f32 = 0.95;
 
 fn deserialize_bool_or_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
@@ -957,10 +955,6 @@ pub fn chat_input(request: ChatCompletionRequest) -> Result<ChatInput, ApiError>
     Ok(adapt_request(request)?.request.input)
 }
 
-fn finite_in(value: f32, range: std::ops::RangeInclusive<f32>) -> bool {
-    value.is_finite() && range.contains(&value)
-}
-
 pub(crate) fn validate_request(
     request: ChatCompletionRequest,
 ) -> Result<ValidatedChatRequest, ApiError> {
@@ -991,39 +985,16 @@ pub(crate) fn validate_request(
                 .ok_or_else(|| ApiError::invalid("max tokens must be greater than zero"))
         })
         .transpose()?;
-    let temperature = request.temperature.unwrap_or(DEFAULT_TEMPERATURE);
-    if !finite_in(temperature, 0.0..=2.0) {
-        return Err(ApiError::invalid(
-            "temperature must be finite and between 0 and 2",
-        ));
-    }
-    let top_p = request.top_p.unwrap_or(DEFAULT_TOP_P);
-    if !finite_in(top_p, 0.0..=1.0) || top_p == 0.0 {
-        return Err(ApiError::invalid(
-            "top_p must be finite, greater than 0 and at most 1",
-        ));
-    }
-    let min_p = request.min_p.unwrap_or(0.0);
-    if !finite_in(min_p, 0.0..=1.0) {
-        return Err(ApiError::invalid("min_p must be finite and between 0 and 1"));
-    }
-    let repetition_penalty = request.repetition_penalty.unwrap_or(1.0);
-    if !repetition_penalty.is_finite() || repetition_penalty <= 0.0 {
-        return Err(ApiError::invalid(
-            "repetition_penalty must be finite and positive",
-        ));
-    }
-    let presence_penalty = request.presence_penalty.unwrap_or(0.0);
-    let frequency_penalty = request.frequency_penalty.unwrap_or(0.0);
-    if !finite_in(presence_penalty, -2.0..=2.0) || !finite_in(frequency_penalty, -2.0..=2.0) {
-        return Err(ApiError::invalid(
-            "presence_penalty and frequency_penalty must be finite and between -2 and 2",
-        ));
-    }
-    let top_k = request.top_k.unwrap_or(0);
-    if top_k > 1 << 24 {
-        return Err(ApiError::invalid("top_k exceeds the supported range"));
-    }
+    let sampling = sampling(SamplingRequest {
+        temperature: request.temperature,
+        top_p: request.top_p,
+        top_k: request.top_k,
+        min_p: request.min_p,
+        repetition_penalty: request.repetition_penalty,
+        presence_penalty: request.presence_penalty,
+        frequency_penalty: request.frequency_penalty,
+        seed: request.seed,
+    })?;
     let conversation = chat_context(request.messages)?;
     let (tools, tool_names) = tools(request.tools.unwrap_or_default())?;
     let tool_choice = tool_choice(request.tool_choice, &tool_names)?;
@@ -1047,16 +1018,7 @@ pub(crate) fn validate_request(
         template_args,
         stop,
         max_tokens,
-        sampling: SamplingControls {
-            temperature,
-            top_p,
-            top_k,
-            min_p,
-            repetition_penalty,
-            presence_penalty,
-            frequency_penalty,
-            seed: crate::responses::request_seed(request.seed),
-        },
+        sampling,
         cache_prompt: request.cache_prompt,
         ignore_eos: request.ignore_eos,
         timings_per_token: request.timings_per_token,
