@@ -15,10 +15,10 @@ const assessmentId = ModelAssessmentIdSchema.make("assessment")
 const capabilities = { vision: false, tools: true, structuredOutput: true, reasoning: { supported: false, efforts: [], defaultEffort: Option.none() } }
 const metadata = { format: "gguf" as const, quantization: "Q4_K", quantizationName: "Q4_K_P", architecture: "qwen35moe", maximumContextLength: Option.some(32_768), storageBytes: 23 * GB }
 
-export const fits: LocalModelAssessment = {
+export const fits: Extract<LocalModelAssessment, { readonly _tag: "Fits" }> = {
   _tag: "Fits", assessmentId, environmentId, profile: { contextLength: 32_768 },
   memory: { domains: [], totalRequiredBytes: 24 * GB, requiredSystemMemoryBytes: 0 },
-  performance: [{ contextTokens: 32_768, estimatedTokensPerSecond: 80 }],
+  performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 80 }] },
 }
 export const doesNotFit: LocalModelAssessment = {
   _tag: "DoesNotFit", assessmentId, environmentId, profile: { contextLength: 32_768 }, memoryDomains: [], totalRequiredBytes: 0, deficitBytes: 4 * GB, limitingResource: "system",
@@ -38,7 +38,7 @@ export const catalogModel = (): CatalogLocalModel => ({
   presentation: { displayName: "Qwen3.6 35B-A3B", variantLabel: ModelVariantLabelSchema.make("Q4"), description: "", license: Option.some("apache-2.0"), sourceUrls: [] },
   catalogData: { releaseDate: ModelReleaseDateSchema.make("2026-01-01"), parameterization: { architecture: "dense", totalParameters: 1 }, intelligence: 1, support: { _tag: "Supported" }, fidelityRank: 1, quantizationAware: false, aliases: [] },
   acquisitionState: { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 24 * GB, primaryPath: "/models/qwen.gguf", ownership: "Magnitude" }, residencyState: { _tag: "Unloaded" } },
-  servingState: { _tag: "Assessed", capabilities, speculativeMethod: Option.none(), metadata, assessment: { _tag: "Fits", assessmentId, environmentId, profile: { contextLength: 32_768 }, memory: { domains: [], totalRequiredBytes: 24 * GB, requiredSystemMemoryBytes: 0 }, performance: [{ contextTokens: 32_768, estimatedTokensPerSecond: 80 }] }, rankingScores: Option.none() },
+  servingState: { _tag: "Assessed", capabilities, speculativeMethod: Option.none(), metadata, assessment: fits, rankingScores: { speed: Option.some(1), intelligence: 1, fidelity: 1 } },
   missingComponents: [],
   storedComponents: [],
   drafterWithheld: false,
@@ -69,12 +69,12 @@ export const attachedDrafter = (availability: AttachedDrafterAvailability = { _t
   ...overrides,
 })
 
-const sourceLabel = (origin: CustomModelOrigin) => origin._tag === "Added" ? "Hugging Face" : origin._tag === "Imported" ? "GGUF file" : origin.source._tag === "Ollama" ? "Ollama" : origin.source._tag === "LmStudio" ? "LM Studio" : origin.source._tag === "Folder" ? "models" : "Hugging Face cache"
+const sourceLabel = (origin: CustomModelOrigin) => origin._tag === "Added" ? "Hugging Face" : origin.source._tag === "Ollama" ? "Ollama" : origin.source._tag === "LmStudio" ? "LM Studio" : origin.source._tag === "Folder" ? "models" : "Hugging Face cache"
 
 export const customModel = (origin: CustomModelOrigin, overrides: Partial<CustomLocalModel> = {}): CustomLocalModel => ({
   _tag: "Custom",
   modelId: CustomFormModelIdSchema.make(origin._tag === "Added" || origin._tag === "Found" && origin.source._tag === "HuggingFaceCache"
-    ? `hf:${repository}/Qwen-Q4_K_P.gguf` : `local:${"a".repeat(64)}`),
+    ? `hf:${repository}/Qwen-Q4_K_P.gguf` : "local:qwen3.6-35b-a3b-uncensored-q4_k_p:aaaaaaaaaaaa"),
   origin,
   presentation: { displayName: "Qwen3.6 35B A3B Uncensored", variantLabel: ModelVariantLabelSchema.make("Q4_K_P"), sourceLabel: sourceLabel(origin), variantOf: Option.some(catalogId), license: Option.none(), sourceUrls: [] },
   drafter: Option.none(),
@@ -90,7 +90,8 @@ export const customModel = (origin: CustomModelOrigin, overrides: Partial<Custom
 })
 
 export const added: CustomModelOrigin = { _tag: "Added", repository, commit: "4f1c2e9abcdef" }
-export const imported: CustomModelOrigin = { _tag: "Imported", path: "/Users/me/models/qwen.gguf" }
+/** A model found in a folder the user added to Magnitude. */
+export const inFolder: CustomModelOrigin = { _tag: "Found", source: { _tag: "Folder", path: "/Users/me/models" } }
 export const foundIn = (source: Extract<CustomModelOrigin, { _tag: "Found" }>["source"]): CustomModelOrigin => ({ _tag: "Found", source })
 
 export const version = (label: string, overrides: Partial<CandidateVersion> = {}): CandidateVersion => ({

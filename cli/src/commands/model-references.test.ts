@@ -68,7 +68,11 @@ describe("model references", () => {
   it("refuses catalog IDs where only custom models apply", () => {
     const result = Effect.runSync(Effect.either(decodeCustomModelId("qwen-test:gguf:q4", (id) => `no ${id}`)))
     expect(result).toMatchObject(Either.left({ message: "no qwen-test:gguf:q4" }))
-    expect(Effect.runSync(Effect.either(decodeCustomModelId(`local:${"e".repeat(64)}`, () => "")))).toEqual(Either.right(`local:${"e".repeat(64)}`))
+    const local = "local:my-finetune-q4_k_m:eeeeeeeeeeee"
+    expect(Effect.runSync(Effect.either(decodeCustomModelId(local, () => "")))).toEqual(Either.right(local))
+    // The pre-release form, a whole digest with no label, is no longer a model ID.
+    expect(Effect.runSync(Effect.either(decodeCustomModelId(`local:${"e".repeat(64)}`, () => ""))))
+      .toMatchObject(Either.left({ message: `Invalid model ID: local:${"e".repeat(64)}` }))
   })
 })
 

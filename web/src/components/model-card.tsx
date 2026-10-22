@@ -130,7 +130,7 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
     ...(model._tag === "Catalog" ? catalogComponentOffers(model).filter(({ component }) => component !== "Drafter").map(offer => ({ label: `Add ${catalogComponentName(offer.component).toLowerCase()}${offer.downloadBytes > 0 ? ` · ${formatStorageSize(offer.downloadBytes)}` : ""}`, icon: <DownloadSimpleIcon />, disabled: command.pending, onClick: () => downloadComponent(model.modelId, offer.component) })) : []),
     ...(onFindOtherVersions ? [{ label: "Find other versions", icon: <MagnifyingGlassIcon />, disabled: false, onClick: onFindOtherVersions }] : []),
     ...(removable && (kind === "hide" || kind === "parts") ? [{ label: "Hide from Magnitude", icon: <EyeSlashIcon />, disabled: pending, onClick: () => hide(model.modelId) }] : []),
-    ...(removable && kind !== "hide" ? [{ label: kind === "forget" ? "Remove from Magnitude" : kind === "parts" ? "Remove downloaded files" : "Remove download", icon: <TrashIcon />, disabled: pending, destructive: true, onClick: () => setConfirmingRemove(true) }] : []),
+    ...(removable && kind !== "hide" ? [{ label: kind === "parts" ? "Remove downloaded files" : "Remove download", icon: <TrashIcon />, disabled: pending, destructive: true, onClick: () => setConfirmingRemove(true) }] : []),
   ]
 
   const status = modelCardStatus(model, hardware)
@@ -233,7 +233,7 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
     <div className="px-5 pb-4 empty:hidden">{notices}</div>
     {replacing && <ConfirmDialog open={confirmingLoad} onOpenChange={setConfirmingLoad} title={`Load ${name}?`}
       description={`Loading ${name} will stop ${replacing}.`} confirmLabel="Load model" onConfirm={() => load(model.modelId)} />}
-    {removable && kind !== "hide" && <ConfirmDialog open={confirmingRemove} onOpenChange={setConfirmingRemove} destructive={kind !== "forget"} {...removalConfirmation(model, canStop)} onConfirm={() => remove(model.modelId)} />}
+    {removable && kind !== "hide" && <ConfirmDialog open={confirmingRemove} onOpenChange={setConfirmingRemove} destructive {...removalConfirmation(model, canStop)} onConfirm={() => remove(model.modelId)} />}
     {model._tag === "Custom" && <DrafterPickerDialog model={model} open={choosingDrafter} onOpenChange={setChoosingDrafter} onChoose={choice => setDrafter(model.modelId, choice)} />}
   </article></TooltipProvider>
 }

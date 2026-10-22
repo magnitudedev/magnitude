@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { ModelReleaseDateSchema, type CatalogLocalModel, type CustomLocalModel } from "@magnitudedev/sdk"
 import { addedModelAwaitingFiles, modelCanDownload, modelCardDrafter, modelCardStatus, modelSubtitle, modelUpdateDescription } from "./model-card-state"
-import { added, attachedDrafter, catalogModel, customModel, doesNotFit, drafterCandidate, foundIn, imported } from "../../test/models/fixtures"
+import { added, attachedDrafter, catalogModel, customModel, doesNotFit, drafterCandidate, foundIn, inFolder } from "../../test/models/fixtures"
 
 const moe = (): CatalogLocalModel => {
   const model = catalogModel()
@@ -29,14 +29,14 @@ describe("model card drafter", () => {
   it("lets a custom model change its drafter in place, with Update when a newer revision exists", () => {
     const attached = modelCardDrafter(customModel(added, { drafter: Option.some(attachedDrafter({ _tag: "Present" }, { updateAvailable: true })) }))
     expect(attached).toMatchObject({ _tag: "Attached", title: "Magnitude DFlash for Qwen3.6 35B-A3B", changeable: true, update: true })
-    expect(modelCardDrafter(customModel(imported))).toEqual({ _tag: "None", changeable: true })
+    expect(modelCardDrafter(customModel(inFolder))).toEqual({ _tag: "None", changeable: true })
   })
   it("offers the recommended drafter only while none is attached or turned off", () => {
     expect(modelCardDrafter(customModel(added, { recommendedDrafter: Option.some(drafterCandidate()) }))).toEqual({ _tag: "Add" })
     expect(modelCardDrafter(customModel(added, { drafterChoice: { _tag: "None" }, recommendedDrafter: Option.some(drafterCandidate()) }))).toEqual({ _tag: "None", changeable: true })
   })
   it("shows an automatic drafter that isn't worked out yet as pending, never as none", () => {
-    expect(modelCardDrafter(customModel(imported, { drafterPending: true }))).toEqual({ _tag: "Pending" })
+    expect(modelCardDrafter(customModel(inFolder, { drafterPending: true }))).toEqual({ _tag: "Pending" })
     expect(modelCardDrafter(customModel(added, { drafterPending: true, recommendedDrafter: Option.some(drafterCandidate()) }))).toEqual({ _tag: "Pending" })
   })
   it("shows a drafter-only download's progress in the cell", () => {

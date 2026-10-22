@@ -10,39 +10,21 @@ import {
   HuggingFaceCredentialSchema,
   isValidAuthInfo,
   type AuthInfo,
-  type HuggingFaceCredential,
 } from "../types/auth";
 import type { AuthStorageShape } from "./contracts";
 
-/** The `auth.json` key of the Hugging Face account; every other key is a provider. */
-export const HUGGING_FACE_AUTH_KEY = "huggingface";
-
-interface AuthFile {
-  readonly providers: Record<string, AuthInfo>;
-  readonly huggingFace: Option.Option<HuggingFaceCredential>;
-}
-
-const decodeHuggingFace = Schema.decodeUnknownOption(HuggingFaceCredentialSchema);
 const encodeHuggingFace = Schema.encodeSync(HuggingFaceCredentialSchema);
 
-function normalizeAuthData(data: unknown): AuthFile {
-  if (typeof data !== "object" || data === null) return { providers: {}, huggingFace: Option.none() };
+function normalizeAuthData(data: unknown): Record<string, AuthInfo> {
+  if (typeof data !== "object" || data === null) return {};
   const providers: Record<string, AuthInfo> = {};
   for (const [key, value] of Object.entries(data)) {
-    if (key !== HUGGING_FACE_AUTH_KEY && isValidAuthInfo(value)) {
+    if (isValidAuthInfo(value)) {
       providers[key] = value;
     }
   }
-  return {
-    providers,
-    huggingFace: decodeHuggingFace((data as Record<string, unknown>)[HUGGING_FACE_AUTH_KEY]),
-  };
+  return providers;
 }
-
-const encodeAuthFile = (file: AuthFile): Record<string, unknown> => Option.match(file.huggingFace, {
-  onNone: () => ({ ...file.providers }),
-  onSome: (credential) => ({ ...file.providers, [HUGGING_FACE_AUTH_KEY]: encodeHuggingFace(credential) }),
-});
 
 export function makeAuthStorage(): Effect.Effect<
   AuthStorageShape,
@@ -57,12 +39,12 @@ export function makeAuthStorage(): Effect.Effect<
 
     // Durable read: Missing is a legitimate first-run state (return empty),
     // Invalid is corruption (return typed error — never silently overwrite).
-    const readAuthFile = (): Effect.Effect<AuthFile, PlatformError | JsonError> =>
+    const readAuthFile = (): Effect.Effect<Record<string, AuthInfo>, PlatformError | JsonError> =>
       Effect.gen(function* () {
         const result = yield* readStructuredFile(g.authFile, Schema.Unknown).pipe(
           Effect.provideService(FileSystem.FileSystem, fs)
         );
-        if (result._tag === "Missing") return { providers: {}, huggingFace: Option.none() };
+        if (result._tag === "Missing") return {};
         if (result._tag === "Invalid") {
           return yield* Effect.fail(
             new SchemaDecodeError({ path: g.authFile, message: result.error.reason })
@@ -72,11 +54,11 @@ export function makeAuthStorage(): Effect.Effect<
       });
 
     // The file is written owner-only (0600); an empty file is removed.
-    const modify = (update: (file: AuthFile) => AuthFile) =>
+    const modify = (update: (providers: Record<string, AuthInfo>) => Record<string, AuthInfo>) =>
       io.withPathLock(
         g.authFile,
         Effect.gen(function* () {
-          const next = encodeAuthFile(update(yield* readAuthFile()));
+          const next = update(yield* readAuthFile());
           if (Object.keys(next).length === 0) {
             yield* io.removeFileIfExists(g.authFile);
           } else {
@@ -86,27 +68,40 @@ export function makeAuthStorage(): Effect.Effect<
       );
 
     return {
-      loadAll: () => readAuthFile().pipe(Effect.map((file) => file.providers)),
+      loadAll: readAuthFile,
 
       get: (providerId) =>
-        readAuthFile().pipe(Effect.map((file) => file.providers[providerId])),
+        readAuthFile().pipe(Effect.map((providers) => providers[providerId])),
 
       set: (providerId, info) =>
-        modify((file) => ({ ...file, providers: { ...file.providers, [providerId]: info } })),
+        modify((providers) => ({ ...providers, [providerId]: info })),
 
       remove: (providerId) =>
-        modify((file) => {
-          const providers = { ...file.providers };
-          delete providers[providerId];
-          return { ...file, providers };
+        modify((providers) => {
+          const next = { ...providers };
+          delete next[providerId];
+          return next;
         }),
 
-      getHuggingFace: Effect.suspend(readAuthFile).pipe(Effect.map((file) => file.huggingFace)),
+      // The Hugging Face sign-in is its own owner-only file; a missing file is
+      // signed out, and an invalid one is corruption, reported like auth.json's.
+      getHuggingFace: readStructuredFile(g.huggingFaceFile, HuggingFaceCredentialSchema).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+        Effect.flatMap((result) => {
+          switch (result._tag) {
+            case "Missing": return Effect.succeed(Option.none());
+            case "Invalid": return Effect.fail(
+              new SchemaDecodeError({ path: g.huggingFaceFile, message: result.error.reason })
+            );
+            case "Present": return Effect.succeed(Option.some(result.value));
+          }
+        })
+      ),
 
       setHuggingFace: (credential) =>
-        modify((file) => ({ ...file, huggingFace: Option.some(credential) })),
+        io.writeSecureJsonFile(g.huggingFaceFile, encodeHuggingFace(credential)),
 
-      removeHuggingFace: Effect.suspend(() => modify((file) => ({ ...file, huggingFace: Option.none() }))),
+      removeHuggingFace: io.removeFileIfExists(g.huggingFaceFile),
     };
   });
 }

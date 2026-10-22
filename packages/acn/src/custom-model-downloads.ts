@@ -1,12 +1,15 @@
 import { Option } from "effect"
 import { bundlePackages, packageHoldsFile } from "@magnitudedev/icn"
-import type {
-  ModelAcquisitionFailure,
-  ModelId,
-  ModelTransferProgress,
+import {
+  parseModelId,
+  sameModelId,
+  type ModelAcquisitionFailure,
+  type ModelId,
+  type ModelTransferProgress,
 } from "@magnitudedev/acn-protocol"
 import type { CustomModelsConfig } from "@magnitudedev/storage"
-import type { ModelDownload, ModelPackage, ServableModelBundle } from "@magnitudedev/icn-protocol/schemas"
+import type { ModelDownload, ModelPackage } from "@magnitudedev/icn-protocol/schemas"
+import { addedModel } from "./custom-models"
 
 /** A download belongs to a model as its target bundle (an added model) or its drafter alone. */
 export interface RelatedDownload {
@@ -14,34 +17,28 @@ export interface RelatedDownload {
   readonly download: ModelDownload
 }
 
+/** The package of a download that holds an added model's first shard, at whatever commit. */
+export const addedTargetPackage = (modelId: ModelId, download: ModelDownload): Option.Option<ModelPackage> => {
+  const identity = parseModelId(modelId)
+  if (identity._tag !== "HuggingFace") return Option.none()
+  return Option.fromNullable(bundlePackages(download.bundle).find((pkg) => pkg.source._tag === "HuggingFace"
+    && packageHoldsFile(pkg, identity.repositoryId, pkg.source.revision, identity.artifactSelector)))
+}
+
 /**
- * Downloads in ICN's order that ACN started for this model. One that carries an added model's
- * declared target file acquires that target, at its pinned commit or at a newer commit an update
- * fetched (so an update that failed or was abandoned still reads as the target's); any other fetches
- * its drafter alone.
+ * Downloads in ICN's order for this model. One that carries an added model's first shard acquires
+ * that target, at its pinned commit or at a newer commit an update fetched (so an update that failed
+ * or was cancelled still reads as the target's); any other fetches its drafter alone.
  */
 export const customModelDownloads = (
   modelId: ModelId,
   config: CustomModelsConfig,
   downloads: readonly ModelDownload[],
 ): readonly RelatedDownload[] => {
-  const declaration = config.declarations[modelId as keyof CustomModelsConfig["declarations"]]
-  const holdsTarget = (download: ModelDownload) => {
-    if (declaration?.origin._tag !== "Added") return false
-    const { repository } = declaration.origin
-    const primary = declaration.target[0]
-    return primary !== undefined && bundlePackages(download.bundle).some((pkg) =>
-      pkg.source._tag === "HuggingFace" && packageHoldsFile(pkg, repository, pkg.source.revision, primary))
-  }
-  return downloads.flatMap((download): readonly RelatedDownload[] => Option.contains(download.forModel, modelId)
-    ? [{ kind: holdsTarget(download) ? "Target" : "Drafter", download }]
+  const added = Option.isSome(addedModel(config, modelId))
+  return downloads.flatMap((download): readonly RelatedDownload[] => sameModelId(download.forModel, modelId)
+    ? [{ kind: added && Option.isSome(addedTargetPackage(modelId, download)) ? "Target" : "Drafter", download }]
     : [])
-}
-
-/** The separate drafter package of a bundle; fetching it alone leaves the target untouched. */
-export const drafterPackage = (bundle: ServableModelBundle): Option.Option<ModelPackage> => {
-  if (bundle._tag === "Standalone") return Option.some(bundle.package)
-  return bundle.draftSource._tag === "Separate" ? Option.some(bundle.draftSource.draft) : Option.none()
 }
 
 export const downloadIsActive = (download: ModelDownload): boolean =>

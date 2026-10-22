@@ -21,11 +21,11 @@ export function isValidAuthInfo(value: unknown): value is AuthInfo {
 }
 
 /**
- * The Hugging Face account Magnitude signed in to, stored in `auth.json` under its own key beside the
- * provider credentials. Tokens decode as `Redacted` so they never reach a log by accident.
+ * The Hugging Face account Magnitude signed in to, stored on its own in `huggingface.json`.
+ * Tokens decode as `Redacted` so they never reach a log by accident.
  */
 export const HuggingFaceCredentialSchema = Schema.Struct({
-  type: Schema.Literal('huggingface-oauth'),
+  type: Schema.Literal('oauth'),
   accessToken: Schema.Redacted(Schema.String),
   refreshToken: Schema.optionalWith(Schema.Redacted(Schema.String), { as: 'Option', exact: true }),
   expiresAt: Schema.optionalWith(Schema.Number, { as: 'Option', exact: true }),

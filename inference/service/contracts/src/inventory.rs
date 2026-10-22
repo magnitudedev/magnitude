@@ -288,7 +288,6 @@ pub enum ExternalOrigin {
     LlamaCpp { hub: Option<HubFile> },
     Ollama { name: String, hub: Option<HubFile> },
     Folder,
-    Imported,
 }
 
 /// A repository-relative GGUF file on the Hugging Face Hub.

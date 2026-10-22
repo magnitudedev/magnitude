@@ -2,7 +2,7 @@ import { BunFileSystem } from "@effect/platform-bun"
 import { Effect, Either, Layer, Option, Schema, Stream, SubscriptionRef } from "effect"
 import { describe, expect, it } from "vitest"
 import type { CustomModelsConfig } from "@magnitudedev/storage"
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -16,7 +16,7 @@ import {
   CandidateInspection,
   CandidateInspectionProgress,
   DrafterCandidate as NativeDrafterCandidate,
-  type ModelCandidate,
+  ModelDownload as NativeModelDownload,
   type ModelDownload,
   type ModelDownloadEncoded,
 } from "@magnitudedev/icn-protocol/schemas"
@@ -31,9 +31,8 @@ import {
 import { CustomModelCommands, CustomModelCommandsLive } from "./custom-model-commands"
 import { CatalogModelSync } from "./catalog-model-sync"
 import { CustomModelReconciler } from "./custom-model-reconciler"
-import { CustomModels, localModelsConfiguration } from "./custom-models"
+import { CustomModels, configuredDrafterChoice, localModelsConfiguration } from "./custom-models"
 import { HuggingFaceAccount } from "./hugging-face-account"
-import { DrafterMethodsLive } from "./drafter-references"
 import { LocalModelSources, type CatalogModelSource } from "./local-model-sources"
 import { LocalModels, catalogAcquisition, customModel } from "./local-models"
 import { customModelDownloads, type RelatedDownload } from "./custom-model-downloads"
@@ -43,9 +42,11 @@ import {
   customModelsConfig,
   customSource,
   drafterReference,
+  drafterSetting,
   foundId,
-  importedId,
+  localId,
   makeTestCustomModels,
+  modelPackage,
   nativeCustomModel,
   nativeDownload,
   readyModel,
@@ -117,9 +118,18 @@ interface DrafterList {
 const listed = (candidates: readonly NativeDrafterCandidate[], entered?: NativeDrafterCandidate): DrafterList =>
   ({ candidates, entered: Option.map(Option.fromNullable(entered), ({ reference }) => reference) })
 
+/** A download ICN was asked to start: the model, and which part of it (`none` for the model itself). */
+interface StartedDownload {
+  readonly modelId: string
+  readonly part: Option.Option<"Drafter" | "Update">
+}
+
+const startedTarget = (modelId: string): StartedDownload => ({ modelId, part: Option.none() })
+const startedDrafter = (modelId: string): StartedDownload => ({ modelId, part: Option.some("Drafter") })
+const startedUpdate = (modelId: string): StartedDownload => ({ modelId, part: Option.some("Update") })
+
 interface Recorded {
-  readonly bundles: ModelCandidate[]
-  readonly started: unknown[]
+  readonly started: StartedDownload[]
   readonly cancelled: string[]
   readonly acknowledged: string[]
   readonly removedFiles: string[]
@@ -143,11 +153,15 @@ const harness = (options: {
   readonly catalogRows?: readonly LocalModelsState["models"][number][]
   readonly catalogInstalled?: readonly string[]
   readonly signedIn?: boolean
-  readonly startDownload?: (bundle: unknown, forModel: string) => Option.Option<ModelDownload>
+  readonly startDownload?: (started: StartedDownload) => Option.Option<ModelDownload>
   readonly pushFailure?: LocalModelMutationFailed
+  /** The local models as ICN lists them now, when they differ from the custom models' own rows. */
+  readonly listedModels?: readonly LocalModelsState["models"][number][]
+  /** Whether the local models change once after the commands start. */
+  readonly localModelsChange?: boolean
 } = {}) => {
   const recorded: Recorded = {
-    bundles: [], started: [], cancelled: [], acknowledged: [], removedFiles: [], drafterRequests: [], catalogSyncs: [], pushes: 0, prunes: 0,
+    started: [], cancelled: [], acknowledged: [], removedFiles: [], drafterRequests: [], catalogSyncs: [], pushes: 0, prunes: 0,
   }
   const downloadList = Effect.runSync(SubscriptionRef.make<readonly ModelDownload[]>(options.downloads ?? []))
   const sourceModels = (options.customModels ?? [nativeCustomModel()]).map(customSource)
@@ -197,21 +211,17 @@ const harness = (options: {
         ?? Effect.succeed(listed(options.drafters ?? [nativeCandidate()]))
     }) as never,
     assess: () => Effect.die("unused"),
-    bundle: (candidate) => Effect.sync(() => {
-      recorded.bundles.push(candidate)
-      return { _tag: "Standalone", package: { id: "bundle" } } as never
-    }),
   }
   const layer = Effect.gen(function* () {
     const config = options.config ?? customModelsConfig()
     const custom = yield* makeTestCustomModels(config)
     const rows = sourceModels.flatMap((entry) => Option.toArray(customModel({
       entry, assessment: undefined, instances: [], related: [], catalog: options.catalog ?? [],
-      drafterChoice: config.drafters[entry.id] ?? { _tag: "Auto" },
+      drafterChoice: configuredDrafterChoice(config, entry.id),
     })))
     const localState: LocalModelsState = {
       preparation: { discovery: { complete: true, modelsFound: rows.length }, assessment: { complete: true, settledModels: 0, totalModels: 0 } },
-      models: [...(options.catalogRows ?? []), ...rows],
+      models: [...(options.catalogRows ?? []), ...(options.listedModels ?? rows)],
       unsupported: [],
       hidden: [],
     }
@@ -222,9 +232,9 @@ const harness = (options: {
         changes: downloadList.changes,
         initialized: Effect.succeed(true),
         refresh: Effect.void,
-        start: (bundle: unknown, forModel: string) => Effect.gen(function* () {
-          recorded.started.push({ bundle, forModel })
-          const started = options.startDownload?.(bundle, forModel) ?? Option.none()
+        start: (modelId: string, part: StartedDownload["part"]) => Effect.gen(function* () {
+          recorded.started.push({ modelId, part })
+          const started = options.startDownload?.({ modelId, part }) ?? Option.none()
           if (Option.isSome(started)) yield* SubscriptionRef.update(downloadList, (list) => [...list, started.value])
           return started
         }),
@@ -245,7 +255,10 @@ const harness = (options: {
       Layer.succeed(LocalModelSources, {
         state: Effect.succeed({ customModels: sourceModels, hiddenModels: [], catalogModels: options.catalog ?? [] }),
       } as never),
-      Layer.succeed(LocalModels, { state: Effect.succeed(localState) } as never),
+      Layer.succeed(LocalModels, {
+        state: Effect.succeed(localState),
+        changes: options.localModelsChange ? Stream.make(undefined) : Stream.never,
+      } as never),
       Layer.succeed(CustomModels, custom),
       Layer.succeed(CustomModelReconciler, {
         push: Effect.sync(() => { recorded.pushes += 1 }).pipe(
@@ -260,7 +273,6 @@ const harness = (options: {
         }),
         downloadComponent: () => Effect.succeed({ started: false }),
       }),
-      DrafterMethodsLive,
       Layer.succeed(HuggingFaceAccount, {
         account: Effect.succeed(options.signedIn
           ? { _tag: "SignedIn" as const, username: "ada", avatarUrl: Option.none() }
@@ -512,7 +524,7 @@ describe("finding models", () => {
 describe("a drafter entered by hand", () => {
   const hand = { _tag: "Local", path: "/drafters/hand-dspark.gguf" } as const
   const handBound = { _tag: "Bound", method: { _tag: "DSpark" }, memoryBytes: 1 }
-  const pinnedByHand = customModelsConfig({ drafters: { [foundId]: { _tag: "Reference", reference: hand, method: { _tag: "DSpark" } } } })
+  const pinnedByHand = customModelsConfig({ drafters: { [foundId]: hand.path } })
   const entered = nativeCandidate({
     category: "Other", reference: hand, name: "hand-dspark.gguf", label: "Untested", lineage: "None",
     method: { _tag: "DSpark" }, onThisComputer: true, sizeBytes: 5, verdict: handBound,
@@ -556,7 +568,7 @@ describe("a drafter entered by hand that is a listed candidate's file", () => {
 
   it("adds no Other row when the pinned file resolves to the listed catalog drafter", async () => {
     const { run } = harness({
-      config: customModelsConfig({ drafters: { [foundId]: { _tag: "Reference", reference: catalogFile, method: { _tag: "DFlash" } } } }),
+      config: customModelsConfig({ drafters: { [foundId]: "hf:magnitudedev/Model-DFlash-GGUF/Model-DFlash-Q8_0.gguf@d1" } }),
       draftersFor: resolvesToCatalog,
     })
     const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.none()).pipe(Effect.map(({ candidates }) => candidates)))
@@ -577,58 +589,72 @@ describe("a drafter entered by hand that is a listed candidate's file", () => {
       Effect.zipWith(models.get, (result, config) => ({ result, saved: config.drafters[foundId] })),
     ))
     expect(Option.map(chosen.result.drafter, ({ reference }) => reference)).toEqual(Option.some(drafterReference))
-    expect(chosen.saved).toEqual({ _tag: "Auto" })
+    // Automatic choice is stored by leaving the model out.
+    expect(chosen.saved).toBeUndefined()
 
     const notRecommended = harness({ config: customModelsConfig({ drafters: {} }), draftersFor: resolvesToCatalog })
     const saved = await notRecommended.run((commands, models) => commands.setModelDrafter(foundId, { _tag: "Reference", reference: catalogFile }).pipe(
       Effect.zipRight(models.get),
     ))
-    expect(saved.drafters[foundId]).toEqual({ _tag: "Reference", reference: drafterReference, method: { _tag: "DFlash" } })
+    expect(saved.drafters[foundId]).toEqual({
+      _tag: "HuggingFace", repository: "magnitudedev/model-DFlash-GGUF", path: "dflash.gguf", revision: "d1",
+    })
   })
 })
 
 describe("adding models", () => {
-  it("declares an added model with its drafter and downloads the bundle ICN builds", async () => {
-    const { run, recorded } = harness()
+  const notYetAdded = () => customModelsConfig({ added: {} })
+
+  it("stores an added model at its commit and asks the inference service to download it", async () => {
+    const { run, recorded } = harness({ config: notYetAdded() })
     const result = await run((commands, models) => Effect.gen(function* () {
       const added = yield* commands.addHuggingFaceModel({ repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false })
       return { added, config: yield* models.get }
     }))
     expect(result.added).toMatchObject({ modelId: addedId, version: "Q4_K_M", outcome: "Started" })
-    expect(result.config.declarations[addedId]?.origin).toEqual({ _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee", pendingCommit: Option.none() })
-    expect(result.config.drafters[addedId]).toEqual({ _tag: "Auto" })
-    expect(recorded.bundles[0]).toMatchObject({
-      source: { _tag: "HuggingFace", repository: "owner/model-GGUF", commit: "c0ffee" },
-      target: ["model-Q4_K_M.gguf"],
-      drafter: Option.some({ method: { _tag: "DFlash" }, reference: drafterReference }),
-    })
-    expect(recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: addedId }])
+    expect(result.config.added[addedId]).toEqual({ revision: "c0ffee", projector: Option.none() })
+    // Automatic choice is stored by leaving the model out of `drafters`.
+    expect(result.config.drafters[addedId]).toBeUndefined()
+    expect(recorded.started).toEqual([startedTarget(addedId)])
     expect(recorded.pushes).toBeGreaterThan(0)
+  })
+
+  it("stores an added model's projector from the inspection", async () => {
+    const withProjector = Schema.decodeUnknownSync(CandidateInspection)({
+      ...Schema.encodeSync(CandidateInspection)(inspection()),
+      projector: { path: "mmproj-F16.gguf", sizeBytes: 10 },
+    })
+    const { run } = harness({ config: notYetAdded(), inspect: withProjector })
+    const config = await run((commands, models) => commands.addHuggingFaceModel({
+      repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false,
+    }).pipe(Effect.zipRight(models.get)))
+    expect(config.added[addedId]).toEqual({ revision: "c0ffee", projector: Option.some("mmproj-F16.gguf") })
   })
 
   it("adds a version of a catalog model's repository that isn't its exact target as a custom model whose catalog drafter is Auto", async () => {
     const catalogDrafter = { _tag: "Catalog", modelId: CatalogFormModelIdSchema.make("qwen3.5-4b:gguf:q4") } as const
-    const { run, recorded } = harness({ drafters: [nativeCandidate({ reference: catalogDrafter, lineage: "Exact" })] })
+    const { run, recorded } = harness({ config: notYetAdded(), drafters: [nativeCandidate({ reference: catalogDrafter, lineage: "Exact" })] })
     const result = await run((commands, models) => Effect.gen(function* () {
       const added = yield* commands.addHuggingFaceModel({ repository, revision: Option.none(), version: Option.some("Q4_K_M"), drafter: { _tag: "Auto" }, force: false })
       return { added, config: yield* models.get }
     }))
     expect(result.added).toMatchObject({ _tag: "Custom", modelId: addedId, outcome: "Started" })
-    expect(result.config.declarations[addedId]?.origin._tag).toBe("Added")
-    expect(result.config.drafters[addedId]).toEqual({ _tag: "Auto" })
+    expect(result.added._tag === "Custom" && Option.map(result.added.drafter, ({ reference }) => reference)).toEqual(Option.some(catalogDrafter))
+    expect(result.config.added[addedId]?.revision).toBe("c0ffee")
+    expect(result.config.drafters[addedId]).toBeUndefined()
     expect(recorded.catalogSyncs).toEqual([])
-    expect(recorded.bundles[0]?.drafter).toEqual(Option.some({ method: { _tag: "DFlash" }, reference: catalogDrafter }))
+    expect(recorded.started).toEqual([startedTarget(addedId)])
   })
 
-  it("pins a drafter the user names when adding", async () => {
+  it("pins a drafter the user names when adding, as config.json spells it", async () => {
     const other = { _tag: "Local", path: "/drafters/dspark.gguf" } as const
-    const { run } = harness({ drafters: [nativeCandidate({
+    const { run } = harness({ config: notYetAdded(), drafters: [nativeCandidate({
       category: "Other", reference: other, method: { _tag: "DSpark" }, verdict: { _tag: "Bound", method: { _tag: "DSpark" }, memoryBytes: 1 },
     })] })
     const config = await run((commands, models) => commands.addHuggingFaceModel({
       repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Reference", reference: other }, force: false,
     }).pipe(Effect.zipRight(models.get)))
-    expect(config.drafters[addedId]).toEqual({ _tag: "Reference", reference: other, method: { _tag: "DSpark" } })
+    expect(config.drafters[addedId]).toEqual({ _tag: "Local", path: "/drafters/dspark.gguf" })
   })
 
   it("installs the catalog model a version exactly is instead of declaring a Hugging Face model", async () => {
@@ -668,15 +694,16 @@ describe("adding models", () => {
     expect(recorded.catalogSyncs).toEqual([])
   })
 
-  it("downloads only the target when the chosen drafter is already on this computer", async () => {
-    const { run, recorded } = harness({ drafters: [nativeCandidate({ onThisComputer: true })] })
+  it("asks only for the model when the chosen drafter is already on this computer, leaving its files to the inference service", async () => {
+    const { run, recorded } = harness({ config: notYetAdded(), drafters: [nativeCandidate({ onThisComputer: true })] })
     const result = await run((commands, models) => Effect.gen(function* () {
       const added = yield* commands.addHuggingFaceModel({ repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" }, force: false })
       return { added, config: yield* models.get }
     }))
     expect(result.added._tag === "Custom" && result.added.drafter.pipe(Option.map(({ onThisComputer }) => onThisComputer))).toEqual(Option.some(true))
-    expect(result.config.drafters[addedId]).toEqual({ _tag: "Auto" })
-    expect(recorded.bundles[0]?.drafter).toEqual(Option.none())
+    expect(result.added._tag === "Custom" && result.added.drafterDownloadStarted).toBe(false)
+    expect(result.config.drafters[addedId]).toBeUndefined()
+    expect(recorded.started).toEqual([startedTarget(addedId)])
   })
 
   it("refuses an unsupported version before anything downloads", async () => {
@@ -741,8 +768,8 @@ describe("adding models", () => {
       return { added, config: yield* models.get }
     }))
     expect(result.added).toMatchObject({ modelId: foundId, outcome: "AlreadyOnThisComputer" })
-    expect(result.config.declarations[foundId]).toBeUndefined()
-    expect(recorded.bundles[0]).toMatchObject({ source: { _tag: "Local", path: "/models" }, target: ["found-Q8_0.gguf"] })
+    expect(result.config.added[foundId]).toBeUndefined()
+    expect(recorded.started).toEqual([startedDrafter(foundId)])
   })
 
   // QA linux-cuda round 3c: pulling a version that is already a found model ("already on this computer") declares
@@ -754,52 +781,17 @@ describe("adding models", () => {
       yield* commands.remove(foundId)
       return yield* models.get
     }))
-    expect(config.declarations[foundId]).toBeUndefined()
+    expect(config.added[foundId]).toBeUndefined()
     expect(config.hidden).toEqual([foundId])
     expect(recorded.removedFiles).toEqual([])
   })
 
 })
 
-describe("a declaration left by a link", () => {
-  const otherImportedId = CustomFormModelIdSchema.make(`local:${"b".repeat(64)}`)
-  const linkedFiles = () => {
-    const root = mkdtempSync(join(tmpdir(), "magnitude-links-"))
-    const file = join(root, "store", "model-Q4_K_M.gguf")
-    const link = join(root, "link.gguf")
-    const second = join(root, "second-link.gguf")
-    mkdirSync(join(root, "store"))
-    writeFileSync(file, "gguf")
-    symlinkSync(file, link)
-    symlinkSync(link, second)
-    return { root, file, link, second }
-  }
-  const importedDeclaration = (path: string) => ({ origin: { _tag: "Imported", path, headerDigest: "b".repeat(64) }, target: [path] })
-
-  it("forgets a declaration left by a link when the model it names is removed", async () => {
-    const { root, file, link } = linkedFiles()
-    try {
-      const { run } = harness({
-        config: customModelsConfig({
-          declarations: { [otherImportedId]: importedDeclaration(link) },
-          drafters: { [otherImportedId]: { _tag: "None" } },
-        }),
-        customModels: [nativeCustomModel({ files: [{ path: file, sizeBytes: 4 }] })],
-      })
-      const config = await run((commands, models) => commands.remove(foundId).pipe(Effect.zipRight(models.get)))
-      expect(config.hidden).toEqual([foundId])
-      expect(config.declarations).toEqual({})
-      expect(config.drafters).toEqual({})
-    } finally {
-      rmSync(root, { recursive: true, force: true })
-    }
-  })
-})
-
 describe("hiding a model that isn't on this computer", () => {
   it("fails for an unknown custom or catalog ID and changes nothing", async () => {
-    const { run } = harness({ config: customModelsConfig({ declarations: {} }) })
-    const unknownCustom = CustomFormModelIdSchema.make(`local:${"c".repeat(64)}`)
+    const { run } = harness({ config: customModelsConfig({ added: {} }) })
+    const unknownCustom = CustomFormModelIdSchema.make("local:unknown-model-q4_k_m:cccccccccccc")
     const unknownCatalog = CatalogFormModelIdSchema.make("no-such-model:gguf:q4")
     const result = await run((commands, models) => Effect.gen(function* () {
       const custom = yield* commands.hide(unknownCustom).pipe(Effect.flip)
@@ -811,7 +803,7 @@ describe("hiding a model that isn't on this computer", () => {
     expect(result.hidden).toEqual([])
   })
 
-  it("hides a catalog model named by its alias", async () => {
+  it("hides a catalog model named by its alias by its catalog ID", async () => {
     const external = CatalogFormModelIdSchema.make("qwen3.6-35b-a3b:gguf:q4")
     const alias = CustomFormModelIdSchema.make("hf:unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf")
     const { run } = harness({
@@ -827,7 +819,7 @@ describe("hiding a model that isn't on this computer", () => {
       catalog: [{ id: external, source: { aliases: Option.some([alias]) } }] as unknown as readonly CatalogModelSource[],
     })
     const hidden = await run((commands, models) => commands.hide(alias).pipe(Effect.zipRight(models.get), Effect.map(({ hidden }) => hidden)))
-    expect(hidden).toEqual([alias])
+    expect(hidden).toEqual([external])
   })
 })
 
@@ -872,7 +864,7 @@ describe("drafter changes", () => {
       Effect.zipRight(models.get),
     ))
     expect(result.drafters[foundId]).toEqual({ _tag: "None" })
-    expect(recorded.bundles).toEqual([])
+    expect(recorded.started).toEqual([])
     expect(recorded.prunes).toBe(0)
   })
 
@@ -910,12 +902,15 @@ describe("drafter changes", () => {
     const chosen = await onDisk.run((commands) => commands.setModelDrafter(foundId, { _tag: "Auto" }))
     expect(chosen.drafterDownloadStarted).toBe(false)
     expect(onDisk.recorded.started).toEqual([])
-    const missing = harness()
+    const missing = harness({ startDownload: () => Option.some(drafterDownload("drafter", { _tag: "Pending", completedBytes: 0, totalBytes: 9 })) })
     expect((await missing.run((commands) => commands.setModelDrafter(foundId, { _tag: "Auto" }))).drafterDownloadStarted).toBe(true)
-    expect(missing.recorded.started).toHaveLength(1)
+    expect(missing.recorded.started).toEqual([startedDrafter(foundId)])
+    // Everything the drafter needs is already here: the inference service admits no download.
+    const nothingToFetch = harness()
+    expect((await nothingToFetch.run((commands) => commands.setModelDrafter(foundId, { _tag: "Auto" }))).drafterDownloadStarted).toBe(false)
   })
 
-  it("keeps Auto, and picking the recommended drafter, saved as Auto; another drafter is pinned with its method", async () => {
+  it("keeps Auto, and picking the recommended drafter, saved as Auto; another drafter is pinned without its method", async () => {
     const other = { _tag: "Local", path: "/drafters/dspark.gguf" } as const
     const recommendedDrafter = {
       category: "CatalogDrafter", reference: drafterReference, name: "Magnitude DFlash for Model", label: "Magnitude DFlash",
@@ -940,9 +935,9 @@ describe("drafter changes", () => {
       const automatic = (yield* models.get).drafters[foundId]
       return { recommended, pinned, automatic }
     }))
-    expect(saved.recommended).toEqual({ _tag: "Auto" })
-    expect(saved.pinned).toEqual({ _tag: "Reference", reference: other, method: { _tag: "DSpark" } })
-    expect(saved.automatic).toEqual({ _tag: "Auto" })
+    expect(saved.recommended).toBeUndefined()
+    expect(saved.pinned).toEqual({ _tag: "Local", path: other.path })
+    expect(saved.automatic).toBeUndefined()
   })
 
   it("refuses a model that is not on this computer", async () => {
@@ -953,21 +948,31 @@ describe("drafter changes", () => {
 })
 
 describe("removal by origin", () => {
-  it("deletes an added model's copy, forgets an imported model, and hides a found model", async () => {
+  it("deletes an added model's copy and hides a found model", async () => {
     const { run, recorded } = harness({
+      config: customModelsConfig({ drafters: { [addedId]: "none", [foundId]: drafterSetting } }),
       downloads: [targetDownload("active", { _tag: "Downloading", completedBytes: 1, totalBytes: 2, stage: "downloading" })],
     })
     const config = await run((commands, models) => Effect.gen(function* () {
       yield* commands.remove(addedId)
-      yield* commands.remove(importedId)
       yield* commands.remove(foundId)
       return yield* models.get
     }))
     expect(recorded.cancelled).toEqual(["active"])
     expect(recorded.removedFiles).toEqual([addedId])
-    expect(recorded.prunes).toBe(2)
-    expect(Object.keys(config.declarations)).toEqual([])
+    expect(recorded.prunes).toBe(1)
+    expect(config.added).toEqual({})
+    expect(Object.keys(config.drafters)).toEqual([foundId])
     expect(config.hidden).toEqual([foundId])
+  })
+
+  it("hides a model found in a folder by its local ID", async () => {
+    const { run, recorded } = harness({
+      customModels: [nativeCustomModel({ modelId: localId, origin: { _tag: "Found", source: { _tag: "Folder", path: "/models" } } })],
+    })
+    const config = await run((commands, models) => commands.remove(localId).pipe(Effect.zipRight(models.get)))
+    expect(config.hidden).toEqual([localId])
+    expect(recorded.removedFiles).toEqual([])
   })
 
   it("ends a removed model's downloads, so none resumes after a restart", async () => {
@@ -999,25 +1004,23 @@ describe("removal by origin", () => {
     })
     const config = await run((commands, models) => commands.remove(addedId).pipe(Effect.zipRight(models.get)))
     expect(recorded.removedFiles).toEqual([addedId])
-    expect(config.declarations[addedId]).toBeUndefined()
+    expect(config.added[addedId]).toBeUndefined()
     expect(config.drafters[addedId]).toBeUndefined()
     expect(config.hidden).toEqual([])
   })
 
-  it("refuses to hide a model added from Hugging Face or imported, and hides a found one", async () => {
+  it("refuses to hide a model added from Hugging Face, and hides a found one", async () => {
     const { run } = harness()
     const result = await run((commands, models) => Effect.gen(function* () {
       const added = yield* commands.hide(addedId).pipe(Effect.flip)
-      const imported = yield* commands.hide(importedId).pipe(Effect.flip)
       yield* commands.hide(foundId)
-      return { added, imported, hidden: (yield* models.get).hidden }
+      yield* commands.hide(foundId)
+      return { added, hidden: (yield* models.get).hidden }
     }))
     expect(result.added).toMatchObject({
       code: "managed_model_not_hideable",
       message: `${addedId} was added to Magnitude, so it can't be hidden. Remove it with \`magnitude catalog remove ${addedId}\` instead.`,
     })
-    expect(result.imported).toMatchObject({ code: "managed_model_not_hideable" })
-    expect(result.imported.message).toContain("was imported into Magnitude")
     expect(result.hidden).toEqual([foundId])
   })
 
@@ -1025,6 +1028,76 @@ describe("removal by origin", () => {
     const { run } = harness({ config: customModelsConfig({ hidden: [foundId] }) })
     const config = await run((commands, models) => commands.unhide(foundId).pipe(Effect.zipRight(models.get)))
     expect(config.hidden).toEqual([])
+  })
+
+  it("matches a local model hidden under an older label by its hash, for hide and unhide", async () => {
+    const olderLabel = CustomFormModelIdSchema.make("local:old-name-q4_k_m:0123456789ab")
+    const { run } = harness({
+      config: customModelsConfig({ hidden: [olderLabel] }),
+      customModels: [nativeCustomModel({ modelId: localId, origin: { _tag: "Found", source: { _tag: "Folder", path: "/models" } } })],
+    })
+    const result = await run((commands, models) => Effect.gen(function* () {
+      yield* commands.hide(localId)
+      const hidden = (yield* models.get).hidden
+      yield* commands.unhide(localId)
+      return { hidden, afterUnhide: (yield* models.get).hidden }
+    }))
+    expect(result.hidden).toEqual([olderLabel])
+    expect(result.afterUnhide).toEqual([])
+  })
+})
+
+describe("stored IDs following the models they name", () => {
+  const olderLabel = CustomFormModelIdSchema.make("local:old-name-q4_k_m:0123456789ab")
+  const folderModel = () => nativeCustomModel({ modelId: localId, origin: { _tag: "Found", source: { _tag: "Folder", path: "/models" } } })
+  const renamedTo = (models: Effect.Effect.Success<typeof CustomModels>, done: (config: CustomModelsConfig) => boolean) => Effect.gen(function* () {
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const current = yield* models.get
+      if (done(current)) return current
+      yield* Effect.sleep("10 millis")
+    }
+    return yield* models.get
+  })
+
+  it("renames a local model stored under an older label in hidden and drafters to its current ID", async () => {
+    const { run } = harness({
+      config: customModelsConfig({ hidden: [olderLabel], drafters: { [olderLabel]: "none", [foundId]: drafterSetting } }),
+      customModels: [folderModel(), nativeCustomModel()],
+      localModelsChange: true,
+    })
+    const config = await run((_, models) => renamedTo(models, (current) => current.hidden.includes(localId)))
+    expect(config.hidden).toEqual([localId])
+    expect(config.drafters).toEqual({
+      [localId]: { _tag: "None" },
+      [foundId]: { _tag: "HuggingFace", repository: "magnitudedev/model-DFlash-GGUF", path: "dflash.gguf", revision: "d1" },
+    })
+  })
+
+  it("renames a catalog model's alias in hidden to its catalog ID, and drops a drafter choice for it", async () => {
+    const external = CatalogFormModelIdSchema.make("qwen3.6-35b-a3b:gguf:q4")
+    const alias = CustomFormModelIdSchema.make("local:qwen3.6-35b-a3b-q4_k_m:abcdefabcdef")
+    const { run } = harness({
+      config: customModelsConfig({ hidden: [alias], drafters: { [alias]: "none" } }),
+      catalogRows: [{
+        _tag: "Catalog", modelId: external, catalogData: { aliases: [alias] }, acquisitionState: { _tag: "NotInstalled" },
+      } as unknown as LocalModelsState["models"][number]],
+      localModelsChange: true,
+    })
+    const config = await run((_, models) => renamedTo(models, (current) => current.hidden.includes(external)))
+    expect(config.hidden).toEqual([external])
+    expect(config.drafters).toEqual({})
+  })
+
+  it("keeps IDs that name no listed model as they are", async () => {
+    const unlisted = CustomFormModelIdSchema.make("local:gone-q8_0:ffffffffffff")
+    const { run } = harness({
+      config: customModelsConfig({ hidden: [unlisted], drafters: { [unlisted]: "none" } }),
+      customModels: [folderModel()],
+      localModelsChange: true,
+    })
+    const config = await run((_, models) => Effect.sleep("50 millis").pipe(Effect.zipRight(models.get)))
+    expect(config.hidden).toEqual([unlisted])
+    expect(Object.keys(config.drafters)).toEqual([unlisted])
   })
 })
 
@@ -1048,10 +1121,11 @@ describe("drafter and download recovery", () => {
         origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
         state: { _tag: "NotInstalled" },
       })],
+      startDownload: () => Option.some(targetDownload("target", { _tag: "Pending", completedBytes: 0, totalBytes: 10 })),
     })
     const result = await run((commands) => commands.sync(addedId))
     expect(result.outcome).toBe("Installing")
-    expect(recorded.bundles[0]).toMatchObject({ target: ["model-Q4_K_M.gguf"] })
+    expect(recorded.started).toEqual([startedTarget(addedId)])
   })
 
   // QA mac-r4-14: a cancelled queued pull came back after a restart, because ACN took every added model still
@@ -1071,11 +1145,12 @@ describe("drafter and download recovery", () => {
     expect(recorded.started).toEqual([])
   })
 
-  it("lists an added model's drafters from its declared repository file while it downloads", async () => {
+  it("lists an added model's drafters from its repository files while it downloads", async () => {
     const { run, recorded } = harness({
       customModels: [nativeCustomModel({
         modelId: addedId,
         origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
+        files: [{ path: "model-Q4_K_M.gguf", sizeBytes: 1_000 }],
         state: { _tag: "NotInstalled" },
       })],
     })
@@ -1090,11 +1165,11 @@ describe("drafter and download recovery", () => {
   it("downloads a missing attached drafter on Sync", async () => {
     const { run, recorded } = harness({
       customModels: [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: drafterReference, state: { _tag: "NotInstalled" }, updateAvailable: false } })],
+      startDownload: () => Option.some(drafterDownload("drafter", { _tag: "Pending", completedBytes: 0, totalBytes: 9 })),
     })
     const result = await run((commands) => commands.sync(foundId))
     expect(result.outcome).toBe("DownloadingDrafter")
-    expect(recorded.bundles[0]).toMatchObject({ drafter: Option.some({ reference: drafterReference }) })
-    expect(recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: foundId }])
+    expect(recorded.started).toEqual([startedDrafter(foundId)])
   })
 })
 
@@ -1113,8 +1188,13 @@ describe("drafter updates", () => {
     const withDrafter = (updateAvailable: boolean) =>
       [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: catalogDrafter, state: { _tag: "Ready" }, updateAvailable } })]
     // ICN reports the update on the drafter itself, whether or not its catalog model is installed.
-    const updating = harness({ customModels: withDrafter(true), catalog: catalog("NotInstalled") })
+    const updating = harness({
+      customModels: withDrafter(true),
+      catalog: catalog("NotInstalled"),
+      startDownload: () => Option.some(drafterDownload("drafter", { _tag: "Pending", completedBytes: 0, totalBytes: 9 })),
+    })
     expect((await updating.run((commands) => commands.sync(foundId))).outcome).toBe("Updating")
+    expect(updating.recorded.started).toEqual([startedDrafter(foundId)])
     const current = harness({ customModels: withDrafter(false), catalog: catalog("Current") })
     expect((await current.run((commands) => commands.sync(foundId))).outcome).toBe("AlreadyCurrent")
     expect(current.recorded.started).toEqual([])
@@ -1127,8 +1207,7 @@ describe("drafter updates", () => {
 describe("added model updates", () => {
   const newer = "b".repeat(40)
   const sameRepositoryDrafter = { _tag: "HuggingFace", repository: "owner/model-GGUF", commit: "c0ffee", path: "mtp.gguf" } as const
-  const movedDrafter = { ...sameRepositoryDrafter, commit: newer }
-  const newerTarget = ["model-Q4_K_M.gguf", "model-Q4_K_M-part2.gguf"]
+  const sameRepositorySetting = "hf:owner/model-GGUF/mtp.gguf@c0ffee"
   const addedReady = (updateCommit?: string) => nativeCustomModel({
     modelId: addedId,
     origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
@@ -1142,60 +1221,51 @@ describe("added model updates", () => {
     },
     ...(updateCommit === undefined ? {} : { updateCommit }),
   })
-  // At the newer commit the same version, named by its primary file, gains a second file and a projector.
-  const newerInspection = Schema.decodeUnknownSync(CandidateInspection)({
-    source: { _tag: "HuggingFace", repository: "owner/model-GGUF", commit: newer },
-    displayName: "",
-    projector: { path: "mmproj.gguf", sizeBytes: 10 },
-    versions: [{
-      label: "Q4_K_M",
-      modelId: addedId,
-      files: newerTarget.map((path) => ({ path, sizeBytes: 60 })),
-      sizeBytes: 120,
-      downloadBytes: 120,
-      recommended: true,
-    }],
+  const config = (drafter: string = sameRepositorySetting) => customModelsConfig({
+    added: { [addedId]: { revision: "c0ffee" } },
+    drafters: { [addedId]: drafter },
   })
-  const config = (pendingCommit?: string) => customModelsConfig({
-    declarations: {
-      [addedId]: {
-        origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee", ...(pendingCommit === undefined ? {} : { pendingCommit }) },
-        target: ["model-Q4_K_M.gguf"],
-      },
-    },
-    drafters: { [addedId]: { _tag: "Reference", reference: sameRepositoryDrafter, method: { _tag: "Mtp" } } },
-  })
-  const update = (state: ModelDownloadEncoded["state"]) =>
-    nativeDownload("update", addedId, { repository: "owner/model-GGUF", revision: newer, path: "model-Q4_K_M.gguf" }, state)
+  // At the newer commit the same version, named by its first shard, gains a second shard and a projector; ICN fetches
+  // them with the same-repository drafter at that commit.
+  const newerTarget = modelPackage("owner/model-GGUF", newer, [
+    "model-Q4_K_M.gguf", "model-Q4_K_M-part2.gguf", { path: "mmproj.gguf", role: "projector" },
+  ])
+  const update = (state: ModelDownloadEncoded["state"], fetched: { readonly drafter: boolean } = { drafter: true }) =>
+    Schema.decodeUnknownSync(NativeModelDownload)({
+      id: "update",
+      forModel: addedId,
+      bundle: fetched.drafter
+        ? {
+            _tag: "SpeculativeDecoding",
+            method: { _tag: "Mtp" },
+            target: newerTarget,
+            draftSource: { _tag: "Separate", draft: modelPackage("owner/model-GGUF", newer, ["mtp.gguf"]) },
+          }
+        : { _tag: "Standalone", package: newerTarget },
+      state,
+    })
   const running = update({ _tag: "Downloading", stage: "downloading", completedBytes: 30, totalBytes: 120, bytesPerSecond: 10 })
-  const movedCandidate = nativeCandidate({
-    category: "NextToModel", reference: movedDrafter, method: { _tag: "Mtp" }, verdict: { _tag: "Bound", method: { _tag: "Mtp" }, memoryBytes: 1 },
-  })
-  const updating = (options: { readonly pendingCommit?: string; readonly downloads?: readonly ModelDownload[]; readonly start?: boolean } = {}) => harness({
-    config: config(options.pendingCommit),
+  const updating = (options: { readonly downloads?: readonly ModelDownload[]; readonly drafter?: string } = {}) => harness({
+    config: config(options.drafter),
     customModels: [addedReady(newer)],
-    inspect: newerInspection,
-    drafters: [movedCandidate],
     downloads: options.downloads,
-    startDownload: options.start === false ? undefined : () => Option.some(running),
+    startDownload: () => Option.some(running),
   })
-  const pinnedCommit = (config: CustomModelsConfig) => {
-    const origin = config.declarations[addedId]?.origin
-    return origin?._tag === "Added" ? { commit: origin.commit, pendingCommit: origin.pendingCommit } : undefined
-  }
   const settled = <A, E>(effect: Effect.Effect<A, E>) => effect.pipe(Effect.zipLeft(Effect.sleep("30 millis")))
-  /** The configuration once the update has settled as `expected` says, as the background settlement gets to it. */
-  const settledTo = (
-    models: Effect.Effect.Success<typeof CustomModels>,
-    expected: (pinned: ReturnType<typeof pinnedCommit>) => boolean,
-  ) => Effect.gen(function* () {
+  /** The configuration once the model is pinned to `revision`, as the background pinning gets to it. */
+  const pinnedTo = (models: Effect.Effect.Success<typeof CustomModels>, revision: string) => Effect.gen(function* () {
     for (let attempt = 0; attempt < 200; attempt += 1) {
       const current = yield* models.get
-      if (expected(pinnedCommit(current))) return current
+      if (current.added[addedId]?.revision === revision) return current
       yield* Effect.sleep("10 millis")
     }
     return yield* models.get
   })
+  const pinnedSetting = {
+    revision: newer,
+    projector: Option.some("mmproj.gguf"),
+  }
+  const sameRepositoryAt = (revision: string) => ({ _tag: "HuggingFace", repository: "owner/model-GGUF", path: "mtp.gguf", revision })
 
   it("shows Update for an added model whose repository has a newer target, and Updating while it downloads", () => {
     const row = (model: ReturnType<typeof nativeCustomModel>, related: readonly RelatedDownload[] = []) => Option.getOrThrow(customModel({
@@ -1205,7 +1275,7 @@ describe("added model updates", () => {
     expect(row(addedReady(newer)).acquisitionState._tag).toBe("UpdateAvailable")
     expect(row(addedReady()).acquisitionState._tag).toBe("Installed")
     // The download of the newer commit counts as the target's, so the model reads as updating, still installed.
-    const related = customModelDownloads(addedId, config(newer), [running])
+    const related = customModelDownloads(addedId, config(), [running])
     expect(related.map(({ kind }) => kind)).toEqual(["Target"])
     expect(row(addedReady(newer), related).acquisitionState).toMatchObject({
       _tag: "Updating",
@@ -1220,71 +1290,71 @@ describe("added model updates", () => {
       const synced = yield* commands.sync(addedId)
       const during = yield* settled(models.get)
       yield* SubscriptionRef.set(downloadList, [update({ _tag: "Completed" })])
-      const after = yield* settledTo(models, (pinned) => pinned?.commit === newer)
+      const after = yield* pinnedTo(models, newer)
       return { synced, during, after }
     }))
     expect(result.synced.outcome).toBe("Updating")
-    expect(recorded.bundles[0]).toMatchObject({
-      source: { _tag: "HuggingFace", repository: "owner/model-GGUF", commit: newer },
-      target: newerTarget,
-      projector: Option.some({ path: "mmproj.gguf" }),
-      drafter: Option.some({ method: { _tag: "Mtp" }, reference: movedDrafter }),
-    })
-    expect(recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: addedId }])
-    // ICN keeps the old commit, so the old copy is still the model and serves.
-    expect(pinnedCommit(result.during)).toEqual({ commit: "c0ffee", pendingCommit: Option.some(newer) })
-    expect(localModelsConfiguration(result.during, []).declarations).toMatchObject([
-      { modelId: addedId, origin: { _tag: "Added", commit: "c0ffee" }, target: ["model-Q4_K_M.gguf"] },
+    // ICN works out what the update fetches; ACN asks for it by intent.
+    expect(recorded.started).toEqual([startedUpdate(addedId)])
+    // Nothing changes while it downloads, so ICN keeps serving the pinned commit.
+    expect(result.during.added[addedId]).toEqual({ revision: "c0ffee", projector: Option.none() })
+    expect(localModelsConfiguration(result.during, []).added).toEqual([
+      { repository: "owner/model-GGUF", path: "model-Q4_K_M.gguf", revision: "c0ffee", projector: Option.none() },
     ])
-    expect(result.during.drafters[addedId]).toEqual({ _tag: "Reference", reference: sameRepositoryDrafter, method: { _tag: "Mtp" } })
-    expect(result.after.declarations[addedId]).toEqual({
-      origin: { _tag: "Added", repository: "owner/model-GGUF", commit: newer, pendingCommit: Option.none() },
-      target: newerTarget,
-      projector: Option.some("mmproj.gguf"),
-    })
-    expect(result.after.drafters[addedId]).toEqual({ _tag: "Reference", reference: movedDrafter, method: { _tag: "Mtp" } })
+    expect(result.during.drafters[addedId]).toEqual(sameRepositoryAt("c0ffee"))
+    // Once it completes: the newer revision, its projector, and the same-repository drafter it fetched.
+    expect(result.after.added[addedId]).toEqual(pinnedSetting)
+    expect(result.after.drafters[addedId]).toEqual(sameRepositoryAt(newer))
   })
 
-  it("abandons a cancelled or failed update and stays on the pinned commit", async () => {
+  it("pins an update that finished while the service was not running", async () => {
+    const { run, recorded } = updating({ downloads: [update({ _tag: "Completed" })] })
+    const config = await run((_, models) => pinnedTo(models, newer))
+    expect(recorded.started).toEqual([])
+    expect(config.added[addedId]).toEqual(pinnedSetting)
+    expect(config.drafters[addedId]).toEqual(sameRepositoryAt(newer))
+  })
+
+  it("moves the revision but keeps a drafter the update didn't fetch, or one from another repository", async () => {
+    const notFetched = updating({ downloads: [update({ _tag: "Completed" }, { drafter: false })] })
+    const kept = await notFetched.run((_, models) => pinnedTo(models, newer))
+    expect(kept.added[addedId]).toEqual(pinnedSetting)
+    expect(kept.drafters[addedId]).toEqual(sameRepositoryAt("c0ffee"))
+
+    const otherRepository = updating({ drafter: drafterSetting, downloads: [update({ _tag: "Completed" })] })
+    const other = await otherRepository.run((_, models) => pinnedTo(models, newer))
+    expect(other.added[addedId]).toEqual(pinnedSetting)
+    expect(other.drafters[addedId]).toEqual({
+      _tag: "HuggingFace", repository: "magnitudedev/model-DFlash-GGUF", path: "dflash.gguf", revision: "d1",
+    })
+  })
+
+  it("ignores a cancelled or failed update and stays on the pinned commit", async () => {
     for (const ended of [
       update({ _tag: "Cancelled", completedBytes: 30, totalBytes: 120 }),
       update({ _tag: "Failed", acknowledged: false, completedBytes: 30, totalBytes: 120, failure: { _tag: "Interrupted" } }),
     ]) {
-      const { run, downloadList } = updating()
+      const { run, recorded, downloadList } = updating()
       const result = await run((commands, models) => Effect.gen(function* () {
         yield* commands.sync(addedId)
         yield* settled(commands.cancelSync(addedId))
-        yield* SubscriptionRef.set(downloadList, [ended])
-        return yield* settledTo(models, (pinned) => Option.isNone(pinned?.pendingCommit ?? Option.none()))
+        yield* settled(SubscriptionRef.set(downloadList, [ended]))
+        return yield* models.get
       }))
-      expect(pinnedCommit(result)).toEqual({ commit: "c0ffee", pendingCommit: Option.none() })
-      expect(result.drafters[addedId]).toEqual({ _tag: "Reference", reference: sameRepositoryDrafter, method: { _tag: "Mtp" } })
+      expect(recorded.cancelled).toEqual(["update"])
+      expect(result.added[addedId]).toEqual({ revision: "c0ffee", projector: Option.none() })
+      expect(result.drafters[addedId]).toEqual(sameRepositoryAt("c0ffee"))
     }
   })
 
-  it("resumes an update a restart interrupted, and settles one that finished meanwhile", async () => {
-    const interrupted = updating({ pendingCommit: newer })
-    const resumed = await interrupted.run((_, models) => Effect.gen(function* () {
-      for (let attempt = 0; attempt < 200 && interrupted.recorded.started.length === 0; attempt += 1) yield* Effect.sleep("10 millis")
-      return yield* settled(models.get)
-    }))
-    expect(interrupted.recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: addedId }])
-    expect(pinnedCommit(resumed)).toEqual({ commit: "c0ffee", pendingCommit: Option.some(newer) })
-
-    const finished = updating({ pendingCommit: newer, downloads: [update({ _tag: "Completed" })] })
-    const pinned = await finished.run((_, models) => settledTo(models, (current) => current?.commit === newer))
-    expect(finished.recorded.started).toEqual([])
-    expect(pinnedCommit(pinned)).toEqual({ commit: newer, pendingCommit: Option.none() })
-  })
-
   it("is current without a newer target and changes nothing", async () => {
-    const { run, recorded } = harness({ config: config(), customModels: [addedReady()], inspect: newerInspection })
+    const { run, recorded } = harness({ config: config(), customModels: [addedReady()] })
     const result = await run((commands, models) => Effect.gen(function* () {
       const synced = yield* commands.sync(addedId)
       return { synced, config: yield* models.get }
     }))
     expect(result.synced.outcome).toBe("AlreadyCurrent")
-    expect(pinnedCommit(result.config)).toEqual({ commit: "c0ffee", pendingCommit: Option.none() })
+    expect(result.config.added[addedId]).toEqual({ revision: "c0ffee", projector: Option.none() })
     expect(recorded.started).toEqual([])
   })
 })
@@ -1303,7 +1373,7 @@ describe("catalog models found elsewhere", () => {
   const owned = CatalogFormModelIdSchema.make("qwen3.6-27b:gguf:q4")
   const cachePath = "/nonexistent-home/.cache/huggingface/hub/models--o--r/snapshots/c/m.gguf"
 
-  it("hides a catalog model whose files are only in an external location by its files' found-model IDs, and refuses one Magnitude owns", async () => {
+  it("hides a catalog model whose files are only in an external location by its catalog ID, and refuses one Magnitude owns", async () => {
     const alias = CustomFormModelIdSchema.make("hf:unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf")
     const { run } = harness({
       catalogRows: [catalogRow(external, "External", cachePath), catalogRow(owned, "Magnitude", "/store/m.gguf")],
@@ -1321,7 +1391,7 @@ describe("catalog models found elsewhere", () => {
       return { files, refused, hidden, afterUnhide, afterAliasUnhide: (yield* models.get).hidden }
     }))
     expect(result.files).toEqual(Option.some({ path: cachePath, location: Option.some("HuggingFaceCache") }))
-    expect(result.hidden).toEqual([alias])
+    expect(result.hidden).toEqual([external])
     expect(result.afterAliasUnhide).toEqual([])
     expect(result.refused.message).toBe(`${owned} is a catalog model. Remove it with \`magnitude catalog remove ${owned}\` instead.`)
     expect(result.afterUnhide).toEqual([])
@@ -1355,14 +1425,26 @@ describe("catalog models found elsewhere", () => {
       yield* commands.hide(external)
       return { files, hidden: (yield* models.get).hidden }
     }))
-    expect(result.hidden).toEqual([alias])
+    expect(result.hidden).toEqual([external])
     expect(Option.isSome(result.files)).toBe(true)
   })
 
-  it("hides a catalog model whose external copy is already hidden again without change, and unhides it by its catalog ID", async () => {
+  it("unhides a catalog model named by an alias, removing its catalog ID and every alias by identity", async () => {
+    const alias = CustomFormModelIdSchema.make("local:qwen3.6-35b-a3b-q4_k_m:abcdefabcdef")
+    const olderLabel = CustomFormModelIdSchema.make("local:qwen3.6-old-q4_k_m:abcdefabcdef")
+    const { run } = harness({
+      config: customModelsConfig({ hidden: [external, olderLabel, foundId] }),
+      catalogRows: [{ _tag: "Catalog", modelId: external, acquisitionState: { _tag: "NotInstalled" } } as unknown as LocalModelsState["models"][number]],
+      catalog: [{ id: external, source: { aliases: Option.some([alias]) } }] as unknown as readonly CatalogModelSource[],
+    })
+    const hidden = await run((commands, models) => commands.unhide(alias).pipe(Effect.zipRight(models.get), Effect.map(({ hidden }) => hidden)))
+    expect(hidden).toEqual([foundId])
+  })
+
+  it("hides an already hidden catalog model again without change, and unhides it by its catalog ID", async () => {
     const alias = CustomFormModelIdSchema.make("hf:unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf")
     const { run } = harness({
-      config: customModelsConfig({ hidden: [alias] }),
+      config: customModelsConfig({ hidden: [external] }),
       catalogRows: [{ _tag: "Catalog", modelId: external, acquisitionState: { _tag: "NotInstalled" } } as unknown as LocalModelsState["models"][number]],
       catalog: [{ id: external, source: { aliases: Option.some([alias]) } }] as unknown as readonly CatalogModelSource[],
     })
@@ -1372,7 +1454,7 @@ describe("catalog models found elsewhere", () => {
       yield* commands.unhide(external)
       return { hidden, afterUnhide: (yield* models.get).hidden }
     }))
-    expect(result.hidden).toEqual([alias])
+    expect(result.hidden).toEqual([external])
     expect(result.afterUnhide).toEqual([])
   })
 
@@ -1405,15 +1487,15 @@ describe("model locations", () => {
     expect(result.relative._tag === "Left" && result.relative.left._tag).toBe("InvalidDirectoryPath")
     expect(result.missing._tag === "Left" && result.missing.left._tag).toBe("DirectoryNotFound")
     expect(result.notDirectory._tag === "Left" && result.notDirectory.left._tag).toBe("PathNotDirectory")
-    expect(result.afterAdd.folders).toEqual([folder])
-    expect(result.afterAdd.disabledLocations).toEqual(["Ollama"])
+    expect(result.afterAdd.paths).toEqual([folder])
+    expect(result.afterAdd.locations).toEqual({ ollama: false })
     expect(result.locations.find(({ kind }) => kind === "Ollama")).toMatchObject({ enabled: false, automatic: true, state: "NotFound" })
     expect(result.locations.find(({ kind }) => kind === "Folder"))
       .toEqual({ kind: "Folder", paths: [{ path: folder, state: "Found" }], enabled: true, automatic: false, state: "Found" })
     expect(result.locations.find(({ kind }) => kind === "Ollama")?.paths.map(({ path }) => path)).toEqual([
       "/nonexistent/ollama", "/nonexistent-home/.ollama/models", "/usr/share/ollama/.ollama/models", "/var/lib/ollama",
     ])
-    expect(result.afterRemove.folders).toEqual([])
+    expect(result.afterRemove.paths).toEqual([])
   })
 
   it("fails a location change the inference service refuses", async () => {

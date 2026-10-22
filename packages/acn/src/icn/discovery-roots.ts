@@ -191,6 +191,17 @@ export const directoryState = (path: string): Effect.Effect<ModelLocationState, 
   return Either.isRight(listing) || !isPermissionDenied(listing.left) ? "Found" : "Unreadable"
 })
 
+/** Whether a path the user lists to scan, a folder or a single GGUF file, exists and can be read. */
+export const scannedPathState = (path: string): Effect.Effect<ModelLocationState, never, FileSystem.FileSystem> => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const stat = yield* fs.stat(path).pipe(Effect.either)
+  if (Either.isRight(stat) && stat.right.type === "File") {
+    const opened = yield* Effect.scoped(fs.open(path, { flag: "r" })).pipe(Effect.either)
+    return Either.isRight(opened) || !isPermissionDenied(opened.left) ? "Found" : "Unreadable"
+  }
+  return yield* directoryState(path)
+})
+
 /**
  * The candidates that are distinct directories: one reached through a symlink, such as
  * `/usr/share/ollama` linked to `/var/lib/ollama`, is the same directory as its target, and the

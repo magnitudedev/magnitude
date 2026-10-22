@@ -2,15 +2,15 @@ import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import type { AttachedDrafterAvailability } from "@magnitudedev/sdk"
 import { customModelSource, drafterUpdateAvailable } from "./custom-model-details"
-import { added, attachedDrafter, catalogModel, customModel, foundIn, imported, repository } from "../../test/models/fixtures"
+import { added, attachedDrafter, catalogModel, customModel, foundIn, inFolder, repository } from "../../test/models/fixtures"
 
 const attached = (availability: AttachedDrafterAvailability, updateAvailable = false) => Option.some(attachedDrafter(availability, { updateAvailable }))
 const downloading: AttachedDrafterAvailability = { _tag: "Downloading", progress: { stage: "downloading", completedBytes: 450, totalBytes: 900, bytesPerSecond: Option.none() } }
 
 describe("custom model details", () => {
-  it("names the source by origin: a pinned repository, an imported path, or where it was found", () => {
+  it("names the source by origin: a pinned repository, or where it was found", () => {
     expect(customModelSource(customModel(added))).toEqual({ label: `${repository} · pinned to 4f1c2e9`, href: Option.some(`https://huggingface.co/${repository}`) })
-    expect(customModelSource(customModel(imported)).label).toBe("/Users/me/models/qwen.gguf")
+    expect(customModelSource(customModel(inFolder)).label).toBe("models · /Users/me/.ollama/models/blobs/sha256-1")
     expect(customModelSource(customModel(foundIn({ _tag: "Ollama" }))).label).toBe("Ollama · /Users/me/.ollama/models/blobs/sha256-1")
   })
   it("shows Update for any custom model whose catalog drafter has a newer revision, once nothing is downloading it", () => {

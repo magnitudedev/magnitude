@@ -27,8 +27,7 @@ pub(crate) fn resolved_installation(
             | ModelPackageInstallationOrigin::LmStudio
             | ModelPackageInstallationOrigin::LlamaCpp
             | ModelPackageInstallationOrigin::Ollama
-            | ModelPackageInstallationOrigin::Folder
-            | ModelPackageInstallationOrigin::Imported => ModelInstallationOwnership::External,
+            | ModelPackageInstallationOrigin::Folder => ModelInstallationOwnership::External,
         },
     }
 }

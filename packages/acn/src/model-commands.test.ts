@@ -108,7 +108,8 @@ it("stops a model named by any ID form, and refuses one that isn't on this compu
   const { ModelSlotController } = await import("./model-slot-controller")
   const { LocalModelRemovals } = await import("./local-model-removals")
   const added = "hf:owner/repo/model-Q4_K_M.gguf"
-  const imported = `local:${"a".repeat(64)}`
+  const imported = "local:folder-model-q4_0:aaaaaaaaaaaa"
+  const olderLabel = "local:older-name-q4_0:aaaaaaaaaaaa"
   const stopped: string[] = []
   const running = (id: string, modelId: string) => ({ id, modelId, lifecycle: { _tag: "Loading", fraction: 0.5, stage: "loading_weights" } })
   const snapshot = Schema.decodeUnknownSync(ModelInstancesSnapshot)({ revision: 1, instances: [
@@ -135,16 +136,17 @@ it("stops a model named by any ID form, and refuses one that isn't on this compu
     Effect.provideService(IcnCatalogInstallations, {} as never),
     Effect.provideService(LocalModelRemovals, {} as never),
   )
-  for (const model of ["model-a:gguf:test", UPGRADED_ALIAS, added, imported]) {
+  // A local model named under an older label is the same model.
+  for (const model of ["model-a:gguf:test", UPGRADED_ALIAS, added, imported, olderLabel]) {
     expect(await Effect.runPromise(stop(model))).toEqual({ stopped: true })
   }
-  expect(stopped).toEqual(["catalog-instance", "catalog-instance", "added-instance", "imported-instance"])
+  expect(stopped).toEqual(["catalog-instance", "catalog-instance", "added-instance", "imported-instance", "imported-instance"])
   const unknown = await Effect.runPromise(stop("hf:owner/repo/missing.gguf").pipe(Effect.flip))
   expect(unknown).toMatchObject({ _tag: "LocalModelMutationFailed", code: "model_not_found", message: "hf:owner/repo/missing.gguf is not a model on this computer." })
-  expect(stopped).toHaveLength(4)
+  expect(stopped).toHaveLength(5)
   // A model on this computer that isn't running has nothing to stop, and says so.
   expect(await Effect.runPromise(stop("model-b:gguf:test"))).toEqual({ stopped: false })
-  expect(stopped).toHaveLength(4)
+  expect(stopped).toHaveLength(5)
 })
 
 it("stops a running model before removing it, and removes an idle model without stopping", async () => {

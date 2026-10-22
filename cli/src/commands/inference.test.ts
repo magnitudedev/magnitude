@@ -21,7 +21,7 @@ import {
   makeDrafterCandidates,
   makeFoundModel,
   makeHardware,
-  makeImportedModel,
+  makeFolderModel,
   makeInspection,
   makeInstalledCatalogModel,
   makeLocations,
@@ -462,12 +462,12 @@ describe("pull and model mutations", () => {
   })
 
   it("renders drafter and removal acknowledgements", () => {
-    const modelId = CustomFormModelIdSchema.make(`local:${"b".repeat(64)}`)
+    const modelId = CustomFormModelIdSchema.make("local:my-finetune-q4_k_m:bbbbbbbbbbbb")
     expect(renderSetDrafter({ modelId, drafter: Option.none(), drafterDownloadStarted: false })).toBe(`Turned off the drafter for ${modelId}.\n`)
     expect(renderSetDrafter({ modelId, drafter: Option.none(), drafterDownloadStarted: false }, "Auto"))
       .toBe(`No drafter is known to work with ${modelId}, so it runs without one.\n`)
-    expect(renderRemoval(modelId, Option.some("forget")))
-      .toBe(`Forgot ${modelId}. Magnitude never deletes your file; it stays where it is.\n`)
+    expect(renderRemoval(modelId, Option.some("hide")))
+      .toBe(`Hid ${modelId} from Magnitude. Its files are untouched.\nUnhide it: magnitude models unhide ${modelId}\n`)
     expect(renderRemoval(FOUND_MODEL_ID, Option.some("hide")))
       .toContain(`Hid ${FOUND_MODEL_ID} from Magnitude. Its files are untouched.`)
     expect(renderRemoval(ADDED_MODEL_ID, Option.some("delete")))
@@ -646,7 +646,7 @@ describe("model status", () => {
 
   it("lists every visible custom model with its source and a footer for what can't run", () => {
     const output = renderModelsStatus(statusView({
-      models: [makeCatalogModel(), makeFoundModel(), makeAddedModel(), makeImportedModel()],
+      models: [makeCatalogModel(), makeFoundModel(), makeAddedModel(), makeFolderModel()],
       unsupported: [makeUnsupportedLocalModel(), makeUnsupportedLocalModel({ displayName: "Other" })],
       hidden: [makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") })],
     }))
@@ -654,7 +654,7 @@ describe("model status", () => {
     expect(output).not.toMatch(/qwen-test:gguf:q4$/m)
     expect(output).toContain("Qwen Test (qwen-test:gguf:q4)")
     expect(output).toContain("Hugging Face cache")
-    expect(output).toContain("GGUF file")
+    expect(output.split("\n").find((line) => line.includes(makeFolderModel().modelId))).toMatch(/\smodels\s/)
     expect(output).toContain("Unavailable - The file was moved or deleted")
     expect(output).not.toContain("hf:a/b/c.gguf")
     expect(output.trimEnd().split("\n").slice(-3)).toEqual([
@@ -1069,7 +1069,7 @@ describe("--json internal identities", () => {
 
   it("never includes internal identities, managed paths, ownership, or ranking inputs", () => {
     const assessed = makeAddedModel().servingState as Extract<CustomLocalModel["servingState"], { _tag: "Assessed" }>
-    const unrunnable = makeImportedModel({ servingState: { ...assessed, assessment: unsupportedAssessment("IQ1_M") } })
+    const unrunnable = makeFolderModel({ servingState: { ...assessed, assessment: unsupportedAssessment("IQ1_M") } })
     const catalog = catalogState([makeCatalogModel(), makeFoundModel(), makeAddedModel()], [makeUnsupportedLocalModel()], [unrunnable])
     const documents = [
       encode(catalogListJson, catalog),

@@ -11,10 +11,16 @@ import {
   SubscriptionRef,
 } from "effect"
 import {
-  CatalogFormModelIdSchema,
+  CustomFormModelIdSchema,
   LocalModelMutationFailed,
+  parseModelId,
+  sameModelId,
+  type AutomaticModelLocationKind,
+  type CustomFormModelId,
+  type DrafterChoice,
+  type HuggingFaceFormModelId,
   type DrafterReference,
-  type SpeculativeMethod,
+  type ModelId,
 } from "@magnitudedev/acn-protocol"
 import {
   CustomModelsConfigSchema,
@@ -22,11 +28,14 @@ import {
   GlobalStorage,
   MagnitudeConfigSchema,
   MagnitudeStorage,
+  type AddedModelSetting,
   type CustomModelsConfig,
+  type DrafterSetting,
+  type ModelLocationName,
 } from "@magnitudedev/storage"
-import type { LocalModelsConfiguration, ModelRoot } from "@magnitudedev/icn-protocol/schemas"
-import type { ResolvedAutomaticLocation } from "./icn/discovery-roots"
+import type * as Native from "@magnitudedev/icn-protocol/schemas"
 import { nativeDrafterReference } from "./drafter-references"
+import type { ResolvedAutomaticLocation } from "./icn/discovery-roots"
 
 /**
  * Every user choice about custom models, persisted under `models` in config.json. `modify` is a
@@ -105,33 +114,153 @@ export const CustomModelsLive: Layer.Layer<
   })
 }))
 
+const locationNames: Readonly<Record<AutomaticModelLocationKind, ModelLocationName>> = {
+  HuggingFaceCache: "huggingface",
+  LmStudio: "lmstudio",
+  LlamaCpp: "llamacpp",
+  Ollama: "ollama",
+}
+
+/** Whether an automatic location is scanned; one config.json doesn't mention is. */
+export const locationEnabled = (config: CustomModelsConfig, kind: AutomaticModelLocationKind): boolean =>
+  config.locations[locationNames[kind]] !== false
+
+/** Turns an automatic location on or off; on is written by leaving it out. */
+export const withLocationEnabled = (
+  config: CustomModelsConfig,
+  kind: AutomaticModelLocationKind,
+  enabled: boolean,
+): CustomModelsConfig => {
+  const { [locationNames[kind]]: _, ...others } = config.locations
+  return { ...config, locations: enabled ? others : { ...others, [locationNames[kind]]: false } }
+}
+
+/** The added model with this ID, and the key it is stored under. */
+export const addedModel = (
+  config: CustomModelsConfig,
+  modelId: ModelId,
+): Option.Option<readonly [HuggingFaceFormModelId, AddedModelSetting]> => Option.fromNullable(
+  Object.entries(config.added).find(([id]) => id === modelId) as readonly [HuggingFaceFormModelId, AddedModelSetting] | undefined,
+)
+
+/** The drafter choice stored for a model, under its ID with any `local:` label. */
+export const configuredDrafter = (config: CustomModelsConfig, modelId: ModelId): Option.Option<DrafterSetting> =>
+  Option.fromNullable(Object.entries(config.drafters).find(([id]) => sameModelId(id, modelId))?.[1])
+
+/** The reference a drafter setting names; `"none"` names none. */
+export const drafterSettingReference = (setting: DrafterSetting): Option.Option<DrafterReference> => {
+  switch (setting._tag) {
+    case "None": return Option.none()
+    case "BuiltIn": return Option.some({ _tag: "Embedded" })
+    case "Catalog": return Option.some({ _tag: "Catalog", modelId: setting.modelId })
+    case "HuggingFace": return Option.some({
+      _tag: "HuggingFace",
+      repository: setting.repository,
+      commit: setting.revision,
+      path: setting.path,
+    })
+    case "Local": return Option.some({ _tag: "Local", path: setting.path })
+  }
+}
+
+/** How config.json spells the choice of a drafter reference, or of none. */
+export const drafterSetting = (reference: Option.Option<DrafterReference>): DrafterSetting => Option.match(reference, {
+  onNone: (): DrafterSetting => ({ _tag: "None" }),
+  onSome: (value): DrafterSetting => {
+    switch (value._tag) {
+      case "Embedded": return { _tag: "BuiltIn" }
+      case "Catalog": return { _tag: "Catalog", modelId: value.modelId }
+      case "HuggingFace": return {
+        _tag: "HuggingFace",
+        repository: value.repository,
+        path: value.path,
+        revision: value.commit,
+      }
+      case "Local": return { _tag: "Local", path: value.path }
+    }
+  },
+})
+
+/** A model's drafter choice as clients see it: automatic when config.json names none. */
+export const configuredDrafterChoice = (config: CustomModelsConfig, modelId: ModelId): DrafterChoice => Option.match(
+  configuredDrafter(config, modelId),
+  {
+    onNone: (): DrafterChoice => ({ _tag: "Auto" }),
+    onSome: (setting): DrafterChoice => Option.match(drafterSettingReference(setting), {
+      onNone: (): DrafterChoice => ({ _tag: "None" }),
+      onSome: (reference): DrafterChoice => ({ _tag: "Reference", reference }),
+    }),
+  },
+)
+
+/** Stores a model's drafter choice; automatic is stored by leaving it out. */
+export const withDrafterChoice = (
+  config: CustomModelsConfig,
+  modelId: CustomFormModelId,
+  choice: DrafterChoice,
+): CustomModelsConfig => {
+  const drafters = Object.fromEntries(Object.entries(config.drafters).filter(([id]) => !sameModelId(id, modelId)))
+  return {
+    ...config,
+    drafters: choice._tag === "Auto" ? drafters : {
+      ...drafters,
+      [modelId]: drafterSetting(choice._tag === "None" ? Option.none() : Option.some(choice.reference)),
+    },
+  }
+}
+
+/** Whether a model is hidden, by its ID with any `local:` label. */
+export const isHidden = (config: CustomModelsConfig, modelId: ModelId): boolean =>
+  config.hidden.some((hidden) => sameModelId(hidden, modelId))
+
 /**
- * The whole snapshot ICN receives. ICN lists hidden models apart and never assesses them; a chosen
- * drafter is delivered with its persisted method, so it is included right after a restart.
+ * Stored IDs renamed to the ones they now name (`canonical`: a catalog model's for one of its aliases, a listed
+ * model's own for an older `local:` label of it): `hidden` entries and `drafters` keys. A drafter choice for a model
+ * that is now a catalog model goes: a catalog model always serves with its catalog drafter.
+ */
+export const withCanonicalReferences = (
+  config: CustomModelsConfig,
+  canonical: (modelId: ModelId) => ModelId,
+): CustomModelsConfig => {
+  const hidden = [...new Set(config.hidden.map(canonical))]
+  const drafters = Object.entries(config.drafters).flatMap(([id, setting]) =>
+    Option.toArray(Option.map(Schema.decodeUnknownOption(CustomFormModelIdSchema)(canonical(id as ModelId)),
+      (renamed) => [renamed, setting] as const)))
+  return { ...config, hidden, drafters: Object.fromEntries(drafters) }
+}
+
+/**
+ * The whole snapshot ICN receives, converted from config.json's choices. ICN lists hidden models apart and never
+ * assesses them; a hidden catalog model is hidden by its external copies.
  */
 export const localModelsConfiguration = (
   config: CustomModelsConfig,
   locations: readonly ResolvedAutomaticLocation[],
-): LocalModelsConfiguration => ({
+): Native.LocalModelsConfiguration => ({
   roots: [
-    ...locations.flatMap((location) => location.paths.map(({ path }): ModelRoot => ({
+    ...locations.flatMap((location) => location.paths.map(({ path }): Native.ModelRoot => ({
       kind: location.kind,
       path,
-      enabled: !config.disabledLocations.includes(location.kind),
+      enabled: locationEnabled(config, location.kind),
     }))),
-    ...config.folders.map((path): ModelRoot => ({ kind: "Folder", path, enabled: true })),
+    ...config.paths.map((path): Native.ModelRoot => ({ kind: "Folder", path, enabled: true })),
   ],
-  declarations: Object.entries(config.declarations).map(([modelId, declaration]) => ({
-    modelId,
-    origin: declaration.origin._tag === "Added"
-      ? { _tag: "Added", repository: declaration.origin.repository, commit: declaration.origin.commit }
-      : { _tag: "Imported", path: declaration.origin.path },
-    target: [...declaration.target],
-    projector: declaration.projector,
-  })) as unknown as LocalModelsConfiguration["declarations"],
-  hidden: config.hidden.filter((modelId) => !Schema.is(CatalogFormModelIdSchema)(modelId)),
-  drafters: Object.entries(config.drafters).map(([modelId, choice]): unknown => choice._tag === "Reference"
-    ? { modelId, drafter: { _tag: "Reference", method: choice.method, reference: nativeDrafterReference(choice.reference) } }
-    : { modelId, drafter: { _tag: choice._tag } }
-  ) as unknown as LocalModelsConfiguration["drafters"],
+  added: Object.entries(config.added).flatMap(([modelId, added]): readonly Native.AddedModel[] => {
+    const identity = parseModelId(modelId as ModelId)
+    return identity._tag === "HuggingFace" && added !== undefined ? [{
+      repository: identity.repositoryId,
+      path: identity.artifactSelector,
+      revision: added.revision,
+      projector: added.projector,
+    }] : []
+  }),
+  hidden: [...config.hidden],
+  drafters: Object.entries(config.drafters).flatMap(([modelId, setting]): readonly Native.DrafterAttachment[] =>
+    setting === undefined ? [] : [{
+      modelId,
+      drafter: Option.match(drafterSettingReference(setting), {
+        onNone: (): Native.DrafterChoice => ({ _tag: "None" }),
+        onSome: (reference): Native.DrafterChoice => ({ _tag: "Reference", reference: nativeDrafterReference(reference) }),
+      }),
+    }]),
 })

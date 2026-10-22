@@ -59,7 +59,7 @@ export const HuggingFaceOAuthConfigLive = Layer.succeed(HuggingFaceOAuthConfig, 
 /**
  * The one Hugging Face sign-in shared by every client. ACN completes a browser (authorization code
  * with PKCE, redirected to a loopback port) or device-code sign-in, keeps the credential in
- * `auth.json`, renews it before it expires, and exposes only the account, never the token, to
+ * `huggingface.json`, renews it before it expires, and exposes only the account, never the token, to
  * clients. `token` and `tokenChanges` are for delivering the credential to the inference service.
  */
 export interface HuggingFaceAccountApi {
@@ -166,7 +166,7 @@ export const HuggingFaceAccountLive: Layer.Layer<
   const http = yield* HttpClient.HttpClient
   const settings = yield* HuggingFaceOAuthConfig
   const stored = yield* storage.auth.getHuggingFace.pipe(
-    Effect.tapError((error) => Effect.logWarning("Could not read the Hugging Face account from auth.json; signed out").pipe(
+    Effect.tapError((error) => Effect.logWarning("Could not read the Hugging Face account from huggingface.json; signed out").pipe(
       Effect.annotateLogs({ cause: error.message }),
     )),
     Effect.orElseSucceed(() => Option.none<HuggingFaceCredential>()),
@@ -232,7 +232,7 @@ export const HuggingFaceAccountLive: Layer.Layer<
         onSome: (credential) => Effect.succeed({ username: credential.username, avatarUrl: credential.avatarUrl }),
       })
       return {
-        type: "huggingface-oauth",
+        type: "oauth",
         accessToken,
         refreshToken: Option.orElse(
           Option.map(Option.fromNullable(tokens.refresh_token), Redacted.make),
@@ -245,7 +245,7 @@ export const HuggingFaceAccountLive: Layer.Layer<
 
   const signedOut = (reason: Option.Option<HuggingFaceSignedOutReason>) =>
     storage.auth.removeHuggingFace.pipe(
-      Effect.tapError((error) => Effect.logWarning("Could not remove the Hugging Face account from auth.json").pipe(
+      Effect.tapError((error) => Effect.logWarning("Could not remove the Hugging Face account from huggingface.json").pipe(
         Effect.annotateLogs({ cause: error.message }),
       )),
       Effect.ignore,
@@ -291,7 +291,7 @@ export const HuggingFaceAccountLive: Layer.Layer<
   })
 
   const signedIn = (credential: HuggingFaceCredential) => storage.auth.setHuggingFace(credential).pipe(
-    Effect.mapError((error) => new OAuthUnavailable({ detail: `auth.json could not be written: ${error.message}` })),
+    Effect.mapError((error) => new OAuthUnavailable({ detail: `huggingface.json could not be written: ${error.message}` })),
     Effect.zipRight(update((current) => ({
       ...current,
       credential: Option.some(credential),

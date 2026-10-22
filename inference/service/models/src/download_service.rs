@@ -1,20 +1,33 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use getrandom::fill;
 use magnitude_service_contracts::models::{
-    ModelDownload, ModelDownloadId, ModelDownloadState, ModelId, ModelDownloads, ModelDownloadsInvalidation,
-    ModelDownloadsResponse, ModelPackage, ModelPackageId, ModelPackageSource, ServableModelBundle,
-    StartModelDownloadRequest, StartModelDownloadResponse,
+    CustomModelPart, ModelDownload, ModelDownloadId, ModelDownloadState, ModelId, ModelDownloads,
+    ModelDownloadsInvalidation, ModelDownloadsResponse, ModelPackage, ModelPackageId,
+    ModelPackageSource, ServableModelBundle, StartModelDownloadRequest,
+    StartModelDownloadResponse,
 };
 use magnitude_service_contracts::{DownloadFailure, DownloadStage, InventoryError, ModelDownloadEvent};
 
 use crate::inventory::ManagedModelStore;
 use crate::requested_downloads::{RequestedDownload, RequestedDownloads};
+
+/// What a download of a custom model fetches, worked out from the local-models configuration and
+/// the files here whenever it is requested or resumed: an added model's files at its pinned commit
+/// with the drafter it downloads with, only the drafter a model's choice resolves to, or an added
+/// model's files at the commit its repository has moved to. Nothing, when all of it is here.
+pub trait CustomModelAcquisition: Send + Sync + 'static {
+    fn bundle(
+        &self,
+        model_id: ModelId,
+        part: Option<CustomModelPart>,
+    ) -> BoxFuture<'_, Result<Option<ServableModelBundle>, InventoryError>>;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DownloadAttemptId(String);
@@ -58,6 +71,7 @@ pub struct ManagedModelDownloads {
     records: Arc<RwLock<BTreeMap<DownloadAttemptId, AttemptRecord>>>,
     downloads: Arc<RwLock<BTreeMap<ModelDownloadId, DownloadRecord>>>,
     requests: Arc<Mutex<RequestedDownloads>>,
+    custom: Arc<OnceLock<Arc<dyn CustomModelAcquisition>>>,
     starts: Arc<tokio::sync::Mutex<()>>,
     revision: Arc<AtomicU64>,
     changes: tokio::sync::broadcast::Sender<ModelDownloadsInvalidation>,
@@ -74,7 +88,7 @@ struct AttemptRecord {
 struct DownloadRecord {
     id: ModelDownloadId,
     bundle: ServableModelBundle,
-    for_model: Option<ModelId>,
+    for_model: ModelId,
     attempt_ids: Vec<DownloadAttemptId>,
     cancelled: bool,
     failure_acknowledged: bool,
@@ -90,6 +104,7 @@ impl ManagedModelDownloads {
             records: Arc::new(RwLock::new(BTreeMap::new())),
             downloads: Arc::new(RwLock::new(BTreeMap::new())),
             requests: Arc::new(Mutex::new(requests)),
+            custom: Arc::new(OnceLock::new()),
             starts: Arc::new(tokio::sync::Mutex::new(())),
             revision: Arc::new(AtomicU64::new(0)),
             changes,
@@ -174,15 +189,43 @@ impl ManagedModelDownloads {
         self.change_requests(|requests| requests.forget_model(model));
     }
 
-    /// Admits a download as `requested`, which is kept until the download ends so a restart
-    /// admits it again.
+    /// Installs what works out a custom model download's files. Until it is, custom downloads are
+    /// refused and none resumes.
+    pub fn set_custom_model_acquisition(&self, acquisition: Arc<dyn CustomModelAcquisition>) {
+        if self.custom.set(acquisition).is_err() {
+            tracing::warn!("the custom model acquisition was already installed");
+        }
+    }
+
+    /// Admits a custom model's download of `part`, resolving its files now.
+    pub(crate) async fn start_custom(
+        &self,
+        model_id: ModelId,
+        part: Option<CustomModelPart>,
+    ) -> Result<StartModelDownloadResponse, InventoryError> {
+        let acquisition = self.custom.get().ok_or_else(|| {
+            InventoryError::NotReady("custom model downloads are not available yet".to_owned())
+        })?;
+        let requested = RequestedDownload {
+            model: model_id.clone(),
+            part: part.map(Into::into),
+        };
+        match acquisition.bundle(model_id.clone(), part).await? {
+            Some(bundle) => self.start_requested(bundle, model_id, requested).await,
+            None => Ok(StartModelDownloadResponse { download: None }),
+        }
+    }
+
+    /// Admits a download of `bundle` for `for_model` as `requested`, which is kept until the
+    /// download ends so a restart admits it again.
     pub(crate) async fn start_requested(
         &self,
-        request: StartModelDownloadRequest,
+        bundle: ServableModelBundle,
+        for_model: ModelId,
         requested: RequestedDownload,
     ) -> Result<StartModelDownloadResponse, InventoryError> {
         let _start_guard = self.starts.lock().await;
-        let packages = bundle_packages(&request.bundle)
+        let packages = bundle_packages(&bundle)
             .into_iter()
             .map(|package| self.manager.acquisition_package(package.clone()))
             .collect::<Result<Vec<_>, _>>()?;
@@ -288,8 +331,8 @@ impl ManagedModelDownloads {
             let id = random_download_id()?;
             let mut record = DownloadRecord {
                 id: id.clone(),
-                bundle: request.bundle,
-                for_model: request.for_model,
+                bundle,
+                for_model,
                 attempt_ids: admitted
                     .iter()
                     .map(|attempt| attempt_identity(attempt).0)
@@ -741,8 +784,7 @@ impl ModelDownloads for ManagedModelDownloads {
         &self,
         request: StartModelDownloadRequest,
     ) -> BoxFuture<'_, Result<StartModelDownloadResponse, InventoryError>> {
-        let requested = RequestedDownload::bundle(&request);
-        Box::pin(self.start_requested(request, requested))
+        Box::pin(self.start_custom(request.model_id, request.part))
     }
 
     fn list(&self) -> BoxFuture<'_, Result<ModelDownloadsResponse, InventoryError>> {
@@ -929,6 +971,10 @@ mod tests {
     };
     use std::path::PathBuf;
 
+    fn test_model() -> ModelId {
+        "hf:owner/repository/target.gguf".parse().unwrap()
+    }
+
     fn package(id: &str, size_bytes: u64) -> ModelPackage {
         ModelPackage {
             id: ModelPackageId(id.to_owned()),
@@ -1004,7 +1050,7 @@ mod tests {
         let record = DownloadRecord {
             id: id.clone(),
             bundle: paired_bundle(target, draft),
-            for_model: None,
+            for_model: test_model(),
             attempt_ids: vec![attempt_id],
             cancelled: false,
             failure_acknowledged: false,
@@ -1048,7 +1094,7 @@ mod tests {
         let record = DownloadRecord {
             id: ModelDownloadId("model_download_test".to_owned()),
             bundle: ServableModelBundle::Standalone { package },
-            for_model: None,
+            for_model: test_model(),
             attempt_ids: vec![attempt_id],
             cancelled: false,
             failure_acknowledged: false,
@@ -1075,7 +1121,7 @@ mod tests {
             bundle: ServableModelBundle::Standalone {
                 package: package("package_test", 10),
             },
-            for_model: None,
+            for_model: test_model(),
             attempt_ids: vec![DownloadAttemptId("attempt_missing".to_owned())],
             cancelled: false,
             failure_acknowledged: false,
@@ -1113,7 +1159,7 @@ mod tests {
             bundle: ServableModelBundle::Standalone {
                 package: package.clone(),
             },
-            for_model: None,
+            for_model: test_model(),
             attempt_ids: vec![attempt_id.clone()],
             cancelled: false,
             failure_acknowledged: false,
@@ -1189,7 +1235,7 @@ mod tests {
             DownloadRecord {
                 id: bundle_id.clone(),
                 bundle: paired_bundle(target.clone(), draft.clone()),
-                for_model: None,
+                for_model: test_model(),
                 attempt_ids: vec![target_id.clone(), draft_id.clone()],
                 cancelled: false,
                 failure_acknowledged: false,
@@ -1210,7 +1256,7 @@ mod tests {
                 bundle: ServableModelBundle::Standalone {
                     package: target.clone(),
                 },
-                for_model: None,
+                for_model: test_model(),
                 attempt_ids: vec![target_id.clone()],
                 cancelled: false,
                 failure_acknowledged: false,
@@ -1247,7 +1293,7 @@ mod tests {
         let record = DownloadRecord {
             id: ModelDownloadId("model_download_test".to_owned()),
             bundle: ServableModelBundle::Standalone { package },
-            for_model: None,
+            for_model: test_model(),
             attempt_ids: vec![attempt_id],
             cancelled: true,
             failure_acknowledged: false,

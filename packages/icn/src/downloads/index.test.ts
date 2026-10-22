@@ -31,28 +31,28 @@ describe("bundle packages", () => {
 })
 
 describe("ICN downloads", () => {
-  it("starts a bundle download for its model and rereads the download list", async () => {
+  it("starts a download of a model's part by intent and rereads the download list", async () => {
     const started: unknown[] = []
     const downloads: unknown[] = []
+    const bundle = { _tag: "Standalone", package: { id: "p" } } as unknown as ServableModelBundle
     const client = { downloads: {
       listModelDownloads: () => Effect.sync(() => ({ downloads: [...downloads] })),
-      startModelDownload: ({ payload }: { readonly payload: { readonly bundle: unknown; readonly forModel: unknown } }) => Effect.sync(() => {
+      startModelDownload: ({ payload }: { readonly payload: { readonly modelId: string; readonly part: unknown } }) => Effect.sync(() => {
         started.push(payload)
-        const download = { id: "model_download_1", bundle: payload.bundle, forModel: payload.forModel, state: { _tag: "Pending", completedBytes: 0, totalBytes: 10 } }
+        const download = { id: "model_download_1", bundle, forModel: payload.modelId, state: { _tag: "Pending", completedBytes: 0, totalBytes: 10 } }
         downloads.push(download)
         return { download: Option.some(download) }
       }),
     } } as unknown as IcnClientService
-    const bundle = { _tag: "Standalone", package: { id: "p" } } as unknown as ServableModelBundle
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const service = yield* IcnDownloads
-      const admitted = yield* service.start(bundle, "local:abc")
+      const admitted = yield* service.start("local:model:aaaaaaaaaaaa", Option.some("Drafter"))
       return { admitted, listed: (yield* service.get).state.downloads.length }
     }).pipe(Effect.provide(makeIcnDownloads().pipe(Layer.provide(Layer.merge(
       Layer.succeed(IcnClient, client),
       Layer.succeed(IcnEvents, IcnEvents.of({ subscribe: Effect.succeed(Stream.never) })),
     )))))))
-    expect(started).toEqual([{ bundle, forModel: Option.some("local:abc") }])
+    expect(started).toEqual([{ modelId: "local:model:aaaaaaaaaaaa", part: Option.some("Drafter") }])
     expect(Option.isSome(result.admitted)).toBe(true)
     expect(result.listed).toBe(1)
   })

@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Option, Ref, Schema } from "effect"
+import { Option, Schema } from "effect"
 import {
   catalogDrafterName,
   DrafterCandidateSchema,
@@ -15,7 +15,7 @@ import { productUnsupportedReasons } from "./unsupported-reasons"
 export const presentField = <K extends string, A>(key: K, value: Option.Option<A>): { readonly [P in K]?: A } =>
   Option.match(value, { onNone: () => ({}), onSome: (present) => ({ [key]: present }) as { readonly [P in K]?: A } })
 
-/** A stable identity for one drafter, used to match candidates and remember binding methods. */
+/** A stable identity for one drafter, used to match candidates. */
 export const drafterReferenceKey = (reference: DrafterReference): string => {
   switch (reference._tag) {
     case "Catalog": return `catalog:${reference.modelId}`
@@ -101,24 +101,3 @@ export const productDrafterCandidate = (
     ? { ...candidate.verdict, reasons: productUnsupportedReasons(candidate.verdict.reasons, candidate.verdict.detail) }
     : candidate.verdict,
 })
-
-/** The method each drafter binds with, learned from the engine; MTP heads are always MTP. */
-export interface DrafterMethodsApi {
-  readonly get: (reference: DrafterReference) => Effect.Effect<Option.Option<SpeculativeMethod>>
-  readonly remember: (reference: DrafterReference, method: SpeculativeMethod) => Effect.Effect<void>
-  readonly snapshot: Effect.Effect<(reference: DrafterReference) => Option.Option<SpeculativeMethod>>
-}
-export class DrafterMethods extends Context.Tag("DrafterMethods")<DrafterMethods, DrafterMethodsApi>() {}
-
-export const DrafterMethodsLive = Layer.effect(DrafterMethods, Effect.gen(function* () {
-  const known = yield* Ref.make(new Map<string, SpeculativeMethod>())
-  const lookup = (methods: ReadonlyMap<string, SpeculativeMethod>) => (reference: DrafterReference) =>
-    reference._tag === "Embedded"
-      ? Option.some<SpeculativeMethod>({ _tag: "Mtp" })
-      : Option.fromNullable(methods.get(drafterReferenceKey(reference)))
-  return DrafterMethods.of({
-    get: (reference) => Ref.get(known).pipe(Effect.map((methods) => lookup(methods)(reference))),
-    snapshot: Ref.get(known).pipe(Effect.map(lookup)),
-    remember: (reference, method) => Ref.update(known, (methods) => new Map(methods).set(drafterReferenceKey(reference), method)),
-  })
-}))

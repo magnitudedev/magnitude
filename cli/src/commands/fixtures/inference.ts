@@ -37,7 +37,8 @@ export const TEST_REPOSITORY = HuggingFaceRepositoryIdSchema.make("HauhauCS/Qwen
 export const TEST_COMMIT = "4f1c2e9d0b7a6c5e4f3a2b1c0d9e8f7a6b5c4d3e"
 export const FOUND_MODEL_ID = CustomFormModelIdSchema.make("hf:bartowski/Qwen-Test-GGUF/Qwen-Test-Q4_K_M.gguf")
 export const ADDED_MODEL_ID = CustomFormModelIdSchema.make(`hf:${TEST_REPOSITORY}/Qwen-Test-Q4_K_P.gguf`)
-export const IMPORTED_MODEL_ID = CustomFormModelIdSchema.make(`local:${"a".repeat(64)}`)
+/** A model found in a folder the user added, which has no Hugging Face identity. */
+export const FOLDER_MODEL_ID = CustomFormModelIdSchema.make("local:qwen-test-q4_k_m:aaaaaaaaaaaa")
 export const CATALOG_DRAFTER_ID = CatalogFormModelIdSchema.make("qwen-test:gguf:q4")
 
 export const makeHardware = (
@@ -298,10 +299,10 @@ export const makeAddedModel = (overrides: Partial<CustomLocalModel> = {}): Custo
   ...overrides,
 })
 
-export const makeImportedModel = (overrides: Partial<CustomLocalModel> = {}): CustomLocalModel => makeFoundModel({
-  modelId: IMPORTED_MODEL_ID,
-  origin: { _tag: "Imported", path: "/Users/test/models/qwen-test.gguf" },
-  presentation: { ...customPresentation("GGUF file"), variantOf: Option.none() },
+export const makeFolderModel = (overrides: Partial<CustomLocalModel> = {}): CustomLocalModel => makeFoundModel({
+  modelId: FOLDER_MODEL_ID,
+  origin: { _tag: "Found", source: { _tag: "Folder", path: "/Users/test/models" } },
+  presentation: { ...customPresentation("models"), variantOf: Option.none() },
   recommendedDrafter: Option.none(),
   acquisitionState: {
     _tag: "Unavailable",

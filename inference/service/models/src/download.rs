@@ -2591,9 +2591,10 @@ mod tests {
     #[tokio::test]
     async fn a_drafter_for_an_installed_target_fetches_only_the_drafter_and_cancels() {
         use crate::download_service::ManagedModelDownloads;
+        use crate::requested_downloads::{RequestedDownload, RequestedPart};
         use magnitude_service_contracts::models::{
-            ModelDownloadState, ModelDownloads, ServableModelBundle, SpeculativeDraftSource,
-            SpeculativeMethod, StartModelDownloadRequest,
+            ModelDownloadState, ModelDownloads, ModelId, ServableModelBundle,
+            SpeculativeDraftSource, SpeculativeMethod,
         };
         let directory = tempfile::tempdir().expect("temporary directory");
         let hf_cache = directory.path().join("hugging-face");
@@ -2659,15 +2660,20 @@ mod tests {
         let downloads = ManagedModelDownloads::open(Arc::clone(&manager))
             .await
             .expect("model downloads");
+        let model: ModelId = "local:model:aaaaaaaaaaaa".parse().unwrap();
         let started = downloads
-            .start(StartModelDownloadRequest {
-                bundle: ServableModelBundle::SpeculativeDecoding {
+            .start_requested(
+                ServableModelBundle::SpeculativeDecoding {
                     target,
                     draft_source: SpeculativeDraftSource::Separate { draft },
                     method: SpeculativeMethod::DFlash,
                 },
-                for_model: Some(format!("local:{}", "a".repeat(64)).parse().unwrap()),
-            })
+                model.clone(),
+                RequestedDownload {
+                    model: model.clone(),
+                    part: Some(RequestedPart::Drafter),
+                },
+            )
             .await
             .expect("drafter-only download")
             .download
@@ -2679,11 +2685,7 @@ mod tests {
         let listed = downloads.list().await.unwrap().downloads;
         assert_eq!(listed.len(), 1);
         assert_eq!(
-            listed[0]
-                .for_model
-                .as_ref()
-                .map(|model| model.as_str().to_owned()),
-            Some(format!("local:{}", "a".repeat(64))),
+            listed[0].for_model, model,
             "the model a drafter is fetched for is echoed in its download"
         );
         let cancelled = downloads.cancel(&started.id).await.expect("cancellation");
@@ -2697,9 +2699,9 @@ mod tests {
     #[tokio::test]
     async fn a_failed_bundle_stops_its_other_package_and_a_retry_admits_fresh_work() {
         use crate::download_service::ManagedModelDownloads;
+        use crate::requested_downloads::RequestedDownload;
         use magnitude_service_contracts::models::{
-            ModelDownloads, ServableModelBundle, SpeculativeDraftSource, SpeculativeMethod,
-            StartModelDownloadRequest,
+            ModelId, ServableModelBundle, SpeculativeDraftSource, SpeculativeMethod,
         };
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = InventoryConfig::with_roots(
@@ -2734,17 +2736,24 @@ mod tests {
         let downloads = ManagedModelDownloads::open(Arc::clone(&manager))
             .await
             .expect("model downloads");
-        let request = || StartModelDownloadRequest {
-            bundle: ServableModelBundle::SpeculativeDecoding {
-                target: target.clone(),
-                draft_source: SpeculativeDraftSource::Separate {
-                    draft: draft.clone(),
+        let model: ModelId = "hf:owner/repository/target.gguf".parse().unwrap();
+        let start = || {
+            downloads.start_requested(
+                ServableModelBundle::SpeculativeDecoding {
+                    target: target.clone(),
+                    draft_source: SpeculativeDraftSource::Separate {
+                        draft: draft.clone(),
+                    },
+                    method: SpeculativeMethod::DSpark,
                 },
-                method: SpeculativeMethod::DSpark,
-            },
-            for_model: None,
+                model.clone(),
+                RequestedDownload {
+                    model: model.clone(),
+                    part: None,
+                },
+            )
         };
-        downloads.start(request()).await.expect("download");
+        start().await.expect("download");
 
         // The drafter exhausts its retries first; the target is still retrying.
         draft_work.sender.send_replace(ModelDownloadEvent::Failed {
@@ -2775,7 +2784,7 @@ mod tests {
             "owner/repository",
         ))
         .expect("repository lock");
-        downloads.start(request()).await.expect("retry");
+        start().await.expect("retry");
         let retried = Arc::clone(
             manager
                 .operations

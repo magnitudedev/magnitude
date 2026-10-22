@@ -159,53 +159,6 @@ export const assessModelCandidateOperation = {
   payloadRequired: true,
 } as const
 
-export const buildCandidateBundleOperation = {
-  operationId: "buildCandidateBundle",
-  transport: "http",
-  method: "POST",
-  path: "/api/v1/candidates/bundle",
-  group: "candidates",
-  successes: [
-    {
-      status: 200,
-      schema: S.suspend(
-        (): S.Schema<Schemas.ServableModelBundle, Schemas.ServableModelBundleEncoded> => Schemas.ServableModelBundle,
-      ),
-      mediaType: "application/json",
-    },
-  ],
-  errors: [
-    {
-      status: 400,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-    {
-      status: 404,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-    {
-      status: 409,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-    {
-      status: 422,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-    {
-      status: 500,
-      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-      mediaType: "application/json",
-    },
-  ],
-  payload: S.suspend((): S.Schema<Schemas.ModelCandidate, Schemas.ModelCandidateEncoded> => Schemas.ModelCandidate),
-  payloadMediaType: "application/json",
-  payloadRequired: true,
-} as const
-
 export const cancelCatalogInstallationOperation = {
   operationId: "cancelCatalogInstallation",
   transport: "http",

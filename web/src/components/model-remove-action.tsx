@@ -12,15 +12,10 @@ export const keepsExternalCopy = (model: LocalModel): boolean => {
   return removalKind(model) === "delete" && "installation" in acquisition && acquisition.installation.ownership === "Mixed"
 }
 
-/** The confirmation for Remove: forgetting a file, deleting only Magnitude's copy, forgetting an added model not yet downloaded, or deleting the download. */
+/** The confirmation for Remove: deleting only Magnitude's copy, forgetting an added model not yet downloaded, or deleting the download. */
 export const removalConfirmation = (model: LocalModel, running: boolean): { readonly title: string; readonly description: string; readonly confirmLabel: string } => {
   const name = formatLocalModelDisplayName(model)
   const confirmLabel = running ? "Stop and remove" : "Remove"
-  if (removalKind(model) === "forget") return {
-    title: running ? `Stop ${name} and remove it from Magnitude?` : `Remove ${name} from Magnitude?`,
-    description: "The file stays where it is. You can add it again with Add GGUF file…",
-    confirmLabel: running ? confirmLabel : "Remove from Magnitude",
-  }
   if (model._tag === "Catalog" && removalKind(model) === "parts") {
     const parts = model.storedComponents.map(component => catalogComponentName(component).toLowerCase()).join(" and ")
     if (parts.length === 0) return {
@@ -51,7 +46,7 @@ export const removalConfirmation = (model: LocalModel, running: boolean): { read
   }
 }
 
-/** Remove for any model: deleting or forgetting asks first; hiding, offered with `onHide`, is undone from the Hidden filter. */
+/** Remove for any model: deleting asks first; hiding, offered with `onHide`, is undone from the Hidden filter. */
 export function ModelRemoveAction({ model, running, disabled, onRemove, onHide }: {
   model: LocalModel
   running: boolean
@@ -64,10 +59,9 @@ export function ModelRemoveAction({ model, running, disabled, onRemove, onHide }
   const kind = removalKind(model)
   const hide = onHide && <Button variant="ghost" size="icon" aria-label={`Hide ${name} from Magnitude`} title="Hide from Magnitude" disabled={disabled} onClick={onHide}><EyeSlashIcon /></Button>
   if (kind === "hide") return hide
-  const forget = kind === "forget"
   return <>
     {kind === "parts" && hide}
-    <Button variant="ghost" size="icon" aria-label={forget ? `Remove ${name} from Magnitude` : kind === "parts" ? `Remove the files Magnitude downloaded for ${name}` : `Remove ${name}`} title={forget ? "Remove from Magnitude" : "Remove download"} disabled={disabled} onClick={() => setConfirming(true)}><TrashIcon /></Button>
-    <ConfirmDialog open={confirming} onOpenChange={setConfirming} destructive={!forget} {...removalConfirmation(model, running)} onConfirm={onRemove} />
+    <Button variant="ghost" size="icon" aria-label={kind === "parts" ? `Remove the files Magnitude downloaded for ${name}` : `Remove ${name}`} title="Remove download" disabled={disabled} onClick={() => setConfirming(true)}><TrashIcon /></Button>
+    <ConfirmDialog open={confirming} onOpenChange={setConfirming} destructive {...removalConfirmation(model, running)} onConfirm={onRemove} />
   </>
 }

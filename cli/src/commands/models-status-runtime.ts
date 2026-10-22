@@ -129,7 +129,6 @@ export const renderRemoval = (
   }
   switch (Option.getOrUndefined(kind)) {
     case "hide": return `Hid ${modelId} from Magnitude. Its files are untouched.\nUnhide it: magnitude models unhide ${modelId}\n`
-    case "forget": return `Forgot ${modelId}. Magnitude never deletes your file; it stays where it is.\n`
     default: return Schema.is(CatalogFormModelIdSchema)(modelId)
       ? `Removed ${modelId} from this computer.\nThe model remains available in the catalog.\n`
       : `Removed ${modelId}.\nMagnitude deleted only its own copy; files other apps manage are untouched.\n`
@@ -360,7 +359,6 @@ const catalogComponentHints = (models: readonly LocalModel[]): string[] => model
 const customSourceDetail = (model: CustomLocalModel): string => {
   switch (model.origin._tag) {
     case "Added": return `Hugging Face · ${model.origin.repository}`
-    case "Imported": return `GGUF file · ${model.origin.path}`
     case "Found": return model.origin.source._tag === "Folder"
       ? `${model.presentation.sourceLabel} · ${model.origin.source.path}`
       : model.presentation.sourceLabel

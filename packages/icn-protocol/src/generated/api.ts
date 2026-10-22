@@ -106,35 +106,6 @@ export const assessModelCandidate = HttpApiEndpoint.post("assessModelCandidate",
     { status: 500 },
   )
 
-export const buildCandidateBundle = HttpApiEndpoint.post("buildCandidateBundle", "/api/v1/candidates/bundle")
-  .setPayload(S.suspend((): S.Schema<Schemas.ModelCandidate, Schemas.ModelCandidateEncoded> => Schemas.ModelCandidate))
-  .addSuccess(
-    S.suspend(
-      (): S.Schema<Schemas.ServableModelBundle, Schemas.ServableModelBundleEncoded> => Schemas.ServableModelBundle,
-    ),
-    { status: 200 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 400 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 404 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 409 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 422 },
-  )
-  .addError(
-    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
-    { status: 500 },
-  )
-
 export const cancelCatalogInstallation = HttpApiEndpoint.post(
   "cancelCatalogInstallation",
   "/api/v1/catalog/installations/:operation_id/cancel",
@@ -840,10 +811,7 @@ export const AnthropicGroup = HttpApiGroup.make("anthropic")
   .add(countAnthropicMessageTokens)
   .add(createAnthropicMessage)
 
-export const CandidatesGroup = HttpApiGroup.make("candidates")
-  .add(buildCandidateBundle)
-  .add(inspectModelCandidate)
-  .add(listDrafterCandidates)
+export const CandidatesGroup = HttpApiGroup.make("candidates").add(inspectModelCandidate).add(listDrafterCandidates)
 
 export const CatalogGroup = HttpApiGroup.make("catalog")
   .add(acknowledgeCatalogInstallationFailure)

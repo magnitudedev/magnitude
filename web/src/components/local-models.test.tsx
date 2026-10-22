@@ -7,7 +7,7 @@ import { ModelRemoveAction, keepsExternalCopy, removalConfirmation } from "./mod
 import { FoundModelsBanner, HuggingFaceLink, NoRecommendations, foundModelsSummary } from "./discover-custom"
 import { ModelsHeader, matchStatus, searchPlaceholder } from "./models-header"
 import { labForName, modelLab, variantLab } from "./model-logo"
-import { added, catalogId, catalogModel, customModel, doesNotFit, foundIn, imported, unsupportedLocal } from "../../test/models/fixtures"
+import { added, catalogId, catalogModel, customModel, doesNotFit, foundIn, inFolder, unsupportedLocal } from "../../test/models/fixtures"
 
 describe("models header", () => {
   it("puts the add action beside the title and the count in the search placeholder", () => {
@@ -37,16 +37,15 @@ describe("model labs", () => {
 
 describe("removing by origin", () => {
   const render = (model: Parameters<typeof removalKind>[0]) => renderToStaticMarkup(<ModelRemoveAction model={model} running={false} disabled={false} onRemove={() => {}} onHide={() => {}} />)
-  it("deletes catalog and added files, forgets imported files, and hides found models", () => {
+  it("deletes catalog and added files, and hides found models, those in a folder the user added included", () => {
     expect(removalKind(catalogModel())).toBe("delete")
     expect(removalKind(customModel(added))).toBe("delete")
-    expect(removalKind(customModel(imported))).toBe("forget")
+    expect(removalKind(customModel(inFolder))).toBe("hide")
     expect(removalKind(customModel(foundIn({ _tag: "LmStudio" })))).toBe("hide")
     expect(render(customModel(added))).toContain('title="Remove download"')
-    expect(render(customModel(imported))).toContain('aria-label="Remove Qwen3.6 35B A3B Uncensored (Q4_K_P) from Magnitude"')
+    expect(render(customModel(inFolder))).toContain('aria-label="Hide Qwen3.6 35B A3B Uncensored (Q4_K_P) from Magnitude"')
     expect(render(customModel(foundIn({ _tag: "Ollama" })))).toContain('aria-label="Hide Qwen3.6 35B A3B Uncensored (Q4_K_P) from Magnitude"')
     expect(render(customModel(added))).not.toContain("Hide")
-    expect(render(customModel(imported))).not.toContain("Hide")
   })
   it("never offers deleting a catalog model whose files are only in another app's location", () => {
     const external = catalogModel()
@@ -102,13 +101,6 @@ describe("removing by origin", () => {
       description: "Anything Magnitude downloaded for it so far is deleted. You can add it again from Hugging Face.",
       confirmLabel: "Remove",
     })
-  })
-  it("tells an imported file how to add it again, without doubled punctuation", () => {
-    const confirmation = removalConfirmation(customModel(imported), false)
-    expect(confirmation.description).toBe("The file stays where it is. You can add it again with Add GGUF file…")
-    expect(confirmation.description).not.toMatch(/…\.$/)
-    expect(confirmation.confirmLabel).toBe("Remove from Magnitude")
-    expect(removalConfirmation(customModel(imported), true).confirmLabel).toBe("Stop and remove")
   })
   it("offers no hide action without a hide handler", () => {
     expect(renderToStaticMarkup(<ModelRemoveAction model={customModel(foundIn({ _tag: "Ollama" }))} running={false} disabled={false} onRemove={() => {}} />)).toBe("")
@@ -170,7 +162,7 @@ describe("hidden filter", () => {
 describe("discover", () => {
   const found = [
     customModel(foundIn({ _tag: "Ollama" })),
-    customModel(foundIn({ _tag: "LmStudio" }), { modelId: customModel(imported).modelId }),
+    customModel(foundIn({ _tag: "LmStudio" })),
     customModel(foundIn({ _tag: "HuggingFaceCache" })),
   ]
   it("summarizes found models that fit, where they were found, and their labs", () => {
@@ -183,7 +175,7 @@ describe("discover", () => {
   })
   it("counts only found models that fit", () => {
     const tooLarge = customModel(foundIn({ _tag: "Ollama" }), { servingState: { ...found[0]!.servingState, _tag: "Assessed", assessment: doesNotFit } as typeof found[0]["servingState"] })
-    expect(renderToStaticMarkup(<FoundModelsBanner models={[customModel(added), customModel(imported), tooLarge]} onView={() => {}} />)).toBe("")
+    expect(renderToStaticMarkup(<FoundModelsBanner models={[customModel(added), tooLarge]} onView={() => {}} />)).toBe("")
     expect(renderToStaticMarkup(<FoundModelsBanner models={[customModel(foundIn({ _tag: "Folder", path: "/Volumes/External/models" }), { presentation: { ...found[0]!.presentation, sourceLabel: "models" } })]} onView={() => {}} />))
       .toContain("You already have 1 model that runs here.</span> <span class=\"text-slate-600 dark:text-slate-300\">Found in your models folder.")
   })

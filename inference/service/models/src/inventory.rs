@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hf_hub::HFClient;
 use magnitude_service_contracts::models::{
-    CatalogPackageRole, CustomModelDeclarationOrigin, FoundSource, InstalledCatalogAttribution,
+    CatalogPackageRole, FoundSource, InstalledCatalogAttribution,
     InstalledModelPackage, InstalledModelPackagesResponse, PackageValidation, LocalModelsConfiguration, ModelFileRelationship, ModelFileRole,
     ModelPackage, ModelPackageId, ModelPackageInstallationOrigin, ModelPackageSource, ModelRoot,
     ModelRootKind, RecommendableModel, ServableModelBundle, SpeculativeDraftSource,
@@ -128,12 +128,12 @@ impl InstalledPackageSnapshot {
         &self,
         revision: u64,
         reconciliation_complete: bool,
-        include: impl Fn(&InstalledModelPackage) -> bool,
+        include: impl Fn(&InstalledPackageRecord) -> bool,
     ) -> InstalledModelPackagesResponse {
         let packages = self
             .records
             .values()
-            .filter(|record| include(&record.installed))
+            .filter(|record| include(record))
             .fold(
                 BTreeMap::<ModelPackageId, InstalledModelPackage>::new(),
                 |mut packages, record| {
@@ -250,7 +250,7 @@ fn occurrence_entries(record: &InstalledPackageRecord) -> Vec<(String, String, P
 }
 
 /// Which occurrence of the same content represents it: the managed store, then the Hugging Face
-/// cache, LM Studio, llama.cpp, Ollama, user folders, and imported files.
+/// cache, LM Studio, llama.cpp, Ollama, and user folders and files.
 pub(crate) fn origin_precedence(origin: ModelPackageInstallationOrigin) -> u8 {
     match origin {
         ModelPackageInstallationOrigin::Magnitude => 0,
@@ -259,12 +259,11 @@ pub(crate) fn origin_precedence(origin: ModelPackageInstallationOrigin) -> u8 {
         ModelPackageInstallationOrigin::LlamaCpp => 3,
         ModelPackageInstallationOrigin::Ollama => 4,
         ModelPackageInstallationOrigin::Folder => 5,
-        ModelPackageInstallationOrigin::Imported => 6,
     }
 }
 
 /// Inventory settings. `local_models` is the local-models configuration in effect before ACN
-/// supplies one at runtime: the model roots to scan, declarations, hidden models and drafters.
+/// supplies one at runtime: the model roots to scan, added models, hidden models and drafters.
 #[derive(Debug, Clone)]
 pub struct InventoryConfig {
     pub root: PathBuf,
@@ -573,7 +572,7 @@ impl ManagedModelStore {
                 let mut response = snapshot.response_of(
                     self.packages_revision.load(Ordering::Acquire),
                     self.reconciliation_complete.load(Ordering::Acquire),
-                    |installed| !self.hidden_occurrence(installed.origin, &installed.package),
+                    |record| !self.hidden_occurrence(record),
                 );
                 for (composed, _, _) in self.composed_catalog_targets(&snapshot) {
                     if !response.packages.iter().any(|installed| installed.package.id == composed.package.id) {
@@ -597,9 +596,7 @@ impl ManagedModelStore {
             .filter_map(|model| {
                 let target = catalog_target(model);
                 let projector = catalog_projector_package(target)?;
-                let visible = |record: &&InstalledPackageRecord| {
-                    !self.hidden_occurrence(record.installed.origin, &record.installed.package)
-                };
+                let visible = |record: &&InstalledPackageRecord| !self.hidden_occurrence(record);
                 let weights = records
                     .records
                     .values()
@@ -1406,40 +1403,6 @@ fn validate_local_models(configuration: &LocalModelsConfiguration) -> Result<(),
             )));
         }
     }
-    for declaration in &configuration.declarations {
-        if let CustomModelDeclarationOrigin::Imported { path } = &declaration.origin
-            && (!path.is_absolute()
-                || declaration.target.is_empty()
-                || declaration
-                    .target
-                    .iter()
-                    .chain(declaration.projector.iter())
-                    .any(|file| !Path::new(file).is_absolute()))
-        {
-            return Err(InventoryError::InvalidRequest(format!(
-                "imported model {} must declare absolute file paths",
-                declaration.model_id
-            )));
-        }
-        if declaration.target.is_empty() {
-            return Err(InventoryError::InvalidRequest(format!(
-                "model {} declares no target file",
-                declaration.model_id
-            )));
-        }
-        // A missing imported file only contributes nothing; a folder is never a model file.
-        if let CustomModelDeclarationOrigin::Imported { path } = &declaration.origin
-            && let Some(folder) = std::iter::once(path.as_path())
-                .chain(declaration.target.iter().map(Path::new))
-                .find(|file| file.is_dir())
-        {
-            return Err(InventoryError::InvalidRequest(format!(
-                "imported model {} names the folder {}; an imported model is one GGUF file",
-                declaration.model_id,
-                folder.display()
-            )));
-        }
-    }
     Ok(())
 }
 
@@ -1593,7 +1556,7 @@ fn scan(
             }));
         }
     }
-    crate::local_roots::scan_declared_files(local, cache, &config.architectures, &mut discovered);
+    crate::local_roots::scan_attached_drafters(local, &mut discovered);
     let (mut cached_models, cached_evidence, _) =
         load_inventory_index(&ModelCache::new(&config.cache_root));
     // The durable entry controls cache validity. Overlay only transient runtime state for an entry
@@ -2369,7 +2332,7 @@ pub(crate) struct ModelGroup {
     pub(crate) projector: Option<PathBuf>,
 }
 
-/// Projectors that declarations pair with their targets, by absolute path. A declaration names
+/// Projectors that added models pair with their targets, by absolute path. An added model names
 /// its projector, so it wins over guessing from the directory.
 pub(crate) struct DeclaredProjectors {
     added: BTreeMap<(String, String), Vec<(String, String)>>,
@@ -2378,20 +2341,12 @@ pub(crate) struct DeclaredProjectors {
 impl DeclaredProjectors {
     pub(crate) fn new(configuration: &LocalModelsConfiguration) -> Self {
         let mut added = BTreeMap::<(String, String), Vec<(String, String)>>::new();
-        for declaration in &configuration.declarations {
-            if let (
-                CustomModelDeclarationOrigin::Added { repository, commit },
-                Some(target),
-                Some(projector),
-            ) = (
-                &declaration.origin,
-                declaration.target.first(),
-                declaration.projector.as_ref(),
-            ) {
+        for model in &configuration.added {
+            if let Some(projector) = &model.projector {
                 added
-                    .entry((repository.as_str().to_owned(), commit.clone()))
+                    .entry((model.repository.as_str().to_owned(), model.revision.clone()))
                     .or_default()
-                    .push((target.clone(), projector.clone()));
+                    .push((model.path.as_str().to_owned(), projector.clone()));
             }
         }
         Self { added }
@@ -3450,7 +3405,7 @@ mod tests {
             attribution(target.clone(), Vec::new()).await,
             InstalledCatalogAttribution::Attributed { .. }
         ));
-        let found_id = crate::package_service::hub_model_id(&found).unwrap();
+        let found_id = crate::package_service::copy_model_id(&found, None).unwrap();
         assert_eq!(found_id.to_string(), "hf:test/model/model.gguf");
 
         // Requests and references made before the upgrade, naming the found model's `hf:` ID, are

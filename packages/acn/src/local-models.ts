@@ -15,6 +15,7 @@ import {
   UnsupportedLocalModelSchema,
   customModelSourceLabel,
   parseModelId,
+  sameModelId,
   type AttachedDrafter,
   type CatalogLocalModel,
   type CustomLocalModel,
@@ -55,14 +56,14 @@ import type {
   ReadyModel,
   UnsupportedLocalModel as NativeUnsupportedLocalModel,
 } from "@magnitudedev/icn-protocol/schemas"
-import type { CustomModelsConfig, PersistedDrafterChoice } from "@magnitudedev/storage"
+import type { CustomModelsConfig } from "@magnitudedev/storage"
 import {
   LocalModelSources,
   type CatalogModelSource,
   type CustomModelSource,
   type LocalModelSourcesState,
 } from "./local-model-sources"
-import { CustomModels } from "./custom-models"
+import { configuredDrafterChoice, CustomModels } from "./custom-models"
 import {
   drafterReferenceKey,
   drafterReferenceNaming,
@@ -391,7 +392,8 @@ const catalogModel = (
       support: catalogSupport(source.support),
       fidelityRank: source.fidelityRank,
       quantizationAware: source.quantizationAware,
-      aliases: Option.getOrElse(source.aliases, () => []).filter((alias) => !hidden.includes(alias)).flatMap((alias) =>
+      aliases: Option.getOrElse(source.aliases, () => [])
+        .filter((alias) => !hidden.some((hiddenId) => sameModelId(hiddenId, alias))).flatMap((alias) =>
         Option.toArray(decodeCustomFormModelId(alias))),
     },
     acquisitionState,
@@ -460,12 +462,16 @@ export const attachedDrafter = (inputs: CustomModelInputs): Option.Option<Attach
       .pipe(Option.filter((candidate) => drafterReferenceKey(candidate.reference) === drafterReferenceKey(reference)))
     const assessedVerdict = Option.fromNullable(assessment?._tag === "Assessed" && native.state._tag === "Ready"
       ? assessment.drafter
-      : undefined).pipe(Option.filter((verdict) => verdict._tag === "Bound" && verdict.method._tag === native.method._tag))
+      : undefined).pipe(Option.filter((verdict) => verdict._tag === "Bound"
+        && Option.exists(native.method, (method) => method._tag === verdict.method._tag)))
     const verdict: DrafterVerdict = native.state._tag === "Rejected"
       ? productDrafterVerdict(native.state as NativeDrafterVerdict) ?? { _tag: "None" }
       : Option.getOrElse(
           Option.orElse(assessedVerdict, () => Option.map(recommended, (candidate) => candidate.verdict)),
-          (): DrafterVerdict => ({ _tag: "Bound", method: native.method, memoryBytes: 0 }),
+          (): DrafterVerdict => Option.match(native.method, {
+            onNone: () => ({ _tag: "None" }),
+            onSome: (method) => ({ _tag: "Bound", method, memoryBytes: 0 }),
+          }),
         )
     const availability: AttachedDrafter["availability"] = Option.match(drafterDownload, {
       onSome: (download) => downloadIsActive(download)
@@ -484,7 +490,7 @@ export const attachedDrafter = (inputs: CustomModelInputs): Option.Option<Attach
       },
     })
     const { name, label } = Option.match(recommended, {
-      onNone: () => drafterReferenceNaming(reference, catalog, Option.some(native.method)),
+      onNone: () => drafterReferenceNaming(reference, catalog, native.method),
       onSome: (candidate) => candidate,
     })
     return Option.some({
@@ -590,12 +596,12 @@ export const customModel = (inputs: CustomModelInputs): Option.Option<CustomLoca
   }))
 }
 
-/** A found or imported model whose assessment is `Unsupported`, listed with every engine reason. */
+/** A found model whose assessment is `Unsupported`, listed with every engine reason. */
 export const unsupportedCustomModel = (inputs: CustomModelInputs): Option.Option<UnsupportedLocalModel> => {
   const { entry } = inputs
   const origin = decodeCustomModelOrigin(entry.source.origin)
   return Option.flatMap(externalUnsupportedAssessment(inputs, origin), (unsupported) => {
-    const path = entry.source.files[0]?.path ?? (origin._tag === "Imported" ? origin.path : entry.id)
+    const path = entry.source.files[0]?.path ?? entry.id
     return validateUnsupportedLocalModel({
       modelId: Option.some(entry.id),
       displayName: entry.source.displayName.trim().length > 0 ? entry.source.displayName : fileStem(path),
@@ -681,14 +687,8 @@ export interface LocalModelsInputs {
 /**
  * Catalog models stay ranked; custom models are never ranked. ICN lists hidden models apart and never
  * assesses them; a hidden external copy of a catalog model is one of them, under the ID its files have as
- * a found model. A found or imported model the engine cannot run joins the unsupported list.
+ * a found model. A found model the engine cannot run joins the unsupported list.
  */
-/** A persisted drafter choice as clients see it; the persisted method is ICN's to receive. */
-const drafterChoice = (persisted: PersistedDrafterChoice | undefined): DrafterChoice =>
-  persisted === undefined ? { _tag: "Auto" }
-    : persisted._tag === "Reference" ? { _tag: "Reference", reference: persisted.reference }
-    : persisted
-
 export const projectLocalModels = (inputs: LocalModelsInputs): LocalModelsState => {
   const { source, assessment, operations, runtime, removals, config, downloads } = inputs
   const latestOperation = new Map(operations.map((operation) => [operation.modelId, operation]))
@@ -698,7 +698,7 @@ export const projectLocalModels = (inputs: LocalModelsInputs): LocalModelsState 
     instances: runtime,
     related: customModelDownloads(entry.id, config, downloads),
     catalog: source.catalogModels,
-    drafterChoice: drafterChoice(config.drafters[entry.id]),
+    drafterChoice: configuredDrafterChoice(config, entry.id),
   })
   const custom = source.customModels.map((entry) => customInputs(
     entry,

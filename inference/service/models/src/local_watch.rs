@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use magnitude_service_contracts::models::{
-    CustomModelDeclarationOrigin, DrafterChoice, DrafterReference, LocalModelsConfiguration,
+    DrafterChoice, DrafterReference, LocalModelsConfiguration,
 };
 use notify::{EventKind, RecursiveMode, Watcher};
 
@@ -30,40 +30,25 @@ pub(crate) struct WatchTarget {
     pub(crate) interest: PathBuf,
 }
 
-/// Every enabled root, recursively, and the directories of declared files: imported models (whose
-/// folder also holds their drafters) and drafters attached by local path. A root that does not
-/// exist yet is watched through its nearest existing ancestor, so creating it is noticed.
+/// Every enabled root, recursively (a root that is one file through its folder, which also holds
+/// its other shards and its drafters), and the directories of drafters attached by local path. A
+/// root that does not exist yet is watched through its nearest existing ancestor, so creating it
+/// is noticed.
 pub(crate) fn watch_targets(configuration: &LocalModelsConfiguration) -> Vec<WatchTarget> {
     let roots = configuration
         .roots
         .iter()
         .filter(|root| root.enabled)
         .map(|root| existing_target(&root.path, true));
-    let declared = configuration
-        .declarations
+    let files = configuration
+        .drafters
         .iter()
-        .filter(|declaration| {
-            matches!(
-                declaration.origin,
-                CustomModelDeclarationOrigin::Imported { .. }
-            )
+        .filter_map(|attachment| match &attachment.drafter {
+            DrafterChoice::Reference {
+                reference: DrafterReference::Local { path },
+            } => path.parent(),
+            _ => None,
         })
-        .flat_map(|declaration| declaration.target.iter().chain(&declaration.projector))
-        .map(Path::new);
-    let drafters =
-        configuration
-            .drafters
-            .iter()
-            .filter_map(|attachment| match &attachment.drafter {
-                DrafterChoice::Reference {
-                    reference: DrafterReference::Local { path },
-                    ..
-                } => Some(path.as_path()),
-                _ => None,
-            });
-    let files = declared
-        .chain(drafters)
-        .filter_map(Path::parent)
         .map(|directory| existing_target(directory, false));
     let mut targets = roots.chain(files).flatten().collect::<Vec<_>>();
     targets.sort();

@@ -216,11 +216,29 @@ export const HuggingFaceArtifactSelectorSchema = NonEmptyString.pipe(
 )
 export type HuggingFaceArtifactSelector = typeof HuggingFaceArtifactSelectorSchema.Type
 
-export const ModelHeaderDigestSchema = Schema.String.pipe(
-  Schema.pattern(/^[0-9a-f]{64}$/, { message: () => "model header digest must be 64 lowercase hex characters" }),
-  Schema.brand("ModelHeaderDigest"),
+/** What identifies a `local:` model: the first 12 lowercase hex characters of its content digest. */
+export const LocalModelHashSchema = Schema.String.pipe(
+  Schema.pattern(/^[0-9a-f]{12}$/, { message: () => "local model hash must be 12 lowercase hex characters" }),
+  Schema.brand("LocalModelHash"),
 )
-export type ModelHeaderDigest = typeof ModelHeaderDigestSchema.Type
+export type LocalModelHash = typeof LocalModelHashSchema.Type
+
+/** The readable part of a `local:` ID (`<name>-<quant>`), which never identifies the model. */
+export const LocalModelLabelSchema = Schema.String.pipe(
+  Schema.pattern(/^[a-z0-9._-]+$/, {
+    message: () => "local model label must be lowercase ASCII letters, digits, '.', '_' and '-'",
+  }),
+  Schema.brand("LocalModelLabel"),
+)
+export type LocalModelLabel = typeof LocalModelLabelSchema.Type
+
+/** A `local:<label>:<hash>` ID's label and hash; the label can't contain `:`. */
+const localParts = (value: string): { readonly label: string; readonly hash: string } | undefined => {
+  if (!value.startsWith("local:")) return undefined
+  const rest = value.slice(6)
+  const split = rest.lastIndexOf(":")
+  return split < 0 ? undefined : { label: rest.slice(0, split), hash: rest.slice(split + 1) }
+}
 
 type ModelIdForm = "Catalog" | "HuggingFace" | "Local"
 
@@ -234,7 +252,10 @@ const modelIdForm = (value: string): ModelIdForm | undefined => {
       : undefined
   }
   if (value.startsWith("local:")) {
-    return Schema.is(ModelHeaderDigestSchema)(value.slice(6)) ? "Local" : undefined
+    const parts = localParts(value)
+    return parts !== undefined && Schema.is(LocalModelLabelSchema)(parts.label) && Schema.is(LocalModelHashSchema)(parts.hash)
+      ? "Local"
+      : undefined
   }
   const components = value.split(":")
   return components.length === 3
@@ -259,7 +280,7 @@ export type ParsedModelId =
       readonly repositoryId: HuggingFaceRepositoryId
       readonly artifactSelector: HuggingFaceArtifactSelector
     }
-  | { readonly _tag: "Local"; readonly headerDigest: ModelHeaderDigest }
+  | { readonly _tag: "Local"; readonly label: LocalModelLabel; readonly hash: LocalModelHash }
 
 export const parseModelId = (modelId: ModelId): ParsedModelId => {
   if (modelId.startsWith("hf:")) {
@@ -270,8 +291,13 @@ export const parseModelId = (modelId: ModelId): ParsedModelId => {
       artifactSelector: Schema.decodeUnknownSync(HuggingFaceArtifactSelectorSchema)(components.slice(2).join("/")),
     }
   }
-  if (modelId.startsWith("local:")) {
-    return { _tag: "Local", headerDigest: Schema.decodeUnknownSync(ModelHeaderDigestSchema)(modelId.slice(6)) }
+  const local = localParts(modelId)
+  if (local !== undefined) {
+    return {
+      _tag: "Local",
+      label: Schema.decodeUnknownSync(LocalModelLabelSchema)(local.label),
+      hash: Schema.decodeUnknownSync(LocalModelHashSchema)(local.hash),
+    }
   }
   const [baseId, format, quality] = modelId.split(":")
   return {
@@ -280,6 +306,17 @@ export const parseModelId = (modelId: ModelId): ParsedModelId => {
     variantId: Schema.decodeUnknownSync(CatalogVariantIdSchema)(`${format}:${quality}`),
   }
 }
+
+/**
+ * What names a model: a `local:` ID's hash, which its label never changes, or any other ID whole. Two IDs are the
+ * same model exactly when their identities match, so an ID stored with an older label still names its model.
+ */
+export const modelIdentity = (modelId: string): string => {
+  const local = localParts(modelId)
+  return local !== undefined && Schema.is(LocalModelHashSchema)(local.hash) ? `local:${local.hash}` : modelId
+}
+
+export const sameModelId = (left: string, right: string): boolean => modelIdentity(left) === modelIdentity(right)
 
 export const CatalogFormModelIdSchema = ModelIdSchema.pipe(Schema.filter(
   (modelId) => modelIdForm(modelId) === "Catalog",
@@ -295,7 +332,7 @@ export type HuggingFaceFormModelId = typeof HuggingFaceFormModelIdSchema.Type
 
 export const LocalFormModelIdSchema = ModelIdSchema.pipe(Schema.filter(
   (modelId) => modelIdForm(modelId) === "Local",
-  { message: () => "model ID must be a local header-digest model ID" },
+  { message: () => "model ID must be a local:<label>:<hash> model ID" },
 ), Schema.brand("LocalFormModelId"))
 export type LocalFormModelId = typeof LocalFormModelIdSchema.Type
 
@@ -912,7 +949,6 @@ export type FoundModelSource = typeof FoundModelSourceSchema.Type
 /** Where a custom model's files came from, and therefore who owns them. */
 export const CustomModelOriginSchema = Schema.Union(
   Schema.TaggedStruct("Added", { repository: HuggingFaceRepositoryIdSchema, commit: NonEmptyString }),
-  Schema.TaggedStruct("Imported", { path: NonEmptyString }),
   Schema.TaggedStruct("Found", { source: FoundModelSourceSchema }),
 )
 export type CustomModelOrigin = typeof CustomModelOriginSchema.Type
@@ -1071,7 +1107,7 @@ const UnavailableModelAcquisitionStateSchema = Schema.TaggedStruct("Unavailable"
 })
 
 /**
- * An added model's managed lifecycle, or for imported and found models, files Magnitude references
+ * An added model's managed lifecycle, or for found models, files Magnitude references
  * but never owns: `External` when readable, `Unavailable` when not.
  */
 export const CustomModelAcquisitionStateSchema = Schema.Union(
@@ -1143,10 +1179,17 @@ export const CustomLocalModelSchema = Schema.TaggedStruct("Custom", {
     return form === "HuggingFace" && isManagedAcquisitionState(model.acquisitionState)
   }
   if (isManagedAcquisitionState(model.acquisitionState)) return false
-  if (model.origin._tag === "Found" && model.origin.source._tag === "HuggingFaceCache") return form === "HuggingFace"
-  return true
+  switch (model.origin.source._tag) {
+    case "HuggingFaceCache": return form === "HuggingFace"
+    // llama.cpp's hub-layout cache records a file's Hub origin; its other files don't.
+    case "LlamaCpp": return true
+    case "LmStudio":
+    case "Ollama":
+    case "Folder": return form === "Local"
+  }
 }, {
-  message: () => "added models carry a Hugging Face ID and managed acquisition; imported and found models are external",
+  message: () => "added models carry a Hugging Face ID and managed acquisition; found models are external, "
+    + "with a Hugging Face ID only where their location records their Hub origin",
 }))
 export type CustomLocalModel = typeof CustomLocalModelSchema.Type
 

@@ -16,14 +16,14 @@ import {
   CATALOG_DRAFTER_ID,
   catalogState,
   FOUND_MODEL_ID,
-  IMPORTED_MODEL_ID,
+  FOLDER_MODEL_ID,
   makeAddedModel,
   makeCatalogModel,
   makeDrafterCandidate,
   makeDrafterCandidates,
   makeFoundModel,
   makeHardware,
-  makeImportedModel,
+  makeFolderModel,
   makeInspection,
   makeInstalledCatalogModel,
   makeLocations,
@@ -116,7 +116,7 @@ afterEach(() => {
 
 const MODEL_IDS = [
   ["hf:owner/repo/selector", ADDED_MODEL_ID],
-  ["local:<digest>", IMPORTED_MODEL_ID],
+  ["local:<label>:<hash>", FOLDER_MODEL_ID],
 ] as const
 
 describe("model mutations accept hf: and local: IDs", () => {
@@ -129,7 +129,7 @@ describe("model mutations accept hf: and local: IDs", () => {
 
   it.each([
     ["hf:owner/repo/selector", makeAddedModel(), `Removed ${ADDED_MODEL_ID}.\nMagnitude deleted only its own copy; files other apps manage are untouched.\n`],
-    ["local:<digest>", makeImportedModel(), `Forgot ${IMPORTED_MODEL_ID}. Magnitude never deletes your file; it stays where it is.\n`],
+    ["local:<label>:<hash>", makeFolderModel(), `Hid ${FOLDER_MODEL_ID} from Magnitude. Its files are untouched.\nUnhide it: magnitude models unhide ${FOLDER_MODEL_ID}\n`],
   ] as const)("catalog remove with a %s ID", async (_, model, expected) => {
     const { text, json, models } = await runBoth({
       getCatalog: succeed(catalogState([model])),
@@ -157,7 +157,7 @@ describe("model mutations accept hf: and local: IDs", () => {
   it.each([
     ["catalog", CATALOG_DRAFTER_ID],
     ["hf:", ADDED_MODEL_ID],
-    ["local:", IMPORTED_MODEL_ID],
+    ["local:", FOLDER_MODEL_ID],
     ["alias", FOUND_MODEL_ID],
   ] as const)("models stop with a %s ID", async (_, modelId) => {
     const { text, json, models } = await runBoth({ stopModel: succeed({ stopped: true }), stop: succeed() }, (options) => stopInstance(` ${modelId} `, options))
@@ -249,11 +249,11 @@ describe("model mutations accept hf: and local: IDs", () => {
   })
 
   it("models hide fails with the service's error for an ID that isn't on this computer", async () => {
-    const message = `${IMPORTED_MODEL_ID} is not a model on this computer.`
+    const message = `${FOLDER_MODEL_ID} is not a model on this computer.`
     const { client } = fakeService({
       hideModel: () => Effect.fail({ _tag: "LocalModelMutationFailed", code: "custom_model_not_found", message, retryable: false }),
     })
-    const result = await capture(hideModel(IMPORTED_MODEL_ID), client)
+    const result = await capture(hideModel(FOLDER_MODEL_ID), client)
     expect(result.stdout).toBe("")
     expect(result.stderr).toContain(message)
     expect(result.exitCode).toBe(1)
@@ -461,12 +461,12 @@ describe("models status variant and drafter columns", () => {
   it("shows what each model is a variant of and its drafter", () => {
     const catalog = makeInstalledCatalogModel()
     const output = renderModelsStatus(statusView({
-      models: [catalog, makeAddedModel(), makeFoundModel(), makeImportedModel(), turnedOff],
+      models: [catalog, makeAddedModel(), makeFoundModel(), makeFolderModel(), turnedOff],
     }))
     expect(output).toMatch(/^MODEL\s+SOURCE\s+VARIANT OF\s+DRAFTER\s+MEMORY\s+CONTEXT\s+STATUS\s+MODEL ID$/m)
     expect(rowOf(output, ADDED_MODEL_ID)).toMatch(/Hugging Face\s+Qwen Test \(qwen-test:gguf:q4\)\s+Magnitude DFlash for Qwen Test\s/)
     expect(rowOf(output, FOUND_MODEL_ID)).toMatch(/Qwen Test \(qwen-test:gguf:q4\)\s+Faster with a drafter · Add \(900 MB\)\s/)
-    expect(rowOf(output, IMPORTED_MODEL_ID)).toMatch(/GGUF file\s+—\s+—\s/)
+    expect(rowOf(output, FOLDER_MODEL_ID)).toMatch(/\smodels\s+—\s+—\s/)
     expect(rowOf(output, turnedOff.modelId)).toMatch(/Turned off\s/)
     expect(rowOf(output, turnedOff.modelId)).not.toContain("Faster with a drafter")
     expect(rowOf(output, catalog.modelId)).toMatch(/Catalog\s+—\s+—\s/)
@@ -573,8 +573,8 @@ const leakyModels = () => {
   const found = withEvidence(makeFoundModel())
   const loadingFound = { ...found, acquisitionState: { ...found.acquisitionState, residencyState: residencies[0] } } as CustomLocalModel
   const assessed = makeAddedModel().servingState as Extract<CustomLocalModel["servingState"], { _tag: "Assessed" }>
-  const tooLarge = makeImportedModel({
-    modelId: CustomFormModelIdSchema.make(`local:${"f".repeat(64)}`),
+  const tooLarge = makeFolderModel({
+    modelId: CustomFormModelIdSchema.make("local:too-large-q8_0:ffffffffffff"),
     servingState: { ...assessed, assessment: { _tag: "DoesNotFit", assessmentId: ModelAssessmentIdSchema.make("assessment_large"), environmentId: AssessmentEnvironmentIdSchema.make("environment_test"), profile: { contextLength: 4096 }, memoryDomains: [memoryEvidence], totalRequiredBytes: 10, deficitBytes: 4, limitingResource: "cuda0" } },
   })
   return { catalog, catalogs, optimizing, found, loadingFound, tooLarge, added: withEvidence(makeAddedModel()) }

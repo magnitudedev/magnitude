@@ -8,7 +8,7 @@ export interface GlobalStoragePaths {
 
   readonly configFile: string
   readonly authFile: string
-  readonly localModelIndexFile: string
+  readonly huggingFaceFile: string
 
   readonly stateRoot: string
   readonly modelsFile: string
@@ -80,7 +80,7 @@ export function makeGlobalStoragePaths(root: string): GlobalStoragePaths {
 
     configFile: join(root, 'config.json'),
     authFile: join(root, 'auth.json'),
-    localModelIndexFile: join(root, 'local-model-index.json'),
+    huggingFaceFile: join(root, 'huggingface.json'),
 
     stateRoot,
     modelsFile: join(stateRoot, 'models.json'),

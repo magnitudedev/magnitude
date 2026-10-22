@@ -187,7 +187,7 @@ describe("Hugging Face sign-in", () => {
     expect(published).toContain("GetHuggingFaceAccount")
     const saved = await Effect.runPromise(storedCredential.pipe(Effect.provideService(GlobalStorage, { root, paths: makeGlobalStoragePaths(root) })))
     expect(Option.map(saved, (credential: HuggingFaceCredential) => Redacted.value(credential.accessToken))).toEqual(Option.some("hf_oauth_browser"))
-    expect((await stat(makeGlobalStoragePaths(root).authFile)).mode & 0o777).toBe(0o600)
+    expect((await stat(makeGlobalStoragePaths(root).huggingFaceFile)).mode & 0o777).toBe(0o600)
   })
 
   it("signs out with Denied when the person declines in the browser", async () => {

@@ -134,11 +134,11 @@ impl ModelDomainResolver {
         }
     }
 
-    /// The model a request names: an `hf:` ID a catalog model lists as an alias (the ID its exact
-    /// target had as a found model before it was attributed) is that catalog model; every other ID
-    /// is itself.
+    /// The model a request names: a custom ID a catalog model lists as an alias (the ID a copy of
+    /// its exact target had as a found model before it was attributed) is that catalog model;
+    /// every other ID is itself.
     pub fn canonical_model_id(&self, model_id: ModelId) -> Result<ModelId, InventoryError> {
-        if !matches!(model_id.parsed(), ParsedModelId::HuggingFace { .. }) {
+        if matches!(model_id.parsed(), ParsedModelId::Catalog { .. }) {
             return Ok(model_id);
         }
         let records = self
@@ -146,7 +146,7 @@ impl ModelDomainResolver {
             .installed_packages
             .read()
             .map_err(|_| InventoryError::Internal("installed package lock poisoned".to_owned()))?;
-        let aliased = catalog_aliases(records.records.values().map(|record| &record.installed), None)
+        let aliased = catalog_aliases(records.records.values(), None)
             .into_iter()
             .find(|(_, aliases)| aliases.contains(&model_id))
             .map(|((base, variant), _)| ModelId::catalog(&base, &variant));
@@ -278,10 +278,7 @@ impl ModelDomainResolver {
             .installed_packages
             .read()
             .map_err(|_| InventoryError::Internal("installed package lock poisoned".to_owned()))?;
-        let aliases = catalog_aliases(
-            records.records.values().map(|record| &record.installed),
-            Some(&self.catalog.models),
-        );
+        let aliases = catalog_aliases(records.records.values(), Some(&self.catalog.models));
         // A catalog drafter's bytes found in any location (a folder's file has its own identity)
         // are on this computer, as they are for the found models that use that drafter.
         let found_drafter_files = self
@@ -307,11 +304,7 @@ impl ModelDomainResolver {
         let occurrence_origins = records
             .records
             .values()
-            .filter(|record| {
-                !self
-                    .inventory
-                    .hidden_occurrence(record.installed.origin, &record.installed.package)
-            })
+            .filter(|record| !self.inventory.hidden_occurrence(record))
             .fold(
                 BTreeMap::<ModelPackageId, InstallationOrigins>::new(),
                 |mut origins, record| {
@@ -964,8 +957,7 @@ impl InstallationOrigins {
             | ModelPackageInstallationOrigin::LmStudio
             | ModelPackageInstallationOrigin::LlamaCpp
             | ModelPackageInstallationOrigin::Ollama
-            | ModelPackageInstallationOrigin::Folder
-            | ModelPackageInstallationOrigin::Imported => self.external = true,
+            | ModelPackageInstallationOrigin::Folder => self.external = true,
         }
     }
 }
@@ -1285,20 +1277,21 @@ fn catalog_draft(definition: &RecommendableModel) -> Option<&ModelPackage> {
     }
 }
 
-/// The `hf:` IDs of external installations of each catalog variant's exact target: what each is
-/// called as a found custom model. Attributed copies always count; with `catalog`, so do exact
-/// copies that are hidden (and so not attributed), which the catalog lists so they can be unhidden
-/// by the catalog ID.
+/// The IDs of external copies of each catalog variant's exact target: what each copy is called as
+/// a found custom model (see `copy_model_id`). Attributed copies always count; with `catalog`, so
+/// do exact copies that are hidden (and so not attributed), which the catalog lists so they can be
+/// unhidden by the catalog ID.
 fn catalog_aliases<'a>(
-    installed: impl Iterator<Item = &'a InstalledModelPackage>,
+    records: impl Iterator<Item = &'a InstalledPackageRecord>,
     catalog: Option<&[RecommendableModel]>,
 ) -> BTreeMap<(CatalogBaseId, CatalogVariantId), BTreeSet<ModelId>> {
     let mut aliases = BTreeMap::<_, BTreeSet<ModelId>>::new();
-    for entry in installed {
+    for record in records {
+        let entry = &record.installed;
         if entry.origin == ModelPackageInstallationOrigin::Magnitude {
             continue;
         }
-        let Some(alias) = crate::package_service::hub_model_id(&entry.package) else {
+        let Some(alias) = record.model_id() else {
             continue;
         };
         let mut variants = Vec::new();
@@ -2234,8 +2227,45 @@ mod tests {
         assert!(resolution.missing_components.is_empty());
     }
 
+    fn record(
+        installed: InstalledModelPackage,
+        primary: Option<crate::package_service::PrimaryEvidence>,
+    ) -> InstalledPackageRecord {
+        use magnitude_service_contracts::{
+            ContentId, Integrity, InventoryEntryId, InventoryModel, InventoryProperties,
+            LocalDeclaration, ModelAvailability, ModelLocation, ModelSource,
+        };
+        InstalledPackageRecord {
+            model: InventoryModel {
+                id: InventoryEntryId(installed.package.id.0.clone()),
+                content_id: ContentId(installed.package.id.0.clone()),
+                created: 0,
+                name: "model".to_owned(),
+                supported_parameters: Vec::new(),
+                availability: ModelAvailability::Available { ready_at: 0 },
+                source: ModelSource::Local {
+                    declared_by: LocalDeclaration::Discovery,
+                },
+                location: ModelLocation::Directory {
+                    source_id: "source".to_owned(),
+                    root: installed.path.clone(),
+                    components: Vec::new(),
+                    total_bytes: 0,
+                    integrity: Integrity::Unverified {
+                        reason: "test".to_owned(),
+                    },
+                },
+                properties: InventoryProperties::Pending,
+                operations: Vec::new(),
+                updated_at: 0,
+            },
+            installed,
+            primary,
+        }
+    }
+
     #[test]
-    fn an_attributed_external_target_keeps_the_hub_id_it_had_as_a_found_model_as_an_alias() {
+    fn an_attributed_external_target_keeps_the_id_each_copy_had_as_a_found_model_as_an_alias() {
         let definition = definition(ServableModelBundle::Standalone {
             package: package("target", 10),
         });
@@ -2245,22 +2275,52 @@ mod tests {
             revision: "a".repeat(40),
         };
         found.files[0].path = PathBuf::from("Qwen3.5-4B-UD-Q4_K_XL.gguf");
-        let mut external = installed(found.clone(), ModelPackageInstallationOrigin::HuggingFaceCache);
-        external.catalog_attribution = InstalledCatalogAttribution::Attributed {
+        let attributed = InstalledCatalogAttribution::Attributed {
             model_id: definition.model_id.clone(),
             variant_id: definition.variant_id.clone(),
         };
-        let mut managed = installed(found, ModelPackageInstallationOrigin::Magnitude);
-        managed.catalog_attribution = external.catalog_attribution.clone();
-        let unattributed =
-            installed(package("other", 10), ModelPackageInstallationOrigin::HuggingFaceCache);
+        let mut external = installed(found.clone(), ModelPackageInstallationOrigin::HuggingFaceCache);
+        external.catalog_attribution = attributed.clone();
+        let mut managed = installed(found.clone(), ModelPackageInstallationOrigin::Magnitude);
+        managed.catalog_attribution = attributed.clone();
+        // The same bytes in a folder record no Hub origin: that copy is called by its `local:` ID.
+        let mut copied = found;
+        copied.source = ModelPackageSource::Local {
+            path: PathBuf::from("/models"),
+        };
+        let mut folder = installed(copied, ModelPackageInstallationOrigin::Folder);
+        folder.catalog_attribution = attributed;
+        let evidence = crate::package_service::PrimaryEvidence {
+            header_digest: "b".repeat(64),
+            local_digest: Some("41ad09c2e7f3".repeat(5) + "abcd"),
+            tensors: crate::gguf::GgufTensors::Model {
+                embedded_mtp: false,
+            },
+            name: Some("Qwen3.5 4B".to_owned()),
+            architecture: Some("qwen35".to_owned()),
+            base_models: Vec::new(),
+            license: None,
+            quantization: None,
+            file_type: Some("Q4_K_M".to_owned()),
+            tags: Vec::new(),
+        };
+        let unattributed = installed(package("other", 10), ModelPackageInstallationOrigin::HuggingFaceCache);
+        let records = [
+            record(external, None),
+            record(managed, None),
+            record(folder, Some(evidence)),
+            record(unattributed, None),
+        ];
 
-        let aliases = catalog_aliases([&external, &managed, &unattributed].into_iter(), None);
+        let aliases = catalog_aliases(records.iter(), None);
         assert_eq!(
             aliases
                 .get(&(definition.model_id.clone(), definition.variant_id.clone()))
                 .map(|aliases| aliases.iter().map(ToString::to_string).collect::<Vec<_>>()),
-            Some(vec!["hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf".to_owned()])
+            Some(vec![
+                "hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf".to_owned(),
+                "local:qwen3.5-4b-q4_k_m:41ad09c2e7f3".to_owned(),
+            ])
         );
         assert_eq!(aliases.len(), 1);
     }

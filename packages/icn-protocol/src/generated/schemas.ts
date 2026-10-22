@@ -13,6 +13,19 @@ export const JsonValue: S.Schema<JsonValue, JsonValue> = S.suspend(
     S.Union(S.String, S.Number, S.Boolean, S.Null, S.Array(JsonValue), S.Record({ key: S.String, value: JsonValue })),
 )
 
+export const AddedModel = S.Struct({
+  path: S.suspend(
+    (): S.Schema<HuggingFaceArtifactSelector, HuggingFaceArtifactSelectorEncoded> => HuggingFaceArtifactSelector,
+  ),
+  projector: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  repository: S.suspend(
+    (): S.Schema<HuggingFaceRepositoryId, HuggingFaceRepositoryIdEncoded> => HuggingFaceRepositoryId,
+  ),
+  revision: S.String,
+})
+export type AddedModel = S.Schema.Type<typeof AddedModel>
+export type AddedModelEncoded = S.Schema.Encoded<typeof AddedModel>
+
 export const AllowedToolRequest = S.Struct({
   function: S.suspend((): S.Schema<FunctionNameRequest, FunctionNameRequestEncoded> => FunctionNameRequest),
   type: S.suspend((): S.Schema<FunctionType, FunctionTypeEncoded> => FunctionType),
@@ -131,7 +144,10 @@ export type AssessmentEnvironmentId = S.Schema.Type<typeof AssessmentEnvironment
 export type AssessmentEnvironmentIdEncoded = S.Schema.Encoded<typeof AssessmentEnvironmentId>
 
 export const AttachedDrafter = S.Struct({
-  method: S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
+  method: S.optionalWith(
+    S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
+    { exact: true, as: "Option" },
+  ),
   reference: S.suspend((): S.Schema<DrafterReference, DrafterReferenceEncoded> => DrafterReference),
   state: S.suspend((): S.Schema<AttachedDrafterState, AttachedDrafterStateEncoded> => AttachedDrafterState),
   updateAvailable: S.Boolean,
@@ -1056,37 +1072,6 @@ export const CustomModelCatalogAttribution = S.Union(
 export type CustomModelCatalogAttribution = S.Schema.Type<typeof CustomModelCatalogAttribution>
 export type CustomModelCatalogAttributionEncoded = S.Schema.Encoded<typeof CustomModelCatalogAttribution>
 
-export const CustomModelDeclaration = S.Struct({
-  modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
-  origin: S.suspend(
-    (): S.Schema<CustomModelDeclarationOrigin, CustomModelDeclarationOriginEncoded> => CustomModelDeclarationOrigin,
-  ),
-  projector: S.optionalWith(S.String, { exact: true, as: "Option" }),
-  target: S.Array(S.String),
-})
-export type CustomModelDeclaration = S.Schema.Type<typeof CustomModelDeclaration>
-export type CustomModelDeclarationEncoded = S.Schema.Encoded<typeof CustomModelDeclaration>
-
-export const CustomModelDeclarationOrigin = S.Union(
-  S.extend(
-    S.TaggedStruct("Added", {
-      commit: S.String,
-      repository: S.suspend(
-        (): S.Schema<HuggingFaceRepositoryId, HuggingFaceRepositoryIdEncoded> => HuggingFaceRepositoryId,
-      ),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.TaggedStruct("Imported", {
-      path: S.String,
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type CustomModelDeclarationOrigin = S.Schema.Type<typeof CustomModelDeclarationOrigin>
-export type CustomModelDeclarationOriginEncoded = S.Schema.Encoded<typeof CustomModelDeclarationOrigin>
-
 export const CustomModelFile = S.Struct({
   path: S.String,
   sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -1105,12 +1090,6 @@ export const CustomModelOrigin = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.TaggedStruct("Imported", {
-      path: S.String,
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
     S.TaggedStruct("Found", {
       source: S.suspend((): S.Schema<FoundSource, FoundSourceEncoded> => FoundSource),
     }),
@@ -1119,6 +1098,10 @@ export const CustomModelOrigin = S.Union(
 )
 export type CustomModelOrigin = S.Schema.Type<typeof CustomModelOrigin>
 export type CustomModelOriginEncoded = S.Schema.Encoded<typeof CustomModelOrigin>
+
+export const CustomModelPart = S.Union(S.Literal("Drafter"), S.Literal("Update"))
+export type CustomModelPart = S.Schema.Type<typeof CustomModelPart>
+export type CustomModelPartEncoded = S.Schema.Encoded<typeof CustomModelPart>
 
 export const CustomModelState = S.Union(
   S.extend(S.TaggedStruct("NotInstalled", {}), S.Record({ key: S.String, value: JsonValue })),
@@ -1262,7 +1245,6 @@ export const DrafterChoice = S.Union(
   S.extend(S.TaggedStruct("None", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
     S.TaggedStruct("Reference", {
-      method: S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
       reference: S.suspend((): S.Schema<DrafterReference, DrafterReferenceEncoded> => DrafterReference),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -1742,6 +1724,10 @@ export const HuggingFaceAccess = S.Union(S.Literal("SignIn"), S.Literal("AcceptT
 export type HuggingFaceAccess = S.Schema.Type<typeof HuggingFaceAccess>
 export type HuggingFaceAccessEncoded = S.Schema.Encoded<typeof HuggingFaceAccess>
 
+export const HuggingFaceArtifactSelector = S.String
+export type HuggingFaceArtifactSelector = S.Schema.Type<typeof HuggingFaceArtifactSelector>
+export type HuggingFaceArtifactSelectorEncoded = S.Schema.Encoded<typeof HuggingFaceArtifactSelector>
+
 export const HuggingFaceCredential = S.Struct({
   token: S.optionalWith(S.String, { exact: true, as: "Option" }),
 })
@@ -2076,9 +2062,7 @@ export type LocalModelRemoval = S.Schema.Type<typeof LocalModelRemoval>
 export type LocalModelRemovalEncoded = S.Schema.Encoded<typeof LocalModelRemoval>
 
 export const LocalModelsConfiguration = S.Struct({
-  declarations: S.Array(
-    S.suspend((): S.Schema<CustomModelDeclaration, CustomModelDeclarationEncoded> => CustomModelDeclaration),
-  ),
+  added: S.Array(S.suspend((): S.Schema<AddedModel, AddedModelEncoded> => AddedModel)),
   drafters: S.Array(S.suspend((): S.Schema<DrafterAttachment, DrafterAttachmentEncoded> => DrafterAttachment)),
   hidden: S.Array(S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId)),
   roots: S.Array(S.suspend((): S.Schema<ModelRoot, ModelRootEncoded> => ModelRoot)),
@@ -2366,10 +2350,7 @@ export type ModelCapabilitiesEncoded = S.Schema.Encoded<typeof ModelCapabilities
 
 export const ModelDownload = S.Struct({
   bundle: S.suspend((): S.Schema<ServableModelBundle, ServableModelBundleEncoded> => ServableModelBundle),
-  forModel: S.optionalWith(
-    S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
-    { exact: true, as: "Option" },
-  ),
+  forModel: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
   id: S.suspend((): S.Schema<ModelDownloadId, ModelDownloadIdEncoded> => ModelDownloadId),
   state: S.suspend((): S.Schema<ModelDownloadState, ModelDownloadStateEncoded> => ModelDownloadState),
 })
@@ -3613,9 +3594,9 @@ export type SpeculativeMethod = S.Schema.Type<typeof SpeculativeMethod>
 export type SpeculativeMethodEncoded = S.Schema.Encoded<typeof SpeculativeMethod>
 
 export const StartModelDownloadRequest = S.Struct({
-  bundle: S.suspend((): S.Schema<ServableModelBundle, ServableModelBundleEncoded> => ServableModelBundle),
-  forModel: S.optionalWith(
-    S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+  modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+  part: S.optionalWith(
+    S.suspend((): S.Schema<CustomModelPart, CustomModelPartEncoded> => CustomModelPart),
     { exact: true, as: "Option" },
   ),
 })

@@ -6,6 +6,7 @@
 
 use crate::candidate_files::RecognizedArchitectures;
 use magnitude_artifacts::gguf::{Directory, Element, Encoding, PROJECTOR_ARCHITECTURE, Scalar, Value};
+use magnitude_service_contracts::models::{LocalModelHash, LocalModelLabel, ModelId, ModelIdError};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read};
@@ -22,6 +23,9 @@ pub struct GgufInspection {
     pub name: Option<String>,
     pub quantization: Option<String>,
     pub quantization_name: Option<String>,
+    /// llama.cpp's name for the declared `general.file_type` (`Q4_K_M`), when one is declared and
+    /// known.
+    pub file_type: Option<String>,
     pub parameter_count: Option<u64>,
     pub active_parameter_count: Option<u64>,
     pub training_context_length: Option<u32>,
@@ -524,6 +528,50 @@ pub fn local_model_digest<'a>(shard_samples: impl IntoIterator<Item = &'a str>) 
     format!("{:x}", digest.finalize())
 }
 
+/// The most characters of a `local:` label's name part.
+const LOCAL_LABEL_NAME_LENGTH: usize = 48;
+
+/// The `local:` ID of a model: `local:<label>:<hash>`, where the hash is the start of its
+/// [`local_model_digest`] and identifies it, and the label is `<name>-<quant>` from its first
+/// shard's header, for reading only. The name is `general.name`, else `general.architecture`,
+/// lowercased, with each run of characters outside `[a-z0-9.]` replaced by `-`, leading and
+/// trailing `-` and `.` trimmed, and cut to [`LOCAL_LABEL_NAME_LENGTH`] characters; a header with
+/// neither is named `model`. The quant is llama.cpp's name for the declared file type, lowercased,
+/// left out with its `-` when none is declared.
+pub fn local_model_id(
+    digest: &str,
+    name: Option<&str>,
+    architecture: Option<&str>,
+    file_type: Option<&str>,
+) -> Result<ModelId, ModelIdError> {
+    let readable = |value: &str| {
+        let mut replaced = String::with_capacity(value.len());
+        for character in value.chars().flat_map(char::to_lowercase) {
+            if character.is_ascii_lowercase() || character.is_ascii_digit() || character == '.' {
+                replaced.push(character);
+            } else if !replaced.ends_with('-') {
+                replaced.push('-');
+            }
+        }
+        let trim = |value: &str| value.trim_matches(['-', '.']).to_owned();
+        trim(&trim(&replaced).chars().take(LOCAL_LABEL_NAME_LENGTH).collect::<String>())
+    };
+    let name = [name, architecture]
+        .into_iter()
+        .flatten()
+        .map(readable)
+        .find(|name| !name.is_empty())
+        .unwrap_or_else(|| "model".to_owned());
+    let label = match file_type {
+        Some(file_type) => format!("{name}-{}", file_type.to_lowercase()),
+        None => name,
+    };
+    Ok(ModelId::local(
+        &LocalModelLabel::new(label)?,
+        &LocalModelHash::of_digest(digest)?,
+    ))
+}
+
 /// The `local:` digest of a model on disk, from its shards' paths, first shard first.
 pub fn local_model_digest_of(shards: &[impl AsRef<Path>]) -> Result<String, GgufError> {
     let samples = shards
@@ -614,14 +662,11 @@ pub(crate) fn interpret(
         .collect();
     // `general.*` describes the file and never decides: a file type this service doesn't know
     // (a quantization newer than it) is no declared quantization, and the label comes from the name.
-    let quantization = Quantization::of(
-        directory,
-        unknown_types,
-        directory
-            .value("general.file_type")
-            .and_then(Value::unsigned)
-            .and_then(|raw| FileType::from_raw(raw).ok()),
-    );
+    let declared = directory
+        .value("general.file_type")
+        .and_then(Value::unsigned)
+        .and_then(|raw| FileType::from_raw(raw).ok());
+    let quantization = Quantization::of(directory, unknown_types, declared);
     let tensor_storage_bytes = directory.tensors.iter().try_fold(0_u64, |total, tensor| {
         total.checked_add(tensor.nbytes).ok_or_else(|| {
             GgufError::Header(magnitude_artifacts::Error::Invalid(
@@ -677,6 +722,10 @@ pub(crate) fn interpret(
         name: string_value(directory, "general.name"),
         quantization: quantization.map(Quantization::name),
         quantization_name: quantization.map(|quantization| quantization.bit_width().to_owned()),
+        file_type: declared
+            .filter(|file_type| !file_type.guessed)
+            .and_then(|file_type| quantization_label(file_type.kind.name()))
+            .map(str::to_owned),
         parameter_count,
         active_parameter_count,
         training_context_length,

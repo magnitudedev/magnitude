@@ -11,10 +11,11 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use magnitude_artifacts::gguf::Encoding;
 use magnitude_service_contracts::models::{
-    CandidateDrafter, CandidateFile, CandidateInspectionPhase, CandidateInspectionProgress,
+    CandidateDrafter, CandidateInspectionPhase, CandidateInspectionProgress,
     CandidateInspectionProgressSink, CandidateInspectionRequest, CandidateSource,
     CatalogInstallationAdmission, CatalogInstallationRemoval, CatalogModels, CatalogModelsResponse,
     CatalogSupport, CustomModel, CustomModelOrigin, CustomModelState, DrafterCandidatesRequest,
+    FoundSource,
     DrafterCategory, DrafterLineage, DrafterReference, DrafterVerdict, HuggingFaceRepositoryId,
     KnownUnsupportedReason, LocalModelRemoval, LocalModels, LocalModelsConfiguration,
     LocalModelsResponse, ModelAssessment, ModelCandidate, ModelCandidates, ModelDomainInvalidation,
@@ -733,11 +734,12 @@ impl StubHub {
 
 // Domain stubs -------------------------------------------------------------------------------
 
-struct StubLocal(Vec<CustomModel>);
+/// The listed custom models and the configuration that lists them.
+struct StubLocal(Vec<CustomModel>, LocalModelsConfiguration);
 
 impl LocalModels for StubLocal {
     fn configuration(&self) -> BoxFuture<'_, Result<LocalModelsConfiguration, InventoryError>> {
-        Box::pin(async { Ok(LocalModelsConfiguration::default()) })
+        Box::pin(async { Ok(self.1.clone()) })
     }
 
     fn configure(
@@ -1181,7 +1183,7 @@ async fn fixture_from(
     )
     .expect("inventory config");
     config.hub_endpoint = Some(endpoint);
-    config.local_models = local_models;
+    config.local_models = local_models.clone();
     config.architectures = super::engine_architectures();
     let models = Arc::new(ManagedModelStore::open(config, std::sync::Arc::new(|| Ok::<u64, std::convert::Infallible>(u64::MAX))).await.expect("model store"));
     models
@@ -1227,7 +1229,7 @@ async fn fixture_from(
         Arc::clone(&lineage),
         super::engine_architectures(),
         Arc::new(StubCatalog),
-        Arc::new(StubLocal(custom)),
+        Arc::new(StubLocal(custom, local_models)),
         crate::assessment::HostDevice::new(&crate::device_lock::DeviceLock::default(), false),
     );
     Fixture {
@@ -1502,8 +1504,6 @@ async fn a_local_file_is_identified_by_its_header_digest_unless_a_listed_model_h
     let (header, length) = llama(7, Encoding::Q8_0).bytes();
     let path = folder.path().join("model.gguf");
     write_complete_bytes(&path, &header, length);
-    let digest =
-        magnitude_service_models::candidate_files::local_model_digest(&[path.clone()]).unwrap();
     let request = || CandidateInspectionRequest::Local { path: path.clone() };
 
     let unlisted = fixture(Vec::new()).await;
@@ -1513,7 +1513,7 @@ async fn a_local_file_is_identified_by_its_header_digest_unless_a_listed_model_h
         .await
         .expect("inspection");
     let version = &inspection.versions[0];
-    assert_eq!(version.model_id.as_str(), format!("local:{digest}"));
+    assert_eq!(version.model_id.as_str(), local_id(&path).as_str());
     assert_eq!(version.on_this_computer, None);
 
     let found = ModelId::hugging_face(
@@ -1551,13 +1551,7 @@ async fn a_copy_of_a_listed_model_elsewhere_is_already_on_this_computer_as_that_
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         write_complete_bytes(path, &bytes, length);
     }
-    let found = ModelId::hugging_face(
-        &HuggingFaceRepositoryId::new("community/Llama-GGUF".to_owned()).unwrap(),
-        &magnitude_service_contracts::models::HuggingFaceArtifactSelector::new(
-            "llama-Q8_0.gguf".to_owned(),
-        )
-        .unwrap(),
-    );
+    let found = local_id(&found_path);
     let mut listed = custom_model(found.clone(), length);
     listed.files[0].path = found_path;
     let fixture = fixture(vec![listed]).await;
@@ -1569,17 +1563,31 @@ async fn a_copy_of_a_listed_model_elsewhere_is_already_on_this_computer_as_that_
         .expect("inspection");
 
     assert_eq!(
-        inspection.versions[0].on_this_computer,
-        Some(found),
+        inspection.versions[0]
+            .on_this_computer
+            .as_ref()
+            .map(ModelId::as_str),
+        Some(found.as_str()),
         "the same bytes at another path are the model already listed"
     );
-    let digest =
-        magnitude_service_models::candidate_files::local_model_digest(&[copy.clone()]).unwrap();
     assert_eq!(
         inspection.versions[0].model_id.as_str(),
-        format!("local:{digest}"),
-        "the copy itself is identified by its header, so it can be recorded as one more location"
+        local_id(&copy).as_str(),
+        "the copy itself has the local: ID of its bytes, the listed model's, so it is one more location"
     );
+}
+
+/// The `local:` ID of a single-file model, from its content digest and header.
+fn local_id(path: &std::path::Path) -> ModelId {
+    let header = magnitude_service_models::gguf::inspect(path).unwrap();
+    magnitude_service_models::gguf::local_model_id(
+        &magnitude_service_models::candidate_files::local_model_digest(&[path.to_path_buf()])
+            .unwrap(),
+        header.name.as_deref(),
+        header.architecture.as_deref(),
+        header.file_type.as_deref(),
+    )
+    .unwrap()
 }
 
 /// Two files with the same header but different weights are two models: a file listed as one is
@@ -1609,14 +1617,11 @@ async fn a_same_header_twin_with_other_weights_is_not_already_on_this_computer()
     let (altered_header, altered_digest) = digests(&altered);
     assert_eq!(twin_header, altered_header);
     assert_ne!(twin_digest, altered_digest);
+    let id = |digest: &str| {
+        magnitude_service_models::gguf::local_model_id(digest, None, None, None).unwrap()
+    };
     let listed = |digest: &str, path: &PathBuf| {
-        let mut model = custom_model(
-            ModelId::local(
-                &magnitude_service_contracts::models::LocalModelDigest::new(digest.to_owned())
-                    .unwrap(),
-            ),
-            bytes.len() as u64,
-        );
+        let mut model = custom_model(id(digest), bytes.len() as u64);
         model.files[0].path = path.clone();
         model
     };
@@ -1632,7 +1637,7 @@ async fn a_same_header_twin_with_other_weights_is_not_already_on_this_computer()
     let inspection = both.candidates.inspect(request()).await.expect("inspection");
     assert_eq!(
         inspection.versions[0].on_this_computer.as_ref().map(ModelId::as_str),
-        Some(format!("local:{altered_digest}").as_str())
+        Some(id(&altered_digest).as_str())
     );
 
     let twin_only = fixture(vec![listed(&twin_digest, &twin)]).await;
@@ -1758,8 +1763,7 @@ async fn a_symlinked_local_file_is_inspected_through_its_link_under_its_own_name
     std::fs::create_dir_all(&snapshot).unwrap();
     let link = snapshot.join("model-Q8_0.gguf");
     std::os::unix::fs::symlink("../../blobs/0123abcd", &link).unwrap();
-    let digest =
-        magnitude_service_models::candidate_files::local_model_digest(&[blob.clone()]).unwrap();
+    let blob_id = local_id(&blob);
     let fixture = fixture(Vec::new()).await;
 
     for request in [link.clone(), snapshot.clone()] {
@@ -1771,7 +1775,7 @@ async fn a_symlinked_local_file_is_inspected_through_its_link_under_its_own_name
         assert_eq!(inspection.versions.len(), 1);
         let version = &inspection.versions[0];
         assert_eq!(version.files[0].path, "model-Q8_0.gguf");
-        assert_eq!(version.model_id.as_str(), format!("local:{digest}"));
+        assert_eq!(version.model_id.as_str(), blob_id.as_str());
         assert!(version.assessment.is_some());
     }
 }
@@ -2507,22 +2511,43 @@ async fn candidate_assessment_is_cached_by_its_material() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn bundles_carry_the_exact_packages_a_rescan_produces() {
-    let fixture = fixture(Vec::new()).await;
-    let candidate = ModelCandidate {
-        drafter: Some(CandidateDrafter {
-            reference: DrafterReference::Catalog {
-                model_id: fixture.catalog_id.clone(),
-            },
-            method: SpeculativeMethod::DFlash,
-        }),
-        ..hugging_face_candidate(COMMUNITY, 'c', "llama-Q8_0.gguf")
+async fn an_added_models_download_carries_the_exact_packages_a_rescan_produces() {
+    use magnitude_service_contracts::models::{
+        AddedModel, DrafterAttachment, DrafterChoice, HuggingFaceArtifactSelector,
     };
+    use magnitude_service_models::CustomModelAcquisition as _;
+    let added = AddedModel {
+        repository: HuggingFaceRepositoryId::new(COMMUNITY.to_owned()).unwrap(),
+        path: HuggingFaceArtifactSelector::new("llama-Q8_0.gguf".to_owned()).unwrap(),
+        revision: commit('c'),
+        projector: None,
+    };
+    let model_id = added.model_id();
+    // The catalog's ID, as `llama_test_catalog` names it, chosen as the added model's drafter.
+    let catalog_id: ModelId = "llama-test:gguf:q8".parse().unwrap();
+    let fixture = fixture_scanning(
+        Vec::new(),
+        LocalModelsConfiguration {
+            added: vec![added],
+            drafters: vec![DrafterAttachment {
+                model_id: model_id.clone(),
+                drafter: DrafterChoice::Reference {
+                    reference: DrafterReference::Catalog {
+                        model_id: catalog_id.clone(),
+                    },
+                },
+            }],
+            ..LocalModelsConfiguration::default()
+        },
+    )
+    .await;
+    assert_eq!(fixture.catalog_id, catalog_id);
     let bundle = fixture
         .candidates
-        .bundle(candidate.clone())
+        .bundle(model_id.clone(), None)
         .await
-        .expect("bundle");
+        .expect("bundle")
+        .expect("the added model has files to download");
     let expected_target = hugging_face_package(&fixture.models, COMMUNITY, "llama-Q8_0.gguf").await;
     let ServableModelBundle::SpeculativeDecoding {
         target,
@@ -2540,26 +2565,6 @@ async fn bundles_carry_the_exact_packages_a_rescan_produces() {
             .await
             .id
     );
-
-    let local = fixture
-        .candidates
-        .bundle(ModelCandidate {
-            source: CandidateSource::Local {
-                path: PathBuf::from("/models"),
-            },
-            target: vec!["model.gguf".to_owned()],
-            projector: Some(CandidateFile {
-                path: "mmproj.gguf".to_owned(),
-                size_bytes: 1,
-            }),
-            ..candidate
-        })
-        .await
-        .expect("drafter-only bundle");
-    assert!(matches!(
-        local,
-        ServableModelBundle::Standalone { package } if package.id == draft.id
-    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2581,14 +2586,11 @@ fn enrichment_for_a_changed_target_keeps_the_models_last_answer_until_it_is_reco
         CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts,
     };
     let enrichment = super::CandidateEnrichment::default();
-    let model_id = ModelId::local(
-        &magnitude_service_contracts::models::LocalModelDigest::new("a".repeat(64)).unwrap(),
-    );
+    let model_id: ModelId = "local:model:aaaaaaaaaaaa".parse().unwrap();
     let result = CustomModelEnrichmentResult {
         variant_of: Some("llama-test:gguf:q8".parse().unwrap()),
-        drafters: Vec::new(),
-        catalog_drafters: Vec::new(),
         license: Some("apache-2.0".to_owned()),
+        ..CustomModelEnrichmentResult::default()
     };
     let key = (model_id.clone(), "package_a".to_owned());
     assert!(enrichment.record(key.clone(), 1, Hub, result.clone()));
@@ -2599,8 +2601,10 @@ fn enrichment_for_a_changed_target_keeps_the_models_last_answer_until_it_is_reco
     );
     assert!(!enrichment.record(key.clone(), 2, Hub, result.clone()));
     assert!(enrichment.is_current(&key, 2, Hub));
-    let origin = CustomModelOrigin::Imported {
-        path: PathBuf::from("/models/model.gguf"),
+    let origin = CustomModelOrigin::Found {
+        source: FoundSource::Folder {
+            path: PathBuf::from("/models"),
+        },
     };
     let package = |id: &str| magnitude_service_contracts::models::ModelPackage {
         id: magnitude_service_contracts::models::ModelPackageId(id.to_owned()),
@@ -2665,9 +2669,7 @@ fn a_local_enrichment_answers_until_the_hub_reaching_one_and_never_replaces_it()
         CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts,
     };
     let enrichment = super::CandidateEnrichment::default();
-    let model_id = ModelId::local(
-        &magnitude_service_contracts::models::LocalModelDigest::new("b".repeat(64)).unwrap(),
-    );
+    let model_id: ModelId = "local:model:bbbbbbbbbbbb".parse().unwrap();
     let local = CustomModelEnrichmentResult {
         variant_of: Some("llama-test:gguf:q8".parse().unwrap()),
         ..CustomModelEnrichmentResult::default()
@@ -2677,8 +2679,10 @@ fn a_local_enrichment_answers_until_the_hub_reaching_one_and_never_replaces_it()
         ..local.clone()
     };
     let key = (model_id.clone(), "package".to_owned());
-    let origin = CustomModelOrigin::Imported {
-        path: PathBuf::from("/models/model.gguf"),
+    let origin = CustomModelOrigin::Found {
+        source: FoundSource::Folder {
+            path: PathBuf::from("/models"),
+        },
     };
     let package = magnitude_service_contracts::models::ModelPackage {
         id: magnitude_service_contracts::models::ModelPackageId("package".to_owned()),
@@ -3169,14 +3173,24 @@ async fn a_version_at_another_commit_is_not_the_added_model_at_its_own() {
         commit: commit('a'),
     };
     let (_directory, store) = bare_store().await;
+    let classified = super::ClassifiedGroup {
+        group,
+        role: magnitude_service_models::candidate_files::CandidateFileRole::Target {
+            architecture: None,
+        },
+        header_digest: "0".repeat(64),
+        local_digest: None,
+        local_id: None,
+        quantization: None,
+        embedded_mtp: false,
+        unreadable: None,
+    };
     let at = |commit: &str, model: &CustomModel| {
         super::on_this_computer(
             &store,
             std::slice::from_ref(model),
             Some((&model_id, commit)),
-            &group,
-            &"0".repeat(64),
-            None,
+            &classified,
             None,
         )
     };

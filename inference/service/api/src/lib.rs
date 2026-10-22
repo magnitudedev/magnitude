@@ -28,7 +28,7 @@ use magnitude_service_contracts::models::{
     ModelAssessmentSubject, ModelAssessments, ModelAssessmentsSnapshot, ModelCandidate,
     ModelCandidates, ModelCapabilities, ModelDownload, ModelDownloadId, ModelDownloads,
     ModelDownloadsResponse, ModelId, ModelInstance, ModelInstanceId, ModelInstancesInvalidation,
-    ModelInstancesSnapshot, ModelLoadDevice, ModelLoadPlan, ParsedModelId, ServableModelBundle,
+    ModelInstancesSnapshot, ModelLoadDevice, ModelLoadPlan, ParsedModelId,
     StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use magnitude_service_contracts::{
@@ -337,7 +337,6 @@ pub fn app(state: AppState, serving: magnitude_serving::Serving) -> Router {
             post(stream_model_candidate_inspection),
         )
         .route("/api/v1/candidates/drafters", post(drafter_candidates))
-        .route("/api/v1/candidates/bundle", post(candidate_bundle))
         .route("/api/v1/model-assessments", get(model_assessments))
         .route(
             "/api/v1/model-assessments/candidates",
@@ -1527,29 +1526,6 @@ async fn drafter_candidates(
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(post, path = "/api/v1/candidates/bundle", operation_id = "buildCandidateBundle", tag = "candidates",
-    request_body(content = ModelCandidate, content_type = "application/json"),
-    responses(
-        (status = 200, description = "The exact bundle a download of the candidate fetches; a candidate whose target is local yields its drafter alone", body = ServableModelBundle),
-        (status = 400, description = "Invalid candidate", body = ErrorResponse),
-        (status = 404, description = "Candidate file not found", body = ErrorResponse),
-        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
-        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
-        (status = 500, description = "Bundle construction failed", body = ErrorResponse)
-    )
-)]
-#[tracing::instrument(name = "icn.candidates.bundle", skip_all, err(Debug))]
-async fn candidate_bundle(
-    State(state): State<AppState>,
-    Json(candidate): Json<ModelCandidate>,
-) -> Result<Json<ServableModelBundle>, ApiError> {
-    model_candidates_domain(&state)?
-        .bundle(candidate)
-        .await
-        .map(Json)
-        .map_err(ApiError::from_inventory)
-}
-
 #[utoipa::path(post, path = "/api/v1/model-assessments/candidates", operation_id = "assessModelCandidate", tag = "models",
     request_body(content = ModelCandidate, content_type = "application/json"),
     responses(
@@ -1758,9 +1734,6 @@ fn custom_model_source(model: &CustomModel) -> (&'static str, String) {
             "huggingface",
             format!("Added from Hugging Face ({})", repository.as_str()),
         ),
-        CustomModelOrigin::Imported { path } => {
-            ("local-file", format!("Added from {}", path.display()))
-        }
         CustomModelOrigin::Found { source } => match source {
             FoundSource::HuggingFaceCache => {
                 ("huggingface-cache", from("Found in the Hugging Face cache"))
@@ -1887,7 +1860,6 @@ fn open_ai_model(
         inspect_model_candidate,
         stream_model_candidate_inspection,
         drafter_candidates,
-        candidate_bundle,
         model_assessments,
         assess_model_candidate,
         model_downloads,
@@ -2842,7 +2814,6 @@ mod tests {
             "/api/v1/sources/hugging-face/resolve",
             "/api/v1/candidates/inspect",
             "/api/v1/candidates/drafters",
-            "/api/v1/candidates/bundle",
             "/api/v1/model-assessments/candidates",
         ] {
             let responses = &value["paths"][path]["post"]["responses"];
@@ -2954,7 +2925,7 @@ mod tests {
     };
 
     fn local_model_id() -> ModelId {
-        format!("local:{}", "ab".repeat(32)).parse().unwrap()
+        "local:model-q4_k_m:abababababab".parse().unwrap()
     }
 
     fn custom_model(model_id: ModelId, origin: CustomModelOrigin) -> CustomModel {
@@ -3220,13 +3191,6 @@ mod tests {
         ) -> BoxFuture<'_, Result<ModelAssessment, InventoryError>> {
             Box::pin(async { Ok(fits_assessment()) })
         }
-
-        fn bundle(
-            &self,
-            _candidate: ModelCandidate,
-        ) -> BoxFuture<'_, Result<ServableModelBundle, InventoryError>> {
-            Box::pin(async { Ok(test_bundle()) })
-        }
     }
 
     fn test_bundle() -> ServableModelBundle {
@@ -3259,7 +3223,7 @@ mod tests {
             ModelDownload {
                 id: id.clone(),
                 bundle: test_bundle(),
-                for_model: None,
+                for_model: "hf:owner/repo/model.gguf".parse().unwrap(),
                 state,
             }
         }
@@ -3274,8 +3238,8 @@ mod tests {
                 Ok(StartModelDownloadResponse {
                     download: Some(ModelDownload {
                         id: ModelDownloadId("download-1".to_owned()),
-                        bundle: request.bundle,
-                        for_model: request.for_model,
+                        bundle: test_bundle(),
+                        for_model: request.model_id,
                         state: ModelDownloadState::Pending {
                             completed_bytes: 0,
                             total_bytes: 100,
@@ -3446,7 +3410,12 @@ mod tests {
         let mut changes = state.resource_changes.subscribe();
         let configuration = json!({
             "roots": [{ "kind": "Ollama", "path": "/home/u/.ollama/models", "enabled": true }],
-            "declarations": [],
+            "added": [{
+                "repository": "owner/Model-GGUF",
+                "path": "Model-Q4_K_M.gguf",
+                "revision": "c".repeat(40),
+                "projector": "mmproj-F16.gguf"
+            }],
             "hidden": [local_model_id()],
             "drafters": [{ "modelId": local_model_id(), "drafter": { "_tag": "None" } }]
         });
@@ -3484,7 +3453,7 @@ mod tests {
             json_request(
                 "PUT",
                 "/api/v1/local-models/configuration",
-                json!({ "roots": [], "declarations": [], "hidden": ["local:short"], "drafters": [] }),
+                json!({ "roots": [], "added": [], "hidden": ["local:short"], "drafters": [] }),
             ),
         )
         .await;
@@ -3714,14 +3683,6 @@ mod tests {
         assert_eq!(body["candidates"].as_array().unwrap().len(), 1);
 
         let (status, body) = send(
-            test_app(state.clone()),
-            json_request("POST", "/api/v1/candidates/bundle", candidate.clone()),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["_tag"], "Standalone");
-
-        let (status, body) = send(
             test_app(state),
             json_request("POST", "/api/v1/model-assessments/candidates", candidate),
         )
@@ -3769,12 +3730,13 @@ mod tests {
             json_request(
                 "POST",
                 "/api/v1/downloads",
-                json!({ "bundle": serde_json::to_value(test_bundle()).unwrap() }),
+                json!({ "modelId": "hf:owner/repo/model.gguf", "part": "Drafter" }),
             ),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["download"]["id"], "download-1");
+        assert_eq!(body["download"]["forModel"], "hf:owner/repo/model.gguf");
         assert_eq!(body["download"]["state"]["totalBytes"], 100);
         assert_eq!(
             changes.recv().await.unwrap().topic,
@@ -4027,15 +3989,6 @@ mod tests {
             (
                 custom_model(
                     local_model_id(),
-                    CustomModelOrigin::Imported {
-                        path: "/models/a.gguf".into(),
-                    },
-                ),
-                ("local-file", "Added from /models/a.gguf"),
-            ),
-            (
-                custom_model(
-                    local_model_id(),
                     CustomModelOrigin::Found {
                         source: FoundSource::Folder {
                             path: "/models".into(),
@@ -4081,7 +4034,6 @@ mod tests {
             ("/api/v1/sources/hugging-face/credential", "put"),
             ("/api/v1/candidates/inspect", "post"),
             ("/api/v1/candidates/drafters", "post"),
-            ("/api/v1/candidates/bundle", "post"),
             ("/api/v1/model-assessments/candidates", "post"),
             ("/api/v1/downloads", "get"),
             ("/api/v1/downloads", "post"),

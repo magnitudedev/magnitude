@@ -10,7 +10,6 @@ import type {
   HuggingFaceRepositorySnapshot,
   ModelAssessment,
   ModelCandidate,
-  ServableModelBundle,
 } from "@magnitudedev/icn-protocol/schemas"
 import { IcnClient, type IcnClientService } from "../client.js"
 
@@ -25,12 +24,11 @@ export type CandidateInspectionStreamError = Effect.Effect.Error<
 >
 export type DrafterCandidatesError = Failure<"candidates", "listDrafterCandidates">
 export type CandidateAssessmentError = Failure<"models", "assessModelCandidate">
-export type CandidateBundleError = Failure<"candidates", "buildCandidateBundle">
 
 /**
  * Files not yet added: Hugging Face search, repository resolution (a revision pinned to its commit),
- * inspection (alone, or as its progress then itself), drafters in ICN's category order (with the listed one a different drafter resolves to), assessment, and the exact bundle a download fetches (a
- * local target yields its drafter alone).
+ * inspection (alone, or as its progress then itself), drafters in ICN's category order (with the listed one a
+ * different drafter resolves to), and assessment.
  */
 export interface IcnCandidatesService {
   readonly search: (request: HuggingFaceModelSearchRequest) => Effect.Effect<HuggingFaceModelSearchResults, HuggingFaceSearchError>
@@ -44,7 +42,6 @@ export interface IcnCandidatesService {
   ) => Stream.Stream<CandidateInspectionEvent, CandidateInspectionStreamError>
   readonly drafters: (request: DrafterCandidatesRequest) => Effect.Effect<DrafterCandidatesResponse, DrafterCandidatesError>
   readonly assess: (candidate: ModelCandidate) => Effect.Effect<ModelAssessment, CandidateAssessmentError>
-  readonly bundle: (candidate: ModelCandidate) => Effect.Effect<ServableModelBundle, CandidateBundleError>
 }
 export class IcnCandidates extends Context.Tag("@magnitudedev/icn/IcnCandidates")<IcnCandidates, IcnCandidatesService>() {}
 
@@ -61,6 +58,5 @@ export const IcnCandidatesLive: Layer.Layer<IcnCandidates, never, IcnClient> = L
     )),
     drafters: (request) => client.candidates.listDrafterCandidates({ payload: request }),
     assess: (candidate) => client.models.assessModelCandidate({ payload: candidate }),
-    bundle: (candidate) => client.candidates.buildCandidateBundle({ payload: candidate }),
   })),
 )

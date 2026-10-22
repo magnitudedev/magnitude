@@ -1,4 +1,4 @@
-import { Effect, Option, Schema } from "effect"
+import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   CatalogFormModelIdSchema,
@@ -6,8 +6,6 @@ import {
 } from "@magnitudedev/acn-protocol"
 import type { CatalogModelSource } from "./local-model-sources"
 import {
-  DrafterMethods,
-  DrafterMethodsLive,
   drafterReferenceKey,
   drafterReferenceNaming,
   productDrafterCandidate,
@@ -42,21 +40,6 @@ describe("drafter identity", () => {
       reasons: [{ _tag: "Unknown", kind: "Unknown", detail: "mismatch" }],
       detail: "mismatch",
     }))
-  })
-
-  it("remembers binding methods and knows MTP heads without asking", async () => {
-    const result = await Effect.runPromise(Effect.gen(function* () {
-      const methods = yield* DrafterMethods
-      const before = yield* methods.get(reference("d.gguf"))
-      yield* methods.remember(reference("d.gguf"), { _tag: "DSpark" })
-      const lookup = yield* methods.snapshot
-      return { before, after: lookup(reference("d.gguf")), embedded: lookup({ _tag: "Embedded" }) }
-    }).pipe(Effect.provide(DrafterMethodsLive)))
-    expect(result).toEqual({
-      before: Option.none(),
-      after: Option.some({ _tag: "DSpark" }),
-      embedded: Option.some({ _tag: "Mtp" }),
-    })
   })
 })
 

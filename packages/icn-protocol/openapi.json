@@ -170,86 +170,6 @@
         }
       }
     },
-    "/api/v1/candidates/bundle": {
-      "post": {
-        "tags": [
-          "candidates"
-        ],
-        "operationId": "buildCandidateBundle",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ModelCandidate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "The exact bundle a download of the candidate fetches; a candidate whose target is local yields its drafter alone",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ServableModelBundle"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid candidate",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Candidate file not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "The operation conflicts with the model's current state",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "The repository's metadata or a file's header is invalid",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Bundle construction failed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/candidates/drafters": {
       "post": {
         "tags": [
@@ -2525,6 +2445,30 @@
   },
   "components": {
     "schemas": {
+      "AddedModel": {
+        "type": "object",
+        "description": "A model added from Hugging Face: its repository and the path of its first shard, which its\n`hf:` ID names (the other shards of a split model follow from that shard's name), the pinned\ncommit, and a projector path in the repository at it.",
+        "required": [
+          "repository",
+          "path",
+          "revision"
+        ],
+        "properties": {
+          "repository": {
+            "$ref": "#/components/schemas/HuggingFaceRepositoryId"
+          },
+          "path": {
+            "$ref": "#/components/schemas/HuggingFaceArtifactSelector"
+          },
+          "revision": {
+            "type": "string"
+          },
+          "projector": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "AllowedToolRequest": {
         "type": "object",
         "required": [
@@ -2796,7 +2740,6 @@
         "type": "object",
         "required": [
           "reference",
-          "method",
           "state",
           "updateAvailable"
         ],
@@ -2805,7 +2748,8 @@
             "$ref": "#/components/schemas/DrafterReference"
           },
           "method": {
-            "$ref": "#/components/schemas/SpeculativeMethod"
+            "$ref": "#/components/schemas/SpeculativeMethod",
+            "description": "How the engine binds it; a drafter it rejects has no method."
           },
           "state": {
             "$ref": "#/components/schemas/AttachedDrafterState"
@@ -4957,77 +4901,6 @@
           }
         ]
       },
-      "CustomModelDeclaration": {
-        "type": "object",
-        "description": "The persisted record of an added or imported model. For `Added`, `target` and `projector` are\nrepository-relative paths at the pinned commit; for `Imported` they are absolute file paths,\nwith the imported file first.",
-        "required": [
-          "modelId",
-          "origin",
-          "target"
-        ],
-        "properties": {
-          "modelId": {
-            "$ref": "#/components/schemas/ModelId"
-          },
-          "origin": {
-            "$ref": "#/components/schemas/CustomModelDeclarationOrigin"
-          },
-          "target": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "projector": {
-            "type": "string"
-          }
-        },
-        "additionalProperties": false
-      },
-      "CustomModelDeclarationOrigin": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "repository",
-              "commit",
-              "_tag"
-            ],
-            "properties": {
-              "repository": {
-                "$ref": "#/components/schemas/HuggingFaceRepositoryId"
-              },
-              "commit": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Added"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "path",
-              "_tag"
-            ],
-            "properties": {
-              "path": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Imported"
-                ]
-              }
-            }
-          }
-        ]
-      },
       "CustomModelFile": {
         "type": "object",
         "required": [
@@ -5073,24 +4946,6 @@
           {
             "type": "object",
             "required": [
-              "path",
-              "_tag"
-            ],
-            "properties": {
-              "path": {
-                "type": "string"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Imported"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
               "source",
               "_tag"
             ],
@@ -5108,6 +4963,14 @@
           }
         ],
         "description": "How a custom model came to be on this computer, which decides who owns its files."
+      },
+      "CustomModelPart": {
+        "type": "string",
+        "description": "Which part of a custom model a download fetches: without one, an added model's files at its\npinned commit with the drafter it downloads with; `Drafter`, only the drafter its choice\nresolves to; `Update`, an added model's files at the commit its repository has moved to.",
+        "enum": [
+          "Drafter",
+          "Update"
+        ]
       },
       "CustomModelState": {
         "oneOf": [
@@ -5511,15 +5374,11 @@
             "type": "object",
             "required": [
               "reference",
-              "method",
               "_tag"
             ],
             "properties": {
               "reference": {
                 "$ref": "#/components/schemas/DrafterReference"
-              },
-              "method": {
-                "$ref": "#/components/schemas/SpeculativeMethod"
               },
               "_tag": {
                 "type": "string",
@@ -5530,7 +5389,7 @@
             }
           }
         ],
-        "description": "The drafter a custom model should use: the recommended one, none, or an exact reference."
+        "description": "The drafter a custom model should use: the recommended one, none, or an exact reference, whose\nmethod the engine works out from the drafter and the model."
       },
       "DrafterLineage": {
         "type": "string",
@@ -6680,6 +6539,10 @@
           "AcceptTerms"
         ]
       },
+      "HuggingFaceArtifactSelector": {
+        "type": "string",
+        "description": "The repository-relative GGUF weights selector used in a Hugging Face model identity."
+      },
       "HuggingFaceCredential": {
         "type": "object",
         "description": "The Hugging Face token presented on every later Hub request; without one, Hub requests are\nanonymous. It is write-only: no response carries it.",
@@ -7577,7 +7440,7 @@
         "description": "The whole local-models configuration ACN owns and hands to ICN, at spawn and after every\nchange. Applying it is idempotent.",
         "required": [
           "roots",
-          "declarations",
+          "added",
           "hidden",
           "drafters"
         ],
@@ -7588,10 +7451,10 @@
               "$ref": "#/components/schemas/ModelRoot"
             }
           },
-          "declarations": {
+          "added": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/CustomModelDeclaration"
+              "$ref": "#/components/schemas/AddedModel"
             }
           },
           "hidden": {
@@ -8364,6 +8227,7 @@
         "required": [
           "id",
           "bundle",
+          "forModel",
           "state"
         ],
         "properties": {
@@ -8776,7 +8640,8 @@
         "additionalProperties": false
       },
       "ModelId": {
-        "type": "string"
+        "type": "string",
+        "description": "A model's identity. Two `local:` IDs are the same model exactly when their hashes match: the\nlabel is for reading only, so equality, order and hashing ignore it."
       },
       "ModelInstallation": {
         "oneOf": [
@@ -11332,16 +11197,16 @@
       },
       "StartModelDownloadRequest": {
         "type": "object",
-        "description": "A bundle to download; `for_model` names the model the download serves, such as the model a\ndrafter is fetched for, and is echoed in every `ModelDownload` it produces.",
+        "description": "A download of a custom model's `part`, by intent: the service works out its files from the\nlocal-models configuration and keeps the request until it ends, resolving it again after a\nrestart. Every `ModelDownload` it produces is for `model_id`.",
         "required": [
-          "bundle"
+          "modelId"
         ],
         "properties": {
-          "bundle": {
-            "$ref": "#/components/schemas/ServableModelBundle"
-          },
-          "forModel": {
+          "modelId": {
             "$ref": "#/components/schemas/ModelId"
+          },
+          "part": {
+            "$ref": "#/components/schemas/CustomModelPart"
           }
         },
         "additionalProperties": false

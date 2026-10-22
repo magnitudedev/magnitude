@@ -4,11 +4,10 @@ use std::sync::atomic::Ordering;
 
 use futures_util::future::BoxFuture;
 use magnitude_service_contracts::models::{
-    CustomModelDeclarationOrigin,
     CatalogPackageAffiliation, CatalogPackageRole, InstalledCatalogAttribution,
     InstalledModelPackage, InstalledModelPackages, InstalledModelPackagesResponse,
     ModelBundleInput, ModelFailure, ModelFile, ModelFileId, ModelFileRelationship, ModelFileRole,
-    ModelPackage, ModelPackageId, ModelPackageInstallationOrigin, ModelPackageOperand,
+    ModelId, ModelPackage, ModelPackageId, ModelPackageInstallationOrigin, ModelPackageOperand,
     ModelPackageProperties, ModelPackageSource, PackageValidation,
     RemoveInstalledModelPackageResponse, ResolvedServableModelBundle, ServableModelBundle,
     ServingProfile,
@@ -63,6 +62,7 @@ pub(crate) struct PrimaryEvidence {
     pub(crate) license: Option<String>,
     #[serde(default)]
     pub(crate) quantization: Option<String>,
+    pub(crate) file_type: Option<String>,
     #[serde(default)]
     pub(crate) tags: Vec<String>,
 }
@@ -71,6 +71,17 @@ impl PrimaryEvidence {
     fn with_local_digest(mut self, local_digest: Option<String>) -> Self {
         self.local_digest = local_digest;
         self
+    }
+
+    /// The `local:` ID of the model this file is the first shard of.
+    pub(crate) fn local_model_id(&self) -> Option<ModelId> {
+        crate::gguf::local_model_id(
+            self.local_digest.as_deref()?,
+            self.name.as_deref(),
+            self.architecture.as_deref(),
+            self.file_type.as_deref(),
+        )
+        .ok()
     }
 
     pub(crate) fn role(
@@ -95,6 +106,7 @@ impl PrimaryEvidence {
             base_models: inspection.base_models.clone(),
             license: inspection.license.clone(),
             quantization: inspection.quantization.clone(),
+            file_type: inspection.file_type.clone(),
             tags: inspection.tags.clone(),
         }
     }
@@ -584,10 +596,9 @@ fn installation_origin(location: &ModelLocation) -> ModelPackageInstallationOrig
             ExternalOrigin::LlamaCpp { .. } => ModelPackageInstallationOrigin::LlamaCpp,
             ExternalOrigin::Ollama { .. } => ModelPackageInstallationOrigin::Ollama,
             ExternalOrigin::Folder => ModelPackageInstallationOrigin::Folder,
-            ExternalOrigin::Imported => ModelPackageInstallationOrigin::Imported,
         },
         ModelLocation::Directory { .. } | ModelLocation::File { .. } => {
-            ModelPackageInstallationOrigin::Imported
+            ModelPackageInstallationOrigin::Folder
         }
     }
 }
@@ -646,11 +657,18 @@ pub fn servable_model_bundle_key_for_bundle(
     }
 }
 
-/// The `hf:` ID a package from a Hugging Face repository has as a custom model: its repository and
-/// the path of its primary weights file.
-pub(crate) fn hub_model_id(
+/// The ID one copy of a model has as a custom model, from that copy alone: `hf:<repository>/<path
+/// of its first shard>` for a package whose location records its Hub origin (the Hugging Face
+/// cache, a llama.cpp hub cache, Magnitude's store), else its `local:` ID. Copies are never merged
+/// across locations: the same bytes outside those locations are `local:`.
+pub(crate) fn copy_model_id(
     package: &ModelPackage,
-) -> Option<magnitude_service_contracts::models::ModelId> {
+    primary: Option<&PrimaryEvidence>,
+) -> Option<ModelId> {
+    hub_model_id(package).or_else(|| primary?.local_model_id())
+}
+
+fn hub_model_id(package: &ModelPackage) -> Option<ModelId> {
     let ModelPackageSource::HuggingFace { repository, .. } = &package.source else {
         return None;
     };
@@ -664,11 +682,18 @@ pub(crate) fn hub_model_id(
         .map(|component| component.as_os_str().to_str())
         .collect::<Option<Vec<_>>>()?
         .join("/");
-    Some(magnitude_service_contracts::models::ModelId::hugging_face(
+    Some(ModelId::hugging_face(
         &magnitude_service_contracts::models::HuggingFaceRepositoryId::new(repository.clone())
             .ok()?,
         &magnitude_service_contracts::models::HuggingFaceArtifactSelector::new(selector).ok()?,
     ))
+}
+
+impl InstalledPackageRecord {
+    /// This copy's ID as a custom model (see [`copy_model_id`]).
+    pub(crate) fn model_id(&self) -> Option<ModelId> {
+        copy_model_id(&self.installed.package, self.primary.as_ref())
+    }
 }
 
 /// Whether `package` holds exactly `target`'s weights: the same Hugging Face repository and commit,
@@ -708,6 +733,7 @@ impl ManagedModelStore {
         &self,
         model: &InventoryModel,
         package: &ModelPackage,
+        hidden: bool,
     ) -> InstalledCatalogAttribution {
         let attributed = |model: &magnitude_service_contracts::models::RecommendableModel| {
             InstalledCatalogAttribution::Attributed {
@@ -722,7 +748,7 @@ impl ManagedModelStore {
                 retryable: false,
             },
         };
-        if self.hidden_occurrence(installation_origin(&model.location), package) {
+        if hidden {
             return InstalledCatalogAttribution::NotCatalogTarget;
         }
         let exact = self
@@ -875,25 +901,33 @@ impl ManagedModelStore {
         }
     }
 
-    /// Whether an occurrence outside Magnitude's store is a found model the configuration hides, by
-    /// the `hf:` ID it has as a found model. Such a copy is never a catalog model's: it is not
-    /// attributed to one and no catalog model counts it as installed, even when it is exactly a
-    /// catalog package; it stays in inventory as a hidden found model.
-    pub(crate) fn hidden_occurrence(
-        &self,
-        origin: ModelPackageInstallationOrigin,
-        package: &ModelPackage,
-    ) -> bool {
-        origin != ModelPackageInstallationOrigin::Magnitude
-            && hub_model_id(package).is_some_and(|model_id| {
-                self.local_models
-                    .read()
-                    .is_ok_and(|configuration| configuration.hidden.contains(&model_id))
+    /// Whether a copy outside Magnitude's store is a found model the configuration hides: by the
+    /// ID it has as a found model, or by the catalog model whose exact target it is. Such a copy is
+    /// never a catalog model's: it is not attributed to one and no catalog model counts it as
+    /// installed, even when it is exactly a catalog package; it stays in inventory as a hidden
+    /// found model.
+    pub(crate) fn hidden_occurrence(&self, record: &InstalledPackageRecord) -> bool {
+        if record.installed.origin == ModelPackageInstallationOrigin::Magnitude {
+            return false;
+        }
+        let Ok(configuration) = self.local_models.read() else {
+            return false;
+        };
+        let package = &record.installed.package;
+        record
+            .model_id()
+            .is_some_and(|model_id| configuration.hidden.contains(&model_id))
+            || self.config.catalog_models.iter().any(|model| {
+                let target = catalog_target(model);
+                (target.id == package.id || exact_target_weights(target, package))
+                    && configuration
+                        .hidden
+                        .contains(&ModelId::catalog(&model.model_id, &model.variant_id))
             })
     }
 
-    /// Whether an added custom model's declaration names exactly this package: its repository,
-    /// pinned commit and target files.
+    /// Whether an added custom model names exactly this package: its repository, pinned commit
+    /// and target files.
     fn declared_added_package(&self, package: &ModelPackage) -> bool {
         let ModelPackageSource::HuggingFace {
             repository,
@@ -909,16 +943,12 @@ impl ManagedModelStore {
             .map(|file| file.path.to_string_lossy().replace('\\', "/"))
             .collect::<BTreeSet<_>>();
         self.local_models.read().is_ok_and(|configuration| {
-            configuration.declarations.iter().any(|declaration| {
-                matches!(
-                    &declaration.origin,
-                    CustomModelDeclarationOrigin::Added { repository: declared, commit }
-                        if declared.as_str().eq_ignore_ascii_case(repository) && commit == revision
-                ) && !declaration.target.is_empty()
-                    && declaration
-                        .target
+            configuration.added.iter().any(|added| {
+                added.repository.as_str().eq_ignore_ascii_case(repository)
+                    && added.revision == *revision
+                    && crate::candidate_files::split_set(added.path.as_str())
                         .iter()
-                        .all(|path| weights.contains(path.as_str()))
+                        .all(|path| weights.contains(path))
             })
         })
     }
@@ -1082,29 +1112,29 @@ impl ManagedModelStore {
                 validation,
                 primary,
             } = self.inspect_package_from_resolved(&resolved)?;
-            let hidden = self.hidden_occurrence(installation_origin(&model.location), &package);
+            let mut record = InstalledPackageRecord {
+                installed: InstalledModelPackage {
+                    path: installed_path(model, &resolved),
+                    origin: installation_origin(&model.location),
+                    validation,
+                    catalog_attribution: InstalledCatalogAttribution::NotCatalogTarget,
+                    package,
+                },
+                model: model.clone(),
+                primary,
+            };
+            let hidden = self.hidden_occurrence(&record);
+            let package = &record.installed.package;
             for catalog_model in &self.config.catalog_models {
                 for (catalog_package, role) in catalog_store_packages(catalog_model) {
                     if !hidden && catalog_package.id == package.id {
-                        self.remember_catalog_package(catalog_model, &package, role);
+                        self.remember_catalog_package(catalog_model, package, role);
                     }
                 }
             }
-            let installed = InstalledModelPackage {
-                path: installed_path(model, &resolved),
-                origin: installation_origin(&model.location),
-                validation,
-                catalog_attribution: self.installed_catalog_attribution(model, &package),
-                package,
-            };
-            records.insert(
-                model.id.clone(),
-                InstalledPackageRecord {
-                    installed,
-                    model: model.clone(),
-                    primary,
-                },
-            );
+            record.installed.catalog_attribution =
+                self.installed_catalog_attribution(model, package, hidden);
+            records.insert(model.id.clone(), record);
         }
         Ok(InstalledPackageSnapshot {
             records,
@@ -1183,7 +1213,7 @@ impl ManagedModelStore {
             .any(|record| record.installed.package.id == package.id);
         let found = records.records.values().any(|record| {
             record.installed.origin != ModelPackageInstallationOrigin::Magnitude
-                && !self.hidden_occurrence(record.installed.origin, &record.installed.package)
+                && !self.hidden_occurrence(record)
                 && exact_target_weights(&package, &record.installed.package)
         });
         Ok(if found && !installed { projector } else { package })
@@ -1196,15 +1226,13 @@ impl ManagedModelStore {
         &self,
         package_id: &ModelPackageId,
     ) -> Result<(ModelPackage, ResolvedModel), InventoryError> {
-        self.installed_package_where(package_id, |installed| {
-            !self.hidden_occurrence(installed.origin, &installed.package)
-        })
+        self.installed_package_where(package_id, |record| !self.hidden_occurrence(record))
     }
 
     fn installed_package_where(
         &self,
         package_id: &ModelPackageId,
-        include: impl Fn(&InstalledModelPackage) -> bool,
+        include: impl Fn(&InstalledPackageRecord) -> bool,
     ) -> Result<(ModelPackage, ResolvedModel), InventoryError> {
         let record = self
             .installed_packages
@@ -1215,7 +1243,7 @@ impl ManagedModelStore {
             .records
             .values()
             .filter(|record| record.installed.package.id == *package_id)
-            .filter(|record| include(&record.installed))
+            .filter(|record| include(record))
             .min_by_key(|record| (origin_precedence(record.installed.origin), &record.model.id))
             .cloned()
             .ok_or_else(|| InventoryError::NotFound(package_id.0.clone()))?;

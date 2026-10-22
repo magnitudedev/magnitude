@@ -4,15 +4,25 @@ import {
   ModelDownload,
   type ModelDownloadEncoded,
 } from "@magnitudedev/icn-protocol/schemas"
-import { CustomFormModelIdSchema, DrafterReferenceSchema } from "@magnitudedev/acn-protocol"
+import {
+  CustomFormModelIdSchema,
+  DrafterReferenceSchema,
+  HuggingFaceFormModelIdSchema,
+  type CustomFormModelId,
+  type HuggingFaceFormModelId,
+} from "@magnitudedev/acn-protocol"
 import { CustomModelsConfigSchema, type CustomModelsConfig } from "@magnitudedev/storage"
 import type { CustomModelSource } from "./local-model-sources"
 import type { CustomModelsApi } from "./custom-models"
 
-export const headerDigest = "0123456789abcdef".repeat(4)
-export const addedId = CustomFormModelIdSchema.make("hf:owner/model-GGUF/model-Q4_K_M.gguf")
-export const foundId = CustomFormModelIdSchema.make("hf:other/found-GGUF/found-Q8_0.gguf")
-export const importedId = CustomFormModelIdSchema.make(`local:${headerDigest}`)
+/** A Hugging Face model ID, which is both a custom model's ID and the key config.json stores an added model under. */
+const huggingFaceId = (id: string) =>
+  CustomFormModelIdSchema.make(HuggingFaceFormModelIdSchema.make(id)) as CustomFormModelId & HuggingFaceFormModelId
+
+export const addedId = huggingFaceId("hf:owner/model-GGUF/model-Q4_K_M.gguf")
+export const foundId = huggingFaceId("hf:other/found-GGUF/found-Q8_0.gguf")
+/** A model found in a folder, which has no Hugging Face identity. */
+export const localId = CustomFormModelIdSchema.make("local:folder-model-q4_k_m:0123456789ab")
 
 export const readyModel = {
   metadata: {
@@ -29,7 +39,8 @@ export const nativeCustomModel = (overrides: Readonly<Record<string, unknown>> =
   Schema.decodeUnknownSync(CustomModel)({
     modelId: foundId,
     displayName: "Found model",
-    origin: { _tag: "Found", source: { _tag: "LmStudio" } },
+    // A Hugging Face cache records each file's Hub origin, so a model found there has a Hugging Face ID.
+    origin: { _tag: "Found", source: { _tag: "HuggingFaceCache" } },
     files: [{ path: "/models/found-Q8_0.gguf", sizeBytes: 1_000 }],
     sizeBytes: 1_000,
     drafterPending: false,
@@ -52,29 +63,34 @@ const drafterFiles = { repository: "magnitudedev/model-DFlash-GGUF", commit: "d1
 
 export const drafterReference = Schema.decodeUnknownSync(DrafterReferenceSchema)({ _tag: "HuggingFace", ...drafterFiles })
 
+/** How config.json spells `drafterReference`. */
+export const drafterSetting = `hf:${drafterFiles.repository}/${drafterFiles.path}@${drafterFiles.commit}`
+
+/** config.json's `models`, as users write it, decoded: an added model, and a drafter chosen for the found model. */
 export const customModelsConfig = (overrides: Record<string, unknown> = {}): CustomModelsConfig =>
   Schema.decodeUnknownSync(CustomModelsConfigSchema)({
-    declarations: {
-      [addedId]: {
-        origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
-        target: ["model-Q4_K_M.gguf"],
-      },
-      [importedId]: {
-        origin: { _tag: "Imported", path: "/models/imported.gguf", headerDigest },
-        target: ["/models/imported.gguf"],
-      },
-    },
-    drafters: { [foundId]: { _tag: "Reference", reference: drafterReference, method: { _tag: "DFlash" } } },
+    added: { [addedId]: { revision: "c0ffee" } },
+    drafters: { [foundId]: drafterSetting },
     ...overrides,
   })
 
-const pkg = (repository: string, revision: string, path: string) => ({
-  id: `${repository}@${revision}:${path}`,
-  files: [{ id: path, path, role: "weights", sha256: "a".repeat(64), sizeBytes: 10 }],
-  relationships: [],
-  source: { _tag: "HuggingFace", repository, revision },
-  properties: { architecture: "gguf", format: "gguf", quantization: "Q4", quantizationName: "Q4" },
-})
+/** A Hugging Face package of repository files at a revision, encoded; each file is weights unless it names its role. */
+export const modelPackage = (
+  repository: string,
+  revision: string,
+  files: readonly (string | { readonly path: string; readonly role: string })[],
+) => {
+  const described = files.map((file) => typeof file === "string" ? { path: file, role: "weights" } : file)
+  return {
+    id: `${repository}@${revision}:${described[0]?.path}`,
+    files: described.map(({ path, role }) => ({ id: path, path, role, sha256: "a".repeat(64), sizeBytes: 10 })),
+    relationships: [],
+    source: { _tag: "HuggingFace", repository, revision },
+    properties: { architecture: "gguf", format: "gguf", quantization: "Q4", quantizationName: "Q4" },
+  }
+}
+
+const pkg = (repository: string, revision: string, path: string) => modelPackage(repository, revision, [path])
 
 export const nativeDownload = (
   id: string,

@@ -168,11 +168,11 @@ fn ensure_deletable_status(model: &InventoryModel) -> Result<(), InventoryError>
     }
 }
 
-/// The files a model is served from, each contained in the root its location scans. Imported
-/// files are named one by one by the user's declaration, so a link there may point anywhere; a
-/// file found in a user folder or LM Studio's folder lies there itself or as a link to anywhere.
-/// Ollama's files are the blobs its manifests name, read through whatever links lead to them, as
-/// people move Ollama's storage to another drive by linking a blob, its blobs folder or the store.
+/// The files a model is served from, each contained in the root its location scans. A file found
+/// in a user folder (or listed by its own path, which its folder contains) or in LM Studio's folder
+/// lies there itself or as a link to anywhere. Ollama's files are the blobs its manifests name,
+/// read through whatever links lead to them, as people move Ollama's storage to another drive by
+/// linking a blob, its blobs folder or the store.
 pub(crate) fn resolve_components(
     root: &Path,
     model: &InventoryModel,
@@ -196,14 +196,6 @@ pub(crate) fn resolve_components(
             Some(hf_hub_root(cache_root)?),
             LinkedFiles::WithinRoot,
         ),
-        (
-            ModelLocation::External {
-                origin: ExternalOrigin::Imported,
-                root,
-                ..
-            },
-            _,
-        ) => (root.clone(), None, LinkedFiles::Anywhere),
         (
             ModelLocation::External {
                 origin: ExternalOrigin::Folder | ExternalOrigin::LmStudio { .. },

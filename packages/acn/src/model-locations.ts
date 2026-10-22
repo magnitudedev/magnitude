@@ -2,15 +2,16 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import { Context, Effect, Layer } from "effect"
 import type { ModelLocation } from "@magnitudedev/acn-protocol"
 import type { CustomModelsConfig } from "@magnitudedev/storage"
+import { locationEnabled } from "./custom-models"
 import {
-  directoryState,
   hostDiscoveryEnvironment,
+  scannedPathState,
   resolveAutomaticLocations,
   type DiscoveryEnvironment,
   type ResolvedAutomaticLocation,
 } from "./icn/discovery-roots"
 
-/** The directories Magnitude scans: automatic locations resolved on this host, then the user's folders. */
+/** What Magnitude scans: automatic locations resolved on this host, then the user's folders and files. */
 export interface ModelLocationsApi {
   readonly environment: DiscoveryEnvironment
   readonly resolve: Effect.Effect<readonly ResolvedAutomaticLocation[]>
@@ -31,11 +32,11 @@ export const makeModelLocations = (
       const automatic = (yield* resolve).map((location): ModelLocation => ({
         kind: location.kind,
         paths: location.paths,
-        enabled: !config.disabledLocations.includes(location.kind),
+        enabled: locationEnabled(config, location.kind),
         automatic: true,
         state: location.state,
       }))
-      const folders = yield* Effect.forEach(config.folders, (path) => directoryState(path).pipe(
+      const folders = yield* Effect.forEach(config.paths, (path) => scannedPathState(path).pipe(
         provide,
         Effect.map((state): ModelLocation => ({ kind: "Folder", paths: [{ path, state }], enabled: true, automatic: false, state })),
       ))

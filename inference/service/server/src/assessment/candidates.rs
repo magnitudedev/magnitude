@@ -20,6 +20,7 @@ use magnitude_engine::assessment::{
 use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
 use magnitude_engine::options::{ModelMethod, PROFILE_SEQUENCES};
 use magnitude_service_contracts::models::{
+    AddedModel, CustomModelPart,
     CandidateDrafter, CandidateFile, CandidateInspection, CandidateInspectionProgressSink,
     CandidateInspectionRequest, CandidateSource, CandidateVersion, CatalogModelState, CatalogModels, CustomModel,
     CustomModelOrigin, CustomModelState, DrafterCandidate, DrafterCandidatesRequest,
@@ -43,7 +44,8 @@ use magnitude_service_models::lineage::{
     CatalogLineage, CatalogLineageMatch,
 };
 use magnitude_service_models::{
-    CachedModelAssessment, CatalogDrafterFit, CatalogFingerprints, ModelShape, CustomModelEnrichment, CustomModelEnrichmentResult,
+    CachedModelAssessment, CatalogDrafterFit, CatalogFingerprints, ModelShape, CustomModelAcquisition,
+    CustomModelEnrichment, CustomModelEnrichmentResult,
     CustomModelFacts, DrafterContent, ManagedModelStore, ModelDomainResolver,
     ServableModelBundleKey, WeightSample, refresh_hugging_face_repository,
     servable_model_bundle_key_for_bundle,
@@ -177,6 +179,8 @@ struct ClassifiedGroup {
     role: CandidateFileRole,
     header_digest: String,
     local_digest: Option<String>,
+    /// The `local:` ID a group read on this computer has.
+    local_id: Option<ModelId>,
     quantization: Option<String>,
     embedded_mtp: bool,
     unreadable: Option<String>,
@@ -449,17 +453,53 @@ impl ManagedModelCandidates {
         // Every automatic candidate, not only the first: the projection attaches the first one on
         // this computer, so built-in heads serve while a better drafter is still to be added.
         let drafters = automatic(self.enumerate_drafters(&target, None, false).await?);
-        if reach == Reach::Hub
-            && let Some(chosen) = self.chosen_drafter(model_id).await
-        {
-            self.learn_drafter_content(&chosen).await;
-        }
+        let chosen = match self.chosen_drafter(model_id).await {
+            Some(reference) => {
+                if reach == Reach::Hub {
+                    self.learn_drafter_content(&reference).await;
+                }
+                self.chosen_candidate(&target, &reference, &drafters).await
+            }
+            None => None,
+        };
         Ok(CustomModelEnrichmentResult {
             variant_of,
             drafters,
             catalog_drafters,
+            chosen,
             license,
         })
+    }
+
+    /// The engine's verdict on a drafter file the model's configuration chooses, when automatic
+    /// choice doesn't list it: a file on this computer from any pass, a Hub file only from the
+    /// pass that reaches the Hub. A catalog drafter's and built-in heads' methods are known
+    /// without one.
+    async fn chosen_candidate(
+        &self,
+        target: &DrafterTarget,
+        reference: &DrafterReference,
+        listed: &[DrafterCandidate],
+    ) -> Option<DrafterCandidate> {
+        if listed.iter().any(|candidate| candidate.reference == *reference) {
+            return None;
+        }
+        let input = match reference {
+            DrafterReference::Local { path } => path.to_str()?.to_owned(),
+            DrafterReference::HuggingFace {
+                repository,
+                commit,
+                path,
+            } if target.reach == Reach::Hub => format!("{}@{commit}:{path}", repository.as_str()),
+            DrafterReference::HuggingFace { .. }
+            | DrafterReference::Catalog { .. }
+            | DrafterReference::Embedded => return None,
+        };
+        self.other_drafter(target, &target.lineage, &input)
+            .await
+            .map_err(|error| tracing::warn!(%error, "the chosen drafter could not be checked"))
+            .ok()
+            .filter(|candidate| candidate.reference == *reference)
     }
 
     /// Fill every custom model's lineage hint and automatic drafters. The projection asks the
@@ -609,7 +649,7 @@ impl ManagedModelCandidates {
             .into_iter()
             .find(|attachment| &attachment.model_id == model_id)
             .and_then(|attachment| match attachment.drafter {
-                DrafterChoice::Reference { reference, .. } => Some(reference),
+                DrafterChoice::Reference { reference } => Some(reference),
                 DrafterChoice::Auto | DrafterChoice::None => None,
             })
     }
@@ -1353,9 +1393,7 @@ impl ManagedModelCandidates {
                             self.models(),
                             &custom,
                             Some((&model_id, snapshot.commit.as_str())),
-                            &group.group,
-                            &group.header_digest,
-                            group.local_digest.as_deref(),
+                            group,
                             None,
                         )
                     });
@@ -1471,21 +1509,13 @@ impl ManagedModelCandidates {
                         .catalog_model_with_content(digest, group.group.primary().size_bytes)
                 });
                 let on_this_computer = catalog_model.clone().or_else(|| {
-                    on_this_computer(
-                        self.models(),
-                        &custom,
-                        None,
-                        &group.group,
-                        &group.header_digest,
-                        group.local_digest.as_deref(),
-                        Some(&root),
-                    )
+                    on_this_computer(self.models(), &custom, None, group, Some(&root))
                 });
                 // A file a listed model is found at keeps that model's identity (a Hugging Face one
                 // when its location gives it); any other file, a copy of a listed model's bytes
-                // included, is identified by its header digest.
+                // included, is identified by its `local:` ID.
                 let model_id = listed_at(&custom, &group.group, &root)
-                    .or_else(|| local_model_id(group.local_digest.as_deref()?))?;
+                    .or_else(|| group.local_id.clone())?;
                 Some(AssessedVersion {
                     group,
                     assessment,
@@ -2631,6 +2661,212 @@ impl ManagedModelCandidates {
     }
 }
 
+/// How the "different drafter" input names a drafter file, so a configured reference is checked
+/// as one; catalog drafters and built-in heads are listed by themselves.
+fn drafter_input(reference: &DrafterReference) -> Option<String> {
+    match reference {
+        DrafterReference::Local { path } => path.to_str().map(str::to_owned),
+        DrafterReference::HuggingFace {
+            repository,
+            commit,
+            path,
+        } => Some(format!("{}@{commit}:{path}", repository.as_str())),
+        DrafterReference::Catalog { .. } | DrafterReference::Embedded => None,
+    }
+}
+
+impl ManagedModelCandidates {
+    /// The drafter a download fetches with a model, for `choice`: the preselected automatic one,
+    /// or the chosen reference as the engine binds it. A separate drafter already on this
+    /// computer, in any location, is used where it is and never fetched; built-in heads come with
+    /// the target.
+    async fn fetched_drafter(
+        &self,
+        request: impl Fn(Option<String>) -> DrafterCandidatesRequest,
+        choice: &DrafterChoice,
+    ) -> Result<Option<CandidateDrafter>, InventoryError> {
+        let chosen = match choice {
+            DrafterChoice::None => return Ok(None),
+            DrafterChoice::Auto => self
+                .drafters(request(None))
+                .await?
+                .candidates
+                .into_iter()
+                .find(|candidate| candidate.automatic),
+            DrafterChoice::Reference { reference } => self
+                .drafters(request(drafter_input(reference)))
+                .await?
+                .candidates
+                .into_iter()
+                .find(|candidate| candidate.reference == *reference),
+        };
+        Ok(chosen
+            .filter(|candidate| {
+                candidate.reference == DrafterReference::Embedded || !candidate.on_this_computer
+            })
+            .and_then(|candidate| {
+                Some(CandidateDrafter {
+                    method: bound_method(&candidate.verdict)?,
+                    reference: candidate.reference,
+                })
+            }))
+    }
+
+    /// An added model's files at `commit` with its projector and the drafter it downloads with.
+    async fn added_bundle(
+        &self,
+        added: &AddedModel,
+        commit: String,
+        choice: &DrafterChoice,
+    ) -> Result<ServableModelBundle, InventoryError> {
+        let candidate = ModelCandidate {
+            source: CandidateSource::HuggingFace {
+                repository: added.repository.clone(),
+                commit: commit.clone(),
+            },
+            target: magnitude_service_models::candidate_files::split_set(added.path.as_str()),
+            projector: added.projector.clone().map(|path| CandidateFile {
+                path,
+                size_bytes: 0,
+            }),
+            drafter: None,
+        };
+        let drafter = self
+            .fetched_drafter(
+                |other| DrafterCandidatesRequest::Candidate {
+                    candidate: candidate.clone(),
+                    other,
+                },
+                choice,
+            )
+            .await?;
+        let drafter = match &drafter {
+            Some(drafter) => self.drafter_package(drafter).await?,
+            None => None,
+        };
+        let snapshot = self.snapshot(added.repository.as_str(), &commit).await?;
+        let primary = PathBuf::from(added.path.as_str());
+        let projector = added.projector.as_deref().map(Path::new);
+        let target = self
+            .hugging_face_package(&snapshot, &primary, projector)
+            .await?;
+        let expected = candidate.target.iter().map(PathBuf::from).collect::<BTreeSet<_>>();
+        let resolved = target
+            .files
+            .iter()
+            .filter(|file| file.role == ModelFileRole::Weights)
+            .map(|file| file.path.clone())
+            .collect::<BTreeSet<_>>();
+        if expected != resolved {
+            return Err(InventoryError::InvalidRequest(format!(
+                "{} is not one complete GGUF at {commit}",
+                added.model_id()
+            )));
+        }
+        Ok(match drafter {
+            None => ServableModelBundle::Standalone { package: target },
+            Some((draft_source, method)) => ServableModelBundle::SpeculativeDecoding {
+                target,
+                draft_source,
+                method,
+            },
+        })
+    }
+
+    /// An added model's update: its files at the commit its repository has moved to, keeping its
+    /// projector where that commit still has it, and a drafter it chose from the same repository
+    /// moved to that commit where it is still there.
+    async fn update_bundle(
+        &self,
+        added: &AddedModel,
+        choice: &DrafterChoice,
+    ) -> Result<ServableModelBundle, InventoryError> {
+        let resolver = self.resolver.get().ok_or_else(|| {
+            InventoryError::NotReady("custom models are not ready yet".to_owned())
+        })?;
+        let update = resolver.added_model_update(added).await?.ok_or_else(|| {
+            InventoryError::NotFound(format!("{} has no update", added.model_id()))
+        })?;
+        let snapshot = self.snapshot(added.repository.as_str(), &update).await?;
+        let has = |path: &str| snapshot_file(&snapshot, Path::new(path)).is_ok();
+        let added = AddedModel {
+            projector: added.projector.clone().filter(|projector| has(projector)),
+            ..added.clone()
+        };
+        let choice = match choice {
+            DrafterChoice::Reference {
+                reference:
+                    DrafterReference::HuggingFace {
+                        repository, path, ..
+                    },
+            } if *repository == added.repository && has(path) => DrafterChoice::Reference {
+                reference: DrafterReference::HuggingFace {
+                    repository: repository.clone(),
+                    commit: snapshot.commit.clone(),
+                    path: path.clone(),
+                },
+            },
+            choice => choice.clone(),
+        };
+        self.added_bundle(&added, snapshot.commit.clone(), &choice).await
+    }
+}
+
+impl CustomModelAcquisition for ManagedModelCandidates {
+    fn bundle(
+        &self,
+        model_id: ModelId,
+        part: Option<CustomModelPart>,
+    ) -> BoxFuture<'_, Result<Option<ServableModelBundle>, InventoryError>> {
+        Box::pin(async move {
+            let configuration = self.local.configuration().await?;
+            let choice = configuration
+                .drafters
+                .iter()
+                .find(|attachment| attachment.model_id == model_id)
+                .map_or(DrafterChoice::Auto, |attachment| attachment.drafter.clone());
+            let added = configuration
+                .added
+                .iter()
+                .find(|added| added.model_id() == model_id);
+            let not_added =
+                || InventoryError::NotFound(format!("{model_id} is not a model added from Hugging Face"));
+            match part {
+                None => {
+                    let added = added.ok_or_else(not_added)?;
+                    self.added_bundle(added, added.revision.clone(), &choice)
+                        .await
+                        .map(Some)
+                }
+                Some(CustomModelPart::Update) => self
+                    .update_bundle(added.ok_or_else(not_added)?, &choice)
+                    .await
+                    .map(Some),
+                Some(CustomModelPart::Drafter) => {
+                    let drafter = self
+                        .fetched_drafter(
+                            |other| DrafterCandidatesRequest::Model {
+                                model_id: model_id.clone(),
+                                other,
+                            },
+                            &choice,
+                        )
+                        .await?;
+                    let Some(drafter) = drafter else {
+                        return Ok(None);
+                    };
+                    Ok(match self.drafter_package(&drafter).await? {
+                        Some((SpeculativeDraftSource::Separate { draft }, _)) => {
+                            Some(ServableModelBundle::Standalone { package: draft })
+                        }
+                        Some((SpeculativeDraftSource::Embedded, _)) | None => None,
+                    })
+                }
+            }
+        })
+    }
+}
+
 impl CatalogFingerprints for ManagedModelCandidates {
     fn catalog_fingerprints(&self) -> BoxFuture<'_, Vec<(ModelId, ModelFingerprint)>> {
         Box::pin(async move { self.catalog_facts().await.fingerprints.clone() })
@@ -2700,59 +2936,6 @@ impl ModelCandidates for ManagedModelCandidates {
                 .assess(&target.material, drafter.as_ref(), method)
                 .await?
                 .profile)
-        })
-    }
-
-    fn bundle(
-        &self,
-        candidate: ModelCandidate,
-    ) -> BoxFuture<'_, Result<ServableModelBundle, InventoryError>> {
-        Box::pin(async move {
-            let drafter = match &candidate.drafter {
-                Some(drafter) => self.drafter_package(drafter).await?,
-                None => None,
-            };
-            match &candidate.source {
-                CandidateSource::HuggingFace { repository, commit } => {
-                    let snapshot = self.snapshot(repository.as_str(), commit).await?;
-                    let primary = candidate.target.first().map(PathBuf::from).ok_or_else(|| {
-                        InventoryError::InvalidRequest("a candidate names its target".to_owned())
-                    })?;
-                    let projector = candidate.projector.as_ref().map(|file| PathBuf::from(&file.path));
-                    let target = self
-                        .hugging_face_package(&snapshot, &primary, projector.as_deref())
-                        .await?;
-                    let expected = candidate.target.iter().map(PathBuf::from).collect::<BTreeSet<_>>();
-                    let resolved = target
-                        .files
-                        .iter()
-                        .filter(|file| file.role == ModelFileRole::Weights)
-                        .map(|file| file.path.clone())
-                        .collect::<BTreeSet<_>>();
-                    if expected != resolved {
-                        return Err(InventoryError::InvalidRequest(
-                            "the candidate's target files are not one complete GGUF".to_owned(),
-                        ));
-                    }
-                    Ok(match drafter {
-                        None => ServableModelBundle::Standalone { package: target },
-                        Some((draft_source, method)) => ServableModelBundle::SpeculativeDecoding {
-                            target,
-                            draft_source,
-                            method,
-                        },
-                    })
-                }
-                CandidateSource::Local { .. } => match drafter {
-                    Some((SpeculativeDraftSource::Separate { draft }, _)) => {
-                        Ok(ServableModelBundle::Standalone { package: draft })
-                    }
-                    _ => Err(InventoryError::InvalidRequest(
-                        "a local model is referenced in place; only a separate Hugging Face or catalog drafter downloads"
-                            .to_owned(),
-                    )),
-                },
-            }
         })
     }
 }
@@ -3166,6 +3349,7 @@ fn classified_group(
         embedded_mtp: classification.embedded_mtp,
         header_digest,
         local_digest: None,
+        local_id: None,
         group,
         unreadable: None,
     }
@@ -3178,6 +3362,7 @@ fn unreadable_group(group: GgufGroup, detail: String) -> ClassifiedGroup {
         role: CandidateFileRole::Target { architecture: None },
         header_digest: String::new(),
         local_digest: None,
+        local_id: None,
         quantization: None,
         embedded_mtp: false,
         group,
@@ -3199,15 +3384,24 @@ fn classify_local(
             let (gguf, classification) = store
                 .classify_local_gguf(&root.join(&group.primary().path), architectures)
                 .ok()?;
+            let local_digest =
+                local_digest(store, group.files.iter().map(|file| root.join(&file.path)));
+            let inspection = gguf.inspection;
             Some(ClassifiedGroup {
                 role: classification.role,
                 quantization: classification.quantization,
                 embedded_mtp: classification.embedded_mtp,
-                header_digest: gguf.inspection.header_digest,
-                local_digest: local_digest(
-                    store,
-                    group.files.iter().map(|file| root.join(&file.path)),
-                ),
+                local_id: local_digest.as_deref().and_then(|digest| {
+                    magnitude_service_models::gguf::local_model_id(
+                        digest,
+                        inspection.name.as_deref(),
+                        inspection.architecture.as_deref(),
+                        inspection.file_type.as_deref(),
+                    )
+                    .ok()
+                }),
+                header_digest: inspection.header_digest,
+                local_digest,
                 group,
                 unreadable: None,
             })
@@ -3378,26 +3572,25 @@ fn assessment_evidence(
     .map_err(|error| InventoryError::Internal(error.to_string()))
 }
 
-fn local_model_id(header_digest: &str) -> Option<ModelId> {
-    magnitude_service_contracts::models::LocalModelDigest::new(header_digest.to_owned())
-        .ok()
-        .map(|digest| ModelId::local(&digest))
-}
-
-/// The custom model already on this computer with the same bytes: the same header digest, the
-/// same Hugging Face identity and weights size (a projector it was found with, such as an Ollama
-/// pull's, is not part of the version), the same files, or files with the same header and sizes
-/// wherever they are.
+/// The custom model already on this computer with the same bytes: the same `local:` identity,
+/// the same Hugging Face identity and weights size (a projector it was found with, such as an
+/// Ollama pull's, is not part of the version), the same files, or files with the same header and
+/// sizes wherever they are.
 fn on_this_computer(
     store: &ManagedModelStore,
     custom: &[CustomModel],
     hugging_face: Option<(&ModelId, &str)>,
-    group: &GgufGroup,
-    header_digest: &str,
-    local_digest: Option<&str>,
+    classified: &ClassifiedGroup,
     root: Option<&Path>,
 ) -> Option<ModelId> {
-    let local = local_digest.and_then(local_model_id);
+    let ClassifiedGroup {
+        group,
+        header_digest,
+        local_digest,
+        local_id: local,
+        ..
+    } = classified;
+    let local_digest = local_digest.as_deref();
     let paths = root
         .map(|root| {
             group
@@ -3435,7 +3628,7 @@ fn on_this_computer(
 fn known_commit(model: &CustomModel) -> Option<&str> {
     match &model.origin {
         CustomModelOrigin::Added { commit, .. } => Some(commit),
-        CustomModelOrigin::Imported { .. } | CustomModelOrigin::Found { .. } => None,
+        CustomModelOrigin::Found { .. } => None,
     }
 }
 

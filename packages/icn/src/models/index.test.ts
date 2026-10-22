@@ -88,7 +88,7 @@ describe("ICN local models", () => {
     } } as unknown as IcnClientService
     const configuration = {
       roots: [{ kind: "Folder" as const, path: "/models", enabled: true }],
-      declarations: [],
+      added: [],
       hidden: [],
       drafters: [],
     }

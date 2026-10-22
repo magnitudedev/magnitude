@@ -2,6 +2,7 @@ import { Context, Duration, Effect, Layer, Option } from "effect"
 import { dataEquivalence } from "@magnitudedev/utils/data-equivalence"
 import {
   ModelDownloadsResponse,
+  type CustomModelPart,
   type ModelDownload,
   type ModelId,
   type ModelPackage,
@@ -19,14 +20,15 @@ export type DownloadAcknowledgeError = Effect.Effect.Error<
 >
 
 /**
- * Non-catalog bundle downloads: added models and drafters fetched alone. `start` admits a download, or
- * none when every package of the bundle is already installed; ICN echoes `forModel` in the download so
- * its progress belongs to that model.
+ * Custom model downloads, by intent: an added model's files, only a model's drafter, or an added model's update.
+ * ICN works out the files from the local-models configuration and keeps the request until it ends, resuming it
+ * after a restart. `start` admits a download, or none when everything it would fetch is already here; every
+ * download names the model it is for.
  */
 export interface IcnDownloadsService extends IcnObservedState<typeof ModelDownloadsResponse.Type, DownloadsReadError> {
   readonly start: (
-    bundle: ServableModelBundle,
-    forModel: ModelId,
+    modelId: ModelId,
+    part: Option.Option<CustomModelPart>,
   ) => Effect.Effect<Option.Option<ModelDownload>, DownloadStartError>
   readonly cancel: (downloadId: string) => Effect.Effect<ModelDownload, DownloadCancelError>
   readonly acknowledgeFailure: (downloadId: string) => Effect.Effect<ModelDownload, DownloadAcknowledgeError>
@@ -55,8 +57,8 @@ export const makeIcnDownloads = (
   const settle = observed.refresh.pipe(Effect.ignore)
   return IcnDownloads.of({
     ...observed,
-    start: (bundle, forModel) => client.downloads.startModelDownload({
-      payload: { bundle, forModel: Option.some(forModel) },
+    start: (modelId, part) => client.downloads.startModelDownload({
+      payload: { modelId, part },
     }).pipe(
       Effect.map(({ download }) => download),
       Effect.tap(() => settle),

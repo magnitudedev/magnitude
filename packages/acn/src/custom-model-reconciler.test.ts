@@ -1,9 +1,11 @@
 import { Data, Effect, Layer, Option, Stream } from "effect"
 import { describe, expect, it } from "vitest"
-import { IcnCandidates, IcnLocalModels } from "@magnitudedev/icn"
+import { IcnLocalModels } from "@magnitudedev/icn"
 import type { LocalModelsConfiguration } from "@magnitudedev/icn-protocol/schemas"
+import { CustomFormModelIdSchema, type LocalModelMutationFailed } from "@magnitudedev/acn-protocol"
+import type { CustomModelsConfig } from "@magnitudedev/storage"
 import { AcnChanges } from "./changes"
-import { CustomModels } from "./custom-models"
+import { CustomModels, type CustomModelsApi } from "./custom-models"
 import { CustomModelReconciler, CustomModelReconcilerLive, disappearedCustomModels } from "./custom-model-reconciler"
 import { ModelLocations } from "./model-locations"
 import { ModelSlotController } from "./model-slot-controller"
@@ -12,210 +14,102 @@ import {
   customModelsConfig,
   drafterReference,
   foundId,
-  importedId,
+  localId,
   makeTestCustomModels,
 } from "./custom-models.test-support"
 
-class IcnOffline extends Data.TaggedError("IcnOffline")<{}> {}
-
-const listedDrafters = <A, E>(candidates: Effect.Effect<A, E>) =>
-  Effect.map(candidates, (listed) => ({ candidates: listed, entered: Option.none() }))
-
 describe("custom model disappearance", () => {
-  it("names forgotten declarations and newly hidden models only", () => {
+  it("names removed added models and newly hidden models only", () => {
     const previous = customModelsConfig()
-    const next = { ...previous, declarations: { [importedId]: previous.declarations[importedId]! }, hidden: [foundId] }
+    const next = { ...previous, added: {}, hidden: [foundId] }
     expect(disappearedCustomModels(previous, next)).toEqual([addedId, foundId])
     expect(disappearedCustomModels(next, next)).toEqual([])
   })
+
+  it("doesn't take a hidden local model renamed to its current label for a newly hidden one", () => {
+    const olderLabel = CustomFormModelIdSchema.make("local:old-name-q4_k_m:0123456789ab")
+    const previous = customModelsConfig({ hidden: [olderLabel] })
+    expect(disappearedCustomModels(previous, { ...previous, hidden: [localId] })).toEqual([])
+  })
 })
 
+interface Recorded {
+  readonly configured: LocalModelsConfiguration[]
+  readonly cleared: string[]
+  readonly published: string[]
+}
+
+/** Runs `use` against a reconciler over these choices, with ICN and the slots recorded. */
+const reconciling = (
+  config: CustomModelsConfig,
+  use: (reconciler: CustomModelReconciler["Type"], custom: CustomModelsApi) => Effect.Effect<void, LocalModelMutationFailed>,
+) => {
+  const recorded: Recorded = { configured: [], cleared: [], published: [] }
+  return Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const custom = yield* makeTestCustomModels(config)
+    const layer = CustomModelReconcilerLive.pipe(Layer.provide(Layer.mergeAll(
+      Layer.succeed(CustomModels, custom),
+      Layer.succeed(ModelLocations, {
+        environment: { platform: "linux", env: {}, home: "/h" },
+        resolve: Effect.succeed([{
+          kind: "HuggingFaceCache" as const,
+          paths: [{ path: "/h/.cache/huggingface/hub", state: "Found" as const }] as const,
+          state: "Found" as const,
+        }]),
+        list: () => Effect.succeed([]),
+      }),
+      Layer.succeed(IcnLocalModels, {
+        configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { recorded.configured.push(configuration) }),
+      } as never),
+      Layer.succeed(ModelSlotController, {
+        state: Effect.succeed({ slots: {
+          primary: { _tag: "ConfiguredLocal", slotId: "primary", selection: { providerId: "local", providerModelId: foundId } },
+          secondary: { _tag: "Unassigned", slotId: "secondary" },
+        } }),
+        updateModelSlot: (slotId: string) => Effect.sync(() => { recorded.cleared.push(slotId) }),
+      } as never),
+      Layer.succeed(AcnChanges, {
+        publish: ({ operation }: { readonly operation: string }) => Effect.sync(() => { recorded.published.push(operation) }),
+        stream: Stream.empty,
+      } as never),
+    )))
+    yield* Effect.flatMap(CustomModelReconciler, (reconciler) => use(reconciler, custom)).pipe(Effect.provide(layer))
+  }))).then(() => recorded)
+}
+
 describe("custom model reconciliation", () => {
-  it("pushes the persisted drafter method at once, corrects it from the engine's verdict, and clears a slot whose model disappears", async () => {
-    const configured: LocalModelsConfiguration[] = []
-    const cleared: string[] = []
-    const published: string[] = []
-    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const custom = yield* makeTestCustomModels(customModelsConfig())
-      const layer = CustomModelReconcilerLive.pipe(Layer.provide(Layer.mergeAll(
-        Layer.succeed(CustomModels, custom),
-        Layer.succeed(ModelLocations, {
-          environment: { platform: "linux", env: {}, home: "/h" },
-          resolve: Effect.succeed([{
-            kind: "HuggingFaceCache" as const,
-            paths: [{ path: "/h/.cache/huggingface/hub", state: "Found" as const }] as const,
-            state: "Found" as const,
-          }]),
-          list: () => Effect.succeed([]),
-        }),
-        Layer.succeed(IcnLocalModels, {
-          configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
-        } as never),
-        Layer.succeed(IcnCandidates, {
-          drafters: () => listedDrafters(Effect.succeed([{
-            category: "CatalogDrafter",
-            reference: drafterReference,
-            name: "Magnitude DFlash for Qwen3.6 35B-A3B",
-            label: "Magnitude DFlash",
-            lineage: "Lineage",
-            method: Option.some({ _tag: "DSpark" }),
-            automatic: true,
-            onThisComputer: false,
-            sizeBytes: 1,
-            verdict: { _tag: "Bound", method: { _tag: "DSpark" }, memoryBytes: 1 },
-          }])),
-        } as never),
-        Layer.succeed(ModelSlotController, {
-          state: Effect.succeed({ slots: {
-            primary: { _tag: "ConfiguredLocal", slotId: "primary", selection: { providerId: "local", providerModelId: foundId } },
-            secondary: { _tag: "Unassigned", slotId: "secondary" },
-          } }),
-          updateModelSlot: (slotId: string) => Effect.sync(() => { cleared.push(slotId) }),
-        } as never),
-        Layer.succeed(AcnChanges, {
-          publish: ({ operation }: { readonly operation: string }) => Effect.sync(() => { published.push(operation) }),
-          stream: Stream.empty,
-        } as never),
-      )))
-      yield* Effect.gen(function* () {
-        const reconciler = yield* CustomModelReconciler
+  it("pushes config.json's choices converted for ICN, and clears a slot whose model disappears", async () => {
+    const recorded = await reconciling(customModelsConfig({ locations: { lmstudio: false }, paths: ["/models"] }), (reconciler, custom) =>
+      Effect.gen(function* () {
         yield* reconciler.push
         yield* Effect.sleep("50 millis")
         yield* custom.modify((config) => Effect.succeed([undefined, { ...config, hidden: [foundId] }] as const))
         yield* Effect.sleep("50 millis")
-      }).pipe(Effect.provide(layer))
-      expect((yield* custom.get).drafters[foundId]).toEqual({
-        _tag: "Reference", reference: drafterReference, method: { _tag: "DSpark" },
-      })
-    })))
-    const first = configured[0]!
-    expect(first.roots).toEqual([{ kind: "HuggingFaceCache", path: "/h/.cache/huggingface/hub", enabled: true }])
-    expect(first.drafters).toEqual([{
-      modelId: foundId,
-      drafter: { _tag: "Reference", method: { _tag: "DFlash" }, reference: drafterReference },
-    }])
-    expect(configured.at(-1)!.drafters).toEqual([{
-      modelId: foundId,
-      drafter: { _tag: "Reference", method: { _tag: "DSpark" }, reference: drafterReference },
-    }])
-    expect(first.hidden).toEqual([])
-    expect(cleared).toEqual(["primary"])
-    expect(published).toContain("ListModelLocations")
-    expect(configured.length).toBeGreaterThanOrEqual(2)
-  })
-
-  it("validates the drafter method of an added model still downloading against its declared repository file", async () => {
-    const configured: LocalModelsConfiguration[] = []
-    const requests: string[] = []
-    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const custom = yield* makeTestCustomModels(customModelsConfig({
-        drafters: { [addedId]: { _tag: "Reference", reference: drafterReference, method: { _tag: "DFlash" } } },
       }))
-      const layer = CustomModelReconcilerLive.pipe(Layer.provide(Layer.mergeAll(
-        Layer.succeed(CustomModels, custom),
-        Layer.succeed(ModelLocations, {
-          environment: { platform: "linux", env: {}, home: "/h" },
-          resolve: Effect.succeed([]),
-          list: () => Effect.succeed([]),
-        }),
-        Layer.succeed(IcnLocalModels, {
-          configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
-        } as never),
-        Layer.succeed(IcnCandidates, {
-          drafters: (request: { readonly _tag: string }) => listedDrafters(Effect.sync(() => {
-            requests.push(request._tag)
-            return request._tag === "Model" ? [] : [{
-              category: "CatalogDrafter",
-              reference: drafterReference,
-              name: "Magnitude DFlash for Qwen3.6 35B-A3B",
-              label: "Magnitude DFlash",
-              lineage: "Lineage",
-              method: Option.some({ _tag: "DFlash" }),
-              automatic: true,
-              onThisComputer: false,
-              sizeBytes: 1,
-              verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: 1 },
-            }]
-          })),
-        } as never),
-        Layer.succeed(ModelSlotController, {
-          state: Effect.succeed({ slots: {
-            primary: { _tag: "Unassigned", slotId: "primary" },
-            secondary: { _tag: "Unassigned", slotId: "secondary" },
-          } }),
-          updateModelSlot: () => Effect.void,
-        } as never),
-        Layer.succeed(AcnChanges, { publish: () => Effect.void, stream: Stream.empty } as never),
-      )))
-      yield* Effect.flatMap(CustomModelReconciler, (reconciler) => reconciler.push.pipe(Effect.andThen(Effect.sleep("50 millis"))))
-        .pipe(Effect.provide(layer))
-    })))
-    expect(requests.slice(0, 2)).toEqual(["Model", "Candidate"])
-    expect(configured[0]!.drafters).toEqual([{
-      modelId: addedId,
-      drafter: { _tag: "Reference", method: { _tag: "DFlash" }, reference: drafterReference },
-    }])
+    const first = recorded.configured[0]!
+    expect(first.roots).toEqual([
+      { kind: "HuggingFaceCache", path: "/h/.cache/huggingface/hub", enabled: true },
+      { kind: "Folder", path: "/models", enabled: true },
+    ])
+    expect(first.added).toEqual([
+      { repository: "owner/model-GGUF", path: "model-Q4_K_M.gguf", revision: "c0ffee", projector: Option.none() },
+    ])
+    // The engine works out a drafter's method from its file; none is sent.
+    expect(first.drafters).toEqual([{ modelId: foundId, drafter: { _tag: "Reference", reference: drafterReference } }])
+    expect(first.hidden).toEqual([])
+    expect(recorded.configured.at(-1)!.hidden).toEqual([foundId])
+    expect(recorded.cleared).toEqual(["primary"])
+    expect(recorded.published).toContain("ListModelLocations")
   })
 
-  it("delivers a chosen drafter right after a restart, while ICN can't list candidates", async () => {
-    const configured: LocalModelsConfiguration[] = []
-    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const custom = yield* makeTestCustomModels(customModelsConfig())
-      const layer = CustomModelReconcilerLive.pipe(Layer.provide(Layer.mergeAll(
-        Layer.succeed(CustomModels, custom),
-        Layer.succeed(ModelLocations, {
-          environment: { platform: "linux", env: {}, home: "/h" },
-          resolve: Effect.succeed([]),
-          list: () => Effect.succeed([]),
-        }),
-        Layer.succeed(IcnLocalModels, {
-          configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
-        } as never),
-        Layer.succeed(IcnCandidates, { drafters: () => listedDrafters(Effect.fail(new IcnOffline())) } as never),
-        Layer.succeed(ModelSlotController, {
-          state: Effect.succeed({ slots: {
-            primary: { _tag: "Unassigned", slotId: "primary" },
-            secondary: { _tag: "Unassigned", slotId: "secondary" },
-          } }),
-          updateModelSlot: () => Effect.void,
-        } as never),
-        Layer.succeed(AcnChanges, { publish: () => Effect.void, stream: Stream.empty } as never),
-      )))
-      yield* Effect.flatMap(CustomModelReconciler, (reconciler) => reconciler.push).pipe(Effect.provide(layer))
-    })))
-    expect(configured[0]!.drafters).toEqual([{
-      modelId: foundId,
-      drafter: { _tag: "Reference", method: { _tag: "DFlash" }, reference: drafterReference },
-    }])
+  it("sends no drafter for automatic choice and None for none", async () => {
+    const recorded = await reconciling(customModelsConfig({ drafters: { [localId]: "none" } }), (reconciler) => reconciler.push)
+    expect(recorded.configured[0]!.drafters).toEqual([{ modelId: localId, drafter: { _tag: "None" } }])
   })
 
   it("delivers a hidden external copy of a catalog model to ICN at start, as after a restart", async () => {
     const alias = "hf:openbmb/MiniCPM5-1B-GGUF/MiniCPM5-1B-Q4_K_M.gguf"
-    const configured: LocalModelsConfiguration[] = []
-    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const custom = yield* makeTestCustomModels(customModelsConfig({ drafters: {}, hidden: [alias] as never }))
-      const layer = CustomModelReconcilerLive.pipe(Layer.provide(Layer.mergeAll(
-        Layer.succeed(CustomModels, custom),
-        Layer.succeed(ModelLocations, {
-          environment: { platform: "linux", env: {}, home: "/h" },
-          resolve: Effect.succeed([]),
-          list: () => Effect.succeed([]),
-        }),
-        Layer.succeed(IcnLocalModels, {
-          configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
-        } as never),
-        Layer.succeed(IcnCandidates, { drafters: () => listedDrafters(Effect.succeed([])) } as never),
-        Layer.succeed(ModelSlotController, {
-          state: Effect.succeed({ slots: {
-            primary: { _tag: "Unassigned", slotId: "primary" },
-            secondary: { _tag: "Unassigned", slotId: "secondary" },
-          } }),
-          updateModelSlot: () => Effect.void,
-        } as never),
-        Layer.succeed(AcnChanges, { publish: () => Effect.void, stream: Stream.empty } as never),
-      )))
-      yield* Effect.flatMap(CustomModelReconciler, () => Effect.sleep("50 millis")).pipe(Effect.provide(layer))
-    })))
-    expect(configured[0]!.hidden).toEqual([alias])
+    const recorded = await reconciling(customModelsConfig({ drafters: {}, hidden: [alias] }), () => Effect.sleep("50 millis"))
+    expect(recorded.configured[0]!.hidden).toEqual([alias])
   })
 })

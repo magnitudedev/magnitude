@@ -11,8 +11,10 @@ two places:
   found model without touching its files. Models added from Hugging Face can't be hidden;
   `catalog remove` removes them.
 
-Model IDs are `hf:<owner>/<repo>/<file>` when a model has a Hugging Face identity and
-`local:<header digest>` otherwise. The same bytes found in two places are one model.
+Model IDs are `hf:<owner>/<repo>/<file>` for a model added from Hugging Face or found in the Hugging
+Face cache, and `local:<name>-<quant>:<hash>` otherwise, such as
+`local:gemma-4-12b-instruct-q8_0:41ad09c2e7f3`. Only the hash identifies a `local:` model; the name
+part is for reading and may change. Each copy's ID comes from that copy alone.
 
 ## Find and add a model
 

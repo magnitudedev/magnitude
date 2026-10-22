@@ -1,11 +1,11 @@
-//! Custom models: every non-catalog model found in the configured locations or declared by ACN,
-//! with one identity per content, an origin that decides who owns its files, and a serving
-//! configuration that includes its attached drafter.
+//! Custom models: every non-catalog model found in the configured locations or added by ACN,
+//! with an identity each copy has on its own, an origin that decides who owns its files, and a
+//! serving configuration that includes its attached drafter.
 //!
-//! Identity is `hf:<owner>/<repository>/<selector>` when any occurrence knows its Hugging Face
-//! file, else `local:<header digest>`. Occurrences with the same header digest and primary size
-//! are the same model wherever they are; the managed store, then the Hugging Face cache, LM
-//! Studio, llama.cpp, Ollama and folders represent it in that order.
+//! A copy's identity is `hf:<owner>/<repository>/<first shard>` when its location records its
+//! Hub origin, else `local:<label>:<hash>` (see `copy_model_id`). Copies with the same identity
+//! and bytes are one model, represented by the managed store, then the Hugging Face cache, LM
+//! Studio, llama.cpp, Ollama and folders, in that order.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -15,13 +15,13 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use magnitude_service_contracts::models::{
-    AttachedDrafter, AttachedDrafterState, CatalogPackageRemover, CatalogPackageRole, CustomModel,
-    CustomModelCatalogAttribution, CustomModelDeclaration, CustomModelDeclarationOrigin,
-    CustomModelFile, CustomModelOrigin, CustomModelState, DrafterCandidate, DrafterChoice,
-    DrafterPruning, DrafterReference, EffectiveModel, FoundSource, HuggingFaceArtifactSelector,
-    HuggingFaceRepositoryId, InstalledCatalogAttribution, InstalledModelPackage,
-    KnownUnsupportedReason, LocalModelDigest, LocalModelRemoval, LocalModels,
-    LocalModelsConfiguration, LocalModelsResponse, ModelDomainInvalidation, ModelFailure,
+    AddedModel, AttachedDrafter, AttachedDrafterState, CatalogPackageRemover, CatalogPackageRole,
+    CustomModel, CustomModelCatalogAttribution, CustomModelFile, CustomModelOrigin,
+    CustomModelState, DrafterCandidate, DrafterChoice, DrafterPruning, DrafterReference,
+    DrafterVerdict, EffectiveModel, FoundSource, HuggingFaceArtifactSelector,
+    HuggingFaceRepositoryId,
+    InstalledCatalogAttribution, InstalledModelPackage, KnownUnsupportedReason, LocalModelRemoval,
+    LocalModels, LocalModelsConfiguration, LocalModelsResponse, ModelDomainInvalidation, ModelFailure,
     ModelFileRole, ModelId, ModelInstallationOwnership, ModelPackage, ModelPackageId,
     ModelPackageInstallationOrigin, ModelServingConfiguration, PackageValidation,
     RecommendableModelCatalog, ResolvedModelInstallation, ServableModelBundle, ServingProfile,
@@ -31,7 +31,6 @@ use magnitude_service_contracts::{
     ExternalOrigin, HubFile, InventoryError, ModelLocation, ModelSource,
 };
 
-use crate::candidate_files::RecognizedArchitectures;
 use crate::catalog_models::catalog_id;
 use crate::gguf::{GgufBaseModel, GgufRole};
 use crate::inventory::{
@@ -61,12 +60,14 @@ pub struct CustomModelFacts<'a> {
 
 /// A custom model's lineage hint, license, its automatic drafter candidates (every candidate the
 /// engine binds, in the order automatic choice takes them, the first being the recommended one),
-/// and the catalog models it matches, whose drafters it may use.
+/// the catalog models it matches, whose drafters it may use, and the drafter file its
+/// configuration chooses by reference, with the engine's verdict on it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CustomModelEnrichmentResult {
     pub variant_of: Option<ModelId>,
     pub drafters: Vec<DrafterCandidate>,
     pub catalog_drafters: Vec<ModelId>,
+    pub chosen: Option<DrafterCandidate>,
     pub license: Option<String>,
 }
 
@@ -74,6 +75,15 @@ impl CustomModelEnrichmentResult {
     #[must_use]
     pub fn recommended_drafter(&self) -> Option<&DrafterCandidate> {
         self.drafters.first()
+    }
+
+    /// The engine's verdict on `reference` for this model, when it is worked out.
+    fn verdict(&self, reference: &DrafterReference) -> Option<&DrafterVerdict> {
+        self.drafters
+            .iter()
+            .chain(&self.chosen)
+            .find(|candidate| candidate.reference == *reference)
+            .map(|candidate| &candidate.verdict)
     }
 }
 
@@ -271,8 +281,7 @@ impl ModelDomainResolver {
             &configuration,
             &self.catalog,
             enrichment.as_ref(),
-            &self.inventory.config.root,
-            &self.inventory.config.architectures,
+            &self.inventory,
             &catalog_drafters,
         );
         self.upstream.annotate(
@@ -281,7 +290,7 @@ impl ModelDomainResolver {
                 .iter_mut()
                 .chain(&mut projection.hidden)
                 .map(|projected| &mut projected.model),
-            &configuration.declarations,
+            &configuration.added,
         );
         projection.revision = installed.revision + self.local.generation.load(Ordering::Acquire);
         projection.reconciliation_complete = installed.reconciliation_complete;
@@ -571,20 +580,28 @@ struct ProjectedModel {
     awaited_drafter: Option<ModelPackageId>,
 }
 
+/// The Hub file a copy in a location that records its Hub origin (the Hugging Face cache,
+/// Magnitude's store) is, at its commit.
 #[derive(Clone)]
 struct HubIdentity {
     file: HubFile,
-    commit: Option<String>,
+    commit: String,
     current: bool,
 }
 
-/// One observed occurrence of a package, with what identity needs from it. `lineage_repository` is
-/// the Hub repository a location names without giving the file its identity: an Ollama `hf.co`
-/// pull's, which serves lineage and drafter matching only.
+/// One observed occurrence of a package, with what identity needs from it. `id` is the copy's own
+/// identity (see `copy_model_id`). `named` is the Hub file the copy is presented as: its Hub
+/// identity's, else the one LM Studio's or llama.cpp's layout names, which never identifies it.
+/// `lineage_repository` is the Hub repository the copy comes from, for lineage and drafter
+/// matching only: its Hub identity's, else one its location names without recording the file's
+/// origin (an LM Studio publisher folder, a llama.cpp manifest or file name, an Ollama `hf.co`
+/// pull).
 struct Occurrence<'a> {
     record: &'a InstalledPackageRecord,
     evidence: Option<&'a PrimaryEvidence>,
+    id: Option<ModelId>,
     hub: Option<HubIdentity>,
+    named: Option<HubFile>,
     lineage_repository: Option<String>,
     ollama_name: Option<&'a str>,
     base: PathBuf,
@@ -598,8 +615,7 @@ impl Occurrence<'_> {
         self.record.installed.origin
     }
 
-    /// The same bytes, wherever they are: the model's `local:` digest and its primary file's size.
-    /// A model without a Hugging Face identity is identified by the same digest.
+    /// The same bytes, wherever they are: the model's content digest and its primary file's size.
     fn content_key(&self) -> Option<(String, u64)> {
         self.evidence
             .and_then(|evidence| evidence.local_digest.clone())
@@ -615,8 +631,7 @@ impl Occurrence<'_> {
             ModelPackageInstallationOrigin::Folder => Some(FoundSource::Folder {
                 path: self.base.clone(),
             }),
-            ModelPackageInstallationOrigin::Magnitude
-            | ModelPackageInstallationOrigin::Imported => None,
+            ModelPackageInstallationOrigin::Magnitude => None,
         }
     }
 
@@ -685,7 +700,7 @@ fn occurrence<'a>(
         .map(|component| component.as_os_str().to_str())
         .collect::<Option<Vec<_>>>()
         .map(|parts| parts.join("/"));
-    let (hub, lineage_repository, ollama_name) =
+    let (hub, named, lineage_repository, ollama_name) =
         match (&record.model.location, &record.model.source) {
             (
                 ModelLocation::MagnitudeCache { .. } | ModelLocation::HuggingFaceCache { .. },
@@ -695,20 +710,23 @@ fn occurrence<'a>(
                     commit,
                     ..
                 },
-            ) => (
-                selector
+            ) => {
+                let hub = selector
                     .as_deref()
                     .and_then(|selector| hub_file(repository, selector))
                     .map(|file| HubIdentity {
                         file,
-                        commit: Some(commit.clone()),
+                        commit: commit.clone(),
                         current: requested_revision == "main",
-                    }),
-                None,
-                None,
-            ),
-            // An Ollama model keeps its `local:` identity: its `hf.co` repository, and the repository
-            // file with its bytes once resolved, serve lineage and drafter matching only.
+                    });
+                let named = hub.as_ref().map(|hub| hub.file.clone());
+                let lineage = named.as_ref().map(|file| file.repository.clone());
+                (hub, named, lineage, None)
+            }
+            // A model in Ollama, LM Studio or llama.cpp outside its hub layout keeps its `local:`
+            // identity: a repository its location names (an `hf.co` pull's, a publisher folder's,
+            // a manifest's) serves lineage and drafter matching only, and LM Studio's and
+            // llama.cpp's Hub file names the model.
             (
                 ModelLocation::External {
                     origin: ExternalOrigin::Ollama { name, hub },
@@ -717,36 +735,32 @@ fn occurrence<'a>(
                 _,
             ) => (
                 None,
+                None,
                 hub.as_ref()
                     .map(|file| file.repository.clone())
                     .or_else(|| ollama_hub_repository(name)),
                 Some(name.as_str()),
             ),
-            (ModelLocation::External { origin, .. }, _) => {
-                let hub = match origin {
-                    ExternalOrigin::LmStudio { hub } | ExternalOrigin::LlamaCpp { hub } => {
-                        hub.as_ref()
-                    }
-                    ExternalOrigin::Ollama { .. }
-                    | ExternalOrigin::Folder
-                    | ExternalOrigin::Imported => None,
-                };
-                (
-                    hub.map(|file| HubIdentity {
-                        file: file.clone(),
-                        commit: None,
-                        current: false,
-                    }),
-                    None,
-                    None,
-                )
-            }
-            _ => (None, None, None),
+            (
+                ModelLocation::External {
+                    origin: ExternalOrigin::LmStudio { hub } | ExternalOrigin::LlamaCpp { hub },
+                    ..
+                },
+                _,
+            ) => (
+                None,
+                hub.clone(),
+                hub.as_ref().map(|file| file.repository.clone()),
+                None,
+            ),
+            _ => (None, None, None, None),
         };
     Some(Occurrence {
         record,
         evidence: record.primary.as_ref(),
+        id: record.model_id(),
         hub,
+        named,
         lineage_repository,
         ollama_name,
         primary: base.join(&primary_file.path),
@@ -787,92 +801,42 @@ fn occurrence_rank(occurrence: &Occurrence<'_>) -> (u8, bool, std::cmp::Reverse<
     )
 }
 
-/// Occurrences of one content, best first.
-struct ContentGroup<'a> {
+/// The copies of one model with the same bytes, best first.
+struct CopyGroup<'a> {
     digest: String,
     occurrences: Vec<&'a Occurrence<'a>>,
 }
 
-impl<'a> ContentGroup<'a> {
+impl<'a> CopyGroup<'a> {
     fn best(&self) -> &'a Occurrence<'a> {
         self.occurrences[0]
     }
 
-    fn hub(&self) -> Option<&'a HubFile> {
+    /// The Hub file the model is presented as (see [`Occurrence::named`]).
+    fn named(&self) -> Option<&'a HubFile> {
         self.occurrences
             .iter()
-            .find_map(|occurrence| occurrence.hub.as_ref().map(|identity| &identity.file))
+            .find_map(|occurrence| occurrence.named.as_ref())
     }
 
-    /// The Hub repository lineage and drafter matching use: the identity's, else one a location
-    /// names (an Ollama `hf.co` pull's).
+    /// The Hub repository lineage and drafter matching use.
     fn lineage_repository(&self) -> Option<String> {
-        self.hub().map(|file| file.repository.clone()).or_else(|| {
-            self.occurrences
-                .iter()
-                .find_map(|occurrence| occurrence.lineage_repository.clone())
-        })
+        self.occurrences
+            .iter()
+            .find_map(|occurrence| occurrence.lineage_repository.clone())
     }
 
-    fn computed_id(&self) -> Option<ModelId> {
-        match self.hub() {
-            Some(file) => Some(ModelId::hugging_face(
-                &HuggingFaceRepositoryId::new(file.repository.clone()).ok()?,
-                &HuggingFaceArtifactSelector::new(file.selector.clone()).ok()?,
-            )),
-            None => Some(ModelId::local(
-                &LocalModelDigest::new(self.digest.clone()).ok()?,
-            )),
-        }
-    }
-
-    fn matches(&self, declaration: &CustomModelDeclaration) -> bool {
-        let Some(target) = declaration.target.first() else {
-            return false;
-        };
-        match &declaration.origin {
-            CustomModelDeclarationOrigin::Added { repository, commit } => {
-                self.occurrences.iter().any(|occurrence| {
-                    occurrence.hub.as_ref().is_some_and(|identity| {
-                        identity.file.repository == repository.as_str()
-                            && identity.file.selector == *target
-                            && identity.commit.as_deref() == Some(commit.as_str())
-                    })
+    /// The added model whose pinned commit these copies are.
+    fn added<'d>(&self, added: &'d [AddedModel]) -> Option<&'d AddedModel> {
+        added.iter().find(|added| {
+            self.occurrences.iter().any(|occurrence| {
+                occurrence.hub.as_ref().is_some_and(|identity| {
+                    identity.file.repository == added.repository.as_str()
+                        && identity.file.selector == added.path.as_str()
+                        && identity.commit == added.revision
                 })
-            }
-            CustomModelDeclarationOrigin::Imported { .. } => self
-                .occurrences
-                .iter()
-                .any(|occurrence| same_file(&occurrence.primary, Path::new(target))),
-        }
-    }
-
-    /// The declaration that names this content: an added model's, else an imported file's while
-    /// no location Magnitude scans holds the same bytes. Importing bytes already found elsewhere
-    /// adds one more location of that model and changes neither its identity nor its origin.
-    fn declaration<'d>(
-        &self,
-        declarations: &'d [CustomModelDeclaration],
-    ) -> Option<&'d CustomModelDeclaration> {
-        let matching = || {
-            declarations
-                .iter()
-                .filter(|declaration| self.matches(declaration))
-        };
-        matching()
-            .find(|declaration| {
-                matches!(
-                    declaration.origin,
-                    CustomModelDeclarationOrigin::Added { .. }
-                )
             })
-            .or_else(|| {
-                let found = self
-                    .occurrences
-                    .iter()
-                    .any(|occurrence| occurrence.found_source().is_some());
-                matching().find(|_| !found)
-            })
+        })
     }
 }
 
@@ -909,10 +873,11 @@ fn project(
     configuration: &LocalModelsConfiguration,
     catalog: &RecommendableModelCatalog,
     enrichment: &dyn CustomModelEnrichment,
-    managed_root: &Path,
-    architectures: &RecognizedArchitectures,
+    inventory: &ManagedModelStore,
     catalog_drafters: &CatalogDrafterRevisions,
 ) -> LocalProjection {
+    let managed_root = inventory.config.root.as_path();
+    let architectures = &inventory.config.architectures;
     let occurrences = snapshot
         .records
         .values()
@@ -947,20 +912,21 @@ fn project(
 
     let mut projection = LocalProjection::default();
     let mut unsupported_paths = BTreeSet::new();
-    let mut groups = BTreeMap::<(String, u64), Vec<&Occurrence<'_>>>::new();
+    let mut groups = BTreeMap::<(ModelId, String, u64), Vec<&Occurrence<'_>>>::new();
     for occurrence in &occurrences {
-        match (occurrence.evidence, occurrence.content_key()) {
-            (Some(evidence), Some(key)) => {
+        match (occurrence.evidence, &occurrence.id, occurrence.content_key()) {
+            (Some(evidence), Some(id), Some((digest, size))) => {
                 if matches!(evidence.role(architectures), GgufRole::Model { .. })
-                    && !catalog_content.contains(&key)
+                    && !catalog_content.contains(&(digest.clone(), size))
                 {
-                    groups.entry(key).or_default().push(occurrence);
+                    groups
+                        .entry((id.clone(), digest, size))
+                        .or_default()
+                        .push(occurrence);
                 }
             }
             _ => {
-                if let Some(unsupported) =
-                    unsupported_model(occurrence, configuration, &mut unsupported_paths)
-                {
+                if let Some(unsupported) = unsupported_model(occurrence, &mut unsupported_paths) {
                     projection.unsupported.push(unsupported);
                 }
             }
@@ -972,35 +938,24 @@ fn project(
         }
     }
 
-    // One model per identity: the declared one, else the best-represented content.
-    let mut identified =
-        BTreeMap::<ModelId, (Option<&CustomModelDeclaration>, ContentGroup)>::new();
-    for ((digest, _), mut members) in groups {
+    // One model per identity: the added model's pinned commit, else the best-represented bytes
+    // (an `hf:` file at two commits is one model).
+    let mut identified = BTreeMap::<ModelId, (Option<&AddedModel>, CopyGroup)>::new();
+    for ((id, digest, _), mut members) in groups {
         members.sort_by_key(|occurrence| occurrence_rank(occurrence));
-        let group = ContentGroup {
+        let group = CopyGroup {
             digest,
             occurrences: members,
         };
-        let declaration = group.declaration(&configuration.declarations);
-        let Some(id) = declaration
-            .map(|declaration| declaration.model_id.clone())
-            .or_else(|| group.computed_id())
-        else {
-            continue;
-        };
-        let rank = |declared: bool, group: &ContentGroup| {
-            (
-                !declared,
-                occurrence_rank(group.best()),
-                group.digest.clone(),
-            )
+        let added = group.added(&configuration.added);
+        let rank = |added: bool, group: &CopyGroup| {
+            (!added, occurrence_rank(group.best()), group.digest.clone())
         };
         match identified.get(&id) {
-            Some((existing_declaration, existing))
-                if rank(existing_declaration.is_some(), existing)
-                    <= rank(declaration.is_some(), &group) => {}
+            Some((existing_added, existing))
+                if rank(existing_added.is_some(), existing) <= rank(added.is_some(), &group) => {}
             _ => {
-                identified.insert(id, (declaration, group));
+                identified.insert(id, (added, group));
             }
         }
     }
@@ -1014,11 +969,16 @@ fn project(
         occurrences: &occurrences,
         present: &present,
     };
-    for (model_id, (declaration, group)) in identified {
-        let Some(projected) = context.model(model_id, declaration, &group) else {
+    for (model_id, (added, group)) in identified {
+        // Hidden by its ID, or as an external copy of a catalog model the configuration hides.
+        let hidden_copy = group
+            .occurrences
+            .iter()
+            .any(|occurrence| inventory.hidden_occurrence(occurrence.record));
+        let Some(projected) = context.model(model_id, added, &group) else {
             continue;
         };
-        if hidden.contains(&projected.model.model_id) {
+        if hidden_copy || hidden.contains(&projected.model.model_id) {
             projection.hidden.push(projected);
         } else {
             projection.models.push(projected);
@@ -1030,11 +990,11 @@ fn project(
         .chain(&projection.hidden)
         .map(|projected| projected.model.model_id.clone())
         .collect::<BTreeSet<_>>();
-    for declaration in &configuration.declarations {
-        if listed.contains(&declaration.model_id) {
+    for added in &configuration.added {
+        if listed.contains(&added.model_id()) {
             continue;
         }
-        let Some(projected) = context.pending_added(declaration) else {
+        let Some(projected) = context.pending_added(added) else {
             continue;
         };
         if hidden.contains(&projected.model.model_id) {
@@ -1048,27 +1008,10 @@ fn project(
 
 fn unsupported_model(
     occurrence: &Occurrence<'_>,
-    configuration: &LocalModelsConfiguration,
     seen: &mut BTreeSet<PathBuf>,
 ) -> Option<UnsupportedLocalModel> {
-    let declared =
-        configuration
-            .declarations
-            .iter()
-            .find_map(|declaration| match &declaration.origin {
-                CustomModelDeclarationOrigin::Imported { path }
-                    if declaration.target.first().is_some_and(|target| {
-                        same_file(&occurrence.primary, Path::new(target))
-                    }) =>
-                {
-                    Some(path.clone())
-                }
-                _ => None,
-            });
-    let origin = match (declared, occurrence.found_source()) {
-        (Some(path), _) => CustomModelOrigin::Imported { path },
-        (None, Some(source)) => CustomModelOrigin::Found { source },
-        (None, None) => return None,
+    let origin = CustomModelOrigin::Found {
+        source: occurrence.found_source()?,
     };
     if !seen.insert(occurrence.primary.clone()) {
         return None;
@@ -1130,11 +1073,11 @@ impl ModelContext<'_> {
     fn model(
         &self,
         model_id: ModelId,
-        declaration: Option<&CustomModelDeclaration>,
-        group: &ContentGroup<'_>,
+        added: Option<&AddedModel>,
+        group: &CopyGroup<'_>,
     ) -> Option<ProjectedModel> {
         let ModelContext {
-            configuration,
+            configuration: _,
             catalog,
             catalog_drafters,
             enrichment,
@@ -1142,18 +1085,13 @@ impl ModelContext<'_> {
             present,
         } = self;
         let representative = group.best();
-        let origin = match declaration.map(|declaration| &declaration.origin) {
-            Some(CustomModelDeclarationOrigin::Added { repository, commit }) => {
-                CustomModelOrigin::Added {
-                    repository: repository.clone(),
-                    commit: commit.clone(),
-                }
-            }
-            Some(CustomModelDeclarationOrigin::Imported { path }) => {
-                CustomModelOrigin::Imported { path: path.clone() }
-            }
-            // Material only in the managed store without a declaration is no longer a model anyone
-            // added; it is not published.
+        let origin = match added {
+            Some(added) => CustomModelOrigin::Added {
+                repository: added.repository.clone(),
+                commit: added.revision.clone(),
+            },
+            // Material only in the managed store that no added model pins is no longer a model
+            // anyone added; it is not published.
             None => CustomModelOrigin::Found {
                 source: group
                     .occurrences
@@ -1163,7 +1101,7 @@ impl ModelContext<'_> {
         };
         let installed = &representative.record.installed;
         let evidence = representative.evidence?;
-        let hub = group.hub();
+        let hub = group.named();
         let (presented_name, variant_label) = crate::candidate_files::model_presentation(
             &hub.map_or_else(
                 || representative.primary.clone(),
@@ -1183,7 +1121,7 @@ impl ModelContext<'_> {
             origin: &origin,
             display_name: &display_name,
             target: &installed.package,
-            hub: group.hub(),
+            hub,
             ollama_name: group
                 .occurrences
                 .iter()
@@ -1195,21 +1133,11 @@ impl ModelContext<'_> {
         let enriched = enrichment.enrich(&facts);
         let enrichment_known = enrichment.knows(&facts);
 
-        let choice = configuration
-            .drafters
-            .iter()
-            .find(|attachment| attachment.model_id == model_id)
-            .map_or(DrafterChoice::Auto, |attachment| attachment.drafter.clone());
+        let choice = self.choice(&model_id);
         let resolve = |reference: DrafterReference, method: SpeculativeMethod| {
             let content = enrichment.drafter_content(&reference);
-            resolve_drafter(
-                reference,
-                method,
-                content,
-                catalog,
-                catalog_drafters,
-                occurrences,
-            )
+            locate_drafter(reference, content, catalog, catalog_drafters, occurrences)
+                .binding(Ok(method))
         };
         let mut automatic = enriched.drafters.iter().filter_map(|candidate| {
             Some(resolve(
@@ -1218,8 +1146,9 @@ impl ModelContext<'_> {
             ))
         });
         // The drafter packages this model would use whatever its choice, so a turned-off drafter
-        // stays referenced while the model is here: its recommended drafter, and the drafter of
-        // every catalog model it matches, even when a drafter beside it is recommended instead.
+        // stays referenced while the model is here: its recommended drafter, the drafter of every
+        // catalog model it matches, even when a drafter beside it is recommended instead, and the
+        // drafter it chose by reference.
         let separate = |resolved: ResolvedDrafter| match resolved.source? {
             SpeculativeDraftSource::Separate { draft } => Some(draft.id),
             SpeculativeDraftSource::Embedded => None,
@@ -1232,21 +1161,16 @@ impl ModelContext<'_> {
             .into_iter()
             .collect::<Vec<_>>();
         candidate_drafters.extend(enriched.catalog_drafters.iter().filter_map(|model_id| {
-            let method = catalog
-                .models
-                .iter()
-                .find(|definition| catalog_id(definition) == *model_id)
-                .and_then(|definition| match &definition.configuration.bundle {
-                    ServableModelBundle::SpeculativeDecoding { method, .. } => Some(method.clone()),
-                    ServableModelBundle::Standalone { .. } => None,
-                })?;
             separate(resolve(
                 DrafterReference::Catalog {
                     model_id: model_id.clone(),
                 },
-                method,
+                catalog_drafter_method(catalog, model_id)?,
             ))
         }));
+        // A drafter chosen by reference binds with the method the engine works out for it and
+        // this model; until it has, the model has no drafter for now rather than none.
+        let mut chosen_pending = false;
         let drafter = match &choice {
             DrafterChoice::None => None,
             // The first automatic candidate on this computer now, so a recommended drafter that
@@ -1260,15 +1184,27 @@ impl ModelContext<'_> {
                     .find(|next| next.source.is_some())
                     .unwrap_or(recommended)
             }),
-            DrafterChoice::Reference { reference, method } => {
-                Some(resolve(reference.clone(), method.clone()))
+            DrafterChoice::Reference { reference } => {
+                let located = locate_drafter(
+                    reference.clone(),
+                    enrichment.drafter_content(reference),
+                    catalog,
+                    catalog_drafters,
+                    occurrences,
+                );
+                if let Some(SpeculativeDraftSource::Separate { draft }) = &located.source {
+                    candidate_drafters.push(draft.id.clone());
+                }
+                let chosen = located.chosen(chosen_method(reference, catalog, &enriched));
+                chosen_pending = chosen.is_none();
+                chosen
             }
         };
 
         let profile = custom_profile(installed);
-        let speculative = drafter
-            .as_ref()
-            .and_then(|drafter| Some((drafter.source.clone()?, drafter.attached.method.clone())));
+        let speculative = drafter.as_ref().and_then(|drafter| {
+            Some((drafter.source.clone()?, drafter.attached.method.clone()?))
+        });
         let bundle = match speculative {
             Some((draft_source, method)) => ServableModelBundle::SpeculativeDecoding {
                 target: installed.package.clone(),
@@ -1345,8 +1281,9 @@ impl ModelContext<'_> {
             .map(|file| file.size_bytes)
             .sum();
         // Only a model that serves is enriched; one that can't serve has no drafter to await.
-        let drafter_pending =
-            matches!(choice, DrafterChoice::Auto) && !enrichment_known && configuration.is_ok();
+        let drafter_pending = (matches!(choice, DrafterChoice::Auto) && !enrichment_known
+            || chosen_pending)
+            && configuration.is_ok();
         Some(ProjectedModel {
             locations: group
                 .occurrences
@@ -1392,23 +1329,23 @@ impl ModelContext<'_> {
 }
 
 impl ModelContext<'_> {
-    /// An added model whose target is not in the store yet: its row exists from the declaration,
-    /// so its download shows as installation progress, and it cannot be served until it lands.
-    fn pending_added(&self, declaration: &CustomModelDeclaration) -> Option<ProjectedModel> {
-        let CustomModelDeclarationOrigin::Added { repository, commit } = &declaration.origin else {
-            return None;
-        };
-        let primary = declaration.target.first()?;
-        let choice = self
-            .configuration
+    /// The drafter choice the configuration makes for a model; none is automatic.
+    fn choice(&self, model_id: &ModelId) -> DrafterChoice {
+        self.configuration
             .drafters
             .iter()
-            .find(|attachment| attachment.model_id == declaration.model_id)
-            .map_or(DrafterChoice::Auto, |attachment| attachment.drafter.clone());
-        let resolved = match &choice {
-            DrafterChoice::Reference { reference, method } => Some(resolve_drafter(
+            .find(|attachment| attachment.model_id == *model_id)
+            .map_or(DrafterChoice::Auto, |attachment| attachment.drafter.clone())
+    }
+
+    /// An added model whose target is not in the store yet: its row exists from the configuration,
+    /// so its download shows as installation progress, and it cannot be served until it lands.
+    fn pending_added(&self, added: &AddedModel) -> Option<ProjectedModel> {
+        let model_id = added.model_id();
+        let choice = self.choice(&model_id);
+        let located = match &choice {
+            DrafterChoice::Reference { reference } => Some(locate_drafter(
                 reference.clone(),
-                method.clone(),
                 self.enrichment.drafter_content(reference),
                 self.catalog,
                 self.catalog_drafters,
@@ -1417,36 +1354,46 @@ impl ModelContext<'_> {
             DrafterChoice::Auto | DrafterChoice::None => None,
         };
         // The drafter it downloads with its target is in use while the target is still arriving.
-        let awaited_drafter = resolved
+        let awaited_drafter = located
             .as_ref()
-            .and_then(|resolved| match &resolved.source {
+            .and_then(|located| match &located.source {
                 Some(SpeculativeDraftSource::Separate { draft }) => Some(draft.id.clone()),
                 _ => None,
             });
-        let drafter = resolved.map(|resolved| resolved.attached);
+        // Its own verdict on a chosen drafter file waits for its files; a catalog drafter's method
+        // and built-in heads' are known.
+        let drafter = match &choice {
+            DrafterChoice::Reference { reference } => located.and_then(|located| {
+                located.chosen(chosen_method(
+                    reference,
+                    self.catalog,
+                    &CustomModelEnrichmentResult::default(),
+                ))
+            }),
+            DrafterChoice::Auto | DrafterChoice::None => None,
+        }
+        .map(|resolved| resolved.attached);
         let (display_name, variant_label) = crate::candidate_files::model_presentation(
-            Path::new(primary),
-            Some(repository.as_str()),
+            Path::new(added.path.as_str()),
+            Some(added.repository.as_str()),
             None,
             &[],
             None,
         );
         Some(ProjectedModel {
             locations: Vec::new(),
-            lineage_repository: Some(repository.as_str().to_owned()),
+            lineage_repository: Some(added.repository.as_str().to_owned()),
             candidate_drafters: Vec::new(),
             model: CustomModel {
-                model_id: declaration.model_id.clone(),
                 origin: CustomModelOrigin::Added {
-                    repository: repository.clone(),
-                    commit: commit.clone(),
+                    repository: added.repository.clone(),
+                    commit: added.revision.clone(),
                 },
                 display_name,
                 variant_label,
                 variant_of: None,
-                files: declaration
-                    .target
-                    .iter()
+                files: crate::candidate_files::split_set(added.path.as_str())
+                    .into_iter()
                     .map(|path| CustomModelFile {
                         path: PathBuf::from(path),
                         size_bytes: 0,
@@ -1454,8 +1401,8 @@ impl ModelContext<'_> {
                     .collect(),
                 size_bytes: 0,
                 projector: None,
+                drafter_pending: drafter.is_none() && choice != DrafterChoice::None,
                 drafter,
-                drafter_pending: choice == DrafterChoice::Auto,
                 recommended_drafter: None,
                 license: None,
                 profile: ServingProfile {
@@ -1463,10 +1410,11 @@ impl ModelContext<'_> {
                 },
                 state: CustomModelState::NotInstalled,
                 update_commit: None,
+                model_id: model_id.clone(),
             },
             configuration: Err(ModelFailure {
                 code: "model_not_installed".to_owned(),
-                message: format!("{} has not finished downloading", declaration.model_id),
+                message: format!("{model_id} has not finished downloading"),
                 retryable: true,
             }),
             managed_packages: Vec::new(),
@@ -1495,15 +1443,77 @@ struct ResolvedDrafter {
     source: Option<SpeculativeDraftSource>,
 }
 
-fn rejected(
-    reference: DrafterReference,
-    method: SpeculativeMethod,
-    detail: String,
-) -> ResolvedDrafter {
+/// What the engine says a drafter binds with for a model: its method, or why it rejects it.
+type DrafterBinding = Result<SpeculativeMethod, (Vec<UnsupportedReason>, String)>;
+
+impl ResolvedDrafter {
+    /// This located drafter as the engine binds it: with its method, or rejected and unused.
+    fn binding(mut self, binding: DrafterBinding) -> Self {
+        match binding {
+            Ok(method) => self.attached.method = Some(method),
+            Err((reasons, detail)) => {
+                self.attached.state = AttachedDrafterState::Rejected { reasons, detail };
+                self.source = None;
+            }
+        }
+        self
+    }
+
+    /// A chosen drafter as it binds when `binding` is known; one that can't be used for its own
+    /// reasons is shown as it is meanwhile, and any other is not worked out yet.
+    fn chosen(self, binding: Option<DrafterBinding>) -> Option<Self> {
+        match binding {
+            Some(binding) => Some(self.binding(binding)),
+            None => matches!(self.attached.state, AttachedDrafterState::Rejected { .. })
+                .then_some(self),
+        }
+    }
+}
+
+/// The method a catalog model's drafter binds with.
+fn catalog_drafter_method(
+    catalog: &RecommendableModelCatalog,
+    model_id: &ModelId,
+) -> Option<SpeculativeMethod> {
+    catalog
+        .models
+        .iter()
+        .find(|definition| catalog_id(definition) == *model_id)
+        .and_then(|definition| match &definition.configuration.bundle {
+            ServableModelBundle::SpeculativeDecoding { method, .. } => Some(method.clone()),
+            ServableModelBundle::Standalone { .. } => None,
+        })
+}
+
+/// How a drafter chosen by reference binds with a model: built-in heads as MTP, a catalog drafter
+/// with its catalog method, and any other drafter file as the engine's verdict on it for this
+/// model says, once it is worked out. A catalog model without a drafter has none, and
+/// [`locate_drafter`] rejects it.
+fn chosen_method(
+    reference: &DrafterReference,
+    catalog: &RecommendableModelCatalog,
+    enriched: &CustomModelEnrichmentResult,
+) -> Option<DrafterBinding> {
+    match reference {
+        DrafterReference::Embedded => Some(Ok(SpeculativeMethod::Mtp)),
+        DrafterReference::Catalog { model_id } => catalog_drafter_method(catalog, model_id).map(Ok),
+        DrafterReference::HuggingFace { .. } | DrafterReference::Local { .. } => {
+            match enriched.verdict(reference)? {
+                DrafterVerdict::Bound { method, .. } => Some(Ok(method.clone())),
+                DrafterVerdict::Rejected { reasons, detail } => {
+                    Some(Err((reasons.clone(), detail.clone())))
+                }
+                DrafterVerdict::None => None,
+            }
+        }
+    }
+}
+
+fn rejected(reference: DrafterReference, detail: String) -> ResolvedDrafter {
     ResolvedDrafter {
         attached: AttachedDrafter {
             reference,
-            method,
+            method: None,
             state: AttachedDrafterState::Rejected {
                 reasons: vec![UnsupportedReason::Known(
                     KnownUnsupportedReason::TargetMismatch {
@@ -1518,12 +1528,11 @@ fn rejected(
     }
 }
 
-/// Resolves a drafter reference against the files on this computer: the file it names, or any
-/// file holding its bytes (`content`), wherever it is. A drafter that is not here yet leaves the
-/// model serving without one until it is.
-fn resolve_drafter(
+/// Locates a drafter reference among the files on this computer: the file it names, or any file
+/// holding its bytes (`content`), wherever it is. A drafter that is not here yet leaves the model
+/// serving without one until it is. How it binds is [`ResolvedDrafter::binding`].
+fn locate_drafter(
     reference: DrafterReference,
-    method: SpeculativeMethod,
     content: Option<DrafterContent>,
     catalog: &RecommendableModelCatalog,
     catalog_drafters: &CatalogDrafterRevisions,
@@ -1538,13 +1547,11 @@ fn resolve_drafter(
             })
             .min_by_key(|occurrence| occurrence.precedence)
     };
-    let separate = |reference: DrafterReference,
-                    method: SpeculativeMethod,
-                    found: Option<&Occurrence<'_>>| match found {
+    let separate = |reference: DrafterReference, found: Option<&Occurrence<'_>>| match found {
         None => ResolvedDrafter {
             attached: AttachedDrafter {
                 reference,
-                method,
+                method: None,
                 state: AttachedDrafterState::NotInstalled,
                 update_available: false,
             },
@@ -1554,7 +1561,7 @@ fn resolve_drafter(
             Ok(()) => ResolvedDrafter {
                 attached: AttachedDrafter {
                     reference,
-                    method,
+                    method: None,
                     state: AttachedDrafterState::Ready,
                     update_available: false,
                 },
@@ -1565,7 +1572,7 @@ fn resolve_drafter(
             Err(failure) => ResolvedDrafter {
                 attached: AttachedDrafter {
                     reference,
-                    method,
+                    method: None,
                     state: AttachedDrafterState::Rejected {
                         reasons: vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)],
                         detail: failure.message,
@@ -1578,28 +1585,24 @@ fn resolve_drafter(
     };
     // Built-in prediction heads are always present; whether the engine binds them is its drafter
     // verdict for the model's assessment, never decided here.
-    let embedded = |reference: DrafterReference, method: SpeculativeMethod| ResolvedDrafter {
+    let embedded = |reference: DrafterReference| ResolvedDrafter {
         attached: AttachedDrafter {
             reference,
-            method,
+            method: None,
             state: AttachedDrafterState::Ready,
             update_available: false,
         },
         source: Some(SpeculativeDraftSource::Embedded),
     };
     match &reference {
-        DrafterReference::Embedded => embedded(reference, method),
+        DrafterReference::Embedded => embedded(reference),
         DrafterReference::Catalog { model_id } => {
             let Some(definition) = catalog
                 .models
                 .iter()
                 .find(|definition| catalog_id(definition) == *model_id)
             else {
-                return rejected(
-                    reference.clone(),
-                    method,
-                    format!("{model_id} is not in the catalog"),
-                );
+                return rejected(reference.clone(), format!("{model_id} is not in the catalog"));
             };
             match &definition.configuration.bundle {
                 ServableModelBundle::SpeculativeDecoding {
@@ -1620,26 +1623,24 @@ fn resolve_drafter(
                         })
                     };
                     match current {
-                        Some(current) => separate(reference, method, Some(current)),
+                        Some(current) => separate(reference, Some(current)),
                         None => match earlier() {
                             Some(earlier) => {
-                                let mut resolved = separate(reference, method, Some(earlier));
+                                let mut resolved = separate(reference, Some(earlier));
                                 resolved.attached.update_available = true;
                                 resolved
                             }
-                            None => separate(reference, method, None),
+                            None => separate(reference, None),
                         },
                     }
                 }
                 ServableModelBundle::SpeculativeDecoding {
                     draft_source: SpeculativeDraftSource::Embedded,
                     ..
-                } => embedded(reference, method),
-                ServableModelBundle::Standalone { .. } => rejected(
-                    reference.clone(),
-                    method,
-                    format!("{model_id} has no drafter"),
-                ),
+                } => embedded(reference),
+                ServableModelBundle::Standalone { .. } => {
+                    rejected(reference.clone(), format!("{model_id} has no drafter"))
+                }
             }
         }
         DrafterReference::HuggingFace {
@@ -1651,14 +1652,14 @@ fn resolve_drafter(
                 occurrence.hub.as_ref().is_some_and(|identity| {
                     identity.file.repository == repository.as_str()
                         && identity.file.selector == *path
-                        && identity.commit.as_deref() == Some(commit.as_str())
+                        && identity.commit == *commit
                 })
             });
-            separate(reference, method, found)
+            separate(reference, found)
         }
         DrafterReference::Local { path } => {
             let found = holding(None, &|occurrence| same_file(&occurrence.primary, path));
-            separate(reference, method, found)
+            separate(reference, found)
         }
     }
 }
@@ -1877,8 +1878,8 @@ impl LocalModels for ManagedLocalModels {
         })
     }
 
-    /// Deletes only the managed-store copy of an added model. Imported and found models are
-    /// forgotten or hidden through the configuration; their files are never Magnitude's.
+    /// Deletes only the managed-store copy of an added model. Found models are hidden through the
+    /// configuration; their files are never Magnitude's.
     fn remove_local(
         &self,
         model_id: &ModelId,
@@ -1954,8 +1955,8 @@ mod tests {
     use std::time::Duration;
 
     use magnitude_service_contracts::models::{
-        CustomModelDeclaration, DrafterAttachment, DrafterCategory, DrafterLineage, DrafterVerdict,
-        ModelAssessmentSubject, ModelRoot, ModelRootKind, RecommendableModel,
+        DrafterAttachment, DrafterCategory, DrafterLineage, DrafterVerdict, LocalModelLabel, ModelAssessmentSubject, ModelRoot, ModelRootKind, ParsedModelId,
+        RecommendableModel,
     };
     use magnitude_service_contracts::{ContentIdentity, ModelInventory as _};
     use sha2::{Digest, Sha256};
@@ -2084,10 +2085,83 @@ mod tests {
         crate::gguf::inspect(path).unwrap().header_digest
     }
 
+    /// The `local:` ID of a single-file model, from its content digest and header.
     fn local_id(path: &Path) -> ModelId {
-        ModelId::local(
-            &LocalModelDigest::new(crate::gguf::local_model_digest_of(&[path]).unwrap()).unwrap(),
+        let header = crate::gguf::inspect(path).unwrap();
+        crate::gguf::local_model_id(
+            &crate::gguf::local_model_digest_of(&[path]).unwrap(),
+            header.name.as_deref(),
+            header.architecture.as_deref(),
+            header.file_type.as_deref(),
         )
+        .unwrap()
+    }
+
+    /// The same `local:` ID stored with another label, as an earlier label rule wrote it.
+    fn relabeled(id: &ModelId, label: &str) -> ModelId {
+        let ParsedModelId::Local { hash, .. } = id.parsed() else {
+            panic!("{id} is a local: ID");
+        };
+        ModelId::local(&LocalModelLabel::new(label).unwrap(), &hash)
+    }
+
+    fn added(repository: &str, path: &str, revision: &str) -> AddedModel {
+        AddedModel {
+            repository: HuggingFaceRepositoryId::new(repository).unwrap(),
+            path: HuggingFaceArtifactSelector::new(path).unwrap(),
+            revision: revision.to_owned(),
+            projector: None,
+        }
+    }
+
+    /// A drafter the engine binds with `method`.
+    fn bound(reference: DrafterReference, method: SpeculativeMethod) -> DrafterCandidate {
+        DrafterCandidate {
+            category: DrafterCategory::Other,
+            reference,
+            name: "drafter".to_owned(),
+            label: "Chosen".to_owned(),
+            size_bytes: 1,
+            lineage: DrafterLineage::Lineage,
+            verdict: DrafterVerdict::Bound {
+                method: method.clone(),
+                memory_bytes: 1,
+            },
+            automatic: false,
+            on_this_computer: true,
+            method: Some(method),
+        }
+    }
+
+    /// `inner`, with the engine's verdict on the drafter a configuration chooses by reference.
+    struct Judges<E> {
+        inner: E,
+        chosen: DrafterCandidate,
+    }
+
+    impl<E: CustomModelEnrichment> CustomModelEnrichment for Judges<E> {
+        fn enrich(&self, model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult {
+            CustomModelEnrichmentResult {
+                chosen: Some(self.chosen.clone()),
+                ..self.inner.enrich(model)
+            }
+        }
+
+        fn knows(&self, model: &CustomModelFacts<'_>) -> bool {
+            self.inner.knows(model)
+        }
+
+        fn drafter_content(&self, reference: &DrafterReference) -> Option<DrafterContent> {
+            self.inner.drafter_content(reference)
+        }
+    }
+
+    /// Only the engine's verdict on the chosen drafter: it binds with `method`.
+    fn judges(reference: DrafterReference, method: SpeculativeMethod) -> Arc<Judges<NoEnrichment>> {
+        Arc::new(Judges {
+            inner: NoEnrichment,
+            chosen: bound(reference, method),
+        })
     }
 
     fn ids(models: &[CustomModel]) -> Vec<String> {
@@ -2304,8 +2378,11 @@ mod tests {
         assert!(snapshot.join("Shared-Q4_K_M.gguf").is_file());
     }
 
+    /// LM Studio records no Hub origin: a publisher/repository folder is only a hint, so its file
+    /// has its `local:` ID and the folder names the repository its lineage and drafters come from.
     #[tokio::test]
-    async fn lm_studio_publisher_layout_gives_the_hub_identity_and_pairs_its_projector() {
+    async fn lm_studio_publisher_layout_gives_a_local_id_with_the_repository_as_lineage_and_pairs_its_projector()
+     {
         let fixture = Fixture::new().await;
         let lm_studio = fixture.root.join("lmstudio");
         let repository = lm_studio.join("lmstudio-community/Vision-GGUF");
@@ -2317,13 +2394,29 @@ mod tests {
             .apply(roots(vec![root(ModelRootKind::LmStudio, &lm_studio)]))
             .await;
 
+        let vision_id = local_id(&repository.join("Vision-Q4_K_M.gguf"));
         let vision = listed
             .models
             .iter()
-            .find(|model| {
-                model.model_id.as_str() == "hf:lmstudio-community/Vision-GGUF/Vision-Q4_K_M.gguf"
-            })
-            .expect("publisher/repository layout gives the hub identity");
+            .find(|model| model.model_id.as_str() == vision_id.as_str())
+            .expect("a publisher/repository file has its local: ID");
+        assert_eq!(
+            fixture
+                .resolver
+                .custom_model_lineage_repository(&vision_id)
+                .unwrap()
+                .as_deref(),
+            Some("lmstudio-community/Vision-GGUF")
+        );
+        let loose = local_id(&lm_studio.join("loose.gguf"));
+        assert_eq!(
+            fixture
+                .resolver
+                .custom_model_lineage_repository(&loose)
+                .unwrap(),
+            None,
+            "a file outside the layout names no repository"
+        );
         assert_eq!(
             vision.origin,
             CustomModelOrigin::Found {
@@ -2335,14 +2428,18 @@ mod tests {
             Some(repository.join("mmproj-Vision-F16.gguf"))
         );
         assert_eq!(vision.files[0].path, repository.join("Vision-Q4_K_M.gguf"));
-        assert!(
-            ids(&listed.models).contains(&local_id(&lm_studio.join("loose.gguf")).to_string()),
-            "a file outside the layout has no hub identity"
-        );
+        let mut listed_ids = ids(&listed.models);
+        listed_ids.sort();
+        let mut expected = vec![vision_id.to_string(), loose.to_string()];
+        expected.sort();
+        assert_eq!(listed_ids, expected);
     }
 
+    /// llama.cpp's flat cache records no Hub origin: its files have `local:` IDs, and a manifest
+    /// or the `<owner>_<repository>_<file>` naming convention names only the repository lineage
+    /// comes from. A manifest still pairs the projector.
     #[tokio::test]
-    async fn llama_cpp_names_parse_by_manifest_or_convention() {
+    async fn llama_cpp_flat_files_have_local_ids_with_lineage_from_manifest_or_name() {
         let fixture = Fixture::new().await;
         let llama = fixture.root.join("llama.cpp");
         write_model(
@@ -2378,38 +2475,53 @@ mod tests {
             .apply(roots(vec![root(ModelRootKind::LlamaCpp, &llama)]))
             .await;
 
-        let listed_ids = ids(&listed.models);
-        assert!(
-            listed_ids.contains(&"hf:ggml-org/gemma_3-1b_it/gemma-3-1b-it-Q4_K_M.gguf".to_owned())
-        );
-        assert!(listed_ids.contains(&"hf:bartowski/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf".to_owned()));
-        assert!(listed_ids.contains(&local_id(&llama.join("plain-name.gguf")).to_string()));
-        assert_eq!(listed.models.len(), 3);
+        let gemma_id = local_id(&llama.join("ggml-org_gemma_3-1b_it_gemma-3-1b-it-Q4_K_M.gguf"));
+        let qwen_id = local_id(&llama.join("bartowski_Qwen3-8B-GGUF_Qwen3-8B-Q4_K_M.gguf"));
+        let plain_id = local_id(&llama.join("plain-name.gguf"));
+        let mut listed_ids = ids(&listed.models);
+        listed_ids.sort();
+        let mut expected = vec![
+            gemma_id.to_string(),
+            qwen_id.to_string(),
+            plain_id.to_string(),
+        ];
+        expected.sort();
+        assert_eq!(listed_ids, expected);
+        let lineage = |id: &ModelId| {
+            fixture
+                .resolver
+                .custom_model_lineage_repository(id)
+                .unwrap()
+        };
+        assert_eq!(lineage(&gemma_id).as_deref(), Some("ggml-org/gemma_3-1b_it"));
+        assert_eq!(lineage(&qwen_id).as_deref(), Some("bartowski/Qwen3-8B-GGUF"));
+        assert_eq!(lineage(&plain_id), None);
         let gemma = listed
             .models
             .iter()
-            .find(|model| model.model_id.as_str().contains("gemma"))
+            .find(|model| model.model_id == gemma_id)
             .unwrap();
         assert_eq!(
             gemma.projector.as_ref().map(|file| file.path.clone()),
             Some(llama.join("ggml-org_gemma_3-1b_it_mmproj-model-f16.gguf")),
             "the manifest pairs the projector although the directory holds two"
         );
-        assert_eq!(gemma.display_name, "gemma 3 1b it");
-        assert_eq!(gemma.variant_label.as_deref(), Some("Q4_K_M"));
         let qwen = listed
             .models
             .iter()
-            .find(|model| model.model_id.as_str().contains("Qwen3-8B"))
+            .find(|model| model.model_id == qwen_id)
             .unwrap();
-        assert_eq!(qwen.display_name, "Qwen3 8B");
-        assert_eq!(qwen.variant_label.as_deref(), Some("Q4_K_M"));
+        assert_eq!(
+            (gemma.display_name.as_str(), qwen.display_name.as_str()),
+            ("gemma 3 1b it", "Qwen3 8B"),
+            "named after the Hub file their manifest or name gives, which never identifies them"
+        );
     }
 
     /// Current llama.cpp writes `-hf` downloads in the Hugging Face hub layout: in `LLAMA_CACHE`
     /// itself or its `hub` folder they are llama.cpp's, keep their Hub identity and commit, and are
-    /// never also listed as flat llama.cpp files. The same layout in the shared Hugging Face cache
-    /// stays the Hugging Face cache's.
+    /// never also listed as flat llama.cpp files, which have `local:` IDs. The same layout in the
+    /// shared Hugging Face cache stays the Hugging Face cache's.
     #[tokio::test]
     async fn llama_cpp_hub_layout_downloads_are_llama_cpp_models_with_their_hub_identity() {
         let fixture = Fixture::new().await;
@@ -2459,7 +2571,9 @@ mod tests {
         assert_eq!(source("hf:owner/Model-GGUF/Model-Q4_K_M.gguf"), llama_cpp);
         assert_eq!(source("hf:owner/Other-GGUF/Other-Q8_0.gguf"), llama_cpp);
         assert_eq!(
-            source("hf:bartowski/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf"),
+            source(
+                local_id(&llama.join("bartowski_Qwen3-8B-GGUF_Qwen3-8B-Q4_K_M.gguf")).as_str()
+            ),
             llama_cpp
         );
         assert_eq!(
@@ -2919,15 +3033,7 @@ mod tests {
         );
         let id: ModelId = "hf:owner/Model-GGUF/Model-Q4_K_M.gguf".parse().unwrap();
         let configuration = LocalModelsConfiguration {
-            declarations: vec![CustomModelDeclaration {
-                model_id: id.clone(),
-                origin: CustomModelDeclarationOrigin::Added {
-                    repository: HuggingFaceRepositoryId::new(repository).unwrap(),
-                    commit: commit.clone(),
-                },
-                target: vec!["Model-Q4_K_M.gguf".to_owned()],
-                projector: None,
-            }],
+            added: vec![added(repository, "Model-Q4_K_M.gguf", &commit)],
             ..LocalModelsConfiguration::default()
         };
         let mut fixture = fixture.restart(catalog.clone()).await;
@@ -2956,8 +3062,8 @@ mod tests {
         }
     }
 
-    /// An added model whose same bytes are also in another tool's location is partly Magnitude's:
-    /// its ownership is Mixed, and Magnitude alone otherwise.
+    /// An added model whose same Hub file is also in the user's Hugging Face cache, a copy with the
+    /// same `hf:` ID, is partly Magnitude's: its ownership is Mixed, and Magnitude alone otherwise.
     #[tokio::test]
     async fn an_added_model_also_found_elsewhere_has_mixed_ownership() {
         use magnitude_service_contracts::models::ModelInstallationOwnership;
@@ -2970,15 +3076,7 @@ mod tests {
         let id: ModelId = "hf:owner/Added-GGUF/Added-Q4_K_M.gguf".parse().unwrap();
         let configuration = LocalModelsConfiguration {
             roots: vec![root(ModelRootKind::HuggingFaceCache, &cache)],
-            declarations: vec![CustomModelDeclaration {
-                model_id: id.clone(),
-                origin: CustomModelDeclarationOrigin::Added {
-                    repository: HuggingFaceRepositoryId::new(repository).unwrap(),
-                    commit: commit.clone(),
-                },
-                target: vec!["Added-Q4_K_M.gguf".to_owned()],
-                projector: None,
-            }],
+            added: vec![added(repository, "Added-Q4_K_M.gguf", &commit)],
             ..LocalModelsConfiguration::default()
         };
         let ownership = |listed: &LocalModelsResponse| {
@@ -3297,11 +3395,15 @@ mod tests {
                 root(ModelRootKind::HuggingFaceCache, &hub),
             ]))
             .await;
+        let mut listed_ids = ids(&both.models);
+        listed_ids.sort();
         assert_eq!(
-            both.models.len(),
-            1,
-            "the same bytes in two locations are one model: {:?}",
-            ids(&both.models)
+            listed_ids,
+            [
+                "hf:unsloth/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf".to_owned(),
+                local.clone()
+            ],
+            "each copy's ID comes from its own location: the cache's is hf:, Ollama's stays local:"
         );
     }
 
@@ -3364,10 +3466,15 @@ mod tests {
         assert!(listed.unsupported.is_empty());
     }
 
+    /// Copies are grouped by their own IDs, never merged across them: the same bytes in a Hugging
+    /// Face cache and in a folder are two models, `hf:` and `local:`; in two places that record no
+    /// Hub origin they share their `local:` ID and are one model, represented by its copy in the
+    /// location that takes precedence.
     #[tokio::test]
-    async fn the_same_bytes_in_two_places_are_one_model_represented_by_precedence() {
+    async fn the_same_bytes_are_one_model_per_copy_id_represented_by_precedence() {
         let fixture = Fixture::new().await;
         let cache = fixture.root.join("hf");
+        let lm_studio = fixture.root.join("lmstudio");
         let folder = fixture.root.join("models");
         let bytes = model_bytes("shared");
         publish_hf_cache(
@@ -3378,21 +3485,94 @@ mod tests {
         );
         fs::create_dir_all(&folder).unwrap();
         fs::write(folder.join("copy-of-shared.gguf"), &bytes).unwrap();
+        let in_lm_studio = lm_studio.join("someone/Shared-GGUF/shared.gguf");
+        fs::create_dir_all(in_lm_studio.parent().unwrap()).unwrap();
+        fs::write(&in_lm_studio, &bytes).unwrap();
+        let local = local_id(&folder.join("copy-of-shared.gguf"));
+        assert_eq!(local, local_id(&in_lm_studio));
 
         let listed = fixture
             .apply(roots(vec![
                 root(ModelRootKind::Folder, &folder),
                 root(ModelRootKind::HuggingFaceCache, &cache),
+                root(ModelRootKind::LmStudio, &lm_studio),
             ]))
             .await;
 
-        assert_eq!(ids(&listed.models), ["hf:owner/Shared-GGUF/shared.gguf"]);
+        assert_eq!(
+            ids(&listed.models),
+            ["hf:owner/Shared-GGUF/shared.gguf".to_owned(), local.to_string()]
+        );
         assert_eq!(
             listed.models[0].origin,
             CustomModelOrigin::Found {
                 source: FoundSource::HuggingFaceCache
             }
         );
+        assert_eq!(
+            listed.models[1].origin,
+            CustomModelOrigin::Found {
+                source: FoundSource::LmStudio
+            },
+            "LM Studio's copy takes precedence over the folder's"
+        );
+        assert_eq!(listed.models[1].files[0].path, in_lm_studio);
+        let mut locations = fixture.resolver.custom_model_locations(&local).unwrap();
+        locations.sort();
+        let mut expected = vec![folder.join("copy-of-shared.gguf"), in_lm_studio.clone()];
+        expected.sort();
+        assert_eq!(locations, expected, "one model, found in two places");
+    }
+
+    /// A copy's ID comes from that copy alone: a folder's file keeps its `local:` ID while the same
+    /// bytes appear in the Hugging Face cache and after they leave it, so nothing stored under it
+    /// is orphaned.
+    #[tokio::test]
+    async fn a_folder_copys_id_never_changes_when_the_same_bytes_come_and_go_in_the_hugging_face_cache()
+     {
+        let fixture = Fixture::new().await;
+        let cache = fixture.root.join("hf");
+        let folder = fixture.root.join("models");
+        let bytes = model_bytes("shared");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("model.gguf"), &bytes).unwrap();
+        let local = local_id(&folder.join("model.gguf")).to_string();
+        let both = roots(vec![
+            root(ModelRootKind::Folder, &folder),
+            root(ModelRootKind::HuggingFaceCache, &cache),
+        ]);
+        let hub = "hf:owner/Shared-GGUF/shared.gguf".to_owned();
+
+        let alone = fixture.apply(both.clone()).await;
+        assert_eq!(ids(&alone.models), [local.clone()]);
+
+        publish_hf_cache(
+            &cache,
+            "owner/Shared-GGUF",
+            &"b".repeat(40),
+            &[("shared.gguf", bytes)],
+        );
+        let cached = fixture.local.refresh_local().await.unwrap();
+        assert_eq!(ids(&cached.models), [hub.clone(), local.clone()]);
+
+        let disabled = fixture
+            .apply(LocalModelsConfiguration {
+                roots: vec![
+                    root(ModelRootKind::Folder, &folder),
+                    ModelRoot {
+                        enabled: false,
+                        ..root(ModelRootKind::HuggingFaceCache, &cache)
+                    },
+                ],
+                ..LocalModelsConfiguration::default()
+            })
+            .await;
+        assert_eq!(ids(&disabled.models), [local.clone()]);
+
+        fixture.apply(both).await;
+        fs::remove_dir_all(cache.join(hf_repo_dir("owner/Shared-GGUF"))).unwrap();
+        let removed = fixture.local.refresh_local().await.unwrap();
+        assert_eq!(ids(&removed.models), [local]);
     }
 
     #[tokio::test]
@@ -3631,10 +3811,11 @@ mod tests {
     }
 
     /// A catalog model whose only copy is exactly its target in a Hugging Face cache (as after
-    /// removing Magnitude's copy) is a found copy. Hiding it by the `hf:` ID it has as a found model
-    /// ends its attribution, even though the catalog remembers the package: the catalog model is
-    /// no longer installed, the copy is a hidden found model under its own ID, and the catalog ID
-    /// no longer resolves to it, across a restart, until it is unhidden.
+    /// removing Magnitude's copy) is a found copy. Hiding it, by the `hf:` ID it has as a found
+    /// model or by the catalog ID, ends its attribution, even though the catalog remembers the
+    /// package: the catalog model is no longer installed, the copy is a hidden found model under
+    /// its own ID, and the catalog ID no longer resolves to it, across a restart, until it is
+    /// unhidden.
     #[tokio::test]
     async fn hiding_a_catalog_models_external_copy_makes_it_a_hidden_found_model() {
         use magnitude_service_contracts::models::{CatalogModelState, InstalledModelPackages as _};
@@ -3658,10 +3839,6 @@ mod tests {
         );
         let catalog = vec![catalog_definition(found)];
         let catalog_model_id = catalog_id(&catalog[0]);
-        let hidden = LocalModelsConfiguration {
-            hidden: vec![found_id.clone()],
-            ..shown.clone()
-        };
 
         let attributed = |fixture: &Fixture| {
             let catalog = fixture.resolver.catalog_snapshot().unwrap();
@@ -3685,57 +3862,67 @@ mod tests {
             catalog_model_id
         );
 
-        for restarted in [false, true] {
-            if restarted {
-                fixture = fixture.restart(catalog.clone()).await;
+        // Hidden by its own ID or by the catalog ID it is the exact target of.
+        for entry in [found_id.clone(), catalog_model_id.clone()] {
+            let hidden = LocalModelsConfiguration {
+                hidden: vec![entry.clone()],
+                ..shown.clone()
+            };
+            for restarted in [false, true] {
+                if restarted {
+                    fixture = fixture.restart(catalog.clone()).await;
+                }
+                let listed = fixture.apply(hidden.clone()).await;
+                assert!(listed.models.is_empty(), "{entry} (restarted: {restarted})");
+                assert_eq!(
+                    ids(&listed.hidden),
+                    [found_id.to_string()],
+                    "{entry} (restarted: {restarted})"
+                );
+                assert!(
+                    !attributed(&fixture),
+                    "the catalog model is not installed: {entry} (restarted: {restarted})"
+                );
+                assert_eq!(
+                    fixture
+                        .resolver
+                        .canonical_model_id(found_id.clone())
+                        .unwrap(),
+                    found_id
+                );
+                assert!(
+                    fixture
+                        .resolver
+                        .assessment_configuration(&ModelAssessmentSubject::Catalog {
+                            model_id: catalog_model_id.clone(),
+                            selection:
+                                magnitude_service_contracts::models::CatalogModelSelection::Effective,
+                        })
+                        .is_err(),
+                    "the catalog ID no longer resolves to the hidden copy: {entry} (restarted: {restarted})"
+                );
             }
-            let listed = fixture.apply(hidden.clone()).await;
-            assert!(listed.models.is_empty(), "restarted: {restarted}");
-            assert_eq!(
-                ids(&listed.hidden),
-                [found_id.to_string()],
-                "restarted: {restarted}"
-            );
+
+            let listed = fixture.apply(shown.clone()).await;
+            assert!(listed.models.is_empty() && listed.hidden.is_empty());
             assert!(
-                !attributed(&fixture),
-                "the catalog model is not installed (restarted: {restarted})"
+                attributed(&fixture),
+                "unhidden, the copy is the catalog model's again: {entry}"
             );
             assert_eq!(
                 fixture
                     .resolver
                     .canonical_model_id(found_id.clone())
                     .unwrap(),
-                found_id
-            );
-            assert!(
-                fixture
-                    .resolver
-                    .assessment_configuration(&ModelAssessmentSubject::Catalog {
-                        model_id: catalog_model_id.clone(),
-                        selection:
-                            magnitude_service_contracts::models::CatalogModelSelection::Effective,
-                    })
-                    .is_err(),
-                "the catalog ID no longer resolves to the hidden copy (restarted: {restarted})"
+                catalog_model_id
             );
         }
-
-        let listed = fixture.apply(shown).await;
-        assert!(listed.models.is_empty() && listed.hidden.is_empty());
-        assert!(
-            attributed(&fixture),
-            "unhidden, the copy is the catalog model's again"
-        );
-        assert_eq!(
-            fixture.resolver.canonical_model_id(found_id).unwrap(),
-            catalog_model_id
-        );
     }
 
     /// QA (linux-debian, round 3c): importing a link to a file holding a catalog target's bytes
     /// started a new model under an ID nothing listed, since those bytes are the catalog model's.
     /// The store names the catalog model whose installed target, in any location, has a file's
-    /// bytes, so the import answers with that catalog model.
+    /// bytes, so a candidate file with those bytes answers with that catalog model.
     #[tokio::test]
     async fn a_copy_of_an_installed_catalog_targets_bytes_is_that_catalog_model() {
         use magnitude_service_contracts::models::InstalledModelPackages as _;
@@ -4284,7 +4471,6 @@ mod tests {
                         reference: DrafterReference::Catalog {
                             model_id: model_id.clone(),
                         },
-                        method: SpeculativeMethod::DFlash,
                     },
                 }],
                 ..shown
@@ -4855,7 +5041,6 @@ mod tests {
                         reference: DrafterReference::Catalog {
                             model_id: model_id.clone(),
                         },
-                        method: SpeculativeMethod::Mtp,
                     },
                 }],
                 ..shown.clone()
@@ -4952,13 +5137,19 @@ mod tests {
             }
         }
 
-        /// Downloads and catalog installations over the store, as the service composes them.
+        /// Downloads and catalog installations over the store, as the service composes them, with
+        /// every custom model's download resolving to the catalog drafter's package.
         async fn services(&self) -> (Arc<crate::ManagedModelDownloads>, Arc<crate::ManagedCatalogInstallations>) {
             let downloads = Arc::new(
                 crate::ManagedModelDownloads::open(self.fixture.resolver.inventory.clone())
                     .await
                     .unwrap(),
             );
+            downloads.set_custom_model_acquisition(Arc::new(FixedAcquisition(
+                ServableModelBundle::Standalone {
+                    package: self.draft.clone(),
+                },
+            )));
             let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
                 self.fixture.resolver.clone(),
                 downloads.clone(),
@@ -5012,6 +5203,20 @@ mod tests {
         }
     }
 
+    /// Resolves every custom model's download, whatever its part, to one bundle.
+    struct FixedAcquisition(ServableModelBundle);
+
+    impl crate::CustomModelAcquisition for FixedAcquisition {
+        fn bundle(
+            &self,
+            _model_id: ModelId,
+            _part: Option<magnitude_service_contracts::models::CustomModelPart>,
+        ) -> futures_util::future::BoxFuture<'_, Result<Option<ServableModelBundle>, InventoryError>>
+        {
+            Box::pin(async move { Ok(Some(self.0.clone())) })
+        }
+    }
+
     fn queued(state: &magnitude_service_contracts::models::ModelDownloadState) -> bool {
         use magnitude_service_contracts::models::ModelDownloadState;
         matches!(state, ModelDownloadState::Pending { .. } | ModelDownloadState::Downloading { .. })
@@ -5020,30 +5225,34 @@ mod tests {
     /// QA mac-r4-14: a drafter fetched alone for a found model (`magnitude models drafter
     /// local:… auto`) was queued when the service restarted, and afterwards nothing was
     /// downloading and the drafter was simply not there. A requested download that has not ended
-    /// is admitted again when the service starts.
+    /// is admitted again when the service starts, resolved again from what it asked for.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_queued_drafter_download_resumes_after_a_restart() {
-        use magnitude_service_contracts::models::{ModelDownloads as _, StartModelDownloadRequest};
+        use magnitude_service_contracts::models::{
+            CustomModelPart, ModelDownloads as _, StartModelDownloadRequest,
+        };
 
         let found = FoundTarget::new().await;
         let _queue = found.queue();
-        let request = StartModelDownloadRequest {
-            bundle: ServableModelBundle::Standalone {
-                package: found.draft.clone(),
-            },
-            for_model: Some(local_id(&found.weights)),
-        };
+        let model_id = local_id(&found.weights);
         let (downloads, _) = found.services().await;
-        let started = downloads.start(request.clone()).await.unwrap().download;
+        let started = downloads
+            .start(StartModelDownloadRequest {
+                model_id: model_id.clone(),
+                part: Some(CustomModelPart::Drafter),
+            })
+            .await
+            .unwrap()
+            .download;
         assert!(started.is_some_and(|download| queued(&download.state)));
         drop(downloads);
 
-        let (_found, downloads, _) = found.restart().await;
+        let (found, downloads, _) = found.restart().await;
         let listed = downloads.list().await.unwrap().downloads;
         assert!(
             matches!(listed.as_slice(), [download]
-                if download.bundle == request.bundle
-                    && download.for_model == request.for_model
+                if download.bundle == ServableModelBundle::Standalone { package: found.draft.clone() }
+                    && download.for_model == model_id
                     && queued(&download.state)),
             "the drafter is downloading again: {listed:?}"
         );
@@ -5090,7 +5299,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cancelled_queued_download_does_not_return_after_a_restart() {
         use magnitude_service_contracts::models::{
-            CatalogComponent, ModelDownloads as _, StartModelDownloadRequest,
+            CatalogComponent, CustomModelPart, ModelDownloads as _, StartModelDownloadRequest,
         };
 
         let found = FoundTarget::new().await;
@@ -5098,10 +5307,8 @@ mod tests {
         let (downloads, installations) = found.services().await;
         let pulled = downloads
             .start(StartModelDownloadRequest {
-                bundle: ServableModelBundle::Standalone {
-                    package: found.draft.clone(),
-                },
-                for_model: Some("hf:owner/Model-DFlash-GGUF/Model-DFlash.gguf".parse().unwrap()),
+                model_id: local_id(&found.weights),
+                part: Some(CustomModelPart::Drafter),
             })
             .await
             .unwrap()
@@ -5118,7 +5325,7 @@ mod tests {
         let listed = downloads.list().await.unwrap().downloads;
         assert!(
             matches!(listed.as_slice(), [download]
-                if download.for_model.as_ref() == Some(&found.model_id) && queued(&download.state)),
+                if download.for_model == found.model_id && queued(&download.state)),
             "only the projector, which was not cancelled, is downloading again: {listed:?}"
         );
     }
@@ -5241,9 +5448,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn installing_a_catalog_model_reuses_the_bytes_of_its_hidden_found_copy() {
         use magnitude_service_contracts::models::{
-            CatalogModelState, InstalledModelPackages as _, ModelDownloads as _,
-            ModelInstallationOwnership, StartModelDownloadRequest,
+            CatalogModelState, InstalledModelPackages as _, ModelInstallationOwnership,
         };
+        use crate::requested_downloads::RequestedDownload;
 
         let fixture = Fixture::new().await;
         let cache = fixture.root.join("hf");
@@ -5286,10 +5493,14 @@ mod tests {
             .await
             .unwrap();
         let started = downloads
-            .start(StartModelDownloadRequest {
-                bundle: catalog[0].configuration.bundle.clone(),
-                for_model: Some(catalog_model_id),
-            })
+            .start_requested(
+                catalog[0].configuration.bundle.clone(),
+                catalog_model_id.clone(),
+                RequestedDownload {
+                    model: catalog_model_id,
+                    part: None,
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -5519,6 +5730,44 @@ mod tests {
         assert_eq!(ids(&listed.hidden), [hidden.to_string()]);
     }
 
+    /// Only a `local:` ID's hash names the model: a hidden entry and a drafter choice stored under
+    /// an older label still apply, and the model is listed under its current label.
+    #[tokio::test]
+    async fn entries_stored_with_an_older_label_still_apply() {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("hidden.gguf"), "hidden");
+        write_mtp_model(&folder.join("heads.gguf"), "heads");
+        let hidden = local_id(&folder.join("hidden.gguf"));
+        let heads = local_id(&folder.join("heads.gguf"));
+        let (stale_hidden, stale_heads) = (
+            relabeled(&hidden, "an-older-label"),
+            relabeled(&heads, "another-older-label"),
+        );
+        assert_ne!(stale_hidden.as_str(), hidden.as_str());
+
+        let listed = fixture
+            .apply(LocalModelsConfiguration {
+                roots: vec![root(ModelRootKind::Folder, &folder)],
+                hidden: vec![stale_hidden],
+                drafters: vec![DrafterAttachment {
+                    model_id: stale_heads,
+                    drafter: DrafterChoice::None,
+                }],
+                ..LocalModelsConfiguration::default()
+            })
+            .await;
+
+        assert_eq!(ids(&listed.hidden), [hidden.to_string()]);
+        assert_eq!(ids(&listed.models), [heads.to_string()]);
+        assert_eq!(listed.models[0].drafter, None);
+        assert!(!listed.models[0].drafter_pending, "the stored choice turns it off");
+        assert!(matches!(
+            fixture.resolver.serving_configuration(&heads).unwrap().bundle,
+            ServableModelBundle::Standalone { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn unreadable_ggufs_are_listed_as_unsupported() {
         let fixture = Fixture::new().await;
@@ -5671,58 +5920,35 @@ mod tests {
         assert_eq!(listed.models.len(), 1);
     }
 
+    /// A single GGUF file listed as a location is a found model in its folder, served in place:
+    /// only that file, never the folder's other models. Removing it is unsupported, and dropping
+    /// the location forgets it without touching the file.
     #[tokio::test]
-    async fn a_folder_is_refused_as_an_imported_model() {
-        let fixture = Fixture::new().await;
-        let folder = fixture.root.join("gguf-import");
-        write_model(&folder.join("model.gguf"), "imported");
-        let declaration = CustomModelDeclaration {
-            model_id: local_id(&folder.join("model.gguf")),
-            origin: CustomModelDeclarationOrigin::Imported {
-                path: folder.clone(),
-            },
-            target: vec![folder.to_string_lossy().into_owned()],
-            projector: None,
-        };
-
-        let refused = fixture
-            .local
-            .configure(LocalModelsConfiguration {
-                declarations: vec![declaration],
-                ..LocalModelsConfiguration::default()
-            })
-            .await;
-        assert!(
-            matches!(&refused, Err(InventoryError::InvalidRequest(message)) if message.contains("names the folder")),
-            "{refused:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn imported_files_are_referenced_in_place_and_forgotten_without_deletion() {
+    async fn a_file_listed_as_a_location_is_found_in_place_and_never_deleted() {
         let fixture = Fixture::new().await;
         let elsewhere = fixture.root.join("Downloads");
-        let file = elsewhere.join("imported.gguf");
-        write_model(&file, "imported");
+        let file = elsewhere.join("listed.gguf");
+        write_model(&file, "listed");
+        write_model(&elsewhere.join("unrelated.gguf"), "unrelated");
         let id = local_id(&file);
-        let declaration = CustomModelDeclaration {
-            model_id: id.clone(),
-            origin: CustomModelDeclarationOrigin::Imported { path: file.clone() },
-            target: vec![file.to_string_lossy().into_owned()],
-            projector: None,
-        };
 
         let listed = fixture
-            .apply(LocalModelsConfiguration {
-                declarations: vec![declaration],
-                ..LocalModelsConfiguration::default()
-            })
+            .apply(roots(vec![root(ModelRootKind::Folder, &file)]))
             .await;
         assert_eq!(ids(&listed.models), [id.to_string()]);
         assert_eq!(
             listed.models[0].origin,
-            CustomModelOrigin::Imported { path: file.clone() }
+            CustomModelOrigin::Found {
+                source: FoundSource::Folder {
+                    path: elsewhere.clone()
+                }
+            }
         );
+        assert_eq!(listed.models[0].files[0].path, file);
+        assert!(matches!(
+            listed.models[0].state,
+            CustomModelState::Ready { .. }
+        ));
         assert!(matches!(
             fixture.local.remove_local(&id).await,
             Err(InventoryError::Unsupported(_))
@@ -5730,14 +5956,71 @@ mod tests {
 
         let forgotten = fixture.apply(LocalModelsConfiguration::default()).await;
         assert!(forgotten.models.is_empty());
-        assert!(
-            file.exists(),
-            "forgetting an imported model never touches its file"
-        );
+        assert!(file.exists(), "forgetting a listed file never touches it");
     }
 
+    /// A listed file that is a split model's first shard brings its sibling shards from its
+    /// folder; a later shard listed on its own is no model.
     #[tokio::test]
-    async fn importing_a_copy_of_a_found_model_adds_a_location_and_never_replaces_it() {
+    async fn a_listed_first_shard_brings_its_sibling_shards() {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("Downloads");
+        let shards = [
+            folder.join("Split-Q4_K_M-00001-of-00002.gguf"),
+            folder.join("Split-Q4_K_M-00002-of-00002.gguf"),
+        ];
+        crate::test_gguf::write_gguf(
+            &shards[0],
+            &[
+                ("general.architecture", Meta::Str("llama")),
+                ("general.name", Meta::Str("Split")),
+                ("split.count", Meta::U32(2)),
+                ("split.no", Meta::U32(0)),
+            ],
+            &["token_embd.weight"],
+        );
+        crate::test_gguf::write_gguf(
+            &shards[1],
+            &[
+                ("general.architecture", Meta::Str("llama")),
+                ("split.count", Meta::U32(2)),
+                ("split.no", Meta::U32(1)),
+            ],
+            &["blk.0.attn_q.weight"],
+        );
+        let header = crate::gguf::inspect(&shards[0]).unwrap();
+        let id = crate::gguf::local_model_id(
+            &crate::gguf::local_model_digest_of(&shards).unwrap(),
+            header.name.as_deref(),
+            header.architecture.as_deref(),
+            header.file_type.as_deref(),
+        )
+        .unwrap();
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &shards[0])]))
+            .await;
+        assert_eq!(ids(&listed.models), [id.to_string()], "{listed:#?}");
+        assert_eq!(
+            listed.models[0]
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>(),
+            shards
+        );
+
+        let later = fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &shards[1])]))
+            .await;
+        assert!(later.models.is_empty(), "{later:#?}");
+    }
+
+    /// A listed file and a copy of it found in LM Studio share their `local:` ID: one model with
+    /// two locations, represented by LM Studio's copy, and kept by the listed file under the same
+    /// ID when the found copy disappears.
+    #[tokio::test]
+    async fn a_listed_file_and_a_found_copy_of_it_are_one_model_kept_by_either() {
         let fixture = Fixture::new().await;
         let lm_studio = fixture.root.join("lmstudio");
         let found = lm_studio.join("lmstudio-community/Shared-GGUF/Shared-Q4_K_M.gguf");
@@ -5746,22 +6029,17 @@ mod tests {
         fs::create_dir_all(copy.parent().unwrap()).unwrap();
         fs::copy(&found, &copy).unwrap();
         let copy_id = local_id(&copy);
-        let configuration = LocalModelsConfiguration {
-            roots: vec![root(ModelRootKind::LmStudio, &lm_studio)],
-            declarations: vec![CustomModelDeclaration {
-                model_id: copy_id.clone(),
-                origin: CustomModelDeclarationOrigin::Imported { path: copy.clone() },
-                target: vec![copy.to_string_lossy().into_owned()],
-                projector: None,
-            }],
-            ..LocalModelsConfiguration::default()
-        };
+        assert_eq!(copy_id, local_id(&found));
+        let configuration = roots(vec![
+            root(ModelRootKind::LmStudio, &lm_studio),
+            root(ModelRootKind::Folder, &copy),
+        ]);
 
         let listed = fixture.apply(configuration).await;
         assert_eq!(
             ids(&listed.models),
-            ["hf:lmstudio-community/Shared-GGUF/Shared-Q4_K_M.gguf"],
-            "the same bytes are one model, keeping the identity its found location gives it"
+            [copy_id.to_string()],
+            "the same bytes outside the Hugging Face cache are one model"
         );
         assert_eq!(
             listed.models[0].origin,
@@ -5776,18 +6054,22 @@ mod tests {
         assert_eq!(
             ids(&after.models),
             [copy_id.to_string()],
-            "the imported copy keeps the model when the found file disappears"
+            "the listed copy keeps the model when the found file disappears"
         );
         assert_eq!(
             after.models[0].origin,
-            CustomModelOrigin::Imported { path: copy.clone() }
+            CustomModelOrigin::Found {
+                source: FoundSource::Folder {
+                    path: copy.parent().unwrap().to_path_buf()
+                }
+            }
         );
         assert_eq!(after.models[0].files[0].path, copy);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn an_imported_symlink_is_served_through_its_link_wherever_it_points() {
+    async fn a_listed_link_is_served_through_its_link_wherever_it_points() {
         let fixture = Fixture::new().await;
         let hub = fixture.root.join("hf/hub");
         let snapshot = publish_shared_hf_cache(
@@ -5802,15 +6084,7 @@ mod tests {
         let id = local_id(&link);
 
         let listed = fixture
-            .apply(LocalModelsConfiguration {
-                declarations: vec![CustomModelDeclaration {
-                    model_id: id.clone(),
-                    origin: CustomModelDeclarationOrigin::Imported { path: link.clone() },
-                    target: vec![link.to_string_lossy().into_owned()],
-                    projector: None,
-                }],
-                ..LocalModelsConfiguration::default()
-            })
+            .apply(roots(vec![root(ModelRootKind::Folder, &link)]))
             .await;
 
         assert_eq!(ids(&listed.models), [id.to_string()]);
@@ -5829,12 +6103,12 @@ mod tests {
                 matches!(
                     model.location,
                     ModelLocation::External {
-                        origin: ExternalOrigin::Imported,
+                        origin: ExternalOrigin::Folder,
                         ..
                     }
                 )
             })
-            .expect("the imported link is published");
+            .expect("the listed link is published");
         let resolved = inventory.resolve_ready(&model.id).await.unwrap();
         assert_eq!(resolved.components[0].path, link);
     }
@@ -5868,14 +6142,9 @@ mod tests {
         let id: ModelId = "hf:owner/Added-GGUF/Added-Q4_K_M.gguf".parse().unwrap();
         let configuration = LocalModelsConfiguration {
             roots: vec![root(ModelRootKind::HuggingFaceCache, &cache)],
-            declarations: vec![CustomModelDeclaration {
-                model_id: id.clone(),
-                origin: CustomModelDeclarationOrigin::Added {
-                    repository: HuggingFaceRepositoryId::new(repository).unwrap(),
-                    commit: commit.clone(),
-                },
-                target: vec!["Added-Q4_K_M.gguf".to_owned()],
+            added: vec![AddedModel {
                 projector: Some("mmproj-Q8_0.gguf".to_owned()),
+                ..added(repository, "Added-Q4_K_M.gguf", &commit)
             }],
             ..LocalModelsConfiguration::default()
         };
@@ -5913,7 +6182,7 @@ mod tests {
         assert_eq!(ids(&after.models), [id.to_string()]);
         assert!(
             matches!(after.models[0].origin, CustomModelOrigin::Added { .. }),
-            "the declaration still names it while ACN keeps it"
+            "the configuration still adds it while ACN keeps it"
         );
         assert!(after.models[0].files[0].path.starts_with(&cache));
     }
@@ -5922,8 +6191,9 @@ mod tests {
     /// model, yet listed a second entry under the file's own `local:` ID. Adding a version previews its
     /// headers first, and the preview's header-only files were inspected through the cache keyed
     /// by content, so the downloaded file with the same SHA-256 took the preview's content sample
-    /// (read from zeros) and a `local:` digest no copy of its bytes has. A downloaded added model and
-    /// a copy of it are one model.
+    /// (read from zeros) and a `local:` digest no copy of its bytes has. A downloaded added model's
+    /// content digest is its own bytes', the one a copy of it has (which is a model of its own,
+    /// listed under its `local:` ID beside the added model's `hf:` ID).
     #[tokio::test]
     async fn a_previewed_then_downloaded_model_has_its_own_bytes_digest() {
         let commit = "c".repeat(40);
@@ -5974,34 +6244,41 @@ mod tests {
         let added_id: ModelId = "hf:owner/Added-GGUF/Added-Q4_K_M.gguf".parse().unwrap();
         let listed = fixture
             .apply(LocalModelsConfiguration {
-                declarations: vec![
-                    CustomModelDeclaration {
-                        model_id: added_id.clone(),
-                        origin: CustomModelDeclarationOrigin::Added {
-                            repository: HuggingFaceRepositoryId::new(repository).unwrap(),
-                            commit: commit.clone(),
-                        },
-                        target: vec!["Added-Q4_K_M.gguf".to_owned()],
-                        projector: None,
-                    },
-                    CustomModelDeclaration {
-                        model_id: local_id(&copy),
-                        origin: CustomModelDeclarationOrigin::Imported { path: copy.clone() },
-                        target: vec![copy.to_string_lossy().into_owned()],
-                        projector: None,
-                    },
-                ],
+                roots: vec![root(ModelRootKind::Folder, &copy)],
+                added: vec![added(repository, "Added-Q4_K_M.gguf", &commit)],
                 ..LocalModelsConfiguration::default()
             })
             .await;
-        assert_eq!(ids(&listed.models), [added_id.to_string()], "{listed:#?}");
+        assert_eq!(
+            ids(&listed.models),
+            [added_id.to_string(), local_id(&copy).to_string()],
+            "{listed:#?}"
+        );
+        let copy_digest = crate::gguf::local_model_digest_of(&[&copy]).unwrap();
+        let records = fixture.inventory().installed_packages.read().unwrap();
+        let digests = records
+            .records
+            .values()
+            .filter(|record| record.installed.origin == ModelPackageInstallationOrigin::Magnitude)
+            .map(|record| {
+                record
+                    .primary
+                    .as_ref()
+                    .and_then(|evidence| evidence.local_digest.clone())
+            })
+            .collect::<Vec<_>>();
+        assert!(!digests.is_empty());
+        assert!(
+            digests.iter().all(|digest| digest.as_ref() == Some(&copy_digest)),
+            "{digests:?}"
+        );
     }
 
-    /// Removing an added model whose same bytes are also in Ollama or the llama.cpp cache deletes
-    /// only Magnitude's copy; once ACN drops the declaration, the model is listed as found from
-    /// that location (by the identity that location gives it) and is not hidden.
+    /// The same bytes as an added model in Ollama or the llama.cpp cache are a found model of their
+    /// own, under their `local:` ID. Removing the added model deletes only Magnitude's copy; once
+    /// ACN drops it from the configuration, the found model stays listed and is not hidden.
     #[tokio::test]
-    async fn removing_an_added_model_found_in_ollama_or_llama_cpp_keeps_it_as_a_found_model() {
+    async fn removing_an_added_model_keeps_its_copy_in_ollama_or_llama_cpp_as_a_found_model() {
         let commit = "c".repeat(40);
         let repository = "owner/Added-GGUF";
         let added_id: ModelId = "hf:owner/Added-GGUF/Added-Q4_K_M.gguf".parse().unwrap();
@@ -6020,7 +6297,7 @@ mod tests {
                     fs::create_dir_all(&location).unwrap();
                     let file = location.join("owner_Added-GGUF_Added-Q4_K_M.gguf");
                     fs::write(&file, &bytes).unwrap();
-                    (ModelRootKind::LlamaCpp, added_id.clone(), file)
+                    (ModelRootKind::LlamaCpp, local_id(&file), file)
                 }
                 FoundSource::Ollama => {
                     write_ollama(
@@ -6040,19 +6317,15 @@ mod tests {
             };
             let shown = roots(vec![root(kind, &location)]);
             let declared = LocalModelsConfiguration {
-                declarations: vec![CustomModelDeclaration {
-                    model_id: added_id.clone(),
-                    origin: CustomModelDeclarationOrigin::Added {
-                        repository: HuggingFaceRepositoryId::new(repository).unwrap(),
-                        commit: commit.clone(),
-                    },
-                    target: vec!["Added-Q4_K_M.gguf".to_owned()],
-                    projector: None,
-                }],
+                added: vec![added(repository, "Added-Q4_K_M.gguf", &commit)],
                 ..shown.clone()
             };
             let listed = fixture.apply(declared).await;
-            assert_eq!(ids(&listed.models), [added_id.to_string()], "{source:?}");
+            assert_eq!(
+                ids(&listed.models),
+                [added_id.to_string(), found_id.to_string()],
+                "{source:?}"
+            );
             assert!(matches!(listed.models[0].origin, CustomModelOrigin::Added { .. }));
 
             let removal = fixture.local.remove_local(&added_id).await.unwrap();
@@ -6084,20 +6357,11 @@ mod tests {
             path: "dflash.gguf".to_owned(),
         };
         let configuration = LocalModelsConfiguration {
-            declarations: vec![CustomModelDeclaration {
-                model_id: id.clone(),
-                origin: CustomModelDeclarationOrigin::Added {
-                    repository: HuggingFaceRepositoryId::new(repository).unwrap(),
-                    commit: commit.clone(),
-                },
-                target: vec!["Pending-Q4_K_M.gguf".to_owned()],
-                projector: None,
-            }],
+            added: vec![added(repository, "Pending-Q4_K_M.gguf", &commit)],
             drafters: vec![DrafterAttachment {
                 model_id: id.clone(),
                 drafter: DrafterChoice::Reference {
                     reference: drafter.clone(),
-                    method: SpeculativeMethod::DFlash,
                 },
             }],
             ..LocalModelsConfiguration::default()
@@ -6110,12 +6374,10 @@ mod tests {
         assert_eq!(model.display_name, "Pending");
         assert_eq!(model.variant_label.as_deref(), Some("Q4_K_M"));
         assert_eq!(
-            model
-                .drafter
-                .as_ref()
-                .map(|attached| (&attached.reference, &attached.state)),
-            Some((&drafter, &AttachedDrafterState::NotInstalled))
+            model.drafter, None,
+            "the engine's verdict on a chosen drafter file waits for the model's files"
         );
+        assert!(model.drafter_pending);
         assert!(
             fixture
                 .local
@@ -6218,13 +6480,15 @@ mod tests {
             commit,
             path: "Model-DFlash-Q8_0.gguf".to_owned(),
         };
+        fixture
+            .resolver
+            .set_custom_model_enrichment(judges(reference.clone(), SpeculativeMethod::DFlash));
         let configuration = LocalModelsConfiguration {
             roots: vec![root(ModelRootKind::Folder, &folder)],
             drafters: vec![DrafterAttachment {
                 model_id: target.clone(),
                 drafter: DrafterChoice::Reference {
                     reference: reference.clone(),
-                    method: SpeculativeMethod::DFlash,
                 },
             }],
             ..LocalModelsConfiguration::default()
@@ -6238,7 +6502,7 @@ mod tests {
             listed.models[0].drafter,
             Some(AttachedDrafter {
                 reference,
-                method: SpeculativeMethod::DFlash,
+                method: Some(SpeculativeMethod::DFlash),
                 state: AttachedDrafterState::Ready,
                 update_available: false,
             })
@@ -6254,7 +6518,114 @@ mod tests {
         ));
     }
 
-    /// Knows the bytes of one drafter reference, as the server learns them from its header.
+    /// A drafter file chosen by reference binds with the method the engine's verdict gives it.
+    /// Until the verdict is known the model has no drafter for now (pending) and serves plain,
+    /// while the drafter stays in use; a bound verdict attaches it with that method, and a rejected
+    /// one shows it rejected and unused.
+    #[tokio::test]
+    async fn a_chosen_drafter_waits_for_the_engines_verdict_and_binds_as_it_says() {
+        let fixture = Fixture::new().await;
+        let commit = "e".repeat(40);
+        let snapshot = publish_managed(
+            &fixture.store,
+            "magnitudedev/Model-DFlash-GGUF",
+            &commit,
+            &[("Model-DFlash-Q8_0.gguf", drafter_bytes("drafter"))],
+        );
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("target.gguf"), "target");
+        let target = local_id(&folder.join("target.gguf"));
+        let reference = DrafterReference::HuggingFace {
+            repository: HuggingFaceRepositoryId::new("magnitudedev/Model-DFlash-GGUF").unwrap(),
+            commit,
+            path: "Model-DFlash-Q8_0.gguf".to_owned(),
+        };
+        let model = |listed: &LocalModelsResponse| {
+            listed
+                .models
+                .iter()
+                .find(|model| model.model_id == target)
+                .cloned()
+                .unwrap()
+        };
+
+        let listed = fixture
+            .apply(LocalModelsConfiguration {
+                roots: vec![root(ModelRootKind::Folder, &folder)],
+                drafters: vec![DrafterAttachment {
+                    model_id: target.clone(),
+                    drafter: DrafterChoice::Reference {
+                        reference: reference.clone(),
+                    },
+                }],
+                ..LocalModelsConfiguration::default()
+            })
+            .await;
+        let pending = model(&listed);
+        assert_eq!(pending.drafter, None);
+        assert!(pending.drafter_pending, "no verdict yet is not no drafter");
+        assert_eq!(served_drafter(&fixture, &target), None);
+        let kept = fixture.local.prune_drafters().await.unwrap();
+        assert!(kept.removed.is_empty(), "the awaited drafter is in use: {kept:?}");
+        assert!(snapshot.join("Model-DFlash-Q8_0.gguf").exists());
+
+        fixture
+            .resolver
+            .set_custom_model_enrichment(judges(reference.clone(), SpeculativeMethod::DSpark));
+        let attached = model(&fixture.local.list_local().await.unwrap());
+        assert_eq!(
+            attached.drafter,
+            Some(AttachedDrafter {
+                reference: reference.clone(),
+                method: Some(SpeculativeMethod::DSpark),
+                state: AttachedDrafterState::Ready,
+                update_available: false,
+            })
+        );
+        assert!(!attached.drafter_pending);
+        assert!(matches!(
+            fixture.resolver.serving_configuration(&target).unwrap().bundle,
+            ServableModelBundle::SpeculativeDecoding {
+                draft_source: SpeculativeDraftSource::Separate { .. },
+                method: SpeculativeMethod::DSpark,
+                ..
+            }
+        ));
+
+        let rejection = (
+            vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)],
+            "the engine does not bind this drafter".to_owned(),
+        );
+        fixture.resolver.set_custom_model_enrichment(Arc::new(Judges {
+            inner: NoEnrichment,
+            chosen: DrafterCandidate {
+                verdict: DrafterVerdict::Rejected {
+                    reasons: rejection.0.clone(),
+                    detail: rejection.1.clone(),
+                },
+                method: None,
+                ..bound(reference.clone(), SpeculativeMethod::DSpark)
+            },
+        }));
+        let rejected = model(&fixture.local.list_local().await.unwrap());
+        assert_eq!(
+            rejected.drafter,
+            Some(AttachedDrafter {
+                reference,
+                method: None,
+                state: AttachedDrafterState::Rejected {
+                    reasons: rejection.0,
+                    detail: rejection.1,
+                },
+                update_available: false,
+            })
+        );
+        assert!(!rejected.drafter_pending);
+        assert_eq!(served_drafter(&fixture, &target), None);
+    }
+
+    /// Knows the bytes of one drafter reference, as the server learns them from its header, and
+    /// that the engine binds it as DFlash.
     struct KnowsDrafter {
         reference: DrafterReference,
         content: DrafterContent,
@@ -6262,7 +6633,10 @@ mod tests {
 
     impl CustomModelEnrichment for KnowsDrafter {
         fn enrich(&self, _model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult {
-            CustomModelEnrichmentResult::default()
+            CustomModelEnrichmentResult {
+                chosen: Some(bound(self.reference.clone(), SpeculativeMethod::DFlash)),
+                ..CustomModelEnrichmentResult::default()
+            }
         }
 
         fn drafter_content(&self, reference: &DrafterReference) -> Option<DrafterContent> {
@@ -6306,7 +6680,6 @@ mod tests {
                 model_id: target.clone(),
                 drafter: DrafterChoice::Reference {
                     reference: reference.clone(),
-                    method: SpeculativeMethod::DFlash,
                 },
             }],
             ..LocalModelsConfiguration::default()
@@ -6410,23 +6783,26 @@ mod tests {
         let folder = fixture.root.join("models");
         write_model(&folder.join("target.gguf"), "target");
         let target = local_id(&folder.join("target.gguf"));
+        let reference = DrafterReference::HuggingFace {
+            repository: HuggingFaceRepositoryId::new("magnitudedev/Model-DFlash-GGUF").unwrap(),
+            commit,
+            path: "Model-DFlash-Q8_0.gguf".to_owned(),
+        };
         let attached = LocalModelsConfiguration {
             roots: vec![root(ModelRootKind::Folder, &folder)],
             drafters: vec![DrafterAttachment {
-                model_id: target,
+                model_id: target.clone(),
                 drafter: DrafterChoice::Reference {
-                    reference: DrafterReference::HuggingFace {
-                        repository: HuggingFaceRepositoryId::new("magnitudedev/Model-DFlash-GGUF")
-                            .unwrap(),
-                        commit,
-                        path: "Model-DFlash-Q8_0.gguf".to_owned(),
-                    },
-                    method: SpeculativeMethod::DFlash,
+                    reference: reference.clone(),
                 },
             }],
             ..LocalModelsConfiguration::default()
         };
+        fixture
+            .resolver
+            .set_custom_model_enrichment(judges(reference, SpeculativeMethod::DFlash));
         fixture.apply(attached.clone()).await;
+        assert!(served_drafter(&fixture, &target).is_some());
         let kept = fixture.local.prune_drafters().await.unwrap();
         assert!(
             kept.removed.is_empty(),
@@ -6477,8 +6853,7 @@ mod tests {
                     })
                     .into_iter()
                     .collect(),
-                catalog_drafters: Vec::new(),
-                license: None,
+                ..CustomModelEnrichmentResult::default()
             }
         }
 
@@ -6556,7 +6931,6 @@ mod tests {
         fn reference(&self, index: usize) -> DrafterChoice {
             DrafterChoice::Reference {
                 reference: self.drafters[index].0.clone(),
-                method: SpeculativeMethod::DFlash,
             }
         }
 
@@ -6762,7 +7136,6 @@ mod tests {
                     reference: DrafterReference::Catalog {
                         model_id: catalog_model_id.clone(),
                     },
-                    method: SpeculativeMethod::Mtp,
                 },
             }],
             ..LocalModelsConfiguration::default()
@@ -6847,7 +7220,6 @@ mod tests {
                     reference: DrafterReference::Catalog {
                         model_id: catalog_model_id.clone(),
                     },
-                    method: SpeculativeMethod::Mtp,
                 },
             }],
             ..LocalModelsConfiguration::default()
@@ -6898,7 +7270,7 @@ mod tests {
     }
 
     /// Recommends each model the drafter beside it and reports it matching one catalog model, as
-    /// enrichment does for a found or imported model with a drafter in its folder.
+    /// enrichment does for a found model with a drafter in its folder.
     struct BesideAndCatalog {
         beside: DrafterReference,
         catalog: Option<ModelId>,
@@ -6924,7 +7296,7 @@ mod tests {
                     method: Some(SpeculativeMethod::Mtp),
                 }],
                 catalog_drafters: self.catalog.iter().cloned().collect(),
-                license: None,
+                ..CustomModelEnrichmentResult::default()
             }
         }
     }
@@ -6969,8 +7341,8 @@ mod tests {
         let catalog_model = catalog_id(&definition);
         let fixture = fixture.restart(vec![definition]).await;
 
-        let folder = fixture.root.join("imported");
-        write_model(&folder.join("model.gguf"), "imported");
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("model.gguf"), "found");
         write_dflash_drafter(&folder.join("mtp.gguf"), "beside");
         let beside = DrafterReference::Local {
             path: folder.join("mtp.gguf"),
@@ -7015,15 +7387,7 @@ mod tests {
         );
         let id: ModelId = "hf:owner/Pending-GGUF/Pending-Q4_K_M.gguf".parse().unwrap();
         let configuration = LocalModelsConfiguration {
-            declarations: vec![CustomModelDeclaration {
-                model_id: id.clone(),
-                origin: CustomModelDeclarationOrigin::Added {
-                    repository: HuggingFaceRepositoryId::new("owner/Pending-GGUF").unwrap(),
-                    commit: "c".repeat(40),
-                },
-                target: vec!["Pending-Q4_K_M.gguf".to_owned()],
-                projector: None,
-            }],
+            added: vec![added("owner/Pending-GGUF", "Pending-Q4_K_M.gguf", &"c".repeat(40))],
             drafters: vec![DrafterAttachment {
                 model_id: id.clone(),
                 drafter: DrafterChoice::Reference {
@@ -7033,7 +7397,6 @@ mod tests {
                         commit: drafter_commit,
                         path: "Model-DFlash-Q8_0.gguf".to_owned(),
                     },
-                    method: SpeculativeMethod::DFlash,
                 },
             }],
             ..LocalModelsConfiguration::default()
@@ -7050,7 +7413,7 @@ mod tests {
 
         fixture
             .apply(LocalModelsConfiguration {
-                declarations: Vec::new(),
+                added: Vec::new(),
                 drafters: Vec::new(),
                 ..configuration
             })
@@ -7091,7 +7454,7 @@ mod tests {
         target: ModelPackage,
         draft: ModelPackage,
         catalog_weights: PathBuf,
-        sibling: CustomModelDeclaration,
+        sibling: AddedModel,
     }
 
     const SIBLING_REPOSITORY: &str = "unsloth/Qwen3.5-4B-MTP-GGUF";
@@ -7170,16 +7533,9 @@ mod tests {
                 ("mmproj-F16.gguf", projector("f16")),
             ],
         );
-        let sibling = CustomModelDeclaration {
-            model_id: format!("hf:{SIBLING_REPOSITORY}/Qwen3.5-4B-Q6_K.gguf")
-                .parse()
-                .unwrap(),
-            origin: CustomModelDeclarationOrigin::Added {
-                repository: HuggingFaceRepositoryId::new(SIBLING_REPOSITORY).unwrap(),
-                commit,
-            },
-            target: vec!["Qwen3.5-4B-Q6_K.gguf".to_owned()],
+        let sibling = AddedModel {
             projector: Some("mmproj-F16.gguf".to_owned()),
+            ..added(SIBLING_REPOSITORY, "Qwen3.5-4B-Q6_K.gguf", &commit)
         };
         let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
             fixture.resolver.clone(),
@@ -7211,14 +7567,14 @@ mod tests {
             )
         }
 
-        /// The sibling declared with `drafter`, then everything that removes packages afterwards:
+        /// The sibling added with `drafter`, then everything that removes packages afterwards:
         /// catalog maintenance and drafter pruning.
         async fn choose_sibling_drafter(&self, drafter: DrafterChoice) {
             self.fixture
                 .apply(LocalModelsConfiguration {
-                    declarations: vec![self.sibling.clone()],
+                    added: vec![self.sibling.clone()],
                     drafters: vec![DrafterAttachment {
-                        model_id: self.sibling.model_id.clone(),
+                        model_id: self.sibling.model_id(),
                         drafter,
                     }],
                     ..LocalModelsConfiguration::default()
@@ -7243,7 +7599,6 @@ mod tests {
         for drafter in [
             DrafterChoice::Reference {
                 reference: DrafterReference::Embedded,
-                method: SpeculativeMethod::Mtp,
             },
             DrafterChoice::None,
         ] {
@@ -7284,7 +7639,7 @@ mod tests {
         setup
             .fixture
             .apply(LocalModelsConfiguration {
-                declarations: vec![setup.sibling.clone()],
+                added: vec![setup.sibling.clone()],
                 ..LocalModelsConfiguration::default()
             })
             .await;
@@ -7341,30 +7696,32 @@ mod tests {
             &[("Other-DFlash-Q8_0.gguf", drafter_bytes("other drafter"))],
         )
         .join("Other-DFlash-Q8_0.gguf");
+        let reference = DrafterReference::HuggingFace {
+            repository: HuggingFaceRepositoryId::new("magnitudedev/Other-DFlash-GGUF").unwrap(),
+            commit: drafter_commit,
+            path: "Other-DFlash-Q8_0.gguf".to_owned(),
+        };
+        setup
+            .fixture
+            .resolver
+            .set_custom_model_enrichment(judges(reference.clone(), SpeculativeMethod::DFlash));
         let with_sibling = LocalModelsConfiguration {
-            declarations: vec![setup.sibling.clone()],
+            added: vec![setup.sibling.clone()],
             drafters: vec![DrafterAttachment {
-                model_id: setup.sibling.model_id.clone(),
-                drafter: DrafterChoice::Reference {
-                    reference: DrafterReference::HuggingFace {
-                        repository: HuggingFaceRepositoryId::new("magnitudedev/Other-DFlash-GGUF")
-                            .unwrap(),
-                        commit: drafter_commit,
-                        path: "Other-DFlash-Q8_0.gguf".to_owned(),
-                    },
-                    method: SpeculativeMethod::DFlash,
-                },
+                model_id: setup.sibling.model_id(),
+                drafter: DrafterChoice::Reference { reference },
             }],
             ..LocalModelsConfiguration::default()
         };
         setup.fixture.apply(with_sibling).await;
+        assert!(served_drafter(&setup.fixture, &setup.sibling.model_id()).is_some());
         let kept = setup.fixture.local.prune_drafters().await.unwrap();
         assert!(kept.removed.is_empty(), "the sibling serves with it: {kept:?}");
 
         setup
             .fixture
             .local
-            .remove_local(&setup.sibling.model_id)
+            .remove_local(&setup.sibling.model_id())
             .await
             .unwrap();
         setup.fixture.apply(LocalModelsConfiguration::default()).await;
@@ -7410,7 +7767,6 @@ mod tests {
             model_id: model_id.clone(),
             drafter: DrafterChoice::Reference {
                 reference: DrafterReference::Embedded,
-                method: SpeculativeMethod::Mtp,
             },
         };
 
@@ -7508,13 +7864,15 @@ mod tests {
                     label: "In this folder".to_owned(),
                     size_bytes: 1,
                     lineage: DrafterLineage::Lineage,
-                    verdict: DrafterVerdict::None,
+                    verdict: DrafterVerdict::Bound {
+                        method: self.method.clone(),
+                        memory_bytes: 1,
+                    },
                     automatic: false,
                     on_this_computer: true,
                     method: Some(self.method.clone()),
                 }],
-                catalog_drafters: Vec::new(),
-                license: None,
+                ..CustomModelEnrichmentResult::default()
             }
         }
     }
@@ -7615,7 +7973,6 @@ mod tests {
                         reference: DrafterReference::Local {
                             path: drafters.join("drafter.gguf"),
                         },
-                        method: SpeculativeMethod::DFlash,
                     },
                 }],
                 ..LocalModelsConfiguration::default()
@@ -7665,13 +8022,18 @@ mod tests {
         write_model(&folder.join("target.gguf"), "target");
         write_dflash_drafter(&drafters.join("drafter.gguf"), "drafter");
         let target = local_id(&folder.join("target.gguf"));
-        fixture
-            .resolver
-            .set_custom_model_enrichment(Arc::new(Recommends {
+        let absent = DrafterReference::Local {
+            path: drafters.join("absent.gguf"),
+        };
+        // The engine's verdict on the chosen file, from when it was here.
+        fixture.resolver.set_custom_model_enrichment(Arc::new(Judges {
+            inner: Recommends {
                 drafter: drafters.join("drafter.gguf"),
                 variant_of: "qwen3.6-35b-a3b:gguf:q4".parse().unwrap(),
                 method: SpeculativeMethod::DFlash,
-            }));
+            },
+            chosen: bound(absent.clone(), SpeculativeMethod::DFlash),
+        }));
         let attach = |drafter: DrafterChoice| LocalModelsConfiguration {
             roots: vec![
                 root(ModelRootKind::Folder, &folder),
@@ -7685,12 +8047,7 @@ mod tests {
         };
 
         fixture
-            .apply(attach(DrafterChoice::Reference {
-                reference: DrafterReference::Local {
-                    path: drafters.join("absent.gguf"),
-                },
-                method: SpeculativeMethod::DFlash,
-            }))
+            .apply(attach(DrafterChoice::Reference { reference: absent }))
             .await;
         let listed = fixture.local.list_local().await.unwrap();
         assert_eq!(
@@ -7699,7 +8056,7 @@ mod tests {
                 .as_ref()
                 .map(|drafter| (drafter.method.clone(), drafter.state.clone())),
             Some((
-                SpeculativeMethod::DFlash,
+                Some(SpeculativeMethod::DFlash),
                 AttachedDrafterState::NotInstalled
             ))
         );
@@ -7971,17 +8328,6 @@ mod tests {
         debounce.await.unwrap();
     }
 
-    fn imported(file: &Path) -> CustomModelDeclaration {
-        CustomModelDeclaration {
-            model_id: local_id(file),
-            origin: CustomModelDeclarationOrigin::Imported {
-                path: file.to_path_buf(),
-            },
-            target: vec![file.to_string_lossy().into_owned()],
-            projector: None,
-        }
-    }
-
     /// The separate drafter file a model serves with, if any.
     fn served_drafter(fixture: &Fixture, model_id: &ModelId) -> Option<PathBuf> {
         match fixture
@@ -8058,17 +8404,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_imported_models_automatic_drafter_beside_it_is_attached_in_place_outside_every_location()
-     {
+    async fn a_listed_files_automatic_drafter_beside_it_is_attached_in_place() {
         for shape in ["dspark", "gemma-mtp", "nextn-mtp"] {
             let fixture = Fixture::new().await;
-            let folder = fixture.root.join("Downloads/imported");
+            let folder = fixture.root.join("Downloads/listed");
             let target = folder.join("target-Q4_K_M.gguf");
             let drafter = folder.join("drafter-beside.gguf");
             let method = write_pair(&target, &drafter, shape);
             write_model(&folder.join("unrelated-model.gguf"), "unrelated");
-            let declaration = imported(&target);
-            let id = declaration.model_id.clone();
+            let id = local_id(&target);
             fixture
                 .resolver
                 .set_custom_model_enrichment(Arc::new(Recommends {
@@ -8079,16 +8423,13 @@ mod tests {
 
             // Auto: no drafter choice is stored, as a pick of the recommended drafter saves.
             let listed = fixture
-                .apply(LocalModelsConfiguration {
-                    declarations: vec![declaration],
-                    ..LocalModelsConfiguration::default()
-                })
+                .apply(roots(vec![root(ModelRootKind::Folder, &target)]))
                 .await;
 
             assert_eq!(
                 ids(&listed.models),
                 [id.to_string()],
-                "{shape}: only the imported file is a model; its folder's other models are not picked up"
+                "{shape}: only the listed file is a model; its folder's other models are not picked up"
             );
             assert_eq!(
                 drafter_state(&listed, &id),
@@ -8142,7 +8483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_imported_models_explicit_local_drafter_elsewhere_is_attached_and_watched() {
+    async fn a_listed_files_explicit_local_drafter_elsewhere_is_attached_and_watched() {
         let fixture = Fixture::new().await;
         let target = fixture.root.join("Downloads/lfm-Q4_K_M.gguf");
         let elsewhere = fixture.root.join("Elsewhere");
@@ -8150,18 +8491,18 @@ mod tests {
         write_model(&target, "target");
         write_dflash_drafter(&drafter, "drafter");
         write_dflash_drafter(&elsewhere.join("loose-drafter.gguf"), "loose");
-        let declaration = imported(&target);
-        let id = declaration.model_id.clone();
+        let id = local_id(&target);
+        let reference = DrafterReference::Local {
+            path: drafter.clone(),
+        };
+        fixture
+            .resolver
+            .set_custom_model_enrichment(judges(reference.clone(), SpeculativeMethod::DFlash));
         let configuration = LocalModelsConfiguration {
-            declarations: vec![declaration],
+            roots: vec![root(ModelRootKind::Folder, &target)],
             drafters: vec![DrafterAttachment {
                 model_id: id.clone(),
-                drafter: DrafterChoice::Reference {
-                    reference: DrafterReference::Local {
-                        path: drafter.clone(),
-                    },
-                    method: SpeculativeMethod::DFlash,
-                },
+                drafter: DrafterChoice::Reference { reference },
             }],
             ..LocalModelsConfiguration::default()
         };
@@ -8229,8 +8570,7 @@ mod tests {
                     ),
                     candidate(DrafterReference::Embedded, SpeculativeMethod::Mtp),
                 ],
-                catalog_drafters: Vec::new(),
-                license: None,
+                ..CustomModelEnrichmentResult::default()
             }
         }
     }
@@ -8291,7 +8631,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_targets_cover_enabled_roots_and_declared_files() {
+    fn watch_targets_cover_enabled_roots_listed_files_and_attached_drafters() {
         let temporary = tempfile::tempdir().unwrap();
         let present = temporary.path().join("present");
         fs::create_dir_all(&present).unwrap();
@@ -8300,6 +8640,8 @@ mod tests {
         let configuration = LocalModelsConfiguration {
             roots: vec![
                 root(ModelRootKind::Folder, &present),
+                // A listed file is watched through its folder.
+                root(ModelRootKind::Folder, &present.join("file.gguf")),
                 ModelRoot {
                     enabled: false,
                     ..root(ModelRootKind::Folder, &temporary.path().join("disabled"))
@@ -8309,21 +8651,12 @@ mod tests {
                     &temporary.path().join("missing/models"),
                 ),
             ],
-            declarations: vec![CustomModelDeclaration {
-                model_id: format!("local:{}", "a".repeat(64)).parse().unwrap(),
-                origin: CustomModelDeclarationOrigin::Imported {
-                    path: present.join("file.gguf"),
-                },
-                target: vec![present.join("file.gguf").to_string_lossy().into_owned()],
-                projector: None,
-            }],
             drafters: vec![DrafterAttachment {
-                model_id: format!("local:{}", "a".repeat(64)).parse().unwrap(),
+                model_id: "local:file:aaaaaaaaaaaa".parse().unwrap(),
                 drafter: DrafterChoice::Reference {
                     reference: DrafterReference::Local {
                         path: drafters.join("drafter.gguf"),
                     },
-                    method: SpeculativeMethod::DFlash,
                 },
             }],
             ..LocalModelsConfiguration::default()

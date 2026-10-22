@@ -28,8 +28,10 @@ string_id!(AssessmentEnvironmentId);
 string_id!(ModelInstanceId);
 string_id!(CatalogInstallationOperationId);
 
+/// A model's identity. Two `local:` IDs are the same model exactly when their hashes match: the
+/// label is for reading only, so equality, order and hashing ignore it.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone)]
 pub struct ModelId(String);
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
@@ -50,11 +52,16 @@ pub struct HuggingFaceRepositoryId(String);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HuggingFaceArtifactSelector(String);
 
-/// The lowercase hex sha256 of a primary GGUF file's header bytes, through the aligned tensor-data
-/// offset. It identifies a custom model with no Hugging Face identity.
+/// The identity of a custom model with no Hugging Face identity: the first
+/// [`LocalModelHash::LENGTH`] lowercase hex characters of its content digest.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LocalModelDigest(String);
+pub struct LocalModelHash(String);
+
+/// The readable part of a `local:` ID (`<name>-<quant>`), which never identifies the model.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LocalModelLabel(String);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid model ID: {message}")]
@@ -152,16 +159,53 @@ impl fmt::Display for CatalogVariantId {
     }
 }
 
-impl LocalModelDigest {
+impl LocalModelHash {
+    /// 48 bits: about one chance in 560 million of two models clashing among 1,000 on a computer.
+    /// Fixed, so an ID never depends on other files.
+    pub const LENGTH: usize = 12;
+
     pub fn new(value: impl Into<String>) -> Result<Self, ModelIdError> {
         let value = value.into();
-        if value.len() != 64
+        if value.len() != Self::LENGTH
             || !value
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
+            return Err(model_id_error(format!(
+                "local model hash must be {} lowercase hex characters",
+                Self::LENGTH
+            )));
+        }
+        Ok(Self(value))
+    }
+
+    /// The hash of a model's lowercase hex content digest.
+    pub fn of_digest(digest: &str) -> Result<Self, ModelIdError> {
+        Self::new(digest.get(..Self::LENGTH).unwrap_or(digest))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for LocalModelHash {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl LocalModelLabel {
+    pub fn new(value: impl Into<String>) -> Result<Self, ModelIdError> {
+        let value = value.into();
+        if value.is_empty()
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+            })
+        {
             return Err(model_id_error(
-                "local model digest must be 64 lowercase hex characters",
+                "local model label must be lowercase ASCII letters, digits, '.', '_' and '-'",
             ));
         }
         Ok(Self(value))
@@ -173,7 +217,7 @@ impl LocalModelDigest {
     }
 }
 
-impl fmt::Display for LocalModelDigest {
+impl fmt::Display for LocalModelLabel {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
@@ -292,7 +336,8 @@ pub enum ParsedModelId {
         artifact_selector: HuggingFaceArtifactSelector,
     },
     Local {
-        digest: LocalModelDigest,
+        label: LocalModelLabel,
+        hash: LocalModelHash,
     },
 }
 
@@ -311,8 +356,16 @@ impl ModelId {
     }
 
     #[must_use]
-    pub fn local(digest: &LocalModelDigest) -> Self {
-        Self(format!("local:{}", digest.0))
+    pub fn local(label: &LocalModelLabel, hash: &LocalModelHash) -> Self {
+        Self(format!("local:{}:{}", label.0, hash.0))
+    }
+
+    /// What names the model: a `local:` ID's hash, or any other ID whole.
+    fn identity(&self) -> (bool, &str) {
+        match self.0.strip_prefix("local:").and_then(|rest| rest.rsplit_once(':')) {
+            Some((_, hash)) => (true, hash),
+            None => (false, &self.0),
+        }
     }
 
     #[must_use]
@@ -347,9 +400,13 @@ fn parse_model_id(value: &str) -> Result<ParsedModelId, ModelIdError> {
         });
     }
 
-    if let Some(digest) = value.strip_prefix("local:") {
+    if let Some(rest) = value.strip_prefix("local:") {
+        let (label, hash) = rest
+            .rsplit_once(':')
+            .ok_or_else(|| model_id_error("local model ID must be local:<label>:<hash>"))?;
         return Ok(ParsedModelId::Local {
-            digest: LocalModelDigest::new(digest)?,
+            label: LocalModelLabel::new(label)?,
+            hash: LocalModelHash::new(hash)?,
         });
     }
 
@@ -365,6 +422,32 @@ fn parse_model_id(value: &str) -> Result<ParsedModelId, ModelIdError> {
 impl fmt::Display for ModelId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+impl PartialEq for ModelId {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl Eq for ModelId {}
+
+impl PartialOrd for ModelId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ModelId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.identity().cmp(&other.identity())
+    }
+}
+
+impl std::hash::Hash for ModelId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.identity().hash(state);
     }
 }
 
@@ -412,13 +495,16 @@ macro_rules! impl_validated_string {
 
 impl_validated_string!(CatalogBaseId, CatalogBaseId::new);
 impl_validated_string!(CatalogVariantId, CatalogVariantId::new);
-impl_validated_string!(LocalModelDigest, LocalModelDigest::new);
+impl_validated_string!(LocalModelHash, LocalModelHash::new);
+impl_validated_string!(LocalModelLabel, LocalModelLabel::new);
 
 #[cfg(test)]
 mod model_id_tests {
     use std::str::FromStr;
 
-    use super::{CatalogBaseId, CatalogVariantId, LocalModelDigest, ModelId, ParsedModelId};
+    use super::{
+        CatalogBaseId, CatalogVariantId, LocalModelHash, LocalModelLabel, ModelId, ParsedModelId,
+    };
 
     #[test]
     fn parses_and_round_trips_standalone_and_nested_artifacts() {
@@ -474,13 +560,11 @@ mod model_id_tests {
 
     #[test]
     fn composes_parses_and_round_trips_local_identity() {
-        let digest = LocalModelDigest::new("0123456789abcdef".repeat(4)).expect("digest");
-        let id = ModelId::local(&digest);
-        assert_eq!(
-            id.as_str(),
-            format!("local:{}", "0123456789abcdef".repeat(4))
-        );
-        assert_eq!(id.parsed(), ParsedModelId::Local { digest });
+        let label = LocalModelLabel::new("gemma-4-12b-instruct-q8_0").expect("label");
+        let hash = LocalModelHash::of_digest(&"41ad09c2e7f3".repeat(6)).expect("hash");
+        let id = ModelId::local(&label, &hash);
+        assert_eq!(id.as_str(), "local:gemma-4-12b-instruct-q8_0:41ad09c2e7f3");
+        assert_eq!(id.parsed(), ParsedModelId::Local { label, hash });
         let encoded = serde_json::to_string(&id).expect("serialize");
         assert_eq!(
             serde_json::from_str::<ModelId>(&encoded).expect("deserialize"),
@@ -489,17 +573,39 @@ mod model_id_tests {
     }
 
     #[test]
+    fn local_identities_with_the_same_hash_are_the_same_model_whatever_their_labels() {
+        let old = ModelId::from_str("local:my-finetune:9f2c1a7b3e04").expect("old");
+        let current = ModelId::from_str("local:my-finetune-q4_k_m:9f2c1a7b3e04").expect("current");
+        let other = ModelId::from_str("local:my-finetune-q4_k_m:9f2c1a7b3e05").expect("other");
+        assert_eq!(old, current);
+        assert_ne!(current, other);
+        assert_eq!(
+            std::collections::BTreeSet::from([old.clone(), current.clone()]).len(),
+            1
+        );
+        assert_eq!(old.as_str(), "local:my-finetune:9f2c1a7b3e04");
+    }
+
+    #[test]
     fn rejects_non_canonical_local_identities() {
         for value in [
-            "local:".to_owned(),
-            format!("local:{}", "A".repeat(64)),
-            format!("local:{}", "a".repeat(63)),
-            format!("local:{}", "a".repeat(65)),
-            format!("local:{}", "g".repeat(64)),
-            format!("LOCAL:{}", "a".repeat(64)),
+            "local:",
+            "local:41ad09c2e7f3",
+            "local::41ad09c2e7f3",
+            "local:model:41AD09C2E7F3",
+            "local:model:41ad09c2e7f",
+            "local:model:41ad09c2e7f3a",
+            "local:model:41ad09c2e7g3",
+            "local:Model:41ad09c2e7f3",
+            "local:my model:41ad09c2e7f3",
         ] {
-            assert!(ModelId::from_str(&value).is_err(), "accepted {value}");
+            assert!(ModelId::from_str(value).is_err(), "accepted {value}");
         }
+        // Only the lowercase prefix makes a local ID; this is a catalog ID's shape.
+        assert!(matches!(
+            ModelId::from_str("LOCAL:model:41ad09c2e7f3").unwrap().parsed(),
+            ParsedModelId::Catalog { .. }
+        ));
     }
 
     #[test]
@@ -920,7 +1026,6 @@ pub enum ModelPackageInstallationOrigin {
     LlamaCpp,
     Ollama,
     Folder,
-    Imported,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1315,10 +1420,6 @@ pub enum CustomModelOrigin {
         repository: HuggingFaceRepositoryId,
         commit: String,
     },
-    Imported {
-        #[cfg_attr(feature = "openapi", schema(value_type = String))]
-        path: PathBuf,
-    },
     Found {
         source: FoundSource,
     },
@@ -1626,22 +1727,23 @@ pub enum AttachedDrafterState {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AttachedDrafter {
     pub reference: DrafterReference,
-    pub method: SpeculativeMethod,
+    /// How the engine binds it; a drafter it rejects has no method.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub method: Option<SpeculativeMethod>,
     pub state: AttachedDrafterState,
     pub update_available: bool,
 }
 
-/// The drafter a custom model should use: the recommended one, none, or an exact reference.
+/// The drafter a custom model should use: the recommended one, none, or an exact reference, whose
+/// method the engine works out from the drafter and the model.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
 pub enum DrafterChoice {
     Auto,
     None,
-    Reference {
-        reference: DrafterReference,
-        method: SpeculativeMethod,
-    },
+    Reference { reference: DrafterReference },
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1763,33 +1865,26 @@ pub struct ModelRoot {
     pub enabled: bool,
 }
 
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum CustomModelDeclarationOrigin {
-    Added {
-        repository: HuggingFaceRepositoryId,
-        commit: String,
-    },
-    Imported {
-        #[cfg_attr(feature = "openapi", schema(value_type = String))]
-        path: PathBuf,
-    },
-}
-
-/// The persisted record of an added or imported model. For `Added`, `target` and `projector` are
-/// repository-relative paths at the pinned commit; for `Imported` they are absolute file paths,
-/// with the imported file first.
+/// A model added from Hugging Face: its repository and the path of its first shard, which its
+/// `hf:` ID names (the other shards of a split model follow from that shard's name), the pinned
+/// commit, and a projector path in the repository at it.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CustomModelDeclaration {
-    pub model_id: ModelId,
-    pub origin: CustomModelDeclarationOrigin,
-    pub target: Vec<String>,
+pub struct AddedModel {
+    pub repository: HuggingFaceRepositoryId,
+    pub path: HuggingFaceArtifactSelector,
+    pub revision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub projector: Option<String>,
+}
+
+impl AddedModel {
+    #[must_use]
+    pub fn model_id(&self) -> ModelId {
+        ModelId::hugging_face(&self.repository, &self.path)
+    }
 }
 
 /// The whole local-models configuration ACN owns and hands to ICN, at spawn and after every
@@ -1799,7 +1894,7 @@ pub struct CustomModelDeclaration {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LocalModelsConfiguration {
     pub roots: Vec<ModelRoot>,
-    pub declarations: Vec<CustomModelDeclaration>,
+    pub added: Vec<AddedModel>,
     pub hidden: Vec<ModelId>,
     pub drafters: Vec<DrafterAttachment>,
 }
@@ -2375,16 +2470,28 @@ pub struct ModelAssessmentsInvalidation {
     pub revision: u64,
 }
 
-/// A bundle to download; `for_model` names the model the download serves, such as the model a
-/// drafter is fetched for, and is echoed in every `ModelDownload` it produces.
+/// A download of a custom model's `part`, by intent: the service works out its files from the
+/// local-models configuration and keeps the request until it ends, resolving it again after a
+/// restart. Every `ModelDownload` it produces is for `model_id`.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartModelDownloadRequest {
-    pub bundle: ServableModelBundle,
+    pub model_id: ModelId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub for_model: Option<ModelId>,
+    pub part: Option<CustomModelPart>,
+}
+
+/// Which part of a custom model a download fetches: without one, an added model's files at its
+/// pinned commit with the drafter it downloads with; `Drafter`, only the drafter its choice
+/// resolves to; `Update`, an added model's files at the commit its repository has moved to.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum CustomModelPart {
+    Drafter,
+    Update,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -2425,9 +2532,7 @@ pub enum ModelDownloadState {
 pub struct ModelDownload {
     pub id: ModelDownloadId,
     pub bundle: ServableModelBundle,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "openapi", schema(nullable = false))]
-    pub for_model: Option<ModelId>,
+    pub for_model: ModelId,
     pub state: ModelDownloadState,
 }
 
@@ -2601,10 +2706,6 @@ pub trait ModelCandidates: Send + Sync + 'static {
         &self,
         candidate: ModelCandidate,
     ) -> BoxFuture<'_, Result<ModelAssessment, InventoryError>>;
-    fn bundle(
-        &self,
-        candidate: ModelCandidate,
-    ) -> BoxFuture<'_, Result<ServableModelBundle, InventoryError>>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2819,44 +2920,38 @@ mod custom_model_wire_tests {
 
     #[test]
     fn local_models_configuration_round_trips() {
-        let digest = "ab".repeat(32);
+        let local = "local:my-finetune-q4_k_m:9f2c1a7b3e04";
         let configuration: LocalModelsConfiguration = serde_json::from_value(json!({
             "roots": [
                 { "kind": "LmStudio", "path": "/home/u/.lmstudio/models", "enabled": true },
-                { "kind": "Folder", "path": "/models", "enabled": false }
+                { "kind": "Folder", "path": "/models/finetune.gguf", "enabled": true }
             ],
-            "declarations": [
+            "added": [
                 {
-                    "modelId": "hf:owner/repo/model-Q4_K_M.gguf",
-                    "origin": { "_tag": "Added", "repository": "owner/repo", "commit": "c".repeat(40) },
-                    "target": ["model-Q4_K_M.gguf"],
+                    "repository": "owner/repo",
+                    "path": "model-Q4_K_M.gguf",
+                    "revision": "c".repeat(40),
                     "projector": "mmproj.gguf"
-                },
-                {
-                    "modelId": format!("local:{digest}"),
-                    "origin": { "_tag": "Imported", "path": "/models/a.gguf" },
-                    "target": ["/models/a.gguf"]
                 }
             ],
-            "hidden": [format!("local:{digest}")],
+            "hidden": [local],
             "drafters": [
-                { "modelId": "hf:owner/repo/model-Q4_K_M.gguf", "drafter": { "_tag": "Auto" } },
+                { "modelId": "hf:owner/repo/model-Q4_K_M.gguf", "drafter": { "_tag": "None" } },
                 {
-                    "modelId": format!("local:{digest}"),
+                    "modelId": local,
                     "drafter": {
                         "_tag": "Reference",
-                        "reference": { "_tag": "Catalog", "modelId": "qwen3.6-35b-a3b:gguf:q4" },
-                        "method": { "_tag": "DFlash" }
+                        "reference": { "_tag": "Catalog", "modelId": "qwen3.6-35b-a3b:gguf:q4" }
                     }
                 }
             ]
         }))
         .expect("deserialize configuration");
         assert_eq!(configuration.roots[0].kind, ModelRootKind::LmStudio);
-        assert!(matches!(
-            configuration.declarations[1].origin,
-            CustomModelDeclarationOrigin::Imported { .. }
-        ));
+        assert_eq!(
+            configuration.added[0].model_id().as_str(),
+            "hf:owner/repo/model-Q4_K_M.gguf"
+        );
         let encoded = serde_json::to_value(&configuration).expect("serialize");
         assert_eq!(
             serde_json::from_value::<LocalModelsConfiguration>(encoded).expect("round trip"),
@@ -2909,7 +3004,7 @@ mod custom_model_wire_tests {
             })
         );
         let subject = ModelAssessmentSubject::Custom {
-            model_id: format!("local:{}", "0".repeat(64))
+            model_id: "local:model:000000000000"
                 .parse()
                 .expect("model ID"),
         };

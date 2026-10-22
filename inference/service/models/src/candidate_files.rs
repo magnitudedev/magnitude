@@ -382,6 +382,27 @@ pub fn split_shard(path: &Path) -> Option<(String, u32, u32)> {
     (index >= 1 && index <= total && total <= 256).then(|| (prefix.to_owned(), index, total))
 }
 
+/// Every shard of the split set whose first shard is the repository path `path`, in order, beside
+/// it; any other file alone.
+#[must_use]
+pub fn split_set(path: &str) -> Vec<String> {
+    let Some((prefix, 1, total)) = split_shard(Path::new(path)) else {
+        return vec![path.to_owned()];
+    };
+    let (folder, name) = path.rsplit_once('/').map_or(("", path), |(folder, name)| (folder, name));
+    let extension = name.rsplit_once('.').map_or("gguf", |(_, extension)| extension);
+    (1..=total)
+        .map(|index| {
+            let shard = format!("{prefix}-{index:05}-of-{total:05}.{extension}");
+            if folder.is_empty() {
+                shard
+            } else {
+                format!("{folder}/{shard}")
+            }
+        })
+        .collect()
+}
+
 /// A version's presentation label: its header's quantization, spelled by the file or folder name
 /// when that names the same weight type more precisely the way GGUF writers do (`UD-Q4_K_XL`,
 /// `Q4_K_P`); with nothing in the header, the quantization the name spells, else its file stem.

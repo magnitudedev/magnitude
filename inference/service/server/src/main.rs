@@ -246,10 +246,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 Arc::new(instances.clone()),
             )
             .context("failed to initialize model domains")?;
-            tokio::spawn({
-                let installations = model_services.installations.clone();
-                async move { installations.resume_requested_downloads().await }
-            });
             let architectures = engine_architectures();
             let lineage = CatalogLineage::new(inventory.clone(), release_catalog.catalog().clone());
             let candidates = ManagedModelCandidates::new(
@@ -261,6 +257,13 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 host.clone(),
             );
             candidates.start_enrichment(model_variants.clone());
+            // Requested downloads of custom models resolve against the local-models configuration
+            // read before the first scan, so every request resumes once its files can be worked out.
+            model_downloads.set_custom_model_acquisition(candidates.clone());
+            tokio::spawn({
+                let installations = model_services.installations.clone();
+                async move { installations.resume_requested_downloads().await }
+            });
             let assessments = ManagedModelAssessments::start(
                 assessor,
                 model_services.catalog.clone(),

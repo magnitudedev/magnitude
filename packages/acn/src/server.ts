@@ -98,7 +98,6 @@ import { CustomModelReconcilerLive } from "./custom-model-reconciler"
 import { HuggingFaceAccountLive, HuggingFaceOAuthConfigLive } from "./hugging-face-account"
 import { CustomModelCommandsLive } from "./custom-model-commands"
 import { CatalogModelSyncLive } from "./catalog-model-sync"
-import { DrafterMethodsLive } from "./drafter-references"
 import { ModelLocationsLive } from "./model-locations"
 import { FileMentionSearcherLive } from "./file-mention-searcher"
 import { FileSystemManagerLive } from "./file-system-manager"
@@ -402,7 +401,7 @@ const addLocalInferenceServices = <A, E, R>(
     withCustomEndpoints
   )
   const withCustomModels = Layer.provideMerge(
-    Layer.mergeAll(CustomModelsLive, ModelLocationsLive, DrafterMethodsLive),
+    Layer.mergeAll(CustomModelsLive, ModelLocationsLive),
     withHardware,
   )
   const withCatalogAdapter = Layer.provideMerge(LocalModelSourcesLive, withCustomModels)

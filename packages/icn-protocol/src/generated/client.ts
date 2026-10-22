@@ -17,7 +17,6 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         createAnthropicMessage: makeHttpOperation(http, options, Operations.createAnthropicMessageOperation),
       },
       candidates: {
-        buildCandidateBundle: makeHttpOperation(http, options, Operations.buildCandidateBundleOperation),
         inspectModelCandidate: makeHttpOperation(http, options, Operations.inspectModelCandidateOperation),
         listDrafterCandidates: makeHttpOperation(http, options, Operations.listDrafterCandidatesOperation),
         streamModelCandidateInspection: makeStreamOperation(

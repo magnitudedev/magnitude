@@ -12,14 +12,14 @@ use magnitude_service_contracts::models::{
     CatalogInstallationOperationState, CatalogInstallationProgress, CatalogInstallationRemoval,
     CatalogInstallationRetentionReason, CatalogInstallations, CatalogInstallationsInvalidation,
     CatalogInstallationsResponse, CatalogModelOptimizer, CatalogOptimizationProgress,
-    CatalogPackageRemover, ModelDownload, ModelDownloadId, ModelDownloadState, ModelDownloads,
-    ModelId, ServableModelBundle, StartModelDownloadRequest,
+    CatalogPackageRemover, CustomModelPart, ModelDownload, ModelDownloadId, ModelDownloadState,
+    ModelDownloads, ModelId, ParsedModelId, ServableModelBundle,
 };
 
 use crate::ManagedModelDownloads;
 use crate::catalog_models::reject_unavailable;
 use crate::model_domains::ModelDomainResolver;
-use crate::requested_downloads::RequestedDownload;
+use crate::requested_downloads::{RequestedDownload, RequestedPart};
 
 #[derive(Debug, Clone)]
 struct OperationBinding {
@@ -208,7 +208,10 @@ impl ManagedCatalogInstallations {
         reject_unavailable(id, self.resolver.catalog_definition(id)?)?;
         self.reject_active(id).await?;
         let bundle = self.resolver.desired_catalog_configuration(id)?.bundle;
-        let requested = RequestedDownload::CatalogModel { model: id.clone() };
+        let requested = RequestedDownload {
+            model: id.clone(),
+            part: None,
+        };
         self.admit(id, bundle, requested).await
     }
 
@@ -224,9 +227,9 @@ impl ManagedCatalogInstallations {
         self.reject_active(id).await?;
         match self.resolver.catalog_component_download(id, component)? {
             Some(bundle) => {
-                let requested = RequestedDownload::CatalogComponent {
+                let requested = RequestedDownload {
                     model: id.clone(),
-                    component,
+                    part: Some(component.into()),
                 };
                 self.admit(id, bundle, requested).await
             }
@@ -269,13 +272,7 @@ impl ManagedCatalogInstallations {
     ) -> Result<CatalogInstallationAdmission, InventoryError> {
         let started = self
             .downloads
-            .start_requested(
-                StartModelDownloadRequest {
-                    bundle,
-                    for_model: Some(id.clone()),
-                },
-                requested,
-            )
+            .start_requested(bundle, id.clone(), requested)
             .await?;
         let Some(download) = started.download else {
             self.cleanup_model(id).await?;
@@ -366,10 +363,11 @@ impl ManagedCatalogInstallations {
     }
 
     /// Admits again every download requested before a restart that has not ended, once the files
-    /// on this computer are known: a catalog installation or component through its own admission,
-    /// so it resolves against the current catalog, any other download as its exact bundle. A
-    /// request already admitted again meanwhile is left alone, and one with nothing left to fetch,
-    /// or that can no longer be admitted, ends.
+    /// on this computer are known, by resolving its intent now: a catalog installation or
+    /// component through the current catalog, a custom model's part through the current
+    /// local-models configuration. A request already admitted again meanwhile is left alone, and
+    /// one with nothing left to fetch, or that can no longer be admitted (its model, added model or
+    /// drafter choice is gone), ends.
     pub async fn resume_requested_downloads(&self) {
         if let Err(error) = self.resolver.inventory.ensure_installed_model_inventory().await {
             tracing::warn!(%error, "resuming requested downloads before the model inventory is complete");
@@ -378,14 +376,32 @@ impl ManagedCatalogInstallations {
             if !self.downloads.is_unresumed(&requested) {
                 continue;
             }
-            let admitted = match &requested {
-                RequestedDownload::CatalogModel { model } => self.install(model).await.map(drop),
-                RequestedDownload::CatalogComponent { model, component } => {
-                    self.install_component(model, *component).await.map(drop)
+            let model = &requested.model;
+            let admitted = match (model.parsed(), requested.part) {
+                (ParsedModelId::Catalog { .. }, None) => self.install(model).await.map(drop),
+                (ParsedModelId::Catalog { .. }, Some(RequestedPart::Projector)) => self
+                    .install_component(model, CatalogComponent::Projector)
+                    .await
+                    .map(drop),
+                (ParsedModelId::Catalog { .. }, Some(RequestedPart::Drafter)) => self
+                    .install_component(model, CatalogComponent::Drafter)
+                    .await
+                    .map(drop),
+                (_, Some(RequestedPart::Projector))
+                | (ParsedModelId::Catalog { .. }, Some(RequestedPart::Update)) => {
+                    Err(InventoryError::InvalidRequest(format!(
+                        "{model} has no such part to download"
+                    )))
                 }
-                RequestedDownload::Bundle { request } => self
+                (_, None) => self.downloads.start_custom(model.clone(), None).await.map(drop),
+                (_, Some(RequestedPart::Drafter)) => self
                     .downloads
-                    .start_requested(request.clone(), requested.clone())
+                    .start_custom(model.clone(), Some(CustomModelPart::Drafter))
+                    .await
+                    .map(drop),
+                (_, Some(RequestedPart::Update)) => self
+                    .downloads
+                    .start_custom(model.clone(), Some(CustomModelPart::Update))
                     .await
                     .map(drop),
             };

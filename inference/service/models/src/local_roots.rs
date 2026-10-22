@@ -1,14 +1,14 @@
-//! Scanners for the read-only model locations ACN configures, and for files declarations name in
-//! place. Each scanner reads directory layouts, manifests and GGUF headers only; it never writes,
-//! moves or hashes a file in full, and partial downloads never form a group.
+//! Scanners for the read-only model locations ACN configures, and for drafter files the
+//! configuration names in place. Each scanner reads directory layouts, manifests and GGUF headers
+//! only; it never writes, moves or hashes a file in full, and partial downloads never form a group.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use magnitude_service_contracts::models::{
-    CustomModelDeclarationOrigin, DrafterChoice, DrafterReference, HuggingFaceArtifactSelector,
-    HuggingFaceRepositoryId, LocalModelsConfiguration, ModelRoot, ModelRootKind,
+    DrafterChoice, DrafterReference, HuggingFaceArtifactSelector, HuggingFaceRepositoryId,
+    LocalModelsConfiguration, ModelRoot, ModelRootKind,
 };
 use magnitude_service_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, ExternalOrigin, HubCacheOwner, HubFile,
@@ -66,6 +66,10 @@ pub(crate) fn scan_root(
     architectures: &RecognizedArchitectures,
 ) -> Result<LocationScan, InventoryError> {
     let mut output = LocationScan::default();
+    if root.kind == ModelRootKind::Folder && root.path.is_file() {
+        scan_folder_file(&root.path, cache, architectures, &mut output)?;
+        return Ok(output);
+    }
     if !root.path.is_dir() {
         return Ok(output);
     }
@@ -720,37 +724,67 @@ fn scan_folder(
     Ok(())
 }
 
-/// Files declarations reference in place: imported models, the drafters in each imported model's
-/// own folder, and drafters attached by local path. A declared file that is missing simply
-/// contributes nothing.
-pub(crate) fn scan_declared_files(
-    configuration: &LocalModelsConfiguration,
+/// A single GGUF file listed as a model location: the file, with its sibling shards when it is a
+/// split model's first shard (a set missing a shard contributes nothing), and the drafters in its
+/// own folder, so its automatic drafter resolves wherever the folder is. Shards past the first
+/// listed on their own are no model.
+fn scan_folder_file(
+    file: &Path,
     cache: &ModelCache,
     architectures: &RecognizedArchitectures,
-    output: &mut Vec<DiscoveryCandidate>,
-) {
-    let imported = configuration
-        .declarations
+    output: &mut LocationScan,
+) -> Result<(), InventoryError> {
+    let Some(folder) = file.parent() else {
+        return Ok(());
+    };
+    let paths = match split_shard_name(file) {
+        None => vec![file.to_path_buf()],
+        Some(_) => match file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(crate::candidate_files::split_set)
+        {
+            Some(shards) if shards.len() > 1 => {
+                shards.into_iter().map(|name| folder.join(name)).collect()
+            }
+            _ => return Ok(()),
+        },
+    };
+    if paths
         .iter()
-        .filter(|declaration| {
-            matches!(
-                declaration.origin,
-                CustomModelDeclarationOrigin::Imported { .. }
-            )
-        })
-        .collect::<Vec<_>>();
-    let folders = imported
-        .iter()
-        .filter_map(|declaration| Path::new(declaration.target.first()?).parent())
-        .map(Path::to_path_buf)
-        .collect::<BTreeSet<_>>();
-    let beside = folders
-        .iter()
-        .flat_map(|folder| folder_drafters(folder, cache, architectures))
+        .any(|path| !path.is_file() || is_partial_download(path))
+    {
+        return Ok(());
+    }
+    let model = ModelGroup {
+        paths,
+        projector: None,
+    };
+    let beside = folder_drafters(folder, cache, architectures)
+        .into_iter()
+        .filter(|path| path != file)
         .map(|path| ModelGroup {
             paths: vec![path],
             projector: None,
         });
+    for group in std::iter::once(model).chain(beside) {
+        push_group(
+            folder,
+            "folder",
+            ExternalOrigin::Folder,
+            &group,
+            &mut output.candidates,
+        )?;
+    }
+    Ok(())
+}
+
+/// Drafters attached by local path, referenced in place wherever they are. A missing file simply
+/// contributes nothing.
+pub(crate) fn scan_attached_drafters(
+    configuration: &LocalModelsConfiguration,
+    output: &mut Vec<DiscoveryCandidate>,
+) {
     let attached =
         configuration
             .drafters
@@ -758,31 +792,22 @@ pub(crate) fn scan_declared_files(
             .filter_map(|attachment| match &attachment.drafter {
                 DrafterChoice::Reference {
                     reference: DrafterReference::Local { path },
-                    ..
-                } => Some(ModelGroup {
-                    paths: vec![path.clone()],
-                    projector: None,
-                }),
+                } => Some(path),
                 _ => None,
             });
-    let models = imported.iter().map(|declaration| ModelGroup {
-        paths: declaration.target.iter().map(PathBuf::from).collect(),
-        projector: declaration.projector.as_ref().map(PathBuf::from),
-    });
-    for group in models.chain(beside).chain(attached) {
-        if let Err(error) = push_declared(&group, output) {
+    for path in attached {
+        if let Err(error) = push_attached_drafter(path, output) {
             tracing::warn!(
-                path = %group.paths[0].display(),
+                path = %path.display(),
                 %error,
-                "declared model file could not be observed"
+                "attached drafter file could not be observed"
             );
         }
     }
 }
 
-/// The drafters "in this folder" for a model imported from `folder`: its own single-file GGUFs,
-/// never a subfolder's, whose header declares a drafter role. They are referenced in place like
-/// the model, so its automatic drafter resolves wherever the folder is.
+/// The drafters "in this folder" for a model listed by its file in `folder`: its own single-file
+/// GGUFs, never a subfolder's, whose header declares a drafter role.
 fn folder_drafters(
     folder: &Path,
     cache: &ModelCache,
@@ -811,41 +836,31 @@ fn folder_drafters(
         .collect()
 }
 
-fn push_declared(
-    group: &ModelGroup,
+fn push_attached_drafter(
+    path: &Path,
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
-    let files = group.paths.iter().chain(group.projector.iter());
-    if files
-        .clone()
-        .any(|path| !path.is_file() || is_partial_download(path))
-    {
+    if !path.is_file() || is_partial_download(path) {
         return Ok(());
     }
-    let Some(root) = common_directory(files) else {
+    let Some(root) = path.parent() else {
         return Ok(());
     };
-    let components = components_for_group(&root, group, None)?;
+    let group = ModelGroup {
+        paths: vec![path.to_path_buf()],
+        projector: None,
+    };
+    let components = components_for_group(root, &group, None)?;
     push_external(
-        &root,
-        "imported",
-        ExternalOrigin::Imported,
+        root,
+        "attached",
+        ExternalOrigin::Folder,
         LocalDeclaration::Configuration,
         components,
         None,
         output,
     );
     Ok(())
-}
-
-fn common_directory<'a>(mut files: impl Iterator<Item = &'a PathBuf>) -> Option<PathBuf> {
-    let mut common = files.next()?.parent()?.to_path_buf();
-    for file in files {
-        while !file.starts_with(&common) {
-            common = common.parent()?.to_path_buf();
-        }
-    }
-    Some(common)
 }
 
 fn read_bounded_json(path: &Path, limit: u64) -> Option<serde_json::Value> {

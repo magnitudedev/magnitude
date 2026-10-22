@@ -16,6 +16,7 @@ import {
   type LocalModelServingState,
   type ServingProfile,
   type SpeculativeMethod,
+  sameModelId,
 } from "./model-state"
 
 /**
@@ -65,7 +66,7 @@ export const localModelDeprecation = (
   ? Option.some(model.catalogData.support)
   : Option.none()
 
-/** The managed lifecycle of a catalog or added model; imported and found models have none. */
+/** The managed lifecycle of a catalog or added model; found models have none. */
 export const localModelManagedAcquisition = (
   model: LocalModel,
 ): Option.Option<LocalModelAcquisitionState> => {
@@ -100,22 +101,27 @@ export const localModelProviderModelId = (
     : Option.none()
 }
 
-/** The model an ID names: its own ID, or a catalog model's alias (its files' ID as a found model). */
+/**
+ * The model an ID names: the model with that identity (a `local:` ID stored with an older label included), or the
+ * catalog model it is an alias of (its files' ID as a found model).
+ */
 export const findLocalModelById = (
   models: readonly LocalModel[],
   modelId: ProviderModelId,
-): Option.Option<LocalModel> => Option.fromNullable(models.find((model) => model.modelId === modelId)
-  ?? models.find((model) => model._tag === "Catalog" && model.catalogData.aliases.some((alias) => alias === (modelId as string))))
+): Option.Option<LocalModel> => Option.fromNullable(models.find((model) => sameModelId(model.modelId, modelId))
+  ?? models.find((model) => model._tag === "Catalog" && model.catalogData.aliases.some((alias) => sameModelId(alias, modelId))))
 
-/** The canonical ID for an ID that may be a catalog model's alias; any other ID is its own. */
+/**
+ * The ID a stored ID now names: a catalog model's for one of its aliases, a listed model's own for its identity under
+ * an older `local:` label, and otherwise the ID itself.
+ */
 export const canonicalLocalModelId = <Id extends ProviderModelId>(
   models: readonly LocalModel[],
   modelId: Id,
-): Id | LocalModel["modelId"] => Option.match(
-  Option.fromNullable(models.find((model) => model._tag === "Catalog"
-    && model.catalogData.aliases.some((alias) => alias === (modelId as string)))),
-  { onNone: () => modelId, onSome: (model) => model.modelId },
-)
+): Id | LocalModel["modelId"] => Option.match(findLocalModelById(models, modelId), {
+  onNone: () => modelId,
+  onSome: (model) => model.modelId,
+})
 
 export const localModelInstalledBytes = (model: LocalModel): Option.Option<number> =>
   Option.map(localModelInstallation(model), ({ installedBytes }) => installedBytes)
@@ -141,7 +147,6 @@ export const catalogDrafterName = (displayName: string, method: Option.Option<Sp
 export const customModelSourceLabel = (origin: CustomModelOrigin): string => {
   switch (origin._tag) {
     case "Added": return "Hugging Face"
-    case "Imported": return "GGUF file"
     case "Found":
       switch (origin.source._tag) {
         case "HuggingFaceCache": return "Hugging Face cache"

@@ -5,7 +5,6 @@ import type { CustomLocalModel, LocalModel } from "@magnitudedev/sdk"
 export const customModelSource = (model: CustomLocalModel): { readonly label: string; readonly href: Option.Option<string> } => {
   const origin = model.origin
   if (origin._tag === "Added") return { label: `${origin.repository} · pinned to ${origin.commit.slice(0, 7)}`, href: Option.some(`https://huggingface.co/${origin.repository}`) }
-  if (origin._tag === "Imported") return { label: origin.path, href: Option.none() }
   const state = model.acquisitionState
   const path = (state._tag === "External" || state._tag === "Unavailable") && state.installation._tag === "Resolved" ? ` · ${state.installation.primaryPath}` : ""
   return { label: `${model.presentation.sourceLabel}${path}`, href: Option.none() }

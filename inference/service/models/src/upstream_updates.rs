@@ -2,7 +2,7 @@
 //! it has an update when the repository's `main` has moved to a commit where its target file is
 //! still present with other content. Checks run in the background, each result is kept for
 //! [`CHECK_INTERVAL`], and a check that cannot reach the Hub keeps the last result and says
-//! nothing. Once an update has landed and the declaration pins its commit, Magnitude's copy at
+//! nothing. Once an update has landed and the configuration pins its commit, Magnitude's copy at
 //! the commit it replaced is removed.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,11 +10,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use magnitude_service_contracts::ModelSource;
+use magnitude_service_contracts::{InventoryError, ModelSource};
 use magnitude_service_contracts::models::{
-    CustomModel, CustomModelDeclaration, CustomModelDeclarationOrigin, CustomModelOrigin,
-    InstalledModelPackages as _, ModelFileRole, ModelPackageId, ModelPackageInstallationOrigin,
-    PackageValidation,
+    AddedModel, CustomModel, CustomModelOrigin, InstalledModelPackages as _, ModelFileRole,
+    ModelPackageId, ModelPackageInstallationOrigin, PackageValidation,
 };
 use tokio::sync::Notify;
 
@@ -35,15 +34,12 @@ struct UpstreamKey {
 }
 
 impl UpstreamKey {
-    fn of(declaration: &CustomModelDeclaration) -> Option<Self> {
-        let CustomModelDeclarationOrigin::Added { repository, commit } = &declaration.origin else {
-            return None;
-        };
-        Some(Self {
-            repository: repository.as_str().to_owned(),
-            commit: commit.clone(),
-            target: declaration.target.clone(),
-        })
+    fn of(added: &AddedModel) -> Self {
+        Self {
+            repository: added.repository.as_str().to_owned(),
+            commit: added.revision.clone(),
+            target: crate::candidate_files::split_set(added.path.as_str()),
+        }
     }
 }
 
@@ -53,7 +49,7 @@ struct UpstreamEntry {
     confirmed: bool,
 }
 
-/// The last upstream check of each added declaration, by repository, pinned commit and target.
+/// The last upstream check of each added model, by repository, pinned commit and target.
 pub(crate) struct UpstreamUpdates {
     entries: Mutex<BTreeMap<UpstreamKey, UpstreamEntry>>,
     wake: Arc<Notify>,
@@ -67,16 +63,16 @@ impl UpstreamUpdates {
         }
     }
 
-    /// Asks the background task to check due declarations and remove replaced copies now.
+    /// Asks the background task to check due added models and remove replaced copies now.
     pub(crate) fn wake(&self) {
         self.wake.notify_one();
     }
 
-    /// Sets each added model's `update_commit` from the last check of its declaration.
+    /// Sets each added model's `update_commit` from the last check of it.
     pub(crate) fn annotate<'a>(
         &self,
         models: impl IntoIterator<Item = &'a mut CustomModel>,
-        declarations: &[CustomModelDeclaration],
+        added: &[AddedModel],
     ) {
         let Ok(entries) = self.entries.lock() else {
             return;
@@ -85,26 +81,18 @@ impl UpstreamUpdates {
             if !matches!(model.origin, CustomModelOrigin::Added { .. }) {
                 continue;
             }
-            model.update_commit = declarations
+            model.update_commit = added
                 .iter()
-                .find(|declaration| declaration.model_id == model.model_id)
-                .and_then(UpstreamKey::of)
-                .and_then(|key| entries.get(&key))
+                .find(|added| added.model_id() == model.model_id)
+                .and_then(|added| entries.get(&UpstreamKey::of(added)))
                 .and_then(|entry| entry.update_commit.clone());
         }
     }
 
-    /// Checks every added declaration whose last result is missing or due, and forgets the ones
-    /// no longer declared. Returns whether any model's update changed.
-    pub(crate) async fn check_due(
-        &self,
-        store: &ManagedModelStore,
-        declarations: &[CustomModelDeclaration],
-    ) -> bool {
-        let keys = declarations
-            .iter()
-            .filter_map(UpstreamKey::of)
-            .collect::<BTreeSet<_>>();
+    /// Checks every added model whose last result is missing or due, and forgets the ones no
+    /// longer added. Returns whether any model's update changed.
+    pub(crate) async fn check_due(&self, store: &ManagedModelStore, added: &[AddedModel]) -> bool {
+        let keys = added.iter().map(UpstreamKey::of).collect::<BTreeSet<_>>();
         let due = {
             let Ok(mut entries) = self.entries.lock() else {
                 return false;
@@ -154,11 +142,11 @@ impl UpstreamUpdates {
         changed
     }
 
-    /// For a declaration whose repository has been reached at least once, the newer commit an
+    /// For an added model whose repository has been reached at least once, the newer commit an
     /// update may be fetching, if any; nothing while it never has.
-    fn confirmed_update(&self, declaration: &CustomModelDeclaration) -> Option<Option<String>> {
+    fn confirmed_update(&self, added: &AddedModel) -> Option<Option<String>> {
         let entries = self.entries.lock().ok()?;
-        let entry = entries.get(&UpstreamKey::of(declaration)?)?;
+        let entry = entries.get(&UpstreamKey::of(added))?;
         entry.confirmed.then(|| entry.update_commit.clone())
     }
 }
@@ -191,15 +179,15 @@ fn target_changed(
             .any(|path| pinned.get(path) != current.get(path))
 }
 
-/// Magnitude's copies of added targets at a commit their declaration no longer pins, once the
+/// Magnitude's copies of added targets at a commit the configuration no longer pins, once the
 /// copy at the pinned commit is installed and valid: the copies an update replaced. `known` gives
-/// a declaration's update commit as the Hub last confirmed it; a copy at that commit is an update
-/// still waiting to be pinned and stays, and nothing is removed for a declaration the Hub has not
+/// an added model's update commit as the Hub last confirmed it; a copy at that commit is an update
+/// still waiting to be pinned and stays, and nothing is removed for a model the Hub has not
 /// confirmed since the service started.
 pub(crate) fn replaced_added_packages(
     snapshot: &InstalledPackageSnapshot,
-    declarations: &[CustomModelDeclaration],
-    known: impl Fn(&CustomModelDeclaration) -> Option<Option<String>>,
+    added: &[AddedModel],
+    known: impl Fn(&AddedModel) -> Option<Option<String>>,
 ) -> Vec<ModelPackageId> {
     fn managed_target(
         record: &crate::inventory::InstalledPackageRecord,
@@ -223,16 +211,13 @@ pub(crate) fn replaced_added_packages(
         Some((repository.as_str(), commit.as_str(), primary.path.as_path()))
     }
     let mut kept = BTreeMap::<(&str, &Path), (&str, Option<String>)>::new();
-    for declaration in declarations {
-        let CustomModelDeclarationOrigin::Added { repository, commit } = &declaration.origin else {
-            continue;
-        };
-        let (Some(target), Some(update)) = (declaration.target.first(), known(declaration)) else {
+    for added in added {
+        let Some(update) = known(added) else {
             continue;
         };
         kept.insert(
-            (repository.as_str(), Path::new(target)),
-            (commit.as_str(), update),
+            (added.repository.as_str(), Path::new(added.path.as_str())),
+            (added.revision.as_str(), update),
         );
     }
     let landed = snapshot
@@ -265,6 +250,27 @@ pub(crate) fn replaced_added_packages(
         .collect()
 }
 
+impl ModelDomainResolver {
+    /// The commit an added model's update fetches: the one the last check confirmed, or, before
+    /// any check has reached the Hub (just after a restart), the one the Hub reports now.
+    pub async fn added_model_update(
+        &self,
+        added: &AddedModel,
+    ) -> Result<Option<String>, InventoryError> {
+        match self.upstream.confirmed_update(added) {
+            Some(update) => Ok(update),
+            None => upstream_update(
+                &self.inventory,
+                added.repository.as_str(),
+                &added.revision,
+                &UpstreamKey::of(added).target,
+            )
+            .await
+            .map_err(InventoryError::Upstream),
+        }
+    }
+}
+
 /// Runs the checks and the removal of replaced copies in the background for as long as the
 /// resolver lives: after every configuration or inventory change, and every few minutes so a
 /// result is renewed once it is due.
@@ -292,7 +298,7 @@ async fn sweep(resolver: &ModelDomainResolver) {
     };
     if resolver
         .upstream
-        .check_due(&resolver.inventory, &configuration.declarations)
+        .check_due(&resolver.inventory, &configuration.added)
         .await
     {
         resolver.local_models_changed();
@@ -302,8 +308,8 @@ async fn sweep(resolver: &ModelDomainResolver) {
         .installed_packages
         .read()
         .map(|snapshot| {
-            replaced_added_packages(&snapshot, &configuration.declarations, |declaration| {
-                resolver.upstream.confirmed_update(declaration)
+            replaced_added_packages(&snapshot, &configuration.added, |added| {
+                resolver.upstream.confirmed_update(added)
             })
         })
         .unwrap_or_default();
@@ -328,8 +334,8 @@ mod tests {
     use super::*;
     use crate::inventory::InventoryConfig;
     use magnitude_service_contracts::models::{
-        CustomModelState, HuggingFaceRepositoryId, LocalModels as _, LocalModelsConfiguration,
-        ModelId, RecommendableModelCatalog,
+        CustomModelState, HuggingFaceArtifactSelector, HuggingFaceRepositoryId, LocalModels as _,
+        LocalModelsConfiguration, RecommendableModelCatalog,
     };
 
     struct NoRemoval;
@@ -421,16 +427,11 @@ mod tests {
         (temporary, Arc::new(store))
     }
 
-    fn declaration(pinned: &str) -> CustomModelDeclaration {
-        CustomModelDeclaration {
-            model_id: format!("hf:{REPOSITORY}/{TARGET}")
-                .parse::<ModelId>()
-                .unwrap(),
-            origin: CustomModelDeclarationOrigin::Added {
-                repository: HuggingFaceRepositoryId::new(REPOSITORY).unwrap(),
-                commit: pinned.to_owned(),
-            },
-            target: vec![TARGET.to_owned()],
+    fn declaration(pinned: &str) -> AddedModel {
+        AddedModel {
+            repository: HuggingFaceRepositoryId::new(REPOSITORY).unwrap(),
+            path: HuggingFaceArtifactSelector::new(TARGET).unwrap(),
+            revision: pinned.to_owned(),
             projector: Some("mmproj.gguf".to_owned()),
         }
     }
@@ -513,7 +514,7 @@ mod tests {
         let local =
             crate::custom_models::ManagedLocalModels::new(resolver.clone(), Arc::new(NoRemoval));
         let configuration = LocalModelsConfiguration {
-            declarations: vec![declaration(&pinned)],
+            added: vec![declaration(&pinned)],
             ..LocalModelsConfiguration::default()
         };
         local.configure(configuration.clone()).await.unwrap();
@@ -524,7 +525,7 @@ mod tests {
         assert!(
             resolver
                 .upstream
-                .check_due(&resolver.inventory, &configuration.declarations)
+                .check_due(&resolver.inventory, &configuration.added)
                 .await
         );
         let listed = local.list_local().await.unwrap();
@@ -536,7 +537,7 @@ mod tests {
         assert!(
             !resolver
                 .upstream
-                .check_due(&resolver.inventory, &configuration.declarations)
+                .check_due(&resolver.inventory, &configuration.added)
                 .await
         );
 
@@ -632,7 +633,7 @@ mod tests {
             }
             snapshot
         };
-        let current = |_: &CustomModelDeclaration| Some(None);
+        let current = |_: &AddedModel| Some(None);
         let pinned_new = [declaration(&new)];
         assert_eq!(
             replaced_added_packages(&snapshot(PackageValidation::Valid), &pinned_new, current),

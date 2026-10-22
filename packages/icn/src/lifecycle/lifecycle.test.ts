@@ -46,7 +46,7 @@ const config = (host: "127.0.0.1" | "::1" = "127.0.0.1") =>
       modelStore: Option.some("/data/models"),
       cacheRoot: Option.some("/data/cache"),
       localModelsConfigurationFile: "/data/cache/local-models-configuration.json",
-      localModels: { roots: [], declarations: [], hidden: [], drafters: [] },
+      localModels: { roots: [], added: [], hidden: [], drafters: [] },
     }),
     host,
     startupTimeout: Duration.seconds(30),
@@ -114,14 +114,14 @@ describe("ICN managed launch", () => {
         localModelsConfigurationFile: file,
         localModels: {
           roots: [{ kind: "Ollama", path: "/models/ollama", enabled: false }],
-          declarations: [],
+          added: [],
           hidden: ["hf:owner/repo/model.gguf"],
           drafters: [],
         },
       })).pipe(Effect.provide(BunContext.layer)));
       expect(JSON.parse(await Bun.file(file).text())).toEqual({
         roots: [{ kind: "Ollama", path: "/models/ollama", enabled: false }],
-        declarations: [],
+        added: [],
         hidden: ["hf:owner/repo/model.gguf"],
         drafters: [],
       });

@@ -11,7 +11,7 @@ import {
   drafterDownload,
   drafterReference,
   foundId,
-  importedId,
+  localId,
   nativeCustomModel,
   nativeDownload,
   targetDownload,
@@ -68,8 +68,8 @@ const attachedDrafter = {
 describe("custom model rows", () => {
   it("projects a found model as external, assessed, and unranked with its source tag", () => {
     const row = Option.getOrThrow(customModel(inputs()))
-    expect(row.origin).toEqual({ _tag: "Found", source: { _tag: "LmStudio" } })
-    expect(row.presentation.sourceLabel).toBe("LM Studio")
+    expect(row.origin).toEqual({ _tag: "Found", source: { _tag: "HuggingFaceCache" } })
+    expect(row.presentation.sourceLabel).toBe("Hugging Face cache")
     expect(row.presentation.variantLabel).toBe("Q4_K_M")
     expect(row.presentation.sourceUrls).toEqual(["https://huggingface.co/other/found-GGUF"])
     expect(row.acquisitionState._tag).toBe("External")
@@ -240,12 +240,13 @@ describe("attached drafters", () => {
     }))
   })
 
-  it("attaches an imported model's automatic drafter in its folder once ICN finds it there", () => {
+  it("attaches a folder model's automatic drafter beside it once ICN finds it there", () => {
     const beside = { _tag: "Local", path: "/home/me/fx/g4imp/mtp-gemma-4-E2B-it-Q4_0.gguf" }
     const mtp = { _tag: "Bound", method: { _tag: "Mtp" }, memoryBytes: 200_000_000 }
     const imported = customSource(nativeCustomModel({
-      modelId: importedId,
-      origin: { _tag: "Imported", path: "/home/me/fx/g4imp/gemma-4-E2B-it-Q4_0.gguf" },
+      modelId: localId,
+      origin: { _tag: "Found", source: { _tag: "Folder", path: "/home/me/fx/g4imp" } },
+      files: [{ path: "/home/me/fx/g4imp/gemma-4-E2B-it-Q4_0.gguf", sizeBytes: 1_000 }],
       drafter: { method: { _tag: "Mtp" }, reference: beside, state: { _tag: "Ready" }, updateAvailable: false },
       recommendedDrafter: {
         category: "NextToModel",
@@ -288,7 +289,7 @@ describe("custom model downloads", () => {
     expect(customModelDownloads(addedId, config, downloads).map(({ kind, download }) => [kind, download.id]))
       .toEqual([["Target", "t"], ["Drafter", "ad"]])
     expect(customModelDownloads(foundId, config, downloads).map(({ kind }) => kind)).toEqual(["Drafter"])
-    expect(customModelDownloads(importedId, config, downloads)).toEqual([])
+    expect(customModelDownloads(localId, config, downloads)).toEqual([])
   })
 
   it("lets a newer attempt supersede an older failure", () => {
@@ -312,7 +313,7 @@ describe("custom model downloads", () => {
       repository: "magnitudedev/catalog-drafters", revision: "r1", path: "drafter.gguf",
     }, { _tag: "Downloading", completedBytes: 3, totalBytes: 9, stage: "downloading" })
     const config = customModelsConfig({
-      drafters: { [foundId]: { _tag: "Reference", reference: { _tag: "Catalog", modelId: "qwen3.6-35b-a3b:gguf:q4" }, method: { _tag: "DFlash" } } },
+      drafters: { [foundId]: "qwen3.6-35b-a3b:gguf:q4" },
     })
     expect(customModelDownloads(foundId, config, [catalogDrafter]).map(({ kind }) => kind)).toEqual(["Drafter"])
   })
@@ -598,7 +599,7 @@ describe("local models state", () => {
     expect(state.unsupported).toEqual([{
       modelId: Option.some(unsupportedId),
       displayName: "Unsupported Model",
-      origin: { _tag: "Found", source: { _tag: "LmStudio" } },
+      origin: { _tag: "Found", source: { _tag: "HuggingFaceCache" } },
       path: "/models/unsupported.gguf",
       reasons: [{ _tag: "Architecture", architecture: "deepseek4" }],
       detail: "unknown architecture deepseek4",

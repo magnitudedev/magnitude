@@ -50,7 +50,7 @@ pub use custom_models::{
     CatalogDrafterFit, CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts,
     DrafterContent, ManagedLocalModels,
 };
-pub use download_service::ManagedModelDownloads;
+pub use download_service::{CustomModelAcquisition, ManagedModelDownloads};
 pub use inventory::{DownloadSpace, InventoryConfig, ManagedModelStore};
 pub use local_roots::llama_cpp_flat_prefix;
 pub use model_domains::{ManagedModelServices, ModelDomainResolver, managed_model_services};

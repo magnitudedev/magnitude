@@ -21,9 +21,10 @@ import {
   ModelParameterizationSchema,
   ModelReleaseDateSchema,
   parseModelId,
+  sameModelId,
 } from "./model-state"
 
-const digest = "a".repeat(32) + "0123456789abcdef".repeat(2)
+const localId = "local:gemma-4-12b-instruct-q8_0:41ad09c2e7f3"
 
 const catalogModel = {
   _tag: "Catalog",
@@ -84,14 +85,15 @@ describe("CatalogSupportSchema", () => {
 })
 
 describe("ModelIdSchema", () => {
-  it("accepts canonical catalog and Hugging Face callable identities", () => {
+  it("accepts canonical catalog, Hugging Face, and local identities", () => {
     expect(Schema.decodeUnknownSync(CatalogBaseIdSchema)("qwen3.5-4b")).toBe("qwen3.5-4b")
     expect(Schema.decodeUnknownSync(CatalogVariantIdSchema)("gguf:q4")).toBe("gguf:q4")
     for (const id of [
       "qwen3.5-4b:gguf:q4",
       "hf:owner/repository/model-q4.gguf",
       "hf:owner/repository/subdirectory/model-00001-of-00002.gguf",
-      `local:${digest}`,
+      localId,
+      "local:my.finetune_v2:9f2c1a7b3e04",
     ]) expect(Schema.decodeUnknownSync(ModelIdSchema)(id)).toBe(id)
   })
 
@@ -108,10 +110,19 @@ describe("ModelIdSchema", () => {
       repositoryId: "owner/repository",
       artifactSelector: "sub/model-q4.gguf",
     })
-    expect(parseModelId(Schema.decodeUnknownSync(ModelIdSchema)(`local:${digest}`))).toEqual({
+    expect(parseModelId(Schema.decodeUnknownSync(ModelIdSchema)(localId))).toEqual({
       _tag: "Local",
-      headerDigest: digest,
+      label: "gemma-4-12b-instruct-q8_0",
+      hash: "41ad09c2e7f3",
     })
+  })
+
+  it("names a local model by its hash alone, so an ID stored under an older label is the same model", () => {
+    expect(sameModelId(localId, "local:gemma-4-12b-it-q8_0:41ad09c2e7f3")).toBe(true)
+    expect(sameModelId(localId, "local:gemma-4-12b-instruct-q8_0:41ad09c2e7f4")).toBe(false)
+    expect(sameModelId("hf:owner/repository/model.gguf", "hf:owner/repository/model.gguf")).toBe(true)
+    expect(sameModelId("hf:owner/repository/model.gguf", "hf:owner/repository/other.gguf")).toBe(false)
+    expect(sameModelId("model:gguf:q4", "model:gguf:q4")).toBe(true)
   })
 
   it("rejects aliases, missing selectors, traversal, backslashes, and non-GGUF artifacts", () => {
@@ -124,8 +135,14 @@ describe("ModelIdSchema", () => {
       "hf:owner/repository/model\n.gguf",
       "owner/repository/model.gguf",
       "local:abc",
-      `local:${digest.toUpperCase()}`,
-      `local:${digest}0`,
+      // The pre-release form: a whole content digest with no label.
+      `local:${"a".repeat(32)}${"0123456789abcdef".repeat(2)}`,
+      "local:gemma:41AD09C2E7F3",
+      "local:gemma:41ad09c2e7f",
+      "local:gemma:41ad09c2e7f30",
+      "local:Gemma-Q8_0:41ad09c2e7f3",
+      "local:gemma q8:41ad09c2e7f3",
+      "local::41ad09c2e7f3",
     ]) expect(() => Schema.decodeUnknownSync(ModelIdSchema)(id)).toThrow()
   })
 })
@@ -185,14 +202,28 @@ describe("LocalModelSchema invariants", () => {
   })
 
   it("ties origin to identity and to who owns the files", () => {
+    for (const source of [{ _tag: "Ollama" }, { _tag: "LmStudio" }, { _tag: "Folder", path: "/models" }]) {
+      expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
+        ...foundModel,
+        modelId: localId,
+        origin: { _tag: "Found", source },
+      })).not.toThrow()
+      // Only a location that records a file's Hub origin gives it a Hugging Face ID.
+      expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
+        ...foundModel,
+        origin: { _tag: "Found", source },
+      })).toThrow()
+    }
+    for (const modelId of [localId, foundModel.modelId]) {
+      expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
+        ...foundModel,
+        modelId,
+        origin: { _tag: "Found", source: { _tag: "LlamaCpp" } },
+      })).not.toThrow()
+    }
     expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
       ...foundModel,
-      modelId: `local:${digest}`,
-      origin: { _tag: "Found", source: { _tag: "Ollama" } },
-    })).not.toThrow()
-    expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
-      ...foundModel,
-      modelId: `local:${digest}`,
+      modelId: localId,
     })).toThrow()
     expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
       ...foundModel,
@@ -203,12 +234,6 @@ describe("LocalModelSchema invariants", () => {
       origin: { _tag: "Added", repository: "owner/repository", commit: "abc" },
       acquisitionState: { _tag: "Installing", progress: { stage: "downloading", completedBytes: 1, totalBytes: 2 } },
     })).not.toThrow()
-    expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
-      ...foundModel,
-      modelId: `local:${digest}`,
-      origin: { _tag: "Imported", path: "/models/model.gguf" },
-      acquisitionState: { _tag: "NotInstalled" },
-    })).toThrow()
   })
 
   it("keeps a custom model's failed serving state tied to a profile", () => {

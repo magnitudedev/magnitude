@@ -3,16 +3,16 @@ import type * as FileSystem from "@effect/platform/FileSystem"
 import type * as Path from "@effect/platform/Path"
 import { Effect, Layer, Option, Redacted } from "effect"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
-import { mkdtemp, rm, stat } from "node:fs/promises"
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { makeGlobalStoragePaths } from "../paths"
 import { GlobalStorage } from "../services"
 import type { HuggingFaceCredential } from "../types"
-import { HUGGING_FACE_AUTH_KEY, makeAuthStorage } from "./storage"
+import { makeAuthStorage } from "./storage"
 
 const credential: HuggingFaceCredential = {
-  type: "huggingface-oauth",
+  type: "oauth",
   accessToken: Redacted.make("hf_oauth_access"),
   refreshToken: Option.some(Redacted.make("hf_oauth_refresh")),
   expiresAt: Option.some(1_900_000_000_000),
@@ -38,24 +38,23 @@ describe("auth storage", () => {
     await rm(root, { recursive: true, force: true })
   })
 
-  it("keeps the Hugging Face account beside providers, owner-only, and out of the provider list", async () => {
+  it("keeps the Hugging Face account in its own owner-only file, out of auth.json", async () => {
     const { providers, huggingFace } = await run(Effect.gen(function* () {
       const auth = yield* makeAuthStorage()
       yield* auth.set("anthropic", { type: "api", key: "sk-test" })
       yield* auth.setHuggingFace(credential)
-      yield* auth.set("openai", { type: "api", key: "sk-other" })
       return { providers: yield* auth.loadAll(), huggingFace: yield* auth.getHuggingFace }
     }))
-    expect(Object.keys(providers).sort()).toEqual(["anthropic", "openai"])
+    expect(Object.keys(providers)).toEqual(["anthropic"])
     expect(Option.map(huggingFace, (stored) => Redacted.value(stored.accessToken))).toEqual(Option.some("hf_oauth_access"))
-    const file = makeGlobalStoragePaths(root).authFile
-    expect((await stat(file)).mode & 0o777).toBe(0o600)
-    const raw = await Bun.file(file).json() as Record<string, { readonly accessToken?: string }>
-    expect(raw[HUGGING_FACE_AUTH_KEY]?.accessToken).toBe("hf_oauth_access")
+    const paths = makeGlobalStoragePaths(root)
+    expect((await stat(paths.huggingFaceFile)).mode & 0o777).toBe(0o600)
+    expect(await Bun.file(paths.huggingFaceFile).json()).toMatchObject({ type: "oauth", accessToken: "hf_oauth_access", username: "ada" })
+    expect(await Bun.file(paths.authFile).text()).not.toContain("hf_oauth")
   })
 
-  it("removes only the account, and the file once nothing is left", async () => {
-    const file = makeGlobalStoragePaths(root).authFile
+  it("deletes the file on sign-out and leaves providers alone", async () => {
+    const paths = makeGlobalStoragePaths(root)
     const afterSignOut = await run(Effect.gen(function* () {
       const auth = yield* makeAuthStorage()
       yield* auth.set("anthropic", { type: "api", key: "sk-test" })
@@ -65,13 +64,15 @@ describe("auth storage", () => {
     }))
     expect(Object.keys(afterSignOut.providers)).toEqual(["anthropic"])
     expect(Option.isNone(afterSignOut.huggingFace)).toBe(true)
-    await run(Effect.gen(function* () {
-      const auth = yield* makeAuthStorage()
-      yield* auth.remove("anthropic")
-      yield* auth.setHuggingFace(credential)
-      yield* auth.removeHuggingFace
-    }))
-    expect(await Bun.file(file).exists()).toBe(false)
+    expect(await Bun.file(paths.huggingFaceFile).exists()).toBe(false)
+  })
+
+  it("reads a missing file as signed out and reports an invalid one", async () => {
+    const read = () => run(Effect.flatMap(makeAuthStorage(), (auth) => auth.getHuggingFace.pipe(Effect.either)))
+    const missing = await read()
+    expect(missing._tag === "Right" && Option.isNone(missing.right)).toBe(true)
+    await writeFile(makeGlobalStoragePaths(root).huggingFaceFile, JSON.stringify({ type: "oauth" }))
+    expect((await read())._tag).toBe("Left")
   })
 
   it("never prints a token when the credential is inspected", () => {

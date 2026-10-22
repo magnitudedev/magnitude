@@ -1,13 +1,15 @@
 import * as FileSystem from "@effect/platform/FileSystem"
-import { Array as Arr, Context, Effect, Either, Layer, Option, Schedule, Schema, Stream } from "effect"
+import { Context, Effect, Either, Layer, Option, Schema, Stream } from "effect"
 import { dirname, basename, isAbsolute, normalize, sep } from "node:path"
 import {
   CandidateInspectionSchema,
+  canonicalLocalModelId,
   CatalogFormModelIdSchema,
   CustomFormModelIdSchema,
   DirectoryAccessDenied,
   DirectoryNotFound,
   DrafterNotUsable,
+  HuggingFaceFormModelIdSchema,
   HuggingFaceRepositoryIdSchema,
   HuggingFaceSearchResultSchema,
   InvalidDirectoryPath,
@@ -20,6 +22,7 @@ import {
   ModelVersionNotRunnable,
   PathNotDirectory,
   preselectedDrafterCandidate,
+  sameModelId,
   type AutomaticModelLocationKind,
   type CandidateInspection,
   type CandidateInspectionProgress,
@@ -33,6 +36,7 @@ import {
   type DrafterChoice,
   type DrafterReference,
   type DrafterTarget,
+  type HuggingFaceFormModelId,
   type HuggingFaceRepositoryId,
   type HuggingFaceSearchResponse,
   type LocalInferenceError,
@@ -44,7 +48,6 @@ import {
   type ModelLocationKind,
 } from "@magnitudedev/acn-protocol"
 import {
-  bundlePackages,
   IcnCandidates,
   IcnDownloads,
   IcnLocalModels,
@@ -53,23 +56,29 @@ import {
 } from "@magnitudedev/icn"
 import type * as Native from "@magnitudedev/icn-protocol/schemas"
 import type { GeneratedClientError } from "@magnitudedev/openapi-effect/client-runtime"
-import type { CustomModelDeclaration, CustomModelsConfig, PersistedDrafterChoice } from "@magnitudedev/storage"
+import type { AddedModelSetting, CustomModelsConfig } from "@magnitudedev/storage"
 import { CatalogModelSync } from "./catalog-model-sync"
-import { CustomModels } from "./custom-models"
+import {
+  addedModel,
+  configuredDrafter,
+  CustomModels,
+  drafterSettingReference,
+  isHidden,
+  withCanonicalReferences,
+  withDrafterChoice,
+  withLocationEnabled,
+} from "./custom-models"
 import { CustomModelReconciler } from "./custom-model-reconciler"
 import {
+  addedTargetPackage,
   currentDownload,
   customModelDownloads,
   downloadHasUnacknowledgedFailure,
   downloadIsActive,
-  drafterPackage,
   type RelatedDownload,
 } from "./custom-model-downloads"
 import {
-  DrafterMethods,
   drafterReferenceKey,
-  drafterReferenceNaming,
-  nativeDrafterReference,
   presentField,
   productDrafterCandidate,
   productDrafterReference,
@@ -100,11 +109,9 @@ const catalogHideRefusal = (modelId: ModelId) => new LocalModelMutationFailed({
   retryable: false,
 })
 
-const managedHideRefusal = (modelId: ModelId, origin: "Added" | "Imported") => new LocalModelMutationFailed({
+const managedHideRefusal = (modelId: ModelId) => new LocalModelMutationFailed({
   code: "managed_model_not_hideable",
-  message: origin === "Added"
-    ? `${modelId} was added to Magnitude, so it can't be hidden. Remove it with \`magnitude catalog remove ${modelId}\` instead.`
-    : `${modelId} was imported into Magnitude, so it can't be hidden. Remove it with \`magnitude catalog remove ${modelId}\` instead.`,
+  message: `${modelId} was added to Magnitude, so it can't be hidden. Remove it with \`magnitude catalog remove ${modelId}\` instead.`,
   retryable: false,
 })
 
@@ -275,36 +282,31 @@ const commandFailed = (operation: string) => (cause: GeneratedClientError<unknow
         retryable: cause._tag !== "GeneratedClientRemoteError" || cause.status >= 500,
       })
 
-const withoutKey = <K extends string, V>(record: Readonly<Record<K, V>>, key: K): Record<K, V> => {
+const withoutKey = <K extends string, V>(record: Readonly<Partial<Record<K, V>>>, key: K): Partial<Record<K, V>> => {
   const next = { ...record }
   delete next[key]
   return next
 }
 
-/** A resolved candidate pinned with the method the engine binds it with; nothing binding keeps Auto. */
-const pinnedChoice = (requested: DrafterChoice, chosen: Option.Option<DrafterCandidate>): PersistedDrafterChoice =>
-  requested._tag === "None"
-    ? { _tag: "None" }
-    : Option.match(Option.filter(chosen, ({ verdict }) => verdict._tag === "Bound"), {
-        onNone: (): PersistedDrafterChoice => ({ _tag: "Auto" }),
-        onSome: ({ reference, verdict }): PersistedDrafterChoice => verdict._tag === "Bound"
-          ? { _tag: "Reference", reference, method: verdict.method }
-          : { _tag: "Auto" },
-      })
-
 /**
  * The drafter choice persisted for a model: Auto stays Auto, as does picking the recommended drafter (by the
  * candidate the choice resolved to, so the catalog drafter's file named by its Hugging Face path counts), so a
- * later catalog drafter still applies; any other reference is pinned, as the candidate it resolved to, with its method.
+ * later catalog drafter still applies; any other reference is pinned as the candidate it resolved to, when the engine
+ * binds it, and the engine works out its method again wherever it is used.
  */
 const persistedChoice = (
   requested: DrafterChoice,
   chosen: Option.Option<DrafterCandidate>,
   recommended: Option.Option<DrafterReference>,
-): PersistedDrafterChoice => {
+): DrafterChoice => {
+  if (requested._tag === "None") return { _tag: "None" }
   const recommendedPicked = requested._tag === "Reference" && Option.exists(recommended,
     (reference) => Option.exists(chosen, (candidate) => drafterReferenceKey(candidate.reference) === drafterReferenceKey(reference)))
-  return requested._tag === "Auto" || recommendedPicked ? { _tag: "Auto" } : pinnedChoice(requested, chosen)
+  if (requested._tag === "Auto" || recommendedPicked) return { _tag: "Auto" }
+  return Option.match(Option.filter(chosen, ({ verdict }) => verdict._tag === "Bound"), {
+    onNone: (): DrafterChoice => ({ _tag: "Auto" }),
+    onSome: ({ reference }): DrafterChoice => ({ _tag: "Reference", reference }),
+  })
 }
 
 export const CustomModelCommandsLive: Layer.Layer<
@@ -318,7 +320,6 @@ export const CustomModelCommandsLive: Layer.Layer<
   | LocalModels
   | CustomModels
   | CustomModelReconciler
-  | DrafterMethods
   | ModelLocations
   | CatalogModelSync
   | HuggingFaceAccount
@@ -332,7 +333,6 @@ export const CustomModelCommandsLive: Layer.Layer<
   const localModels = yield* LocalModels
   const customModels = yield* CustomModels
   const reconciler = yield* CustomModelReconciler
-  const methods = yield* DrafterMethods
   const locations = yield* ModelLocations
   const catalogSync = yield* CatalogModelSync
   const fs = yield* FileSystem.FileSystem
@@ -477,15 +477,19 @@ export const CustomModelCommandsLive: Layer.Layer<
       }
     }
     const custom = (yield* sources.state).customModels.find(({ id }) => id === target.modelId)
-    const declaration = (yield* customModels.get).declarations[target.modelId as CustomFormModelId]
-    // An added model still downloading has no files yet; its declared repository file stands in.
-    if (custom?.source.state._tag === "NotInstalled" && declaration?.origin._tag === "Added") {
-      const candidate: DrafterTarget = {
-        _tag: "Candidate",
-        source: { _tag: "HuggingFace", repository: declaration.origin.repository, commit: declaration.origin.commit },
-        files: declaration.target,
+    // An added model still downloading has no files yet; its repository files at its pinned commit stand in.
+    if (custom?.source.state._tag === "NotInstalled" && custom.source.origin._tag === "Added") {
+      const candidate: Native.ModelCandidate = {
+        source: { _tag: "HuggingFace", repository: custom.source.origin.repository, commit: custom.source.origin.commit } as Native.CandidateSource,
+        target: custom.source.files.map(({ path }) => path),
+        projector: Option.none(),
+        drafter: Option.none(),
       }
-      return yield* nativeTarget(candidate)
+      return {
+        request: (other: Option.Option<string>) =>
+          ({ _tag: "Candidate", candidate, other }) as Native.DrafterCandidatesRequest,
+        candidate: Option.some(candidate),
+      }
     }
     const primary = custom?.source.files[0]?.path
     return {
@@ -509,9 +513,6 @@ export const CustomModelCommandsLive: Layer.Layer<
     const native = yield* icn.drafters(request(entered)).pipe(Effect.catchAll(candidateFailed(label)))
     const { catalogModels } = yield* sources.state
     const candidates = native.candidates.flatMap((candidate) => Option.toArray(productDrafterCandidate(candidate, catalogModels)))
-    yield* Effect.forEach(candidates, (candidate) => candidate.verdict._tag === "Bound"
-      ? methods.remember(candidate.reference, candidate.verdict.method)
-      : Effect.void, { discard: true })
     const resolved = Option.flatMap(native.entered, productDrafterReference)
     return {
       candidates,
@@ -535,11 +536,11 @@ export const CustomModelCommandsLive: Layer.Layer<
    * listed candidate adds no row, and one that can't be checked now is left out rather than failing the list.
    */
   const withPinnedDrafter = (modelId: ModelId, target: DrafterTarget, candidates: readonly DrafterCandidate[]) => Effect.gen(function* () {
-    const pinned = (yield* customModels.get).drafters[modelId as CustomFormModelId]
-    if (pinned?._tag !== "Reference") return candidates
+    const pinned = Option.flatMap(configuredDrafter(yield* customModels.get, modelId), drafterSettingReference)
+    if (Option.isNone(pinned)) return candidates
     const listed = new Set(candidates.map(({ reference }) => drafterReferenceKey(reference)))
-    if (listed.has(drafterReferenceKey(pinned.reference))) return candidates
-    const entered = yield* Option.match(otherReference(pinned.reference), {
+    if (listed.has(drafterReferenceKey(pinned.value))) return candidates
+    const entered = yield* Option.match(otherReference(pinned.value), {
       onNone: () => Effect.succeed(Option.none<DrafterCandidate>()),
       onSome: (input) => listNativeDrafterCandidates(target, Option.some(input)).pipe(
         Effect.map(({ entered }) => entered),
@@ -587,214 +588,83 @@ export const CustomModelCommandsLive: Layer.Layer<
     return Option.some(candidate)
   })
 
-  const candidateDrafter = (chosen: Option.Option<DrafterCandidate>) => Effect.gen(function* () {
-    if (Option.isNone(chosen)) return Option.none<Native.CandidateDrafter>()
-    const { reference, verdict, method: known } = chosen.value
-    const method = verdict._tag === "Bound"
-      ? Option.some(verdict.method)
-      : Option.isSome(known) ? known : yield* methods.get(reference)
-    return Option.map(method, (value): Native.CandidateDrafter => ({
-      method: value,
-      reference: nativeDrafterReference(reference),
-    }) as Native.CandidateDrafter)
-  })
+  /**
+   * Fetches only the drafter its persisted choice resolves to, for a model whose target is already on this computer.
+   * A separate drafter already on this computer, in any location, is used where it is; built-in heads need nothing.
+   */
+  const startDrafterOnly = (modelId: CustomFormModelId, chosen: DrafterCandidate) =>
+    chosen.onThisComputer || chosen.reference._tag === "Embedded"
+      ? Effect.succeed(false)
+      : downloads.start(modelId, Option.some("Drafter")).pipe(Effect.map(Option.isSome))
 
-  /** Fetches only the drafter of a model whose target is already on this computer. */
-  const startDrafterOnly = (modelId: CustomFormModelId, target: DrafterTarget, chosen: DrafterCandidate) => Effect.gen(function* () {
-    if (chosen.onThisComputer || chosen.reference._tag === "Embedded") return false
-    const { candidate } = yield* nativeTarget(target)
-    const drafter = yield* candidateDrafter(Option.some(chosen))
-    if (Option.isNone(candidate) || Option.isNone(drafter)) return false
-    const draft = drafterPackage(yield* icn.bundle({ ...candidate.value, drafter }))
-    if (Option.isNone(draft)) return false
-    yield* downloads.start({ _tag: "Standalone", package: draft.value } as Native.ServableModelBundle, modelId)
-    return true
-  })
-
-  const startAddedDownload = (
-    modelId: CustomFormModelId,
-    declaration: CustomModelDeclaration,
-    chosen: Option.Option<DrafterCandidate>,
-  ) => Effect.gen(function* () {
-    if (declaration.origin._tag !== "Added") return false
-    // A separate drafter already on this computer, in any location, is used where it is, never downloaded.
-    const downloaded = Option.filter(chosen, ({ reference, onThisComputer }) => reference._tag === "Embedded" || !onThisComputer)
-    const bundle = yield* icn.bundle({
-      source: { _tag: "HuggingFace", repository: declaration.origin.repository, commit: declaration.origin.commit } as Native.CandidateSource,
-      target: [...declaration.target],
-      projector: Option.map(declaration.projector, (path) => ({ path, sizeBytes: 0 })),
-      drafter: yield* candidateDrafter(downloaded),
-    })
-    yield* downloads.start(bundle, modelId)
-    return true
-  })
-
-  type AddedDeclaration = CustomModelDeclaration & { readonly origin: Extract<CustomModelDeclaration["origin"], { readonly _tag: "Added" }> }
 
   /**
-   * An added model's version re-resolved at a newer commit: the same version, which its model ID
-   * names, with that commit's shards and projector, and a drafter from the same repository moved to
-   * that commit when it is still there.
+   * An added model pinned to the commit its newest download of its files fetched, when that download completed at
+   * another commit (an update): `revision` and the projector move to it, and a drafter chosen from the same repository
+   * moves along when the update fetched it there. ICN then serves the new copy and removes the one it replaced. A
+   * cancelled or failed update leaves the model on its pinned commit, still serving.
    */
-  const resolveAddedAt = (
+  const pinnedUpdate = (
+    config: CustomModelsConfig,
     modelId: CustomFormModelId,
-    declaration: AddedDeclaration,
-    commit: string,
-    chosen: Option.Option<DrafterCandidate>,
-  ) => Effect.gen(function* () {
-    const { repository } = declaration.origin
-    const native = yield* icn.inspect({ _tag: "HuggingFace", repository, revision: commit })
-      .pipe(Effect.catchAll(candidateFailed(`${repository}@${commit}`)))
-    const version = native.versions.find((candidate) => candidate.modelId === modelId)
-    const target = version?.files.map(({ path }) => path) ?? []
-    if (!Arr.isNonEmptyReadonlyArray(target) || native.source._tag !== "HuggingFace") {
-      return yield* new LocalModelMutationFailed({
-        code: "custom_model_update_unavailable",
-        message: `${repository} no longer has this version at its newest commit.`,
-        retryable: false,
-      })
+    all: readonly Native.ModelDownload[],
+  ): CustomModelsConfig => {
+    const added = addedModel(config, modelId)
+    const latest = all.flatMap((download) => sameModelId(download.forModel, modelId)
+      ? Option.toArray(Option.map(addedTargetPackage(modelId, download), (target) => ({ download, target })))
+      : []).at(-1)
+    if (Option.isNone(added) || latest?.download.state._tag !== "Completed") return config
+    const [key, setting] = added.value
+    const { download, target } = latest
+    if (target.source._tag !== "HuggingFace" || target.source.revision === setting.revision) return config
+    const { repository, revision: commit } = target.source
+    const pinned: AddedModelSetting = {
+      revision: commit,
+      projector: Option.fromNullable(target.files.find(({ role }) => role === "projector")?.path),
     }
-    const source = { _tag: "HuggingFace" as const, repository, commit: native.source.commit }
-    const drafter = yield* Option.match(
-      Option.filter(chosen, ({ reference }) => reference._tag === "HuggingFace" && reference.repository === repository),
-      {
-        onNone: () => Effect.succeed(chosen),
-        // A drafter the new commit no longer has stays at the commit it was pinned to.
-        onSome: ({ reference }) => chooseDrafter(
-          { _tag: "Candidate", source, files: target },
-          { _tag: "Reference", reference: { ...reference, commit: source.commit } as DrafterReference },
-        ).pipe(Effect.orElseSucceed(() => chosen)),
-      },
-    )
-    const resolved: AddedDeclaration = {
-      origin: { _tag: "Added", repository, commit: source.commit, pendingCommit: Option.none() },
-      target,
-      projector: Option.map(native.projector, ({ path }) => path),
+    const drafter = configuredDrafter(config, modelId)
+    const fetchedDraft = download.bundle._tag === "SpeculativeDecoding" && download.bundle.draftSource._tag === "Separate"
+      ? Option.some(download.bundle.draftSource.draft)
+      : Option.none()
+    const moved = Option.flatMap(Option.zipWith(drafter, fetchedDraft, (setting, draft) => [setting, draft] as const),
+      ([setting, draft]) => setting._tag === "HuggingFace" && setting.repository === repository
+        && packageHoldsFile(draft, setting.repository, commit, setting.path)
+        ? Option.some({ ...setting, revision: commit })
+        : Option.none())
+    return {
+      ...config,
+      added: { ...config.added, [key]: pinned },
+      drafters: Option.match(moved, {
+        onNone: () => config.drafters,
+        onSome: (setting) => ({ ...config.drafters, [modelId]: setting }),
+      }),
     }
-    return { declaration: resolved, drafter }
-  })
+  }
 
-  /** The drafter a model fetches with its files: the attached one, else the persisted choice ICN has not bound yet. */
-  const drafterToFetch = (modelId: CustomFormModelId, config: CustomModelsConfig) => Effect.gen(function* () {
-    const attached = Option.flatMap(yield* rowFor(modelId), ({ drafter }) => drafter)
-    const configured = config.drafters[modelId]
-    const { catalogModels } = yield* sources.state
-    return Option.orElse(
-      Option.map(attached, (drafter): DrafterCandidate => ({
-        category: "Other", reference: drafter.reference, name: drafter.name, label: drafter.label,
-        sizeBytes: drafter.sizeBytes, lineage: "None", verdict: drafter.verdict, automatic: false, onThisComputer: false,
-        method: Option.none(),
-      })),
-      () => configured?._tag === "Reference" ? Option.some<DrafterCandidate>({
-        category: "Other", reference: configured.reference,
-        ...drafterReferenceNaming(configured.reference, catalogModels, Option.some(configured.method)), sizeBytes: 0,
-        lineage: "None", verdict: { _tag: "None" }, automatic: false, onThisComputer: false, method: Option.some(configured.method),
-      }) : Option.none(),
-    )
-  })
-
-  /** Changes an added declaration still pending `commit`; a removed model or another update is left alone. */
-  const modifyPending = (
-    modelId: CustomFormModelId,
-    commit: string,
-    f: (declaration: AddedDeclaration, config: CustomModelsConfig) => CustomModelsConfig,
-  ) => customModels.modify((config) => {
-    const current = config.declarations[modelId]
-    const pending = current?.origin._tag === "Added" && Option.contains(current.origin.pendingCommit, commit)
-    return Effect.succeed([pending, pending ? f(current as AddedDeclaration, config) : config] as const)
-  })
-
-  /**
-   * Pins a downloaded update: the declaration takes the newer commit with its shards, projector and
-   * a moved same-repository drafter, so ICN serves the new copy and removes the one it replaced.
-   */
-  const finishUpdate = (modelId: CustomFormModelId, declaration: AddedDeclaration, commit: string) => Effect.gen(function* () {
-    const config = yield* customModels.get
-    const { declaration: pinned, drafter } = yield* resolveAddedAt(modelId, declaration, commit, yield* drafterToFetch(modelId, config))
-    const changed = yield* modifyPending(modelId, commit, (_, current) => {
-      const configured = current.drafters[modelId]
-      return {
-        ...current,
-        declarations: { ...current.declarations, [modelId]: pinned },
-        drafters: configured?._tag === "Reference"
-          ? { ...current.drafters, [modelId]: pinnedChoice(configured, drafter) }
-          : current.drafters,
-      }
+  /** Pins every added model whose update finished downloading. */
+  const pinFinishedUpdates = Effect.gen(function* () {
+    const all = (yield* downloads.get).state.downloads
+    const changed = yield* customModels.modify((config) => {
+      const next = (Object.keys(config.added) as CustomFormModelId[])
+        .reduce((current, modelId) => pinnedUpdate(current, modelId, all), config)
+      return Effect.succeed([next !== config, next] as const)
     })
     if (changed) yield* settle
   })
 
-  /** Abandons an update that was cancelled or failed: the model stays on its pinned commit and keeps serving. */
-  const abandonUpdate = (modelId: CustomFormModelId, commit: string) => modifyPending(modelId, commit, (declaration, config) => ({
-    ...config,
-    declarations: { ...config.declarations, [modelId]: { ...declaration, origin: { ...declaration.origin, pendingCommit: Option.none() } } },
-  }))
-
-  /**
-   * Fetches an added model's update at `commit` while it keeps serving its pinned commit, recording
-   * the commit as pending once the download is admitted. An update whose files are all here already
-   * is pinned at once.
-   */
-  const startUpdate = (modelId: CustomFormModelId, declaration: AddedDeclaration, commit: string) => Effect.gen(function* () {
-    const config = yield* customModels.get
-    const resolved = yield* resolveAddedAt(modelId, declaration, commit, yield* drafterToFetch(modelId, config))
-    const downloaded = Option.filter(resolved.drafter, ({ reference, onThisComputer }) => reference._tag === "Embedded" || !onThisComputer)
-    const bundle = yield* icn.bundle({
-      source: { _tag: "HuggingFace", repository: resolved.declaration.origin.repository, commit: resolved.declaration.origin.commit } as Native.CandidateSource,
-      target: [...resolved.declaration.target],
-      projector: Option.map(resolved.declaration.projector, (path) => ({ path, sizeBytes: 0 })),
-      drafter: yield* candidateDrafter(downloaded),
-    })
-    const download = yield* downloads.start(bundle, modelId)
-    yield* customModels.modify((current) => {
-      const latest = current.declarations[modelId]
-      return Effect.succeed([undefined, latest?.origin._tag !== "Added" ? current : {
-        ...current,
-        declarations: { ...current.declarations, [modelId]: { ...latest, origin: { ...latest.origin, pendingCommit: Option.some(commit) } } },
-      }] as const)
-    })
-    if (Option.isNone(download)) yield* finishUpdate(modelId, declaration, commit)
-  })
-
-  const pendingUpdateLock = yield* Effect.makeSemaphore(1)
-
-  /**
-   * Settles every pending update from its download: a finished one is pinned, a cancelled or failed one
-   * is abandoned, and one a restart left without a download is fetched again, keeping its bytes.
-   */
-  const settlePendingUpdates = pendingUpdateLock.withPermits(1)(Effect.gen(function* () {
-    const config = yield* customModels.get
-    const all = (yield* downloads.get).state.downloads
-    yield* Effect.forEach(Object.entries(config.declarations), ([id, declaration]) => {
-      if (declaration.origin._tag !== "Added" || Option.isNone(declaration.origin.pendingCommit)) return Effect.void
-      const modelId = id as CustomFormModelId
-      const added = declaration as AddedDeclaration
-      const commit = declaration.origin.pendingCommit.value
-      const { repository } = declaration.origin
-      const download = all.findLast((candidate) => Option.contains(candidate.forModel, modelId)
-        && bundlePackages(candidate.bundle).some((pkg) => packageHoldsFile(pkg, repository, commit, declaration.target[0])))
-      const step: Effect.Effect<unknown, unknown> = download === undefined
-        ? startUpdate(modelId, added, commit)
-        : downloadIsActive(download)
-          ? Effect.void
-          : download.state._tag === "Completed"
-            ? finishUpdate(modelId, added, commit)
-            : abandonUpdate(modelId, commit)
-      return step.pipe(Effect.catchAll((error) => Effect.logWarning(
-        `Unable to settle the update of ${modelId}: ${error instanceof Error ? error.message : String(error)}`,
-      )))
-    }, { discard: true })
-  }))
-
-  const persistDrafter = (modelId: CustomFormModelId, choice: PersistedDrafterChoice, declaration: Option.Option<CustomModelDeclaration>) =>
+  /** Stores a model's drafter choice, and the model itself when it was just added; a model chosen is never hidden. */
+  const persistDrafter = (
+    modelId: CustomFormModelId,
+    choice: DrafterChoice,
+    added: Option.Option<readonly [HuggingFaceFormModelId, AddedModelSetting]>,
+  ) =>
     customModels.modify((config) => Effect.succeed([undefined, {
-      ...config,
-      declarations: Option.match(declaration, {
-        onNone: () => config.declarations,
-        onSome: (value) => ({ ...config.declarations, [modelId]: value }),
+      ...withDrafterChoice(config, modelId, choice),
+      added: Option.match(added, {
+        onNone: () => config.added,
+        onSome: ([id, setting]) => ({ ...config.added, [id]: setting }),
       }),
-      drafters: { ...config.drafters, [modelId]: choice },
-      hidden: config.hidden.filter((hidden) => hidden !== modelId),
+      hidden: config.hidden.filter((hidden) => !sameModelId(hidden, modelId)),
     } satisfies CustomModelsConfig] as const))
 
   // A model-location command changes nothing but the configuration, so it pushes and fails when ICN refuses it.
@@ -814,30 +684,13 @@ export const CustomModelCommandsLive: Layer.Layer<
       : candidateFailed("model")(cause)
 
   const rowFor = (modelId: ModelId) => localModels.state.pipe(Effect.map((state) => Option.fromNullable(
-    [...state.models, ...state.hidden].find((model): model is CustomLocalModel => model._tag === "Custom" && model.modelId === modelId),
+    [...state.models, ...state.hidden].find((model): model is CustomLocalModel =>
+      model._tag === "Custom" && sameModelId(model.modelId, modelId)),
   )))
-
-  /** The file a path names once links are followed; a path that can't be resolved names itself. */
-  const realPath = (path: string) => fs.realPath(path).pipe(Effect.orElseSucceed(() => path))
-
-  const modelFiles = (modelId: CustomFormModelId) => sources.state.pipe(Effect.map(({ customModels: models, hiddenModels }) =>
-    [...models, ...hiddenModels].find(({ id }) => id === modelId)?.source.files.map(({ path }) => path) ?? []))
-
-  /** Imported declarations, other than `except`, whose file is one of `paths`, however each was reached. */
-  const importedDeclarationsOf = (config: CustomModelsConfig, paths: readonly string[], except: Option.Option<CustomFormModelId>) =>
-    Effect.gen(function* () {
-      const files = new Set(yield* Effect.forEach(paths, realPath))
-      const imported = Object.entries(config.declarations).flatMap(([id, declaration]) =>
-        declaration.origin._tag === "Imported" && !Option.contains(except, id as CustomFormModelId)
-          ? [{ id: id as CustomFormModelId, path: declaration.origin.path }]
-          : [])
-      const matching = yield* Effect.filter(imported, ({ path }) => realPath(path).pipe(Effect.map((file) => files.has(file))))
-      return matching.map(({ id }) => id)
-    })
 
   /** A catalog model's ID for one of its aliases: the ID its files have as a found model. */
   const catalogModelForAlias = (modelId: ModelId) => sources.state.pipe(Effect.map(({ catalogModels }) => Option.fromNullable(
-    catalogModels.find(({ source }) => Option.exists(source.aliases, (aliases) => aliases.includes(modelId as string)))?.id)))
+    catalogModels.find(({ source }) => Option.exists(source.aliases, (aliases) => aliases.some((alias) => sameModelId(alias, modelId))))?.id)))
 
   const isKnownCatalogModel = (modelId: CatalogFormModelId) => Effect.gen(function* () {
     const { catalogModels } = yield* sources.state
@@ -974,20 +827,20 @@ export const CustomModelCommandsLive: Layer.Layer<
         ? { _tag: "Model", modelId }
         : { _tag: "Candidate", source, files: selected.files }
       const chosen = yield* chooseDrafter(target, drafter)
-      const declaration: Option.Option<CustomModelDeclaration> = Option.isSome(existing)
+      const added = Option.isSome(existing)
         ? Option.none()
-        : Option.some({
-            origin: { _tag: "Added", repository: source.repository, commit: source.commit, pendingCommit: Option.none() },
-            target: selected.files,
+        : Option.map(Schema.decodeUnknownOption(HuggingFaceFormModelIdSchema)(modelId), (id) => [id, {
+            revision: source.commit,
             projector: Option.map(inspection.projector, ({ path }) => path),
-          })
+          } satisfies AddedModelSetting] as const)
       // Auto stays Auto, so the model follows automatic choice (a catalog drafter by lineage included); only a
       // drafter the user names is pinned.
-      yield* persistDrafter(modelId, persistedChoice(drafter, chosen, Option.none()), declaration)
+      yield* persistDrafter(modelId, persistedChoice(drafter, chosen, Option.none()), added)
       yield* settle
-      const drafterDownloadStarted = Option.isSome(declaration)
-        ? yield* startAddedDownload(modelId, declaration.value, chosen).pipe(Effect.as(false))
-        : yield* Option.match(chosen, { onNone: () => Effect.succeed(false), onSome: (value) => startDrafterOnly(modelId, target, value) })
+      // An added model downloads its files with the drafter its choice resolves to.
+      const drafterDownloadStarted = Option.isSome(added)
+        ? yield* downloads.start(modelId, Option.none()).pipe(Effect.as(false))
+        : yield* Option.match(chosen, { onNone: () => Effect.succeed(false), onSome: (value) => startDrafterOnly(modelId, value) })
       return {
         _tag: "Custom" as const,
         modelId,
@@ -1003,62 +856,57 @@ export const CustomModelCommandsLive: Layer.Layer<
       if (Option.isNone(row)) return yield* notFound(modelId)
       const chosen = yield* chooseDrafter({ _tag: "Model", modelId }, drafter)
       const recommended = Option.map(row.value.recommendedDrafter, ({ reference }) => reference)
-      yield* customModels.modify((config) => Effect.succeed([undefined, {
-        ...config,
-        drafters: { ...config.drafters, [modelId]: persistedChoice(drafter, chosen, recommended) },
-      }] as const))
+      yield* customModels.modify((config) => Effect.succeed([undefined,
+        withDrafterChoice(config, modelId, persistedChoice(drafter, chosen, recommended))] as const))
       // Changing or turning off a drafter only changes the choice: the drafter stays on disk, so turning it back on
       // downloads nothing. Unused drafters go when a model is removed.
       yield* settle
       const drafterDownloadStarted = yield* Option.match(chosen, {
         onNone: () => Effect.succeed(false),
-        onSome: (value) => startDrafterOnly(modelId, { _tag: "Model", modelId }, value),
+        onSome: (value) => startDrafterOnly(modelId, value),
       })
       return { drafter: chosen, drafterDownloadStarted }
     }).pipe(Effect.catchAll(toMutation)),
 
     hide: (requested) => Effect.gen(function* () {
-      // An alias names its catalog model. A catalog model found only in an external location is hidden by its
-      // files' found-model IDs, which ICN then stops attributing to the catalog model; hiding it again changes nothing.
+      // An alias names its catalog model. A catalog model found only in an external location is hidden by its catalog
+      // ID, and ICN then stops attributing its copies to it; hiding it again changes nothing.
       const modelId: ModelId = Option.getOrElse(yield* catalogModelForAlias(requested), () => requested)
-      const known = Schema.is(CatalogFormModelIdSchema)(modelId)
-        ? yield* isKnownCatalogModel(modelId)
-        : Option.isSome(yield* rowFor(modelId)) || (yield* customModels.get).declarations[modelId as CustomFormModelId] !== undefined
-      if (!known) return yield* notFound(modelId)
-      const hiddenIds = Schema.is(CatalogFormModelIdSchema)(modelId)
-        ? yield* Effect.gen(function* () {
-            const aliases = yield* catalogAliases(modelId)
-            const { hidden } = yield* customModels.get
-            const alreadyHidden = aliases.length > 0 && aliases.every((alias) => hidden.includes(alias))
-            return alreadyHidden || Option.isSome(yield* externalCatalogFiles(modelId))
-              ? aliases
-              : yield* catalogHideRefusal(modelId)
-          })
-        : [modelId]
-      const declaration = Schema.is(CustomFormModelIdSchema)(modelId) ? (yield* customModels.get).declarations[modelId] : undefined
-      if (declaration !== undefined) return yield* managedHideRefusal(modelId, declaration.origin._tag)
-      yield* customModels.modify((config) => Effect.succeed([undefined, {
-        ...config,
-        hidden: [...config.hidden, ...hiddenIds.filter((id) => !config.hidden.includes(id))],
-      }] as const))
+      const config = yield* customModels.get
+      if (Schema.is(CatalogFormModelIdSchema)(modelId)) {
+        if (!(yield* isKnownCatalogModel(modelId))) return yield* notFound(modelId)
+        if (!isHidden(config, modelId) && Option.isNone(yield* externalCatalogFiles(modelId))) {
+          return yield* catalogHideRefusal(modelId)
+        }
+      } else {
+        if (Option.isSome(addedModel(config, modelId))) return yield* managedHideRefusal(modelId)
+        if (Option.isNone(yield* rowFor(modelId))) return yield* notFound(modelId)
+      }
+      yield* customModels.modify((current) => Effect.succeed([undefined, isHidden(current, modelId)
+        ? current
+        : { ...current, hidden: [...current.hidden, modelId] }] as const))
       yield* settle
     }),
 
     externalCatalogFiles,
 
-    unhide: (modelId) => Effect.gen(function* () {
-      const shownIds: readonly ModelId[] = Schema.is(CatalogFormModelIdSchema)(modelId) ? yield* catalogAliases(modelId) : [modelId]
+    unhide: (requested) => Effect.gen(function* () {
+      // An alias names its catalog model, which shows again with every copy hidden by the ID it has as a found model.
+      const modelId: ModelId = Option.getOrElse(yield* catalogModelForAlias(requested), () => requested)
+      const shownIds: readonly ModelId[] = Schema.is(CatalogFormModelIdSchema)(modelId)
+        ? [modelId, ...yield* catalogAliases(modelId)]
+        : [modelId]
       yield* customModels.modify((config) => Effect.succeed([undefined, {
         ...config,
-        hidden: config.hidden.filter((hidden) => !shownIds.includes(hidden)),
+        hidden: config.hidden.filter((hidden) => !shownIds.some((shown) => sameModelId(shown, hidden))),
       }] as const))
       yield* settle
     }),
 
     addFolder: (path) => validateFolder(path).pipe(
-      Effect.flatMap((folder) => customModels.modify((config) => Effect.succeed([undefined, config.folders.includes(folder)
+      Effect.flatMap((folder) => customModels.modify((config) => Effect.succeed([undefined, config.paths.includes(folder)
         ? config
-        : { ...config, folders: [...config.folders, folder] }] as const))),
+        : { ...config, paths: [...config.paths, folder] }] as const))),
       Effect.zipRight(reconciler.push),
     ),
 
@@ -1068,52 +916,38 @@ export const CustomModelCommandsLive: Layer.Layer<
       const folder = normalize(trimmed)
       yield* customModels.modify((config) => Effect.succeed([undefined, {
         ...config,
-        folders: config.folders.filter((existing) => existing !== folder && existing !== trimmed),
+        paths: config.paths.filter((existing) => existing !== folder && existing !== trimmed),
       }] as const))
       yield* reconciler.push
     }),
 
-    setLocationEnabled: (kind, enabled) => customModels.modify((config) => Effect.succeed([undefined, {
-      ...config,
-      disabledLocations: enabled
-        ? config.disabledLocations.filter((disabled) => disabled !== kind)
-        : config.disabledLocations.includes(kind) ? config.disabledLocations : [...config.disabledLocations, kind],
-    }] as const)).pipe(Effect.zipRight(reconciler.push)),
+    setLocationEnabled: (kind, enabled) => customModels.modify((config) => Effect.succeed([undefined,
+      withLocationEnabled(config, kind, enabled)] as const)).pipe(Effect.zipRight(reconciler.push)),
 
     listLocations: customModels.get.pipe(Effect.flatMap(locations.list)),
 
     remove: (modelId) => Effect.gen(function* () {
       const { config, related } = yield* modelAcquisition(modelId)
-      const declaration = config.declarations[modelId]
-      // A declaration an earlier import left for a file this model lists, reached through a link, goes with it.
-      const duplicates = yield* importedDeclarationsOf(config, yield* modelFiles(modelId), Option.some(modelId))
-      const forgetDuplicates = (current: CustomModelsConfig): CustomModelsConfig => duplicates.reduce((next, id) => ({
-        ...next,
-        declarations: withoutKey(next.declarations, id),
-        drafters: withoutKey(next.drafters, id),
-      }), current)
-      if (declaration === undefined) {
+      const added = addedModel(config, modelId)
+      if (Option.isNone(added)) {
         if (Option.isNone(yield* rowFor(modelId))) return yield* notFound(modelId)
         yield* endDownloads(related)
-        yield* customModels.modify((current) => Effect.succeed([undefined, forgetDuplicates(current.hidden.includes(modelId)
+        yield* customModels.modify((current) => Effect.succeed([undefined, isHidden(current, modelId)
           ? current
-          : { ...current, hidden: [...current.hidden, modelId] })] as const))
+          : { ...current, hidden: [...current.hidden, modelId] }] as const))
         yield* settle
         return {}
       }
       yield* endDownloads(related)
-      if (declaration.origin._tag === "Added") {
-        // ICN deletes only Magnitude's copy; the same bytes elsewhere remain and the model stays as found.
-        yield* localModels_.removeFiles(modelId).pipe(
-          Effect.catchIf((error) => error._tag === "GeneratedClientRemoteError" && error.status === 404, () => Effect.void),
-          Effect.mapError(commandFailed("remove")),
-        )
-      }
-      yield* customModels.modify((current) => Effect.succeed([undefined, forgetDuplicates({
-        ...current,
-        declarations: withoutKey(current.declarations, modelId),
-        drafters: withoutKey(current.drafters, modelId),
-      })] as const))
+      // ICN deletes only Magnitude's copy; the same bytes elsewhere remain and the model stays as found.
+      yield* localModels_.removeFiles(modelId).pipe(
+        Effect.catchIf((error) => error._tag === "GeneratedClientRemoteError" && error.status === 404, () => Effect.void),
+        Effect.mapError(commandFailed("remove")),
+      )
+      yield* customModels.modify((current) => Effect.succeed([undefined, {
+        ...withDrafterChoice(current, modelId, { _tag: "Auto" }),
+        added: withoutKey(current.added, added.value[0]),
+      }] as const))
       yield* settle
       yield* pruneDrafters
       return {}
@@ -1122,46 +956,30 @@ export const CustomModelCommandsLive: Layer.Layer<
     sync: (modelId) => Effect.gen(function* () {
       const row = yield* rowFor(modelId)
       const { config, related } = yield* modelAcquisition(modelId)
-      const declaration = config.declarations[modelId]
-      if (Option.isNone(row) && declaration === undefined) return yield* notFound(modelId)
+      const added = Option.isSome(addedModel(config, modelId))
+      if (Option.isNone(row) && !added) return yield* notFound(modelId)
       const attached = Option.flatMap(row, ({ drafter }) => drafter)
-      // Until ICN has bound a configured drafter (just after a restart) the persisted choice names it.
-      const configured = config.drafters[modelId]
-      const sourceState = yield* sources.state
-      const chosen = Option.orElse(
-        Option.map(attached, (drafter): DrafterCandidate => ({
-          category: "Other", reference: drafter.reference, name: drafter.name, label: drafter.label,
-          sizeBytes: drafter.sizeBytes, lineage: "None", verdict: drafter.verdict, automatic: false, onThisComputer: false,
-          method: Option.none(),
-        })),
-        () => configured?._tag === "Reference" ? Option.some<DrafterCandidate>({
-          category: "Other", reference: configured.reference,
-          ...drafterReferenceNaming(configured.reference, sourceState.catalogModels, Option.some(configured.method)), sizeBytes: 0,
-          lineage: "None", verdict: { _tag: "None" }, automatic: false, onThisComputer: false, method: Option.some(configured.method),
-        }) : Option.none(),
-      )
       const acquisition = Option.map(row, ({ acquisitionState }) => acquisitionState._tag)
       const targetActive = Option.exists(currentDownload(related, "Target"), downloadIsActive)
-      const targetMissing = declaration?.origin._tag === "Added" && !targetActive
+      const targetMissing = added && !targetActive
         && Option.match(acquisition, { onNone: () => true, onSome: (tag) => tag === "NotInstalled" || tag === "InstallFailed" })
       const current = { outcome: "AlreadyCurrent" as LocalModelSyncOutcome }
-      if (targetMissing && declaration !== undefined) {
-        return (yield* startAddedDownload(modelId, declaration, chosen)) ? { outcome: "Installing" as const } : current
+      if (targetMissing) {
+        return Option.isSome(yield* downloads.start(modelId, Option.none())) ? { outcome: "Installing" as const } : current
       }
-      const updateCommit = Option.flatMap(
-        Option.fromNullable(sourceState.customModels.find(({ id }) => id === modelId)),
-        ({ source }) => source.updateCommit,
-      )
-      if (declaration?.origin._tag === "Added" && Option.isSome(updateCommit) && !targetActive
+      const updateCommit = Option.flatMap(Option.fromNullable((yield* sources.state).customModels.find(({ id }) => id === modelId)),
+        ({ source }) => source.updateCommit)
+      if (added && Option.isSome(updateCommit) && !targetActive
         && Option.exists(acquisition, (tag) => tag === "UpdateAvailable" || tag === "UpdateFailed")) {
-        yield* pendingUpdateLock.withPermits(1)(startUpdate(modelId, declaration as AddedDeclaration, updateCommit.value))
+        // ICN fetches the update at the commit its repository has moved to; the model keeps serving until it lands.
+        yield* downloads.start(modelId, Option.some("Update"))
         return { outcome: "Updating" as const }
       }
       const drafterUpdate = Option.exists(attached, ({ updateAvailable }) => updateAvailable)
       const drafterMissing = Option.exists(attached, ({ availability }) => availability._tag === "DownloadFailed")
       const drafterActive = Option.exists(currentDownload(related, "Drafter"), downloadIsActive)
-      if ((!drafterUpdate && !drafterMissing) || drafterActive || targetActive || Option.isNone(chosen)) return current
-      const started = yield* startDrafterOnly(modelId, { _tag: "Model", modelId }, chosen.value)
+      if ((!drafterUpdate && !drafterMissing) || drafterActive || targetActive) return current
+      const started = Option.isSome(yield* downloads.start(modelId, Option.some("Drafter")))
       return started ? { outcome: drafterUpdate ? "Updating" as const : "DownloadingDrafter" as const } : current
     }).pipe(Effect.mapError((cause) => cause._tag === "LocalModelMutationFailed" ? cause : commandFailed("sync")(
       cause as GeneratedClientError<unknown> | ModelCandidateError,
@@ -1185,18 +1003,25 @@ export const CustomModelCommandsLive: Layer.Layer<
     ),
   })
 
-  // ICN resumes every requested download a restart interrupted and drops a cancelled one, so ACN starts none
-  // itself. An update a restart interrupted is fetched again only when ICN no longer has its download, one that
-  // finished or ended meanwhile settles, and from then on each update settles as its download changes. A push
-  // first relearns the drafter methods an update's bundle needs.
-  yield* Effect.gen(function* () {
-    yield* reconciler.push.pipe(Effect.ignore)
-    yield* localModels.state.pipe(
-      Effect.filterOrFail((current) => current.preparation.discovery.complete, () => "discovering" as const),
-      Effect.retry(Schedule.spaced("1 second")),
-    )
-    yield* settlePendingUpdates
-    yield* Stream.merge(downloads.changes, customModels.changes).pipe(Stream.runForEach(() => settlePendingUpdates))
-  }).pipe(Effect.forkScoped)
+  // ICN resumes every requested download a restart interrupted, an update included, and drops a cancelled one, so
+  // ACN starts none itself; each update is pinned as its download finishes.
+  yield* downloads.changes.pipe(
+    Stream.runForEach(() => pinFinishedUpdates.pipe(Effect.catchAll((error) => Effect.logWarning(
+      `Unable to pin a finished update: ${error.message}`,
+    )))),
+    Effect.forkScoped,
+  )
+  // Stored IDs follow the models they name: a catalog model's alias becomes its catalog ID once the catalog lists
+  // it, and an older `local:` label the current one.
+  yield* localModels.changes.pipe(
+    Stream.runForEach(() => Effect.gen(function* () {
+      const { models, hidden } = yield* localModels.state
+      yield* customModels.modify((config) => Effect.succeed([undefined,
+        withCanonicalReferences(config, (modelId) => canonicalLocalModelId([...models, ...hidden], modelId))] as const))
+    }).pipe(
+      Effect.catchAll((error) => Effect.logWarning(`Unable to rename stored model references: ${error.message}`)),
+    )),
+    Effect.forkScoped,
+  )
   return commands
 }))

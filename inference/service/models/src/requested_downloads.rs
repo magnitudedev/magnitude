@@ -2,46 +2,54 @@ use std::fs;
 use std::path::Path;
 
 use magnitude_service_contracts::models::{
-    CatalogComponent, ModelDownloadId, ModelId, StartModelDownloadRequest,
+    CatalogComponent, CustomModelPart, ModelDownloadId, ModelId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const FILE_NAME: &str = "requested-downloads.json";
 
-/// A download the user asked for, as it was asked: a catalog installation or one of its
-/// components is admitted again through the catalog, so it resolves against the current catalog
-/// and files; any other download is its exact bundle.
+/// A download the user asked for, as intent only: a model and which part of it. It is admitted
+/// again by resolving that intent against what the service holds then (the catalog, the
+/// local-models configuration, the files here), never from a stored wire contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub(crate) enum RequestedDownload {
-    CatalogModel {
-        model: ModelId,
-    },
-    CatalogComponent {
-        model: ModelId,
-        component: CatalogComponent,
-    },
-    Bundle {
-        request: StartModelDownloadRequest,
-    },
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RequestedDownload {
+    pub(crate) model: ModelId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) part: Option<RequestedPart>,
+}
+
+/// A catalog model's component, or a custom model's part (see [`CustomModelPart`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub(crate) enum RequestedPart {
+    Projector,
+    Drafter,
+    Update,
+}
+
+impl From<CatalogComponent> for RequestedPart {
+    fn from(component: CatalogComponent) -> Self {
+        match component {
+            CatalogComponent::Projector => Self::Projector,
+            CatalogComponent::Drafter => Self::Drafter,
+        }
+    }
+}
+
+impl From<CustomModelPart> for RequestedPart {
+    fn from(part: CustomModelPart) -> Self {
+        match part {
+            CustomModelPart::Drafter => Self::Drafter,
+            CustomModelPart::Update => Self::Update,
+        }
+    }
 }
 
 impl RequestedDownload {
     fn concerns(&self, model: &ModelId) -> bool {
-        match self {
-            Self::CatalogModel { model: requested }
-            | Self::CatalogComponent {
-                model: requested, ..
-            } => requested == model,
-            Self::Bundle { request } => request.for_model.as_ref() == Some(model),
-        }
-    }
-
-    pub(crate) fn bundle(request: &StartModelDownloadRequest) -> Self {
-        Self::Bundle {
-            request: request.clone(),
-        }
+        self.model == *model
     }
 }
 
@@ -158,10 +166,42 @@ mod tests {
     use super::*;
 
     fn catalog(model: &str) -> RequestedDownload {
-        RequestedDownload::CatalogComponent {
+        RequestedDownload {
             model: model.parse().unwrap(),
-            component: CatalogComponent::Projector,
+            part: Some(CatalogComponent::Projector.into()),
         }
+    }
+
+    #[test]
+    fn requests_are_stored_as_a_model_and_a_part() {
+        let root = tempfile::tempdir().unwrap();
+        let mut requests = RequestedDownloads::default();
+        let added = "hf:unsloth/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf";
+        for (index, request) in [
+            RequestedDownload {
+                model: "qwen3.5-4b:gguf:q4".parse().unwrap(),
+                part: None,
+            },
+            RequestedDownload {
+                model: added.parse().unwrap(),
+                part: Some(CustomModelPart::Drafter.into()),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            requests.admitted(request, ModelDownloadId(format!("model_download_{index}")));
+        }
+        requests.persist(root.path()).unwrap();
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(root.path().join(FILE_NAME)).unwrap())
+                .unwrap(),
+            serde_json::json!({ "requests": [
+                { "model": "qwen3.5-4b:gguf:q4" },
+                { "model": added, "part": "Drafter" },
+            ] })
+        );
     }
 
     #[test]
@@ -185,7 +225,7 @@ mod tests {
             root.path().join(FILE_NAME),
             serde_json::to_vec(&serde_json::json!({
                 "requests": [
-                    { "_tag": "Unknown" },
+                    { "model": "qwen3.5-4b:gguf:q4", "part": "Unknown" },
                     serde_json::to_value(catalog("qwen3.5-4b:gguf:q4")).unwrap(),
                 ],
             }))
