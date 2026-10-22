@@ -42,6 +42,7 @@ import type { ApplicationSnapshot, AppearancePreference } from "@magnitudedev/sd
 import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessChange, type NetworkBind, type OwnerCapability } from "@magnitudedev/sdk"
 import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
 import { SettingsGroup, SettingsRow } from "./components/settings-row"
+import { LANGUAGES, isLanguage, useI18n } from "./i18n"
 import {
   activeLocalModel, useAgentClient, type AddModelRequest, type ApplicationPage,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
@@ -569,6 +570,31 @@ function ThemeRow() {
         return <Button key={value} size="sm" variant={appearance === value ? "secondary" : "ghost"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}
     </div>} />
 }
+const languageNames = {
+  en: "English",
+  es: "Español",
+  "zh-CN": "简体中文",
+  hi: "हिन्दी",
+  bn: "বাংলা",
+  fr: "Français",
+  de: "Deutsch",
+  ja: "日本語",
+  pt: "Português",
+  it: "Italiano",
+  uk: "Українська",
+} as const
+
+function LanguageRow() {
+  const { language, setLanguage, t } = useI18n()
+  return <SettingsRow label={t("language")} hint={t("languageHint")} control={
+    <Select value={language} onValueChange={value => { if (isLanguage(value)) setLanguage(value) }}>
+      <SelectTrigger aria-label={t("language")} className="min-w-44"><SelectValue>{languageNames[language]}</SelectValue></SelectTrigger>
+      <SelectContent>
+        {LANGUAGES.map(value => <SelectItem key={value} value={value}>{languageNames[value]}</SelectItem>)}
+      </SelectContent>
+    </Select>
+  } />
+}
 /** The application that owns the service, and whether it supports a request. */
 function useApplicationOwner() {
   const client = useAgentClient()
@@ -778,7 +804,7 @@ function SettingsPage() {
   const { storagePending, networkPending } = useRestartPending()
   useAtomMount(useMemo(() => Atom.make(Effect.all([Atom.refresh(client.Configuration.GetModelStorage({})), Atom.refresh(client.Configuration.GetNetworkAccess({})), Atom.refresh(client.Models.ListModelLocations({}))], { discard: true })), [client]))
   return <>
-    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><ModelLocationsRow /><HuggingFaceRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
+    <SettingsGroup label="General"><LanguageRow /><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><ModelLocationsRow /><HuggingFaceRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
     <SettingsGroup label="About"><AboutRow /></SettingsGroup>
     {remote && <SettingsGroup label="This browser"><SignOutRow /></SettingsGroup>}
     {(storagePending || networkPending) && <div aria-hidden="true" className="h-44" />}
