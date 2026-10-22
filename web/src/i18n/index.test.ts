@@ -30,6 +30,20 @@ describe("react-i18next locale resources", () => {
     }
   })
 
+  test("translates navigation and settings chrome through exact known labels", () => {
+    const labels = [
+      ["General", "General", "一般", "Général", "Allgemein", "一般", "Geral", "Generale", "Загальні"],
+      ["Theme", "Tema", "主题", "Thème", "Design", "テーマ", "Tema", "Tema", "Тема"],
+      ["Open navigation", "Abrir navegación", "打开导航", "Ouvrir la navigation", "Navigation öffnen", "ナビゲーションを開く", "Abrir navegação", "Apri navigazione", "Відкрити навігацію"],
+    ] as const
+    const languages = ["en", "es", "zh-CN", "fr", "de", "ja", "pt", "it", "uk"] as const
+    for (const [english, ...translations] of labels) {
+      for (const [index, language] of languages.entries()) {
+        expect(translateKnownMessage(english, language)).toBe(translations[index])
+      }
+    }
+  })
+
   test("translates known service messages and preserves unknown diagnostics", () => {
     expect(translateKnownMessage("Couldn’t load the model catalog", "es")).toBe("No se pudo cargar el catálogo de modelos")
     const diagnostic = "unrecognized diagnostic from the service"
