@@ -41,7 +41,7 @@ function safeStorage(): Pick<Storage, "getItem" | "setItem"> | undefined {
   }
 }
 
-export function readLanguage(storage = safeStorage()): Language {
+export function readLanguage(storage: Pick<Storage, "getItem"> | undefined = safeStorage()): Language {
   try {
     const stored = storage?.getItem(STORAGE_KEY)
     return isLanguage(stored) ? stored : "en"
