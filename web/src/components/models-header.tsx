@@ -14,7 +14,7 @@ export const matchStatus = (count: number) => `${count} ${count === 1 ? "model" 
  * Catalog and My Models share one header: the title with the page's add action on the right, then
  * search on the left and the selects on the right. The count lives in the search placeholder.
  */
-export function ModelsHeader({ title, action, selectedCount, matchingCount, search, onSearch, controls }: {
+export function ModelsHeader({ title, action, matchingCount, search, onSearch, controls }: {
   title: string
   action: ReactNode
   selectedCount: number
