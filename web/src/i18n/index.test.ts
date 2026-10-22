@@ -3,8 +3,6 @@ import { i18n, isLanguage, LANGUAGES, readLanguage, STORAGE_KEY, translateKnownM
 import { en } from "./catalogs/en"
 import { es } from "./catalogs/es"
 import { zhCN } from "./catalogs/zh-CN"
-import { hi } from "./catalogs/hi"
-import { bn } from "./catalogs/bn"
 import { fr } from "./catalogs/fr"
 import { de } from "./catalogs/de"
 import { ja } from "./catalogs/ja"
@@ -12,19 +10,19 @@ import { pt } from "./catalogs/pt"
 import { it } from "./catalogs/it"
 import { uk } from "./catalogs/uk"
 
-const catalogs = { en, es, "zh-CN": zhCN, hi, bn, fr, de, ja, pt, it, uk }
+const catalogs = { en, es, "zh-CN": zhCN, fr, de, ja, pt, it, uk }
 
 describe("react-i18next locale resources", () => {
-  test("exposes exactly the eleven requested LTR locales", () => {
-    expect(LANGUAGES).toEqual(["en", "es", "zh-CN", "hi", "bn", "fr", "de", "ja", "pt", "it", "uk"])
+  test("exposes exactly the nine requested LTR locales", () => {
+    expect(LANGUAGES).toEqual(["en", "es", "zh-CN", "fr", "de", "ja", "pt", "it", "uk"])
     for (const language of LANGUAGES) expect(isLanguage(language)).toBe(true)
     for (const excluded of ["ur", "zh-TW", "id", "ko", "vi", "xx", null]) expect(isLanguage(excluded)).toBe(false)
   })
 
   test("translates representative labels through i18next", () => {
     const examples = [
-      ["en", "Settings"], ["es", "Ajustes"], ["zh-CN", "设置"], ["hi", "सेटिंग्स"],
-      ["bn", "সেটিংস"], ["fr", "Paramètres"], ["de", "Einstellungen"], ["ja", "設定"],
+      ["en", "Settings"], ["es", "Ajustes"], ["zh-CN", "设置"],
+      ["fr", "Paramètres"], ["de", "Einstellungen"], ["ja", "設定"],
       ["pt", "Configurações"], ["it", "Impostazioni"], ["uk", "Налаштування"],
     ] as const
     for (const [language, expected] of examples) {
@@ -45,7 +43,7 @@ describe("react-i18next locale resources", () => {
     expect(readLanguage({ getItem: () => { throw new Error("storage blocked") } })).toBe("en")
   })
 
-  test("all eleven catalogs have identical non-empty message keys", () => {
+  test("all nine catalogs have identical non-empty message keys", () => {
     const expectedKeys = Object.keys(en).sort()
     for (const [language, catalog] of Object.entries(catalogs)) {
       expect(Object.keys(catalog).sort(), language).toEqual(expectedKeys)
