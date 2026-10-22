@@ -14,7 +14,7 @@ export const matchStatus = (count: number) => `${count} ${count === 1 ? "model" 
  * Catalog and My Models share one header: the title with the page's add action on the right, then
  * search on the left and the selects on the right. The count lives in the search placeholder.
  */
-export function ModelsHeader({ title, action, matchingCount, search, onSearch, controls }: {
+export function ModelsHeader({ title, action, selectedCount, matchingCount, search, onSearch, controls }: {
   title: string
   action: ReactNode
   selectedCount: number
@@ -33,7 +33,7 @@ export function ModelsHeader({ title, action, matchingCount, search, onSearch, c
     <div className={pageLayout.catalogToolbar}>
       <div className={`relative ${pageLayout.modelSearch}`}>
         <MagnifyingGlassIcon aria-hidden="true" className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-slate-500" />
-        <Input aria-label={t("searchModels")} placeholder={t("searchModelsPlaceholder")} className="pl-8" value={search} onChange={event => onSearch(event.target.value)} />
+        <Input aria-label={t("searchModels")} placeholder={t("searchModelsPlaceholder", { count: selectedCount })} className="pl-8" value={search} onChange={event => onSearch(event.target.value)} />
       </div>
       <div className="flex flex-wrap items-center gap-2">{controls}</div>
       <span className="sr-only" role="status">{matchStatus(matchingCount)}</span>
