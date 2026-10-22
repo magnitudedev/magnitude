@@ -114,7 +114,7 @@
         "method": "mtp",
         "draft": { "type": "file", "repository": "unsloth/Qwen3.8-Flash-Next-GGUF", "path": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" }
       },
-      "variants": [{"variantId": "gguf:nvfp4-q8", "format": "NVFP4-Q8_0", "variantLabel": "NVFP4 Q8", "fidelityRank": 70, "quantizationAware": true}, {"variantId": "gguf:nvfp4-q6", "format": "NVFP4-Q6_K", "variantLabel": "NVFP4 Q6", "fidelityRank": 65, "quantizationAware": true}],
+      "variants": [{"variantId": "gguf:nvfp4-q8", "format": "NVFP4-Q8_0", "variantLabel": "NVFP4 Q8", "fidelityRank": 70, "quantizationAware": true}],
       "projector": { "path": "mmproj/mmproj-Qwen3.8-Flash-Next-NVFP4-BF16.gguf" },
       "license": "nvidia-open-model-license",
       "artificialAnalysis": {

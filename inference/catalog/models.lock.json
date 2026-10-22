@@ -1,18 +1,44 @@
 {
-  "bonsai-8b-q1": { "target": "48516770dd04643643e9f9019a2a349cf26c5dbd" },
-  "deepseek-v4-flash": { "target": "fbbb5b93fb787c21338159b0af3318bb3f4d9768", "speculativeDraft": "fbbb5b93fb787c21338159b0af3318bb3f4d9768" },
-  "gemma-4-12b-it-qat": { "target": "980b060c40a8539ac159e0501a3e0f66a6365af3", "speculativeDraft": "628fa4b14a6f0defce5f107f5770250e05b4e035" },
-  "gemma-4-26b-a4b-it-qat": { "target": "7b92b5b28818151e8669af2e45e88d6086f490dd", "speculativeDraft": "20d79f403bf11c19d71f6957e5c9600cedb28d19" },
-  "gemma-4-31b-it-qat": { "target": "43cc1aeb31adf47ec06a854507ce552cd9862e6f", "speculativeDraft": "c9bc80a3f8893739dd1453a98c69ffb696afb2c1" },
-  "gemma-4-e2b-it-qat": { "target": "66a399f68ddd113b06dff02fca9523e55465d11d", "speculativeDraft": "b162b6d707634cd9e985a65cfc8b1d3cc73b9fbb" },
-  "gemma-4-e4b-it-qat": { "target": "8c5a9e4fd5482e2be20fe0bf013b4c262a8f4265", "speculativeDraft": "ca8128d445bfaf9f2210f8c62d1c4986439ee4fb" },
-  "glm-5.2": { "target": "abc55e72527792c6e77069c99b4cb7de16fa9f23" },
-  "laguna-s-2.1": { "target": "750f92f90cf54159c4d7a610cb7b3e74498e75c6" },
+  "bonsai-8b-q1": {
+    "target": "48516770dd04643643e9f9019a2a349cf26c5dbd"
+  },
+  "deepseek-v4-flash": {
+    "target": "fbbb5b93fb787c21338159b0af3318bb3f4d9768",
+    "speculativeDraft": "fbbb5b93fb787c21338159b0af3318bb3f4d9768"
+  },
+  "gemma-4-12b-it-qat": {
+    "target": "980b060c40a8539ac159e0501a3e0f66a6365af3",
+    "speculativeDraft": "628fa4b14a6f0defce5f107f5770250e05b4e035"
+  },
+  "gemma-4-26b-a4b-it-qat": {
+    "target": "7b92b5b28818151e8669af2e45e88d6086f490dd",
+    "speculativeDraft": "20d79f403bf11c19d71f6957e5c9600cedb28d19"
+  },
+  "gemma-4-31b-it-qat": {
+    "target": "43cc1aeb31adf47ec06a854507ce552cd9862e6f",
+    "speculativeDraft": "c9bc80a3f8893739dd1453a98c69ffb696afb2c1"
+  },
+  "gemma-4-e2b-it-qat": {
+    "target": "66a399f68ddd113b06dff02fca9523e55465d11d",
+    "speculativeDraft": "b162b6d707634cd9e985a65cfc8b1d3cc73b9fbb"
+  },
+  "gemma-4-e4b-it-qat": {
+    "target": "8c5a9e4fd5482e2be20fe0bf013b4c262a8f4265",
+    "speculativeDraft": "ca8128d445bfaf9f2210f8c62d1c4986439ee4fb"
+  },
+  "glm-5.2": {
+    "target": "abc55e72527792c6e77069c99b4cb7de16fa9f23"
+  },
+  "laguna-s-2.1": {
+    "target": "750f92f90cf54159c4d7a610cb7b3e74498e75c6"
+  },
   "lfm2.5-2.6b": {
     "target": "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc",
     "speculativeDraft": "60103108e36ef66c2591c2b1ea3e6530a4e2c3b0"
   },
-  "lfm2.5-24b-a2b": { "target": "0912d33141f77e10705345a6732bfd83f0252fdc" },
+  "lfm2.5-24b-a2b": {
+    "target": "0912d33141f77e10705345a6732bfd83f0252fdc"
+  },
   "lfm2.5-8b-a1b": {
     "target": "dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0",
     "speculativeDraft": "0e2ce447c266c98603073cf9927a56130b9dca43"
@@ -25,34 +51,60 @@
     "target": "3c3f7e84f14a760ff26d17ab5932d4aa996227c0",
     "speculativeDraft": "06e20d2ca305f10ab0c4436b07cd48240b815963"
   },
-  "minicpm5-1b": { "target": "3d55fac80935ae6456986ad2384b5cbcc4d6c948" },
+  "minicpm5-1b": {
+    "target": "3d55fac80935ae6456986ad2384b5cbcc4d6c948"
+  },
   "minicpm5-2b": {
     "target": "2079a22f3beaa4e306449978533478fe0522f4b3",
     "speculativeDraft": "fbc306afa97f19283820af3089f9306f7b2051cb"
   },
-  "muse-glimmer-30b": { "target": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5", "speculativeDraft": "40434dabff898ca2dda99f88a02b422a03715d67" },
-  "nemotron-3-super-120b-a12b": { "target": "036038fb30334a2d56a146c6f0d4871ab5edccbb" },
-  "nemotron-3-ultra-550b-a55b": { "target": "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6" },
-  "nemotron-3.5-lightning-30b-a3b": {
-    "target": "88d7ce0b0fa385c5108866ce5d33690927531a37",
-    "speculativeDraft": "4f5b414b9388a4543dcc4b24758e09d68140a6fe"
+  "muse-glimmer-30b": {
+    "target": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5",
+    "speculativeDraft": "40434dabff898ca2dda99f88a02b422a03715d67"
+  },
+  "nemotron-3-super-120b-a12b": {
+    "target": "036038fb30334a2d56a146c6f0d4871ab5edccbb"
+  },
+  "nemotron-3-ultra-550b-a55b": {
+    "target": "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6"
   },
   "nemotron-3.5-bolt-74b-a9b": {
     "target": "e0fecb69cb3e5e4c5e8a056fa2aec98c78e91246",
     "speculativeDraft": "341de320b3c2802b22c1a633c97ce78d51512bc6"
   },
+  "nemotron-3.5-lightning-30b-a3b": {
+    "target": "88d7ce0b0fa385c5108866ce5d33690927531a37",
+    "speculativeDraft": "4f5b414b9388a4543dcc4b24758e09d68140a6fe"
+  },
   "nemotron-3.5-super-vl-120b-a12b": {
     "target": "75a5829055f69a0359085ae6bbd0a81b60bc05c6",
     "speculativeDraft": "8602acac5a96c69bf094ce83d941341944b2789d"
   },
-  "qwen3.5-122b-a10b": { "target": "907becb33103ab66b23da06a2dc74a5fca0583bd" },
-  "qwen3.5-4b": { "target": "86835bf9949e4d14d6860f7910b1340ad4f271a9", "speculativeDraft": "0094e74a88676605d53b79c7c3d26096335c9746" },
-  "qwen3.5-9b": { "target": "9716a636ee4bddc3fed678220b7a33dd2a4160ae", "speculativeDraft": "58b69e4e18f40906a95320507b802899d50e5292" },
+  "qwen3.5-122b-a10b": {
+    "target": "907becb33103ab66b23da06a2dc74a5fca0583bd"
+  },
+  "qwen3.5-4b": {
+    "target": "86835bf9949e4d14d6860f7910b1340ad4f271a9",
+    "speculativeDraft": "0094e74a88676605d53b79c7c3d26096335c9746"
+  },
+  "qwen3.5-9b": {
+    "target": "9716a636ee4bddc3fed678220b7a33dd2a4160ae",
+    "speculativeDraft": "58b69e4e18f40906a95320507b802899d50e5292"
+  },
   "qwen3.6-35b-a3b": {
     "target": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
     "speculativeDraft": "4f5e4df8dc4520256bdc0bc8752c7010bbfb1eec"
   },
-  "qwen3.8-27b": { "target": "27af057ecb382ddfea5d12837360a8980560e3ed", "speculativeDraft": "ead2a051a43bf91e8982e00d2c060efb3b984cb5" },
-  "qwen3.8-flash-next": { "target": "766911a6b7369840a91dbcd95f9f997acaab6cd6", "speculativeDraft": "766911a6b7369840a91dbcd95f9f997acaab6cd6" },
-  "qwen3.8-flash-next-nvfp4": { "target": "1589f6e77f502705acac9d00c7ca627f3f098dbb", "speculativeDraft": "766911a6b7369840a91dbcd95f9f997acaab6cd6" }
+  "qwen3.8-27b": {
+    "target": "27af057ecb382ddfea5d12837360a8980560e3ed",
+    "speculativeDraft": "ead2a051a43bf91e8982e00d2c060efb3b984cb5"
+  },
+  "qwen3.8-flash-next": {
+    "target": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+    "speculativeDraft": "766911a6b7369840a91dbcd95f9f997acaab6cd6"
+  },
+  "qwen3.8-flash-next-nvfp4": {
+    "target": "2be0646f7baa1d5b5cbec636c0e9e787e4de27e9",
+    "speculativeDraft": "766911a6b7369840a91dbcd95f9f997acaab6cd6"
+  }
 }
