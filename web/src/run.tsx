@@ -1,4 +1,5 @@
 import "./styles/tailwind.css"
+import "./i18n"
 import { createRoot } from "react-dom/client"
 import { useMemo } from "react"
 import { RegistryProvider, Result, useAtomValue } from "@effect-atom/atom-react"
