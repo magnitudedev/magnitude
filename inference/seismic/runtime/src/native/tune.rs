@@ -3630,17 +3630,21 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         } = request;
         let backend = super::backend_name(&device.kind);
         let entry_name = super::entry_name(module, entry);
-        let mut implementation = super::on_device(
+        let mut implementation = super::device_defaults(
             device,
-            module
-                .native_implementation(entry, backend)
-                .cloned()
-                .ok_or_else(|| {
-                    TuneError::Declaration(format!(
-                        "`{entry_name}` has no native implementation for `{}`",
-                        backend.as_str()
-                    ))
-                })?,
+            super::on_device(
+                device,
+                module
+                    .native_implementation(entry, backend)
+                    .cloned()
+                    .ok_or_else(|| {
+                        TuneError::Declaration(format!(
+                            "`{entry_name}` has no native implementation for `{}`",
+                            backend.as_str()
+                        ))
+                    })?,
+            ),
+            &bindings,
         );
         implementation = implementation.at_elements(&bindings);
         fix(&mut implementation, statics.params())?;
@@ -7193,14 +7197,22 @@ pub fn implementation_digest(
 ) -> Result<String, TuneError> {
     let backend = super::backend_name(&device.kind);
     let entry_name = super::entry_name(module, entry);
-    let implementation = module
-        .native_implementation(entry, backend)
-        .ok_or_else(|| {
-            TuneError::Declaration(format!(
-                "`{entry_name}` has no native implementation for `{}`",
-                backend.as_str()
-            ))
-        })?;
+    // The declaration as the device offers its defaults: a stored result is
+    // qualified against them.
+    let implementation = super::device_defaults(
+        device,
+        module
+            .native_implementation(entry, backend)
+            .cloned()
+            .ok_or_else(|| {
+                TuneError::Declaration(format!(
+                    "`{entry_name}` has no native implementation for `{}`",
+                    backend.as_str()
+                ))
+            })?,
+        bindings,
+    );
+    let implementation = &implementation;
     let default = implementation
         .default_specialization(statics)
         .map_err(|error| TuneError::Declaration(error.to_string()))?;

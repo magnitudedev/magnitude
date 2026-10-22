@@ -18,6 +18,12 @@ pub enum Stop {
     Count(NonZeroUsize),
     /// Once [`Timing::resolved`] holds at `error_rate`.
     Resolved { error_rate: f64 },
+    /// Once [`Timing::resolved`] holds at `error_rate`, or once the samples
+    /// cover `seconds` of device time, whichever comes first: at least one
+    /// sample. Where samples are long the budget bounds a point's time, and
+    /// a median it ends before the fewest samples that bound one has no
+    /// interval.
+    Within { error_rate: f64, seconds: f64 },
 }
 
 /// How a point is measured: when sampling stops, and the device time a
@@ -48,6 +54,10 @@ pub fn measure<W: Work>(
     let (mut stopping, error_rate) = match how.stop {
         Stop::Count(samples) => (Stopping::Count(samples.get()), None),
         Stop::Resolved { error_rate } => (Stopping::resolved(error_rate), Some(error_rate)),
+        Stop::Within {
+            error_rate,
+            seconds,
+        } => (Stopping::within(error_rate, seconds), Some(error_rate)),
     };
     slot.sample_alone(
         how.min_sample_seconds,

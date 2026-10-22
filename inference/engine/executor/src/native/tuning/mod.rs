@@ -4686,9 +4686,14 @@ impl<'a> Tuner<'a> {
             bindings: bindings.clone(),
             outcome,
         };
-        let defaults = implementation
+        implementation
             .default_specialization(statics)
             .map_err(|error| failure(error.to_string()))?;
+        // The canonical default as the device offers it, as a stored
+        // fallback holds it.
+        let defaults = case
+            .device_default(self.device, statics)
+            .ok_or_else(|| failure("the device offers no default at these statics".into()))?;
         let shapes = self.shapes(case, &key)?;
         if shapes.is_empty() {
             return Err(failure("the engine's bounds admit no tuning point".into()));

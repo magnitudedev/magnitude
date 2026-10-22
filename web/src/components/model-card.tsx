@@ -21,7 +21,7 @@ import { removalConfirmation } from "./model-remove-action"
 import { fitNotice, loadRefusal } from "./model-fit"
 import { downloadNotice, modelCommandNotice, modelRemovalNotice, ModelLoadNotice } from "./model-error"
 import { acquiring } from "./models-page"
-import { catalogDrafterOnlyUpdate, modelCardDrafter, modelCardStatus, modelSubtitle, modelUpdateDescription, type StatusTone } from "./model-card-state"
+import { addedModelAwaitingFiles, catalogDrafterOnlyUpdate, modelCanDownload, modelCardDrafter, modelCardStatus, modelSubtitle, modelUpdateDescription, type StatusTone } from "./model-card-state"
 
 interface PrimaryAction {
   readonly label: ReactNode
@@ -87,8 +87,9 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
   const loadFailure = residency?._tag === "Failed" && !command.pendingOperations.includes("load") ? residency.failure : null
   const loadNotice = refusal === null ? loadFailure : null
   const downloadFailure = (acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed") && !command.pendingOperations.includes("install") ? acquisition.failure : null
-  const canDownload = supported && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
-  const fit = supported ? fitNotice(model) : null
+  const awaitingFiles = addedModelAwaitingFiles(model)
+  const canDownload = modelCanDownload(model)
+  const fit = supported && !awaitingFiles ? fitNotice(model) : null
   const modelUpdate = Option.isNone(deprecation) && !transferring && installed && supported && acquisition._tag === "UpdateAvailable" && !catalogDrafterOnlyUpdate(model)
   const requestLoad = () => { if (replacing) setConfirmingLoad(true); else load(model.modelId) }
   const name = formatLocalModelDisplayName(model)
@@ -115,7 +116,7 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
       },
     })
     : transferring || acquisition._tag === "Unavailable" || downloadFailure ? null
-    : !installed ? { label: <>Download <span className="tabular-nums opacity-75">{formatStorageSize(model.storageBytes)}</span></>, icon: <DownloadSimpleIcon />, disabled: pending || !canDownload, onClick: () => install(model.modelId) }
+    : !installed ? { label: <>Download{model.storageBytes > 0 && <> <span className="tabular-nums opacity-75">{formatStorageSize(model.storageBytes)}</span></>}</>, icon: <DownloadSimpleIcon />, disabled: pending || !canDownload, onClick: () => install(model.modelId) }
     : !supported ? null
     : canStop ? { label: "Stop", icon: <SquareIcon />, disabled: stopping.pending, outline: true, onClick: () => stop() }
     : modelUpdate ? { label: "Update", ...Option.match(modelUpdateDescription(model), { onNone: () => ({}), onSome: tooltip => ({ tooltip }) }), icon: <ArrowClockwiseIcon />, disabled: pending, onClick: () => install(model.modelId) }
@@ -123,7 +124,7 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
     : { label: "Load", icon: <PlayIcon />, disabled: pending || refusal !== null, ...(refusal ? { title: refusal } : {}), onClick: requestLoad }
 
   const kind = removalKind(model)
-  const removable = !transferring && (installed || acquisition._tag === "Unavailable") && !(Option.isSome(deprecation) && !localModelIsInstalled(model))
+  const removable = !transferring && (installed || acquisition._tag === "Unavailable" || awaitingFiles) && !(Option.isSome(deprecation) && !localModelIsInstalled(model))
   const menu: MenuAction[] = [
     ...(modelUpdate && !canStop && !loadNotice ? [{ label: "Load this version", icon: <PlayIcon />, disabled: pending || refusal !== null, onClick: requestLoad }] : []),
     ...(model._tag === "Catalog" ? catalogComponentOffers(model).filter(({ component }) => component !== "Drafter").map(offer => ({ label: `Add ${catalogComponentName(offer.component).toLowerCase()}${offer.downloadBytes > 0 ? ` · ${formatStorageSize(offer.downloadBytes)}` : ""}`, icon: <DownloadSimpleIcon />, disabled: command.pending, onClick: () => downloadComponent(model.modelId, offer.component) })) : []),
@@ -182,7 +183,7 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
     ? <span className="flex min-w-0 items-center gap-2"><span className="whitespace-nowrap tabular-nums">{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)}</span>
       {Option.isSome(memoryUse) && <span aria-hidden="true" className="h-1 w-10 shrink-0 xl:w-14 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-700"><span className={`block h-full rounded-full ${memoryUse.value > 0.8 ? "bg-orange-500 dark:bg-orange-400" : "bg-slate-400"}`} style={{ width: `${Math.max(4, memoryUse.value * 100)}%` }} /></span>}</span>
     : model.servingState._tag === "Assessed" ? <span className="text-slate-500">Doesn’t fit</span>
-    : model.servingState._tag === "Assessing" ? <span className="text-slate-500">Checking…</span>
+    : model.servingState._tag === "Assessing" && !awaitingFiles ? <span className="text-slate-500">Checking…</span>
     : <span className="text-slate-500">—</span>
 
   const attachedAvailability = model._tag === "Custom" ? Option.getOrUndefined(Option.map(model.drafter, value => value.availability)) : undefined

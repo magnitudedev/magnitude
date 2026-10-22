@@ -98,10 +98,10 @@ pub use planning::{
     ArtifactComponent, ArtifactComponentKind, AssessmentFit, AssessmentFitVerdict,
     AssessmentGraphResourceBounds, AssessmentHeaderBounds, AssessmentMemoryBounds,
     AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding, AttentionShape, BackendPlan,
-    CONVERSATION_CHECKPOINTS, CapabilityPlan, ComponentPlan, ComponentSelection, ConvolutionBinding,
-    ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding, DenseBinding,
-    DenseBranchBinding, DenseScales, DeviceProcessBytes, DraftBlockBinding, DraftProgramPlan,
-    DraftWidths,
+    CONVERSATION_CHECKPOINTS, CPU_IMAGE_CELLS, CapabilityPlan, ComponentPlan, ComponentSelection,
+    ConvolutionBinding, ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding,
+    DenseBinding, DenseBranchBinding, DenseScales, DeviceProcessBytes, DraftBlockBinding,
+    DraftProgramPlan, DraftWidths,
     EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding,
     FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, HostProcessBytes,
     HostTablePlan, ImportProgramSlot, MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding,
@@ -113,7 +113,7 @@ pub use planning::{
     SharedHeadProgramPlan, StartupSlots, StateCapacityPlan, StateProgramPlan, StateResourcePlan,
     StateStorePlan, SublayerTail, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan,
     TensorOperations, VisionProgramPlan, WeightPlan, WeightScalePlan, WeightStorageIdentity,
-    draft_ladder, image_cell_limit, resident_element, resident_elements, resident_layout, source_element,
+    draft_ladder, image_cell_limit, max_image_cells, resident_element, resident_elements, resident_layout, source_element,
 };
 
 /// Whether this executor runs `definition` with its draft head selected.

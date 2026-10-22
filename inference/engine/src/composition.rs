@@ -14,6 +14,7 @@ use crate::worker::{
 use magnitude_executor::UnpreparedUnits;
 use magnitude_artifacts::PackageIdentity;
 use magnitude_executor::{
+    image_cell_limit, max_image_cells,
     platform::{DeviceRequest, MemoryReserves},
     ExecutionPath,
 };
@@ -111,6 +112,9 @@ pub enum ReadinessMismatch {
         host: InputModalities,
         worker: InputModalities,
     },
+    /// The host cannot bound its image resize to the cells the worker's
+    /// device encodes per image.
+    ImageCells { reason: String },
 }
 
 impl fmt::Display for ReadinessMismatch {
@@ -128,6 +132,10 @@ impl fmt::Display for ReadinessMismatch {
                 formatter,
                 "the worker accepts {worker:?} but the host resolved {host:?}"
             ),
+            Self::ImageCells { reason } => write!(
+                formatter,
+                "the host cannot bound its images to the cells the worker's device encodes: {reason}"
+            ),
         }
     }
 }
@@ -137,7 +145,8 @@ impl std::error::Error for ReadinessMismatch {}
 impl ReadyEngine {
     /// Bind host artifacts to a connected worker. The worker must have
     /// loaded exactly the package the host resolved and read the same chat
-    /// templates and input modalities from it.
+    /// templates and input modalities from it. The engine's host resizes
+    /// images to the cells the worker's device encodes.
     pub fn new(
         host: Arc<HostArtifacts>,
         connection: WorkerConnection,
@@ -162,6 +171,14 @@ impl ReadyEngine {
                 worker: ready.modalities,
             });
         }
+        let host = image_cell_limit(
+            host.definition(),
+            ready.service.launch_rows(),
+            max_image_cells(ready.backend),
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|cells| host.within_image_cells(cells))
+        .map_err(|reason| ReadinessMismatch::ImageCells { reason })?;
         Ok(Self {
             host,
             client: connection.client,

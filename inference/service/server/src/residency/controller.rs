@@ -45,7 +45,7 @@ use super::{
     ResidencyLease, ResidencyNotification, ResidencyWorker, ResolvedResidencyTarget,
 };
 use crate::configurations::{ResolvedConfiguration, ResolvedConfigurations};
-use crate::device_lock::{DeviceLock, DeviceShare};
+use crate::device_lock::{DeviceHold, DeviceLock, DeviceShare};
 use crate::hardware::execution_backend;
 use crate::memory_domains::instance_allocation;
 use crate::worker_process::WorkerLauncher;
@@ -93,7 +93,6 @@ struct EngineResidency {
     environment: Arc<ResidencyEnvironment>,
     client: ResidencyClient<ResidentEngine>,
     supervisor: MemorySupervisor,
-    preparations: PreparationJobs,
     next_instance_id: Arc<AtomicU64>,
 }
 
@@ -122,12 +121,10 @@ impl ModelInstances {
                 .for_domain(&seismic::StoreKind::HostRam, host_capacity),
             client.notifier(),
         );
-        let preparations = PreparationJobs::default();
         let driver = EngineResidency {
             environment: Arc::clone(&environment),
             client: client.clone(),
             supervisor: supervisor.clone(),
-            preparations: preparations.clone(),
             next_instance_id: Arc::new(AtomicU64::new(1)),
         };
         tokio::spawn(ModelResidency::new(driver).run(inbox));
@@ -135,7 +132,7 @@ impl ModelInstances {
             environment,
             residency: client,
             supervisor,
-            preparations,
+            preparations: PreparationJobs::default(),
             assessments: Arc::default(),
         }
     }
@@ -157,6 +154,14 @@ impl ModelInstances {
             Some(refusal) => Err(refusal),
             None => Ok(()),
         }
+    }
+
+    /// The residency loads `target` unless it is resident, and the load's Prepare searches what
+    /// its bundle's catalog optimization would: one waiting for the device ends without running.
+    /// Marked before the residency releases another model, whose release frees the device.
+    fn requested(&self, target: &ResolvedResidencyTarget) {
+        self.preparations
+            .loading(&servable_model_bundle_key_for_bundle(&target.configuration.bundle));
     }
 
     /// A fresh memory observation from the resident worker, when one is resident.
@@ -182,6 +187,7 @@ impl ModelInstances {
     pub async fn ensure_resident(&self, model_id: &str) -> Result<ModelInstance, InventoryError> {
         let target = self.target(model_id)?;
         self.admit(&target).await?;
+        self.requested(&target);
         match self
             .residency
             .acquire(target, ResidencyAcquisition::Warm)
@@ -200,6 +206,7 @@ impl ModelInstances {
     ) -> Result<ResidencyLease<ResidentEngine>, InventoryError> {
         let target = self.target(model_id)?;
         self.admit(&target).await?;
+        self.requested(&target);
         match self
             .residency
             .acquire(
@@ -304,7 +311,7 @@ impl CatalogModelOptimizer for ModelInstances {
     fn optimize_catalog_model(
         &self,
         model_id: ModelId,
-        progress: Box<dyn Fn(CatalogOptimizationProgress) + Send + Sync>,
+        progress: Box<dyn Fn(Option<CatalogOptimizationProgress>) + Send + Sync>,
     ) -> BoxFuture<'static, ()> {
         let environment = Arc::clone(&self.environment);
         let preparations = self.preparations.clone();
@@ -589,9 +596,13 @@ impl EngineResidency {
         instance_id: &ModelInstanceId,
         device: &Arc<DeviceShare>,
     ) -> Result<SpawnedWorker, ModelOperationFailure> {
-        let spawned = EngineWorker::spawn(&self.environment.launcher, Arc::clone(device)).map_err(
-            |error| ModelOperationFailure::new("worker_spawn_failed", format!("{error:#}"), true),
-        )?;
+        let spawned = EngineWorker::spawn(
+            &self.environment.launcher,
+            DeviceHold::Share(Arc::clone(device)),
+        )
+        .map_err(|error| {
+            ModelOperationFailure::new("worker_spawn_failed", format!("{error:#}"), true)
+        })?;
         let worker: Arc<dyn ResidencyWorker> = spawned.worker.clone();
         self.client
             .notifier()
@@ -610,13 +621,14 @@ impl EngineResidency {
         let environment = &self.environment;
         let resolved = environment.configurations.resolve(&configuration).await?;
         // The load shares the device for its lifetime: its workers hold the share until each is
-        // proven retired. A measurement job holding it is preempted: the load waits only for its
-        // bounded kill.
+        // proven retired. A job holding it (the measurement job or a catalog optimization, of
+        // this bundle or any other) is preempted: the load waits only for its bounded kill, and
+        // the records an optimization published stand.
         let device = Arc::new(match environment.device.try_share() {
             Some(device) => device,
             None => {
                 self.progress(instance_id, ModelLoadStage::Queued, None);
-                tracing::info!("load preempts the measurement job and waits for its kill");
+                tracing::info!("load preempts the job holding the device and waits for its kill");
                 let device = environment.device.share().await;
                 self.progress(instance_id, ModelLoadStage::Preparing, None);
                 device
@@ -632,13 +644,10 @@ impl EngineResidency {
         let plan = load_plan(&preview)?;
         self.progress(instance_id, ModelLoadStage::Preparing, Some(&plan));
 
-        // A load never searches kernels. The bundle's post-install job is stopped first; the
-        // records it published stand. The Load worker reports tuning units without a record:
+        // A load never searches kernels. The Load worker reports tuning units without a record:
         // with none it is the load, one worker. Otherwise it places nothing and ends, a
         // Prepare worker searches what is missing and is proven gone, and a second Load worker
         // serves what is stored (the engine's one sequence, `load_prepared`).
-        self.preparations
-            .stop(&servable_model_bundle_key_for_bundle(&configuration.bundle));
         let mut manifest = resolved.manifest.clone();
         manifest.device = DeviceRequest::Selector(preview.device);
         // The sequence runs on a blocking thread, which outlives this task when the load is
@@ -733,6 +742,7 @@ impl EngineResidency {
                 ReadinessMismatch::Package { .. } => "worker_package_mismatch",
                 ReadinessMismatch::TemplateFingerprint { .. } => "worker_template_mismatch",
                 ReadinessMismatch::Modalities { .. } => "worker_modalities_mismatch",
+                ReadinessMismatch::ImageCells { .. } => "worker_image_cells_mismatch",
             };
             ModelOperationFailure::new(code, mismatch.to_string(), false)
         })?;

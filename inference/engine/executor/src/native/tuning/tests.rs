@@ -3571,3 +3571,62 @@ fn stored_cpu_fallback_matches_the_device_default() {
         Some(stored)
     );
 }
+
+/// On a CPU whose tier forms quantized dots from vector integer products
+/// (AVX2, AVX-512, VNNI), a projection over packed weights defaults to its
+/// INT8 form, and its records are keyed apart from those of the F32 default.
+/// Over dense weights, and on tiers with portable integer dots (x86-64-v2,
+/// NEON), the declared F32 form stays the default.
+#[test]
+fn cpu_projection_default_form_follows_the_tier_integer_dots() {
+    let device = seismic::Devices::discover(&[])
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
+        .unwrap()
+        .unwrap();
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(name.clone(), if name == "DS" || name == "DB" { 0 } else { 8 })
+        });
+    let case = |down| DenseOutputTuning {
+        down,
+        activation: Element::bf16(),
+        down_kind: WeightKind::DenseDown,
+        scopes: vec![WeightScope::TargetSublayer(
+            magnitude_family_contracts::SublayerIndex {
+                block: 0,
+                sublayer: 1,
+            },
+        )],
+    };
+    let int8 = |case: &DenseOutputTuning| {
+        case.device_default(&device, &statics)
+            .unwrap()
+            .param("INT8")
+            .unwrap()
+    };
+    let vector = seismic::cpu::Tier::detected().unwrap().quantized_dots() > 0;
+    let packed = ["q4k@rows8", "q6k@rows8", "q8g32s@rows8", "iq4g32@rows8", "q4k@rows16"]
+        .map(|name| case(Element::named(name).expect("a CPU weight storage")));
+    for case in &packed {
+        assert_eq!(int8(case), u64::from(vector), "{}", case.down.name());
+    }
+    let dense = case(Element::bf16());
+    assert_eq!(int8(&dense), 0);
+    assert_eq!(
+        implementation
+            .default_specialization(&statics)
+            .unwrap()
+            .param("INT8"),
+        Some(0),
+        "the declaration's own default is the F32 form"
+    );
+    // A CPU digest names no binding: packed and dense weights share it
+    // exactly when they share the default.
+    let digest = |case: &DenseOutputTuning| case.digest(&device, &statics).unwrap();
+    assert_eq!(digest(&packed[0]) != digest(&dense), vector);
+}

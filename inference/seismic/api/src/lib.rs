@@ -2431,7 +2431,7 @@ impl<E: Entry> BoundEntry<E> {
         device: &Device,
         statics: &NativeSpecialization,
     ) -> Result<Option<NativeSpecialization>, CheckedBundleError> {
-        generated::native_default_specialization::<E>(device, statics)
+        generated::native_default_specialization::<E>(device, statics, &self.elements)
     }
 
     /// Validate a stored choice for this entry's actual element bindings.
@@ -4327,6 +4327,7 @@ pub mod generated {
     pub fn native_default_specialization<E: Entry>(
         device: &Device,
         statics: &NativeSpecialization,
+        elements: &[(&str, Element)],
     ) -> Result<Option<NativeSpecialization>, CheckedBundleError> {
         let module = E::module()?;
         let entry = E::resolve(module)?;
@@ -4334,6 +4335,7 @@ pub mod generated {
             device.inner(),
             module.checked(),
             entry.id(),
+            &element_bindings(elements),
             statics,
         ))
     }

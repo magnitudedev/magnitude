@@ -34,8 +34,9 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
         adjusted_messages.push_back(msg);
     }
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, adjusted_messages);
-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, adjusted_messages);
+    auto rendered          = common_chat_template_render_prompt(tmpl, inputs, adjusted_messages);
+    data.prompt            = std::move(rendered.prompt);
+    data.generation_prompt = std::move(rendered.generation_prompt);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.preserved_tokens  = { TOOL_CALL_START, TOOL_CALL_END };
     if (tool_list_tokens) {

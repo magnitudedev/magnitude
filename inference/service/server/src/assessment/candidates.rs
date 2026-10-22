@@ -354,6 +354,7 @@ pub struct ManagedModelCandidates {
     enrichment: Arc<CandidateEnrichment>,
     resolver: std::sync::OnceLock<Arc<ModelDomainResolver>>,
     weight_samples: std::sync::RwLock<BTreeMap<String, Option<WeightSample>>>,
+    host: super::HostDevice,
 }
 
 /// The engine's recognized architectures, which search and file classification use.
@@ -370,6 +371,7 @@ impl ManagedModelCandidates {
         architectures: RecognizedArchitectures,
         catalog: Arc<dyn CatalogModels>,
         local: Arc<dyn LocalModels>,
+        host: super::HostDevice,
     ) -> Arc<Self> {
         Arc::new(Self {
             assessor,
@@ -382,6 +384,7 @@ impl ManagedModelCandidates {
             enrichment: Arc::new(CandidateEnrichment::default()),
             resolver: std::sync::OnceLock::new(),
             weight_samples: std::sync::RwLock::new(BTreeMap::new()),
+            host,
         })
     }
 
@@ -653,7 +656,10 @@ impl ManagedModelCandidates {
     // Assessment ---------------------------------------------------------------------------
 
     /// Assess exact header material: the engine prepares it, its supported context becomes the
-    /// profile, and the result is cached by the material's identity and the method.
+    /// profile, and the result is cached by the material's identity and the method. Its
+    /// preparation shares the measured device where that is the host's cores, as the pool's
+    /// attempts do ([`super::HostDevice`]): a catalog model's drafter fit is worked out for minutes
+    /// after a start, beside the measurement job.
     async fn assess(
         &self,
         target: &TargetMaterial,
@@ -675,6 +681,7 @@ impl ManagedModelCandidates {
         if let Some(cached) = self.models().read_model_assessment(&evidence) {
             return Ok(cached);
         }
+        let _share = self.host.share().await;
         let paths = ModelPackagePaths {
             target: target.target.clone(),
             projector: target.projector.clone(),

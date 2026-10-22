@@ -1,4 +1,4 @@
-import { Effect, Layer, Option, Stream } from "effect"
+import { Data, Effect, Layer, Option, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import { IcnCandidates, IcnLocalModels } from "@magnitudedev/icn"
 import type { LocalModelsConfiguration } from "@magnitudedev/icn-protocol/schemas"
@@ -15,6 +15,8 @@ import {
   importedId,
   makeTestCustomModels,
 } from "./custom-models.test-support"
+
+class IcnOffline extends Data.TaggedError("IcnOffline")<{}> {}
 
 const listedDrafters = <A, E>(candidates: Effect.Effect<A, E>) =>
   Effect.map(candidates, (listed) => ({ candidates: listed, entered: Option.none() }))
@@ -169,7 +171,7 @@ describe("custom model reconciliation", () => {
         Layer.succeed(IcnLocalModels, {
           configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
         } as never),
-        Layer.succeed(IcnCandidates, { drafters: () => listedDrafters(Effect.fail(new Error("offline"))) } as never),
+        Layer.succeed(IcnCandidates, { drafters: () => listedDrafters(Effect.fail(new IcnOffline())) } as never),
         Layer.succeed(ModelSlotController, {
           state: Effect.succeed({ slots: {
             primary: { _tag: "Unassigned", slotId: "primary" },

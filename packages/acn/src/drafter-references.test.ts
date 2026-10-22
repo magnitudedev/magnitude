@@ -68,19 +68,19 @@ describe("drafter naming", () => {
   }] as unknown as readonly CatalogModelSource[]
 
   it("names a catalog drafter from the catalog, as ICN does, before ICN describes it", () => {
-    expect(drafterReferenceNaming({ _tag: "Catalog", modelId: catalogId }, catalog)).toEqual({
+    expect(drafterReferenceNaming({ _tag: "Catalog", modelId: catalogId }, catalog, Option.some({ _tag: "DFlash" }))).toEqual({
       name: "Magnitude DFlash for Qwen3.5 4B",
       label: "Trained for Qwen3.5 4B",
     })
   })
 
   it("names embedded heads, and Hugging Face and local files the user chose", () => {
-    expect(drafterReferenceNaming({ _tag: "Embedded" }, [])).toEqual({ name: "MTP heads", label: "Built into this model" })
-    expect(drafterReferenceNaming(reference("sub/dflash.gguf"), [])).toEqual({
+    expect(drafterReferenceNaming({ _tag: "Embedded" }, [], Option.none())).toEqual({ name: "MTP heads", label: "Built into this model" })
+    expect(drafterReferenceNaming(reference("sub/dflash.gguf"), [], Option.none())).toEqual({
       name: "z-lab/drafters/dflash.gguf",
       label: "Chosen by you",
     })
-    expect(drafterReferenceNaming({ _tag: "Local", path: "/models/mtp.gguf" }, [])).toEqual({
+    expect(drafterReferenceNaming({ _tag: "Local", path: "/models/mtp.gguf" }, [], Option.none())).toEqual({
       name: "mtp.gguf",
       label: "Chosen by you",
     })
@@ -93,7 +93,7 @@ describe("drafter naming", () => {
       name: "Something else",
       label: "Something",
       lineage: "Lineage",
-      method: Option.none(),
+      method: Option.some({ _tag: "DFlash" }),
       automatic: true,
       onThisComputer: false,
       sizeBytes: 1,

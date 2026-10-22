@@ -40,19 +40,39 @@ pub struct ResourceLimits {
     pub lookahead: bool,
 }
 
-/// The most merged cells one image encodes, whatever its model declares:
-/// about 4.2 MP at Qwen3-VL's 32-pixel cells. A larger image is resized
-/// down to it.
+/// The most merged cells one image encodes, whatever its model declares and
+/// whatever its device: about 4.2 MP at Qwen3-VL's 32-pixel cells. A larger
+/// image is resized down to it.
 pub const MAX_IMAGE_CELLS: usize = 4096;
 
+/// The most merged cells one image encodes on the CPU backend. An image is
+/// one launch, and a CPU launch completes during its submission, so nothing
+/// (a cancellation, a stop, an admission, a status request) is applied until
+/// the whole tower has run. On a 4-vCPU x86 host Qwen3.5 0.8B's tower encodes
+/// 64 cells in ~4 s, 256 in ~17 s, 1024 in ~130 s and 4000 in ~45 min. A
+/// larger image is resized down to it: about 0.26 MP at Qwen3-VL's 32-pixel
+/// cells.
+pub const CPU_IMAGE_CELLS: usize = 256;
+
+/// The most merged cells one image encodes on `backend`, whatever its model
+/// declares.
+pub const fn max_image_cells(backend: BackendName) -> usize {
+    match backend {
+        BackendName::Cpu => CPU_IMAGE_CELLS,
+        _ => MAX_IMAGE_CELLS,
+    }
+}
+
 /// The most merged cells one image of `definition` encodes in a load whose
-/// launches carry `launch_rows` rows: the declared resize's bound within
-/// [`MAX_IMAGE_CELLS`]. Prefill places an image's features across launches,
-/// unless its rows attend each other in the decoder: such an image is one
-/// launch. Zero without vision.
+/// launches carry `launch_rows` rows and whose device encodes at most
+/// `device_cells` ([`max_image_cells`]): the declared resize's bound within
+/// `device_cells`. Prefill places an image's features across launches, unless
+/// its rows attend each other in the decoder: such an image is one launch.
+/// Zero without vision.
 pub fn image_cell_limit(
     definition: &ModelDefinition,
     launch_rows: usize,
+    device_cells: usize,
 ) -> Result<usize, crate::PlanError> {
     let Some(vision) = &definition.vision else {
         return Ok(0);
@@ -68,7 +88,7 @@ pub fn image_cell_limit(
                 if attention.media_rows == magnitude_family_contracts::MediaRowAttention::Bidirectional
         )
     });
-    let limit = declared.min(MAX_IMAGE_CELLS);
+    let limit = declared.min(device_cells);
     let limit = if bidirectional {
         limit.min(launch_rows)
     } else {
@@ -1027,9 +1047,6 @@ impl ResourcePlanner {
         let history_bound =
             usize::try_from(capacity_bytes.domain_bytes / checkpoint_history_row_bytes.max(1))
                 .unwrap_or(usize::MAX);
-        if checkpoint_history_row_bytes != 0 && history_bound < context {
-            return Err("one context exceeds the device domain's history capacity".into());
-        }
         // A request needs at least one history row and one recurrent bank.
         // This is an address-space ceiling from physical bytes, never an
         // admission policy; each actual row and bank is claimed on demand.
@@ -1050,9 +1067,11 @@ impl ResourcePlanner {
                 .checked_add(retention_entries)
                 .ok_or("retained numerical capacity overflow")?,
         };
-        // The history reservation (graphs are sealed over it): a context for
-        // every bank owner, but never more rows than the device's stable
-        // domain capacity could ever back.
+        // The history reservation (graphs are sealed over it): as many rows
+        // as the device's stable domain capacity could ever back, and at
+        // least one context. A context whose history the domain cannot back
+        // is not refused here: whether the model fits is the assessment's
+        // verdict at its fit depth, and each row is claimed on demand.
         let history_rows = history_bound.max(context);
         let bank_count = bank_capacity
             .storage_total()

@@ -61,6 +61,32 @@ size_t string::length() const {
     return len;
 }
 
+bool string::equals(const string & other) const noexcept {
+    if (length() != other.length()) {
+        return false;
+    }
+    size_t i = 0, j = 0, a = 0, b = 0;
+    while (i < parts.size() && j < other.parts.size()) {
+        const std::string & x = parts[i].val;
+        const std::string & y = other.parts[j].val;
+        const size_t n = std::min(x.size() - a, y.size() - b);
+        if (x.compare(a, n, y, b, n) != 0) {
+            return false;
+        }
+        a += n;
+        b += n;
+        if (a == x.size()) {
+            ++i;
+            a = 0;
+        }
+        if (b == y.size()) {
+            ++j;
+            b = 0;
+        }
+    }
+    return true;
+}
+
 void string::hash_update(hasher & hash) const noexcept {
     for (const auto & part : parts) {
         hash.update(part.val.data(), part.val.length());

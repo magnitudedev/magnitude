@@ -1228,6 +1228,7 @@ async fn fixture_from(
         super::engine_architectures(),
         Arc::new(StubCatalog),
         Arc::new(StubLocal(custom)),
+        crate::assessment::HostDevice::new(&crate::device_lock::DeviceLock::default(), false),
     );
     Fixture {
         _directory: directory,
@@ -3770,7 +3771,9 @@ impl magnitude_service_contracts::models::CatalogModelOptimizer for NoCatalogEff
         &self,
         _model_id: ModelId,
         _progress: Box<
-            dyn Fn(magnitude_service_contracts::models::CatalogOptimizationProgress) + Send + Sync,
+            dyn Fn(Option<magnitude_service_contracts::models::CatalogOptimizationProgress>)
+                + Send
+                + Sync,
         >,
     ) -> BoxFuture<'static, ()> {
         Box::pin(async {})
@@ -3896,6 +3899,7 @@ async fn live_fixture_reaching(
         super::engine_architectures(),
         services.catalog.clone(),
         services.local.clone(),
+        crate::assessment::HostDevice::new(&crate::device_lock::DeviceLock::default(), false),
     );
     hub.unreachable.store(!live_hub.reachable, Ordering::SeqCst);
     candidates.start_enrichment(resolver.clone());

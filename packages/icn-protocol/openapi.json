@@ -3558,10 +3558,11 @@
       },
       "CatalogModel": {
         "type": "object",
-        "description": "A catalog variant and its state on this computer. `aliases` are the `hf:` IDs its target's\nfiles found in an external location (a Hugging Face cache) would have as custom models, which\nclients resolve to this model, so references made before the file was attributed keep working.",
+        "description": "A catalog variant and its state on this computer. `desired`: the model installing it fetches\nand serves here. `drafter_withheld`: it fits this computer only without its catalog drafter (or\nnot at all), so it is fetched, served and assessed without it, installed or not: it loads when\nit fits without it, and otherwise is refused with its own shortfall. `aliases` are the `hf:` IDs\nits target's files found in an external location (a Hugging Face cache) would have as custom\nmodels, which clients resolve to this model, so references made before the file was attributed\nkeep working.",
         "required": [
           "id",
           "desired",
+          "drafterWithheld",
           "displayName",
           "variantLabel",
           "description",
@@ -3581,6 +3582,9 @@
           },
           "desired": {
             "$ref": "#/components/schemas/ReadyModel"
+          },
+          "drafterWithheld": {
+            "type": "boolean"
           },
           "displayName": {
             "type": "string"
@@ -3665,7 +3669,6 @@
               "updateState",
               "missingComponents",
               "storedComponents",
-              "drafterWithheld",
               "_tag"
             ],
             "properties": {
@@ -3690,9 +3693,6 @@
                   "$ref": "#/components/schemas/CatalogComponent"
                 }
               },
-              "drafterWithheld": {
-                "type": "boolean"
-              },
               "_tag": {
                 "type": "string",
                 "enum": [
@@ -3702,7 +3702,7 @@
             }
           }
         ],
-        "description": "A catalog model's state here. `drafter_withheld`: it serves, and is assessed, without its\ncatalog drafter, which it doesn't fit with: it loads when it fits without it, and otherwise is\nrefused with its own shortfall. `stored_components`: the parts\nMagnitude stores for a model whose weights are only in another app's location (its projector\npackage and drafter), which Remove deletes while the found weights stay and keep serving."
+        "description": "A catalog model's state here. `stored_components`: the parts\nMagnitude stores for a model whose weights are only in another app's location (its projector\npackage and drafter), which Remove deletes while the found weights stay and keep serving."
       },
       "CatalogModelUpdate": {
         "oneOf": [

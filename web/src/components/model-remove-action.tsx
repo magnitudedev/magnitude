@@ -4,6 +4,7 @@ import { catalogComponentName, formatLocalModelDisplayName, removalKind } from "
 import { type LocalModel } from "@magnitudedev/sdk"
 import { Button } from "./ui/button"
 import { ConfirmDialog } from "./confirm-dialog"
+import { addedModelAwaitingFiles } from "./model-card-state"
 
 /** Whether the files Remove deletes are only Magnitude's copy, with the same bytes also in another location that keeps the model listed. */
 export const keepsExternalCopy = (model: LocalModel): boolean => {
@@ -11,7 +12,7 @@ export const keepsExternalCopy = (model: LocalModel): boolean => {
   return removalKind(model) === "delete" && "installation" in acquisition && acquisition.installation.ownership === "Mixed"
 }
 
-/** The confirmation for Remove: forgetting a file, deleting only Magnitude's copy, or deleting the download. */
+/** The confirmation for Remove: forgetting a file, deleting only Magnitude's copy, forgetting an added model not yet downloaded, or deleting the download. */
 export const removalConfirmation = (model: LocalModel, running: boolean): { readonly title: string; readonly description: string; readonly confirmLabel: string } => {
   const name = formatLocalModelDisplayName(model)
   const confirmLabel = running ? "Stop and remove" : "Remove"
@@ -32,6 +33,11 @@ export const removalConfirmation = (model: LocalModel, running: boolean): { read
       description: "The model file is in another app's location, which Magnitude never deletes, so the model stays in My Models and runs from there. Hide it to stop listing it.",
       confirmLabel,
     }
+  }
+  if (addedModelAwaitingFiles(model)) return {
+    title: `Remove ${name} from Magnitude?`,
+    description: "Anything Magnitude downloaded for it so far is deleted. You can add it again from Hugging Face.",
+    confirmLabel,
   }
   if (keepsExternalCopy(model)) return {
     title: running ? `Stop ${name} and remove Magnitude’s copy?` : `Remove Magnitude’s copy of ${name}?`,

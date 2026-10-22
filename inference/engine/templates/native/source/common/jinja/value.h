@@ -317,7 +317,7 @@ struct value_string_t : public value_t {
     }
 protected:
     virtual bool equivalent(const value_t & other) const override {
-        return typeid(*this) == typeid(other) && val_str.str() == other.val_str.str();
+        return typeid(*this) == typeid(other) && val_str.equals(other.val_str);
     }
 };
 using value_string = std::shared_ptr<value_string_t>;

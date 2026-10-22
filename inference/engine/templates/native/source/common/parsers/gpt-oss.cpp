@@ -16,7 +16,8 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template & 
         adjusted_messages.push_back(msg);
     }
 
-    auto prompt = common_chat_template_direct_apply_impl(tmpl, inputs, /* messages_override= */ adjusted_messages);
+    auto rendered = common_chat_template_render_prompt(tmpl, inputs, /* messages_override= */ adjusted_messages);
+    auto & prompt = rendered.prompt;
 
     // Check if we need to replace the return token with end token during
     // inference and without generation prompt. For more details see:
@@ -29,8 +30,8 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template & 
         }
     }
 
-    data.prompt            = prompt;
-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, /* messages_override= */ adjusted_messages);
+    data.prompt            = std::move(prompt);
+    data.generation_prompt = std::move(rendered.generation_prompt);
     data.message_delimiters = {
         { COMMON_CHAT_ROLE_ASSISTANT, "<|start|>assistant" },
         { COMMON_CHAT_ROLE_USER,      "<|start|>user"      },

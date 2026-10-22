@@ -2595,6 +2595,236 @@ mod tests {
         );
     }
 
+    /// The Ollama model named `name`, as the inventory publishes it.
+    async fn ollama_inventory_model(
+        fixture: &Fixture,
+        name: &str,
+    ) -> magnitude_service_contracts::InventoryModel {
+        fixture
+            .inventory()
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|model| {
+                matches!(
+                    &model.location,
+                    ModelLocation::External {
+                        origin: ExternalOrigin::Ollama { name: found, .. },
+                        ..
+                    } if found == name
+                )
+            })
+            .expect("the Ollama model is published")
+    }
+
+    /// QA (Windows, main-qa 2026-10-20): an Ollama blob symlinked to a file on another drive made
+    /// every configuration change fail with "deletion is unsafe", hiding every Ollama model and
+    /// the folder just added. The link is followed: its model is listed and served through it, and
+    /// nothing Magnitude does to it touches the file it leads to.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ollama_blob_linked_to_another_drive_is_listed_and_served_through_its_link() {
+        let fixture = Fixture::new().await;
+        let ollama = fixture.root.join("ollama");
+        let llama = model_bytes("llama gguf");
+        write_ollama(
+            &ollama,
+            "registry.ollama.ai",
+            "library",
+            "llama3.2",
+            "1b",
+            &[("application/vnd.ollama.image.model", &llama)],
+        );
+        let linked = model_bytes("linked gguf");
+        write_ollama(
+            &ollama,
+            "registry.ollama.ai",
+            "library",
+            "linked",
+            "latest",
+            &[("application/vnd.ollama.image.model", &linked)],
+        );
+        let blob = ollama
+            .join("blobs")
+            .join(format!("sha256-{}", sha256(&linked)));
+        let elsewhere = fixture.root.join("other-drive/blob");
+        fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        fs::rename(&blob, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &blob).unwrap();
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("folder.gguf"), "folder");
+
+        fixture
+            .local
+            .configure(roots(vec![root(ModelRootKind::Ollama, &ollama)]))
+            .await
+            .unwrap();
+        let listed = fixture
+            .apply(roots(vec![
+                root(ModelRootKind::Ollama, &ollama),
+                root(ModelRootKind::Folder, &folder),
+            ]))
+            .await;
+
+        let mut names = listed
+            .models
+            .iter()
+            .map(|model| model.display_name.as_str())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["folder", "linked:latest", "llama3.2:1b"]);
+        assert!(
+            listed
+                .models
+                .iter()
+                .all(|model| matches!(model.state, CustomModelState::Ready { .. }))
+        );
+        let model = ollama_inventory_model(&fixture, "linked:latest").await;
+        let inventory = fixture.inventory();
+        let resolved = inventory.resolve_ready(&model.id).await.unwrap();
+        assert_eq!(resolved.components[0].path, blob);
+        assert!(!inventory.plan_delete(&model.id).await.unwrap().supported);
+        assert!(inventory.delete(&model.id).await.is_err());
+        assert!(fs::symlink_metadata(&blob).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(&elsewhere).unwrap(), linked);
+    }
+
+    /// People move Ollama's storage by linking its whole blobs folder to another drive. A store a
+    /// newer Ollama wrote, whose tags link to manifests kept as blobs, is then read through both
+    /// links.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ollama_store_whose_blobs_folder_is_linked_elsewhere_is_listed() {
+        let fixture = Fixture::new().await;
+        let ollama = fixture.root.join("ollama");
+        let qwen = model_bytes("qwen moved blobs");
+        let document = write_ollama(
+            &ollama,
+            "registry.ollama.ai",
+            "library",
+            "qwen3.5",
+            "0.8b",
+            &[("application/vnd.ollama.image.model", &qwen)],
+        );
+        fs::remove_dir_all(ollama.join("manifests")).unwrap();
+        write_ollama_v2(&ollama, "ollama.com", "library/qwen3.5/0.8b", &document);
+        let elsewhere = fixture.root.join("other-drive/blobs");
+        fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        fs::rename(ollama.join("blobs"), &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, ollama.join("blobs")).unwrap();
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Ollama, &ollama)]))
+            .await;
+
+        assert_eq!(
+            listed
+                .models
+                .iter()
+                .map(|model| model.display_name.as_str())
+                .collect::<Vec<_>>(),
+            ["qwen3.5:0.8b"]
+        );
+        assert!(matches!(
+            listed.models[0].state,
+            CustomModelState::Ready { .. }
+        ));
+        let model = ollama_inventory_model(&fixture, "qwen3.5:0.8b").await;
+        fixture.inventory().resolve_ready(&model.id).await.unwrap();
+    }
+
+    /// An Ollama blob linked to a file that is gone, such as one on a drive that was removed, lists
+    /// its model as unreadable; every other model is still listed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ollama_blob_linked_to_a_missing_file_is_unreadable_and_hides_no_other_model() {
+        let fixture = Fixture::new().await;
+        let ollama = fixture.root.join("ollama");
+        let llama = model_bytes("llama gguf");
+        write_ollama(
+            &ollama,
+            "registry.ollama.ai",
+            "library",
+            "llama3.2",
+            "1b",
+            &[("application/vnd.ollama.image.model", &llama)],
+        );
+        let linked = model_bytes("linked gguf");
+        write_ollama(
+            &ollama,
+            "registry.ollama.ai",
+            "library",
+            "linked",
+            "latest",
+            &[("application/vnd.ollama.image.model", &linked)],
+        );
+        let blob = ollama
+            .join("blobs")
+            .join(format!("sha256-{}", sha256(&linked)));
+        let elsewhere = fixture.root.join("other-drive/blob");
+        fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        fs::rename(&blob, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &blob).unwrap();
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("folder.gguf"), "folder");
+        let configuration = roots(vec![
+            root(ModelRootKind::Ollama, &ollama),
+            root(ModelRootKind::Folder, &folder),
+        ]);
+        assert_eq!(fixture.apply(configuration).await.models.len(), 3);
+
+        fs::remove_file(&elsewhere).unwrap();
+        let listed = fixture.local.refresh_local().await.unwrap();
+
+        let mut names = listed
+            .models
+            .iter()
+            .map(|model| model.display_name.as_str())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["folder", "llama3.2:1b"]);
+        assert_eq!(listed.unsupported.len(), 1);
+        assert_eq!(listed.unsupported[0].display_name, "linked:latest");
+        assert_eq!(
+            listed.unsupported[0].reasons,
+            [UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)]
+        );
+        assert!(fs::symlink_metadata(&blob).unwrap().file_type().is_symlink());
+    }
+
+    /// A configuration whose rescan failed is not applied, so sending it again rescans rather than
+    /// finding nothing changed while its locations were never scanned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_configuration_whose_rescan_failed_rescans_when_sent_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("model.gguf"), "model");
+        let hub = fixture.store.join("hub");
+        fs::create_dir_all(&hub).unwrap();
+        fs::set_permissions(&hub, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&hub).is_ok() {
+            // Running as a user that reads everything (root): the rescan can't be made to fail.
+            fs::set_permissions(&hub, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let configuration = roots(vec![root(ModelRootKind::Folder, &folder)]);
+
+        assert!(
+            fixture
+                .local
+                .configure(configuration.clone())
+                .await
+                .is_err()
+        );
+        fs::set_permissions(&hub, fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.local.configure(configuration).await.unwrap();
+
+        assert_eq!(fixture.local.list_local().await.unwrap().models.len(), 1);
+    }
+
     /// A model Ollama 0.40 stores for its MLX runner, one safetensors blob per tensor, can't be
     /// read in place, so it is listed under "can't run" by its Ollama name with the format as its
     /// reason, beside the store's GGUF pulls.
@@ -3762,7 +3992,7 @@ mod tests {
         fn optimize_catalog_model(
             &self,
             _model_id: ModelId,
-            _progress: Box<dyn Fn(magnitude_service_contracts::models::CatalogOptimizationProgress) + Send + Sync>,
+            _progress: Box<dyn Fn(Option<magnitude_service_contracts::models::CatalogOptimizationProgress>) + Send + Sync>,
         ) -> futures_util::future::BoxFuture<'static, ()> {
             Box::pin(async {})
         }
@@ -4932,6 +5162,79 @@ mod tests {
         );
     }
 
+    /// QA linux-arm64 / mac-m1: once the store was scanned again (a drafter change, a restart),
+    /// `catalog remove` of a stored target with its projector deleted the projector's own package
+    /// first, which unlinked the target's projector file, then failed with "model not found:
+    /// package_…" and left the weights. Remove deletes the whole target in one call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_stored_target_with_its_projector_after_a_rescan_removes_everything() {
+        use magnitude_service_contracts::models::{
+            CatalogInstallationRemoval, InstalledModelPackages as _,
+        };
+
+        let fixture = Fixture::new().await;
+        let projector = gguf_bytes(
+            &[
+                ("general.architecture", Meta::Str("clip")),
+                ("general.name", Meta::Str("projector")),
+            ],
+            &["v.patch_embd.weight"],
+        );
+        let (weights, projector) = (model_bytes("model"), projector);
+        let reclaimed_bytes = (weights.len() + projector.len()) as u64;
+        publish_managed(
+            &fixture.store,
+            "owner/Model-GGUF",
+            &"a".repeat(40),
+            &[("Model-Q4_K_M.gguf", weights), ("mmproj-F16.gguf", projector)],
+        );
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        let target = fixture.inventory().list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        let projector_package = crate::inventory::catalog_projector_package(&target).unwrap();
+        let catalog = vec![catalog_definition(target.clone())];
+        let model_id = catalog_id(&catalog[0]);
+        let fixture = fixture.restart(catalog).await;
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        let listed = fixture
+            .inventory()
+            .list_installed()
+            .await
+            .unwrap()
+            .packages
+            .into_iter()
+            .map(|installed| installed.package.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            listed,
+            BTreeSet::from([target.id.clone(), projector_package.id]),
+            "the scan lists the target and, from the same file, its projector package"
+        );
+
+        let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
+            fixture.resolver.clone(),
+            Arc::new(
+                crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
+                    .await
+                    .unwrap(),
+            ),
+            Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
+            Arc::new(NoOptimizer),
+        );
+        let removed = installations.remove(&model_id).await.unwrap();
+
+        assert_eq!(
+            removed,
+            CatalogInstallationRemoval::Removed {
+                reclaimed_bytes,
+                kept_components: Vec::new(),
+            }
+        );
+        fixture.inventory().ensure_installed_model_inventory().await.unwrap();
+        assert!(fixture.inventory().list_installed().await.unwrap().packages.is_empty());
+    }
+
     /// Hiding changes only what is shown: installing a catalog model whose target is exactly a
     /// hidden found copy copies that copy's bytes into Magnitude's store instead of downloading
     /// them, needs no further download, and leaves the copy's files where they are.
@@ -5070,6 +5373,127 @@ mod tests {
                 .hidden,
             [found_id]
         );
+    }
+
+    /// An optimizer whose job waits for the device and never gets it, as beside a resident model.
+    struct WaitingOptimizer {
+        waiting: Arc<std::sync::atomic::AtomicBool>,
+        stopped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    /// Sets its flag once dropped: the job's future was dropped, so the job stopped.
+    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl magnitude_service_contracts::models::CatalogModelOptimizer for WaitingOptimizer {
+        fn optimize_catalog_model(
+            &self,
+            _model_id: ModelId,
+            progress: Box<dyn Fn(Option<magnitude_service_contracts::models::CatalogOptimizationProgress>) + Send + Sync>,
+        ) -> futures_util::future::BoxFuture<'static, ()> {
+            let waiting = Arc::clone(&self.waiting);
+            let stopped = SetOnDrop(Arc::clone(&self.stopped));
+            Box::pin(async move {
+                let _stopped = stopped;
+                progress(None);
+                waiting.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            })
+        }
+    }
+
+    /// QA optimization-memory: an optimization deferred while another model is resident waits
+    /// for the device without gating the model. Meanwhile the installation reads as completed
+    /// (the model is installed and loadable), never as an optimization stuck preparing, and
+    /// removing the model stops the waiting job.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_optimization_waiting_for_the_device_reads_completed_and_ends_with_removal() {
+        use magnitude_service_contracts::models::{
+            CatalogInstallationAdmission, CatalogInstallationOperationState,
+            CatalogInstallations as _, InstalledModelPackages as _,
+        };
+
+        let fixture = Fixture::new().await;
+        let cache = fixture.root.join("hf");
+        let commit = "a".repeat(40);
+        let bytes = model_bytes("model");
+        publish_hf_cache(
+            &cache,
+            "owner/Model-GGUF",
+            &commit,
+            &[("Model-Q4_K_M.gguf", bytes.clone())],
+        );
+        let shown = roots(vec![root(ModelRootKind::HuggingFaceCache, &cache)]);
+        fixture.apply(shown.clone()).await;
+        let found = fixture.inventory().list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        let found_id = ModelId::hugging_face(
+            &HuggingFaceRepositoryId::new("owner/Model-GGUF").unwrap(),
+            &HuggingFaceArtifactSelector::new("Model-Q4_K_M.gguf").unwrap(),
+        );
+        let catalog = vec![catalog_definition(found)];
+        let model_id = catalog_id(&catalog[0]);
+        let (endpoint, _requests) = serve_metadata_only(
+            "owner/Model-GGUF",
+            commit,
+            vec![("Model-Q4_K_M.gguf", bytes)],
+        );
+        let fixture = fixture.restart_with_hub(endpoint, catalog.clone()).await;
+        fixture
+            .apply(LocalModelsConfiguration {
+                hidden: vec![found_id],
+                ..shown
+            })
+            .await;
+
+        let downloads = Arc::new(
+            crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
+                .await
+                .unwrap(),
+        );
+        let waiting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
+            fixture.resolver.clone(),
+            downloads,
+            Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
+            Arc::new(WaitingOptimizer {
+                waiting: Arc::clone(&waiting),
+                stopped: Arc::clone(&stopped),
+            }),
+        );
+        let CatalogInstallationAdmission::Admitted { .. } =
+            installations.install(&model_id).await.unwrap()
+        else {
+            panic!("the installation is admitted");
+        };
+        for _ in 0..200 {
+            if waiting.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(waiting.load(Ordering::SeqCst), "the download completes and its optimization waits");
+        let operations = installations
+            .list_catalog_installations()
+            .await
+            .unwrap()
+            .operations;
+        assert!(
+            matches!(operations.as_slice(), [operation]
+                if operation.state == CatalogInstallationOperationState::Completed),
+            "nothing optimizes while the job waits for the device: {operations:?}"
+        );
+        assert!(!stopped.load(Ordering::SeqCst));
+
+        installations.remove(&model_id).await.unwrap();
+        assert!(stopped.load(Ordering::SeqCst), "removal stops the waiting optimization");
     }
 
     #[tokio::test]

@@ -34,6 +34,8 @@ use assessor::{
 use environment::AssessmentEnvironment;
 use measurement::MeasurementStatus;
 
+use crate::device_lock::{DeviceLock, DeviceShare};
+
 /// Bounds one target's whole attempt: material resolution and the engine's arithmetic.
 const MODEL_ASSESSMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const MODEL_ASSESSMENT_SOURCE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -358,6 +360,16 @@ impl AssessmentPoolCurrent {
         true
     }
 
+    /// Whether every slice is read and no entry is being assessed.
+    fn settled(&self) -> bool {
+        self.domains().into_iter().all(|domain| {
+            matches!(domain, ModelAssessmentDomainSnapshot::Available { .. })
+                && assessment_domain_entries(domain)
+                    .iter()
+                    .all(|entry| !matches!(entry.state, ModelAssessmentEntryState::Assessing))
+        })
+    }
+
     fn references_assessing(&self, key: &AssessmentWorkKey) -> bool {
         self.domains().into_iter().any(|domain| {
             assessment_domain_entries(domain).iter().any(|entry| {
@@ -447,6 +459,56 @@ pub struct ManagedModelAssessments {
     active: Mutex<ActiveAssessments>,
     preparations: PreparationCoordinator,
     concurrency: Arc<tokio::sync::Semaphore>,
+    host: HostDevice,
+}
+
+/// The device the measurement job times, where it is the host's own cores (a CPU executor): the
+/// pool's work runs on them too. On a 4-vCPU EPYC 7763 the catalog's 73 models turned a 9.6 s
+/// point into 226 s, and every record the job stored then would price this machine for good. So
+/// a job starts only once the pool has settled (every slice read and no entry assessing, which
+/// [`Self::settled`] reports), and each later attempt, the pool's or a candidate's
+/// (`candidates::ManagedModelCandidates`, whose drafter fits are worked out for minutes after a
+/// start), shares the device, waiting for a running job to end rather than preempting it: a job
+/// is tens of seconds, and one ended at every arrival would be measured in pieces. A GPU's points run on the GPU: the pool shares nothing with them, and is always
+/// settled for them.
+#[derive(Clone)]
+pub struct HostDevice {
+    device: Option<DeviceLock>,
+    settled: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl HostDevice {
+    /// The measured device `device`, which is the host's cores where `host` holds.
+    pub fn new(device: &DeviceLock, host: bool) -> Self {
+        Self {
+            device: host.then(|| device.clone()),
+            settled: Arc::new(tokio::sync::watch::Sender::new(!host)),
+        }
+    }
+
+    /// Whether the pool has settled, as it changes: the measurement job waits for it.
+    pub fn settled(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.settled.subscribe()
+    }
+
+    /// A share of the device for one attempt, where it is the host's cores, once no job holds
+    /// it.
+    async fn share(&self) -> Option<DeviceShare> {
+        match &self.device {
+            Some(device) => Some(device.share_after_measurement().await),
+            None => None,
+        }
+    }
+
+    /// Note the pool's state `current`, where the device is the host's cores.
+    fn observe(&self, current: &AssessmentPoolCurrent) {
+        if self.device.is_some() {
+            self.settled.send_if_modified(|settled| {
+                let now = current.settled();
+                std::mem::replace(settled, now) != now
+            });
+        }
+    }
 }
 
 struct ActiveAssessment {
@@ -510,12 +572,14 @@ impl ActiveAssessments {
 
 impl ManagedModelAssessments {
     /// Start the pool in the assessor's environment, adopting each new one `measurement`
-    /// brings. Both source slices are `Pending` until their first read.
+    /// brings, each attempt sharing `host`. Both source slices are `Pending` until their first
+    /// read.
     pub fn start(
         assessor: Arc<ModelAssessor>,
         catalog: Arc<dyn CatalogModels>,
         local: Arc<dyn LocalModels>,
         measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
+        host: HostDevice,
     ) -> Arc<Self> {
         let (changes, _) = tokio::sync::broadcast::channel(64);
         let concurrency = assessment_concurrency();
@@ -541,6 +605,7 @@ impl ManagedModelAssessments {
             active: Mutex::new(ActiveAssessments::new()),
             preparations: PreparationCoordinator::default(),
             concurrency: Arc::new(tokio::sync::Semaphore::new(concurrency)),
+            host,
         });
         let owner = Arc::clone(&service);
         tokio::spawn(async move { owner.run(measurement).await });
@@ -557,6 +622,7 @@ impl ManagedModelAssessments {
         }
         current.snapshot.revision = current.snapshot.revision.saturating_add(1);
         let revision = current.snapshot.revision;
+        self.host.observe(&current);
         drop(current);
         let _ = self.changes.send(ModelAssessmentsInvalidation { revision });
         true
@@ -728,10 +794,11 @@ impl ManagedModelAssessments {
         }
     }
 
-    /// One attempt at `item` within the pool's concurrency and the target deadline; `None` when
-    /// the pool is closing.
+    /// One attempt at `item` within the pool's concurrency and the target deadline, sharing the
+    /// host's device where it is measured; `None` when the pool is closing.
     async fn attempt(&self, item: AssessmentWork) -> Option<AssessmentOutcome> {
         let _permit = Arc::clone(&self.concurrency).acquire_owned().await.ok()?;
+        let _share = self.host.share().await;
         let key = item.key.clone();
         Some(
             tokio::time::timeout(MODEL_ASSESSMENT_TIMEOUT, self.assessor.assess(item))
@@ -845,6 +912,7 @@ impl ManagedModelAssessments {
             let applied = current.republish(&environment.id, state, &keys, &outcomes);
             current.snapshot.revision = current.snapshot.revision.saturating_add(1);
             let revision = current.snapshot.revision;
+            service.host.observe(&current);
             drop(current);
             log_dropped_catalog_models(applied.dropped_catalog_models);
             let _ = service
@@ -864,6 +932,7 @@ impl ManagedModelAssessments {
         }
         current.snapshot.revision = current.snapshot.revision.saturating_add(1);
         let revision = current.snapshot.revision;
+        self.host.observe(&current);
         drop(current);
         log_dropped_catalog_models(applied.dropped_catalog_models);
         let _ = self.changes.send(ModelAssessmentsInvalidation { revision });
@@ -1042,6 +1111,61 @@ mod tests {
             key: AssessmentWorkKey(key.to_owned()),
             work: None,
         }
+    }
+
+    /// Where the measured device is the host's cores, an attempt's share keeps a job from taking
+    /// it, and waits for one that holds it to end without preempting it; where it is not, an
+    /// attempt shares nothing.
+    #[tokio::test(start_paused = true)]
+    async fn attempts_share_the_host_cores_with_the_measurement_job() {
+        let device = DeviceLock::default();
+        let share = HostDevice::new(&device, true).share().await;
+        assert!(share.is_some());
+        assert!(device.try_job().is_none());
+        drop(share);
+        let mut job = device.try_job().unwrap();
+        let host = HostDevice::new(&device, true);
+        let waiting = tokio::spawn(async move { host.share().await.is_some() });
+        tokio::select! {
+            () = job.preempted() => panic!("an attempt preempted the job"),
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+        }
+        assert!(!waiting.is_finished());
+        drop(job);
+        assert!(waiting.await.unwrap());
+        assert!(HostDevice::new(&device, false).share().await.is_none());
+        assert!(device.try_job().is_some());
+    }
+
+    /// The pool settles for the job once every slice is read and no entry is assessing; a GPU's
+    /// job never waits for it.
+    #[test]
+    fn the_pool_settles_once_nothing_is_assessing() {
+        let device = DeviceLock::default();
+        let host = HostDevice::new(&device, true);
+        let settled = host.settled();
+        let mut current = assessment_pool_current();
+        host.observe(&current);
+        assert!(!*settled.borrow(), "slices unread");
+        let subject = assessment_subject("a", CatalogModelSelection::Desired);
+        current.replace_domain(
+            AssessmentDomain::Catalog,
+            1,
+            &[assessment_target(subject.clone(), "work-a")],
+        );
+        current.replace_domain(AssessmentDomain::Custom, 1, &[]);
+        host.observe(&current);
+        assert!(!*settled.borrow(), "an entry assessing");
+        current.apply_outcome(&AssessmentOutcome {
+            key: AssessmentWorkKey("work-a".to_owned()),
+            result: Ok(fits(
+                &subject,
+                magnitude_service_contracts::models::ModelPerformance::Pending,
+            )),
+        });
+        host.observe(&current);
+        assert!(*settled.borrow());
+        assert!(*HostDevice::new(&device, false).settled().borrow());
     }
 
     fn assessment_pool_current() -> AssessmentPoolCurrent {

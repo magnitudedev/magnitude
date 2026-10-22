@@ -87,6 +87,16 @@ impl Tier {
         }
     }
 
+    /// How the tier's quantized (INT8) dots multiply: 0 in portable integer
+    /// loops, 1 with AVX2 byte products, 2 with AVX-512 VNNI.
+    pub const fn quantized_dots(self) -> u8 {
+        match self {
+            Tier::X86V2 | Tier::Neon => 0,
+            Tier::X86V3 | Tier::X86V4 => 1,
+            Tier::X86V4Vnni => 2,
+        }
+    }
+
     /// Whether the host has every feature of the tier.
     pub fn is_detected(self) -> bool {
         match self {

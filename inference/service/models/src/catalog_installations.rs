@@ -31,7 +31,8 @@ struct OperationBinding {
 
 /// Catalog installations: a download, then kernel tuning for the installed model. Each admitted
 /// installation has one job that follows its download and, once the download is verified and
-/// published, runs the optimizer. The operation is `Optimizing` while that runs.
+/// published, runs the optimizer. The operation is `Optimizing` while that runs, and `Completed`
+/// while the optimizer waits for the device.
 pub struct ManagedCatalogInstallations {
     this: Weak<Self>,
     resolver: Arc<ModelDomainResolver>,
@@ -132,30 +133,34 @@ impl ManagedCatalogInstallations {
                 binding.model_id,
                 Box::new(move |progress| {
                     if let Some(installations) = this.upgrade() {
-                        installations.set_optimization(&progress_id, Some(progress));
+                        installations.set_optimization(&progress_id, progress);
                     }
                 }),
             )
             .await;
     }
 
-    /// Stop the operation's optimization, if it is optimizing, and wait until it has stopped.
-    /// Returns whether it was optimizing.
+    /// Stop the operation's optimization, if it is optimizing or waiting for the device to, and
+    /// wait until it has stopped. Returns whether it was. A job waiting for the device reads
+    /// `Completed`: the model is installed, and nothing optimizes until the device is free.
     async fn stop_optimization(&self, id: &CatalogInstallationOperationId) -> Result<bool, InventoryError> {
-        if self.binding(id)?.optimization.is_none() {
-            return Ok(false);
-        }
+        let optimizing = match self.operation(id).await?.state {
+            CatalogInstallationOperationState::Optimizing { .. } => true,
+            CatalogInstallationOperationState::Completed => false,
+            _ => return Ok(false),
+        };
         let job = self
             .jobs
             .lock()
             .expect("catalog installation job lock")
             .remove(id);
+        let stopped = optimizing || job.is_some();
         if let Some(job) = job {
             job.abort();
             let _ = job.await;
         }
         self.set_optimization(id, None);
-        Ok(true)
+        Ok(stopped)
     }
 
     fn binding(
@@ -200,10 +205,9 @@ impl ManagedCatalogInstallations {
         id: &ModelId,
     ) -> Result<CatalogInstallationAdmission, InventoryError> {
         let _mutation = self.mutations.lock().await;
-        let definition = self.resolver.catalog_definition(id)?;
-        reject_unavailable(id, definition)?;
+        reject_unavailable(id, self.resolver.catalog_definition(id)?)?;
         self.reject_active(id).await?;
-        let bundle = definition.configuration.bundle.clone();
+        let bundle = self.resolver.desired_catalog_configuration(id)?.bundle;
         let requested = RequestedDownload::CatalogModel { model: id.clone() };
         self.admit(id, bundle, requested).await
     }

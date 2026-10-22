@@ -1,5 +1,5 @@
 import { BunFileSystem } from "@effect/platform-bun"
-import { Effect, Layer, Option, Schema, Stream, SubscriptionRef } from "effect"
+import { Effect, Either, Layer, Option, Schema, Stream, SubscriptionRef } from "effect"
 import { describe, expect, it } from "vitest"
 import type { CustomModelsConfig } from "@magnitudedev/storage"
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
@@ -25,6 +25,7 @@ import {
   CustomFormModelIdSchema,
   DrafterReferenceSchema,
   HuggingFaceRepositoryIdSchema,
+  LocalModelMutationFailed,
   type LocalModelsState,
 } from "@magnitudedev/acn-protocol"
 import { CustomModelCommands, CustomModelCommandsLive } from "./custom-model-commands"
@@ -143,6 +144,7 @@ const harness = (options: {
   readonly catalogInstalled?: readonly string[]
   readonly signedIn?: boolean
   readonly startDownload?: (bundle: unknown, forModel: string) => Option.Option<ModelDownload>
+  readonly pushFailure?: LocalModelMutationFailed
 } = {}) => {
   const recorded: Recorded = {
     bundles: [], started: [], cancelled: [], acknowledged: [], removedFiles: [], drafterRequests: [], catalogSyncs: [], pushes: 0, prunes: 0,
@@ -245,7 +247,11 @@ const harness = (options: {
       } as never),
       Layer.succeed(LocalModels, { state: Effect.succeed(localState) } as never),
       Layer.succeed(CustomModels, custom),
-      Layer.succeed(CustomModelReconciler, { push: Effect.sync(() => { recorded.pushes += 1 }) }),
+      Layer.succeed(CustomModelReconciler, {
+        push: Effect.sync(() => { recorded.pushes += 1 }).pipe(
+          Effect.zipRight(options.pushFailure === undefined ? Effect.void : Effect.fail(options.pushFailure)),
+        ),
+      }),
       Layer.succeed(CatalogModelSync, {
         installed: (modelId) => Effect.succeed((options.catalogInstalled ?? []).includes(modelId)),
         sync: (modelId) => Effect.sync(() => {
@@ -1408,6 +1414,21 @@ describe("model locations", () => {
       "/nonexistent/ollama", "/nonexistent-home/.ollama/models", "/usr/share/ollama/.ollama/models", "/var/lib/ollama",
     ])
     expect(result.afterRemove.folders).toEqual([])
+  })
+
+  it("fails a location change the inference service refuses", async () => {
+    const folder = mkdtempSync(join(tmpdir(), "magnitude-folder-"))
+    const refused = new LocalModelMutationFailed({ code: "local_models_configuration_failed", message: "refused", retryable: true })
+    const { run } = harness({ pushFailure: refused })
+    const result = await run((commands) => Effect.gen(function* () {
+      return {
+        add: yield* commands.addFolder(folder).pipe(Effect.either),
+        remove: yield* commands.removeFolder(folder).pipe(Effect.either),
+        disable: yield* commands.setLocationEnabled("Ollama", false).pipe(Effect.either),
+        enable: yield* commands.setLocationEnabled("Ollama", true).pipe(Effect.either),
+      }
+    }))
+    for (const outcome of Object.values(result)) expect(outcome).toEqual(Either.left(refused))
   })
 })
 

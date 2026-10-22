@@ -77,7 +77,11 @@ const claudeCodeLoginLocations = (
   }
 }
 
-export const harnessConnectionPaths = (isolatedHome?: string, inheritedEnvironment: Readonly<Record<string, string | undefined>> = process.env): HarnessConnectionPaths => {
+export const harnessConnectionPaths = (
+  isolatedHome?: string,
+  inheritedEnvironment: Readonly<Record<string, string | undefined>> = process.env,
+  platform: NodeJS.Platform = process.platform,
+): HarnessConnectionPaths => {
   const home = isolatedHome ?? homedir()
   const environment = isolatedHome === undefined ? inheritedEnvironment : {}
   const piRoot = resolve(environment.PI_CODING_AGENT_DIR ?? `${home}/.pi/agent`)
@@ -92,7 +96,10 @@ export const harnessConnectionPaths = (isolatedHome?: string, inheritedEnvironme
     : environment.PI_CODING_AGENT_DIR || `${ompConfigRoot}/agent`)
   const clineRoot = environment.CLINE_DATA_DIR || `${home}/.cline/data`
   const clineProviders = environment.CLINE_PROVIDER_SETTINGS_PATH || `${clineRoot}/settings/providers.json`
-  const hermesRoot = environment.HERMES_HOME ?? `${home}/.hermes`
+  // Native Windows Hermes keeps its home in the local application data folder, not the profile.
+  const hermesRoot = environment.HERMES_HOME ?? (platform === "win32"
+    ? `${environment.LOCALAPPDATA?.trim() || `${home}/AppData/Local`}/hermes`
+    : `${home}/.hermes`)
   const openClawRoot = environment.OPENCLAW_STATE_DIR ?? `${home}/.openclaw`
   const codexRoot = environment.CODEX_HOME ?? `${home}/.codex`
   const skillInstallation = (root: string): SkillInstallationPaths => ({

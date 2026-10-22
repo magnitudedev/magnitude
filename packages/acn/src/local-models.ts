@@ -398,7 +398,7 @@ const catalogModel = (
     servingState: catalogModelServingState(ready, assessment, catalogScores, unavailableFailure),
     missingComponents: source.localState._tag === "Installed" ? source.localState.missingComponents : [],
     storedComponents: source.localState._tag === "Installed" ? source.localState.storedComponents : [],
-    drafterWithheld: source.localState._tag === "Installed" && source.localState.drafterWithheld,
+    drafterWithheld: source.drafterWithheld,
   })
 }
 
@@ -484,7 +484,7 @@ export const attachedDrafter = (inputs: CustomModelInputs): Option.Option<Attach
       },
     })
     const { name, label } = Option.match(recommended, {
-      onNone: () => drafterReferenceNaming(reference, catalog),
+      onNone: () => drafterReferenceNaming(reference, catalog, Option.some(native.method)),
       onSome: (candidate) => candidate,
     })
     return Option.some({

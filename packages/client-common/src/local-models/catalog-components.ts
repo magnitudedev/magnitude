@@ -18,7 +18,7 @@ export const catalogComponentDownloadLabel = ({ downloadBytes }: CatalogMissingC
   downloadBytes > 0 ? `Download (${formatStorageSize(downloadBytes)})` : "Download"
 
 /**
- * Why an installed catalog model runs without its catalog drafter: it doesn't fit this computer with it. A withheld
+ * Why a catalog model runs without its catalog drafter, installed or not: it doesn't fit this computer with it. A withheld
  * model is assessed served plain, so its verdict tells whether it fits only without the drafter or not at all.
  */
 export const catalogDrafterWithheldNote = (model: LocalModel): Option.Option<string> => {

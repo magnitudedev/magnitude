@@ -507,6 +507,46 @@ pub(crate) fn on_device(
     implementation
 }
 
+/// `implementation`'s declared defaults as `device` offers them at
+/// `bindings`. On a CPU whose tier forms quantized dots from vector integer
+/// products (AVX2, AVX-512 or VNNI), a projection with a packed weight
+/// operand defaults to its `INT8` form: it quantizes the staged rows to Q8
+/// blocks and runs the representation's integer dot, and the F32 form is
+/// the challenger. Elsewhere (x86-64-v2, NEON, dense weights, GPUs) the
+/// declaration's defaults stand.
+pub(crate) fn device_defaults(
+    device: &DeviceInner,
+    mut implementation: NativeImplementation,
+    bindings: &ElementBindings,
+) -> NativeImplementation {
+    use seismic_lang::checked::NativeParameterRole;
+    let OpenedKind::Cpu(_) = &device.kind else {
+        return implementation;
+    };
+    let Some(tier) =
+        seismic_native_cpu::Tier::detected().filter(|tier| tier.quantized_dots() > 0)
+    else {
+        return implementation;
+    };
+    let packed = bindings.iter().any(|(_, representation)| {
+        let name = seismic_lang::registry::representation_info(representation).name;
+        seismic_native_cpu::components::resolve(tier, name)
+            .is_some_and(|kernels| kernels.dense_bytes == 0)
+    });
+    if !packed {
+        return implementation;
+    }
+    for parameter in &mut implementation.params {
+        if parameter.role == NativeParameterRole::Declared
+            && parameter.form
+            && parameter.name == "INT8"
+        {
+            parameter.values.sort_by_key(|value| *value != 1);
+        }
+    }
+    implementation
+}
+
 /// Check a cached choice against the implementation as it exists on this
 /// device. CPU worker and ISA parameters are Seismic-owned additions to the
 /// checked declaration, so validating the bare declaration rejects a valid
@@ -527,22 +567,24 @@ pub fn specialization_valid(
         })
 }
 
-/// The default specialization of `entry` at `statics` as `device` offers the
-/// implementation ([`on_device`]): on a CPU device it also values the
-/// Seismic-owned worker counts and tier, which a stored choice carries and
-/// the bare declaration's default lacks. `None` when the backend has no
-/// implementation or nothing is admissible at `statics`.
+/// The default specialization of `entry` at `bindings` and `statics` as
+/// `device` offers the implementation ([`on_device`], [`device_defaults`]):
+/// on a CPU device it also values the Seismic-owned worker counts and tier,
+/// which a stored choice carries and the bare declaration's default lacks.
+/// `None` when the backend has no implementation or nothing is admissible at
+/// `statics`.
 pub fn default_specialization(
     device: &Arc<DeviceInner>,
     module: &CheckedModule,
     entry: EntryId,
+    bindings: &ElementBindings,
     statics: &NativeSpecialization,
 ) -> Option<NativeSpecialization> {
     module
         .native_implementation(entry, backend_name(&device.kind))
         .cloned()
         .and_then(|implementation| {
-            on_device(device, implementation)
+            device_defaults(device, on_device(device, implementation), bindings)
                 .default_specialization(statics)
                 .ok()
         })

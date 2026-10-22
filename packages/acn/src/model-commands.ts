@@ -16,7 +16,7 @@ import {
   type SlotId,
 } from "@magnitudedev/acn-protocol"
 import { IcnCatalogInstallations, IcnClient, IcnInstances } from "@magnitudedev/icn"
-import { canonicalLocalModelId, projectInferenceLoadPlan } from "@magnitudedev/acn-protocol"
+import { canonicalLocalModelId, localModelIsInstalled, projectInferenceLoadPlan } from "@magnitudedev/acn-protocol"
 import { LocalModels } from "./local-models"
 import { ModelSlotController } from "./model-slot-controller"
 import { LocalModelRemovals } from "./local-model-removals"
@@ -26,7 +26,7 @@ import { CatalogModelSync } from "./catalog-model-sync"
 
 /** Commands by canonical model ID: a catalog ID addresses its installation, a custom ID its downloads. */
 export interface ModelCommandsApi {
-  readonly sync: (modelId: ModelId) => Effect.Effect<{ readonly outcome: LocalModelSyncOutcome }, LocalInferenceError>
+  readonly sync: (modelId: ModelId) => Effect.Effect<{ readonly outcome: LocalModelSyncOutcome }, LocalInferenceError | ModelVersionNotRunnable>
   readonly downloadCatalogComponent: (modelId: ModelId, component: CatalogComponent) =>
     Effect.Effect<{ readonly started: boolean }, LocalInferenceError>
   readonly cancelSync: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
@@ -80,6 +80,22 @@ export const ModelCommandsLive: Layer.Layer<
           verdict: { _tag: "Unsupported", reasons },
         }))
   }))
+  /**
+   * A catalog model not yet on this computer that needs more memory than it can provide is refused before ICN is
+   * asked to download it. An installed one still updates, and one not yet assessed is never refused.
+   */
+  const downloadable = (modelId: CatalogFormModelId) => localModels.state.pipe(Effect.flatMap(({ models }) => {
+    const model = models.find((candidate) => candidate.modelId === modelId)
+    const serving = model?.servingState
+    return model === undefined || serving?._tag !== "Assessed" || serving.assessment._tag !== "DoesNotFit"
+      || localModelIsInstalled(model)
+      ? Effect.succeed(modelId)
+      : Effect.fail(new ModelVersionNotRunnable({
+          reference: modelId,
+          version: modelId,
+          verdict: { _tag: "DoesNotFit", deficitBytes: serving.assessment.deficitBytes },
+        }))
+  }))
   const scope = yield* Effect.scope
   const client = yield* IcnClient
   const installations = yield* IcnCatalogInstallations
@@ -123,11 +139,11 @@ export const ModelCommandsLive: Layer.Layer<
     if (instance !== undefined) yield* client.models.stopModelInstance({ path: { instance_id: instance.id } })
     return { stopped: instance !== undefined }
   }).pipe(Effect.mapError((cause) => modelCommandFailure("stop", cause)))
-  const byForm = <A>(
+  const byForm = <A, CatalogError, CustomError>(
     requested: ModelId,
-    catalogCommand: (id: CatalogFormModelId) => Effect.Effect<A, LocalInferenceError>,
-    customCommand: (id: typeof CustomFormModelIdSchema.Type) => Effect.Effect<A, LocalInferenceError>,
-  ) => canonical(requested).pipe(Effect.flatMap((modelId) => Schema.is(CatalogFormModelIdSchema)(modelId)
+    catalogCommand: (id: CatalogFormModelId) => Effect.Effect<A, CatalogError>,
+    customCommand: (id: typeof CustomFormModelIdSchema.Type) => Effect.Effect<A, CustomError>,
+  ) => canonical(requested).pipe(Effect.flatMap((modelId): Effect.Effect<A, CatalogError | CustomError> => Schema.is(CatalogFormModelIdSchema)(modelId)
     ? catalogCommand(modelId)
     : customCommand(Schema.decodeSync(CustomFormModelIdSchema)(modelId))))
   const catalogCancel = (modelId: CatalogFormModelId) => operationFor(modelId).pipe(
@@ -173,7 +189,7 @@ export const ModelCommandsLive: Layer.Layer<
         )))),
   )
   return ModelCommands.of({
-    sync: (modelId) => byForm(modelId, catalogSync.sync, custom.sync),
+    sync: (modelId) => byForm(modelId, (id) => downloadable(id).pipe(Effect.flatMap(catalogSync.sync)), custom.sync),
     downloadCatalogComponent: (modelId, component) => byForm(
       modelId,
       (id) => catalogSync.downloadComponent(id, component),

@@ -281,15 +281,22 @@ pub(crate) mod tests {
     }
 
     fn environment(context_limit: u64) -> Environment {
+        environment_within(context_limit, u64::MAX)
+    }
+
+    /// The fixture planned on the host's device with at most
+    /// `capacity_bytes` of its stable capacity.
+    fn environment_within(context_limit: u64, capacity_bytes: u64) -> Environment {
         let inventory = std::sync::Arc::new(seismic::Inventory::discover(&[]).unwrap());
         let catalog = seismic::Devices::new(inventory.clone());
-        let selected = crate::platform::select_device(
+        let mut selected = crate::platform::select_device(
             &catalog,
             ExecutionPath::Native,
             crate::platform::DeviceRequest::Automatic,
             &MemoryReserves::standard(),
         )
         .unwrap();
+        selected.assessment_capacity_bytes = selected.assessment_capacity_bytes.min(capacity_bytes);
         let mut definition = crate::planning::tests::fixture_definition();
         definition.decoder.context_limit = context_limit;
         let manifest = crate::planning::tests::fixture_manifest(&definition);
@@ -412,6 +419,29 @@ pub(crate) mod tests {
         assert!(estimates
             .iter()
             .all(|estimate| estimate.tokens_per_second.is_finite()));
+    }
+
+    /// A device whose domain cannot back one full context's history is
+    /// assessed like any other, never failing to plan: the fit at the fit
+    /// depth gives the verdict.
+    #[test]
+    fn a_context_beyond_the_domains_history_capacity_is_assessed() {
+        // The fixture stores 256 bytes of history per token: 150,000 tokens
+        // are 38.4 MB, beyond a 16 MiB domain.
+        let environment = environment_within(150_000, 16 << 20);
+        let request = request(150_000, &[25_000]);
+        let prepared =
+            prepare_execution_assessment(&environment.definition, &environment.draft, 150_000)
+                .expect("a context the domain cannot back is not a planning failure");
+        assert_eq!(prepared.fit_context_tokens, 100_000);
+        assert!(assess_execution_fit(
+            &prepared,
+            &environment.draft,
+            &environment.topology,
+            &environment.status,
+            &request,
+        )
+        .is_ok());
     }
 
     #[test]

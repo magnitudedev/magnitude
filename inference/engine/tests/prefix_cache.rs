@@ -367,6 +367,52 @@ fn a_rewritten_reply_resumes_at_the_previous_prompt() {
     assert_eq!(next.cached, first.len() - 1);
 }
 
+/// Short turns of a conversation whose template renders the previous reply
+/// unlike the generation prompt it followed (an empty reasoning block the
+/// history omits): each prompt declares where its last message opens and
+/// where its next turn leaves it, as chat preparation does. Every turn is far
+/// shorter than the minimum branch gain, yet each resumes where the previous
+/// turn left its prompt, rather than all at the first turn's last message.
+#[test]
+#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+fn short_rewritten_turns_resume_where_the_previous_turn_left_its_prompt() {
+    let (mut host, vocabulary, tokenizer) = owner();
+    let suffix = tokenizer
+        .encode(" Reply in one word.", SpecialTokens::Literal)
+        .unwrap();
+    let mut history = text(&tokenizer, 41, 400);
+    let mut previous: Option<usize> = None;
+    for turn in 0..6 {
+        let opened = history.len();
+        history.extend(text(&tokenizer, 50 + turn, 20));
+        let left = history.len();
+        let mut prompt = history.clone();
+        prompt.extend(&suffix);
+        let [done] =
+            run_with_cache_points(&mut host, vocabulary, &[(prompt, vec![opened, left])], 4)
+                .try_into()
+                .ok()
+                .unwrap();
+        eprintln!(
+            "turn {turn}: prompt={} cached={}",
+            done.prompt.len(),
+            done.cached
+        );
+        match previous {
+            None => assert_eq!(done.cached, 0),
+            Some(left) => assert_eq!(
+                done.cached, left,
+                "turn {turn} resumes where the last turn left"
+            ),
+        }
+        previous = Some(left);
+        let reply = text(&tokenizer, 60 + turn, 3);
+        assert_ne!(reply[0], suffix[0]);
+        history.extend(reply);
+    }
+    assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
+}
+
 /// A long system prompt, then a last message that changes on every request,
 /// with its start declared as a cache point (as chat preparation declares
 /// the boundary opening the last message). Every request after the first

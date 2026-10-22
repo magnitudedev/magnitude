@@ -825,6 +825,7 @@ std::string common_chat_template_direct_apply_impl(
     jinja::global_from_json(ctx, inp, inputs.mark_input);
 
     // render
+    ++templates_native::renders;
     jinja::runtime runtime(ctx);
     const jinja::value results = runtime.execute(tmpl.prog);
     auto parts = jinja::runtime::gather_string_parts(results);
@@ -847,32 +848,31 @@ std::string common_chat_template_direct_apply(
     return common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
 }
 
-std::string common_chat_template_generation_prompt_impl(
+common_chat_rendered_prompt common_chat_template_render_prompt(
     const common_chat_template & tmpl,
     const autoparser::generation_params & inputs,
     const std::optional<json> & messages_override,
     const std::optional<json> & tools_override,
     const std::optional<json> & additional_context) {
 
+    std::string prompt = common_chat_template_direct_apply_impl(tmpl, inputs, messages_override, tools_override, additional_context);
+    // These parameters differ from `inputs` only in add_generation_prompt and
+    // the continuation, which rendering does not read, so the prompt is the
+    // comparison's render on its own side and only the other side renders.
     autoparser::generation_params params = inputs;
-    params.add_generation_prompt = false;
+    params.add_generation_prompt = !inputs.add_generation_prompt;
     params.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
-    std::string no_gen_prompt    = common_chat_template_direct_apply_impl(tmpl, params, messages_override, tools_override, additional_context);
-    params.add_generation_prompt = true;
-    std::string gen_prompt       = common_chat_template_direct_apply_impl(tmpl, params, messages_override, tools_override, additional_context);
+    std::string other = common_chat_template_direct_apply_impl(tmpl, params, messages_override, tools_override, additional_context);
+    const std::string & no_gen_prompt = inputs.add_generation_prompt ? other : prompt;
+    const std::string & gen_prompt    = inputs.add_generation_prompt ? prompt : other;
 
     size_t prefix_len = 0;
     size_t min_size = std::min(no_gen_prompt.size(), gen_prompt.size());
     while (prefix_len < min_size && no_gen_prompt[prefix_len] == gen_prompt[prefix_len]) {
         prefix_len++;
     }
-    return gen_prompt.substr(prefix_len);
-}
-
-std::string common_chat_template_generation_prompt(
-    const common_chat_template & tmpl,
-    const autoparser::generation_params & inputs) {
-    return common_chat_template_generation_prompt_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
+    std::string generation_prompt = gen_prompt.substr(prefix_len);
+    return { std::move(prompt), std::move(generation_prompt) };
 }
 
 namespace workaround {
@@ -1188,8 +1188,9 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         common_chat_params data;
         auto params_copy               = params;
         params_copy.reasoning_format   = COMMON_REASONING_FORMAT_NONE;
-        data.prompt                    = common_chat_template_direct_apply_impl(tmpl, params_copy);
-        data.generation_prompt         = common_chat_template_generation_prompt_impl(tmpl, params);
+        auto rendered                  = common_chat_template_render_prompt(tmpl, params_copy);
+        data.prompt                    = std::move(rendered.prompt);
+        data.generation_prompt         = std::move(rendered.generation_prompt);
         data.format                    = COMMON_CHAT_FORMAT_PEG_NATIVE;
         auto parser                    = build_chat_peg_parser([&data](common_chat_peg_builder &p) {
             return p.literal(data.generation_prompt) << p.content(p.rest());

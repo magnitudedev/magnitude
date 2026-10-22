@@ -82,7 +82,7 @@ value statement::execute(context & ctx) {
 
 value identifier::execute_impl(context & ctx) {
     auto it = ctx.get_val(val);
-    auto builtins = global_builtins();
+    const auto & builtins = global_builtins();
     if (!it->is_undefined()) {
         if (ctx.is_get_stats) {
             value_t::stats_t::mark_used(it);
@@ -305,7 +305,7 @@ static value try_builtin_func(context & ctx, const std::string & name, value & i
         value_t::stats_t::mark_used(input);
         input->stats.ops.insert(name);
     }
-    auto builtins = input->get_builtins();
+    const auto & builtins = input->get_builtins();
     auto it = builtins.find(name);
     if (it != builtins.end()) {
         JJ_DEBUG("Binding built-in '%s'", name.c_str());
@@ -541,8 +541,6 @@ value for_statement::execute_impl(context & ctx) {
 
     std::vector<value> filtered_items;
     for (size_t i = 0; i < items.size(); ++i) {
-        context loop_scope(scope);
-
         value current = items[i];
 
         std::function<void(context&)> scope_update_fn = [](context &) { /* no-op */};
@@ -588,6 +586,7 @@ value for_statement::execute_impl(context & ctx) {
         }
 
         if (select_expr && test_expr) {
+            context loop_scope(scope);
             scope_update_fn(loop_scope);
             value test_val = test_expr->execute(loop_scope);
             if (!test_val->as_bool()) {

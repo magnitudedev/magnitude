@@ -672,6 +672,40 @@ fn a_launch_that_discards_its_requests_lookahead_is_charged_the_wait() {
     );
 }
 
+/// A queued step's service starts where its predecessor's ends, once the
+/// predecessor's results are read: pipelined flights charge the time they
+/// overlap once, so a chain's durations add up to no more than its span.
+#[test]
+fn a_queued_step_is_charged_from_where_its_predecessor_ends() {
+    let Some((mut domain, mut bindings)) = fixture_with(None, true, true) else {
+        return;
+    };
+    let request = RequestId(73);
+    open(&mut domain, &mut bindings, request);
+    domain.plan_successors(vec![prefill(request, 1)]);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
+    let began = flight.work.runnable;
+    let (first, bindings) = finish_one(&mut domain, flight);
+    let first_duration = first.physical_duration();
+    assert!(bindings.lookahead.is_some(), "the next chunk is queued");
+    domain
+        .reconcile(first, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 1)]);
+    assert_eq!(
+        flight.work.runnable,
+        began + first_duration,
+        "the claimed step starts where its predecessor ends"
+    );
+    let (second, _) = finish_one(&mut domain, flight);
+    let span = began.elapsed();
+    assert!(
+        first_duration + second.physical_duration() <= span,
+        "{first_duration:?} + {:?} exceeds the chain's span {span:?}",
+        second.physical_duration()
+    );
+}
+
 /// Growth changes bindings: every entry that can grow resolves a queued
 /// lookahead first, then commits the slab.
 #[test]
@@ -1138,21 +1172,22 @@ fn vision_input(placements: &[(usize, &str)], count: usize) -> PreparedModelInpu
     .unwrap()
 }
 
-/// An image encodes its declared cells within the engine's bound, across
+/// An image encodes its declared cells within its device's bound, across
 /// launches; one whose rows attend each other in the decoder fits one launch.
 #[test]
 fn an_image_encodes_its_declared_cells_and_one_launch_when_bidirectional() {
     use magnitude_family_contracts::{MediaRowAttention, Operator, VisionResize};
-    assert_eq!(crate::image_cell_limit(&tiny_definition(), 2).unwrap(), 0);
+    let any = crate::MAX_IMAGE_CELLS;
+    assert_eq!(crate::image_cell_limit(&tiny_definition(), 2, any).unwrap(), 0);
     let mut definition = vision_definition();
-    assert_eq!(crate::image_cell_limit(&definition, 2).unwrap(), 4);
+    assert_eq!(crate::image_cell_limit(&definition, 2, any).unwrap(), 4);
     let vision = definition.vision.as_mut().unwrap();
     vision.preprocessing.resize = VisionResize::PixelBounds {
         min_pixels: 16,
         max_pixels: 1 << 30,
     };
     assert_eq!(
-        crate::image_cell_limit(&definition, 512).unwrap(),
+        crate::image_cell_limit(&definition, 512, any).unwrap(),
         crate::MAX_IMAGE_CELLS
     );
     for block in &mut definition.decoder.blocks {
@@ -1162,7 +1197,35 @@ fn an_image_encodes_its_declared_cells_and_one_launch_when_bidirectional() {
             }
         }
     }
-    assert_eq!(crate::image_cell_limit(&definition, 512).unwrap(), 512);
+    assert_eq!(crate::image_cell_limit(&definition, 512, any).unwrap(), 512);
+}
+
+/// A CPU encodes an image in one launch it completes during its submission:
+/// its images are bounded to [`crate::CPU_IMAGE_CELLS`], a GPU's to
+/// [`crate::MAX_IMAGE_CELLS`].
+#[test]
+fn a_cpu_encodes_fewer_image_cells_than_a_gpu() {
+    use magnitude_family_contracts::VisionResize;
+    use seismic::BackendName;
+    assert!(crate::CPU_IMAGE_CELLS < crate::MAX_IMAGE_CELLS);
+    let mut definition = vision_definition();
+    definition.vision.as_mut().unwrap().preprocessing.resize = VisionResize::PixelBounds {
+        min_pixels: 16,
+        max_pixels: 1 << 30,
+    };
+    for (backend, cells) in [
+        (BackendName::Cpu, crate::CPU_IMAGE_CELLS),
+        (BackendName::Metal, crate::MAX_IMAGE_CELLS),
+        (BackendName::Cuda, crate::MAX_IMAGE_CELLS),
+        (BackendName::Vulkan, crate::MAX_IMAGE_CELLS),
+    ] {
+        assert_eq!(crate::max_image_cells(backend), cells, "{backend:?}");
+        assert_eq!(
+            crate::image_cell_limit(&definition, 512, crate::max_image_cells(backend)).unwrap(),
+            cells,
+            "{backend:?}"
+        );
+    }
 }
 
 const TEXT: crate::TokenId = crate::TokenId(5);

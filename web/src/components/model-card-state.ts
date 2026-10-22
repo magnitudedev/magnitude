@@ -54,6 +54,21 @@ export const modelCardDrafter = (model: LocalModel): ModelCardDrafter => {
 export const catalogDrafterOnlyUpdate = (model: LocalModel): boolean =>
   model._tag === "Catalog" && model.acquisitionState._tag === "UpdateAvailable" && model.acquisitionState.parts.every(part => part === "Drafter")
 
+/**
+ * An added model whose files have not arrived: not downloaded yet, downloading, or after a cancelled or failed
+ * download. Magnitude assesses a custom model only from its files, so it has no assessment until they land; the
+ * repository step already checked that the version runs here. Its card claims no assessment in progress and keeps
+ * Download and Remove, so a cancelled download can be started again or the model forgotten.
+ */
+export const addedModelAwaitingFiles = (model: LocalModel): boolean =>
+  model._tag === "Custom" && ["NotInstalled", "Installing", "InstallFailed"].includes(model.acquisitionState._tag)
+
+/** Whether Download (or Retry download) can fetch the model: one assessed to fit, or an added model awaiting its files. */
+export const modelCanDownload = (model: LocalModel): boolean =>
+  addedModelAwaitingFiles(model)
+  || (model._tag === "Custom" || model.catalogData.support._tag === "Supported")
+    && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
+
 /** A card's Status cell: where the model is in its lifecycle, from not downloaded to running. */
 export const modelCardStatus = (model: LocalModel, hardware: Option.Option<LocalInferenceHardware>): { readonly label: string; readonly tone: StatusTone } => {
   const acquisition = model.acquisitionState

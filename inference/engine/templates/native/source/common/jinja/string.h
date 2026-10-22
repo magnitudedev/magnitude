@@ -39,6 +39,8 @@ struct string {
 
     std::string str() const;
     size_t length() const;
+    // whether both concatenate to the same text, without materializing either
+    bool equals(const string & other) const noexcept;
     void hash_update(hasher & hash) const noexcept;
     bool all_parts_are_input() const;
     bool is_uppercase() const;

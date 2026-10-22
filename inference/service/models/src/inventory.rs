@@ -34,6 +34,8 @@ use crate::store_fs::ensure_store_layout;
 
 /// The failure code of a model whose files are in a format the engine can't read.
 pub(crate) const UNSUPPORTED_FORMAT_CODE: &str = "unsupported_format";
+/// The failure code of a found model whose file can't be opened.
+const UNREADABLE_CODE: &str = "unreadable";
 const MAX_SCAN_ENTRIES: usize = 100_000;
 const MAX_SCAN_DEPTH: usize = 8;
 const BACKGROUND_RECONCILIATION_RETRY_DELAY: std::time::Duration =
@@ -155,6 +157,16 @@ impl InstalledPackageSnapshot {
         }
     }
 
+    /// The snapshot files Magnitude's copies of `package_id` are made of, each by repository,
+    /// commit and path.
+    fn managed_entries(&self, package_id: &ModelPackageId) -> BTreeSet<(String, String, PathBuf)> {
+        self.records
+            .values()
+            .filter(|record| &record.installed.package.id == package_id)
+            .flat_map(occurrence_entries)
+            .collect()
+    }
+
     /// Whether deleting Magnitude's copies of `package_id` would unlink a snapshot file that a
     /// Magnitude package outside `removing` is served from too. Two packages can name the same
     /// file in one snapshot (a target with its projector, and the same weights found on their own
@@ -164,47 +176,77 @@ impl InstalledPackageSnapshot {
         package_id: &ModelPackageId,
         removing: &BTreeSet<ModelPackageId>,
     ) -> bool {
-        let entries = |record: &InstalledPackageRecord| -> Vec<(String, String, PathBuf)> {
-            let (
-                ModelPackageInstallationOrigin::Magnitude,
-                ModelLocation::MagnitudeCache { components, .. },
-                ModelSource::HuggingFace {
-                    repository, commit, ..
-                },
-            ) = (
-                record.installed.origin,
-                &record.model.location,
-                &record.model.source,
-            )
-            else {
-                return Vec::new();
-            };
-            components
-                .iter()
-                .map(|component| {
-                    (
-                        repository.to_lowercase(),
-                        commit.clone(),
-                        component.path.clone(),
-                    )
-                })
-                .collect()
-        };
-        let removed = self
-            .records
-            .values()
-            .filter(|record| &record.installed.package.id == package_id)
-            .flat_map(entries)
-            .collect::<BTreeSet<_>>();
+        let removed = self.managed_entries(package_id);
         self.records
             .values()
             .filter(|record| {
                 &record.installed.package.id != package_id
                     && !removing.contains(&record.installed.package.id)
             })
-            .flat_map(entries)
+            .flat_map(occurrence_entries)
             .any(|entry| removed.contains(&entry))
     }
+
+    /// `removing` without the packages whose every snapshot file the others in it hold (the
+    /// projector package of a target stored with its projector, say): deleting those deletes the
+    /// files, so such a package goes with them rather than separately.
+    pub(crate) fn without_contained_managed_packages(
+        &self,
+        removing: &[ModelPackageId],
+    ) -> Vec<ModelPackageId> {
+        let mut largest_first = removing
+            .iter()
+            .map(|package_id| (package_id, self.managed_entries(package_id)))
+            .collect::<Vec<_>>();
+        largest_first.sort_by(|(left_id, left), (right_id, right)| {
+            right
+                .len()
+                .cmp(&left.len())
+                .then_with(|| left_id.cmp(right_id))
+        });
+        let mut deleted = BTreeSet::new();
+        let mut kept = BTreeSet::new();
+        for (package_id, entries) in largest_first {
+            if entries.is_empty() || !entries.is_subset(&deleted) {
+                deleted.extend(entries);
+                kept.insert(package_id);
+            }
+        }
+        removing
+            .iter()
+            .filter(|package_id| kept.contains(package_id))
+            .cloned()
+            .collect()
+    }
+}
+
+/// The snapshot files of a Magnitude occurrence, each by repository, commit and path; none for an
+/// occurrence elsewhere.
+fn occurrence_entries(record: &InstalledPackageRecord) -> Vec<(String, String, PathBuf)> {
+    let (
+        ModelPackageInstallationOrigin::Magnitude,
+        ModelLocation::MagnitudeCache { components, .. },
+        ModelSource::HuggingFace {
+            repository, commit, ..
+        },
+    ) = (
+        record.installed.origin,
+        &record.model.location,
+        &record.model.source,
+    )
+    else {
+        return Vec::new();
+    };
+    components
+        .iter()
+        .map(|component| {
+            (
+                repository.to_lowercase(),
+                commit.clone(),
+                component.path.clone(),
+            )
+        })
+        .collect()
 }
 
 /// Which occurrence of the same content represents it: the managed store, then the Hugging Face
@@ -784,30 +826,41 @@ impl ManagedModelStore {
     }
 
     /// Applies a whole configuration and rescans when it differs from the current one. Applying
-    /// the same configuration again does nothing.
+    /// the same configuration again does nothing. A configuration whose rescan fails is not
+    /// applied, so sending it again rescans again.
     pub(crate) async fn configure_local_models(
         &self,
         configuration: LocalModelsConfiguration,
     ) -> Result<bool, InventoryError> {
         validate_local_models(&configuration)?;
-        let (changed, roots) = {
+        let (previous, roots) = {
             let mut current = self.local_models.write().map_err(|_| {
                 InventoryError::Internal("local-models configuration lock poisoned".to_owned())
             })?;
-            let changed = *current != configuration;
+            if *current == configuration {
+                return Ok(false);
+            }
             let roots = configuration
                 .roots
                 .iter()
                 .filter(|root| !current.roots.contains(root))
                 .map(|root| canonical_or_self(&root.path))
                 .collect::<BTreeSet<_>>();
-            *current = configuration;
-            (changed, roots)
+            (
+                std::mem::replace(&mut *current, configuration.clone()),
+                roots,
+            )
         };
-        if changed {
-            self.rescan_model_roots(roots).await?;
+        if let Err(error) = self.rescan_model_roots(roots).await {
+            let mut current = self.local_models.write().map_err(|_| {
+                InventoryError::Internal("local-models configuration lock poisoned".to_owned())
+            })?;
+            if *current == configuration {
+                *current = previous;
+            }
+            return Err(error);
         }
-        Ok(changed)
+        Ok(true)
     }
 
     async fn reconcile_model_inventory(
@@ -2085,11 +2138,27 @@ fn reuse_metadata(
 }
 
 /// A candidate whose files are in a format the engine can't read is incompatible as found; its
-/// files are never opened.
+/// files are never opened. One whose primary file can't be opened, such as a link to a removed
+/// drive, is listed as unreadable, whatever an earlier inspection of the same content found.
 fn enrich_candidate(
     candidate: &ArtifactCandidate,
     cache: &ModelCache,
 ) -> Result<InventoryModel, InventoryError> {
+    if let Err(error) = fs::File::open(&candidate.primary) {
+        return Ok(unavailable_model(
+            candidate.id.clone(),
+            candidate.content_id.clone(),
+            candidate.created,
+            candidate.ready_at,
+            candidate.source.clone(),
+            candidate.location.clone(),
+            &candidate.primary,
+            candidate.deletable,
+            UNREADABLE_CODE,
+            format!("{} can't be read: {error}", candidate.primary.display()),
+            false,
+        ));
+    }
     if let Some(detail) = &candidate.unsupported_format {
         return Ok(unavailable_model(
             candidate.id.clone(),
@@ -2746,16 +2815,19 @@ fn artifact_observation_key(
     let mut digest = Sha256::new();
     digest.update(b"magnitude-filesystem-observation-v1\0");
     for path in paths {
-        let metadata = path.metadata().map_err(io_error)?;
-        if !metadata.is_file() {
-            return Err(InventoryError::Io(format!(
-                "model component is not a regular file: {}",
-                path.display()
-            )));
-        }
+        let identity = match path.metadata() {
+            Ok(metadata) if metadata.is_file() => file_identity(&path, &metadata),
+            Ok(_) => {
+                return Err(InventoryError::Io(format!(
+                    "model component is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            Err(error) => broken_link_identity(&path).ok_or_else(|| io_error(error))?,
+        };
         digest.update(path.to_string_lossy().as_bytes());
         digest.update(b"\0");
-        digest.update(file_identity(&path, &metadata).as_bytes());
+        digest.update(identity.as_bytes());
         digest.update(b"\0");
     }
     Ok(format!("sha256:{:x}", digest.finalize()))
@@ -2766,6 +2838,16 @@ fn model_observation_key(
     model: &InventoryModel,
 ) -> Result<String, InventoryError> {
     artifact_observation_key(inventory_root, &model.source, &model.location)
+}
+
+/// A component that is a link whose target can't be read is still on disk, as the link, and is
+/// observed by where it points; its model is listed as unreadable.
+fn broken_link_identity(path: &Path) -> Option<String> {
+    let target = fs::read_link(path).ok()?;
+    let mut digest = Sha256::new();
+    digest.update(b"broken-link\0");
+    digest.update(target.to_string_lossy().as_bytes());
+    Some(format!("{:x}", digest.finalize()))
 }
 
 fn file_identity(path: &Path, metadata: &fs::Metadata) -> String {

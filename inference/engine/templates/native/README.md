@@ -65,6 +65,20 @@ the next parser read the delimiter's bytes, and Kimi K2 published `<|` in reason
 `end`, and `space`, `chars` and repetitions that could continue. The text before the undecided point
 is still read; strict parses are unchanged.
 
+Patch 0028 makes a loop item cost its body. Upstream copied the whole enclosing scope for every item
+of every loop (a scope only a loop filter reads), copied the table of builtins on every name lookup
+and builtin call, and compared string keys by concatenating them. Templates that scan the rest of
+the conversation for each message (Gemma 4) run a number of items quadratic in its length, so these
+costs multiplied with it. Rendered output is unchanged.
+
+Patch 0029 renders the prompt once. Upstream rendered the conversation three times per
+preparation: the prompt, then the conversation without and with the generation prompt to find the
+generation prompt. Those two renders differ from the prompt's only in `add_generation_prompt` and
+the continuation, and rendering does not read the continuation, so one of them is the prompt
+itself. Every family takes both from `common_chat_template_render_prompt`, which renders the other
+side alone. Prompts and generation prompts are unchanged. A preparation describes how many renders
+it made.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.

@@ -687,7 +687,7 @@ export const CustomModelCommandsLive: Layer.Layer<
       })),
       () => configured?._tag === "Reference" ? Option.some<DrafterCandidate>({
         category: "Other", reference: configured.reference,
-        ...drafterReferenceNaming(configured.reference, catalogModels), sizeBytes: 0,
+        ...drafterReferenceNaming(configured.reference, catalogModels, Option.some(configured.method)), sizeBytes: 0,
         lineage: "None", verdict: { _tag: "None" }, automatic: false, onThisComputer: false, method: Option.some(configured.method),
       }) : Option.none(),
     )
@@ -797,6 +797,7 @@ export const CustomModelCommandsLive: Layer.Layer<
       hidden: config.hidden.filter((hidden) => hidden !== modelId),
     } satisfies CustomModelsConfig] as const))
 
+  // A model-location command changes nothing but the configuration, so it pushes and fails when ICN refuses it.
   const settle = reconciler.push.pipe(Effect.catchAll((error) => Effect.logWarning(error.message)))
 
   /** After a model is removed, ICN deletes Magnitude's drafter packages no model uses. */
@@ -1058,7 +1059,7 @@ export const CustomModelCommandsLive: Layer.Layer<
       Effect.flatMap((folder) => customModels.modify((config) => Effect.succeed([undefined, config.folders.includes(folder)
         ? config
         : { ...config, folders: [...config.folders, folder] }] as const))),
-      Effect.zipRight(settle),
+      Effect.zipRight(reconciler.push),
     ),
 
     removeFolder: (path) => Effect.gen(function* () {
@@ -1069,7 +1070,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         ...config,
         folders: config.folders.filter((existing) => existing !== folder && existing !== trimmed),
       }] as const))
-      yield* settle
+      yield* reconciler.push
     }),
 
     setLocationEnabled: (kind, enabled) => customModels.modify((config) => Effect.succeed([undefined, {
@@ -1077,7 +1078,7 @@ export const CustomModelCommandsLive: Layer.Layer<
       disabledLocations: enabled
         ? config.disabledLocations.filter((disabled) => disabled !== kind)
         : config.disabledLocations.includes(kind) ? config.disabledLocations : [...config.disabledLocations, kind],
-    }] as const)).pipe(Effect.zipRight(settle)),
+    }] as const)).pipe(Effect.zipRight(reconciler.push)),
 
     listLocations: customModels.get.pipe(Effect.flatMap(locations.list)),
 
@@ -1135,7 +1136,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         })),
         () => configured?._tag === "Reference" ? Option.some<DrafterCandidate>({
           category: "Other", reference: configured.reference,
-          ...drafterReferenceNaming(configured.reference, sourceState.catalogModels), sizeBytes: 0,
+          ...drafterReferenceNaming(configured.reference, sourceState.catalogModels, Option.some(configured.method)), sizeBytes: 0,
           lineage: "None", verdict: { _tag: "None" }, automatic: false, onThisComputer: false, method: Option.some(configured.method),
         }) : Option.none(),
       )

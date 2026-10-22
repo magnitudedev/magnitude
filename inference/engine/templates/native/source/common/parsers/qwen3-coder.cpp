@@ -6,8 +6,9 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
 
     const std::string GEN_PREFIX = "<|im_start|>assistant\n";
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+    auto rendered          = common_chat_template_render_prompt(tmpl, inputs);
+    data.prompt            = std::move(rendered.prompt);
+    data.generation_prompt = std::move(rendered.generation_prompt);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
 
     auto supports_reasoning = tmpl.source().find("<think>") != std::string::npos;

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { ModelReleaseDateSchema, type CatalogLocalModel, type CustomLocalModel } from "@magnitudedev/sdk"
-import { modelCardDrafter, modelCardStatus, modelSubtitle, modelUpdateDescription } from "./model-card-state"
-import { added, attachedDrafter, catalogModel, customModel, drafterCandidate, foundIn, imported } from "../../test/models/fixtures"
+import { addedModelAwaitingFiles, modelCanDownload, modelCardDrafter, modelCardStatus, modelSubtitle, modelUpdateDescription } from "./model-card-state"
+import { added, attachedDrafter, catalogModel, customModel, doesNotFit, drafterCandidate, foundIn, imported } from "../../test/models/fixtures"
 
 const moe = (): CatalogLocalModel => {
   const model = catalogModel()
@@ -52,6 +52,29 @@ describe("model card status", () => {
     expect(modelCardStatus(customModel(foundIn({ _tag: "LmStudio" })), Option.none())).toEqual({ label: "On this computer", tone: "stored" })
     const running = customModel(added, { acquisitionState: { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/m.gguf", ownership: "Magnitude" }, residencyState: { _tag: "Ready" } } as never })
     expect(modelCardStatus(running, Option.none())).toEqual({ label: "Running", tone: "ready" })
+  })
+})
+
+describe("model card download", () => {
+  // ACN projects an added model whose target hasn't landed as Assessing: it is assessed only from its files.
+  const notDownloaded = (acquisitionState: CustomLocalModel["acquisitionState"]) =>
+    customModel(added, { acquisitionState, servingState: { _tag: "Assessing", profile: { contextLength: 100_000 } }, storageBytes: 0, drafterPending: true })
+  it("keeps Download for an added model whose download was cancelled or failed, though it has no assessment", () => {
+    const cancelled = notDownloaded({ _tag: "NotInstalled" })
+    expect(addedModelAwaitingFiles(cancelled)).toBe(true)
+    expect(modelCanDownload(cancelled)).toBe(true)
+    expect(modelCanDownload(notDownloaded({ _tag: "InstallFailed", failure: { _tag: "Interrupted" } } as never))).toBe(true)
+  })
+  it("downloads a catalog model only once it is assessed to fit", () => {
+    const absent = { ...catalogModel(), acquisitionState: { _tag: "NotInstalled" as const } }
+    expect(addedModelAwaitingFiles(absent)).toBe(false)
+    expect(modelCanDownload(absent)).toBe(true)
+    expect(modelCanDownload({ ...absent, servingState: { _tag: "Assessing", profile: { contextLength: 100_000 } } } as never)).toBe(false)
+    expect(modelCanDownload({ ...absent, servingState: { ...absent.servingState, assessment: doesNotFit } } as never)).toBe(false)
+  })
+  it("never treats a downloaded or found model as awaiting files", () => {
+    expect(addedModelAwaitingFiles(customModel(added))).toBe(false)
+    expect(addedModelAwaitingFiles(customModel(foundIn({ _tag: "LmStudio" })))).toBe(false)
   })
 })
 

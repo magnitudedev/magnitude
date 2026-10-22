@@ -37,7 +37,8 @@ describe("browser harness setup", () => {
       expect(setup.prompt).toContain(model.id)
       expect(setup.docsUrl).toBe(`https://docs.magnitude.dev/integrations/${harness}`)
       expect(setup.prompt.includes(key)).toBe(remote)
-      expect(setup.prompt).toContain(platform === "win32" ? "%USERPROFILE%\\" : "~/")
+      const home = platform !== "win32" ? "~/" : harness === "hermes" ? "%LOCALAPPDATA%\\hermes\\" : "%USERPROFILE%\\"
+      expect(setup.prompt).toContain(home)
       expect(setup.prompt).not.toContain(platform === "win32" ? "~/." : "%USERPROFILE%")
       expect(setup.prompt).toContain(platform === "win32" ? "curl.exe" : "curl -s")
       const configs = blocks(setup.prompt)

@@ -1,0 +1,304 @@
+--- a/common/chat-auto-parser-generator.cpp
++++ b/common/chat-auto-parser-generator.cpp
+@@ -33,8 +33,9 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &
+                                                   const autoparser &              autoparser) {
+     // Create the result structure
+     common_chat_params data;
+-    data.prompt            = common_chat_template_direct_apply(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt(tmpl, inputs);
++    auto rendered          = common_chat_template_render_prompt(tmpl, inputs);
++    data.prompt            = std::move(rendered.prompt);
++    data.generation_prompt = std::move(rendered.generation_prompt);
+     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+     data.preserved_tokens  = autoparser.preserved_tokens;
+     data.additional_stops.insert(data.additional_stops.end(),
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -825,6 +825,7 @@ std::string common_chat_template_direct_apply_impl(
+     jinja::global_from_json(ctx, inp, inputs.mark_input);
+ 
+     // render
++    ++templates_native::renders;
+     jinja::runtime runtime(ctx);
+     const jinja::value results = runtime.execute(tmpl.prog);
+     auto parts = jinja::runtime::gather_string_parts(results);
+@@ -847,32 +848,31 @@ std::string common_chat_template_direct_apply(
+     return common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
+ }
+ 
+-std::string common_chat_template_generation_prompt_impl(
++common_chat_rendered_prompt common_chat_template_render_prompt(
+     const common_chat_template & tmpl,
+     const autoparser::generation_params & inputs,
+     const std::optional<json> & messages_override,
+     const std::optional<json> & tools_override,
+     const std::optional<json> & additional_context) {
+ 
++    std::string prompt = common_chat_template_direct_apply_impl(tmpl, inputs, messages_override, tools_override, additional_context);
++    // These parameters differ from `inputs` only in add_generation_prompt and
++    // the continuation, which rendering does not read, so the prompt is the
++    // comparison's render on its own side and only the other side renders.
+     autoparser::generation_params params = inputs;
+-    params.add_generation_prompt = false;
++    params.add_generation_prompt = !inputs.add_generation_prompt;
+     params.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+-    std::string no_gen_prompt    = common_chat_template_direct_apply_impl(tmpl, params, messages_override, tools_override, additional_context);
+-    params.add_generation_prompt = true;
+-    std::string gen_prompt       = common_chat_template_direct_apply_impl(tmpl, params, messages_override, tools_override, additional_context);
++    std::string other = common_chat_template_direct_apply_impl(tmpl, params, messages_override, tools_override, additional_context);
++    const std::string & no_gen_prompt = inputs.add_generation_prompt ? other : prompt;
++    const std::string & gen_prompt    = inputs.add_generation_prompt ? prompt : other;
+ 
+     size_t prefix_len = 0;
+     size_t min_size = std::min(no_gen_prompt.size(), gen_prompt.size());
+     while (prefix_len < min_size && no_gen_prompt[prefix_len] == gen_prompt[prefix_len]) {
+         prefix_len++;
+     }
+-    return gen_prompt.substr(prefix_len);
+-}
+-
+-std::string common_chat_template_generation_prompt(
+-    const common_chat_template & tmpl,
+-    const autoparser::generation_params & inputs) {
+-    return common_chat_template_generation_prompt_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
++    std::string generation_prompt = gen_prompt.substr(prefix_len);
++    return { std::move(prompt), std::move(generation_prompt) };
+ }
+ 
+ namespace workaround {
+@@ -1188,8 +1188,9 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
+         common_chat_params data;
+         auto params_copy               = params;
+         params_copy.reasoning_format   = COMMON_REASONING_FORMAT_NONE;
+-        data.prompt                    = common_chat_template_direct_apply_impl(tmpl, params_copy);
+-        data.generation_prompt         = common_chat_template_generation_prompt_impl(tmpl, params);
++        auto rendered                  = common_chat_template_render_prompt(tmpl, params_copy);
++        data.prompt                    = std::move(rendered.prompt);
++        data.generation_prompt         = std::move(rendered.generation_prompt);
+         data.format                    = COMMON_CHAT_FORMAT_PEG_NATIVE;
+         auto parser                    = build_chat_peg_parser([&data](common_chat_peg_builder &p) {
+             return p.literal(data.generation_prompt) << p.content(p.rest());
+--- a/common/chat.h
++++ b/common/chat.h
+@@ -366,10 +366,6 @@ std::string common_chat_template_direct_apply(
+     const common_chat_template & tmpl,
+     const autoparser::generation_params & inputs);
+ 
+-std::string common_chat_template_generation_prompt(
+-    const common_chat_template &          tmpl,
+-    const autoparser::generation_params & inputs);
+-
+ std::optional<common_chat_params> common_chat_try_specialized_template(
+         const common_chat_template &          tmpl,
+         const std::string &                   src,
+--- a/common/parsers/cohere2moe.cpp
++++ b/common/parsers/cohere2moe.cpp
+@@ -37,8 +37,9 @@ common_chat_params common_chat_params_init_cohere2moe(const common_chat_template
+     // Stable prefix of the generation prompt that precedes the (forced) <|START_THINKING|> marker.
+     const std::string GEN_PREFIX = TURN_START + CHATBOT;
+ 
+-    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs);
++    auto rendered           = common_chat_template_render_prompt(tmpl, inputs);
++    data.prompt             = std::move(rendered.prompt);
++    data.generation_prompt  = std::move(rendered.generation_prompt);
+     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
+     data.supports_thinking  = true;
+     data.thinking_start_tag = THINK_START;
+--- a/common/parsers/deepseek.cpp
++++ b/common/parsers/deepseek.cpp
+@@ -104,10 +104,10 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
+     const std::string GEN_PROMPT   = "<｜Assistant｜>";
+     const std::string TC_SEPARATOR = "\n\n";
+ 
+-    data.prompt = common_chat_template_direct_apply_impl(
+-        tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(
++    auto rendered = common_chat_template_render_prompt(
+         tmpl, inputs, adjusted_messages, std::nullopt, additional_context);
++    data.prompt = std::move(rendered.prompt);
++    data.generation_prompt = std::move(rendered.generation_prompt);
+     data.format             = COMMON_CHAT_FORMAT_PEG_NATIVE;
+     data.supports_thinking  = true;
+     data.thinking_start_tag = THINK_START;
+--- a/common/parsers/functionary-v3-2.cpp
++++ b/common/parsers/functionary-v3-2.cpp
+@@ -5,8 +5,9 @@ common_chat_params common_chat_params_init_functionary_v3_2(const common_chat_te
+                                                                    const autoparser::generation_params & inputs) {
+     common_chat_params data;
+ 
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
++    auto rendered          = common_chat_template_render_prompt(tmpl, inputs);
++    data.prompt            = std::move(rendered.prompt);
++    data.generation_prompt = std::move(rendered.generation_prompt);
+     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+     data.preserved_tokens  = {
+         ">>>all",
+--- a/common/parsers/gemma4.cpp
++++ b/common/parsers/gemma4.cpp
+@@ -377,8 +377,9 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &
+                                                          const autoparser::generation_params & inputs) {
+     common_chat_params data;
+ 
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
++    auto rendered          = common_chat_template_render_prompt(tmpl, inputs);
++    data.prompt            = std::move(rendered.prompt);
++    data.generation_prompt = std::move(rendered.generation_prompt);
+ 
+     if (inputs.add_generation_prompt && string_ends_with(data.prompt, "<turn|>\n")) {
+         // This may happen if the model generates content + tool_call, the
+--- a/common/parsers/gigachat-v3.cpp
++++ b/common/parsers/gigachat-v3.cpp
+@@ -6,8 +6,9 @@ common_chat_params common_chat_params_init_gigachat_v3(
+ 
+     common_chat_params data;
+ 
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
++    auto rendered          = common_chat_template_render_prompt(tmpl, inputs);
++    data.prompt            = std::move(rendered.prompt);
++    data.generation_prompt = std::move(rendered.generation_prompt);
+     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+     data.supports_thinking = false;
+     data.preserved_tokens  = {
+--- a/common/parsers/gpt-oss.cpp
++++ b/common/parsers/gpt-oss.cpp
+@@ -16,7 +16,8 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template &
+         adjusted_messages.push_back(msg);
+     }
+ 
+-    auto prompt = common_chat_template_direct_apply_impl(tmpl, inputs, /* messages_override= */ adjusted_messages);
++    auto rendered = common_chat_template_render_prompt(tmpl, inputs, /* messages_override= */ adjusted_messages);
++    auto & prompt = rendered.prompt;
+ 
+     // Check if we need to replace the return token with end token during
+     // inference and without generation prompt. For more details see:
+@@ -29,8 +30,8 @@ common_chat_params common_chat_params_init_gpt_oss(const common_chat_template &
+         }
+     }
+ 
+-    data.prompt            = prompt;
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, /* messages_override= */ adjusted_messages);
++    data.prompt            = std::move(prompt);
++    data.generation_prompt = std::move(rendered.generation_prompt);
+     data.message_delimiters = {
+         { COMMON_CHAT_ROLE_ASSISTANT, "<|start|>assistant" },
+         { COMMON_CHAT_ROLE_USER,      "<|start|>user"      },
+--- a/common/parsers/kimi-k2.cpp
++++ b/common/parsers/kimi-k2.cpp
+@@ -6,8 +6,9 @@ common_chat_params common_chat_params_init_kimi_k2(const common_chat_template &
+                                                           const autoparser::generation_params & inputs) {
+     common_chat_params data;
+ 
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
++    auto rendered          = common_chat_template_render_prompt(tmpl, inputs);
++    data.prompt            = std::move(rendered.prompt);
++    data.generation_prompt = std::move(rendered.generation_prompt);
+     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+     data.supports_thinking = true;
+     data.preserved_tokens  = {
+--- a/common/parsers/kimi-k3.cpp
++++ b/common/parsers/kimi-k3.cpp
+@@ -9,8 +9,9 @@ common_chat_params common_chat_params_init_kimi_k3(const common_chat_template &
+                                                           const autoparser::generation_params & inputs) {
+     common_chat_params data;
+ 
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
++    auto rendered          = common_chat_template_render_prompt(tmpl, inputs);
++    data.prompt            = std::move(rendered.prompt);
++    data.generation_prompt = std::move(rendered.generation_prompt);
+     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+     data.supports_thinking = true;
+ 
+--- a/common/parsers/lfm2.cpp
++++ b/common/parsers/lfm2.cpp
+@@ -34,8 +34,9 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &
+         adjusted_messages.push_back(msg);
+     }
+ 
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, adjusted_messages);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, adjusted_messages);
++    auto rendered          = common_chat_template_render_prompt(tmpl, inputs, adjusted_messages);
++    data.prompt            = std::move(rendered.prompt);
++    data.generation_prompt = std::move(rendered.generation_prompt);
+     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+     data.preserved_tokens  = { TOOL_CALL_START, TOOL_CALL_END };
+     if (tool_list_tokens) {
+--- a/common/parsers/minicpm5.cpp
++++ b/common/parsers/minicpm5.cpp
+@@ -10,8 +10,9 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
+                                                            const autoparser::generation_params & inputs) {
+     common_chat_params data;
+ 
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
++    auto rendered          = common_chat_template_render_prompt(tmpl, inputs);
++    data.prompt            = std::move(rendered.prompt);
++    data.generation_prompt = std::move(rendered.generation_prompt);
+     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+     data.supports_thinking = true;
+     data.preserved_tokens  = {
+--- a/common/parsers/minimax-m3.cpp
++++ b/common/parsers/minimax-m3.cpp
+@@ -4,8 +4,9 @@ common_chat_params common_chat_params_init_minimax_m3(const common_chat_template
+                                                              const autoparser::generation_params & inputs) {
+     common_chat_params data;
+ 
+-    data.prompt             = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt  = common_chat_template_generation_prompt_impl(tmpl, inputs);
++    auto rendered           = common_chat_template_render_prompt(tmpl, inputs);
++    data.prompt             = std::move(rendered.prompt);
++    data.generation_prompt  = std::move(rendered.generation_prompt);
+     data.format             = COMMON_CHAT_FORMAT_PEG_MINIMAX_M3;
+     data.supports_thinking  = true;
+     data.thinking_start_tag = "<mm:think>";
+--- a/common/parsers/ministral3.cpp
++++ b/common/parsers/ministral3.cpp
+@@ -51,8 +51,9 @@ common_chat_params common_chat_params_init_ministral_3(const common_chat_templat
+     data.supports_thinking  = true;
+     data.thinking_start_tag = "[THINK]";
+     data.thinking_end_tags  = {"[/THINK]"};
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, /* messages_override = */ adjusted_messages);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, /* messages_override = */ adjusted_messages);
++    auto rendered          = common_chat_template_render_prompt(tmpl, inputs, /* messages_override = */ adjusted_messages);
++    data.prompt            = std::move(rendered.prompt);
++    data.generation_prompt = std::move(rendered.generation_prompt);
+     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+     data.preserved_tokens  = {
+         "[THINK]",
+--- a/common/parsers/parsers.h
++++ b/common/parsers/parsers.h
+@@ -31,8 +31,13 @@ std::string common_chat_template_direct_apply_impl(
+     const std::optional<json> & tools_override = std::nullopt,
+     const std::optional<json> & additional_context = std::nullopt);
+ 
+-// the suffix a template appends when add_generation_prompt is set
+-std::string common_chat_template_generation_prompt_impl(
++// the prompt a template renders, and its generation prompt: the suffix the template appends when
++// add_generation_prompt is set. The prompt is one of the generation prompt's two renders, rendered once.
++struct common_chat_rendered_prompt {
++    std::string prompt;
++    std::string generation_prompt;
++};
++common_chat_rendered_prompt common_chat_template_render_prompt(
+     const common_chat_template & tmpl,
+     const autoparser::generation_params & inputs,
+     const std::optional<json> & messages_override = std::nullopt,
+--- a/common/parsers/qwen3-coder.cpp
++++ b/common/parsers/qwen3-coder.cpp
+@@ -6,8 +6,9 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
+ 
+     const std::string GEN_PREFIX = "<|im_start|>assistant\n";
+ 
+-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
++    auto rendered          = common_chat_template_render_prompt(tmpl, inputs);
++    data.prompt            = std::move(rendered.prompt);
++    data.generation_prompt = std::move(rendered.generation_prompt);
+     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+ 
+     auto supports_reasoning = tmpl.source().find("<think>") != std::string::npos;

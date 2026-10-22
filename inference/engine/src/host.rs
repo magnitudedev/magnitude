@@ -2,7 +2,8 @@
 //!
 //! One resolution produces them (`EngineConfiguration::resolve`); request
 //! preparation, host-only operations (count, template apply, properties) and
-//! loads all share that value. They never open a device.
+//! loads all share that value, a load's bounded to the images its device
+//! encodes. They never open a device.
 
 use crate::error::{ArtifactError, RequestError, ResolveError, UnsupportedModel, UnsupportedReason};
 use crate::families;
@@ -16,15 +17,16 @@ use magnitude_chat::{
     artifacts::{gguf_byte_bpe, gguf_templates},
     request::ImageInput,
 };
-use magnitude_executor::image_cell_limit;
+use magnitude_executor::{image_cell_limit, MAX_IMAGE_CELLS};
 use magnitude_family_contracts::{
-    FamilyError, FamilyInputAdapter, MarkerTokens, ModelDefinition, ModelFamily,
+    FamilyError, MarkerTokens, ModelDefinition, ModelFamily, ModelInputAdapter,
     PreparedModelInput, TokenPlan,
 };
 use std::{fmt, sync::Arc};
 
 /// The package's chat and input semantics: tokenizer, templates, media
 /// processor and the recognized family's input adapter.
+#[derive(Clone)]
 pub struct HostArtifacts {
     package: Arc<Package>,
     family: &'static dyn ModelFamily,
@@ -35,11 +37,11 @@ pub struct HostArtifacts {
     /// host-only sizing (counting).
     declared: ModelDefinition,
     tokenizer: Arc<ByteBpeTokenizer>,
-    templates: TemplateBundle,
+    templates: Arc<TemplateBundle>,
     /// The templates' header-only chat facts, established once.
     inspection: TemplateInspection,
     media: Option<ImageProcessor>,
-    input_adapter: FamilyInputAdapter,
+    input_adapter: Arc<dyn ModelInputAdapter + Send + Sync>,
 }
 
 struct TokenizerMarkers<'a>(&'a ByteBpeTokenizer);
@@ -266,7 +268,8 @@ impl HostArtifacts {
     /// tokenizer, templates, media processor and input adapter.
     /// `served_context` bounds the served definition within the declared one;
     /// `launch_rows`, a load's launch row bound, bounds its image resize to the
-    /// cells that load's vision graphs encode.
+    /// cells a load on any device encodes ([`Self::within_image_cells`]
+    /// bounds it to one device's).
     pub(crate) fn interpret(
         package: Package,
         served_context: Option<usize>,
@@ -290,13 +293,9 @@ impl HostArtifacts {
         let unsupported =
             |detail: String| ResolveError::Unsupported(UnsupportedModel::unreadable(detail));
         if let Some(launch_rows) = launch_rows {
-            let cells = image_cell_limit(&definition, launch_rows)
+            let cells = image_cell_limit(&definition, launch_rows, MAX_IMAGE_CELLS)
                 .map_err(|error| unsupported(error.to_string()))?;
-            if let Some(vision) = definition.vision.as_mut() {
-                vision
-                    .bound_cells(cells as u64)
-                    .map_err(|error| unsupported(error.to_string()))?;
-            }
+            bound_images(&mut definition, cells).map_err(unsupported)?;
         }
         let tokenizer = Arc::new(
             gguf_byte_bpe(
@@ -316,19 +315,11 @@ impl HostArtifacts {
         let inspection = templates
             .inspect()
             .map_err(|detail| ResolveError::Unsupported(UnsupportedModel::chat_template(detail)))?;
-        let media = definition
-            .vision
-            .as_ref()
-            .map(|vision| {
-                let config = vision
-                    .image_processor_config()
-                    .map_err(|error| unsupported(error.to_string()))?;
-                ImageProcessor::new(config).map_err(unsupported)
-            })
-            .transpose()?;
+        let media = media_processor(&definition).map_err(unsupported)?;
         let input_adapter = family
             .input_adapter(&definition, &TokenizerMarkers(&tokenizer))
-            .map_err(|error| ResolveError::Unsupported(error.into()))?;
+            .map_err(|error| ResolveError::Unsupported(error.into()))?
+            .into();
         Ok(Self {
             package: Arc::new(package),
             family,
@@ -336,11 +327,29 @@ impl HostArtifacts {
             draft_unavailable,
             declared,
             tokenizer,
-            templates,
+            templates: Arc::new(templates),
             inspection,
             media,
             input_adapter,
         })
+    }
+
+    /// These artifacts for a load whose device encodes at most `cells` cells
+    /// per image: the served image resize and its media processor bounded to
+    /// them, so a larger image is resized down rather than refused. Shared
+    /// unchanged when the served resize admits no more.
+    pub(crate) fn within_image_cells(self: Arc<Self>, cells: usize) -> Result<Arc<Self>, String> {
+        let Some(vision) = &self.definition.vision else {
+            return Ok(self);
+        };
+        let served = vision.max_cells().map_err(|error| error.to_string())?;
+        if served <= cells as u64 {
+            return Ok(self);
+        }
+        let mut bounded = (*self).clone();
+        bound_images(&mut bounded.definition, cells)?;
+        bounded.media = media_processor(&bounded.definition)?;
+        Ok(Arc::new(bounded))
     }
 
     /// Open and interpret a package at its declared context.
@@ -455,6 +464,30 @@ impl HostArtifacts {
             .prepare(definition, token_plan, &media)
             .map_err(|error| invalid(error.to_string()))
     }
+}
+
+/// Bound `definition`'s image resize to at most `cells` cells per image.
+fn bound_images(definition: &mut ModelDefinition, cells: usize) -> Result<(), String> {
+    match definition.vision.as_mut() {
+        Some(vision) => vision
+            .bound_cells(cells as u64)
+            .map_err(|error| error.to_string()),
+        None => Ok(()),
+    }
+}
+
+/// The media processor of `definition`'s image resize, when it reads images.
+fn media_processor(definition: &ModelDefinition) -> Result<Option<ImageProcessor>, String> {
+    definition
+        .vision
+        .as_ref()
+        .map(|vision| {
+            let config = vision
+                .image_processor_config()
+                .map_err(|error| error.to_string())?;
+            ImageProcessor::new(config)
+        })
+        .transpose()
 }
 
 /// A tokenizer whose vocabulary is not the model's: the package's tokenizer
@@ -670,6 +703,58 @@ mod tests {
                 detail: "not a head of this target".into()
             }]
         );
+    }
+
+    /// QA (pq-deb13, 4 vCPU): a 2560×1600 image was one 4000-cell encode
+    /// that held the CPU engine for ~57 minutes after its client left. A
+    /// load's host resizes images to the cells its device encodes: on the
+    /// CPU a large image is resized down to them rather than refused, and on
+    /// a GPU it encodes as the resolved host resizes it.
+    #[test]
+    fn a_large_image_is_resized_to_the_cells_its_device_encodes() {
+        use magnitude_artifacts::{ArtifactIdentity, PackageIdentity};
+        use magnitude_executor::{max_image_cells, CPU_IMAGE_CELLS};
+        use magnitude_family_common::headers;
+        use seismic::BackendName;
+        let mut resolved = magnitude_family_qwen35::Qwen35Family
+            .inspect(
+                &headers::catalog("qwen3.5-4b__target-gguf:q4"),
+                Some(&headers::catalog("qwen3.5-4b__projector")),
+                PackageIdentity {
+                    target: ArtifactIdentity([7; 32]),
+                    projector: Some(ArtifactIdentity([8; 32])),
+                },
+            )
+            .unwrap();
+        let any_device = image_cell_limit(&resolved, 512, MAX_IMAGE_CELLS).unwrap();
+        bound_images(&mut resolved, any_device).unwrap();
+        let cell = {
+            let p = &resolved.vision.as_ref().unwrap().preprocessing;
+            (p.patch * p.merge) as usize
+        };
+        let encoded = |definition: &ModelDefinition, height, width| {
+            let (height, width) = media_processor(definition)
+                .unwrap()
+                .unwrap()
+                .resized_size(height, width)
+                .unwrap();
+            height * width / (cell * cell)
+        };
+        assert_eq!(encoded(&resolved, 1600, 2560), 4000);
+        for (backend, large, small) in [
+            (BackendName::Cpu, CPU_IMAGE_CELLS, 64),
+            (BackendName::Metal, 4000, 64),
+            (BackendName::Cuda, 4000, 64),
+            (BackendName::Vulkan, 4000, 64),
+        ] {
+            let cells = image_cell_limit(&resolved, 512, max_image_cells(backend)).unwrap();
+            let mut load = resolved.clone();
+            bound_images(&mut load, cells).unwrap();
+            let resized = encoded(&load, 1600, 2560);
+            assert!(resized <= cells, "{backend:?}: {resized} cells over {cells}");
+            assert!(resized * 4 >= large * 3, "{backend:?}: {resized} cells, not ~{large}");
+            assert_eq!(encoded(&load, 256, 256), small, "{backend:?}");
+        }
     }
 
     #[test]

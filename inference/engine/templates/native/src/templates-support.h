@@ -70,6 +70,8 @@ struct tool_relaxation {
     common_chat_schema_relaxation relaxation;
 };
 extern thread_local std::vector<tool_relaxation> relaxations;
+// Conversation renders of the current operation, drained by the ABI at operation boundaries.
+extern thread_local uint64_t renders;
 void relax(const std::string & tool, const common_chat_schema & node, const std::string & keyword,
            common_chat_schema_relaxation::reason_kind reason);
 }

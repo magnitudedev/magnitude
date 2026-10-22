@@ -1,7 +1,7 @@
 //! What the engine's own kernels achieve on an executor (spec §2.14): for
 //! each weight format a load can hold resident, the weight bytes its decode
 //! projection streams per second along each allocation route of its
-//! placements and the FLOPs per second of its prefill projection; what its
+//! placements and the FLOPs per second of its projection over many rows; what its
 //! decode attention costs per call and per history byte over each history
 //! layout, how much slower its calls run composed in a step than alone,
 //! what a launch costs inside a sealed graph, and what a step costs on the
@@ -25,10 +25,10 @@
 //! subnormal a CPU would slow on.
 //!
 //! The kernels are few, and each is formed once per job ([`Programs`]): two
-//! `dense_expand` programs per format at H = 4096 and F = [`FEATURES`], one
-//! held to the decode projection's one row and one to the prefill
-//! projection's 512 ([`Rows`]: each forms only the launches its rows
-//! select), one `dense_output` at the
+//! `dense_expand` programs per format at H = 4096 and the executor's F
+//! ([`Sizes`]), one held to the decode projection's one row and one to the
+//! matrix throughput's rows ([`Rows`]: each forms only the launches its
+//! rows select), one `dense_output` at the
 //! composition chain's shape, the decode attention over each history
 //! layout, and `conditioning_overlay`. Every route, size and depth reuses
 //! them. Forming a kernel is a compile (0.9 s on an M4 Pro's Metal, 1.5 to
@@ -49,7 +49,7 @@
 //! depth. A streaming kernel's figure is timed with its calls rotating
 //! through as many argument sets as span four times the largest cache that
 //! can serve them ([`CACHE_MULTIPLE`]), so the bytes come from memory: a
-//! projection's sets at F = [`FEATURES`] hold tens of megabytes each, and a
+//! projection's sets hold megabytes to tens of megabytes each, and a
 //! history's, at a depth meeting the 100-launch rule, at least the bytes it
 //! reads in 50 launch costs, so a rotation's sets stay few. A rotation at
 //! one token of dense history (4 KiB) would take 262,144 sets over a 256
@@ -77,7 +77,8 @@ use seismic::measure::{Attempt, Measure, Outcome, Reason, Record, RecordStore, T
 use seismic::{
     AccessPathId, AccessRoute, BoundEntry, CallError, DType, Device, DeviceTopology, Element,
     Entry, Executor, GraphTiming, Identity, KernelIdentity, Measurer, NativeKernel,
-    NativeSpecialization, Point, PointKey, SlabLayout, SlabRegion, SlabTensor, StorageKind, Tensor,
+    NativeSpecialization, Point, PointKey, Reported, ReportedBy, SlabLayout, SlabRegion,
+    SlabTensor, StorageKind, Tensor,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -87,13 +88,48 @@ use std::sync::Arc;
 /// reference model's (Qwen3.5-9B at Q4).
 const CHAIN_FORMAT: Encoding = Encoding::Q4K;
 
-/// The F of every `dense_expand` program, where the executor's largest
-/// allocation holds a weight of it (else the largest power of two below
-/// that does). At one row a call reads two Q4_K weights of 16384 × 4096
-/// (75 MB): 128 µs at the 588 GB/s an RTX 3090 streams and 321 µs at an M4
-/// Pro's 235 GB/s, against their launch costs of 1.06 and 1.53 µs, so
-/// launching is under 1% of the call (0.8% and 0.5%).
-const FEATURES: u64 = 16384;
+/// How large the walk's projections are on an executor: the F of every
+/// `dense_expand` program, where the executor's largest allocation holds a
+/// weight of it (else the largest power of two below that does), and the
+/// rows of the matrix throughput's.
+///
+/// On a GPU, F is 16384: at one row a call reads two Q4_K weights of 16384
+/// × 4096 (75 MB), 128 µs at the 588 GB/s an RTX 3090 streams and 321 µs at
+/// an M4 Pro's 235 GB/s, against their launch costs of 1.06 and 1.53 µs, so
+/// launching is under 1% of the call (0.8% and 0.5%). Its arithmetic reaches
+/// its throughput only over many rows, which reuse each weight: 512, the
+/// prefill chunk loads run (`programs::invocation_demand`, the largest
+/// tuning row class within the standard service's 512 launch rows).
+///
+/// The CPU's kernels are arithmetic where a GPU's stream: on a 4-vCPU EPYC
+/// 7763 (2026-10-21) a 512-row call of the default specialization took
+/// about 512 one-row calls (Q4G32S 33 s), 4 to 52 s each, so the 17 formats'
+/// throughputs took most of an hour. Its throughput is reached at the 8
+/// rows a decode step is priced at most (every format within 5% of its 512
+/// × 16384 figure), and F 4096, the reference H, is as far from its 46 ns
+/// launch: a one-row call reads 19 MB, at least 2.4 ms. Every projection
+/// point is then a quarter as long, and a throughput's a 256th.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sizes {
+    features: u64,
+    matrix_rows: u64,
+}
+
+impl Sizes {
+    /// The sizes of `backend`'s points.
+    fn of(backend: seismic::BackendName) -> Self {
+        match backend {
+            seismic::BackendName::Cpu => Self {
+                features: HIDDEN,
+                matrix_rows: crate::operators::attention::graph::DECODE_ROWS,
+            },
+            _ => Self {
+                features: 16384,
+                matrix_rows: 512,
+            },
+        }
+    }
+}
 
 /// The representation `backend` keeps [`CHAIN_FORMAT`] weights resident as.
 fn chain_element(backend: seismic::BackendName) -> Option<Element> {
@@ -125,11 +161,6 @@ pub const HISTORY_LAYOUTS: [KvCodec; 2] = [KvCodec::Dense, KvCodec::AffineK8V4];
 /// model's (Qwen3.5-9B).
 const HIDDEN: u64 = 4096;
 
-/// The rows of the prefill projection: the prefill chunk loads run
-/// (`programs::invocation_demand`, the largest tuning row class within the
-/// standard service's 512 launch rows).
-const PREFILL_ROWS: u64 = 512;
-
 /// The calls of the launch graph and of the composition chain: the regime a
 /// step is priced in (a decode step makes 100 to 300 calls).
 const GRAPH_CALLS: usize = 256;
@@ -146,6 +177,27 @@ const CHAIN_LAYER_CALLS: usize = 4;
 
 /// How many launch costs one sized call takes at least.
 const LAUNCH_MULTIPLE: f64 = 100.;
+
+/// The part of a history call's time below which its bytes' time from
+/// memory leaves it unrotated: half the tolerance a median is resolved to
+/// ([`seismic::measure::MEDIAN_TOLERANCE`]), so reading every byte from
+/// memory, with nothing of it overlapping the call's other work, would move
+/// the call by less than its measurement can tell. A GPU's attention reads
+/// near its memory's rate, far above it; a CPU's 0.3% to 1% of its call
+/// (a 4-vCPU EPYC 7763, 2026-10-21).
+const UNROTATED: f64 = seismic::measure::MEDIAN_TOLERANCE / 2.;
+
+/// The device seconds a point's samples cover at most beyond the one that
+/// reaches it, unless its median is resolved first. A GPU's points resolve
+/// in milliseconds, and a CPU's projection points in under 2 s (eight
+/// samples, the fewest that bound a median at one in twenty, of calls of 2
+/// to 220 ms on a 4-vCPU EPYC 7763): they are resolved as without it. A
+/// CPU's history rotation or composition chain takes 0.5 to 1.5 s a sample
+/// there, which eight samples and their leads would make 15 s a point; two
+/// such samples of hundreds of calls each agree within a few percent, inside
+/// the 10% a median is resolved to. A point then takes at most this, one
+/// more sample and the two leads around them ([`seismic::measure::Stop`]).
+pub const SAMPLING_SECONDS: f64 = 2.0;
 
 /// How many times the largest cache serving it a rotation spans (sized
 /// beyond the cache, spec §2.10). Under the rotation's cyclic access an LRU
@@ -211,7 +263,7 @@ pub struct WeightRate {
 pub struct MatrixCosts {
     /// The resident representation the weights take on the executor.
     pub format: Element,
-    /// FLOPs per second of `dense_expand` at 512 rows.
+    /// FLOPs per second of `dense_expand` at the executor's matrix rows.
     pub flops: MeasuredCost,
     /// The program's F.
     pub features: u64,
@@ -531,20 +583,20 @@ impl<E: Entry> Clone for Formation<E> {
     }
 }
 
-/// The rows a formed projection serves: one, a decode step's, or
-/// [`PREFILL_ROWS`], a prefill chunk's. A kernel formed for one forms only
-/// the launches those rows select, and is never called at others.
+/// The rows a formed projection serves: one, a decode step's, or the
+/// matrix throughput's ([`Sizes`]). A kernel formed for one forms only the
+/// launches those rows select, and is never called at others.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Rows {
     Decode,
-    Prefill,
+    Matrix,
 }
 
 impl Rows {
-    fn count(self) -> u64 {
+    fn count(self, sizes: Sizes) -> u64 {
         match self {
             Self::Decode => 1,
-            Self::Prefill => PREFILL_ROWS,
+            Self::Matrix => sizes.matrix_rows,
         }
     }
 }
@@ -604,7 +656,7 @@ impl<E: Entry> Formation<E> {
     fn form(
         &self,
         device: &Device,
-        rows: Option<Rows>,
+        rows: Option<u64>,
     ) -> Result<NativeKernel<E>, ExecutorCostsError> {
         let statics = self.statics(device.backend())?;
         let specialization = self
@@ -615,7 +667,7 @@ impl<E: Entry> Formation<E> {
                 ExecutorCostsError(format!("`{}` admits nothing at {statics:?}", E::NAME))
             })?;
         let specialization = match rows {
-            Some(rows) => specialization.with_range(SELECTED_ROWS, rows.count(), rows.count()),
+            Some(rows) => specialization.with_range(SELECTED_ROWS, rows, rows),
             None => specialization,
         };
         self.entry
@@ -629,6 +681,7 @@ impl<E: Entry> Formation<E> {
 /// attention over each layout and `conditioning_overlay`.
 #[derive(Clone)]
 struct ProgramSet {
+    sizes: Sizes,
     /// Each measured format with its F and program.
     expands: Vec<(Element, u64, Formation<dense_expand::Entry>)>,
     /// The chain's down projection, at its format's F.
@@ -639,18 +692,24 @@ struct ProgramSet {
 }
 
 impl ProgramSet {
-    /// The programs of `formats` ([`measured_formats`]) on an executor
-    /// whose largest allocation is `largest`, the chain in `chain`.
-    fn new(formats: &[Element], chain: Element, largest: u64) -> Result<Self, ExecutorCostsError> {
+    /// The programs of `formats` ([`measured_formats`]) at `sizes` on an
+    /// executor whose largest allocation is `largest`, the chain in `chain`.
+    fn new(
+        sizes: Sizes,
+        formats: &[Element],
+        chain: Element,
+        largest: u64,
+    ) -> Result<Self, ExecutorCostsError> {
         let expands = formats
             .iter()
             .map(|&format| {
-                let features = features(format, largest)?;
+                let features = features(sizes, format, largest)?;
                 Ok((format, features, expand(format, features)))
             })
             .collect::<Result<Vec<_>, ExecutorCostsError>>()?;
         Ok(Self {
-            output: output(chain, features(chain, largest)?),
+            sizes,
+            output: output(chain, features(sizes, chain, largest)?),
             expands,
             dense: attend::<attention_decode::Entry>(KvCodec::Dense)?,
             affine: attend::<attention_decode_k8v4::Entry>(KvCodec::AffineK8V4)?,
@@ -691,8 +750,7 @@ impl ProgramSet {
             .name("measurement-formation".into())
             .spawn(move || {
                 let decodes = (0..set.expands.len()).map(|index| Job::Expand(index, Rows::Decode));
-                let prefills =
-                    (0..set.expands.len()).map(|index| Job::Expand(index, Rows::Prefill));
+                let matrices = (0..set.expands.len()).map(|index| Job::Expand(index, Rows::Matrix));
                 // The attention programs are one long compile each (the
                 // affine one's 1.2 s alone on an RTX 3090's Vulkan, against
                 // 0.7 s for a decode projection): they start first, beside
@@ -702,24 +760,24 @@ impl ProgramSet {
                     .into_iter()
                     .chain(decodes)
                     .chain([Job::Copy, Job::Output])
-                    .chain(prefills)
+                    .chain(matrices)
                     .collect::<Vec<_>>();
                 let formed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     seismic::Workers::of_the_host().each(&jobs, |job| match *job {
                         Job::Expand(index, rows) => {
-                            let (_, decode, prefill) = &forming.expands[index];
-                            let formed = set.expands[index].2.form(&device, Some(rows));
+                            let (_, decode, matrix) = &forming.expands[index];
+                            let formed = set.expands[index]
+                                .2
+                                .form(&device, Some(rows.count(set.sizes)));
                             match rows {
                                 Rows::Decode => decode.set(formed),
-                                Rows::Prefill => prefill.set(formed),
+                                Rows::Matrix => matrix.set(formed),
                             }
                         }
                         Job::Copy => forming.copy.set(set.copy.form(&device, None)),
                         Job::Dense => forming.dense.set(set.dense.form(&device, None)),
                         Job::Affine => forming.affine.set(set.affine.form(&device, None)),
-                        Job::Output => forming
-                            .output
-                            .set(set.output.form(&device, Some(Rows::Decode))),
+                        Job::Output => forming.output.set(set.output.form(&device, Some(1))),
                     })
                 }));
                 if formed.is_err() {
@@ -741,10 +799,10 @@ enum Job {
     Output,
 }
 
-/// The F of `format`'s program: [`FEATURES`], halved while a weight of it
-/// exceeds the executor's largest allocation.
-fn features(format: Element, largest: u64) -> Result<u64, ExecutorCostsError> {
-    let mut features = FEATURES;
+/// The F of `format`'s program: the executor's ([`Sizes`]), halved while a
+/// weight of it exceeds the executor's largest allocation.
+fn features(sizes: Sizes, format: Element, largest: u64) -> Result<u64, ExecutorCostsError> {
+    let mut features = sizes.features;
     while expand_weight_bytes(format, features)? / 2 > largest {
         features /= 2;
         if features < QUERY_WIDTH {
@@ -762,7 +820,8 @@ fn features(format: Element, largest: u64) -> Result<u64, ExecutorCostsError> {
 /// failure as their own.
 #[derive(Clone)]
 struct Programs {
-    /// Each measured format's program for decode, then for prefill.
+    /// Each measured format's program for decode, then for the matrix
+    /// throughput.
     expands: Vec<(
         Element,
         Forming<dense_expand::Entry>,
@@ -833,23 +892,23 @@ impl Programs {
         format: Element,
         rows: Rows,
     ) -> Result<&NativeKernel<dense_expand::Entry>, ExecutorCostsError> {
-        let (_, decode, prefill) = self
+        let (_, decode, matrix) = self
             .expands
             .iter()
             .find(|(measured, _, _)| *measured == format)
             .expect("every measured format has a program");
         match rows {
             Rows::Decode => kernel(decode),
-            Rows::Prefill => kernel(prefill),
+            Rows::Matrix => kernel(matrix),
         }
     }
 
     /// Every program formed: no compile runs beside a point that touches
     /// the host.
     fn settled(&self) {
-        for (_, decode, prefill) in &self.expands {
+        for (_, decode, matrix) in &self.expands {
             decode.wait();
-            prefill.wait();
+            matrix.wait();
         }
         self.output.wait();
         self.dense.wait();
@@ -860,9 +919,9 @@ impl Programs {
     /// Every program not formed yet is never formed: the formation thread
     /// panicked.
     fn abandon(&self) {
-        for (_, decode, prefill) in &self.expands {
+        for (_, decode, matrix) in &self.expands {
             decode.abandon();
-            prefill.abandon();
+            matrix.abandon();
         }
         self.output.abandon();
         self.dense.abandon();
@@ -994,8 +1053,9 @@ impl Times for Measured<'_, '_> {
     ) -> Result<Timing, Stop<Self::Missing>> {
         let key = self.records.key(spec);
         let how = Measure {
-            stop: seismic::measure::Stop::Resolved {
+            stop: seismic::measure::Stop::Within {
                 error_rate: crate::SEARCH_SETTINGS.error_rate,
+                seconds: SAMPLING_SECONDS,
             },
             // The device time a sample covers at least, which sets its
             // repetitions: tuning's, the one owner.
@@ -1043,18 +1103,34 @@ impl Times for Measured<'_, '_> {
 
 /// The largest cache that can serve the executor's storage: its device's
 /// reported cache, at least [`UNREPORTED_CACHE`], the floor for the
-/// memory-side caches no API reports.
+/// memory-side caches no API reports. A host CPU's last-level caches as
+/// Linux or Windows reports them (every instance the executor's cores share,
+/// summed) are its largest, and stand alone: a rotation over four times them
+/// reads what one over 256 MiB does (on a 4-vCPU EPYC 7763 of 32 MiB, every
+/// weight rate within run-to-run spread over 128 MiB and over 1 GiB,
+/// 2026-10-21), in an eighth of the time, which on a CPU, whose kernels read
+/// a gigabyte in up to 1.5 s, is most of its job. macOS reports an Apple
+/// CPU's L2, behind which its system-level cache sits.
 fn largest_cache(topology: &DeviceTopology, executor: &Executor) -> u64 {
-    topology
+    match topology
         .physical_device(executor.physical())
         .and_then(|physical| physical.cache())
-        .map_or(UNREPORTED_CACHE, |cache| cache.value.max(UNREPORTED_CACHE))
+    {
+        Some(Reported {
+            value,
+            by: ReportedBy::LinuxSysfsCache | ReportedBy::WindowsProcessorCache,
+        }) => value,
+        Some(cache) => cache.value.max(UNREPORTED_CACHE),
+        None => UNREPORTED_CACHE,
+    }
 }
 
 /// The argument sets a rotation of calls each reading `bytes` takes so that
-/// its bytes span [`CACHE_MULTIPLE`] times `cache`: at least one.
+/// its bytes span [`CACHE_MULTIPLE`] times `cache`: at least two, so no call
+/// reads the bytes the call before it read (a CPU's f32 projection, one set
+/// of 134 MB over a 128 MiB span, read 15% faster than over two).
 fn rotation_sets(cache: u64, bytes: u64) -> u64 {
-    (CACHE_MULTIPLE * cache).div_ceil(bytes.max(1)).max(1)
+    (CACHE_MULTIPLE * cache).div_ceil(bytes.max(1)).max(2)
 }
 
 /// One allocation route of the executor's placements, and how an operand
@@ -1647,7 +1723,12 @@ fn largest_plane(layout: KvCodec, depth: u64) -> Result<u64, ExecutorCostsError>
 
 /// The slab store of one sequence's `layout` history at `depth` tokens, as
 /// the engine's geometry rule lays out a store of its `depth` + 1 rows: its
-/// rows per slab, regions, slab layout and slabs.
+/// rows per slab, regions, slab layout and slabs. A slab holds no more
+/// pages than the rows take: the rule's slabs fill a byte target that a
+/// shallow history reads a small part of, and every argument set of a
+/// rotation holds a store of its own, so a rotation of many shallow sets
+/// would allocate many times the bytes it spans (625 sets of 64 MiB, 41 GB,
+/// for the 1.7 MB a 4-vCPU EPYC's dense history reads at depth 420).
 fn history_store(
     layout: KvCodec,
     depth: u64,
@@ -1659,7 +1740,8 @@ fn history_store(
         0,
     )
     .map_err(ExecutorCostsError)?;
-    let rows_per_slab = geometry.slab_rows as u64;
+    let page_rows = geometry.page_rows as u64;
+    let rows_per_slab = (geometry.slab_rows as u64).min(rows.next_multiple_of(page_rows));
     let regions = planes(layout)?
         .into_iter()
         .map(|(element, width)| SlabRegion {
@@ -2396,7 +2478,7 @@ fn walk<T: Times>(
             backend.as_str()
         )))
     })?;
-    let programs = ProgramSet::new(formats, chain_format, largest)?;
+    let programs = ProgramSet::new(Sizes::of(backend), formats, chain_format, largest)?;
     let copy_identity = programs.copy.identity(backend)?;
     let (routes, placements) = Route::all(topology, executor)?;
     // Device storage's first route: where the figures not of a route (the
@@ -2605,7 +2687,7 @@ fn walk<T: Times>(
         samples: chain.samples,
     };
 
-    // Each format's throughput at 512 rows, from its prefill program.
+    // Each format's throughput at the executor's matrix rows.
     let mut matrices = Vec::new();
     for &format in formats {
         match matrix(backend, &programs, format, device_route, times) {
@@ -2707,8 +2789,8 @@ fn weight_point(features: u64, sets: u64, route: &Route) -> [(&'static str, u64)
 }
 
 /// The matrix throughput of weights resident as `format`: its
-/// `dense_expand` program at 512 rows over one argument set (arithmetic,
-/// which a cache does not serve).
+/// `dense_expand` program at the executor's matrix rows ([`Sizes`]) over
+/// one argument set (arithmetic, which a cache does not serve).
 fn matrix<T: Times>(
     backend: seismic::BackendName,
     programs: &ProgramSet,
@@ -2717,24 +2799,25 @@ fn matrix<T: Times>(
     times: &mut T,
 ) -> Result<MatrixCosts, Stop<T::Missing>> {
     let (features, formation) = programs.expand(format);
+    let rows = Rows::Matrix.count(programs.sizes);
     let timing = times.time(
         PointSpec::new(
             vec![formation.identity(backend)?],
-            &[("rows", PREFILL_ROWS)],
+            &[("rows", rows)],
             &weight_point(features, 1, route),
         ),
         programs,
         &mut calls::<dense_expand::Entry, _>(
-            move |formed: &Programs| formed.expand(format, Rows::Prefill),
+            move |formed: &Programs| formed.expand(format, Rows::Matrix),
             move |device, backings| {
-                ExpandCase::new(device, backings, format, route, PREFILL_ROWS, features, 1)
+                ExpandCase::new(device, backings, format, route, rows, features, 1)
             },
             ExpandCase::args,
         ),
     )?;
     // A multiply and an add per weight, per row, of the gate and the up
     // projection.
-    let flops = 2.0 * 2.0 * (PREFILL_ROWS * features * HIDDEN) as f64;
+    let flops = 2.0 * 2.0 * (rows * features * HIDDEN) as f64;
     Ok(MatrixCosts {
         format,
         flops: MeasuredCost::rate(flops, &timing),
@@ -2752,7 +2835,9 @@ fn matrix<T: Times>(
 /// exceeds the largest allocation, and doubles until a timed call is sized
 /// or no deeper plane fits; the line runs through that depth and twice it,
 /// or, where the allocation admits no deeper, through half of it and it,
-/// each timed rotating through the sets that span the cache.
+/// each timed rotating through the sets that span the cache, or over one
+/// set where the searched call's bytes from memory are too small a part of
+/// it to move it ([`UNROTATED`]).
 fn history<E: Attention, T: Times>(
     backend: seismic::BackendName,
     programs: &ProgramSet,
@@ -2796,14 +2881,14 @@ fn history<E: Attention, T: Times>(
     while depth > 1 && !fits(depth)? {
         depth /= 2;
     }
-    loop {
+    let searched = loop {
         let timing = time(depth, 1, times)?;
         if (sized(&timing, launch) && timing.median >= 2.0 * one_token.median) || !fits(2 * depth)?
         {
-            break;
+            break timing;
         }
         depth *= 2;
-    }
+    };
     let (near_depth, far_depth) = if fits(2 * depth)? {
         (depth, 2 * depth)
     } else {
@@ -2816,16 +2901,22 @@ fn history<E: Attention, T: Times>(
                 .into(),
         )));
     }
-    let near = time(
-        near_depth,
-        rotation_sets(cache, near_depth * per_token),
-        times,
-    )?;
-    let far = time(
-        far_depth,
-        rotation_sets(cache, far_depth * per_token),
-        times,
-    )?;
+    // Where the searched call's bytes, read from memory at the activation
+    // rate, are a small part of its time, where they come from cannot move
+    // it: its kernel is that much slower than streaming them. Each depth is
+    // then timed over one argument set, a call of milliseconds rather than a
+    // rotation of a second (a CPU's attention, its history read at 110 to 310
+    // MB/s against 30 GB/s streaming), and resolved; else over a rotation.
+    let rotated = (depth * per_token) as f64 / activation_rate > UNROTATED * searched.median;
+    let sets = |depth: u64| {
+        if rotated {
+            rotation_sets(cache, depth * per_token)
+        } else {
+            1
+        }
+    };
+    let near = time(near_depth, sets(near_depth), times)?;
+    let far = time(far_depth, sets(far_depth), times)?;
     if !(far.median > near.median) {
         return Err(Stop::Failed(ExecutorCostsError(format!(
             "{far_depth} tokens took no longer than {near_depth}"
@@ -2841,14 +2932,19 @@ fn history<E: Attention, T: Times>(
         let rate = |seconds: f64| between / (seconds - near.median).max(f64::MIN_POSITIVE);
         (rate(slowest), rate(fastest))
     });
+    // A call takes at least its bytes' time: where the line meets zero
+    // tokens below zero seconds (an arithmetic-bound attention's fixed part,
+    // well under a millisecond, read at depths whose calls take tens of
+    // them), the fixed cost is none.
     let near_bytes = bytes(near_depth) / rate;
+    let fixed = |seconds: f64| (seconds - near_bytes).max(0.);
     Ok(HistoryCosts {
         layout,
         fixed_seconds: MeasuredCost {
-            value: near.median - near_bytes,
+            value: fixed(near.median),
             interval: near
                 .interval
-                .map(|(fastest, slowest)| (fastest - near_bytes, slowest - near_bytes)),
+                .map(|(fastest, slowest)| (fixed(fastest), fixed(slowest))),
             samples: near.samples,
         },
         bytes_per_second: MeasuredCost {
@@ -2962,14 +3058,38 @@ mod tests {
         }
     }
 
+    /// A CPU's projections are sized to its arithmetic, every other
+    /// backend's to a GPU's: a CPU measures F 4096 and its throughput at the
+    /// 8 rows a decode step is priced at most, so no point's call takes
+    /// seconds.
+    #[test]
+    fn a_cpus_projections_are_sized_to_its_arithmetic() {
+        for backend in seismic::BackendName::ALL {
+            let sizes = Sizes::of(backend);
+            if backend == seismic::BackendName::Cpu {
+                assert_eq!(sizes.features, HIDDEN);
+                assert_eq!(
+                    sizes.matrix_rows,
+                    crate::operators::attention::graph::DECODE_ROWS
+                );
+            } else {
+                assert_eq!((sizes.features, sizes.matrix_rows), (16384, 512));
+            }
+        }
+    }
+
     /// Every program of the walk gives each static its entry declares on
     /// every backend, so no figure goes unmeasured for want of one.
     #[test]
     fn every_walk_program_gives_its_statics_on_every_backend() {
         for backend in seismic::BackendName::ALL {
-            let programs =
-                ProgramSet::new(&measured_formats(backend), chain_element(backend).unwrap(), 1 << 34)
-                    .unwrap();
+            let programs = ProgramSet::new(
+                Sizes::of(backend),
+                &measured_formats(backend),
+                chain_element(backend).unwrap(),
+                1 << 34,
+            )
+            .unwrap();
             let mut statics = vec![
                 programs.output.statics(backend),
                 programs.dense.statics(backend),
@@ -2981,6 +3101,16 @@ mod tests {
                 given.unwrap_or_else(|error| panic!("{backend:?}: {}", error.0));
             }
         }
+    }
+
+    /// A rotation spans four times the cache in at least two sets: a call
+    /// never reads the bytes the call before it read.
+    #[test]
+    fn a_rotation_takes_at_least_two_sets() {
+        assert_eq!(rotation_sets(32 << 20, 134 << 20), 2);
+        assert_eq!(rotation_sets(32 << 20, 64 << 20), 2);
+        assert_eq!(rotation_sets(32 << 20, 1 << 20), 128);
+        assert_eq!(rotation_sets(UNREPORTED_CACHE, 75 << 20), 14);
     }
 
     /// The measured formats hold the activation dtype's and the chain's,

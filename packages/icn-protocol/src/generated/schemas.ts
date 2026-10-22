@@ -464,6 +464,7 @@ export const CatalogModel = S.Struct({
   description: S.String,
   desired: S.suspend((): S.Schema<ReadyModel, ReadyModelEncoded> => ReadyModel),
   displayName: S.String,
+  drafterWithheld: S.Boolean,
   fidelityRank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   id: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
   intelligence: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -497,7 +498,6 @@ export const CatalogModelState = S.Union(
   S.extend(S.TaggedStruct("NotInstalled", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
     S.TaggedStruct("Installed", {
-      drafterWithheld: S.Boolean,
       effective: S.suspend((): S.Schema<EffectiveModel, EffectiveModelEncoded> => EffectiveModel),
       installation: S.suspend((): S.Schema<ModelInstallation, ModelInstallationEncoded> => ModelInstallation),
       missingComponents: S.Array(

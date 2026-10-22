@@ -29,9 +29,9 @@ pub use estimate::{
     StepSeconds,
 };
 pub use executor_costs::{
-    ExecutorCosts, ExecutorCostsError, Figure, HistoryCosts, MatrixCosts,
-    MeasuredCost, Measurement, Placement, Placements, StoredCosts, Unmeasured, WeightRate,
-    HISTORY_LAYOUTS,
+    ExecutorCosts, ExecutorCostsError, Figure, HistoryCosts, MatrixCosts, MeasuredCost,
+    Measurement, Placement, Placements, StoredCosts, Unmeasured, WeightRate, HISTORY_LAYOUTS,
+    SAMPLING_SECONDS,
 };
 pub use launches::{Declarations, Kernel, Launches};
 

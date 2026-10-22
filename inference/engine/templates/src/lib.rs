@@ -122,6 +122,7 @@ pub struct PreparedDescription {
     /// Schema keywords the grammar does not enforce. Values generated under a
     /// relaxed schema may violate these keywords; every other keyword holds.
     pub relaxations: Vec<Relaxation>,
+    pub renders: u64,
 }
 
 /// What a relaxed schema constrains.

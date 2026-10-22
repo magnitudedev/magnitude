@@ -409,8 +409,8 @@ describe("local models state", () => {
             updateState: { _tag: "Current" },
             missingComponents,
             storedComponents: [],
-            drafterWithheld: false,
           },
+          drafterWithheld: false,
         },
       } as unknown as LocalModelSourcesState["catalogModels"][number]] },
       assessment: assessments([]),
@@ -432,6 +432,30 @@ describe("local models state", () => {
       ["Installed", [drafter]],
       ["Installed", []],
     ])
+  })
+
+  it("reports a catalog drafter withheld before the model is installed, as ICN works it out per model", () => {
+    const project = (localState: unknown) => projectLocalModels({
+      source: { ...sources([]), catalogModels: [{
+        id: "minicpm5-2b:gguf:q8",
+        source: {
+          aliases: Option.none(), description: "", displayName: "MiniCPM5 2B", fidelityRank: 1, intelligence: 1,
+          desired: { metadata: { storageBytes: 2_679_710_688 }, profile: { contextLength: 131_072 }, speculativeMethod: Option.none() },
+          drafterWithheld: true,
+          license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, quantizationAware: false,
+          releaseDate: "2026-09-01", sourceUrls: [], support: { level: "supported" }, variantLabel: "Q8",
+          localState,
+        },
+      } as unknown as LocalModelSourcesState["catalogModels"][number]] },
+      assessment: assessments([]),
+      operations: [],
+      runtime: [],
+      removals: new Map(),
+      config: customModelsConfig(),
+      downloads: [],
+    }).models[0]
+    const offered = project({ _tag: "NotInstalled" })
+    expect(offered?._tag === "Catalog" && [offered.drafterWithheld, offered.storageBytes]).toEqual([true, 2_679_710_688])
   })
 
   it("lists catalog models with their aliases and leaves hiding an external copy to ICN", () => {
@@ -457,8 +481,8 @@ describe("local models state", () => {
           updateState: { _tag: "Current" },
           missingComponents,
           storedComponents: [],
-          drafterWithheld: false,
         },
+        drafterWithheld: false,
         parameterization: { architecture: "dense", totalParameters: 1 },
         quantizationAware: false,
         releaseDate: "2026-08-29",
