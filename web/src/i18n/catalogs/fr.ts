@@ -652,4 +652,4 @@ export const fr = {
   noModelsDownloaded: "Aucun modèle téléchargé pour le moment. Trouvez-en un dans Découvrir.",
   couldNotCheckAvailableModels: "Impossible de vérifier les modèles disponibles",
   restartServerToApply: "{{reason}} Redémarrez le serveur Magnitude pour appliquer les modifications.",
-} satisfies typeof en
+} satisfies { [K in keyof typeof en]: string }
