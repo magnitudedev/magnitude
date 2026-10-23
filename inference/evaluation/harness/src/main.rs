@@ -3,19 +3,24 @@
 //! paths, `--artifacts`) and a fixture set, renders the fixtures through the
 //! engine's own serving chat path, and writes an evaluation result record
 //! (`result.json`, `specs/26-10-08/evaluation-contracts.md`) with its traces
-//! into a run directory.
+//! into a run directory. `mrig` runs it; each subcommand serves instruments:
 //!
 //! - `render`: the exact tokens of each fixture (`rendered.jsonl`), or with
 //!   `--stdin` one rendered fixture per request line, for sizing searches.
 //! - `time`: prefill and decode throughput at context lengths and
-//!   concurrency, and drafting acceptance with the catalog drafter.
+//!   concurrency (`step`).
 //! - `logits`: the distributions at every scored position (`logits.f32`,
-//!   `logits.json`).
+//!   `logits.json`), judged by `magnitude-references kl` (`kl`).
 //! - `draft`: the catalog drafter's proposals at anchors in the scored spans
-//!   (`draft.jsonl`).
-//! - `precision-probe` (development feature): the added KL of a pinned tuning
-//!   selection alongside dimensionless precision measurements from its trace
-//!   (`precision_probe.json`).
+//!   (`draft.jsonl`, `draft`).
+//! - `prepare`: the model's Prepare alone (its tuning search, publishing
+//!   records), imported nowhere: with `--tuning-survey`, the time of every
+//!   configuration of the surveyed entries at the model's points, from the
+//!   model's headers alone (a catalog header export opens as the model with
+//!   zero weights) (`kernel`).
+//!
+//! Every engine subcommand takes the development tuning tools
+//! ([`development`]): pins and the survey.
 //!
 //! Every request is rendered with `--request-options`, the request fields the
 //! serving benchmark sends (reasoning disabled by default), recorded in each
@@ -32,10 +37,9 @@ mod draft;
 mod engine;
 mod fixture;
 mod logits;
-#[cfg(feature = "precision-probe")]
-mod probe;
 mod record;
 mod render;
+mod selection;
 mod steps;
 mod time;
 mod tuning;
@@ -71,7 +75,6 @@ enum Command {
     /// missing.
     #[command(hide = true, name = engine::WORKER_COMMAND)]
     Worker {
-        #[cfg(feature = "tuning-survey")]
         #[command(flatten)]
         survey: development::SurveyArgs,
     },
@@ -88,7 +91,7 @@ enum Command {
         #[arg(long, conflicts_with_all = ["context", "output", "build_identity"])]
         stdin: bool,
     },
-    /// Prefill and decode throughput, and drafting acceptance.
+    /// Prefill and decode throughput.
     Time {
         #[command(flatten)]
         common: Common,
@@ -107,19 +110,19 @@ enum Command {
         #[arg(long, default_value_t = 32)]
         steps: usize,
         /// Decode steps whose device time is attributed by entry, each launch
-        /// timed alone (a diagnostic; a step's launches must fit the device's
-        /// timestamp buffer).
+        /// timed alone (a diagnostic).
         #[arg(long, default_value_t = 0)]
         attribution_steps: usize,
+        /// One further prefill sample whose device time is attributed by
+        /// entry, each launch timed alone (a diagnostic).
+        #[arg(long)]
+        prefill_attribution: bool,
         /// Prefill samples, the first of them cold.
         #[arg(long, default_value_t = 4)]
         prefill_samples: usize,
         /// Queue each decode step's successor before it completes, as served.
         #[arg(long, default_value = "on", value_parser = on_off, action = clap::ArgAction::Set)]
         lookahead: bool,
-        /// Skip drafting acceptance even when the catalog declares a drafter.
-        #[arg(long)]
-        no_drafting: bool,
     },
     /// Next-token distributions at every scored position.
     Logits {
@@ -143,6 +146,16 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         verify_width: usize,
     },
+    /// The model's Prepare alone: its tuning search, nothing imported.
+    Prepare {
+        #[command(flatten)]
+        common: Common,
+        #[command(flatten)]
+        engine: EngineArgs,
+        /// Context length the load would serve: the tuning points' histories.
+        #[arg(long)]
+        context: usize,
+    },
     /// The catalog drafter's proposals at anchors in the scored spans.
     Draft {
         #[command(flatten)]
@@ -162,17 +175,6 @@ enum Command {
         /// on the device (a diagnostic).
         #[arg(long)]
         attribute: bool,
-    },
-    /// The added KL of a pinned tuning selection against the defaults (and
-    /// references), alongside the trace's dimensionless precision measurements.
-    #[cfg(feature = "precision-probe")]
-    PrecisionProbe {
-        #[command(flatten)]
-        common: Common,
-        #[command(flatten)]
-        engine: EngineArgs,
-        #[command(flatten)]
-        probe: probe::ProbeArgs,
     },
 }
 
@@ -283,10 +285,8 @@ struct EngineArgs {
     /// Tune the run's first load afresh, ignoring stored tuning results.
     #[arg(long)]
     fresh_tuning: bool,
-    #[cfg(feature = "pinned-tuning")]
     #[command(flatten)]
     pin: development::PinArgs,
-    #[cfg(feature = "tuning-survey")]
     #[command(flatten)]
     survey: development::SurveyArgs,
 }
@@ -400,13 +400,10 @@ fn engine_options(
         .transpose()?;
     // A survey measures: it is installed in the worker process that runs a
     // model's Prepare, never here, where the model is loaded.
-    #[cfg(feature = "tuning-survey")]
     let worker_arguments = engine.survey.worker_arguments();
-    #[cfg(not(feature = "tuning-survey"))]
-    let worker_arguments = Vec::new();
     let development = Development {
-        #[cfg(feature = "pinned-tuning")]
-        pin: development::Pin::install(&engine.pin)?,
+        pin: development::Pin::install(&engine.pin, &inputs.run.path("selection.json"))?,
+        survey: engine.survey.clone(),
     };
     Ok((
         EngineOptions {
@@ -431,15 +428,14 @@ fn engine_options(
 
 /// The installed development tools, finished after the run.
 struct Development {
-    #[cfg(feature = "pinned-tuning")]
     pin: development::Pin,
+    survey: development::SurveyArgs,
 }
 
 impl Development {
     fn finish(self) -> Result<(), String> {
-        #[cfg(feature = "pinned-tuning")]
         self.pin.finish()?;
-        Ok(())
+        self.survey.report()
     }
 }
 
@@ -464,44 +460,15 @@ fn tuned(
 
 fn run(command: Command) -> Result<(), String> {
     match command {
-        Command::Worker {
-            #[cfg(feature = "tuning-survey")]
-            survey,
-        } => {
+        Command::Worker { survey } => {
             use magnitude_engine::worker::{
                 WorkerExit, serve_worker, transport::stdio_worker_transport,
             };
-            #[cfg(feature = "tuning-survey")]
             survey.install()?;
             match serve_worker(stdio_worker_transport()) {
                 WorkerExit::Prepared | WorkerExit::Shutdown => Ok(()),
                 exit => Err(format!("worker ended: {exit:?}")),
             }
-        }
-        #[cfg(feature = "precision-probe")]
-        Command::PrecisionProbe {
-            common,
-            engine,
-            probe,
-        } => {
-            if engine.pin.tuning_record.is_some()
-                || engine.pin.tuning_replay.is_some()
-                || engine.pin.tuning_defaults
-            {
-                return Err("the precision probe pins its own selections".into());
-            }
-            let inputs = Inputs::read(&common, "harness.precision_probe")?;
-            let (options, development) = engine_options(&engine, &inputs)?;
-            let measurement = probe::run(&inputs, &options, &probe)?;
-            development.finish()?;
-            let (mut measurements, traces) = tuned(&engine, &options)?;
-            measurements.insert("precision_probe".into(), measurement.result);
-            inputs.finish(
-                measurement.rendered_digest,
-                Some(vec![measurement.device]),
-                measurements,
-                traces,
-            )
         }
         Command::Render {
             common,
@@ -524,9 +491,9 @@ fn run(command: Command) -> Result<(), String> {
             warm,
             steps,
             attribution_steps,
+            prefill_attribution,
             prefill_samples,
             lookahead,
-            no_drafting,
         } => {
             if contexts.is_empty()
                 || concurrency.is_empty()
@@ -560,9 +527,9 @@ fn run(command: Command) -> Result<(), String> {
                     warm,
                     steps,
                     attribution_steps,
+                    prefill_attribution,
                     prefill_samples,
                     lookahead,
-                    drafting: !no_drafting,
                 },
             )?;
             development.finish()?;
@@ -570,10 +537,32 @@ fn run(command: Command) -> Result<(), String> {
             let (mut measurements, traces) = tuned(&engine, &options)?;
             measurements.insert("speed".into(), Value::from(timed.speed));
             measurements.insert("load".into(), timed.load);
-            if let Some(drafting) = timed.drafting {
-                measurements.insert("drafting".into(), drafting);
-            }
             inputs.finish(digest, Some(timed.devices), measurements, traces)
+        }
+        Command::Prepare {
+            common,
+            engine,
+            context,
+        } => {
+            let inputs = Inputs::read(&common, "harness.prepare")?;
+            let rendered = inputs.render(Some(context))?;
+            let digest = inputs.write_rendered(&rendered)?;
+            let (options, development) = engine_options(&engine, &inputs)?;
+            engine::prepare(
+                &inputs.artifacts.artifacts,
+                &options,
+                &engine::Load {
+                    drafter: false,
+                    proposals: None,
+                    context_tokens: context,
+                    decode_rows: 1,
+                    exported_logits_rows: 0,
+                    lookahead: true,
+                },
+            )?;
+            development.finish()?;
+            let (measurements, traces) = tuned(&engine, &options)?;
+            inputs.finish(digest, None, measurements, traces)
         }
         Command::Logits {
             common,

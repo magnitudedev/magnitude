@@ -474,6 +474,295 @@ pub struct Metadata {
     pub value: Value,
 }
 
+/// A GGUF metadata value type (`gguf_type`): how a scalar, or each element of an array, is
+/// stored. [`Value`] keeps only the kind of number, so a header keeps these to encode its values
+/// back to their bytes ([`StoredHeader`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueType {
+    U8,
+    I8,
+    U16,
+    I16,
+    U32,
+    I32,
+    F32,
+    Bool,
+    String,
+    U64,
+    I64,
+    F64,
+}
+
+impl ValueType {
+    fn from_id(id: u32) -> Result<Self, Error> {
+        Ok(match id {
+            0 => Self::U8,
+            1 => Self::I8,
+            2 => Self::U16,
+            3 => Self::I16,
+            4 => Self::U32,
+            5 => Self::I32,
+            6 => Self::F32,
+            7 => Self::Bool,
+            8 => Self::String,
+            10 => Self::U64,
+            11 => Self::I64,
+            12 => Self::F64,
+            _ => return Err(invalid(format!("unsupported GGUF metadata type {id}"))),
+        })
+    }
+
+    fn id(self) -> u32 {
+        match self {
+            Self::U8 => 0,
+            Self::I8 => 1,
+            Self::U16 => 2,
+            Self::I16 => 3,
+            Self::U32 => 4,
+            Self::I32 => 5,
+            Self::F32 => 6,
+            Self::Bool => 7,
+            Self::String => 8,
+            Self::U64 => 10,
+            Self::I64 => 11,
+            Self::F64 => 12,
+        }
+    }
+
+    /// The bytes of `element` stored as this type (little-endian), or an error when it is
+    /// another kind of value or out of this type's range.
+    fn encode(self, element: Element<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
+        let range = || invalid(format!("GGUF value {element:?} does not fit {self:?}"));
+        match (self, element) {
+            (Self::U8, Element::Unsigned(value)) => {
+                out.push(u8::try_from(value).map_err(|_| range())?);
+            }
+            (Self::I8, Element::Signed(value)) => {
+                out.extend(i8::try_from(value).map_err(|_| range())?.to_le_bytes());
+            }
+            (Self::U16, Element::Unsigned(value)) => {
+                out.extend(u16::try_from(value).map_err(|_| range())?.to_le_bytes());
+            }
+            (Self::I16, Element::Signed(value)) => {
+                out.extend(i16::try_from(value).map_err(|_| range())?.to_le_bytes());
+            }
+            (Self::U32, Element::Unsigned(value)) => {
+                out.extend(u32::try_from(value).map_err(|_| range())?.to_le_bytes());
+            }
+            (Self::I32, Element::Signed(value)) => {
+                out.extend(i32::try_from(value).map_err(|_| range())?.to_le_bytes());
+            }
+            (Self::F32, Element::Float(value)) => {
+                let stored = value as f32;
+                if f64::from(stored).to_bits() != value.to_bits() && !value.is_nan() {
+                    return Err(range());
+                }
+                out.extend(stored.to_le_bytes());
+            }
+            (Self::Bool, Element::Bool(value)) => out.push(u8::from(value)),
+            (Self::String, Element::String(value)) => encode_string(value, out),
+            (Self::U64, Element::Unsigned(value)) => out.extend(value.to_le_bytes()),
+            (Self::I64, Element::Signed(value)) => out.extend(value.to_le_bytes()),
+            (Self::F64, Element::Float(value)) => out.extend(value.to_le_bytes()),
+            _ => return Err(range()),
+        }
+        Ok(())
+    }
+}
+
+/// How one metadata value is stored: a scalar, or an array of elements of one type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredType {
+    Scalar(ValueType),
+    Array(ValueType),
+}
+
+/// One metadata entry of a [`StoredHeader`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredMetadata {
+    pub metadata: Metadata,
+    pub stored: StoredType,
+}
+
+/// One little-endian GGUF file's header as it is stored: its version, its metadata with each
+/// value's stored type, and its tensor directory in stored order, so it encodes back to the bytes
+/// it was read from ([`StoredHeader::encode`]) and an edited copy keeps every value's type.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredHeader {
+    pub version: u32,
+    pub metadata: Vec<StoredMetadata>,
+    /// Offsets are relative to the data section.
+    pub tensors: Vec<TensorDescriptor>,
+}
+
+impl StoredHeader {
+    /// The header of the GGUF file `source`; tensor payloads need not follow it.
+    pub fn read<R: Read + Seek>(source: &mut R) -> Result<Self, Error> {
+        let (directory, types) = read_stored_directory(source, DEFAULT_HEADER_LIMIT, false)?;
+        if directory.byte_order != ByteOrder::Little {
+            return Err(invalid("a stored GGUF header must be little-endian"));
+        }
+        Ok(Self {
+            version: directory.version,
+            metadata: directory
+                .metadata
+                .into_iter()
+                .zip(types)
+                .map(|(metadata, stored)| StoredMetadata { metadata, stored })
+                .collect(),
+            tensors: directory.tensors,
+        })
+    }
+
+    /// A header whose `tensors` (name, outermost-first shape and encoding) are stored in order,
+    /// each at the alignment boundary after the one before.
+    pub fn new(
+        version: u32,
+        metadata: Vec<StoredMetadata>,
+        tensors: impl IntoIterator<Item = (String, Vec<u64>, Encoding)>,
+    ) -> Result<Self, Error> {
+        let mut header = Self {
+            version,
+            metadata,
+            tensors: Vec::new(),
+        };
+        let alignment = header.alignment()?;
+        let mut offset = 0u64;
+        for (name, shape, encoding) in tensors {
+            if shape.contains(&0)
+                || shape
+                    .last()
+                    .is_none_or(|row| row % encoding.block_elements() != 0)
+            {
+                return Err(invalid(format!(
+                    "invalid block geometry on tensor {name:?}"
+                )));
+            }
+            let nbytes = stored_bytes(&name, &shape, encoding)?;
+            header.tensors.push(TensorDescriptor {
+                name,
+                shape,
+                encoding,
+                offset,
+                nbytes,
+            });
+            offset = aligned(
+                offset
+                    .checked_add(nbytes)
+                    .ok_or_else(|| invalid("GGUF data section overflows"))?,
+                alignment,
+            )?;
+        }
+        Ok(header)
+    }
+
+    pub fn value(&self, name: &str) -> Option<&Value> {
+        self.metadata
+            .iter()
+            .find(|entry| entry.metadata.name == name)
+            .map(|entry| &entry.metadata.value)
+    }
+
+    /// `general.alignment`, or GGUF's default of 32.
+    pub fn alignment(&self) -> Result<u64, Error> {
+        match self.value("general.alignment") {
+            None => Ok(32),
+            Some(value) => value
+                .unsigned()
+                .filter(|alignment| alignment.is_power_of_two())
+                .ok_or_else(|| invalid("alignment must be a positive power of two")),
+        }
+    }
+
+    /// Every byte of the header through its aligned tensor-data offset.
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        let count = |count: usize| u64::try_from(count).expect("a count fits u64");
+        let mut out = b"GGUF".to_vec();
+        out.extend(self.version.to_le_bytes());
+        out.extend(count(self.tensors.len()).to_le_bytes());
+        out.extend(count(self.metadata.len()).to_le_bytes());
+        for entry in &self.metadata {
+            encode_string(&entry.metadata.name, &mut out);
+            match (entry.stored, &entry.metadata.value) {
+                (StoredType::Scalar(stored), Value::Scalar(scalar)) => {
+                    out.extend(stored.id().to_le_bytes());
+                    stored.encode(scalar_element(scalar), &mut out)?;
+                }
+                (StoredType::Array(stored), Value::Array(array)) => {
+                    out.extend(9u32.to_le_bytes());
+                    out.extend(stored.id().to_le_bytes());
+                    out.extend(count(array.len()).to_le_bytes());
+                    for element in array.iter() {
+                        stored.encode(element, &mut out)?;
+                    }
+                }
+                _ => {
+                    return Err(invalid(format!(
+                        "metadata {:?} is not stored as {:?}",
+                        entry.metadata.name, entry.stored
+                    )));
+                }
+            }
+        }
+        for tensor in &self.tensors {
+            encode_string(&tensor.name, &mut out);
+            out.extend(
+                u32::try_from(tensor.shape.len())
+                    .expect("a tensor rank fits u32")
+                    .to_le_bytes(),
+            );
+            for dimension in tensor.shape.iter().rev() {
+                out.extend(dimension.to_le_bytes());
+            }
+            out.extend((tensor.encoding as u32).to_le_bytes());
+            out.extend(tensor.offset.to_le_bytes());
+        }
+        let length = aligned(count(out.len()), self.alignment()?)?;
+        out.resize(
+            usize::try_from(length).map_err(|_| invalid("GGUF header exceeds host address range"))?,
+            0,
+        );
+        Ok(out)
+    }
+}
+
+fn scalar_element(scalar: &Scalar) -> Element<'_> {
+    match scalar {
+        Scalar::String(value) => Element::String(value),
+        Scalar::Bool(value) => Element::Bool(*value),
+        Scalar::Unsigned(value) => Element::Unsigned(*value),
+        Scalar::Signed(value) => Element::Signed(*value),
+        Scalar::Float(value) => Element::Float(*value),
+    }
+}
+
+fn encode_string(value: &str, out: &mut Vec<u8>) {
+    out.extend(
+        u64::try_from(value.len())
+            .expect("a length fits u64")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn aligned(offset: u64, alignment: u64) -> Result<u64, Error> {
+    offset
+        .checked_add(alignment - 1)
+        .map(|offset| offset & !(alignment - 1))
+        .ok_or_else(|| invalid("GGUF data alignment overflows"))
+}
+
+/// The bytes a tensor of `shape` (in either order) stores in `encoding`.
+fn stored_bytes(name: &str, shape: &[u64], encoding: Encoding) -> Result<u64, Error> {
+    let elements = shape
+        .iter()
+        .try_fold(1u64, |product, dimension| product.checked_mul(*dimension))
+        .ok_or_else(|| invalid(format!("tensor {name:?} element count overflows")))?;
+    (elements / encoding.block_elements())
+        .checked_mul(encoding.block_bytes())
+        .ok_or_else(|| invalid(format!("tensor {name:?} byte size overflows")))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorDescriptor {
     pub name: String,
@@ -609,32 +898,32 @@ impl<R: Read> Reader<'_, R> {
         String::from_utf8(bytes).map_err(|_| invalid("invalid UTF-8 in GGUF header"))
     }
 
-    fn scalar(&mut self, kind: u32) -> Result<Scalar, Error> {
+    fn scalar(&mut self, kind: ValueType) -> Result<Scalar, Error> {
         Ok(match kind {
-            0 => Scalar::Unsigned(u64::from(self.u8()?)),
-            1 => Scalar::Signed(i64::from(self.u8()? as i8)),
-            2 => Scalar::Unsigned(u64::from(self.u16()?)),
-            3 => Scalar::Signed(i64::from(self.u16()? as i16)),
-            4 => Scalar::Unsigned(u64::from(self.u32()?)),
-            5 => Scalar::Signed(i64::from(self.u32()? as i32)),
-            6 => Scalar::Float(f64::from(f32::from_bits(self.u32()?))),
-            7 => match self.u8()? {
+            ValueType::U8 => Scalar::Unsigned(u64::from(self.u8()?)),
+            ValueType::I8 => Scalar::Signed(i64::from(self.u8()? as i8)),
+            ValueType::U16 => Scalar::Unsigned(u64::from(self.u16()?)),
+            ValueType::I16 => Scalar::Signed(i64::from(self.u16()? as i16)),
+            ValueType::U32 => Scalar::Unsigned(u64::from(self.u32()?)),
+            ValueType::I32 => Scalar::Signed(i64::from(self.u32()? as i32)),
+            ValueType::F32 => Scalar::Float(f64::from(f32::from_bits(self.u32()?))),
+            ValueType::Bool => match self.u8()? {
                 0 => Scalar::Bool(false),
                 1 => Scalar::Bool(true),
                 _ => return Err(invalid("invalid GGUF boolean")),
             },
-            8 => Scalar::String(self.string()?),
-            10 => Scalar::Unsigned(self.u64()?),
-            11 => Scalar::Signed(self.u64()? as i64),
-            12 => Scalar::Float(f64::from_bits(self.u64()?)),
-            _ => return Err(invalid(format!("unsupported GGUF metadata type {kind}"))),
+            ValueType::String => Scalar::String(self.string()?),
+            ValueType::U64 => Scalar::Unsigned(self.u64()?),
+            ValueType::I64 => Scalar::Signed(self.u64()? as i64),
+            ValueType::F64 => Scalar::Float(f64::from_bits(self.u64()?)),
         })
     }
 
-    fn value(&mut self) -> Result<Value, Error> {
+    fn value(&mut self) -> Result<(Value, StoredType), Error> {
         let kind = self.u32()?;
         if kind != 9 {
-            return Ok(Value::Scalar(self.scalar(kind)?));
+            let kind = ValueType::from_id(kind)?;
+            return Ok((Value::Scalar(self.scalar(kind)?), StoredType::Scalar(kind)));
         }
         let element = self.u32()?;
         let count = self.u64()?;
@@ -650,8 +939,9 @@ impl<R: Read> Reader<'_, R> {
             return Err(invalid("nested or oversized GGUF array"));
         }
         let count = usize::try_from(count).map_err(|_| invalid("oversized GGUF array"))?;
-        Ok(Value::Array(match element {
-            8 => {
+        let element = ValueType::from_id(element)?;
+        let array = match element {
+            ValueType::String => {
                 let mut strings = Strings::default();
                 strings
                     .ends
@@ -663,29 +953,36 @@ impl<R: Read> Reader<'_, R> {
                 strings.text.shrink_to_fit();
                 Array::String(strings)
             }
-            7 => Array::Bool(self.elements(count, element, |scalar| match scalar {
+            ValueType::Bool => Array::Bool(self.elements(count, element, |scalar| match scalar {
                 Scalar::Bool(value) => value,
                 _ => unreachable!("a GGUF boolean element reads as a boolean"),
             })?),
-            1 | 3 | 5 | 11 => Array::Signed(self.elements(count, element, |scalar| match scalar {
-                Scalar::Signed(value) => value,
-                _ => unreachable!("a signed GGUF element reads as signed"),
-            })?),
-            6 | 12 => Array::Float(self.elements(count, element, |scalar| match scalar {
-                Scalar::Float(value) => value,
-                _ => unreachable!("a GGUF float element reads as a float"),
-            })?),
-            _ => Array::Unsigned(self.elements(count, element, |scalar| match scalar {
-                Scalar::Unsigned(value) => value,
-                _ => unreachable!("an unsigned GGUF element reads as unsigned"),
-            })?),
-        }))
+            ValueType::I8 | ValueType::I16 | ValueType::I32 | ValueType::I64 => {
+                Array::Signed(self.elements(count, element, |scalar| match scalar {
+                    Scalar::Signed(value) => value,
+                    _ => unreachable!("a signed GGUF element reads as signed"),
+                })?)
+            }
+            ValueType::F32 | ValueType::F64 => {
+                Array::Float(self.elements(count, element, |scalar| match scalar {
+                    Scalar::Float(value) => value,
+                    _ => unreachable!("a GGUF float element reads as a float"),
+                })?)
+            }
+            ValueType::U8 | ValueType::U16 | ValueType::U32 | ValueType::U64 => {
+                Array::Unsigned(self.elements(count, element, |scalar| match scalar {
+                    Scalar::Unsigned(value) => value,
+                    _ => unreachable!("an unsigned GGUF element reads as unsigned"),
+                })?)
+            }
+        };
+        Ok((Value::Array(array), StoredType::Array(element)))
     }
 
     fn elements<T>(
         &mut self,
         count: usize,
-        kind: u32,
+        kind: ValueType,
         unwrap: impl Fn(Scalar) -> T,
     ) -> Result<Vec<T>, Error> {
         let mut values = Vec::new();
@@ -945,6 +1242,15 @@ fn read_directory_with_payload<R: Read + Seek>(
     header_limit: u64,
     require_payload: bool,
 ) -> Result<Directory, Error> {
+    read_stored_directory(source, header_limit, require_payload).map(|(directory, _)| directory)
+}
+
+/// The directory of a GGUF file with the stored type of each of its metadata values.
+fn read_stored_directory<R: Read + Seek>(
+    source: &mut R,
+    header_limit: u64,
+    require_payload: bool,
+) -> Result<(Directory, Vec<StoredType>), Error> {
     let size = source.seek(SeekFrom::End(0))?;
     source.seek(SeekFrom::Start(0))?;
     let mut reader = Reader {
@@ -978,11 +1284,12 @@ fn read_directory_with_payload<R: Read + Seek>(
     }
 
     let mut metadata = Vec::new();
+    let mut types = Vec::new();
     let mut names = HashSet::new();
     let mut alignment = 32;
     for _ in 0..metadata_count {
         let name = reader.string()?;
-        let value = reader.value()?;
+        let (value, stored) = reader.value()?;
         if !names.insert(name.clone()) {
             return Err(invalid(format!("duplicate metadata {name:?}")));
         }
@@ -993,6 +1300,7 @@ fn read_directory_with_payload<R: Read + Seek>(
                 .ok_or_else(|| invalid("alignment must be a positive power of two"))?;
         }
         metadata.push(Metadata { name, value });
+        types.push(stored);
     }
 
     let mut tensors = Vec::new();
@@ -1025,14 +1333,7 @@ fn read_directory_with_payload<R: Read + Seek>(
         if offset % alignment != 0 {
             return Err(invalid(format!("misaligned tensor {name:?}")));
         }
-        let elements = shape
-            .iter()
-            .try_fold(1u64, |product, dimension| product.checked_mul(*dimension));
-        let elements =
-            elements.ok_or_else(|| invalid(format!("tensor {name:?} element count overflows")))?;
-        let nbytes = (elements / encoding.block_elements())
-            .checked_mul(encoding.block_bytes())
-            .ok_or_else(|| invalid(format!("tensor {name:?} byte size overflows")))?;
+        let nbytes = stored_bytes(&name, &shape, encoding)?;
         shape.reverse();
         tensors.push(TensorDescriptor {
             name,
@@ -1043,11 +1344,7 @@ fn read_directory_with_payload<R: Read + Seek>(
         });
     }
 
-    let data_offset = reader
-        .offset
-        .checked_add(alignment - 1)
-        .map(|offset| offset & !(alignment - 1))
-        .ok_or_else(|| invalid("GGUF data alignment overflows"))?;
+    let data_offset = aligned(reader.offset, alignment)?;
     let mut stored = tensors.iter().collect::<Vec<_>>();
     stored.sort_by_key(|tensor| tensor.offset);
     let mut end = data_offset;
@@ -1081,7 +1378,7 @@ fn read_directory_with_payload<R: Read + Seek>(
             directory: Box::new(directory),
         });
     }
-    Ok(directory)
+    Ok((directory, types))
 }
 
 #[derive(Clone, Debug)]

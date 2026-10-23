@@ -81,7 +81,7 @@ def test_set_roundtrip_reports_file_digest(tmp_path, families):
     assert read_set(path) == (fixtures, written)
 
 
-def test_cli_output_is_identical_across_processes(tmp_path):
+def test_sets_are_identical_across_processes(tmp_path):
     digests = set()
     for seed in ("1", "2"):
         path = tmp_path / f"{seed}.jsonl"
@@ -89,12 +89,8 @@ def test_cli_output_is_identical_across_processes(tmp_path):
             [
                 sys.executable,
                 "-c",
-                "from magnitude_fixtures.cli import main; main()",
-                "build",
-                "retrieval",
-                "--count",
-                "2",
-                "--output",
+                "import sys; from pathlib import Path; from magnitude_fixtures import build, write_set; "
+                "write_set(Path(sys.argv[1]), build('retrieval', count=2))",
                 str(path),
             ],
             check=True,

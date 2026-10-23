@@ -465,37 +465,6 @@ pub fn mappings(m: usize) -> &'static [Mapping] {
     }
 }
 
-/// The row counts of a timing sweep: `CUDA_TIMING_ROWS` (comma-separated)
-/// or `default`.
-pub fn timing_rows(default: &[usize]) -> Vec<usize> {
-    match std::env::var("CUDA_TIMING_ROWS") {
-        Ok(list) => list
-            .split(',')
-            .map(|rows| rows.trim().parse().expect("CUDA_TIMING_ROWS: row counts"))
-            .collect(),
-        Err(_) => default.to_vec(),
-    }
-}
-
-/// The formats of a timing sweep: `CUDA_TIMING_FORMATS` (comma-separated
-/// representation names, e.g. `q4k,q6k`) or every format.
-pub fn timing_formats() -> Vec<Format> {
-    match std::env::var("CUDA_TIMING_FORMATS") {
-        Ok(list) => list
-            .split(',')
-            .map(|name| {
-                *Format::ALL
-                    .iter()
-                    .find(|format| format.representation() == name.trim())
-                    .expect(
-                        "CUDA_TIMING_FORMATS: a resident representation name, e.g. q4k or mxfp4g32",
-                    )
-            })
-            .collect(),
-        Err(_) => Format::ALL.to_vec(),
-    }
-}
-
 /// q8_1 quantization of rows of `k` as the INT8 path forms them: per 32
 /// values d = max|x| / 127 and x ~= d * rint(x / d). Returns the dequantized
 /// rows and each value's half quantization step (d / 2).
@@ -618,10 +587,4 @@ pub fn check(label: &str, actual: &[f32], expected: &[f64], tolerance: &[f64]) {
         tolerance[worst.1],
         worst.0
     );
-}
-
-/// A zero-filled resident weight for timings: device time does not depend on
-/// weight values, and the host conversion of 4B-sized weights is slow.
-pub fn timing_weight(device: &Device, format: Format, rows: usize, k: usize) -> Tensor {
-    Tensor::zeros(device, format.resident(), &[rows as u64, k as u64]).unwrap()
 }

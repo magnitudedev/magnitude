@@ -1,8 +1,9 @@
 """Independent float32 reference for DFlash and DSpark drafts (GGUF architecture `dflash`).
 
-`magnitude-references check-draft` compares it with the released draft code. Released-code adapters: Transformers 5.17.0 Muse assistant, an explicitly supplied pinned Z-Lab
-DFlash/DFlash2 model.py, and DSpark dflash.py/dspark.py from a supplied source directory
-(default RadixArk/Qwen3.8-27B-DSpark@b9a5dbdf). No one adapter defines every checkpoint mask.
+`check_draft` compares it with the released draft code (`tests/test_released.py`). Released-code
+adapters: Transformers 5.17.0 Muse assistant, the pinned Z-Lab DFlash/DFlash2 model.py
+(`ZLAB_CODE`), and DSpark dflash.py/dspark.py from a supplied source directory (default
+RadixArk/Qwen3.8-27B-DSpark@b9a5dbdf). No one adapter defines every checkpoint mask.
 Common dense-draft operations:
 - context: the target's residual entering each of `target_layers` (the released `target_layer_ids`
   are layer *outputs*; the GGUF stores them + 1), float32, concatenated per token, then
@@ -224,6 +225,13 @@ class DFlashReference:
                         torch.stack(confidence, 1), hidden)
 
     # released-code cross-checks ----------------------------------------------------------------
+
+    @property
+    def released_code(self) -> str:
+        """The released code this draft is checked against: DSpark's for a DSpark draft, the
+        Muse assistant's (transformers) for a noncausal DFlash draft, and the pinned Z-Lab
+        model.py, whose layers keep their own causality, for DFlash2 or any causal layer."""
+        return "dspark" if self.dspark else "zlab" if self.dflash2 or any(self.causal) else "muse"
 
     def released(self, features: torch.Tensor, anchor: torch.Tensor, rows: int | None = None,
                  source: str = "muse", source_path: Path | None = None, source_config: Path | None = None) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:

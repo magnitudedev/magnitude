@@ -4,7 +4,7 @@
 //! tests (through the `fixtures` feature) read the machines here.
 //!
 //! Every recorded value names its source: a run on our hosts
-//! (`magnitude-remote` run id), a Vulkan Hardware Database report
+//! (an evaluation run id), a Vulkan Hardware Database report
 //! (vulkan.gpuinfo.org/displayreport.php?id=N), or the issue that reported
 //! the machine. The database's reports list memory types under their heap
 //! and do not give the types' global order; each layout here lists them heap

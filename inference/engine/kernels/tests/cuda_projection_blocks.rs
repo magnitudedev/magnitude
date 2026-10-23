@@ -4,11 +4,10 @@
 //! gated rows the state entries publish. Tests return early without CUDA.
 
 mod cuda_common;
-mod timing_common;
 
 use cuda_common::*;
 use magnitude_kernels::{attention_output, attention_project, gated_delta_project};
-use seismic::{Element, NativeSpecialization, Tensor};
+use seismic::{Element, NativeSpecialization};
 use seismic_lang::registry::bf16_round;
 
 const ROWS: [usize; 8] = [1, 3, 8, 12, 16, 17, 40, 128];
@@ -477,126 +476,6 @@ fn cuda_scaled_projections_match_host_model() {
                     &tolerance,
                 );
             }
-        }
-    }
-}
-
-/// Device time per call on the 4B geometry over zero-filled weights; the
-/// rotation exceeds the 24 MiB L2.
-#[test]
-#[ignore = "timing; run explicitly on the measurement host"]
-fn cuda_projection_block_timings() {
-    let Some(device) = cuda() else { return };
-    let options = seismic::measure::Measure {
-        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
-        min_sample_seconds: 0.002,
-    };
-    let measure = |point| timing_common::measured(point, &options);
-    let (h, nk, nv, w) = (2560usize, 16usize, 32usize, 128usize);
-    let (qkv, z) = ((2 * nk + nv) * w, nv * w);
-    let rotation = 4;
-    let project_weights: Vec<[Tensor; 4]> = (0..rotation)
-        .map(|_| {
-            [
-                timing_weight(&device, Format::Q5K, qkv, h),
-                timing_weight(&device, Format::Q4K, z, h),
-                timing_weight(&device, Format::Q8, nv, h),
-                timing_weight(&device, Format::Q8, nv, h),
-            ]
-        })
-        .collect();
-    let output_weights: Vec<Tensor> = (0..rotation * 2)
-        .map(|_| timing_weight(&device, Format::Q5K, h, z))
-        .collect();
-    let project_bytes: f64 = project_weights[0].iter().map(|t| t.byte_len() as f64).sum();
-    let output_bytes = output_weights[0].byte_len() as f64;
-    for m in timing_rows(&[1, 8, 32, 128, 512]) {
-        let hidden = f32_tensor(&device, &[m as u64, h as u64], &vec![0.5; m * h]);
-        let norm = f32_tensor(&device, &[h as u64], &vec![1.0; h]);
-        let gated = bf16_tensor(
-            &device,
-            &[m as u64, nv as u64, w as u64],
-            &vec![0.25; m * z],
-        );
-        let no_bound = f32_tensor(&device, &[0], &[]);
-        for &mapping in mappings(m) {
-            let kernel = gated_delta_project::native_for_device_with(
-                &device,
-                gated_delta_project::Elements {
-                    NW: Element::f32(),
-                    QW: Format::Q5K.resident(),
-                    GW: Format::Q4K.resident(),
-                    AW: Format::Q8.resident(),
-                    BW: Format::Q8.resident(),
-                    A: Element::bf16(),
-                },
-                &mapping.projection_params(statics_specialization(&[
-                    ("H", h),
-                    ("PT", 1),
-                    ("NM", h),
-                    ("NK", nk),
-                    ("NV", nv),
-                    ("W", w),
-                ])),
-            )
-            .unwrap();
-            let args = project_weights
-                .iter()
-                .map(|weights| gated_delta_project::Args {
-                    hidden: &hidden,
-                    input_norm: &norm,
-                    qkv_weight: &weights[0],
-                    gate_weight: &weights[1],
-                    alpha_weight: &weights[2],
-                    beta_weight: &weights[3],
-                    epsilon: EPSILON,
-                    qkv_bound: &no_bound,
-                    gate_bound: &no_bound,
-                })
-                .collect();
-            let measured = measure(kernel.point(args).unwrap());
-            println!(
-                "recurrent project M={m} K={h} N={} {mapping:?}: {:.1} us, {:.0} GB/s, {:.2} TFLOP/s",
-                qkv + z + 2 * nv,
-                measured.median * 1e6,
-                project_bytes / measured.median / 1e9,
-                2.0 * (m * h * (qkv + z + 2 * nv)) as f64 / measured.median / 1e12
-            );
-            let kernel = attention_output::native_for_device_with(
-                &device,
-                attention_output::Elements {
-                    A: Element::bf16(),
-                    OW: Format::Q5K.resident(),
-                },
-                &mapping.projection_params(statics_specialization(&[
-                    ("D", h),
-                    ("SN", 1),
-                    ("IN", 0),
-                    ("Q", nv),
-                    ("W", w),
-                    ("OS", 0),
-                ])),
-            )
-            .unwrap();
-            let inject = no_inject(&device, hidden.extents()[0]);
-            let args = output_weights
-                .iter()
-                .map(|weight| attention_output::Args {
-                    hidden: &hidden,
-                    inject: &inject,
-                    gated: &gated,
-                    output_weight: weight,
-                    output_scale: &no_bound,
-                    output_bound: &no_bound,
-                })
-                .collect();
-            let measured = measure(kernel.point(args).unwrap());
-            println!(
-                "recurrent output M={m} K={z} N={h} {mapping:?}: {:.1} us, {:.0} GB/s, {:.2} TFLOP/s",
-                measured.median * 1e6,
-                output_bytes / measured.median / 1e9,
-                2.0 * (m * h * z) as f64 / measured.median / 1e12
-            );
         }
     }
 }

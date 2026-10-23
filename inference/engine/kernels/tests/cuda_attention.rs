@@ -1,7 +1,6 @@
 //! The CUDA `attention_decode` / `attention_prefill` in Qwen's form against
 //! the same cases, host model and portable-body pin as the Metal tests
-//! (included verbatim; their Metal tests skip without a Metal device), plus
-//! timings.
+//! (included verbatim; their Metal tests skip without a Metal device).
 
 include!("attention.rs");
 
@@ -77,8 +76,8 @@ fn cuda_decode_matches_portable_body() {
     }
 }
 
-/// Visible spans crossing slab edges (the device measurement's binding: one
-/// span over several slabs) at every decode configuration.
+/// Visible spans crossing slab edges (one span over several slabs) at every
+/// decode configuration.
 #[test]
 fn cuda_decode_reads_spans_crossing_history_slabs() {
     let Some(device) = cuda() else { return };
@@ -222,77 +221,6 @@ fn cuda_eight_query_group_decode_and_prefill_match_host_model() {
                 &gated,
                 &bound,
                 &expected,
-            );
-        }
-    }
-}
-
-/// Device time per call at the 4B geometry: decode of one row at contexts
-/// 256 / 4k / 16k and a 128-row prefill chunk after 1k of history. Each
-/// rotation entry owns its histories, so rotations exceed the 24 MiB L2 at
-/// long contexts.
-#[test]
-#[ignore = "timing; run explicitly on the measurement host"]
-fn cuda_attention_timings() {
-    let Some(device) = cuda() else { return };
-    let options = seismic::measure::Measure {
-        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
-        min_sample_seconds: 0.002,
-    };
-    let measure = |point| timing_common::measured(point, &options);
-    for context in [256usize, 4096, 16384] {
-        let rows = vec![Row {
-            spans: vec![(0, context as i32 - 1)],
-            fresh: (0, 1),
-            destination: context as i32 - 1,
-            position: context as i32 - 1,
-        }];
-        let case = Case::new(QWEN, context, 1, &rows, 3);
-        let rotation = if context >= 4096 { 3 } else { 1 };
-        let mut bounds = (0..rotation)
-            .map(|_| Bound::new(&device, &case))
-            .collect::<Vec<_>>();
-        for config in DECODE_CONFIGS {
-            let kernel = cuda_decode(&device, QWEN, config);
-            let args = bounds
-                .iter_mut()
-                .map(|bound| args!(attention_decode, bound, case))
-                .collect();
-            let measured = measure(kernel.point(args).unwrap());
-            let bytes = (context * QWEN.kv * QWEN.w() * 2 * 2) as f64;
-            println!(
-                "decode context {context} PARTS,WARPS,SLICES {config:?}: {:.1} us, KV read {:.0} GB/s",
-                measured.median * 1e6,
-                bytes / measured.median / 1e9
-            );
-        }
-    }
-    for (rows, history) in [(128usize, 1024i32), (128, 0)] {
-        let spans = if history > 0 {
-            vec![(0, history)]
-        } else {
-            vec![]
-        };
-        let rows_spec = (0..rows)
-            .map(|row| Row {
-                spans: spans.clone(),
-                fresh: (0, row as i32 + 1),
-                destination: history + row as i32,
-                position: history + row as i32,
-            })
-            .collect::<Vec<_>>();
-        let case = Case::new(QWEN, history as usize + rows, 1, &rows_spec, 9);
-        let mut bound = Bound::new(&device, &case);
-        for config in PREFILL_CONFIGS {
-            let kernel = cuda_prefill(&device, QWEN, config);
-            let measured = measure(
-                kernel
-                    .point(vec![args!(attention_prefill, bound, case)])
-                    .unwrap(),
-            );
-            println!(
-                "prefill {rows} rows after {history} history WARPS,SPLIT_GROUPS {config:?}: {:.1} us",
-                measured.median * 1e6
             );
         }
     }

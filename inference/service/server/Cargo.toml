@@ -43,6 +43,10 @@ tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 
+[[test]]
+name = "residency_lifecycle"
+harness = false
+
 [dev-dependencies]
 flate2.workspace = true
 hf-hub.workspace = true

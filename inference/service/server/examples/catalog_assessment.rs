@@ -1,8 +1,8 @@
 //! Assess the complete release catalog through the service's production assessment path (the
 //! environment and its identity, the automatic pool and the per-target assessor) and report the
 //! snapshot with its timings. Speeds are estimated from the measurements a service's
-//! measurement job stored in the cache root; without them they are pending. Development evidence
-//! only.
+//! measurement job stored in the cache root; without them they are pending. `mrig assess
+//! --catalog` runs it after measuring the machine into that cache root.
 //!
 //! ```text
 //! catalog_assessment --bundle model-planner-inputs.bundle --cache-root DIR --model-store DIR \

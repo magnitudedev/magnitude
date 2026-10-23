@@ -1633,6 +1633,36 @@ impl<'a> RemoteRanges<'a> {
         })
     }
 
+    /// The file at `url` outside the Hub, read without a credential. Its length is the total of
+    /// the server's answer to a one-byte range request.
+    pub(crate) async fn open_url(
+        http: &'a reqwest::Client,
+        url: reqwest::Url,
+    ) -> Result<Self, InventoryError> {
+        let response =
+            send_hub_request(|| http.get(url.clone()).header(RANGE, "bytes=0-0")).await?;
+        let logical_size = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("bytes 0-0/"))
+            .and_then(|total| total.parse::<u64>().ok())
+            .filter(|_| response.status() == reqwest::StatusCode::PARTIAL_CONTENT)
+            .ok_or_else(|| {
+                InventoryError::Upstream(format!(
+                    "{url} did not answer a range request (HTTP {})",
+                    response.status()
+                ))
+            })?;
+        Ok(Self {
+            http,
+            token: None,
+            url: response.url().clone(),
+            hub_host: None,
+            logical_size,
+        })
+    }
+
     pub(crate) fn logical_length(&self) -> usize {
         usize::try_from(self.logical_size).unwrap_or(usize::MAX)
     }
@@ -2134,6 +2164,43 @@ impl ManagedModelStore {
         })
         .await
         .map_err(|error| InventoryError::Internal(error.to_string()))?
+    }
+
+    /// Exactly the bytes `range` of the file `path` of `snapshot`, by one range request.
+    pub async fn hub_file_range(
+        &self,
+        snapshot: &HuggingFaceRepositorySnapshot,
+        path: &Path,
+        range: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>, InventoryError> {
+        let file = snapshot
+            .gguf_files
+            .iter()
+            .find(|file| file.path == path)
+            .ok_or_else(|| {
+                InventoryError::NotFound(format!(
+                    "{} has no {}",
+                    snapshot.repository,
+                    path.display()
+                ))
+            })?;
+        let (Ok(start), Ok(end)) = (usize::try_from(range.start), usize::try_from(range.end)) else {
+            return Err(InventoryError::Internal(
+                "range exceeds the host address range".to_owned(),
+            ));
+        };
+        let token = self.hub_token();
+        RemoteRanges::new(
+            &self.http,
+            token.as_deref(),
+            self.client.endpoint(),
+            &snapshot.repository,
+            &snapshot.commit,
+            path,
+            file.size_bytes,
+        )?
+        .read(start, end)
+        .await
     }
 
     /// The cached header of one file of a repository snapshot, readable or not, when it holds

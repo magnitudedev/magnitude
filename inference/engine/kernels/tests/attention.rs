@@ -11,9 +11,6 @@ use seismic::{
 
 include!("attention_common/fixtures.rs");
 
-mod timing_common;
-use timing_common::Timed;
-
 /// Device tensors of one case, in the family's Qwen form (see
 /// `attention_k8v4.rs`).
 struct Bound {
@@ -698,9 +695,9 @@ fn attention_reads_and_writes_across_history_slabs() {
     check_attention_slab_case(&case, false);
 }
 
-/// Visible spans crossing slab edges, as the device measurement binds them
-/// (one span over the whole synthetic history, several slabs deep): the
-/// entries walk each slab's part of a span.
+/// Visible spans crossing slab edges (one span over the whole synthetic
+/// history, several slabs deep): the entries walk each slab's part of a
+/// span.
 #[test]
 fn attention_reads_spans_crossing_history_slabs() {
     let rows = [
@@ -895,113 +892,6 @@ fn eight_query_group_prefill_matches_host_model() {
                 &gated,
                 &bound,
                 &expected,
-            );
-        }
-    }
-}
-
-/// Device time of one decode layer's attention at Qwen3.5-4B geometry
-/// (indicative only on a shared development GPU): `cargo test --release
-/// --test attention -- --ignored --nocapture decode_timing`. Context 1 (the
-/// row sees only itself) is the entry's launch floor.
-#[test]
-#[ignore]
-fn decode_timing() {
-    for device in devices() {
-        decode_timing_on(&device);
-    }
-}
-
-fn decode_timing_on(device: &Device) {
-    let configs = [
-        (32, 16, 4),
-        (32, 8, 4),
-        (64, 8, 4),
-        (64, 16, 4),
-        (128, 16, 4),
-        (32, 16, 8),
-        (64, 32, 4),
-    ];
-    for context in [1usize, 256, 4096, 16384] {
-        let rows = [Row {
-            spans: vec![(0, context as i32 - 1)],
-            fresh: (0, 1),
-            destination: context as i32 - 1,
-            position: context as i32 - 1,
-        }];
-        let case = Case::new(QWEN, context + 64, 1, &rows, 3);
-        for (config, specialization) in decode_specializations_on(device, QWEN, &configs) {
-            let kernel = decode_kernel(device, &specialization);
-            let mut bound = Bound::new(device, &case);
-            let measurement = kernel
-                .time(vec![args!(attention_decode, bound, case)], &TIMING)
-                .unwrap();
-            let kv_bytes = (context * QWEN.kv * QWEN.w() * 2 * 2) as f64;
-            eprintln!(
-                "decode context {context} {config}: {:.1} us (KV read {:.0} GB/s)",
-                measurement.median * 1e6,
-                kv_bytes / measurement.median / 1e9
-            );
-        }
-    }
-}
-
-/// Device time of one prefill layer's attention at Qwen3.5-4B geometry, rows
-/// of one sequence after `history` rows (indicative only on a shared
-/// development GPU): `cargo test --release --test attention -- --ignored
-/// --nocapture prefill_timing`. FLOP counts both products of every visible
-/// (row, key) pair.
-#[test]
-#[ignore]
-fn prefill_timing() {
-    for device in devices() {
-        prefill_timing_on(&device);
-    }
-}
-
-fn prefill_timing_on(device: &Device) {
-    for (rows, history) in [(128usize, 0i32), (128, 4096), (512, 0), (512, 16384)] {
-        let spans = if history > 0 {
-            vec![(0, history)]
-        } else {
-            vec![]
-        };
-        let rows = (0..rows)
-            .map(|row| Row {
-                spans: spans.clone(),
-                fresh: (0, row as i32 + 1),
-                destination: history + row as i32,
-                position: history + row as i32,
-            })
-            .collect::<Vec<_>>();
-        let pairs = rows
-            .iter()
-            .map(|row| (history + row.fresh.1 - row.fresh.0) as f64)
-            .sum::<f64>();
-        let flop = pairs * (QWEN.kv * QWEN.g * QWEN.w() * 4) as f64;
-        let case = Case::new(QWEN, history as usize + rows.len(), 1, &rows, 9);
-        let configs = [
-            (16, 1),
-            (16, 128),
-            (16, 256),
-            (16, 512),
-            (8, 1),
-            (8, 256),
-            (32, 1),
-            (32, 256),
-            (32, 512),
-        ];
-        for (config, specialization) in prefill_specializations_on(device, QWEN, &configs) {
-            let kernel = prefill_kernel(device, &specialization);
-            let mut bound = Bound::new(device, &case);
-            let measurement = kernel
-                .time(vec![args!(attention_prefill, bound, case)], &TIMING)
-                .unwrap();
-            eprintln!(
-                "prefill {} rows after {history} history {config}: {:.1} us ({:.2} TFLOP/s)",
-                rows.len(),
-                measurement.median * 1e6,
-                flop / measurement.median / 1e12
             );
         }
     }

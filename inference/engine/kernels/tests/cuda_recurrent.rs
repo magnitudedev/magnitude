@@ -1,6 +1,6 @@
 //! The CUDA `gated_delta_step` / `gated_delta_chunk` against the same
 //! cases, portable-body oracle and host model as the Metal tests (included
-//! verbatim; their Metal tests skip without a Metal device), plus timings.
+//! verbatim; their Metal tests skip without a Metal device).
 
 include!("recurrent_stages.rs");
 
@@ -506,93 +506,5 @@ fn cuda_chunk_every_catalog_value_head_count_matches_the_host_model() {
                 (1.5e-2, 3e-3),
             );
         }
-    }
-}
-
-/// Device time per call at the 4B geometry (one layer), each slot in its own
-/// bank pair: decode, MTP verify (2-16 rows per slot, alone and 8 batched)
-/// and prefill, the step up to 16 rows per slot and the chunk from 2 rows. Calls
-/// rotate over 16 argument sets (state arenas beyond the 24 MiB L2), so state
-/// traffic comes from DRAM as across a model's layers.
-#[test]
-#[ignore = "timing; run explicitly on the measurement host"]
-fn cuda_recurrent_timings() {
-    let Some(device) = cuda() else { return };
-    let options = seismic::measure::Measure {
-        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
-        min_sample_seconds: 0.002,
-    };
-    let measure = |point| timing_common::measured(point, &options);
-    // Slots of `per_slot` rows each: decode (1 row), MTP verify (2-16 rows
-    // per request, alone and 8 requests batched) and prefill.
-    for (slots, per_slot) in [
-        (1usize, 1usize),
-        (8, 1),
-        (1, 2),
-        (1, 4),
-        (1, 8),
-        (1, 16),
-        (8, 4),
-        (8, 8),
-        (1, 32),
-        (1, 128),
-        (1, 512),
-    ] {
-        let label = format!("{slots} x {per_slot} rows");
-        let slots = (0..slots)
-            .map(|s| slot(per_slot, per_slot, 1 + s, 1 + slots + s))
-            .collect::<Vec<_>>();
-        let banks = slots.iter().map(|s| s.following).max().unwrap() + 1;
-        let geometry = Geometry { banks, ..QWEN_4B };
-        let rows = slots.len() * per_slot;
-        let case = Case::new(geometry, rows, slots, false, 5).with_bf16_activations();
-        let mut rotation = (0..16)
-            .map(|_| case.tensors(&device, Element::bf16()))
-            .collect::<Vec<_>>();
-        if per_slot <= 16 {
-            for mapping in STEPS {
-                let kernel = case.cuda_step(&device, Element::bf16(), mapping);
-                let args = rotation.iter_mut().map(|t| t.step_args(&case)).collect();
-                let measured = measure(kernel.point(args).unwrap());
-                println!("{label}: step {mapping:?} {:.1} us", measured.median * 1e6);
-            }
-        }
-        if rows >= 2 {
-            for mapping in CHUNK_ROWS {
-                let kernel = case.cuda_chunk(&device, Element::bf16(), mapping);
-                let args = rotation.iter_mut().map(|t| t.chunk_args(&case)).collect();
-                let measured = measure(kernel.point(args).unwrap());
-                println!(
-                    "{label}: chunk ROWS {mapping} {:.1} us",
-                    measured.median * 1e6
-                );
-            }
-        }
-    }
-}
-
-/// Three calls each of the 4B step at 1 row (ROWS 4, WARPS 8) and the chunk at
-/// 512 rows (ROWS 128), each on its own argument set, for a profiler
-/// (`ncu --kernel-name <entry> --launch-skip 2 --launch-count 1`).
-#[test]
-#[ignore = "profiling; run explicitly under a profiler"]
-fn cuda_recurrent_profile_launches() {
-    let Some(device) = cuda() else { return };
-    let slot = |rows| slot(rows, rows, 1, 2);
-    let geometry = Geometry {
-        banks: 3,
-        ..QWEN_4B
-    };
-    let decode = Case::new(geometry, 1, vec![slot(1)], false, 5).with_bf16_activations();
-    let step = decode.cuda_step(&device, Element::bf16(), (4, 8));
-    for _ in 0..3 {
-        let mut t = decode.tensors(&device, Element::bf16());
-        step.call(t.step_args(&decode)).unwrap();
-    }
-    let prefill = Case::new(geometry, 512, vec![slot(512)], false, 5).with_bf16_activations();
-    let chunk = prefill.cuda_chunk(&device, Element::bf16(), 128);
-    for _ in 0..3 {
-        let mut t = prefill.tensors(&device, Element::bf16());
-        chunk.call(t.chunk_args(&prefill)).unwrap();
     }
 }

@@ -18,7 +18,7 @@ Start with the [architecture overview](docs/overview.md), then the
 | `service/` | HTTP service, contracts, catalog, assessment, and worker lifecycle |
 | `seismic/` | Language, compiler, runtime, native libraries, device backends, and hardware research |
 | `catalog/` | Model catalog and planner inputs |
-| `evaluation/` | Fixtures, harness, references, serving bench, build comparison and remote runs |
+| `evaluation/` | `mrig`, every check and measurement on the hosts, and what its instruments drive: fixtures, the harness, the references and the serving benchmark (`bench`) |
 
 ## Build and test
 

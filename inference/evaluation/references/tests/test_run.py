@@ -50,7 +50,7 @@ def test_contract_logits_output(tmp_path: Path, tiny_llama: Path) -> None:
     assert json.loads((output / "reference.json").read_text()) == record
     result = json.loads((output / "result.json").read_text())
     assert result["schema"] == "evaluation-result/1" and result["tool"] == "reference"
-    from magnitude_remote.build import identify
+    from magnitude_rig.build import identify
     # The dirty digest moves with any concurrent edit of the tree; the commit and the shape do not.
     assert set(result["build"]) == {"commit", "dirty_digest"} and result["build"]["commit"] == identify().commit
     assert result["rendered_digest"] == header["rendered_digest"]

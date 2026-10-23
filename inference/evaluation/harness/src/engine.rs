@@ -4,14 +4,12 @@
 
 use crate::artifacts::Artifacts;
 use magnitude_engine::composition::{
-    EngineConfiguration, ReadyEngine, ResolvedEngineConfiguration, load_in_process,
-    start_in_process,
+    EngineConfiguration, ResolvedEngineConfiguration, load_in_process,
 };
 use magnitude_engine::load_native_domain;
 use magnitude_engine::options::{
     ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, ResolvedMethod,
 };
-use magnitude_engine::worker::protocol::LoadProgress;
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use magnitude_executor::{
     Demand, DomainError, ExecutionPath, ExecutorDomain, NumericalProfile, Operation, Outcome,
@@ -137,16 +135,20 @@ pub fn worker(options: &EngineOptions) -> Result<std::process::Command, String> 
     Ok(worker)
 }
 
-/// Load `resolved` on a worker thread of this process behind the engine's
-/// worker protocol, as the engine's own hosts load: the model's Prepare
-/// first, in a worker process of this executable, when tuning records are
-/// missing. `progress` sees each step.
-pub fn start(
-    resolved: ResolvedEngineConfiguration,
-    options: &EngineOptions,
-    progress: impl FnMut(LoadProgress),
-) -> Result<ReadyEngine, String> {
-    start_in_process(resolved, worker(options)?, progress).map_err(|error| error.to_string())
+/// The model's Prepare alone, as a load that found tuning records missing
+/// runs it: its search, in a worker process of this executable, publishing
+/// records to the kernel cache, with nothing imported or loaded here.
+pub fn prepare(artifacts: &Artifacts, options: &EngineOptions, load: &Load) -> Result<(), String> {
+    use magnitude_engine::worker::{Preparation, prepare, start_worker_process};
+    let resolved = configuration(artifacts, options, load)?;
+    let command = worker(options)?;
+    match prepare(&resolved.manifest, || start_worker_process(command), |_| {})
+        .map_err(|error| error.to_string())?
+    {
+        Preparation::Prepared | Preparation::Unneeded => Ok(()),
+        Preparation::Unshared => Err("a Prepare needs a kernel cache (--cache-dir)".into()),
+        Preparation::Incomplete(error) => Err(format!("the Prepare did not finish: {error}")),
+    }
 }
 
 pub struct Engine {

@@ -1,18 +1,17 @@
 # magnitude-fixtures
 
 The only model inputs of evaluation: deterministic chat conversations in the fixture format of
-`specs/26-10-08/evaluation-contracts.md`, written as JSON Lines fixture sets.
+`specs/26-10-08/evaluation-contracts.md`, written as JSON Lines fixture sets. `mrig` builds the
+set an instrument's `--fixture` names on every run (it is deterministic) and stores it by its
+digest (SHA-256 of the file bytes); the serving benchmark builds its own.
 
 ```bash
 cd inference/evaluation
-uv run magnitude-fixtures build tools --output results/fixtures/tools.jsonl
-uv run magnitude-fixtures build retrieval --count 4 --queries 1 --output retrieval.jsonl
 uv run pytest fixtures
 ```
 
-`--count` is the number of independent sessions (lanes, default 8); `--queries` is the number of
-keys a retrieval probe asks for (default 4). The command prints the set's digest (SHA-256 of
-the file bytes).
+`count` is the number of independent sessions (lanes, default 8); `queries` is the number of
+keys a retrieval probe asks for (default 4).
 
 ```python
 from magnitude_fixtures import build, read_set, write_set, validation

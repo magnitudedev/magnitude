@@ -1,6 +1,6 @@
 """Qualify catalog image serving with and without its drafter on fixed fixtures.
 
-Run through magnitude-remote, which records source, artifacts and host evidence.
+Run through `mrig serve`, which records source, artifacts and host evidence.
 This checks observable answers and speculative serving, not distributional quality.
 """
 

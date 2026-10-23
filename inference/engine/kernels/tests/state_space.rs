@@ -9,7 +9,6 @@
 // successor changes: accepted banks, the zero seed, and unrelated banks keep
 // their exact bytes.
 
-mod timing_common;
 mod versions_common;
 
 use magnitude_kernels::{state_space_chunk, state_space_gate, state_space_step};
@@ -1001,106 +1000,6 @@ fn gate_matches_the_portable_body_and_host_model() {
             for rows in [1, 16, 70] {
                 let case = GateCase::new(8, heads, 64, rows, 62);
                 check_mixed(&format!("{backend} gate {name} {rows} rows"), true, &case.native(&device), &case.host(), (1e-6, 3e-3));
-            }
-        }
-    }
-}
-
-/// The median device time (us) of each launch of the calls `run` makes, each
-/// launch in its own timed unit, joined as "a + b".
-fn launch_medians(device: &Device, run: impl FnOnce()) -> String {
-    let trace = device.trace_submissions(seismic::TraceDetail::Launches).unwrap();
-    run();
-    let mut launches: Vec<Vec<f64>> = Vec::new();
-    for submission in trace.collect().unwrap() {
-        for launch in submission.launches {
-            if let Some((start, end)) = launch.device {
-                if launches.len() <= launch.launch {
-                    launches.resize(launch.launch + 1, Vec::new());
-                }
-                launches[launch.launch].push((end - start) * 1e6);
-            }
-        }
-    }
-    launches
-        .iter_mut()
-        .map(|samples| {
-            samples.sort_by(f64::total_cmp);
-            format!("{:.1}", samples[samples.len() / 2])
-        })
-        .collect::<Vec<_>>()
-        .join(" + ")
-}
-
-/// Device time per call at the Nemotron-H Lightning and Super geometries
-/// (BF16 activations): the step at batched decode (B slots of one row), a
-/// 16-row verify slot and 4 slots of 4 rows, and the chunk at 512 and 2048
-/// prefill rows; the decode lines report the SSM state traffic (each slot
-/// reads and writes its whole state). Calls rotate over argument sets of at
-/// least 512 MiB of banks, so state comes from DRAM as it does across a
-/// model's layers.
-#[test]
-#[ignore = "timing; run explicitly on the measurement host"]
-fn state_space_timings() {
-    let options = seismic::measure::Measure {
-        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(11).unwrap()),
-        min_sample_seconds: 0.01,
-    };
-    let measure = |point| timing_common::measured(point, &options);
-    for device in devices() {
-        let backend = device.backend().as_str();
-        for (name, geometry) in &nemotron()[..2] {
-            let bank_bytes = geometry.state_bank() * 4;
-            let mut cases: Vec<(String, bool, usize, Vec<SlotCase>)> = [1usize, 8, 32]
-                .into_iter()
-                .map(|b| (format!("step decode B={b}"), false, b, (0..b).map(|s| slot(1, 1, 1 + s, 1 + b + s)).collect()))
-                .collect();
-            cases.push(("step verify 16".into(), false, 16, vec![slot(16, 16, 1, 2)]));
-            cases.push(("step 4 x 4".into(), false, 16, (0..4).map(|s| slot(4, 4, 1 + s, 5 + s)).collect()));
-            for rows in [512usize, 2048] {
-                cases.push((format!("chunk prefill {rows}"), true, rows, vec![slot(rows, rows, 1, 2)]));
-            }
-            for (label, chunk, rows, slots) in cases {
-                let banks = slots.iter().map(|s| s.following).max().unwrap() + 1;
-                let g = Geometry { banks, tape: 0, ..*geometry };
-                let case = Case::new(g, rows, slots.clone(), 5).with_bf16_activations();
-                let sets = (512usize << 20).div_ceil(banks * bank_bytes).max(2);
-                let mut rotation = (0..sets).map(|_| case.bind(&device, false)).collect::<Vec<_>>();
-                for mapping in mappings(g) {
-                    let specialization = case.specialization(&device, mapping);
-                    let (seconds, launches) = if chunk {
-                        let kernel = state_space_chunk::native_for_device_with(
-                            &device,
-                            state_space_chunk::Elements { A: Element::bf16() },
-                            &specialization,
-                        )
-                        .unwrap();
-                        let args = rotation.iter_mut().map(|bound| bound.chunk_args(case.slab_banks)).collect();
-                        let seconds = measure(kernel.point(args).unwrap()).median;
-                        let launches = launch_medians(&device, || {
-                            for bound in rotation.iter_mut() {
-                                kernel.call(bound.chunk_args(case.slab_banks)).unwrap();
-                            }
-                        });
-                        (seconds, format!(" (inputs + products + scan {launches} us)"))
-                    } else {
-                        let kernel = state_space_step::native_for_device_with(
-                            &device,
-                            state_space_step::Elements { A: Element::bf16() },
-                            &specialization,
-                        )
-                        .unwrap();
-                        let args = rotation.iter_mut().map(|bound| bound.step_args(case.slab_banks)).collect();
-                        (measure(kernel.point(args).unwrap()).median, String::new())
-                    };
-                    let traffic = 2.0 * (slots.len() * bank_bytes) as f64;
-                    println!(
-                        "{backend} {name} {label} ROWS {mapping}: {:.1} us, {:.2} us/row, state traffic {:.0} GB/s{launches}",
-                        seconds * 1e6,
-                        seconds * 1e6 / rows as f64,
-                        traffic / seconds / 1e9
-                    );
-                }
             }
         }
     }

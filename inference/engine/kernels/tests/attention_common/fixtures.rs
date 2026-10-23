@@ -1,6 +1,5 @@
 // Shared fixtures of the gated-attention entry tests (`attention.rs`,
-// `cuda_attention.rs`, `attention_k8v4.rs`, `attention_segments.rs`), included
-// textually: cases of rows with their controls, projections, weights and dense
+// `cuda_attention.rs`, `attention_k8v4.rs`), included textually: cases of rows with their controls, projections, weights and dense
 // history, the host model of the portable body, the devices, device tensors
 // and the row builders.
 
@@ -481,13 +480,3 @@ fn speculative_rows(rows: usize, context: i32) -> Vec<Row> {
         })
         .collect()
 }
-
-/// How the attention timing tests measure a kernel's rotation
-/// (`timing_common::Timed`); the includers without a timing test leave it
-/// unused.
-#[allow(dead_code)]
-const TIMING: seismic::measure::Measure = seismic::measure::Measure {
-    stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
-    min_sample_seconds: 0.005,
-};
-

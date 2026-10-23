@@ -63,9 +63,6 @@ pub struct Rendered {
     pub scored_spans: Vec<Range<usize>>,
     /// The length of `generation`'s serving prompt, when the fixture has one.
     pub generation_prefix_tokens: Option<usize>,
-    /// That serving prompt, when rendered in this process: a rendered file
-    /// holds only its length.
-    pub generation_prompt: Option<Vec<u32>>,
 }
 
 /// The contract's rendered-fixture line, as read from a rendered file.
@@ -133,7 +130,6 @@ impl RenderedFile {
                     .map(|[start, end]| start..end)
                     .collect(),
                 generation_prefix_tokens: line.generation_prefix_tokens,
-                generation_prompt: None,
             });
         }
         if rendered.is_empty() {
@@ -348,18 +344,12 @@ impl<'a> Renderer<'a> {
                 .map_err(failed)?;
             scored_spans.push(token_range(&offsets, bytes));
         }
-        let generation_prompt = conversation
+        let generation_prefix_tokens = conversation
             .generation_prefix
             .map(|prefix| {
                 let request =
                     self.request(&conversation.messages[..prefix], &conversation.tools)?;
-                Ok::<_, String>(
-                    self.prepare(&request)?
-                        .tokens
-                        .iter()
-                        .map(|token| token.0)
-                        .collect(),
-                )
+                Ok::<_, String>(self.prepare(&request)?.tokens.len())
             })
             .transpose()
             .map_err(failed)?;
@@ -370,8 +360,7 @@ impl<'a> Renderer<'a> {
             context_target,
             tokens,
             scored_spans,
-            generation_prefix_tokens: generation_prompt.as_ref().map(Vec::len),
-            generation_prompt,
+            generation_prefix_tokens,
         })
     }
 

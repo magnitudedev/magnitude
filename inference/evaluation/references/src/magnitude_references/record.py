@@ -23,9 +23,9 @@ def utc_stamp() -> str:
 
 
 def build() -> dict:
-    """The local working tree's contract `build` object, from the remote package, which owns build
+    """The local working tree's contract `build` object, from the rig package, which owns build
     identity. Runs on hosts without a git checkout receive it from the controller (`--build-identity`)."""
-    from magnitude_remote.build import identify
+    from magnitude_rig.build import identify
     return identify().to_json()
 
 

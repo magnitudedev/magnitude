@@ -586,6 +586,11 @@ pub fn catalog_lock_digest() -> String {
     lock_digest(CATALOG_LOCK.as_bytes())
 }
 
+/// The SHA-256 of the curated catalog source (`catalog/models.json`) this build holds, in hex.
+pub fn catalog_source_digest() -> String {
+    lock_digest(CATALOG_SOURCE.as_bytes())
+}
+
 pub fn model_catalog_lock() -> Result<ModelCatalogLock, InventoryError> {
     model_catalog_lock_from(CATALOG_LOCK.as_bytes(), &catalog_source()?)
 }

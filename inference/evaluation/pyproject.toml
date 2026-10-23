@@ -6,22 +6,20 @@ dependencies = [
   "magnitude-fixtures",
   "magnitude-references",
   "magnitude-bench",
-  "magnitude-compare",
-  "magnitude-remote",
+  "magnitude-rig",
 ]
 
 [tool.uv]
 package = false
 
 [tool.uv.workspace]
-members = ["fixtures", "references", "bench", "compare", "remote"]
+members = ["fixtures", "references", "bench", "rig"]
 
 [tool.uv.sources]
 magnitude-fixtures = { workspace = true }
 magnitude-references = { workspace = true }
 magnitude-bench = { workspace = true }
-magnitude-compare = { workspace = true }
-magnitude-remote = { workspace = true }
+magnitude-rig = { workspace = true }
 
 [dependency-groups]
 dev = ["pytest>=9.1.1", "pytest-asyncio>=1"]

@@ -293,19 +293,7 @@ impl ManagedModelStore {
             path,
             file.size_bytes,
         )?;
-        let mut parts = Vec::new();
-        for read in WeightSample::reads(&directory) {
-            let (Ok(start), Ok(end)) = (usize::try_from(read.start), usize::try_from(read.end))
-            else {
-                continue;
-            };
-            if read.end > file.size_bytes {
-                continue;
-            }
-            let bytes = remote.read(start, end).await?;
-            parts.push((read, bytes));
-        }
-        let sample = WeightSample::from_reads(parts);
+        let sample = remote_weight_sample(&mut remote, &directory).await?;
         self.cache.write_index(
             ModelIndexKind::HuggingFaceWeightSample,
             &evidence,
@@ -315,6 +303,47 @@ impl ManagedModelStore {
         );
         Ok(sample)
     }
+
+    /// The weight sample of the Ollama registry blob `digest` (`sha256:<hex>`, a GGUF model
+    /// layer) of the library model `model`: its header and one exact range request per sampled
+    /// tensor.
+    pub async fn ollama_registry_weight_sample(
+        &self,
+        model: &str,
+        digest: &str,
+    ) -> Result<Option<WeightSample>, InventoryError> {
+        let url = reqwest::Url::parse(OLLAMA_REGISTRY)
+            .and_then(|registry| registry.join(&format!("v2/library/{model}/blobs/{digest}")))
+            .map_err(|error| InventoryError::InvalidRequest(error.to_string()))?;
+        let mut remote = RemoteRanges::open_url(&self.http, url).await?;
+        let header = crate::remote_header::read_header(&mut remote, &[]).await?;
+        let directory = read_header(&header)
+            .map_err(|error| InventoryError::Integrity(format!("{model}@{digest}: {error}")))?;
+        remote_weight_sample(&mut remote, &directory).await
+    }
+}
+
+/// The Ollama registry, whose library models' layers are blobs addressed by digest.
+const OLLAMA_REGISTRY: &str = "https://registry.ollama.ai/";
+
+/// The weight sample of the remote GGUF file `directory` describes, one exact range request per
+/// sampled tensor the file holds.
+async fn remote_weight_sample(
+    remote: &mut RemoteRanges<'_>,
+    directory: &Directory,
+) -> Result<Option<WeightSample>, InventoryError> {
+    let mut parts = Vec::new();
+    for read in WeightSample::reads(directory) {
+        let (Ok(start), Ok(end)) = (usize::try_from(read.start), usize::try_from(read.end)) else {
+            continue;
+        };
+        if end > remote.logical_length() {
+            continue;
+        }
+        let bytes = remote.read(start, end).await?;
+        parts.push((read, bytes));
+    }
+    Ok(WeightSample::from_reads(parts))
 }
 
 #[cfg(test)]

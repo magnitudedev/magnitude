@@ -1,13 +1,13 @@
 //! `time`: prefill and decode throughput at context lengths and concurrency,
-//! on fixtures sized to each context, plus drafting acceptance from the
-//! engine's own counters when the catalog declares a drafter.
+//! on fixtures sized to each context, without drafting (the drafter's
+//! acceptance is `draft`'s; served drafting is the serving benchmark's).
 //!
 //! Cells, at each context N and concurrency C:
 //! - `prefill`: C fresh sequences take their fixtures' tokens in prefill
 //!   steps of at most `PREFILL_ROWS` rows packed across sequences, as the
-//!   service bounds them; one cold sample, then warm samples (median). A
-//!   full prefill step launches more kernels than a device's timestamp
-//!   buffer can time one by one, so prefill is not attributed by entry;
+//!   service bounds them; one cold sample, then warm samples (median). With
+//!   `--prefill-attribution`, one further sample runs each launch in its own
+//!   timed unit and decomposes the prefill's device time by entry;
 //! - `decode`: C sequences hold their fixtures' tokens as history, then
 //!   decode together, each step feeding back its greedy selections: warm
 //!   steps, then measured steps (median).
@@ -24,18 +24,9 @@ use crate::engine::{self, Engine, EngineOptions, Load, PREFILL_ROWS, Sequence, S
 use crate::fixture::FixtureSet;
 use crate::render::{Rendered, Renderer};
 use crate::steps::{attribution, device_end, median, medians, summary, window};
-use magnitude_engine::composition::ReadyEngine;
-use magnitude_engine::options::ResolvedMethod;
-use magnitude_engine::worker::{RequestEvent, RequestOptions};
 use magnitude_executor::{Demand, Operation, WorkKind};
-use magnitude_generation::{EndOfGeneration, MethodChoice, Options, Sampling, Shaping};
-use magnitude_scheduler::prefix_cache::PrefixRetention;
 use seismic::{SubmissionTrace, TraceDetail, host_seconds};
 use serde_json::{Value, json};
-use std::future::Future;
-use std::pin::pin;
-use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
 
 const MS: f64 = 1e3;
 
@@ -45,10 +36,11 @@ pub struct TimeOptions {
     pub warm: usize,
     pub steps: usize,
     pub attribution_steps: usize,
+    /// Attribute one further prefill sample's device time by entry.
+    pub prefill_attribution: bool,
     /// Prefill samples, the first of them cold.
     pub prefill_samples: usize,
     pub lookahead: bool,
-    pub drafting: bool,
 }
 
 pub struct Timed {
@@ -56,7 +48,6 @@ pub struct Timed {
     pub speed: Vec<Value>,
     /// The target load's wall and processor time.
     pub load: Value,
-    pub drafting: Option<Value>,
     pub devices: Vec<String>,
 }
 
@@ -76,7 +67,6 @@ pub fn run(
             .collect::<Result<Vec<_>, _>>()?;
         by_context.push((context, rendered));
     }
-    let drafting = time.drafting && artifacts.drafter.is_some();
 
     let longest = by_context
         .iter()
@@ -134,27 +124,6 @@ pub fn run(
         }
     }
     drop(engine);
-    // Drafting serves each fixture's generation request as sized to the
-    // first context.
-    let drafting = if drafting {
-        let (context, rendered) = &by_context[0];
-        let prompts = set
-            .fixtures
-            .iter()
-            .zip(rendered)
-            .filter_map(|(fixture, rendered)| {
-                fixture
-                    .generation
-                    .as_ref()
-                    .map(|generation| (rendered, generation.max_tokens))
-            })
-            .collect::<Vec<_>>();
-        let mut drafting = drafting_acceptance(artifacts, options, &prompts)?;
-        drafting["context"] = json!(context);
-        Some(drafting)
-    } else {
-        None
-    };
     let rendered = by_context
         .into_iter()
         .flat_map(|(_, rendered)| rendered)
@@ -163,7 +132,6 @@ pub fn run(
         rendered,
         speed,
         load,
-        drafting,
         devices,
     })
 }
@@ -275,6 +243,20 @@ fn prefill_cell(
     drop(trace);
     let mut warm = samples_ms[1..].to_vec();
     let median_ms = median(&mut warm);
+    // Untimed: each launch runs in its own timed unit, and each step of the
+    // sample collects its own launches.
+    let attributed = if time.prefill_attribution {
+        let trace = traced(engine, TraceDetail::Launches)?;
+        let (_, steps) = prefill_sample(engine, histories, &trace)?;
+        let mut submissions = steps
+            .into_iter()
+            .flat_map(|step| step.submissions)
+            .collect::<Vec<_>>();
+        submissions.extend(trace.collect().map_err(|error| error.to_string())?);
+        attribution(&submissions, 1, f64::INFINITY)
+    } else {
+        Value::Null
+    };
     Ok(json!({
         "tokens_per_second": rows / (median_ms / MS),
         "samples": samples_ms[1..].iter().map(|ms| rows / (ms / MS)).collect::<Vec<_>>(),
@@ -284,6 +266,7 @@ fn prefill_cell(
             "cold_ms": samples_ms[0],
             "samples_ms": &samples_ms[1..],
             "median_step": medians(&summaries),
+            "attribution": attributed,
         },
     }))
 }
@@ -402,8 +385,7 @@ fn measure(
         let mut attributed_end = f64::NEG_INFINITY;
         for _ in 0..time.attribution_steps {
             // Attributed steps are untimed, so each collects its own launches
-            // even under lookahead: a step's launch timestamps can fit the
-            // trace's buffer, a window's do not.
+            // even under lookahead.
             let operations = make(sequences)?;
             let mut refs = sequences.iter_mut().collect::<Vec<_>>();
             let (step, _) = engine.step(operations, &mut refs, Some(&trace))?;
@@ -442,173 +424,4 @@ pub fn process_cpu_seconds() -> f64 {
     let read = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut time) };
     assert_eq!(read, 0, "the process has a processor-time clock");
     time.tv_sec as f64 + time.tv_nsec as f64 * 1e-9
-}
-
-/// Drive a future on this thread; the engine client is executor-agnostic.
-fn block_on<T>(future: impl Future<Output = T>) -> T {
-    struct Unpark(std::thread::Thread);
-    impl Wake for Unpark {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
-    let mut context = Context::from_waker(&waker);
-    let mut future = pin!(future);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => std::thread::park(),
-        }
-    }
-}
-
-/// Greedy generation of every fixture's serving request with the catalog
-/// drafter, through the engine's worker: proposed and accepted drafts are
-/// the generation's own counters. A verification commits its accepted
-/// proposals plus one token, after the first token the prompt yields, so
-/// verifications are `completion - 1 - accepted`.
-fn drafting_acceptance(
-    artifacts: &Artifacts,
-    options: &EngineOptions,
-    prompts: &[(&Rendered, usize)],
-) -> Result<Value, String> {
-    if prompts.is_empty() {
-        return Err("drafting needs fixtures with a generation request".into());
-    }
-    let longest = prompts
-        .iter()
-        .map(|(rendered, max_tokens)| {
-            rendered
-                .generation_prompt
-                .as_ref()
-                .expect("a generation request")
-                .len()
-                + max_tokens
-        })
-        .max()
-        .expect("nonempty");
-    let resolved = engine::configuration(
-        artifacts,
-        options,
-        &Load {
-            drafter: true,
-            proposals: None,
-            context_tokens: longest,
-            decode_rows: magnitude_engine::options::standard_service_limits().decode_tokens,
-            exported_logits_rows: 0,
-            lookahead: true,
-        },
-    )?;
-    // Each load step once; its measured progress repeats per unit and weight.
-    let mut reported = None;
-    let engine = engine::start(resolved, options, |progress| {
-        let step = std::mem::discriminant(&progress);
-        if reported != Some(step) {
-            reported = Some(step);
-            eprintln!("magnitude-harness: load {progress:?}");
-        }
-    })?;
-    let method = match engine.ready_info().model.method {
-        ResolvedMethod::DFlash { proposals } => MethodChoice::DFlash { proposals },
-        ResolvedMethod::Mtp {
-            greedy_proposals, ..
-        } => MethodChoice::Mtp {
-            proposals: greedy_proposals,
-        },
-        ResolvedMethod::Plain => {
-            return Err("the catalog drafter did not load a drafting method".into());
-        }
-    };
-    let (mut proposed, mut accepted, mut verifications) = (0usize, 0usize, 0usize);
-    let mut requests = Vec::with_capacity(prompts.len());
-    for (rendered, max_tokens) in prompts {
-        let prompt = rendered
-            .generation_prompt
-            .as_ref()
-            .expect("a generation request");
-        let usage = generate(&engine, prompt, *max_tokens, method)?;
-        let verified = usage
-            .completion_tokens
-            .saturating_sub(1 + usage.draft_n_accepted);
-        proposed += usage.draft_n;
-        accepted += usage.draft_n_accepted;
-        verifications += verified;
-        requests.push(json!({
-            "fixture_id": rendered.fixture_id,
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "proposed": usage.draft_n,
-            "accepted": usage.draft_n_accepted,
-            "verifications": verified,
-        }));
-    }
-    drop(engine);
-    Ok(json!({
-        "proposed": proposed,
-        "accepted": accepted,
-        "tokens_per_verify": (accepted + verifications) as f64 / verifications.max(1) as f64,
-        "requests": requests,
-    }))
-}
-
-fn generate(
-    engine: &ReadyEngine,
-    prompt: &[u32],
-    max_tokens: usize,
-    method: MethodChoice,
-) -> Result<magnitude_generation::DetailedUsage, String> {
-    let host = engine.host();
-    let input = host
-        .prepare_input(
-            prompt
-                .iter()
-                .copied()
-                .map(magnitude_generation::TokenId)
-                .collect(),
-            &[],
-        )
-        .map_err(|error| error.to_string())?;
-    let definition = host.definition();
-    let options = Options {
-        max_tokens,
-        output_capacity: 16,
-        context_limit: usize::try_from(definition.decoder.context_limit)
-            .map_err(|_| "context exceeds the host domain")?,
-        vocabulary: usize::try_from(definition.decoder.vocabulary)
-            .map_err(|_| "vocabulary exceeds the host domain")?,
-        stop_tokens: host.tokenizer().stop_tokens().clone(),
-        suppressed_tokens: host.tokenizer().suppressed_tokens().clone(),
-        sampling: Sampling::Greedy,
-        shaping: Shaping {
-            temperature: 0.0,
-            ..Shaping::default()
-        },
-        seed: 0,
-        forced_quantum: 0,
-        method,
-        end_of_generation: EndOfGeneration::Stop,
-        reasoning_budget: None,
-    };
-    block_on(async {
-        let mut request = engine
-            .client()
-            .admit(RequestOptions {
-                input,
-                options,
-                constraint: None,
-                retention: PrefixRetention::Transient,
-                output_capacity: 16,
-            })
-            .await
-            .map_err(|error| error.to_string())?;
-        loop {
-            match request.receive().await {
-                Some(RequestEvent::Output(_)) => {}
-                Some(RequestEvent::Completed { usage, .. }) => return Ok(usage),
-                Some(RequestEvent::Failed(error)) => return Err(error.to_string()),
-                None => return Err("the request ended without a terminal event".into()),
-            }
-        }
-    })
 }

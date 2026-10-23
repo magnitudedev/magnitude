@@ -488,7 +488,7 @@ pub fn content_sample_digest(
 ) -> io::Result<String> {
     use io::SeekFrom;
     let mut digest = Sha256::new();
-    let mut copy = |reader: &mut (dyn ReadSeek), start: u64, length: u64| -> io::Result<()> {
+    let mut copy = |reader: &mut dyn ReadSeek, start: u64, length: u64| -> io::Result<()> {
         reader.seek(SeekFrom::Start(start))?;
         let copied = io::copy(&mut reader.take(length), &mut digest)?;
         if copied == length {

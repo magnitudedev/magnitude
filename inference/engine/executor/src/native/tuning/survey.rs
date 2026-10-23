@@ -13,7 +13,8 @@
 //! these files (tuning spec §E2) and reports, per entry instance, the choice
 //! quality at the evaluations the survey's load would have allowed its
 //! search, the configurations needed, and the per-point gap of one
-//! configuration for all points (example `tuning_replay`).
+//! configuration for all points (`replay.md` beside a harness survey's
+//! records, which `mrig kernel` reports).
 //!
 //! On a shared host the whole surveying process must run under the host's
 //! GPU lock: its model load, the tuning of entries it does not survey and
@@ -47,6 +48,11 @@ static SURVEY: Mutex<Option<TuningSurvey>> = Mutex::new(None);
 /// Install the survey for every later program preparation in this process.
 pub fn install(survey: TuningSurvey) {
     *SURVEY.lock().expect("tuning survey lock poisoned") = Some(survey);
+}
+
+/// Whether a survey is installed in this process.
+pub(crate) fn installed() -> bool {
+    SURVEY.lock().expect("tuning survey lock poisoned").is_some()
 }
 
 /// The installed survey, when it names `entry`.
@@ -102,6 +108,11 @@ pub(super) fn record(
 /// Replays per entry instance.
 pub const REPLAY_RUNS: usize = 1000;
 
+/// The replay report's line for an entry instance no point of the load
+/// demands: every configuration scores zero, so a search has nothing to
+/// choose between.
+pub const NO_DEMAND: &str = "No point has demand at this load: every configuration scores alike.";
+
 /// Replay the production search against every survey file in `directory`
 /// ([`REPLAY_RUNS`] runs each, §E2) and report, as Markdown: per entry
 /// instance, the chosen configuration's true cost relative to the true best
@@ -143,6 +154,17 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
         let allowance = field("allowance_seconds")?
             .as_f64()
             .ok_or_else(|| format!("{}: `allowance_seconds` is not a time", path.display()))?;
+        if result.points.iter().all(|point| point.weight == 0.0) {
+            writeln!(
+                report,
+                "### {} [{}] {}\n\n{NO_DEMAND}\n",
+                result.entry,
+                field("bindings")?.as_str().unwrap_or_default(),
+                field("statics")?,
+            )
+            .expect("writing to a string");
+            continue;
+        }
         let time = &result.time;
         let per_configuration =
             (time.forming_seconds + time.measuring_seconds + time.validating_seconds)

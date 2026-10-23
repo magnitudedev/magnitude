@@ -4,7 +4,7 @@ Each case is a small synthetic GGUF of one family, built from the metadata of a 
 that family (every `<architecture>.*` key of the real header is written, with synthetic values, and no
 other architecture key; the tokenizer keeps the real model/pre/special-token keys over a small
 vocabulary). `check_families` runs every case's reference against transformers (and every draft case
-against the released draft code), covering the family variation axes listed in each case. Templates
+against the released draft code; `tests/test_released.py`), covering the family variation axes listed in each case. Templates
 are read once from Hugging Face by byte range and cached under `gguf.HEADER_CACHE`.
 """
 from __future__ import annotations
@@ -839,11 +839,11 @@ def check_families(names: set[str] | None, device: torch.device, zlab_source: Pa
             dflash(case, target.hidden_size).write(path)
             package = Package.local(path)
             draft = DFlashReference(package, Weights(package, device, True), target)
-            source = "dspark" if draft.dspark else "zlab" if draft.dflash2 else "muse"
+            source = draft.released_code
             source_config = None
             if draft.dflash2:
                 source_config = directory / f"{case.name}.source-config.json"
                 source_config.write_text(json.dumps({"is_causal": case.axes.get("causal", False)}) + "\n")
-            report = check_draft(draft, 12, 3, None, source, zlab_source if draft.dflash2 else None, source_config)
+            report = check_draft(draft, 12, 3, None, source, zlab_source if source == "zlab" else None, source_config)
             reports.append({"case": case.name, "target_case": case.target, "covers": list(case.covers), **report})
     return reports

@@ -15,8 +15,6 @@ use seismic::{
     Tensor,
 };
 
-mod timing_common;
-
 const SENTINEL: f32 = 7.25;
 
 #[derive(Clone, Copy)]
@@ -2111,108 +2109,6 @@ fn convolved_form(
             tape: read(&t.tape),
         },
     )
-}
-
-/// The median device time (µs) of each launch of the calls `run` makes, each
-/// launch in its own timed unit, joined as "a + b".
-fn launch_medians(device: &Device, run: impl FnOnce()) -> String {
-    let trace = device
-        .trace_submissions(seismic::TraceDetail::Launches)
-        .unwrap();
-    run();
-    let mut launches: Vec<Vec<f64>> = Vec::new();
-    for submission in trace.collect().unwrap() {
-        for launch in submission.launches {
-            if let Some((start, end)) = launch.device {
-                if launches.len() <= launch.launch {
-                    launches.resize(launch.launch + 1, Vec::new());
-                }
-                launches[launch.launch].push((end - start) * 1e6);
-            }
-        }
-    }
-    launches
-        .iter_mut()
-        .map(|samples| {
-            samples.sort_by(f64::total_cmp);
-            format!("{:.1}", samples[samples.len() / 2])
-        })
-        .collect::<Vec<_>>()
-        .join(" + ")
-}
-
-/// Device time per call at the 4B geometry (one layer, bf16 activations): the
-/// step at 1 row, one row in each of 8 slots, and 8 and 16 rows; the chunk at
-/// 8, 16, 128 and 512 rows, with each launch's time. Calls rotate over 16
-/// argument sets (≥ 96 MiB of state arenas), so state traffic comes from DRAM
-/// as it does across a model's layers.
-#[test]
-#[ignore = "timing; run explicitly on the measurement host"]
-fn metal_recurrent_timings() {
-    let Some(device) = metal() else {
-        return;
-    };
-    let options = seismic::measure::Measure {
-        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(15).unwrap()),
-        min_sample_seconds: 0.01,
-    };
-    let measure = |point| timing_common::measured(point, &options);
-    let slot = |rows, previous, following| slot(rows, rows, previous, following);
-    for (label, rows, slots) in [
-        ("step 1 row", 1usize, vec![slot(1, 1, 2)]),
-        (
-            "step 8 slots x 1 row",
-            8,
-            (0..8).map(|s| slot(1, 1 + s, 9 + s)).collect::<Vec<_>>(),
-        ),
-        ("step 4 rows", 4, vec![slot(4, 1, 2)]),
-        ("step 8 rows", 8, vec![slot(8, 1, 2)]),
-        ("step 16 rows", 16, vec![slot(16, 1, 2)]),
-        ("chunk 1 row", 1, vec![slot(1, 1, 2)]),
-        ("chunk 4 rows", 4, vec![slot(4, 1, 2)]),
-        ("chunk 8 rows", 8, vec![slot(8, 1, 2)]),
-        ("chunk 16 rows", 16, vec![slot(16, 1, 2)]),
-        ("chunk 128 rows", 128, vec![slot(128, 1, 2)]),
-        ("chunk 512 rows", 512, vec![slot(512, 1, 2)]),
-    ] {
-        let banks = slots.iter().map(|s| s.following).max().unwrap() + 1;
-        let geometry = Geometry {
-            key_heads: 16,
-            value_heads: 32,
-            width: 128,
-            convolution: 4,
-            banks,
-            tape: 0,
-        };
-        let case = Case::new(geometry, rows, slots, false, 5).with_bf16_activations();
-        let mut rotation = (0..16)
-            .map(|_| case.tensors(&device, Element::bf16()))
-            .collect::<Vec<_>>();
-        if label.starts_with("step") {
-            for step_rows in [32u64, 16, 64] {
-                let kernel = case.native_step(&device, Element::bf16(), step_rows);
-                let args = rotation.iter_mut().map(|t| t.step_args(&case)).collect();
-                let measured = measure(kernel.point(args).unwrap());
-                println!("{label} ROWS {step_rows}: {:.1} us", measured.median * 1e6);
-            }
-        } else {
-            for chunk_rows in CHUNK_ROWS {
-                let kernel = case.native_chunk(&device, Element::bf16(), chunk_rows);
-                let args = rotation.iter_mut().map(|t| t.chunk_args(&case)).collect();
-                let measured = measure(kernel.point(args).unwrap());
-                let launches = launch_medians(&device, || {
-                    for t in rotation.iter_mut() {
-                        kernel.call(t.chunk_args(&case)).unwrap();
-                    }
-                });
-                println!(
-                    "{label} ROWS {chunk_rows}: {:.1} us (launches {} us)",
-                    measured.median * 1e6,
-                    launches
-                );
-            }
-        }
-    }
 }
 
 /// The normalized staging of the batch fallback retains its prior projection

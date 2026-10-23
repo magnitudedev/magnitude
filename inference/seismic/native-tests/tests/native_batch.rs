@@ -142,3 +142,48 @@ fn canonical_formation_alone_serves_a_legal_choice_without_building_observations
         );
     }
 }
+
+/// A launch-detail trace times every launch of a batch however many it
+/// holds: more launches than one Metal sample buffer has pairs for take
+/// further pages of samples.
+#[test]
+fn a_launch_trace_times_more_launches_than_one_sample_buffer_holds() {
+    let devices = Devices::discover(&[]).unwrap();
+    let Ok(device) = devices.open_backend(BackendName::Metal) else {
+        return;
+    };
+    let rows =
+        scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
+            .unwrap();
+    let values = [1.0f32, -2.0, 3.0, 4.0];
+    let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+    let input = Tensor::from_host(&device, Element::f32(), &[2, 2], &bytes).unwrap();
+    // SAFETY: the authored entry writes every f32 result element.
+    let mut result = unsafe { Tensor::uninitialized(&device, Element::f32(), &[2, 2]) }.unwrap();
+    // Two pages of launch pairs (Metal's largest sample buffer holds 2048
+    // pairs) and part of a third.
+    let launches = 2 * 2_048 + 52;
+    let trace = device.trace_submissions(seismic::TraceDetail::Launches).unwrap();
+    let mut batch = NativeTensorBatch::new(&device);
+    for _ in 0..launches {
+        batch
+            .push(
+                &rows,
+                scale_rows::Args { x: &input, factor: 3.0 },
+                scale_rows::OutputArgs { value: &mut result },
+            )
+            .unwrap();
+    }
+    batch.submit().unwrap().wait().unwrap();
+    let submissions = trace.collect().unwrap();
+    let timed = submissions
+        .iter()
+        .flat_map(|submission| &submission.launches)
+        .filter(|launch| launch.device.is_some_and(|(start, end)| end >= start))
+        .count();
+    assert_eq!(timed, launches);
+    assert_eq!(
+        result.read_to_host().unwrap(),
+        values.map(|value| value * 3.0).iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>()
+    );
+}

@@ -188,9 +188,6 @@ class LocalSource(Source):
         start = self.header.data_offset + info.offset
         return self.map[start:start + info.nbytes]
 
-    def describe(self) -> str:
-        return str(self.path)
-
 
 def hub_url(repository: str, revision: str, path: str) -> str:
     return f"https://huggingface.co/{repository}/resolve/{revision}/{path}"
@@ -243,9 +240,6 @@ class RemoteSource(Source):
             raise RuntimeError(f"{self.url}: short range read ({len(data)} of {size} bytes)")
         return data
 
-    def describe(self) -> str:
-        return f"{self.repository}@{self.revision}/{self.path}"
-
 
 SHARD = re.compile(r"^(?P<prefix>.*)-(?P<index>\d{5})-of-(?P<count>\d{5})(?P<suffix>\.gguf)$")
 
@@ -263,7 +257,6 @@ class Package:
     """A (possibly split) GGUF model: the first shard's metadata and every shard's tensors."""
 
     def __init__(self, sources: list[Source]):
-        self.sources = sources
         self.metadata = sources[0].header.metadata
         self.location: dict[str, Source] = {}
         for source in sources:
@@ -276,10 +269,6 @@ class Package:
     def local(path: Path) -> "Package":
         path = Path(path)
         return Package([LocalSource(path.with_name(name)) for name in shard_paths(path.name)])
-
-    @staticmethod
-    def remote(repository: str, revision: str, path: str, cache: Path | None = None) -> "Package":
-        return Package([RemoteSource(repository, revision, shard, cache) for shard in shard_paths(path)])
 
     @property
     def architecture(self) -> str:
@@ -396,22 +385,5 @@ class Writer:
         self.stream.close()
 
 
-def metadata_json(metadata: dict[str, Value]) -> dict:
-    """Compact JSON view of metadata (long arrays truncated), for provenance records."""
-    view = {}
-    for key, value in metadata.items():
-        if value.kind == GGUFValueType.ARRAY and len(value.value) > 64:
-            view[key] = {"length": len(value.value), "head": value.value[:8]}
-        else:
-            view[key] = value.value
-    return view
-
-
-def describe(package: Package) -> dict:
-    """A package's compact metadata and tensor directory."""
-    return {"metadata": metadata_json(package.metadata),
-            "tensors": {name: [list(package.info(name).shape), package.info(name).type.name] for name in package.names()}}
-
-
-# Headers of immutable Hugging Face revisions, read once by byte range (synthetic templates, slices).
+# Headers of immutable Hugging Face revisions, read once by byte range (synthetic templates).
 HEADER_CACHE = Path.home() / ".cache" / "magnitude" / "gguf-headers"

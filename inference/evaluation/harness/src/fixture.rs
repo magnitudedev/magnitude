@@ -23,7 +23,6 @@ pub struct Fixture {
 #[derive(Clone, Debug, Deserialize)]
 pub struct Generation {
     pub prefix: usize,
-    pub max_tokens: usize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

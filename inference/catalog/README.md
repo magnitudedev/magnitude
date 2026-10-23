@@ -21,7 +21,16 @@ cargo run --release -p magnitude-service-catalog-tool -- update-lock ...   # adv
 cargo run --release -p magnitude-service-catalog-tool -- build-bundle ...  # build the header bundle
 cargo run --release -p magnitude-service-catalog-tool -- headers --output DIR --model-store DIR  # headers for tests
 cargo run --release -p magnitude-service-catalog-tool -- acquire --model qwen3.5-4b:gguf:q4 --model-store DIR
+cargo run --release -p magnitude-service-catalog-tool -- audit --headers DIR --output FILE --model-store DIR  # tensor-type audit
+cargo run --release -p magnitude-service-catalog-tool -- header local PATH  # metadata and tensors
+cargo run --release -p magnitude-service-catalog-tool -- slice --output FILE hub --repository REPO --revision REV --path PATH --model-store DIR
 ```
+
+`fixture-header` and `weight-sample` write the assessment fixtures (see
+`engine/fixtures/assessment/README.md`); `slice` writes a truncated real-weight GGUF of a model too
+large to run whole, with a provenance record beside it. `header`, `weight-sample` and `slice` read
+a `local PATH` or a `hub --repository REPO --revision REV --path PATH --model-store DIR` file; a
+Hub file is read by range requests only, through the model store's Hub client.
 
 `acquire` resolves one catalog model at its locked revisions, downloads into a managed model store
 only the target, drafter and projector files that are missing, verifies them through the service's

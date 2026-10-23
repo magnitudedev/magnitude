@@ -7,9 +7,12 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
 magnitude-artifacts = { path = "../../engine/artifacts" }
 magnitude-service-contracts.workspace = true
 magnitude-service-models.workspace = true
 magnitude-executor = { path = "../../engine/executor" }
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true

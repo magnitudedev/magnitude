@@ -25,10 +25,12 @@ used as evidence; this report establishes locked-source header facts, not local
 installation presence. The generated per-file evidence is
 `catalog/results/catalog-tensor-types.json` and is intentionally ignored.
 
-Reproduce from the repository root (network access is required):
+Reproduce from `inference/` (network access is required); the tool audits the
+catalog and lock it is built with, through the catalog's own resolution and
+header export:
 
 ```sh
-uv run --with huggingface-hub inference/catalog/audit_tensor_types.py
+cargo run --release -p magnitude-service-catalog-tool -- audit --headers DIR --output catalog/results/catalog-tensor-types.json --model-store DIR
 ```
 
 The auditor exits nonzero if a locked artifact is unavailable, a tensor type is

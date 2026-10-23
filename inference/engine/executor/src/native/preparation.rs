@@ -356,9 +356,12 @@ impl NativePreparationCache {
         let searched = censused.search()?;
         // A development survey measures the units it owns in the search's
         // process, after the search: one more walk that forms nothing and
-        // reads every other unit's published choice.
+        // reads every other unit's published choice. Without an installed
+        // survey there is nothing to measure and no walk.
         #[cfg(feature = "tuning-survey")]
-        let searched = {
+        let searched = if !super::tuning::survey::installed() {
+            searched
+        } else {
             let mut survey = Preparation::new(
                 plan,
                 tuning.definition,

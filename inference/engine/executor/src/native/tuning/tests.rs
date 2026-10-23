@@ -1761,6 +1761,7 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
             PointShape {
                 label: "m1".into(),
                 weight: 1.,
+                terms: Vec::new(),
                 rows: 1,
                 sequences: 1,
                 context: None,

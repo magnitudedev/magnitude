@@ -5496,12 +5496,6 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             self.time.building_seconds += began.elapsed().as_secs_f64();
             points.push(ground.validator.point(point)?);
         }
-        if self.implementation.launch_scoped() {
-            return Err(TuneError::Domain(
-                "a survey measures programs formed whole; launches formed separately are searched"
-                    .into(),
-            ));
-        }
         let formation = Formation {
             device: &self.device,
             module: self.module,
@@ -7511,21 +7505,20 @@ impl Tuned<'_> {
         let mut admission = Observed::default();
         let validator = &self.ground.validator;
         let mut records = Vec::new();
+        // The unit's programs as its search forms them: launches formed
+        // separately from held launch programs, or programs formed whole.
+        let mut programs = if self.formation.implementation.launch_scoped() {
+            Programs::Launches(LaunchPrograms::default())
+        } else {
+            Programs::Whole(WholePrograms::default())
+        };
         // One batch of the walk: its programs formed together, then each
         // measured. A batch is as many as form at once.
-        let mut survey = |batch: Vec<NativeSpecialization>| {
+        let mut survey = |batch: Vec<NativeSpecialization>| -> Result<(), TuneError> {
             let began = Instant::now();
-            let formed = self
-                .formation
-                .forming(batch.into_iter().map(Formable::Program).collect())
-                .map(Forming::run);
+            let kernels = programs.form(self.formation, &batch, &[])?;
             time.forming_seconds += began.elapsed().as_secs_f64();
-            for call in formed.into_iter().flat_map(|formed| formed.calls) {
-                let (Formable::Program(specialization), Product::Program(kernel)) =
-                    (call.formable, call.product)
-                else {
-                    unreachable!("a survey forms whole programs");
-                };
+            for (specialization, kernel) in batch.into_iter().zip(kernels) {
                 let began = Instant::now();
                 let (artifact, outcome) = match kernel {
                     Err(exclusion) => (None, Outcome::Excluded(exclusion)),
@@ -7561,23 +7554,31 @@ impl Tuned<'_> {
                     outcome,
                 });
             }
+            Ok(())
         };
         // The admissible configurations in the declaration's order, the
         // defaults first, a batch at a time: the walk holds one batch, and
         // the survey the records it returns.
         let threads = formation_threads(usize::MAX);
         let mut batch = Vec::with_capacity(threads);
+        let mut failed = None;
         self.formation
             .implementation
             .walk_admissible(self.statics, |specialization| {
                 batch.push(specialization.clone());
                 if batch.len() == threads {
-                    survey(std::mem::take(&mut batch));
+                    if let Err(error) = survey(std::mem::take(&mut batch)) {
+                        failed = Some(error);
+                        return false;
+                    }
                 }
                 true
             })
             .map_err(|error| TuneError::Declaration(error.to_string()))?;
-        survey(batch);
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        survey(batch)?;
         let measured = |record: &ConfigurationRecord| match &record.outcome {
             Outcome::Measured { points, .. } => Some(points.clone()),
             Outcome::Excluded(_) => None,

@@ -100,11 +100,6 @@ struct Pending {
     committed: f64,
 }
 
-/// Timestamp samples one launch-detail trace may hold between collections
-/// (two per launch): Metal's largest sample buffer, 32 KiB of 8-byte
-/// timestamps.
-const LAUNCH_SAMPLES: usize = 4_096;
-
 enum Timeline {
     /// Device intervals are already host times (CPU, and Metal at
     /// submission detail).
@@ -177,7 +172,7 @@ impl SubmissionTrace {
             #[cfg(target_os = "macos")]
             OpenedKind::Metal(opened) if detail == TraceDetail::Launches => {
                 Timeline::Metal(Arc::new(
-                    seismic_metal::LaunchTimestamps::new(opened.service(), LAUNCH_SAMPLES)
+                    seismic_metal::LaunchTimestamps::new(opened.service())
                         .map_err(TraceError::Execution)?,
                 ))
             }

@@ -9,7 +9,6 @@
 // Every case checks the outputs, the published windows (copies), and that
 // no bank other than each slot's successor changes.
 
-mod timing_common;
 mod versions_common;
 
 use magnitude_kernels::short_conv_rows;
@@ -437,48 +436,6 @@ fn tape_versions_equal_runs_that_stopped_there() {
                     && same_bits(&bank(&from_tape.window), &bank(&expected.window)),
                 "{backend}: version (bank, {accepted}) differs from a run that stopped after {} rows",
                 1 + accepted
-            );
-        }
-    }
-}
-
-/// Device time per call at the LFM2 geometry (BF16 output): decode at 1 and
-/// 8 slots, a 16-row verify, and 512 and 2048 prefill rows; also the bytes
-/// the call moves (u | c rows, the window reads and the published window).
-#[test]
-#[ignore = "timing; run explicitly on the measurement host"]
-fn short_conv_timings() {
-    let options = seismic::measure::Measure {
-        stop: seismic::measure::Stop::Count(std::num::NonZeroUsize::new(11).unwrap()),
-        min_sample_seconds: 0.01,
-    };
-    let measure = |point| timing_common::measured(point, &options);
-    let geometry = Geometry {
-        channels: 2048,
-        taps: 3,
-        banks: 0,
-        tape: 0,
-    };
-    for device in devices() {
-        let backend = device.backend().as_str();
-        let decode = |b: usize| (0..b).map(|s| slot(1, 1, 1 + s, 1 + b + s)).collect::<Vec<_>>();
-        for (label, rows, slots) in [
-            ("decode B=1", 1usize, decode(1)),
-            ("decode B=8", 8, decode(8)),
-            ("verify 16", 16, vec![slot(16, 1, 1, 2)]),
-            ("prefill 512", 512, vec![slot(512, 512, 1, 2)]),
-            ("prefill 2048", 2048, vec![slot(2048, 2048, 1, 2)]),
-        ] {
-            let banks = slots.iter().map(|s| s.following).max().unwrap() + 1;
-            let case = Case::new(Geometry { banks, ..geometry }, rows, slots.clone(), 3);
-            let mut rotation = (0..8).map(|_| case.bind(&device, false)).collect::<Vec<_>>();
-            let args = rotation.iter_mut().map(|bound| bound.args(case.slab_banks)).collect();
-            let seconds = measure(kernel(&device, Element::bf16()).point(args).unwrap()).median;
-            let bytes = rows * 2048 * (8 + 2) + slots.len() * 2 * 2 * 2048 * 4;
-            println!(
-                "{backend} short conv {label}: {:.1} us ({:.0} GB/s effective)",
-                seconds * 1e6,
-                bytes as f64 / seconds / 1e9
             );
         }
     }

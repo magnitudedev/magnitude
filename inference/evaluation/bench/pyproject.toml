@@ -9,7 +9,6 @@ description = "The serving benchmark: real fixture workloads over HTTP, our engi
 requires-python = ">=3.12"
 dependencies = [
   "magnitude-fixtures",
-  "magnitude-remote",
   "httpx==0.28.1",
   "psutil>=7",
   "pydantic==2.13.5",

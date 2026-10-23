@@ -640,3 +640,75 @@ fn split_gguf_requires_the_split_naming_and_consistent_shards() {
     ));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// A header encodes back to the bytes it was read from, every metadata value in its own stored
+/// type, and an edited copy keeps those types.
+#[test]
+fn a_stored_header_encodes_back_to_its_bytes() {
+    let array = |element: u32, count: u64, values: &[u8]| {
+        let mut bytes = element.to_le_bytes().to_vec();
+        bytes.extend(count.to_le_bytes());
+        bytes.extend_from_slice(values);
+        bytes
+    };
+    let metadata = [
+        ("u8", 0, vec![7]),
+        ("i8", 1, vec![0xff]),
+        ("u16", 2, u16_value(513)),
+        ("i16", 3, (-2i16).to_le_bytes().to_vec()),
+        ("u32", 4, 70_000u32.to_le_bytes().to_vec()),
+        ("i32", 5, (-3i32).to_le_bytes().to_vec()),
+        ("f32", 6, 0.1f32.to_le_bytes().to_vec()),
+        ("bool", 7, vec![1]),
+        ("string", 8, string_value("text")),
+        ("u64", 10, u64::MAX.to_le_bytes().to_vec()),
+        ("i64", 11, i64::MIN.to_le_bytes().to_vec()),
+        ("f64", 12, 0.1f64.to_le_bytes().to_vec()),
+        ("u16s", 9, array(2, 2, &[1, 0, 2, 0])),
+        ("f32s", 9, array(6, 1, &1.5f32.to_le_bytes())),
+        (
+            "strings",
+            9,
+            array(8, 2, &[string_value("a"), string_value("")].concat()),
+        ),
+        ("empty", 9, array(8, 0, &[])),
+    ];
+    let bytes = container(
+        false,
+        &[entry(), ("norm", vec![32], Encoding::F32 as u32, 1024)],
+        &metadata,
+    );
+    let header = gguf::StoredHeader::read(&mut Cursor::new(bytes.clone())).unwrap();
+    let encoded = header.encode().unwrap();
+    let directory = gguf::read_header(&encoded).unwrap();
+    assert_eq!(encoded, bytes[..directory.data_offset as usize]);
+    assert_eq!(
+        header.metadata[2].stored,
+        gguf::StoredType::Scalar(gguf::ValueType::U16)
+    );
+
+    let mut edited = header.metadata.clone();
+    edited[2].metadata.value = Value::Scalar(Scalar::Unsigned(9));
+    let laid_out = gguf::StoredHeader::new(
+        3,
+        edited.clone(),
+        header
+            .tensors
+            .iter()
+            .map(|tensor| (tensor.name.clone(), tensor.shape.clone(), tensor.encoding)),
+    )
+    .unwrap();
+    assert_eq!(
+        laid_out
+            .tensors
+            .iter()
+            .map(|tensor| tensor.offset)
+            .collect::<Vec<_>>(),
+        [0, 288]
+    );
+    let reread = gguf::StoredHeader::read(&mut Cursor::new(laid_out.encode().unwrap())).unwrap();
+    assert_eq!(reread.metadata, edited);
+    assert_eq!(reread.tensors, laid_out.tensors);
+    edited[2].metadata.value = Value::Scalar(Scalar::Unsigned(70_000));
+    assert!(gguf::StoredHeader::new(3, edited, []).unwrap().encode().is_err());
+}

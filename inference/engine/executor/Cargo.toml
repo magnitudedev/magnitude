@@ -43,8 +43,3 @@ magnitude-family-qwen4exp = { path = "../families/qwen4exp" }
 # The recorded machines' topologies, for fit and assessment over the spec's
 # situations (`platform::policy`, `planning::assessment`).
 seismic = { workspace = true, features = ["fixtures"] }
-
-# Development-only: replays the tuning search against survey records.
-[[example]]
-name = "tuning_replay"
-required-features = ["tuning-survey"]

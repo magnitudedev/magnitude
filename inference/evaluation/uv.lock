@@ -5,11 +5,10 @@ requires-python = ">=3.12"
 [manifest]
 members = [
     "magnitude-bench",
-    "magnitude-compare",
     "magnitude-evaluation",
     "magnitude-fixtures",
     "magnitude-references",
-    "magnitude-remote",
+    "magnitude-rig",
 ]
 
 [[package]]
@@ -429,7 +428,6 @@ dependencies = [
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "magnitude-fixtures" },
-    { name = "magnitude-remote" },
     { name = "psutil" },
     { name = "pydantic" },
     { name = "tokenizers" },
@@ -441,29 +439,9 @@ requires-dist = [
     { name = "httpx", specifier = "==0.28.1" },
     { name = "huggingface-hub", specifier = ">=1.27,<2" },
     { name = "magnitude-fixtures", editable = "fixtures" },
-    { name = "magnitude-remote", editable = "remote" },
     { name = "psutil", specifier = ">=7" },
     { name = "pydantic", specifier = "==2.13.5" },
     { name = "tokenizers", specifier = ">=0.22,<1" },
-]
-
-[[package]]
-name = "magnitude-compare"
-version = "0.1.0"
-source = { editable = "compare" }
-dependencies = [
-    { name = "magnitude-fixtures" },
-    { name = "magnitude-references" },
-    { name = "magnitude-remote" },
-    { name = "numpy" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "magnitude-fixtures", editable = "fixtures" },
-    { name = "magnitude-references", editable = "references" },
-    { name = "magnitude-remote", editable = "remote" },
-    { name = "numpy", specifier = "==2.5.3" },
 ]
 
 [[package]]
@@ -472,10 +450,9 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "magnitude-bench" },
-    { name = "magnitude-compare" },
     { name = "magnitude-fixtures" },
     { name = "magnitude-references" },
-    { name = "magnitude-remote" },
+    { name = "magnitude-rig" },
 ]
 
 [package.dev-dependencies]
@@ -487,10 +464,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "magnitude-bench", editable = "bench" },
-    { name = "magnitude-compare", editable = "compare" },
     { name = "magnitude-fixtures", editable = "fixtures" },
     { name = "magnitude-references", editable = "references" },
-    { name = "magnitude-remote", editable = "remote" },
+    { name = "magnitude-rig", editable = "rig" },
 ]
 
 [package.metadata.requires-dev]
@@ -516,7 +492,7 @@ version = "0.1.0"
 source = { editable = "references" }
 dependencies = [
     { name = "gguf" },
-    { name = "magnitude-remote" },
+    { name = "magnitude-rig" },
     { name = "numpy" },
     { name = "torch" },
 ]
@@ -532,7 +508,7 @@ check = [
 requires-dist = [
     { name = "gguf", specifier = "==0.19.0" },
     { name = "huggingface-hub", marker = "extra == 'check'" },
-    { name = "magnitude-remote", editable = "remote" },
+    { name = "magnitude-rig", editable = "rig" },
     { name = "numpy", specifier = "==2.5.3" },
     { name = "safetensors", marker = "extra == 'check'" },
     { name = "torch", specifier = "==2.14.0" },
@@ -541,9 +517,19 @@ requires-dist = [
 provides-extras = ["check"]
 
 [[package]]
-name = "magnitude-remote"
+name = "magnitude-rig"
 version = "0.1.0"
-source = { editable = "remote" }
+source = { editable = "rig" }
+dependencies = [
+    { name = "magnitude-bench" },
+    { name = "magnitude-fixtures" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "magnitude-bench", editable = "bench" },
+    { name = "magnitude-fixtures", editable = "fixtures" },
+]
 
 [[package]]
 name = "markdown-it-py"

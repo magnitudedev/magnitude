@@ -1,17 +1,14 @@
 """magnitude-bench: the serving benchmark, over HTTP, on a catalog model at context lengths.
 
-    magnitude-bench run --mode tools --model qwen3.5-4b:gguf:q4 --context 4k,16k \\
+    magnitude-bench job --mode tools --model qwen3.5-4b:gguf:q4 --context 4k,16k \\
         [--engine magnitude --engine llama.cpp ...] [--section context,parallel] \\
-        [--tuning-seconds 60] [--fresh-tuning] [--host ALIAS|POOL] [--no-gate]
+        [--tuning-seconds 60] [--fresh-tuning] --artifacts FILE --output DIR --build-identity FILE
 
-`run` is one evaluation job through `magnitude_remote.flow`, locally or on a host (or the
-first free member of a pool): build our engine and the harness, acquire the catalog model,
-wait for the thermal gate, then `job` measures inside the recorded run directory
-`inference/evaluation/results/<run id>/`.
-
-Paths given to `run` (binaries, model stores, profiles) are paths on the executing host;
-local relative paths are resolved before the job starts. A binary given is used as is and not
-built: `--magnitude-binary PATH --magnitude-build '{"commit": …, "dirty_digest": null}'
+`job` measures inside a run directory on the executing host; `mrig bench` takes the same
+measurement options and runs it there (building our engine and the harness, acquiring the
+model, holding the device and passing the thermal gate). Paths given (binaries, model stores,
+profiles) are paths on that host. A binary given is used as is and not built:
+`--magnitude-binary PATH --magnitude-build '{"commit": …, "dirty_digest": null}'
 --no-tuning-trace` measures another build's engine (one predating the tuning options).
 """
 
@@ -21,7 +18,6 @@ import json
 import os
 import signal
 import sys
-from dataclasses import replace
 from pathlib import Path
 from typing import get_args
 
@@ -40,27 +36,8 @@ from .plan import SECTIONS
 from .policy import ENGINES, MODES
 from .store import RunStore
 
-#: Options whose value is a path on the executing host.
-PATH_OPTIONS = (
-    "--magnitude-binary", "--harness", "--magnitude-cache-dir", "--magnitude-kernel-cache-root",
-    "--llama-binary", "--ollama-binary", "--ollama-models",
-)
-#: Our engine's persistent kernel caches on the executing host, unless a run names its own:
-#: a user's installation keeps compiled kernels and tuning across launches.
-KERNEL_CACHE_ROOT = "{root}/kernel-cache"
-KERNEL_CACHE_OPTIONS = ("--magnitude-cache-dir", "--magnitude-kernel-cache-root")
-#: Engines whose prompts the harness renders host-only (GGUF): the run builds the harness.
+#: Engines whose prompts the harness renders host-only (GGUF): their runs need `--harness`.
 HOST_RENDERED = ("magnitude", "llama.cpp", "ollama", "ollama-registry")
-#: Our binaries as the flow builds them on the executing host: (option, path, package).
-BUILT = (
-    ("--magnitude-binary", "{target}/release/magnitude-engine", "magnitude-engine-cli"),
-    ("--harness", "{target}/release/magnitude-harness", "magnitude-harness"),
-)
-#: The job in the evaluation workspace, with only the bench's own dependencies installed.
-JOB = (
-    "{uv}", "run", "--project", "evaluation", "--package", "magnitude-bench", "--frozen",
-    "magnitude-bench", "job",
-)
 
 
 def choices(value: str, allowed: tuple[str, ...]) -> tuple[str, ...]:
@@ -83,9 +60,8 @@ def contexts(value: str) -> tuple[int, ...]:
 
 
 def measurement_options(parser: argparse.ArgumentParser) -> None:
-    """The options of a measurement, shared by `run` and the `job` it records."""
+    """The options of a measurement, apart from its model: `job`'s, and `mrig bench`'s."""
     parser.add_argument("--mode", required=True, choices=MODES, help="fixture family served")
-    parser.add_argument("--model", required=True, help="catalog reference <model>:<variant>")
     parser.add_argument("--context", required=True, help="context lengths, e.g. 4k,16k")
     parser.add_argument("--engine", action="append", choices=ENGINES, default=[],
                         help="repeatable; default magnitude")
@@ -119,8 +95,7 @@ def measurement_options(parser: argparse.ArgumentParser) -> None:
     magnitude.add_argument("--magnitude-cache-dir", type=Path,
                            help="the engine's kernel cache, exactly this directory")
     magnitude.add_argument("--magnitude-kernel-cache-root", type=Path,
-                           help="persistent per-model, per-binary kernel caches under this root "
-                                f"(`run` default: {KERNEL_CACHE_ROOT})")
+                           help="persistent per-model, per-binary kernel caches under this root")
     magnitude.add_argument("--magnitude-prefill-tokens", type=int)
     magnitude.add_argument("--magnitude-mtp-proposals", type=int)
     magnitude.add_argument("--magnitude-draft-budget",
@@ -155,16 +130,8 @@ def parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     commands = root.add_subparsers(dest="command", required=True)
-    run = commands.add_parser("run", help="run a measurement locally or on a host")
-    measurement_options(run)
-    run.add_argument("--host", help="ssh alias or pool; omitted runs locally")
-    run.add_argument("--no-gate", action="store_true", help="skip the thermal gate")
-    run.add_argument(
-        "--max-hold",
-        type=float,
-        help="seconds the job may hold the host's lock (the flow's default when omitted)",
-    )
-    job = commands.add_parser("job", help="measure inside a run directory (run by the flow)")
+    job = commands.add_parser("job", help="measure inside a run directory (run by mrig bench)")
+    job.add_argument("--model", required=True, help="catalog reference <model>:<variant>")
     measurement_options(job)
     job.add_argument("--artifacts", type=Path, required=True, help="catalog acquisition JSON")
     job.add_argument("--output", type=Path, required=True, help="the run directory")
@@ -230,76 +197,26 @@ def engine_options(args: argparse.Namespace) -> EngineOptions:
     )
 
 
-def built(engines: list[str], argv: list[str]) -> list[tuple[str, str, str]]:
-    """The binaries the run builds: our engine when measured, the harness for any GGUF
-    engine, each unless `argv` names one."""
-    needed = {"--magnitude-binary": "magnitude" in engines,
-              "--harness": any(engine in HOST_RENDERED for engine in engines)}
-    given = {token.partition("=")[0] for token in argv}
-    return [binary for binary in BUILT if needed[binary[0]] and binary[0] not in given]
+def arguments(args: argparse.Namespace) -> list[str]:
+    """The measurement options `args` holds (parsed by `measurement_options`) as `job` takes
+    them: every option whose value is not its default."""
+    declared = argparse.ArgumentParser(add_help=False)
+    measurement_options(declared)
 
+    def text(value) -> str:
+        return value.model_dump_json() if isinstance(value, SourceBuild) else str(value)
 
-def job_arguments(argv: list[str], *, local: bool, engines: list[str]) -> list[str]:
-    """`run`'s measurement options as the job's: flow-only options removed, local relative
-    paths resolved, and our binaries as the flow builds them unless given."""
-    result: list[str] = []
-    tokens = iter(argv)
-    for token in tokens:
-        name, separator, value = token.partition("=")
-        if name == "--no-gate":
-            continue
-        if name in ("--host", "--max-hold"):
-            if not separator:
-                next(tokens)
-            continue
-        if name in PATH_OPTIONS:
-            value = value if separator else next(tokens)
-            if local and not value.startswith(("{", "~")):
-                value = str(Path(value).absolute())
-            result += [name, value]
-            continue
-        result.append(token)
-    for option, path, _ in built(engines, result):
-        result += [option, path]
-    if "magnitude" in engines and not any(
-        token.partition("=")[0] in KERNEL_CACHE_OPTIONS for token in result
-    ):
-        result += ["--magnitude-kernel-cache-root", KERNEL_CACHE_ROOT]
+    result = []
+    for action in declared._actions:
+        value = getattr(args, action.dest)
+        flag = action.option_strings[0]
+        if isinstance(action, argparse._StoreTrueAction):
+            result += [flag] if value else []
+        elif isinstance(action, argparse._AppendAction):
+            result += [token for item in value for token in (flag, text(item))]
+        elif value != action.default:
+            result += [flag, text(value)]
     return result
-
-
-def run(argv: list[str], args: argparse.Namespace) -> int:
-    from magnitude_remote.connection import HostUnavailable
-    from magnitude_remote.flow import Job, StepFailed, execute
-    from magnitude_remote.host.gate import GateSettings
-
-    engines = args.engine or ["magnitude"]
-    arguments = job_arguments(argv[1:], local=args.host is None, engines=engines)
-    packages = [
-        argument for _, _, package in built(engines, argv[1:]) for argument in ("-p", package)
-    ]
-    job = Job(
-        tool="bench",
-        model=args.model,
-        build=(("cargo", "build", "--release", *packages),) if packages else (),
-        gate=None if args.no_gate else GateSettings(),
-        command=(
-            *JOB,
-            *arguments,
-            "--artifacts", "{artifacts}", "--output", "{run_dir}",
-            "--build-identity", "{build_file}",
-        ),
-    )
-    if args.max_hold is not None:
-        job = replace(job, max_hold_seconds=args.max_hold)
-    try:
-        outcome = execute(job, args.host)
-    except (StepFailed, HostUnavailable) as error:
-        print(f"magnitude-bench: {error}", file=sys.stderr)
-        return 1
-    print(json.dumps({"run_id": outcome.run_id, "host": outcome.host,
-                      "results": str(outcome.results), "code": outcome.code}))
-    return outcome.code
 
 
 async def managed(coroutine):
@@ -346,16 +263,21 @@ def job(argv: list[str], args: argparse.Namespace) -> int:
     return 0 if summary["status"] == "completed" else 130 if summary["status"] == "cancelled" else 1
 
 
+def check(args: argparse.Namespace) -> None:
+    """Every measurement option's meaning, checked before anything runs; raises ValueError."""
+    catalog_reference(args.model)
+    choices(args.section, tuple(SECTIONS))
+    contexts(args.context)
+    artifact_pairs(args.artifact)
+    engine_options(args)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     args = parser().parse_args(argv)
     try:
-        catalog_reference(args.model)
-        choices(args.section, tuple(SECTIONS))
-        contexts(args.context)
-        artifact_pairs(args.artifact)
-        engine_options(args)
-        return run(argv, args) if args.command == "run" else job(argv, args)
+        check(args)
+        return job(argv, args)
     except (ValueError, OSError) as error:
         print(f"magnitude-bench: {error}", file=sys.stderr)
         return 2

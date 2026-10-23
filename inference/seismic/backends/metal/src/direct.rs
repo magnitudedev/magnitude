@@ -95,27 +95,44 @@ fn sample_timestamps(device: &MetalDevice) -> TimestampPair {
     TimestampPair { gpu, host }
 }
 
-/// A device buffer of GPU timestamp samples shared by the timed batches of
-/// one measurement. Metal bounds how many sample buffers may exist, so timed
-/// batches take ranges of one buffer instead of allocating their own.
+/// The GPU timestamp samples shared by the timed batches of one measurement:
+/// one sample index space over pages of [`PAGE_SAMPLES`] samples, each a
+/// Metal sample buffer of its largest size, added as reservations reach
+/// them and kept for later ones. Metal bounds how many sample buffers may
+/// exist, so timed batches take ranges of these pages instead of allocating
+/// their own. A launch's start and end samples are a pair at an even index,
+/// so a pair never straddles two pages.
 pub struct LaunchTimestamps {
-    samples: Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>,
-    capacity: usize,
+    device: MetalDevice,
+    pages: std::sync::Mutex<Vec<Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>>>,
     /// First unreserved sample.
     next: std::sync::Mutex<usize>,
 }
 
-// The sample buffer is written by the device and resolved after completion.
+/// Samples of one page: Metal's largest sample buffer, 32 KiB of 8-byte
+/// timestamps (even, so launch pairs never straddle a page).
+const PAGE_SAMPLES: usize = 4_096;
+
+// The sample buffers are written by the device and resolved after completion.
 unsafe impl Send for LaunchTimestamps {}
 unsafe impl Sync for LaunchTimestamps {}
 
 impl LaunchTimestamps {
-    /// A buffer of `samples` timestamp samples (two per timed launch).
-    pub fn new(device: &MetalDevice, samples: usize) -> Result<Self, ExecutionError> {
-        crate::pooled(|| Self::form(device, samples))
+    /// Timestamp samples for timed launches (two per launch), with their
+    /// first page formed: a device that cannot sample them fails here.
+    pub fn new(device: &MetalDevice) -> Result<Self, ExecutionError> {
+        let first = crate::pooled(|| Self::page(device))?;
+        Ok(Self {
+            device: device.clone(),
+            pages: std::sync::Mutex::new(vec![first]),
+            next: std::sync::Mutex::new(0),
+        })
     }
 
-    fn form(device: &MetalDevice, samples: usize) -> Result<Self, ExecutionError> {
+    fn page(
+        device: &MetalDevice,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>, ExecutionError> {
+        let samples = PAGE_SAMPLES;
         let failed = |detail: &str| ExecutionError::SubmissionFailed(detail.into());
         let raw = device.handle().raw();
         if !raw.supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary) {
@@ -136,36 +153,58 @@ impl LaunchTimestamps {
         descriptor.setStorageMode(MTLStorageMode::Shared);
         // SAFETY: Metal validates the count when forming the buffer.
         unsafe { descriptor.setSampleCount(samples) };
-        let buffer = raw
-            .newCounterSampleBufferWithDescriptor_error(&descriptor)
+        raw.newCounterSampleBufferWithDescriptor_error(&descriptor)
             .map_err(|error| {
                 ExecutionError::SubmissionFailed(format!(
                     "Metal refused a {samples}-sample timestamp buffer: {}",
                     error.localizedDescription()
                 ))
-            })?;
-        Ok(Self {
-            samples: buffer,
-            capacity: samples,
-            next: std::sync::Mutex::new(0),
-        })
+            })
     }
 
+    /// Reserve `samples` consecutive samples, adding the pages they reach.
     fn reserve(&self, samples: usize) -> Result<usize, ExecutionError> {
         let mut next = self
             .next
             .lock()
             .expect("timestamp cursor lock is never poisoned");
         let first = *next;
-        if first + samples > self.capacity {
-            return Err(ExecutionError::SubmissionFailed(format!(
-                "timed launches need {} timestamp samples; the buffer holds {}",
-                first + samples,
-                self.capacity
-            )));
+        let mut pages = self.pages.lock().expect("timestamp page lock is never poisoned");
+        while pages.len() * PAGE_SAMPLES < first + samples {
+            pages.push(crate::pooled(|| Self::page(&self.device))?);
         }
         *next += samples;
         Ok(first)
+    }
+
+    /// The page holding sample `index`, and the index within it.
+    fn locate(
+        &self,
+        index: usize,
+    ) -> (Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>, usize) {
+        let pages = self.pages.lock().expect("timestamp page lock is never poisoned");
+        (pages[index / PAGE_SAMPLES].clone(), index % PAGE_SAMPLES)
+    }
+
+    /// The resolved ticks of samples `first..first + count`, page by page.
+    fn resolve(&self, first: usize, count: usize) -> Option<Vec<u64>> {
+        let mut ticks = Vec::with_capacity(count);
+        let mut index = first;
+        while index < first + count {
+            let (page, offset) = self.locate(index);
+            let length = (PAGE_SAMPLES - offset).min(first + count - index);
+            // SAFETY: the range lies inside the page and the batch's reserved samples.
+            let data = crate::pooled(|| unsafe {
+                page.resolveCounterRange(NSRange::new(offset, length))
+            })?;
+            ticks.extend(
+                data.to_vec()
+                    .chunks_exact(8)
+                    .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("eight bytes"))),
+            );
+            index += length;
+        }
+        Some(ticks)
     }
 
     /// Release every range. Only valid once every timed batch that reserved
@@ -391,17 +430,18 @@ impl DirectBatch {
                         "timed Metal batch exceeds its declared launch count".into(),
                     ));
                 }
+                let (page, offset) = timestamps.locate(*first + 2 * *encoded);
                 crate::pooled(|| {
                     let pass = MTLComputePassDescriptor::computePassDescriptor();
                     pass.setDispatchType(MTLDispatchType::Serial);
-                    // SAFETY: index 0 always exists; sample indices lie
-                    // inside the batch's reserved range.
+                    // SAFETY: index 0 always exists; the pair lies inside
+                    // one page of the batch's reserved range.
                     unsafe {
                         let attachment =
                             pass.sampleBufferAttachments().objectAtIndexedSubscript(0);
-                        attachment.setSampleBuffer(Some(&timestamps.samples));
-                        attachment.setStartOfEncoderSampleIndex(*first + 2 * *encoded);
-                        attachment.setEndOfEncoderSampleIndex(*first + 2 * *encoded + 1);
+                        attachment.setSampleBuffer(Some(&page));
+                        attachment.setStartOfEncoderSampleIndex(offset);
+                        attachment.setEndOfEncoderSampleIndex(offset + 1);
                     }
                     let encoder = command
                         .computeCommandEncoderWithDescriptor(&pass)
@@ -583,18 +623,10 @@ impl DirectSubmission {
         let samples = if timing.encoded == 0 {
             Vec::new()
         } else {
-            // SAFETY: the range lies inside the batch's reserved samples.
-            crate::pooled(|| unsafe {
-                timing
-                    .timestamps
-                    .samples
-                    .resolveCounterRange(NSRange::new(timing.first, 2 * timing.encoded))
-            }
-            .map(|data| data.to_vec()))
-            .ok_or_else(|| failed("Metal did not resolve the timed batch's samples"))?
-            .chunks_exact(8)
-            .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("eight bytes")))
-            .collect::<Vec<_>>()
+            timing
+                .timestamps
+                .resolve(timing.first, 2 * timing.encoded)
+                .ok_or_else(|| failed("Metal did not resolve the timed batch's samples"))?
         };
         // GPU ticks map linearly onto the host clock between the pair taken
         // when the batch was formed and one taken now.

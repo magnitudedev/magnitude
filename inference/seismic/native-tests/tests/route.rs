@@ -3407,3 +3407,55 @@ fn a_ranged_kernel_forms_and_serves_only_its_range() {
         );
     }
 }
+
+/// A survey of a unit whose launches are formed separately forms them as its
+/// search does, from held launch programs, and measures and validates every
+/// admissible configuration: each launch's own choices, at a point where each
+/// launch works.
+#[test]
+fn a_survey_times_every_configuration_of_launches_formed_separately() {
+    let devices = Devices::discover(&[]).unwrap();
+    let Ok(device) = devices.open_backend(BackendName::Metal) else {
+        return;
+    };
+    let implementation = scoped_scale::native_implementation(&device).unwrap().unwrap();
+    assert!(implementation.launch_scoped());
+    let small = f32_tensor(&device, &[8], &exact_values(8));
+    let large = f32_tensor(&device, &[64], &exact_values(64));
+    let points = [("small", &small), ("large", &large)]
+        .into_iter()
+        .map(|(label, x)| TuningPoint::<scoped_scale::Entry> {
+            label: label.into(),
+            weight: 1.,
+            class: None,
+            cost: 1.,
+            workload: seismic::WorkloadRotation::All,
+            rotation: vec![scoped_scale::Args { x }],
+            initialize: None,
+            written: Default::default(),
+        })
+        .collect::<Vec<_>>();
+    let survey = scoped_scale::native_tune(
+        &device,
+        &NativeSpecialization::new(),
+        points,
+        NumericalRequirement::BitExact,
+        Strategy::Survey(SurveyPlan {
+            samples: 3,
+            min_sample_seconds: 0.0002,
+            domains: Default::default(),
+        }),
+    )
+    .unwrap();
+    // Two widths by two row counts for each of the two launches.
+    assert_eq!(survey.configurations.len(), 16);
+    for record in &survey.configurations {
+        let Outcome::Measured { points, .. } = &record.outcome else {
+            panic!("{:?}", record.outcome)
+        };
+        assert_eq!(survey.admitted(record), Ok(()));
+        assert_eq!(points.len(), 2);
+        assert!(points.iter().all(|point| (1..=3).contains(&point.samples.len())));
+    }
+    assert!(matches!(survey.method, TuningMethod::Survey { samples: 3 }));
+}

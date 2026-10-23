@@ -21,10 +21,12 @@ special-token key names. Assessment reads none of what is cut, and verdicts were
 identical before and after trimming. The tokenizer digest in a fixture's `ModelFingerprint` is the
 trimmed table's, so it does not match the full file.
 
-To add a header, run `python3 -I fetch_header.py REPO REVISION PATH`. It fetches with ranged GETs
-only (the first few MB, never the whole file), then trims and gzips into `headers/`. `HF_TOKEN` is
-sent when set. A header from Ollama's registry (`ollama-<model>-<tag>.gguf.gz`) is the model
-layer's blob read the same way and trimmed by the same `trim`. The manifest lists Hugging Face
+To add a header, run
+`cargo run -p magnitude-service-catalog-tool -- fixture-header --repository REPO --revision REVISION --path PATH --model-store DIR`
+in `inference/`. It reads the header with range requests only (never the whole file), then trims
+and gzips it into `headers/`. `HF_TOKEN` is sent when set. A header from Ollama's registry
+(`ollama-<model>-<tag>.gguf.gz`) is the model layer's blob read the same way and trimmed the same
+way. The manifest lists Hugging Face
 files only, so such a header serves the service's tests alone; `ollama-qwen3.6-35b-a3b.gguf.gz` is
 `registry.ollama.ai/library/qwen3.6:35b-a3b`, blob
 `sha256:d372de8e934898a59e6ccfabc3368474711384d8f1fd4d22d87a3f0a45400cdc`.
@@ -33,9 +35,11 @@ files only, so such a header serves the service's tests alone; `ollama-qwen3.6-3
 
 `weight-samples/<repository file name without .gguf>.json` is one real file's weight sample, as the
 service's `WeightSample` serializes it (tensor name to its first 64 values), for the service's weight-lineage tests. To add one,
-run `python3 -I fetch_weight_sample.py SOURCE NAME`, where `SOURCE` is `hf:REPO@REVISION:PATH`,
-`ollama:MODEL@sha256:DIGEST` or a local path; it reads the header and then only the sampled values,
-with ranged GETs. Sources (`ollama-qwen3.6-35b-a3b` is the blob named above):
+run `cargo run -p magnitude-service-catalog-tool -- weight-sample --name NAME SOURCE` in
+`inference/`, where `SOURCE` is `hub --repository REPO --revision REVISION --path PATH --model-store DIR`,
+`ollama --model MODEL --digest sha256:DIGEST --model-store DIR` or `local PATH`; it reads the
+header and then only the sampled values, with range requests. Sources
+(`ollama-qwen3.6-35b-a3b` is the blob named above):
 
 | Sample | Source |
 | --- | --- |

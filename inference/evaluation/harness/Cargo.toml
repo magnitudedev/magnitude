@@ -15,10 +15,11 @@ path = "src/main.rs"
 clap.workspace = true
 libc.workspace = true
 magnitude-chat = { path = "../../engine/chat" }
-magnitude-engine = { path = "../../engine" }
+# The engine's development tuning tools (pins and the survey), which only the
+# harness enables; a served engine is built without them.
+magnitude-engine = { path = "../../engine", features = ["pinned-tuning", "tuning-survey"] }
 magnitude-executor = { path = "../../engine/executor" }
 magnitude-family-contracts = { path = "../../engine/families/contracts" }
-magnitude-generation = { path = "../../engine/generation" }
 magnitude-scheduler = { path = "../../engine/scheduler" }
 magnitude-serving = { path = "../../engine/serving" }
 magnitude-state = { path = "../../engine/state" }
@@ -27,16 +28,3 @@ serde.workspace = true
 # Fixture key order is rendered: chat templates print tool schemas in it.
 serde_json = { workspace = true, features = ["preserve_order"] }
 sha2.workspace = true
-
-[features]
-# Development-only: `--tuning-record FILE`, `--tuning-replay FILE` and
-# `--tuning-defaults` pin tuned configurations across runs for bit-exact
-# comparisons (`magnitude_executor::pinned_tuning`).
-pinned-tuning = ["magnitude-engine/pinned-tuning"]
-# Development-only: `--tuning-survey DIR` surveys every admissible tuning
-# configuration for replaying the search (`magnitude_executor::tuning_survey`).
-tuning-survey = ["magnitude-engine/tuning-survey"]
-# Development-only: `precision-probe` compares the logits of a pinned tuning
-# selection with the defaults' (and references) alongside the tuning trace's
-# dimensionless precision measurements. It pins through `pinned-tuning`.
-precision-probe = ["pinned-tuning"]

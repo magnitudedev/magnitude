@@ -11,7 +11,8 @@
 //! assessment result, with the model's capabilities and template
 //! fingerprint alongside. `--topology` prints the topology, its discovery
 //! diagnostics and the executor's costs (each with its samples and interval)
-//! instead; `--breakdown` prints each model's step call by call.
+//! instead; `--breakdown` prints each model's step call by call. `mrig assess`
+//! runs it per model, `mrig device` for the topology.
 
 use magnitude_engine::{
     assessment::{
