@@ -41,51 +41,70 @@ impl<'a> QualificationView<'a> {
     }
 
     pub(super) fn qualify_shape_rows(&self, device: &Device) -> Result<(), CatalogFailure> {
-        // One vocabulary row at unit temperature without cuts or penalties:
-        // shaping is the identity.
+        // Exercise both cuts together, across the vocabulary's first and last
+        // tokens. Equal peaks test the stable tie cutoff; unequal peaks test
+        // that the maximum's fixed-point mass is exactly one unit.
         let vocabulary = self.geometry.vocabulary;
-        let values = (0..vocabulary)
-            .map(|token| (token % 4) as f32 - 1.0)
-            .collect::<Vec<_>>();
-        let params = [1.0_f32, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0];
-        let history = [-1_i32; 64];
-        let mut logits = tensor_f32(device, &[1, vocabulary], &values, "shape_rows", "fixed")?;
-        let params = tensor_f32(device, &[1, 8], &params, "shape_rows", "fixed")?;
-        let history_bytes = history
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-        let history = Tensor::from_host(device, Element::i32(), &[1, 64], &history_bytes)
-            .map_err(|error| qualification("shape_rows", "fixed", error))?;
-        // The row is unconstrained, so its empty mask is never read.
-        let mask = Tensor::zeros(device, Element::u32(), &[1, vocabulary.div_ceil(32)])
-            .map_err(|error| qualification("shape_rows", "fixed", error))?;
-        let constrained = Tensor::zeros(device, Element::i32(), &[1])
-            .map_err(|error| qualification("shape_rows", "fixed", error))?;
-        self.programs
-            .target
-            .shape
-            .call(shape_rows::Args {
-                logits: &mut logits,
-                mask: &mask,
-                constrained: &constrained,
-                params: &params,
-                history: &history,
-            })
-            .map_err(|error| qualification("shape_rows", "fixed", error))?;
-        let output = logits
-            .read_to_host()
-            .map_err(|error| qualification("shape_rows", "fixed", error))?;
-        let expected = values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-        if output != expected {
-            return Err(qualification(
-                "shape_rows",
-                "fixed",
-                "identity smoke mismatch",
-            ));
+        for (second, top_p, keep_second) in [(4.0_f32, 0.5_f32, false), (3.0, 0.8, true)] {
+            let values = (0..vocabulary)
+                .map(|token| {
+                    if token == 0 {
+                        4.0
+                    } else if token + 1 == vocabulary {
+                        second
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
+                .collect::<Vec<_>>();
+            let params = [1.0_f32, 2.0, top_p, 0.0, 1.0, 0.0, 0.0, 0.0];
+            let history = [-1_i32; 64];
+            let mut logits = tensor_f32(device, &[1, vocabulary], &values, "shape_rows", "fixed")?;
+            let params = tensor_f32(device, &[1, 8], &params, "shape_rows", "fixed")?;
+            let history_bytes = history
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
+            let history = Tensor::from_host(device, Element::i32(), &[1, 64], &history_bytes)
+                .map_err(|error| qualification("shape_rows", "fixed", error))?;
+            // The row is unconstrained, so its empty mask is never read.
+            let mask = Tensor::zeros(device, Element::u32(), &[1, vocabulary.div_ceil(32)])
+                .map_err(|error| qualification("shape_rows", "fixed", error))?;
+            let constrained = Tensor::zeros(device, Element::i32(), &[1])
+                .map_err(|error| qualification("shape_rows", "fixed", error))?;
+            self.programs
+                .target
+                .shape
+                .call(shape_rows::Args {
+                    logits: &mut logits,
+                    mask: &mask,
+                    constrained: &constrained,
+                    params: &params,
+                    history: &history,
+                })
+                .map_err(|error| qualification("shape_rows", "fixed", error))?;
+            let output = logits
+                .read_to_host()
+                .map_err(|error| qualification("shape_rows", "fixed", error))?;
+            let expected = values
+                .iter()
+                .enumerate()
+                .map(|(token, &value)| {
+                    if token == 0 || (keep_second && token as u64 + 1 == vocabulary) {
+                        value
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
+            if output != expected {
+                return Err(qualification(
+                    "shape_rows",
+                    "fixed",
+                    "top-k/top-p cutoff mismatch",
+                ));
+            }
         }
         Ok(())
     }

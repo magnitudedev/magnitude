@@ -185,7 +185,11 @@ bool shape_survives(shape_survivor survivor, uint token, out float value, out ui
 }
 
 uint64_t shape_mass(shape_survivor survivor, float value) {
-    return uint64_t(exp(value - survivor.maximum) * 4294967296.0);
+    // A mass is at most 2^32. Keep that endpoint in integer arithmetic:
+    // on the tested NVIDIA Vulkan path, direct float -> u64 conversion
+    // contributed (high=1, low=0xffffffff) to the histogram instead.
+    const float weight = exp(value - survivor.maximum);
+    return weight >= 1.0 ? (1ul << 32) : uint64_t(uint(weight * 4294967296.0));
 }
 
 // Descending digit of a weighted histogram at which the running weight
@@ -200,8 +204,14 @@ uint shape_descend(uint bins, uint64_t target, inout uint64_t above) {
         for (uint i = 0u; i < per; ++i)
             total += shape_histogram(bins - 1u - (lane * per + i));
         shape_shared_u64_put(SHAPE_LANE_TOTALS + 2u * lane, total);
-        subgroupMemoryBarrierShared();
-        subgroupBarrier();
+    }
+    // Publish lane totals in a workgroup phase before the leader consumes
+    // them. Subgroup-only synchronization here produced inconsistent
+    // radix cutoffs on the tested NVIDIA Vulkan path.
+    barrier();
+    if (SEISMIC_SUBGROUP == 0u) {
+        const uint lane = SEISMIC_LANE;
+        const uint per = bins / 32u;
         if (lane == 0u) {
             uint64_t running = above;
             uint digit = SHAPE_BINS;

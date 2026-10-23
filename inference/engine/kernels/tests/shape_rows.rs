@@ -550,6 +550,41 @@ fn shaping_reference(logits: &[f32], p: &[f32], history: &[i32]) -> (Vec<f32>, V
 }
 
 #[test]
+fn native_shaping_preserves_unit_mass_when_top_k_precedes_top_p() {
+    // The maximum has mass exactly 2^32. Its low word is zero, not u32::MAX;
+    // the histogram and total must agree for both tied and unequal peaks.
+    for device in devices() {
+        eprintln!("unit probability mass: {:?}", device.backend());
+        for vocabulary in [6usize, 513, 248_320] {
+            for (second, top_p, keep_second) in [
+                (4.0, 0.5, false),
+                (4.0, 0.95, true),
+                (3.0, 0.8, true),
+                (3.0, 0.7, false),
+            ] {
+                let mut logits = vec![f32::NEG_INFINITY; vocabulary];
+                logits[0] = 4.0;
+                logits[vocabulary - 1] = second;
+                let params = [1.0, 2.0, top_p, 0.0, 1.0, 0.0, 0.0, 0.0];
+                for &parts in partitions(&device) {
+                    let actual = native_shape(&device, &logits, 1, vocabulary, &params, &[-1; 64], parts);
+                    let mut expected = vec![f32::NEG_INFINITY; vocabulary];
+                    expected[0] = 4.0;
+                    if keep_second {
+                        expected[vocabulary - 1] = second;
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "{:?}, V={vocabulary}, second={second}, top_p={top_p}, PARTS={parts}",
+                        device.backend()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn native_shaping_matches_the_host_reference() {
     for device in devices() {
         native_shaping_matches_the_host_reference_on(&device);
