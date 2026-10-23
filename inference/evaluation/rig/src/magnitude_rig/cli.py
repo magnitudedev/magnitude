@@ -83,7 +83,7 @@ def _inspect(arguments) -> int:
         if not arguments.host:
             raise SystemExit("inspect -- COMMAND needs --host")
         remote = connect(hosts.host(arguments.host))
-        code, stdout, stderr = read(remote, f"cd {shlex.quote(remote.root)} && {shlex.join(command)}")
+        code, stdout, stderr = read(remote, remote.command(command, cwd=remote.root)[-1])
         print(stdout, end="")
         print(stderr, end="", file=sys.stderr)
         return code

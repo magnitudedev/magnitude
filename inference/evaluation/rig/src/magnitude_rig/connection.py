@@ -56,6 +56,20 @@ def shell(alias: str, local: bool, line: str) -> list[str]:
     return ["/bin/sh", "-c", line] if local else ["ssh", *SSH_OPTIONS, alias, line]
 
 
+def windows_command(argv: list[str], cwd: str | None = None) -> str:
+    """Preserve native arguments across either Windows OpenSSH default shell."""
+    def quote(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+    script = "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; "
+    script += "$start = New-Object System.Diagnostics.ProcessStartInfo; $start.UseShellExecute = $false; "
+    script += f"$start.FileName = {quote(argv[0])}; $start.Arguments = {quote(subprocess.list2cmdline(argv[1:]))}; "
+    if cwd is not None:
+        script += f"$start.WorkingDirectory = {quote(cwd)}; "
+    script += "$child = [System.Diagnostics.Process]::Start($start); $child.WaitForExit(); exit $child.ExitCode"
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode()
+    return f"powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded}"
+
+
 class HostUnavailable(Exception):
     """The host cannot be reached, or its agent session ended."""
 
@@ -77,11 +91,13 @@ class Remote:
     backends: tuple[str, ...]  # what the host can run, probed on connect
     ready: bool  # `mrig setup` verified the host
 
-    def command(self, argv: list[str], *, login: bool = False) -> list[str]:
+    def command(self, argv: list[str], *, login: bool = False, cwd: str | None = None) -> list[str]:
         """The ssh argv running `argv` on the host (in a login shell when asked, on POSIX)."""
         if self.windows:
-            return ["ssh", *SSH_OPTIONS, self.alias, subprocess.list2cmdline(argv)]
+            return ["ssh", *SSH_OPTIONS, self.alias, windows_command(argv, cwd)]
         line = shlex.join(argv)
+        if cwd is not None:
+            line = f"cd {shlex.quote(cwd)} && {line}"
         if login:
             line = f'exec "$SHELL" -lc {shlex.quote("exec " + line)}'
         return shell(self.alias, self.local, line)
@@ -135,7 +151,7 @@ def connect(config: HostConfig) -> Remote:
         system, machine, windows, python = "Windows", "unknown", True, "python"
     bootstrap = _BOOTSTRAP.format(source=base64.b64encode(AGENT_SOURCE).decode())
     argv = [python, "-", config.root, config.models, json.dumps(dict(config.env))]
-    line = subprocess.list2cmdline(argv) if windows else shlex.join(argv)
+    line = windows_command(argv) if windows else shlex.join(argv)
     probed = json.loads(_ssh(config, line, stdin=bootstrap.encode()).strip().splitlines()[-1])
     probed["backends"] = tuple(probed["backends"])
     return Remote(config.alias, config.local, windows, system, machine, python, **probed)
