@@ -36,7 +36,7 @@ mod validation;
 mod weight_lineage;
 
 pub use cache::{
-    CachedModelAssessment, ModelCache, ModelCacheWorkspace, ModelIndexKind,
+    CachedModelAssessment, CachedModelPresentation, ModelCache, ModelCacheWorkspace, ModelIndexKind,
 };
 pub use catalog::{
     CatalogLockAdvance, GeneratedReleaseCatalog, ReleaseCatalog, ReleaseRecommendableCatalog,

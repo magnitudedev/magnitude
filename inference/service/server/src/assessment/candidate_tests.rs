@@ -1308,7 +1308,7 @@ fn version<'a>(
 // Tests --------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn inspection_groups_versions_and_reports_each_engine_verdict() {
+async fn inspection_groups_versions_and_preserves_presentation_and_engine_verdicts() {
     let on_disk = ModelId::hugging_face(
         &HuggingFaceRepositoryId::new(COMMUNITY.to_owned()).unwrap(),
         &magnitude_service_contracts::models::HuggingFaceArtifactSelector::new(
@@ -1337,6 +1337,17 @@ async fn inspection_groups_versions_and_reports_each_engine_verdict() {
 
     assert_eq!(inspection.display_name, "Llama Finetune");
     assert_eq!(inspection.variant_of, Some(fixture.catalog_id.clone()));
+    let CandidateSource::HuggingFace { commit, .. } = &inspection.source else {
+        panic!("the inspected Hub commit is pinned");
+    };
+    for version in &inspection.versions {
+        let cached = fixture.models.derived_cache()
+            .read_model_presentation(&version.model_id, commit)
+            .expect("inspection remembers every exact version before returning");
+        assert_eq!(cached.display_name, inspection.display_name);
+        assert_eq!(cached.variant_label, version.label);
+        assert_eq!(cached.variant_of, Some(fixture.catalog_id.clone()));
+    }
     assert!(inspection.unsupported_architecture.is_none());
     assert_eq!(
         inspection.versions.len(),
@@ -1394,6 +1405,54 @@ async fn inspection_groups_versions_and_reports_each_engine_verdict() {
         version(&inspection, "llama-Q4_K_M.gguf").model_id.as_str(),
         format!("hf:{COMMUNITY}/llama-Q4_K_M.gguf")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_presentation_cache_write_does_not_republish_the_same_miss() {
+    let fixture = fixture(Vec::new()).await;
+    let blocked = fixture._directory.path().join("cache/indexes/inspections/candidate-presentation");
+    std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    let id = format!("hf:{COMMUNITY}/llama-Q4_K_M.gguf").parse().unwrap();
+    assert!(!fixture.candidates.remember_presentation(&id, &commit('c'), magnitude_service_models::CachedModelPresentation {
+        display_name: "Llama Finetune".to_owned(),
+        variant_label: "Q4_K_M".to_owned(),
+        variant_of: Some(fixture.catalog_id.clone()),
+        license: None,
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_presentation_is_restored_from_cached_headers_without_weights_or_hub() {
+    let fixture = fixture(Vec::new()).await;
+    let inspection = fixture.candidates.inspect(CandidateInspectionRequest::HuggingFace {
+        repository: HuggingFaceRepositoryId::new(COMMUNITY).unwrap(),
+        revision: "main".to_owned(),
+    }).await.unwrap();
+    let CandidateSource::HuggingFace { repository, commit } = &inspection.source else {
+        panic!("Hub inspection");
+    };
+    let version = version(&inspection, "llama-Q4_K_M.gguf");
+    let remembered = fixture.models.derived_cache().read_model_presentation(&version.model_id, commit)
+        .expect("inspection preserves its presentation before the target is added");
+    assert_eq!(remembered.display_name, inspection.display_name);
+    assert_eq!(remembered.variant_label, version.label);
+    assert_eq!(remembered.variant_of, Some(fixture.catalog_id.clone()));
+    // An invalid derived entry is a cache miss, just like eviction or an older installation.
+    fixture.models.derived_cache().write_model_presentation(&version.model_id, commit, &magnitude_service_models::CachedModelPresentation {
+        display_name: String::new(),
+        variant_label: version.label.clone(),
+        variant_of: None,
+        license: None,
+    });
+    let mut pending = custom_model(version.model_id.clone(), 0);
+    pending.origin = CustomModelOrigin::Added { repository: repository.clone(), commit: commit.clone() };
+    pending.state = CustomModelState::NotInstalled;
+    assert!(fixture.candidates.restore_pending_presentation(&pending, super::Reach::Local).await.unwrap());
+    let restored = fixture.models.derived_cache().read_model_presentation(&version.model_id, commit).unwrap();
+    assert_eq!(restored.display_name, inspection.display_name);
+    assert_eq!(restored.variant_label, version.label);
+    assert_eq!(restored.variant_of, Some(fixture.catalog_id.clone()));
 }
 
 /// An inspection reports, in order: every header read, counted from none to all; each version

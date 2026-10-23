@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use getrandom::fill;
-use magnitude_service_contracts::models::{ModelAssessment, ModelCapabilities};
+use magnitude_service_contracts::models::{ModelAssessment, ModelCapabilities, ModelId, ParsedModelId};
 use magnitude_service_utils::file_cache::{
     read_json, read_object, write_json_atomic,
 };
@@ -26,6 +26,17 @@ pub struct CachedModelAssessment {
     pub profile: ModelAssessment,
 }
 
+/// Presentation already established by candidate inspection, before the weights are installed.
+/// This is derived engine data, never a declaration supplied by the client.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CachedModelPresentation {
+    pub display_name: String,
+    pub variant_label: String,
+    pub variant_of: Option<ModelId>,
+    pub license: Option<String>,
+}
+
 const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
@@ -41,6 +52,7 @@ pub enum ModelIndexKind {
     RecommendableModelCatalog,
     ModelAssessment,
     CandidateClassification,
+    CandidatePresentation,
     OllamaHubFile,
 }
 
@@ -58,6 +70,7 @@ impl ModelIndexKind {
             Self::RecommendableModelCatalog => "catalogs/recommendable-models",
             Self::ModelAssessment => "assessments/model-configurations",
             Self::CandidateClassification => "inspections/candidate-classification",
+            Self::CandidatePresentation => "inspections/candidate-presentation",
             Self::OllamaHubFile => "sources/hugging-face/ollama-files",
         }
     }
@@ -151,6 +164,39 @@ impl ModelCache {
         self.write_index(ModelIndexKind::ModelAssessment, evidence, assessment);
     }
 
+    /// A version's inspected identity at an immutable Hub commit. Changing the release catalog
+    /// invalidates its family mapping; no repository name is used to guess a family on a miss.
+    pub fn read_model_presentation(
+        &self,
+        model_id: &ModelId,
+        commit: &str,
+    ) -> Option<CachedModelPresentation> {
+        self.read_index::<CachedModelPresentation>(
+            ModelIndexKind::CandidatePresentation,
+            &presentation_evidence(model_id, commit),
+        )
+        .filter(|presentation| {
+            !presentation.display_name.trim().is_empty()
+                && !presentation.variant_label.trim().is_empty()
+                && presentation.variant_of.as_ref().is_none_or(|id| {
+                    matches!(id.parsed(), ParsedModelId::Catalog { .. })
+                })
+        })
+    }
+
+    pub fn write_model_presentation(
+        &self,
+        model_id: &ModelId,
+        commit: &str,
+        presentation: &CachedModelPresentation,
+    ) {
+        self.write_index(
+            ModelIndexKind::CandidatePresentation,
+            &presentation_evidence(model_id, commit),
+            presentation,
+        );
+    }
+
     /// The engine's compiled-kernel store, shared by loads and tuning.
     #[must_use]
     pub fn kernel_directory(&self) -> PathBuf {
@@ -237,6 +283,14 @@ impl ModelCache {
     }
 }
 
+fn presentation_evidence(model_id: &ModelId, commit: &str) -> String {
+    static CATALOG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let catalog = CATALOG.get_or_init(|| {
+        format!("{}:{}", crate::catalog::catalog_source_digest(), crate::catalog::catalog_lock_digest())
+    });
+    format!("candidate-presentation-v1:{catalog}:{model_id}@{commit}")
+}
+
 fn evidence_digest(evidence: &str) -> String {
     hex_sha256(evidence.as_bytes())
 }
@@ -257,6 +311,31 @@ mod tests {
 
     fn profile(context_length: u32) -> ServingProfile {
         ServingProfile { context_length }
+    }
+
+    #[test]
+    fn inspected_presentation_is_pinned_to_commit_and_selected_file_across_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = ModelCache::new(directory.path());
+        let q4: ModelId = "hf:publisher/Qwen-Finetune-GGUF/model-Q4_K_M.gguf".parse().unwrap();
+        let q8: ModelId = "hf:publisher/Qwen-Finetune-GGUF/model-Q8_0.gguf".parse().unwrap();
+        let presentation = CachedModelPresentation {
+            display_name: "Qwen Finetune".to_owned(),
+            variant_label: "Q4_K_M".to_owned(),
+            variant_of: Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()),
+            license: None,
+        };
+        let commit = "c".repeat(40);
+        cache.write_model_presentation(&q4, &commit, &presentation);
+        let reopened = ModelCache::new(directory.path());
+        assert_eq!(reopened.read_model_presentation(&q4, &commit), Some(presentation.clone()));
+        assert_eq!(reopened.read_model_presentation(&q8, &commit), None);
+        assert_eq!(reopened.read_model_presentation(&q4, &"d".repeat(40)), None);
+        cache.write_model_presentation(&q4, &commit, &CachedModelPresentation {
+            variant_of: Some(q8),
+            ..presentation
+        });
+        assert_eq!(reopened.read_model_presentation(&q4, &commit), None, "a family must be a validated catalog identity");
     }
 
     #[test]

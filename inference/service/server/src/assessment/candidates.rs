@@ -44,7 +44,7 @@ use magnitude_service_models::lineage::{
     CatalogLineage, CatalogLineageMatch,
 };
 use magnitude_service_models::{
-    CachedModelAssessment, CatalogDrafterFit, CatalogFingerprints, ModelShape, CustomModelAcquisition,
+    CachedModelAssessment, CachedModelPresentation, CatalogDrafterFit, CatalogFingerprints, ModelShape, CustomModelAcquisition,
     CustomModelEnrichment, CustomModelEnrichmentResult,
     CustomModelFacts, DrafterContent, ManagedModelStore, ModelDomainResolver,
     ServableModelBundleKey, WeightSample, refresh_hugging_face_repository,
@@ -396,6 +396,78 @@ impl ManagedModelCandidates {
         self.assessor.models()
     }
 
+    /// Remember the inspected version before ACN can declare it. The list can then show the
+    /// same identity while downloading, including after the service or desktop restarts.
+    fn remember_presentation(
+        &self,
+        model_id: &ModelId,
+        commit: &str,
+        presentation: CachedModelPresentation,
+    ) -> bool {
+        let cache = self.models().derived_cache();
+        if cache.read_model_presentation(model_id, commit).as_ref() == Some(&presentation) {
+            return false;
+        }
+        cache.write_model_presentation(model_id, commit, &presentation);
+        // Cache writes are best effort. Publishing a change after a failed write would wake
+        // the restoration pass again with the same miss, creating an endless refresh loop.
+        cache.read_model_presentation(model_id, commit).as_ref() == Some(&presentation)
+    }
+
+    /// Rebuild a missing presentation from the exact version's cached header; the Hub pass may
+    /// refill that header, but neither pass needs the target's weight download to finish.
+    async fn restore_pending_presentation(
+        &self,
+        model: &CustomModel,
+        reach: Reach,
+    ) -> Result<bool, InventoryError> {
+        let CustomModelOrigin::Added { repository, commit } = &model.origin else {
+            return Ok(false);
+        };
+        if !matches!(model.state, CustomModelState::NotInstalled)
+            || self.models().derived_cache().read_model_presentation(&model.model_id, commit).is_some()
+        {
+            return Ok(false);
+        }
+        let ParsedModelId::HuggingFace { artifact_selector, .. } = model.model_id.parsed() else {
+            return Ok(false);
+        };
+        let request = HuggingFaceRepositoryRequest {
+            repository: repository.as_str().to_owned(),
+            revision: commit.clone(),
+        };
+        let snapshot = match reach {
+            Reach::Local => match magnitude_service_models::cached_hugging_face_repository(self.models(), &request) {
+                Some(snapshot) => snapshot,
+                None => return Ok(false),
+            },
+            Reach::Hub => self.snapshot(repository.as_str(), commit).await?,
+        };
+        let file = snapshot_file(&snapshot, Path::new(artifact_selector.as_str()))?;
+        let header = match reach {
+            Reach::Local => match self.models()
+                .cached_hugging_face_header_digest(repository.as_str(), commit, file)
+                .and_then(|digest| self.models().cached_header(&digest))
+            {
+                Some(bytes) => bytes,
+                None => return Ok(false),
+            },
+            Reach::Hub => self.models()
+                .hugging_face_gguf_header(repository.as_str(), commit, file, &[]).await?.bytes,
+        };
+        let (_, classified) = header_inspection(&header)?;
+        let variant_of = match ModelShape::from_header_prefix(&header) {
+            Some(shape) => shape.variant_of(&self.catalog_facts().await.fingerprints),
+            None => None,
+        };
+        Ok(self.remember_presentation(&model.model_id, commit, CachedModelPresentation {
+            display_name: display_name(repository.as_str()),
+            variant_label: version_label(&file.path, classified.quantization.as_deref()),
+            variant_of,
+            license: snapshot.license,
+        }))
+    }
+
     /// The drafter a model is recommended: the first candidate the engine binds.
     pub async fn recommended_drafter(
         &self,
@@ -550,15 +622,35 @@ impl ManagedModelCandidates {
                         .models
                         .into_iter()
                         .chain(response.hidden)
-                        .map(|model| model.model_id)
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            for model in &models {
+                let key = (model.model_id.clone(), "presentation".to_owned());
+                if failed.get(&key).is_some_and(|(failed_at, at)| {
+                    *failed_at == revision && at.elapsed() < ENRICHMENT_RETRY_DELAY
+                }) {
+                    continue;
+                }
+                match self.restore_pending_presentation(model, reach).await {
+                    Ok(changed) => {
+                        failed.remove(&key);
+                        if changed {
+                            resolver.custom_model_enrichment_changed();
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(model.id = %model.model_id.as_str(), ?reach, %error, "pending model presentation could not be restored");
+                        failed.insert(key, (revision, std::time::Instant::now()));
+                    }
+                }
+            }
             // Models with no result yet come first, so a model just added or installed is
             // never kept waiting behind recomputing the others; each result is published as
             // soon as it is known, and a pass restarts as soon as the inputs move again.
             let mut pending = models
                 .into_iter()
+                .map(|model| model.model_id)
                 .filter_map(|model_id| {
                     let configuration = self
                         .assessor
@@ -1407,8 +1499,16 @@ impl ManagedModelCandidates {
             })
             .collect::<Vec<_>>();
         let variant_of = self.inspection_variant_of(&versions).await;
+        let catalog = &self.catalog_facts().await.fingerprints;
+        let families = versions.iter().map(|version| {
+            let shape = self.models().cached_header(&version.group.header_digest)
+                .and_then(|header| ModelShape::from_header_prefix(&header))
+                .or_else(|| version.assessment.as_ref()?.fingerprint.as_ref().map(ModelShape::of));
+            let family = version.catalog_model.clone().or_else(|| shape.and_then(|shape| shape.variant_of(catalog)));
+            (version.model_id.clone(), family)
+        }).collect::<BTreeMap<_, _>>();
         let projector_bytes = projector.map_or(0, |projector| projector.group.size_bytes());
-        Ok(CandidateInspection {
+        let inspection = CandidateInspection {
             source: CandidateSource::HuggingFace {
                 repository: HuggingFaceRepositoryId::new(snapshot.repository.clone())
                     .map_err(|error| InventoryError::InvalidRequest(error.to_string()))?,
@@ -1420,7 +1520,20 @@ impl ManagedModelCandidates {
             versions: candidate_versions(versions, Some(projector_bytes)),
             projector: projector.map(|projector| candidate_file(projector.group.primary())),
             unsupported_architecture,
-        })
+        };
+        let mut changed = false;
+        for version in &inspection.versions {
+            changed |= self.remember_presentation(&version.model_id, &snapshot.commit, CachedModelPresentation {
+                display_name: inspection.display_name.clone(),
+                variant_label: version.label.clone(),
+                variant_of: families.get(&version.model_id).cloned().flatten(),
+                license: inspection.license.clone(),
+            });
+        }
+        if changed && let Some(resolver) = self.resolver.get() {
+            resolver.custom_model_enrichment_changed();
+        }
+        Ok(inspection)
     }
 
     async fn inspect_local(

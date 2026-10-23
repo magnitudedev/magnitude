@@ -966,6 +966,7 @@ fn project(
         catalog,
         catalog_drafters,
         enrichment,
+        cache: inventory.derived_cache(),
         occurrences: &occurrences,
         present: &present,
     };
@@ -1065,6 +1066,7 @@ struct ModelContext<'a> {
     catalog: &'a RecommendableModelCatalog,
     catalog_drafters: &'a CatalogDrafterRevisions,
     enrichment: &'a dyn CustomModelEnrichment,
+    cache: &'a crate::ModelCache,
     occurrences: &'a [Occurrence<'a>],
     present: &'a BTreeMap<ModelPackageId, &'a InstalledModelPackage>,
 }
@@ -1081,6 +1083,7 @@ impl ModelContext<'_> {
             catalog,
             catalog_drafters,
             enrichment,
+            cache,
             occurrences,
             present,
         } = self;
@@ -1112,10 +1115,13 @@ impl ModelContext<'_> {
             &evidence.base_models,
             evidence.quantization.as_deref(),
         );
+        let inspected = added.and_then(|added| cache.read_model_presentation(&model_id, &added.revision));
         let display_name = match (representative.ollama_name, hub) {
             (Some(name), None) => name.to_owned(),
             _ => presented_name,
         };
+        let display_name = inspected.as_ref().map_or(display_name, |known| known.display_name.clone());
+        let variant_label = inspected.as_ref().map_or(variant_label, |known| Some(known.variant_label.clone()));
         let facts = CustomModelFacts {
             model_id: &model_id,
             origin: &origin,
@@ -1307,7 +1313,8 @@ impl ModelContext<'_> {
                 origin,
                 display_name,
                 variant_label,
-                variant_of: enriched.variant_of.clone(),
+                variant_of: inspected.as_ref().and_then(|known| known.variant_of.clone())
+                    .or_else(|| enriched.variant_of.clone()),
                 files,
                 size_bytes,
                 projector,
@@ -1318,7 +1325,9 @@ impl ModelContext<'_> {
                     .recommended_drafter()
                     .filter(|_| choice != DrafterChoice::None)
                     .cloned(),
-                license: enriched.license.or_else(|| evidence.license.clone()),
+                license: enriched.license
+                    .or_else(|| inspected.as_ref().and_then(|known| known.license.clone()))
+                    .or_else(|| evidence.license.clone()),
                 profile,
                 state,
                 update_commit: None,
@@ -1380,6 +1389,7 @@ impl ModelContext<'_> {
             &[],
             None,
         );
+        let inspected = self.cache.read_model_presentation(&model_id, &added.revision);
         Some(ProjectedModel {
             locations: Vec::new(),
             lineage_repository: Some(added.repository.as_str().to_owned()),
@@ -1389,9 +1399,9 @@ impl ModelContext<'_> {
                     repository: added.repository.clone(),
                     commit: added.revision.clone(),
                 },
-                display_name,
-                variant_label,
-                variant_of: None,
+                display_name: inspected.as_ref().map_or(display_name, |known| known.display_name.clone()),
+                variant_label: inspected.as_ref().map_or(variant_label, |known| Some(known.variant_label.clone())),
+                variant_of: inspected.as_ref().and_then(|known| known.variant_of.clone()),
                 files: crate::candidate_files::split_set(added.path.as_str())
                     .into_iter()
                     .map(|path| CustomModelFile {
@@ -1404,7 +1414,7 @@ impl ModelContext<'_> {
                 drafter_pending: drafter.is_none() && choice != DrafterChoice::None,
                 drafter,
                 recommended_drafter: None,
-                license: None,
+                license: inspected.and_then(|known| known.license),
                 profile: ServingProfile {
                     context_length: DEFAULT_EXTERNAL_CONTEXT,
                 },
@@ -6343,6 +6353,55 @@ mod tests {
             );
             assert!(listed.hidden.is_empty(), "{source:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn inspected_presentation_survives_pending_restart_and_installation() {
+        let fixture = Fixture::new().await;
+        let commit = "c".repeat(40);
+        let repository = "HauhauCS/Qwen3.6-35B-A3B-Uncensored-GGUF";
+        let path = "Qwen3.6-35B-A3B-Q4_K_P.gguf";
+        let id: ModelId = format!("hf:{repository}/{path}").parse().unwrap();
+        let presentation = crate::CachedModelPresentation {
+            display_name: "Qwen3.6 35B A3B Uncensored".to_owned(),
+            variant_label: "Q4_K_P".to_owned(),
+            variant_of: Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()),
+            license: Some("apache-2.0".to_owned()),
+        };
+        fixture.inventory().derived_cache().write_model_presentation(&id, &commit, &presentation);
+        let configuration = LocalModelsConfiguration {
+            added: vec![added(repository, path, &commit)],
+            ..LocalModelsConfiguration::default()
+        };
+        let assert_presentation = |model: &CustomModel| {
+            assert_eq!(model.display_name, presentation.display_name);
+            assert_eq!(model.variant_label.as_deref(), Some(presentation.variant_label.as_str()));
+            assert_eq!(model.variant_of, presentation.variant_of);
+            assert_eq!(model.license, presentation.license);
+            assert_eq!(model.origin, CustomModelOrigin::Added {
+                repository: HuggingFaceRepositoryId::new(repository).unwrap(),
+                commit: commit.clone(),
+            });
+        };
+        let pending = fixture.apply(configuration.clone()).await;
+        assert_presentation(&pending.models[0]);
+        assert_eq!(pending.models[0].state, CustomModelState::NotInstalled);
+
+        let fixture = fixture.restart(Vec::new()).await;
+        let pending = fixture.apply(configuration.clone()).await;
+        assert_presentation(&pending.models[0]);
+        assert_eq!(pending.models[0].state, CustomModelState::NotInstalled);
+
+        publish_managed(&fixture.store, repository, &commit, &[(path, model_bytes("different GGUF header name"))]);
+        let installed = fixture.local.refresh_local().await.unwrap();
+        assert_presentation(&installed.models[0]);
+        assert!(matches!(installed.models[0].state, CustomModelState::Ready { .. }));
+
+        let different_commit = fixture.apply(LocalModelsConfiguration {
+            added: vec![added(repository, path, &"d".repeat(40))],
+            ..LocalModelsConfiguration::default()
+        }).await;
+        assert_eq!(different_commit.models[0].variant_of, None, "a different commit cannot borrow the inspected family's identity");
     }
 
     #[tokio::test]
