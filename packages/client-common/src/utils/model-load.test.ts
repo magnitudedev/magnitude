@@ -34,7 +34,7 @@ describe("model optimization wording", () => {
 describe("memory shortage and stop wording", () => {
   it("states a blocked shortage with its two figures and a load under pressure with none", () => {
     const blocked = describeMemoryShortage({ _tag: "Blocked", requiredBytes: 30 * 2 ** 30, availableBytes: 24 * 2 ** 30 })
-    expect(blocked).toBe("This model needs 30 GB and 24 GB is available. Quit apps you aren’t using, or choose a smaller model.")
+    expect(blocked).toBe("This model needs 32.3 GB and 25.8 GB is available. Quit apps you aren’t using, or choose a smaller model.")
     expect(describeMemoryShortage({ _tag: "UnderPressure" })).not.toMatch(/\d/)
   })
 

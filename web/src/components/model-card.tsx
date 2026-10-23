@@ -291,7 +291,7 @@ function CardActions({ name, primary, transfer, menu }: { name: string; primary:
       <XIcon aria-hidden="true" className="relative text-slate-500" />
     </Button>
     : primary
-      ? withTooltip(primary.tooltip, <Button variant={primary.outline ? "outline" : "default"} disabled={primary.disabled} onClick={primary.onClick} {...(primary.title ? { title: primary.title } : {})} className="w-32">{primary.icon}{primary.label}</Button>)
+      ? withTooltip(primary.tooltip, <Button variant={primary.outline ? "outline" : "default"} disabled={primary.disabled} onClick={primary.onClick} {...(primary.title ? { title: primary.title } : {})} className="min-w-32">{primary.icon}{primary.label}</Button>)
       : null
   if (main === null && menu.length === 0) return null
   return <div className="flex shrink-0 items-center gap-1">

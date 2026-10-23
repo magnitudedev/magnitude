@@ -6,16 +6,19 @@ import {
 } from "./format-bytes"
 
 describe("byte formatting", () => {
-  it("formats memory using the hardware convention", () => {
-    expect(formatMemorySize(3.4 * 1024 ** 3)).toBe("3.4 GB")
-    expect(formatMemorySize(16 * 1024 ** 3)).toBe("16 GB")
-    expect(formatMemorySize(512 * 1024 ** 3)).toBe("512 GB")
-    expect(formatMemorySize(768 * 1024 ** 2)).toBe("768 MB")
-    expect(formatMemorySize(2 * 1024 ** 4)).toBe("2 TB")
+  it("formats memory in the same decimal units as storage", () => {
+    expect(formatMemorySize(3.4 * 1000 ** 3)).toBe("3.4 GB")
+    expect(formatMemorySize(16 * 1000 ** 3)).toBe("16 GB")
+    expect(formatMemorySize(512 * 1000 ** 3)).toBe("512 GB")
+    expect(formatMemorySize(768 * 1000 ** 2)).toBe("768 MB")
+    expect(formatMemorySize(2 * 1000 ** 4)).toBe("2 TB")
+    const bytes = 34.5 * 1024 ** 3
+    expect(formatMemorySize(bytes)).toBe("37 GB")
+    expect(formatMemorySize(bytes)).toBe(formatStorageSize(bytes))
   })
 
   it("rounds minimum requirements upward", () => {
-    expect(formatMemorySize(2 * 1024 ** 3 + 1, { rounding: "up" })).toBe("2.1 GB")
+    expect(formatMemorySize(2 * 1000 ** 3 + 1, { rounding: "up" })).toBe("2.1 GB")
   })
 
   it("formats storage sizes with adaptive decimal units", () => {
@@ -41,7 +44,7 @@ describe("byte formatting", () => {
 
   it("promotes values that round across a unit boundary", () => {
     expect(formatStorageSize(999_999)).toBe("1 MB")
-    expect(formatMemorySize(1024 ** 3 - 1, { rounding: "up" })).toBe("1 GB")
+    expect(formatMemorySize(1000 ** 3 - 1, { rounding: "up" })).toBe("1 GB")
   })
 
   it("formats transfer rates with decimal megabytes", () => {

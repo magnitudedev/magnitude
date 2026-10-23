@@ -43,8 +43,8 @@ describe("tray model line", () => {
     const loaded = modelTrayPresentation(observed({ _tag: "Ready", allocation: { contextWindowTokens: 4096, memoryDomains: [
       { memoryDomainId: LocalInferenceMemoryDomainIdSchema.make("unified"), modelBytes: 16 * 1024 ** 3, contextBytes: 2 * 1024 ** 3, computeBytes: 0, auxiliaryBytes: 0 },
     ] } }))
-    expect(Option.map(loaded.status, ({ detail }) => detail)).toEqual(Option.some({ _tag: "Memory", text: "18 GB" }))
-    expect(loaded.label).toMatch(/ · Loaded · 18 GB$/)
+    expect(Option.map(loaded.status, ({ detail }) => detail)).toEqual(Option.some({ _tag: "Memory", text: "19.3 GB" }))
+    expect(loaded.label).toMatch(/ · Loaded · 19\.3 GB$/)
   })
 })
 

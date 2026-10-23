@@ -106,7 +106,7 @@ it.each(hardwareScenarios)("presents $label from observed data", scenario => {
 it("keeps laptop identity with discrete or external graphics", () => {
   const result = hardwareDetails(identity("Dell", "XPS 15 9530", "Portable"), hardware("Intel Core i7-13700H", 32, 16, [{ name: "RTX 5090", memory: 32 }]))
   expect(Option.getOrThrow(result.photo).kind).toBe("Device")
-  expect(result.accelerators[0]?.detail).toBe("32 GB VRAM")
+  expect(result.accelerators[0]?.detail).toBe("34.4 GB VRAM")
 })
 it("never substitutes a graphics card for an unknown portable or all-in-one", () => {
   for (const formFactor of ["Portable", "AllInOne"] as const) {
@@ -121,8 +121,8 @@ it("does not treat shared GPU memory as VRAM or select a component photo", () =>
 })
 it("keeps multi-GPU memory separate and handles duplicate names", () => {
   const result = hardwareDetails(null, hardware("AMD", 128, 32, [{ name: "RTX 5090", memory: 32 }, { name: "RTX 5090", memory: 32 }]))
-  expect(result.summary[0]?.value).toBe("128 GB")
-  expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["32 GB VRAM", "32 GB VRAM"])
+  expect(result.summary[0]?.value).toBe("137.4 GB")
+  expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["34.4 GB VRAM", "34.4 GB VRAM"])
   expect(new Set(result.accelerators.map(gpu => gpu.id)).size).toBe(2)
 })
 it("never infers variable Apple chip specifications or a desktop SKU from a mobile suffix", () => {
@@ -157,7 +157,7 @@ it("counts dedicated memory once when two backends expose one physical domain", 
   const accelerator = value.accelerators[0]!
   const executor = accelerator.executors[0]!
   const result = hardwareDetails(null, { ...value, accelerators: [{ ...accelerator, executors: [executor, { ...executor, deviceId: "vulkan-alias" as typeof executor.deviceId, backend: "vulkan" }] }] })
-  expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["24 GB VRAM"])
+  expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["25.8 GB VRAM"])
   expect(result.groups.at(-1)?.details).toContain("CUDA acceleration")
   expect(result.groups.at(-1)?.details).not.toContain("Vulkan acceleration")
 })
@@ -178,7 +178,7 @@ it("keeps ordinary shared system RAM distinct from unified memory in mixed syste
   const value = hardware("AMD", 64, 16, [{ name: "Integrated graphics", memory: 64, shared: true }, { name: "RTX 4090", memory: 24 }])
   const result = hardwareDetails(null, { ...value, memoryDomains: value.memoryDomains.map(domain => domain.memoryDomainId === "system" ? { ...domain, kind: "System" as const } : domain) })
   expect(result.summary[0]?.label).toBe("System RAM")
-  expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["Shares system RAM", "24 GB VRAM"])
+  expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["Shares system RAM", "25.8 GB VRAM"])
   expect(Option.getOrThrow(result.photo).kind).toBe("Component")
 })
 
@@ -200,13 +200,13 @@ it("labels PC components consistently and numbers separate GPUs", () => {
   expect(result.groups.map(group => group.label)).toEqual(["CPU", "Memory", "GPU 1", "GPU 2"])
   expect(result.groups[0]?.name).toBe("AMD Ryzen 9 9950X")
   expect(result.groups[1]?.details).toEqual(["System RAM"])
-  expect(result.groups[2]?.details[0]).toBe("32 GB VRAM")
-  expect(result.groups[2]?.details).toEqual(["32 GB VRAM", "CUDA acceleration", "1,792 GB/s Memory bandwidth (spec)"])
+  expect(result.groups[2]?.details[0]).toBe("34.4 GB VRAM")
+  expect(result.groups[2]?.details).toEqual(["34.4 GB VRAM", "CUDA acceleration", "1,792 GB/s Memory bandwidth (spec)"])
 })
 
 it.each(["RTX 5090", "Radeon 8060S Graphics", "Arc B580", "RX 580"])("omits implementation-specific GPU unit counts from the %s card", name => {
   const result = hardwareDetails(null, hardware("Unknown", 64, 8, [{ name, memory: 16 }]))
   const group = result.groups.find(group => group.label === "GPU")!
   expect(group.details.some(detail => /CUDA cores|GPU compute units|Xe cores|Stream processors/.test(detail))).toBe(false)
-  expect(group.details[0]).toBe("16 GB VRAM")
+  expect(group.details[0]).toBe("17.2 GB VRAM")
 })

@@ -14,7 +14,7 @@ describe("desktop failure presentation", () => {
   it("states a blocked load in one sentence with the required memory rounded upward", () => {
     const html = renderToStaticMarkup(<ModelLoadNotice failure={memory} />)
     expect(html).toContain("Not enough memory right now")
-    expect(html).toContain("This model needs 30.2 GB and 25 GB is available.")
+    expect(html).toContain("This model needs 32.4 GB and 26.9 GB is available.")
     expect(html).not.toMatch(/PRIVATE|bytes|32358673408|title=|<details/)
     expect(html.match(/role="alert"/g)).toHaveLength(1)
   })

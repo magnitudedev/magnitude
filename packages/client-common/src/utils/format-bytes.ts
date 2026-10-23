@@ -95,7 +95,7 @@ export const formatMemorySize = (
   options: FormatMemorySizeOptions = {},
 ): string =>
   formatScaledSize(bytes, {
-    base: 1024,
+    base: 1000,
     minimumUnit: "MB",
     fractionDigits: () => 1,
     rounding: options.rounding,

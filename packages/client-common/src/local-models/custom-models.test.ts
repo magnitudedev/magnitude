@@ -45,7 +45,7 @@ describe("unsupported reasons in the UI", () => {
       reference: "owner/model-GGUF:Q8_0",
       version: "Q8_0",
       verdict: { _tag: "DoesNotFit", deficitBytes: 6 * 1024 ** 3 + 1 },
-    }))).toBe("Q8_0 needs 6.1 GB more memory than this computer can provide.")
+    }))).toBe("Q8_0 needs 6.5 GB more memory than this computer can provide.")
   })
 
   it("explains a refused drafter in the client's words, never the engine's detail", () => {

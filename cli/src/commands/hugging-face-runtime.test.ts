@@ -13,7 +13,7 @@ describe("catalog inspect with a named version that doesn't run here", () => {
   it("explains a too-large version, how to force it, and the recommended version", () => {
     const inspection = makeInspection({ selectedVersion: Option.some("Q8_K_P") })
     expect(acquisitionHint(inspection)).toBe([
-      `Q8_K_P needs 8 GB more memory than this computer can provide. Download it anyway with: magnitude catalog pull ${TEST_REPOSITORY}:Q8_K_P --force`,
+      `Q8_K_P needs 8.6 GB more memory than this computer can provide. Download it anyway with: magnitude catalog pull ${TEST_REPOSITORY}:Q8_K_P --force`,
       `The recommended version is Q4_K_P. Download: magnitude catalog pull ${TEST_REPOSITORY}:Q4_K_P`,
     ].join("\n"))
     expect(renderInspection({ inspection, drafters: [], models: [] })).not.toContain("No version of this model runs")
@@ -35,7 +35,7 @@ describe("catalog inspect with a named version that doesn't run here", () => {
     expect(acquisitionHint(withoutRecommendation).split("\n").at(-1)).toBe("Other versions run here; see the table above.")
     const nothingRuns = makeInspection({ selectedVersion: Option.some("Q8_K_P"), versions: [tooLarge!, unsupported!] })
     expect(acquisitionHint(nothingRuns).split("\n")).toEqual([
-      `Q8_K_P needs 8 GB more memory than this computer can provide. Download it anyway with: magnitude catalog pull ${TEST_REPOSITORY}:Q8_K_P --force`,
+      `Q8_K_P needs 8.6 GB more memory than this computer can provide. Download it anyway with: magnitude catalog pull ${TEST_REPOSITORY}:Q8_K_P --force`,
       "No version of this model runs on this computer.",
     ])
   })

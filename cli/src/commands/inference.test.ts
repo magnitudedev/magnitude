@@ -508,7 +508,7 @@ describe("pull and model mutations", () => {
     })
     const refused = await run(pull(tooLarge.client, reference, pullReference(reference), drafterArgument("auto")))
     expect(refused._tag === "Left" && (refused.left as { message: string }).message).toBe(
-      `Q8_0 needs 6 GB more memory than this computer can provide. Download it anyway with: magnitude catalog pull ${reference} --force`,
+      `Q8_0 needs 6.5 GB more memory than this computer can provide. Download it anyway with: magnitude catalog pull ${reference} --force`,
     )
     const unsupported = fakeClient({
       addHuggingFaceModel: () => Effect.fail(new ModelVersionNotRunnable({
@@ -538,7 +538,7 @@ describe("pull and model mutations", () => {
     const refused = await run(pull(client, modelId, pullReference(modelId), drafterArgument("auto")))
     expect(refused._tag === "Left" && refused.left).toBeInstanceOf(ModelVersionNotRunnable)
     expect(refused._tag === "Left" && renderCommandError(refused.left, false))
-      .toBe(`${modelId} needs 6 GB more memory than this computer can provide.\n`)
+      .toBe(`${modelId} needs 6.5 GB more memory than this computer can provide.\n`)
   })
 
   it("resolves a drafter reference against the chosen version before adding", async () => {

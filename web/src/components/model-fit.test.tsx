@@ -12,8 +12,8 @@ describe("Load model action", () => {
     const html = renderToStaticMarkup(<LoadModelButton model={doesNotFit} pending={false} onLoad={() => {}} />)
     expect(html).toContain("Load model")
     expect(html).toMatch(/<button[^>]*disabled=""/)
-    expect(html).toContain("needs 1.7 GB more memory than this computer can provide")
-    expect(loadRefusal(doesNotFit)).toContain("1.7 GB")
+    expect(html).toContain("needs 1.9 GB more memory than this computer can provide")
+    expect(loadRefusal(doesNotFit)).toContain("1.9 GB")
   })
   it("is enabled when the model fits or is still being assessed", () => {
     for (const model of [fits, { servingState: { _tag: "Assessing" } } as unknown as Pick<CatalogLocalModel, "servingState">]) {
