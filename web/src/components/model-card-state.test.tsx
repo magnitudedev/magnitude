@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { ModelReleaseDateSchema, type CatalogLocalModel, type CustomLocalModel } from "@magnitudedev/sdk"
-import { addedModelAwaitingFiles, modelCanDownload, modelCardDrafter, modelCardStatus, modelSubtitle, modelUpdateDescription } from "./model-card-state"
+import { addedModelAwaitingFiles, modelCanDownload, modelCardDrafter, modelCardStatus, modelSubtitle, modelTransferEstimate, modelUpdateDescription } from "./model-card-state"
 import { added, attachedDrafter, catalogModel, customModel, doesNotFit, drafterCandidate, foundIn, inFolder } from "../../test/models/fixtures"
 
 const moe = (): CatalogLocalModel => {
@@ -56,6 +56,19 @@ describe("model card status", () => {
 })
 
 describe("model card download", () => {
+  const progress = { stage: "downloading" as const, completedBytes: 240_000_000, totalBytes: 6_000_000_000, bytesPerSecond: Option.some(24_000_000) }
+  it("estimates remaining time from bytes still to transfer", () => {
+    expect(modelTransferEstimate(progress)).toBe("est. 4 min")
+    expect(modelTransferEstimate({ ...progress, completedBytes: 5_000_000_000 })).toBe("est. <1 min")
+  })
+  it("waits for a usable rate and known total before claiming an ETA", () => {
+    expect(modelTransferEstimate({ ...progress, bytesPerSecond: Option.none() })).toBe("Estimating…")
+    expect(modelTransferEstimate({ ...progress, bytesPerSecond: Option.some(0) })).toBe("Estimating…")
+    expect(modelTransferEstimate({ ...progress, completedBytes: 0, totalBytes: 0 })).toBe("Estimating…")
+  })
+  it("clears the estimate during queueing, preparation, verification and publishing", () => {
+    for (const stage of ["queued", "resolving", "checking_space", "verifying", "publishing"] as const) expect(modelTransferEstimate({ ...progress, stage })).toBeNull()
+  })
   // ACN projects an added model whose target hasn't landed as Assessing: it is assessed only from its files.
   const notDownloaded = (acquisitionState: CustomLocalModel["acquisitionState"]) =>
     customModel(added, { acquisitionState, servingState: { _tag: "Assessing", profile: { contextLength: 100_000 } }, storageBytes: 0, drafterPending: true })

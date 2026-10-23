@@ -3,11 +3,20 @@ import {
   catalogDrafterState, catalogVariantOfName, customModelDrafterOffer, describeModelLoadStage, formatModelParameters, formatModelReleaseAge,
   localModelSpeculativeMethodLabel,
 } from "@magnitudedev/client-common"
-import type { LocalInferenceHardware, LocalModel } from "@magnitudedev/sdk"
+import type { LocalInferenceHardware, LocalModel, ModelTransferProgress } from "@magnitudedev/sdk"
 import { modelLab } from "./model-logo"
 import { drafterUpdateAvailable } from "./custom-model-details"
 
 export type StatusTone = "ready" | "busy" | "absent" | "stored" | "problem"
+
+/** Time left from the live transfer rate; preparation and verification have no download ETA. */
+export const modelTransferEstimate = (progress: ModelTransferProgress): string | null => {
+  if (progress.stage !== "downloading") return null
+  const rate = Option.getOrNull(progress.bytesPerSecond)
+  if (rate === null || rate <= 0 || progress.totalBytes <= 0) return "Estimating…"
+  const seconds = (progress.totalBytes - progress.completedBytes) / rate
+  return seconds < 60 ? "est. <1 min" : `est. ${Math.ceil(seconds / 60)} min`
+}
 
 /** What a card's Drafter cell shows and offers. */
 export type ModelCardDrafter =

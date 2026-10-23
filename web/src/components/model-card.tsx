@@ -21,7 +21,7 @@ import { removalConfirmation } from "./model-remove-action"
 import { fitNotice, loadRefusal } from "./model-fit"
 import { downloadNotice, modelCommandNotice, modelRemovalNotice, ModelLoadNotice } from "./model-error"
 import { acquiring } from "./models-page"
-import { addedModelAwaitingFiles, catalogDrafterOnlyUpdate, modelCanDownload, modelCardDrafter, modelCardStatus, modelSubtitle, modelUpdateDescription, type StatusTone } from "./model-card-state"
+import { addedModelAwaitingFiles, catalogDrafterOnlyUpdate, modelCanDownload, modelCardDrafter, modelCardStatus, modelSubtitle, modelTransferEstimate, modelUpdateDescription, type StatusTone } from "./model-card-state"
 
 interface PrimaryAction {
   readonly label: ReactNode
@@ -43,6 +43,7 @@ interface MenuAction {
 
 interface Transfer {
   readonly label: string
+  readonly estimate: string | null
   readonly percent: number | null
   readonly cancelLabel: string
   readonly pending: boolean
@@ -98,13 +99,13 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
     if (acquisition._tag === "Optimizing") {
       const { stage, completed, total } = acquisition.progress
       const percent = stage === "tuning" && total > 0 ? Math.min(100, completed * 100 / total) : null
-      return { label: percent === null ? "Optimizing" : `Optimizing ${Math.floor(percent)}%`, percent, cancelLabel: "Skip optimization", pending: command.pending, onCancel: () => cancel(model.modelId) }
+      return { label: percent === null ? "Optimizing" : `Optimizing ${Math.floor(percent)}%`, estimate: null, percent, cancelLabel: "Skip optimization", pending: command.pending, onCancel: () => cancel(model.modelId) }
     }
     if (acquisition._tag !== "Installing" && acquisition._tag !== "Updating") return null
     const { progress } = acquisition
     const percent = progress.totalBytes > 0 ? progress.completedBytes / progress.totalBytes * 100 : null
     const label = progress.stage === "downloading" && percent !== null ? `${Math.floor(percent)}%` : transferStages[progress.stage]
-    return { label, percent, cancelLabel: "Cancel download", pending: command.pending, onCancel: () => cancel(model.modelId) }
+    return { label, estimate: modelTransferEstimate(progress), percent, cancelLabel: "Cancel download", pending: command.pending, onCancel: () => cancel(model.modelId) }
   })()
 
   const primary: PrimaryAction | null = Option.isSome(deprecation)
@@ -277,15 +278,20 @@ const withTooltip = (label: string | undefined, trigger: ReactElement) => label 
 
 /** The main action as one plain button (a transfer fills it), then a narrow "⋮" holding everything else. */
 function CardActions({ name, primary, transfer, menu }: { name: string; primary: PrimaryAction | null; transfer: Transfer | null; menu: readonly MenuAction[] }) {
+  // Without a menu, the bar occupies the button (32), gap (1) and menu (6) together.
+  const transferWidth = menu.length > 0 ? "w-32" : "w-39"
   const main = transfer
-    ? <Button variant="outline" disabled={transfer.pending} onClick={transfer.onCancel} aria-label={`${transfer.cancelLabel} for ${name}`} title={transfer.cancelLabel}
-      className="relative min-w-32 justify-between overflow-hidden">
+    ? <Button variant="outline" disabled={transfer.pending} onClick={transfer.onCancel} aria-label={`${transfer.cancelLabel} for ${name}`} title={[transfer.label, transfer.estimate, transfer.cancelLabel].filter(Boolean).join(" · ")}
+      className={`relative ${transferWidth} justify-between overflow-hidden`}>
       <span aria-hidden="true" className={`absolute inset-y-0 left-0 bg-blue-500/20 transition-[width] duration-500 ease-out ${transfer.percent === null ? "motion-safe:animate-pulse" : ""}`} style={{ width: `${transfer.percent ?? 100}%` }} />
-      <span className="relative tabular-nums text-blue-800 dark:text-blue-200">{transfer.label}</span>
+      <span className="relative flex min-w-0 items-center gap-1.5 whitespace-nowrap tabular-nums">
+        <span className="shrink-0 text-blue-800 dark:text-blue-200">{transfer.label}</span>
+        {transfer.estimate !== null && <><span aria-hidden="true" className="text-slate-400">·</span><span className="min-w-0 truncate text-xs font-normal text-slate-600 dark:text-slate-300" title={transfer.estimate}>{transfer.estimate}</span></>}
+      </span>
       <XIcon aria-hidden="true" className="relative text-slate-500" />
     </Button>
     : primary
-      ? withTooltip(primary.tooltip, <Button variant={primary.outline ? "outline" : "default"} disabled={primary.disabled} onClick={primary.onClick} {...(primary.title ? { title: primary.title } : {})} className="min-w-32">{primary.icon}{primary.label}</Button>)
+      ? withTooltip(primary.tooltip, <Button variant={primary.outline ? "outline" : "default"} disabled={primary.disabled} onClick={primary.onClick} {...(primary.title ? { title: primary.title } : {})} className="w-32">{primary.icon}{primary.label}</Button>)
       : null
   if (main === null && menu.length === 0) return null
   return <div className="flex shrink-0 items-center gap-1">
