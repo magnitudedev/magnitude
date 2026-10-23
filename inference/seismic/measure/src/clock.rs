@@ -644,20 +644,18 @@ pub fn warm<S: Slotted>(
     raised
 }
 
-/// Raise the device `slots` run on with its held `clock`, without a
-/// deadline (an establishment's length is bounded by its rule); nothing for
-/// work whose clock is not held ([`HeldClocks`]).
+/// Raise the device `slots` run on with its held `clock`, its readings
+/// submitted only while they fit before `deadline`; nothing for work whose
+/// clock is not held ([`HeldClocks`]).
 pub(crate) fn raise_held<S: Slotted>(
     clock: Option<&Clock<<S::Work as Work>::Error>>,
     slots: &[S],
-) -> Result<(), <S::Work as Work>::Error> {
+    deadline: Deadline,
+) -> Result<(), WorkError<<S::Work as Work>::Error>> {
     let Some(clock) = clock else {
         return Ok(());
     };
-    warm(clock, slots, Deadline::default()).map_err(|error| match error {
-        WorkError::Failed(error) => error,
-        WorkError::Expired => unreachable!("a raise without a deadline does not expire"),
-    })
+    warm(clock, slots, deadline)
 }
 
 /// The sustained clocks a caller holds across measurements, one per clock

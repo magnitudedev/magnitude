@@ -85,13 +85,15 @@ impl Measurer {
     }
 
     /// Measure the points `store` holds no record of, each formed only once
-    /// `attempting` lets it proceed, and record each but one not formed now
-    /// or whose timing failed ([`measure::measure_all`], the one writer of
-    /// records).
+    /// `attempting` lets it proceed, nothing submitted that is forecast to
+    /// end past `deadline`, and record each but one not formed now, whose
+    /// timing failed or that expired ([`measure::measure_all`], the one
+    /// writer of records).
     pub fn measure_all<K, W, G, F>(
         &mut self,
         points: Vec<(K, F)>,
         how: &Measure,
+        deadline: measure::Deadline,
         store: &dyn RecordStore<K>,
         attempting: &mut dyn FnMut(&K) -> Attempt,
     ) -> Vec<(K, Outcome<CallError, G>)>
@@ -100,6 +102,6 @@ impl Measurer {
         G: std::fmt::Display,
         F: FnOnce() -> Result<W, measure::Unformed<G>>,
     {
-        measure::measure_all(points, how, &mut self.clocks, store, attempting)
+        measure::measure_all(points, how, deadline, &mut self.clocks, store, attempting)
     }
 }

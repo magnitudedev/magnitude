@@ -406,17 +406,19 @@ impl<W: Work> Slot<W> {
         clock: Option<&Clock<W::Error>>,
         deadline: Deadline,
     ) -> Result<(), WorkError<W::Error>> {
+        // The wall time sampling has taken, its leads, submissions and
+        // reads among it, is what a budget bounds ([`Stopping`]).
+        let began = Instant::now();
         let lead = self.lead(deadline)?;
         let begun = self.begin(&lead, min_sample_seconds, deadline);
         let (mut sample, passes) = behind(begun, lead.wait())?;
-        // The calls of one sample, whose seconds each sample gives per call.
-        let calls = self.calls(passes) as f64;
         loop {
             // Submitted before the sample is read, so that the device goes
             // from the sample into it without a pause. The sample is
-            // expected to take as long as the slot's calls last priced.
-            let spent = calls * self.samples.iter().sum::<f64>();
-            let expected = self.call_seconds.unwrap_or(0.) * calls;
+            // expected to take as long as the samples before it took, the
+            // one being read among them.
+            let spent = began.elapsed().as_secs_f64();
+            let expected = spent / (self.samples.len() + 1) as f64;
             let follow = match stopping.after(self.samples.len() + 1, spent + expected) {
                 After::Continues => self.submit(passes, deadline).map(Follow::Sample),
                 After::Reads(resolution) => self
@@ -445,8 +447,7 @@ impl<W: Work> Slot<W> {
                     evicting: None,
                 },
                 Follow::Lead(lead, resolution) => {
-                    let spent = calls * self.samples.iter().sum::<f64>();
-                    if resolution.stops(&self.samples, spent) {
+                    if resolution.stops(&self.samples, began.elapsed().as_secs_f64()) {
                         return behind(Ok(()), lead.wait());
                     }
                     let next = self.submit(passes, deadline);
@@ -596,15 +597,18 @@ impl Rounds for Counted {
 /// When a slot sampled alone stops ([`Slot::sample_alone`]): after a count
 /// of samples its caller named, or once its median is resolved
 /// ([`Timing::resolved`] at the error rate), the rule read at counts
-/// growing by a sixteenth, or, where the caller gave a budget, once its
-/// samples cover that much device time, whichever comes first. The fewest
-/// samples a resolved median takes follow from the error rate, and its
-/// bound holds however many are taken: a measurement for a caller that
-/// names how precise, not how many. A budget bounds how long that takes
-/// where a sample is long: the rule is also read before the sample that is
-/// expected to reach it, so at most one sample and two leads follow the
-/// budget, and a median the budget ends before it is resolved has no
-/// interval below the fewest samples that bound one.
+/// growing by a sixteenth, or, where the caller gave a budget, once
+/// sampling has taken that much wall time (its leads, submissions and reads
+/// as well as its samples), whichever comes first. The fewest samples a
+/// resolved median takes follow from the error rate, and its bound holds
+/// however many are taken: a measurement for a caller that names how
+/// precise, not how many. A budget bounds how long that takes: sampling
+/// stops before a sample expected to end past it is submitted, so the
+/// sample in flight is the last (a lead behind it would be a pass of
+/// nothing: a one-sample point on a 12-core M6's CPU took three passes, its
+/// lead, its sample and a trailing lead, 2026-10-22), and a median the
+/// budget ends before it is resolved has no interval below the fewest
+/// samples that bound one.
 pub(crate) enum Stopping {
     /// After this many samples.
     Count(usize),
@@ -613,7 +617,7 @@ pub(crate) enum Stopping {
 }
 
 /// The stopping rule of a resolved median: its error rate, the count it is
-/// next read at, and the device seconds its samples may cover.
+/// next read at, and the wall seconds its sampling may take.
 pub(crate) struct Resolution {
     error_rate: f64,
     next: usize,
@@ -648,8 +652,8 @@ impl Stopping {
         })
     }
 
-    /// Sampling until the median is resolved at `error_rate` or the samples
-    /// cover `seconds` of device time, whichever comes first.
+    /// Sampling until the median is resolved at `error_rate` or sampling
+    /// has taken `seconds` of wall time, whichever comes first.
     pub(crate) fn within(error_rate: f64, seconds: f64) -> Self {
         let mut stopping = Self::resolved(error_rate);
         if let Self::Resolved(resolution) = &mut stopping {
@@ -658,31 +662,30 @@ impl Stopping {
         stopping
     }
 
-    /// What the rule does once `count` samples are read, which are expected
-    /// to cover `expected` seconds of device time.
+    /// What the rule does once `count` samples are read, by when sampling
+    /// is expected to have taken `expected` seconds of wall time.
     fn after(&mut self, count: usize, expected: f64) -> After<'_> {
         match self {
             Self::Count(samples) if count < *samples => After::Continues,
             Self::Count(_) => After::Stops,
-            Self::Resolved(resolution)
-                if count == resolution.next || resolution.reaches(expected) =>
-            {
-                After::Reads(resolution)
-            }
+            // The next sample would end past the budget: nothing follows the
+            // one in flight, not even the lead a reading of the rule queues.
+            Self::Resolved(resolution) if resolution.reaches(expected) => After::Stops,
+            Self::Resolved(resolution) if count == resolution.next => After::Reads(resolution),
             Self::Resolved(_) => After::Continues,
         }
     }
 }
 
 impl Resolution {
-    /// Whether samples covering `seconds` of device time reach the budget.
+    /// Whether sampling that has taken `seconds` reaches the budget.
     fn reaches(&self, seconds: f64) -> bool {
         self.budget.is_some_and(|budget| seconds >= budget)
     }
 
     /// Whether sampling stops at `samples`, a count the rule is read at,
-    /// which cover `seconds` of device time: the median is resolved, or the
-    /// samples have reached the budget. A reading the budget asked for
+    /// having taken `seconds` of wall time: the median is resolved, or
+    /// sampling has reached the budget. A reading the budget asked for
     /// leaves the rule's own counts as they are.
     fn stops(&mut self, samples: &[f64], seconds: f64) -> bool {
         if samples.len() >= self.next {
@@ -1124,34 +1127,31 @@ mod tests {
         );
     }
 
-    /// A work whose samples are long stops once they cover its budget,
-    /// before its median is resolved: the rule is read before the sample
-    /// expected to reach the budget, so a lead follows that sample and
-    /// nothing more, and the median has no interval. A work whose samples
-    /// are short is resolved within it, as without one.
+    /// Sampling stops once it has taken its budget of wall time, before
+    /// its median is resolved: with none, after one sample, its lead and
+    /// the sample the only passes submitted, and its median has no interval.
+    /// A work whose budget is ample is resolved within it, as without one.
     #[test]
-    fn a_budget_ends_long_samples_before_the_median_is_resolved() {
+    fn a_budget_ends_sampling_before_the_median_is_resolved() {
         const RATE: f64 = 0.05;
         let log = Log::default();
         let mut slot = Slot::new(Scripted::new(0, 1., &log));
         slot.sample_alone(
             1e-3,
-            &mut Stopping::within(RATE, 2.5),
+            &mut Stopping::within(RATE, 0.),
             None,
             Deadline::default(),
         )
         .unwrap_or_else(|_| panic!("scripted work does not fail"));
-        assert_eq!(slot.samples(), [1.; 3]);
-        // Its lead, the calibrating pass (the first sample), two samples,
-        // and the lead behind the last.
-        assert_eq!(submissions(&log), [(0, 1); 5]);
+        assert_eq!(slot.samples(), [1.]);
+        assert_eq!(submissions(&log), [(0, 1); 2]);
         assert_eq!(slot.measurement(Some(RATE)).interval, None);
 
         let log = Log::default();
         let mut slot = Slot::new(Scripted::new(0, 1e-4, &log));
         slot.sample_alone(
             1e-3,
-            &mut Stopping::within(RATE, 2.5),
+            &mut Stopping::within(RATE, 60.),
             None,
             Deadline::default(),
         )

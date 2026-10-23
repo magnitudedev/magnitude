@@ -36,11 +36,13 @@
 //! their bytes only, their arithmetic is not derived), attention's
 //! arithmetic at many rows (priced at the bf16 matrix throughput, not
 //! measured on the attention entry), contention between devices, compute
-//! overlapping transfers, and sustained throttling. A format or layout the
-//! executor's costs do not hold leaves the estimate unavailable
-//! ([`AssessmentError::Unmeasured`]); no figure is borrowed from another.
+//! overlapping transfers, and sustained throttling. A figure the
+//! executor's costs have not read yet is priced from those they have, by
+//! the costs' own accessors (`ExecutorCosts::route_rate`,
+//! `ExecutorCosts::matrix_flops`, `ExecutorCosts::history_line`), until a
+//! job reads it.
 
-use super::demand::{Bytes, Call, DecodeDemand, Flops};
+use super::demand::{Bytes, Call, DecodeDemand, Flops, Work};
 use super::executor_costs::ExecutorCosts;
 use super::AssessmentError;
 use seismic::{Element, StorageKind};
@@ -80,24 +82,24 @@ pub struct Pricing<'a> {
 impl Pricing<'_> {
     /// The seconds of `bytes`, each format's at its weight rate in device
     /// storage, `scale` times over.
-    fn weights(&self, bytes: &[Bytes], scale: f64) -> Result<f64, AssessmentError> {
-        bytes.iter().try_fold(0.0, |seconds, bytes| {
-            Ok(seconds
+    fn weights(&self, bytes: &[Bytes], scale: f64) -> f64 {
+        bytes.iter().fold(0.0, |seconds, bytes| {
+            seconds
                 + scale * bytes.bytes as f64
-                    / self.costs.weight_rate(StorageKind::Device, bytes.format)?)
+                    / self.costs.weight_rate(StorageKind::Device, bytes.format)
         })
     }
 
     /// Activation-dtype bytes in `storage`: the slowest rate of its
     /// placement's paths.
-    pub fn activations(&self, storage: StorageKind) -> Result<f64, AssessmentError> {
+    pub fn activations(&self, storage: StorageKind) -> f64 {
         self.costs.weight_rate(storage, Element::bf16())
     }
 
     /// The seconds of `flops` over their format's throughput.
-    fn compute(&self, flops: &[Flops], scale: f64) -> Result<f64, AssessmentError> {
-        flops.iter().try_fold(0.0, |seconds, flops| {
-            Ok(seconds + scale * flops.flops as f64 / self.costs.matrix_flops(flops.format)?)
+    fn compute(&self, flops: &[Flops], scale: f64) -> f64 {
+        flops.iter().fold(0.0, |seconds, flops| {
+            seconds + scale * flops.flops as f64 / self.costs.matrix_flops(flops.format)
         })
     }
 }
@@ -164,25 +166,54 @@ fn call_seconds(
     sequences: u64,
     depth: u32,
 ) -> Result<CallSeconds, AssessmentError> {
-    let work = &call.work;
+    let launches = call.launches.at(sequences)?;
+    work_seconds(&call.work, pricing, sequences, depth, launches)
+}
+
+/// The calls of `works`' time at one row and `depth` tokens alone, each a
+/// launch: the composition chain's calls as [`step_seconds`] prices a
+/// step's ([`ExecutorCosts::composition`]).
+pub(crate) fn calls_seconds(
+    works: &[Work],
+    costs: &ExecutorCosts,
+    depth: u32,
+) -> Result<f64, AssessmentError> {
+    let pricing = Pricing {
+        costs,
+        lookahead: false,
+    };
+    works.iter().try_fold(0.0, |seconds, work| {
+        Ok(seconds + work_seconds(work, &pricing, 1, depth, 1)?.total())
+    })
+}
+
+/// The time of `work` at `sequences` sequences, one row each, dispatched
+/// in `launches` launches.
+fn work_seconds(
+    work: &Work,
+    pricing: &Pricing<'_>,
+    sequences: u64,
+    depth: u32,
+    launches: u64,
+) -> Result<CallSeconds, AssessmentError> {
     let rows = sequences;
     let (rows_f, sequences) = (rows as f64, sequences as f64);
-    let mut bytes = pricing.weights(&work.weights, 1.0)?;
+    let mut bytes = pricing.weights(&work.weights, 1.0);
     if let Some(experts) = &work.experts {
         let union = expert_union(experts.experts, experts.selected, rows);
-        bytes += pricing.weights(&experts.slab_bytes, union)?;
+        bytes += pricing.weights(&experts.slab_bytes, union);
     }
     let activations = rows_f * work.row_bytes as f64 + sequences * work.sequence_bytes as f64;
     if activations > 0.0 {
-        bytes += activations / pricing.activations(StorageKind::Device)?;
+        bytes += activations / pricing.activations(StorageKind::Device);
     }
     let upload = rows_f * work.upload_row_bytes as f64;
     if upload > 0.0 {
-        bytes += upload / pricing.activations(StorageKind::Upload)?;
+        bytes += upload / pricing.activations(StorageKind::Upload);
     }
-    let mut compute = pricing.compute(&work.row_flops, rows_f)?;
+    let mut compute = pricing.compute(&work.row_flops, rows_f);
     if let Some(experts) = &work.experts {
-        compute += pricing.compute(&experts.slab_flops, rows_f * experts.selected as f64)?;
+        compute += pricing.compute(&experts.slab_flops, rows_f * experts.selected as f64);
     }
     let mut fixed = 0.0;
     if let Some(history) = &work.history {
@@ -193,21 +224,21 @@ fn call_seconds(
         // activation dtype's rate there.
         bytes += match history.layout {
             Some(layout) => {
-                fixed = pricing.costs.history(layout)?.fixed_seconds.value;
-                read / pricing.costs.history_rate(layout)?
+                let line = pricing.costs.history_line(layout, tokens)?;
+                fixed = line.fixed_seconds;
+                read * line.seconds_per_byte
             }
-            None => read / pricing.activations(StorageKind::Device)?,
+            None => read / pricing.activations(StorageKind::Device),
         };
         compute += rows_f * history.flops_per_token as f64 * tokens
-            / pricing.costs.matrix_flops(Element::bf16())?;
+            / pricing.costs.matrix_flops(Element::bf16());
     }
-    let launches = call.launches.at(rows)?;
     Ok(CallSeconds {
         bytes,
         compute,
         fixed,
         launches,
-        launch: launches as f64 * pricing.costs.launch_seconds.value,
+        launch: launches as f64 * pricing.costs.launch(),
     })
 }
 
@@ -239,7 +270,7 @@ pub fn step_seconds(
             .iter()
             .map(|call| call_seconds(call, pricing, sequences, depth))
             .collect::<Result<_, _>>()?,
-        composition: pricing.costs.composition.value,
+        composition: pricing.costs.composition(),
         step: pricing.costs.step_seconds(pricing.lookahead),
     })
 }
@@ -266,7 +297,9 @@ pub fn estimate_decode(
 mod tests {
     use super::*;
     use crate::assessment::demand::{Experts, HistoryRead, Work};
-    use crate::assessment::executor_costs::{MeasuredCost, Placement, WeightRate};
+    use crate::assessment::executor_costs::{
+        HistoryCosts, MeasuredCost, Placement, RouteCosts, WeightRate,
+    };
     use crate::assessment::launches::{Declarations, Kernel};
     use magnitude_state::KvCodec;
     use seismic::AccessRoute;
@@ -340,6 +373,15 @@ mod tests {
         call
     }
 
+    /// `actual` is `expected` to rounding: a history line is derived from
+    /// its ladder's rungs.
+    fn close(actual: f64, expected: f64) {
+        assert!(
+            (actual / expected - 1.).abs() < 1e-12,
+            "{actual} is not {expected}"
+        );
+    }
+
     #[test]
     fn depths_keep_the_limit_and_drop_what_exceeds_it() {
         assert_eq!(
@@ -369,9 +411,7 @@ mod tests {
     #[test]
     fn a_decode_of_many_rows_is_compute_bound() {
         let mut costs = crate::assessment::fixtures::costs();
-        for matrix in &mut costs.matrices {
-            matrix.flops.value = 2e12;
-        }
+        costs.activation_matrix.as_mut().unwrap().flops.value = 2e12;
         let demand = call(projection());
         let pricing = pricing(&costs);
         assert!(!only(step_seconds(&demand, &pricing, 1, 1_000).unwrap()).compute_bound());
@@ -417,46 +457,36 @@ mod tests {
             |costs: &ExecutorCosts| only(step_seconds(&demand, &pricing(costs), 1, 1_000).unwrap());
         // Upload storage on device storage's route.
         let same = bytes(&costs);
-        assert_eq!(same.bytes, 5e6 / 300e9 + 1e9 / 200e9);
-        assert_eq!(same.fixed, 10e-6);
+        close(same.bytes, 5e6 / 300e9 + 1e9 / 200e9);
+        close(same.fixed, 10e-6);
         // Upload storage on a route of its own (a discrete GPU's pinned host
         // RAM).
-        costs.weight_rates.push(WeightRate {
-            route: AccessRoute::Upload,
-            format: Element::bf16(),
-            bytes_per_second: rate(20e9),
-            features: 16384,
-        });
+        let route = |route, value| RouteCosts {
+            route,
+            activation: Some(WeightRate {
+                bytes_per_second: rate(value),
+                features: 16384,
+            }),
+            formats: Vec::new(),
+        };
+        costs.routes.push(route(AccessRoute::Upload, 20e9));
         costs.placements.upload = Placement::along(AccessRoute::Upload);
-        assert_eq!(bytes(&costs).bytes, 3e6 / 300e9 + 2e6 / 20e9 + 1e9 / 200e9);
-        // An upload route left unmeasured leaves the estimate unavailable,
-        // never priced at device storage's rate.
-        let mut unmeasured = costs.clone();
-        unmeasured
-            .weight_rates
-            .retain(|rate| rate.route != AccessRoute::Upload);
-        assert!(matches!(
-            step_seconds(&demand, &pricing(&unmeasured), 1, 1_000),
-            Err(AssessmentError::Unmeasured(_))
-        ));
+        close(bytes(&costs).bytes, 3e6 / 300e9 + 2e6 / 20e9 + 1e9 / 200e9);
         // Device storage spanning a second, slower route (an integrated
         // GPU's own memory, then a heap of host RAM): weights at the slower
         // rate, history at its layout's rate scaled by the same ratio.
         let mut spanning = costs.clone();
-        spanning.weight_rates.push(WeightRate {
-            route: AccessRoute::VulkanHeap(1),
-            format: Element::bf16(),
-            bytes_per_second: rate(100e9),
-            features: 16384,
-        });
+        spanning
+            .routes
+            .push(route(AccessRoute::VulkanHeap(1), 100e9));
         spanning
             .placements
             .device
             .rest
             .push(AccessRoute::VulkanHeap(1));
-        assert_eq!(
+        close(
             bytes(&spanning).bytes,
-            3e6 / 100e9 + 2e6 / 20e9 + 1e9 / (200e9 * (100e9 / 300e9))
+            3e6 / 100e9 + 2e6 / 20e9 + 1e9 / (200e9 * (100e9 / 300e9)),
         );
         let round_trip = Pricing {
             costs: &costs,
@@ -512,10 +542,10 @@ mod tests {
         let pricing = pricing(&costs);
         let at =
             |sequences, depth| only(step_seconds(&demand, &pricing, sequences, depth).unwrap());
-        assert_eq!(at(1, 1_000).bytes, 1_000.0 * 1024.0 / 200e9);
-        assert_eq!(at(1, 1_000).fixed, 10e-6);
+        close(at(1, 1_000).bytes, 1_000.0 * 1024.0 / 200e9);
+        close(at(1, 1_000).fixed, 10e-6);
         assert_eq!(at(1, 4_096).bytes, at(1, 100_000).bytes);
-        assert_eq!(at(2, 100_000).bytes, 2.0 * 4_096.0 * 1024.0 / 200e9);
+        close(at(2, 100_000).bytes, 2.0 * 4_096.0 * 1024.0 / 200e9);
         assert_eq!(at(2, 100_000).compute, 2.0 * 4_096.0 * 4096.0 / 20e12);
         let estimates = estimate_decode(&demand, &pricing, 1, &[1_000, 4_096, 100_000]).unwrap();
         assert!(estimates[0].tokens_per_second > estimates[1].tokens_per_second);
@@ -529,9 +559,14 @@ mod tests {
     #[test]
     fn each_format_streams_at_its_own_rate() {
         let mut costs = crate::assessment::fixtures::costs();
-        for rate in &mut costs.weight_rates {
-            if rate.format == Element::f32() {
-                rate.bytes_per_second.value = 100e9;
+        for (format, rates) in &mut costs.first.formats {
+            if *format == Element::f32() {
+                rates
+                    .streamed
+                    .as_mut()
+                    .expect("the fixture streams every format")
+                    .bytes_per_second
+                    .value = 100e9;
             }
         }
         let demand = call(Work {
@@ -565,39 +600,128 @@ mod tests {
         assert_eq!(bytes(1), 3e6 / 300e9);
     }
 
-    /// A format or layout the costs do not hold leaves the estimate
-    /// unavailable, never priced at another's figure.
+    /// A format whose pilot could not be read is priced at the activation
+    /// dtype's rate along the same route and its throughput: the estimate
+    /// is made, from the figures that are.
     #[test]
-    fn an_unmeasured_format_or_layout_is_unavailable() {
-        let costs = crate::assessment::fixtures::costs();
-        let pricing = pricing(&costs);
-        let unmeasured = |work| {
-            matches!(
-                step_seconds(&call(work), &pricing, 1, 1),
-                Err(AssessmentError::Unmeasured(_))
-            )
-        };
-        assert!(unmeasured(Work {
-            row_flops: vec![Flops {
-                format: Element::f16(),
-                flops: 1,
-            }],
-            ..Work::default()
-        }));
-        assert!(unmeasured(Work {
+    fn a_format_without_a_pilot_is_priced_at_the_activation_dtypes_figures() {
+        let mut costs = crate::assessment::fixtures::costs();
+        costs.first.activation.bytes_per_second.value = 150e9;
+        costs.activation_matrix.as_mut().unwrap().flops.value = 10e12;
+        costs.first
+            .formats
+            .retain(|(format, _)| *format != Element::f32());
+        costs
+            .matrices
+            .retain(|(format, _)| *format != Element::f32());
+        let demand = call(Work {
             weights: vec![Bytes {
-                format: Element::f16(),
-                bytes: 1,
+                format: Element::f32(),
+                bytes: 3_000_000,
+            }],
+            row_flops: vec![Flops {
+                format: Element::f32(),
+                flops: 4_000_000,
             }],
             ..Work::default()
-        }));
-        let mut dense_only = crate::assessment::fixtures::costs();
-        dense_only
-            .histories
-            .retain(|history| history.layout == KvCodec::Dense);
-        let affine = Work {
+        });
+        let call = only(step_seconds(&demand, &pricing(&costs), 1, 1).unwrap());
+        assert_eq!(call.bytes, 3e6 / 150e9);
+        assert_eq!(call.compute, 4e6 / 10e12);
+    }
+
+    /// Until a job reads a format's streaming rate and throughput, its
+    /// pilot prices them: its bytes at the slower of its pilot's rate and
+    /// the activation dtype's streaming one, its arithmetic at its pilot's
+    /// one-row rate.
+    #[test]
+    fn a_format_read_only_by_its_pilot_is_priced_from_it() {
+        let mut costs = crate::assessment::fixtures::costs();
+        costs.first.activation.bytes_per_second.value = 150e9;
+        costs
+            .matrices
+            .retain(|(format, _)| *format != Element::f32());
+        let demand = call(Work {
+            weights: vec![Bytes {
+                format: Element::f32(),
+                bytes: 3_000_000,
+            }],
+            row_flops: vec![Flops {
+                format: Element::f32(),
+                flops: 4_000_000,
+            }],
+            ..Work::default()
+        });
+        let priced = |pilot: f64, costs: &mut ExecutorCosts| {
+            let (_, rates) = costs.first
+                .formats
+                .iter_mut()
+                .find(|(format, _)| *format == Element::f32())
+                .unwrap();
+            rates.streamed = None;
+            rates.pilot.bytes_per_second.value = pilot;
+            only(step_seconds(&demand, &pricing(costs), 1, 1).unwrap())
+        };
+        // A pilot faster than memory streams: memory bounds the rate.
+        assert_eq!(priced(400e9, &mut costs).bytes, 3e6 / 150e9);
+        // A pilot slower than memory: its arithmetic bounds it, and its
+        // rate over f32's 4-byte weights is half a FLOP per byte.
+        let slow = priced(100e9, &mut costs);
+        assert_eq!(slow.bytes, 3e6 / 100e9);
+        assert_eq!(slow.compute, 4e6 / 50e9);
+    }
+
+    /// Costs holding the probe alone price every demand from it: weights
+    /// and rows at its rate, arithmetic at its one-row FLOP rate, history at
+    /// its rate with no fixed cost, launches and the step at none, and the
+    /// calls as they run alone.
+    #[test]
+    fn the_probe_alone_prices_every_demand() {
+        let mut costs = crate::assessment::fixtures::costs();
+        costs.first.activation.bytes_per_second.value = 150e9;
+        costs.first.formats.clear();
+        costs.matrices.clear();
+        costs.activation_matrix = None;
+        costs.dense = HistoryCosts::new(KvCodec::Dense, Vec::new()).unwrap();
+        costs.composition = None;
+        costs.launch_seconds = None;
+        costs.step_pipelined_seconds = None;
+        costs.step_round_trip_seconds = None;
+        let demand = call(Work {
+            weights: vec![Bytes {
+                format: Element::f32(),
+                bytes: 3_000_000,
+            }],
+            row_flops: vec![Flops {
+                format: Element::f32(),
+                flops: 4_000_000,
+            }],
             history: Some(HistoryRead {
-                layout: Some(KvCodec::AffineK8V4),
+                layout: Some(KvCodec::Dense),
+                bytes_per_token: 1_000,
+                flops_per_token: 0,
+                window: None,
+            }),
+            ..Work::default()
+        });
+        let step = step_seconds(&demand, &pricing(&costs), 1, 1_000).unwrap();
+        assert_eq!((step.composition, step.step), (1., 0.));
+        let call = only(step);
+        assert_eq!((call.fixed, call.launch), (0., 0.));
+        close(call.bytes, (3e6 + 1e6) / 150e9);
+        // bf16's 2-byte weights: a FLOP per byte at one row, two per
+        // weight.
+        close(call.compute, 4e6 / 150e9);
+    }
+
+    /// History no native attention entry reads is no load's: its demand
+    /// cannot be priced.
+    #[test]
+    fn history_no_entry_reads_is_a_demand_failure() {
+        let costs = crate::assessment::fixtures::costs();
+        let rotated = Work {
+            history: Some(HistoryRead {
+                layout: Some(KvCodec::RotatedK4V4),
                 bytes_per_token: 1,
                 flops_per_token: 0,
                 window: None,
@@ -605,8 +729,8 @@ mod tests {
             ..Work::default()
         };
         assert!(matches!(
-            step_seconds(&call(affine), &self::pricing(&dense_only), 1, 1),
-            Err(AssessmentError::Unmeasured(_))
+            step_seconds(&call(rotated), &pricing(&costs), 1, 1),
+            Err(AssessmentError::Demand(_))
         ));
     }
 }

@@ -143,7 +143,7 @@ fn resolving(samples: u32, rate: f64) -> Option<u32> {
 
 /// The fewest samples [`median_interval`] bounds the median of at error
 /// rate `rate`: below them no sampling is resolved, whatever it read.
-pub(crate) fn fewest_bounding(rate: f64) -> usize {
+pub fn fewest_bounding(rate: f64) -> usize {
     // All of `n` samples favourable multiply the mixture by a factor that
     // tends to two each, so some count resolves.
     (1..)

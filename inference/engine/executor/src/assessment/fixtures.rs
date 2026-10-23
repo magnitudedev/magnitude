@@ -35,7 +35,8 @@ const FORMATS: [Encoding; 16] = [
 /// pipelined and a 150 µs round-trip step.
 pub(crate) fn costs() -> super::ExecutorCosts {
     use super::executor_costs::{
-        HistoryCosts, MatrixCosts, MeasuredCost, Placement, Placements, WeightRate,
+        FormatRates, HistoryCosts, MatrixCosts, MeasuredCost, Placement, Placements, RouteCosts,
+        WeightRate, HISTORY_DEPTHS,
     };
     let cost = |value| MeasuredCost {
         value,
@@ -64,42 +65,53 @@ pub(crate) fn costs() -> super::ExecutorCosts {
         .collect::<Vec<_>>();
     formats.sort_unstable_by_key(|element| element.name());
     formats.dedup();
+    formats.retain(|format| *format != seismic::Element::bf16());
+    let rate = || WeightRate {
+        bytes_per_second: cost(300e9),
+        features: 16384,
+    };
+    let matrix = || MatrixCosts {
+        flops: cost(20e12),
+        features: 16384,
+    };
+    // 10 µs a call and its history at 200 GB/s, at every rung.
+    let history = |layout| {
+        let per_token = super::executor_costs::token_bytes(layout).unwrap() as f64;
+        let at = |depth: u64| cost(10e-6 + depth as f64 * per_token / 200e9);
+        HistoryCosts::new(layout, HISTORY_DEPTHS.iter().map(|&depth| at(depth)).collect())
+            .unwrap()
+    };
     super::ExecutorCosts {
-        weight_rates: formats
-            .iter()
-            .map(|&format| WeightRate {
-                route: seismic::AccessRoute::Device,
-                format,
-                bytes_per_second: cost(300e9),
-                features: 16384,
-            })
-            .collect(),
         placements: Placements {
             device: Placement::along(seismic::AccessRoute::Device),
             upload: Placement::along(seismic::AccessRoute::Device),
         },
+        first: RouteCosts {
+            route: seismic::AccessRoute::Device,
+            activation: rate(),
+            formats: formats
+                .iter()
+                .map(|&format| {
+                    let rates = FormatRates {
+                        pilot: rate(),
+                        streamed: Some(rate()),
+                    };
+                    (format, rates)
+                })
+                .collect(),
+        },
+        routes: Vec::new(),
+        activation_matrix: Some(matrix()),
         matrices: formats
             .into_iter()
-            .map(|format| MatrixCosts {
-                format,
-                flops: cost(20e12),
-                features: 16384,
-            })
+            .map(|format| (format, matrix()))
             .collect(),
-        histories: super::HISTORY_LAYOUTS
-            .iter()
-            .map(|&layout| HistoryCosts {
-                layout,
-                fixed_seconds: cost(10e-6),
-                bytes_per_second: cost(200e9),
-                depths: [2048, 4096],
-            })
-            .collect(),
-        composition: cost(1.2),
-        launch_seconds: cost(5e-6),
-        step_pipelined_seconds: cost(50e-6),
-        step_round_trip_seconds: cost(150e-6),
-        unmeasured: Vec::new(),
+        dense: history(magnitude_state::KvCodec::Dense),
+        affine: history(magnitude_state::KvCodec::AffineK8V4),
+        composition: Some(cost(1.2)),
+        launch_seconds: Some(cost(5e-6)),
+        step_pipelined_seconds: Some(cost(50e-6)),
+        step_round_trip_seconds: Some(cost(150e-6)),
     }
 }
 

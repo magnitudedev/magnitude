@@ -31,12 +31,13 @@ mod work;
 pub use clock::{warm, Clock, HeldClocks, Raise, RaiseOutcome, SustainedClock};
 pub use deadline::{Deadline, WorkError};
 pub use measure::{
-    measure, measure_all, Attempt, Measure, Outcome, Reason, Record, RecordStore, Stop, StoreError,
-    Unformed,
+    measure, measure_all, Attempt, Measure, Outcome, Reason, Record, RecordStore, Stop,
+    StoreError, Unformed,
 };
 pub use session::{sample, Counted, Measurement, Passes, Rounds, Slot, SlotFailure, Slotted};
 pub use statistics::{
-    median, median_interval, median_of, Shuffle, Tally, Timing, Verdict, MEDIAN_TOLERANCE,
+    fewest_bounding, median, median_interval, median_of, Shuffle, Tally, Timing, Verdict,
+    MEDIAN_TOLERANCE,
 };
 pub use store::JsonFileStore;
 pub use work::{Gauge, Pending, Work};

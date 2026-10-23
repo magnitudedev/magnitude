@@ -18,11 +18,10 @@ pub enum Stop {
     Count(NonZeroUsize),
     /// Once [`Timing::resolved`] holds at `error_rate`.
     Resolved { error_rate: f64 },
-    /// Once [`Timing::resolved`] holds at `error_rate`, or once the samples
-    /// cover `seconds` of device time, whichever comes first: at least one
-    /// sample. Where samples are long the budget bounds a point's time, and
-    /// a median it ends before the fewest samples that bound one has no
-    /// interval.
+    /// Once [`Timing::resolved`] holds at `error_rate`, or once sampling has
+    /// taken `seconds` of wall time, whichever comes first: at least one
+    /// sample. The budget bounds a point's time, and a median it ends before
+    /// the fewest samples that bound one has no interval.
     Within { error_rate: f64, seconds: f64 },
 }
 
@@ -39,18 +38,35 @@ pub struct Measure {
 
 /// Measure `work`: raised first to its sustained clock where `clocks`
 /// holds one for it (none for a measurement of the device as it is), then
-/// sampled as `how` says. The one way to time a point.
+/// sampled as `how` says, with no cutoff.
 pub fn measure<W: Work>(
     work: W,
     how: &Measure,
     clocks: Option<&mut HeldClocks<W::Clock, W::Error>>,
 ) -> Result<Measurement, W::Error> {
+    time(work, how, clocks, Deadline::default()).map_err(|error| match error {
+        WorkError::Failed(error) => error,
+        WorkError::Expired => unreachable!("measuring without a deadline does not expire"),
+    })
+}
+
+/// The one way to time a point: [`measure`] with a cutoff. Nothing is
+/// submitted that is forecast to end past `deadline` (a raise's readings,
+/// a lead, a sample). A point the deadline ends keeps the samples it read,
+/// its interval what they reach (none below the fewest that bound one),
+/// and expires only where it read none.
+fn time<W: Work>(
+    work: W,
+    how: &Measure,
+    clocks: Option<&mut HeldClocks<W::Clock, W::Error>>,
+    deadline: Deadline,
+) -> Result<Measurement, WorkError<W::Error>> {
     let mut slot = Slot::new(work);
     let clock = match clocks {
         Some(clocks) => clocks.hold(&slot)?,
         None => None,
     };
-    raise_held(clock.as_deref(), std::slice::from_ref(&slot))?;
+    raise_held(clock.as_deref(), std::slice::from_ref(&slot), deadline)?;
     let (mut stopping, error_rate) = match how.stop {
         Stop::Count(samples) => (Stopping::Count(samples.get()), None),
         Stop::Resolved { error_rate } => (Stopping::resolved(error_rate), Some(error_rate)),
@@ -59,16 +75,16 @@ pub fn measure<W: Work>(
             seconds,
         } => (Stopping::within(error_rate, seconds), Some(error_rate)),
     };
-    slot.sample_alone(
+    match slot.sample_alone(
         how.min_sample_seconds,
         &mut stopping,
         clock.as_deref(),
-        Deadline::default(),
-    )
-    .map_err(|error| match error {
-        WorkError::Failed(error) => error,
-        WorkError::Expired => unreachable!("sampling without a deadline does not expire"),
-    })?;
+        deadline,
+    ) {
+        Ok(()) => {}
+        Err(WorkError::Expired) if !slot.samples().is_empty() => {}
+        Err(error) => return Err(error),
+    }
     Ok(slot.measurement(error_rate))
 }
 
@@ -195,6 +211,10 @@ pub enum Unformed<G> {
     /// nothing is recorded, as for a timing that fails, and whether the
     /// failure is permanent is the host's decision ([`Attempt::Skip`]).
     Now(G),
+    /// What forming it waits for (its kernels' compiles) did not end before
+    /// the deadline: nothing is recorded, and the attempt says nothing of the
+    /// point.
+    Expired,
 }
 
 /// What became of one point of [`measure_all`].
@@ -217,23 +237,31 @@ pub enum Outcome<E, G> {
     /// it again, and whether the failure is permanent is the host's
     /// decision ([`Attempt::Skip`]).
     Failed(E),
+    /// The deadline ended it before it read a sample, or before its work was
+    /// formed or attempted ([`Unformed::Expired`]): nothing is recorded, and
+    /// its attempt, where the host made one, says nothing of the point.
+    Expired,
     /// Its record could not be read or written.
     Store(StoreError),
 }
 
 /// Measure every point of `points` that `store` holds no record of, as
-/// `how` says, with `clocks` holding the sustained clocks. Each point's
-/// work is formed by its own `F` only after `attempting` says to proceed,
-/// so a host's attempt covers forming it as well as timing it. A point that
-/// fails does not stop the rest. This is the one writer of records: a
+/// `how` says, with `clocks` holding the sustained clocks, submitting
+/// nothing forecast to end past `deadline` ([`time`]). Each point's work is
+/// formed by its own `F` only after `attempting` says to proceed, so a
+/// host's attempt covers forming it as well as timing it; a point reached
+/// once the deadline has passed is neither attempted nor formed. A point
+/// that fails does not stop the rest. This is the one writer of records: a
 /// point measured is recorded as its timing, and one skipped or whose work
 /// cannot be formed under its key ([`Unformed::Never`]) as unobtainable with
 /// the reason. One whose work could not be formed now ([`Unformed::Now`]) or
 /// whose timing fails is not recorded: either can fail for a moment's
-/// reason, and only its host knows when one is permanent.
+/// reason, and only its host knows when one is permanent. Nor is one that
+/// expired.
 pub fn measure_all<K, W, G, F>(
     points: Vec<(K, F)>,
     how: &Measure,
+    deadline: Deadline,
     clocks: &mut HeldClocks<W::Clock, W::Error>,
     store: &dyn RecordStore<K>,
     attempting: &mut dyn FnMut(&K) -> Attempt,
@@ -248,7 +276,8 @@ where
         .map(|(key, form)| {
             let outcome = match store.load(&key) {
                 Ok(Some(record)) => Outcome::Loaded(record),
-                Ok(None) => attempt(&key, form, how, clocks, store, attempting),
+                Ok(None) if deadline.expired() => Outcome::Expired,
+                Ok(None) => attempt(&key, form, how, deadline, clocks, store, attempting),
                 Err(error) => Outcome::Store(error),
             };
             (key, outcome)
@@ -262,6 +291,7 @@ fn attempt<K, W, G, F>(
     key: &K,
     form: F,
     how: &Measure,
+    deadline: Deadline,
     clocks: &mut HeldClocks<W::Clock, W::Error>,
     store: &dyn RecordStore<K>,
     attempting: &mut dyn FnMut(&K) -> Attempt,
@@ -281,12 +311,14 @@ where
                 Outcome::Unformed(error),
             ),
             Err(Unformed::Now(error)) => (None, Outcome::Unmade(error)),
-            Ok(work) => match measure(work, how, Some(clocks)) {
+            Err(Unformed::Expired) => (None, Outcome::Expired),
+            Ok(work) => match time(work, how, Some(clocks), deadline) {
                 Ok(measurement) => {
                     let timing = measurement.timing();
                     (Some(Record::Measured(timing)), Outcome::Measured(timing))
                 }
-                Err(error) => (None, Outcome::Failed(error)),
+                Err(WorkError::Expired) => (None, Outcome::Expired),
+                Err(WorkError::Failed(error)) => (None, Outcome::Failed(error)),
             },
         },
     };
@@ -402,6 +434,7 @@ mod tests {
         let outcomes = measure_all(
             points,
             &how,
+            Deadline::default(),
             &mut HeldClocks::new(0.05, 1e-3),
             &store,
             &mut |key| {
@@ -453,5 +486,49 @@ mod tests {
         assert!(matches!(records["measured"], Record::Measured(_)));
         assert!(!records.contains_key("unmade"));
         assert!(!records.contains_key("failed"));
+    }
+
+    /// Once the deadline has passed a point no record holds is neither
+    /// attempted nor formed, and one whose forming outlasts it is attempted
+    /// but not recorded: each expires. A stored point is still loaded.
+    #[test]
+    fn a_passed_deadline_expires_every_point_no_record_holds() {
+        let store = Memory::default();
+        let stored = Record::Measured(Timing::of(&[1.], 0.05));
+        store.store(&"stored", &stored).unwrap();
+        let how = Measure {
+            stop: Stop::Count(NonZeroUsize::new(3).unwrap()),
+            min_sample_seconds: 0.,
+        };
+        let mut attempted = Vec::new();
+        let passed = Deadline::new(Some(std::time::Instant::now()));
+        let work: fn() -> Result<Fixed, Unformed<&'static str>> = || Ok(Fixed(Ok(1.)));
+        let outcomes = measure_all(
+            vec![("stored", work), ("late", work)],
+            &how,
+            passed,
+            &mut HeldClocks::new(0.05, 1e-3),
+            &store,
+            &mut |key| {
+                attempted.push(*key);
+                Attempt::Proceed
+            },
+        );
+        assert!(matches!(&outcomes[0], ("stored", Outcome::Loaded(_))));
+        assert!(matches!(&outcomes[1], ("late", Outcome::Expired)));
+        let outcomes = measure_all::<_, Fixed, &'static str, _>(
+            vec![("compiling", || Err(Unformed::Expired))],
+            &how,
+            Deadline::default(),
+            &mut HeldClocks::new(0.05, 1e-3),
+            &store,
+            &mut |key| {
+                attempted.push(*key);
+                Attempt::Proceed
+            },
+        );
+        assert!(matches!(&outcomes[0], ("compiling", Outcome::Expired)));
+        assert_eq!(attempted, ["compiling"]);
+        assert_eq!(store.0.borrow().len(), 1);
     }
 }

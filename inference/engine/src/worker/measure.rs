@@ -46,9 +46,11 @@ pub struct MeasureRequest {
     /// selects.
     pub executor: seismic::ExecutorSelector,
     /// This job, as its attempt markers name it, so the attempt of a job
-    /// preempted by a load is released rather than counted
-    /// ([`release_preempted`]).
+    /// its host kills is released rather than counted ([`release_killed`]).
     pub job: MeasureJob,
+    /// The time the job has from its start: what its host's time for it
+    /// ([`magnitude_executor::assessment::MEASUREMENT_SECONDS`]) has left.
+    pub time: std::time::Duration,
 }
 
 /// One measurement job's identity, which its host chooses distinct from the
@@ -77,6 +79,9 @@ pub enum MeasureFailure {
     Point { key: PointKey, reason: String },
     /// An attempt could not be recorded, so a point ran unrecorded.
     Attempt { reason: String },
+    /// A figure after the probe could not be read outside its points'
+    /// timings: the costs keep pricing it from those read.
+    Figure { reason: String },
 }
 
 impl fmt::Display for MeasureFailure {
@@ -95,6 +100,7 @@ impl fmt::Display for MeasureFailure {
                 write!(formatter, " of kernels {kernels}: {reason}")
             }
             Self::Attempt { reason } => write!(formatter, "recording an attempt: {reason}"),
+            Self::Figure { reason } => write!(formatter, "a priced figure: {reason}"),
         }
     }
 }
@@ -168,7 +174,8 @@ impl AttemptMarkers {
     }
 
     /// Undo `job`'s attempt of `key`, where it is the attempt counted last:
-    /// the job was preempted, which says nothing of the point.
+    /// the job was killed, or its time ended, which says nothing of the
+    /// point.
     fn release(&self, key: &impl Serialize, job: MeasureJob) -> Result<(), StoreError> {
         let record = self.record(key)?;
         if record.job != Some(job) {
@@ -193,11 +200,11 @@ impl AttemptMarkers {
     }
 }
 
-/// Release `job`'s attempt of `key` in the kernel cache at `kernels`: the
-/// job was preempted while timing it (by a load, which kills it at once),
+/// Release `job`'s attempt of `key` in the kernel cache at `kernels`: its
+/// host killed the job while timing it (for a load, or as its time ended),
 /// so the point is attempted again uncounted. Only `job`'s own attempt is
 /// undone; a key it never marked is left as it is.
-pub fn release_preempted(
+pub fn release_killed(
     kernels: &Path,
     job: MeasureJob,
     key: &PointKey,
@@ -219,7 +226,7 @@ pub(super) fn measure_only(
         return WorkerExit::TransportFailed(error.to_string());
     }
     let mut lost = None;
-    let failures = measure_machine(&request, &mut |event| {
+    let MeasureEnd { failures, held } = measure_machine(&request, &mut |event| {
         if lost.is_none() {
             let message = match event {
                 MeasureEvent::Attempting(key) => WorkerMessage::Attempting { key },
@@ -231,24 +238,42 @@ pub(super) fn measure_only(
     if let Some(error) = lost {
         return WorkerExit::TransportFailed(error);
     }
-    match sender.send(WorkerMessage::MeasureFinished { failures }) {
+    let sent = sender.send(WorkerMessage::MeasureFinished { failures });
+    // Released once the job is reported.
+    drop(held);
+    match sent {
         Ok(()) => WorkerExit::Measured,
         Err(error) => WorkerExit::TransportFailed(error.to_string()),
     }
 }
 
+/// How a measurement job ended: what it could not measure, and what its
+/// points were made in and from, which its caller releases once it has
+/// reported the job ([`magnitude_executor::assessment::Measurement::held`]).
+pub struct MeasureEnd {
+    pub failures: Vec<MeasureFailure>,
+    pub held: Option<magnitude_executor::assessment::Held>,
+}
+
 /// Measure the cost points of the request's executor that have no record,
-/// each until its median is resolved. A point that ended two jobs
-/// is not timed: it is recorded unobtainable, so the executor's costs
-/// complete without it. Each attempt reaches `report` before it is
-/// recorded, and each record the job stores after the walk. Returns what
-/// could not be measured. The worker's measure mode runs it; a tool may run
-/// it in its own process.
+/// within the request's time: what it does not reach is left for the next
+/// job, its attempts released. A point that ended two jobs is not timed: it
+/// is recorded unobtainable, so the executor's costs complete without it. Each attempt reaches `report`
+/// before it is recorded, and each record as soon as the job stores it.
+/// Returns what could not be measured, and what the job's points were made
+/// in and from. The worker's measure mode runs it; a tool may run it in its
+/// own process.
 pub fn measure_machine(
     request: &MeasureRequest,
     report: &mut dyn FnMut(MeasureEvent),
-) -> Vec<MeasureFailure> {
-    let machine = |reason: String| vec![MeasureFailure::Machine { reason }];
+) -> MeasureEnd {
+    // The job's time runs from its start: discovering the machine and
+    // opening the executor are part of it.
+    let deadline = std::time::Instant::now() + request.time;
+    let machine = |reason: String| MeasureEnd {
+        failures: vec![MeasureFailure::Machine { reason }],
+        held: None,
+    };
     let catalog = match Devices::discover(&request.paths) {
         Ok(catalog) => catalog,
         Err(error) => return machine(error.to_string()),
@@ -282,81 +307,108 @@ pub fn measure_machine(
         magnitude_executor::SEARCH_SETTINGS.error_rate,
         magnitude_executor::MIN_SAMPLE_SECONDS,
     );
-    let measured = ExecutorCosts::measure(&mut measurer, &device, &records, &mut |key| {
-        // A point that ended two jobs is not timed again; the measurer records it
-        // unobtainable with this reason.
-        match markers.unobtainable(key) {
-            Ok(Some(reason)) => return Attempt::Skip(Reason::new(reason)),
-            Ok(None) => {}
-            Err(error) => unrecorded.borrow_mut().push(error),
-        }
-        // Reported before it is recorded, so a host that preempts the job
-        // knows every attempt the job may have counted.
-        report(MeasureEvent::Attempting(key.clone()));
-        if let Err(error) = markers.attempting(key, request.job) {
-            unrecorded.borrow_mut().push(error);
-        }
-        Attempt::Proceed
-    });
+    // Reports attempts and records as the walk goes; a RefCell as both the
+    // attempting and the visiting closures report.
+    let report = RefCell::new(report);
+    let mut failures = Vec::new();
+    let measured = ExecutorCosts::measure(
+        &mut measurer,
+        &device,
+        &records,
+        deadline,
+        &mut |key| {
+            // A point that ended two jobs is not timed again; the measurer
+            // records it unobtainable with this reason.
+            match markers.unobtainable(key) {
+                Ok(Some(reason)) => return Attempt::Skip(Reason::new(reason)),
+                Ok(None) => {}
+                Err(error) => unrecorded.borrow_mut().push(error),
+            }
+            // Reported before it is recorded, so a host that kills the job
+            // knows every attempt the job may have counted.
+            (report.borrow_mut())(MeasureEvent::Attempting(key.clone()));
+            if let Err(error) = markers.attempting(key, request.job) {
+                unrecorded.borrow_mut().push(error);
+            }
+            Attempt::Proceed
+        },
+        &mut |key, outcome| {
+            let record = match outcome {
+                Outcome::Loaded(_) => None,
+                Outcome::Measured(timing) => Some(Record::Measured(timing)),
+                Outcome::Skipped(reason) => Some(Record::Unobtainable { reason }),
+                // Formation is deterministic for its key: the measurer
+                // recorded it unobtainable with the failure, and the job
+                // reports it too.
+                Outcome::Unformed(error) => {
+                    let reason = error.to_string();
+                    failures.push(MeasureFailure::Point {
+                        key: key.clone(),
+                        reason: reason.clone(),
+                    });
+                    Some(Record::Unobtainable {
+                        reason: Reason::new(reason),
+                    })
+                }
+                // Left unrecorded, with its attempt still counted as one
+                // ended job: the next job takes it, and only the two-job rule
+                // makes the failure permanent.
+                Outcome::Unmade(error) => {
+                    failures.push(MeasureFailure::Point {
+                        key,
+                        reason: error.to_string(),
+                    });
+                    return;
+                }
+                Outcome::Failed(error) => {
+                    failures.push(MeasureFailure::Point {
+                        key,
+                        reason: error.to_string(),
+                    });
+                    return;
+                }
+                // The job's time ended before the point read a sample: no
+                // failure of it, so its attempt is released, as a killed
+                // job's is, and the next job takes it.
+                Outcome::Expired => {
+                    if let Err(error) = markers.release(&key, request.job) {
+                        unrecorded.borrow_mut().push(error);
+                    }
+                    return;
+                }
+                Outcome::Store(error) => {
+                    failures.push(MeasureFailure::Point {
+                        key: key.clone(),
+                        reason: error.to_string(),
+                    });
+                    None
+                }
+            };
+            if let Err(error) = markers.resolved(&key) {
+                unrecorded.borrow_mut().push(error);
+            }
+            if let Some(record) = record {
+                (report.borrow_mut())(MeasureEvent::Recorded(key, record));
+            }
+        },
+    );
     let measurement = match measured {
         Ok(measurement) => measurement,
         Err(error) => return machine(error.to_string()),
     };
-    let mut failures = Vec::new();
-    for (key, outcome) in measurement.points {
-        let record = match outcome {
-            Outcome::Loaded(_) => None,
-            Outcome::Measured(timing) => Some(Record::Measured(timing)),
-            Outcome::Skipped(reason) => Some(Record::Unobtainable { reason }),
-            // Formation is deterministic for its key: the measurer recorded it
-            // unobtainable with the failure, and the job reports it too.
-            Outcome::Unformed(error) => {
-                let reason = error.to_string();
-                failures.push(MeasureFailure::Point {
-                    key: key.clone(),
-                    reason: reason.clone(),
-                });
-                Some(Record::Unobtainable {
-                    reason: Reason::new(reason),
-                })
-            }
-            // Left unrecorded, with its attempt still counted as one ended
-            // job: the next job takes it, and only the two-job rule makes the
-            // failure permanent.
-            Outcome::Unmade(error) => {
-                failures.push(MeasureFailure::Point {
-                    key,
-                    reason: error.to_string(),
-                });
-                continue;
-            }
-            Outcome::Failed(error) => {
-                failures.push(MeasureFailure::Point {
-                    key,
-                    reason: error.to_string(),
-                });
-                continue;
-            }
-            Outcome::Store(error) => {
-                failures.push(MeasureFailure::Point {
-                    key: key.clone(),
-                    reason: error.to_string(),
-                });
-                None
-            }
-        };
-        if let Err(error) = markers.resolved(&key) {
-            unrecorded.borrow_mut().push(error);
-        }
-        if let Some(record) = record {
-            report(MeasureEvent::Recorded(key, record));
-        }
-    }
     if let Some(error) = measurement.ended {
         failures.push(MeasureFailure::Machine {
             reason: error.to_string(),
         });
     }
+    failures.extend(
+        measurement
+            .failures
+            .into_iter()
+            .map(|error| MeasureFailure::Figure {
+                reason: error.to_string(),
+            }),
+    );
     failures.extend(
         unrecorded
             .into_inner()
@@ -365,7 +417,10 @@ pub fn measure_machine(
                 reason: error.to_string(),
             }),
     );
-    failures
+    MeasureEnd {
+        failures,
+        held: Some(measurement.held),
+    }
 }
 
 /// Run the measurement job of `request` in the worker at the other end of
@@ -422,14 +477,14 @@ mod tests {
         assert_eq!(markers.unobtainable(&other).unwrap(), None);
     }
 
-    /// A preempted job's attempt is released, not counted: only the job's
+    /// A killed job's attempt is released, not counted: only the job's
     /// own attempt, and an earlier job's ended attempt still counts.
     #[test]
-    fn a_preempted_attempt_is_released() {
+    fn a_killed_attempt_is_released() {
         let kernels = tempfile::tempdir().unwrap();
         let markers = AttemptMarkers::new(kernels.path());
         let key = "vulkan driver 580: composition chain";
-        // A job ends on the point, then the next is preempted on it twice.
+        // A job ends on the point, then the next is killed on it twice.
         markers.attempting(&key, MeasureJob(1)).unwrap();
         markers.attempting(&key, MeasureJob(2)).unwrap();
         markers.release(&key, MeasureJob(2)).unwrap();
@@ -450,6 +505,7 @@ mod tests {
             kernels: "/cache/kernels".into(),
             executor: seismic::ExecutorSelector::Cuda { uuid: [7; 16] },
             job: MeasureJob(9),
+            time: std::time::Duration::from_millis(9_500),
         };
         let encoded = postcard::to_allocvec(&HostMessage::Measure {
             request: request.clone(),
@@ -466,6 +522,9 @@ mod tests {
             },
             MeasureFailure::Attempt {
                 reason: "read-only cache".into(),
+            },
+            MeasureFailure::Figure {
+                reason: "no implementation".into(),
             },
         ];
         let encoded = postcard::to_allocvec(&WorkerMessage::MeasureFinished {

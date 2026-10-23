@@ -38,32 +38,49 @@
 //! holds is reached, in the order the walk reads them, while the walk goes
 //! on: each point waits only for its own kernels. The points are timed one
 //! after another on the device, which a compile does not share; those that
-//! touch the host (a route of host storage, the launch graph's host times)
-//! come last, once every compile has ended.
+//! touch the host (a route of host storage, the launch graph's host times,
+//! and every point of an executor whose device is the host's CPU) are timed
+//! only once every compile has ended.
 //!
-//! The history's depth is searched from the depth the one-token call and
-//! the activation dtype's weight rate predict meets the rule (one call
-//! takes at least 100 launch costs and its history at least its fixed
-//! part), each depth its own point of one argument set (unrotated),
-//! doubling until a measured call meets it. That search only finds the
-//! depth. A streaming kernel's figure is timed with its calls rotating
-//! through as many argument sets as span four times the largest cache that
-//! can serve them ([`CACHE_MULTIPLE`]), so the bytes come from memory: a
-//! projection's sets hold megabytes to tens of megabytes each, and a
-//! history's, at a depth meeting the 100-launch rule, at least the bytes it
-//! reads in 50 launch costs, so a rotation's sets stay few. A rotation at
-//! one token of dense history (4 KiB) would take 262,144 sets over a 256
-//! MiB cache, more than a device keeps resident (m4-pro's Metal driver
-//! refused that rotation's views to its residency set, about 370,000
-//! resources). Every rotated operand of every point is a view of one
+//! The costs need one point: the probe, the activation dtype's rate along
+//! device storage's first route, the walk's first. Every other figure is
+//! held where its point was read and priced from those that were until
+//! then ([`ExecutorCosts`]), so the costs exist, and price every model, once
+//! the probe is stored. The walk's steps after it are one plan ([`plan`]),
+//! each figure before those whose prices without it are less far off, so
+//! what a job's time leaves unread is what is priced closest. A job takes
+//! [`MEASUREMENT_SECONDS`] of wall time from its start at most, whatever
+//! the machine: each point samples for its part of the time left, or until
+//! its median is resolved; nothing is submitted that is forecast to end past
+//! it, compiles' waits included, and no point is begun whose making and
+//! fewest passes, where records forecast them, would. A point it ends
+//! before any sample is not recorded, and the next job measures it.
+//!
+//! A history layout's costs are read on a ladder of depths
+//! ([`HISTORY_DEPTHS`], the depths estimates read), as far as a rung fits
+//! its storage and its call a point's share of the job, each rung's calls
+//! rotating from memory where memory can move them ([`UNROTATED`]), in at
+//! most an eighth of its storage; an estimate prices a depth on the segment
+//! of the ladder it lies in. The composition chain's layers read their
+//! weights and history from memory as a model's do, and its ratio is its
+//! time over its calls' as the other figures price them
+//! ([`ChainRead::composition`]), so it scales a step's price to its time. A
+//! streaming kernel's figure is timed with its calls rotating through as
+//! many argument sets as span four times the largest cache that can serve
+//! them ([`CACHE_MULTIPLE`]), so the bytes come from memory: a projection's
+//! sets hold megabytes to tens of megabytes each, and a history rung's
+//! thirty-two megabytes or more, so a rotation's sets stay few (Metal
+//! refuses a rotation of hundreds of thousands of views to its residency
+//! set). Every rotated operand of every point is a view of one
 //! zero-filled backing per route ([`Backings`]), allocated once a job, so a
 //! point's making allocates and fills none of its rotation; the history
 //! rows a point appends are zeroed again once it is timed.
 //!
-//! A weight format, history layout or upload-only route whose points fail,
-//! or that the job records unobtainable, is unmeasured with its reason, and
-//! what it would price is unavailable; the other figures stand.
+//! A point that fails, or that the job records unobtainable, leaves its
+//! figure priced from those read; a probe that does means the executor
+//! cannot stream its own weights, and it has no costs.
 
+use super::demand::{Bytes, Flops, HistoryRead, Work};
 use super::AssessmentError;
 use crate::{resident_element, resident_elements, resident_layout, ExecutionPath};
 use magnitude_artifacts::gguf::Encoding;
@@ -161,8 +178,8 @@ pub const HISTORY_LAYOUTS: [KvCodec; 2] = [KvCodec::Dense, KvCodec::AffineK8V4];
 /// model's (Qwen3.5-9B).
 const HIDDEN: u64 = 4096;
 
-/// The calls of the launch graph and of the composition chain: the regime a
-/// step is priced in (a decode step makes 100 to 300 calls).
+/// The calls of the launch graph, and the most of the composition chain:
+/// the regime a step is priced in (a decode step makes 100 to 300 calls).
 const GRAPH_CALLS: usize = 256;
 
 /// The width of the launch graph's rows: 64 F32 values, one call's least
@@ -175,29 +192,43 @@ const GRAPH_WIDTH: u64 = 64;
 /// makes.
 const CHAIN_LAYER_CALLS: usize = 4;
 
-/// How many launch costs one sized call takes at least.
-const LAUNCH_MULTIPLE: f64 = 100.;
+/// The wall seconds a measurement job takes at most, from its start,
+/// whatever the machine. Its points share them equally ([`plan`]): each
+/// samples for its share, or until its median is resolved, so a slower
+/// machine takes fewer samples of each point rather than longer, and a
+/// faster one ends sooner.
+pub const MEASUREMENT_SECONDS: f64 = 10.0;
+
+/// The depths a history layout's ladder is read at, in tokens, as far as
+/// its rungs fit ([`Walk::rung`]): from below the shortest context a model
+/// serves to 256K, doubling. Estimates read 8K to 1M tokens (25K, 50K and
+/// 75K, and each model's context); past the last rung measured, the
+/// deepest segment prices them. A straight line through two depths does
+/// not run through calls at the others: a history call's time per token
+/// falls with depth where more of the device's parallelism fills (a GB10's
+/// 20-core CPU: a line through 6K and 12K tokens priced 262K 36% slow), and
+/// rises where a GPU's attention splits more (a GB10's CUDA and Vulkan: a
+/// line through 64K and 128K priced 16K 25% to 78% slow; 2026-10-22).
+pub const HISTORY_DEPTHS: [u64; 6] = [8192, 16384, 32768, 65536, 131072, 262144];
+
+/// The part of the smallest store a history rung's rotation reaches that
+/// the rotation may take: a rotation that would exceed it reads fewer sets,
+/// and a rung one set of which exceeds it is not read. The job runs while no
+/// model is loaded, but the OS and other processes hold some of each store,
+/// which a store's capacity does not say (an 8 GB M1's Metal had 2.4 GB to
+/// give, 2026-10-21).
+const ROTATION_SHARE: u64 = 8;
 
 /// The part of a history call's time below which its bytes' time from
-/// memory leaves it unrotated: half the tolerance a median is resolved to
-/// ([`seismic::measure::MEDIAN_TOLERANCE`]), so reading every byte from
-/// memory, with nothing of it overlapping the call's other work, would move
-/// the call by less than its measurement can tell. A GPU's attention reads
-/// near its memory's rate, far above it; a CPU's 0.3% to 1% of its call
-/// (a 4-vCPU EPYC 7763, 2026-10-21).
+/// memory leaves it timed over one argument set: half the tolerance a
+/// median is resolved to ([`seismic::measure::MEDIAN_TOLERANCE`]), so
+/// reading every byte from memory, with nothing of it overlapping the
+/// call's other work, would move the call by less than its measurement can
+/// tell. A GPU's attention reads near its memory's rate, far above it; a
+/// CPU's 0.3% to 1% of its call (a 4-vCPU EPYC 7763, 2026-10-21), where a
+/// rotation's pass of ten 95 ms calls made one sample a second (a 2-core
+/// Ryzen 5600X, 2026-10-22).
 const UNROTATED: f64 = seismic::measure::MEDIAN_TOLERANCE / 2.;
-
-/// The device seconds a point's samples cover at most beyond the one that
-/// reaches it, unless its median is resolved first. A GPU's points resolve
-/// in milliseconds, and a CPU's projection points in under 2 s (eight
-/// samples, the fewest that bound a median at one in twenty, of calls of 2
-/// to 220 ms on a 4-vCPU EPYC 7763): they are resolved as without it. A
-/// CPU's history rotation or composition chain takes 0.5 to 1.5 s a sample
-/// there, which eight samples and their leads would make 15 s a point; two
-/// such samples of hundreds of calls each agree within a few percent, inside
-/// the 10% a median is resolved to. A point then takes at most this, one
-/// more sample and the two leads around them ([`seismic::measure::Stop`]).
-pub const SAMPLING_SECONDS: f64 = 2.0;
 
 /// How many times the largest cache serving it a rotation spans (sized
 /// beyond the cache, spec §2.10). Under the rotation's cyclic access an LRU
@@ -228,6 +259,15 @@ pub struct MeasuredCost {
 }
 
 impl MeasuredCost {
+    /// `timing`'s seconds.
+    fn of(timing: &Timing) -> Self {
+        Self {
+            value: timing.median,
+            interval: timing.interval,
+            samples: timing.samples,
+        }
+    }
+
     /// `units` over each of `timing`'s times: a rate, its interval from the
     /// times' (the slowest time bounds it below).
     fn rate(units: f64, timing: &Timing) -> Self {
@@ -247,10 +287,6 @@ impl MeasuredCost {
 /// rate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WeightRate {
-    /// The route the weights were allocated along.
-    pub route: AccessRoute,
-    /// The resident representation the weights take.
-    pub format: Element,
     /// Weight bytes per second its `dense_expand` streams at one row (its
     /// decode form) with its weights along the route.
     pub bytes_per_second: MeasuredCost,
@@ -258,11 +294,35 @@ pub struct WeightRate {
     pub features: u64,
 }
 
+/// One allocation route's weight rates: the activation dtype's `A`, which
+/// every estimate reads (rows, state and uploads along it), and each other
+/// format's read along it. A route of device storage's placement holds a
+/// load's weights, so every measured format is read along it; any other
+/// holds rows alone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteCosts<A = Option<WeightRate>> {
+    pub route: AccessRoute,
+    /// The activation dtype's (bf16) rate, its weights streaming from
+    /// memory: along device storage's first route the probe, which the
+    /// costs require ([`ExecutorCosts::first`]); along another, where read.
+    pub activation: A,
+    /// Each other format's rates, where its pilot was read.
+    pub formats: Vec<(Element, FormatRates)>,
+}
+
+/// A format's rates along one route: its pilot's, its calls over one
+/// argument set, and its rate streaming from memory, read over the sets
+/// that span the cache (the pilot's own where memory cannot move its calls,
+/// [`UNROTATED`]) once a job has read it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormatRates {
+    pub pilot: WeightRate,
+    pub streamed: Option<WeightRate>,
+}
+
 /// The matrix throughput of one format.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MatrixCosts {
-    /// The resident representation the weights take on the executor.
-    pub format: Element,
     /// FLOPs per second of `dense_expand` at the executor's matrix rows.
     pub flops: MeasuredCost,
     /// The program's F.
@@ -270,19 +330,94 @@ pub struct MatrixCosts {
 }
 
 /// What the decode attention entry costs over one history layout, its
-/// history in device storage, from a call at `depths[0]` and one at
-/// `depths[1]` tokens: a fixed cost per call and the history bytes read per
-/// second beyond it.
+/// history in device storage along its first route: one sequence's call at
+/// each rung of its ladder read, the `i`th at [`HISTORY_DEPTHS`]`[i]`
+/// tokens, as far as the ladder was read.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HistoryCosts {
+    layout: KvCodec,
+    /// The history bytes one token of the layout holds.
+    per_token: u64,
+    rungs: Vec<MeasuredCost>,
+}
+
+/// The cost of a history call at one depth: the segment of a layout's
+/// ladder the depth lies in (the nearest where it lies outside), as a fixed
+/// cost per call and the seconds each history byte read beyond it takes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HistoryLine {
+    pub fixed_seconds: f64,
+    pub seconds_per_byte: f64,
+}
+
+impl HistoryCosts {
+    /// `layout`'s costs from the `rungs` its ladder read, at most one at
+    /// each of [`HISTORY_DEPTHS`].
+    pub fn new(layout: KvCodec, rungs: Vec<MeasuredCost>) -> Result<Self, ExecutorCostsError> {
+        assert!(
+            rungs.len() <= HISTORY_DEPTHS.len(),
+            "a ladder has a rung at each of its depths at most"
+        );
+        Ok(Self {
+            layout,
+            per_token: token_bytes(layout)?,
+            rungs,
+        })
+    }
+
     /// The codec the history is stored in.
-    pub layout: KvCodec,
-    /// The seconds of a call beyond its history's bytes at the rate.
-    pub fixed_seconds: MeasuredCost,
-    /// History bytes read per second along device storage's first route.
-    pub bytes_per_second: MeasuredCost,
-    /// The two depths the line runs through.
-    pub depths: [u64; 2],
+    pub fn layout(&self) -> KvCodec {
+        self.layout
+    }
+
+    /// Each rung read: its depth in tokens and one call's seconds there.
+    pub fn rungs(&self) -> impl Iterator<Item = (u64, &MeasuredCost)> {
+        HISTORY_DEPTHS.into_iter().zip(&self.rungs)
+    }
+
+    /// The line of the segment `tokens` lies in, on each rung's time at
+    /// least that of every rung below it, as a call over more history takes
+    /// no less time (a GB10's 20-core CPU read 16K tokens of affine history
+    /// no slower than 8K, 2026-10-22). Its seconds per byte are the far
+    /// rung's time beyond the near one's, none on a flat segment; its fixed
+    /// cost the near time less its bytes' time, none where the line meets
+    /// zero tokens below zero seconds (a call takes at least its bytes'
+    /// time). Where one rung was read the line runs through it from no
+    /// fixed cost, and where none was, at `stream` bytes per second, the
+    /// rate memory streams them at, which a call reads its history no
+    /// faster than.
+    pub fn line(&self, tokens: f64, stream: f64) -> HistoryLine {
+        let per_token = self.per_token as f64;
+        let rungs = self
+            .rungs()
+            .scan(0f64, |slowest, (depth, cost)| {
+                *slowest = slowest.max(cost.value);
+                Some((depth as f64, *slowest))
+            })
+            .collect::<Vec<_>>();
+        match rungs[..] {
+            [] => HistoryLine {
+                fixed_seconds: 0.,
+                seconds_per_byte: 1. / stream,
+            },
+            [(depth, seconds)] => HistoryLine {
+                fixed_seconds: 0.,
+                seconds_per_byte: seconds / (depth * per_token),
+            },
+            _ => {
+                let segment = rungs
+                    .windows(2)
+                    .position(|pair| tokens <= pair[1].0)
+                    .unwrap_or(rungs.len() - 2);
+                let [(near_depth, near), (far_depth, far)] = [rungs[segment], rungs[segment + 1]];
+                let seconds_per_byte = (far - near) / ((far_depth - near_depth) * per_token);
+                HistoryLine {
+                    fixed_seconds: (near - near_depth * per_token * seconds_per_byte).max(0.),
+                    seconds_per_byte,
+                }
+            }
+        }
+    }
 }
 
 /// One storage kind's placement as the routes of its paths, in order: at
@@ -320,149 +455,256 @@ impl Placements {
     }
 }
 
-/// A figure of executor costs.
+/// A figure no point of the costs measured, which the costs price from the
+/// figures that were ([`ExecutorCosts`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Figure {
-    /// The weight rate of one format along one allocation route.
+pub enum Derived {
+    /// The activation dtype's rate along a route other than device
+    /// storage's first.
+    ActivationRate(AccessRoute),
+    /// A format's rate streaming along a route of device storage's
+    /// placement.
     WeightRate(AccessRoute, Element),
-    /// The matrix throughput of weights resident as one representation.
+    /// The activation dtype's matrix throughput.
+    ActivationMatrix,
+    /// A format's matrix throughput.
     MatrixThroughput(Element),
-    /// The decode attention cost over one history layout.
-    HistoryCost(KvCodec),
+    /// A history layout's costs at the depths past its last rung read.
+    History(KvCodec),
+    /// The composition ratio.
+    Composition,
+    /// The launch cost.
+    Launch,
+    /// The step costs.
+    Step,
 }
 
-impl fmt::Display for Figure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WeightRate(route, format) => {
-                write!(
-                    formatter,
-                    "the {} weight rate along {route:?}",
-                    format.name()
-                )
-            }
-            Self::MatrixThroughput(format) => {
-                write!(formatter, "the {} matrix throughput", format.name())
-            }
-            Self::HistoryCost(layout) => {
-                write!(formatter, "the {} attention cost", layout.identity())
-            }
-        }
-    }
-}
-
-/// A figure the executor's kernels could not produce, and why.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Unmeasured {
-    /// The figure left out.
-    pub figure: Figure,
-    /// The failure its points ended with, or the reason recorded with one.
-    pub reason: String,
-}
-
-/// What the engine's kernels achieve on one executor.
+/// What the engine's kernels achieve on one executor: every figure an
+/// estimate reads. One is required: the probe, the activation dtype's rate
+/// along device storage's first route, the walk's first point. Every other
+/// is held where it was read, and until then priced from what was by its
+/// accessor ([`Derived`]), so the costs give an estimate once the probe is
+/// read, and a closer one with every figure read after it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutorCosts {
-    /// One per measured format and route of the executor's placements.
-    pub weight_rates: Vec<WeightRate>,
     /// Each storage kind's placement as the routes of its paths, in order:
     /// its weight rate is the slowest of theirs.
     pub placements: Placements,
-    /// One per measured format ([`measured_formats`]), in its order.
-    pub matrices: Vec<MatrixCosts>,
-    /// One per measured [`HISTORY_LAYOUTS`] entry, in its order.
-    pub histories: Vec<HistoryCosts>,
-    /// The device time of the composition chain's sealed graph over the sum
-    /// of its calls' times alone.
-    pub composition: MeasuredCost,
-    /// Device seconds of one call inside a sealed graph.
-    pub launch_seconds: MeasuredCost,
+    /// Device storage's first route, the activation dtype's rate along it
+    /// the probe.
+    pub first: RouteCosts<WeightRate>,
+    /// Every other route of the placements.
+    pub routes: Vec<RouteCosts>,
+    /// The activation dtype's (bf16) matrix throughput, where read.
+    pub activation_matrix: Option<MatrixCosts>,
+    /// Each other format's matrix throughput, where it was measured.
+    pub matrices: Vec<(Element, MatrixCosts)>,
+    /// The dense history's costs.
+    pub dense: HistoryCosts,
+    /// The affine K8/V4 history's costs.
+    pub affine: HistoryCosts,
+    /// The device time of the composition chain's sealed graph over its
+    /// calls' as the other figures price them alone, where read.
+    pub composition: Option<MeasuredCost>,
+    /// Device seconds of one call inside a sealed graph, where read.
+    pub launch_seconds: Option<MeasuredCost>,
     /// Host seconds per run beyond its device time, runs queued back to back
-    /// (decode with lookahead).
-    pub step_pipelined_seconds: MeasuredCost,
+    /// (decode with lookahead), where read.
+    pub step_pipelined_seconds: Option<MeasuredCost>,
     /// Host seconds of one submit and wait beyond its device time (decode
-    /// without lookahead).
-    pub step_round_trip_seconds: MeasuredCost,
-    /// The figures not measured, with why.
-    pub unmeasured: Vec<Unmeasured>,
+    /// without lookahead), where read.
+    pub step_round_trip_seconds: Option<MeasuredCost>,
 }
 
 impl ExecutorCosts {
-    /// The step cost a decode under `lookahead` pays.
+    /// The step cost a decode under `lookahead` pays; none until read.
     pub fn step_seconds(&self, lookahead: bool) -> f64 {
-        if lookahead {
-            self.step_pipelined_seconds.value
+        let step = if lookahead {
+            self.step_pipelined_seconds
         } else {
-            self.step_round_trip_seconds.value
+            self.step_round_trip_seconds
+        };
+        step.map_or(0., |step| step.value)
+    }
+
+    /// The device seconds of one call inside a sealed graph; none until
+    /// read.
+    pub fn launch(&self) -> f64 {
+        self.launch_seconds.map_or(0., |launch| launch.value)
+    }
+
+    /// The composition ratio; until read, 1, as the calls run alone.
+    pub fn composition(&self) -> f64 {
+        self.composition.map_or(1., |composition| composition.value)
+    }
+
+    /// The costs of `route`, a route of the placements: the activation
+    /// dtype's bytes per second along it (the probe along device storage's
+    /// first route, the rate read along another, and until read there, the
+    /// probe), and each other format's rates.
+    fn route(&self, route: AccessRoute) -> (f64, &[(Element, FormatRates)]) {
+        let probe = &self.first.activation;
+        if route == self.first.route {
+            return (probe.bytes_per_second.value, &self.first.formats);
         }
+        let costs = self
+            .routes
+            .iter()
+            .find(|costs| costs.route == route)
+            .expect("every route of the placements has its costs");
+        let activation = costs.activation.as_ref().unwrap_or(probe);
+        (activation.bytes_per_second.value, &costs.formats)
     }
 
-    /// Why `figure` is not one of the costs: the reason it was left
-    /// unmeasured, or that the walk measures no such figure.
-    fn missing(&self, figure: Figure) -> AssessmentError {
-        let reason = self
-            .unmeasured
-            .iter()
-            .find(|unmeasured| unmeasured.figure == figure)
-            .map_or("the costs measure no such figure", |unmeasured| {
-                &unmeasured.reason
-            });
-        AssessmentError::Unmeasured(format!("{figure} on this executor: {reason}"))
-    }
-
-    /// The bytes per second of `format` along `route`.
-    fn route_rate(&self, route: AccessRoute, format: Element) -> Result<f64, AssessmentError> {
-        self.weight_rates
-            .iter()
-            .find(|rate| rate.route == route && rate.format == format)
-            .map(|rate| rate.bytes_per_second.value)
-            .ok_or_else(|| self.missing(Figure::WeightRate(route, format)))
+    /// The bytes per second of `format` along `route`: its rate streaming
+    /// from memory; until a job reads it, the slower of its pilot's rate and
+    /// the activation dtype's along the route, as a call takes at least its
+    /// arithmetic (which its pilot reads from a cache) and at least its
+    /// bytes' time from memory. Where its pilot could not be read, the
+    /// activation dtype's alone, which streams the bytes at least as fast as
+    /// a format that decodes them.
+    pub fn route_rate(&self, route: AccessRoute, format: Element) -> f64 {
+        let (activation, formats) = self.route(route);
+        if format == Element::bf16() {
+            return activation;
+        }
+        match formats.iter().find(|(read, _)| *read == format) {
+            Some((_, rates)) => rates.streamed.as_ref().map_or_else(
+                || rates.pilot.bytes_per_second.value.min(activation),
+                |streamed| streamed.bytes_per_second.value,
+            ),
+            None => activation,
+        }
     }
 
     /// The bytes per second of `format` in `storage`: the slowest rate of
     /// its placement's paths, since a load's bytes may lie along any of
     /// them.
-    pub fn weight_rate(
-        &self,
-        storage: StorageKind,
-        format: Element,
-    ) -> Result<f64, AssessmentError> {
+    pub fn weight_rate(&self, storage: StorageKind, format: Element) -> f64 {
         let placement = self.placements.of(storage);
-        placement.rest.iter().try_fold(
-            self.route_rate(placement.first, format)?,
-            |slowest, route| Ok(slowest.min(self.route_rate(*route, format)?)),
+        placement.rest.iter().fold(
+            self.route_rate(placement.first, format),
+            |slowest, route| slowest.min(self.route_rate(*route, format)),
         )
     }
 
-    /// The matrix throughput of weights resident as `format`.
-    pub fn matrix_flops(&self, format: Element) -> Result<f64, AssessmentError> {
-        self.matrices
-            .iter()
-            .find(|matrix| matrix.format == format)
-            .map(|matrix| matrix.flops.value)
-            .ok_or_else(|| self.missing(Figure::MatrixThroughput(format)))
+    /// The matrix throughput of weights resident as `format`: its measured
+    /// throughput; until a job measures it, its pilot's arithmetic rate at
+    /// one row along device storage's first route, as a CPU's rows take
+    /// about one row's time each (a 12-core M6's CPU ran 8 rows in 7 to 9.4
+    /// times one row's time, 2026-10-22), and a GPU, whose rows share its
+    /// weights' bytes, reads every throughput in its first job. Where its
+    /// pilot could not be read, the activation dtype's, which its arithmetic
+    /// runs in once its weights are decoded (an M4 Max's Metal, 2026-10-21:
+    /// every format within 2.5% of bf16); the activation dtype's own, until
+    /// read, at the probe's one-row rate, by the same bound.
+    pub fn matrix_flops(&self, format: Element) -> f64 {
+        let activation = self.activation_matrix.as_ref().map_or_else(
+            || one_row_flops(Element::bf16(), &self.first.activation),
+            |matrix| matrix.flops.value,
+        );
+        if format == Element::bf16() {
+            return activation;
+        }
+        if let Some((_, matrix)) = self.matrices.iter().find(|(read, _)| *read == format) {
+            return matrix.flops.value;
+        }
+        match self.first.formats.iter().find(|(read, _)| *read == format) {
+            Some((_, rates)) => one_row_flops(format, &rates.pilot),
+            None => activation,
+        }
     }
 
-    /// The decode attention costs of history stored as `layout`.
+    /// The figures no point measured, of every format `backend` measures
+    /// ([`measured_formats`]): priced where an estimate reads them.
+    pub fn derived(&self, backend: seismic::BackendName) -> Vec<Derived> {
+        let others = measured_formats(backend)
+            .into_iter()
+            .filter(|format| *format != Element::bf16())
+            .collect::<Vec<_>>();
+        let device = &self.placements.device;
+        let rates = std::iter::once(device.first)
+            .chain(device.rest.iter().copied())
+            .flat_map(|route| {
+                let (_, formats) = self.route(route);
+                others
+                    .iter()
+                    .filter(|format| {
+                        !formats
+                            .iter()
+                            .any(|(read, rates)| read == *format && rates.streamed.is_some())
+                    })
+                    .map(move |format| Derived::WeightRate(route, *format))
+            });
+        let matrices = others
+            .iter()
+            .filter(|format| {
+                self.matrices
+                    .iter()
+                    .all(|(measured, _)| measured != *format)
+            })
+            .map(|format| Derived::MatrixThroughput(*format));
+        let activations = self
+            .routes
+            .iter()
+            .filter(|costs| costs.activation.is_none())
+            .map(|costs| Derived::ActivationRate(costs.route));
+        let histories = [&self.dense, &self.affine]
+            .into_iter()
+            .filter(|history| history.rungs.len() < HISTORY_DEPTHS.len())
+            .map(|history| Derived::History(history.layout));
+        let unread = [
+            (self.activation_matrix.is_none(), Derived::ActivationMatrix),
+            (self.composition.is_none(), Derived::Composition),
+            (self.launch_seconds.is_none(), Derived::Launch),
+            (
+                self.step_pipelined_seconds.is_none() || self.step_round_trip_seconds.is_none(),
+                Derived::Step,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(unread, figure)| unread.then_some(figure));
+        activations
+            .chain(rates)
+            .chain(unread)
+            .chain(histories)
+            .chain(matrices)
+            .collect()
+    }
+
+    /// The decode attention costs of history stored as `layout`; none for
+    /// a layout no native attention entry reads, which no load stores.
     pub fn history(&self, layout: KvCodec) -> Result<&HistoryCosts, AssessmentError> {
-        self.histories
-            .iter()
-            .find(|history| history.layout == layout)
-            .ok_or_else(|| self.missing(Figure::HistoryCost(layout)))
+        match layout.spec(DType::BF16, 1, 1).encoding() {
+            HistoryEncoding::Dense => Ok(&self.dense),
+            HistoryEncoding::Affine => Ok(&self.affine),
+            HistoryEncoding::Unsupported => Err(AssessmentError::Demand(format!(
+                "no native attention entry reads {} history",
+                layout.identity()
+            ))),
+        }
     }
 
-    /// The history bytes per second of `layout`'s history in device
-    /// storage: its layout's rate, measured along device storage's first
-    /// route, scaled down by the slowest route of the placement against
-    /// that one (in the activation dtype the history holds), since the
-    /// kernel reads no faster than the path its history lies along (spec
-    /// §2.14).
-    pub fn history_rate(&self, layout: KvCodec) -> Result<f64, AssessmentError> {
+    /// A call's cost over `tokens` of `layout`'s history in device storage:
+    /// its ladder's line there ([`HistoryCosts::line`]), measured along
+    /// device storage's first route, its seconds per byte scaled up by the
+    /// slowest route of the placement against that one (in the activation
+    /// dtype the history holds), since the kernel reads no faster than the
+    /// path its history lies along (spec §2.14).
+    pub fn history_line(
+        &self,
+        layout: KvCodec,
+        tokens: f64,
+    ) -> Result<HistoryLine, AssessmentError> {
         let measured_along = self.placements.device.first;
         let activation = Element::bf16();
-        let slowdown = self.weight_rate(StorageKind::Device, activation)?
-            / self.route_rate(measured_along, activation)?;
-        Ok(self.history(layout)?.bytes_per_second.value * slowdown)
+        let along = self.route_rate(measured_along, activation);
+        let slowdown = self.weight_rate(StorageKind::Device, activation) / along;
+        let line = self.history(layout)?.line(tokens, along);
+        Ok(HistoryLine {
+            seconds_per_byte: line.seconds_per_byte / slowdown,
+            ..line
+        })
     }
 }
 
@@ -485,28 +727,49 @@ fn failed(what: &str) -> impl Fn(&dyn fmt::Display) -> ExecutorCostsError + '_ {
 /// What the stored records give of an executor's costs.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoredCosts {
+    /// The probe is stored.
     Complete {
         costs: ExecutorCosts,
         /// The records the costs were derived from, in the walk's order:
         /// the evidence they are a function of.
         records: Vec<(PointKey, Record)>,
+        /// Whether a later point no record holds is still to be measured:
+        /// its figure is priced until it is.
+        pending: bool,
     },
-    /// The first point of the walk no record holds: never attempted, or
-    /// not to its end.
+    /// The probe, which no record holds: never attempted, or not to its
+    /// end.
     Missing(PointKey),
 }
 
 /// What a measurement job's walk did.
 #[derive(Debug)]
 pub struct Measurement {
-    /// Every point visited, in order, with what became of it.
-    pub points: Vec<(PointKey, Outcome<CallError, ExecutorCostsError>)>,
     /// Why the walk ended before its end where no visited point's outcome
-    /// says: a kernel's identity or a layout's planes that cannot be
-    /// derived, a placement the executor lacks, or the dense attention a
-    /// later figure needs left unmeasured. None when it reached its end or
-    /// a point every estimate needs ended it.
+    /// says: the probe's kernel identity that cannot be derived, or a
+    /// placement the executor lacks. None when it reached its end or the
+    /// probe's own outcome ended it.
     pub ended: Option<ExecutorCostsError>,
+    /// Why a step after the probe could not be read outside its points'
+    /// timings: its figure stays priced.
+    pub failures: Vec<ExecutorCostsError>,
+    /// What the job's points were made in and from, which its caller
+    /// releases once it has reported the job: every record is stored by
+    /// then, and releasing it is no part of the job's time (a GB10's CPU
+    /// took 54 ms over a job's rotations and kernels, 2026-10-22).
+    pub held: Held,
+}
+
+/// The storage a job's points' rotations viewed and the kernels it formed.
+pub struct Held {
+    _backings: Backings,
+    _programs: Option<Programs>,
+}
+
+impl fmt::Debug for Held {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Held")
+    }
 }
 
 /// The least cache a path is bounded by: 256 MiB, the largest memory-side
@@ -516,7 +779,8 @@ pub struct Measurement {
 /// Vulkan device's cache, so no smaller bound is known to clear one.
 const UNREPORTED_CACHE: u64 = 256 << 20;
 
-/// How the walk ended without its costs.
+/// Why a step has no timing: for the probe, how the walk ended without its
+/// costs ([`walk`]).
 enum Stop<M> {
     /// A point no record holds, which nothing measures here: its key where
     /// times come from records alone, and never where every point is timed
@@ -525,9 +789,12 @@ enum Stop<M> {
     /// A point cannot be timed: it failed, or is recorded unobtainable. The
     /// job's visited points report it.
     Point(ExecutorCostsError),
-    /// The walk failed outside any point's timing: a kernel's identity, a
-    /// layout's planes, a placement, a record that cannot be read.
+    /// The step failed outside any point's timing: a kernel's identity, a
+    /// layout's planes, a placement, a record store that cannot be read.
     Failed(ExecutorCostsError),
+    /// The job's deadline passed before a point read a sample: the next job
+    /// measures it.
+    Expired,
 }
 
 impl<M> From<ExecutorCostsError> for Stop<M> {
@@ -684,6 +951,8 @@ struct ProgramSet {
     sizes: Sizes,
     /// Each measured format with its F and program.
     expands: Vec<(Element, u64, Formation<dense_expand::Entry>)>,
+    /// The format the composition chain's projections are resident in.
+    chain: Element,
     /// The chain's down projection, at its format's F.
     output: Formation<dense_output::Entry>,
     dense: Formation<attention_decode::Entry>,
@@ -711,6 +980,7 @@ impl ProgramSet {
             sizes,
             output: output(chain, features(sizes, chain, largest)?),
             expands,
+            chain,
             dense: attend::<attention_decode::Entry>(KvCodec::Dense)?,
             affine: attend::<attention_decode_k8v4::Entry>(KvCodec::AffineK8V4)?,
             copy: copy(),
@@ -732,9 +1002,19 @@ impl ProgramSet {
     /// the cache holds loaded, not compiled. They form on a thread of their
     /// own, the walk's early reads first, while the walk goes on:
     /// a point waits only for its own kernels, and a compile is host work
-    /// while most points are timed on the device ([`Programs::settled`]).
-    fn form(&self, device: &Device) -> Programs {
+    /// while most points are timed on the device ([`Programs::settled`]),
+    /// no point waiting past `deadline`.
+    fn form(&self, device: &Device, deadline: std::time::Instant) -> Programs {
+        let host = matches!(
+            device
+                .topology()
+                .physical_device(device.info().physical())
+                .map(|physical| physical.identity()),
+            Some(seismic::PhysicalIdentity::Host { .. })
+        );
         let programs = Programs {
+            deadline,
+            host,
             expands: self
                 .expands
                 .iter()
@@ -749,19 +1029,40 @@ impl ProgramSet {
         std::thread::Builder::new()
             .name("measurement-formation".into())
             .spawn(move || {
-                let decodes = (0..set.expands.len()).map(|index| Job::Expand(index, Rows::Decode));
-                let matrices = (0..set.expands.len()).map(|index| Job::Expand(index, Rows::Matrix));
-                // The attention programs are one long compile each (the
-                // affine one's 1.2 s alone on an RTX 3090's Vulkan, against
-                // 0.7 s for a decode projection): they start first, beside
-                // the short ones the weight rates read, so each has formed
-                // by its history's points.
-                let jobs = [Job::Affine, Job::Dense]
-                    .into_iter()
-                    .chain(decodes)
-                    .chain([Job::Copy, Job::Output])
-                    .chain(matrices)
-                    .collect::<Vec<_>>();
+                let index = |format: Element| {
+                    set.expands
+                        .iter()
+                        .position(|(measured, _, _)| *measured == format)
+                        .expect("every measured format has a program")
+                };
+                let (activation, chain) = (index(Element::bf16()), index(set.chain));
+                let others = (0..set.expands.len()).filter(|&other| other != activation);
+                let decodes = others
+                    .clone()
+                    .filter(|&other| other != chain)
+                    .map(|other| Job::Expand(other, Rows::Decode));
+                let matrices = others.map(|other| Job::Expand(other, Rows::Matrix));
+                // The probe's program comes first, so the probe waits on no
+                // other compile however few the host's threads; then the
+                // programs of the plan's early points ([`plan`]), so those
+                // wait on no other format's. The attention programs are one
+                // long compile each (the affine one's 1.2 s alone on an RTX
+                // 3090's Vulkan, against 0.7 s for a decode projection):
+                // they start next, beside the short ones the weight rates
+                // read, so each has formed by its history's points.
+                let mut jobs = vec![
+                    Job::Expand(activation, Rows::Decode),
+                    Job::Affine,
+                    Job::Dense,
+                    Job::Expand(chain, Rows::Decode),
+                    Job::Copy,
+                    Job::Output,
+                    Job::Expand(activation, Rows::Matrix),
+                ];
+                // The chain's format is a backend's resident form of Q4_K,
+                // which may be the activation dtype's.
+                jobs.dedup();
+                jobs.extend(decodes.chain(matrices));
                 let formed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     seismic::Workers::of_the_host().each(&jobs, |job| match *job {
                         Job::Expand(index, rows) => {
@@ -790,7 +1091,7 @@ impl ProgramSet {
 }
 
 /// One program [`ProgramSet::form`] forms.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Job {
     Expand(usize, Rows),
     Copy,
@@ -832,6 +1133,12 @@ struct Programs {
     dense: Forming<attention_decode::Entry>,
     affine: Forming<attention_decode_k8v4::Entry>,
     copy: Forming<conditioning_overlay::Entry>,
+    /// When the job's [`MEASUREMENT_SECONDS`] end: a point waits for its
+    /// kernels no longer.
+    deadline: std::time::Instant,
+    /// Whether the executor's device is the host's CPU, whose cores the
+    /// compiles run on.
+    host: bool,
 }
 
 /// A kernel forming on the formation thread.
@@ -869,18 +1176,26 @@ impl<T> Pending<T> {
         self.ready.notify_all();
     }
 
-    /// The value, once set. A defect of the thread setting it (a panic) is
-    /// this thread's too.
-    fn wait(&self) -> &T {
+    /// The value, once set; none where `deadline` passes first. A defect of
+    /// the thread setting it (a panic) is this thread's too.
+    fn wait(&self, deadline: std::time::Instant) -> Option<&T> {
         let mut held = self.lock.lock().expect("pending lock poisoned");
         loop {
             if let Some(value) = self.value.get() {
-                return value;
+                return Some(value);
             }
             if self.abandoned.load(std::sync::atomic::Ordering::SeqCst) {
                 panic!("the formation thread panicked");
             }
-            held = self.ready.wait(held).expect("pending lock poisoned");
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            held = self
+                .ready
+                .wait_timeout(held, left)
+                .expect("pending lock poisoned")
+                .0;
         }
     }
 }
@@ -891,29 +1206,55 @@ impl Programs {
         &self,
         format: Element,
         rows: Rows,
-    ) -> Result<&NativeKernel<dense_expand::Entry>, ExecutorCostsError> {
+    ) -> Result<&NativeKernel<dense_expand::Entry>, Unformed<ExecutorCostsError>> {
         let (_, decode, matrix) = self
             .expands
             .iter()
             .find(|(measured, _, _)| *measured == format)
             .expect("every measured format has a program");
         match rows {
-            Rows::Decode => kernel(decode),
-            Rows::Matrix => kernel(matrix),
+            Rows::Decode => self.kernel(decode),
+            Rows::Matrix => self.kernel(matrix),
         }
     }
 
-    /// Every program formed: no compile runs beside a point that touches
-    /// the host.
-    fn settled(&self) {
-        for (_, decode, matrix) in &self.expands {
-            decode.wait();
-            matrix.wait();
+    /// A formed kernel for a point, or why it was not: it failed to form
+    /// ([`Unformed::Never`]), or the job's deadline passed first
+    /// ([`Unformed::Expired`]). A point on the host's CPU waits for every
+    /// program, so no compile shares the cores it is timed on.
+    fn kernel<'p, E: Entry>(
+        &'p self,
+        forming: &'p Forming<E>,
+    ) -> Result<&'p NativeKernel<E>, Unformed<ExecutorCostsError>> {
+        if self.host {
+            self.settled()?;
         }
-        self.output.wait();
-        self.dense.wait();
-        self.affine.wait();
-        self.copy.wait();
+        forming
+            .wait(self.deadline)
+            .ok_or(Unformed::Expired)?
+            .as_ref()
+            .map_err(|error| Unformed::Never(error.clone()))
+    }
+
+    /// Every program formed, or the job's deadline passed first: no compile
+    /// runs beside a point that touches the host.
+    fn settled(&self) -> Result<(), Unformed<ExecutorCostsError>> {
+        let formed = self
+            .expands
+            .iter()
+            .flat_map(|(_, decode, matrix)| {
+                [decode.wait(self.deadline), matrix.wait(self.deadline)]
+            })
+            .all(|formed| formed.is_some())
+            && self.output.wait(self.deadline).is_some()
+            && self.dense.wait(self.deadline).is_some()
+            && self.affine.wait(self.deadline).is_some()
+            && self.copy.wait(self.deadline).is_some();
+        if formed {
+            Ok(())
+        } else {
+            Err(Unformed::Expired)
+        }
     }
 
     /// Every program not formed yet is never formed: the formation thread
@@ -930,11 +1271,6 @@ impl Programs {
     }
 }
 
-/// A formed kernel, or why it was not, once it is formed.
-fn kernel<E: Entry>(forming: &Forming<E>) -> Result<&NativeKernel<E>, ExecutorCostsError> {
-    forming.wait().as_ref().map_err(Clone::clone)
-}
-
 /// How a point is made on a device from the walk's formed kernels, its
 /// rotated operands views of the job's backings, when no record holds it:
 /// a kernel that did not form can never make it ([`Unformed::Never`]), and
@@ -949,14 +1285,77 @@ trait Times {
     type Missing;
 
     /// The timing of `spec`'s point: its record, or `build`'s point, made
-    /// from `programs` formed on a device, measured there and its record
+    /// from `programs` formed on a device, measured there for at most its
+    /// `share` of the job or until its median is resolved, and its record
     /// stored.
     fn time(
         &mut self,
         spec: PointSpec,
         programs: &ProgramSet,
         build: &mut Build<'_>,
+        share: Share,
     ) -> Result<Timing, Stop<Self::Missing>>;
+
+    /// The timing of `spec`'s point as [`Times::time`] gives it, what its
+    /// making adds to the job's backings released once it is timed: a deep
+    /// history rung's rotation, which no later point reads.
+    fn time_apart(
+        &mut self,
+        spec: PointSpec,
+        programs: &ProgramSet,
+        build: &mut Build<'_>,
+        share: Share,
+    ) -> Result<Timing, Stop<Self::Missing>>;
+}
+
+/// A step's part of the job: one point of the `left` the plan reads from
+/// it on, its own among them, each sampling for an equal part of the time
+/// the job has left. A point that ends before its part passes the rest
+/// to the points after it, and one that takes longer (its fewest samples
+/// longer than its part) takes it from them, so the job keeps its time.
+#[derive(Clone, Copy, Debug)]
+struct Share {
+    left: usize,
+    /// What reading its point is forecast to take, where records forecast
+    /// it (a deeper rung from the rung below, a format's streaming rate and
+    /// throughput from its pilot): the job starts no point whose making and
+    /// fewest passes, a lead and a sample, end past its time, as the first a
+    /// point submits has no reading of its own to forecast it by (a GB10's
+    /// CPU started a 262K rung 9.6 s into a job and ended it at 10.85 s,
+    /// 2026-10-22).
+    forecast: Option<Forecast>,
+}
+
+/// What reading a point is forecast to take: the seconds of one pass of its
+/// calls, and the bytes its making lays out.
+#[derive(Clone, Copy, Debug)]
+struct Forecast {
+    pass: f64,
+    bytes: u64,
+}
+
+impl Share {
+    /// This share where a pass of its point's calls is forecast to take
+    /// `pass` seconds and its making to lay out `bytes`.
+    fn forecast(self, pass: f64, bytes: u64) -> Self {
+        Self {
+            forecast: Some(Forecast { pass, bytes }),
+            ..self
+        }
+    }
+}
+
+/// What a point's outcome gives the walk: its timing, or why it has none.
+fn timed<M>(outcome: &Outcome<CallError, ExecutorCostsError>) -> Result<Timing, Stop<M>> {
+    match outcome {
+        Outcome::Loaded(record) => self::outcome(record),
+        Outcome::Measured(timing) => Ok(*timing),
+        Outcome::Skipped(reason) => Err(unobtainable(reason)),
+        Outcome::Unformed(error) | Outcome::Unmade(error) => Err(Stop::Point(error.clone())),
+        Outcome::Failed(error) => Err(Stop::Point(failed("timing a point")(error))),
+        Outcome::Expired => Err(Stop::Expired),
+        Outcome::Store(error) => Err(Stop::Point(failed("a measurement record")(error))),
+    }
 }
 
 /// The records of one executor, keyed by its identity.
@@ -1011,6 +1410,7 @@ impl Times for Retraced<'_> {
         spec: PointSpec,
         _: &ProgramSet,
         _: &mut Build<'_>,
+        _: Share,
     ) -> Result<Timing, Stop<PointKey>> {
         let key = self.records.key(spec);
         match self.records.load(&key)? {
@@ -1021,6 +1421,16 @@ impl Times for Retraced<'_> {
             }
             None => Err(Stop::Missing(key)),
         }
+    }
+
+    fn time_apart(
+        &mut self,
+        spec: PointSpec,
+        programs: &ProgramSet,
+        build: &mut Build<'_>,
+        share: Share,
+    ) -> Result<Timing, Stop<PointKey>> {
+        self.time(spec, programs, build, share)
     }
 }
 
@@ -1037,8 +1447,42 @@ struct Measured<'a, 'd> {
     /// The storage every point's rotated operands view, allocated as the
     /// first points that need it are made.
     backings: Backings,
-    /// Every point visited, in order, with what became of it.
-    visited: Vec<(PointKey, Outcome<CallError, ExecutorCostsError>)>,
+    /// Told of every point visited, in order, with what became of it, as
+    /// soon as it is known.
+    visit: &'a mut dyn FnMut(PointKey, Outcome<CallError, ExecutorCostsError>),
+    /// When the job's [`MEASUREMENT_SECONDS`] end.
+    deadline: std::time::Instant,
+}
+
+impl Measured<'_, '_> {
+    /// Whether a point of `share` can be read before the job's time ends:
+    /// its forecast making, lead and one sample end before it
+    /// ([`Share::forecast`]), or nothing forecasts it.
+    fn starts(&self, share: Share) -> bool {
+        share.forecast.is_none_or(|Forecast { pass, bytes }| {
+            let seconds = self.backings.filling(bytes) + 2. * pass;
+            std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds)
+                <= self.deadline
+        })
+    }
+
+    /// How a point is sampled in its `share` of the time the job has left:
+    /// until its median is resolved or its share is spent, each sample
+    /// covering at least tuning's least device time (which sets its
+    /// repetitions: tuning's, the one owner).
+    fn within(&self, share: Share) -> Measure {
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs_f64();
+        Measure {
+            stop: seismic::measure::Stop::Within {
+                error_rate: crate::SEARCH_SETTINGS.error_rate,
+                seconds: remaining / share.left as f64,
+            },
+            min_sample_seconds: crate::MIN_SAMPLE_SECONDS,
+        }
+    }
 }
 
 impl Times for Measured<'_, '_> {
@@ -1050,17 +1494,16 @@ impl Times for Measured<'_, '_> {
         spec: PointSpec,
         programs: &ProgramSet,
         build: &mut Build<'_>,
+        share: Share,
     ) -> Result<Timing, Stop<Self::Missing>> {
         let key = self.records.key(spec);
-        let how = Measure {
-            stop: seismic::measure::Stop::Within {
-                error_rate: crate::SEARCH_SETTINGS.error_rate,
-                seconds: SAMPLING_SECONDS,
-            },
-            // The device time a sample covers at least, which sets its
-            // repetitions: tuning's, the one owner.
-            min_sample_seconds: crate::MIN_SAMPLE_SECONDS,
-        };
+        // One no record holds that cannot be read in the time left is not
+        // attempted, so not recorded: the next job reads it.
+        if !self.starts(share) && self.records.load::<Self::Missing>(&key)?.is_none() {
+            return Err(Stop::Expired);
+        }
+        let how = self.within(share);
+        let deadline = self.deadline;
         // The point is made only when no record holds it and the host
         // attempts it, so a stored or skipped point is never made. Every
         // program is formed, all at once, when the first point no record
@@ -1074,30 +1517,37 @@ impl Times for Measured<'_, '_> {
             vec![(key, || {
                 build(
                     device,
-                    formed.get_or_init(|| programs.form(device)),
+                    formed.get_or_init(|| programs.form(device, deadline)),
                     backings,
                 )
             })],
             &how,
+            seismic::measure::Deadline::new(Some(deadline)),
             self.records.store,
             &mut |key| {
-                formed.get_or_init(|| programs.form(device));
+                formed.get_or_init(|| programs.form(device, deadline));
                 host(key)
             },
         );
         let (key, outcome) = outcomes.pop().expect("one point is measured");
-        let result = match &outcome {
-            Outcome::Loaded(record) => self::outcome(record),
-            Outcome::Measured(timing) => Ok(*timing),
-            Outcome::Skipped(reason) => Err(unobtainable(reason)),
-            Outcome::Unformed(error) | Outcome::Unmade(error) => Err(Stop::Point(error.clone())),
-            Outcome::Failed(error) => Err(Stop::Point(failed("timing a point")(error))),
-            Outcome::Store(error) => Err(Stop::Point(failed("a measurement record")(error))),
-        };
-        self.visited.push((key, outcome));
+        let result = timed(&outcome);
+        (self.visit)(key, outcome);
         // The next point reads zeros where this one wrote.
         self.backings.restore().map_err(Stop::Failed)?;
         result
+    }
+
+    fn time_apart(
+        &mut self,
+        spec: PointSpec,
+        programs: &ProgramSet,
+        build: &mut Build<'_>,
+        share: Share,
+    ) -> Result<Timing, Stop<Self::Missing>> {
+        let held = self.backings.held();
+        let timed = self.time(spec, programs, build, share);
+        self.backings.release_to(&held);
+        timed
     }
 }
 
@@ -1380,9 +1830,44 @@ struct Backings {
     /// The views of the backings the points made since the last restore
     /// write.
     written: Vec<Tensor>,
+    /// The bytes the job's backings were allocated and zero-filled with, and
+    /// the wall seconds that took: the rate a point's making lays out more
+    /// at ([`Backings::filling`]).
+    filled: (u64, f64),
 }
 
 impl Backings {
+    /// The wall seconds allocating and zero-filling `bytes` more is
+    /// forecast to take, at the rate the job's backings filled so far; none
+    /// before any was, when the job has made no point to spend its time on.
+    /// Filling is page faults as much as writes (a GB10's CPU took about a
+    /// second over a 262K rung's two gigabytes, 2026-10-22).
+    fn filling(&self, bytes: u64) -> f64 {
+        let (filled, seconds) = self.filled;
+        if filled == 0 {
+            0.
+        } else {
+            bytes as f64 * seconds / filled as f64
+        }
+    }
+
+    /// How many allocations each route's backing holds.
+    fn held(&self) -> Vec<usize> {
+        self.routes
+            .iter()
+            .map(|(_, allocations)| allocations.len())
+            .collect()
+    }
+
+    /// Release every allocation beyond those `held` counted, once the views
+    /// of them are restored and gone.
+    fn release_to(&mut self, held: &[usize]) {
+        self.routes.truncate(held.len());
+        for ((_, allocations), &kept) in self.routes.iter_mut().zip(held) {
+            allocations.truncate(kept);
+        }
+    }
+
     /// Note that the point being made writes `views`.
     fn writes(&mut self, views: impl IntoIterator<Item = Tensor>) {
         self.written.extend(views);
@@ -1460,6 +1945,7 @@ impl Backings {
         }
         let added = sizes[backing.len()..].to_vec();
         if !added.is_empty() {
+            let began = std::time::Instant::now();
             backing.extend(route.place(device, || {
                 added
                     .iter()
@@ -1470,6 +1956,8 @@ impl Backings {
                     })
                     .collect()
             })?);
+            self.filled.0 += added.iter().sum::<u64>();
+            self.filled.1 += began.elapsed().as_secs_f64();
         }
         let mut placed = placed.into_iter();
         let views = operands
@@ -1490,12 +1978,6 @@ impl Backings {
             .try_into()
             .unwrap_or_else(|_| unreachable!("one view list per operand")))
     }
-}
-
-/// Whether one call of `timing` takes at least [`LAUNCH_MULTIPLE`] launch
-/// costs.
-fn sized(timing: &Timing, launch: f64) -> bool {
-    timing.median >= LAUNCH_MULTIPLE * launch
 }
 
 /// The arguments of one `dense_expand` call over `rows` rows of F
@@ -1632,6 +2114,21 @@ fn expand_weight_bytes(weight: Element, features: u64) -> Result<u64, ExecutorCo
         .map_err(|error| failed("dense_expand weights")(&error))
 }
 
+/// The FLOPs per second of `format`'s decode projection at one row at its
+/// weight rate `rate`: a multiply and an add per weight of its gate and up
+/// projections in one call's time at the rate.
+fn one_row_flops(format: Element, rate: &WeightRate) -> f64 {
+    2.0 * 2.0 * (rate.features * HIDDEN) as f64 / call_seconds(format, rate)
+}
+
+/// The seconds of one `dense_expand` call of `format` at one row at its
+/// weight rate `rate`: its weights' bytes at the rate.
+fn call_seconds(format: Element, rate: &WeightRate) -> f64 {
+    let bytes = expand_weight_bytes(format, rate.features)
+        .expect("a format whose rate was read has weights of its F");
+    bytes as f64 / rate.bytes_per_second.value
+}
+
 /// The arguments of one decode attention call of one sequence at `depth`
 /// tokens of history in one layout: one row that appends its key and value
 /// and reads every token before it.
@@ -1696,7 +2193,7 @@ fn planes(layout: KvCodec) -> Result<Vec<(Element, u64)>, ExecutorCostsError> {
 
 /// The history bytes one token of `layout` holds over the reference
 /// key/value heads.
-fn token_bytes(layout: KvCodec) -> Result<u64, ExecutorCostsError> {
+pub(super) fn token_bytes(layout: KvCodec) -> Result<u64, ExecutorCostsError> {
     planes(layout)?
         .iter()
         .try_fold(0u64, |total, (element, width)| {
@@ -2139,72 +2636,6 @@ fn launch_graph(
     Ok(SealedGraph { plan, bound })
 }
 
-/// The arguments of one `dense_output` call at one row.
-struct OutputCase {
-    residual: Tensor,
-    product: Tensor,
-    down: Tensor,
-    out_rows: Tensor,
-    scale: Tensor,
-    bound: Tensor,
-}
-
-impl OutputCase {
-    /// One call at one row onto a residual of H = [`HIDDEN`] from a product
-    /// of F `features`.
-    fn new(device: &Device, weight: Element, features: u64) -> Result<Self, ExecutorCostsError> {
-        let error = failed("dense_output arguments");
-        let zeros = |element, extents: &[u64]| {
-            Tensor::zeros(device, element, extents).map_err(|cause| error(&cause))
-        };
-        Ok(Self {
-            residual: zeros(Element::f32(), &[1, HIDDEN])?,
-            product: zeros(Element::bf16(), &[1, features])?,
-            down: zeros(weight, &[HIDDEN, features])?,
-            out_rows: every_row(device, 1)?,
-            scale: zeros(Element::f32(), &[0])?,
-            bound: zeros(Element::f32(), &[bound_extent(weight)])?,
-        })
-    }
-
-    fn args(&mut self) -> dense_output::Args<'_> {
-        dense_output::Args {
-            residual: &self.residual,
-            product: &self.product,
-            down_weight: &self.down,
-            out_rows: &self.out_rows,
-            down_scale: &self.scale,
-            down_bound: &self.bound,
-        }
-    }
-}
-
-/// The arguments of one `conditioning_overlay` call of one row of `width`.
-struct CopyCase {
-    input: Tensor,
-    out: Tensor,
-}
-
-impl CopyCase {
-    fn new(device: &Device, width: u64) -> Result<Self, ExecutorCostsError> {
-        let zeros = || {
-            Tensor::zeros(device, Element::f32(), &[1, width])
-                .map_err(|cause| failed("conditioning_overlay arguments")(&cause))
-        };
-        Ok(Self {
-            input: zeros()?,
-            out: zeros()?,
-        })
-    }
-
-    fn args(&mut self) -> conditioning_overlay::Args<'_> {
-        conditioning_overlay::Args {
-            input: &self.input,
-            out: &mut self.out,
-        }
-    }
-}
-
 /// `dense_output` onto the residual from the chain's query-wide product.
 fn output(weight: Element, features: u64) -> Formation<dense_output::Entry> {
     Formation::new(
@@ -2240,33 +2671,82 @@ struct ChainKernels<'p> {
 impl<'p> ChainKernels<'p> {
     /// The chain's kernels of `programs`, its projection at decode rows over
     /// `weight`.
-    fn of(programs: &'p Programs, weight: Element) -> Result<Self, ExecutorCostsError> {
+    fn of(programs: &'p Programs, weight: Element) -> Result<Self, Unformed<ExecutorCostsError>> {
         Ok(Self {
             expand: programs.expand(weight, Rows::Decode)?,
-            attend: kernel(&programs.dense)?,
-            output: kernel(&programs.output)?,
-            copy: kernel(&programs.copy)?,
+            attend: programs.kernel(&programs.dense)?,
+            output: programs.kernel(&programs.output)?,
+            copy: programs.kernel(&programs.copy)?,
         })
     }
 }
 
-/// The composition chain: [`GRAPH_CALLS`] / [`CHAIN_LAYER_CALLS`] layers of
+/// The operands of the composition chain: `sets` layers' projection
+/// weights, down weights and dense history in one layout, each set's own, so
+/// a chain cycling through them reads them from memory as a model's layers
+/// do; the row's operands, one set's for all; the down projection's bound,
+/// and the residual each layer's copy writes.
+struct ChainOperands {
+    expand: Vec<ExpandCase>,
+    attend: Vec<AttendCase>,
+    downs: Vec<Tensor>,
+    down_bound: Tensor,
+    residual: Tensor,
+    features: u64,
+}
+
+impl ChainOperands {
+    /// The operands of `sets` layers over `weight` weights at F `features`
+    /// and `depth` tokens of dense history, its weights and history along
+    /// `route`.
+    fn new(
+        device: &Device,
+        backings: &mut Backings,
+        weight: Element,
+        features: u64,
+        route: &Route,
+        depth: u64,
+        sets: u64,
+    ) -> Result<Self, ExecutorCostsError> {
+        let [gate_weights, up_weights] = ExpandCase::operands(weight, features, sets)?;
+        let [gates, ups, downs, histories] = backings.lay_out(
+            device,
+            route,
+            [
+                gate_weights,
+                up_weights,
+                Operand::canonical(weight, &[HIDDEN, features], sets)?,
+                AttendCase::operand(KvCodec::Dense, depth, sets)?,
+            ],
+        )?;
+        let zeros = |element, extents: &[u64]| {
+            Tensor::zeros(device, element, extents)
+                .map_err(|cause| failed("composition chain arguments")(&cause))
+        };
+        Ok(Self {
+            expand: ExpandCase::over(device, weight, 1, gates, ups)?,
+            attend: AttendCase::over(device, backings, KvCodec::Dense, depth, histories)?,
+            downs,
+            down_bound: zeros(Element::f32(), &[bound_extent(weight)])?,
+            residual: zeros(Element::f32(), &[1, HIDDEN])?,
+            features,
+        })
+    }
+}
+
+/// The composition chain: `layers` layers of [`CHAIN_LAYER_CALLS`] calls of
 /// the engine's decode kernels at one row, from the walk's formed kernels:
 /// each layer's gate/up projection (`dense_expand`, F `features`), whose
 /// product's first query-wide values are the dense attention's query at
 /// `depth` tokens and whose whole product the down projection
 /// (`dense_output`) takes onto the residual, which a row op's copy
-/// (`conditioning_overlay`) hands to the next layer. Every layer binds the
-/// same weights and history, as the calls timed alone do, so the two differ
-/// only in their composition.
+/// (`conditioning_overlay`) hands to the next layer. The `i`th layer binds
+/// the weights and history of the operands' set `i` modulo their sets.
 fn composition_chain(
     device: &Device,
     kernels: ChainKernels<'_>,
-    backings: &mut Backings,
-    weight: Element,
-    features: u64,
-    route: &Route,
-    depth: u64,
+    operands: &ChainOperands,
+    layers: usize,
 ) -> Result<SealedGraph, ExecutorCostsError> {
     let error = failed("composition chain");
     let ChainKernels {
@@ -2275,24 +2755,17 @@ fn composition_chain(
         output: output_kernel,
         copy: copy_kernel,
     } = kernels;
-    // The weights and the history in one layout, so they span bytes of
-    // their own.
-    let [gate_weights, up_weights] = ExpandCase::operands(weight, features, 1)?;
-    let [gates, ups, histories] = backings.lay_out(
-        device,
-        route,
-        [
-            gate_weights,
-            up_weights,
-            AttendCase::operand(KvCodec::Dense, depth, 1)?,
-        ],
-    )?;
-    let expands = ExpandCase::over(device, weight, 1, gates, ups)?;
-    let expand = &expands[0];
-    let attends = AttendCase::over(device, backings, KvCodec::Dense, depth, histories)?;
-    let attend = &attends[0];
-    let output = OutputCase::new(device, weight, features)?;
-    let residual_tensor = CopyCase::new(device, HIDDEN)?.out;
+    let ChainOperands {
+        expand: expands,
+        attend: attends,
+        downs,
+        down_bound,
+        residual: residual_tensor,
+        features,
+    } = operands;
+    let features = *features;
+    // The row's operands, one set's for all.
+    let (expand, attend) = (&expands[0], &attends[0]);
     let mut graph = device.native_graph();
     let mut bound = Vec::new();
     let mut bind = |graph: &mut seismic::NativeGraph, tensor: &Tensor| {
@@ -2302,15 +2775,12 @@ fn composition_chain(
         bound.push((port.clone(), tensor.clone()));
         Ok::<_, ExecutorCostsError>(port)
     };
-    let mut residual = bind(&mut graph, &residual_tensor)?;
+    let mut residual = bind(&mut graph, residual_tensor)?;
     let norm = bind(&mut graph, &expand.norm)?;
-    let gate = bind(&mut graph, &expand.gate)?;
-    let up = bind(&mut graph, &expand.up)?;
     let rows = bind(&mut graph, &expand.out_rows)?;
     let scale = bind(&mut graph, &expand.scale)?;
     let expand_bound = bind(&mut graph, &expand.bound)?;
-    let down = bind(&mut graph, &output.down)?;
-    let down_bound = bind(&mut graph, &output.bound)?;
+    let down_bound = bind(&mut graph, down_bound)?;
     let attention_gate = bind(&mut graph, &attend.gate)?;
     let key = bind(&mut graph, &attend.key)?;
     let value = bind(&mut graph, &attend.value)?;
@@ -2323,9 +2793,24 @@ fn composition_chain(
     let visible = bind(&mut graph, &attend.visible)?;
     let fresh = bind(&mut graph, &attend.fresh)?;
     let destinations = bind(&mut graph, &attend.destinations)?;
-    let mut history_key = bind(&mut graph, &attend.planes[0])?;
-    let mut history_value = bind(&mut graph, &attend.planes[1])?;
-    for _ in 0..GRAPH_CALLS / CHAIN_LAYER_CALLS {
+    // Each set's weights and history.
+    let mut sets = expands
+        .iter()
+        .zip(attends)
+        .zip(downs)
+        .map(|((expand, attend), down)| {
+            Ok::<_, ExecutorCostsError>((
+                bind(&mut graph, &expand.gate)?,
+                bind(&mut graph, &expand.up)?,
+                bind(&mut graph, down)?,
+                bind(&mut graph, &attend.planes[0])?,
+                bind(&mut graph, &attend.planes[1])?,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let count = sets.len();
+    for layer in 0..layers {
+        let (gate, up, down, history_key, history_value) = &mut sets[layer % count];
         let product = graph
             .enqueue(
                 expand_kernel,
@@ -2410,29 +2895,19 @@ fn composition_chain(
 /// makes, its rotated operands views of the job's backings; `kernel` picks
 /// it from the walk's programs.
 fn calls<'f, E: Entry, C: 'f>(
-    kernel: impl for<'p> Fn(&'p Programs) -> Result<&'p NativeKernel<E>, ExecutorCostsError> + 'f,
+    kernel: impl for<'p> Fn(&'p Programs) -> Result<&'p NativeKernel<E>, Unformed<ExecutorCostsError>>
+        + 'f,
     cases: impl Fn(&Device, &mut Backings) -> Result<Vec<C>, ExecutorCostsError> + 'f,
     args: for<'a> fn(&'a mut C) -> E::Args<'a>,
 ) -> impl FnMut(&Device, &Programs, &mut Backings) -> Result<Point, Unformed<ExecutorCostsError>> + 'f
 {
     move |device, programs, backings| {
-        let kernel = kernel(programs).map_err(Unformed::Never)?;
+        let kernel = kernel(programs)?;
         let mut cases = cases(device, backings).map_err(Unformed::Now)?;
         kernel
             .point(cases.iter_mut().map(args).collect())
             .map(Point::Kernel)
             .map_err(|error| Unformed::Now(failed(E::NAME)(&error)))
-    }
-}
-
-/// The formats measured along `route`: every measured format where it is a
-/// route of device storage's placement, which holds a load's weights;
-/// otherwise the activation dtype alone, as only rows are uploaded.
-fn route_formats(route: &Route, formats: &[Element]) -> Vec<Element> {
-    if route.storage == StorageKind::Device {
-        formats.to_vec()
-    } else {
-        vec![Element::bf16()]
     }
 }
 
@@ -2444,314 +2919,786 @@ fn launch_graph_point<T: Times>(
     programs: &ProgramSet,
     copy: &KernelIdentity,
     timing: GraphTiming,
+    share: Share,
 ) -> Result<Timing, Stop<T::Missing>> {
     let point = PointSpec::new(
         vec![copy.clone()],
         &[("calls", GRAPH_CALLS as u64), ("width", GRAPH_WIDTH)],
         &[("timing", timing_ordinal(timing))],
     );
-    times.time(point, programs, &mut |device, formed, _| {
+    let mut build = |device: &Device, formed: &Programs, _: &mut Backings| {
         if timing != GraphTiming::Device {
-            formed.settled();
+            formed.settled()?;
         }
-        let copy = kernel(&formed.copy).map_err(Unformed::Never)?;
+        let copy = formed.kernel(&formed.copy)?;
         launch_graph(device, copy)
             .and_then(|graph| graph.point(timing))
             .map_err(Unformed::Now)
-    })
+    };
+    times.time(point, programs, &mut build, share)
 }
 
-/// The walk: every point executor costs are made of, in order, and the
-/// costs derived from their timings.
+/// What the walk reads, one step at a time, in its order ([`plan`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Step {
+    /// A point of a format's weight rate along the route at an index of the
+    /// walk's routes ([`Routes::iter`]).
+    WeightRate(usize, Element, Pass),
+    /// One timing of the launch graph.
+    Launch(GraphTiming),
+    /// One point of a history layout's ladder.
+    Rung(KvCodec, Rung),
+    /// The composition chain.
+    Chain,
+    /// A format's matrix throughput.
+    Matrix(Element),
+}
+
+/// A point of a weight rate: its pilot, its calls over one argument set,
+/// which decides whether they rotate ([`UNROTATED`]); or its rate, read
+/// over the sets that span the cache, or the pilot's one where memory
+/// cannot move its calls. The activation dtype's calls stream from memory
+/// by what its rate is, and have no pilot: its rate prices the bytes every
+/// other pilot weighs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pass {
+    Pilot,
+    Rate,
+}
+
+/// A point of a history ladder: its pilot, one argument set at the first
+/// depth, which decides whether its rungs rotate ([`UNROTATED`]); or the
+/// rung at an index of [`HISTORY_DEPTHS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rung {
+    Pilot,
+    Depth(usize),
+}
+
+/// The rungs of a ladder the plan reads early: its two shallowest, the
+/// fewest a line with a fixed cost runs through.
+const FIRST_RUNGS: usize = 2;
+
+impl Step {
+    /// The probe: the activation dtype's rate along device storage's first
+    /// route, the walk's first step. The costs need it, and price every
+    /// figure not read from it ([`ExecutorCosts`]); and the first point
+    /// measured establishes the device's sustained clock with its own work.
+    fn probe() -> Self {
+        Self::WeightRate(0, Element::bf16(), Pass::Rate)
+    }
+
+    /// Whether it reads a format's rate streaming from memory, which its
+    /// pilot prices until then.
+    fn streams(self) -> bool {
+        matches!(self, Self::WeightRate(_, format, Pass::Rate) if format != Element::bf16())
+    }
+}
+
+impl fmt::Display for Step {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WeightRate(_, format, pass) => {
+                write!(formatter, "the {} weight rate's {pass:?}", format.name())
+            }
+            Self::Launch(timing) => write!(formatter, "the launch graph's {timing:?} time"),
+            Self::Rung(layout, rung) => {
+                write!(formatter, "the {} attention's {rung:?}", layout.identity())
+            }
+            Self::Chain => formatter.write_str("the composition chain"),
+            Self::Matrix(format) => write!(formatter, "the {} matrix throughput", format.name()),
+        }
+    }
+}
+
+/// Every step of the walk over `routes` and `formats` after its probe
+/// ([`Step::probe`]), in its order, each figure before those priced closer
+/// without it: first the activation dtype along device storage's other
+/// routes. The launch graph's runs follow it, as the graph's trivial calls
+/// leave a GPU at a clock it does not sustain under a step's load (an RTX
+/// 3090's Vulkan launch read 13.6 µs so, 3.1 µs after streaming work); then
+/// the dense history's first rungs, which the composition chain reads (a
+/// CPU's attention reads its history at a hundredth of memory's rate, which
+/// prices history unread: 110 to 310 MB/s against 30 GB/s on a 4-vCPU EPYC
+/// 7763); the activation dtype's matrix throughput, during which the affine
+/// attention's compile (the job's longest) ends; and what touches the host
+/// (host storage's routes, which hold only rows, and the launch graph's
+/// host times), once no compile shares it; then every other format's pilot
+/// along each device storage route, without which it is priced at the
+/// activation dtype's figures (a 12-core M6's CPU formats stream at 0.05 to
+/// 0.58 of bf16 and multiply at 0.13 to 0.83 of it, 2026-10-22). Then the
+/// rest, the figures priced furthest off until read first: the formats'
+/// streaming rates, which a pilot may price up to twice as fast and which
+/// the walk reads in the order their pilots price them furthest off
+/// ([`Read::overlap`]); then each layout's deeper rungs (a GB10's CPU priced
+/// 75K tokens 33% slow on its first rungs' line, 2026-10-22); then the
+/// formats' matrix throughputs, which their pilots price within the 7 to
+/// 9.4 eighths of a row's time eight rows took on a 12-core M6's CPU, and
+/// which price a step only where arithmetic bounds it.
+fn plan(routes: &[&Route], formats: &[Element]) -> Vec<Step> {
+    let activation = Element::bf16();
+    let others = formats
+        .iter()
+        .copied()
+        .filter(|format| *format != activation)
+        .collect::<Vec<_>>();
+    let (device, host): (Vec<usize>, Vec<usize>) =
+        (0..routes.len()).partition(|&index| routes[index].storage == StorageKind::Device);
+    let first_rungs = |layout| {
+        [Rung::Pilot, Rung::Depth(0), Rung::Depth(1)].map(move |rung| Step::Rung(layout, rung))
+    };
+    let mut steps = Vec::new();
+    steps.extend(
+        device
+            .iter()
+            .map(|&route| Step::WeightRate(route, activation, Pass::Rate))
+            .filter(|step| *step != Step::probe()),
+    );
+    steps.push(Step::Launch(GraphTiming::Device));
+    steps.extend(first_rungs(KvCodec::Dense));
+    steps.push(Step::Chain);
+    steps.push(Step::Matrix(activation));
+    steps.extend(first_rungs(KvCodec::AffineK8V4));
+    steps.extend(
+        host.iter()
+            .map(|&route| Step::WeightRate(route, activation, Pass::Rate)),
+    );
+    steps.extend([GraphTiming::Waited, GraphTiming::Queued].map(Step::Launch));
+    for pass in [Pass::Pilot, Pass::Rate] {
+        for &route in &device {
+            steps.extend(
+                others
+                    .iter()
+                    .map(|&format| Step::WeightRate(route, format, pass)),
+            );
+        }
+    }
+    steps.extend(HISTORY_LAYOUTS.into_iter().flat_map(|layout| {
+        (FIRST_RUNGS..HISTORY_DEPTHS.len()).map(move |index| Step::Rung(layout, Rung::Depth(index)))
+    }));
+    steps.extend(others.iter().map(|&format| Step::Matrix(format)));
+    steps
+}
+
+/// What a walk gives: the costs, whether a point it reached no record holds
+/// (whose figure is priced until a job measures it), and why each step
+/// whose figure is otherwise priced could not be read outside its points'
+/// timings (a kernel's identity that cannot be derived), which the job
+/// reports.
+struct Walked {
+    costs: ExecutorCosts,
+    pending: bool,
+    failures: Vec<ExecutorCostsError>,
+}
+
+/// The walk: every step of its [`plan`], in order, and the costs derived
+/// from their timings. Where the probe, its first, has none, the walk ends
+/// without costs. Any other step that has none leaves its figure priced
+/// from those read ([`ExecutorCosts`]), and a ladder's step that has none
+/// ends the ladder below it.
 fn walk<T: Times>(
     topology: &DeviceTopology,
     executor: &Executor,
     times: &mut T,
-) -> Result<ExecutorCosts, Stop<T::Missing>> {
+) -> Result<Walked, Stop<T::Missing>> {
     let backend = executor.backend();
     let formats = &measured_formats(backend);
-    let cache = largest_cache(topology, executor);
     let largest = executor.limits().max_allocation.value;
-    let chain_format = chain_element(backend).ok_or_else(|| {
+    let chain = chain_element(backend).ok_or_else(|| {
         Stop::Failed(ExecutorCostsError(format!(
             "{CHAIN_FORMAT:?} has no resident form on {}",
             backend.as_str()
         )))
     })?;
-    let programs = ProgramSet::new(Sizes::of(backend), formats, chain_format, largest)?;
-    let copy_identity = programs.copy.identity(backend)?;
+    let programs = ProgramSet::new(Sizes::of(backend), formats, chain, largest)?;
     let (routes, placements) = Route::all(topology, executor)?;
-    // Device storage's first route: where the figures not of a route (the
-    // matrix throughputs, the history costs, the composition chain) are
-    // measured, as a load's weights and history are allocated first.
-    let device_route = &routes.device;
-
-    let mut unmeasured = Vec::new();
-    let mut optional = |figure: Figure, stop: Stop<T::Missing>| match stop {
-        Stop::Point(error) | Stop::Failed(error) => {
-            unmeasured.push(Unmeasured {
-                figure,
-                reason: error.0,
-            });
-            Ok(())
-        }
-        missing @ Stop::Missing(_) => Err(missing),
+    let routes = routes.iter().collect::<Vec<_>>();
+    let steps = plan(&routes, formats);
+    // Each step is one point, after the probe.
+    let points = 1 + steps.len();
+    let walk = Walk {
+        backend,
+        copy: programs.copy.identity(backend)?,
+        programs,
+        cache: largest_cache(topology, executor),
+        largest,
+        room: rotation_room(topology, routes[0]),
+        // A point's part of the job, which shapes are sized to from records
+        // (a history rung, the composition chain): a start derives it from
+        // the same plan, so it retraces the same points.
+        point_seconds: MEASUREMENT_SECONDS / points as f64,
+        routes,
     };
-
-    // Each format's weight rate along each route of device storage's
-    // placement. A route of another storage reads host memory, so it is
-    // timed last, once no compile shares the host (`weight_rate`).
-    let mut weight_rates = Vec::new();
-    let (device_storage, host_storage): (Vec<_>, Vec<_>) = routes
-        .iter()
-        .partition(|route| route.storage == StorageKind::Device);
-    for route in device_storage {
-        for format in route_formats(route, formats) {
-            match weight_rate(backend, &programs, format, route, cache, times) {
-                Ok(rate) => weight_rates.push(rate),
-                // The activation dtype's rate along a route of device
-                // storage's placement prices every load's rows and state:
-                // it is no option.
-                Err(stop) if format == Element::bf16() => {
-                    return Err(stop);
-                }
-                Err(stop) => optional(Figure::WeightRate(route.route, format), stop)?,
-            }
-        }
-    }
-
-    // The launch graph's runs' device time. It follows the weight rates: the
-    // first point measured on a device establishes its sustained clock with
-    // its own work, and the graph's trivial calls leave a GPU at a clock it
-    // does not sustain under a step's load (an RTX 3090's Vulkan launch read
-    // 13.6 µs so, 3.1 µs after streaming work). Its host times are the last
-    // points (`launch_graph_point`).
-    let device = launch_graph_point(times, &programs, &copy_identity, GraphTiming::Device)?;
-    // A run's device time is its calls' (the launch cost is its share of
-    // one).
-    let graph_calls = GRAPH_CALLS as f64;
-    let launch = device.median / graph_calls;
-    let launch_seconds = MeasuredCost {
-        value: launch,
-        interval: device
-            .interval
-            .map(|(low, high)| (low / graph_calls, high / graph_calls)),
-        samples: device.samples,
-    };
-
-    // Each history layout at two depths in its bytes' regime, searched from
-    // the depth the activation dtype's rate along the route predicts.
-    let activation_rate = weight_rates
-        .iter()
-        .find(|rate| rate.route == device_route.route && rate.format == Element::bf16())
-        .expect("the walk measures the activation dtype's rate along device storage or ends")
-        .bytes_per_second
-        .value;
-    // The dense history first: the composition chain reads its depth. Every
-    // other layout follows the matrix throughputs, so its program's compile
-    // (the affine attention's is the job's longest) ends meanwhile.
-    let layout_history =
-        |layout: KvCodec, times: &mut T| match layout.spec(DType::BF16, 1, 1).encoding() {
-            HistoryEncoding::Dense => history::<attention_decode::Entry, _>(
-                backend,
-                &programs,
-                layout,
-                device_route,
-                cache,
-                largest,
-                launch,
-                activation_rate,
-                times,
-            ),
-            HistoryEncoding::Affine => history::<attention_decode_k8v4::Entry, _>(
-                backend,
-                &programs,
-                layout,
-                device_route,
-                cache,
-                largest,
-                launch,
-                activation_rate,
-                times,
-            ),
-            HistoryEncoding::Unsupported => Err(Stop::Failed(ExecutorCostsError(
-                "the layout has no native attention entry".into(),
-            ))),
-        };
-    let (dense_layouts, later_layouts): (Vec<KvCodec>, Vec<KvCodec>) = HISTORY_LAYOUTS
-        .into_iter()
-        .partition(|layout| *layout == KvCodec::Dense);
-    let mut histories = Vec::new();
-    for layout in dense_layouts {
-        match layout_history(layout, times) {
-            Ok(history) => histories.push(history),
-            Err(stop) => optional(Figure::HistoryCost(layout), stop)?,
-        }
-    }
-
-    // The composition chain, over the dense history at the depth its bytes'
-    // regime was measured at, and its calls alone.
-    let depth = histories
-        .iter()
-        .find(|history| history.layout == KvCodec::Dense)
-        .map(|history| history.depths[1])
-        .ok_or_else(|| {
-            Stop::Failed(ExecutorCostsError(
-                "the dense attention was not measured".into(),
-            ))
-        })?;
-    let (features, expand_chain) = programs.expand(chain_format);
-    let kernels = vec![
-        expand_chain.identity(backend)?,
-        programs.dense.identity(backend)?,
-        programs.output.identity(backend)?,
-        copy_identity.clone(),
-    ];
-    let chain = times.time(
-        PointSpec::new(
-            kernels.clone(),
-            &[("calls", GRAPH_CALLS as u64), ("rows", 1)],
-            &[("depth", depth)],
-        ),
-        &programs,
-        &mut |device, formed, backings| {
-            let kernels = ChainKernels::of(formed, chain_format).map_err(Unformed::Never)?;
-            composition_chain(
-                device,
-                kernels,
-                backings,
-                chain_format,
-                features,
-                device_route,
-                depth,
-            )
-            .and_then(|chain| chain.point(GraphTiming::Device))
-            .map_err(Unformed::Now)
+    let probe = walk.probe(
+        Share {
+            left: points,
+            forecast: None,
         },
+        times,
     )?;
-    // Each call alone is the point of its kind at the chain's shape and one
-    // argument set: where the history's depth search timed that point, its
-    // record serves both.
-    let alone = |index: usize, point: &[(&str, u64)]| {
-        PointSpec::new(vec![kernels[index].clone()], &[("rows", 1)], point)
-    };
-    let alone = [
-        times.time(
-            alone(0, &weight_point(features, 1, device_route)),
-            &programs,
-            &mut calls::<dense_expand::Entry, _>(
-                move |formed: &Programs| formed.expand(chain_format, Rows::Decode),
-                |device, backings| {
-                    ExpandCase::new(device, backings, chain_format, device_route, 1, features, 1)
-                },
-                ExpandCase::args,
-            ),
-        )?,
-        times.time(
-            alone(1, &[("depth", depth), ("sets", 1)]),
-            &programs,
-            &mut calls::<attention_decode::Entry, _>(
-                |formed: &Programs| kernel(&formed.dense),
-                |device, backings| {
-                    AttendCase::new(device, backings, KvCodec::Dense, device_route, depth, 1)
-                },
-                AttendCase::dense,
-            ),
-        )?,
-        times.time(
-            alone(2, &[("features", features), ("sets", 1)]),
-            &programs,
-            &mut calls::<dense_output::Entry, _>(
-                |formed: &Programs| kernel(&formed.output),
-                |device, _| Ok(vec![OutputCase::new(device, chain_format, features)?]),
-                OutputCase::args,
-            ),
-        )?,
-        times.time(
-            alone(3, &[("width", HIDDEN), ("sets", 1)]),
-            &programs,
-            &mut calls::<conditioning_overlay::Entry, _>(
-                |formed: &Programs| kernel(&formed.copy),
-                |device, _| Ok(vec![CopyCase::new(device, HIDDEN)?]),
-                CopyCase::args,
-            ),
-        )?,
-    ];
-    let layer = alone.iter().map(|timing| timing.median).sum::<f64>();
-    let separate = layer * (GRAPH_CALLS / CHAIN_LAYER_CALLS) as f64;
-    let composition = MeasuredCost {
-        value: chain.median / separate,
-        interval: chain
-            .interval
-            .map(|(low, high)| (low / separate, high / separate)),
-        samples: chain.samples,
-    };
-
-    // Each format's throughput at the executor's matrix rows.
-    let mut matrices = Vec::new();
-    for &format in formats {
-        match matrix(backend, &programs, format, device_route, times) {
-            Ok(matrix) => matrices.push(matrix),
-            Err(stop) => optional(Figure::MatrixThroughput(format), stop)?,
+    let mut read = Read::new(walk.routes.len(), probe);
+    let mut left = points - 1;
+    let mut pending = false;
+    let mut failures = Vec::new();
+    let mut steps = steps;
+    for index in 0..steps.len() {
+        // The formats' streaming rates are read in the order their pilots
+        // price them furthest off ([`Read::overlap`]), once every pilot is
+        // read: the order follows from records, so a start retraces it.
+        let streamed = |step: &Step| step.streams();
+        if streamed(&steps[index]) && (index == 0 || !streamed(&steps[index - 1])) {
+            let end = index + steps[index..].iter().take_while(|step| streamed(step)).count();
+            steps[index..end]
+                .sort_by(|near, far| read.overlap(*far).total_cmp(&read.overlap(*near)));
         }
-    }
-    for layout in later_layouts {
-        match layout_history(layout, times) {
-            Ok(history) => histories.push(history),
-            Err(stop) => optional(Figure::HistoryCost(layout), stop)?,
-        }
-    }
-
-    for route in host_storage {
-        for format in route_formats(route, formats) {
-            match weight_rate(backend, &programs, format, route, cache, times) {
-                Ok(rate) => weight_rates.push(rate),
-                Err(stop) => optional(Figure::WeightRate(route.route, format), stop)?,
+        let step = steps[index];
+        let share = Share {
+            left,
+            forecast: None,
+        };
+        left -= 1;
+        match walk.step(step, share, &mut read, times) {
+            Ok(()) => {}
+            Err(stop) => {
+                if let Step::Rung(layout, _) = step {
+                    read.ladder(layout).ended = true;
+                }
+                match stop {
+                    Stop::Missing(_) => pending = true,
+                    Stop::Failed(error) => failures.push(failed(&step.to_string())(&error)),
+                    // The point's own outcome reports it.
+                    Stop::Point(_) | Stop::Expired => {}
+                }
             }
         }
     }
-
-    // The launch graph's host time waited for and queued, once no compile
-    // runs beside it. A run's host time beyond its device time is the step
-    // cost, whose interval is the host time's beyond the median device time.
-    let waited = launch_graph_point(times, &programs, &copy_identity, GraphTiming::Waited)?;
-    let queued = launch_graph_point(times, &programs, &copy_identity, GraphTiming::Queued)?;
-    let beyond = |timing: Timing| MeasuredCost {
-        value: timing.median - device.median,
-        interval: timing
-            .interval
-            .map(|(low, high)| (low - device.median, high - device.median)),
-        samples: timing.samples,
-    };
-    let step_round_trip_seconds = beyond(waited);
-    let step_pipelined_seconds = beyond(queued);
-
-    Ok(ExecutorCosts {
-        weight_rates,
-        placements,
-        matrices,
-        histories,
-        composition,
-        launch_seconds,
-        step_pipelined_seconds,
-        step_round_trip_seconds,
-        unmeasured,
+    Ok(Walked {
+        costs: read.costs(&walk, placements)?,
+        pending,
+        failures,
     })
 }
 
+/// What every step of a walk reads from: the executor's programs, its
+/// routes (device storage's first route first: where the figures not of a
+/// route, the matrix throughputs, the history costs and the composition
+/// chain, are measured, as a load's weights and history are allocated
+/// first), the largest cache serving them and the largest allocation, what
+/// a history rotation may take, and a point's share of the job.
+struct Walk<'r> {
+    backend: seismic::BackendName,
+    programs: ProgramSet,
+    copy: KernelIdentity,
+    routes: Vec<&'r Route>,
+    cache: u64,
+    largest: u64,
+    room: u64,
+    point_seconds: f64,
+}
+
+/// What a history rotation along `route` may take: an eighth of the least
+/// of the stores and grants along it ([`ROTATION_SHARE`]).
+fn rotation_room(topology: &DeviceTopology, route: &Route) -> u64 {
+    route
+        .along
+        .iter()
+        .map(|path| {
+            let path = topology
+                .access_path(*path)
+                .expect("a placement's paths belong to its topology");
+            let store = topology
+                .store(path.store())
+                .expect("a path's store belongs to its topology")
+                .capacity()
+                .value;
+            path.grant().map_or(store, |grant| grant.value.min(store))
+        })
+        .min()
+        .expect("a route has a path")
+        / ROTATION_SHARE
+}
+
+/// What a walk has read so far, step by step: its probe, and every other
+/// figure where read.
+struct Read {
+    probe: WeightRate,
+    /// The activation dtype's rate along each route after the probe's, the
+    /// `i`th the route at index `i + 1`.
+    activation: Vec<Option<WeightRate>>,
+    /// The other formats' rates along each route, by index.
+    formats: Vec<Vec<(Element, FormatRates)>>,
+    launch: Option<Timing>,
+    waited: Option<Timing>,
+    queued: Option<Timing>,
+    dense: Ladder,
+    affine: Ladder,
+    chain: Option<ChainRead>,
+    activation_matrix: Option<MatrixCosts>,
+    matrices: Vec<(Element, MatrixCosts)>,
+}
+
+/// A history layout's ladder as the walk has read it.
+#[derive(Default)]
+struct Ladder {
+    /// Whether its calls rotate through the sets that span the cache, once
+    /// its pilot is read ([`UNROTATED`]).
+    rotated: Option<bool>,
+    /// The rungs read, the `i`th at [`HISTORY_DEPTHS`]`[i]` tokens.
+    rungs: Vec<MeasuredCost>,
+    /// Whether no deeper rung is read.
+    ended: bool,
+}
+
+impl Read {
+    fn new(routes: usize, probe: WeightRate) -> Self {
+        Self {
+            probe,
+            activation: vec![None; routes - 1],
+            formats: vec![Vec::new(); routes],
+            launch: None,
+            waited: None,
+            queued: None,
+            dense: Ladder::default(),
+            affine: Ladder::default(),
+            chain: None,
+            activation_matrix: None,
+            matrices: Vec::new(),
+        }
+    }
+
+    /// `layout`'s ladder, a measured layout's ([`HISTORY_LAYOUTS`]).
+    fn ladder(&mut self, layout: KvCodec) -> &mut Ladder {
+        match layout {
+            KvCodec::Dense => &mut self.dense,
+            KvCodec::AffineK8V4 => &mut self.affine,
+            KvCodec::RotatedK4V4 => unreachable!("no step reads a layout no entry reads"),
+        }
+    }
+
+    /// How far `step`'s format's pilot may price its streaming rate off: its
+    /// arithmetic's time over its bytes' time from memory, the smaller over
+    /// the larger. Its pilot prices a call at the larger of the two, as if
+    /// they overlapped wholly, which a call taking both in turn reads up to
+    /// twice as long as where they are alike (a GB10's CPU read Q8_0 models
+    /// 42% slower than its pilot priced them, 2026-10-22), and within the
+    /// smaller part of it where one dominates. A format whose pilot was not
+    /// read has no rate to read.
+    fn overlap(&self, step: Step) -> f64 {
+        let Step::WeightRate(index, format, Pass::Rate) = step else {
+            unreachable!("only streaming rates are ordered")
+        };
+        let stream = self.stream(index);
+        self.formats[index]
+            .iter()
+            .find(|(read, _)| *read == format)
+            .map_or(0., |(_, rates)| {
+                let pilot = rates.pilot.bytes_per_second.value;
+                pilot.min(stream) / pilot.max(stream)
+            })
+    }
+
+    /// The activation dtype's rate along the route at `index`: the rate
+    /// memory streams it at, the probe's along device storage's first route
+    /// and wherever none was read ([`ExecutorCosts::route_rate`]).
+    fn stream(&self, index: usize) -> f64 {
+        index
+            .checked_sub(1)
+            .and_then(|other| self.activation[other].as_ref())
+            .unwrap_or(&self.probe)
+            .bytes_per_second
+            .value
+    }
+
+    /// The costs of what the walk read.
+    fn costs(
+        self,
+        walk: &Walk<'_>,
+        placements: Placements,
+    ) -> Result<ExecutorCosts, ExecutorCostsError> {
+        // A run's device time is its calls' (the launch cost is its share
+        // of one), none where unread.
+        let device = self.launch.map_or(0., |device| device.median);
+        // A run's host time beyond its device time is the step cost, whose
+        // interval is the host time's beyond the median device time.
+        let beyond = |timing: Option<Timing>| {
+            timing.map(|timing| MeasuredCost {
+                value: timing.median - device,
+                interval: timing
+                    .interval
+                    .map(|(low, high)| (low - device, high - device)),
+                samples: timing.samples,
+            })
+        };
+        let mut formats = self.formats.into_iter();
+        let mut costs = ExecutorCosts {
+            first: RouteCosts {
+                route: walk.routes[0].route,
+                activation: self.probe,
+                formats: formats.next().expect("the walk has device storage's first route"),
+            },
+            routes: walk.routes[1..]
+                .iter()
+                .zip(self.activation)
+                .zip(formats)
+                .map(|((route, activation), formats)| RouteCosts {
+                    route: route.route,
+                    activation,
+                    formats,
+                })
+                .collect(),
+            placements,
+            activation_matrix: self.activation_matrix,
+            matrices: self.matrices,
+            dense: HistoryCosts::new(KvCodec::Dense, self.dense.rungs)?,
+            affine: HistoryCosts::new(KvCodec::AffineK8V4, self.affine.rungs)?,
+            composition: None,
+            launch_seconds: self.launch.map(|device| MeasuredCost {
+                value: device.median / GRAPH_CALLS as f64,
+                interval: device
+                    .interval
+                    .map(|(low, high)| (low / GRAPH_CALLS as f64, high / GRAPH_CALLS as f64)),
+                samples: device.samples,
+            }),
+            step_pipelined_seconds: beyond(self.queued),
+            step_round_trip_seconds: beyond(self.waited),
+        };
+        // The chain's calls are priced from every other figure.
+        costs.composition = self
+            .chain
+            .map(|chain| chain.composition(&walk.programs, &costs))
+            .transpose()?;
+        Ok(costs)
+    }
+}
+
+impl Walk<'_> {
+    /// The probe ([`Step::probe`]): the activation dtype's rate along device
+    /// storage's first route, rotating through the sets that span the cache.
+    fn probe<T: Times>(&self, share: Share, times: &mut T) -> Result<WeightRate, Stop<T::Missing>> {
+        weight_rate(
+            self.backend,
+            &self.programs,
+            Element::bf16(),
+            self.routes[0],
+            self.cache,
+            true,
+            times,
+            share,
+        )
+    }
+
+    /// Read `step` into `read`.
+    fn step<T: Times>(
+        &self,
+        step: Step,
+        share: Share,
+        read: &mut Read,
+        times: &mut T,
+    ) -> Result<(), Stop<T::Missing>> {
+        match step {
+            Step::WeightRate(index, format, pass) => {
+                let route = self.routes[index];
+                let rate = |rotated, times: &mut T, share| {
+                    weight_rate(
+                        self.backend,
+                        &self.programs,
+                        format,
+                        route,
+                        self.cache,
+                        rotated,
+                        times,
+                        share,
+                    )
+                };
+                if format == Element::bf16() {
+                    // The plan reads the probe's route's rate as the probe.
+                    read.activation[index - 1] = Some(rate(true, times, share)?);
+                    return Ok(());
+                }
+                match pass {
+                    Pass::Pilot => {
+                        let pilot = rate(false, times, share)?;
+                        read.formats[index].push((
+                            format,
+                            FormatRates {
+                                pilot,
+                                streamed: None,
+                            },
+                        ));
+                    }
+                    Pass::Rate => {
+                        let stream = read.stream(index);
+                        // A format whose pilot was not read has no rates.
+                        let Some((_, rates)) = read.formats[index]
+                            .iter_mut()
+                            .find(|(read, _)| *read == format)
+                        else {
+                            return Ok(());
+                        };
+                        // The part of a call its bytes' time from memory
+                        // takes, at the rate memory streams them.
+                        let pilot = rates.pilot.bytes_per_second.value;
+                        let rotated = pilot / stream > UNROTATED;
+                        // A call is forecast at the slower of its pilot's
+                        // rate and memory's, a pass at its sets' calls.
+                        let bytes = expand_weight_bytes(format, rates.pilot.features)?;
+                        let sets = weight_sets(self.cache, bytes, rotated);
+                        let call = bytes as f64 / pilot.min(stream);
+                        let share = share.forecast(call * sets as f64, bytes * sets);
+                        let streamed = rate(rotated, times, share)?;
+                        rates.streamed = Some(streamed);
+                    }
+                }
+            }
+            Step::Launch(timing) => {
+                let measured =
+                    launch_graph_point(times, &self.programs, &self.copy, timing, share)?;
+                *match timing {
+                    GraphTiming::Device => &mut read.launch,
+                    GraphTiming::Waited => &mut read.waited,
+                    GraphTiming::Queued => &mut read.queued,
+                } = Some(measured);
+            }
+            Step::Rung(layout, rung) => {
+                let activation_rate = read.stream(0);
+                let ladder = read.ladder(layout);
+                match layout.spec(DType::BF16, 1, 1).encoding() {
+                    HistoryEncoding::Dense => self.rung::<attention_decode::Entry, _>(
+                        layout,
+                        rung,
+                        ladder,
+                        activation_rate,
+                        times,
+                        share,
+                    )?,
+                    HistoryEncoding::Affine => self.rung::<attention_decode_k8v4::Entry, _>(
+                        layout,
+                        rung,
+                        ladder,
+                        activation_rate,
+                        times,
+                        share,
+                    )?,
+                    HistoryEncoding::Unsupported => {
+                        unreachable!("every measured layout has a native attention entry")
+                    }
+                }
+            }
+            Step::Chain => read.chain = Some(self.chain(read, times, share)?),
+            Step::Matrix(format) => {
+                // Another format's call is forecast at its matrix rows' times
+                // its pilot's one-row call, about what a CPU takes
+                // ([`ExecutorCosts::matrix_flops`]) and more than a GPU.
+                let share = match read.formats[0].iter().find(|(read, _)| *read == format) {
+                    Some((_, rates)) => {
+                        let rows = Rows::Matrix.count(self.programs.sizes) as f64;
+                        let call = rows * call_seconds(format, &rates.pilot);
+                        share.forecast(call, expand_weight_bytes(format, rates.pilot.features)?)
+                    }
+                    None => share,
+                };
+                let matrix = matrix(
+                    self.backend,
+                    &self.programs,
+                    format,
+                    self.routes[0],
+                    times,
+                    share,
+                )?;
+                if format == Element::bf16() {
+                    read.activation_matrix = Some(matrix);
+                } else {
+                    read.matrices.push((format, matrix));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Walk<'_> {
+    /// The composition chain over the dense history's first rung: its
+    /// device time, and its layers. Its layers cycle through as many sets of
+    /// weights and history as span the cache ([`rotation_sets`]), as many as
+    /// the rotation's room holds and a step's calls take at most, so each
+    /// reads them from memory as a model's layers do: one set of weights and
+    /// history the cache holds runs a chain faster than a model runs (a
+    /// GB10's CPU composed one set's layers at 0.855 of their calls alone,
+    /// where a 4B model decoded at 1.11 of its calls' price, 2026-10-23).
+    fn chain<T: Times>(
+        &self,
+        read: &Read,
+        times: &mut T,
+        share: Share,
+    ) -> Result<ChainRead, Stop<T::Missing>> {
+        let backend = self.backend;
+        let programs = &self.programs;
+        let chain_format = programs.chain;
+        let device_route = self.routes[0];
+        let depth = HISTORY_DEPTHS[0];
+        let (features, expand_chain) = programs.expand(chain_format);
+        let kernels = vec![
+            expand_chain.identity(backend)?,
+            programs.dense.identity(backend)?,
+            programs.output.identity(backend)?,
+            self.copy.clone(),
+        ];
+        // A layer's time as the walk's records price it: its projections'
+        // weights at the activation dtype's rate (a forecast, which an
+        // M4 Max's Q4_K rate meets within 2%), its attention at the dense
+        // history's line, and its copy a launch, each priced as the costs
+        // price it where unread.
+        let stream = read.stream(0);
+        let dense = HistoryCosts::new(KvCodec::Dense, read.dense.rungs.clone())?;
+        let launch = read
+            .launch
+            .map_or(0., |device| device.median / GRAPH_CALLS as f64);
+        let weight_bytes = expand_weight_bytes(chain_format, features)?
+            + chain_format
+                .canonical_byte_len(&[HIDDEN, features])
+                .map_err(|error| failed("dense_output weights")(&error))?;
+        let history_bytes = AttendCase::operand(KvCodec::Dense, depth, 1)?.bytes()?;
+        let line = dense.line(depth as f64, stream);
+        let layer = weight_bytes as f64 / stream
+            + line.fixed_seconds
+            + (depth * token_bytes(KvCodec::Dense)?) as f64 * line.seconds_per_byte
+            + launch;
+        let most = (GRAPH_CALLS / CHAIN_LAYER_CALLS) as u64;
+        let sets = rotation_sets(self.cache, weight_bytes + history_bytes)
+            .min(self.room / history_bytes)
+            .clamp(1, most);
+        // As many layers as a run holds that leaves a point's share of the
+        // job twice the fewest samples that bound a median, at least the
+        // sets' and at most a step's calls: room for its leads and for the
+        // readings past the fewest a wide spread takes.
+        let run = self.point_seconds
+            / (2 * seismic::measure::fewest_bounding(crate::SEARCH_SETTINGS.error_rate)) as f64;
+        let layers = ((run / layer) as u64).clamp(sets, most);
+        let timing = times.time(
+            PointSpec::new(
+                kernels,
+                &[("calls", layers * CHAIN_LAYER_CALLS as u64), ("rows", 1)],
+                &[("depth", depth), ("sets", sets)],
+            ),
+            programs,
+            &mut |device: &Device, formed: &Programs, backings: &mut Backings| {
+                let kernels = ChainKernels::of(formed, chain_format)?;
+                let operands = ChainOperands::new(
+                    device,
+                    backings,
+                    chain_format,
+                    features,
+                    device_route,
+                    depth,
+                    sets,
+                )
+                .map_err(Unformed::Now)?;
+                composition_chain(device, kernels, &operands, layers as usize)
+                    .and_then(|chain| chain.point(GraphTiming::Device))
+                    .map_err(Unformed::Now)
+            },
+            share.forecast(layer * layers as f64, sets * (weight_bytes + history_bytes)),
+        )?;
+        Ok(ChainRead { timing, layers })
+    }
+}
+
+/// What the composition chain read: its device time over its layers.
+#[derive(Clone, Copy)]
+struct ChainRead {
+    timing: Timing,
+    layers: u64,
+}
+
+impl ChainRead {
+    /// The calls of one of its layers of `programs`' chain as a decode
+    /// demand states them, at one row: the gate/up projection, the
+    /// attention over its dense history, the down projection and the copy.
+    /// Their rows' bytes, a few kilobytes against the weights' megabytes,
+    /// are none.
+    fn layer(programs: &ProgramSet) -> Result<[Work; CHAIN_LAYER_CALLS], ExecutorCostsError> {
+        let format = programs.chain;
+        let (features, _) = programs.expand(format);
+        let output = format
+            .canonical_byte_len(&[HIDDEN, features])
+            .map_err(|error| failed("dense_output weights")(&error))?;
+        Ok([
+            Work {
+                weights: vec![Bytes {
+                    format,
+                    bytes: expand_weight_bytes(format, features)?,
+                }],
+                row_flops: vec![Flops {
+                    format,
+                    flops: 2 * 2 * features * HIDDEN,
+                }],
+                ..Work::default()
+            },
+            Work {
+                history: Some(HistoryRead {
+                    layout: Some(KvCodec::Dense),
+                    bytes_per_token: token_bytes(KvCodec::Dense)?,
+                    flops_per_token: 2 * KV_HEADS * GROUP * (2 * HEAD_WIDTH),
+                    window: None,
+                }),
+                ..Work::default()
+            },
+            Work {
+                weights: vec![Bytes {
+                    format,
+                    bytes: output,
+                }],
+                row_flops: vec![Flops {
+                    format,
+                    flops: 2 * features * HIDDEN,
+                }],
+                ..Work::default()
+            },
+            Work::default(),
+        ])
+    }
+
+    /// The composition ratio: the chain's time over its calls' as `costs`
+    /// price them alone, the chain of `programs` ([`super::estimate::calls_seconds`]), so a step
+    /// priced from the same costs is scaled to what composing its calls
+    /// takes.
+    fn composition(
+        &self,
+        programs: &ProgramSet,
+        costs: &ExecutorCosts,
+    ) -> Result<MeasuredCost, ExecutorCostsError> {
+        let depth = u32::try_from(HISTORY_DEPTHS[0])
+            .map_err(|_| ExecutorCostsError("the chain's depth exceeds u32".into()))?;
+        let priced = self.layers as f64
+            * super::estimate::calls_seconds(&Self::layer(programs)?, costs, depth)
+                .map_err(|error| failed("pricing the composition chain")(&error))?;
+        Ok(MeasuredCost {
+            value: self.timing.median / priced,
+            interval: self
+                .timing
+                .interval
+                .map(|(low, high)| (low / priced, high / priced)),
+            samples: self.timing.samples,
+        })
+    }
+}
+
 /// The weight rate of `format` along `route`: its `dense_expand` program at
-/// one row, its calls rotating through the sets that span the cache.
+/// one row, its calls rotating through the sets that span the cache where
+/// `rotated`, else over one argument set.
 fn weight_rate<T: Times>(
     backend: seismic::BackendName,
     programs: &ProgramSet,
     format: Element,
     route: &Route,
     cache: u64,
+    rotated: bool,
     times: &mut T,
+    share: Share,
 ) -> Result<WeightRate, Stop<T::Missing>> {
     let (features, formation) = programs.expand(format);
     let bytes = expand_weight_bytes(format, features)?;
-    let sets = rotation_sets(cache, bytes);
+    let sets = weight_sets(cache, bytes, rotated);
     let timing = times.time(
         PointSpec::new(
             vec![formation.identity(backend)?],
@@ -2763,7 +3710,7 @@ fn weight_rate<T: Times>(
             move |formed: &Programs| {
                 // Host memory is timed with no compile sharing the host.
                 if route.storage != StorageKind::Device {
-                    formed.settled();
+                    formed.settled()?;
                 }
                 formed.expand(format, Rows::Decode)
             },
@@ -2772,13 +3719,22 @@ fn weight_rate<T: Times>(
             },
             ExpandCase::args,
         ),
+        share,
     )?;
     Ok(WeightRate {
-        route: route.route,
-        format,
         bytes_per_second: MeasuredCost::rate(bytes as f64, &timing),
         features,
     })
+}
+
+/// The argument sets a weight rate's calls, each reading `bytes`, take:
+/// those that span the cache where `rotated`, else one.
+fn weight_sets(cache: u64, bytes: u64, rotated: bool) -> u64 {
+    if rotated {
+        rotation_sets(cache, bytes)
+    } else {
+        1
+    }
 }
 
 /// The point entries of a `dense_expand` call at F `features` over `sets`
@@ -2797,6 +3753,7 @@ fn matrix<T: Times>(
     format: Element,
     route: &Route,
     times: &mut T,
+    share: Share,
 ) -> Result<MatrixCosts, Stop<T::Missing>> {
     let (features, formation) = programs.expand(format);
     let rows = Rows::Matrix.count(programs.sizes);
@@ -2814,146 +3771,126 @@ fn matrix<T: Times>(
             },
             ExpandCase::args,
         ),
+        share,
     )?;
     // A multiply and an add per weight, per row, of the gate and the up
     // projection.
     let flops = 2.0 * 2.0 * (rows * features * HIDDEN) as f64;
     Ok(MatrixCosts {
-        format,
         flops: MeasuredCost::rate(flops, &timing),
         features,
     })
 }
 
-/// What `E` costs over `layout` at one sequence, its history along
-/// `route`: `t = fixed + bytes / rate` through two depths in the bytes'
-/// regime. A call over one argument set is sized when it takes at least
-/// [`LAUNCH_MULTIPLE`] launch costs and its history at least its fixed part
-/// (twice the one-token time). The search starts at the depth the one-token
-/// call predicts sized with its history read at `activation_rate` (the
-/// activation dtype's weight rate along `route`), halved while its plane
-/// exceeds the largest allocation, and doubles until a timed call is sized
-/// or no deeper plane fits; the line runs through that depth and twice it,
-/// or, where the allocation admits no deeper, through half of it and it,
-/// each timed rotating through the sets that span the cache, or over one
-/// set where the searched call's bytes from memory are too small a part of
-/// it to move it ([`UNROTATED`]).
-fn history<E: Attention, T: Times>(
-    backend: seismic::BackendName,
-    programs: &ProgramSet,
-    layout: KvCodec,
-    route: &Route,
-    cache: u64,
-    largest: u64,
-    launch: f64,
-    activation_rate: f64,
-    times: &mut T,
-) -> Result<HistoryCosts, Stop<T::Missing>> {
-    let identity = E::program(programs).identity(backend)?;
-    let per_token = token_bytes(layout)?;
-    let time = |depth: u64, sets: u64, times: &mut T| {
-        times.time(
+impl Walk<'_> {
+    /// One point of `layout`'s ladder, read through `E`, its history along
+    /// device storage's first route, into `ladder`, with history streaming
+    /// from memory at `activation_rate`.
+    ///
+    /// The pilot times the first depth over one argument set: where its
+    /// history's bytes, read from memory at the activation rate, are under
+    /// [`UNROTATED`] of its time, where they come from cannot move it, and
+    /// every rung is timed over one set, each sample one call, the first
+    /// rung loading the pilot's record; else each rung rotates through the
+    /// sets that span the cache, so its history comes from memory as it
+    /// does at the depths estimates read. A rotation takes at most the
+    /// walk's room: where the sets that span the cache exceed it, fewer
+    /// sets read the rung, some of its bytes perhaps from a cache.
+    ///
+    /// A rung is read where its plane fits the largest allocation and one
+    /// set of it the room, and, above the first, where its call, priced
+    /// from the slowest rung below at its depth, fits a point's share of the
+    /// job (a deep rung needs few samples, and reading deeper is what prices
+    /// deep contexts: a Ryzen 5600X's attention, read to 16K tokens, priced
+    /// 24K to 96K 19% slow, 2026-10-22); a rung above the first releases its
+    /// rotation once it is timed ([`Times::time_apart`]). The ladder ends at
+    /// the first rung it does not read, and its line runs through those it
+    /// did ([`HistoryCosts::line`]).
+    fn rung<E: Attention, T: Times>(
+        &self,
+        layout: KvCodec,
+        rung: Rung,
+        ladder: &mut Ladder,
+        activation_rate: f64,
+        times: &mut T,
+        share: Share,
+    ) -> Result<(), Stop<T::Missing>> {
+        if ladder.ended {
+            return Ok(());
+        }
+        let programs = &self.programs;
+        let identity = E::program(programs).identity(self.backend)?;
+        let per_token = token_bytes(layout)?;
+        let route = self.routes[0];
+        let point = |depth: u64, sets: u64| {
             PointSpec::new(
                 vec![identity.clone()],
                 &[("rows", 1)],
                 &[("depth", depth), ("sets", sets)],
-            ),
-            programs,
-            &mut calls::<E, _>(
-                |formed: &Programs| kernel(E::formed(formed)),
+            )
+        };
+        let build = |depth: u64, sets: u64| {
+            calls::<E, _>(
+                |formed: &Programs| formed.kernel(E::formed(formed)),
                 move |device, backings| {
                     AttendCase::new(device, backings, layout, route, depth, sets)
                 },
                 E::args,
-            ),
-        )
-    };
-    let fits = |depth: u64| -> Result<bool, Stop<T::Missing>> {
-        Ok(largest_plane(layout, depth)? <= largest)
-    };
-    let one_token = time(1, 1, times)?;
-    // A call at depth d takes the one-token time and d - 1 more tokens'
-    // bytes at the rate: the least d whose call takes the larger of the two
-    // bounds.
-    let bound = (LAUNCH_MULTIPLE * launch).max(2.0 * one_token.median);
-    let predicted = ((bound - one_token.median) * activation_rate / per_token as f64).ceil();
-    let mut depth = (predicted as u64).saturating_add(1).max(2);
-    while depth > 1 && !fits(depth)? {
-        depth /= 2;
-    }
-    let searched = loop {
-        let timing = time(depth, 1, times)?;
-        if (sized(&timing, launch) && timing.median >= 2.0 * one_token.median) || !fits(2 * depth)?
-        {
-            break timing;
+            )
+        };
+        let (index, sets) = match rung {
+            Rung::Pilot => (0, 1),
+            Rung::Depth(index) => {
+                let bytes = HISTORY_DEPTHS[index] * per_token;
+                let rotated = ladder
+                    .rotated
+                    .expect("the plan reads a ladder's pilot before its rungs");
+                let sets = if rotated {
+                    rotation_sets(self.cache, bytes)
+                        .min(self.room / bytes)
+                        .max(1)
+                } else {
+                    1
+                };
+                (index, sets)
+            }
+        };
+        let depth = HISTORY_DEPTHS[index];
+        if largest_plane(layout, depth)? > self.largest || depth * per_token > self.room {
+            ladder.ended = true;
+            return Ok(());
         }
-        depth *= 2;
-    };
-    let (near_depth, far_depth) = if fits(2 * depth)? {
-        (depth, 2 * depth)
-    } else {
-        (depth / 2, depth)
-    };
-    if near_depth == 0 {
-        return Err(Stop::Failed(ExecutorCostsError(
-            "the largest allocation holds one token of history: no second depth to separate \
-             the fixed cost from"
-                .into(),
-        )));
-    }
-    // Where the searched call's bytes, read from memory at the activation
-    // rate, are a small part of its time, where they come from cannot move
-    // it: its kernel is that much slower than streaming them. Each depth is
-    // then timed over one argument set, a call of milliseconds rather than a
-    // rotation of a second (a CPU's attention, its history read at 110 to 310
-    // MB/s against 30 GB/s streaming), and resolved; else over a rotation.
-    let rotated = (depth * per_token) as f64 / activation_rate > UNROTATED * searched.median;
-    let sets = |depth: u64| {
-        if rotated {
-            rotation_sets(cache, depth * per_token)
-        } else {
-            1
+        let timing = match (rung, ladder.rungs.last()) {
+            (Rung::Depth(_), Some(_)) => {
+                let below = HISTORY_DEPTHS[index - 1];
+                let slowest = ladder
+                    .rungs
+                    .iter()
+                    .map(|cost| cost.value)
+                    .fold(0., f64::max);
+                let call = slowest * depth as f64 / below as f64;
+                if call > self.point_seconds {
+                    ladder.ended = true;
+                    return Ok(());
+                }
+                times.time_apart(
+                    point(depth, sets),
+                    programs,
+                    &mut build(depth, sets),
+                    share.forecast(call * sets as f64, sets * depth * per_token),
+                )?
+            }
+            _ => times.time(point(depth, sets), programs, &mut build(depth, sets), share)?,
+        };
+        match rung {
+            Rung::Pilot => {
+                ladder.rotated =
+                    Some((depth * per_token) as f64 / activation_rate > UNROTATED * timing.median);
+            }
+            Rung::Depth(_) => ladder.rungs.push(MeasuredCost::of(&timing)),
         }
-    };
-    let near = time(near_depth, sets(near_depth), times)?;
-    let far = time(far_depth, sets(far_depth), times)?;
-    if !(far.median > near.median) {
-        return Err(Stop::Failed(ExecutorCostsError(format!(
-            "{far_depth} tokens took no longer than {near_depth}"
-        ))));
+        Ok(())
     }
-    let bytes = |depth: u64| (depth * per_token) as f64;
-    // The bytes' rate is the far depth's time beyond the near one's, its
-    // interval from the far time's; the fixed cost is the near time less
-    // its bytes at that rate.
-    let between = bytes(far_depth) - bytes(near_depth);
-    let rate = between / (far.median - near.median);
-    let interval = far.interval.map(|(fastest, slowest)| {
-        let rate = |seconds: f64| between / (seconds - near.median).max(f64::MIN_POSITIVE);
-        (rate(slowest), rate(fastest))
-    });
-    // A call takes at least its bytes' time: where the line meets zero
-    // tokens below zero seconds (an arithmetic-bound attention's fixed part,
-    // well under a millisecond, read at depths whose calls take tens of
-    // them), the fixed cost is none.
-    let near_bytes = bytes(near_depth) / rate;
-    let fixed = |seconds: f64| (seconds - near_bytes).max(0.);
-    Ok(HistoryCosts {
-        layout,
-        fixed_seconds: MeasuredCost {
-            value: fixed(near.median),
-            interval: near
-                .interval
-                .map(|(fastest, slowest)| (fixed(fastest), fixed(slowest))),
-            samples: near.samples,
-        },
-        bytes_per_second: MeasuredCost {
-            value: rate,
-            interval,
-            samples: far.samples,
-        },
-        depths: [near_depth, far_depth],
-    })
 }
 
 /// The executor `executor` names in `topology`, and its identity.
@@ -2973,17 +3910,24 @@ impl ExecutorCosts {
     /// Measure `device`'s cost points through `measurer`: each point of the
     /// walk goes to `measure_all`, which loads it from `store` or reports it to
     /// `attempting`, makes it only when attempted (the walk's kernels formed
-    /// with the first, [`ProgramSet::form`]), times it at the
-    /// sustained clock until its median is resolved, and stores its record.
-    /// `device` holds no path limit: the walk passes over a placement's paths
-    /// by holding them. Fails when `device`'s executor is not of its own
-    /// topology's revision; otherwise returns every point visited, with what
-    /// ended the walk early.
+    /// with the first, [`ProgramSet::form`]), times it at the sustained
+    /// clock for its share of the time left before `deadline` (the job's
+    /// [`MEASUREMENT_SECONDS`] from its start) or until its median is
+    /// resolved, and stores its record; `visit` is told what became of each
+    /// point as soon as it is known. A point the deadline ends before any
+    /// sample expires ([`Outcome::Expired`]), unrecorded, and the probe so
+    /// ends the walk. `device` holds no path limit: the walk
+    /// passes over a placement's paths by holding them. Fails when
+    /// `device`'s executor is not of its own topology's revision; otherwise
+    /// returns what ended the walk early, and what the job's points were
+    /// made in and from ([`Measurement::held`]).
     pub fn measure(
         measurer: &mut Measurer,
         device: &Device,
         store: &dyn RecordStore<PointKey>,
+        deadline: std::time::Instant,
         attempting: &mut dyn FnMut(&PointKey) -> Attempt,
+        visit: &mut dyn FnMut(PointKey, Outcome<CallError, ExecutorCostsError>),
     ) -> Result<Measurement, ExecutorCostsError> {
         let topology = device.topology().clone();
         let executor = device.info().clone();
@@ -2997,30 +3941,38 @@ impl ExecutorCosts {
             attempting,
             programs: std::cell::OnceCell::new(),
             backings: Backings::default(),
-            visited: Vec::new(),
+            visit,
+            deadline,
         };
         // What the walk derives is the start's to derive from the records;
-        // the job reports the records, and why the walk ended early where no
-        // visited point says.
-        let ended = match walk(&topology, &executor, &mut measured) {
-            Ok(_) | Err(Stop::Point(_)) => None,
-            Err(Stop::Failed(error)) => Some(error),
+        // the job reports the records as they come, and why the walk ended
+        // early, or left a figure derived, where no visited point says.
+        let walked = walk(&topology, &executor, &mut measured);
+        let held = Held {
+            _backings: measured.backings,
+            _programs: measured.programs.into_inner(),
+        };
+        let (ended, failures) = match walked {
+            Ok(walked) => (None, walked.failures),
+            Err(Stop::Point(_) | Stop::Expired) => (None, Vec::new()),
+            Err(Stop::Failed(error)) => (Some(error), Vec::new()),
             Err(Stop::Missing(never)) => match never {},
         };
         Ok(Measurement {
-            points: measured.visited,
             ended,
+            failures,
+            held,
         })
     }
 
     /// The costs `store`'s records give `executor`, retracing the walk the job
-    /// measures and measuring nothing (forming nothing): complete, or the first
-    /// point missing (never attempted, or not to its end: pending). A point
-    /// recorded unobtainable leaves its format, layout or upload-only route
-    /// unmeasured with the recorded reason, or fails the costs when it is one
-    /// every estimate needs (the launch graph, the weight rate of each route of
-    /// device storage's placement, the dense attention and the composition
-    /// chain), as does a record that cannot be read.
+    /// measures and measuring nothing (forming nothing): complete once the
+    /// probe is stored ([`Step::probe`]), pending while a later point no
+    /// record holds is still to be measured (its figure priced meanwhile),
+    /// and otherwise missing the probe (never attempted, or not to its end).
+    /// Another point recorded unobtainable leaves its figure priced; the
+    /// probe recorded so fails the costs, as does a record store that cannot
+    /// be read.
     pub fn stored(
         topology: &DeviceTopology,
         executor: &Executor,
@@ -3033,13 +3985,17 @@ impl ExecutorCosts {
             },
             read: Vec::new(),
         };
+        // A failure outside a point's timing, which leaves its figure
+        // derived, is the job's to report: it recurs at each of its walks.
         match walk(topology, executor, &mut stored) {
-            Ok(costs) => Ok(StoredCosts::Complete {
-                costs,
+            Ok(walked) => Ok(StoredCosts::Complete {
+                costs: walked.costs,
                 records: stored.read,
+                pending: walked.pending,
             }),
             Err(Stop::Missing(key)) => Ok(StoredCosts::Missing(key)),
             Err(Stop::Point(error) | Stop::Failed(error)) => Err(error),
+            Err(Stop::Expired) => unreachable!("timings from records alone have no deadline"),
         }
     }
 }
@@ -3047,6 +4003,250 @@ impl ExecutorCosts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A depth is priced on the segment of the ladder it lies in, and one
+    /// outside it on the nearest: a ladder whose time per token falls with
+    /// depth prices each segment at its own rate, where one line through
+    /// its first two rungs would price the deepest slow.
+    #[test]
+    fn a_depth_is_priced_on_its_ladder_segment() {
+        let per_token = token_bytes(KvCodec::Dense).unwrap() as f64;
+        let cost = |value| MeasuredCost {
+            value,
+            interval: None,
+            samples: 8,
+        };
+        // 10 µs a call; history at 100 GB/s to 16K tokens, 200 GB/s beyond.
+        let at = |depth: f64| {
+            let shallow = depth.min(16384.) * per_token / 100e9;
+            let deep = (depth - 16384.).max(0.) * per_token / 200e9;
+            10e-6 + shallow + deep
+        };
+        let [first, second, third] = HISTORY_DEPTHS[..3] else {
+            unreachable!("the ladder has three rungs and more")
+        };
+        let history = HistoryCosts::new(
+            KvCodec::Dense,
+            vec![cost(at(first as f64)), cost(at(second as f64)), cost(at(third as f64))],
+        )
+        .unwrap();
+        let price = |depth: f64| {
+            let line = history.line(depth, 1e9);
+            line.fixed_seconds + depth * per_token * line.seconds_per_byte
+        };
+        for depth in [4096., 12000., 16384., 24576., 65536.] {
+            assert!((price(depth) / at(depth) - 1.).abs() < 1e-9, "{depth}");
+        }
+        assert!((history.line(65536., 1e9).seconds_per_byte * 200e9 - 1.).abs() < 1e-9);
+    }
+
+    /// A rung that reads faster than one below it is priced at the slower
+    /// one's time, as a call over more history takes no less: its segment is
+    /// flat, each byte priced at none, and the segment past it rises from
+    /// the slower time.
+    #[test]
+    fn a_rung_faster_than_one_below_it_prices_a_flat_segment() {
+        let per_token = token_bytes(KvCodec::AffineK8V4).unwrap() as f64;
+        let cost = |value| MeasuredCost {
+            value,
+            interval: None,
+            samples: 8,
+        };
+        let history = HistoryCosts::new(
+            KvCodec::AffineK8V4,
+            vec![cost(2e-3), cost(1.5e-3), cost(4e-3)],
+        )
+        .unwrap();
+        let flat = history.line(12000., 1e9);
+        assert_eq!(flat.seconds_per_byte, 0.);
+        assert_eq!(flat.fixed_seconds, 2e-3);
+        let rising = history.line(24576., 1e9);
+        let between = (HISTORY_DEPTHS[2] - HISTORY_DEPTHS[1]) as f64 * per_token;
+        assert!((rising.seconds_per_byte * between / 2e-3 - 1.).abs() < 1e-12);
+    }
+
+    /// A ladder with one rung prices every depth on the line through it
+    /// from no fixed cost, and one with none at the rate memory streams its
+    /// bytes at.
+    #[test]
+    fn a_ladder_with_fewer_than_two_rungs_is_priced_through_the_origin() {
+        let per_token = token_bytes(KvCodec::Dense).unwrap() as f64;
+        let one = HistoryCosts::new(
+            KvCodec::Dense,
+            vec![MeasuredCost {
+                value: 2e-3,
+                interval: None,
+                samples: 8,
+            }],
+        )
+        .unwrap();
+        let line = one.line(65536., 1e9);
+        assert_eq!(line.fixed_seconds, 0.);
+        assert!((line.seconds_per_byte * HISTORY_DEPTHS[0] as f64 * per_token / 2e-3 - 1.).abs() < 1e-12);
+        let none = HistoryCosts::new(KvCodec::Dense, Vec::new()).unwrap();
+        assert_eq!(
+            none.line(65536., 1e9),
+            HistoryLine {
+                fixed_seconds: 0.,
+                seconds_per_byte: 1e-9,
+            }
+        );
+    }
+
+    /// The plan reads everything after the probe, which it leaves out, in
+    /// its order, each step one point: a job's share follows from the plan
+    /// alone.
+    #[test]
+    fn the_plan_reads_every_step_after_the_probe_in_order() {
+        let route = |storage| Route {
+            route: AccessRoute::Device,
+            storage,
+            passed: Vec::new(),
+            along: Vec::new(),
+        };
+        let (device, upload) = (route(StorageKind::Device), route(StorageKind::Upload));
+        let (bf16, f32) = (Element::bf16(), Element::f32());
+        let steps = plan(&[&device, &upload], &[bf16, f32]);
+        let first = |layout| {
+            [Rung::Pilot, Rung::Depth(0), Rung::Depth(1)].map(|rung| Step::Rung(layout, rung))
+        };
+        let deeper = |layout| (2..HISTORY_DEPTHS.len()).map(move |index| Step::Rung(layout, Rung::Depth(index)));
+        let mut expected = vec![Step::Launch(GraphTiming::Device)];
+        expected.extend(first(KvCodec::Dense));
+        expected.extend([Step::Chain, Step::Matrix(bf16)]);
+        expected.extend(first(KvCodec::AffineK8V4));
+        expected.extend([
+            Step::WeightRate(1, bf16, Pass::Rate),
+            Step::Launch(GraphTiming::Waited),
+            Step::Launch(GraphTiming::Queued),
+            Step::WeightRate(0, f32, Pass::Pilot),
+            Step::WeightRate(0, f32, Pass::Rate),
+        ]);
+        expected.extend(deeper(KvCodec::Dense).chain(deeper(KvCodec::AffineK8V4)));
+        expected.push(Step::Matrix(f32));
+        assert_eq!(steps, expected);
+    }
+
+    /// The composition ratio is the chain's time over its layers' calls as
+    /// the costs price them alone, each a launch: here the fixture's 300
+    /// GB/s weights, 20 TFLOP/s, 10 µs and 200 GB/s history and 5 µs
+    /// launches, the chain read at 1.25 times their price.
+    #[test]
+    fn the_composition_ratio_is_the_chain_over_its_calls_priced() {
+        let costs = crate::assessment::fixtures::costs();
+        let backend = seismic::BackendName::Cpu;
+        let chain = chain_element(backend).unwrap();
+        let programs =
+            ProgramSet::new(Sizes::of(backend), &measured_formats(backend), chain, 1 << 34)
+                .unwrap();
+        let (features, _) = programs.expand(chain);
+        let depth = HISTORY_DEPTHS[0] as f64;
+        let launch = 5e-6;
+        let call = |bytes: f64, rate: f64, flops: f64| (bytes / rate).max(flops / 20e12) + launch;
+        let output = chain.canonical_byte_len(&[HIDDEN, features]).unwrap() as f64;
+        let history = depth * token_bytes(KvCodec::Dense).unwrap() as f64;
+        let flops = (features * HIDDEN) as f64;
+        let layer = call(expand_weight_bytes(chain, features).unwrap() as f64, 300e9, 4. * flops)
+            + call(history, 200e9, depth * (2 * KV_HEADS * GROUP * 2 * HEAD_WIDTH) as f64)
+            + 10e-6
+            + call(output, 300e9, 2. * flops)
+            + launch;
+        let layers = 6;
+        let read = ChainRead {
+            timing: Timing {
+                median: 1.25 * layers as f64 * layer,
+                interval: None,
+                samples: 8,
+            },
+            layers,
+        };
+        let ratio = read.composition(&programs, &costs).unwrap();
+        assert!((ratio.value / 1.25 - 1.).abs() < 1e-12, "{}", ratio.value);
+    }
+
+    /// Records held in memory.
+    #[derive(Default)]
+    struct Held(std::cell::RefCell<Vec<(PointKey, Record)>>);
+
+    impl RecordStore<PointKey> for Held {
+        fn load(&self, key: &PointKey) -> Result<Option<Record>, seismic::measure::StoreError> {
+            Ok(self
+                .0
+                .borrow()
+                .iter()
+                .find(|(held, _)| held == key)
+                .map(|(_, record)| record.clone()))
+        }
+
+        fn store(
+            &self,
+            key: &PointKey,
+            record: &Record,
+        ) -> Result<(), seismic::measure::StoreError> {
+            self.0.borrow_mut().push((key.clone(), record.clone()));
+            Ok(())
+        }
+    }
+
+    /// The stored records give the probe until it is stored; then complete
+    /// costs, pending while every later point is not, each figure but the
+    /// probe priced. The probe recorded unobtainable gives no costs.
+    #[test]
+    fn stored_costs_complete_with_the_probe() {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let topology = catalog.topology();
+        let executor = topology
+            .executors()
+            .iter()
+            .find(|executor| executor.backend() == seismic::BackendName::Cpu)
+            .unwrap()
+            .clone();
+        let measured = Record::Measured(Timing {
+            median: 1e-3,
+            interval: None,
+            samples: 8,
+        });
+        let stored = Held::default();
+        let StoredCosts::Missing(probe) =
+            ExecutorCosts::stored(&topology, &executor, &stored).unwrap()
+        else {
+            panic!("nothing is stored")
+        };
+        stored.store(&probe, &measured).unwrap();
+        let StoredCosts::Complete {
+            costs,
+            records,
+            pending,
+        } = ExecutorCosts::stored(&topology, &executor, &stored).unwrap()
+        else {
+            panic!("the probe is stored")
+        };
+        assert!(pending, "the later points are still to be measured");
+        assert_eq!(records.len(), 1);
+        assert!(costs.first.formats.is_empty());
+        assert!(costs
+            .routes
+            .iter()
+            .all(|route| route.activation.is_none() && route.formats.is_empty()));
+        let derived = costs.derived(seismic::BackendName::Cpu);
+        for figure in [
+            Derived::ActivationMatrix,
+            Derived::Composition,
+            Derived::Launch,
+            Derived::Step,
+            Derived::History(KvCodec::Dense),
+            Derived::History(KvCodec::AffineK8V4),
+        ] {
+            assert!(derived.contains(&figure), "{figure:?}");
+        }
+
+        let unobtainable = Held::default();
+        let reason = Reason::new("no kernel");
+        unobtainable
+            .store(&probe, &Record::Unobtainable { reason })
+            .unwrap();
+        assert!(ExecutorCosts::stored(&topology, &executor, &unobtainable).is_err());
+    }
 
     /// Every codec a native attention entry reads is a measured layout.
     #[test]

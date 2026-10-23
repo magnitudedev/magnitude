@@ -21,20 +21,21 @@ use magnitude_engine::{
     },
     error::UnsupportedModel,
     options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
-    worker::measure::{measure_machine, MeasureEvent, MeasureJob, MeasureRequest},
+    worker::measure::{measure_machine, MeasureEnd, MeasureEvent, MeasureJob, MeasureRequest},
 };
 use magnitude_executor::{
     assessment::{
-        decode_pricing, step_seconds, DomainFit, ExecutionFit, ExecutionShortfall, ExecutorCosts,
-        MeasuredCost,
+        decode_pricing, step_seconds, Derived, DomainFit, ExecutionFit, ExecutionShortfall,
+        ExecutorCosts, FormatRates, HistoryCosts, MatrixCosts, MeasuredCost, WeightRate,
+        MEASUREMENT_SECONDS,
     },
     platform::{DeviceRequest, MemoryReserves},
 };
-use seismic::{Devices, DiagnosticSource, StoreId, StoreIdentity};
+use seismic::{Devices, DiagnosticSource, Element, StoreId, StoreIdentity};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const STANDARD_DEPTHS: [u32; 3] = [25_000, 50_000, 75_000];
 
@@ -47,6 +48,8 @@ struct Options {
     sequences: u32,
     /// Print each model's step call by call at each depth.
     breakdown: bool,
+    /// The measurement job's time, its service's by default.
+    time: Duration,
     /// Print the topology, its discovery diagnostics, its measurements and
     /// the executor costs rather than assess models.
     topology: bool,
@@ -54,7 +57,8 @@ struct Options {
 }
 
 const USAGE: &str = "magnitude-assess --device auto|metal|cuda|vulkan|cpu --kernels DIR \
-     [--depths 25000,50000,75000] [--sequences 1] [--breakdown] [--method auto|plain] \
+     [--seconds 10] [--depths 25000,50000,75000] [--sequences 1] [--breakdown] \
+     [--method auto|plain] \
      (--topology | TARGET.gguf[,[PROJECTOR.gguf][,DRAFT.gguf]]...)";
 
 fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
@@ -69,6 +73,7 @@ fn parse() -> Result<Options, String> {
     // A serving profile's, as the service estimates.
     let mut sequences = PROFILE_SEQUENCES;
     let mut breakdown = false;
+    let mut seconds = MEASUREMENT_SECONDS;
     let mut method = ModelMethod::Auto;
     let mut topology = false;
     let mut models = Vec::new();
@@ -96,6 +101,11 @@ fn parse() -> Result<Options, String> {
                 sequences = value(&argument, &mut args)?
                     .parse()
                     .map_err(|error| format!("--sequences: {error}"))?
+            }
+            "--seconds" => {
+                seconds = value(&argument, &mut args)?
+                    .parse()
+                    .map_err(|error| format!("--seconds: {error}"))?
             }
             "--kernels" => kernels = Some(PathBuf::from(value(&argument, &mut args)?)),
             "--breakdown" => breakdown = true,
@@ -143,6 +153,8 @@ fn parse() -> Result<Options, String> {
         depths,
         sequences,
         breakdown,
+        time: Duration::try_from_secs_f64(seconds)
+            .map_err(|error| format!("--seconds: {error}"))?,
         topology,
         models,
     })
@@ -209,13 +221,14 @@ fn run() -> Result<bool, String> {
     // Measured as the job measures: what is stored is kept, and each record
     // stored now is printed.
     let started = Instant::now();
-    let failures = measure_machine(
+    let MeasureEnd { failures, held } = measure_machine(
         &MeasureRequest {
             paths: served,
             kernels: options.kernels.clone(),
             executor: executor.selector(),
             // Nothing preempts the tool's job; its process names it.
             job: MeasureJob(u64::from(std::process::id())),
+            time: options.time,
         },
         &mut |event| {
             if let MeasureEvent::Recorded(key, record) = event {
@@ -228,6 +241,7 @@ fn run() -> Result<bool, String> {
     );
     let measure_seconds = started.elapsed().as_secs_f64();
     eprintln!("magnitude-assess: measured in {measure_seconds:.3} s");
+    drop(held);
     for failure in &failures {
         eprintln!("magnitude-assess: not measured: {failure}");
     }
@@ -236,8 +250,10 @@ fn run() -> Result<bool, String> {
     if options.topology {
         let costs = match &measurements {
             Measurements::Measured {
-                costs: measured, ..
-            } => costs(measured),
+                costs: measured,
+                pending,
+                ..
+            } => costs(measured, executor.backend(), *pending),
             Measurements::Pending => json!("pending"),
             Measurements::Unavailable { reason } => json!({ "unavailable": reason }),
         };
@@ -305,44 +321,96 @@ fn cost(cost: &MeasuredCost) -> Value {
     json!({ "value": cost.value, "interval": cost.interval, "samples": cost.samples })
 }
 
-/// The executor's costs, each with its interval and samples.
-fn costs(costs: &ExecutorCosts) -> Value {
-    json!({
-        "weightRates": costs.weight_rates.iter().map(|rate| {
-            // The launch cost's share of one call: its two weights of F × 4096
-            // at the rate measured.
-            let call = rate
-                .format
-                .canonical_byte_len(&[rate.features, 4096])
-                .map(|bytes| 2.0 * bytes as f64 / rate.bytes_per_second.value)
-                .ok();
-            json!({
-                "route": rate.route,
-                "format": rate.format.name(),
-                "bytesPerSecond": cost(&rate.bytes_per_second),
-                "features": rate.features,
-                "launchFraction": call.map(|call| costs.launch_seconds.value / call),
-            })
-        }).collect::<Vec<_>>(),
-        "matrixFlopsPerSecond": costs.matrices.iter().map(|matrix| json!({
-            "format": matrix.format.name(),
+/// The executor's costs, each with its interval and samples, the figures
+/// priced from them of `backend`'s formats, and whether a point is still
+/// pending.
+fn costs(costs: &ExecutorCosts, backend: seismic::BackendName, pending: bool) -> Value {
+    let rate = |format: Element, rate: &WeightRate| {
+        // The launch cost's share of one call: its two weights of F × 4096
+        // at the rate measured.
+        let call = format
+            .canonical_byte_len(&[rate.features, 4096])
+            .map(|bytes| 2.0 * bytes as f64 / rate.bytes_per_second.value)
+            .ok();
+        json!({
+            "format": format.name(),
+            "bytesPerSecond": cost(&rate.bytes_per_second),
+            "features": rate.features,
+            "launchFraction": call.map(|call| costs.launch() / call),
+        })
+    };
+    let matrix = |format: Element, matrix: &MatrixCosts| {
+        json!({
+            "format": format.name(),
             "flops": cost(&matrix.flops),
             "features": matrix.features,
-        })).collect::<Vec<_>>(),
-        "history": costs.histories.iter().map(|history| json!({
-            "layout": history.layout.identity(),
-            "fixedSeconds": cost(&history.fixed_seconds),
-            "bytesPerSecond": cost(&history.bytes_per_second),
-            "depths": history.depths,
-        })).collect::<Vec<_>>(),
-        "composition": cost(&costs.composition),
-        "launchSeconds": cost(&costs.launch_seconds),
-        "stepPipelinedSeconds": cost(&costs.step_pipelined_seconds),
-        "stepRoundTripSeconds": cost(&costs.step_round_trip_seconds),
-        "unmeasured": costs.unmeasured.iter().map(|unmeasured| json!({
-            "figure": unmeasured.figure.to_string(),
-            "reason": unmeasured.reason,
-        })).collect::<Vec<_>>(),
+        })
+    };
+    let route = |route: seismic::AccessRoute,
+                 activation: Option<&WeightRate>,
+                 formats: &[(Element, FormatRates)]| {
+        json!({
+            "route": route,
+            "rates": activation
+                .map(|activation| rate(Element::bf16(), activation))
+                .into_iter()
+                .chain(formats.iter().map(|(format, rates)| {
+                    // Its streaming rate where read, with its pilot's.
+                    let mut read = rate(*format, rates.streamed.as_ref().unwrap_or(&rates.pilot));
+                    read["streamed"] = json!(rates.streamed.is_some());
+                    read["pilotBytesPerSecond"] = cost(&rates.pilot.bytes_per_second);
+                    read
+                }))
+                .collect::<Vec<_>>(),
+        })
+    };
+    let history = |history: &HistoryCosts| {
+        json!({
+            "layout": history.layout().identity(),
+            "rungs": history.rungs().map(|(depth, seconds)| json!({
+                "depth": depth,
+                "seconds": cost(seconds),
+            })).collect::<Vec<_>>(),
+        })
+    };
+    json!({
+        // Device storage's first route, its bf16 rate the probe, then the rest.
+        "weightRates": std::iter::once(route(
+            costs.first.route,
+            Some(&costs.first.activation),
+            &costs.first.formats,
+        ))
+        .chain(costs.routes.iter().map(|other| {
+            route(other.route, other.activation.as_ref(), &other.formats)
+        }))
+        .collect::<Vec<_>>(),
+        "matrixFlopsPerSecond": costs
+            .activation_matrix
+            .iter()
+            .map(|measured| matrix(Element::bf16(), measured))
+            .chain(costs.matrices.iter().map(|(format, measured)| matrix(*format, measured)))
+            .collect::<Vec<_>>(),
+        "history": [history(&costs.dense), history(&costs.affine)],
+        "composition": costs.composition.as_ref().map(cost),
+        "launchSeconds": costs.launch_seconds.as_ref().map(cost),
+        "stepPipelinedSeconds": costs.step_pipelined_seconds.as_ref().map(cost),
+        "stepRoundTripSeconds": costs.step_round_trip_seconds.as_ref().map(cost),
+        // Priced from the figures read until measured.
+        "derived": costs.derived(backend).iter().map(|derived| match derived {
+            Derived::ActivationRate(route) => json!({ "activationRate": route }),
+            Derived::WeightRate(route, format) => {
+                json!({ "weightRate": { "route": route, "format": format.name() } })
+            }
+            Derived::ActivationMatrix => json!("activationMatrix"),
+            Derived::MatrixThroughput(format) => {
+                json!({ "matrixThroughput": format.name() })
+            }
+            Derived::History(layout) => json!({ "history": layout.identity() }),
+            Derived::Composition => json!("composition"),
+            Derived::Launch => json!("launch"),
+            Derived::Step => json!("step"),
+        }).collect::<Vec<_>>(),
+        "pending": pending,
     })
 }
 
@@ -408,14 +476,8 @@ fn print_breakdown(
         model.target.display(),
         demand.calls.len(),
         pricing.lookahead,
-        pricing
-            .activations(seismic::StorageKind::Device)
-            .map_err(failed)?
-            / 1e9,
-        pricing
-            .activations(seismic::StorageKind::Upload)
-            .map_err(failed)?
-            / 1e9,
+        pricing.activations(seismic::StorageKind::Device) / 1e9,
+        pricing.activations(seismic::StorageKind::Upload) / 1e9,
     );
     for &depth in &options.depths {
         let step = step_seconds(demand, &pricing, sequences, depth).map_err(failed)?;

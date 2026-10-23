@@ -104,17 +104,22 @@ impl AssessmentStructure {
     /// What this machine's stored records give assessment now: the selected
     /// executor's costs, derived from the records of its cost points in the
     /// kernel cache at `kernels`, opening no device and measuring nothing.
-    /// A point the measurement job found unobtainable is a record too, so
-    /// the costs complete without it; a point with no record leaves them
-    /// `Pending`, for the job to take. Costs that cannot be derived from
-    /// what is stored (an unreadable record, or a point every estimate
-    /// needs recorded unobtainable) are `Unavailable`.
+    /// The costs are `Measured` once the probe is stored, pending while a
+    /// later point has no record yet (its figure priced from those read
+    /// until the job takes it); before then they are `Pending`. Costs that
+    /// cannot be derived from what is stored (a record store that cannot be
+    /// read, or the probe recorded unobtainable) are `Unavailable`.
     pub fn stored_measurements(&self, kernels: &Path) -> Measurements {
         let records = KernelCache::measurement_records(kernels);
         match ExecutorCosts::stored(&self.topology, &self.selected.info, &records) {
-            Ok(StoredCosts::Complete { costs, records }) => Measurements::Measured {
+            Ok(StoredCosts::Complete {
+                costs,
+                records,
+                pending,
+            }) => Measurements::Measured {
                 costs: Arc::new(costs),
                 records: Arc::new(records),
+                pending,
             },
             Ok(StoredCosts::Missing(_)) => Measurements::Pending,
             Err(error) => Measurements::Unavailable {
@@ -129,18 +134,22 @@ impl AssessmentStructure {
 /// stored.
 #[derive(Clone)]
 pub enum Measurements {
-    /// The job has not stored a record of every point yet: fit is assessed
-    /// and speed is pending.
+    /// The job has not stored the probe yet: fit is assessed and speed is
+    /// pending.
     Pending,
-    /// The stored records give no costs, and why: every fitting model's
-    /// speed is unavailable.
+    /// The stored records give no costs, and why: the probe is recorded
+    /// unobtainable (the executor cannot stream its own weights), or the
+    /// records cannot be read, and every fitting model's speed is
+    /// unavailable.
     Unavailable { reason: String },
     /// The selected executor's costs, and the stored records they were
-    /// derived from, which identify them. What could not be measured is in
-    /// them, so a model whose calls need it estimates as unavailable.
+    /// derived from, which identify them. Every model's speed is estimated
+    /// from them; while `pending`, a later point is still to be measured and
+    /// its figure is priced until it is.
     Measured {
         costs: Arc<ExecutorCosts>,
         records: Arc<Vec<(seismic::PointKey, seismic::measure::Record)>>,
+        pending: bool,
     },
 }
 
@@ -360,17 +369,10 @@ pub fn finish_model_assessment(
                 Measurements::Unavailable { reason } => Performance::Unavailable {
                     reason: reason.clone(),
                 },
-                Measurements::Measured { costs, .. } => {
-                    match estimate_execution(preparation, draft, costs, &request) {
-                        Ok(estimates) => Performance::Estimated(estimates),
-                        // A cost the model's calls need could not be measured
-                        // on this machine: its speed is unavailable.
-                        Err(AssessmentError::Unmeasured(reason)) => {
-                            Performance::Unavailable { reason }
-                        }
-                        Err(error) => return Err(ModelAssessmentError::Assessment(error)),
-                    }
-                }
+                Measurements::Measured { costs, .. } => Performance::Estimated(
+                    estimate_execution(preparation, draft, costs, &request)
+                        .map_err(ModelAssessmentError::Assessment)?,
+                ),
             },
         },
     };

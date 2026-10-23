@@ -36,14 +36,9 @@ impl JsonFileStore {
             .join(format!("{:x}.json", Sha256::digest(key))))
     }
 
-    /// The value stored under `key`, none when none is; a file larger than
-    /// `largest` bytes, the most a value of `key` is written as, is an
-    /// error like any other unreadable one.
-    pub fn load<V: DeserializeOwned>(
-        &self,
-        key: &impl Serialize,
-        largest: u64,
-    ) -> Result<Option<V>, StoreError> {
+    /// The bytes stored under `key`, none when none is, read to at most
+    /// `largest` + 1 bytes; every failure but an absent file is an error.
+    fn bytes(&self, key: &impl Serialize, largest: u64) -> Result<Option<Vec<u8>>, StoreError> {
         let path = self.path(key)?;
         let failed = |cause: std::io::Error| error(format!("{}: {cause}", path.display()));
         let file = match std::fs::File::open(&path) {
@@ -55,6 +50,21 @@ impl JsonFileStore {
         file.take(largest + 1)
             .read_to_end(&mut bytes)
             .map_err(failed)?;
+        Ok(Some(bytes))
+    }
+
+    /// The value stored under `key`, none when none is; a file larger than
+    /// `largest` bytes, the most a value of `key` is written as, is an
+    /// error like any other unreadable one.
+    pub fn load<V: DeserializeOwned>(
+        &self,
+        key: &impl Serialize,
+        largest: u64,
+    ) -> Result<Option<V>, StoreError> {
+        let Some(bytes) = self.bytes(key, largest)? else {
+            return Ok(None);
+        };
+        let path = self.path(key)?;
         if bytes.len() as u64 > largest {
             return Err(error(format!(
                 "{}: larger than the {largest} bytes a value of its key is written as",
@@ -81,10 +91,18 @@ impl JsonFileStore {
 }
 
 /// Records under serializable keys, each read bounded by
-/// [`Record::largest`].
+/// [`Record::largest`]. A record is a measurement's cache entry, which
+/// losing costs only measuring its point again: a file that is no record
+/// (larger than any, or not decoding as one, as a record of an earlier
+/// form does not) holds none, so its point is measured again and the file
+/// replaced. A file that cannot be read is an error.
 impl<K: Serialize> RecordStore<K> for JsonFileStore {
     fn load(&self, key: &K) -> Result<Option<Record>, StoreError> {
-        JsonFileStore::load(self, key, Record::largest())
+        let largest = Record::largest();
+        Ok(self
+            .bytes(key, largest)?
+            .filter(|bytes| bytes.len() as u64 <= largest)
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok()))
     }
 
     fn store(&self, key: &K, record: &Record) -> Result<(), StoreError> {
@@ -98,8 +116,9 @@ mod tests {
     use crate::measure::Reason;
     use crate::statistics::Timing;
 
-    /// A stored record loads back; one larger than any record is an error,
-    /// as is one that does not decode; the widest records fit the bound.
+    /// A stored record loads back; a file larger than any record, or one
+    /// that does not decode as one, holds none; the widest records fit the
+    /// bound.
     #[test]
     fn records_load_back_bounded_by_the_largest_record() {
         let directory = tempfile::tempdir().unwrap();
@@ -121,9 +140,9 @@ mod tests {
         assert_eq!(RecordStore::load(&store, &key).unwrap(), Some(skipped));
         let path = store.path(&key).unwrap();
         std::fs::write(&path, vec![b' '; Record::largest() as usize + 1]).unwrap();
-        assert!(RecordStore::load(&store, &key).is_err());
+        assert_eq!(RecordStore::load(&store, &key).unwrap(), None);
         std::fs::write(&path, b"{").unwrap();
-        assert!(RecordStore::load(&store, &key).is_err());
+        assert_eq!(RecordStore::load(&store, &key).unwrap(), None);
     }
 
     /// A reason is cut to its bound at a character boundary.

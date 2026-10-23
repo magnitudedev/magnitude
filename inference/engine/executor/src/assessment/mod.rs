@@ -29,9 +29,9 @@ pub use estimate::{
     StepSeconds,
 };
 pub use executor_costs::{
-    ExecutorCosts, ExecutorCostsError, Figure, HistoryCosts, MatrixCosts, MeasuredCost,
-    Measurement, Placement, Placements, StoredCosts, Unmeasured, WeightRate, HISTORY_LAYOUTS,
-    SAMPLING_SECONDS,
+    Derived, ExecutorCosts, ExecutorCostsError, FormatRates, Held, HistoryCosts, HistoryLine,
+    MatrixCosts, MeasuredCost, Measurement, Placement, Placements, RouteCosts, StoredCosts,
+    WeightRate, HISTORY_LAYOUTS, MEASUREMENT_SECONDS,
 };
 pub use launches::{Declarations, Kernel, Launches};
 
@@ -52,10 +52,6 @@ pub enum AssessmentError {
     Graph(GraphError),
     /// A memory observation or fit bound could not be established.
     Memory(String),
-    /// A figure the estimate needs (a weight format's throughput, a history
-    /// layout's attention cost) is not measured on the executor: the
-    /// estimate is unavailable.
-    Unmeasured(String),
 }
 
 impl fmt::Display for AssessmentError {
@@ -67,7 +63,6 @@ impl fmt::Display for AssessmentError {
                 write!(formatter, "assessment graph construction failed: {error}")
             }
             Self::Memory(message) => write!(formatter, "assessment memory bound failed: {message}"),
-            Self::Unmeasured(message) => write!(formatter, "not measured: {message}"),
         }
     }
 }
