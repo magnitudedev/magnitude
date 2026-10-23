@@ -46,7 +46,7 @@ import {
   activeLocalModel, useAgentClient, type AddModelRequest, type ApplicationPage,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
-  formatStorageSize, formatTransferRate, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory,
+  formatStorageSize, formatTransferRate, localModelIsInstalled, localModelProviderModelId, localModelConnectionOptions, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory,
   useCustomModels, useHiddenLocalModels, useUnsupportedLocalModels,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
@@ -384,9 +384,9 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
 function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; selectedModel: Option.Option<ProviderModelId> }) {
   const service = useSession()
   const models = useLocalModels()
-  const canConnect = serviceReady && Result.isSuccess(models) && models.value.models.some(model => Option.isSome(localModelProviderModelId(model)))
+  const commandModels = Result.isSuccess(models) ? localModelConnectionOptions(models.value.models) : []
+  const canConnect = serviceReady && commandModels.length > 0
   const navigate = useNavigate()
-  const hardware = useLocalInferenceHardware()
   const state = useAtomValue(service.application)
   // The desktop app, its service, and the agents always share one computer and user, so it
   // configures agents in place. A browser can't know where its viewer's agents run.
@@ -399,10 +399,7 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
   const { remote } = useRemoteAccess()
   const client = useAgentClient()
   const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
-  const available = Result.isSuccess(models) ? models.value.models.filter(model => Option.isSome(localModelProviderModelId(model))) : []
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value))?.model.modelId : undefined
-  const ranked = Result.isSuccess(hardware) ? rankedLocalModelOptions(available.map(model => ({ id: model.modelId, kind: "stored" as const, model })), { fastToSmart: 0.5, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, available.length).map(option => option.model) : available
-  const commandModels = ranked.map(model => ({ id: model.modelId, label: formatLocalModelDisplayName(model) }))
   const defaultModel = commandModels.find(model => model.id === active)?.id ?? commandModels[0]?.id
   return <>
     {!serviceReady && <p className="mt-5 text-sm text-slate-500">{desktop ? "Configuration checks are available. Start the service from Status before connecting a harness." : "Start the service from Status before setting up an agent."}</p>}

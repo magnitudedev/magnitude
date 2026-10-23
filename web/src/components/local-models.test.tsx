@@ -6,7 +6,7 @@ import { removalKind } from "@magnitudedev/client-common"
 import { ModelRemoveAction, keepsExternalCopy, removalConfirmation } from "./model-remove-action"
 import { FoundModelsBanner, HuggingFaceLink, NoRecommendations, foundModelsSummary } from "./discover-custom"
 import { ModelsHeader, matchStatus, searchPlaceholder } from "./models-header"
-import { labForName, modelLab, variantLab } from "./model-logo"
+import { ModelLogo, labForName, modelLab, modelLogoLab, variantLab } from "./model-logo"
 import { added, catalogId, catalogModel, customModel, doesNotFit, foundIn, inFolder, unsupportedLocal } from "../../test/models/fixtures"
 
 describe("models header", () => {
@@ -29,9 +29,30 @@ describe("model labs", () => {
     expect(modelLab(catalogModel())?.name).toBe("Qwen")
     expect(modelLab(customModel(added))?.name).toBe("Qwen")
     expect(modelLab(customModel(added, { presentation: { ...customModel(added).presentation, variantOf: Option.none(), displayName: "Gemma 4 31B it abliterated" } }))?.name).toBe("Gemma")
-    expect(variantLab(Option.some(catalogId), "Anything")?.name).toBe("Qwen")
+    expect(variantLab(Option.some(catalogId), "Anything")).toBeUndefined()
     expect(labForName("Llama 3.1 8B Instruct")?.name).toBe("Meta")
     expect(labForName("gpt-oss 20B")).toBeUndefined()
+  })
+  it("keeps variant artwork only when the displayed name contains its family", () => {
+    for (const name of ["Qwen3.5 9B", "Huihui qWeN-3.5 uncensored", "Qwen_Qwen3.5", "DeepSeek R1 Distill Qwen 7B"]) {
+      expect(variantLab(Option.some(catalogId), name)?.name).toBe("Qwen")
+    }
+    for (const name of ["Ornith 1.5 9B", "NotQwen 9B", "Qwenish 9B", ""]) {
+      expect(variantLab(Option.some(catalogId), name)).toBeUndefined()
+    }
+    expect(variantLab(Option.none(), "Qwen3.5 9B")).toBeUndefined()
+    expect(variantLab(Option.some("lfm2.5-2.6b:gguf:q5"), "Liquid LFM2.5 2.6B")?.name).toBe("Liquid AI")
+    expect(variantLab(Option.some("llama-3.1-8b:gguf:q4"), "Hermes 3 Llama3.1 8B")?.name).toBe("Meta")
+  })
+  it("uses the publisher initial for custom artwork without changing its family classification", () => {
+    const original = customModel(added)
+    const model = customModel(added, { presentation: { ...original.presentation, displayName: "Ornith 1.5 9B" } })
+    expect(modelLab(model)?.name).toBe("Qwen")
+    expect(modelLogoLab(model)).toBeUndefined()
+    expect(renderToStaticMarkup(<ModelLogo model={model} />)).toMatch(/>H<\/span>/)
+    expect(renderToStaticMarkup(<ModelLogo model={model} />)).not.toContain("Qwen logo")
+    expect(renderToStaticMarkup(<ModelLogo model={catalogModel()} />)).toContain("Qwen logo")
+    expect(renderToStaticMarkup(<FoundModelsBanner models={[customModel(inFolder, { presentation: model.presentation })]} onView={() => {}} />)).not.toContain("Qwen logo")
   })
 })
 

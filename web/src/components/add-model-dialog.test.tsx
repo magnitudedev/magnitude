@@ -50,6 +50,14 @@ describe("find step", () => {
     expect(html).toContain("Qwen logo")
     expect(html).not.toMatch(/<button[^>]*disabled=""/)
   })
+  it("uses a neutral publisher initial when a result's name omits its variant family", () => {
+    const html = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loaded", response: {
+      results: [{ repository, displayName: "Ornith 1.5 9B", uploader: "ornith-ai", variantOf: Option.some(catalogId), downloads: 100, architecture: Option.some("qwen35"), unsupported: Option.none(), gated: false, versionCount: Option.none() }],
+    } }} />)
+    expect(html).toMatch(/>O<\/span>/)
+    expect(html).not.toContain("Qwen logo")
+    expect(html).toContain("Variant of Qwen")
+  })
   it("shows a result of an architecture Magnitude doesn't run disabled, with why", () => {
     const html = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loaded", response: {
       results: [{ repository: HuggingFaceRepositoryIdSchema.make("unsloth/DeepSeek-V4-Flash-GGUF"), displayName: "DeepSeek V4 Flash", uploader: "unsloth", variantOf: Option.none(), downloads: 900, architecture: Option.some("deepseek4"), unsupported: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]), gated: false, versionCount: Option.none() }],

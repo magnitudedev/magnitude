@@ -2,7 +2,7 @@ import { Option } from "effect"
 import { ArrowRightIcon } from "@phosphor-icons/react"
 import type { CustomLocalModel } from "@magnitudedev/sdk"
 import { Button } from "./ui/button"
-import { HuggingFaceLogo, LabLogo, modelLab, type ModelLab } from "./model-logo"
+import { HuggingFaceLogo, LabLogo, modelLogoLab, type ModelLab } from "./model-logo"
 
 const joinWithAnd = (values: readonly string[]) =>
   values.length <= 2 ? values.join(" and ") : `${values.slice(0, -1).join(", ")}, and ${values.at(-1)}`
@@ -20,7 +20,7 @@ const foundPlace = (model: CustomLocalModel): string => {
 export const foundModelsSummary = (models: readonly CustomLocalModel[]): Option.Option<{ readonly count: number; readonly places: string; readonly labs: readonly ModelLab[] }> => {
   const fitting = models.filter(model => model.origin._tag === "Found" && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits")
   if (fitting.length === 0) return Option.none()
-  const labs = [...new Set(fitting.flatMap(model => Option.toArray(Option.fromNullable(modelLab(model)))))]
+  const labs = [...new Set(fitting.flatMap(model => Option.toArray(Option.fromNullable(modelLogoLab(model)))))]
   return Option.some({ count: fitting.length, places: joinWithAnd([...new Set(fitting.map(foundPlace))]), labs })
 }
 

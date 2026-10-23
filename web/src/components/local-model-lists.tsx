@@ -3,7 +3,7 @@ import { CaretRightIcon, EyeIcon } from "@phosphor-icons/react"
 import { formatLocalModelDisplayName, unsupportedLocalModelSourceTag, unsupportedReasonMessages } from "@magnitudedev/client-common"
 import type { CustomLocalModel, UnsupportedLocalModel } from "@magnitudedev/sdk"
 import { Button } from "./ui/button"
-import { ModelLogo, NamedLogo, labForName } from "./model-logo"
+import { ModelLogo, NamedLogo } from "./model-logo"
 import { pageLayout } from "./page-layout"
 
 /** Where a model's files came from: "Hugging Face", "Ollama", "LM Studio", "Hugging Face cache", or a folder name. */
@@ -23,7 +23,7 @@ export function UnsupportedModels({ models }: { models: readonly UnsupportedLoca
     </summary>
     <ul aria-label="Models that can’t run" className="mt-2 divide-y divide-slate-200 rounded-xl border border-slate-200 dark:divide-slate-750 dark:border-slate-750">
       {models.map(model => <li key={model.path} title={model.detail} className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-2.5 text-slate-500 dark:text-slate-400">
-        <span className="flex min-w-0 items-center gap-3 sm:w-80"><span className="opacity-60"><NamedLogo lab={labForName(model.displayName)} name={model.displayName} className="size-5" /></span><span className="truncate" title={model.path}>{model.displayName}</span></span>
+        <span className="flex min-w-0 items-center gap-3 sm:w-80"><span className="opacity-60"><NamedLogo lab={undefined} name={model.origin._tag === "Added" ? model.origin.repository.split("/")[0]! : model.displayName} className="size-5" /></span><span className="truncate" title={model.path}>{model.displayName}</span></span>
         <SourceTag label={unsupportedLocalModelSourceTag(model)} />
         <span className="min-w-0 flex-1">{unsupportedReasonMessages(model.reasons).join(". ")}</span>
       </li>)}

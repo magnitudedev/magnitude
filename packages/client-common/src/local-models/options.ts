@@ -6,6 +6,7 @@ import type {
   LocalModelRankingScores,
   LocalModelsState,
   ModelSlotsState,
+  ProviderModelId,
 } from "@magnitudedev/sdk"
 import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import { installedLocalModels, localModelProviderModelId } from "./projection"
@@ -65,6 +66,16 @@ export const localModelRankingUtility = (
 
 export const targetPhysicalMemoryBytes = (hardware: LocalInferenceHardware): number =>
   hardware.memoryDomains.reduce((total, domain) => total + domain.totalBytes, 0)
+
+/** Every installed, fitting model an agent can use, including custom models without ranking scores. */
+export const localModelConnectionOptions = (
+  models: readonly LocalModel[],
+): readonly { readonly id: ProviderModelId; readonly label: string }[] => models
+  .flatMap(model => Option.toArray(Option.map(localModelProviderModelId(model), id => ({
+    id,
+    label: formatLocalModelDisplayName(model),
+  }))))
+  .sort((left, right) => left.label.localeCompare(right.label) || left.id.localeCompare(right.id))
 
 export const rankedLocalModelOptions = (
   options: readonly LocalModelOption[],

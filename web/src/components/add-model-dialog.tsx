@@ -209,7 +209,7 @@ function SearchResultRow({ result, models, onOpen }: { result: HuggingFaceSearch
     onNone: () => [result.uploader, ...(Option.isSome(variantOf) ? [`Variant of ${variantOf.value}`] : []), ...(result.gated ? [GATED_SEARCH_RESULT_LABEL] : [])].join(" · "),
   })
   return <button type="button" onClick={onOpen} disabled={Option.isSome(unsupported)} className="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-blue-500 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent dark:hover:bg-slate-800 dark:disabled:hover:bg-transparent">
-    <NamedLogo lab={variantLab(result.variantOf, result.displayName)} name={result.displayName} className="size-6" />
+    <NamedLogo lab={variantLab(result.variantOf, result.displayName)} name={result.uploader} className="size-6" />
     <span className="min-w-0 flex-1">
       <span className="block truncate text-sm font-medium" title={result.repository}>{result.displayName}</span>
       <span className="block truncate text-xs text-slate-500">{detail}</span>
@@ -247,7 +247,7 @@ function RepositoryStep({ reference, preview, file, models, onBack, onAdded }: {
   const { view, retry } = useInspection(reference)
   if (view._tag === "Inspected") return <InspectedRepository inspection={view.inspection} file={file} models={models} onAdded={onAdded} {...(onBack ? { onBack } : {})} />
   const variantOf = catalogVariantOfName(models, preview.variantOf)
-  const header = <RepositoryHeader displayName={preview.displayName} lab={variantLab(preview.variantOf, preview.displayName)} onBack={onBack}
+  const header = <RepositoryHeader displayName={preview.displayName} initialName={Option.getOrElse(Option.map(preview.repository, repository => repository.split("/")[0]!), () => preview.displayName)} lab={variantLab(preview.variantOf, preview.displayName)} onBack={onBack}
     source={Option.match(preview.repository, { onNone: () => <span className="font-mono">{reference}</span>, onSome: repositoryLink })}
     facts={Option.toArray(Option.map(variantOf, name => `Variant of ${name}`))} />
   if (view._tag === "Failed") return <>{header}<DialogBody><InspectionFailure error={view.error} onRetry={retry} /></DialogBody></>
@@ -351,11 +351,11 @@ export function InspectionVersionList({ versions }: { versions: readonly Candida
 }
 
 /** The repository step's header: back, logo, name, and one line with the repository link and its facts. */
-function RepositoryHeader({ displayName, lab, source, facts, onBack }: { displayName: string; lab: ReturnType<typeof variantLab>; source: ReactNode; facts: readonly string[]; onBack: (() => void) | undefined }) {
+function RepositoryHeader({ displayName, initialName = displayName, lab, source, facts, onBack }: { displayName: string; initialName?: string; lab: ReturnType<typeof variantLab>; source: ReactNode; facts: readonly string[]; onBack: (() => void) | undefined }) {
   return <DialogHeader>
     <div className="flex items-start gap-3 pr-8">
       {onBack && <BackButton onBack={onBack} />}
-      <NamedLogo lab={lab} name={displayName} className="mt-0.5 size-7" />
+      <NamedLogo lab={lab} name={initialName} className="mt-0.5 size-7" />
       <div className="min-w-0">
         <DialogTitle className="truncate">{displayName}</DialogTitle>
         <DialogDescription className="truncate">
@@ -535,7 +535,7 @@ export function RepositoryView({ inspection, models, selectedVersion, revealedVe
   const source = inspection.source
   const facts = [...(Option.isSome(variantOf) ? [`Variant of ${variantOf.value}`] : []), ...Option.toArray(inspection.license)]
   return <>
-    <RepositoryHeader displayName={inspection.displayName} lab={variantLab(inspection.variantOf, inspection.displayName)} facts={facts} onBack={onBack}
+    <RepositoryHeader displayName={inspection.displayName} initialName={source._tag === "HuggingFace" ? source.repository.split("/")[0]! : inspection.displayName} lab={variantLab(inspection.variantOf, inspection.displayName)} facts={facts} onBack={onBack}
       source={source._tag === "HuggingFace" ? repositoryLink(source.repository) : <span className="font-mono" title={source.path}>{source.path}</span>} />
     <DialogBody>
       {Option.isSome(inspection.unsupportedArchitecture)

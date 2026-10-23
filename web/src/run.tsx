@@ -59,7 +59,8 @@ export const renderApplication = <E,>(entry: ApplicationEntry<E>) => {
     const remote = Option.isSome(status) && status.value._tag !== "Local"
     const scope = yield* Scope.make()
     const runtime = yield* Effect.runtime<never>()
-    window.addEventListener("beforeunload", () => { Runtime.runFork(runtime)(Scope.close(scope, Exit.void)) }, { once: true })
+    // A blocked navigation still fires beforeunload. Close only when the page actually leaves.
+    window.addEventListener("pagehide", event => { if (!event.persisted) Runtime.runFork(runtime)(Scope.close(scope, Exit.void)) })
     const connection = yield* makeFirstPartyConnection(MagnitudeClient.layer({ origin, autoStart: false, reconnect: entry.reconnect }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
     const client = createAgentClient(connection.client, { host: entry.host, navigation: entry.navigation })
     const readError = Either.isLeft(appearance) ? "The saved appearance could not be read. Using System appearance." : null

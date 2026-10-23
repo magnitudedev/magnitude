@@ -9,6 +9,18 @@ import { GuardedCommand, guardedCommandLayer } from "@magnitudedev/utils/guarded
 const helper = fileURLToPath(new URL(`../../daemon-management/dist/native/${process.platform}-${process.arch}/magnitude-command`, import.meta.url))
 
 describe.skipIf(process.platform === "win32")("Protected command lifetime", () => {
+  it("keeps reused descriptors open when retired helpers are garbage collected", async () => {
+    const fixture = fileURLToPath(new URL("./fixtures/guarded-command-gc.ts", import.meta.url))
+    const child = spawn(process.execPath, [fixture, helper], { stdio: ["ignore", "ignore", "pipe"], timeout: 3_000 })
+    let stderr = ""
+    child.stderr!.on("data", chunk => { stderr += chunk })
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject)
+      child.once("close", resolve)
+    })
+    expect({ code, stderr }).toEqual({ code: 0, stderr: "" })
+  })
+
   it("returns the command status and both output streams", async () => {
     const result = await Effect.runPromise(Effect.gen(function* () {
       const command = yield* GuardedCommand

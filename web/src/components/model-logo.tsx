@@ -51,9 +51,23 @@ export const modelLab = (model: LocalModel): ModelLab | undefined =>
       onSome: labForCatalogId,
     })
 
-/** The lab of a Hugging Face result or candidate: its catalog lineage first, then its name. */
+/** Custom artwork follows its variant family only when the displayed name still names that family. */
 export const variantLab = (variantOf: Option.Option<string>, name: string): ModelLab | undefined =>
-  Option.match(variantOf, { onNone: () => labForName(name), onSome: labForCatalogId })
+  Option.getOrUndefined(Option.flatMap(variantOf, id => Option.filter(
+    Option.fromNullable(labForCatalogId(id)),
+    lab => lab.prefixes.some(prefix => new RegExp(`(^|[^\\p{L}\\p{N}])${prefix}(?!\\p{L})`, "iu").test(name)),
+  )))
+
+/** Artwork is separate from the family classification used by filters and compatibility labels. */
+export const modelLogoLab = (model: LocalModel): ModelLab | undefined =>
+  model._tag === "Catalog" ? modelLab(model) : variantLab(model.presentation.variantOf, model.presentation.displayName)
+
+const modelInitialName = (model: LocalModel): string =>
+  model._tag === "Custom"
+    ? model.origin._tag === "Added"
+      ? model.origin.repository.split("/")[0]!
+      : /^hf:([^/]+)\//.exec(model.modelId)?.[1] ?? model.presentation.displayName
+    : model.presentation.displayName
 
 export function LabLogo({ lab, className = "size-10" }: { readonly lab: ModelLab; readonly className?: string }) {
   return <img src={lab.src} alt={`${lab.name} logo`} className={`shrink-0 object-contain ${className} ${lab.theme}`} />
@@ -63,11 +77,11 @@ export function LabLogo({ lab, className = "size-10" }: { readonly lab: ModelLab
 export function NamedLogo({ lab, name, className = "size-10" }: { readonly lab: ModelLab | undefined; readonly name: string; readonly className?: string }) {
   return lab
     ? <LabLogo lab={lab} className={className} />
-    : <span aria-hidden="true" className={`inline-flex shrink-0 items-center justify-center font-heading text-slate-600 dark:text-slate-300 ${className}`}>{name.slice(0, 1)}</span>
+    : <span aria-hidden="true" className={`inline-flex shrink-0 items-center justify-center font-heading text-slate-600 dark:text-slate-300 ${className}`}>{Array.from(name.trim())[0]?.toUpperCase()}</span>
 }
 
 export function ModelLogo({ model, className = "size-10" }: { readonly model: LocalModel; readonly className?: string }) {
-  return <NamedLogo lab={modelLab(model)} name={model.presentation.displayName} className={className} />
+  return <NamedLogo lab={modelLogoLab(model)} name={modelInitialName(model)} className={className} />
 }
 
 /** The Hugging Face mark, decorative beside text that already names Hugging Face. */
