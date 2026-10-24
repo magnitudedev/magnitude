@@ -326,7 +326,8 @@
 }
 
 .chat-scroll { scrollbar-gutter: stable; }
-.chat-composer:focus-within { border-color: var(--magnitude-blue-500); }
+.chat-composer:focus-within { border-color: color-mix(in srgb, var(--magnitude-slate-300) 70%, var(--magnitude-slate-500)); }
+[data-theme=dark] .chat-composer:focus-within { border-color: color-mix(in srgb, var(--magnitude-slate-700) 70%, var(--magnitude-slate-500)); }
 .chat-prose { overflow-wrap: anywhere; }
 .chat-prose > * + * { margin-top: 12px; }
 .chat-prose ul { list-style: disc; padding-left: 20px; }

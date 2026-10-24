@@ -12,7 +12,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../ui/select"
-import { ActionTooltip } from "../ui/tooltip"
+import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip"
 
 export function ChatThinkingSelect({
   model,
@@ -31,52 +31,56 @@ export function ChatThinkingSelect({
     ? "Select a model to configure thinking."
     : !levels.length || label === "Off"
     ? "This model does not support thinking."
-    : `This model always uses ${label.toLowerCase()} thinking.`
+    : `${label} is the only thinking option for this model.`
 
   return (
-    <Select
-      value={effort ?? ""}
-      disabled={disabled}
-      onValueChange={(next) => {
-        if (next) onChange(next)
-      }}
-    >
-      <ActionTooltip
-        label={explanation}
-        disabled={!disabled}
-        trigger={
-          // Disabled buttons do not receive focus or pointer events. The wrapper
-          // keeps their explanation available to mouse and keyboard users.
+    <Tooltip disabled={!disabled}>
+      <TooltipTrigger
+        delay={0}
+        closeOnClick={false}
+        render={
+          // The disabled select cannot receive pointer events. Its focusable
+          // wrapper owns the explanation and the disabled cursor instead.
           <span
             tabIndex={disabled ? 0 : undefined}
             aria-label={disabled ? `Thinking level: ${label}` : undefined}
-            className="inline-flex rounded-md outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30"
+            aria-description={disabled ? explanation : undefined}
+            className={`inline-flex rounded-md outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30 ${disabled ? "cursor-not-allowed" : ""}`}
           >
-            <SelectTrigger
-              aria-label="Thinking level"
-              variant="inline"
-              className="h-8 px-2 text-xs text-slate-500 hover:bg-slate-100 disabled:pointer-events-none dark:text-slate-400 dark:hover:bg-slate-800"
+            <Select
+              value={effort ?? ""}
+              disabled={disabled}
+              onValueChange={(next) => {
+                if (next) onChange(next)
+              }}
             >
-              <SelectValue>
-                <ChartBarIcon aria-hidden="true" className="size-3" />
-                {label}
-              </SelectValue>
-            </SelectTrigger>
+              <SelectTrigger
+                aria-label="Thinking level"
+                variant="inline"
+                className="h-8 px-2 text-xs text-slate-500 hover:bg-slate-100 disabled:pointer-events-none dark:text-slate-400 dark:hover:bg-slate-800"
+              >
+                <SelectValue>
+                  <ChartBarIcon aria-hidden="true" className="size-3" />
+                  {label}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent
+                side="top"
+                align="start"
+                alignItemWithTrigger={false}
+                className="w-36"
+              >
+                {levels.map((level) => (
+                  <SelectItem key={level.value} value={level.value}>
+                    {level.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </span>
         }
       />
-      <SelectContent
-        side="top"
-        align="start"
-        alignItemWithTrigger={false}
-        className="w-36"
-      >
-        {levels.map((level) => (
-          <SelectItem key={level.value} value={level.value}>
-            {level.label}
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
+      <TooltipContent>{explanation}</TooltipContent>
+    </Tooltip>
   )
 }

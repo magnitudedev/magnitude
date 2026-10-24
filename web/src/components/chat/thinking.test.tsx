@@ -50,11 +50,14 @@ describe("Chat thinking control", () => {
     expect(html).toContain(">Off</span>")
     expect(html).toContain('tabindex="0"')
     expect(html).toContain('aria-label="Thinking level: Off"')
+    expect(html).toContain('aria-description="This model does not support thinking."')
+    expect(html).toContain("cursor-not-allowed")
   })
   it("keeps the control visible before model selection", () => {
     const html = render(undefined)
     expect(trigger(html)).toMatch(/\sdisabled(?:=|\s|>)/)
     expect(html).toContain(">Off</span>")
+    expect(html).toContain('aria-description="Select a model to configure thinking."')
   })
   it("shows the actual fixed mandatory level instead of incorrectly saying Off", () => {
     const html = render(
@@ -69,6 +72,8 @@ describe("Chat thinking control", () => {
     expect(trigger(html)).toMatch(/\sdisabled(?:=|\s|>)/)
     expect(html).toContain(">High</span>")
     expect(html).not.toContain(">Off</span>")
+    expect(html).toContain('aria-description="High is the only thinking option for this model."')
+    expect(html).toContain("cursor-not-allowed")
   })
   it("enables the dropdown for configurable levels and preserves selection", () => {
     for (const level of ["none", "low", "medium", "high"]) {
@@ -76,6 +81,8 @@ describe("Chat thinking control", () => {
       expect(trigger(html)).toBeDefined()
       expect(trigger(html)).not.toMatch(/\sdisabled(?:=|\s|>)/)
       expect(html).not.toContain('aria-label="Thinking level:')
+      expect(html).not.toContain('aria-description=')
+      expect(html).not.toMatch(/<span[^>]*cursor-not-allowed/)
       const label =
         level === "none" ? "Off" : level[0]!.toUpperCase() + level.slice(1)
       expect(html).toContain(`>${label}</span>`)
@@ -92,5 +99,6 @@ describe("Chat thinking control", () => {
     )
     expect(trigger(html)).toMatch(/\sdisabled(?:=|\s|>)/)
     expect(html).toContain(">Off</span>")
+    expect(html).toContain('aria-description="This model does not support thinking."')
   })
 })
