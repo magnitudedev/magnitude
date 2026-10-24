@@ -28,36 +28,8 @@ pub enum OpenError {
     Missing,
     /// The device does not meet the floor.
     Floor(String),
-    /// Creating the device or one of its objects, or running its fma probe,
-    /// failed.
+    /// Creating the device or one of its objects failed.
     Creation(String),
-    /// Without `VK_KHR_shader_fma`, GLSL `fma` beside a `NoContraction`
-    /// `a * b + c` of the same operands is not one fused operation (or the
-    /// expression is contracted), so `seismic_fma_rn` cannot be bound: the
-    /// device fails the floor (§16.1). The bits of both witness results.
-    MultiplyAdd {
-        fma: u32,
-        separate: u32,
-    },
-    /// Where modules do not declare `RoundingModeRTE 32`, the device's
-    /// default fp32 rounding of `operation` is not round-to-nearest-even on
-    /// the witness `operands` (a, b, integer): the device fails the floor
-    /// (§16.1). The expected and actual result bits.
-    Rounding {
-        operation: Rounded,
-        operands: [u32; 3],
-        expected: u32,
-        actual: u32,
-    },
-}
-
-/// An fp32 operation whose rounding the open-time probe checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Rounded {
-    Add,
-    Multiply,
-    SignedConversion,
-    UnsignedConversion,
 }
 
 impl OpenError {
@@ -66,16 +38,6 @@ impl OpenError {
     pub fn floor_reason(&self) -> Option<String> {
         match self {
             Self::Floor(reason) => Some(reason.clone()),
-            Self::MultiplyAdd { fma, separate } => Some(format!(
-                "it lacks VK_KHR_shader_fma and its fma is not fused beside a NoContraction multiply-add \
-                 (witness fma {fma:#010x}, multiply-add {separate:#010x}; fused {:#010x}, rounded twice {:#010x})",
-                crate::probe::FUSED,
-                crate::probe::ROUNDED_TWICE,
-            )),
-            Self::Rounding { operation, operands, expected, actual } => Some(format!(
-                "without RoundingModeRTE 32 its fp32 {operation:?} of witness {operands:#010x?} gives \
-                 {actual:#010x}, not the nearest-even {expected:#010x}"
-            )),
             Self::Loader(_) | Self::Missing | Self::Creation(_) => None,
         }
     }
@@ -87,11 +49,7 @@ impl fmt::Display for OpenError {
             Self::Loader(error) => write!(f, "{error}"),
             Self::Missing => f.write_str("the Vulkan device is no longer present"),
             Self::Creation(reason) => write!(f, "opening the Vulkan device failed: {reason}"),
-            Self::Floor(_) | Self::MultiplyAdd { .. } | Self::Rounding { .. } => write!(
-                f,
-                "the Vulkan device does not meet the floor: {}",
-                self.floor_reason().expect("a floor error has a reason")
-            ),
+            Self::Floor(reason) => write!(f, "the Vulkan device does not meet the floor: {reason}"),
         }
     }
 }
@@ -186,11 +144,10 @@ pub struct MemoryBudget {
 }
 
 /// The process's Vulkan devices: the one logical device of each opened
-/// physical device, and each probed physical device's numerical verdict.
+/// physical device.
 #[derive(Default)]
 struct Registry {
     opened: Vec<Device>,
-    numerics: Vec<([u8; 16], Result<(), OpenError>)>,
 }
 
 fn registry() -> MutexGuard<'static, Registry> {
@@ -199,78 +156,6 @@ fn registry() -> MutexGuard<'static, Registry> {
         .get_or_init(Mutex::default)
         .lock()
         .expect("the device registry lock is never poisoned")
-}
-
-/// Whether a device with these facts must pass the open-time probes:
-/// without `RoundingModeRTE 32` its default fp32 rounding, and without
-/// `VK_KHR_shader_fma` its `fma`, are established only by running them.
-fn probed(facts: &Facts) -> bool {
-    !facts.rounding_rte_32 || !facts.shader_fma.float32
-}
-
-/// Run the numerical probes a device with these facts needs.
-fn probe(device: &Device) -> Result<(), OpenError> {
-    if !device.facts().rounding_rte_32 {
-        crate::probe::rounding(device)?;
-    }
-    if !device.facts().shader_fma.float32 {
-        crate::probe::multiply_add(device)?;
-    }
-    Ok(())
-}
-
-impl Registry {
-    /// The numerical verdict of `device`: recorded once per physical device
-    /// and process, by discovery or by the first open.
-    fn verdict(&mut self, device: &Device) -> Result<(), OpenError> {
-        let uuid = device.facts().uuid;
-        if let Some((_, verdict)) = self.numerics.iter().find(|(probed, _)| *probed == uuid) {
-            return verdict.clone();
-        }
-        let verdict = probe(device);
-        self.numerics.push((uuid, verdict.clone()));
-        verdict
-    }
-}
-
-/// Whether a physical device meeting the static floor also meets its
-/// numerical part (§16.1), so discovery reports the availability an open
-/// keeps. A device needing probes is opened briefly to run them, once per
-/// process; the verdict is recorded and the probing device released, so a
-/// process that only discovers holds no device. A device already open passed
-/// at its open.
-pub(crate) fn numerical_floor(
-    instance: &'static Instance,
-    physical: vk::PhysicalDevice,
-    facts: &Facts,
-) -> Result<(), OpenError> {
-    if !probed(facts) {
-        return Ok(());
-    }
-    let mut registry = registry();
-    if registry
-        .opened
-        .iter()
-        .any(|device| device.facts().uuid == facts.uuid)
-    {
-        return Ok(());
-    }
-    if let Some((_, verdict)) = registry
-        .numerics
-        .iter()
-        .find(|(uuid, _)| *uuid == facts.uuid)
-    {
-        return verdict.clone();
-    }
-    match Inner::create(instance, physical, facts.clone()) {
-        Ok(inner) => registry.verdict(&Device {
-            inner: Arc::new(inner),
-        }),
-        Err(error) => {
-            registry.numerics.push((facts.uuid, Err(error.clone())));
-            Err(error)
-        }
-    }
 }
 
 impl Inner {
@@ -355,10 +240,7 @@ impl Device {
         self.inner.memory.set_host_memory_account(account);
     }
     /// Open the physical device with this UUID, revalidating it against
-    /// the floor, including its numerical part: without `RoundingModeRTE 32`
-    /// its default fp32 rounding must pass the rounding probe, and without
-    /// `VK_KHR_shader_fma` its `fma` must pass the multiply-add probe. A
-    /// verdict discovery recorded is kept rather than probed again.
+    /// the floor.
     ///
     /// A physical device has one logical device for the process, created by
     /// the first open and shared by every later one, like CUDA's primary
@@ -386,9 +268,6 @@ impl Device {
         let device = Self {
             inner: Arc::new(Inner::create(instance, physical, facts)?),
         };
-        if probed(device.facts()) {
-            registry.verdict(&device)?;
-        }
         registry.opened.push(device.clone());
         Ok(device)
     }

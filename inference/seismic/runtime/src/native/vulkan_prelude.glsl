@@ -7,8 +7,8 @@
 // the module runs with RTE rounding and signed-zero/Inf/NaN preservation for
 // fp32, and for fp16 where the device has fp16 arithmetic
 // (`SEISMIC_HAS_FLOAT16`), so `+` and `*` are single correctly rounded
-// operations (on the NVIDIA proprietary driver fp32 RTE is the probed default
-// rather than a declared mode, §16.1). Without fp16 arithmetic, fp16 is a
+// operations (on the NVIDIA proprietary driver fp32 rounds by the device's
+// default rather than a declared mode). Without fp16 arithmetic, fp16 is a
 // storage format only: kernels compute in fp32 and convert with the helpers
 // below. Float division is always `seismic_div_rn`, never a bare `/`: GLSL
 // `/` is only 2.5 ULP, and NVIDIA's compiler traps on it under
@@ -183,9 +183,11 @@ uint seismic_normalize(uint bits, out int exponent) {
 }
 
 // Explicitly rounded arithmetic. `seismic_fma_rn` is one fused, correctly
-// rounded multiply-add: formation binds `fma` to `OpFmaKHR` where the
-// device has `VK_KHR_shader_fma`, and a device without it opens only if its
-// `fma` is fused (§16.1).
+// rounded multiply-add where the device has `VK_KHR_shader_fma` (formation
+// binds `fma` to `OpFmaKHR`). Elsewhere it is GLSL `fma`, which the driver
+// may fuse or round twice. `seismic_div_rn`'s fast path takes its residuals
+// from `fma`, so there its quotient is correctly rounded only where `fma` is
+// fused.
 float seismic_add_rn(float a, float b) {
     return a + b;
 }

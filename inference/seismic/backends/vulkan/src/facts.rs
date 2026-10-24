@@ -281,12 +281,12 @@ pub struct Facts {
     pub denorm_preserve_32: bool,
     /// `RoundingModeRTE 32` is emitted when true (§7.3). False on the NVIDIA
     /// proprietary driver, whose compiler traps on fp32 `OpFDiv` under it
-    /// (580.159.03, §16.1); opening such a device probes that its default
-    /// fp32 rounding is round-to-nearest-even.
+    /// (580.159.03); there fp32 rounds by the device's default.
     pub rounding_rte_32: bool,
     pub mixed_dot_accelerated: bool,
     /// `VK_KHR_shader_fma` with fp32 `OpFmaKHR` (fp16/fp64 as reported):
-    /// `seismic_fma_rn` is bound to `OpFmaKHR` (§16.1).
+    /// `seismic_fma_rn` is bound to `OpFmaKHR`, so it is fused. Without it,
+    /// `seismic_fma_rn` is GLSL `fma`, which the driver may fuse or round twice.
     pub shader_fma: ShaderFma,
     pub f32_atomic_add: bool,
     pub shared_int64_atomics: bool,
@@ -475,7 +475,7 @@ impl Facts {
             if self.rounding_rte_32 {
                 "declared"
             } else {
-                "probed"
+                "default"
             },
             if self.shader_fma.float32 {
                 "khr"

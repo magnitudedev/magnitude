@@ -765,9 +765,8 @@ fn no_device(backend: BackendName) -> Diagnostic {
 /// Read the backend crates and the OS. Only cheap native queries run, except
 /// what the backends themselves need to establish availability, grants and
 /// capability: a Metal device's language and tensor-operation probes
-/// (compiles), a Vulkan device's numerical probes, and a discrete CUDA
-/// device's usable memory, which needs its context (the last two once per
-/// process).
+/// (compiles), and a discrete CUDA device's usable memory, which needs its
+/// context (once per process).
 pub(crate) fn gather(paths: &[PathBuf]) -> Result<Gathered, DiscoveryError> {
     let host = host::capacity().map_err(DiscoveryError::HostMemory)?;
     let os_build = host::os_build().map_err(DiscoveryError::OsBuild)?;

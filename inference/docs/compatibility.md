@@ -103,12 +103,10 @@ The CPU backend is always available as the fallback.
   - `VK_KHR_workgroup_memory_explicit_layout`, with 8-bit, 16-bit, and scalar layouts
   - `VK_EXT_memory_budget`
 - **Numerics:**
-  - fp32 round-to-nearest-even
+  - fp32 round-to-nearest-even, declared as `RoundingModeRTE 32` wherever the driver compiles
+    it (the NVIDIA proprietary driver does not; there fp32 rounds by the device's default)
   - fp32 signed zero, Inf, and NaN preservation
-  - a fused `fma`, either through `VK_KHR_shader_fma` or confirmed by a probe
-  - the probes (`fma`, and fp32 rounding where `RoundingModeRTE 32` is not declared) run at
-    discovery, once per process, so a device failing one is unavailable and selection falls
-    back to CPU
+  - discovery reads device properties only; it opens no device and runs no probe
 - **Limits:**
   - 32 KiB of shared memory
   - 1024 invocations per workgroup, with workgroup size at least (1024, 1024, 64)
@@ -140,7 +138,9 @@ The CPU backend is always available as the fallback.
   - Required only alongside cooperative matrix.
   - Without it, kernels compute in fp32 over 16-bit storage.
 - **Cooperative matrix** (`VK_KHR_cooperative_matrix`, subgroup-scope 16×16×16).
-- **Shader float atomics, 64-bit shared atomics, and `VK_KHR_shader_fma`.**
+- **Shader float atomics and 64-bit shared atomics.**
+- **`VK_KHR_shader_fma`.** With it, `fma` compiles to `OpFmaKHR` and is fused. Without it,
+  `fma` is GLSL `fma`, which the driver may fuse or round twice.
 
 ### Coverage
 

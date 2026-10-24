@@ -3,8 +3,8 @@
 //! with RTE rounding and signed-zero/Inf/NaN preservation for fp32, and for
 //! fp16 on devices with fp16 arithmetic, plus `DenormPreserve 32` where the
 //! device supports it. `RoundingModeRTE 32` is left out where the driver
-//! cannot compile it (NVIDIA proprietary, §16.1); there the device's fp32
-//! rounding is probed at open instead.
+//! cannot compile it (NVIDIA proprietary); there fp32 rounds by the device's
+//! default.
 //!
 //! glslang has no global switch for this, and `precise` is per object.
 
@@ -19,8 +19,7 @@ pub struct Environment {
     /// `SignedZeroInfNanPreserve 16` are declared.
     pub float16: bool,
     /// `RoundingModeRTE 32` is declared. When false, fp32 add, multiply and
-    /// conversion rounding is the device's default, which opening verifies
-    /// is round-to-nearest-even.
+    /// conversion round by the device's default.
     pub rounding_rte_32: bool,
     /// `DenormPreserve 32` is declared.
     pub denorm_preserve_32: bool,

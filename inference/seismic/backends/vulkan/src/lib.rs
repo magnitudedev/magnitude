@@ -12,11 +12,10 @@ mod facts;
 pub mod formation;
 mod instance;
 mod memory;
-mod probe;
 pub mod seal;
 pub mod toolchain;
 
-pub use device::{Device, HeapBudget, MemoryBudget, OpenError, Rounded};
+pub use device::{Device, HeapBudget, MemoryBudget, OpenError};
 pub use facts::{
     Allocation, Calibration, Description, DeviceType, Facts, FormationFacts, Limits, MemoryHeap,
     MemoryLayout, MemoryType, SubgroupWidth, SUBGROUP_WIDTH,
@@ -24,28 +23,15 @@ pub use facts::{
 pub use instance::LoaderError;
 pub use memory::{AllocationAccount, Buffer, PlacedStorage};
 
-/// Enumerate the physical devices against the whole floor, so a device
-/// discovery reports available opens: one meeting the static floor whose
-/// numerics only a probe establishes is opened briefly, once per process,
-/// to run it (`device::numerical_floor`). GPUs come first, so the first
-/// device of the backend is a GPU when there is one.
+/// Enumerate the physical devices against the floor, from their reported
+/// properties alone: discovery opens no logical device. GPUs come first, so
+/// the first device of the backend is a GPU when there is one.
 pub fn discover() -> Result<Vec<Description>, LoaderError> {
     let instance = instance::instance()?;
     let mut descriptions = instance
         .physical_devices()?
         .into_iter()
-        .map(|physical| {
-            let mut description = facts::describe(instance, physical);
-            if description.floor.is_ok() {
-                description.floor = device::numerical_floor(instance, physical, &description.facts)
-                    .map_err(|error| {
-                        error.floor_reason().unwrap_or_else(|| {
-                            format!("its numerical probes could not run: {error}")
-                        })
-                    });
-            }
-            description
-        })
+        .map(|physical| facts::describe(instance, physical))
         .collect::<Vec<_>>();
     descriptions.sort_by_key(|description| !description.facts.is_gpu());
     Ok(descriptions)
@@ -77,9 +63,8 @@ mod tests {
     use super::*;
 
     /// Every device discovery reports available opens, and one it reports
-    /// unavailable (below the static floor, or failing a numerical probe)
-    /// fails to open for the same reason; storage round-trips through host
-    /// writes and reads.
+    /// unavailable (below the floor) fails to open for the same reason;
+    /// storage round-trips through host writes and reads.
     #[test]
     fn devices_meeting_the_floor_open_and_round_trip_storage() {
         let devices = match discover() {
@@ -127,13 +112,6 @@ mod tests {
             assert_eq!(back, bytes);
             let budget = device.memory_budget();
             assert!(budget.heap_budget_bytes > 0);
-            // Formed `fma` (OpFmaKHR where bound) is fused beside a sealed
-            // `a*b+c`, which is rounded twice (§7.3, §13.1).
-            probe::multiply_add(&device).expect("fma is fused and a*b+c is not contracted");
-            // fp32 rounds to nearest even whether RTE 32 is declared or
-            // probed at open.
-            probe::rounding(&device)
-                .expect("fp32 add, multiply and conversion round to nearest even");
         }
     }
 
@@ -175,9 +153,9 @@ mod tests {
             seal::unsealed(&sealed, &[16, 32]).expect("module"),
             (0, true)
         );
-        // The probed environment leaves out only `RoundingModeRTE 32`
-        // (4 words).
-        let probed = seal::seal(
+        // Where the driver cannot compile it, the environment leaves out
+        // only `RoundingModeRTE 32` (4 words).
+        let without_rte = seal::seal(
             &compiled,
             seal::Environment {
                 rounding_rte_32: false,
@@ -186,10 +164,10 @@ mod tests {
         )
         .expect("seal");
         assert_eq!(
-            seal::unsealed(&probed, &[16, 32]).expect("module"),
+            seal::unsealed(&without_rte, &[16, 32]).expect("module"),
             (0, false)
         );
-        assert_eq!(probed.len(), sealed.len() - 4);
+        assert_eq!(without_rte.len(), sealed.len() - 4);
         // Without fp16 arithmetic, the two fp16 modes (8 words) are left out
         // and the fp32 environment is complete.
         let fp32 = seal::seal(
@@ -203,7 +181,7 @@ mod tests {
         assert_eq!(seal::unsealed(&fp32, &[32]).expect("module"), (0, true));
         assert_eq!(seal::unsealed(&fp32, &[16]).expect("module"), (0, false));
         assert_eq!(fp32.len(), sealed.len() - 8);
-        formation::validate(&probed).expect("a sealed module validates");
+        formation::validate(&without_rte).expect("a sealed module validates");
         formation::validate(&sealed).expect("a sealed module validates");
         formation::validate(&fp32).expect("a sealed module validates");
         // `fma` becomes `OpFmaKHR` (opcode 4427, six words) with its
