@@ -23,3 +23,5 @@ export {
   type TreeRpcs,
   type TreeClient,
 } from "../rpc-tree"
+
+export { Chat } from "./chat"

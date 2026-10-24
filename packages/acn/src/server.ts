@@ -1,3 +1,6 @@
+import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
+import { ChatInferenceLive } from "./chat/inference"
+import { ChatServiceLive } from "./chat/service"
 import {
   BunHttpServer,
   BunFileSystem,
@@ -29,6 +32,7 @@ import {
   Stream,
 } from "effect"
 import {
+  ChatStorageLive,
   StorageLive,
   GlobalStorage,
   MagnitudeStorage,
@@ -352,7 +356,12 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     withSharedClient
   )
   const withUsage = Layer.provideMerge(Layer.merge(ServingUsageLive, InferenceActivityLive), withCatalog)
-  const withModelCatalog = Layer.provideMerge(ModelCatalogLive, withUsage)
+  const withChatDependencies = Layer.provideMerge(Layer.merge(
+    ChatInferenceLive,
+    ChatStorageLive.pipe(Layer.provide(BunSqliteDriverLayer)),
+  ), withUsage)
+  const withChat = Layer.provideMerge(ChatServiceLive, withChatDependencies)
+  const withModelCatalog = Layer.provideMerge(ModelCatalogLive, withChat)
   const withCredentials = Layer.provideMerge(
     ProviderCredentialsLive,
     withModelCatalog

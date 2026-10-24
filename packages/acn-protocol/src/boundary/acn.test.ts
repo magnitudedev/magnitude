@@ -38,6 +38,7 @@ describe("ACN boundary lifecycle policy", () => {
       "StreamDisplayView",
       "StreamModelCandidateInspection",
       "WatchApplicationOwner",
+      "WatchChatConversation",
       "WatchFile",
       "WatchHarnessConnections",
       "WatchProjectFiles",

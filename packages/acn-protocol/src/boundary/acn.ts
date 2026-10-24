@@ -16,7 +16,10 @@ import { Connections } from "./connections"
 import { Application } from "./application"
 import { HuggingFace } from "./hugging-face"
 
+import { Chat } from "./chat"
+
 export const MagnitudeRpcs = {
+  chat: Chat,
   projects: Projects,
   agent: Agent,
   connection: Connection,

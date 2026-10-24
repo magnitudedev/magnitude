@@ -26,3 +26,5 @@ export * from "./harness-connections"
 export * from "./server-settings"
 export * from "./application-owner"
 export * from "./remote-access"
+
+export * from "./chat"

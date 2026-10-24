@@ -1,3 +1,4 @@
+import { ChatService } from "../chat/service";
 import { ServingUsage } from "../serving-usage";
 import {
   AcnRpcGroup, Configuration,
@@ -52,6 +53,7 @@ const normalizeBashOutput = (output: string): string =>
 /** Exhaustive server implementation of the composed ACN boundary. */
 export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const lifecycle = yield* AcnServiceLifecycle;
+    const chat = yield* ChatService;
     const sessionCommands = yield* SessionCommands;
     const sessionLifecycle = yield* SessionLifecycle;
     const sessionInspector = yield* SessionInspector;
@@ -142,6 +144,15 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       });
 
     return {
+      ListChatModels: () => chat.models,
+      ListChatConversations: ({ offset, limit }) => chat.list(offset, limit),
+      GetChatConversation: ({ conversationId }) => chat.get(conversationId),
+      CreateChatConversation: ({ conversationId, settings }) => chat.create(conversationId, settings),
+      UpdateChatConversation: ({ conversationId, title, settings }) => chat.update(conversationId, title, settings),
+      DeleteChatConversation: ({ conversationId }) => chat.remove(conversationId),
+      StartChatGeneration: input => chat.start(input),
+      StopChatGeneration: ({ conversationId, generationId }) => chat.stop(conversationId, generationId),
+      WatchChatConversation: ({ conversationId }) => chat.watch(conversationId),
       // Connection
       Health: () => lifecycle.state.pipe(
         Effect.map((state) => makeHealthResponse(ACN_VERSION, state)),
