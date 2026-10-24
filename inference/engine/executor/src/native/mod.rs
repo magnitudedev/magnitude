@@ -39,7 +39,8 @@ pub(crate) use target::{
     PostNormKernels, ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels,
     RecurrentKernels, RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels,
     SelectedPrefillKernel, SelectionKernels,
-    ShortConvKernels, StateSpaceKernels, StreamsKernels, SublayerOutput, TableConversion,
+    ShortConvKernels, StateSpaceKernels, StreamsEntryKernels, StreamsKernels,
+    SublayerOutput, TableConversion,
     TapKernels,
 };
 #[cfg(feature = "pinned-tuning")]

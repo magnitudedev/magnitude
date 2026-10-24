@@ -6,6 +6,7 @@
 
 use super::super::*;
 use super::*;
+use crate::operators::streams::{MixDownBinding, MixUpBinding, StreamsBinding};
 use magnitude_family_contracts::{NGramHash, Operator, SublayerIndex, WeightKind, WeightScope};
 use magnitude_kernels::{
     ngram_gate, ngram_inject, ngram_rows, repeat_rows, stored_rows, stream_mix_down,
@@ -95,13 +96,15 @@ impl SlotControls {
 }
 
 impl<'a> QualificationView<'a> {
-    /// The streams' entries of the decoder's mix sites, once: over one row
-    /// of ones under a norm of ones and zero projections, a site's low-rank
-    /// row is 0, its inject values `2 sigmoid(0) = 1`, each stream's inverse
-    /// `rsqrt(1 + epsilon)`, and its partials `sigmoid(0) · inverse / S`;
-    /// the widening copies its row into each stream.
+    /// The streams' entries of each mix site, once per entry binding: over
+    /// one row of ones under a norm of ones and zero projections, a site's
+    /// low-rank row is 0, its inject values `2 sigmoid(0) = 1`, each
+    /// stream's inverse `rsqrt(1 + epsilon)`, and its partials
+    /// `sigmoid(0) · inverse / S`; the widening copies its row into each
+    /// stream.
     pub(super) fn qualify_streams(&self, device: &Device) -> Result<(), CatalogFailure> {
-        let mut bindings = std::collections::HashSet::new();
+        let mut qualified = QualifiedSites::default();
+        let mut widened = false;
         for (binding, kernels) in self
             .plan
             .target()
@@ -110,13 +113,18 @@ impl<'a> QualificationView<'a> {
             .zip(&self.programs.target.blocks)
             .filter_map(|(slot, block)| slot.streams().zip(block.streams.as_ref()))
         {
-            if bindings.insert(binding) {
-                qualify_stream_binding(device, binding, kernels)?;
-            }
+            qualify_stream_binding(device, binding, kernels, &mut qualified, !widened)?;
+            widened = true;
         }
         for block in self.programs.head.iter().flat_map(|head| &head.blocks) {
             if let Some((binding, kernels)) = block.binding.streams.zip(block.streams.as_ref()) {
-                qualify_stream_binding(device, binding, kernels)?;
+                qualify_stream_binding(
+                    device,
+                    binding,
+                    kernels,
+                    &mut QualifiedSites::default(),
+                    true,
+                )?;
             }
         }
         Ok(())
@@ -260,7 +268,7 @@ impl<'a> QualificationView<'a> {
         }
 
         // Every head reads slot 0 of a one-slot table held in slots.
-        let slots = zeros(binding.table_source, &[1, binding.width])?;
+        let slots = zeros(binding.table, &[1, binding.width])?;
         let decoded = kernels
             .stored
             .call(stored_rows::Args {
@@ -366,10 +374,21 @@ impl<'a> QualificationView<'a> {
     }
 }
 
+/// The streams entry bindings already qualified.
+#[derive(Default)]
+struct QualifiedSites {
+    down: std::collections::HashSet<MixDownBinding>,
+    up: std::collections::HashSet<MixUpBinding>,
+}
+
+/// The entries of `binding`'s sites that `qualified` lacks, and the
+/// widening when `widen`.
 fn qualify_stream_binding(
     device: &Device,
-    binding: crate::operators::streams::StreamsBinding,
+    binding: StreamsBinding,
     kernels: &StreamsKernels,
+    qualified: &mut QualifiedSites,
+    widen: bool,
 ) -> Result<(), CatalogFailure> {
     let label = format!("{binding:?}");
     let geometry = binding.geometry;
@@ -378,58 +397,67 @@ fn qualify_stream_binding(
     const EPSILON: f32 = 1.0e-5;
     let streams = semantic_ones(device, Element::f32(), &[1, s * h], entry, &label)?;
     let hidden = view(&streams, &[1, s, h], entry, &label)?;
-    let norm = semantic_ones(device, binding.norm, &[s, h], entry, &label)?;
-    let down = semantic_zeros(device, binding.down, &[r, s * h], entry, &label)?;
-    let inject = semantic_zeros(device, binding.inject, &[s, s * h], entry, &label)?;
-    let up = semantic_zeros(device, binding.up, &[s * h, r], entry, &label)?;
     let inverse = 1.0 / (1.0 + EPSILON).sqrt();
     let inverses = vec![inverse; s as usize];
-    let mixed = kernels
-        .down
-        .call(stream_mix_down::Args {
-            hidden: &hidden,
-            norm: &norm,
-            down_weight: &down,
-            inject_weight: &inject,
-            epsilon: EPSILON,
-        })
-        .map_err(|error| qualification_dynamic("stream_mix_down", &label, error))?;
-    require_zero_result(&mixed.r0, "stream_mix_down", &label)?;
-    require_f32_near(&mixed.r1, &vec![1.0; s as usize], "stream_mix_down", &label)?;
-    require_f32_near(&mixed.r2, &inverses, "stream_mix_down", &label)?;
-    // The exit site injects into nothing: its inject weights are a
-    // zero-row view of its down weights.
-    let exit = kernels
-        .exit
-        .call(stream_mix_down::Args {
-            hidden: &hidden,
-            norm: &norm,
-            down_weight: &down,
-            inject_weight: &down
+    for (site, kernels) in binding
+        .entries()
+        .present()
+        .zip(kernels.sites.as_ref().present())
+    {
+        let up_pending = qualified.up.insert(site.up);
+        if !qualified.down.insert(site.down) && !up_pending {
+            continue;
+        }
+        let norm = semantic_ones(device, site.down.norm, &[s, h], entry, &label)?;
+        let down = semantic_zeros(device, site.down.down, &[r, s * h], entry, &label)?;
+        // An exit site injects into nothing: its inject weights are a
+        // zero-row view of its down weights.
+        let inject = match site.down.inject {
+            Some(element) => semantic_zeros(device, element, &[s, s * h], entry, &label)?,
+            None => down
                 .slice_leading(0, 0)
                 .map_err(|error| qualification_dynamic("stream_mix_down", &label, error))?,
-            epsilon: EPSILON,
-        })
-        .map_err(|error| qualification_dynamic("stream_mix_down", &label, error))?;
-    require_zero_result(&exit.r0, "stream_mix_down", &label)?;
-    require_f32_near(&exit.r2, &inverses, "stream_mix_down", &label)?;
-    let partials = kernels
-        .up
-        .call(stream_mix_up::Args {
-            low: &mixed.r0,
-            up_weight: &up,
-            hidden: &hidden,
-            inverse: &mixed.r2,
-            norm: &norm,
-        })
-        .map_err(|error| qualification_dynamic("stream_mix_up", &label, error))?
-        .value;
-    require_f32_near(
-        &partials,
-        &vec![0.5 * inverse / s as f32; (s * h) as usize],
-        "stream_mix_up",
-        &label,
-    )?;
+        };
+        let mixed = kernels
+            .down
+            .call(stream_mix_down::Args {
+                hidden: &hidden,
+                norm: &norm,
+                down_weight: &down,
+                inject_weight: &inject,
+                epsilon: EPSILON,
+            })
+            .map_err(|error| qualification_dynamic("stream_mix_down", &label, error))?;
+        require_zero_result(&mixed.r0, "stream_mix_down", &label)?;
+        if site.down.injected() {
+            require_f32_near(&mixed.r1, &vec![1.0; s as usize], "stream_mix_down", &label)?;
+        }
+        require_f32_near(&mixed.r2, &inverses, "stream_mix_down", &label)?;
+        if !up_pending {
+            continue;
+        }
+        let up = semantic_zeros(device, site.up.up, &[s * h, r], entry, &label)?;
+        let partials = kernels
+            .up
+            .call(stream_mix_up::Args {
+                low: &mixed.r0,
+                up_weight: &up,
+                hidden: &hidden,
+                inverse: &mixed.r2,
+                norm: &norm,
+            })
+            .map_err(|error| qualification_dynamic("stream_mix_up", &label, error))?
+            .value;
+        require_f32_near(
+            &partials,
+            &vec![0.5 * inverse / s as f32; (s * h) as usize],
+            "stream_mix_up",
+            &label,
+        )?;
+    }
+    if !widen {
+        return Ok(());
+    }
     let row_values = (0..h)
         .map(|index| (index % 7) as f32 - 3.0)
         .collect::<Vec<_>>();

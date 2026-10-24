@@ -117,12 +117,12 @@ pub enum TableFill {
     /// In the table's resident representation, converted by the weight's
     /// import entry from staging, queued ahead of the step that names them.
     Imported,
-    /// As stored, written by the host into slots the device reads in place;
-    /// a reader decodes them (`stored_rows`) to the values of their
-    /// conversion into `decoded`, the representation the table would be
-    /// resident in. A step reading them waits at a gate until the host has
-    /// written them.
-    Stored { decoded: Element },
+    /// In the table's resident representation, read from the artifact as
+    /// stored and converted row by row by the host (the CPU backend's
+    /// registered row conversion), which writes them into slots the device
+    /// reads in place (`stored_rows`). A step reading them waits at a gate
+    /// until the host has written them.
+    Stored,
 }
 
 impl WeightPlan {
@@ -144,13 +144,13 @@ impl WeightPlan {
         self.progressive_depth().is_some()
     }
 
-    /// Whether the weight is a table whose slots the host writes as stored
+    /// Whether the weight is a table whose slots the host fills
     /// (`TableFill::Stored`): it takes no import entry.
     pub fn stored_in_slots(&self) -> bool {
         matches!(
             self.streamed,
             Some(StreamedRows {
-                fill: TableFill::Stored { .. },
+                fill: TableFill::Stored,
                 ..
             })
         )
@@ -191,21 +191,11 @@ impl WeightPlan {
     /// The bytes of the stored tensor in the upload representation:
     /// `source_bytes`, or a streamed table's whole rows, of which a load
     /// uploads only its slots' (an imported table) or none (a stored one,
-    /// whose slots hold rows as stored).
-    pub fn stored_bytes(&self) -> u64 {
+    /// whose filler reads its rows).
+    pub fn stored_bytes(&self) -> Result<u64, String> {
         match self.streamed {
-            Some(StreamedRows {
-                table_rows,
-                landing_rows,
-                fill: TableFill::Imported,
-                ..
-            }) => self.source_bytes / (self.shape[0] - landing_rows) * table_rows,
-            Some(StreamedRows {
-                table_rows,
-                fill: TableFill::Stored { .. },
-                ..
-            }) => self.resident_bytes / self.shape[0] * table_rows,
-            None => self.source_bytes,
+            Some(_) => representation_bytes(self.upload, &self.stored_shape()),
+            None => Ok(self.source_bytes),
         }
     }
 
@@ -1529,10 +1519,9 @@ pub struct PerLayerEntryBinding {
 }
 
 /// An n-gram input sublayer (`operators::ngram`): its rows per position
-/// (`ngram_rows`), read from its streamed table as stored (`table_source`)
-/// and decoded as if repacked to `table` (`stored_rows`), projected to the
-/// key and value rows, gated into the streams (`ngram_gate`) and convolved
-/// over its window (`ngram_inject`).
+/// (`ngram_rows`), read from its stored table's slots, resident as `table`
+/// (`stored_rows`), projected to the key and value rows, gated into the
+/// streams (`ngram_gate`) and convolved over its window (`ngram_inject`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NGramBinding {
     pub hidden: u64,
@@ -1544,7 +1533,6 @@ pub struct NGramBinding {
     pub width: u64,
     pub kernel: u64,
     pub dilation: u64,
-    pub table_source: Element,
     pub table: Element,
     pub key: Element,
     pub value: Element,
@@ -1722,7 +1710,7 @@ fn push_gathered_table(
     read_whole: bool,
 ) -> Result<(), String> {
     if role.kind == WeightKind::NGramTable {
-        return push_stored_table(out, inventory, component, role, descriptor);
+        return push_stored_table(out, inventory, component, role, descriptor, form);
     }
     let plan = |form| {
         let mut planned = Vec::with_capacity(1);
@@ -1804,29 +1792,32 @@ fn selected_read_rows(
     Ok(target.max(drafter))
 }
 
-/// The slots of an n-gram table: the rows its hit rate plateaus at (2.9 M,
-/// 256 MiB of IQ4_NL rows), a multiple of every row tile.
-pub const NGRAM_TABLE_SLOTS: u64 = 180 * 16_384;
+/// The byte budget of an n-gram table's slots, in its rows as stored: the
+/// rows its hit rate plateaus at (2.9 M; 253 MiB of IQ4_NL rows as stored).
+/// The slots hold the rows resident, so they are the budget over a resident
+/// row's bytes (`push_stored_table`).
+pub const NGRAM_TABLE_STORED_ROWS: u64 = 180 * 16_384;
 
-/// Plan an n-gram table (`TableFill::Stored`): slots for
-/// `NGRAM_TABLE_SLOTS` of its rows (all of them, of a table of no more) as
-/// stored, in the encoding of its 32-value blocks (`stored_block_element`),
-/// which the host writes and its reader (`stored_rows`) decodes as their
-/// registered conversion does, and a directory of the form the plan picks
-/// (`DirectoryForm::of`). A table with import transforms, a second-level
-/// scale, rows past I32 or an encoding without a stored block form is
-/// refused. The slots are the weight's shape and resident bytes; the load
-/// uploads nothing.
+/// Plan an n-gram table (`TableFill::Stored`): resident as any weight is, in
+/// the streamed layout (`streamed_layout`), in slots holding the bytes of
+/// `NGRAM_TABLE_STORED_ROWS` of its rows as stored (all of them, of a table
+/// of no more), which the host converts from the artifact's rows
+/// (`stored_table::row_conversion`) and writes, and a directory of the form
+/// the plan picks (`DirectoryForm::of`). A table with import transforms,
+/// rows past I32 or without a host row conversion into its resident
+/// representation is refused. The slots are the weight's shape and resident
+/// bytes; the load uploads nothing.
 fn push_stored_table(
     out: &mut Vec<WeightPlan>,
     inventory: &[TensorDescriptor],
     component: ArtifactComponent,
     role: WeightRole,
     descriptor: &WeightDescriptor,
+    form: ResidentForm,
 ) -> Result<(), String> {
     let refused = |reason: &str| {
         format!(
-            "n-gram table {:?} cannot be streamed as stored: {reason}",
+            "n-gram table {:?} cannot be a stored table: {reason}",
             descriptor.name
         )
     };
@@ -1848,48 +1839,43 @@ fn push_stored_table(
     if table_rows > i32::MAX as u64 {
         return Err(refused("its rows exceed I32"));
     }
-    let (block, decoded) = stored_block_element(stored.encoding)
-        .ok_or_else(|| refused(&format!("{:?} has no stored block form", stored.encoding)))?;
-    if representation_bytes(block, &stored.shape)? != stored.nbytes {
-        return Err(refused("its rows are not whole blocks"));
-    }
-    let slots = NGRAM_TABLE_SLOTS.min(table_rows);
-    let shape = vec![slots, width];
-    out.push(WeightPlan {
-        role,
+    let mut planned = Vec::with_capacity(1);
+    push_weight(
+        &mut planned,
+        inventory,
         component,
-        source: block,
-        upload: block,
-        resident: block,
-        resident_bytes: representation_bytes(block, &shape)?,
-        shape,
-        descriptor: descriptor.clone(),
-        source_bytes: 0,
-        scale: None,
-        bound: 0,
-        streamed: Some(StreamedRows {
-            table_rows,
-            staging_rows: 0,
-            landing_rows: 0,
-            directory: DirectoryForm::of(table_rows, slots),
-            fill: TableFill::Stored { decoded },
-        }),
-    });
-    Ok(())
-}
-
-/// The encoding of `encoding`'s 32-value blocks as stored, and the packed
-/// representation its registered conversion decodes them as: what a stored
-/// table's slots hold and its reader decodes.
-pub fn stored_block_element(encoding: Encoding) -> Option<(Element, Element)> {
-    match encoding {
-        Encoding::Q8_0 => Some((Element::named("gguf_q8_0")?, Element::named("q8g32s")?)),
-        Encoding::Iq4Nl => Some((
-            Element::named("gguf_iq4_nl_block")?,
-            Element::named("iq4g32s")?,
-        )),
-        _ => None,
+        role.scope,
+        role.kind,
+        descriptor,
+        ResidentForm {
+            layout: streamed_layout(form.layout),
+            ..form
+        },
+    )?;
+    let mut table = planned.remove(0);
+    if crate::stored_table::row_conversion(table.upload, table.resident).is_none() {
+        return Err(refused(&format!(
+            "the host has no row conversion of {} into {}",
+            table.upload.name(),
+            table.resident.name()
+        )));
     }
+    let budget = representation_bytes(table.upload, &[NGRAM_TABLE_STORED_ROWS, width])?;
+    let slots = (budget / representation_bytes(table.resident, &[1, width])?).min(table_rows);
+    table.shape = vec![slots, width];
+    table.resident_bytes = representation_bytes(table.resident, &table.shape)?;
+    table.source_bytes = 0;
+    // A stored table is read by row, never through a packed projection.
+    table.bound = 0;
+    table.streamed = Some(StreamedRows {
+        table_rows,
+        staging_rows: 0,
+        landing_rows: 0,
+        directory: DirectoryForm::of(table_rows, slots),
+        fill: TableFill::Stored,
+    });
+    out.push(table);
+    Ok(())
 }
 
 fn push_weight(
@@ -2471,6 +2457,157 @@ mod representation_byte_tests {
                 assert_eq!(
                     (element.representation(), element.layout()),
                     (representation, layout)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod stored_table_tests {
+    use super::*;
+    use magnitude_family_contracts::SublayerIndex;
+
+    fn ngram_role() -> WeightRole {
+        WeightRole {
+            scope: WeightScope::TargetSublayer(SublayerIndex {
+                block: 0,
+                sublayer: 2,
+            }),
+            kind: WeightKind::NGramTable,
+        }
+    }
+
+    /// Flash Next's n-gram table (320,001,536 rows 160 wide) in each
+    /// 32-value block encoding a preset stores it in (160 is not a multiple
+    /// of 256): resident in its rows16 form on every native backend, in as
+    /// many slots as the bytes of `NGRAM_TABLE_STORED_ROWS` rows as stored
+    /// hold (gguf-quant-unification.md §2, Memory). Q5_0 is Q4_K_M's.
+    #[test]
+    fn an_ngram_table_is_resident_in_the_bytes_of_its_stored_rows() {
+        const ROWS: u64 = 320_001_536;
+        let component = ArtifactComponent {
+            kind: ArtifactComponentKind::Target,
+            identity: ArtifactIdentity([0; 32]),
+        };
+        // (encoding, stored block bytes, resident, resident row bytes, slots)
+        for (encoding, block, resident, row, slots) in [
+            (Encoding::Iq4Nl, 18, "iq4g32s", 96, 2_764_800),
+            (Encoding::Q8_0, 34, "q8g32s", 176, 2_848_581),
+            (Encoding::Q4_0, 18, "q4g32s", 96, 2_764_800),
+            (Encoding::Q5_0, 22, "q5g32s", 128, 2_534_400),
+            (Encoding::Q5_1, 24, "q5g32", 144, 2_457_600),
+            (Encoding::Mxfp4, 17, "mxfp4g32", 96, 2_611_200),
+        ] {
+            let stored_row = 5 * block;
+            let inventory = [TensorDescriptor {
+                name: "ngram".into(),
+                shape: vec![ROWS, 160],
+                encoding,
+                offset: 0,
+                nbytes: ROWS * stored_row,
+            }];
+            let descriptor = WeightDescriptor::stored("ngram", [ROWS, 160]);
+            for backend in BackendName::ALL {
+                let mut out = Vec::new();
+                push_stored_table(
+                    &mut out,
+                    &inventory,
+                    component,
+                    ngram_role(),
+                    &descriptor,
+                    ResidentForm {
+                        activation: DType::BF16,
+                        layout: resident_layout(ExecutionPath::Native, backend),
+                    },
+                )
+                .unwrap();
+                let [table] = &out[..] else {
+                    panic!("one plan per table")
+                };
+                assert_eq!(
+                    table.resident,
+                    Element::stored(resident, Layout::Rows16).unwrap()
+                );
+                assert_eq!(table.shape, vec![slots, 160], "{encoding:?}");
+                assert_eq!(table.resident_bytes, slots * row, "{encoding:?}");
+                let budget = NGRAM_TABLE_STORED_ROWS * stored_row;
+                assert!(table.resident_bytes <= budget && budget < table.resident_bytes + row);
+                assert_eq!(table.streamed.unwrap().fill, TableFill::Stored);
+                assert_eq!(table.stored_bytes().unwrap(), ROWS * stored_row);
+            }
+        }
+    }
+
+    /// A table without a host row conversion into its resident form (a
+    /// dense one) is refused.
+    #[test]
+    fn an_ngram_table_without_a_host_row_conversion_is_refused() {
+        let inventory = [TensorDescriptor {
+            name: "ngram".into(),
+            shape: vec![64, 160],
+            encoding: Encoding::F16,
+            offset: 0,
+            nbytes: 64 * 160 * 2,
+        }];
+        let error = push_stored_table(
+            &mut Vec::new(),
+            &inventory,
+            ArtifactComponent {
+                kind: ArtifactComponentKind::Target,
+                identity: ArtifactIdentity([0; 32]),
+            },
+            ngram_role(),
+            &WeightDescriptor::stored("ngram", [64, 160]),
+            ResidentForm {
+                activation: DType::BF16,
+                layout: Layout::Rows16,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("no row conversion"), "{error}");
+    }
+
+    /// The qwen4exp fixture with its n-gram table stored as Q5_0 blocks (as
+    /// a Q4_K_M preset stores Flash Next's) plans on every native backend,
+    /// its n-gram input reading the table's resident rows16 slots.
+    #[test]
+    fn a_q5_0_ngram_table_plans() {
+        let definition = crate::planning::tests::qwen4exp_fixture_definition();
+        let mut manifest = crate::planning::tests::stored_table_manifest(&definition);
+        let mut offset = 0;
+        for tensor in &mut manifest.target.tensors {
+            if tensor.encoding == Encoding::Iq4Nl {
+                tensor.encoding = Encoding::Q5_0;
+                tensor.nbytes = tensor.shape.iter().product::<u64>() / 32 * 22;
+            }
+            tensor.offset = offset;
+            offset += tensor.nbytes;
+        }
+        manifest.target.files[0].size = offset;
+        for backend in BackendName::ALL {
+            let load = ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                ComponentSelection {
+                    head: false,
+                    vision: false,
+                },
+                resident_layout(ExecutionPath::Native, backend),
+            )
+            .unwrap();
+            let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+            let bindings = plan
+                .target()
+                .blocks()
+                .iter()
+                .filter_map(|block| block.ngram())
+                .collect::<Vec<_>>();
+            assert!(!bindings.is_empty());
+            for binding in bindings {
+                assert_eq!(
+                    binding.table,
+                    Element::stored("q5g32s", Layout::Rows16).unwrap()
                 );
             }
         }

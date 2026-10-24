@@ -20,7 +20,8 @@ use super::AssessmentError;
 use crate::operators::attention::graph::selected_segments;
 use crate::operators::gated_delta::graph::StepForm;
 use crate::operators::routed::fused_graph::DecodeForm;
-use crate::operators::{parallel::DenseBesideRouted, streams::StreamsBinding, InputForm};
+use crate::operators::streams::{MixSite, StreamsBinding};
+use crate::operators::{parallel::DenseBesideRouted, InputForm};
 use crate::{
     FeedForwardProgramSlot, GeneralRoutedBinding, MixerProgramSlot, ModelLoadPlan,
     PerLayerEntryBinding, ReadoutHead, SublayerTail, WeightPlan,
@@ -527,14 +528,14 @@ fn mix_site(
     step: &mut Step<'_>,
     load: &ModelLoadPlan,
     scope: WeightScope,
-    streams: StreamsBinding,
-    injected: bool,
+    site: MixSite,
+    inject: Option<Element>,
 ) -> Result<(), AssessmentError> {
     let weight = |kind, bound| planned(load, scope, kind, bound);
-    let norm = weight(WeightKind::HyperConnectionNorm, streams.norm)?;
-    let mut down = vec![norm, weight(WeightKind::HyperConnectionDown, streams.down)?];
-    if injected {
-        down.push(weight(WeightKind::HyperConnectionInject, streams.inject)?);
+    let norm = weight(WeightKind::HyperConnectionNorm, site.norm)?;
+    let mut down = vec![norm, weight(WeightKind::HyperConnectionDown, site.down)?];
+    if let Some(inject) = inject {
+        down.push(weight(WeightKind::HyperConnectionInject, inject)?);
     }
     step.call(
         Kernel::of::<kernels::stream_mix_down::Entry>(),
@@ -542,7 +543,7 @@ fn mix_site(
     )?;
     step.call(
         Kernel::of::<kernels::stream_mix_up::Entry>(),
-        projection(&[weight(WeightKind::HyperConnectionUp, streams.up)?, norm])?,
+        projection(&[weight(WeightKind::HyperConnectionUp, site.up)?, norm])?,
     )
 }
 
@@ -568,9 +569,10 @@ fn sublayer_input(
         .ok_or_else(|| demand_error(format!("{scope:?} is not a decoder sublayer")))?;
     match &sublayer.input {
         InputNorm::HyperConnectionMix(_) => {
-            let streams =
-                streams.ok_or_else(|| demand_error(format!("{scope:?} mixes without streams")))?;
-            mix_site(step, load, scope, streams, true)
+            let site = streams
+                .and_then(|streams| streams.sublayer(index.sublayer))
+                .ok_or_else(|| demand_error(format!("{scope:?} mixes without its site")))?;
+            mix_site(step, load, scope, site.site, Some(site.inject))
         }
         _ => planned(load, scope, WeightKind::InputNorm, norm).map(|_| ()),
     }
@@ -597,7 +599,7 @@ fn ngram(
         Kernel::of::<kernels::ngram_rows::Entry>(),
         sequences(bank_bytes(layout, component + 1, 1, index)?),
     )?;
-    let table = weight(WeightKind::NGramTable, binding.table_source)?;
+    let table = weight(WeightKind::NGramTable, binding.table)?;
     let slots = table.shape[0];
     if slots == 0 || table.resident_bytes % slots != 0 {
         return Err(demand_error(format!(
@@ -1259,8 +1261,12 @@ impl DecodeDemand {
 
         // The last block's graph ends with the decoder's exit site, which
         // injects into nothing.
-        if let Some(streams) = target.blocks().last().and_then(|block| block.streams()) {
-            mix_site(&mut step, load, WeightScope::Target, streams, false)?;
+        if let Some(exit) = target
+            .blocks()
+            .last()
+            .and_then(|block| block.streams()?.exit)
+        {
+            mix_site(&mut step, load, WeightScope::Target, exit, None)?;
         }
 
         // The selection readout graph: the features over the final row under

@@ -890,6 +890,108 @@ pub(crate) mod tests {
         manifest
     }
 
+    /// The qwen4exp fixture without its n-gram input, its tensors encoded
+    /// as `encoding` names them (F16 otherwise), and its program plan.
+    fn streams_program_plan(
+        encoding: impl Fn(&str) -> Encoding,
+    ) -> Result<(ModelLoadPlan, ProgramPlan), crate::error::PlanError> {
+        let mut definition = qwen4exp_fixture_definition();
+        definition.decoder.blocks[0].sublayers.truncate(2);
+        let mut manifest = fixture_manifest(&definition);
+        let mut offset = 0;
+        for tensor in &mut manifest.target.tensors {
+            let values = tensor.shape.iter().product::<u64>();
+            tensor.encoding = encoding(&tensor.name);
+            tensor.nbytes = match tensor.encoding {
+                Encoding::Q8_0 => values / 32 * 34,
+                _ => values * 2,
+            };
+            tensor.offset = offset;
+            offset += tensor.nbytes;
+        }
+        manifest.target.files[0].size = offset;
+        let selection = ComponentSelection {
+            head: false,
+            vision: false,
+        };
+        let load =
+            ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows8)
+                .unwrap();
+        let plan = load.program_plan(&definition, KvCodec::Dense)?;
+        Ok((load, plan))
+    }
+
+    /// A decoder whose mix sites all plan one representation binds every
+    /// block's sites at what the one decoder-wide binding bound (the exit
+    /// site's norm, down and up elements, the sublayers' inject element),
+    /// the exit site on the last block only; so its streams entries are the
+    /// decoder-wide binding's: a sublayer site's and the exit's first stage,
+    /// and one second stage.
+    #[test]
+    fn uniform_streams_blocks_bind_the_decoder_wide_elements() {
+        use crate::operators::streams::{InjectingSite, MixSite};
+        let (load, plan) = streams_program_plan(|_| Encoding::F16).unwrap();
+        let element = |scope, kind| planned_element(load.target(), scope, kind).unwrap();
+        let exit = MixSite {
+            norm: element(WeightScope::Target, WeightKind::HyperConnectionNorm),
+            down: element(WeightScope::Target, WeightKind::HyperConnectionDown),
+            up: element(WeightScope::Target, WeightKind::HyperConnectionUp),
+        };
+        let site = InjectingSite {
+            site: exit,
+            inject: element(
+                WeightScope::TargetSublayer(SublayerIndex {
+                    block: 0,
+                    sublayer: 0,
+                }),
+                WeightKind::HyperConnectionInject,
+            ),
+        };
+        let blocks = plan.target().blocks();
+        let mut downs = std::collections::HashSet::new();
+        let mut ups = std::collections::HashSet::new();
+        for (index, block) in blocks.iter().enumerate() {
+            let streams = block.streams().unwrap();
+            assert_eq!(streams.mixer, site);
+            assert_eq!(streams.feed_forward, Some(site));
+            assert_eq!(streams.exit, (index + 1 == blocks.len()).then_some(exit));
+            for entries in streams.entries().present() {
+                downs.insert(entries.down);
+                ups.insert(entries.up);
+            }
+        }
+        assert_eq!(downs.len(), 2);
+        assert_eq!(ups.len(), 1);
+    }
+
+    /// Mix sites whose weights plan different representations (as an
+    /// IQ3_M file's do, by layer) plan: each block binds its own sites'
+    /// elements, and the exit site its own.
+    #[test]
+    fn mixed_streams_sites_plan_their_own_elements() {
+        let packed = |name: &str| {
+            if matches!(name, "blk.1.ffn_hc_down" | "output_hc_up") {
+                Encoding::Q8_0
+            } else {
+                Encoding::F16
+            }
+        };
+        let (load, plan) = streams_program_plan(packed).unwrap();
+        let element = |scope, kind| planned_element(load.target(), scope, kind).unwrap();
+        let scope = |block, sublayer| WeightScope::TargetSublayer(SublayerIndex { block, sublayer });
+        let blocks = plan.target().blocks();
+        let [first, last] = [blocks[0].streams().unwrap(), blocks[1].streams().unwrap()];
+        let down = |scope| element(scope, WeightKind::HyperConnectionDown);
+        assert_ne!(down(scope(1, 1)), down(scope(0, 1)));
+        assert_eq!(first.feed_forward.unwrap().site.down, down(scope(0, 1)));
+        assert_eq!(last.mixer.site.down, down(scope(1, 0)));
+        assert_eq!(last.feed_forward.unwrap().site.down, down(scope(1, 1)));
+        let exit = last.exit.unwrap();
+        assert_eq!(exit.up, element(WeightScope::Target, WeightKind::HyperConnectionUp));
+        assert_ne!(exit.up, last.mixer.site.up);
+        assert_eq!(first.exit, None);
+    }
+
     /// Decoders over hyper-connection streams prepare on the device: their
     /// entries (attention, gated delta, routed, the streams' and the n-gram
     /// input's) qualify in the forms their block graphs read and join, their

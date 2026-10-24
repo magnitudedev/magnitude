@@ -4,7 +4,7 @@
 //! site. The widening (`repeat_rows`) has no tuning parameters.
 
 use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
-use crate::operators::streams::{StreamsBinding, StreamsGeometry};
+use crate::operators::streams::{MixDownBinding, MixUpBinding, StreamsGeometry};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{stream_mix_down, stream_mix_up};
 use seismic::{BuildError, Element, Tensor};
@@ -32,12 +32,11 @@ fn streams_and_norm(
     Ok((streams, norm))
 }
 
-/// `stream_mix_down` at the mix sites `scopes`: the sublayers' sites, with
-/// inject values, or the exit site, without.
+/// `stream_mix_down` at the mix sites `scopes`: sublayers' sites, with
+/// inject values, or exit sites, without.
 #[derive(Clone)]
 pub(crate) struct StreamMixDownTuning {
-    pub binding: StreamsBinding,
-    pub injected: bool,
+    pub binding: MixDownBinding,
     /// Every site prepared with this specialization.
     pub scopes: Vec<WeightScope>,
     pub epsilon: f32,
@@ -53,16 +52,10 @@ pub(crate) struct StreamMixDownCase {
 
 impl StreamMixDownTuning {
     fn elements(&self) -> stream_mix_down::Elements {
-        // The exit site binds its absent inject weight at the down weight's
-        // element (`CheckedStreamsEntries`).
         stream_mix_down::Elements {
             NW: self.binding.norm,
             DW: self.binding.down,
-            IW: if self.injected {
-                self.binding.inject
-            } else {
-                self.binding.down
-            },
+            IW: self.binding.inject_element(),
             A: self.binding.activation,
         }
     }
@@ -84,7 +77,7 @@ impl EntryTuning for StreamMixDownTuning {
             elements.DW.name(),
             elements.IW.name(),
             elements.A.name(),
-            u64::from(self.injected)
+            u64::from(self.binding.injected())
         )
     }
 
@@ -94,7 +87,7 @@ impl EntryTuning for StreamMixDownTuning {
             ("H", geometry.hidden),
             ("S", geometry.streams),
             ("LR", geometry.rank),
-            ("C", u64::from(self.injected)),
+            ("C", u64::from(self.binding.injected())),
         ])
     }
 
@@ -115,7 +108,7 @@ impl EntryTuning for StreamMixDownTuning {
                 let (hidden, norm) =
                     streams_and_norm(inputs, scope, geometry, point.rows, index as u64 + 1)?;
                 let down = inputs.weight(scope, WeightKind::HyperConnectionDown)?;
-                let inject = if self.injected {
+                let inject = if self.binding.injected() {
                     inputs
                         .weight(scope, WeightKind::HyperConnectionInject)?
                         .reshape(&[geometry.streams, geometry.width()])
@@ -151,7 +144,7 @@ impl EntryTuning for StreamMixDownTuning {
 /// `stream_mix_up` at every mix site `scopes`.
 #[derive(Clone)]
 pub(crate) struct StreamMixUpTuning {
-    pub binding: StreamsBinding,
+    pub binding: MixUpBinding,
     pub scopes: Vec<WeightScope>,
 }
 

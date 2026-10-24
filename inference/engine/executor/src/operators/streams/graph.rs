@@ -2,7 +2,7 @@
 //! streams (block 0), and a mix site over the streams (each sublayer's, and
 //! the decoder's exit).
 
-use super::{StreamsBinding, StreamsGeometry};
+use super::{MixDownBinding, MixUpBinding, Sites, StreamsBinding, StreamsGeometry};
 use crate::ModelLoadPlan;
 use crate::native::StreamsKernels;
 use crate::programs::graph::{GraphError, draft::GraphDraft};
@@ -12,13 +12,24 @@ use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{repeat_rows, stream_mix_down, stream_mix_up};
 use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
-/// The kernel entries of a decoder's streams: the sublayers' mix sites
-/// (`down`, with inject), the exit site (`exit`, without), their second stage
-/// (`up`), and the widening (`repeat`).
-pub(crate) struct StreamsEntries<'a, G: GraphDraft + 'a> {
+/// The kernel entries of one mix site: `stream_mix_down` (with inject
+/// values at a sublayer's site, without at the exit) and `stream_mix_up`.
+pub(crate) struct SiteEntries<'a, G: GraphDraft + 'a> {
     pub down: G::Binding<'a, stream_mix_down::Entry>,
-    pub exit: G::Binding<'a, stream_mix_down::Entry>,
     pub up: G::Binding<'a, stream_mix_up::Entry>,
+}
+
+impl<'a, G: GraphDraft + 'a> Copy for SiteEntries<'a, G> {}
+impl<'a, G: GraphDraft + 'a> Clone for SiteEntries<'a, G> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+/// The kernel entries of a block's streams: each mix site's, and the
+/// widening (`repeat`).
+pub(crate) struct StreamsEntries<'a, G: GraphDraft + 'a> {
+    pub sites: Sites<SiteEntries<'a, G>>,
     pub repeat: G::Binding<'a, repeat_rows::Entry>,
 }
 
@@ -32,57 +43,64 @@ impl<'a, G: GraphDraft + 'a> Clone for StreamsEntries<'a, G> {
 impl<'a> From<&'a StreamsKernels> for StreamsEntries<'a, NativeGraph> {
     fn from(kernels: &'a StreamsKernels) -> Self {
         Self {
-            down: &kernels.down,
-            exit: &kernels.exit,
-            up: &kernels.up,
+            sites: kernels.sites.as_ref().map(|site| SiteEntries {
+                down: &site.down,
+                up: &site.up,
+            }),
             repeat: &kernels.repeat,
         }
     }
 }
 
-/// The element assignments of a decoder's streams entries from its binding.
-/// The exit site binds its absent inject weight at the down weight's element
-/// (a zero-row view of it).
-pub(crate) struct CheckedStreamsEntries {
+/// The element assignments of a mix site's entries.
+pub(crate) struct CheckedSiteEntries {
     down: [(&'static str, Element); 4],
-    exit: [(&'static str, Element); 4],
     up: [(&'static str, Element); 3],
+}
+
+/// The element assignments of a block's streams entries from its binding.
+pub(crate) struct CheckedStreamsEntries {
+    sites: Sites<CheckedSiteEntries>,
     repeat: [(&'static str, Element); 0],
 }
 
 impl CheckedStreamsEntries {
     pub(crate) fn new(binding: StreamsBinding) -> Self {
         Self {
-            down: down_elements(binding, binding.inject),
-            exit: down_elements(binding, binding.down),
-            up: [
-                ("UW", binding.up),
-                ("NW", binding.norm),
-                ("A", binding.activation),
-            ],
+            sites: binding.entries().map(|site| CheckedSiteEntries {
+                down: down_elements(site.down),
+                up: up_elements(site.up),
+            }),
             repeat: [],
         }
     }
 
     pub(crate) fn entries(&self) -> StreamsEntries<'_, NativeGraphMetadata> {
         StreamsEntries {
-            down: &self.down,
-            exit: &self.exit,
-            up: &self.up,
+            sites: self.sites.as_ref().map(|site| SiteEntries {
+                down: &site.down[..],
+                up: &site.up[..],
+            }),
             repeat: &self.repeat,
         }
     }
 }
 
-/// `stream_mix_down`'s element assignments with inject weights of `inject`.
-pub(crate) fn down_elements(
-    binding: StreamsBinding,
-    inject: Element,
-) -> [(&'static str, Element); 4] {
+/// `stream_mix_down`'s element assignments.
+pub(crate) fn down_elements(binding: MixDownBinding) -> [(&'static str, Element); 4] {
     [
         ("NW", binding.norm),
         ("DW", binding.down),
-        ("IW", inject),
+        ("IW", binding.inject_element()),
+        ("A", binding.activation),
+    ]
+}
+
+/// `stream_mix_up`'s element assignments.
+pub(crate) fn up_elements(binding: MixUpBinding) -> [(&'static str, Element); 3] {
+    [
+        ("UW", binding.up),
+        ("NW", binding.norm),
         ("A", binding.activation),
     ]
 }
@@ -124,7 +142,7 @@ pub(crate) struct MixSite {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mix_site<'a, G: GraphDraft + 'a>(
     graph: &mut G,
-    entries: StreamsEntries<'a, G>,
+    entries: SiteEntries<'a, G>,
     load: &ModelLoadPlan,
     scope: WeightScope,
     geometry: StreamsGeometry,
@@ -154,7 +172,7 @@ pub(crate) fn mix_site<'a, G: GraphDraft + 'a>(
         down.slice_leading(0, 0)
     };
     let mixed = graph.enqueue(
-        if injected { entries.down } else { entries.exit },
+        entries.down,
         &[
             ("M", rows),
             ("H", h),

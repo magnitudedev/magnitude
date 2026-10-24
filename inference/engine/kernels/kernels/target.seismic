@@ -133,23 +133,23 @@ native conditioning_overlay for cpu from "cpu/conditioning_overlay.rs":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
-# Rows of a streamed table whose slots hold its rows as stored (an n-gram
-# table, `TableFill::Stored`): `slots[s]` is a stored row of W values in its
-# 32-value block encoding E (IQ4_NL or Q8_0). Row m of the result is the
-# slot `gathered_row` names for `tokens[m, 0]` (a (row, status) selection),
-# decoded exactly as its registered conversion to U and rounded once to A.
-# A failed selection and a row without a slot read slot 0.
+# Rows of a streamed table whose slots the host fills (an n-gram table,
+# `TableFill::Stored`): `slots[s]` is a resident row of W values. Row m of
+# the result is the slot `gathered_row` names for `tokens[m, 0]` (a (row,
+# status) selection), decoded and rounded once to A. A failed selection and a
+# row without a slot read slot 0. Unlike `embedding_rows`, no F32 copy, scale
+# or normalization.
 fn stored_rows[M, S, W, R, F](slots: &tensor[S, W] E, tokens: &tensor[M, 2] i32,
     directory: &tensor[R, F] i32) -> tensor[M, W] A where R >= 0 and F >= 1:
-    let blocks = repack[U = U](slots)
     let mut rows = tensor[M, W] A
     parallel for row in 0..M:
         let slot = gathered_row(directory, tokens[row, 0])
-        rows[row] = f32(blocks[slot])
+        rows[row] = f32(slots[slot])
     return rows
 
-# Each native decodes the stored blocks itself. Metal, CUDA and Vulkan: one
-# threadgroup per row and 256 columns, a thread per value.
+# Each native decodes the slots' rows16 rows through the shared decoders.
+# Metal, CUDA and Vulkan: one threadgroup per row and 256 columns, a thread
+# per value.
 native stored_rows for metal from "metal/stored_rows.metal":
     static (W)
     launch stored_rows:

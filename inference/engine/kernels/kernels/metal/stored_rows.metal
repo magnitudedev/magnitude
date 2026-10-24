@@ -1,21 +1,9 @@
-// Read directory-selected slots in their stored IQ4_NL or Q8_0 encoding.
-// Both have an F16 scale per 32 values; codes are nonlinear nibbles or
-// signed bytes. Decode directly and round once to the activation element.
-#include "lib/core/activation.h"
+// Read directory-selected slots, rows16 rows of the table's resident
+// representation, through the packet decoders, a thread per value, and round
+// once to the activation element.
+#define KERNEL_W0 SEISMIC_SLOTS
+#include "lib/projection/projection.h"
 #include "lib/core/gathered.h"
-
-#if defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q8_0)
-#define STORED_BLOCK_BYTES 34
-#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ4_NL_BLOCK)
-#define STORED_BLOCK_BYTES 18
-#else
-#error "stored_rows requires IQ4_NL or Q8_0 blocks"
-#endif
-
-constant float stored_iq4[16] = {
-    -127.0f, -104.0f, -83.0f, -65.0f, -49.0f, -35.0f, -22.0f, -10.0f,
-    1.0f, 13.0f, 25.0f, 38.0f, 53.0f, 69.0f, 89.0f, 113.0f,
-};
 
 kernel void stored_rows(
     device const uchar *slots [[buffer(SEISMIC_BUFFER_SLOTS)]],
@@ -26,23 +14,14 @@ kernel void stored_rows(
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
     const ulong row = group.x;
-    const ulong column = ulong(group.y) * 256ul + thread_index;
-    if (column >= SEISMIC_DIM_W)
+    const uint column = group.y * 256u + thread_index;
+    const uint width = uint(SEISMIC_DIM_W);
+    if (column >= width)
         return;
-    const ulong slot = gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R, SEISMIC_DIM_F,
-        tokens[row * SEISMIC_TOKENS_STRIDE_0]);
-    // Strides of external storage count packets.
-    device const uchar *block = slots + slot * SEISMIC_SLOTS_STRIDE_0 * SEISMIC_ELEMENT_E_PACKET_SIZE +
-                                (column / 32ul) * STORED_BLOCK_BYTES;
-    const float scale = float(as_type<half>(ushort(block[0] | (ushort(block[1]) << 8))));
-    const uint within = uint(column % 32ul);
-#if defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q8_0)
-    const uint raw = block[2 + within];
-    const float value = float(int(raw) - (raw >= 128u ? 256 : 0));
-#else
-    const uint code = (block[2 + within % 16u] >> (4u * (within / 16u))) & 15u;
-    const float value = stored_iq4[code];
-#endif
-    element::put<element::Act>(rows, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
-        value * scale);
+    const uint slot = uint(gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R, SEISMIC_DIM_F,
+        tokens[row * SEISMIC_TOKENS_STRIDE_0]));
+    projection::Weights<packets::W0> table{slots, KERNEL_W0_LAYOUT(width), width, nullptr};
+    typename packets::W0::packet packet = table.packet(slot, column / 32u);
+    element::put<element::Act>(rows, row * SEISMIC_RESULT_0_STRIDE_0 + ulong(column) * SEISMIC_RESULT_0_STRIDE_1,
+        packets::value_at<packets::W0>(packet, column % 32u));
 }

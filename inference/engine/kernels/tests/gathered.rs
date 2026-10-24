@@ -1,8 +1,11 @@
 // Reads of a streamed gathered table through its directory (`gathered_row`,
 // target.seismic), dense and hashed, on every backend this host opens:
 //
-// - `stored_rows` decodes the stored IQ4_NL rows its directory names exactly
-//   as its portable body does and as an independent host decode does;
+// - `stored_rows` decodes the resident rows its directory names exactly as
+//   its portable body does, slots holding stored rows converted by the
+//   registry's host repack; for IQ4_NL and Q8_0 also exactly as the decode
+//   of the rows as stored does (what the slots held before they were
+//   resident);
 // - `embedding_rows` through a hashed directory reads what a direct read of
 //   the slots it names reads.
 
@@ -100,10 +103,22 @@ fn decode(stored: &[u8], row: usize, width: usize, q8: bool) -> Vec<f32> {
         .collect()
 }
 
+/// Whether a native decode `actual` is the portable decode `expected`: the
+/// same bits, or both zero (the shared decoders form a biased code's value
+/// as one fused `d * code - offset * d`, whose exact cancellation is +0
+/// where the registry's reference keeps the sign of `d * 0`), or both NaN
+/// (random scale fields include NaNs, whose payloads no conversion or
+/// decode keeps).
+fn same_value(actual: f32, expected: f32) -> bool {
+    actual.to_bits() == expected.to_bits()
+        || (actual == 0.0 && expected == 0.0)
+        || (actual.is_nan() && expected.is_nan())
+}
+
 fn stored_rows_native(
     device: &Device,
     width: u64,
-    q8: bool,
+    resident: Element,
 ) -> seismic::NativeKernel<stored_rows::Entry> {
     let spec = NativeSpecialization::new().with_static("W", width);
     let spec = seismic::generated::native_implementation::<stored_rows::Entry>(device)
@@ -114,8 +129,7 @@ fn stored_rows_native(
     stored_rows::native_for_device_with(
         device,
         stored_rows::Elements {
-            E: Element::named(if q8 { "gguf_q8_0" } else { "gguf_iq4_nl_block" }).unwrap(),
-            U: Element::named(if q8 { "q8g32s" } else { "iq4g32s" }).unwrap(),
+            E: resident,
             A: Element::bf16(),
         },
         &spec,
@@ -130,7 +144,7 @@ fn stored_rows_portable(
     tokens: &[i32],
     directory: &[i32],
     directory_shape: [usize; 2],
-    q8: bool,
+    resident: &str,
 ) -> Vec<f32> {
     use seismic_lang::{
         checked::{SourceFile, check_source},
@@ -147,14 +161,7 @@ fn stored_rows_portable(
     });
     let module = check_source(sources).unwrap();
     let elements = ElementBindings::new()
-        .bind(
-            "E",
-            registry::representation(if q8 { "gguf_q8_0" } else { "gguf_iq4_nl_block" }).unwrap(),
-        )
-        .bind(
-            "U",
-            registry::representation(if q8 { "q8g32s" } else { "iq4g32s" }).unwrap(),
-        )
+        .bind("E", registry::representation(resident).unwrap())
         .bind("A", registry::dense(DType::BF16));
     let logical = module
         .entry(module.entry_named("stored_rows").unwrap(), &elements)
@@ -169,7 +176,7 @@ fn stored_rows_portable(
     };
     let arguments = [
         TensorData::encoded(
-            registry::representation(if q8 { "gguf_q8_0" } else { "gguf_iq4_nl_block" }).unwrap(),
+            registry::representation(resident).unwrap(),
             shape.to_vec(),
             slots.to_vec(),
         )
@@ -195,15 +202,56 @@ fn stored_rows_portable(
 
 #[test]
 fn stored_rows_decode_the_rows_their_directory_names() {
-    for q8 in [false, true] {
-        stored_rows_match(q8);
+    // The 32-value block encodings an n-gram table of width 160 is stored
+    // in, each with its rows16 resident form; IQ4_NL and Q8_0 (`Some(q8)`)
+    // were read as stored before.
+    for (source, resident, as_stored) in [
+        ("gguf_iq4_nl_block", "iq4g32s@rows16", Some(false)),
+        ("gguf_q8_0", "q8g32s@rows16", Some(true)),
+        ("gguf_q4_0", "q4g32s@rows16", None),
+        ("gguf_q5_0", "q5g32s@rows16", None),
+        ("gguf_q5_1", "q5g32@rows16", None),
+    ] {
+        stored_rows_match(source, resident, as_stored);
     }
 }
 
-fn stored_rows_match(q8: bool) {
+fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>) {
     let (rows, slots, width, buckets) = (300usize, 24usize, 160usize, 64usize);
     let mut random = Random(41);
-    let stored_slots = stored(&mut random, slots, width, q8);
+    let (source_element, resident_element) =
+        (Element::named(source).unwrap(), Element::named(resident).unwrap());
+    let stored_slots = match as_stored {
+        Some(q8) => stored(&mut random, slots, width, q8),
+        None => (0..source_element
+            .canonical_byte_len(&[slots as u64, width as u64])
+            .unwrap())
+            .map(|_| (random.next().to_bits() >> 8) as u8)
+            .collect(),
+    };
+    let stored_slots = resident_element
+        .repack_source(source_element, stored_slots)
+        .unwrap();
+    let resident_slots = resident_element
+        .repack_host(source_element, &[slots as u64, width as u64], &stored_slots)
+        .unwrap();
+    // The portable body is the reference of an encoding not read as stored
+    // before.
+    let decode = |slot: usize| match as_stored {
+        Some(q8) => decode(&stored_slots, slot, width, q8),
+        None => {
+            let shape = [1, width];
+            let row = resident_slots.len() / slots;
+            stored_rows_portable(
+                &resident_slots[slot * row..(slot + 1) * row],
+                shape,
+                &[0, 0],
+                &[],
+                [0, 1],
+                resident,
+            )
+        }
+    };
     let held = (0..slots)
         .map(|slot| (slot * 37 + 5) % rows)
         .collect::<Vec<_>>();
@@ -221,7 +269,7 @@ fn stored_rows_match(q8: bool) {
         .collect::<Vec<_>>();
     let expected = selections
         .chunks_exact(2)
-        .flat_map(|pair| decode(&stored_slots, found(&dense, pair[0]), width, q8))
+        .flat_map(|pair| decode(found(&dense, pair[0])))
         .collect::<Vec<_>>();
     let forms = [
         (dense.clone(), [rows, 1]),
@@ -235,7 +283,7 @@ fn stored_rows_match(q8: bool) {
                 .chunks_exact(2)
                 .flat_map(|pair| {
                     let slot = usize::try_from(pair[0]).map_or(0, |row| row.min(slots - 1));
-                    decode(&stored_slots, slot, width, q8)
+                    decode(slot)
                 })
                 .collect::<Vec<_>>(),
             _ => expected.clone(),
@@ -248,26 +296,26 @@ fn stored_rows_match(q8: bool) {
             _ => selections.clone(),
         };
         let portable = stored_rows_portable(
-            &stored_slots,
+            &resident_slots,
             [slots, width],
             &selections,
             directory,
             *shape,
-            q8,
+            resident,
         );
         assert!(
             same_bits(&portable, &expected),
-            "portable, directory {shape:?}"
+            "{source} portable, directory {shape:?}"
         );
         for device in devices() {
             let slots_tensor = Tensor::from_host(
                 &device,
-                Element::named(if q8 { "gguf_q8_0" } else { "gguf_iq4_nl_block" }).unwrap(),
+                resident_element,
                 &[slots as u64, width as u64],
-                &stored_slots,
+                &resident_slots,
             )
             .unwrap();
-            let result = stored_rows_native(&device, width as u64, q8)
+            let result = stored_rows_native(&device, width as u64, resident_element)
                 .call(stored_rows::Args {
                     slots: &slots_tensor,
                     tokens: &ints(&device, &[selections.len() as u64 / 2, 2], &selections),
@@ -276,11 +324,27 @@ fn stored_rows_match(q8: bool) {
                 .unwrap()
                 .value;
             let actual = read(&result);
+            // Rows read as stored before decode to their former bits. The
+            // others decode to the portable values (`same_value`).
+            let decoded = match as_stored {
+                Some(_) => same_bits(&actual, &expected),
+                None => {
+                    actual.len() == expected.len()
+                        && actual.iter().zip(&expected).all(|(a, e)| same_value(*a, *e))
+                }
+            };
             assert!(
-                same_bits(&actual, &expected),
-                "{:?} directory {shape:?}: {:?}",
+                decoded,
+                "{source} {:?} directory {shape:?}: {:?}",
                 device.backend(),
-                first_difference(&actual, &expected)
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .enumerate()
+                    .find(|(_, (a, e))| match as_stored {
+                        Some(_) => a.to_bits() != e.to_bits(),
+                        None => !same_value(**a, **e),
+                    })
             );
         }
     }

@@ -33,7 +33,7 @@ use super::state_space::graph::{
     CheckedStateSpaceEntries, StateSpaceBlock, StateSpaceGraphEntries, state_space,
 };
 use super::streams::StreamsGeometry;
-use super::streams::graph::{StreamsEntries, mix_site};
+use super::streams::graph::{SiteEntries, mix_site};
 use super::{
     FeedForward, InputForm, Join, Mixer, PairedBlock, SublayerInput, SublayerSource,
     attention as attention_operator, bank_component_index, dense_ffn, gated_delta,
@@ -317,7 +317,7 @@ impl BlockSublayers<'_> {
         &self,
         graph: &mut G,
         source: SublayerSource<'_>,
-        streams: Option<StreamsEntries<'e, G>>,
+        site: Option<SiteEntries<'e, G>>,
         sublayer: u32,
         hidden: &WorkflowTensor,
         weights: &mut Vec<(WeightPort, NativePort)>,
@@ -330,7 +330,7 @@ impl BlockSublayers<'_> {
                 let geometry = StreamsGeometry::of(self.geometry)
                     .map_err(|error| error.to_string())?
                     .ok_or("a mix site without residual streams")?;
-                let entries = streams.ok_or("a mix site without its streams entries")?;
+                let entries = site.ok_or("a mix site without its streams entries")?;
                 let site = mix_site(
                     graph,
                     entries,
@@ -366,7 +366,7 @@ impl BlockSublayers<'_> {
         &self,
         graph: &mut G,
         entries: MixerEntries<'e, G>,
-        streams: Option<StreamsEntries<'e, G>>,
+        site: Option<SiteEntries<'e, G>>,
         hidden: &WorkflowTensor,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
@@ -390,7 +390,7 @@ impl BlockSublayers<'_> {
         let component_index = bank_component_index(&geometry.blocks, block_index)
             .map_err(|error| error.to_string())?;
         let (input_rows, form, join) =
-            self.read(graph, paired.mixer_input, streams, 0, hidden, weights)?;
+            self.read(graph, paired.mixer_input, site, 0, hidden, weights)?;
         let input = SublayerInput {
             rows: &input_rows,
             form,
@@ -578,7 +578,7 @@ impl BlockSublayers<'_> {
         &self,
         graph: &mut G,
         entries: Option<FeedForwardEntries<'e, G>>,
-        streams: Option<StreamsEntries<'e, G>>,
+        site: Option<SiteEntries<'e, G>>,
         mixed: WorkflowTensor,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
@@ -598,7 +598,7 @@ impl BlockSublayers<'_> {
                     weights: &mut Vec<(WeightPort, NativePort)>,
                     source: Option<SublayerSource<'_>>| {
             let source = source.ok_or("a routed feed-forward without its input source")?;
-            self.read(graph, source, streams, 1, &mixed, weights)
+            self.read(graph, source, site, 1, &mixed, weights)
         };
         Ok(match (paired.feed_forward, entries) {
             (None, None) => mixed,

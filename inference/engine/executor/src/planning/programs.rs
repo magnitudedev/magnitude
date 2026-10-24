@@ -71,7 +71,8 @@ pub struct TargetBlockProgramSlot {
     /// The per-layer input sublayer after the feed-forward.
     per_layer: Option<PerLayerBinding>,
     /// The decoder's hyper-connection streams, which the block reads and
-    /// writes through mix sites.
+    /// writes through its mix sites, each bound at its own weights'
+    /// elements.
     streams: Option<StreamsBinding>,
     /// The n-gram input after the feed-forward.
     ngram: Option<NGramBinding>,
@@ -618,11 +619,7 @@ pub(super) fn derive_program_plan(
         activation: active_element,
     };
     let decoder = &definition.decoder;
-    let streams = operators::streams::binding(
-        decoder,
-        |scope, kind| lookup(target, scope, kind),
-        active_element,
-    )?;
+    let streams = operators::streams::StreamsGeometry::of(decoder)?;
     let mut blocks = Vec::with_capacity(decoder.blocks.len());
     for (index, block) in decoder.blocks.iter().enumerate() {
         let index = u32::try_from(index)
@@ -676,7 +673,22 @@ pub(super) fn derive_program_plan(
                     })
                     .transpose()?,
             )
-            .with_streams(streams)
+            .with_streams(
+                streams
+                    .map(|geometry| {
+                        // The last block ends with the decoder's exit site.
+                        let last = index as usize + 1 == decoder.blocks.len();
+                        operators::streams::binding(
+                            geometry,
+                            mixer,
+                            paired.feed_forward.is_some().then_some(feed_forward),
+                            last.then_some(WeightScope::Target),
+                            |scope, kind| lookup(target, scope, kind),
+                            active_element,
+                        )
+                    })
+                    .transpose()?,
+            )
             .with_ngram(
                 paired
                     .ngram
@@ -685,8 +697,7 @@ pub(super) fn derive_program_plan(
                             block: index,
                             sublayer: 2,
                         });
-                        // The table is read as stored and decoded as the
-                        // representation it would be imported to.
+                        // The table's slots, resident, filled by the host.
                         let table = target
                             .iter()
                             .find(|table| {
@@ -697,7 +708,7 @@ pub(super) fn derive_program_plan(
                                     }
                             })
                             .and_then(|table| match table.streamed?.fill {
-                                TableFill::Stored { decoded } => Some((table.resident, decoded)),
+                                TableFill::Stored => Some(table.resident),
                                 TableFill::Imported => None,
                             })
                             .ok_or(PlanError::Topology(
@@ -838,10 +849,11 @@ pub(super) fn derive_program_plan(
                     &head_block.residual,
                 )?
                 .map(|geometry| {
-                    operators::streams::binding_sites(
+                    operators::streams::binding(
                         geometry,
-                        scope,
-                        [mixer, feed_forward],
+                        mixer,
+                        Some(feed_forward),
+                        Some(scope),
                         |scope, kind| lookup(weights, scope, kind),
                         active_element,
                     )

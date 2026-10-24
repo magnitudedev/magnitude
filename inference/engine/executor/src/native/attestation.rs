@@ -649,6 +649,18 @@ impl AttestedPrograms {
                 u128::from(NativeKernel::<$entry::Entry>::planned_invocation_workspace_bytes())
             };
         }
+        // The streams entries of blocks `streams`: each distinct binding of
+        // each site's entries once.
+        let streams_bytes = |streams: &[crate::operators::streams::StreamsBinding]| {
+            let mut downs = HashSet::new();
+            let mut ups = HashSet::new();
+            for site in streams.iter().flat_map(|binding| binding.entries().present()) {
+                downs.insert(site.down);
+                ups.insert(site.up);
+            }
+            downs.len() as u128 * bytes!(stream_mix_down)
+                + ups.len() as u128 * bytes!(stream_mix_up)
+        };
         // The fused routed form's entries: the decode ones by the backend's
         // form.
         let routed_bytes = bytes!(routed_route)
@@ -870,11 +882,13 @@ impl AttestedPrograms {
                     + bytes!(ngram_inject);
             }
         }
-        let mut charged_streams = HashSet::new();
-        for binding in target.blocks().iter().filter_map(|block| block.streams()) {
-            if charged_streams.insert(binding) {
-                bytes += 2 * bytes!(stream_mix_down) + bytes!(stream_mix_up) + bytes!(repeat_rows);
-            }
+        let streams = target
+            .blocks()
+            .iter()
+            .filter_map(|block| block.streams())
+            .collect::<Vec<_>>();
+        if !streams.is_empty() {
+            bytes += streams_bytes(&streams) + bytes!(repeat_rows);
         }
         if target.per_layer().is_some() {
             bytes += 2 * bytes!(import_dense)
@@ -915,10 +929,8 @@ impl AttestedPrograms {
             for &binding in head.blocks() {
                 if charged_heads.insert(binding) {
                     bytes += bytes!(feature_copy) + bytes!(feature_rows);
-                    if binding.streams.is_some() {
-                        bytes += 2 * bytes!(stream_mix_down)
-                            + bytes!(stream_mix_up)
-                            + bytes!(repeat_rows);
+                    if let Some(streams) = binding.streams {
+                        bytes += streams_bytes(&[streams]) + bytes!(repeat_rows);
                     }
                     bytes += bytes!(draft_rows)
                         + 2 * bytes!(attention_project)
@@ -1313,8 +1325,7 @@ impl AttestedPrograms {
                         prepared
                             .target
                             .streams
-                            .get(&binding)
-                            .cloned()
+                            .kernels(binding)
                             .ok_or_else(|| missing("stream_mix", binding))
                     })
                     .transpose()?;
@@ -1812,12 +1823,9 @@ impl AttestedPrograms {
                 + u128::from(handles.gate.invocation_workspace_bytes())
                 + u128::from(handles.inject.invocation_workspace_bytes());
         }
-        for handles in prepared.target.streams.values() {
-            bytes += u128::from(handles.down.invocation_workspace_bytes())
-                + u128::from(handles.exit.invocation_workspace_bytes())
-                + u128::from(handles.up.invocation_workspace_bytes())
-                + u128::from(handles.repeat.invocation_workspace_bytes());
-        }
+        charge!(prepared.target.streams.down.values());
+        charge!(prepared.target.streams.up.values());
+        charge!(prepared.target.streams.repeat.iter());
         for entry in prepared.target.per_layer_entry.values() {
             bytes += u128::from(entry.round.invocation_workspace_bytes())
                 + u128::from(entry.project.invocation_workspace_bytes())
@@ -1887,10 +1895,11 @@ impl AttestedPrograms {
             charge!(head.copy.values());
             charge!(head.gather.values());
             for handles in head.streams.values() {
-                bytes += u128::from(handles.down.invocation_workspace_bytes())
-                    + u128::from(handles.exit.invocation_workspace_bytes())
-                    + u128::from(handles.up.invocation_workspace_bytes())
-                    + u128::from(handles.repeat.invocation_workspace_bytes());
+                for site in handles.sites.as_ref().present() {
+                    bytes += u128::from(site.down.invocation_workspace_bytes())
+                        + u128::from(site.up.invocation_workspace_bytes());
+                }
+                bytes += u128::from(handles.repeat.invocation_workspace_bytes());
             }
             charge!(head.priming_project.values());
             for handles in head.attention.values() {
@@ -2588,9 +2597,10 @@ impl AttestedPrograms {
                 charge!(&block.copy);
                 charge!(&block.gather);
                 if let Some(streams) = &block.streams {
-                    charge!(&streams.down);
-                    charge!(&streams.exit);
-                    charge!(&streams.up);
+                    for site in streams.sites.as_ref().present() {
+                        charge!(&site.down);
+                        charge!(&site.up);
+                    }
                     charge!(&streams.repeat);
                 }
                 charge!(&block.input);

@@ -40,14 +40,14 @@ use super::tuning::{
 use super::*;
 use crate::operators::gated_delta::graph::StepForm;
 use crate::operators::routed::fused_graph::DecodeForm;
-use crate::operators::streams::StreamsBinding;
+use crate::operators::streams::SiteEntryBindings;
 use crate::programs::invocation_demand::{GraphInvocationDemand, InvocationCounts};
 use crate::{
     DenseBinding, GeneralRoutedBinding, ModelLoadPlan, ReadoutHead, ShortConvBinding,
     StateSpaceBinding, SublayerTail,
 };
 use magnitude_family_contracts::{
-    InputNorm, ModelDefinition, SublayerIndex, WeightKind, WeightScope,
+    ModelDefinition, SublayerIndex, WeightKind, WeightScope,
 };
 use magnitude_kernels::{
     attention_append_dense, cluster_token_rows, conditioning_overlay, corrector_attention,
@@ -147,6 +147,21 @@ impl<K: Copy + Eq + std::hash::Hash> BindingLayers<K> {
     fn scopes(&self, binding: K) -> Vec<WeightScope> {
         self.layers[&binding].clone()
     }
+}
+
+/// Each distinct binding of `bindings` in order of first appearance, with
+/// the layers it is prepared for in model order.
+fn ordered_layers<K: Eq>(
+    bindings: impl IntoIterator<Item = (K, WeightScope)>,
+) -> Vec<(K, Vec<WeightScope>)> {
+    let mut ordered: Vec<(K, Vec<WeightScope>)> = Vec::new();
+    for (binding, scope) in bindings {
+        match ordered.iter_mut().find(|(known, _)| *known == binding) {
+            Some((_, scopes)) => scopes.push(scope),
+            None => ordered.push((binding, vec![scope])),
+        }
+    }
+    ordered
 }
 
 /// The scope of sublayer `sublayer` (0 the mixer, 1 the feed-forward) of
@@ -574,8 +589,6 @@ struct Preparation<'a> {
     hidden: u64,
     /// The target's vocabulary: the static dimension of token selection.
     vocabulary: u64,
-    /// The scopes of the decoder's sublayer mix sites (`operators::streams`).
-    stream_sites: Vec<WeightScope>,
     target: TargetKernels,
     head: Option<HeadKernels>,
     shared_head: Option<SharedHeadKernels>,
@@ -607,12 +620,6 @@ impl<'a> Preparation<'a> {
             softcap: crate::programs::graph::readout::readout_softcap(&definition.decoder),
             hidden: definition.decoder.hidden,
             vocabulary: definition.decoder.vocabulary,
-            stream_sites: definition
-                .decoder
-                .sublayers()
-                .filter(|(_, sublayer)| matches!(sublayer.input, InputNorm::HyperConnectionMix(_)))
-                .map(|(index, _)| WeightScope::TargetSublayer(index))
-                .collect(),
             target: TargetKernels::default(),
             head: plan.head().map(|_| HeadKernels::default()),
             shared_head: plan.shared_head().map(|_| SharedHeadKernels::default()),
@@ -1277,16 +1284,22 @@ impl<'a> Preparation<'a> {
                 }
             }
         }
-        let mut streams = HashSet::new();
-        for b in target.blocks().iter().filter_map(|block| block.streams()) {
-            if streams.insert(b) && !self.target.streams.contains_key(&b) {
-                if let Some(kernels) =
-                    self.streams(b, self.stream_sites.clone(), WeightScope::Target)?
-                {
-                    self.target.streams.insert(b, kernels);
-                }
-            }
-        }
+        let sites = target
+            .blocks()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| Some((index, block.streams()?)))
+            .flat_map(|(index, binding)| {
+                binding.entries().scoped([
+                    sublayer_scope(index, 0),
+                    sublayer_scope(index, 1),
+                    WeightScope::Target,
+                ])
+            })
+            .collect::<Vec<_>>();
+        let mut streams = std::mem::take(&mut self.target.streams);
+        self.streams(&mut streams, &sites)?;
+        self.target.streams = streams;
         let b = target.readout();
         let bindings = format!("{b:?}");
         let features = self.target_features(&bindings, b.norm, b.activation)?;
@@ -2045,13 +2058,12 @@ impl<'a> Preparation<'a> {
         let stored = self.spec.fixed(
             &format!(
                 "E={},A={}",
-                binding.table_source.name(),
+                binding.table.name(),
                 binding.activation.name()
             ),
             &[("W", binding.width)],
             stored_rows::native_entry_with(stored_rows::Elements {
-                E: binding.table_source,
-                U: binding.table,
+                E: binding.table,
                 A: binding.activation,
             }),
         )?;
@@ -2085,50 +2097,53 @@ impl<'a> Preparation<'a> {
         })
     }
 
-    /// A decoder's hyper-connection streams: the sublayers' mix sites, the
-    /// exit site, and the widening of the embedded rows.
+    /// The hyper-connection streams entries of mix sites `sites` (each
+    /// site's entry bindings at its scope) that `prepared` lacks: each
+    /// distinct `stream_mix_down` and `stream_mix_up` binding prepared once,
+    /// tuned over every site that binds it in site order, and the widening
+    /// of the embedded rows.
     fn streams(
         &mut self,
-        binding: StreamsBinding,
-        sites: Vec<WeightScope>,
-        exit_scope: WeightScope,
-    ) -> Result<Option<StreamsKernels>, CatalogFailure> {
-        let down = self.spec.tuned(
-            &mut self.tuning,
-            &StreamMixDownTuning {
-                binding,
-                injected: true,
-                scopes: sites.clone(),
-                epsilon: self.epsilon,
-            },
-        )?;
-        let exit = self.spec.tuned(
-            &mut self.tuning,
-            &StreamMixDownTuning {
-                binding,
-                injected: false,
-                scopes: vec![exit_scope],
-                epsilon: self.epsilon,
-            },
-        )?;
-        let up = self.spec.tuned(
-            &mut self.tuning,
-            &StreamMixUpTuning {
-                binding,
-                scopes: sites.iter().copied().chain([exit_scope]).collect(),
-            },
-        )?;
-        let spec = &mut self.spec;
-        let repeat = fixed!(spec, repeat_rows, "fixed");
-        Ok(match (down, exit, up, repeat) {
-            (Some(down), Some(exit), Some(up), Some(repeat)) => Some(StreamsKernels {
-                down,
-                exit,
-                up,
-                repeat,
-            }),
-            _ => None,
-        })
+        prepared: &mut StreamsEntryKernels,
+        sites: &[(SiteEntryBindings, WeightScope)],
+    ) -> Result<(), CatalogFailure> {
+        if sites.is_empty() {
+            return Ok(());
+        }
+        let downs = ordered_layers(sites.iter().map(|(site, scope)| (site.down, *scope)));
+        for (binding, scopes) in downs {
+            if prepared.down.contains_key(&binding) {
+                continue;
+            }
+            let kernel = self.spec.tuned(
+                &mut self.tuning,
+                &StreamMixDownTuning {
+                    binding,
+                    scopes,
+                    epsilon: self.epsilon,
+                },
+            )?;
+            if let Some(kernel) = kernel {
+                prepared.down.insert(binding, kernel);
+            }
+        }
+        let ups = ordered_layers(sites.iter().map(|(site, scope)| (site.up, *scope)));
+        for (binding, scopes) in ups {
+            if prepared.up.contains_key(&binding) {
+                continue;
+            }
+            let kernel = self
+                .spec
+                .tuned(&mut self.tuning, &StreamMixUpTuning { binding, scopes })?;
+            if let Some(kernel) = kernel {
+                prepared.up.insert(binding, kernel);
+            }
+        }
+        if prepared.repeat.is_none() {
+            let spec = &mut self.spec;
+            prepared.repeat = fixed!(spec, repeat_rows, "fixed");
+        }
+        Ok(())
     }
 
     /// The per-layer entry: the embedding's projection into F32 per-layer
@@ -2648,20 +2663,22 @@ impl<'a> Preparation<'a> {
                 self.tuning.set_invocations(calls, true);
             }
             let bindings = format!("{b:?}");
-            let stream_kernels = b
-                .streams
-                .map(|streams| {
-                    self.streams(
-                        streams,
-                        vec![
+            let stream_kernels = match b.streams {
+                Some(streams) => {
+                    let mut prepared = StreamsEntryKernels::default();
+                    let sites = streams
+                        .entries()
+                        .scoped([
                             head_sublayer_scope(head_index, 0),
                             head_sublayer_scope(head_index, 1),
-                        ],
-                        head_scope(head_index),
-                    )
-                })
-                .transpose()?
-                .flatten();
+                            head_scope(head_index),
+                        ])
+                        .collect::<Vec<_>>();
+                    self.streams(&mut prepared, &sites)?;
+                    prepared.kernels(streams)
+                }
+                None => None,
+            };
             let copy = fixed!(
                 self.spec,
                 feature_copy,

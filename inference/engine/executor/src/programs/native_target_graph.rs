@@ -3287,7 +3287,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     let (mixed, mut state_ports, controls) = sublayers.mixer(
         graph,
         mixer_entries,
-        streams_entries,
+        streams_entries.map(|entries| entries.sites.mixer),
         &hidden,
         weights,
         constants,
@@ -3301,7 +3301,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     let output = sublayers.feed_forward(
         graph,
         feed_forward_entries,
-        streams_entries,
+        streams_entries.and_then(|entries| entries.sites.feed_forward),
         mixed,
         weights,
         constants,
@@ -3325,15 +3325,14 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     let residual = (block_index + 1 == geometry.blocks.len()
         && load.residual_conditioning().is_some())
     .then(|| output.clone());
-    // The last block ends with the decoder's exit site, whose partials the
-    // readout sums.
-    let output = match (streams, streams_entries, &geometry.exit.norm) {
-        (Some(streams), Some(entries), ExitNorm::HyperConnectionHead(site))
-            if block_index + 1 == geometry.blocks.len() =>
-        {
+    // The block that binds the decoder's exit site (the last) ends with it,
+    // and the readout sums its partials.
+    let exit = streams_entries.and_then(|entries| entries.sites.exit);
+    let output = match (streams, exit, &geometry.exit.norm) {
+        (Some(streams), Some(exit), ExitNorm::HyperConnectionHead(site)) => {
             mix_site(
                 graph,
-                entries,
+                exit,
                 load,
                 WeightScope::Target,
                 streams,

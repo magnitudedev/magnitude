@@ -51,7 +51,7 @@ impl<'a> From<&'a NGramKernels> for NGramEntries<'a, NativeGraph> {
 
 /// Entry element assignments from the binding.
 pub(crate) struct CheckedNGramEntries {
-    stored: [(&'static str, Element); 3],
+    stored: [(&'static str, Element); 2],
     key: [(&'static str, Element); 3],
     value: [(&'static str, Element); 3],
     norms: [(&'static str, Element); 1],
@@ -60,11 +60,7 @@ pub(crate) struct CheckedNGramEntries {
 impl CheckedNGramEntries {
     pub(crate) fn new(binding: NGramBinding) -> Self {
         Self {
-            stored: [
-                ("E", binding.table_source),
-                ("U", binding.table),
-                ("A", binding.activation),
-            ],
+            stored: [("E", binding.table), ("A", binding.activation)],
             key: [
                 ("A", binding.activation),
                 ("W", binding.key),

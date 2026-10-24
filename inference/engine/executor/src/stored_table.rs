@@ -1,6 +1,7 @@
-//! Stored tables: a streamed gathered table whose slots hold rows as stored
-//! (`TableFill::Stored`, an n-gram table), written by the host while the
-//! steps that read them wait at a gate.
+//! Stored tables: a streamed gathered table whose slots the host fills
+//! (`TableFill::Stored`, an n-gram table), converting each row it reads from
+//! the artifact into the table's resident representation as it writes it
+//! (`row_conversion`), while the steps that read them wait at a gate.
 //!
 //! The slots and the table's directory live in host-shared storage
 //! (`seismic::Tensor::shared`), which the host writes in place while device
@@ -10,7 +11,7 @@
 //!
 //! - the filler (a thread of the table's own) takes each step's rows in
 //!   queue order, as the host knows them or once it learns them (a step
-//!   whose tokens the device selected), writes every row the step names
+//!   whose tokens the device selected), converts every row the step names
 //!   that no slot holds into a free slot, publishes the directory entries,
 //!   and raises the gate to `n`;
 //! - the device raises the read timeline to `n` once step `n` has read its
@@ -36,11 +37,25 @@ use crate::device_table::KeptRows;
 use crate::planning::DirectoryForm;
 use crate::slot_directory::SlotDirectory;
 use magnitude_artifacts::UncachedSource;
+use seismic::cpu::repack::{External, Packed, RowConversion};
+use seismic::Element;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/// How the host converts a stored table's rows from `stored`, their
+/// encoding in the artifact, into `resident`, the representation its slots
+/// hold: the CPU backend's registered row conversion, whose rows equal every
+/// device repack's. Only `rows16` slots, one row to a tile, take rows one at
+/// a time; `None` for any other pair.
+pub fn row_conversion(stored: Element, resident: Element) -> Option<&'static RowConversion> {
+    match resident.layout() {
+        seismic::Layout::Rows16 => seismic::cpu::repack::resolve(stored.name(), resident.name()),
+        _ => None,
+    }
+}
 
 /// How long the filler waits for steps to read the rows of slots it needs
 /// before it fails the step: far beyond any step's device time.
@@ -176,7 +191,7 @@ impl NoticeStep {
     }
 }
 
-/// A table whose slots the host fills as stored.
+/// A table whose slots the host fills, converting its rows as stored.
 pub struct StoredTable {
     shared: Arc<Shared>,
     jobs: Mutex<Option<mpsc::Sender<Job>>>,
@@ -191,12 +206,17 @@ struct Job {
 }
 
 struct Shared {
-    /// `[slots, width]` rows as stored.
+    /// `[slots, width]` rows, resident.
     slots: seismic::Tensor,
     /// `[entries, fields]` I32 (`DirectoryForm`).
     directory: seismic::Tensor,
     fields: u64,
+    /// How a row as stored becomes a slot's row.
+    conversion: &'static RowConversion,
+    width: u64,
+    /// The bytes of a row as stored and of a slot's row.
     row_bytes: usize,
+    slot_bytes: usize,
     /// The table's rows in the artifact file: `rows` of `row_bytes` from
     /// `offset`.
     source: UncachedSource,
@@ -219,14 +239,15 @@ struct State {
 }
 
 impl StoredTable {
-    /// A table of `rows` rows of `width` values stored as `element` (each
-    /// `row_bytes` bytes, from `offset` in the file `source` reads), in
-    /// `slots` slots and a directory of `form`, on `device`. Its slots are
-    /// empty (`seed`).
+    /// A table of `rows` rows of `width` values stored as `stored` (from
+    /// `offset` in the file `source` reads), in `slots` slots of the
+    /// `resident` representation and a directory of `form`, on `device`.
+    /// Its slots are empty (`seed`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &seismic::Device,
-        element: seismic::Element,
+        stored: seismic::Element,
+        resident: seismic::Element,
         rows: u64,
         width: u64,
         slots: u64,
@@ -236,9 +257,19 @@ impl StoredTable {
         kept: Option<KeptRows>,
     ) -> Result<Self, String> {
         let failed = |error: &dyn std::fmt::Display| format!("stored table: {error}");
-        let row_bytes = element
-            .canonical_byte_len(&[1, width])
-            .map_err(|error| failed(&error))?;
+        let conversion = row_conversion(stored, resident).ok_or_else(|| {
+            failed(&format!(
+                "no host row conversion of {} into {}",
+                stored.name(),
+                resident.name()
+            ))
+        })?;
+        let row_bytes = |element: seismic::Element| {
+            element
+                .canonical_byte_len(&[1, width])
+                .map_err(|error| failed(&error))
+        };
+        let (slot_bytes, row_bytes) = (row_bytes(resident)?, row_bytes(stored)?);
         if source.size() < offset + rows * row_bytes {
             return Err(failed(&"the artifact does not hold the table's rows"));
         }
@@ -247,7 +278,7 @@ impl StoredTable {
         }
         let directory = SlotDirectory::new(rows, slots, 1, form);
         let (entries, fields) = (form.entries(rows, slots), form.fields());
-        let slots_tensor = seismic::Tensor::shared(device, element, &[slots, width])
+        let slots_tensor = seismic::Tensor::shared(device, resident, &[slots, width])
             .map_err(|error| failed(&error))?;
         let directory_tensor =
             seismic::Tensor::shared(device, seismic::Element::i32(), &[entries, fields])
@@ -256,7 +287,10 @@ impl StoredTable {
             slots: slots_tensor,
             directory: directory_tensor,
             fields,
+            conversion,
+            width,
             row_bytes: row_bytes as usize,
+            slot_bytes: slot_bytes as usize,
             source,
             offset,
             rows,
@@ -511,22 +545,24 @@ impl Shared {
             claimed.insert(slot);
             taken.push(slot);
         }
-        // Read the absent rows straight into their slots, then publish
+        // Read the absent rows, convert each into its slot, then publish
         // those that were read; a row that was not leaves its slot free.
         let ranges = absent
             .iter()
             .map(|row| (self.offset + row * self.row_bytes as u64, self.row_bytes))
             .collect::<Vec<_>>();
         let mut read = vec![false; absent.len()];
+        let mut converted = vec![0u8; self.slot_bytes];
         self.source.read_ranges(&ranges, |index, bytes| {
             let written = bytes
                 .map_err(|error| error.to_string())
                 .and_then(|bytes| {
-                    let offset = (taken[index] * self.row_bytes) as u64;
+                    self.convert(bytes, &mut converted);
+                    let offset = (taken[index] * self.slot_bytes) as u64;
                     // SAFETY: the slot's previous row has been read by every
                     // step that named it, and no queued step names the
                     // slot's new row before its gate opens.
-                    unsafe { self.slots.write_shared(offset, bytes) }
+                    unsafe { self.slots.write_shared(offset, &converted) }
                         .map_err(|error| error.to_string())
                 });
             match written {
@@ -557,6 +593,30 @@ impl Shared {
             slots: FailedSlots::Only(failed),
             error: format!("stored table rows: {}", errors.join("; ")),
         }))
+    }
+
+    /// The slot row of the row `stored` as stored (`row_conversion`).
+    fn convert(&self, stored: &[u8], slot: &mut [u8]) {
+        let width = self.width;
+        let packets = width.div_ceil(self.conversion.group as u64);
+        // SAFETY: `stored` is a read range of `row_bytes`, one row of
+        // `width` values as stored, and `slot` a buffer of `slot_bytes`, one
+        // resident row: each a one-row tensor.
+        unsafe {
+            let from = External::from_tensor(
+                stored.as_ptr(),
+                &[1, width],
+                &[packets, 1],
+                self.conversion.source,
+            );
+            let to = Packed::from_tensor(
+                slot.as_mut_ptr(),
+                &[1, width],
+                &[1, 1],
+                self.conversion.target,
+            );
+            seismic::cpu::repack::rows(&from, &to, 0..1);
+        }
     }
 
     /// Write the directory entries that changed.
@@ -597,13 +657,33 @@ mod tests {
     const ROWS: u64 = 4096;
     const WIDTH: u64 = 160;
     const ROW_BYTES: usize = 90;
+    /// A resident `iq4g32s@rows16` row of 160 values: 80 bytes of codes, 10
+    /// of scales, aligned to 16.
+    const SLOT_BYTES: usize = 96;
+
+    fn stored() -> Element {
+        Element::named("gguf_iq4_nl_block").unwrap()
+    }
+
+    fn resident() -> Element {
+        Element::named("iq4g32s@rows16").unwrap()
+    }
 
     /// Table row `row` as stored: five IQ4_NL blocks whose scale bytes name
-    /// the row and whose nibbles follow it.
+    /// the row and whose nibbles follow it, in the conversion's domain.
     fn row(row: u64) -> Vec<u8> {
-        (0..ROW_BYTES)
+        let bytes = (0..ROW_BYTES)
             .map(|byte| (row as usize * 7 + byte * 13) as u8)
-            .collect()
+            .collect();
+        resident().repack_source(stored(), bytes).unwrap()
+    }
+
+    /// Table row `row` as its slot holds it: the registry's host reference
+    /// of its conversion.
+    fn slot_row(row: u64) -> Vec<u8> {
+        resident()
+            .repack_host(stored(), &[1, WIDTH], &self::row(row))
+            .unwrap()
     }
 
     fn table(name: &str, slots: u64, form: DirectoryForm) -> (std::path::PathBuf, StoredTable) {
@@ -620,7 +700,8 @@ mod tests {
             .unwrap();
         let table = StoredTable::new(
             &device,
-            Element::named("gguf_iq4_nl_block").unwrap(),
+            stored(),
+            resident(),
             ROWS,
             WIDTH,
             slots,
@@ -633,7 +714,7 @@ mod tests {
         (path, table)
     }
 
-    /// The stored row a reader finds for `row`, probing the device's
+    /// The slot row a reader finds for `row`, probing the device's
     /// directory as `gathered_row` does.
     fn found(table: &StoredTable, row: u64) -> Option<Vec<u8>> {
         let mut directory = vec![0u8; table.directory().byte_len() as usize];
@@ -658,9 +739,9 @@ mod tests {
             }
         };
         let slot = usize::try_from(slot).ok()?;
-        let mut bytes = vec![0u8; ROW_BYTES];
+        let mut bytes = vec![0u8; SLOT_BYTES];
         // SAFETY: as above.
-        unsafe { table.slots_tensor().read_shared((slot * ROW_BYTES) as u64, &mut bytes) }
+        unsafe { table.slots_tensor().read_shared((slot * SLOT_BYTES) as u64, &mut bytes) }
             .unwrap();
         Some(bytes)
     }
@@ -689,7 +770,7 @@ mod tests {
                 assert!(queued.gate.wait(queued.value, Duration::from_secs(10)));
                 assert_eq!(table.failure(queued.value), None);
                 for row in &rows {
-                    assert_eq!(found(&table, *row), Some(self::row(*row)), "{form:?} row {row}");
+                    assert_eq!(found(&table, *row), Some(slot_row(*row)), "{form:?} row {row}");
                 }
                 read_done(&queued);
             }
@@ -708,11 +789,11 @@ mod tests {
         let second = table.queue(StepRows::Known(vec![vec![5]])).unwrap();
         assert!(!second.gate.wait(2, Duration::from_millis(100)));
         for row in [1, 2, 3, 4] {
-            assert_eq!(found(&table, row), Some(self::row(row)));
+            assert_eq!(found(&table, row), Some(slot_row(row)));
         }
         read_done(&first);
         assert!(second.gate.wait(2, Duration::from_secs(10)));
-        assert_eq!(found(&table, 5), Some(row(5)));
+        assert_eq!(found(&table, 5), Some(slot_row(5)));
         // One of the first step's rows left; the others are still found.
         let held = [1, 2, 3, 4]
             .into_iter()
@@ -736,7 +817,7 @@ mod tests {
         assert!(!step.gate.reached(1));
         sender.send(vec![vec![7], vec![9]]).unwrap();
         assert!(step.gate.wait(1, Duration::from_secs(10)));
-        assert_eq!(found(&table, 9), Some(row(9)));
+        assert_eq!(found(&table, 9), Some(slot_row(9)));
         read_done(&step);
         // A row outside the table fails the slot that named it, and the
         // step's gate opens.
@@ -786,7 +867,7 @@ mod tests {
         assert_eq!(failure.slots, FailedSlots::Only(BTreeSet::from([1])));
         assert!(failure.fails(1) && !failure.fails(0));
         for row in [1, 2, 3] {
-            assert_eq!(found(&table, row), Some(self::row(row)));
+            assert_eq!(found(&table, row), Some(slot_row(row)));
         }
         assert_eq!(found(&table, 3500), None);
         read_done(&step);
@@ -794,7 +875,7 @@ mod tests {
         let next = table.queue(StepRows::Known(vec![vec![4], vec![5]])).unwrap();
         assert!(next.gate.wait(2, Duration::from_secs(10)));
         assert_eq!(table.failure(2), None);
-        assert_eq!(found(&table, 5), Some(row(5)));
+        assert_eq!(found(&table, 5), Some(slot_row(5)));
         read_done(&next);
         drop(table);
         std::fs::remove_file(path).unwrap();

@@ -78,12 +78,12 @@ pub(super) fn shape_key(sublayer: NGramSublayer<'_>) -> String {
 
 /// The program binding of an n-gram input sublayer of `decoder`: `lookup`
 /// resolves the planned element of a role in its scope, `table` the
-/// streamed table's stored element and the element its reads decode as.
+/// resident element of the stored table's slots.
 pub(crate) fn binding(
     sublayer: NGramSublayer<'_>,
     decoder: &Decoder,
     lookup: impl Fn(WeightKind) -> Result<Element, PlanError>,
-    table: (Element, Element),
+    table: Element,
     activation: Element,
 ) -> Result<NGramBinding, PlanError> {
     let op = sublayer.op;
@@ -107,8 +107,7 @@ pub(crate) fn binding(
         width: op.width,
         kernel: op.kernel,
         dilation: op.dilation,
-        table_source: table.0,
-        table: table.1,
+        table,
         key: lookup(WeightKind::NGramKey)?,
         value: lookup(WeightKind::NGramValue)?,
         norm,

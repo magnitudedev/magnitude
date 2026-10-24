@@ -1,4 +1,4 @@
-use crate::operators::streams::StreamsBinding;
+use crate::operators::streams::{MixDownBinding, MixUpBinding, Sites, StreamsBinding};
 use crate::{
     AttentionBinding, DenseBinding, EmbeddingBinding, FeaturesBinding, GeneralRoutedBinding,
     ReadoutBinding, RecurrentBinding, RoutedBinding, ShortConvBinding, StateSpaceBinding,
@@ -39,7 +39,7 @@ pub struct TargetKernels {
     pub(super) per_layer_entry: HashMap<crate::PerLayerEntryBinding, PerLayerEntryKernels>,
     pub(super) per_layer: HashMap<crate::PerLayerBinding, PerLayerKernels>,
     pub(super) parallel: HashMap<crate::ParallelBinding, ParallelKernels>,
-    pub(super) streams: HashMap<StreamsBinding, StreamsKernels>,
+    pub(super) streams: StreamsEntryKernels,
     pub(super) ngram: HashMap<crate::NGramBinding, NGramKernels>,
 }
 
@@ -57,16 +57,50 @@ pub struct NGramKernels {
     pub inject: NativeKernel<magnitude_kernels::ngram_inject::Entry>,
 }
 
-/// A decoder's hyper-connection streams (`operators::streams`): the
-/// sublayers' mix sites (`down`, with inject values) and the exit site
-/// (`exit`, without), their second stage (`up`), and the widening of the
-/// embedded rows (`repeat`). Every site of a decoder shares one binding.
+/// A mix site's entries (`operators::streams`): its first stage (`down`,
+/// with inject values at a sublayer's site, without at the exit) and its
+/// second (`up`).
+#[derive(Clone, Debug)]
+pub struct MixSiteKernels {
+    pub down: NativeKernel<magnitude_kernels::stream_mix_down::Entry>,
+    pub up: NativeKernel<magnitude_kernels::stream_mix_up::Entry>,
+}
+
+/// A block's hyper-connection streams (`operators::streams`): each mix
+/// site's entries, at that site's own binding, and the widening of the
+/// embedded rows (`repeat`).
 #[derive(Clone, Debug)]
 pub struct StreamsKernels {
-    pub down: NativeKernel<magnitude_kernels::stream_mix_down::Entry>,
-    pub exit: NativeKernel<magnitude_kernels::stream_mix_down::Entry>,
-    pub up: NativeKernel<magnitude_kernels::stream_mix_up::Entry>,
+    pub sites: Sites<MixSiteKernels>,
     pub repeat: NativeKernel<magnitude_kernels::repeat_rows::Entry>,
+}
+
+/// The distinct streams entries of a program, each prepared once for every
+/// site that binds it.
+#[derive(Debug, Default)]
+pub struct StreamsEntryKernels {
+    pub(super) down:
+        HashMap<MixDownBinding, NativeKernel<magnitude_kernels::stream_mix_down::Entry>>,
+    pub(super) up: HashMap<MixUpBinding, NativeKernel<magnitude_kernels::stream_mix_up::Entry>>,
+    pub(super) repeat: Option<NativeKernel<magnitude_kernels::repeat_rows::Entry>>,
+}
+
+impl StreamsEntryKernels {
+    /// The entries of `binding`'s sites; none when any was not prepared.
+    pub(super) fn kernels(&self, binding: StreamsBinding) -> Option<StreamsKernels> {
+        Some(StreamsKernels {
+            sites: binding
+                .entries()
+                .map(|site| {
+                    Some(MixSiteKernels {
+                        down: self.down.get(&site.down)?.clone(),
+                        up: self.up.get(&site.up)?.clone(),
+                    })
+                })
+                .flatten()?,
+            repeat: self.repeat.clone()?,
+        })
+    }
 }
 
 /// A dense branch beside a general routed branch: the dense branch's

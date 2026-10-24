@@ -776,7 +776,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         let attention_site = match (streams, entries.streams) {
             (Some(streams), Some(entries)) => Some(mix_site(
                 &mut graph,
-                entries,
+                entries.sites.mixer,
                 load,
                 attention_scope,
                 streams,
@@ -861,7 +861,10 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         let feed_forward_site = match (streams, entries.streams) {
             (Some(streams), Some(entries)) => Some(mix_site(
                 &mut graph,
-                entries,
+                entries
+                    .sites
+                    .feed_forward
+                    .ok_or("head streams entries lack the feed-forward site")?,
                 load,
                 feed_forward_scope,
                 streams,
@@ -1008,7 +1011,10 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
             (Some(streams), Some(entries)) => {
                 mix_site(
                     &mut graph,
-                    entries,
+                    entries
+                        .sites
+                        .exit
+                        .ok_or("head streams entries lack the exit site")?,
                     load,
                     head,
                     streams,

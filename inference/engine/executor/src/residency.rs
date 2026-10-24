@@ -661,7 +661,7 @@ impl ResidencyStore {
             .map_err(|error| invalid(error.to_string()))?;
         let (source, offset, length) = stored.file_range();
         let row_bytes = plan
-            .resident
+            .upload
             .canonical_byte_len(&[1, plan.shape[1]])
             .map_err(|error| invalid(error.to_string()))?;
         if streamed.table_rows.checked_mul(row_bytes) != Some(length) {
@@ -683,6 +683,7 @@ impl ResidencyStore {
         });
         let table = StoredTable::new(
             &self.device,
+            plan.upload,
             plan.resident,
             streamed.table_rows,
             plan.shape[1],
@@ -1074,9 +1075,10 @@ impl ResidencyStore {
         let largest = weights
             .iter()
             .filter(|plan| !plan.placed_on_host())
-            .map(WeightPlan::stored_bytes)
-            .max()
-            .unwrap_or(0);
+            .try_fold(0, |largest, plan| {
+                plan.stored_bytes().map(|bytes| bytes.max(largest))
+            })
+            .map_err(invalid)?;
         let mut report = MappedImportReport::default();
         // Measurement only: timed Metal encoders change the device path, so
         // these numbers attribute work but are not production load timings.
