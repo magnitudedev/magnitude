@@ -1,6 +1,7 @@
 import type { ReactNode } from "react"
 import { InfoIcon, WarningCircleIcon } from "@phosphor-icons/react"
 import { Button } from "./ui/button"
+import { translateKnownMessage, useI18n } from "../i18n"
 
 export interface NoticeContent {
   readonly title: string
@@ -12,8 +13,10 @@ export interface NoticeContent {
 export function NoticeAction({ children, onClick, disabled = false }: {
   children: ReactNode; onClick: () => void; disabled?: boolean
 }) {
+  const { language } = useI18n()
+  const translatedChildren = typeof children === "string" ? translateKnownMessage(children, language) : children
   return <Button variant="link" size="unstyled" disabled={disabled} onClick={onClick}
-    className="min-h-6 py-0.5 text-xs font-medium text-inherit underline-offset-4 hover:underline">{children}</Button>
+    className="min-h-6 py-0.5 text-xs font-medium text-inherit underline-offset-4 hover:underline">{translatedChildren}</Button>
 }
 
 export function ErrorNotice({ title, description, severity = "error", actions, children, className = "" }: NoticeContent & {
@@ -21,6 +24,9 @@ export function ErrorNotice({ title, description, severity = "error", actions, c
   readonly children?: ReactNode
   readonly className?: string
 }) {
+  const { language } = useI18n()
+  const translatedTitle = translateKnownMessage(title, language)
+  const translatedDescription = description ? translateKnownMessage(description, language) : description
   const Icon = severity === "info" ? InfoIcon : WarningCircleIcon
   const colors = severity === "error"
     ? "border-red-200 bg-red-200/10 text-red-700 dark:border-red-800 dark:bg-red-800/10 dark:text-red-300"
@@ -30,8 +36,8 @@ export function ErrorNotice({ title, description, severity = "error", actions, c
   return <div role={severity === "error" ? "alert" : "status"} className={`flex min-w-0 items-start gap-2.5 rounded-lg border px-3 py-2.5 ${colors} ${className}`}>
     <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
     <div className="min-w-0 flex-1 break-words text-left">
-      <p className="m-0 text-[13px] font-semibold leading-5 text-slate-900 dark:text-slate-100">{title}</p>
-      {description && <p className="mt-0.5 text-xs leading-5 text-slate-600 dark:text-slate-400">{description}</p>}
+      <p className="m-0 text-[13px] font-semibold leading-5 text-slate-900 dark:text-slate-100">{translatedTitle}</p>
+      {description && <p className="mt-0.5 text-xs leading-5 text-slate-600 dark:text-slate-400">{translatedDescription}</p>}
       {actions && <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1">{actions}</div>}
       {children}
     </div>

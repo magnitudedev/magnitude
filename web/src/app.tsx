@@ -42,6 +42,7 @@ import type { ApplicationSnapshot, AppearancePreference } from "@magnitudedev/sd
 import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessChange, type NetworkBind, type OwnerCapability } from "@magnitudedev/sdk"
 import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
 import { SettingsGroup, SettingsRow } from "./components/settings-row"
+import { LANGUAGES, isLanguage, useI18n, type MessageKey } from "./i18n"
 import {
   activeLocalModel, useAgentClient, type AddModelRequest, type ApplicationPage,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
@@ -81,7 +82,7 @@ const inferenceUrl = (address: string, port: number) => `http://${address}:${por
 const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
   ? `robocopy "${from}" "${to}" /E /MOVE`
   : `mv "${from}/"* "${to}/"`
-const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
+const pageNameKeys: Record<ApplicationPage, MessageKey> = { discover: "discover", catalog: "catalog", models: "myModels", connections: "connections", usage: "usage", status: "status", settings: "settings" }
 const pageIcons = { discover: StackIcon, catalog: SquaresFourIcon, models: CubeIcon, connections: PlugIcon, usage: ChartBarIcon, status: PulseIcon, settings: SlidersIcon }
 
 const minutesRemaining = (seconds: number) => seconds < 60 ? "Less than 1 min" : `About ${Math.ceil(seconds / 60)} min`
@@ -287,6 +288,7 @@ function LabOption({ lab }: { lab: ModelLab | null }) {
   return <span className="flex items-center gap-2">{lab ? <LabLogo lab={lab} className="size-4" /> : <BuildingsIcon aria-hidden="true" className="size-4 text-slate-500" />}{lab ? lab.name : "Any lab"}</span>
 }
 function Models({ page }: { page: "discover" | "catalog" | "models" }) {
+  const { t } = useI18n()
   const installedOnly = page === "models"
   const discover = page === "discover"
   const catalog = useCatalogModels()
@@ -319,7 +321,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const request: Option.Option<AddDialogRequest> = Option.isSome(linkedRequest) ? linkedRequest : pageRequest
   const openDialog = (next: AddDialogRequest) => setPageRequest(Option.some(next))
   const closeDialog = () => { setPageRequest(Option.none()); if (Option.isSome(linkedRequest)) clearLinkedRequest() }
-  if (Result.isFailure(catalog)) return <>{!discover && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Couldn’t load the model catalog" description="Model information is unavailable. Check the service on Status." className="mt-5" /></>
+  if (Result.isFailure(catalog)) return <>{!discover && <h1 className={pageLayout.pageTitle}>{t(pageNameKeys[page])}</h1>}<ErrorNotice title="Couldn’t load the model catalog" description="Model information is unavailable. Check the service on Status." className="mt-5" /></>
   if (!Result.isSuccess(catalog) && !discover) return <ModelsSkeleton page={page} />
   const models = (Result.isSuccess(catalog) ? catalog.value.models : []).filter((model): model is CatalogLocalModel => model._tag === "Catalog")
   const custom = Result.isSuccess(customModels) ? customModels.value : []
@@ -349,7 +351,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     {dialog}
   </>
   return <>
-    <ModelsHeader title={pageNames[page]} selectedCount={selected.length} matchingCount={visible.length} search={search} onSearch={setSearch}
+    <ModelsHeader title={t(pageNameKeys[page])} selectedCount={selected.length} matchingCount={visible.length} search={search} onSearch={setSearch}
       action={installedOnly ? null : <Button variant="outline" onClick={openAddFromHuggingFace}><HuggingFaceLogo />Add from Hugging Face</Button>}
       controls={<>
         <Select items={filterOptions} value={filter} onValueChange={value => { if (value !== null) setFilter(value) }}>
@@ -553,6 +555,7 @@ function StatusOverview() {
 type UpdateTransfer = (typeof ApplicationUpdateState.Type)["transfer"]
 const firstFailure = (results: ReadonlyArray<Result.Result<unknown, unknown>>) => results.find((result): result is Result.Failure<unknown, unknown> => Result.isFailure(result) && !result.waiting)
 function ThemeRow() {
+  const { t } = useI18n()
   const appearance = useAppearancePreference()
   const session = useSession()
   const saveAppearance = useMemo(() => Atom.fn((preference: AppearancePreference) => session.saveAppearance(preference).pipe(
@@ -560,11 +563,34 @@ function ThemeRow() {
   const save = useAtomSet(saveAppearance)
   const saving = useAtomValue(saveAppearance)
   const readError = useAtomValue(appearanceReadError)
-  return <SettingsRow label="Theme" alert={!saving.waiting && (Result.isFailure(saving) ? <ErrorNotice title="Your theme wasn’t saved" description="Your previous appearance setting is still in use." /> : readError ? <ErrorNotice title="Couldn’t read your saved theme" description="System appearance is being used for this window." /> : undefined)} control={
-    <div className="inline-flex rounded-md border border-slate-300 p-0.5 dark:border-slate-700" role="group" aria-label="Theme">
+  return <SettingsRow label={t("theme")} alert={!saving.waiting && (Result.isFailure(saving) ? <ErrorNotice title="Your theme wasn’t saved" description="Your previous appearance setting is still in use." /> : readError ? <ErrorNotice title="Couldn’t read your saved theme" description="System appearance is being used for this window." /> : undefined)} control={
+    <div className="inline-flex rounded-md border border-slate-300 p-0.5 dark:border-slate-700" role="group" aria-label={t("theme")}>
       {(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon
-        return <Button key={value} size="sm" variant={appearance === value ? "secondary" : "ghost"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}
+        return <Button key={value} size="sm" variant={appearance === value ? "secondary" : "ghost"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{t(value)}</Button> })}
     </div>} />
+}
+const languageNames = {
+  en: "English",
+  es: "Español",
+  "zh-CN": "简体中文",
+  fr: "Français",
+  de: "Deutsch",
+  ja: "日本語",
+  pt: "Português",
+  it: "Italiano",
+  uk: "Українська",
+} as const
+
+function LanguageRow() {
+  const { language, setLanguage, t } = useI18n()
+  return <SettingsRow label={t("language")} hint={t("languageHint")} control={
+    <Select value={language} onValueChange={value => { if (isLanguage(value)) setLanguage(value) }}>
+      <SelectTrigger aria-label={t("language")} className="min-w-44"><SelectValue>{languageNames[language]}</SelectValue></SelectTrigger>
+      <SelectContent>
+        {LANGUAGES.map(value => <SelectItem key={value} value={value}>{languageNames[value]}</SelectItem>)}
+      </SelectContent>
+    </Select>
+  } />
 }
 /** The application that owns the service, and whether it supports a request. */
 function useApplicationOwner() {
@@ -769,19 +795,21 @@ function SignOutRow() {
     control={<Button size="sm" variant="outline" disabled={signingOut.waiting} onClick={() => run()}>Sign out</Button>} />
 }
 function SettingsPage() {
+  const { t } = useI18n()
   // A fresh mount observes hand edits; writes refresh in their own Effect actions.
   const client = useAgentClient()
   const { remote } = useRemoteAccess()
   const { storagePending, networkPending } = useRestartPending()
   useAtomMount(useMemo(() => Atom.make(Effect.all([Atom.refresh(client.Configuration.GetModelStorage({})), Atom.refresh(client.Configuration.GetNetworkAccess({})), Atom.refresh(client.Models.ListModelLocations({}))], { discard: true })), [client]))
   return <>
-    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><ModelLocationsRow /><HuggingFaceRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
-    <SettingsGroup label="About"><AboutRow /></SettingsGroup>
-    {remote && <SettingsGroup label="This browser"><SignOutRow /></SettingsGroup>}
+    <SettingsGroup label={t("general")}><LanguageRow /><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><ModelLocationsRow /><HuggingFaceRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
+    <SettingsGroup label={t("about")}><AboutRow /></SettingsGroup>
+    {remote && <SettingsGroup label={t("thisBrowser")}><SignOutRow /></SettingsGroup>}
     {(storagePending || networkPending) && <div aria-hidden="true" className="h-44" />}
   </>
 }
 export function App() {
+  const { t } = useI18n()
   const session = useSession()
   const observation = useServiceObservation()
   const page = useAtomValue(session.page)
@@ -795,7 +823,7 @@ export function App() {
       : page === "usage" ? <ServingUsage />
       : page === "settings" ? <SettingsPage />
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
-      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("status")}>Open Status</NoticeAction>} /></> : <ModelsSkeleton page={page} />)
+      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{t(pageNameKeys[page])}</h1>}<ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("status")}>Open Status</NoticeAction>} /></> : <ModelsSkeleton page={page} />)
       : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
       : null}
   </AppShell></>
@@ -837,6 +865,7 @@ function QuitFailureDialog() {
   </AlertDialog>
 }
 export function AppShell({ page, navigate, platform, children }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; children: ReactNode }) {
+  const { t } = useI18n()
   const narrow = useNarrowViewport()
   const [open, setOpen] = useState(false)
   // Only the navigation chrome changes across `md`; the page stays mounted, so resizing keeps its state.
@@ -844,7 +873,7 @@ export function AppShell({ page, navigate, platform, children }: { page: Applica
     {narrow ? <NarrowBar open={open} onOpen={() => setOpen(true)} /> : <DockedSidebar page={page} navigate={navigate} platform={platform} />}
     <main key={page} className="min-w-0 flex-1 overflow-y-auto" inert={narrow && open}>
       <div data-page-content className={narrow ? "mx-auto w-full max-w-6xl px-4 pb-8 pt-5" : `mx-auto w-[calc(100vw-224px)] max-w-[min(100%,72rem)] px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
-        {page !== "catalog" && page !== "models" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
+        {page !== "catalog" && page !== "models" && <h1 className={pageLayout.pageTitle}>{t(pageNameKeys[page])}</h1>}
         {children}
       </div>
     </main>
@@ -852,31 +881,34 @@ export function AppShell({ page, navigate, platform, children }: { page: Applica
   </div>
 }
 function Navigation({ page, navigate, onNavigate }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
+  const { t } = useI18n()
   return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
-    {(Object.keys(pageNames) as ApplicationPage[]).map(key => {
+    {(Object.keys(pageNameKeys) as ApplicationPage[]).map(key => {
       const Icon = pageIcons[key]
-      return <Button variant="ghost" key={key} disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={pageNames[key]} aria-current={page === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
-        <Icon className="size-4 shrink-0" />{pageNames[key]}
+      return <Button variant="ghost" key={key} disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={t(pageNameKeys[key])} aria-current={page === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+        <Icon className="size-4 shrink-0" />{t(pageNameKeys[key])}
       </Button>
     })}
   </nav>
 }
 /** Below `md`: a top bar that opens a navigation drawer over the page, closed by default. */
 function NarrowBar({ open, onOpen }: { open: boolean; onOpen: () => void }) {
+  const { t } = useI18n()
   return <header className="flex h-14 shrink-0 items-center gap-3 border-b border-slate-200 px-4 dark:border-slate-750" inert={open}>
-    <button type="button" className="inline-flex size-10 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 dark:hover:bg-slate-800" aria-label="Open navigation" aria-expanded={open} aria-controls="desktop-navigation" onClick={onOpen}>
+    <button type="button" className="inline-flex size-10 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 dark:hover:bg-slate-800" aria-label={t("openNavigation")} aria-expanded={open} aria-controls="desktop-navigation" onClick={onOpen}>
       <SidebarSimpleIcon className="size-5" />
     </button>
     <span className="flex items-center gap-2 font-heading text-base font-semibold"><MagnitudeMark className="h-7 w-7 shrink-0" />Magnitude</span>
   </header>
 }
 function NavigationDrawer({ page, navigate, onClose }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onClose: () => void }) {
+  const { t } = useI18n()
   return <div className="fixed inset-0 z-50 flex" onKeyDown={event => { if (event.key === "Escape") onClose() }}>
-    <button type="button" aria-label="Close navigation" className="absolute inset-0 cursor-default bg-black/45 dark:bg-black/70" onClick={onClose} />
-    <aside aria-label="Navigation" className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-6 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">
+    <button type="button" aria-label={t("closeNavigation")} className="absolute inset-0 cursor-default bg-black/45 dark:bg-black/70" onClick={onClose} />
+    <aside aria-label={t("navigation")} className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-6 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">
       <div className="mb-6 flex h-10 items-center justify-between px-4">
         <span className="flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude</span>
-        <button type="button" autoFocus className="inline-flex size-10 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" aria-label="Close navigation" onClick={onClose}><XIcon className="size-5" /></button>
+        <button type="button" autoFocus className="inline-flex size-10 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" aria-label={t("closeNavigation")} onClick={onClose}><XIcon className="size-5" /></button>
       </div>
       <Navigation page={page} navigate={navigate} onNavigate={onClose} />
     </aside>
@@ -884,13 +916,14 @@ function NavigationDrawer({ page, navigate, onClose }: { page: ApplicationPage; 
 }
 /** From `md` up: the collapsible sidebar with the window's integrated controls and drag regions. */
 function DockedSidebar({ page, navigate, platform }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined }) {
+  const { t } = useI18n()
   const [collapsed, setCollapsed] = useState(false)
   const integratedControls = platform === "darwin" || platform === "win32"
   const sidebarWidth = collapsed ? 0 : 224
   return <>
     {integratedControls && <div aria-hidden="true" data-window-drag-region style={{ left: sidebarWidth }} className="absolute right-0 top-0 z-50 h-8 select-none transition-[left] duration-250 ease-in-out motion-reduce:transition-none [-webkit-app-region:drag]" />}
     <div data-window-drag-region={integratedControls ? "" : undefined} style={{ width: collapsed ? (platform === "darwin" ? 128 : 64) : sidebarWidth }} className={`absolute left-0 top-0 z-50 flex h-[42px] items-center justify-end px-4 transition-[width] duration-250 ease-in-out motion-reduce:transition-none ${integratedControls ? "select-none [-webkit-app-region:drag]" : ""}`}>
-      <button type="button" className="inline-flex size-6 items-center justify-center rounded-sm text-slate-500 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-100 [-webkit-app-region:no-drag]" aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-expanded={!collapsed} aria-controls="desktop-navigation" onClick={() => setCollapsed(value => !value)}>
+      <button type="button" className="inline-flex size-6 items-center justify-center rounded-sm text-slate-500 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-100 [-webkit-app-region:no-drag]" aria-label={t(collapsed ? "expandSidebar" : "collapseSidebar")} aria-expanded={!collapsed} aria-controls="desktop-navigation" onClick={() => setCollapsed(value => !value)}>
         <SidebarSimpleIcon className="size-5" />
       </button>
     </div>
