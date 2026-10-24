@@ -14,6 +14,14 @@ describe("inference residency projection", () => {
       .toEqual({ _tag: "Stopped", reason: "user_stop" })
   })
 
+  it("carries the device a ready instance runs on", () => {
+    expect(projectInferenceResidency(instance({
+      _tag: "Ready", allocation: { contextWindowTokens: 4096, memoryDomains: [] }, device: { id: "cuda:0", backend: "cuda" },
+    }))).toEqual({
+      _tag: "Ready", allocation: { contextWindowTokens: 4096, memoryDomains: [] }, device: { deviceId: "cuda:0", backend: "cuda" },
+    })
+  })
+
   it("carries a memory shortage with its form", () => {
     const failed = (shortage: unknown) => projectInferenceResidency(instance({
       _tag: "Failed",

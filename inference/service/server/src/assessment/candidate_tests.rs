@@ -3980,6 +3980,7 @@ async fn live_fixture_reaching(
         Arc::clone(&models),
         directory.path().join("kernels"),
         magnitude_executor::platform::MemoryReserves::standard(),
+        crate::assessment::environment::ServingDevice::of(seismic::ExecutorSelector::HostCpu),
     );
     LiveFixture {
         _directory: directory,

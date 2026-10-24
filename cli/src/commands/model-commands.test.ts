@@ -552,7 +552,7 @@ const withEvidence = <M extends CatalogLocalModel | CustomLocalModel>(model: M):
 
 const residencies = [
   { _tag: "Loading", stage: "loading_weights", fraction: 0.5, plannedAllocation: Option.some(plan) },
-  { _tag: "Ready", allocation },
+  { _tag: "Ready", allocation, device: plan.device },
   { _tag: "Stopping", reason: "user_stop", allocation: { _tag: "Resident", allocation } },
   { _tag: "Stopping", reason: "user_stop", allocation: { _tag: "Planned", allocation: Option.some(plan) } },
 ] as const

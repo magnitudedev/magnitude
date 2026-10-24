@@ -1669,13 +1669,7 @@ export const HardwareSnapshot = S.Struct({
     S.suspend((): S.Schema<HardwarePhysicalDevice, HardwarePhysicalDeviceEncoded> => HardwarePhysicalDevice),
   ),
   platform: S.String,
-  selected_executor: S.optionalWith(
-    S.Union(
-      S.Null,
-      S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
-    ),
-    { exact: true, as: "Option" },
-  ),
+  selected_executor: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
   system_product_name: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   topology_fingerprint: S.String,
   transfer_paths: S.Array(
@@ -1836,52 +1830,6 @@ export type IcnParentCommandEncoded = S.Schema.Encoded<typeof IcnParentCommand>
 export const IcnParentCommandType = S.Literal("shutdown")
 export type IcnParentCommandType = S.Schema.Type<typeof IcnParentCommandType>
 export type IcnParentCommandTypeEncoded = S.Schema.Encoded<typeof IcnParentCommandType>
-
-export const IcnStartupBackend = S.Union(
-  S.extend(
-    S.Struct({
-      hardwareLabel: S.String,
-      type: S.Literal("cpu"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      hardwareLabel: S.String,
-      type: S.Literal("metal"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      hardwareLabel: S.String,
-      type: S.Literal("cuda"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      hardwareLabel: S.String,
-      type: S.Literal("vulkan"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type IcnStartupBackend = S.Schema.Type<typeof IcnStartupBackend>
-export type IcnStartupBackendEncoded = S.Schema.Encoded<typeof IcnStartupBackend>
-
-export const IcnStartupProgressRecord = S.Struct({
-  backend: S.suspend((): S.Schema<IcnStartupBackend, IcnStartupBackendEncoded> => IcnStartupBackend),
-  type: S.suspend(
-    (): S.Schema<IcnStartupProgressRecordType, IcnStartupProgressRecordTypeEncoded> => IcnStartupProgressRecordType,
-  ),
-})
-export type IcnStartupProgressRecord = S.Schema.Type<typeof IcnStartupProgressRecord>
-export type IcnStartupProgressRecordEncoded = S.Schema.Encoded<typeof IcnStartupProgressRecord>
-
-export const IcnStartupProgressRecordType = S.Literal("preparing_backend")
-export type IcnStartupProgressRecordType = S.Schema.Type<typeof IcnStartupProgressRecordType>
-export type IcnStartupProgressRecordTypeEncoded = S.Schema.Encoded<typeof IcnStartupProgressRecordType>
 
 export const IcnStartupRecord = S.Struct({
   apiVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
@@ -2584,6 +2532,7 @@ export const ModelInstanceLifecycle = S.Union(
       allocation: S.suspend(
         (): S.Schema<ModelInstanceAllocation, ModelInstanceAllocationEncoded> => ModelInstanceAllocation,
       ),
+      device: S.suspend((): S.Schema<ModelLoadDevice, ModelLoadDeviceEncoded> => ModelLoadDevice),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),

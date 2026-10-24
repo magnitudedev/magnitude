@@ -92,7 +92,7 @@ describe("service installation presentation", () => {
     ).toBe(false);
   });
 
-  it("keeps installation through generic launch observations, but shows exact backend preparation", () => {
+  it("keeps installation through launch observations", () => {
     const installing = report(new ServiceChecking({}), {
       _tag: "Installing",
       phase: "StartingMagnitude",
@@ -102,13 +102,5 @@ describe("service installation presentation", () => {
     expect(
       report(installing, { _tag: "Starting", phase: "PreparingAcn" })
     ).toBe(installing);
-    const phase = {
-      _tag: "PreparingBackend" as const,
-      backend: { _tag: "Cuda" as const, hardwareLabel: "NVIDIA GPU" },
-    };
-    expect(report(installing, { _tag: "Starting", phase })).toEqual({
-      _tag: "Starting",
-      phase,
-    });
   });
 });

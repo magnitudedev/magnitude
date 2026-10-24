@@ -20,7 +20,7 @@ const gigabytes = (bytes: number) => Math.round(bytes / GIGABYTE)
 export const updateHardwareFromSummary = (summary: AcnHardwareSummary): UpdateHardware => {
   const gpuName = label(summary.gpuName, 96)
   return {
-    backend: summary.backend,
+    backend: Option.some(summary.backend),
     gpu_name: gpuName,
     gpu_kind: Option.isSome(gpuName) ? summary.gpuKind : Option.none(),
     gpu_memory_gb: Option.isSome(gpuName) ? Option.map(summary.gpuMemoryBytes, gigabytes) : Option.none(),

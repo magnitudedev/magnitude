@@ -64,48 +64,6 @@ pub enum IcnParentCommandType {
     Shutdown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct IcnStartupProgressRecord {
-    #[serde(rename = "type")]
-    pub record_type: IcnStartupProgressRecordType,
-    pub backend: IcnStartupBackend,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum IcnStartupProgressRecordType {
-    PreparingBackend,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(
-    tag = "type",
-    rename_all = "snake_case",
-    rename_all_fields = "camelCase"
-)]
-pub enum IcnStartupBackend {
-    Cpu {
-        #[serde(rename = "hardwareLabel")]
-        hardware_label: String,
-    },
-    Metal {
-        #[serde(rename = "hardwareLabel")]
-        hardware_label: String,
-    },
-    Cuda {
-        #[serde(rename = "hardwareLabel")]
-        hardware_label: String,
-    },
-    Vulkan {
-        #[serde(rename = "hardwareLabel")]
-        hardware_label: String,
-    },
-}
-
 /// Installation declaration written by the installer or the local build beside the installed
 /// service. The service selects its execution device at runtime, so the declaration names no
 /// backend; it binds the installation to one engine build.
@@ -138,17 +96,6 @@ mod tests {
         assert_eq!(startup["type"], "icn_ready");
         assert_eq!(startup["protocolVersion"], 1);
         assert_eq!(startup["instanceId"], "instance");
-
-        let progress = serde_json::to_value(IcnStartupProgressRecord {
-            record_type: IcnStartupProgressRecordType::PreparingBackend,
-            backend: IcnStartupBackend::Cuda {
-                hardware_label: "NVIDIA GPU".to_owned(),
-            },
-        })
-        .expect("serialize progress");
-        assert_eq!(progress["type"], "preparing_backend");
-        assert_eq!(progress["backend"]["type"], "cuda");
-        assert_eq!(progress["backend"]["hardwareLabel"], "NVIDIA GPU");
 
         let installation = serde_json::to_value(IcnInstallationDeclaration {
             schema_version: 1,

@@ -42,12 +42,56 @@ export const acceleratorMemoryDomainIds = (
 ): ReadonlySet<LocalInferenceMemoryDomainId> =>
   new Set(accelerator.executors.flatMap(({ memoryDomainIds }) => memoryDomainIds))
 
-/** The backend an accelerator runs on: the backend of the executor the engine selects, if it is one of the accelerator's. */
-export const acceleratorBackend = (
-  hardware: LocalInferenceHardware,
-  accelerator: LocalInferenceHardware["accelerators"][number],
-): Option.Option<LocalInferenceBackend> => Option.flatMap(hardware.selectedDeviceId, selected =>
-  Option.fromNullable(accelerator.executors.find(({ deviceId }) => deviceId === selected)?.backend))
+/** An accelerator's role: it holds the active device (in use, on that device's backend), or it is available. */
+export type LocalHardwareRole =
+  | { readonly _tag: "InUse"; readonly backend: LocalInferenceBackend }
+  | { readonly _tag: "Available" }
+
+export interface LocalHardwareDevice {
+  readonly accelerator: LocalInferenceHardware["accelerators"][number]
+  readonly role: LocalHardwareRole
+  /** Its own memory's total; none for a GPU whose memory is host RAM. */
+  readonly dedicatedMemoryBytes: Option.Option<number>
+  /** Whether it can place memory in host RAM. */
+  readonly placesOnHost: boolean
+}
+
+export interface LocalHardwareRoles {
+  /** The machine's title: its product name, then its CPU; never an accelerator's name. */
+  readonly machineName: string
+  /** Whether host RAM is the active device's own memory (Apple Silicon, or a serving integrated GPU). */
+  readonly unifiedMemory: boolean
+  /** Every usable accelerator, the one holding the active device first. */
+  readonly devices: readonly LocalHardwareDevice[]
+}
+
+const uniqueNames = (values: readonly string[]): string[] =>
+  [...new Set(values.map((value) => value.trim()).filter(Boolean))]
+
+/** The roles of the machine and its devices; every surface reads them from here. */
+export const deriveHardwareRoles = (hardware: LocalInferenceHardware): LocalHardwareRoles => {
+  const domains = new Map(hardware.memoryDomains.map((domain) => [domain.memoryDomainId, domain]))
+  const devices = hardware.accelerators.map((accelerator): LocalHardwareDevice => {
+    const own = [...acceleratorMemoryDomainIds(accelerator)].flatMap((id) => {
+      const domain = domains.get(id)!
+      return domain.kind === "PhysicalDevice" ? [domain] : []
+    })
+    const active = accelerator.executors.find(({ deviceId }) => deviceId === hardware.activeDeviceId)
+    return {
+      accelerator,
+      role: active === undefined ? { _tag: "Available" } : { _tag: "InUse", backend: active.backend },
+      dedicatedMemoryBytes: own.length === 0 ? Option.none() : Option.some(own.reduce((sum, domain) => sum + domain.totalBytes, 0)),
+      placesOnHost: acceleratorMemoryDomainIds(accelerator).size > own.length,
+    }
+  })
+  const isAppleSilicon = hardware.platform === "MacOS" && hardware.architecture === "Arm64"
+  return {
+    machineName: uniqueNames([...Option.toArray(hardware.productName), ...Option.toArray(hardware.processor)]).join(" · ")
+      || (isAppleSilicon ? "Apple Silicon" : "CPU"),
+    unifiedMemory: hardware.memoryDomains.some((domain) => domain.kind === "UnifiedMemory"),
+    devices: [...devices.filter(({ role }) => role._tag === "InUse"), ...devices.filter(({ role }) => role._tag === "Available")],
+  }
+}
 
 const domainLabel = (
   hardware: LocalInferenceHardware,
@@ -55,12 +99,10 @@ const domainLabel = (
   physicalOrdinal: number,
 ): string => {
   if (domain.kind === "System") return "System memory"
+  if (domain.kind === "UnifiedMemory") return "Unified memory"
   const accelerators = hardware.accelerators.filter((accelerator) =>
     acceleratorMemoryDomainIds(accelerator).has(domain.memoryDomainId))
-  const name = [...new Set(accelerators.map(({ name }) => name.trim()).filter(Boolean))].join(" + ")
-  return domain.kind === "UnifiedMemory"
-    ? `${name || Option.getOrElse(hardware.processor, () => "System")} · Unified memory`
-    : `${name || "Accelerator"} · GPU ${physicalOrdinal}`
+  return `${uniqueNames(accelerators.map(({ name }) => name)).join(" + ") || "Accelerator"} · GPU ${physicalOrdinal}`
 }
 
 export interface HardwareMemoryViewOptions {

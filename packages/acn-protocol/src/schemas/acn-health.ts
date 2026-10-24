@@ -35,14 +35,6 @@ export const AcnInstallationPlanSchema = Schema.Struct({
 });
 export type AcnInstallationPlan = typeof AcnInstallationPlanSchema.Type;
 
-export const StartupBackendSchema = Schema.Union(
-  Schema.TaggedStruct("Cpu", { hardwareLabel: NonEmptyString }),
-  Schema.TaggedStruct("Metal", { hardwareLabel: NonEmptyString }),
-  Schema.TaggedStruct("Cuda", { hardwareLabel: NonEmptyString }),
-  Schema.TaggedStruct("Vulkan", { hardwareLabel: NonEmptyString }),
-)
-export type StartupBackend = typeof StartupBackendSchema.Type
-
 export const AcnInstallingActivitySchema = Schema.TaggedStruct("Installing", {
   phase: AcnInstallationPhaseSchema,
   plan: AcnInstallationPlanSchema,
@@ -51,7 +43,6 @@ export type AcnInstallingActivity = typeof AcnInstallingActivitySchema.Type;
 
 export const AcnStartupActivitySchema = Schema.Union(
   Schema.Literal("WaitingForOwnership", "Resolving", "Starting"),
-  Schema.TaggedStruct("PreparingBackend", { backend: StartupBackendSchema }),
   AcnInstallingActivitySchema,
 );
 export type AcnStartupActivity = typeof AcnStartupActivitySchema.Type;
@@ -77,7 +68,8 @@ export class AcnStarting extends Schema.TaggedClass<AcnStarting>()("Starting", {
 }) {}
 
 export const AcnHardwareSummarySchema = Schema.Struct({
-  backend: Schema.optionalWith(Schema.Literal("cpu", "metal", "cuda", "vulkan"), { as: "Option", exact: true }),
+  /** The active device's backend: a resident model's device, and otherwise the serving device. */
+  backend: Schema.Literal("cpu", "metal", "cuda", "vulkan"),
   gpuName: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
   gpuKind: Schema.optionalWith(Schema.Literal("discrete", "integrated"), { as: "Option", exact: true }),
   gpuMemoryBytes: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),

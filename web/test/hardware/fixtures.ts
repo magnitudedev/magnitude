@@ -7,9 +7,9 @@ export const hardware = (processor: string, memory: number, cores: number, accel
   platform: processor.startsWith("Apple") ? "MacOS" : "Linux", architecture: processor.startsWith("Apple") || processor === "NVIDIA GB10" ? "Arm64" : "X64", processor,
   ...(physicalCores === undefined ? {} : { physicalCores }), logicalCores: cores, totalSystemMemoryBytes: memory * GiB,
   accelerators: accelerators.map((gpu, i) => ({ acceleratorId: `gpu-${i}`, name: gpu.name, executors: [{ deviceId: `executor-${i}`, backend: processor.startsWith("Apple") ? "metal" : /nvidia|rtx|gb10/i.test(gpu.name) ? "cuda" : "vulkan", memoryDomainIds: [gpu.shared ? "system" : `gpu-${i}`] }] })),
-  // The engine takes the first GPU's executor, or the host CPU without one.
-  selectedDeviceId: accelerators.length > 0 ? "executor-0" : "host-cpu",
-  memoryDomains: [{ memoryDomainId: "system", kind: accelerators.some(gpu => gpu.shared) ? "UnifiedMemory" : "System", totalBytes: memory * GiB },
+  // The active device is the first GPU's executor, or the host CPU without one; host RAM is unified when it is that GPU's memory.
+  activeDeviceId: accelerators.length > 0 ? "executor-0" : "host-cpu",
+  memoryDomains: [{ memoryDomainId: "system", kind: accelerators[0]?.shared ? "UnifiedMemory" : "System", totalBytes: memory * GiB },
     ...accelerators.flatMap((gpu, i) => gpu.shared ? [] : [{ memoryDomainId: `gpu-${i}`, kind: "PhysicalDevice", totalBytes: gpu.memory * GiB }])],
 })
 export const hardwareScenarios = [

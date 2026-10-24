@@ -4,9 +4,10 @@
 use magnitude_engine::assessment::{AssessmentSetup, AssessmentStructure, Measurements};
 use magnitude_engine::options::{ModelPolicy, standard_service_limits};
 use magnitude_engine::worker::protocol::EngineBuild;
-use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
+use magnitude_executor::ExecutionPath;
+use magnitude_executor::platform::{DeviceRequest, MemoryReserves, SelectionError, select};
 use magnitude_service_contracts::models::AssessmentEnvironmentId;
-use seismic::Devices;
+use seismic::{Devices, ExecutorSelector};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -16,16 +17,55 @@ pub fn serving_policy() -> ModelPolicy {
     ModelPolicy::default()
 }
 
-/// The device the service loads, assesses and reports every model on: the engine's automatic
-/// selection.
-pub const SERVING_DEVICE: DeviceRequest = DeviceRequest::Automatic;
+/// The request the service's device is selected by: the engine's automatic selection.
+const SERVING_REQUEST: DeviceRequest = DeviceRequest::Automatic;
 
-/// The structure every model is assessed on: the [`SERVING_DEVICE`]. Opens no device
-/// and measures nothing.
-pub fn assessment_structure(devices: &Devices) -> anyhow::Result<AssessmentStructure> {
+/// The device the service assesses, loads and reports every model on: [`SERVING_REQUEST`]
+/// selected once over the service's topology. The service discovers its device inventory once
+/// and never refreshes it, so the topology has one revision for the service's lifetime and the
+/// serving device is decided once, at startup. Assessment, every load preview (and so every
+/// load) and the hardware report read this value; none of them selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServingDevice(ExecutorSelector);
+
+impl ServingDevice {
+    /// Select the serving device over `devices`' topology.
+    pub fn select(devices: &Devices) -> Result<Self, SelectionError> {
+        let executor = select(&devices.topology(), ExecutionPath::Native, SERVING_REQUEST)?;
+        tracing::info!(
+            device = %executor.selector(),
+            device.name = %executor.name(),
+            backend = executor.backend().as_str(),
+            "serving device selected"
+        );
+        Ok(Self(executor.selector()))
+    }
+
+    /// The serving device named by `selector`, for tests that serve on a chosen device.
+    #[cfg(test)]
+    pub(crate) fn of(selector: ExecutorSelector) -> Self {
+        Self(selector)
+    }
+
+    pub fn selector(self) -> ExecutorSelector {
+        self.0
+    }
+
+    /// The engine request that opens exactly this device or fails.
+    pub fn request(self) -> DeviceRequest {
+        DeviceRequest::Selector(self.0)
+    }
+}
+
+/// The structure every model is assessed on: the [`ServingDevice`]. Opens no device and
+/// measures nothing.
+pub fn assessment_structure(
+    devices: &Devices,
+    serving: ServingDevice,
+) -> anyhow::Result<AssessmentStructure> {
     let structure = AssessmentStructure::discover(
         devices,
-        SERVING_DEVICE,
+        serving.request(),
         MemoryReserves::standard(),
         serving_policy(),
         standard_service_limits(),
@@ -133,14 +173,33 @@ mod tests {
     use seismic::BackendName;
 
     fn cpu_structure() -> AssessmentStructure {
-        AssessmentStructure::discover(
+        assessment_structure(
             &seismic::Devices::discover(&[]).expect("device catalog"),
-            DeviceRequest::Backend(BackendName::Cpu),
-            MemoryReserves::standard(),
-            serving_policy(),
-            standard_service_limits(),
+            ServingDevice::of(ExecutorSelector::HostCpu),
         )
-        .expect("the CPU backend is selectable")
+        .expect("the host CPU is usable")
+    }
+
+    /// The serving device is the automatic selection, and the structure is assessed on exactly
+    /// the serving device it is given, whatever the automatic selection is.
+    #[test]
+    fn the_structure_is_assessed_on_the_serving_device() {
+        let devices = seismic::Devices::discover(&[]).expect("device catalog");
+        let automatic = select(&devices.topology(), ExecutionPath::Native, SERVING_REQUEST)
+            .expect("the host CPU is usable");
+        let serving = ServingDevice::select(&devices).unwrap();
+        assert_eq!(serving.selector(), automatic.selector());
+        for executor in devices
+            .topology()
+            .executors()
+            .iter()
+            .filter(|executor| magnitude_executor::platform::unusable_reason(executor).is_none())
+        {
+            let serving = ServingDevice::of(executor.selector());
+            let structure = assessment_structure(&devices, serving).unwrap();
+            assert_eq!(structure.selected.info.selector(), serving.selector());
+            assert_eq!(structure.device, serving.request());
+        }
     }
 
     fn environment_id(

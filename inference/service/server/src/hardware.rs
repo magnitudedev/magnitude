@@ -1,6 +1,6 @@
 //! `GET /api/v1/hardware` (integration spec §5.4, §9.4; memory-reserves spec §5.5): the service
-//! process's own Seismic topology (its physical devices with their executors and the one the
-//! engine's selection takes, the stores, and the access and transfer paths with their grants)
+//! process's own Seismic topology (its physical devices with their executors and the serving
+//! device, the stores, and the access and transfer paths with their grants)
 //! and its status under the service's reserve
 //! policy, as the engine's fit reads them, merged with the resident worker's readings. The
 //! service opens no executor, so only a loaded worker reads a device store's live free bytes.
@@ -11,8 +11,7 @@ use std::time::UNIX_EPOCH;
 
 use futures_util::future::BoxFuture;
 use magnitude_engine::worker::protocol::MemoryObservation;
-use magnitude_executor::ExecutionPath;
-use magnitude_executor::platform::{Fit, MemoryReserves, select};
+use magnitude_executor::platform::{Fit, MemoryReserves};
 use magnitude_service_contracts::{
     ExecutionBackend, HardwareAccessPath, HardwareBackendDiagnostic, HardwareDeviceId,
     HardwareDeviceKind, HardwareDeviceMemory, HardwareDiagnosticSource, HardwareExecutor,
@@ -26,7 +25,7 @@ use seismic::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::assessment::environment::SERVING_DEVICE;
+use crate::assessment::environment::ServingDevice;
 use crate::build_identity;
 use crate::memory_domains::{store_domain_id, store_identity_id};
 use crate::residency::controller::ModelInstances;
@@ -82,21 +81,25 @@ impl ResidentMemory for ModelInstances {
 pub struct HardwareInventory {
     inventory: Arc<Inventory>,
     reserves: MemoryReserves,
+    serving: ServingDevice,
     machine: Arc<MachineDescription>,
     resident: Arc<dyn ResidentMemory>,
 }
 
 impl HardwareInventory {
     /// Describe the machine once; every snapshot then reads `inventory`'s current topology, a
-    /// fresh status sample and the resident worker's fresh observations.
+    /// fresh status sample and the resident worker's fresh observations, and reports `serving`
+    /// as the device the service serves on.
     pub fn new(
         inventory: Arc<Inventory>,
         reserves: MemoryReserves,
+        serving: ServingDevice,
         resident: Arc<dyn ResidentMemory>,
     ) -> Self {
         Self {
             inventory,
             reserves,
+            serving,
             machine: Arc::new(MachineDescription::discover()),
             resident,
         }
@@ -108,6 +111,7 @@ impl HardwareInventory {
     fn snapshot_with(
         inventory: &Inventory,
         reserves: &MemoryReserves,
+        serving: ServingDevice,
         machine: &MachineDescription,
         resident: Option<&MemoryObservation>,
     ) -> Result<HardwareSnapshot, InventoryError> {
@@ -116,7 +120,7 @@ impl HardwareInventory {
             sample: inventory.sample(&topology),
             runtime: RuntimeStatus::default(),
         };
-        let mut snapshot = snapshot(&topology, &status, reserves, machine)?;
+        let mut snapshot = snapshot(&topology, &status, reserves, serving, machine)?;
         if let Some(resident) = resident {
             merge_resident(&mut snapshot.device_memory, resident);
         }
@@ -177,11 +181,12 @@ impl HardwareProvider for HardwareInventory {
     fn snapshot(&self) -> BoxFuture<'_, Result<HardwareSnapshot, InventoryError>> {
         let inventory = Arc::clone(&self.inventory);
         let reserves = self.reserves;
+        let serving = self.serving;
         let machine = Arc::clone(&self.machine);
         Box::pin(async move {
             let resident = self.resident.observe().await;
             crate::spawn_blocking_traced(move || {
-                Self::snapshot_with(&inventory, &reserves, &machine, resident.as_ref())
+                Self::snapshot_with(&inventory, &reserves, serving, &machine, resident.as_ref())
             })
             .await
             .map_err(|error| {
@@ -203,6 +208,7 @@ fn snapshot(
     topology: &DeviceTopology,
     status: &Status,
     reserves: &MemoryReserves,
+    serving: ServingDevice,
     machine: &MachineDescription,
 ) -> Result<HardwareSnapshot, InventoryError> {
     let fit = Fit::new(topology, status, reserves);
@@ -370,8 +376,6 @@ fn snapshot(
         })
         .collect();
     let internal = |error: &dyn std::fmt::Display| InventoryError::Internal(error.to_string());
-    // Selection's only failure is that no executor can run the request.
-    let selected_executor = select(topology, ExecutionPath::Native, SERVING_DEVICE).ok();
     let captured_at = status
         .sample
         .taken
@@ -390,7 +394,7 @@ fn snapshot(
         backend_diagnostics,
         topology_fingerprint: format!("{:x}", Sha256::digest(topology.normalized().as_bytes())),
         physical_devices,
-        selected_executor: selected_executor.map(|executor| executor_id(executor.id())),
+        selected_executor: HardwareDeviceId::new(serving.selector().to_string()),
         host_ram,
         device_memory,
         volumes,
@@ -565,9 +569,11 @@ mod tests {
     fn snapshot_keeps_physical_identity_and_all_placement_references() {
         let inventory = Inventory::discover(&[]).unwrap();
         let topology = inventory.topology();
+        let serving = ServingDevice::of(seismic::ExecutorSelector::HostCpu);
         let observed = HardwareInventory::snapshot_with(
             &inventory,
             &MemoryReserves::standard(),
+            serving,
             &MachineDescription::discover(),
             None,
         )
@@ -598,14 +604,14 @@ mod tests {
                 }
             }
         }
-        if let Some(selected) = &observed.selected_executor {
-            assert!(
-                observed
-                    .physical_devices
-                    .iter()
-                    .flat_map(|physical| &physical.executors)
-                    .any(|executor| &executor.id == selected)
-            );
-        }
+        // The report names the serving device it is given, whatever the automatic selection.
+        assert_eq!(observed.selected_executor.as_str(), "host-cpu");
+        assert!(
+            observed
+                .physical_devices
+                .iter()
+                .flat_map(|physical| &physical.executors)
+                .any(|executor| executor.id == observed.selected_executor)
+        );
     }
 }

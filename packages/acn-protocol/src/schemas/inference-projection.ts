@@ -49,23 +49,29 @@ type SnapshotExecutor = { readonly executor: InferenceSchema.HardwareExecutor; r
 const snapshotExecutors = (hardware: InferenceSchema.HardwareSnapshot): readonly SnapshotExecutor[] =>
   hardware.physical_devices.flatMap(physical => physical.executors.map(executor => ({ executor, physical })))
 
-/** The executor the engine selects, if any can run; a selection naming no reported executor breaks ICN's contract. */
-const resolveSelected = (
+/**
+ * The active device: the device a resident (Ready) model runs on, and otherwise the service's
+ * serving device. A device naming no reported executor breaks ICN's contract.
+ */
+const resolveActive = (
   hardware: InferenceSchema.HardwareSnapshot,
-): Effect.Effect<Option.Option<SnapshotExecutor>, InferenceHardwareProjectionError> => Option.match(
-  Option.flatMap(hardware.selected_executor, Option.fromNullable), {
-    onNone: () => Effect.succeed(Option.none()),
-    onSome: id => Option.match(Option.fromNullable(snapshotExecutors(hardware).find(({ executor }) => executor.id === id)), {
-      onNone: () => Effect.fail(new InferenceHardwareProjectionError({ message: `Selected executor ${id} is not a reported executor` })),
-      onSome: selected => Effect.succeed(Option.some(selected)),
-    }),
+  instances: InferenceSchema.ModelInstancesSnapshot,
+): Effect.Effect<SnapshotExecutor, InferenceHardwareProjectionError> => {
+  const id = instances.instances.flatMap(({ lifecycle }) => lifecycle._tag === "Ready" ? [lifecycle.device.id] : [])[0]
+    ?? hardware.selected_executor
+  return Option.match(Option.fromNullable(snapshotExecutors(hardware).find(({ executor }) => executor.id === id)), {
+    onNone: () => Effect.fail(new InferenceHardwareProjectionError({ message: `Active device ${id} is not a reported executor` })),
+    onSome: Effect.succeed,
   })
+}
 
 export const projectInferenceHardware = (
   hardware: InferenceSchema.HardwareSnapshot,
+  instances: InferenceSchema.ModelInstancesSnapshot,
 ): Effect.Effect<LocalInferenceHardware, InferenceHardwareProjectionError> => Effect.gen(function* () {
   const host = hardware.host_ram
   const placements = yield* resolvePlacements(hardware)
+  const active = yield* resolveActive(hardware, instances)
   const accelerators = hardware.physical_devices.flatMap(physical => {
     const executors = physical.executors.filter(executor => executor.availability.type === "available")
     const [first] = executors
@@ -80,12 +86,12 @@ export const projectInferenceHardware = (
       })),
     }]
   })
-  const shared = accelerators.some(physical => physical.executors.some(executor =>
-    executor.memoryDomainIds.some(id => id === host.store.id)))
   const memoryDomains = [
     {
       memoryDomainId: LocalInferenceMemoryDomainIdSchema.make(host.store.id),
-      kind: shared ? "UnifiedMemory" as const : "System" as const,
+      // Host RAM is unified only when it is the active device's own memory: a GPU is integrated
+      // exactly when its memory is the host's.
+      kind: active.physical.kind === "integrated_gpu" ? "UnifiedMemory" as const : "System" as const,
       totalBytes: host.store.total_capacity_bytes,
       availableBytes: Option.some(host.current_free_bytes),
     },
@@ -117,8 +123,7 @@ export const projectInferenceHardware = (
     logicalCores: Math.max(1, hardware.logical_cores),
     totalSystemMemoryBytes: host.store.total_capacity_bytes,
     accelerators,
-    selectedDeviceId: Option.map(yield* resolveSelected(hardware), ({ executor }) =>
-      LocalInferenceDeviceIdSchema.make(executor.id)),
+    activeDeviceId: LocalInferenceDeviceIdSchema.make(active.executor.id),
     memoryDomains,
   }
 })
@@ -153,13 +158,14 @@ const deviceBytes = (
   }
 }
 
-/** The machine as one record: the backend the engine runs on, the GPU it runs on if any, and why a present GPU is not used. */
+/** The machine as one record: the active device's backend, its GPU if it is one, and why a present GPU is not used. */
 export const summarizeInferenceHardware = (
   hardware: InferenceSchema.HardwareSnapshot,
+  instances: InferenceSchema.ModelInstancesSnapshot,
 ): Effect.Effect<AcnHardwareSummary, InferenceHardwareProjectionError> => Effect.gen(function* () {
   const bytes = deviceBytes(hardware, yield* resolvePlacements(hardware))
-  const selected = yield* resolveSelected(hardware)
-  const used = Option.getOrUndefined(Option.filter(selected, ({ physical }) => physical.kind !== "cpu"))
+  const active = yield* resolveActive(hardware, instances)
+  const used = active.physical.kind === "cpu" ? undefined : active
   const largestFirst = snapshotExecutors(hardware).filter(({ physical }) => physical.kind !== "cpu")
     .sort((a, b) => bytes(b) - bytes(a))
   const diagnostics = Option.getOrElse(hardware.backend_diagnostics, () => [])
@@ -171,7 +177,7 @@ export const summarizeInferenceHardware = (
   }
   const unused = used ? undefined : largestFirst[0]
   return {
-    backend: Option.map(selected, ({ executor }) => executor.backend),
+    backend: active.executor.backend,
     gpuName: Option.fromNullable(used?.executor.name).pipe(Option.filter(name => name.length > 0)),
     gpuKind: used ? Option.some(used.physical.kind === "integrated_gpu" ? "integrated" : "discrete") : Option.none(),
     gpuMemoryBytes: used ? Option.some(bytes(used)) : Option.none(),

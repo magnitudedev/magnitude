@@ -534,6 +534,8 @@ export const ModelResidencySchema = Schema.Union(
   }),
   Schema.TaggedStruct("Ready", {
     allocation: ModelInstanceAllocationSchema,
+    /** The device the worker opened: the one this instance runs on. */
+    device: ModelLoadDeviceSchema,
   }),
   Schema.TaggedStruct("Stopping", {
     reason: ModelReleaseReasonSchema,
@@ -1669,8 +1671,8 @@ export const LocalInferenceHardwareSchema = Schema.Struct({
   logicalCores: PositiveSafeInteger,
   totalSystemMemoryBytes: NonNegativeSafeInteger,
   accelerators: Schema.Array(LocalInferenceAcceleratorSchema),
-  /** The executor the engine selects: the one every load runs on. None when no executor can run. */
-  selectedDeviceId: Schema.optionalWith(LocalInferenceDeviceIdSchema, { as: "Option", exact: true }),
+  /** The active device: the one a resident model runs on, and otherwise the service's serving device. */
+  activeDeviceId: LocalInferenceDeviceIdSchema,
   memoryDomains: Schema.Array(LocalInferenceMemoryDomainSchema),
 }).pipe(Schema.filter((hardware) => {
   const memoryDomainIds = hardware.memoryDomains.map(({ memoryDomainId }) => memoryDomainId)

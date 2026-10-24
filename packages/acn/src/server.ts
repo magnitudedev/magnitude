@@ -50,7 +50,7 @@ import type { JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channe
 import {
   MagnitudeHealthResponseSchema,
   AcnRpcGroup, } from "@magnitudedev/acn-protocol"
-import { IcnHardware, IcnProcess, makeIcnProvider, ReleaseIcnInstallationError } from "@magnitudedev/icn"
+import { IcnHardware, IcnInstances, IcnProcess, makeIcnProvider, ReleaseIcnInstallationError } from "@magnitudedev/icn"
 import { AcnBoundaryLive } from "./boundary/acn"
 import { defaultDataDir } from "./data-dir"
 import { AgentFactoryLive } from "./agent-factory"
@@ -884,7 +884,9 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
         Effect.map(({ state }) => Option.some(state)),
         Effect.catchAll(() => Effect.succeed(Option.none())),
       )
-      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie), hardware)
+      const instances = yield* Context.get(applicationContext, IcnInstances).get
+      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie),
+        Option.map(hardware, snapshot => ({ hardware: snapshot, instances })))
       return {
         subscriptions: Context.get(applicationContext, AcnSubscriptions),
         icn,

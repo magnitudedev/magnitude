@@ -36,6 +36,7 @@ use magnitude_service_models::{
     InventoryConfig, ManagedModelDownloads, ModelDomainResolver, load_release_catalog,
     managed_model_services,
 };
+use magnitude_service_server::assessment::environment::ServingDevice;
 use magnitude_service_server::configurations::ResolvedConfigurations;
 use magnitude_service_server::device_lock::DeviceLock;
 use magnitude_service_server::hardware::HardwareInventory;
@@ -123,10 +124,12 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         seismic: SeismicHostMemory::new(catalog.clone(), reserves),
         headroom: AtomicU64::new(NO_OVERRIDE),
     });
+    let serving = ServingDevice::select(&catalog)?;
     let configurations = Arc::new(ResolvedConfigurations::new(
         inventory.clone(),
         inventory.derived_cache().kernel_directory(),
         reserves,
+        serving,
     ));
     let harness = |idle_timeout: Duration, namespace: &str| {
         let instances = ModelInstances::start(ResidencyEnvironment {
@@ -224,6 +227,7 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         plan.device.id.as_str(),
         plan.device.backend
     );
+    assert_eq!(plan.device.id.as_str(), serving.selector().to_string());
 
     // Host-only properties: answered from the resolved configuration, never loading.
     let started = Instant::now();
@@ -249,9 +253,10 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
     // Ensure: a worker loads exactly the previewed device.
     let started = Instant::now();
     let ready = main.instances.ensure_resident(&first).await?;
-    let ModelInstanceLifecycle::Ready { allocation } = &ready.lifecycle else {
+    let ModelInstanceLifecycle::Ready { allocation, device } = &ready.lifecycle else {
         panic!("ensure returned {:?}", ready.lifecycle)
     };
+    assert_eq!(device, &plan.device, "the worker opened the planned device");
     println!(
         "ensure       {:>7.3} s  {} context {} domains {:?}",
         started.elapsed().as_secs_f64(),
@@ -281,9 +286,14 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
     let hardware = HardwareInventory::new(
         catalog.inventory().clone(),
         reserves,
+        serving,
         Arc::new(main.instances.clone()),
     );
     let snapshot = HardwareProvider::snapshot(&hardware).await?;
+    assert_eq!(
+        snapshot.selected_executor, device.id,
+        "the report names the serving device"
+    );
     println!(
         "hardware     {:>7.3} s  worker stores {:?}; snapshot device memory {:?}",
         started.elapsed().as_secs_f64(),

@@ -249,11 +249,7 @@ export const reduceLifecycle = (
       if (Option.isNone(state.activity)) return active;
       const observation = state.activity.value;
       if (observation._tag === "Starting") {
-        if (
-          active._tag === "Installing" &&
-          typeof observation.phase === "string"
-        )
-          return active;
+        if (active._tag === "Installing") return active;
         return LifecycleFsm.transition(active, "Starting", {
           phase: observation.phase,
         });

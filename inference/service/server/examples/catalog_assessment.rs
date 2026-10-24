@@ -27,7 +27,7 @@ use magnitude_service_models::{
 };
 use magnitude_service_server::assessment::assessor::ModelAssessor;
 use magnitude_service_server::assessment::environment::{
-    AssessmentEnvironment, assessment_structure,
+    AssessmentEnvironment, ServingDevice, assessment_structure,
 };
 use magnitude_service_server::assessment::measurement::MeasurementStatus;
 use magnitude_service_server::assessment::{HostDevice, ManagedModelAssessments};
@@ -114,7 +114,10 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
         Arc::new(NoCatalogEffects),
         Arc::new(NoCatalogEffects),
     )?;
-    let structure = Arc::new(assessment_structure(&catalog)?);
+    let structure = Arc::new(assessment_structure(
+        &catalog,
+        ServingDevice::select(&catalog)?,
+    )?);
     let stored = structure.stored_measurements(&kernels);
     let environment = Arc::new(AssessmentEnvironment::new(
         Arc::clone(&structure),

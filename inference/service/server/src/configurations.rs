@@ -27,7 +27,7 @@ use magnitude_service_models::{
 };
 
 use crate::assessment::assessor::engine_material;
-use crate::assessment::environment::{SERVING_DEVICE, serving_policy};
+use crate::assessment::environment::{ServingDevice, serving_policy};
 
 /// Resolved configurations kept for reuse beyond those still held elsewhere. A resolution holds
 /// the model's package metadata, tokenizers and templates, 100 to 250 MB for a 250K-token
@@ -39,8 +39,8 @@ const RETAINED_CONFIGURATIONS: usize = 1;
 pub struct ResolvedConfiguration {
     /// Chat semantics: tokenizer, templates, properties.
     pub host: Arc<HostArtifacts>,
-    /// What a worker loads. Its device request is automatic; a load replaces it with the
-    /// previewed device.
+    /// What a worker loads, on exactly the serving device: its preview and its load open that
+    /// device or fail.
     pub manifest: ExecutionManifest,
     /// The installed packages the configuration reads.
     pub package_ids: Vec<ModelPackageId>,
@@ -53,6 +53,7 @@ pub struct ResolvedConfigurations {
     models: Arc<ManagedModelStore>,
     kernel_directory: PathBuf,
     reserves: MemoryReserves,
+    serving: ServingDevice,
     cache: ResolutionCache<ResolvedConfiguration>,
 }
 
@@ -61,11 +62,13 @@ impl ResolvedConfigurations {
         models: Arc<ManagedModelStore>,
         kernel_directory: PathBuf,
         reserves: MemoryReserves,
+        serving: ServingDevice,
     ) -> Self {
         Self {
             models,
             kernel_directory,
             reserves,
+            serving,
             cache: ResolutionCache::new(RETAINED_CONFIGURATIONS),
         }
     }
@@ -110,8 +113,12 @@ impl ResolvedConfigurations {
         paths: ModelPackagePaths,
         package_ids: Vec<ModelPackageId>,
     ) -> Result<Arc<ResolvedConfiguration>, InventoryError> {
-        let configuration =
-            engine_configuration(paths, self.kernel_directory.clone(), self.reserves);
+        let configuration = engine_configuration(
+            paths,
+            self.kernel_directory.clone(),
+            self.reserves,
+            self.serving,
+        );
         let resolved = crate::spawn_blocking_traced(move || configuration.resolve())
             .await
             .map_err(|error| {
@@ -128,11 +135,13 @@ impl ResolvedConfigurations {
 }
 
 /// The engine configuration serving a bundle's material: its components, its declared method
-/// (a separate draft's method is the bundle's, never `Auto`), the standard service limits.
+/// (a separate draft's method is the bundle's, never `Auto`), the standard service limits, on
+/// the serving device.
 fn engine_configuration(
     package: ModelPackagePaths,
     kernel_directory: PathBuf,
     reserves: MemoryReserves,
+    serving: ServingDevice,
 ) -> EngineConfiguration {
     EngineConfiguration {
         package: PackageOptions {
@@ -150,7 +159,7 @@ fn engine_configuration(
         context_tokens: None,
         service: standard_service_limits(),
         path: ExecutionPath::Native,
-        device: SERVING_DEVICE,
+        device: serving.request(),
         kernel_cache: Some(kernel_directory),
         reserves,
     }
@@ -346,10 +355,12 @@ mod tests {
     #[ignore = "requires MAGNITUDE_TEST_TARGET_GGUF and its DSpark MAGNITUDE_TEST_DRAFT_GGUF"]
     fn a_draft_bundle_serves_its_declared_method_or_is_refused() {
         let kernels = std::env::temp_dir();
+        let serving = ServingDevice::of(seismic::ExecutorSelector::HostCpu);
         let resolved = engine_configuration(
             material(ModelMethod::DSpark),
             kernels.clone(),
             MemoryReserves::standard(),
+            serving,
         )
         .resolve()
         .unwrap();
@@ -366,10 +377,13 @@ mod tests {
             ModelMethod::DFlash2,
             ModelMethod::LiLiCorr,
         ] {
-            let Err(error) =
-                engine_configuration(material(method), kernels.clone(), MemoryReserves::standard())
-                    .resolve()
-            else {
+            let Err(error) = engine_configuration(
+                material(method),
+                kernels.clone(),
+                MemoryReserves::standard(),
+                serving,
+            )
+            .resolve() else {
                 panic!("{method:?} resolved over a DSpark draft")
             };
             let InventoryError::ModelOperation { code, message, .. } = resolve_failure(error)
@@ -379,6 +393,24 @@ mod tests {
             assert_eq!(code, "invalid_model_configuration");
             assert!(message.contains("the package's draft is DSpark"), "{message}");
         }
+    }
+
+    /// Every configuration, so every preview and load, is on exactly the serving device.
+    #[test]
+    fn a_configuration_is_on_the_serving_device() {
+        let serving = ServingDevice::of(seismic::ExecutorSelector::HostCpu);
+        let configuration = engine_configuration(
+            ModelPackagePaths {
+                target: PathBuf::from("target.gguf"),
+                projector: None,
+                draft: None,
+                method: ModelMethod::Plain,
+            },
+            std::env::temp_dir(),
+            MemoryReserves::standard(),
+            serving,
+        );
+        assert_eq!(configuration.device, serving.request());
     }
 
     fn key(index: usize) -> ServableModelBundleKey {

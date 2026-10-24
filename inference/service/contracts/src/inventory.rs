@@ -704,9 +704,9 @@ pub struct HardwareSnapshot {
     pub backend_diagnostics: Vec<HardwareBackendDiagnostic>,
     pub topology_fingerprint: String,
     pub physical_devices: Vec<HardwarePhysicalDevice>,
-    /// The executor the service's device selection takes: the one every load runs on. None when
-    /// no executor can run (each one's unavailability says why).
-    pub selected_executor: Option<HardwareDeviceId>,
+    /// The serving device: the executor the service selected once over its topology, which it
+    /// assesses every model on and loads every model on. The service does not run without one.
+    pub selected_executor: HardwareDeviceId,
     /// Memory the OS manages; every machine has it.
     pub host_ram: HardwareHostRam,
     pub device_memory: Vec<HardwareDeviceMemory>,

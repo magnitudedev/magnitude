@@ -161,7 +161,7 @@ it("counts dedicated memory once when two backends expose one physical domain", 
   expect(result.groups.at(-1)?.details).toContain("CUDA acceleration")
   expect(result.groups.at(-1)?.details).not.toContain("Vulkan acceleration")
 })
-it("shows the selected backend on the GPU the engine selects, and none on the others", () => {
+it("shows the backend on the GPU holding the active device, and none on the others", () => {
   const value = hardware("AMD", 64, 16, [{ name: "RTX 3090", memory: 24 }, { name: "RTX 3090", memory: 24 }])
   const views = value.accelerators.map(accelerator => ({ ...accelerator, executors: [
     ...accelerator.executors,
@@ -173,12 +173,20 @@ it("shows the selected backend on the GPU the engine selects, and none on the ot
     ["CUDA acceleration"],
     [],
   ])
+  expect(result.groups.slice(2).map(group => group.details.includes("In use"))).toEqual([true, false])
 })
-it("keeps ordinary shared system RAM distinct from unified memory in mixed systems", () => {
+it("leads with the serving discrete GPU and keeps an integrated GPU's host RAM as system memory", () => {
   const value = hardware("AMD", 64, 16, [{ name: "Integrated graphics", memory: 64, shared: true }, { name: "RTX 4090", memory: 24 }])
-  const result = hardwareDetails(null, { ...value, memoryDomains: value.memoryDomains.map(domain => domain.memoryDomainId === "system" ? { ...domain, kind: "System" as const } : domain) })
+  const result = hardwareDetails(null, {
+    ...value,
+    activeDeviceId: value.accelerators[1]!.executors[0]!.deviceId,
+    memoryDomains: value.memoryDomains.map(domain => domain.memoryDomainId === "system" ? { ...domain, kind: "System" as const } : domain),
+  })
   expect(result.summary[0]?.label).toBe("System RAM")
-  expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["Shares system RAM", "25.8 GB VRAM"])
+  expect(result.accelerators.map(gpu => gpu.detail)).toEqual(["25.8 GB VRAM", "Shares system RAM"])
+  expect(result.groups.slice(2).map(group => [group.name, group.details.includes("In use"), group.details.includes("Available")]))
+    .toEqual([["RTX 4090", true, false], ["Integrated graphics", false, true]])
+  expect(result.cpuInference).toBe(false)
   expect(Option.getOrThrow(result.photo).kind).toBe("Component")
 })
 
@@ -201,7 +209,7 @@ it("labels PC components consistently and numbers separate GPUs", () => {
   expect(result.groups[0]?.name).toBe("AMD Ryzen 9 9950X")
   expect(result.groups[1]?.details).toEqual(["System RAM"])
   expect(result.groups[2]?.details[0]).toBe("34.4 GB VRAM")
-  expect(result.groups[2]?.details).toEqual(["34.4 GB VRAM", "CUDA acceleration", "1,792 GB/s Memory bandwidth (spec)"])
+  expect(result.groups[2]?.details).toEqual(["34.4 GB VRAM", "CUDA acceleration", "In use", "1,792 GB/s Memory bandwidth (spec)"])
 })
 
 it.each(["RTX 5090", "Radeon 8060S Graphics", "Arc B580", "RX 580"])("omits implementation-specific GPU unit counts from the %s card", name => {

@@ -285,11 +285,6 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
                   Option.none()
                 );
               }
-              case "PreparingBackend":
-                return yield* lifecycle.reportStarting({
-                  _tag: "PreparingBackend",
-                  backend: event.backend,
-                }, Option.none());
             }
           }),
       };

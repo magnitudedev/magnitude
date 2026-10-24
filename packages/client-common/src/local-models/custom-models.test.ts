@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import {
   CatalogFormModelIdSchema,
   DrafterNotUsable,
+  LocalInferenceDeviceIdSchema,
   ModelVersionNotRunnable,
   UnsupportedReasonSchema,
   type CandidateVersion,
@@ -338,7 +339,7 @@ describe("custom models in client projections", () => {
       acquisitionState: {
         _tag: "External",
         installation: { _tag: "Resolved", installedBytes: 2, primaryPath: "/m.gguf", ownership: "External" },
-        residencyState: { _tag: "Ready", allocation: { contextWindowTokens: 4096, memoryDomains: [] } },
+        residencyState: { _tag: "Ready", allocation: { contextWindowTokens: 4096, memoryDomains: [] }, device: { deviceId: LocalInferenceDeviceIdSchema.make("cuda:0"), backend: "cuda" } },
       },
     })
     const state: LocalModelsState = {

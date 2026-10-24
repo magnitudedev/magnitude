@@ -1,5 +1,5 @@
 //! Post-install kernel tuning: after a catalog download, one inference worker runs the model's
-//! Prepare on the device a load would select, so the first load finds every tuning record in the
+//! Prepare on the serving device, as a load does, so the first load finds every tuning record in the
 //! kernel cache and is one worker, as any later load. The job resolves and previews exactly as a
 //! load does and never imports the model. It runs only with the device to itself
 //! ([`crate::device_lock`]): a search beside a resident or loading model would take the memory
@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 
 use magnitude_engine::worker::Preparation as WorkerPreparation;
 use magnitude_engine::worker::protocol::LoadProgress;
-use magnitude_executor::platform::DeviceRequest;
 use magnitude_service_contracts::models::{
     CatalogOptimizationProgress, CatalogOptimizationStage, ModelId, ModelLoadDevice,
 };
@@ -145,8 +144,7 @@ async fn prepare(
         return Ok(Preparation::Skipped("the load preview failed"));
     };
     let device = load_plan(&preview)?.device;
-    let mut manifest = resolved.manifest.clone();
-    manifest.device = DeviceRequest::Selector(preview.device);
+    let manifest = resolved.manifest.clone();
     loop {
         let waiting = || {
             tracing::info!(%model_id, "installed model optimization waits for the device");

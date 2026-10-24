@@ -31,12 +31,13 @@ export const LocalInferenceHardwareLive: Layer.Layer<
   const instances = yield* IcnInstances
   const changes = yield* AcnChanges
   const scope = yield* Scope.Scope
-  const state = hardware.get.pipe(
-    Effect.flatMap(({ state }) => projectLocalInferenceHardware(state)),
+  // The active device is a resident model's, so the projection reads instances with the hardware.
+  const state = Effect.all([hardware.get, instances.get]).pipe(
+    Effect.flatMap(([{ state }, current]) => projectLocalInferenceHardware(state, current)),
     Effect.orDie,
   )
-  const projectedChanges = hardware.changes.pipe(
-    Stream.mapEffect(({ state }) => projectLocalInferenceHardware(state).pipe(
+  const projectedChanges = Stream.zipLatest(hardware.changes, instances.changes).pipe(
+    Stream.mapEffect(([{ state }, current]) => projectLocalInferenceHardware(state, current).pipe(
       Effect.tapError((error) => Effect.logWarning("Unable to project local inference hardware").pipe(
         Effect.annotateLogs({ cause: error.message }),
       )),

@@ -1,7 +1,7 @@
 import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import { LocalInferenceHardwareSchema, ModelInstanceAllocationSchema } from "@magnitudedev/sdk"
-import { deriveHardwareMemoryView } from "./hardware-memory"
+import { deriveHardwareMemoryView, deriveHardwareRoles } from "./hardware-memory"
 
 const GiB = 1024 ** 3
 const hardware = (available: number | null = 8 * GiB, discrete = false, bothBackends = false) => Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
@@ -13,7 +13,7 @@ const hardware = (available: number | null = 8 * GiB, discrete = false, bothBack
       ...(bothBackends ? [{ deviceId: "vulkan", backend: "vulkan", memoryDomainIds: ["gpu"] }] : []),
     ] },
   ],
-  selectedDeviceId: "primary",
+  activeDeviceId: "primary",
   memoryDomains: [
     { memoryDomainId: "system", kind: discrete ? "System" : "UnifiedMemory", totalBytes: 16 * GiB, ...(available === null ? {} : { availableBytes: available }) },
     ...(discrete ? [{ memoryDomainId: "gpu", kind: "PhysicalDevice", totalBytes: 16 * GiB, availableBytes: 8 * GiB }] : []),
@@ -53,5 +53,53 @@ describe("hardware memory breakdown", () => {
     expect(domain.status).toBe("rounding_adjusted")
     expect(domain.systemAndAppsBytes).toBe(0)
     expect(domain.usedBytes! + domain.freeBytes!).toBe(16 * GiB)
+  })
+})
+
+describe("hardware roles", () => {
+  // An iGPU that can place in host RAM, and a discrete GPU serving. Host RAM is the iGPU's memory, not the serving device's.
+  const hybrid = (overrides: Record<string, unknown> = {}) => Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
+    platform: "Windows", architecture: "X64", productName: "Zenbook Pro", processor: "AMD Ryzen 9 7940HS",
+    logicalCores: 16, totalSystemMemoryBytes: 32 * GiB,
+    accelerators: [
+      { acceleratorId: "igpu", name: "AMD Radeon(TM) Graphics", executors: [{ deviceId: "vulkan:0", backend: "vulkan", memoryDomainIds: ["system"] }] },
+      { acceleratorId: "dgpu", name: "NVIDIA GeForce RTX 4060", executors: [
+        { deviceId: "cuda:0", backend: "cuda", memoryDomainIds: ["vram"] },
+        { deviceId: "vulkan:1", backend: "vulkan", memoryDomainIds: ["vram", "system"] },
+      ] },
+    ],
+    activeDeviceId: "cuda:0",
+    memoryDomains: [
+      { memoryDomainId: "system", kind: "System", totalBytes: 32 * GiB, availableBytes: 16 * GiB },
+      { memoryDomainId: "vram", kind: "PhysicalDevice", totalBytes: 8 * GiB },
+    ],
+    ...overrides,
+  })
+
+  it("titles a hybrid machine by its product and CPU, leads with the serving dGPU, and keeps host RAM as system memory", () => {
+    const roles = deriveHardwareRoles(hybrid())
+    expect(roles.machineName).toBe("Zenbook Pro · AMD Ryzen 9 7940HS")
+    expect(roles.unifiedMemory).toBe(false)
+    expect(roles.devices.map(({ accelerator, role }) => [accelerator.acceleratorId, role])).toEqual([
+      ["dgpu", { _tag: "InUse", backend: "cuda" }],
+      ["igpu", { _tag: "Available" }],
+    ])
+    expect(roles.devices.map(({ dedicatedMemoryBytes, placesOnHost }) => [dedicatedMemoryBytes, placesOnHost]))
+      .toEqual([[Option.some(8 * GiB), true], [Option.none(), true]])
+    expect(deriveHardwareMemoryView(hybrid(), Option.none()).domains.map(({ label }) => label))
+      .toEqual(["System memory", "NVIDIA GeForce RTX 4060 · GPU 1"])
+  })
+  it("titles a machine without a product name by its CPU, never an accelerator", () => {
+    expect(deriveHardwareRoles({ ...hybrid(), productName: Option.none() }).machineName).toBe("AMD Ryzen 9 7940HS")
+  })
+  it("marks every device available while the CPU serves", () => {
+    expect(deriveHardwareRoles(hybrid({ activeDeviceId: "host-cpu" })).devices.map(({ role }) => role._tag))
+      .toEqual(["Available", "Available"])
+  })
+  it("keeps Apple Silicon's host RAM as unified memory", () => {
+    const roles = deriveHardwareRoles(hardware())
+    expect(roles.unifiedMemory).toBe(true)
+    expect(roles.devices.map(({ role }) => role)).toEqual([{ _tag: "InUse", backend: "metal" }])
+    expect(deriveHardwareMemoryView(hardware(), Option.none()).domains[0]?.label).toBe("Unified memory")
   })
 })

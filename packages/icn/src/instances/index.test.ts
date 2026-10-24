@@ -32,6 +32,7 @@ const instances = (revision: number): ModelInstancesSnapshot => ({
         contextWindowTokens: 8_192,
         memoryDomains: [],
       },
+      device: { id: "cuda:0", backend: "cuda" },
     },
   }],
 })

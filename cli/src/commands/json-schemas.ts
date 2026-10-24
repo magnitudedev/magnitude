@@ -72,7 +72,7 @@ const ResidencyJsonSchema = Schema.Union(
   stopped,
   requested,
   Schema.Struct({ ...loading.fields, plannedAllocation: optional(LoadPlanJsonSchema) }),
-  Schema.Struct({ ...ready.fields, allocation: AllocationJsonSchema }),
+  Schema.Struct({ ...ready.fields, allocation: AllocationJsonSchema, device: LoadDeviceJsonSchema }),
   Schema.Struct({ ...stopping.fields, allocation: StoppingAllocationJsonSchema }),
   residencyFailed,
 )
@@ -158,7 +158,7 @@ export const CustomLocalModelJsonSchema = Schema.Struct({
 export const LocalModelJsonSchema = Schema.Union(CatalogLocalModelJsonSchema, CustomLocalModelJsonSchema)
 
 export const LocalInferenceHardwareJsonSchema = Schema.Struct({
-  ...Struct.omit(LocalInferenceHardwareSchema.from.fields, "selectedDeviceId"),
+  ...Struct.omit(LocalInferenceHardwareSchema.from.fields, "activeDeviceId"),
   accelerators: Schema.Array(Schema.Struct({
     ...Struct.omit(LocalInferenceAcceleratorSchema.fields, "acceleratorId", "executors"),
     executors: Schema.Array(Schema.Struct(Struct.omit(LocalInferenceAcceleratorSchema.fields.executors.value.fields, "deviceId", "memoryDomainIds"))),

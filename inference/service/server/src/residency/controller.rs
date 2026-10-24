@@ -2,10 +2,11 @@
 //! an `inference-worker` process, and the instance operations the API serves.
 //!
 //! A load resolves the model through the shared resolved-configuration cache (§8.5), waits for
-//! memory admission, previews the load on the service's device catalog (the admission check and
-//! the load plan), and loads exactly the previewed device in a worker. The worker's measured load
-//! progress drives the instance's stage and fraction; readiness is verified against the host's
-//! resolution before the instance is Ready.
+//! memory admission, previews the load on the serving device in the service's device catalog (the
+//! admission check and the load plan), and loads exactly that device in a worker. The worker's
+//! measured load progress drives the instance's stage and fraction; readiness is verified against
+//! the host's resolution before the instance is Ready, and the Ready instance records the device
+//! the worker opened.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -20,7 +21,7 @@ use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::preview::LoadPreview;
 use magnitude_engine::worker::{EngineClient, Preparation, load_prepared};
 use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation};
-use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
+use magnitude_executor::platform::MemoryReserves;
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover,
     InstalledModelPackages as _, MemoryShortage, ModelAssessment, ModelAssessmentDomainSnapshot,
@@ -34,7 +35,7 @@ use magnitude_service_models::{
     ManagedModelStore, ModelDomainResolver, serving_configuration_fingerprint,
     servable_model_bundle_key_for_bundle,
 };
-use seismic::Devices;
+use seismic::{BackendName, Devices, ExecutorSelector};
 
 use super::optimization::{self, PreparationJobs};
 use super::supervisor::{HostMemoryObserver, MemorySupervisor};
@@ -437,11 +438,16 @@ pub(super) fn load_plan(preview: &LoadPreview) -> Result<ModelLoadPlan, ModelOpe
     Ok(ModelLoadPlan {
         context_window_tokens: context_window_tokens(preview.context_tokens)?,
         required_memory_bytes: preview.required_bytes,
-        device: ModelLoadDevice {
-            id: HardwareDeviceId::new(preview.device.to_string()),
-            backend: execution_backend(preview.backend),
-        },
+        device: load_device(preview.device, preview.backend),
     })
+}
+
+/// An engine executor as the instance state names it.
+fn load_device(device: ExecutorSelector, backend: BackendName) -> ModelLoadDevice {
+    ModelLoadDevice {
+        id: HardwareDeviceId::new(device.to_string()),
+        backend: execution_backend(backend),
+    }
 }
 
 fn context_window_tokens(tokens: u64) -> Result<u32, ModelOperationFailure> {
@@ -648,8 +654,7 @@ impl EngineResidency {
         // with none it is the load, one worker. Otherwise it places nothing and ends, a
         // Prepare worker searches what is missing and is proven gone, and a second Load worker
         // serves what is stored (the engine's one sequence, `load_prepared`).
-        let mut manifest = resolved.manifest.clone();
-        manifest.device = DeviceRequest::Selector(preview.device);
+        let manifest = resolved.manifest.clone();
         // The sequence runs on a blocking thread, which outlives this task when the load is
         // stopped: it starts no further worker once the task is gone.
         let abandoned = Arc::new(AtomicBool::new(false));
@@ -746,24 +751,16 @@ impl EngineResidency {
             };
             ModelOperationFailure::new(code, mismatch.to_string(), false)
         })?;
-        if ready.ready_info().device != preview.device {
-            return Err(ModelOperationFailure::new(
-                "worker_device_mismatch",
-                format!(
-                    "the worker opened {} but the load was previewed on {}",
-                    ready.ready_info().device,
-                    preview.device
-                ),
-                false,
-            ));
-        }
         let context_window_tokens = plan.context_window_tokens;
-        let allocation = instance_allocation(context_window_tokens, &ready.ready_info().census);
+        let ready_info = ready.ready_info();
+        let allocation = instance_allocation(context_window_tokens, &ready_info.census);
+        let device = load_device(ready_info.device, ready_info.backend);
         let (host, client, _) = ready.into_parts();
-        tracing::info!(device = %preview.device, "model ready");
+        tracing::info!(device = %device.id, "model ready");
         Ok(PreparedResidency {
             package_ids: resolved.package_ids.clone(),
             allocation,
+            device,
             worker,
             resident: ResidentEngine {
                 host,

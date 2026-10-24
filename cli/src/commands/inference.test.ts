@@ -4,6 +4,9 @@ import {
   CatalogFormModelIdSchema,
   CustomFormModelIdSchema,
   DirectoryNotFound,
+  LocalInferenceAcceleratorIdSchema,
+  LocalInferenceDeviceIdSchema,
+  LocalInferenceMemoryDomainIdSchema,
   ModelVersionNotRunnable,
   type CustomLocalModel,
   type ModelCatalogState,
@@ -38,6 +41,7 @@ import type { CliModelsClient } from "./inference-client"
 import { parseDrafterArgument, parsePullReference } from "./model-references"
 import { asJson, jsonDocument, renderCommandError, runCommand } from "./output"
 import { findModel } from "./model-format"
+import { describeLocalHardware } from "./inference-format"
 import {
   addModelFolder,
   cancelDownload,
@@ -288,6 +292,22 @@ describe("catalog renderers", () => {
     expect(lines.at(-2)).toBe("Learn more: magnitude docs recommendations")
     expect(lines.at(-1)).toBe("Looking for a specific version, finetune, or uncensored model? magnitude catalog search \"<model name>\"")
     expect(renderRecommendations({ ...view, ranked: [] }).trimEnd().split("\n").at(-1)).toContain("magnitude catalog search")
+  })
+
+  it("heads recommendations with the machine, and lists the device in use before available ones", () => {
+    const base = makeHardware({ productName: Option.some("Workstation") })
+    const system = LocalInferenceMemoryDomainIdSchema.make("system")
+    const igpu = { ...base.accelerators[0]!, acceleratorId: LocalInferenceAcceleratorIdSchema.make("igpu"), name: "Integrated graphics",
+      executors: [{ deviceId: LocalInferenceDeviceIdSchema.make("vulkan:0"), backend: "vulkan" as const, memoryDomainIds: [system] }] }
+    const hardware = { ...base, accelerators: [igpu, ...base.accelerators],
+      memoryDomains: [{ memoryDomainId: system, kind: "System" as const, totalBytes: base.totalSystemMemoryBytes, availableBytes: Option.none() }, ...base.memoryDomains] }
+    const model = makeCatalogModel()
+    const lines = renderRecommendations({ catalog: catalogState([model]), models: [model], hardware, preference: { label: "Balanced" }, ranked: [model] }).split("\n")
+    expect(lines[1]).toBe("Workstation · Test CPU - 68.7 GB")
+    expect(describeLocalHardware(hardware).accelerators).toEqual([
+      { name: "Test GPU", details: "25.8 GB VRAM · CUDA acceleration · in use" },
+      { name: "Integrated graphics", details: "shares system memory · available" },
+    ])
   })
 
   it("prints the search command for other versions in catalog details", () => {

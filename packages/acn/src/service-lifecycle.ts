@@ -8,7 +8,7 @@ import {
   type AcnStopping,
   type AcnStoppingReason,
 } from "@magnitudedev/acn-protocol"
-import type { HardwareSnapshot } from "@magnitudedev/icn-protocol/schemas"
+import type { HardwareSnapshot, ModelInstancesSnapshot } from "@magnitudedev/icn-protocol/schemas"
 import { HttpServerRequest, HttpServerResponse } from "@effect/platform"
 import { Context, Deferred, Effect, Layer, Option, SubscriptionRef, Stream, type Scope } from "effect"
 
@@ -37,7 +37,10 @@ export interface AcnServiceLifecycleApi {
     activity: AcnStartupActivity,
     progress: Option.Option<AcnStartupProgress>,
   ) => Effect.Effect<void>
-  readonly becomeReady: (rpc: AcnRpcApplication, hardware: Option.Option<HardwareSnapshot>) => Effect.Effect<void>
+  readonly becomeReady: (
+    rpc: AcnRpcApplication,
+    machine: Option.Option<{ readonly hardware: HardwareSnapshot; readonly instances: ModelInstancesSnapshot }>,
+  ) => Effect.Effect<void>
   readonly beginStopping: (request: AcnStopRequest) => Effect.Effect<boolean>
   readonly awaitStopping: Effect.Effect<AcnStopping>
 }
@@ -122,7 +125,7 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
           }),
         )
 
-    const becomeReady: AcnServiceLifecycleApi["becomeReady"] = (rpc, hardware) =>
+    const becomeReady: AcnServiceLifecycleApi["becomeReady"] = (rpc, machine) =>
       transitionLock.withPermits(1)(
         Effect.gen(function* () {
           const current = yield* SubscriptionRef.get(runtime)
@@ -131,9 +134,9 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
             return yield* Effect.dieMessage("ACN became ready more than once")
           }
           // A snapshot whose placements do not resolve breaks ICN's contract, as in the hardware projection.
-          const summary = yield* Option.match(hardware, {
+          const summary = yield* Option.match(machine, {
             onNone: () => Effect.succeed(Option.none()),
-            onSome: snapshot => summarizeInferenceHardware(snapshot).pipe(
+            onSome: ({ hardware, instances }) => summarizeInferenceHardware(hardware, instances).pipe(
               Effect.map(Option.some),
               Effect.orDie,
             ),

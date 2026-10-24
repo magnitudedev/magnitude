@@ -1,5 +1,5 @@
 import { Cause, FiberId, Option } from "effect"
-import { CatalogFormModelIdSchema, LocalModelMutationFailed } from "@magnitudedev/sdk"
+import { CatalogFormModelIdSchema, LocalInferenceDeviceIdSchema, LocalModelMutationFailed } from "@magnitudedev/sdk"
 import { describe, expect, it } from "vitest"
 import { localModelCommandStatus, localModelCommandFailure, type LocalModelCommand } from "./service"
 import { makeSetupModel } from "../application/fixtures/model"
@@ -27,7 +27,7 @@ describe("model-specific command feedback", () => {
   })
   it("retires load feedback when the model is observed ready without erasing other commands", () => {
     const base = makeSetupModel(true)
-    const model = { ...base, modelId: first, acquisitionState: { ...base.acquisitionState, residencyState: { _tag: "Ready" as const, allocation: { contextWindowTokens: 4096, memoryDomains: [] } } } }
+    const model = { ...base, modelId: first, acquisitionState: { ...base.acquisitionState, residencyState: { _tag: "Ready" as const, allocation: { contextWindowTokens: 4096, memoryDomains: [] }, device: { deviceId: LocalInferenceDeviceIdSchema.make("cuda:0"), backend: "cuda" as const } } } }
     expect(localModelCommandStatus(first, [[observation("load")], [observation("remove")]], Option.some(model)).failures).toEqual([failure("remove")])
   })
   it("shows removal failure once while retaining a separate load rejection", () => {

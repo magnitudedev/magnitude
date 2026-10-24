@@ -6313,6 +6313,7 @@
           "native_build",
           "topology_fingerprint",
           "physical_devices",
+          "selected_executor",
           "host_ram",
           "device_memory",
           "volumes",
@@ -6376,15 +6377,8 @@
             }
           },
           "selected_executor": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/HardwareDeviceId",
-                "description": "The executor the service's device selection takes: the one every load runs on. None when\nno executor can run (each one's unavailability says why)."
-              }
-            ]
+            "$ref": "#/components/schemas/HardwareDeviceId",
+            "description": "The serving device: the executor the service selected once over its topology, which it\nassesses every model on and loads every model on. The service does not run without one."
           },
           "host_ram": {
             "$ref": "#/components/schemas/HardwareHostRam",
@@ -6834,104 +6828,6 @@
         "type": "string",
         "enum": [
           "shutdown"
-        ]
-      },
-      "IcnStartupBackend": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "hardwareLabel",
-              "type"
-            ],
-            "properties": {
-              "hardwareLabel": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "cpu"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "hardwareLabel",
-              "type"
-            ],
-            "properties": {
-              "hardwareLabel": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "metal"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "hardwareLabel",
-              "type"
-            ],
-            "properties": {
-              "hardwareLabel": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "cuda"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "hardwareLabel",
-              "type"
-            ],
-            "properties": {
-              "hardwareLabel": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "vulkan"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "IcnStartupProgressRecord": {
-        "type": "object",
-        "required": [
-          "type",
-          "backend"
-        ],
-        "properties": {
-          "type": {
-            "$ref": "#/components/schemas/IcnStartupProgressRecordType"
-          },
-          "backend": {
-            "$ref": "#/components/schemas/IcnStartupBackend"
-          }
-        },
-        "additionalProperties": false
-      },
-      "IcnStartupProgressRecordType": {
-        "type": "string",
-        "enum": [
-          "preparing_backend"
         ]
       },
       "IcnStartupRecord": {
@@ -8829,11 +8725,16 @@
             "type": "object",
             "required": [
               "allocation",
+              "device",
               "_tag"
             ],
             "properties": {
               "allocation": {
                 "$ref": "#/components/schemas/ModelInstanceAllocation"
+              },
+              "device": {
+                "$ref": "#/components/schemas/ModelLoadDevice",
+                "description": "The device the worker opened and serves on."
               },
               "_tag": {
                 "type": "string",

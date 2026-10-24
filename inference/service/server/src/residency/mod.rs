@@ -15,7 +15,7 @@ use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
     MemoryShortage, ModelId, ModelInstance, ModelInstanceAllocation, ModelInstanceFailure,
     ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot,
-    ModelLoadPlan,
+    ModelLoadDevice, ModelLoadPlan,
     ModelLoadStage, ModelPackageId, ModelReleaseReason, ModelServingConfiguration,
     ModelStoppingAllocation,
 };
@@ -117,6 +117,8 @@ fn verify_worker_retirement(worker: &dyn ResidencyWorker) -> Result<(), ModelOpe
 pub struct PreparedResidency<R> {
     pub package_ids: Vec<ModelPackageId>,
     pub allocation: ModelInstanceAllocation,
+    /// The device the worker opened.
+    pub device: ModelLoadDevice,
     pub worker: Arc<dyn ResidencyWorker>,
     pub resident: R,
 }
@@ -721,11 +723,17 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         if ready.instance.id != instance_id {
             return;
         }
-        let lifecycle = ModelInstanceLifecycle::Ready { allocation };
-        if ready.instance.lifecycle == lifecycle {
+        let ModelInstanceLifecycle::Ready {
+            allocation: published,
+            ..
+        } = &mut ready.instance.lifecycle
+        else {
+            unreachable!("Ready residency must project Ready lifecycle")
+        };
+        if *published == allocation {
             return;
         }
-        ready.instance.lifecycle = lifecycle;
+        *published = allocation;
         self.publish_current();
     }
 
@@ -1091,7 +1099,8 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                     id: instance_id.clone(),
                     model_id: loading.instance.model_id,
                     lifecycle: ModelInstanceLifecycle::Ready {
-                        allocation: prepared.allocation.clone(),
+                        allocation: prepared.allocation,
+                        device: prepared.device,
                     },
                 };
                 let mut ready = ReadyResidency {
@@ -1164,7 +1173,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 reason,
                 allocation: ModelStoppingAllocation::Resident {
                     allocation: match &ready.instance.lifecycle {
-                        ModelInstanceLifecycle::Ready { allocation } => allocation.clone(),
+                        ModelInstanceLifecycle::Ready { allocation, .. } => allocation.clone(),
                         _ => unreachable!("Ready residency must project Ready lifecycle"),
                     },
                 },
@@ -1320,7 +1329,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             } => ModelStoppingAllocation::Planned {
                 allocation: planned_allocation,
             },
-            ModelInstanceLifecycle::Ready { allocation } => {
+            ModelInstanceLifecycle::Ready { allocation, .. } => {
                 ModelStoppingAllocation::Resident { allocation }
             }
             _ => unreachable!("only a loading or ready worker can fail"),
@@ -1807,6 +1816,7 @@ mod tests {
                                 context_window_tokens: 1,
                                 memory_domains: Vec::new(),
                             },
+                            device: test_device(),
                             worker,
                             resident: model_id.to_string(),
                         }),
@@ -1900,6 +1910,64 @@ mod tests {
 
     fn test_target(model_id: &str) -> ResolvedResidencyTarget {
         test_target_with_key(model_id, &format!("configuration:{model_id}"))
+    }
+
+    /// The device every test worker opens.
+    fn test_device() -> ModelLoadDevice {
+        ModelLoadDevice {
+            id: magnitude_service_contracts::HardwareDeviceId::new(
+                "vulkan:00112233-4455-6677-8899-aabbccddeeff",
+            ),
+            backend: magnitude_service_contracts::ExecutionBackend::Vulkan,
+        }
+    }
+
+    /// A ready instance carries the device its worker opened, through a newer allocation
+    /// standing, and its stopped state carries none.
+    #[tokio::test]
+    async fn a_ready_instance_carries_its_workers_device_until_it_stops() {
+        let (client, mut loads, _, actor) = test_residency(true);
+        let ResidencyGrant::Ready(ready) = client
+            .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
+            .await
+            .expect("warm acquisition")
+        else {
+            panic!("warm acquisition returned a lease")
+        };
+        let (instance_id, _) = loads.recv().await.expect("model load");
+        let ModelInstanceLifecycle::Ready { device, .. } = &ready.lifecycle else {
+            panic!("a warm grant is ready")
+        };
+        assert_eq!(*device, test_device());
+
+        let observed = ModelInstanceAllocation {
+            context_window_tokens: 2,
+            memory_domains: Vec::new(),
+        };
+        client
+            .notifier()
+            .send(ResidencyNotification::AllocationObserved {
+                instance_id: instance_id.clone(),
+                allocation: observed.clone(),
+            });
+        let snapshot = client.snapshot().await.unwrap();
+        assert_eq!(
+            snapshot.instances.last().map(|instance| &instance.lifecycle),
+            Some(&ModelInstanceLifecycle::Ready {
+                allocation: observed,
+                device: test_device(),
+            })
+        );
+
+        client.stop(instance_id).await.expect("ready stop");
+        let snapshot = client.snapshot().await.unwrap();
+        assert!(matches!(
+            snapshot.instances.last().map(|instance| &instance.lifecycle),
+            Some(ModelInstanceLifecycle::Stopped {
+                reason: ModelReleaseReason::UserStop
+            })
+        ));
+        actor.abort();
     }
 
     fn test_target_with_key(model_id: &str, configuration_key: &str) -> ResolvedResidencyTarget {

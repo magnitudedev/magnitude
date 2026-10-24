@@ -846,6 +846,8 @@ pub enum ModelInstanceLifecycle {
     },
     Ready {
         allocation: ModelInstanceAllocation,
+        /// The device the worker opened and serves on.
+        device: ModelLoadDevice,
     },
     #[serde(rename_all = "camelCase")]
     Stopping {

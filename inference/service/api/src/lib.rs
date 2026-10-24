@@ -13,8 +13,7 @@ use axum::{Json, Router};
 use futures_util::{future::BoxFuture, stream::BoxStream};
 use magnitude_service_contracts::bootstrap_protocol::{
     IcnBinaryIdentity, IcnInstallationDeclaration, IcnParentCommand, IcnParentCommandType,
-    IcnStartupBackend, IcnStartupProgressRecord, IcnStartupProgressRecordType, IcnStartupRecord,
-    IcnStartupRecordType,
+    IcnStartupRecord, IcnStartupRecordType,
 };
 use magnitude_service_contracts::models::{
     CandidateInspection, CandidateInspectionEvent, CandidateInspectionProgress,
@@ -1971,11 +1970,8 @@ fn open_ai_model(
         IcnBinaryIdentity,
         IcnStartupRecord,
         IcnStartupRecordType,
-        IcnStartupProgressRecord,
         IcnParentCommand,
         IcnParentCommandType,
-        IcnStartupProgressRecordType,
-        IcnStartupBackend,
         IcnInstallationDeclaration,
         ExecutionBackend,
         ModelLoadDevice
@@ -2684,6 +2680,12 @@ mod tests {
                             allocation: ModelInstanceAllocation {
                                 context_window_tokens: 1,
                                 memory_domains: Vec::new(),
+                            },
+                            device: ModelLoadDevice {
+                                id: magnitude_service_contracts::HardwareDeviceId::new(
+                                    "host-cpu",
+                                ),
+                                backend: ExecutionBackend::Cpu,
                             },
                         },
                     }],

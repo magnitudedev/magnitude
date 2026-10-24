@@ -49,6 +49,7 @@ export const projectInferenceResidency = (
     case "Ready": return {
       _tag: "Ready",
       allocation: projectInferenceAllocation(instance.lifecycle.allocation),
+      device: projectInferenceLoadDevice(instance.lifecycle.device),
     }
     case "Stopping": return {
       _tag: "Stopping",

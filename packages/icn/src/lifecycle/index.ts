@@ -8,7 +8,6 @@ import * as HttpClientError from "@effect/platform/HttpClientError";
 import * as Path from "@effect/platform/Path";
 import {
   IcnBinaryIdentity,
-  IcnStartupProgressRecord,
   IcnStartupRecord,
 } from "@magnitudedev/icn-protocol";
 import { GeneratedClientTransportError } from "@magnitudedev/openapi-effect/client-runtime";
@@ -59,7 +58,6 @@ import {
 import { resolveReleaseIcnInstallation } from "./release-installation.js";
 import {
   IcnPreparationReporter,
-  icnPreparationBackend,
   type IcnPreparationReporter as IcnPreparationReporterService,
 } from "./preparation.js";
 
@@ -472,17 +470,6 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         Effect.gen(function* () {
           yield* appendBounded(output, `${line}\n`, config.outputLimitBytes);
           yield* logged(`${line}\n`);
-          if (line.startsWith("MAGNITUDE_ICN_PROGRESS ")) {
-            const encoded = line.slice("MAGNITUDE_ICN_PROGRESS ".length);
-            const record = yield* Schema.decodeUnknown(
-              Schema.parseJson(IcnStartupProgressRecord)
-            )(encoded);
-            yield* reporter.report({
-              _tag: "PreparingBackend",
-              backend: icnPreparationBackend(record.backend),
-            });
-            return;
-          }
           if (!line.startsWith("MAGNITUDE_ICN_READY ")) return;
           const encoded = line.slice("MAGNITUDE_ICN_READY ".length);
           const record = yield* Schema.decodeUnknown(

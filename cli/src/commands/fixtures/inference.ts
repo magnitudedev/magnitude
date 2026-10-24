@@ -56,7 +56,7 @@ export const makeHardware = (
     name: "Test GPU",
     executors: [{ deviceId: LocalInferenceDeviceIdSchema.make("cuda:test"), backend: "cuda", memoryDomainIds: [TEST_MEMORY_DOMAIN_ID] }],
   }],
-  selectedDeviceId: Option.some(LocalInferenceDeviceIdSchema.make("cuda:test")),
+  activeDeviceId: LocalInferenceDeviceIdSchema.make("cuda:test"),
   memoryDomains: [{
     memoryDomainId: TEST_MEMORY_DOMAIN_ID,
     kind: "PhysicalDevice",

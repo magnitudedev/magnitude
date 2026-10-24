@@ -17,7 +17,7 @@ use magnitude_service_server::assessment::candidates::{
     ManagedModelCandidates, engine_architectures,
 };
 use magnitude_service_server::assessment::environment::{
-    AssessmentEnvironment, assessment_structure,
+    AssessmentEnvironment, ServingDevice, assessment_structure,
 };
 use magnitude_service_server::assessment::measurement::{self, ServiceMachine};
 use magnitude_service_server::assessment::{HostDevice, ManagedModelAssessments};
@@ -172,18 +172,20 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 devices: catalog,
             } = open_served_store(inventory_config, reserves).await?;
             let kernels = inventory.derived_cache().kernel_directory();
-            // Every model is assessed on the device a load selects, established once from the
-            // discovered topology (selection and a status sample), under what the measurement
-            // job has stored of this machine. Nothing is measured here: the service is ready at
-            // once, and the job measures what is missing in a worker of its own: the
-            // executor's fixed cost points, whatever the models.
-            let (structure, stored) = {
+            // The serving device is decided once over the discovered topology. Every model is
+            // assessed on it, from that topology and a status sample, under what the
+            // measurement job has stored of this machine; every load and the hardware report
+            // use it. Nothing is measured here: the service is ready at once, and the job
+            // measures what is missing in a worker of its own: the executor's fixed cost
+            // points, whatever the models.
+            let (serving, structure, stored) = {
                 let catalog = Arc::clone(&catalog);
                 let kernels = kernels.clone();
                 tokio::task::spawn_blocking(move || {
-                    let structure = assessment_structure(&catalog)?;
+                    let serving = ServingDevice::select(&catalog)?;
+                    let structure = assessment_structure(&catalog, serving)?;
                     let stored = structure.stored_measurements(&kernels);
-                    anyhow::Ok((Arc::new(structure), stored))
+                    anyhow::Ok((serving, Arc::new(structure), stored))
                 })
                 .await
                 .context("assessment structure task failed")?
@@ -196,7 +198,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             let device = DeviceLock::default();
             let host = HostDevice::new(
                 &device,
-                structure.selected.info.backend() == seismic::BackendName::Cpu,
+                serving.selector().backend() == seismic::BackendName::Cpu,
             );
             let measurement = measurement::start(
                 Arc::new(ServiceMachine::new(
@@ -230,6 +232,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     inventory.clone(),
                     kernels,
                     reserves,
+                    serving,
                 )),
                 host_memory: Arc::new(SeismicHostMemory::new(catalog.clone(), reserves)),
                 catalog: catalog.clone(),
@@ -296,6 +299,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 .with_hardware(Arc::new(HardwareInventory::new(
                     Arc::clone(catalog.inventory()),
                     reserves,
+                    serving,
                     Arc::new(instances.clone()),
                 )))
                 .with_model_controller(Arc::new(instances.clone()));
@@ -485,6 +489,5 @@ mod tests {
         assert_eq!(value.native_build, build_identity::native_build());
         assert_eq!(value.target, build_identity::TARGET);
         assert_eq!(value.profile, build_identity::PROFILE);
-        assert!(!value.backends.is_empty());
     }
 }

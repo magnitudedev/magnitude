@@ -2,16 +2,17 @@
 //!
 //! A host either names the device (a backend or an exact selector) or asks
 //! for automatic selection. Automatic selection takes backends in the fixed
-//! order Metal > CUDA > Vulkan > CPU, uses the first backend that has a usable
-//! device, and within it the first device in Seismic's enumeration order. A
-//! device is usable when Seismic reports it available (its driver or loader
-//! is present and it meets its backend's floor; Seismic discovery is the
-//! authority) and its memory backing is established. Automatic Vulkan
-//! candidates are GPUs: a software Vulkan device (lavapipe) is never an
-//! accelerator, so the native CPU backend is automatic when no accelerator
-//! is usable. Selection never ranks devices by fit or speed. Preview,
-//! assessment and load all select through here, so the assessed device is
-//! the device a load uses.
+//! order Metal > CUDA > Vulkan > CPU and uses the first backend that has a
+//! usable device. Within a backend, whether automatic or requested by name,
+//! a usable discrete GPU comes before every other usable device (an
+//! integrated GPU sharing host memory), then Seismic's enumeration order
+//! decides. A device is usable when Seismic reports it available (its
+//! driver or loader is present and it meets its backend's floor; Seismic
+//! discovery is the authority) and its memory backing is established.
+//! Automatic Vulkan candidates are GPUs: a software Vulkan device (lavapipe)
+//! is never an accelerator, so the native CPU backend is automatic when no
+//! accelerator is usable. Selection orders devices by kind only, never by
+//! fit or speed. An exact selector resolves exactly that device or fails.
 
 use crate::ExecutionPath;
 use seismic::{
@@ -178,19 +179,24 @@ pub fn select(
     };
     let mut evidence = Vec::new();
     for &backend in backends {
-        for device in topology.executors().iter().filter(|device| {
-            device.backend() == backend
-                && (request != DeviceRequest::Automatic || automatic_candidate(device))
-        }) {
-            match unusable_reason(device) {
-                None => return Ok(device.clone()),
-                Some(reason) => evidence.push(format!(
-                    "{} ({}): {reason}",
-                    device.selector(),
-                    device.name()
-                )),
-            }
+        let candidates = || {
+            topology.executors().iter().filter(move |device| {
+                device.backend() == backend
+                    && (request != DeviceRequest::Automatic || automatic_candidate(device))
+            })
+        };
+        // `min_by_key` keeps the first of equal keys: enumeration order
+        // within each kind.
+        if let Some(device) = candidates()
+            .filter(|device| unusable_reason(device).is_none())
+            .min_by_key(|device| device.kind() != ExecutorKind::DiscreteGpu)
+        {
+            return Ok(device.clone());
         }
+        evidence.extend(candidates().filter_map(|device| {
+            unusable_reason(device)
+                .map(|reason| format!("{} ({}): {reason}", device.selector(), device.name()))
+        }));
         evidence.extend(
             topology
                 .diagnostics()
@@ -245,25 +251,82 @@ mod tests {
         assert!("gpu".parse::<DeviceRequest>().is_err());
     }
 
-    /// The automatic rule over the live topology: the first usable device of
-    /// the first backend (in the fixed order) that has one. The host CPU is
-    /// always usable, so automatic selection always succeeds.
+    /// The automatic rule over the live topology: a usable device of the
+    /// first backend (in the fixed order) that has one, discrete when that
+    /// backend has a usable discrete GPU. The host CPU is always usable, so
+    /// automatic selection always succeeds.
     #[test]
-    fn automatic_selection_takes_the_first_usable_device_of_the_first_usable_backend() {
+    fn automatic_selection_takes_a_usable_device_of_the_first_usable_backend() {
         let catalog = seismic::Inventory::discover(&[]).unwrap();
         let topology = catalog.topology();
-        let expected = AUTOMATIC_BACKEND_ORDER
-            .iter()
-            .find_map(|&backend| {
-                topology.executors().iter().find(|device| {
-                    device.backend() == backend
-                        && automatic_candidate(device)
-                        && unusable_reason(device).is_none()
-                })
+        let usable = |backend| {
+            topology.executors().iter().filter(move |device| {
+                device.backend() == backend
+                    && automatic_candidate(device)
+                    && unusable_reason(device).is_none()
             })
+        };
+        let backend = AUTOMATIC_BACKEND_ORDER
+            .into_iter()
+            .find(|&backend| usable(backend).next().is_some())
             .expect("the host CPU is usable");
         let selected = select(&topology, ExecutionPath::Native, DeviceRequest::Automatic).unwrap();
-        assert_eq!(selected.selector(), expected.selector());
+        assert!(usable(backend).any(|device| device.selector() == selected.selector()));
+        if usable(backend).any(|device| device.kind() == ExecutorKind::DiscreteGpu) {
+            assert_eq!(selected.kind(), ExecutorKind::DiscreteGpu);
+        }
+    }
+
+    /// A Ryzen iGPU enumerated before an RTX 4070, both on Vulkan, and no
+    /// CUDA: automatic and Vulkan requests both take the discrete GPU.
+    #[test]
+    fn a_usable_discrete_gpu_comes_before_an_integrated_gpu_enumerated_first() {
+        let topology = seismic::fixtures::recorded::ryzen_igpu_and_rtx4070();
+        let vulkan = topology
+            .executors()
+            .iter()
+            .filter(|device| device.backend() == BackendName::Vulkan)
+            .map(|device| device.kind())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vulkan,
+            [ExecutorKind::IntegratedGpu, ExecutorKind::DiscreteGpu],
+            "the iGPU is enumerated first"
+        );
+        assert!(
+            topology
+                .executors()
+                .iter()
+                .all(|device| device.backend() != BackendName::Cuda),
+            "CUDA has no device"
+        );
+        for request in [
+            DeviceRequest::Automatic,
+            DeviceRequest::Backend(BackendName::Vulkan),
+        ] {
+            let selected = select(&topology, ExecutionPath::Native, request).unwrap();
+            assert_eq!(selected.backend(), BackendName::Vulkan, "{request}");
+            assert_eq!(selected.kind(), ExecutorKind::DiscreteGpu, "{request}");
+            assert_eq!(selected.name(), "NVIDIA GeForce RTX 4070", "{request}");
+        }
+    }
+
+    /// The integrated GPU stays selectable: by its exact selector.
+    #[test]
+    fn an_integrated_gpu_is_selected_by_its_exact_selector() {
+        let topology = seismic::fixtures::recorded::ryzen_igpu_and_rtx4070();
+        let igpu = topology
+            .executors()
+            .iter()
+            .find(|device| device.kind() == ExecutorKind::IntegratedGpu)
+            .unwrap();
+        let selected = select(
+            &topology,
+            ExecutionPath::Native,
+            DeviceRequest::Selector(igpu.selector()),
+        )
+        .unwrap();
+        assert_eq!(selected.selector(), igpu.selector());
     }
 
     #[cfg(target_os = "macos")]
