@@ -200,14 +200,20 @@ describe("discover", () => {
     expect(renderToStaticMarkup(<FoundModelsBanner models={[customModel(foundIn({ _tag: "Folder", path: "/Volumes/External/models" }), { presentation: { ...found[0]!.presentation, sourceLabel: "models" } })]} onView={() => {}} />))
       .toContain("You already have 1 model that runs here.</span> <span class=\"text-slate-600 dark:text-slate-300\">Found in your models folder.")
   })
-  it("adds one Hugging Face line under the recommendations, and offers it beside Explore Catalog when nothing fits", () => {
+  it("offers an accessible dismiss action without changing the existing model summary", () => {
+    const html = renderToStaticMarkup(<FoundModelsBanner models={found} onView={() => {}} onDismiss={() => {}} dismissing />)
+    expect(html).toContain('aria-label="Dismiss found models notice"')
+    expect(html).toContain("You already have 3 models that run here.")
+    expect(html).toMatch(/<button[^>]*aria-label="Dismiss found models notice"[^>]*disabled/)
+  })
+  it("adds one Hugging Face line under the recommendations, and offers it beside Browse all models when nothing fits", () => {
     const link = renderToStaticMarkup(<HuggingFaceLink onAdd={() => {}} />)
     expect(link).toContain("Looking for a specific version, finetune, or uncensored model?")
     expect(link).toContain("Add from Hugging Face")
     expect(link).not.toContain("border-dashed")
     const empty = renderToStaticMarkup(<NoRecommendations onExplore={() => {}} onAdd={() => {}} />)
     expect(empty).toContain("No fitting recommendations right now.")
-    expect(empty).toContain("Explore Catalog")
+    expect(empty).toContain("Browse all models")
     expect(empty).toContain("Add from Hugging Face")
   })
 })

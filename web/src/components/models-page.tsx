@@ -1,9 +1,10 @@
 import type { ReactNode } from "react"
 import { Option } from "effect"
-import { formatLocalModelDisplayName, localModelIsInstalled, useLocalModelCommandStatus, useLocalModelMutations, type AddModelRequest, type ApplicationPage } from "@magnitudedev/client-common"
+import { formatLocalModelDisplayName, localModelIsInstalled, useLocalModelCommandStatus, useLocalModelMutations, type ApplicationPage } from "@magnitudedev/client-common"
 import type { CustomLocalModel, CustomModelAcquisitionState, LocalModel } from "@magnitudedev/sdk"
 import { HiddenModels, UnhideButton } from "./local-model-lists"
-import { FoundModelsBanner, HuggingFaceLink, NoRecommendations } from "./discover-custom"
+import { ErrorNotice, NoticeAction } from "./error-notice"
+import { NoRecommendations } from "./discover-custom"
 import { modelLab, type ModelLab } from "./model-logo"
 import type { AddDialogRequest } from "./add-model-dialog"
 
@@ -32,7 +33,7 @@ export const selectModels = ({ library, hidden, filter, lab, search, sort }: {
     return matchesFilter && matchesLab(model)
   })
   const query = search.trim().toLowerCase()
-  const visible = selected.filter(model => `${formatLocalModelDisplayName(model)} ${model._tag === "Catalog" ? model.presentation.description : model.presentation.sourceLabel}`.toLowerCase().includes(query))
+  const visible = selected.filter(model => `${formatLocalModelDisplayName(model)} ${modelLab(model)?.name ?? ""} ${model._tag === "Catalog" ? model.presentation.description : model.presentation.sourceLabel}`.toLowerCase().includes(query))
   if (sort !== "recommended") visible.sort((a, b) => {
     const byName = formatLocalModelDisplayName(a).localeCompare(formatLocalModelDisplayName(b), undefined, { numeric: true }) || a.modelId.localeCompare(b.modelId)
     return sort === "smallest" ? a.storageBytes - b.storageBytes || byName : sort === "largest" ? b.storageBytes - a.storageBytes || byName : byName
@@ -42,17 +43,7 @@ export const selectModels = ({ library, hidden, filter, lab, search, sort }: {
 
 /** Find other versions on Hugging Face: only a Catalog page's catalog cards, searching for the model's name. */
 export const otherVersionsRequest = (page: ApplicationPage, model: LocalModel): Option.Option<AddDialogRequest> =>
-  page === "catalog" && model._tag === "Catalog" ? Option.some({ _tag: "Search", query: model.presentation.displayName }) : Option.none()
-
-/**
- * Add from Hugging Face opens the dialog where catalog and custom models live: in place on Catalog,
- * and from Discover by switching to Catalog with the dialog open over it.
- */
-export const addFromHuggingFace = (page: ApplicationPage, openInPlace: (request: AddDialogRequest) => void, openOnCatalog: (request: AddModelRequest) => void) => () => {
-  const request = { _tag: "Search", query: "" } as const
-  if (page === "discover") openOnCatalog(request)
-  else openInPlace(request)
-}
+  (page === "catalog" || page === "discover") && model._tag === "Catalog" ? Option.some({ _tag: "Search", query: model.presentation.displayName }) : Option.none()
 
 /** Adding a model closes the dialog and shows it in My Models, where its download progresses. */
 export const afterModelAdded = (closeDialog: () => void, navigate: (page: ApplicationPage) => void) => () => {
@@ -84,30 +75,21 @@ export function ModelsListing({ filter, models, card, empty, footer }: {
 }
 
 /** Whether Discover's recommendations are still coming, ranked, none fit, or can't be ranked without the hardware. */
-export type DiscoverRecommendationState = "pending" | "ranked" | "none" | "unavailable"
+export type DiscoverRecommendationState = "pending" | "ranked" | "none" | "unavailable" | "failed"
 
-/**
- * Discover: the hardware card, the found-models banner, the recommendations, then one Hugging Face
- * line below them; when nothing fits, Add from Hugging Face sits beside Explore Catalog instead.
- */
-export function DiscoverSections({ hardware, found, notice, preference, recommendations, state, onViewFound, onAdd, onExplore }: {
-  hardware: ReactNode
-  found: readonly CustomLocalModel[]
-  notice?: ReactNode
+/** Recommendations share Discover's header, hardware summary and Add action with All models. */
+export function DiscoverSections({ preference, recommendations, state, onAdd, onExplore }: {
   preference: ReactNode
   recommendations: ReactNode
   state: DiscoverRecommendationState
-  onViewFound: () => void
   onAdd: () => void
   onExplore: () => void
 }) {
   return <>
-    {hardware}
-    <FoundModelsBanner models={found} onView={onViewFound} />
-    {notice}
     {preference}
     {recommendations}
-    {state === "ranked" && <HuggingFaceLink onAdd={onAdd} />}
     {state === "none" && <NoRecommendations onExplore={onExplore} onAdd={onAdd} />}
+    {state === "failed" && <ErrorNotice title="Couldn’t assess model recommendations" description="Some model assessments failed. Browse all models to see their individual status." actions={<NoticeAction onClick={onExplore}>Browse all models</NoticeAction>} />}
+    {state === "unavailable" && <p className="mb-6 text-sm text-slate-500">Browse all models while hardware recommendations are unavailable.</p>}
   </>
 }

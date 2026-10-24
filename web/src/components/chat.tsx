@@ -371,7 +371,7 @@ function ChatView({
             )}
             {Result.isSuccess(modelResult) && !models.length && (
               <p className="mb-3 text-xs text-slate-500">
-                Install a text model from Discover or Catalog to start chatting.
+                Install a text model from Discover to start chatting.
               </p>
             )}
             {!settingsValid && (

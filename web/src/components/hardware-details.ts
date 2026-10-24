@@ -70,7 +70,7 @@ export const hardwareDetails = (identity: MachineIdentityObservation | null, har
   const accelerators = roles.devices.map(({ accelerator, role, dedicatedMemoryBytes, placesOnHost }) => {
     const dedicatedBytes = Option.filter(dedicatedMemoryBytes, bytes => bytes > 0)
     return {
-      id: accelerator.acceleratorId, name: accelerator.name, hostOnly: Option.isNone(dedicatedMemoryBytes),
+      id: accelerator.acceleratorId, name: accelerator.name, hostOnly: Option.isNone(dedicatedMemoryBytes), dedicatedMemoryBytes: dedicatedBytes,
       detail: Option.match(dedicatedBytes, {
         onSome: bytes => `${formatMemorySize(bytes)} VRAM${placesOnHost ? " + shared system RAM" : ""}`,
         onNone: () => !placesOnHost ? "Local acceleration" : unified && role._tag === "InUse" ? "Shares unified memory" : "Shares system RAM",
@@ -90,7 +90,7 @@ export const hardwareDetails = (identity: MachineIdentityObservation | null, har
     { label: integratedChip ? "Chip" : "CPU", name: processorName, truncateName: !findHardwareFacts("Processor", processorName), details: processorDetails.map(fact => `${fact.value} ${fact.label}`) },
     { label: "Memory", name: memoryFacts[0]?.value ?? "Unknown", truncateName: false, details: memoryFacts.map((fact, index) => index === 0 ? fact.label : `${fact.value} ${fact.label}`) },
     ...visibleAccelerators.map((accelerator, index) => ({
-      label: visibleAccelerators.length > 1 ? `GPU ${index + 1}` : "GPU", name: accelerator.name, truncateName: !findHardwareFacts("Accelerator", accelerator.name),
+      label: visibleAccelerators.length > 1 ? `GPU ${index + 1}` : "GPU", name: accelerator.name, dedicatedMemoryBytes: accelerator.dedicatedMemoryBytes, truncateName: !findHardwareFacts("Accelerator", accelerator.name),
       details: [accelerator.detail, ...accelerator.role,
         ...accelerator.facts.filter(fact => !hiddenAcceleratorFactLabels.has(fact.label)).map(fact => `${fact.value} ${fact.label}`)],
     })),

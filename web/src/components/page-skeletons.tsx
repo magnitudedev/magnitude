@@ -35,26 +35,22 @@ function LoadingStatus({ title, detail, assessment }: { title: string; detail: s
     </div>
   </div>
 }
-export function HardwarePending({ identifying = false }: { identifying?: boolean }) {
-  return <div aria-busy="true" aria-label="Detecting your hardware" className={`relative ${pageLayout.hardware}`} data-loading-region="">
-    <div className={`grid items-center gap-6 ${pageLayout.hardwareGrid}`}>
-      <div aria-hidden="true" className={pageLayout.hardwarePhoto}><Skeleton className="aspect-[4/3] w-full rounded-none" /></div>
-      <div className="min-w-0"><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Your machine</p><LoadingStatus title={identifying ? "Identifying your machine" : "Reading hardware capabilities"} detail={identifying ? "Looking up your computer’s make and model." : "Checking your chip, graphics, and available memory."} />
-        <div aria-hidden="true" className="mt-5 flex flex-wrap gap-x-7 gap-y-4">{[0,1].map(index => <div key={index} className="flex items-center gap-3"><Skeleton className="size-5 shrink-0" /><div><SkeletonLine className={index === 0 ? "h-7 w-24 text-lg" : "h-5 w-24 text-sm"} /><SkeletonLine className="h-4 w-24 text-xs" /></div></div>)}</div>
-      </div>
-    </div>
+export function HardwarePending({ identifying = false, startingService = false }: { identifying?: boolean; startingService?: boolean }) {
+  return <div aria-busy="true" aria-label="Detecting your hardware" className="mb-6 flex items-center gap-3 py-1 text-xs text-slate-500" data-loading-region="">
+    <CircleNotchIcon aria-hidden="true" className="size-4 motion-safe:animate-spin" />
+    <span role="status">{startingService ? "Starting Magnitude…" : identifying ? "Identifying your machine…" : "Reading hardware capabilities…"}</span>
   </div>
 }
-export function RecommendationsSkeleton({ assessment, waitingForHardware = false }: { assessment?: { settledModels: number; totalModels: number }; waitingForHardware?: boolean }) {
+export function RecommendationsSkeleton({ assessment, waitingForHardware = false, waitingForService = false }: { assessment?: { settledModels: number; totalModels: number }; waitingForHardware?: boolean; waitingForService?: boolean }) {
   return <div aria-busy="true" aria-label="Loading recommendations" className="relative mb-8" data-loading-region="">
     <div className={pageLayout.recommendations}>
       <div aria-hidden="true" className={pageLayout.recommendationList}>{Array.from({length:5},(_,index) => <div key={index} className={`${pageLayout.recommendationRow} border-transparent`}><span className="w-4 shrink-0 text-sm text-slate-500">{index+1}</span><Skeleton className="size-7 shrink-0" /><SkeletonLine className="h-5 min-w-0 flex-1 text-sm" width={index%2 ? "90%" : "75%"} /></div>)}</div>
       <div className={pageLayout.recommendationPane}>
-        <div aria-hidden="true" className={pageLayout.recommendationToolbar}><div className="flex gap-1"><Skeleton className="h-8 w-16" /><Skeleton className="h-8 w-16" /></div><Skeleton className="h-8 w-40" /></div>
+        <div aria-hidden="true" className="mb-4 flex justify-end"><Skeleton className="h-8 w-40" /></div>
         <div className="grid min-h-72">
           <div aria-hidden="true" className="invisible col-start-1 row-start-1 min-w-0"><RadarSkeleton /></div>
           <div className="col-start-1 row-start-1 flex min-w-0 items-center px-3">
-          <LoadingStatus title={waitingForHardware ? "Waiting for hardware" : assessment ? "Assessing models" : "Loading model catalog"} detail={waitingForHardware ? "Recommendations need your machine’s capabilities." : assessment ? "Estimating memory fit and speed on your machine." : "Preparing model configurations for assessment."} assessment={waitingForHardware ? undefined : assessment} />
+          <LoadingStatus title={waitingForService ? "Waiting for the service" : waitingForHardware ? "Waiting for hardware" : assessment ? assessment.totalModels > 0 ? "Assessing models" : "Preparing models for assessment" : "Loading model catalog"} detail={waitingForService ? "Hardware detection and model assessment begin when it is ready." : waitingForHardware ? "Recommendations need your machine’s capabilities." : assessment ? "Estimating memory fit and speed on your machine." : "Preparing model configurations for assessment."} assessment={waitingForHardware || waitingForService ? undefined : assessment} />
           </div>
         </div>
       </div>
@@ -65,12 +61,17 @@ export function ModelCardsSkeleton({ library = false }: { library?: boolean }) {
   return <LoadingRegion label={library ? "Loading your models" : "Loading catalog models"}>
     <div className="grid items-start gap-3">{[0,1,2,3].map(index => <article key={index} className="overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-850">
       <div className="flex items-center gap-4 px-5 py-4"><Skeleton className="size-10 shrink-0" /><div className="min-w-0 flex-1"><SkeletonLine className="h-6 text-[15px]" width={index%2 ? "55%" : "40%"} /><SkeletonLine className="h-4 text-xs" width={library ? "30%" : "22%"} /></div><Skeleton className="h-8 w-36" /></div>
-      <div className="grid grid-cols-3 gap-px border-t border-slate-200 bg-slate-200 lg:grid-cols-5 dark:border-slate-750 dark:bg-slate-750">{[0,1,2,3,4].map(cell => <div key={cell} className="bg-white px-4 py-2.5 dark:bg-slate-850"><SkeletonLine className="h-6 text-[13px]" width="65%" /></div>)}</div>
+      <div className={`grid gap-px border-t border-slate-200 bg-slate-200 dark:border-slate-750 dark:bg-slate-750 ${library ? "grid-cols-3 lg:grid-cols-5" : "grid-cols-2 lg:grid-cols-4"}`}>{Array.from({ length: library ? 5 : 4 }, (_, cell) => <div key={cell} className="bg-white px-4 py-2.5 dark:bg-slate-850"><SkeletonLine className="h-6 text-[13px]" width="65%" /></div>)}</div>
     </article>)}</div>
   </LoadingRegion>
 }
-export function ModelsSkeleton({ page }: { page: "discover" | "catalog" | "models" }) {
-  if (page === "discover") return <><HardwarePending /><RecommendationPreference /><RecommendationsSkeleton /></>
+export function ModelsSkeleton({ page, startingService = false }: { page: "discover" | "catalog" | "models"; startingService?: boolean }) {
+  if (page !== "models") return <>
+    <div className="mb-6 flex items-center justify-between gap-3"><h1 className={pageLayout.pageTitle}>Discover</h1><Skeleton className="h-8 w-48" /></div>
+    <HardwarePending startingService={startingService} />
+    <div aria-hidden="true" className="mb-6 flex flex-wrap items-center justify-between gap-6 border-b border-slate-200 pb-2 dark:border-slate-750"><div className="flex gap-6 py-2 text-sm text-slate-500"><span>Recommended</span><span>All models</span></div><Skeleton className="h-8 w-64" /></div>
+    {page === "discover" ? <><RecommendationPreference /><RecommendationsSkeleton waitingForService={startingService} /></> : <ModelCardsSkeleton />}
+  </>
   return <>
     <div className={pageLayout.modelHeader}><h1 className={pageLayout.pageTitle}>{page === "models" ? "My Models" : "Catalog"}</h1><Skeleton className={`h-8 ${page === "models" ? "w-36" : "w-48"}`} /></div>
     <div className={pageLayout.catalogToolbar}><Skeleton className={`h-8 ${pageLayout.modelSearch}`} /><div className="flex flex-wrap items-center gap-2"><Skeleton className="h-8 w-32" /><Skeleton className="h-8 w-28" /><Skeleton className="h-8 w-36" /></div></div>

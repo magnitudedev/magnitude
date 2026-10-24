@@ -5,7 +5,7 @@ import { UsageFigures } from "./serving-usage"
 import { MemoryFigures } from "./memory-breakdown"
 
 it("marks loading regions and keeps decorative placeholders out of the accessibility tree", () => {
-  for (const component of [<HardwarePending />, <ConnectionsSkeleton />, <LoginSkeleton />, <RecommendationsSkeleton />, <UpdatesSkeleton />, ...(["catalog", "models"] as const).map(page => <ModelsSkeleton page={page} />)]) {
+  for (const component of [<ConnectionsSkeleton />, <LoginSkeleton />, <RecommendationsSkeleton />, <UpdatesSkeleton />, ...(["catalog", "models"] as const).map(page => <ModelsSkeleton page={page} />)]) {
     const html = renderToStaticMarkup(component)
     expect(html).toContain('aria-busy="true"')
     expect(html).toContain('role="status"')
@@ -45,4 +45,35 @@ it("distinguishes waiting from measurable assessment without inventing progress"
   expect(measured).toContain('max="55" value="12"')
   expect(renderToStaticMarkup(<HardwarePending identifying />)).toContain("Identifying your machine")
   expect(renderToStaticMarkup(<HardwarePending />)).toContain("Reading hardware capabilities")
+})
+
+it("keeps hardware detection inline and gives Discover its shared frame while loading", () => {
+  const hardware = renderToStaticMarkup(<HardwarePending />)
+  expect(hardware).toContain('role="status"')
+  expect(hardware).toContain("Reading hardware capabilities")
+  expect(hardware).not.toContain("<figure")
+  expect(hardware).not.toContain("border-")
+  for (const page of ["discover", "catalog"] as const) {
+    const html = renderToStaticMarkup(<ModelsSkeleton page={page} />)
+    expect(html).toContain("Discover</h1>")
+    expect(html).toContain("All models")
+    expect(html).not.toContain("Catalog</h1>")
+  }
+})
+
+it("does not claim hardware work or assessment progress before the service is ready", () => {
+  const html = renderToStaticMarkup(<ModelsSkeleton page="discover" startingService />)
+  expect(html).toContain("Starting Magnitude…")
+  expect(html).toContain("Waiting for the service")
+  expect(html).not.toContain("Reading hardware capabilities")
+  expect(html).not.toContain("Loading model catalog")
+  expect(html).not.toContain("<progress")
+})
+
+it("distinguishes catalog loading from preparation before assessment totals exist", () => {
+  const html = renderToStaticMarkup(<RecommendationsSkeleton assessment={{ settledModels: 0, totalModels: 0 }} />)
+  expect(html).toContain("Preparing models for assessment")
+  expect(html).not.toContain("Loading model catalog")
+  expect(html).not.toContain("<progress")
+  expect(html).not.toContain("0 of 0")
 })

@@ -38,6 +38,8 @@ const api: DesktopApi = {
   presentModel: value => command(client => client.PresentModel(Schema.decodeUnknownSync(ModelTrayPresentation)(value))),
   getAppearance: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.GetAppearance({}))),
   setAppearance: preference => command(client => client.SetAppearance({ preference })),
+  getFoundModelsNoticeDismissed: () => query(client => client.GetFoundModelsNoticeDismissed({})),
+  dismissFoundModelsNotice: () => command(client => client.DismissFoundModelsNotice({})),
   retry: () => command(client => client.Retry({})),
   resolveQuitFailure: decision => command(client => client.ResolveQuitFailure({ decision })),
   chooseOpenPath: request => query(client => client.ChooseOpenPath(Schema.decodeUnknownSync(OpenPathRequest)(request))).then(Schema.encodeSync(OpenPathResult)),

@@ -14,7 +14,7 @@ import { PreparedUpdateInstaller, reconcilePreparedUpdate, recordStartupFailure,
 import { isNewerVersion } from "@magnitudedev/release"
 import { LINUX_DESKTOP_EXECUTABLE_PATH } from "@magnitudedev/release/executables"
 import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
-import { makeAppearancePreferences, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
+import { makeAppearancePreferences, makeFoundModelsNoticePreferences, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
 import { readUpdateConfiguration, isUpdateAcceptanceBuild } from "./update-config"
 import { NativeTrayFactory, NativeTrayFailed, TrayOwner, TrayOwnerLive, type TrayMenu } from "./tray-owner"
 import { CommandExecutor, FetchHttpClient } from "@effect/platform"
@@ -144,6 +144,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   }
   const preferenceWrites = yield* Effect.makeSemaphore(1)
   const appearance = yield* makeAppearancePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
+  const foundModelsNotice = yield* makeFoundModelsNoticePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
   const initialAppearance = yield* appearance.read.pipe(Effect.catchAll(error =>
     Effect.logWarning(error.message).pipe(Effect.as("system" as const))))
   nativeTheme.themeSource = initialAppearance
@@ -328,7 +329,7 @@ const program = Effect.scoped(Effect.gen(function* () {
       Effect.zipRight(showNotice({ title: "Couldn’t open this link", description: `${error.message} Magnitude opens model links from “Use this model” on Hugging Face.` }))),
     onRight: link => Effect.gen(function* () {
       const action = { _tag: "OpenHuggingFaceModel" as const, repository: link.repository, file: link.file }
-      yield* show("catalog")
+      yield* show("discover")
       yield* Ref.set(pendingAddModel, Option.some(action))
       yield* PubSub.publish(actions, action)
     }),
@@ -413,6 +414,8 @@ const program = Effect.scoped(Effect.gen(function* () {
       Effect.sync(() => { nativeTheme.themeSource = preference }))),
     SetAppearance: ({ preference }) => preferenceWrites.withPermits(1)(appearance.write(preference)).pipe(Effect.tapError(Effect.logError), Effect.mapError(connectionError),
       Effect.tap(() => Effect.sync(() => { nativeTheme.themeSource = preference })), Effect.as({})),
+    GetFoundModelsNoticeDismissed: () => foundModelsNotice.readDismissed.pipe(Effect.mapError(connectionError)),
+    DismissFoundModelsNotice: () => preferenceWrites.withPermits(1)(foundModelsNotice.dismiss).pipe(Effect.mapError(connectionError), Effect.as({})),
     Retry: () => service.retry.pipe(Effect.as({})),
     ResolveQuitFailure: ({ decision }) => Ref.getAndSet(pendingQuitDecision, Option.none()).pipe(
       Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: pending => Deferred.succeed(pending, decision) })), Effect.as({})),

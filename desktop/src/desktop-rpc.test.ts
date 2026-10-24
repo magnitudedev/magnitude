@@ -5,11 +5,11 @@ import { AcnRpcRecoveryPolicyTag } from "@magnitudedev/sdk"
 import { InferenceHostRpcs } from "./desktop-rpc"
 
 describe("desktop host recovery contract", () => {
-  it("declares every finite call and never allows host actions to be replayed", () => {
+  it("declares every finite call and permits replay only for reads and idempotent notice dismissal", () => {
     for (const rpc of InferenceHostRpcs.requests.values()) {
       if (RpcSchema.isStreamSchema(rpc.successSchema)) continue
       expect(Context.getOption(rpc.annotations, AcnRpcRecoveryPolicyTag), rpc._tag)
-        .toEqual(Option.some(["ApplicationInfo", "MachineIdentity", "GetAppearance", "GetModelStorage", "GetNetworkAccess"].includes(rpc._tag) ? "ReplaySafe" : "AtMostOnce"))
+        .toEqual(Option.some(["ApplicationInfo", "MachineIdentity", "GetAppearance", "GetModelStorage", "GetNetworkAccess", "GetFoundModelsNoticeDismissed", "DismissFoundModelsNotice"].includes(rpc._tag) ? "ReplaySafe" : "AtMostOnce"))
     }
   })
 })

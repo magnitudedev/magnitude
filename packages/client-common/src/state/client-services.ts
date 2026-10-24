@@ -58,5 +58,6 @@ export const hostlessApplication: ApplicationHost = {
     read: Effect.succeed("system"),
     save: () => Effect.fail(new ApplicationHostFailed({ message: "Appearance can't be saved here." })),
   },
+  foundModelsNotice: { readDismissed: Effect.succeed(false), dismiss: Effect.void },
   shell: Option.none(),
 }

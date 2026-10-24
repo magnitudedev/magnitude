@@ -135,6 +135,7 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
   ]
 
   const status = modelCardStatus(model, hardware)
+  const showStatus = page === "models" || status.tone !== "absent"
 
   const drafterState = modelCardDrafter(model)
   const drafter: ReactNode = (() => {
@@ -145,7 +146,7 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
         else Option.map(customModelDrafterOffer(model), offer => setDrafter(model.modelId, { _tag: "Reference", reference: offer.candidate.reference }))
       }} />
       case "Adding": return <span className="tabular-nums text-blue-700 dark:text-blue-300">Adding · {drafterState.percent === null ? "Preparing" : `${drafterState.percent}%`}</span>
-      case "Withheld": return <span className="text-slate-500" title={drafterState.note}>Off · doesn’t fit</span>
+      case "Withheld": return <span className="text-slate-500" aria-label="Drafter unavailable">—</span>
       case "Pending": return <span className="text-slate-500">{PENDING_DRAFTER_LABEL}</span>
       case "Unknown": return <span className="text-slate-500">—</span>
       case "Attached":
@@ -183,17 +184,17 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
   const memory = model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
     ? <span className="flex min-w-0 items-center gap-2"><span className="whitespace-nowrap tabular-nums">{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)}</span>
       {Option.isSome(memoryUse) && <span aria-hidden="true" className="h-1 w-10 shrink-0 xl:w-14 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-700"><span className={`block h-full rounded-full ${memoryUse.value > 0.8 ? "bg-orange-500 dark:bg-orange-400" : "bg-slate-400"}`} style={{ width: `${Math.max(4, memoryUse.value * 100)}%` }} /></span>}</span>
-    : model.servingState._tag === "Assessed" ? <span className="text-slate-500">Doesn’t fit</span>
+    : model.servingState._tag === "Assessed" ? <span className="text-slate-500" title={refusal ?? undefined}>{model.servingState.assessment._tag === "DoesNotFit" ? "Doesn’t fit this machine" : "Unsupported"}</span>
     : model.servingState._tag === "Assessing" && !awaitingFiles ? <span className="text-slate-500">Checking…</span>
-    : <span className="text-slate-500">—</span>
+    : <span className="text-slate-500">{model.servingState._tag === "Failed" ? "Assessment failed" : "—"}</span>
 
   const attachedAvailability = model._tag === "Custom" ? Option.getOrUndefined(Option.map(model.drafter, value => value.availability)) : undefined
   const notices = <>
-    {Option.isSome(deprecation) && <ErrorNotice severity="info" title={Option.isSome(replacement) ? "A replacement model is available" : "This model is no longer supported"} description={Option.isSome(replacement) ? `Switch to ${formatLocalModelDisplayName(replacement.value)} to continue receiving support.` : "Choose another model from Catalog."} className="mt-3" />}
+    {Option.isSome(deprecation) && <ErrorNotice severity="info" title={Option.isSome(replacement) ? "A replacement model is available" : "This model is no longer supported"} description={Option.isSome(replacement) ? `Switch to ${formatLocalModelDisplayName(replacement.value)} to continue receiving support.` : "Choose another model from Discover."} className="mt-3" />}
     {Option.isSome(replacement) && replacementCommand.failures.map(failure => <ErrorNotice key={`replacement-${failure.operation}`} {...modelCommandNotice(failure)} className="mt-3" />)}
-    {Option.isNone(deprecation) && fit !== null && (refusal !== null || !loadFailure) && !downloadFailure && <ErrorNotice severity="info" title={fit} className="mt-3" />}
+    {Option.isNone(deprecation) && (page === "models" || refusal === null) && fit !== null && (refusal !== null || !loadFailure) && !downloadFailure && <ErrorNotice severity="info" title={fit} className="mt-3" />}
     {residency !== undefined && modelStoppedForMemory(residency) && !command.pendingOperations.includes("load") && <ErrorNotice severity="warning" title={MODEL_STOPPED_FOR_MEMORY_MESSAGE} description="It was stopped to keep your other apps running. Quit apps you aren’t using before loading it again." className="mt-3" />}
-    {model._tag === "Catalog" && model.catalogData.support._tag === "Disabled" && <ErrorNotice severity="warning" title="This model is unavailable" description="Choose another model from Catalog." className="mt-3" />}
+    {model._tag === "Catalog" && model.catalogData.support._tag === "Disabled" && <ErrorNotice severity="warning" title="This model is unavailable" description="Choose another model from Discover." className="mt-3" />}
     {acquisition._tag === "Unavailable" && <ErrorNotice severity="warning" title="This model’s files can’t be read" description="Check that the file is still there and its drive is connected." className="mt-3" />}
     {downloadFailure && <ErrorNotice {...downloadNotice(downloadFailure)} className="mt-3" actions={<>
       {canDownload && <NoticeAction disabled={pending} onClick={() => install(model.modelId)}>Retry download</NoticeAction>}
@@ -211,17 +212,17 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
     <div className="flex items-center gap-4 px-5 py-4">
       <ModelLogo model={model} className="size-10" />
       <div className="min-w-0 flex-1">
-        <h2 title={name} className="flex min-w-0 items-center gap-2 font-sans text-[15px] font-medium leading-6 tracking-normal">
+        <h2 title={name} className="flex min-w-0 items-baseline gap-2 font-sans text-[15px] font-medium leading-6 tracking-normal">
           <span className="min-w-0 truncate">{model.presentation.displayName}</span>
-          <span className="shrink-0 rounded bg-slate-100 px-1 font-mono text-[11px] leading-4 font-normal text-slate-500 dark:bg-slate-800 dark:text-slate-400">{model.presentation.variantLabel}</span>
+          <span className="shrink-0 text-xs font-normal text-slate-500 dark:text-slate-400">{model.presentation.variantLabel}</span>
           {sourceBadge}
         </h2>
         <p className="truncate text-xs text-slate-500">{modelSubtitle(model, models, page)}</p>
       </div>
       <CardActions name={name} primary={primary} transfer={transfer} menu={menu} />
     </div>
-    <dl className="grid grid-cols-3 gap-px border-t border-slate-200 bg-slate-200 lg:grid-cols-5 dark:border-slate-750 dark:bg-slate-750">
-      <StripCell label="Status"><StatusLabel {...status} /></StripCell>
+    <dl className={`grid gap-px border-t border-slate-200 bg-slate-200 dark:border-slate-750 dark:bg-slate-750 ${showStatus ? "grid-cols-3 lg:grid-cols-5" : "grid-cols-2 lg:grid-cols-4"}`}>
+      {showStatus && <StripCell label="Status"><StatusLabel {...status} /></StripCell>}
       <StripCell label="Memory">{memory}</StripCell>
       <StripCell label="Drafter">{drafter}</StripCell>
       <StripCell label="Estimated speed">

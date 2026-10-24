@@ -28,6 +28,10 @@ const host: ApplicationHost = {
     read: call(() => bridge.getAppearance()),
     save: preference => call(() => bridge.setAppearance(preference)),
   },
+  foundModelsNotice: {
+    readDismissed: call(() => bridge.getFoundModelsNoticeDismissed()),
+    dismiss: call(() => bridge.dismissFoundModelsNotice()),
+  },
   shell: Option.some({
     actions: observe(HostAction, bridge.actions),
     presentModel: value => call(() => bridge.presentModel(Schema.encodeSync(ModelTrayPresentation)(value))),

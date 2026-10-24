@@ -1,19 +1,19 @@
 import { LOCAL_MODEL_RANKING_SCALE_LABELS } from "@magnitudedev/client-common"
 
 export function ModelPreferenceSlider({ value, onChange }: { value: number; onChange?: (value: number) => void }) {
-  return <div className="mt-5">
-    <div className="relative flex h-6 items-center">
-      <input type="range" min="0" max="4" step="1" aria-label="Model preference" aria-valuetext={LOCAL_MODEL_RANKING_SCALE_LABELS[value]} value={value} disabled={!onChange} onChange={event => onChange?.(Number(event.target.value))} className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-slate-200 accent-blue-600 dark:bg-slate-700 [&::-webkit-slider-thumb]:size-4 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-500 [&::-webkit-slider-thumb]:shadow-sm" />
-      <div aria-hidden="true" className="pointer-events-none absolute inset-x-2 flex items-center justify-between">
-        {LOCAL_MODEL_RANKING_SCALE_LABELS.map((label, index) => <span key={label} data-preference-tick={index} className={`h-3 w-0.5 rounded-full ${index === value ? "bg-transparent" : "bg-slate-500 dark:bg-slate-400"}`} />)}
+  return <div>
+    <div className="relative flex h-5 items-center">
+      <input type="range" min="0" max="4" step="1" aria-label="Model preference" aria-valuetext={LOCAL_MODEL_RANKING_SCALE_LABELS[value]} value={value} disabled={!onChange} onChange={event => onChange?.(Number(event.target.value))} className="h-1 w-full cursor-pointer appearance-none rounded-full bg-slate-200 accent-blue-600 dark:bg-slate-700 [&::-webkit-slider-thumb]:size-3.5 [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-blue-500" />
+      <div aria-hidden="true" className="pointer-events-none absolute inset-x-1.5 flex justify-between">
+        {LOCAL_MODEL_RANKING_SCALE_LABELS.map((label, index) => <span key={label} data-preference-tick={index} className={`h-2 w-px ${index === value ? "bg-transparent" : "bg-slate-400 dark:bg-slate-500"}`} />)}
       </div>
     </div>
-    <div className="relative mt-2 h-8">
-      {LOCAL_MODEL_RANKING_SCALE_LABELS.map((label, index) => <button key={label} disabled={!onChange} onClick={() => onChange?.(index)} aria-pressed={index === value} className={`absolute rounded py-1 text-xs focus-visible:outline-2 focus-visible:outline-blue-500 ${index === value ? "font-semibold text-blue-700 dark:text-blue-400" : "text-slate-500"}`} style={{ left: `${index * 25}%`, transform: `translateX(${index === 0 ? 0 : index === 4 ? -100 : -50}%)` }}>{label}</button>)}
+    <div className="relative mt-0.5 h-5">
+      {LOCAL_MODEL_RANKING_SCALE_LABELS.map((label, index) => <button key={label} type="button" disabled={!onChange} onClick={() => onChange?.(index)} aria-pressed={index === value} className={`absolute rounded py-0.5 text-xs focus-visible:outline-2 focus-visible:outline-blue-500 ${index === value ? "font-semibold text-blue-700 dark:text-blue-400" : "text-slate-500 dark:text-slate-400"}`} style={{ left: `${index * 25}%`, transform: `translateX(${index === 0 ? 0 : index === 4 ? -100 : -50}%)` }}>{label}</button>)}
     </div>
   </div>
 }
 
 export function RecommendationPreference({ value = 2, onChange }: { value?: number; onChange?: (value: number) => void }) {
-  return <section aria-label="Recommendation preference" className="my-6"><div className="flex flex-wrap items-end justify-between gap-4 md:flex-nowrap"><div><h2 className="font-heading text-xl">Recommended for your machine</h2><p className="mt-2 text-sm text-slate-500">Faster replies or smarter answers. Choose what matters more to you.</p></div><span className="rounded-full bg-blue-50 px-4 py-2 text-sm font-medium text-blue-700 dark:bg-slate-800 dark:text-blue-400">{LOCAL_MODEL_RANKING_SCALE_LABELS[value]}</span></div><ModelPreferenceSlider value={value} onChange={onChange} /></section>
+  return <section aria-label="Recommendation preference" className="mb-5 mt-3"><p className="mb-2 text-[13px] font-medium text-slate-600 dark:text-slate-300">Ranked for your machine.<span className="ml-1 font-normal text-slate-500">Choose faster replies or smarter answers.</span></p><ModelPreferenceSlider value={value} onChange={onChange} /></section>
 }

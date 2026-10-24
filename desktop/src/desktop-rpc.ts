@@ -20,6 +20,8 @@ export const InferenceHostRpcs = RpcGroup.make(
   Rpc.make("PresentModel", { payload: ModelTrayPresentation, success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("GetAppearance", { payload: Unit, success: AppearancePreference, error: HostError }).pipe(replaySafe),
   Rpc.make("SetAppearance", { payload: Schema.Struct({ preference: AppearancePreference }), success: Unit, error: HostError }).pipe(atMostOnce),
+  Rpc.make("GetFoundModelsNoticeDismissed", { payload: Unit, success: Schema.Boolean, error: HostError }).pipe(replaySafe),
+  Rpc.make("DismissFoundModelsNotice", { payload: Unit, success: Unit, error: HostError }).pipe(replaySafe),
   Rpc.make("Retry", { payload: Unit, success: Unit, error: HostError }).pipe(atMostOnce),
   Rpc.make("ResolveQuitFailure", { payload: Schema.Struct({ decision: QuitFailureDecision }), success: Unit, error: HostError }).pipe(atMostOnce),
   ChooseOpenPath,
@@ -32,6 +34,8 @@ export interface DesktopApi {
   readonly presentModel: (value: typeof ModelTrayPresentation.Encoded) => Promise<void>
   readonly getAppearance: () => Promise<AppearancePreference>
   readonly setAppearance: (preference: AppearancePreference) => Promise<void>
+  readonly getFoundModelsNoticeDismissed: () => Promise<boolean>
+  readonly dismissFoundModelsNotice: () => Promise<void>
   readonly retry: () => Promise<void>
   readonly resolveQuitFailure: (decision: QuitFailureDecision) => Promise<void>
   readonly chooseOpenPath: (request: typeof OpenPathRequest.Encoded) => Promise<typeof OpenPathResult.Encoded>

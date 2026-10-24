@@ -17,6 +17,12 @@ export interface HostAppearance {
   readonly save: (preference: AppearancePreference) => Effect.Effect<void, ApplicationHostFailed>
 }
 
+/** A viewer's one-time acknowledgement of models found outside Magnitude. */
+export interface HostFoundModelsNotice {
+  readonly readDismissed: Effect.Effect<boolean, ApplicationHostFailed>
+  readonly dismiss: Effect.Effect<void, ApplicationHostFailed>
+}
+
 /** What the native open dialog chooses: one folder. */
 export interface HostOpenPathRequest {
   readonly title: string
@@ -36,12 +42,13 @@ export interface HostShell {
 
 /**
  * What the machine showing the UI provides. Electron provides every group; a browser provides only
- * appearance. Pages show a control when its capability is present. Everything about the machine
+ * viewer preferences. Pages show a control when its capability is present. Everything about the machine
  * running Magnitude, including its owner, comes from ACN instead.
  */
 export interface ApplicationHost {
   readonly window: Option.Option<HostWindow>
   readonly appearance: HostAppearance
+  readonly foundModelsNotice: HostFoundModelsNotice
   readonly shell: Option.Option<HostShell>
 }
 export const ApplicationHost = Context.GenericTag<ApplicationHost>("client/ApplicationHost")

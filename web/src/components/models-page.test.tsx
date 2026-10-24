@@ -3,7 +3,7 @@ import type { ReactElement } from "react"
 import { describe, expect, it, vi } from "vitest"
 import { Option } from "effect"
 import type { ModelId } from "@magnitudedev/sdk"
-import { DiscoverSections, HiddenModelUnhide, ModelsListing, addFromHuggingFace, afterModelAdded, otherVersionsRequest, selectModels } from "./models-page"
+import { DiscoverSections, HiddenModelUnhide, ModelsListing, afterModelAdded, otherVersionsRequest, selectModels } from "./models-page"
 import { ModelsHeader } from "./models-header"
 import { modelLabs } from "./model-logo"
 import { added, catalogModel, customModel, doesNotFit, foundIn } from "../../test/models/fixtures"
@@ -76,7 +76,7 @@ describe("find other versions", () => {
   it("is offered only on Catalog page catalog cards and searches for the model's name", () => {
     expect(otherVersionsRequest("catalog", qwen)).toEqual(Option.some({ _tag: "Search", query: "Qwen3.6 35B-A3B" }))
     expect(otherVersionsRequest("models", qwen)).toEqual(Option.none())
-    expect(otherVersionsRequest("discover", qwen)).toEqual(Option.none())
+    expect(otherVersionsRequest("discover", qwen)).toEqual(Option.some({ _tag: "Search", query: "Qwen3.6 35B-A3B" }))
     expect(otherVersionsRequest("catalog", gemma)).toEqual(Option.none())
   })
 })
@@ -90,39 +90,24 @@ describe("adding a model", () => {
 })
 
 describe("discover", () => {
-  const found = [customModel(foundIn({ _tag: "Ollama" }))]
-  const discover = (state: Parameters<typeof DiscoverSections>[0]["state"]) => renderToStaticMarkup(<DiscoverSections hardware={<p>hardware card</p>} found={found} notice={<p>stop notice</p>}
-    preference={<p>preference</p>} recommendations={<p>recommendations</p>} state={state} onViewFound={() => {}} onAdd={() => {}} onExplore={() => {}} />)
-  it("puts the found-models banner between the hardware card and the recommendations, and the Hugging Face line below them", () => {
+  const discover = (state: Parameters<typeof DiscoverSections>[0]["state"]) => renderToStaticMarkup(<DiscoverSections
+    preference={<p>preference</p>} recommendations={<p>recommendations</p>} state={state} onAdd={() => {}} onExplore={() => {}} />)
+  it("keeps the preference above the recommendations without a duplicate Add action or model-details view", () => {
     const html = discover("ranked")
-    const order = ["hardware card", "You already have 1 model that runs here.", "recommendations", "Looking for a specific version, finetune, or uncensored model?"].map(text => html.indexOf(text))
-    expect(order.every(index => index >= 0)).toBe(true)
-    expect([...order].sort((a, b) => a - b)).toEqual(order)
-    expect(html).toContain("Add from Hugging Face")
+    expect(html.indexOf("preference")).toBeLessThan(html.indexOf("recommendations"))
+    expect(html).not.toContain("Add from Hugging Face")
+    expect(html).not.toContain("Details")
     expect(html).not.toContain("No fitting recommendations")
   })
-  it("adds no Hugging Face line while recommendations load or without hardware, and offers it beside Explore Catalog when nothing fits", () => {
-    expect(discover("pending")).not.toContain("Add from Hugging Face")
-    expect(discover("unavailable")).not.toContain("Add from Hugging Face")
+  it("offers All models and Add when nothing fits, and does not mistake missing hardware for no fit", () => {
+    expect(discover("pending")).not.toContain("No fitting recommendations")
+    expect(discover("unavailable")).toContain("hardware recommendations are unavailable")
+    expect(discover("unavailable")).not.toContain("No fitting recommendations")
+    expect(discover("failed")).toContain("Couldn’t assess model recommendations")
+    expect(discover("failed")).not.toContain("No fitting recommendations")
     const none = discover("none")
-    expect(none).not.toContain("Looking for a specific version")
     expect(none).toContain("No fitting recommendations right now.")
-    expect(none).toContain("Explore Catalog")
+    expect(none).toContain("Browse all models")
     expect(none).toContain("Add from Hugging Face")
-    expect(none.indexOf("recommendations")).toBeLessThan(none.indexOf("No fitting recommendations"))
-  })
-})
-
-describe("Add from Hugging Face", () => {
-  it("switches Discover to Catalog with the dialog open over it, and opens in place on Catalog", () => {
-    const openInPlace = vi.fn()
-    const openOnCatalog = vi.fn()
-    addFromHuggingFace("discover", openInPlace, openOnCatalog)()
-    expect(openOnCatalog).toHaveBeenCalledWith({ _tag: "Search", query: "" })
-    expect(openInPlace).not.toHaveBeenCalled()
-    openOnCatalog.mockClear()
-    addFromHuggingFace("catalog", openInPlace, openOnCatalog)()
-    expect(openInPlace).toHaveBeenCalledWith({ _tag: "Search", query: "" })
-    expect(openOnCatalog).not.toHaveBeenCalled()
   })
 })

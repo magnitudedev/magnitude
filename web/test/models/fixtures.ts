@@ -20,7 +20,7 @@ export const fits: Extract<LocalModelAssessment, { readonly _tag: "Fits" }> = {
   memory: { domains: [], totalRequiredBytes: 24 * GB, requiredSystemMemoryBytes: 0 },
   performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 80 }] },
 }
-export const doesNotFit: LocalModelAssessment = {
+export const doesNotFit: Extract<LocalModelAssessment, { readonly _tag: "DoesNotFit" }> = {
   _tag: "DoesNotFit", assessmentId, environmentId, profile: { contextLength: 32_768 }, memoryDomains: [], totalRequiredBytes: 0, deficitBytes: 4 * GB, limitingResource: "system",
 }
 export const unsupported = (...reasons: [UnsupportedReason, ...UnsupportedReason[]]): LocalModelAssessment => ({

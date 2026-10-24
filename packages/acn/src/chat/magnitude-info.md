@@ -38,8 +38,7 @@ Memory pressure and concurrent requests can also affect performance. Ground expl
 
 ## App layout
 
-- **Discover:** hardware-based recommendations and the speed/intelligence preference.
-- **Catalog:** model search, filters, variants, compatibility, and details.
+- **Discover:** detected hardware and two views: Recommended offers hardware-based recommendations and the speed/intelligence preference; All models offers catalog search, lab and machine-fit filters, variants, and inline memory, drafter, speed, and intelligence information.
 - **My Models:** installed models, download and preparation progress, loading, stopping, and removal.
 - **Connections:** configure external applications and coding agents.
 - **Usage:** historical inference activity, token counts, speed, and latency.

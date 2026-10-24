@@ -1,16 +1,17 @@
-import { ErrorNotice } from "./error-notice"
 import { HardwarePending } from "./page-skeletons"
+import { ErrorNotice } from "./error-notice"
 import { pageLayout } from "./page-layout"
 import { Option } from "effect"
 import { useMemo } from "react"
-import { Result, useAtomValue } from "@effect-atom/atom-react"
-import { MemoryIcon, CircuitryIcon, CpuIcon, InfoIcon } from "@phosphor-icons/react"
+import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
+import { InfoIcon } from "@phosphor-icons/react"
 import { useAgentClient, localModelRadarAxes, localModelSpeedTooltip, useLocalInferenceHardware } from "@magnitudedev/client-common"
 import { ActionTooltip } from "./ui/tooltip"
 import { type HardwarePhoto } from "./hardware-photos"
-import { hardwareDetails } from "./hardware-details"
-import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
-import type { LocalInferenceHardware, LocalModel } from "@magnitudedev/sdk"
+import { HardwareSummary } from "./machine-summary"
+import { useSession } from "../session"
+export { HardwareSummary } from "./machine-summary"
+import type { LocalModel } from "@magnitudedev/sdk"
 
 /** An estimated speed's small slate info icon, explaining what the estimate leaves out. */
 export function SpeedInfo() {
@@ -52,10 +53,14 @@ export function ModelRadar({ model }: { model: LocalModel }) {
 
 export function HardwareOverview() {
   const client = useAgentClient()
+  const session = useSession()
+  const state = useAtomValue(session.discover)
+  const setExpanded = useAtomSet(useMemo(() => Atom.fn((expanded: boolean) => session.updateDiscover({ machineExpanded: expanded })), [session]))
   const machine = useAtomValue(client.Configuration.GetServerMachine({})).result
-  const identity = Result.map(machine, value => value.identity)
-  if (Result.isInitial(identity)) return <HardwarePending identifying />
-  return <HardwareCard identity={Result.isSuccess(identity) ? identity.value : null} />
+  const hardware = useLocalInferenceHardware()
+  if (Result.isFailure(hardware)) return <ErrorNotice title="Couldn’t read your hardware" description="Recommendations will return when hardware information is available." className="mb-6" />
+  if (!Result.isSuccess(hardware) || Result.isInitial(machine)) return <HardwarePending identifying={Result.isSuccess(hardware)} />
+  return <HardwareSummary identity={Result.isSuccess(machine) ? machine.value.identity : null} value={hardware.value} expanded={state.machineExpanded} onExpandedChange={setExpanded} />
 }
 export function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {
   const frame = photo.framing
@@ -64,38 +69,4 @@ export function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {
       <image href={photo.src} width={frame.sourceWidth} height={frame.sourceHeight} />
     </svg>
   </figure>
-}
-function HardwareCard({ identity }: { identity: MachineIdentityObservation | null }) {
-  const hardware = useLocalInferenceHardware()
-  if (Result.isInitial(hardware)) return <HardwarePending />
-  if (Result.isFailure(hardware)) return <ErrorNotice title="Couldn’t read your hardware" description="Recommendations will return when hardware information is available." className="my-6" />
-  if (!Result.isSuccess(hardware)) return <div className="my-6 rounded-2xl border border-slate-200 p-6 text-sm text-slate-500 dark:border-slate-750">{"Getting to know your machine…"}</div>
-  return <HardwareSummary identity={identity} value={hardware.value} />
-}
-export function HardwareSummary({ identity, value }: { identity: MachineIdentityObservation | null; value: LocalInferenceHardware }) {
-  const presentation = hardwareDetails(identity, value)
-  return <section aria-label="Your hardware" className={pageLayout.hardware}>
-    <div className={`grid items-center gap-6 ${Option.isSome(presentation.photo) ? pageLayout.hardwareGrid : ""}`}>
-      {Option.isSome(presentation.photo) && <div className="w-full max-w-[260px]"><HardwarePhotograph photo={presentation.photo.value} /></div>}
-      <div className="min-w-0">
-        <p className="text-xs font-medium uppercase tracking-widest text-slate-500 dark:text-slate-400">{presentation.category}{presentation.cpuInference ? " · CPU inference" : ""}</p>
-        <h2 title={Option.isNone(presentation.deviceId) ? Option.getOrElse(presentation.name, () => "Your computer") : undefined} className={`mt-2 font-heading text-xl ${Option.isSome(presentation.deviceId) ? "break-words" : "truncate"}`}>{Option.getOrElse(presentation.name, () => "Your computer")}</h2>
-        <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(min(100%,220px),1fr))] gap-x-6 gap-y-4">
-          {presentation.groups.map(group => {
-            const Icon = group.label === "Memory" ? MemoryIcon : group.label.startsWith("GPU") ? CircuitryIcon : CpuIcon
-            return <div key={group.label} className="min-w-0">
-              <div className="flex items-center gap-2">
-                <Icon aria-hidden="true" className="size-4 shrink-0 text-blue-600 dark:text-blue-400" />
-                <p className="m-0 text-xs font-medium leading-tight text-slate-500 dark:text-slate-400">{group.label}</p>
-              </div>
-              <div className="min-w-0">
-                <p title={group.truncateName ? group.name : undefined} className={`mb-0 mt-1 text-sm font-semibold leading-snug ${group.truncateName ? "truncate" : "break-words"}`}>{group.name}</p>
-                <div className="mt-1 flex flex-col gap-0.5">{group.details.map(detail => <p key={detail} className="m-0 text-xs leading-snug text-slate-500 dark:text-slate-400">{detail.replace(/ \(spec\)/g, "")}</p>)}</div>
-              </div>
-            </div>
-          })}
-        </div>
-      </div>
-    </div>
-  </section>
 }

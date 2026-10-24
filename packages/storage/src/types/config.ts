@@ -32,6 +32,7 @@ export const MagnitudeConfigSchema = Schema.Struct({
   providers: SerializableOptional(CustomEndpointDeclarationsSchema),
   autoDownloadUpdates: SerializableOptional(Schema.Boolean),
   appearance: SerializableOptional(Schema.Literal("system", "light", "dark")),
+  foundModelsNoticeDismissed: SerializableOptional(Schema.Boolean),
   modelsDirectory: SerializableOptional(Schema.NonEmptyTrimmedString.pipe(Schema.maxLength(4_096))),
   network: SerializableOptional(NetworkAccessConfigSchema),
   models: SerializableOptional(CustomModelsConfigSchema),

@@ -33,6 +33,7 @@ export { UpdatePreferences, UpdatePreferencesFailed, makeUpdatePreferences } fro
 export { previousInstallationUpgrade } from "./previous-installation-live"
 
 export { AppearancePreferences, AppearancePreferencesFailed, makeAppearancePreferences } from "./appearance-preferences"
+export { FoundModelsNoticePreferences, FoundModelsNoticeFailed, makeFoundModelsNoticePreferences } from "./found-models-notice"
 
 export { recoverWindowsUpdateDirectory, WindowsUpdateDirectoryFailed } from "./windows-update-directory"
 
