@@ -1,3 +1,4 @@
+import { Chat } from "./chat";
 import { Group } from "@magnitudedev/effect-query";
 import { Agent } from "./agent";
 import { Application } from "./application";
@@ -17,6 +18,7 @@ import { Shell } from "./shell";
 import { Skills } from "./skills";
 
 export const AcnQueries = Group.make({
+  Chat,
   Projects,
   Agent,
   Application,
