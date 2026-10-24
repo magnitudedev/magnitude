@@ -1,4 +1,4 @@
-import { memo, useState } from "react"
+import { memo, useMemo, useState } from "react"
 import { Option } from "effect"
 import type { ChatGeneration } from "@magnitudedev/sdk"
 import {
@@ -8,9 +8,10 @@ import {
   CopyIcon,
   CheckIcon,
 } from "@phosphor-icons/react"
-import Markdown from "react-markdown"
+import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { IconButton, number, seconds } from "./shared"
+import { ChatCodeBlock } from "./code-block"
 export function ChatResponse({
   generation: g,
   retry,
@@ -55,7 +56,7 @@ export function ChatResponse({
           </div>
         </details>
       )}
-      {g.content && <ChatMarkdown content={g.content} />}
+      {g.content && <ChatMarkdown content={g.content} notify={notify} />}
       {g.status !== "running" && (
         <>
           {Option.isSome(g.error) && (
@@ -144,26 +145,49 @@ export function ChatResponse({
 
 const ChatMarkdown = memo(function ChatMarkdown({
   content,
+  notify,
 }: {
   content: string
+  notify: (text: string) => void
 }) {
+  // Stable renderer identities preserve copy feedback while new tokens arrive.
+  const components = useMemo<Components>(
+    () => ({
+      pre: ({ node, children }) => {
+        const code = node?.children.find(
+          (child) => child.type === "element" && child.tagName === "code"
+        )
+        if (!code || code.type !== "element") return <pre>{children}</pre>
+        // Markdown adds one display newline. Remove only that one, preserving
+        // indentation, trailing spaces and intentional blank lines when copying.
+        const text = code.children
+          .flatMap((child) => (child.type === "text" ? [child.value] : []))
+          .join("")
+          .replace(/\n$/, "")
+        const classes = code.properties.className
+        const language = Array.isArray(classes)
+          ? String(
+              classes.find((name) => String(name).startsWith("language-")) ?? ""
+            ).slice(9)
+          : ""
+        return <ChatCodeBlock code={text} language={language} notify={notify} />
+      },
+      a: ({ children, href }) => (
+        <a href={href} target="_blank" rel="noreferrer noopener">
+          {children}
+        </a>
+      ),
+      img: ({ alt }) => (
+        <span className="text-slate-500">
+          {alt ? `[Image: ${alt}]` : "[Image]"}
+        </span>
+      ),
+    }),
+    [notify]
+  )
   return (
     <div className="chat-prose text-sm leading-6">
-      <Markdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          a: ({ children, href }) => (
-            <a href={href} target="_blank" rel="noreferrer noopener">
-              {children}
-            </a>
-          ),
-          img: ({ alt }) => (
-            <span className="text-slate-500">
-              {alt ? `[Image: ${alt}]` : "[Image]"}
-            </span>
-          ),
-        }}
-      >
+      <Markdown remarkPlugins={[remarkGfm]} components={components}>
         {content}
       </Markdown>
     </div>

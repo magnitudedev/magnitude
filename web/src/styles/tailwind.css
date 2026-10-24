@@ -333,10 +333,43 @@
 .chat-prose ol { list-style: decimal; padding-left: 20px; }
 .chat-prose li + li { margin-top: 8px; }
 .chat-prose strong { font-weight: 600; }
-.chat-prose h1, .chat-prose h2, .chat-prose h3 { font-weight: 600; }
+.chat-prose :where(h1, h2, h3, h4, h5, h6) { font-family: var(--font-sans); font-weight: 600; margin-top: 24px; margin-bottom: 10px; }
+.chat-prose > :first-child, .chat-prose :where(li, blockquote) > :first-child { margin-top: 0; }
+.chat-prose h1 { font-size: 22px; line-height: 30px; }
+.chat-prose h2 { font-size: 18px; line-height: 26px; }
+.chat-prose h3 { font-size: 16px; line-height: 24px; }
+.chat-prose h4 { font-size: 14px; line-height: 22px; }
+.chat-prose h5 { font-size: 13px; line-height: 20px; }
+.chat-prose h6 { font-size: 12px; line-height: 20px; color: var(--magnitude-slate-500); }
+.chat-prose :where(li, blockquote) > * + * { margin-top: 10px; }
+.chat-prose li > :where(ul, ol) { margin-top: 6px; }
+.chat-prose ul ul { list-style-type: circle; }
+.chat-prose ul ul ul { list-style-type: square; }
+.chat-prose ol ol { list-style-type: lower-alpha; }
+.chat-prose ol ol ol { list-style-type: lower-roman; }
 .chat-prose a { color: var(--magnitude-blue-700); text-decoration: underline; }
 .chat-prose pre { overflow-x: auto; border-radius: 8px; padding: 12px; background: var(--magnitude-slate-100); font-size: 12px; line-height: 20px; }
 .chat-prose :not(pre) > code { border-radius: 3px; padding: 1px 4px; background: var(--magnitude-slate-100); font-size: 12px; }
+.chat-prose .chat-code-block pre { margin: 0; border-radius: 0; background: transparent; }
+.chat-code-block pre:focus-visible { outline: 2px solid var(--magnitude-blue-500); outline-offset: -2px; }
+.chat-code-block .hljs-comment, .chat-code-block .hljs-quote { color: var(--magnitude-slate-500); font-style: italic; }
+.chat-code-block .hljs-keyword, .chat-code-block .hljs-selector-tag, .chat-code-block .hljs-doctag { color: var(--magnitude-violet-700); }
+.chat-code-block .hljs-string, .chat-code-block .hljs-regexp, .chat-code-block .hljs-addition { color: var(--magnitude-green-700); }
+.chat-code-block .hljs-number, .chat-code-block .hljs-literal, .chat-code-block .hljs-attr, .chat-code-block .hljs-variable, .chat-code-block .hljs-template-variable { color: var(--magnitude-orange-700); }
+.chat-code-block .hljs-title, .chat-code-block .hljs-built_in, .chat-code-block .hljs-section, .chat-code-block .hljs-name { color: var(--magnitude-blue-700); }
+.chat-code-block .hljs-meta, .chat-code-block .hljs-symbol, .chat-code-block .hljs-bullet { color: var(--magnitude-indigo-700); }
+.chat-code-block .hljs-deletion { color: var(--magnitude-red-700); }
+.chat-code-block .hljs-emphasis { font-style: italic; }
+.chat-code-block .hljs-strong { font-weight: 600; }
+[data-theme=dark] .chat-code-block .hljs-comment, [data-theme=dark] .chat-code-block .hljs-quote { color: var(--magnitude-slate-400); }
+[data-theme=dark] .chat-code-block .hljs-keyword, [data-theme=dark] .chat-code-block .hljs-selector-tag, [data-theme=dark] .chat-code-block .hljs-doctag { color: var(--magnitude-violet-300); }
+[data-theme=dark] .chat-code-block .hljs-string, [data-theme=dark] .chat-code-block .hljs-regexp, [data-theme=dark] .chat-code-block .hljs-addition { color: var(--magnitude-green-300); }
+[data-theme=dark] .chat-code-block .hljs-number, [data-theme=dark] .chat-code-block .hljs-literal, [data-theme=dark] .chat-code-block .hljs-attr, [data-theme=dark] .chat-code-block .hljs-variable, [data-theme=dark] .chat-code-block .hljs-template-variable { color: var(--magnitude-orange-300); }
+[data-theme=dark] .chat-code-block .hljs-title, [data-theme=dark] .chat-code-block .hljs-built_in, [data-theme=dark] .chat-code-block .hljs-section, [data-theme=dark] .chat-code-block .hljs-name { color: var(--magnitude-blue-300); }
+[data-theme=dark] .chat-code-block .hljs-meta, [data-theme=dark] .chat-code-block .hljs-symbol, [data-theme=dark] .chat-code-block .hljs-bullet { color: var(--magnitude-indigo-300); }
+[data-theme=dark] .chat-code-block .hljs-deletion { color: var(--magnitude-red-400); }
+[data-theme=dark] .chat-prose blockquote, [data-theme=dark] .chat-prose h6 { color: var(--magnitude-slate-400); }
+[data-theme=dark] .chat-prose blockquote { border-color: var(--magnitude-slate-600); }
 .chat-prose blockquote { border-left: 2px solid var(--magnitude-slate-300); padding-left: 12px; color: var(--magnitude-slate-500); }
 .chat-prose table { display: block; overflow-x: auto; border-collapse: collapse; }
 .chat-prose th, .chat-prose td { border-bottom: 1px solid var(--magnitude-slate-200); padding: 8px 12px; text-align: left; }
