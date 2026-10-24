@@ -239,39 +239,25 @@ pub fn read_local(path: &Path) -> Result<LocalGgufRead, GgufError> {
 fn read_counted(file: &mut Counted) -> Result<LocalGgufRead, GgufError> {
     let length = file.file.metadata()?.len();
     let mut bytes = Vec::new();
-    let data_offset = loop {
-        let wanted = match crate::header_layout::walk(&bytes) {
-            Ok(crate::header_layout::Layout::Complete { data_offset, .. }) => break data_offset,
-            Ok(crate::header_layout::Layout::Incomplete { estimate, .. }) => estimate,
-            Err(_) if bytes.len() >= 8 && bytes[..4] != MAGIC => {
-                return Err(GgufError::InvalidMagic);
-            }
-            Err(_) if bytes.len() >= 8 => {
-                let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-                if !SUPPORTED_VERSIONS.contains(&version) {
-                    return Err(GgufError::UnsupportedVersion(version));
-                }
-                return Err(GgufError::Header(magnitude_artifacts::Error::Invalid(
-                    "invalid GGUF header".to_owned(),
-                )));
-            }
-            Err(error) => {
-                return Err(GgufError::Header(magnitude_artifacts::Error::Invalid(error)));
-            }
-        };
-        if bytes.len() >= crate::header_layout::MAX_HEADER_BYTES {
-            return Err(GgufError::Header(magnitude_artifacts::Error::Invalid(
-                "GGUF header exceeds the largest header read".to_owned(),
-            )));
-        }
-        let wanted = wanted
-            .max(READ_STEP)
-            .min(crate::header_layout::MAX_HEADER_BYTES - bytes.len());
-        if append(file, &mut bytes, wanted)? == 0 {
+    let data_offset = match magnitude_artifacts::gguf::read_header_bytes(file, &mut bytes) {
+        Ok(data_offset) => data_offset,
+        Err(magnitude_artifacts::Error::Truncated { .. }) => {
             return Err(GgufError::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "GGUF header is shorter than its tensor-data offset",
             )));
+        }
+        Err(error) => {
+            let version = bytes
+                .get(4..8)
+                .map(|version| u32::from_le_bytes(version.try_into().expect("four bytes")));
+            return Err(match version {
+                Some(_) if bytes[..4] != MAGIC => GgufError::InvalidMagic,
+                Some(version) if !SUPPORTED_VERSIONS.contains(&version) => {
+                    GgufError::UnsupportedVersion(version)
+                }
+                _ => GgufError::Header(error),
+            });
         }
     };
     let header_bytes = (data_offset as u64).min(length);
@@ -351,9 +337,6 @@ pub fn declared_length(directory: &Directory) -> u64 {
         .max()
         .map_or(0, |end| end.saturating_add(directory.data_offset))
 }
-
-/// The least a header read asks for at once.
-const READ_STEP: usize = 1024 * 1024;
 
 /// Append up to `wanted` bytes from `file` to `bytes`; how many it appended.
 fn append(file: &mut Counted, bytes: &mut Vec<u8>, wanted: usize) -> io::Result<usize> {

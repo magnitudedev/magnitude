@@ -697,10 +697,9 @@ pub struct HardwareSnapshot {
     pub logical_cores: usize,
     /// Engine build identity: engine version plus kernel bundle identity.
     pub native_build: String,
-    /// Backends compiled into the engine build.
-    pub enabled_backends: Vec<ExecutionBackend>,
     /// Backends that discovery could not enumerate on this machine, with the engine's own reason,
-    /// for example an absent driver. Empty when every compiled backend enumerated.
+    /// for example an absent driver or a backend this build lacks. Empty when every backend
+    /// enumerated.
     #[serde(default)]
     pub backend_diagnostics: Vec<HardwareBackendDiagnostic>,
     pub topology_fingerprint: String,

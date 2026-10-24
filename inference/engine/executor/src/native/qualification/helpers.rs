@@ -518,7 +518,7 @@ pub(super) fn semantic_dense_values(
             .collect(),
         Some(DType::F16) => values
             .iter()
-            .flat_map(|value| f16_bits(*value).to_le_bytes())
+            .flat_map(|value| seismic::f16_bits(*value).to_le_bytes())
             .collect(),
         Some(DType::BF16) => values
             .iter()
@@ -838,7 +838,7 @@ pub(super) fn read_dense_values(
         Some(DType::F16) => Ok(bytes
             .chunks_exact(2)
             .map(|chunk| {
-                f16_to_f32(u16::from_le_bytes(
+                seismic::f16_to_f32(u16::from_le_bytes(
                     chunk.try_into().expect("two-byte chunk"),
                 ))
             })
@@ -859,43 +859,6 @@ pub(super) fn read_dense_values(
             "result is not dense floating point",
         )),
     }
-}
-
-pub(super) fn f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    let mantissa = bits & 0x7f_ffff;
-    if exponent >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if exponent <= 0 {
-        if exponent < -10 {
-            return sign;
-        }
-        return sign | (((mantissa | 0x80_0000) >> (1 - exponent + 13)) as u16);
-    }
-    let rounded = mantissa + 0x0fff + ((mantissa >> 13) & 1);
-    sign | ((exponent as u16) << 10) | ((rounded >> 13) as u16)
-}
-
-pub(super) fn f16_to_f32(value: u16) -> f32 {
-    let sign = (u32::from(value & 0x8000)) << 16;
-    let exponent = u32::from((value >> 10) & 0x1f);
-    let mantissa = u32::from(value & 0x03ff);
-    let bits = if exponent == 0 {
-        if mantissa == 0 {
-            sign
-        } else {
-            let shift = mantissa.leading_zeros() - 21;
-            sign | ((127 - 15 - shift + 1) << 23) | ((mantissa << (shift + 1) & 0x03ff) << 13)
-        }
-    } else if exponent == 0x1f {
-        sign | 0x7f80_0000 | (mantissa << 13)
-    } else {
-        sign | ((exponent + 127 - 15) << 23) | (mantissa << 13)
-    };
-    f32::from_bits(bits)
 }
 
 #[cfg(test)]

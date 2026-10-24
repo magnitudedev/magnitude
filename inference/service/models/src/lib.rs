@@ -12,7 +12,6 @@ mod download;
 mod download_service;
 pub mod gguf;
 mod header_cache;
-mod header_layout;
 mod hugging_face;
 mod identity;
 mod inventory;

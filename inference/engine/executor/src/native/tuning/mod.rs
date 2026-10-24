@@ -1988,7 +1988,7 @@ impl Noise {
                 bytes.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes())
             }),
             DType::F16 => (2, |value, bytes| {
-                bytes.extend_from_slice(&f16_bits(value).to_le_bytes())
+                bytes.extend_from_slice(&seismic::f16_bits(value).to_le_bytes())
             }),
             other => {
                 return Err(format!(
@@ -2551,19 +2551,6 @@ fn element_count(extents: &[u64]) -> Result<usize, String> {
         .try_fold(1u64, |count, extent| count.checked_mul(*extent))
         .and_then(|count| usize::try_from(count).ok())
         .ok_or_else(|| "tuning tensor size overflows".to_owned())
-}
-
-fn f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    let mantissa = bits & 0x7f_ffff;
-    if exponent <= 0 {
-        // |value| < 2^-14 in [-1, 1): flush to signed zero.
-        return sign;
-    }
-    let rounded = (mantissa + 0x1000) >> 13;
-    sign | (((exponent as u32) << 10) + rounded) as u16
 }
 
 /// An entry, its element bindings and its static values: what one tuning

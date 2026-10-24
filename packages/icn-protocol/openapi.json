@@ -6311,7 +6311,6 @@
           "architecture",
           "logical_cores",
           "native_build",
-          "enabled_backends",
           "topology_fingerprint",
           "physical_devices",
           "host_ram",
@@ -6360,19 +6359,12 @@
             "type": "string",
             "description": "Engine build identity: engine version plus kernel bundle identity."
           },
-          "enabled_backends": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ExecutionBackend"
-            },
-            "description": "Backends compiled into the engine build."
-          },
           "backend_diagnostics": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/HardwareBackendDiagnostic"
             },
-            "description": "Backends that discovery could not enumerate on this machine, with the engine's own reason,\nfor example an absent driver. Empty when every compiled backend enumerated."
+            "description": "Backends that discovery could not enumerate on this machine, with the engine's own reason,\nfor example an absent driver or a backend this build lacks. Empty when every backend\nenumerated."
           },
           "topology_fingerprint": {
             "type": "string"
@@ -6765,8 +6757,7 @@
           "capabilities",
           "target",
           "profile",
-          "rustc",
-          "backends"
+          "rustc"
         ],
         "properties": {
           "version": {
@@ -6801,14 +6792,6 @@
           "rustc": {
             "type": "string",
             "minLength": 1
-          },
-          "backends": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ExecutionBackend"
-            },
-            "description": "Backends compiled into the engine build.",
-            "minItems": 1
           }
         },
         "additionalProperties": false

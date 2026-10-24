@@ -3300,23 +3300,11 @@ pub(crate) fn widen(bytes: &[u8], dtype: ActivationDType) -> Vec<u8> {
             let bits = u16::from_le_bytes([pair[0], pair[1]]);
             let value = match dtype {
                 ActivationDType::BF16 => f32::from_bits(u32::from(bits) << 16),
-                ActivationDType::F16 => f16_to_f32(bits),
+                ActivationDType::F16 => seismic::f16_to_f32(bits),
             };
             value.to_le_bytes()
         })
         .collect()
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exponent = i32::from((bits >> 10) & 0x1f);
-    let mantissa = f32::from(bits & 0x3ff);
-    match exponent {
-        0 => sign * mantissa * 2f32.powi(-24),
-        31 if mantissa == 0.0 => sign * f32::INFINITY,
-        31 => f32::NAN,
-        _ => sign * (1.0 + mantissa / 1024.0) * 2f32.powi(exponent - 15),
-    }
 }
 
 pub struct NativeDraftProgram {

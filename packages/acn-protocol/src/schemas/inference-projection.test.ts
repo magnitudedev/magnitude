@@ -23,7 +23,7 @@ const paths = [
 ]
 const fields = (overrides: Record<string, unknown> = {}) => ({
   captured_at: 1, platform: "linux", architecture: "x86_64", cpu_model: "AMD EPYC 7742", logical_cores: 4,
-  native_build: "test", enabled_backends: [], topology_fingerprint: "test", host_ram: host, device_memory: [],
+  native_build: "test", topology_fingerprint: "test", host_ram: host, device_memory: [],
   volumes: [], physical_devices: [cpu], selected_executor: "host-cpu", access_paths: [], transfer_paths: [], ...overrides,
 })
 const snapshot = (overrides: Record<string, unknown> = {}) => Schema.decodeUnknownSync(HardwareSnapshot)(fields(overrides))
@@ -112,14 +112,13 @@ it("reports a GPU's memory as its own memory's total, or what its grant lets it 
   expect(gpuMemory([{ id: 0, executor: "vulkan:0", store: "vram", grant: null }, granted(1, 8)], [vram]))
     .toEqual(Option.some(32))
 })
-it("explains an unused GPU from its own reason, then the backend diagnostic, the build, and otherwise as not selected", () => {
+it("explains an unused GPU from its own reason, then the backend diagnostic, and otherwise as not selected", () => {
   const reason = (executors: unknown[], overrides: Record<string, unknown> = {}) => Effect.runSync(summarizeInferenceHardware(
     snapshot({ physical_devices: [cpu, { ...gpu, executors }], access_paths: paths, ...overrides }))).gpuUnusedReason
   expect(reason([executor("cuda:0", "cuda", [], "driver too old")])).toEqual(Option.some("driver too old"))
   const diagnostic = { source: { type: "backend", backend: "cuda" }, message: "no driver" }
   expect(reason([gpu.executors[0]], { backend_diagnostics: [diagnostic] })).toEqual(Option.some("cuda: no driver"))
-  expect(reason([gpu.executors[0]])).toEqual(Option.some("cuda: not available in this build"))
-  expect(reason([gpu.executors[0]], { enabled_backends: ["cuda"] })).toEqual(Option.some("cuda: not selected"))
+  expect(reason([gpu.executors[0]])).toEqual(Option.some("cuda: not selected"))
 })
 it("reports no GPU fields on a CPU-only machine", () => {
   const summary = Effect.runSync(summarizeInferenceHardware(snapshot({ cpu_model: null })))

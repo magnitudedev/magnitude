@@ -1034,8 +1034,8 @@ impl AffineMixHistory {
                     let magnitude = 0.25 + (index.wrapping_mul(17) % 127) as f32 / 64.0;
                     let offset = -0.75 + (index.wrapping_mul(43) % 97) as f32 / 96.0;
                     [
-                        super::f16_bits(magnitude / levels as f32).to_le_bytes(),
-                        super::f16_bits(offset).to_le_bytes(),
+                        seismic::f16_bits(magnitude / levels as f32).to_le_bytes(),
+                        seismic::f16_bits(offset).to_le_bytes(),
                     ]
                 })
                 .flatten()

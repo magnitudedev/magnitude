@@ -2491,7 +2491,6 @@ mod tests {
                     "cpu_model": "Test CPU",
                     "logical_cores": 8,
                     "native_build": "test-build",
-                    "enabled_backends": ["cpu"],
                     "topology_fingerprint": "topology",
                     "host_ram": {
                         "store": {

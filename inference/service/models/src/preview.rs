@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1800,19 +1799,13 @@ pub(crate) enum HeaderPrefix {
 /// header does, or an integrity error when the header itself is invalid: reading further can't
 /// change that verdict.
 pub(crate) fn header_prefix(prefix: &[u8]) -> Result<HeaderPrefix, InventoryError> {
-    let temporary =
-        tempfile::NamedTempFile::new().map_err(|error| InventoryError::Io(error.to_string()))?;
-    fs::write(temporary.path(), prefix).map_err(|error| InventoryError::Io(error.to_string()))?;
-    let directory = match crate::gguf::known_tensors(magnitude_artifacts::gguf::inspect_header(
-        temporary.path(),
-    )) {
+    let parsed = magnitude_artifacts::gguf::read_header(prefix).and_then(|directory| {
+        directory.require_execution_byte_order()?;
+        Ok(directory)
+    });
+    let directory = match crate::gguf::known_tensors(parsed) {
         Ok(directory) => directory,
         Err(magnitude_artifacts::Error::Truncated { .. }) => return Ok(HeaderPrefix::Truncated),
-        Err(magnitude_artifacts::Error::Io(error))
-            if error.kind() == std::io::ErrorKind::UnexpectedEof =>
-        {
-            return Ok(HeaderPrefix::Truncated);
-        }
         Err(error) => return Err(InventoryError::Integrity(error.to_string())),
     };
     usize::try_from(directory.data_offset)
@@ -2216,9 +2209,9 @@ impl ManagedModelStore {
         let cached = self.cached_hugging_face_header(repository, commit, file)?;
         let bytes = self.cache.read_header(cached.digest()?)?;
         matches!(
-            crate::header_layout::walk(&bytes),
-            Ok(crate::header_layout::Layout::Complete { entries, .. })
-                if entries.iter().any(crate::header_layout::Entry::shared)
+            magnitude_artifacts::gguf::walk(&bytes),
+            Ok(magnitude_artifacts::gguf::Walk::Complete(header))
+                if header.entries.iter().any(crate::header_cache::shared)
         )
         .then_some(bytes)
     }
@@ -2485,6 +2478,7 @@ impl ManagedModelStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     use magnitude_service_contracts::LocalDeclaration;
 
@@ -4456,20 +4450,20 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_near_miss_is_read_from_the_whole_header_where_later_keys_settle_it() {
-        use crate::header_layout::{Layout, walk};
         use crate::search_shape::{ModelShape, SHAPE_PREFIX_BYTES};
         use crate::test_gguf::fixture_header;
+        use magnitude_artifacts::gguf::{Walk, walk};
         let fixture = "Qwen3.5-4B-Q3_K_M";
         let header = fixture_header(fixture);
         // The MTP head count moved after the token list, as tools that append MTP heads write it.
-        let Ok(Layout::Complete { entries, .. }) = walk(&header) else {
+        let Ok(Walk::Complete(layout)) = walk(&header) else {
             panic!("complete header");
         };
-        let entry = |key: &str| entries.iter().find(|entry| entry.key == key).unwrap();
+        let entry = |key: &str| layout.entries.iter().find(|entry| entry.head.key == key).unwrap();
         let (nextn, tokens) = (entry("qwen35.nextn_predict_layers"), entry("tokenizer.ggml.tokens"));
-        let mut moved = header[..nextn.start].to_vec();
+        let mut moved = header[..nextn.head.start].to_vec();
         moved.extend_from_slice(&header[nextn.end..tokens.end]);
-        moved.extend_from_slice(&header[nextn.start..nextn.end]);
+        moved.extend_from_slice(&header[nextn.head.start..nextn.end]);
         moved.extend_from_slice(&header[tokens.end..]);
         let prefix_shape = ModelShape::from_header_prefix(&moved[..SHAPE_PREFIX_BYTES]).unwrap();
         let catalog_shape = ModelShape::from_header_prefix(&header).unwrap();

@@ -71,7 +71,7 @@ fn entry() -> Entry<'static> {
     ("weight", vec![256, 2], Encoding::Q4K as u32, 0)
 }
 fn read(bytes: Vec<u8>) -> Result<gguf::Directory, Error> {
-    gguf::read_directory(&mut Cursor::new(bytes), gguf::DEFAULT_HEADER_LIMIT)
+    gguf::read_directory(&mut Cursor::new(bytes))
 }
 #[test]
 fn portable_directory_reverses_axes_without_reading_tensor_storage() {
@@ -96,7 +96,7 @@ fn portable_directory_reverses_axes_without_reading_tensor_storage() {
             source: Cursor::new(container(big, &[entry()], &[], 32)),
             read: 0,
         };
-        let d = gguf::read_directory(&mut source, gguf::DEFAULT_HEADER_LIMIT).unwrap();
+        let d = gguf::read_directory(&mut source).unwrap();
         assert_eq!(
             d.byte_order,
             if big {
@@ -108,7 +108,9 @@ fn portable_directory_reverses_axes_without_reading_tensor_storage() {
         assert_eq!(d.tensor("weight").unwrap().shape, [2, 256]);
         assert_eq!(d.tensor("weight").unwrap().nbytes, 288);
         assert_eq!(d.data_offset % 32, 0);
-        assert!((source.read as u64) <= d.data_offset);
+        // The header's read-ahead (the walk's estimate of its rest) stops short of the end of
+        // the tensor storage.
+        assert!((source.read as u64) < d.data_offset + d.tensor("weight").unwrap().nbytes);
         assert_eq!(d.require_execution_byte_order().is_err(), big);
     }
 }
@@ -178,15 +180,18 @@ fn arrays_are_held_by_their_element_type() {
     );
     assert!(gguf::Array::of([Scalar::Unsigned(1), Scalar::Bool(true)]).is_err());
 
-    // A count the remaining header cannot hold at its element's size is refused before its
-    // elements are allocated.
-    let oversized = read(container(
-        false,
-        &[entry()],
-        &[("kinds", 9, array(5, 1 << 20, &kinds))],
-        32,
-    ));
-    assert!(matches!(oversized, Err(Error::Invalid(message)) if message.contains("oversized")));
+    // A count no header can hold at its element's size is refused before anything is read for
+    // it; one the file merely ends before is a truncated header. Neither allocates its elements.
+    let declaring = |count: u64| {
+        read(container(
+            false,
+            &[entry()],
+            &[("kinds", 9, array(5, count, &kinds))],
+            32,
+        ))
+    };
+    assert!(matches!(declaring(1 << 40), Err(Error::Invalid(message)) if message.contains("oversized")));
+    assert!(matches!(declaring(1 << 20), Err(Error::Truncated { .. })));
 }
 #[test]
 fn rejects_truncation_geometry_overlap_and_duplicate_names() {
@@ -252,8 +257,6 @@ fn oversized_header_requests_and_size_overflow_are_rejected_before_allocation() 
         32
     ))
     .is_err());
-    let bytes = container(false, &[entry()], &[], 32);
-    assert!(gguf::read_directory(&mut Cursor::new(bytes), 32).is_err());
 }
 #[test]
 fn declaration_order_does_not_depend_on_physical_order() {
@@ -297,4 +300,85 @@ fn artifact_pins_validated_source_and_codec_descriptions() {
     std::fs::write(&path, container(true, &[entry()], &[], 32)).unwrap();
     assert!(gguf::GgufArtifact::open(&path).is_err());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// On every real header fixture: the walk of the whole header is the directory the engine reads
+/// from it, and the walk of any prefix is the whole header's walk cut short: the entries before
+/// the cut, the entry it falls in, and a need the header's remaining bytes cover, which a reader
+/// growing the prefix by the estimate follows to the whole header.
+#[test]
+fn every_prefix_of_a_real_header_walks_as_the_whole_header_cut_short() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/assessment/headers");
+    let mut fixtures = std::fs::read_dir(fixtures)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    fixtures.sort();
+    assert!(!fixtures.is_empty());
+    for path in fixtures {
+        let name = path.display();
+        let mut bytes = Vec::new();
+        let data_offset = gguf::read_header_bytes(
+            &mut flate2::read::GzDecoder::new(std::fs::File::open(&path).unwrap()),
+            &mut bytes,
+        )
+        .unwrap();
+        bytes.truncate(data_offset);
+        let Ok(gguf::Walk::Complete(header)) = gguf::walk(&bytes) else {
+            panic!("{name}: a whole header");
+        };
+
+        let directory = match gguf::read_header(&bytes) {
+            Ok(directory) => directory,
+            Err(Error::UnknownTensorTypes { directory, .. }) => *directory,
+            Err(error) => panic!("{name}: {error}"),
+        };
+        assert_eq!(directory.data_offset, header.data_offset as u64, "{name}");
+        assert_eq!(directory.alignment, header.alignment, "{name}");
+        assert_eq!(
+            directory.metadata,
+            header.entries.iter().map(gguf::Entry::metadata).collect::<Vec<_>>(),
+            "{name}"
+        );
+        let known = header
+            .tensors
+            .iter()
+            .filter(|tensor| Encoding::try_from(tensor.type_id).is_ok());
+        assert_eq!(directory.tensors.len(), known.clone().count(), "{name}");
+        for (descriptor, tensor) in directory.tensors.iter().zip(known) {
+            let mut shape = tensor.dimensions().collect::<Vec<_>>();
+            shape.reverse();
+            assert_eq!(
+                (descriptor.name.as_str(), &descriptor.shape, descriptor.encoding as u32, descriptor.offset),
+                (tensor.name, &shape, tensor.type_id, tensor.offset),
+                "{name}"
+            );
+        }
+
+        let mut cuts = (0..data_offset).step_by(data_offset / 32 + 1).collect::<Vec<_>>();
+        for entry in &header.entries {
+            cuts.extend([entry.head.end, (entry.head.end + entry.end) / 2]);
+        }
+        for cut in cuts {
+            let prefix = match gguf::walk(&bytes[..cut]).unwrap() {
+                gguf::Walk::Complete(whole) => {
+                    assert_eq!(whole, header, "{name} at {cut}");
+                    continue;
+                }
+                gguf::Walk::Incomplete(prefix) => prefix,
+            };
+            let held = prefix.entries.len();
+            assert_eq!(prefix.entries, header.entries[..held], "{name} at {cut}");
+            assert!(
+                header.entries.get(held).is_none_or(|next| next.end > cut),
+                "{name} at {cut}: an entry in hand is left out"
+            );
+            if let Some(open) = prefix.open {
+                assert_eq!(open, header.entries[held].head, "{name} at {cut}");
+            }
+            assert_eq!(prefix.preamble.is_some(), cut >= 24, "{name} at {cut}");
+            assert!(1 <= prefix.minimum && prefix.minimum <= prefix.estimate, "{name} at {cut}");
+            assert!(cut + prefix.minimum <= data_offset, "{name} at {cut}: {} more", prefix.minimum);
+        }
+    }
 }

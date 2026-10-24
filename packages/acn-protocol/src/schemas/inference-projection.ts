@@ -167,7 +167,6 @@ export const summarizeInferenceHardware = (
     if (executor.availability.type === "unavailable") return executor.availability.reason
     const diagnostic = diagnostics.find(item => item.source.type === "backend" && item.source.backend === executor.backend)
     if (diagnostic) return `${executor.backend}: ${diagnostic.message}`
-    if (!hardware.enabled_backends.includes(executor.backend)) return `${executor.backend}: not available in this build`
     return `${executor.backend}: not selected`
   }
   const unused = used ? undefined : largestFirst[0]

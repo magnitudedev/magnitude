@@ -7,15 +7,20 @@ use crate::{ArtifactIdentity, Error, FileSource};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
-    io::{BufReader, Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
+mod walk;
+
+pub use walk::{
+    Entry, EntryHead, HEADER_LIMIT, Header, Preamble, Prefix, TensorInfo, Walk, read_header_bytes,
+    walk,
+};
+
 /// The `general.architecture` a multimodal projector declares.
 pub const PROJECTOR_ARCHITECTURE: &str = "clip";
-
-pub const DEFAULT_HEADER_LIMIT: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ByteOrder {
@@ -512,6 +517,16 @@ impl ValueType {
         })
     }
 
+    /// The bytes one value of this type takes; for a string, the least (its length).
+    fn width(self) -> usize {
+        match self {
+            Self::U8 | Self::I8 | Self::Bool => 1,
+            Self::U16 | Self::I16 => 2,
+            Self::U32 | Self::I32 | Self::F32 => 4,
+            Self::String | Self::U64 | Self::I64 | Self::F64 => 8,
+        }
+    }
+
     fn id(self) -> u32 {
         match self {
             Self::U8 => 0,
@@ -598,7 +613,7 @@ pub struct StoredHeader {
 impl StoredHeader {
     /// The header of the GGUF file `source`; tensor payloads need not follow it.
     pub fn read<R: Read + Seek>(source: &mut R) -> Result<Self, Error> {
-        let (directory, types) = read_stored_directory(source, DEFAULT_HEADER_LIMIT, false)?;
+        let (directory, types) = read_stored_directory(source, false)?;
         if directory.byte_order != ByteOrder::Little {
             return Err(invalid("a stored GGUF header must be little-endian"));
         }
@@ -665,13 +680,7 @@ impl StoredHeader {
 
     /// `general.alignment`, or GGUF's default of 32.
     pub fn alignment(&self) -> Result<u64, Error> {
-        match self.value("general.alignment") {
-            None => Ok(32),
-            Some(value) => value
-                .unsigned()
-                .filter(|alignment| alignment.is_power_of_two())
-                .ok_or_else(|| invalid("alignment must be a positive power of two")),
-        }
+        self.value("general.alignment").map_or(Ok(32), alignment)
     }
 
     /// Every byte of the header through its aligned tensor-data offset.
@@ -724,6 +733,15 @@ impl StoredHeader {
         );
         Ok(out)
     }
+}
+
+/// The tensor-data alignment a `general.alignment` value declares: a power of two, stored as an
+/// integer of any width.
+fn alignment(value: &Value) -> Result<u64, Error> {
+    value
+        .unsigned()
+        .filter(|alignment| alignment.is_power_of_two())
+        .ok_or_else(|| invalid("alignment must be a positive power of two"))
 }
 
 fn scalar_element(scalar: &Scalar) -> Element<'_> {
@@ -817,196 +835,14 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::Invalid(message.into())
 }
 
-/// Reads a header up to `end`: the source's end, or the header limit when `bounded` because the
-/// source extends past it. Running out of a source is truncation; running past the limit is an
-/// oversized header.
-struct Reader<'a, R> {
-    source: &'a mut R,
-    offset: u64,
-    end: u64,
-    bounded: bool,
-    order: ByteOrder,
-}
-
-impl<R: Read> Reader<'_, R> {
-    fn check(&self, size: u64) -> Result<(), Error> {
-        if size <= self.end.saturating_sub(self.offset) {
-            Ok(())
-        } else {
-            Err(self.beyond_end())
-        }
-    }
-
-    fn beyond_end(&self) -> Error {
-        if self.bounded {
-            invalid(format!("oversized GGUF header at byte {}", self.offset))
-        } else {
-            Error::Truncated {
-                offset: self.offset,
-            }
-        }
-    }
-
-    fn take<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        self.check(N as u64)?;
-        let mut bytes = [0; N];
-        self.source.read_exact(&mut bytes)?;
-        self.offset += N as u64;
-        Ok(bytes)
-    }
-
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.take::<1>()?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, Error> {
-        let bytes = self.take()?;
-        Ok(match self.order {
-            ByteOrder::Little => u16::from_le_bytes(bytes),
-            ByteOrder::Big => u16::from_be_bytes(bytes),
-        })
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        let bytes = self.take()?;
-        Ok(match self.order {
-            ByteOrder::Little => u32::from_le_bytes(bytes),
-            ByteOrder::Big => u32::from_be_bytes(bytes),
-        })
-    }
-
-    fn u64(&mut self) -> Result<u64, Error> {
-        let bytes = self.take()?;
-        Ok(match self.order {
-            ByteOrder::Little => u64::from_le_bytes(bytes),
-            ByteOrder::Big => u64::from_be_bytes(bytes),
-        })
-    }
-
-    fn string(&mut self) -> Result<String, Error> {
-        let size = self.u64()?;
-        self.check(size)?;
-        let size =
-            usize::try_from(size).map_err(|_| invalid("GGUF string exceeds host address range"))?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(size)
-            .map_err(|_| invalid("cannot allocate bounded GGUF string"))?;
-        bytes.resize(size, 0);
-        self.source.read_exact(&mut bytes)?;
-        self.offset += size as u64;
-        String::from_utf8(bytes).map_err(|_| invalid("invalid UTF-8 in GGUF header"))
-    }
-
-    fn scalar(&mut self, kind: ValueType) -> Result<Scalar, Error> {
-        Ok(match kind {
-            ValueType::U8 => Scalar::Unsigned(u64::from(self.u8()?)),
-            ValueType::I8 => Scalar::Signed(i64::from(self.u8()? as i8)),
-            ValueType::U16 => Scalar::Unsigned(u64::from(self.u16()?)),
-            ValueType::I16 => Scalar::Signed(i64::from(self.u16()? as i16)),
-            ValueType::U32 => Scalar::Unsigned(u64::from(self.u32()?)),
-            ValueType::I32 => Scalar::Signed(i64::from(self.u32()? as i32)),
-            ValueType::F32 => Scalar::Float(f64::from(f32::from_bits(self.u32()?))),
-            ValueType::Bool => match self.u8()? {
-                0 => Scalar::Bool(false),
-                1 => Scalar::Bool(true),
-                _ => return Err(invalid("invalid GGUF boolean")),
-            },
-            ValueType::String => Scalar::String(self.string()?),
-            ValueType::U64 => Scalar::Unsigned(self.u64()?),
-            ValueType::I64 => Scalar::Signed(self.u64()? as i64),
-            ValueType::F64 => Scalar::Float(f64::from_bits(self.u64()?)),
-        })
-    }
-
-    fn value(&mut self) -> Result<(Value, StoredType), Error> {
-        let kind = self.u32()?;
-        if kind != 9 {
-            let kind = ValueType::from_id(kind)?;
-            return Ok((Value::Scalar(self.scalar(kind)?), StoredType::Scalar(kind)));
-        }
-        let element = self.u32()?;
-        let count = self.u64()?;
-        // The smallest encoding of one element, so a count is bounded by the header's bytes before
-        // its elements are allocated.
-        let encoded = match element {
-            0 | 1 | 7 => 1,
-            2 | 3 => 2,
-            4..=6 => 4,
-            _ => 8,
-        };
-        if element == 9 || count > (self.end - self.offset) / encoded {
-            return Err(invalid("nested or oversized GGUF array"));
-        }
-        let count = usize::try_from(count).map_err(|_| invalid("oversized GGUF array"))?;
-        let element = ValueType::from_id(element)?;
-        let array = match element {
-            ValueType::String => {
-                let mut strings = Strings::default();
-                strings
-                    .ends
-                    .try_reserve_exact(count)
-                    .map_err(|_| invalid("cannot allocate bounded GGUF array"))?;
-                for _ in 0..count {
-                    strings.push(&self.string()?)?;
-                }
-                strings.text.shrink_to_fit();
-                Array::String(strings)
-            }
-            ValueType::Bool => Array::Bool(self.elements(count, element, |scalar| match scalar {
-                Scalar::Bool(value) => value,
-                _ => unreachable!("a GGUF boolean element reads as a boolean"),
-            })?),
-            ValueType::I8 | ValueType::I16 | ValueType::I32 | ValueType::I64 => {
-                Array::Signed(self.elements(count, element, |scalar| match scalar {
-                    Scalar::Signed(value) => value,
-                    _ => unreachable!("a signed GGUF element reads as signed"),
-                })?)
-            }
-            ValueType::F32 | ValueType::F64 => {
-                Array::Float(self.elements(count, element, |scalar| match scalar {
-                    Scalar::Float(value) => value,
-                    _ => unreachable!("a GGUF float element reads as a float"),
-                })?)
-            }
-            ValueType::U8 | ValueType::U16 | ValueType::U32 | ValueType::U64 => {
-                Array::Unsigned(self.elements(count, element, |scalar| match scalar {
-                    Scalar::Unsigned(value) => value,
-                    _ => unreachable!("an unsigned GGUF element reads as unsigned"),
-                })?)
-            }
-        };
-        Ok((Value::Array(array), StoredType::Array(element)))
-    }
-
-    fn elements<T>(
-        &mut self,
-        count: usize,
-        kind: ValueType,
-        unwrap: impl Fn(Scalar) -> T,
-    ) -> Result<Vec<T>, Error> {
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(count)
-            .map_err(|_| invalid("cannot allocate bounded GGUF array"))?;
-        for _ in 0..count {
-            values.push(unwrap(self.scalar(kind)?));
-        }
-        Ok(values)
-    }
-}
-
-pub fn read_directory<R: Read + Seek>(
-    source: &mut R,
-    header_limit: u64,
-) -> Result<Directory, Error> {
-    read_directory_with_payload(source, header_limit, true)
+pub fn read_directory<R: Read + Seek>(source: &mut R) -> Result<Directory, Error> {
+    read_stored_directory(source, true).map(|(directory, _)| directory)
 }
 
 /// Read a GGUF header held in memory (every byte through the aligned data
 /// offset); tensor payloads need not follow it.
 pub fn read_header(bytes: &[u8]) -> Result<Directory, Error> {
-    read_directory_with_payload(&mut std::io::Cursor::new(bytes), DEFAULT_HEADER_LIMIT, false)
+    stored_directory(bytes, bytes.len() as u64, false).map(|(directory, _)| directory)
 }
 
 /// Inspect one downloaded GGUF file header before weight payloads exist.
@@ -1075,11 +911,7 @@ pub(crate) fn inspect_component_header(
 }
 
 fn read_file_directory(source: &FileSource, require_payload: bool) -> Result<Directory, Error> {
-    let directory = read_directory_with_payload(
-        &mut BufReader::with_capacity(1 << 20, source.reader()),
-        DEFAULT_HEADER_LIMIT,
-        require_payload,
-    )?;
+    let (directory, _) = read_stored_directory(&mut source.reader(), require_payload)?;
     directory.require_execution_byte_order()?;
     Ok(directory)
 }
@@ -1237,114 +1069,74 @@ fn merge_shards(shards: Vec<Directory>) -> Result<(Directory, Vec<u64>), Error> 
     ))
 }
 
-fn read_directory_with_payload<R: Read + Seek>(
-    source: &mut R,
-    header_limit: u64,
-    require_payload: bool,
-) -> Result<Directory, Error> {
-    read_stored_directory(source, header_limit, require_payload).map(|(directory, _)| directory)
-}
-
 /// The directory of a GGUF file with the stored type of each of its metadata values.
 fn read_stored_directory<R: Read + Seek>(
     source: &mut R,
-    header_limit: u64,
     require_payload: bool,
 ) -> Result<(Directory, Vec<StoredType>), Error> {
     let size = source.seek(SeekFrom::End(0))?;
     source.seek(SeekFrom::Start(0))?;
-    let mut reader = Reader {
-        source,
-        offset: 0,
-        end: size.min(header_limit),
-        bounded: size > header_limit,
-        order: ByteOrder::Little,
-    };
-    if &reader.take::<4>()? != b"GGUF" {
-        return Err(invalid("not a GGUF container"));
-    }
-    let version_bytes = reader.take::<4>()?;
-    if version_bytes == [0, 0, 0, 3] {
-        reader.order = ByteOrder::Big;
-    }
-    let version = match reader.order {
-        ByteOrder::Little => u32::from_le_bytes(version_bytes),
-        ByteOrder::Big => u32::from_be_bytes(version_bytes),
-    };
-    if !matches!(version, 2 | 3) {
-        return Err(invalid(format!("unsupported GGUF version {version}")));
-    }
-    let tensor_count = reader.u64()?;
-    let metadata_count = reader.u64()?;
-    if tensor_count
-        .checked_add(metadata_count)
-        .is_none_or(|count| count > (reader.end - reader.offset) / 12)
-    {
-        return Err(reader.beyond_end());
-    }
+    let mut bytes = Vec::new();
+    read_header_bytes(source, &mut bytes)?;
+    stored_directory(&bytes, size, require_payload)
+}
 
-    let mut metadata = Vec::new();
-    let mut types = Vec::new();
-    let mut names = HashSet::new();
-    let mut alignment = 32;
-    for _ in 0..metadata_count {
-        let name = reader.string()?;
-        let (value, stored) = reader.value()?;
-        if !names.insert(name.clone()) {
-            return Err(invalid(format!("duplicate metadata {name:?}")));
-        }
-        if name == "general.alignment" {
-            alignment = value
-                .unsigned()
-                .filter(|alignment| alignment.is_power_of_two())
-                .ok_or_else(|| invalid("alignment must be a positive power of two"))?;
-        }
-        metadata.push(Metadata { name, value });
-        types.push(stored);
-    }
-
+/// The directory of the GGUF header `bytes` begin, for a file of `size` bytes, with the stored
+/// type of each of its metadata values. With `require_payload`, every tensor's bytes must lie
+/// within the file.
+fn stored_directory(
+    bytes: &[u8],
+    size: u64,
+    require_payload: bool,
+) -> Result<(Directory, Vec<StoredType>), Error> {
+    let Walk::Complete(header) = walk(bytes)? else {
+        return Err(Error::Truncated {
+            offset: bytes.len() as u64,
+        });
+    };
+    let (metadata, types) = header
+        .entries
+        .iter()
+        .map(|entry| (entry.metadata(), entry.head.stored))
+        .unzip();
+    let alignment = header.alignment;
     let mut tensors = Vec::new();
     let mut unknown = std::collections::BTreeMap::<u32, u32>::new();
-    names.clear();
-    for _ in 0..tensor_count {
-        let name = reader.string()?;
-        let rank = reader.u32()?;
-        if name.is_empty() || !names.insert(name.clone()) || !(1..=4).contains(&rank) {
+    let mut names = HashSet::new();
+    for tensor in &header.tensors {
+        let name = tensor.name;
+        if name.is_empty() || !names.insert(name) {
             return Err(invalid(format!(
                 "invalid or duplicate tensor directory entry {name:?}"
             )));
         }
-        let mut shape = (0..rank)
-            .map(|_| reader.u64())
-            .collect::<Result<Vec<_>, _>>()?;
-        let type_id = reader.u32()?;
-        let offset = reader.u64()?;
         // A type id this parser doesn't know is a newer quantization, not a damaged header: the
         // rest of the directory is still read, and the ids are reported together.
-        let Ok(encoding) = Encoding::try_from(type_id) else {
-            *unknown.entry(type_id).or_default() += 1;
+        let Ok(encoding) = Encoding::try_from(tensor.type_id) else {
+            *unknown.entry(tensor.type_id).or_default() += 1;
             continue;
         };
+        let mut shape = tensor.dimensions().collect::<Vec<_>>();
         if shape.contains(&0) || shape[0] % encoding.block_elements() != 0 {
             return Err(invalid(format!(
                 "invalid block geometry on tensor {name:?}"
             )));
         }
-        if offset % alignment != 0 {
+        if tensor.offset % alignment != 0 {
             return Err(invalid(format!("misaligned tensor {name:?}")));
         }
-        let nbytes = stored_bytes(&name, &shape, encoding)?;
+        let nbytes = stored_bytes(name, &shape, encoding)?;
         shape.reverse();
         tensors.push(TensorDescriptor {
-            name,
+            name: name.to_owned(),
             shape,
             encoding,
-            offset,
+            offset: tensor.offset,
             nbytes,
         });
     }
 
-    let data_offset = aligned(reader.offset, alignment)?;
+    let data_offset = header.data_offset as u64;
     let mut stored = tensors.iter().collect::<Vec<_>>();
     stored.sort_by_key(|tensor| tensor.offset);
     let mut end = data_offset;
@@ -1365,8 +1157,8 @@ fn read_stored_directory<R: Read + Seek>(
     }
 
     let directory = Directory {
-        version,
-        byte_order: reader.order,
+        version: header.preamble.version,
+        byte_order: header.preamble.byte_order,
         alignment,
         data_offset,
         metadata,

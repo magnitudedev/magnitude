@@ -1658,7 +1658,6 @@ export const HardwareSnapshot = S.Struct({
   device_memory: S.Array(
     S.suspend((): S.Schema<HardwareDeviceMemory, HardwareDeviceMemoryEncoded> => HardwareDeviceMemory),
   ),
-  enabled_backends: S.Array(S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend)),
   host_ram: S.suspend((): S.Schema<HardwareHostRam, HardwareHostRamEncoded> => HardwareHostRam),
   logical_cores: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   native_build: S.String,
@@ -1811,9 +1810,6 @@ export type HuggingFaceRepositorySnapshotEncoded = S.Schema.Encoded<typeof Huggi
 
 export const IcnBinaryIdentity = S.Struct({
   api_version: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
-  backends: S.Array(S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend)).pipe(
-    S.minItems(1),
-  ),
   capabilities: S.Array(S.String).pipe(S.minItems(1)),
   native_build: S.String.pipe(S.minLength(1)),
   profile: S.String.pipe(S.minLength(1)),

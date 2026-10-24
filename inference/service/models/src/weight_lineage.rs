@@ -183,7 +183,7 @@ fn decode(encoding: Encoding, bytes: &[u8]) -> Option<Vec<f32>> {
             .collect::<Vec<_>>(),
         Encoding::F16 => bytes
             .chunks_exact(2)
-            .map(|value| f16_to_f32(u16::from_le_bytes([value[0], value[1]])))
+            .map(|value| seismic_lang::registry::f16_to_f32(u16::from_le_bytes([value[0], value[1]])))
             .collect(),
         Encoding::BF16 => bytes
             .chunks_exact(2)
@@ -192,18 +192,6 @@ fn decode(encoding: Encoding, bytes: &[u8]) -> Option<Vec<f32>> {
         _ => return None,
     };
     (!values.is_empty() && values.iter().all(|value| value.is_finite())).then_some(values)
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
-    let exponent = i32::from((bits >> 10) & 0x1f);
-    let mantissa = f32::from(bits & 0x3ff);
-    match exponent {
-        0 => sign * mantissa * 2f32.powi(-24),
-        0x1f if mantissa == 0.0 => sign * f32::INFINITY,
-        0x1f => f32::NAN,
-        _ => sign * (1.0 + mantissa / 1024.0) * 2f32.powi(exponent - 15),
-    }
 }
 
 fn is_constant(values: &[f32]) -> bool {

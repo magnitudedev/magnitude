@@ -3173,10 +3173,50 @@ mod tests {
         assert_eq!(f16_to_f32(1), 2.0f32.powi(-24));
         assert_eq!(f16_to_f32(0x03ff), 1023.0 * 2.0f32.powi(-24));
         for bits in 0..=u16::MAX {
+            let sign = u32::from(bits & 0x8000) << 16;
+            let exponent = i32::from((bits >> 10) & 0x1f);
+            let mantissa = u32::from(bits & 0x03ff);
+            let exact = match exponent {
+                0x1f => 0x7f80_0000 | mantissa << 13 | sign,
+                0 => (mantissa as f32 * 2f32.powi(-24)).to_bits() | sign,
+                _ => ((1024 + mantissa) as f32 * 2f32.powi(exponent - 25)).to_bits() | sign,
+            };
             let value = f16_to_f32(bits);
-            if !value.is_nan() {
+            assert_eq!(value.to_bits(), exact, "half widening {bits:04x}");
+            if value.is_nan() {
+                let encoded = f16_bits(value);
+                assert!(f16_to_f32(encoded).is_nan(), "half NaN {bits:04x}");
+                assert_eq!(encoded & 0x8000, bits & 0x8000, "half NaN sign {bits:04x}");
+            } else {
                 assert_eq!(f16_bits(value), bits, "half encoding {bits:04x}");
             }
+        }
+    }
+
+    #[test]
+    fn half_encoding_rounds_to_nearest_even() {
+        let cases: [(f32, u16); 14] = [
+            // Ties between 1 and its successor go to the even payload.
+            (1.0 + 2f32.powi(-11), 0x3c00),
+            (1.0 + 3.0 * 2f32.powi(-11), 0x3c02),
+            (1.0 + 2f32.powi(-11) + 2f32.powi(-20), 0x3c01),
+            // A mantissa carry adds into the exponent, including from an odd one.
+            (2.0 - 2f32.powi(-12), 0x4000),
+            (-(2.0 - 2f32.powi(-12)), 0xc000),
+            (4.0 - 2f32.powi(-11), 0x4400),
+            // Largest finite, the overflow tie, and past it.
+            (65_504.0, 0x7bff),
+            (65_519.0, 0x7bff),
+            (65_520.0, 0x7c00),
+            // Subnormal ties and the boundary into the normal range.
+            (2f32.powi(-25), 0x0000),
+            (1.5 * 2f32.powi(-25), 0x0001),
+            (3.0 * 2f32.powi(-25), 0x0002),
+            (2f32.powi(-14) - 2f32.powi(-25), 0x0400),
+            (-2f32.powi(-26), 0x8000),
+        ];
+        for (value, bits) in cases {
+            assert_eq!(f16_bits(value), bits, "{value:e}");
         }
     }
 

@@ -387,7 +387,6 @@ fn snapshot(
         physical_cores: machine.physical_cores,
         logical_cores: machine.logical_cores,
         native_build: build_identity::native_build(),
-        enabled_backends: build_identity::compiled_backends(),
         backend_diagnostics,
         topology_fingerprint: format!("{:x}", Sha256::digest(topology.normalized().as_bytes())),
         physical_devices,

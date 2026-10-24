@@ -2,9 +2,8 @@
 //! bound.
 //!
 //! Headers of one repository's files share their tokenizer, nearly all of each header's bytes. A
-//! header is therefore stored as a recipe of segments: each large metadata entry (see
-//! `header_layout`) is a chunk file named by its own sha256 and stored once however many headers
-//! hold it, and the rest of the header is inline in the recipe. The cache is bounded by the bytes
+//! header is therefore stored as a recipe of segments: each large metadata entry ([`shared`]) is
+//! a chunk file named by its own sha256 and stored once however many headers hold it, and the rest of the header is inline in the recipe. The cache is bounded by the bytes
 //! of its recipes and the chunks they reference. Reading a header marks it used; once the cache
 //! outgrows its capacity the least recently used headers are evicted, except those pinned by the
 //! caller (installed packages and the release catalog's headers) and those used within a grace
@@ -22,7 +21,17 @@ use std::time::{Duration, SystemTime};
 use magnitude_service_utils::file_cache::{read_bytes, write_bytes_atomic};
 use sha2::{Digest, Sha256};
 
-use crate::header_layout::{Layout, MAX_HEADER_BYTES, walk};
+use magnitude_artifacts::gguf::{Entry, HEADER_LIMIT, Walk, walk};
+
+/// A metadata entry at least this large (a tokenizer's token list, scores, types or merges) is
+/// shared between headers instead of read or stored again.
+const SHARED_ENTRY_BYTES: usize = 64 * 1024;
+
+/// Whether `entry` is stored once for every header holding it, and read from another header
+/// holding it instead of fetched again.
+pub(crate) fn shared(entry: &Entry<'_>) -> bool {
+    entry.range().len() >= SHARED_ENTRY_BYTES
+}
 
 /// The default bound on the header cache's bytes.
 pub(crate) const HEADER_CAPACITY_BYTES: u64 = 512 * 1024 * 1024;
@@ -78,7 +87,7 @@ impl HeaderCache {
             return None;
         }
         let path = self.recipes.join(digest);
-        let recipe = read_bytes(&path, MAX_HEADER_BYTES)?;
+        let recipe = read_bytes(&path, HEADER_LIMIT)?;
         match self
             .assemble(&recipe)
             .filter(|header| hex_sha256(header) == digest)
@@ -113,7 +122,7 @@ impl HeaderCache {
                     header.extend_from_slice(&chunk);
                 }
             }
-            if header.len() > MAX_HEADER_BYTES {
+            if header.len() > HEADER_LIMIT {
                 return None;
             }
         }
@@ -155,7 +164,7 @@ impl HeaderCache {
     /// `pinned` once the cache has outgrown its capacity.
     pub(crate) fn write(&self, header: &[u8], pinned: impl FnOnce() -> BTreeSet<String>) -> String {
         let digest = hex_sha256(header);
-        if header.len() > MAX_HEADER_BYTES {
+        if header.len() > HEADER_LIMIT {
             return digest;
         }
         let Ok(mut state) = self.state.lock() else {
@@ -167,16 +176,14 @@ impl HeaderCache {
             let mut inline = Vec::new();
             let mut written = 0_u64;
             let mut cursor = 0;
-            if let Ok(Layout::Complete { entries, .. }) = walk(header) {
-                for entry in entries
-                    .iter()
-                    .filter(|entry| entry.shared() && entry.end <= header.len())
-                {
-                    if entry.start > cursor {
-                        segments.push(Segment::Inline(entry.start - cursor));
-                        inline.extend_from_slice(&header[cursor..entry.start]);
+            if let Ok(Walk::Complete(layout)) = walk(header) {
+                for entry in layout.entries.iter().filter(|entry| shared(entry)) {
+                    let range = entry.range();
+                    if range.start > cursor {
+                        segments.push(Segment::Inline(range.start - cursor));
+                        inline.extend_from_slice(&header[cursor..range.start]);
                     }
-                    let bytes = &header[entry.start..entry.end];
+                    let bytes = &header[range];
                     let chunk = hex_sha256(bytes);
                     let path = self.chunks.join(&chunk);
                     if fs::metadata(&path)
@@ -184,7 +191,7 @@ impl HeaderCache {
                     {
                         touch(&path);
                     } else {
-                        write_bytes_atomic(&path, &self.lock, bytes, MAX_HEADER_BYTES);
+                        write_bytes_atomic(&path, &self.lock, bytes, HEADER_LIMIT);
                         written += bytes.len() as u64;
                     }
                     segments.push(Segment::Chunk {
@@ -199,7 +206,7 @@ impl HeaderCache {
                 inline.extend_from_slice(&header[cursor..]);
             }
             let recipe = encode_recipe(&segments, &inline);
-            write_bytes_atomic(&recipe_path, &self.lock, &recipe, MAX_HEADER_BYTES);
+            write_bytes_atomic(&recipe_path, &self.lock, &recipe, HEADER_LIMIT);
             written += recipe.len() as u64;
             state.written_since_sweep += written;
         }
@@ -354,7 +361,7 @@ fn parse_table(bytes: &[u8]) -> Option<(Vec<Segment>, &[u8])> {
             bytes.get(offset + 1..offset + 9)?.try_into().ok()?,
         ))
         .ok()
-        .filter(|length| *length <= MAX_HEADER_BYTES)?;
+        .filter(|length| *length <= HEADER_LIMIT)?;
         offset += 9;
         segments.push(match kind {
             INLINE => Segment::Inline(length),

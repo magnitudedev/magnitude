@@ -3174,7 +3174,11 @@ impl ScalarVal {
                 CmpOp::Gt => x > y,
                 CmpOp::Ge => x >= y,
             },
-            (Self::F16(x), Self::F16(y)) => compare_float(op, f16_to_f32(x), f16_to_f32(y)),
+            (Self::F16(x), Self::F16(y)) => compare_float(
+                op,
+                crate::registry::f16_to_f32(x),
+                crate::registry::f16_to_f32(y),
+            ),
             (Self::BF16(x), Self::BF16(y)) => compare_float(
                 op,
                 f32::from_bits((x as u32) << 16),
@@ -3196,23 +3200,6 @@ fn compare_float(op: CmpOp, x: f32, y: f32) -> bool {
         CmpOp::Gt => x > y,
         CmpOp::Ge => x >= y,
     }
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits as u32) & 0x8000) << 16;
-    let exponent = ((bits >> 10) & 0x1f) as u32;
-    let fraction = (bits & 0x03ff) as u32;
-    let encoded = match exponent {
-        0 if fraction == 0 => sign,
-        0 => {
-            let shift = fraction.leading_zeros() - 21;
-            let normalized = (fraction << shift) & 0x03ff;
-            sign | ((113 - shift) << 23) | (normalized << 13)
-        }
-        0x1f => sign | 0x7f80_0000 | (fraction << 13),
-        _ => sign | ((exponent + 112) << 23) | (fraction << 13),
-    };
-    f32::from_bits(encoded)
 }
 
 // ---------------------------------------------------------------------------

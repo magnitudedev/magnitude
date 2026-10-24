@@ -93,8 +93,6 @@ with (root / 'server.log').open('w') as log:
         record('health', health)
         hardware = request('/api/v1/hardware')
         assert hardware['native_build'] == metadata['nativeBuild']
-        # The artifact compiles in every backend of its host; Seismic discovery decides usability.
-        assert sorted(hardware['enabled_backends']) == {'darwin-arm64': ['cpu', 'metal'], 'darwin-x64': ['cpu']}[host], hardware
         devices = [device for domain in hardware['memory_domains'] for device in domain['devices']]
         assert any(device['backend'] == 'cpu' and 'unavailable_reason' not in device for device in devices), hardware
         record('hardware-identity', hardware)

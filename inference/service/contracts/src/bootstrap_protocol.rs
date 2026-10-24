@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ExecutionBackend;
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -21,9 +19,6 @@ pub struct IcnBinaryIdentity {
     pub profile: String,
     #[cfg_attr(feature = "openapi", schema(min_length = 1))]
     pub rustc: String,
-    /// Backends compiled into the engine build.
-    #[cfg_attr(feature = "openapi", schema(min_items = 1))]
-    pub backends: Vec<ExecutionBackend>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -164,21 +159,5 @@ mod tests {
             installation,
             serde_json::json!({ "schemaVersion": 1, "nativeBuild": "native" })
         );
-    }
-
-    #[test]
-    fn identity_names_compiled_backends_in_lowercase() {
-        let identity = serde_json::to_value(IcnBinaryIdentity {
-            version: "0.0.0".to_owned(),
-            api_version: 1,
-            native_build: "native".to_owned(),
-            capabilities: vec!["hardware".to_owned()],
-            target: "aarch64-apple-darwin".to_owned(),
-            profile: "release".to_owned(),
-            rustc: "rustc".to_owned(),
-            backends: vec![ExecutionBackend::Cpu, ExecutionBackend::Metal],
-        })
-        .expect("serialize identity");
-        assert_eq!(identity["backends"], serde_json::json!(["cpu", "metal"]));
     }
 }

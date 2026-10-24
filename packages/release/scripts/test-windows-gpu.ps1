@@ -38,7 +38,6 @@ function AssertResponse($response) {
 try {
  $hardware=Request GET '/api/v1/hardware' $null
  if ($hardware.native_build -ne $declaration.nativeBuild) { throw 'Running engine identity differs from the installation' }
- if (@($hardware.enabled_backends) -notcontains $Backend) { throw "The engine build does not include $Backend" }
  # Seismic discovery is the eligibility authority: a device below its backend floor carries unavailable_reason.
  $domains=@($hardware.memory_domains | Where-Object {@($_.devices | Where-Object {$_.backend -eq $Backend -and $_.kind -ne 'cpu' -and !$_.unavailable_reason}).Count -gt 0})
  if ($domains.Count -eq 0) { throw "No usable $Backend GPU hardware domain: $(@($hardware.memory_domains.devices | Where-Object {$_.backend -eq $Backend} | ForEach-Object {"$($_.name): $($_.unavailable_reason)"}) -join '; ')" }

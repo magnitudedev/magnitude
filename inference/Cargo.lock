@@ -2607,6 +2607,7 @@ dependencies = [
  "notify",
  "reqwest",
  "same-file",
+ "seismic-lang",
  "serde",
  "serde_json",
  "sha2 0.10.9",

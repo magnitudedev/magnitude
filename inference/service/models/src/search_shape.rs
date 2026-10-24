@@ -22,7 +22,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
-use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Value, read_header};
+use magnitude_artifacts::gguf::{
+    Directory, Entry, PROJECTOR_ARCHITECTURE, StoredType, Value, ValueType, Walk, read_header,
+    walk,
+};
 use magnitude_service_contracts::models::{ModelFingerprint, ModelId, UnsupportedReason};
 use magnitude_service_contracts::{HuggingFaceRepositoryRequest, InventoryError};
 use reqwest::header::RANGE;
@@ -30,7 +33,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::ModelIndexKind;
 use crate::candidate_files::{CandidateGguf, RecognizedArchitectures, group_ggufs};
-use crate::header_layout::{Layout, walk};
 use crate::inventory::ManagedModelStore;
 
 /// The bytes read from the start of a search result's GGUF.
@@ -102,33 +104,31 @@ pub(crate) enum RepositoryModel {
 /// The header metadata in a GGUF prefix: its complete entries, as a header of their own without
 /// tensors, and the token list's element count when the prefix reaches it.
 fn prefix_metadata(bytes: &[u8]) -> Option<(Directory, Option<u64>)> {
-    let (entries, open) = match walk(bytes).ok()? {
-        Layout::Complete { entries, .. } => (entries, None),
-        Layout::Incomplete { entries, open, .. } => (entries, open),
+    let (preamble, entries, alignment, open) = match walk(bytes).ok()? {
+        Walk::Complete(header) => (header.preamble, header.entries, header.alignment, None),
+        Walk::Incomplete(prefix) => (
+            prefix.preamble?,
+            prefix.entries,
+            prefix.alignment,
+            prefix.open,
+        ),
     };
     let vocab_size = entries
         .iter()
-        .find(|entry| entry.key == TOKENS_KEY)
-        .map(|entry| entry.head_end)
-        .or_else(|| {
-            open.filter(|open| open.key == TOKENS_KEY)
-                .map(|open| open.head_end)
-        })
-        .and_then(|head_end| {
-            let head = bytes.get(head_end.checked_sub(16)?..head_end)?;
-            let le_u32 =
-                |at: usize| u32::from_le_bytes(head[at..at + 4].try_into().unwrap_or_default());
-            (le_u32(0) == 9 && le_u32(4) == 8)
-                .then(|| u64::from_le_bytes(head[8..16].try_into().unwrap_or_default()))
-        });
-    let mut metadata = bytes.get(..entries.last()?.end)?.to_vec();
-    metadata
-        .get_mut(8..16)?
-        .copy_from_slice(&0_u64.to_le_bytes());
-    metadata
-        .get_mut(16..24)?
-        .copy_from_slice(&u64::try_from(entries.len()).ok()?.to_le_bytes());
-    Some((read_header(&metadata).ok()?, vocab_size))
+        .map(|entry| entry.head)
+        .chain(open)
+        .find(|head| head.key == TOKENS_KEY)
+        .filter(|head| head.stored == StoredType::Array(ValueType::String))
+        .map(|head| head.count);
+    let directory = Directory {
+        version: preamble.version,
+        byte_order: preamble.byte_order,
+        alignment,
+        data_offset: (entries.last()?.end as u64).next_multiple_of(alignment),
+        metadata: entries.iter().map(Entry::metadata).collect(),
+        tensors: Vec::new(),
+    };
+    Some((directory, vocab_size))
 }
 
 impl ModelShape {
@@ -428,9 +428,10 @@ async fn read_repository_model(
         // architecture, width and vocabulary; otherwise (no shape yet, or a near miss) the whole
         // header is read.
         let prefix_shape = ModelShape::from_header_prefix(&prefix);
-        let complete = matches!(walk(&prefix), Ok(Layout::Complete { .. }));
-        let settled = match walk(&prefix) {
-            Ok(Layout::Incomplete { .. }) => prefix_shape.as_ref().is_some_and(|shape| {
+        let walked = walk(&prefix);
+        let complete = matches!(walked, Ok(Walk::Complete(_)));
+        let settled = match walked {
+            Ok(Walk::Incomplete(_)) => prefix_shape.as_ref().is_some_and(|shape| {
                 catalog
                     .iter()
                     .any(|(_, fingerprint)| shape.matches(fingerprint))

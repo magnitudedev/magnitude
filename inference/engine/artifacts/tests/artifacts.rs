@@ -124,7 +124,7 @@ fn directory_is_bounded_portable_and_preserves_metadata() {
             source: Cursor::new(container(big, &[entry()], &[])),
             read: 0,
         };
-        let directory = gguf::read_directory(&mut source, gguf::DEFAULT_HEADER_LIMIT).unwrap();
+        let directory = gguf::read_directory(&mut source).unwrap();
         assert_eq!(
             directory.byte_order,
             if big {
@@ -134,18 +134,18 @@ fn directory_is_bounded_portable_and_preserves_metadata() {
             }
         );
         assert_eq!(directory.tensor("weight").unwrap().shape, [2, 256]);
-        assert!((source.read as u64) <= directory.data_offset);
+        // The header's read-ahead (the walk's estimate of its rest) stops short of the end of
+        // the tensor storage.
+        let tensor = directory.tensor("weight").unwrap();
+        assert!((source.read as u64) < directory.data_offset + tensor.nbytes);
         assert_eq!(directory.require_execution_byte_order().is_err(), big);
     }
 
-    let directory = gguf::read_directory(
-        &mut Cursor::new(container(
-            false,
-            &[entry()],
-            &[("general.name", 8, string_value("fixture"))],
-        )),
-        gguf::DEFAULT_HEADER_LIMIT,
-    )
+    let directory = gguf::read_directory(&mut Cursor::new(container(
+        false,
+        &[entry()],
+        &[("general.name", 8, string_value("fixture"))],
+    )))
     .unwrap();
     assert_eq!(
         directory.value("general.name"),
@@ -158,8 +158,7 @@ fn header_inspection_accepts_declared_weights_without_payload() {
     let root = temporary_directory("header-only");
     let path = root.join("header.gguf");
     let full = container(false, &[entry()], &[]);
-    let directory =
-        gguf::read_directory(&mut Cursor::new(&full), gguf::DEFAULT_HEADER_LIMIT).unwrap();
+    let directory = gguf::read_directory(&mut Cursor::new(&full)).unwrap();
     std::fs::write(&path, &full[..directory.data_offset as usize]).unwrap();
     let inspected = gguf::inspect_header(&path).unwrap();
     assert_eq!(inspected.tensors, directory.tensors);
@@ -339,8 +338,7 @@ fn bf16_is_a_dense_two_byte_container_encoding() {
         &[("weight", vec![4, 2], Encoding::BF16 as u32, 0)],
         &[],
     );
-    let directory =
-        gguf::read_directory(&mut Cursor::new(bytes), gguf::DEFAULT_HEADER_LIMIT).unwrap();
+    let directory = gguf::read_directory(&mut Cursor::new(bytes)).unwrap();
     let tensor = directory.tensor("weight").unwrap();
     assert_eq!(tensor.encoding, Encoding::BF16);
     assert_eq!(tensor.nbytes, 16);
@@ -403,8 +401,7 @@ fn audited_encoding_ids_and_block_geometry_match_pinned_ggml() {
             &[("weight", vec![block_elements, 2], type_id, 0)],
             &[],
         );
-        let directory =
-            gguf::read_directory(&mut Cursor::new(bytes), gguf::DEFAULT_HEADER_LIMIT).unwrap();
+        let directory = gguf::read_directory(&mut Cursor::new(bytes)).unwrap();
         let tensor = directory.tensor("weight").unwrap();
         assert_eq!(tensor.encoding, encoding);
         assert_eq!(tensor.nbytes, block_bytes * 2);
@@ -416,14 +413,11 @@ fn audited_encoding_ids_and_block_geometry_match_pinned_ggml() {
 #[test]
 fn removed_or_unknown_encoding_ids_are_reported_with_the_rest_of_the_directory() {
     for type_id in [4, 5, 31, 32, 33, 36, 37, 38, 42, 200, u32::MAX] {
-        let error = gguf::read_directory(
-            &mut Cursor::new(container(
-                false,
-                &[("weight", vec![32], type_id, 0), ("norm", vec![32], 0, 32)],
-                &[],
-            )),
-            gguf::DEFAULT_HEADER_LIMIT,
-        )
+        let error = gguf::read_directory(&mut Cursor::new(container(
+            false,
+            &[("weight", vec![32], type_id, 0), ("norm", vec![32], 0, 32)],
+            &[],
+        )))
         .unwrap_err();
         let Error::UnknownTensorTypes { types, directory } = &error else {
             panic!("{type_id}: {error:?}");
@@ -438,16 +432,27 @@ fn removed_or_unknown_encoding_ids_are_reported_with_the_rest_of_the_directory()
 fn a_header_cut_short_is_truncated_and_one_past_the_limit_is_invalid() {
     let bytes = container(false, &[("weight", vec![32], 0, 0)], &[]);
     for end in [6, 20, 50] {
-        let error = gguf::read_directory(
-            &mut Cursor::new(bytes[..end].to_vec()),
-            gguf::DEFAULT_HEADER_LIMIT,
-        )
-        .unwrap_err();
+        let error = gguf::read_directory(&mut Cursor::new(bytes[..end].to_vec())).unwrap_err();
         assert!(matches!(error, Error::Truncated { .. }), "{end}: {error}");
         assert!(error.unreadable());
     }
-    let error = gguf::read_directory(&mut Cursor::new(bytes.clone()), 40).unwrap_err();
-    assert!(matches!(error, Error::Invalid(_)), "{error}");
+    // A name whose declared length ends the header exactly at the limit is only cut short; one
+    // byte longer, no header can hold it.
+    let mut bytes = container(
+        false,
+        &[("weight", vec![32], 0, 0)],
+        &[("general.name", 8, string_value(""))],
+    );
+    let Ok(gguf::Walk::Complete(header)) = gguf::walk(&bytes) else {
+        panic!("a whole header");
+    };
+    let text = header.entries[0].head.end;
+    for (length, beyond) in [(gguf::HEADER_LIMIT - text, false), (gguf::HEADER_LIMIT - text + 1, true)] {
+        bytes[text - 8..text].copy_from_slice(&(length as u64).to_le_bytes());
+        let error = gguf::read_directory(&mut Cursor::new(bytes.clone())).unwrap_err();
+        assert_eq!(matches!(error, Error::Invalid(_)), beyond, "{error}");
+        assert_eq!(matches!(error, Error::Truncated { .. }), !beyond, "{error}");
+    }
 }
 
 fn u16_value(value: u16) -> Vec<u8> {
@@ -471,8 +476,7 @@ fn shard(
     ];
     all.extend(metadata.iter().cloned());
     let mut bytes = container(false, entries, &all);
-    let directory =
-        gguf::read_directory(&mut Cursor::new(&bytes), gguf::DEFAULT_HEADER_LIMIT).unwrap();
+    let directory = gguf::read_directory(&mut Cursor::new(&bytes)).unwrap();
     for tensor in &directory.tensors {
         let start = (directory.data_offset + tensor.offset) as usize;
         bytes[start..start + tensor.nbytes as usize].fill(fill);
@@ -515,9 +519,7 @@ fn write_split(root: &std::path::Path, header_only: bool) -> Vec<PathBuf> {
         .map(|(index, bytes)| {
             let path = root.join(format!("model-{:05}-of-00003.gguf", index + 1));
             let bytes = if header_only {
-                let directory =
-                    gguf::read_directory(&mut Cursor::new(bytes), gguf::DEFAULT_HEADER_LIMIT)
-                        .unwrap();
+                let directory = gguf::read_directory(&mut Cursor::new(bytes)).unwrap();
                 &bytes[..directory.data_offset as usize]
             } else {
                 &bytes[..]
