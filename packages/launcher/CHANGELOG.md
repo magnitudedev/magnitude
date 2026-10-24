@@ -1,5 +1,11 @@
 # @magnitudedev/cli
 
+## 0.2.11
+
+### Patch Changes
+
+- Update the RPC contract to v10 and rebuild the bundled harness plugins against it.
+
 ## 0.2.10
 
 ### Patch Changes
