@@ -56,7 +56,7 @@ describe("chat reasoning capabilities", () => {
       Option.some("medium")
     )
   })
-  it("has no reasoning control or request value for models without reasoning", () => {
+  it("omits the request value for models without reasoning", () => {
     expect(chatReasoningLevels(model(null))).toEqual([])
     expect(chatReasoningEffort(model(null), Option.some("high"))).toEqual(
       Option.none()

@@ -23,7 +23,6 @@ import {
   chatComposerText,
   completeChatSubmission,
   selectedChat,
-  chatReasoningLevels,
   chatReasoningEffort,
   localModelProviderModelId,
   localModelServingProfile,
@@ -39,7 +38,6 @@ import {
   XIcon,
   SquareIcon,
   CircleNotchIcon,
-  ChartBarIcon,
 } from "@phosphor-icons/react"
 import { Button } from "./ui/button"
 import {
@@ -59,13 +57,13 @@ import {
   errorText,
   none,
   number,
-  titleCase,
   value,
 } from "./chat/shared"
 import { ChatResponse } from "./chat/response"
 import { ChatRequestStatus } from "./chat/activity"
 import { ChatSettingsPanel } from "./chat/settings"
 import { ChatHistoryPanel } from "./chat/history"
+import { ChatThinkingSelect } from "./chat/thinking"
 
 export function ChatPage() {
   const id = useAtomValue(selectedChat)
@@ -132,7 +130,6 @@ function ChatView({
   const modelId = value(settings.modelId) ?? models[0]?.id
   const model = models.find((m) => m.id === modelId)
   const reasoning = model ? Option.getOrNull(model.reasoning) : null
-  const levels = chatReasoningLevels(model)
   const effort = value(chatReasoningEffort(model, settings.reasoningEffort))
   const effectiveSettings: ChatSettings = {
     ...settings,
@@ -424,7 +421,6 @@ function ChatView({
                     onValueChange={(next) => {
                       if (next) {
                         const m = models.find((m) => m.id === next)
-                        const r = m ? Option.getOrNull(m.reasoning) : null
                         patch({
                           modelId: Option.some(ChatModelId.make(next)),
                           reasoningEffort: chatReasoningEffort(
@@ -492,37 +488,13 @@ function ChatView({
                       ))}
                     </SelectContent>
                   </Select>
-                  {reasoning && levels.length > 1 && (
-                    <Select
-                      value={effort}
-                      onValueChange={(next) => {
-                        if (next) patch({ reasoningEffort: Option.some(next) })
-                      }}
-                    >
-                      <SelectTrigger
-                        aria-label="Thinking level"
-                        variant="inline"
-                        className="h-8 px-2 text-xs text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
-                      >
-                        <SelectValue>
-                          <ChartBarIcon aria-hidden="true" className="size-3" />
-                          {titleCase(effort ?? reasoning.default_effort)}
-                        </SelectValue>
-                      </SelectTrigger>
-                      <SelectContent
-                        side="top"
-                        align="start"
-                        alignItemWithTrigger={false}
-                        className="w-36"
-                      >
-                        {levels.map((level) => (
-                          <SelectItem key={level.value} value={level.value}>
-                            {level.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  )}
+                  <ChatThinkingSelect
+                    model={model}
+                    selected={settings.reasoningEffort}
+                    onChange={(next) =>
+                      patch({ reasoningEffort: Option.some(next) })
+                    }
+                  />
                 </div>
                 {active ? (
                   <Button

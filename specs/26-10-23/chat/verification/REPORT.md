@@ -18,14 +18,14 @@ The development web app is running at [http://127.0.0.1:5189/chat](http://127.0.
 
 | Package | Final result |
 | --- | --- |
-| Web | 322 passed |
+| Web | 328 passed |
 | ACN: Chat and adjacent startup/catalog/usage/activity tests | 51 passed |
 | ACN protocol | 87 passed |
 | Storage | 85 passed |
 | SDK | 43 passed |
 | Client common | 121 passed; 1 pre-existing failure |
 
-709 checks passed across these runs. Commands used `bunx --bun vitest run`, with the ACN run targeted to the affected domains. Targeted TypeScript checks passed for ACN, storage, client common, web, and desktop. Web and Electron production builds passed. Release preparation allocated RPC 10, and the official release verification passed.
+715 checks passed across these runs. Commands used `bunx --bun vitest run`, with the ACN run targeted to the affected domains. Targeted TypeScript checks passed for ACN, storage, client common, web, and desktop. Web and Electron production builds passed. Release preparation allocated RPC 10, and the official release verification passed.
 
 The unchanged client-common failure is `src/utils/local-model-radar.test.ts:41`: the test expects DFlash speculation `0.5`, while the existing implementation returns `0.4`. It was reproduced using copies of the source and test extracted from the starting Git revision. Neither file was changed for Chat.
 
@@ -44,7 +44,7 @@ Hardware: Apple M4 Max, 64 GiB unified memory, Metal.
 
 These were functional checks, not comparative model benchmarks. They were run through `mrig script --backend metal --host local`, with purpose and duration estimates. Reusable live-check sources are [local-chat.ts](local-chat.ts) and [context-limit.ts](context-limit.ts).
 
-Native model metadata correctly exposes MiniCPM5's `none` as **Off**, and `high` as **High**. The LFM model's mandatory single effort hides the redundant selector. Four-level metadata is also covered by deterministic tests; unsupported Low/Medium choices are never invented.
+Native model metadata correctly exposes MiniCPM5's `none` as **Off**, and `high` as **High**. The thinking control always stays visible. Models without reasoning show disabled **Off**; fixed mandatory reasoning shows the actual fixed level, disabled. Both have keyboard-accessible explanations. The LFM model currently reports mandatory **High** reasoning, so its disabled control shows **High**. Four-level metadata is also covered by deterministic tests; unsupported Low/Medium choices are never invented.
 
 ## UI review
 
@@ -55,3 +55,13 @@ The review found and corrected the initial Stop race, a narrow drawer translatio
 ![Native Chat in dark mode](native-chat-dark.png)
 
 ![Narrow Chat in light mode](chat-light-narrow.png)
+
+## Thinking control visibility correction
+
+Removed conditional hiding after review. Added six rendering regressions covering absent model selection, no reasoning metadata, Off-only capability, fixed mandatory reasoning, all four configurable levels, and an unsupported previous selection. The complete web suite passes (328 tests), the reasoning capability tests pass (4), and the targeted web type check passes.
+
+Verified the actual native and browser controls with Liquid and MiniCPM/Qwen: disabled fixed level stays visible, keyboard focus opens its explanation, Enter/Space cannot open a disabled menu, switching models re-enables the dropdown, and Off remains selectable where supported. An isolated browser fixture using the production component also verified the no-thinking **Off** tooltip and four-level **Medium** selection, then was removed. No additional inference run was needed for this presentation-only change.
+
+![Native fixed thinking control with explanation](native-thinking-fixed.png)
+
+![Unsupported thinking control and tooltip in isolated component check](thinking-off.png)
