@@ -2527,6 +2527,7 @@ dependencies = [
 name = "magnitude-kernels"
 version = "0.1.0"
 dependencies = [
+ "magnitude-ggml",
  "seismic",
  "seismic-build",
  "seismic-lang",

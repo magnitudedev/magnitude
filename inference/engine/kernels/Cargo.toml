@@ -11,6 +11,7 @@ seismic.workspace = true
 seismic-build.workspace = true
 
 [dev-dependencies]
+magnitude-ggml.workspace = true
 seismic-lang.workspace = true
 seismic-std.workspace = true
 # Offline formation of focused requests (`tests/priming_formation.rs`).
