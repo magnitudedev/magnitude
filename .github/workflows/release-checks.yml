@@ -3,6 +3,10 @@ name: Release checks
 on:
   workflow_dispatch:
     inputs:
+      intel_installer_only:
+        description: Exercise the signed Intel Mac installer and CPU inference from the existing audit artifacts
+        type: boolean
+        default: false
       windows_fixture_only:
         description: Build only the timestamped Windows installer fixture, reusing the existing native engine for tests
         type: boolean
@@ -55,11 +59,11 @@ jobs:
       model: ${{ inputs.macos_cpu_model }}
 
   integrations:
-    if: ${{ !inputs.macos_cpu_artifact_run_id && !inputs.windows_fixture_only }}
+    if: ${{ !inputs.macos_cpu_artifact_run_id && !inputs.windows_fixture_only && !inputs.intel_installer_only }}
     uses: ./.github/workflows/integrations.yml
 
   static:
-    if: ${{ !inputs.macos_cpu_artifact_run_id && !inputs.windows_fixture_only }}
+    if: ${{ !inputs.macos_cpu_artifact_run_id && !inputs.windows_fixture_only && !inputs.intel_installer_only }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -90,7 +94,7 @@ jobs:
       - run: bun run packages/release/scripts/matrix.ts
 
   release-build:
-    if: ${{ !inputs.macos_cpu_artifact_run_id && !inputs.windows_fixture_only }}
+    if: ${{ !inputs.macos_cpu_artifact_run_id && !inputs.windows_fixture_only && !inputs.intel_installer_only }}
     permissions:
       contents: read
       actions: read
@@ -146,3 +150,56 @@ jobs:
             ${{ runner.temp }}/installer-audit/hosting/
             ${{ runner.temp }}/installer-audit/acceptance-publisher.cer
           if-no-files-found: error
+
+  intel-installer:
+    if: github.event_name == 'workflow_dispatch' && inputs.intel_installer_only
+    runs-on: macos-15-large
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: host-darwin-x64
+          path: native
+          run-id: 40220873374
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: installer-fixture-darwin-x64
+          path: fixture
+          run-id: 40220873374
+          github-token: ${{ github.token }}
+      - name: Prepare disposable local installer and engine feeds
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import pathlib,json,shutil
+          root=pathlib.Path.home()/'installer-audit-next';root.mkdir(mode=0o700)
+          fixture=pathlib.Path('fixture');hosting=fixture/'hosting' if (fixture/'hosting').exists() else fixture
+          shutil.copytree(hosting,root/'hosting')
+          artifacts=[json.loads(p.read_text()) for p in pathlib.Path('native').glob('*.artifact.json')]
+          plan=json.loads(pathlib.Path('packages/release/release-plan.json').read_text())
+          release=root/'release/@magnitudedev/cli@0.2.10';release.mkdir(parents=True)
+          manifest={'schemaVersion':2,'version':'0.2.10','acnRevision':plan['revision'],'tag':'@magnitudedev/cli@0.2.10','sourceCommit':'c344259558f95dbfdbb643c1b559a2ca126f9332','rpc':plan['rpc'],'plugins':[],'artifacts':artifacts}
+          (release/'magnitude-release.json').write_text(json.dumps(manifest))
+          engine=next(a for a in artifacts if a['id']=='icn-base-darwin-x64')
+          shutil.copy2(pathlib.Path('native')/engine['filename'],release/engine['filename'])
+          (root/'tls.conf').write_text('[req]\ndistinguished_name=subject\nx509_extensions=extensions\nprompt=no\n[subject]\nCN=localhost\n[extensions]\nsubjectAltName=DNS:localhost,DNS:github.com\n')
+          PYTHON
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -config "$HOME/installer-audit-next/tls.conf" -keyout "$HOME/installer-audit-next/fixture-tls.key" -out "$HOME/installer-audit-next/fixture-tls.crt"
+      - name: Run the unchanged signed installer and real CPU API acceptance
+        run: |
+          uv run --project inference/evaluation mrig script scripts/installer-audit-intel.sh --host local --backend cpu --purpose 'Qualify native Intel macOS15 curl installer, cold engine acquisition, current CLI, final response and streaming from the exact built archives' --estimate 8m
+          grep -q 'RESULT=next-complete-answer-and-streaming-passed' "$HOME/installer-audit-next/acceptance-api.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: intel-installer-acceptance
+          path: |
+            /Users/runner/installer-audit-next/*.log
+            /Users/runner/installer-audit-next/*.json
+          if-no-files-found: warn
