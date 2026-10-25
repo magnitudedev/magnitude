@@ -383,12 +383,7 @@ impl Former {
 
     /// The row layout weights are resident in on this backend.
     fn resident_layout(&self) -> registry::Layout {
-        match self {
-            Self::Vulkan => registry::Layout::Rows16,
-            Self::Cuda { .. } => registry::Layout::Mma16,
-            #[cfg(target_os = "macos")]
-            Self::Metal { .. } => registry::Layout::Rows32,
-        }
+        self.backend().resident_layout()
     }
 
     fn backend(&self) -> BackendName {

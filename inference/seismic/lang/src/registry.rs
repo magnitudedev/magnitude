@@ -9,6 +9,7 @@
 
 use crate::ids::{CapabilityId, IntrinsicId, RepresentationConversionId, RepresentationId};
 use crate::types::DType;
+use magnitude_ggml::Encoding;
 
 pub use crate::repr::{
     CodeInterpretation, DecodeComponent, DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFormat,
@@ -53,6 +54,18 @@ impl BackendName {
             BackendName::Metal => "metal",
             BackendName::Cuda => "cuda",
             BackendName::Vulkan => "vulkan",
+        }
+    }
+
+    /// The row layout this backend's native kernels read resident packed
+    /// weights in: Metal `rows32`, CUDA `mma16`, Vulkan `rows16`, the CPU
+    /// `rows8`.
+    pub const fn resident_layout(self) -> Layout {
+        match self {
+            BackendName::Cpu => Layout::Rows8,
+            BackendName::Metal => Layout::Rows32,
+            BackendName::Cuda => Layout::Mma16,
+            BackendName::Vulkan => Layout::Rows16,
         }
     }
 
@@ -1350,6 +1363,84 @@ pub fn representation_conversion_info(
 ) -> &'static RepresentationConversion {
     internals::representation_conversion_info(id)
 }
+/// A GGUF source the registry converts from: its ggml type, the type's
+/// blocks one source packet holds, its storage name, and the resident
+/// representation its conversion writes. Packet bytes and values are the
+/// type's block geometry (`magnitude_ggml`) times `blocks`.
+#[derive(Clone, Copy, Debug)]
+struct GgufSource {
+    encoding: Encoding,
+    blocks: u64,
+    name: &'static str,
+    resident: &'static str,
+}
+
+const fn gguf_source_spec(
+    encoding: Encoding,
+    blocks: u64,
+    name: &'static str,
+    resident: &'static str,
+) -> GgufSource {
+    GgufSource {
+        encoding,
+        blocks,
+        name,
+        resident,
+    }
+}
+
+const GGUF_SOURCES: [GgufSource; 17] = [
+    gguf_source_spec(Encoding::Q3K, 1, "gguf_q3_k", "q6k"),
+    gguf_source_spec(Encoding::Iq3S, 1, "gguf_iq3_s", "q6k"),
+    gguf_source_spec(Encoding::Q4K, 1, "gguf_q4_k", "q4k"),
+    gguf_source_spec(Encoding::Q5K, 1, "gguf_q5_k", "q5k"),
+    gguf_source_spec(Encoding::Q6K, 1, "gguf_q6_k", "q6k"),
+    gguf_source_spec(Encoding::Q8_0, 1, "gguf_q8_0", "q8g32s"),
+    gguf_source_spec(Encoding::Iq4Nl, 8, "gguf_iq4_nl", "iq4g32"),
+    gguf_source_spec(Encoding::Iq4Xs, 1, "gguf_iq4_xs", "iq4g32"),
+    gguf_source_spec(Encoding::Q4_0, 1, "gguf_q4_0", "q4g32s"),
+    gguf_source_spec(Encoding::Iq4Nl, 1, "gguf_iq4_nl_block", "iq4g32s"),
+    gguf_source_spec(Encoding::Q5_0, 1, "gguf_q5_0", "q5g32s"),
+    gguf_source_spec(Encoding::Q5_1, 1, "gguf_q5_1", "q5g32"),
+    gguf_source_spec(Encoding::Mxfp4, 1, "gguf_mxfp4", "mxfp4g32"),
+    gguf_source_spec(Encoding::Nvfp4, 1, "gguf_nvfp4", "nvfp4g16"),
+    gguf_source_spec(Encoding::Iq2Xs, 1, "gguf_iq2_xs", "iq2xs"),
+    gguf_source_spec(Encoding::Iq3Xxs, 1, "gguf_iq3_xxs", "iq3xxs"),
+    gguf_source_spec(Encoding::Iq2Xxs, 1, "gguf_iq2_xxs", "iq2xxs"),
+];
+
+/// The external storage rows of `width` stored values of `encoding` are
+/// read as: the registered source of the most blocks whose packet divides
+/// the row (a GGUF row is whole blocks); `None` when the registry converts
+/// from none.
+pub fn gguf_source(encoding: Encoding, width: u64) -> Option<RepresentationId> {
+    GGUF_SOURCES
+        .iter()
+        .filter(|source| {
+            source.encoding == encoding
+                && width.is_multiple_of(encoding.block_elements() * source.blocks)
+        })
+        .max_by_key(|source| source.blocks)
+        .and_then(|source| representation(source.name))
+}
+
+/// The storage `source`'s registered conversion writes in `layout` for
+/// products taking `operands`. A source converts into one representation,
+/// which has one element per layout and operand recipe, so it is unique.
+pub fn conversion_destination(
+    source: RepresentationId,
+    layout: Layout,
+    operands: OperandRecipe,
+) -> Option<RepresentationId> {
+    representations()
+        .iter()
+        .find(|info| {
+            info.layout == layout
+                && info.operands == operands
+                && representation_conversion(source, info.id).is_some()
+        })
+        .map(|info| info.id)
+}
 /// A registry table indexed by one kind of typed registry identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Table {
@@ -1641,25 +1732,13 @@ pub(crate) mod internals {
         // stored) is an iq4g32s packet. Q4_0, Q5_0, Q5_1, MXFP4 and NVFP4
         // move their codes and scale fields bit for bit into representations
         // of their own.
-        let external_specs = [
-            ("gguf_q3_k", 110, 256, "q6k"),
-            ("gguf_iq3_s", 110, 256, "q6k"),
-            ("gguf_q4_k", 144, 256, "q4k"),
-            ("gguf_q5_k", 176, 256, "q5k"),
-            ("gguf_q6_k", 210, 256, "q6k"),
-            ("gguf_q8_0", 34, 32, "q8g32s"),
-            ("gguf_iq4_nl", 144, 256, "iq4g32"),
-            ("gguf_iq4_xs", 136, 256, "iq4g32"),
-            ("gguf_q4_0", 18, 32, "q4g32s"),
-            ("gguf_iq4_nl_block", 18, 32, "iq4g32s"),
-            ("gguf_q5_0", 22, 32, "q5g32s"),
-            ("gguf_q5_1", 24, 32, "q5g32"),
-            ("gguf_mxfp4", 17, 32, "mxfp4g32"),
-            ("gguf_nvfp4", 36, 64, "nvfp4g16"),
-            ("gguf_iq2_xs", 74, 256, "iq2xs"),
-            ("gguf_iq3_xxs", 98, 256, "iq3xxs"),
-            ("gguf_iq2_xxs", 66, 256, "iq2xxs"),
-        ];
+        let external_specs = GGUF_SOURCES.map(|source| {
+            let packet_size = u32::try_from(source.encoding.block_bytes() * source.blocks)
+                .expect("a GGUF source packet fits u32 bytes");
+            let logical_group = u32::try_from(source.encoding.block_elements() * source.blocks)
+                .expect("a GGUF source packet fits u32 values");
+            (source.name, packet_size, logical_group, source.resident)
+        });
         for (name, packet_size, logical_group, _) in external_specs {
             representations.push(RepresentationInfo {
                 id: RepresentationId::new(representations.len() as u32),

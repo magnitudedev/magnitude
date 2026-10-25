@@ -2240,6 +2240,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "libc",
+ "magnitude-ggml",
  "serde",
  "sha2 0.11.0",
 ]
@@ -2470,6 +2471,13 @@ version = "0.1.0"
 dependencies = [
  "magnitude-artifacts",
  "magnitude-executor",
+ "serde",
+]
+
+[[package]]
+name = "magnitude-ggml"
+version = "0.1.0"
+dependencies = [
  "serde",
 ]
 
@@ -4109,6 +4117,7 @@ dependencies = [
 name = "seismic"
 version = "0.1.0"
 dependencies = [
+ "magnitude-ggml",
  "seismic-compiler",
  "seismic-lang",
  "seismic-measure",
@@ -4222,6 +4231,7 @@ name = "seismic-lang"
 version = "0.1.0"
 dependencies = [
  "dunce",
+ "magnitude-ggml",
  "num-bigint",
  "num-traits",
  "postcard",

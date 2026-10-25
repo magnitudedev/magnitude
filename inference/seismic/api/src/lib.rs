@@ -457,6 +457,28 @@ impl Element {
     pub fn stored(storage: &str, layout: Layout) -> Option<Element> {
         seismic_lang::registry::storage(storage, layout).map(Element)
     }
+    /// The external storage rows of `width` stored values of `encoding`
+    /// are read as, when the registry converts from it.
+    pub fn gguf_source(encoding: magnitude_ggml::Encoding, width: u64) -> Option<Element> {
+        seismic_lang::registry::gguf_source(encoding, width).map(Element)
+    }
+    /// Every external (artifact-format) storage the registry converts from.
+    pub fn external_sources() -> impl Iterator<Item = Element> {
+        seismic_lang::registry::representations()
+            .iter()
+            .filter(|info| {
+                matches!(
+                    info.kind,
+                    seismic_lang::registry::RepresentationKind::External(_)
+                )
+            })
+            .map(|info| Element(info.id))
+    }
+    /// The storage this external source's registered conversion writes in
+    /// `layout` for products taking `operands`; `None` when it has none.
+    pub fn converted(&self, layout: Layout, operands: OperandRecipe) -> Option<Element> {
+        seismic_lang::registry::conversion_destination(self.0, layout, operands).map(Element)
+    }
     /// How products over this element take their activation operands
     /// (`operands(W)`).
     pub fn operand_recipe(&self) -> OperandRecipe {

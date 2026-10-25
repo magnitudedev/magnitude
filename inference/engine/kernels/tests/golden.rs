@@ -410,11 +410,7 @@ struct Ctx {
 
 impl Ctx {
     fn layout(&self) -> Layout {
-        match self.backend {
-            BackendName::Cuda => Layout::Mma16,
-            BackendName::Metal => Layout::Rows32,
-            _ => Layout::Rows16,
-        }
+        self.backend.resident_layout()
     }
     fn tensor(&self, element: Element, shape: &[u64], bytes: &[u8]) -> Tensor {
         Tensor::from_host(&self.device, element, shape, bytes)

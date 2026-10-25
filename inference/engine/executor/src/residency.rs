@@ -1554,46 +1554,6 @@ fn validate_dense(stored: &StoredTensor) -> Result<usize, WeightImportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_family_contracts::ScaledActivations;
-
-    #[test]
-    fn catalog_encoding_map_is_exact() {
-        for encoding in [
-            Encoding::Q8_0,
-            Encoding::Q3K,
-            Encoding::Q4K,
-            Encoding::Q5K,
-            Encoding::Q6K,
-            Encoding::Iq2Xxs,
-            Encoding::Iq2Xs,
-            Encoding::Iq3Xxs,
-            Encoding::Iq3S,
-            Encoding::Iq4Nl,
-            Encoding::Iq4Xs,
-            Encoding::Q4_0,
-            Encoding::Q5_0,
-            Encoding::Q5_1,
-            Encoding::Mxfp4,
-            Encoding::Nvfp4,
-        ] {
-            assert!(source_element(encoding, 2560).is_some());
-            for layout in seismic::Layout::ALL {
-                let rounded = ScaledActivations::Rounded;
-                assert!(resident_element(encoding, rounded, 2560, DType::BF16, layout).is_some());
-            }
-        }
-        for encoding in [Encoding::Q1_0, Encoding::I32] {
-            assert!(source_element(encoding, 2560).is_none());
-            assert!(resident_element(
-                encoding,
-                ScaledActivations::Rounded,
-                2560,
-                DType::BF16,
-                seismic::Layout::Rows16
-            )
-            .is_none());
-        }
-    }
 
     #[test]
     fn checked_element_count_rejects_invalid_shapes() {

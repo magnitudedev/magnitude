@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "solver",
   "solver/lab",
+  "ggml",
   "engine",
   "engine/artifacts",
   "engine/chat",
@@ -108,6 +109,7 @@ serde = { version = "=1.0.229", features = ["derive"] }
 postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
 seismic-std = { path = "seismic-std" }
 seismic-lang = { path = "seismic/lang" }
+magnitude-ggml = { path = "ggml" }
 seismic-metal = { path = "seismic/backends/metal" }
 seismic-cpu = { path = "seismic/backends/cpu" }
 seismic-cuda = { path = "seismic/backends/cuda" }

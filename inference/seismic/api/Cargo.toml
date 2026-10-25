@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+magnitude-ggml.workspace = true
 seismic-lang.workspace = true
 seismic-compiler.workspace = true
 seismic-runtime.workspace = true

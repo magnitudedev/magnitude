@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 dunce = "=1.0.5"
+magnitude-ggml.workspace = true
 num-bigint = "=0.4.8"
 num-traits = "=0.2.19"
 postcard.workspace = true

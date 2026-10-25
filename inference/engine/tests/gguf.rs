@@ -343,7 +343,7 @@ fn every_prefix_of_a_real_header_walks_as_the_whole_header_cut_short() {
         let known = header
             .tensors
             .iter()
-            .filter(|tensor| Encoding::try_from(tensor.type_id).is_ok());
+            .filter(|tensor| Encoding::from_id(tensor.type_id).is_some());
         assert_eq!(directory.tensors.len(), known.clone().count(), "{name}");
         for (descriptor, tensor) in directory.tensors.iter().zip(known) {
             let mut shape = tensor.dimensions().collect::<Vec<_>>();

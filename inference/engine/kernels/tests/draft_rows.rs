@@ -37,11 +37,7 @@ impl Random {
 
 /// The resident layout of the device's backend.
 fn resident_layout(device: &Device) -> Layout {
-    match device.backend() {
-        seismic::BackendName::Cuda => Layout::Mma16,
-        seismic::BackendName::Metal => Layout::Rows32,
-        _ => Layout::Rows16,
-    }
+    device.backend().resident_layout()
 }
 
 /// The resident q8 element of the device's backend.
