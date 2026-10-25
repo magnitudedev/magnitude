@@ -30,7 +30,7 @@ const run = Effect.gen(function* () {
   for (const name of yield* fs.readDirectory(artifacts)) {
     if (!name.endsWith('.artifact.json')) continue
     const artifact = JSON.parse(yield* fs.readFileString(join(artifacts,name)))
-    if (os === 'darwin' ? artifact.kind !== 'desktop-update' : artifact.kind !== 'desktop-installer') continue
+    if (artifact.kind !== 'desktop' || (os === 'darwin' && !artifact.filename.endsWith('.zip'))) continue
     const format = os === 'darwin' ? 'mac-zip' : artifact.filename.endsWith('.deb') ? 'deb' : artifact.filename.endsWith('.rpm') ? 'rpm' : 'pacman'
     const destination = join(hosting,format)
     yield* writeInstallationDistribution({output:destination,origin:'https://localhost:18443',appleTeam:process.env.APPLE_TEAM_ID || '8YCG6CT28C',windowsPublisher:'Magnitude Update Acceptance',publicKey:config.publicKey})

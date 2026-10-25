@@ -51,26 +51,22 @@ jobs:
         run: echo "version=$(jq -r '.version' packages/launcher/package.json)" >> "$GITHUB_OUTPUT"
 
   catalog:
+    permissions:
+      contents: read
+      actions: read
     runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v4
+      # Reuse the immutable planner bundle already built from the same application source.
+      - uses: actions/download-artifact@v4
         with:
-          ref: ${{ inputs.source_commit }}
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: ${{ env.BUN_VERSION }}
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-      - uses: ./.github/actions/build-cache
-        with:
-          scope: catalog
-      - run: bun install --frozen-lockfile
-      - run: bun run icn:catalog:build-bundle
+          name: catalog-inputs
+          path: catalog-inputs
+          run-id: 40220014974
+          github-token: ${{ github.token }}
       - uses: actions/upload-artifact@v4
         with:
           name: catalog-inputs
-          path: inference/target/catalog-inputs/
+          path: catalog-inputs/
           if-no-files-found: error
 
   # Every native kernel forms with each GPU backend's real toolchain, and every kernel every
@@ -225,6 +221,11 @@ jobs:
           AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
           AZURE_SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_SIGNING_CERTIFICATE_PROFILE }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-${{ matrix.id }}
+          path: release/${{ matrix.id }}/
+          if-no-files-found: error
       - name: Prepare Unix script offers for the built candidate
         if: runner.os != 'Windows'
         run: bun scripts/installer-audit-fixture.ts finish "${{ runner.temp }}/installer-audit" "release/${{ matrix.id }}" "${{ matrix.id }}"
@@ -256,11 +257,6 @@ jobs:
           path: |
             ${{ runner.temp }}/installer-audit/hosting/
             ${{ runner.temp }}/installer-audit/acceptance-publisher.cer
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        with:
-          name: host-${{ matrix.id }}
-          path: release/${{ matrix.id }}/
           if-no-files-found: error
       - name: Retain Apple notarization diagnostics
         if: always() && runner.os == 'macOS' && inputs.apple_distribution
