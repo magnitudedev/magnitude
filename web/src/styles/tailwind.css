@@ -10,6 +10,41 @@
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 @custom-variant mac (&:where([data-desktop-platform="darwin"], [data-desktop-platform="darwin"] *));
 
+.settings-status-card { --status-quiet: var(--magnitude-slate-500); --status-soft: var(--magnitude-slate-600); --status-ink: var(--magnitude-slate-800); --status-track: var(--magnitude-slate-150); --status-bg: white; --memory-weights: var(--magnitude-blue-600); --memory-cache: var(--magnitude-violet-400); --memory-runtime: var(--magnitude-slate-400); border: 1px solid var(--magnitude-slate-300); border-radius: 8px; background: var(--status-bg); color: var(--status-ink); overflow: hidden; }
+[data-theme=dark] .settings-status-card { --status-quiet: var(--magnitude-slate-400); --status-soft: var(--magnitude-slate-300); --status-ink: var(--magnitude-slate-200); --status-track: var(--magnitude-slate-750); --status-bg: var(--magnitude-slate-850); --memory-weights: var(--magnitude-blue-400); --memory-runtime: var(--magnitude-slate-500); border-color: var(--magnitude-slate-750); }
+.settings-status-top { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 14px 16px 0; min-height: 42px; }
+.settings-status-model { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.settings-status-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; line-height: 22px; font-weight: 500; }
+.settings-status-logo { display: inline-block; width: 15px; height: 15px; margin-right: 7px; vertical-align: -2.5px; object-fit: contain; }
+.settings-service-indicator { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 12px; height: 18px; color: var(--status-quiet); }
+.settings-service-indicator > svg { width: 13px; height: 13px; }
+.settings-service-indicator > span { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.settings-service-indicator.is-ready { color: var(--magnitude-green-600); }
+[data-theme=dark] .settings-service-indicator.is-ready { color: var(--magnitude-green-400); }
+.settings-service-indicator.is-failed { color: var(--magnitude-red-500); }
+.settings-status-controls { display: flex; align-items: center; justify-content: flex-end; flex-shrink: 0; gap: 22px; }
+.settings-status-action { width: 90px; flex-shrink: 0; }
+.settings-status-activity { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; line-height: 20px; color: var(--status-quiet); white-space: nowrap; }
+.settings-status-activity > svg { width: 12px; height: 12px; }
+.settings-status-activity > strong { margin-left: 2px; color: var(--status-soft); font-weight: 500; font-variant-numeric: tabular-nums; }
+.settings-memory { padding: 12px 16px 13px; }
+.settings-memory-bar { display: flex; width: 100%; height: 7px; overflow: hidden; border-radius: 3px; background: var(--status-track); }
+.settings-memory-segment { height: 100%; flex-shrink: 0; }
+.settings-memory-segment + .settings-memory-segment { border-left: 2px solid var(--status-bg); }
+.settings-memory-segment.weights, .settings-memory-key.weights { background: var(--memory-weights); }
+.settings-memory-segment.cache, .settings-memory-key.cache { background: var(--memory-cache); }
+.settings-memory-segment.runtime, .settings-memory-key.runtime { background: var(--memory-runtime); }
+.settings-memory-legend { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 9px; font-size: 11px; line-height: 17px; color: var(--status-quiet); }
+.settings-memory-total { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; color: var(--status-soft); font-weight: 500; }
+.settings-memory-total > strong { font-size: 12px; font-weight: 600; color: var(--status-ink); font-variant-numeric: tabular-nums; }
+.settings-memory-pending { color: var(--status-quiet); font-weight: 400; }
+.settings-memory-parts { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px 16px; }
+.settings-memory-item { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.settings-memory-item > strong { color: var(--status-soft); font-weight: 500; font-variant-numeric: tabular-nums; }
+.settings-memory-key { width: 5px; height: 5px; border-radius: 1px; flex-shrink: 0; }
+@media (max-width: 1100px) { .settings-status-top { gap: 16px; } .settings-status-controls { gap: 14px; } .settings-status-activity { font-size: 10px; gap: 4px; } }
+@media (max-width: 650px) { .settings-status-top { flex-wrap: wrap; gap: 8px; padding-top: 12px; } .settings-status-controls { width: 100%; justify-content: space-between; } .settings-status-action { width: 80px; margin-left: auto; } .settings-memory { padding-top: 10px; } .settings-memory-legend { flex-wrap: wrap; gap: 6px 14px; } .settings-memory-parts { margin-left: auto; gap: 6px 14px; } .settings-memory-item { font-size: 10px; gap: 4px; } }
+
 @theme inline {
   --color-*: initial;
   --color-transparent: transparent;

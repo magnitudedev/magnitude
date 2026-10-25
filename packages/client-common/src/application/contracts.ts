@@ -1,7 +1,7 @@
 import { Schema } from "effect"
 import { HuggingFaceArtifactSelectorSchema, HuggingFaceRepositoryIdSchema } from "@magnitudedev/sdk/desktop-host"
 
-export const ApplicationPage = Schema.Literal("discover", "catalog", "models", "chat", "connections", "usage", "status", "settings")
+export const ApplicationPage = Schema.Literal("discover", "catalog", "models", "chat", "connections", "usage", "settings")
 export type ApplicationPage = typeof ApplicationPage.Type
 /** A message raised outside the renderer, shown in the app while its window exists. */
 export const HostNotice = Schema.Struct({ title: Schema.String, description: Schema.String })

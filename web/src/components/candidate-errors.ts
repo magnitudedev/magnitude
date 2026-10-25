@@ -11,7 +11,7 @@ export interface CandidateNotice extends NoticeContent {
   readonly access?: HuggingFaceAccessRequired
 }
 
-const unreachable = { title: "Couldn’t reach the Magnitude service", description: "Check the service on Status, then try again.", retryable: true }
+const unreachable = { title: "Couldn’t reach the Magnitude service", description: "Check the service in Settings, then try again.", retryable: true }
 
 const sourceUnavailableNotice = (error: ModelSourceUnavailable): CandidateNotice => {
   switch (error.reason) {

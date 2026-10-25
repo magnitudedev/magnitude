@@ -9,7 +9,7 @@ const bridge: DesktopApi = window.__magnitudeDesktop
 
 const failure = (error: unknown) => {
   const decoded = Schema.decodeUnknownEither(Schema.Struct({ message: Schema.String }))(error)
-  return new ApplicationHostFailed({ message: decoded._tag === "Right" ? decoded.right.message : "Magnitude could not complete this action. Try again or check Status." })
+  return new ApplicationHostFailed({ message: decoded._tag === "Right" ? decoded.right.message : "Magnitude could not complete this action. Try again or check Settings." })
 }
 const call = <A,>(action: () => Promise<A>) => Effect.tryPromise({ try: action, catch: failure })
 const observe = <A, I>(schema: Schema.Schema<A, I>, subscribe: (value: (encoded: I) => void, error: (message: string) => void) => () => void) =>

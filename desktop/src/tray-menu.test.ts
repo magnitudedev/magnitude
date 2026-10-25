@@ -9,12 +9,12 @@ const model = {
   canStop: true,
 }
 describe("native tray menu", () => {
-  it.each(["Starting", "Failed", "CleanupFailed", "Stopping", "Stopped"] as const)("keeps Open, Status, and Quit available during %s without stale model actions", service => {
+  it.each(["Starting", "Failed", "CleanupFailed", "Stopping", "Stopped"] as const)("keeps Open, Settings, and Quit available during %s without stale model actions", service => {
     const menu = buildTrayMenu({ service, model, updateReady: false }, actions())
     const labels = menu.flatMap(item => "label" in item && typeof item.label === "string" ? [item.label] : [])
     expect(labels).toContain("Model status unavailable")
     expect(labels).toContain("Open Magnitude")
-    expect(labels).toContain("Status")
+    expect(labels).toContain("Settings")
     expect(labels).toContain("Quit Magnitude")
     expect(labels).not.toContain("Stop Model")
     expect(labels).not.toContain(model.label)
@@ -30,7 +30,7 @@ describe("native tray menu", () => {
     const callbacks = actions()
     const menu = buildTrayMenu({ service: "Ready", model, updateReady: true }, callbacks)
     for (const item of menu) if ("click" in item) item.click?.()
-    expect(callbacks.open.mock.calls).toEqual([[], ["discover"], ["status"]])
+    expect(callbacks.open.mock.calls).toEqual([[], ["discover"], ["settings"]])
     expect(callbacks.stopModel).toHaveBeenCalledOnce()
     expect(callbacks.quit).toHaveBeenCalledOnce()
     expect(callbacks.restartUpdate).toHaveBeenCalledOnce()

@@ -10,8 +10,6 @@ export const pageLayout = {
   recommendationPane: "min-w-0 border-t border-slate-200 p-5 dark:border-slate-750 lg:border-l lg:border-t-0",
   recommendationToolbar: "mb-4 flex flex-wrap items-center justify-between gap-3",
   modelRadar: "mx-auto my-3 aspect-[360/270] w-full max-w-sm",
-  statusStack: "mt-7 space-y-6",
-  statusHero: "rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850",
   card: "rounded-2xl border border-slate-200 bg-white p-6 dark:border-slate-750 dark:bg-slate-850",
   settingsCard: "mt-6 rounded-lg border border-slate-300 bg-white px-5 py-5 dark:border-slate-750 dark:bg-slate-850",
   pageTitle: "shrink-0 font-heading text-[24px] font-semibold tracking-tight md:text-[28px]",

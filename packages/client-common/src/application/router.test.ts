@@ -13,6 +13,7 @@ describe("application routes", () => {
   })
   it("rejects paths that are not pages", () => {
     expect(pageFromPath("/inference/v1")).toEqual(Option.none())
+    expect(pageFromPath("/status")).toEqual(Option.none())
     expect(pageFromPath("/settings/network")).toEqual(Option.none())
   })
 })

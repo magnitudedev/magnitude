@@ -116,7 +116,7 @@ export function HuggingFaceRowView({ account, pending, notice, deviceCode, onSig
 }) {
   if (!Result.isSuccess(account)) return <SettingsRow label={huggingFaceLabel}
     hint={Result.isFailure(account) ? undefined : <SkeletonLine className="h-4 text-xs" width="220px" />}
-    alert={Result.isFailure(account) ? <ErrorNotice title="Couldn’t read your Hugging Face account" description="Check the service on Status, then try again." /> : undefined} />
+    alert={Result.isFailure(account) ? <ErrorNotice title="Couldn’t read your Hugging Face account" description="Check the service in Settings, then try again." /> : undefined} />
   const current = account.value
   const code = visibleDeviceCode(current, deviceCode, Date.now())
   return <SettingsRow label={huggingFaceLabel} hint={<AccountHint account={current} />} alert={notice && <ErrorNotice {...notice} />}

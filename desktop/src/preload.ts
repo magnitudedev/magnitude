@@ -20,7 +20,7 @@ const command = (select: (client: InferenceHostClient) => Effect.Effect<unknown,
     const failure = Cause.failureOption(cause)
     // contextBridge preserves ordinary Error messages, not Effect's FiberFailure identity.
     throw new Error(Option.isSome(failure) && Schema.is(HostError)(failure.value)
-      ? failure.value.message : "Magnitude could not complete this action. Try again or check Status.")
+      ? failure.value.message : "Magnitude could not complete this action. Try again or check Settings.")
   },
 }))
 const query = <A>(select: (client: InferenceHostClient) => Effect.Effect<A, unknown>) => runtime.runPromiseExit(Effect.flatMap(HostClient, select)).then(Exit.match({
@@ -28,7 +28,7 @@ const query = <A>(select: (client: InferenceHostClient) => Effect.Effect<A, unkn
   onFailure: cause => {
     const failure = Cause.failureOption(cause)
     throw new Error(Option.isSome(failure) && Schema.is(HostError)(failure.value)
-      ? failure.value.message : "Magnitude could not complete this action. Try again or check Status.")
+      ? failure.value.message : "Magnitude could not complete this action. Try again or check Settings.")
   },
 }))
 const api: DesktopApi = {

@@ -5,7 +5,7 @@ import { ChatPage } from "./components/chat"
 import { ErrorNotice, NoticeAction } from "./components/error-notice"
 import { LoadModelButton, fitNotice, loadRefusal } from "./components/model-fit"
 import { ModelLoadFailureIndicator, ModelLoadNotice, modelRemovalNotice, downloadNotice, modelCommandNotice } from "./components/model-error"
-import { LoadingRegion, SkeletonLine, ModelsSkeleton, ModelCardsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton } from "./components/page-skeletons"
+import { SkeletonLine, ModelsSkeleton, ModelCardsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton } from "./components/page-skeletons"
 import { pageLayout } from "./components/page-layout"
 import { RecommendationPreference } from "./components/model-preference-slider"
 import { ServingUsage } from "./components/serving-usage"
@@ -14,7 +14,6 @@ import { ActionTooltip, TooltipProvider } from "./components/ui/tooltip"
 import { Button } from "./components/ui/button"
 import { Switch } from "./components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select"
-import { Progress } from "./components/ui/progress"
 import { MagnitudeMark } from "./components/magnitude-mark"
 import {
   ChatCircleIcon,
@@ -23,9 +22,7 @@ import {
   StackIcon,
   CubeIcon,
   PlugIcon,
-  PulseIcon,
   ChartBarIcon,
-  CheckCircleIcon,
   SlidersIcon,
   DownloadSimpleIcon,
   CircleNotchIcon,
@@ -42,15 +39,15 @@ import { CopyCommand } from "./components/copy-command"
 import { useMemo, useRef, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
-import { type ProviderModelId, type CatalogLocalModel, type CustomModelAcquisitionState, type LocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
-import type { ApplicationSnapshot, AppearancePreference } from "@magnitudedev/sdk/desktop-host"
+import { type ProviderModelId, type CatalogLocalModel, type CustomModelAcquisitionState, type LocalModel, type ModelOptimizationProgress } from "@magnitudedev/sdk"
+import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessChange, type NetworkBind, type OwnerCapability } from "@magnitudedev/sdk"
 import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
 import { SettingsGroup, SettingsRow } from "./components/settings-row"
 import {
   activeLocalModel, useAgentClient, type ApplicationPage,
-  useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
-  describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
+  useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, useLocalInferenceHardware, formatLocalModelDisplayName,
+  describeModelOptimization,
   formatStorageSize, formatTransferRate, localModelIsInstalled, localModelProviderModelId, localModelConnectionOptions, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory,
   useCustomModels, useHiddenLocalModels, useUnsupportedLocalModels,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
@@ -63,7 +60,7 @@ import { signOut, useDisconnectWarning, useRemoteAccess, viewerPlatform } from "
 import { useNarrowViewport } from "./lib/viewport"
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "./components/ui/alert-dialog"
 import { HardwareOverview, ModelRadar } from "./components/discovery-visuals"
-import { MemoryBreakdown } from "./components/memory-breakdown"
+import { SettingsStatus } from "./components/settings-status"
 import { HarnessConnections, type CommandModel } from "./components/harness-connections"
 import { HarnessSetupList } from "./components/harness-setup"
 import { OtherApps } from "./components/other-apps"
@@ -85,8 +82,8 @@ const inferenceUrl = (address: string, port: number) => `http://${address}:${por
 const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
   ? `robocopy "${from}" "${to}" /E /MOVE`
   : `mv "${from}/"* "${to}/"`
-const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Discover", chat: "Chat", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
-const pageIcons = { discover: StackIcon, catalog: StackIcon, models: CubeIcon, chat: ChatCircleIcon, connections: PlugIcon, usage: ChartBarIcon, status: PulseIcon, settings: SlidersIcon }
+const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Discover", chat: "Chat", models: "My Models", connections: "Connections", usage: "Usage", settings: "Settings" }
+const pageIcons = { discover: StackIcon, catalog: StackIcon, models: CubeIcon, chat: ChatCircleIcon, connections: PlugIcon, usage: ChartBarIcon, settings: SlidersIcon }
 
 const minutesRemaining = (seconds: number) => seconds < 60 ? "Less than 1 min" : `About ${Math.ceil(seconds / 60)} min`
 /** Tuning's time remaining from its observed rate; units are measured configurations, so they track time. */
@@ -336,7 +333,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const request: Option.Option<AddDialogRequest> = Option.isSome(linkedRequest) ? linkedRequest : pageRequest
   const openDialog = (next: AddDialogRequest) => setPageRequest(Option.some(next))
   const closeDialog = () => { setPageRequest(Option.none()); if (Option.isSome(linkedRequest)) clearLinkedRequest() }
-  if (Result.isFailure(catalog)) return <><h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1><ErrorNotice title="Couldn’t load the model catalog" description="Model information is unavailable. Check the service on Status." className="mt-5" /></>
+  if (Result.isFailure(catalog)) return <><h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1><ErrorNotice title="Couldn’t load the model catalog" description="Model information is unavailable. Check the service in Settings." className="mt-5" /></>
   if (!Result.isSuccess(catalog) && !discover) return <ModelsSkeleton page={page} />
   const models = (Result.isSuccess(catalog) ? catalog.value.models : []).filter((model): model is CatalogLocalModel => model._tag === "Catalog")
   const custom = Result.isSuccess(customModels) ? customModels.value : []
@@ -433,8 +430,8 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value))?.model.modelId : undefined
   const defaultModel = commandModels.find(model => model.id === active)?.id ?? commandModels[0]?.id
   return <>
-    {!serviceReady && <p className="mt-5 text-sm text-slate-500">{desktop ? "Configuration checks are available. Start the service from Status before connecting a harness." : "Start the service from Status before setting up an agent."}</p>}
-    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service on Status." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("discover")}>Discover models</NoticeAction>} />}
+    {!serviceReady && <p className="mt-5 text-sm text-slate-500">{desktop ? "Configuration checks are available. Check the service in Settings before connecting a harness." : "Check the service in Settings before setting up an agent."}</p>}
+    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service in Settings." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("discover")}>Discover models</NoticeAction>} />}
     {desktop
       ? <DesktopHarnessConnections canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform} selectedModel={selectedModel} />
       : Option.isSome(apiOrigin) && <HarnessSetupList defaultModel={defaultModel} origin={apiOrigin.value} remote={remote} platform={viewerPlatform()} />}
@@ -459,127 +456,6 @@ function DesktopHarnessConnections({ canConnect, models, defaultModel, platform,
       : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={models} defaultModel={defaultModel} platform={platform}
           onConnect={harness => connect({ harness, model: selectedModel, installSkill: true })} onDisconnect={harness => disconnect({ harness })} />}
   </>
-}
-/** The model row's status: the load stage in full while loading, the memory in use once loaded. */
-const modelStatusText = (residency: ModelResidency, hardware: Option.Option<LocalInferenceHardware>): string => {
-  switch (residency._tag) {
-    case "Requested": return describeModelLoadStage("preparing", Option.none(), hardware)
-    case "Loading": return describeModelLoadStage(residency.stage, residency.plannedAllocation, hardware)
-    case "Ready": return `Loaded · ${formatModelMemory(residency.allocation)}`
-    case "Stopping": return "Stopping…"
-    case "Unloaded":
-    case "Stopped":
-    case "Failed": return "Not loaded"
-  }
-}
-/** A load's completed fraction; a requested load has not started. */
-const loadFraction = (residency: ModelResidency): Option.Option<number> => {
-  switch (residency._tag) {
-    case "Requested": return Option.some(0)
-    case "Loading": return Option.some(residency.fraction)
-    default: return Option.none()
-  }
-}
-function ModelStatus() {
-  const models = useLocalModels()
-  const hardware = useLocalInferenceHardware()
-  const { stop } = useLocalModelMutations()
-  const stopping = useLocalModelStopStatus()
-  const presentation = Result.isSuccess(models) ? modelTrayPresentation(models.value) : null
-  const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value)) : undefined
-  if (Result.isInitial(models)) return <LoadingRegion label="Loading model status" className="mt-5"><div className="flex h-12 items-center gap-3"><SkeletonLine className="h-6 w-64" /></div></LoadingRegion>
-  if (Result.isSuccess(models) && !active) return <div className="mt-5 flex min-h-12 items-center"><p className="m-0 text-base text-slate-500 dark:text-slate-400">No model is loaded yet. It will load automatically on the first request.</p></div>
-  return <div className="mt-5">
-    <div className="flex min-h-12 items-center justify-between gap-5">
-      <div className="flex min-w-0 items-center gap-3">
-        {active ? <ModelLogo model={active.model} className="size-6 shrink-0" /> : <CubeIcon aria-hidden="true" className="size-5 shrink-0 text-slate-400 dark:text-slate-500" />}
-        <div className="flex min-w-0 items-baseline gap-2">
-          <p title={active ? formatLocalModelDisplayName(active.model) : undefined} className={`m-0 min-w-0 truncate ${active ? "text-base font-medium text-slate-800 dark:text-slate-200" : "text-sm text-slate-500 dark:text-slate-400"}`}>{active ? formatLocalModelDisplayName(active.model) : presentation?.label ?? (Result.isFailure(models) ? "Model status unavailable" : "Reading model status…")}</p>
-          {active && <><span aria-hidden="true" className="text-slate-400 dark:text-slate-500">·</span><span className={`shrink-0 text-xs ${active.residency._tag === "Ready" ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>{modelStatusText(active.residency, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none())}</span></>}
-        </div>
-      </div>
-      {presentation?.canStop && <Button variant="outline" className="hover:border-red-300 hover:text-red-600 dark:hover:border-red-800 dark:hover:text-red-400" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button>}
-    </div>
-    {active && Option.match(loadFraction(active.residency), {
-      onNone: () => null,
-      onSome: fraction => <div className="mt-4 flex items-center gap-3">
-        <Progress aria-label="Model loading progress" className="flex-1" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={fraction * 100} />
-        <span className="w-9 shrink-0 text-right text-xs tabular-nums text-slate-500 dark:text-slate-400">{formatModelLoadPercentage(fraction)}</span>
-      </div>,
-    })}
-    {Result.isFailure(models) && <ErrorNotice title="Couldn’t read model status" description="Magnitude can’t confirm whether a model is running." className="mt-2" />}
-    {Option.isSome(stopping.failure) && <ErrorNotice title="Couldn’t stop the model" description={stopping.failure.value} className="mt-2" />}
-  </div>
-}
-function DownloadActivity() {
-  const models = useLocalModels()
-  const active = Result.isSuccess(models) ? models.value.models.filter(model => acquiring(model.acquisitionState) || model.acquisitionState._tag === "Removing") : []
-  if (Result.isInitial(models)) return null
-  if (Result.isSuccess(models) && active.length === 0) return null
-  return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-700">
-    {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Optimizing" ? "Optimizing" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} /></li>)}</ul>}
-  </div>
-}
-function Status({ observation }: { observation: ServiceObservation }) {
-  const session = useSession()
-  const retry = useAtomSet(session.retryService)
-  const retrying = useAtomValue(session.retryService)
-  const snapshot = Result.isSuccess(observation.service) ? observation.service.value : null
-  const service = snapshot ?? undefined
-  const tray = Option.getOrUndefined(observation.tray)
-  const ready=service?._tag === "Ready"
-  return <div className={pageLayout.statusStack}>
-    <section aria-busy={!snapshot} aria-label={!snapshot ? "Loading service status" : undefined} className={pageLayout.statusHero}>
-      <div className="flex items-center justify-between gap-4 border-b border-slate-200 pb-4 dark:border-slate-700">
-        <h2 className="m-0 text-base font-medium text-slate-600 dark:text-slate-300">Magnitude service</h2>
-        <div className={`flex h-8 items-center gap-2 rounded-full px-3 text-sm font-medium ${ready ? "bg-green-200/20 text-green-700 dark:bg-green-800/20 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>
-          {ready ? <CheckCircleIcon aria-label="Service ready" weight="fill" className="size-5 shrink-0" /> : <PulseIcon className="size-4 shrink-0" />}
-          <span>{!snapshot ? <SkeletonLine className="h-4 w-16 text-xs" /> : ready ? "Ready" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Unavailable" : "Starting"}</span>
-        </div>
-      </div>
-      {ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-5 h-12 w-64" /> : service?._tag === "Failed" || service?._tag === "CleanupFailed" ? null : <p className="mt-5 text-sm text-slate-500">Starting the service…</p>}
-      {ready && <DownloadActivity />}
-      {service && "message" in service && <ErrorNotice className="mt-5" title={service._tag === "CleanupFailed" ? "Couldn’t confirm the service has stopped" : "The service couldn’t start"}
-        description={service._tag === "CleanupFailed" ? "Some background work may still be running. Quit Magnitude to retry cleanup." : service.message}
-        actions={service._tag === "Failed" && observation.canRetry ? <NoticeAction disabled={retrying.waiting} onClick={() => retry()}>Retry service</NoticeAction> : undefined} />}
-      {Result.isFailure(retrying) && !retrying.waiting && service?._tag !== "Failed" && service?._tag !== "Ready" && <ErrorNotice title="Couldn’t retry the service" className="mt-3" />}
-    </section>
-    <MemoryBreakdown />
-    {ready && <StatusOverview />}
-    {tray?._tag === "Unavailable" && <ErrorNotice severity="warning" title="The tray icon isn’t available" description="Closing this window keeps Magnitude running. Open it again from your applications menu." />}
-  </div>
-}
-const compact = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 })
-function StatusTile({ label, value, detail, onClick }: { label: string; value: ReactNode; detail: ReactNode; onClick: () => void }) {
-  return <button type="button" onClick={onClick} className="min-w-0 cursor-pointer rounded-lg p-3 text-left transition-colors hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800">
-    <span className="block text-xs text-slate-500">{label}</span>
-    <span className="mt-1 block truncate font-heading text-xl tabular-nums">{value}</span>
-    <span className="mt-0.5 block truncate text-xs text-slate-500">{detail}</span>
-  </button>
-}
-function StatusOverview() {
-  const client = useAgentClient()
-  const session = useSession()
-  const navigate = useNavigate()
-  const usage = useAtomValue(client.Models.GetServingUsage({ period: "Today", timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, model: Option.none() })).result
-  const rows = useAtomValue(client.Connections.WatchHarnessConnections({})).result
-  const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
-  const today = Result.isSuccess(usage) && usage.value._tag === "Available" ? usage.value : null
-  const installed = Result.isSuccess(rows) && rows.value._tag === "Ready" ? rows.value.connections.filter(row => row.installed) : null
-  const connected = installed?.filter(row => row.inspection._tag === "Connected").length
-  const address = Result.isSuccess(network) && network.value.enabled ? Option.getOrElse(network.value.bind, () => "All interfaces") : null
-  const loading = <SkeletonLine className="h-4 text-xs" width="80px" />
-  return <section aria-label="Activity" className={`${pageLayout.card} grid grid-cols-1 gap-2 p-3 md:grid-cols-3`}>
-    <StatusTile label="Today" onClick={() => navigate("usage")}
-      value={today ? `${compact.format(today.totalTokens)} tokens` : Result.isInitial(usage) ? loading : "Unavailable"}
-      detail={today ? `${today.requests.toLocaleString()} ${today.requests === 1 ? "request" : "requests"}` : null} />
-    <StatusTile label="Agents" onClick={() => navigate("connections")}
-      value={connected !== undefined ? `${connected} connected` : Result.isInitial(rows) ? loading : "Unavailable"}
-      detail={installed ? `${installed.length} installed` : null} />
-    <StatusTile label="Network access" onClick={() => navigate("settings")}
-      value={Result.isSuccess(network) ? network.value.enabled ? "On" : "Off" : Result.isInitial(network) ? loading : "Unavailable"}
-      detail={Result.isSuccess(network) ? address ?? "This computer only" : null} />
-  </section>
 }
 type UpdateTransfer = (typeof ApplicationUpdateState.Type)["transfer"]
 const firstFailure = (results: ReadonlyArray<Result.Result<unknown, unknown>>) => results.find((result): result is Result.Failure<unknown, unknown> => Result.isFailure(result) && !result.waiting)
@@ -799,13 +675,14 @@ function SignOutRow() {
     alert={Result.isFailure(signingOut) && !signingOut.waiting ? <ErrorNotice title="Couldn’t sign out" description="Check that this device can still reach Magnitude, then try again." /> : undefined}
     control={<Button size="sm" variant="outline" disabled={signingOut.waiting} onClick={() => run()}>Sign out</Button>} />
 }
-function SettingsPage() {
+function SettingsPage({ observation }: { observation: ServiceObservation }) {
   // A fresh mount observes hand edits; writes refresh in their own Effect actions.
   const client = useAgentClient()
   const { remote } = useRemoteAccess()
   const { storagePending, networkPending } = useRestartPending()
   useAtomMount(useMemo(() => Atom.make(Effect.all([Atom.refresh(client.Configuration.GetModelStorage({})), Atom.refresh(client.Configuration.GetNetworkAccess({})), Atom.refresh(client.Models.ListModelLocations({}))], { discard: true })), [client]))
   return <>
+    <SettingsStatus observation={observation} />
     <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><ModelLocationsRow /><HuggingFaceRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
     <SettingsGroup label="About"><AboutRow /></SettingsGroup>
     {remote && <SettingsGroup label="This browser"><SignOutRow /></SettingsGroup>}
@@ -820,14 +697,13 @@ export function App() {
   const service = Result.isSuccess(observation.service) ? observation.service.value : null
   const platform = Option.getOrUndefined(Option.map(session.clientWindow, window => window.platform))
   return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><AppShell page={page} navigate={navigate} platform={platform}>
-      {service?._tag === "Unreachable" ? <CannotReachMagnitude />
+      {page === "settings" ? <SettingsPage observation={observation} />
+      : service?._tag === "Unreachable" ? <CannotReachMagnitude />
       : service?._tag === "Reconnecting" ? <ReconnectingToMagnitude />
-      : page === "status" ? Result.isFailure(observation.service) ? <ErrorNotice title="Couldn’t read service status" description="Magnitude can’t confirm the service’s current state." className="mt-7" /> : <Status observation={observation} />
       : page === "chat" ? <ChatPage />
       : page === "usage" ? <ServingUsage />
-      : page === "settings" ? <SettingsPage />
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
-      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("status")}>Open Status</NoticeAction>} /></> : <ModelsSkeleton page={page} startingService />)
+      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("settings")}>Open Settings</NoticeAction>} /></> : <ModelsSkeleton page={page} startingService />)
       : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
       : null}
   </AppShell></>
@@ -885,9 +761,9 @@ export function AppShell({ page, navigate, platform, children }: { page: Applica
 }
 function Navigation({ page, navigate, onNavigate }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
   return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
-    {(["discover", "chat", "models", "connections", "usage", "status", "settings"] as const).map(key => {
+    {(["discover", "chat", "models", "connections", "usage", "settings"] as const).map(key => {
       const Icon = pageIcons[key]
-      return <Button variant="ghost" key={key} disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={pageNames[key]} aria-current={(page === "catalog" ? "discover" : page) === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${key === "status" ? "mt-auto" : ""} ${(page === "catalog" ? "discover" : page) === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+      return <Button variant="ghost" key={key} disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={pageNames[key]} aria-current={(page === "catalog" ? "discover" : page) === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${key === "settings" ? "mt-auto" : ""} ${(page === "catalog" ? "discover" : page) === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
         <Icon className="size-4 shrink-0" />{pageNames[key]}
       </Button>
     })}

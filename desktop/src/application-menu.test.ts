@@ -27,7 +27,7 @@ describe("application menu", () => {
       if (!item.click) throw new Error("Navigation action missing")
       Reflect.apply(item.click, undefined, [])
     }
-    expect(actions.open.mock.calls).toEqual([["discover"], ["chat"], ["models"], ["connections"], ["usage"], ["status"], ["settings"]])
+    expect(actions.open.mock.calls).toEqual([["discover"], ["chat"], ["models"], ["connections"], ["usage"], ["settings"]])
     expect(actions.quit).not.toHaveBeenCalled()
   })
   it("offers Mac command registration separately from application Quit", () => {

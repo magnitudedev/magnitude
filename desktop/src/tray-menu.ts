@@ -22,7 +22,7 @@ export const buildTrayMenu = (state: {
   { type: "separator" as const },
   { label: "Open Magnitude", click: () => actions.open() },
   { label: "Discover Models", click: () => actions.open("discover") },
-  { label: "Status", click: () => actions.open("status") },
+  { label: "Settings", click: () => actions.open("settings") },
   ...(state.service === "Ready" && state.model.canStop ? [{ label: "Stop Model", click: actions.stopModel }] : []),
   { type: "separator" as const },
   ...(state.updateReady ? [{ label: "Restart to Update", click: actions.restartUpdate }] : []),

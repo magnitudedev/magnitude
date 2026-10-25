@@ -26,7 +26,6 @@ export const buildApplicationMenu = (platform: NodeJS.Platform, actions: {
       { label: "My Models", click: () => actions.open("models") },
       { label: "Connections", click: () => actions.open("connections") },
       { label: "Usage", click: () => actions.open("usage") },
-      { label: "Status", click: () => actions.open("status") },
       { label: "Settings", click: () => actions.open("settings") },
     ] },
     { label: "Window", submenu: [{ role: "minimize" }, { role: "close" }] },

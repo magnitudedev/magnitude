@@ -20,11 +20,12 @@ it("does not turn unobserved usage or memory into zero or an empty-state claim",
   expect(usage).toContain('data-slot="skeleton"')
   expect(usage).not.toContain('No requests')
   expect(usage).not.toContain('>0<')
-  const memory = renderToStaticMarkup(<MemoryFigures allocation={null} />)
+  const memory = renderToStaticMarkup(<MemoryFigures allocation={null} reading />)
   expect(memory).toContain('data-slot="skeleton"')
   expect(memory).not.toContain('0 MB')
   expect(memory).not.toContain('data-memory-bytes="0"')
-  for (const category of ['Model weights', 'KV cache', 'Overhead']) expect(memory).toContain(category)
+  expect(memory).toContain('Model memory')
+  expect(memory).not.toContain('data-memory-category')
 })
 
 it("shows assessment progress inside the recommendation skeleton", () => {
