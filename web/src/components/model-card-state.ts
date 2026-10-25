@@ -52,7 +52,8 @@ export const modelCardDrafter = (model: LocalModel): ModelCardDrafter => {
     return { _tag: "Adding", percent: progress.totalBytes > 0 ? Math.floor(progress.completedBytes * 100 / progress.totalBytes) : null }
   }
   if (attached !== undefined) return { _tag: "Attached", label: Option.getOrElse(method, () => attached.name), title: attached.name, changeable: true, update: drafterUpdateAvailable(model) }
-  if (model.drafterPending) return { _tag: "Pending" }
+  // Drafter selection waits for the target files; that is not an active search.
+  if (model.drafterPending) return { _tag: addedModelAwaitingFiles(model) ? "Unknown" : "Pending" }
   return Option.match(customModelDrafterOffer(model), {
     onNone: (): ModelCardDrafter => ({ _tag: "None", changeable: true }),
     onSome: (): ModelCardDrafter => ({ _tag: "Add" }),

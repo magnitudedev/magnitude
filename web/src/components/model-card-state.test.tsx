@@ -39,6 +39,15 @@ describe("model card drafter", () => {
     expect(modelCardDrafter(customModel(inFolder, { drafterPending: true }))).toEqual({ _tag: "Pending" })
     expect(modelCardDrafter(customModel(added, { drafterPending: true, recommendedDrafter: Option.some(drafterCandidate()) }))).toEqual({ _tag: "Pending" })
   })
+  it("does not claim to search for a drafter while the target files are missing or downloading", () => {
+    for (const acquisitionState of [
+      { _tag: "NotInstalled" },
+      { _tag: "Installing", progress: { stage: "downloading", completedBytes: 0, totalBytes: 100, bytesPerSecond: Option.none() } },
+      { _tag: "InstallFailed", failure: { _tag: "Interrupted" } },
+    ] as const) {
+      expect(modelCardDrafter(customModel(added, { acquisitionState, drafterPending: true }))).toEqual({ _tag: "Unknown" })
+    }
+  })
   it("shows a drafter-only download's progress in the cell", () => {
     const downloading = attachedDrafter({ _tag: "Downloading", progress: { stage: "downloading", completedBytes: 450, totalBytes: 900, bytesPerSecond: Option.none() } })
     expect(modelCardDrafter(customModel(added, { drafter: Option.some(downloading) }))).toEqual({ _tag: "Adding", percent: 50 })

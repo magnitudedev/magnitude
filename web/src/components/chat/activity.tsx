@@ -26,13 +26,6 @@ const phases = {
   prefill: "Processing prompt",
   thinking: "Thinking",
 }
-const operations = {
-  discovery: "Benchmarking baseline",
-  form: "Comparing implementations",
-  measure: "Benchmarking variants",
-  promote: "Validating candidate",
-  confirm: "Confirming performance",
-}
 export function ChatRequestStatus({ generation }: { generation: ChatGeneration }) {
   const clock = useAtomValue(tick)
   const now = Result.isSuccess(clock) ? clock.value : Date.now()
@@ -45,12 +38,12 @@ export function ChatActivityStatus({ generation, now }: { generation: ChatGenera
   const measures: string[] = []
   let progress: number | undefined
   let progressText: string | undefined
-  let substatus = {
+  const substatus = {
     starting: "Connecting to inference",
     model_queued: "Awaiting model availability",
     preparing_model: "Preparing inference runtime",
     queued: "Awaiting execution",
-    optimizing: "Tuning kernels",
+    optimizing: "Testing kernel variants",
     loading: "Importing weights",
     finalizing: "Preparing model for inference",
     preparing: "Preparing conversation",
@@ -58,9 +51,7 @@ export function ChatActivityStatus({ generation, now }: { generation: ChatGenera
     thinking: "",
   }[activity.phase]
   if (activity.phase === "optimizing" && load?.kind === "tuning") {
-    const work = value(load.work)
-    if (work) substatus = operations[work.operation]
-    measures.push(count(load.measured_configurations) + " kernel variants tested")
+    measures.push(count(load.measured_configurations) + " tested")
   } else if (activity.phase === "loading" && load?.kind === "weights") {
     progress = percent(load.completed_bytes, load.total_bytes)
     if (progress !== undefined) progressText = bytes(load.completed_bytes) + " / " + bytes(load.total_bytes) + " GB"

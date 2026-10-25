@@ -122,14 +122,29 @@ describe("Chat presentation", () => {
       expect(html).not.toContain("aria-expanded")
       expect(html).not.toContain("·")
       if (phase === "optimizing") {
-        expect(html).toContain("Benchmarking variants")
-        expect(html).toContain("155 kernel variants tested")
+        expect(html).toContain("Testing kernel variants")
+        expect(html).toContain("155 tested")
         expect(html).not.toContain("programs")
         expect(html).not.toContain("budget")
         expect(html).not.toContain("attention_decode")
       }
     }
   )
+  it("keeps optimization wording stable across rapid tuning operations and missing work details", () => {
+    const render = (operation?: string) => renderToStaticMarkup(
+      <ChatActivityStatus generation={generation({
+        status: "running",
+        activity: { phase: "optimizing", since: 100, loadDetails: {
+          kind: "tuning", measured_configurations: 155, formed_programs: 142,
+          elapsed_ms: 18_900, budget_ms: 60_000,
+          ...(operation ? { work: { entry: "attention_decode", operation } } : {}),
+        } },
+      })} now={1100} />
+    )
+    for (const operation of ["discovery", "form", "measure", "promote", "confirm"]) {
+      expect(render(operation)).toBe(render())
+    }
+  })
   it("renders measured prefill counts and compact percentage without a long progress bar", () => {
     const html = renderToStaticMarkup(
       <ChatActivityStatus
