@@ -95,4 +95,6 @@ jobs:
     with:
       source_commit: ${{ github.sha }}
       validate_candidate: true
-      windows_distribution: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_distribution }}
+      windows_distribution: false
+      apple_distribution: true
+    secrets: inherit

@@ -194,6 +194,12 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
           APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+      - name: Prepare disposable installer publisher
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bun scripts/installer-audit-fixture.ts prepare "${{ runner.temp }}/installer-audit"
+          echo "MAGNITUDE_UPDATE_ACCEPTANCE_CONFIG=${{ runner.temp }}/installer-audit/configuration.json" >> "$GITHUB_ENV"
       - name: Build Unix host
         if: runner.os != 'Windows'
         run: bun run packages/release/scripts/build/host.ts "${{ matrix.id }}" catalog-inputs "release/${{ matrix.id }}"
@@ -219,6 +225,38 @@ jobs:
           AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
           AZURE_SIGNING_CERTIFICATE_PROFILE: ${{ vars.AZURE_SIGNING_CERTIFICATE_PROFILE }}
+      - name: Prepare Unix script offers for the built candidate
+        if: runner.os != 'Windows'
+        run: bun scripts/installer-audit-fixture.ts finish "${{ runner.temp }}/installer-audit" "release/${{ matrix.id }}" "${{ matrix.id }}"
+      - name: Prepare timestamped Windows script fixture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          . ./packages/release/scripts/build/windows-engine-toolchain.ps1
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Magnitude Update Acceptance, O=Magnitude Update Acceptance' -CertStoreLocation Cert:\CurrentUser\My -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256
+          $fixture = Join-Path $env:RUNNER_TEMP 'installer-audit'
+          New-Item -ItemType Directory -Force $fixture | Out-Null
+          $cer = Join-Path $fixture 'acceptance-publisher.cer'
+          Export-Certificate -Cert $cert -FilePath $cer | Out-Null
+          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null
+          $nodeVersion = (& node.exe -p process.versions.node).Trim()
+          $library = Join-Path $fixture 'node.lib'
+          Invoke-WebRequest "https://nodejs.org/download/release/v$nodeVersion/win-x64/node.lib" -OutFile $library
+          $env:MAGNITUDE_NODE_LIBRARY = $library
+          $env:MAGNITUDE_SCRIPT_ACCEPTANCE_OUTPUT = $fixture
+          $env:MAGNITUDE_ACCEPTANCE_WINDOWS_CERTIFICATE = $cert.Thumbprint
+          $env:MAGNITUDE_ACCEPTANCE_TIMESTAMP_SERVER = 'http://timestamp.digicert.com'
+          $env:MAGNITUDE_ACCEPTANCE_NSIS = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          bun packages/release/scripts/acceptance/prepare-windows-script-fixture.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Windows script fixture build failed.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-fixture-${{ matrix.id }}
+          path: |
+            ${{ runner.temp }}/installer-audit/hosting/
+            ${{ runner.temp }}/installer-audit/acceptance-publisher.cer
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: host-${{ matrix.id }}
