@@ -69,7 +69,7 @@ export function HardwareSummary({
     }
   })
   return (
-    <section aria-label={`Your machine: ${machine}`} className="mb-6">
+    <section aria-label={`Your machine: ${machine}`} className="mb-5">
       <button
         type="button"
         aria-expanded={open}

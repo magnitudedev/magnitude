@@ -126,7 +126,7 @@ export function ChatHistoryPanel({
                     </span>
                     <span className="mt-1 block text-[11px] text-slate-500">
                       {chat.messageCount} messages
-                      {chat.active ? " · Responding" : ""}
+                      {chat.active ? " · Running" : ""}
                     </span>
                   </button>
                   <div className="mt-1 flex justify-end">

@@ -89,21 +89,45 @@ describe("Chat presentation", () => {
     }
   })
   it.each(ChatPhase.literals)(
-    "renders %s above the composer with only measured fields",
+    "renders %s only when a preparation or thinking status is needed",
     (phase) => {
       const g = generation({
         status: "running",
-        activity: { phase, since: 100 },
+        activity: {
+          phase,
+          since: 100,
+          ...(phase === "optimizing" ? { loadDetails: {
+            kind: "tuning",
+            measured_configurations: 155,
+            formed_programs: 142,
+            elapsed_ms: 18_900,
+            budget_ms: 60_000,
+            work: { entry: "attention_decode", operation: "measure" },
+          } } : {}),
+        },
       })
       const html = renderToStaticMarkup(
         <ChatActivityStatus generation={g} now={1100} />
       )
+      if (phase === "generating" || phase === "responding") {
+        expect(html).toBe("")
+        return
+      }
       expect(html).toContain('role="status"')
-      expect(html).toContain("Elapsed")
-      expect(html).toContain("1.0s")
+      expect(html).toContain('aria-label="Request elapsed time"')
+      expect(html).toContain("00:01")
       expect(html).not.toContain('role="progressbar"')
       expect(html).not.toContain("Remaining")
       expect(html).not.toContain("GB/s")
+      expect(html).not.toContain("aria-expanded")
+      expect(html).not.toContain("·")
+      if (phase === "optimizing") {
+        expect(html).toContain("Benchmarking variants")
+        expect(html).toContain("155 kernel variants tested")
+        expect(html).not.toContain("programs")
+        expect(html).not.toContain("budget")
+        expect(html).not.toContain("attention_decode")
+      }
     }
   )
   it("renders measured prefill counts and compact percentage without a long progress bar", () => {
@@ -125,7 +149,8 @@ describe("Chat presentation", () => {
     )
     expect(html).toContain('aria-valuenow="25"')
     expect(html).toContain("2,048 / 8,192")
-    expect(html).toContain("1,536")
+    expect(html).toContain("1,536 cached")
+    expect(html).not.toContain("aria-expanded")
     expect(html).not.toContain('style="width:')
   })
 })

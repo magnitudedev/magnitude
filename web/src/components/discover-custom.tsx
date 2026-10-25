@@ -28,7 +28,7 @@ export const foundModelsSummary = (models: readonly CustomLocalModel[]): Option.
 export function FoundModelsBanner({ models, onView, onDismiss, dismissing = false }: { models: readonly CustomLocalModel[]; onView: () => void; onDismiss?: () => void; dismissing?: boolean }) {
   return Option.match(foundModelsSummary(models), {
     onNone: () => null,
-    onSome: summary => <section aria-label="Models already on this computer" className="mb-6 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border border-slate-200 bg-white px-4 py-1.5 dark:border-slate-750 dark:bg-slate-850">
+    onSome: summary => <section aria-label="Models already on this computer" className="mb-5 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border border-slate-200 bg-white px-4 py-1.5 dark:border-slate-750 dark:bg-slate-850">
       {summary.labs.length > 0 && <span className="flex shrink-0 items-center gap-1.5">{summary.labs.slice(0, 3).map(lab => <LabLogo key={lab.name} lab={lab} className="size-5" />)}</span>}
       <p className="min-w-0 flex-1 text-sm"><span className="font-medium">You already have {summary.count} {summary.count === 1 ? "model that runs" : "models that run"} here.</span> <span className="text-slate-600 dark:text-slate-300">Found in {summary.places}.</span></p>
       <a href="/models" onClick={event => { event.preventDefault(); onView() }} className="inline-flex shrink-0 items-center gap-1.5 border-b border-current pb-0.5 text-[13px] font-medium leading-none text-slate-700 outline-none hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 dark:hover:text-slate-100">View in My Models<ArrowRightIcon aria-hidden="true" className="size-4" /></a>

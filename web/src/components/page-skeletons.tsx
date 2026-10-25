@@ -36,7 +36,7 @@ function LoadingStatus({ title, detail, assessment }: { title: string; detail: s
   </div>
 }
 export function HardwarePending({ identifying = false, startingService = false }: { identifying?: boolean; startingService?: boolean }) {
-  return <div aria-busy="true" aria-label="Detecting your hardware" className="mb-6 flex items-center gap-3 py-1 text-xs text-slate-500" data-loading-region="">
+  return <div aria-busy="true" aria-label="Detecting your hardware" className="mb-5 flex items-center gap-3 py-1 text-xs text-slate-500" data-loading-region="">
     <CircleNotchIcon aria-hidden="true" className="size-4 motion-safe:animate-spin" />
     <span role="status">{startingService ? "Starting Magnitude…" : identifying ? "Identifying your machine…" : "Reading hardware capabilities…"}</span>
   </div>
