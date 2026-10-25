@@ -181,6 +181,9 @@ jobs:
           root=pathlib.Path.home()/'installer-audit-next';root.mkdir(mode=0o700)
           fixture=pathlib.Path('fixture');hosting=fixture/'hosting' if (fixture/'hosting').exists() else fixture
           shutil.copytree(hosting,root/'hosting')
+          helpers=root/'helpers';helpers.mkdir()
+          for name in ['installer-audit-mac-check.sh','installer-audit-unix-runtime.py','installer-audit-unix-api.py']:
+            shutil.copy2(pathlib.Path('scripts')/name,helpers/name)
           artifacts=[json.loads(p.read_text()) for p in pathlib.Path('native').glob('*.artifact.json')]
           plan=json.loads(pathlib.Path('packages/release/release-plan.json').read_text())
           release=root/'release/@magnitudedev/cli@0.2.10';release.mkdir(parents=True)
