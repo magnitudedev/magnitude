@@ -318,6 +318,9 @@ mod tests {
         let tuning = LoadProgress::Tuning {
             completed: 1,
             total: 2,
+            work: None,
+            measured_configurations: 0,
+            formed_programs: 0,
         };
         let mut reported = Vec::new();
         let (loaded, preparation) = load_prepared(
@@ -325,7 +328,7 @@ mod tests {
             attempts(&missing, &events),
             scripted_prepare(
                 vec![
-                    WorkerMessage::LoadProgress { progress: tuning },
+                    WorkerMessage::LoadProgress { progress: tuning.clone() },
                     WorkerMessage::Prepared,
                 ],
                 &events,

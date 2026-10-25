@@ -162,6 +162,7 @@ export const ChatServiceLive = Layer.scoped(
           completed: Option.none(),
           total: Option.none(),
           cached: Option.none(),
+          loadDetails: Option.none(),
           ...details,
         }),
       }
@@ -179,11 +180,14 @@ export const ChatServiceLive = Layer.scoped(
                 : p.stage === "finalizing"
                 ? "finalizing"
                 : p.stage === "queued"
-                ? "queued"
+                ? "model_queued"
                 : p.stage === "preparing"
-                ? "preparing"
+                ? "preparing_model"
                 : "loading",
-              { fraction: someFinite(Math.min(1, Math.max(0, p.fraction))) }
+              {
+                fraction: someFinite(Math.min(1, Math.max(0, p.fraction))),
+                loadDetails: p.details,
+              }
             )
           else if (p.phase === "prefill")
             setPhase(entry, "prefill", {
@@ -197,7 +201,7 @@ export const ChatServiceLive = Layer.scoped(
               total: Option.some(p.total_tokens),
               cached: Option.some(p.cached_tokens),
             })
-          else if (p.phase !== "generating") setPhase(entry, p.phase)
+          else setPhase(entry, p.phase)
         }
         if (Option.isSome(chunk.timings)) {
           const t = chunk.timings.value
@@ -478,12 +482,13 @@ export const ChatServiceLive = Layer.scoped(
               content: "",
               reasoning: "",
               activity: Option.some({
-                phase: "queued",
+                phase: "starting",
                 since: now,
                 fraction: Option.none(),
                 completed: Option.none(),
                 total: Option.none(),
                 cached: Option.none(),
+                loadDetails: Option.none(),
               }),
               metrics: emptyChatMetrics,
               error: Option.none(),

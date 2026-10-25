@@ -114,15 +114,37 @@ pub enum HostMessage {
     Shutdown,
 }
 
-/// Engine load progress, in order. Each measured step counts work done, never time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningOperation {
+    Discovery,
+    Form,
+    Measure,
+    Promote,
+    Confirm,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuningWork {
+    pub entry: String,
+    pub operation: TuningOperation,
+}
+
+/// Engine load progress. Tuning reports time budget; import reports resident bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoadProgress {
     /// Device selection, planning, opening the device and program preparation.
     Preparing,
     /// Tuning kernels for the device. Reported only by a Prepare that searches, never by a
     /// load: `total` is the tuning time in milliseconds and `completed` the milliseconds
     /// spent. It starts at zero when the census begins; tuning may finish before `total`.
-    Tuning { completed: u64, total: u64 },
+    Tuning {
+        completed: u64,
+        total: u64,
+        work: Option<TuningWork>,
+        measured_configurations: u64,
+        formed_programs: u64,
+    },
     /// Target weight import, in resident bytes. It starts at zero before any import.
     ImportingWeights { completed_bytes: u64, total_bytes: u64 },
     /// State allocation, memory policy and warm-up.

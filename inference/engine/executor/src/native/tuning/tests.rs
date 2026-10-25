@@ -2071,7 +2071,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     ));
     assert!(matches!(events[1], TuningEvent::Progress { total: all, .. } if all == total));
     assert!(matches!(
-        &events[2],
+        &events[3],
         TuningEvent::Started {
             entry: "dense_output",
             points: 7,

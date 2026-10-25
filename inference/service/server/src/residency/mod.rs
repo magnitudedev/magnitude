@@ -10,6 +10,7 @@ pub mod supervisor;
 pub mod worker;
 
 use std::sync::Arc;
+use magnitude_serving::source::ModelLoadDetails;
 
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
@@ -24,7 +25,7 @@ use magnitude_service_contracts::models::{
 pub const MEMORY_SHORTAGE_FAILURE_CODE: &str = "memory_shortage";
 
 /// Observes model loading: its stage and completed fraction in `[0, 1]`.
-pub type LoadingObserver = Arc<dyn Fn(ModelLoadStage, f32) + Send + Sync>;
+pub type LoadingObserver = Arc<dyn Fn(ModelLoadStage, f32, Option<ModelLoadDetails>) + Send + Sync>;
 
 pub enum ResidencyAcquisition {
     Inference { progress: Option<LoadingObserver> },
@@ -124,6 +125,7 @@ pub struct PreparedResidency<R> {
 }
 
 struct LoadingResidency<R> {
+    details: Option<ModelLoadDetails>,
     instance: ModelInstance,
     configuration: ModelServingConfiguration,
     configuration_key: String,
@@ -215,6 +217,7 @@ pub enum ResidencyNotification {
         instance_id: ModelInstanceId,
         stage: ModelLoadStage,
         fraction: f32,
+        details: Option<ModelLoadDetails>,
         planned_allocation: Option<ModelLoadPlan>,
     },
     LoadingStopCompleted {
@@ -672,8 +675,9 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 instance_id,
                 stage,
                 fraction,
+                details,
                 planned_allocation,
-            } => self.load_progress(instance_id, stage, fraction, planned_allocation),
+            } => self.load_progress(instance_id, stage, fraction, details, planned_allocation),
             ResidencyNotification::AllocationObserved {
                 instance_id,
                 allocation,
@@ -743,7 +747,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             return;
         }
         if self.package_removal_active || !self.package_removals.is_empty() {
-            self.queue.push_back(waiter);
+            self.enqueue(waiter);
             return;
         }
         match &mut self.state {
@@ -752,7 +756,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 if loading.instance.model_id == waiter.target.model_id
                     && loading.configuration_key == waiter.target.configuration_key =>
             {
-                Self::notify_progress(&waiter, &loading.instance.lifecycle);
+                Self::notify_progress(&waiter, &loading.instance.lifecycle, loading.details.as_ref());
                 loading.waiters.push(waiter);
             }
             ResidencyState::Ready(ready)
@@ -762,13 +766,27 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 self.grant_ready(waiter);
             }
             ResidencyState::Loading(_) | ResidencyState::Releasing(_) => {
-                self.queue.push_back(waiter);
+                self.enqueue(waiter);
             }
             ResidencyState::Ready(_) => {
-                self.queue.push_back(waiter);
+                self.enqueue(waiter);
                 self.begin_ready_release(ModelReleaseReason::Replacement, Vec::new());
             }
         }
+    }
+
+    /// Waiting for residency is a model wait, before the engine has a request to schedule.
+    fn enqueue(&mut self, waiter: AcquisitionWaiter<D::Resident>) {
+        Self::notify_progress(
+            &waiter,
+            &ModelInstanceLifecycle::Loading {
+                stage: ModelLoadStage::Queued,
+                fraction: 0.0,
+                planned_allocation: None,
+            },
+            None,
+        );
+        self.queue.push_back(waiter);
     }
 
     fn admit_package_removal(&mut self) {
@@ -835,8 +853,9 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 planned_allocation: None,
             },
         };
-        Self::notify_progress(&first, &instance.lifecycle);
+        Self::notify_progress(&first, &instance.lifecycle, None);
         self.state = ResidencyState::Loading(LoadingResidency {
+            details: None,
             instance,
             configuration: first.target.configuration.clone(),
             configuration_key: first.target.configuration_key.clone(),
@@ -858,7 +877,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         while let Some(waiter) = self.queue.pop_front() {
             if waiter.target == target {
                 if let ResidencyState::Loading(loading) = &mut self.state {
-                    Self::notify_progress(&waiter, &loading.instance.lifecycle);
+                    Self::notify_progress(&waiter, &loading.instance.lifecycle, loading.details.as_ref());
                     loading.waiters.push(waiter);
                 }
             } else {
@@ -1056,6 +1075,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         instance_id: ModelInstanceId,
         stage: ModelLoadStage,
         fraction: f32,
+        details: Option<ModelLoadDetails>,
         planned_allocation: Option<ModelLoadPlan>,
     ) {
         let ResidencyState::Loading(loading) = &mut self.state else {
@@ -1069,14 +1089,18 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             fraction,
             planned_allocation,
         };
-        if loading.instance.lifecycle == lifecycle {
+        if loading.instance.lifecycle == lifecycle && loading.details == details {
             return;
         }
+        let lifecycle_changed = loading.instance.lifecycle != lifecycle;
+        loading.details = details;
         loading.instance.lifecycle = lifecycle;
         for waiter in &loading.waiters {
-            Self::notify_progress(waiter, &loading.instance.lifecycle);
+            Self::notify_progress(waiter, &loading.instance.lifecycle, loading.details.as_ref());
         }
-        self.publish_current();
+        if lifecycle_changed {
+            self.publish_current();
+        }
     }
 
     fn load_finished(
@@ -1136,6 +1160,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 self.publish_current();
                 self.admit_package_removal();
                 if !self.package_removal_active {
+                    self.queue.retain(|waiter| !waiter.reply.is_closed());
                     if self.queue.is_empty() {
                         self.refresh_idle_deadline();
                     } else {
@@ -1466,6 +1491,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     }
 
     fn resume_pending(&mut self) {
+        self.queue.retain(|waiter| !waiter.reply.is_closed());
         self.admit_package_removal();
         if self.package_removal_active || !self.package_removals.is_empty() {
             return;
@@ -1571,7 +1597,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         }
     }
 
-    fn notify_progress(waiter: &AcquisitionWaiter<D::Resident>, lifecycle: &ModelInstanceLifecycle) {
+    fn notify_progress(waiter: &AcquisitionWaiter<D::Resident>, lifecycle: &ModelInstanceLifecycle, details: Option<&ModelLoadDetails>) {
         let ResidencyAcquisition::Inference {
             progress: Some(observer),
         } = &waiter.purpose
@@ -1586,7 +1612,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             ModelInstanceLifecycle::Ready { .. } => (ModelLoadStage::Finalizing, 1.0),
             _ => return,
         };
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(stage, fraction)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(stage, fraction, details.cloned())));
     }
 
     fn inventory_failure(failure: &ModelOperationFailure) -> InventoryError {

@@ -3936,6 +3936,9 @@
                 "type": "number",
                 "format": "float"
               },
+              "details": {
+                "$ref": "#/components/schemas/ModelLoadDetails"
+              },
               "phase": {
                 "type": "string",
                 "enum": [
@@ -7015,6 +7018,32 @@
         },
         "additionalProperties": false
       },
+      "KernelTuningOperation": {
+        "type": "string",
+        "description": "Selected optional tuning work, not a fixed sequence of global phases.",
+        "enum": [
+          "discovery",
+          "form",
+          "measure",
+          "promote",
+          "confirm"
+        ]
+      },
+      "KernelTuningWork": {
+        "type": "object",
+        "required": [
+          "entry",
+          "operation"
+        ],
+        "properties": {
+          "entry": {
+            "type": "string"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/KernelTuningOperation"
+          }
+        }
+      },
       "KnownUnsupportedReason": {
         "oneOf": [
           {
@@ -8875,6 +8904,78 @@
           }
         },
         "additionalProperties": false
+      },
+      "ModelLoadDetails": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "elapsed_ms",
+              "budget_ms",
+              "measured_configurations",
+              "formed_programs",
+              "kind"
+            ],
+            "properties": {
+              "elapsed_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "budget_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "work": {
+                "$ref": "#/components/schemas/KernelTuningWork"
+              },
+              "measured_configurations": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "formed_programs": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "tuning"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "completed_bytes",
+              "total_bytes",
+              "kind"
+            ],
+            "properties": {
+              "completed_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "total_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "weights"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Exact stage observations; budget time is not configuration completion."
       },
       "ModelLoadDevice": {
         "type": "object",

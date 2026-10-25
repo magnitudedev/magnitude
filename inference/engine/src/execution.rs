@@ -7,7 +7,9 @@ use crate::error::{
     classify_platform,
 };
 use crate::options::{ExecutionManifest, ResolvedMethod};
-use crate::worker::protocol::LoadProgress;
+use crate::worker::protocol::{LoadProgress, TuningOperation, TuningWork};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use magnitude_artifacts::{ArtifactIdentity, Package, PackageIdentity};
 use magnitude_batching::Demand;
 use magnitude_executor::{
@@ -215,6 +217,7 @@ fn tuning_report(
 ) -> Result<TuningReport, LoadError> {
     Ok(TuningReport {
         progress,
+        live: RefCell::new(LiveTuning::default()),
         trace: manifest
             .tuning_trace
             .as_deref()
@@ -1019,9 +1022,40 @@ fn warm_up(
 /// Reports a search's tuning, or the records a load read: a search's
 /// progress to the host, each unit on the engine's diagnostic stream, and
 /// every event to the tuning trace the host asked for.
+#[derive(Default)]
+struct LiveTuning {
+    completed: u64,
+    total: u64,
+    work: Option<TuningWork>,
+    units: BTreeMap<(String, String, BTreeMap<String, u64>), (u64, u64)>,
+}
+
 struct TuningReport {
+    live: RefCell<LiveTuning>,
     progress: Rc<dyn Fn(LoadProgress)>,
     trace: Option<TuningTrace>,
+}
+
+impl TuningReport {
+    fn report_live(&self, live: &LiveTuning) {
+        if live.total == 0 {
+            return;
+        }
+        let (measured_configurations, formed_programs) = live.units.values().fold(
+            (0u64, 0u64),
+            |(measured, programs), (next_measured, next_programs)| (
+                measured.saturating_add(*next_measured),
+                programs.saturating_add(*next_programs),
+            ),
+        );
+        (self.progress)(LoadProgress::Tuning {
+            completed: live.completed,
+            total: live.total,
+            work: live.work.clone(),
+            measured_configurations,
+            formed_programs,
+        });
+    }
 }
 
 impl TuningObserver for TuningReport {
@@ -1033,12 +1067,35 @@ impl TuningObserver for TuningReport {
             // Only a search that finds a unit without a record reports
             // progress; a load never does.
             TuningEvent::Progress { completed, total } => {
-                if *total > 0 {
-                    (self.progress)(LoadProgress::Tuning {
-                        completed: *completed as u64,
-                        total: *total as u64,
-                    });
+                let mut live = self.live.borrow_mut();
+                live.completed = *completed as u64;
+                live.total = *total as u64;
+                self.report_live(&live);
+            }
+            TuningEvent::WorkStarted { entry, stage } => {
+                let mut live = self.live.borrow_mut();
+                live.work = Some(TuningWork {
+                    entry: (*entry).to_owned(),
+                    operation: match stage {
+                        seismic::Stage::Discovery => TuningOperation::Discovery,
+                        seismic::Stage::Form => TuningOperation::Form,
+                        seismic::Stage::Measure => TuningOperation::Measure,
+                        seismic::Stage::Promote => TuningOperation::Promote,
+                        seismic::Stage::Confirm => TuningOperation::Confirm,
+                    },
+                });
+                self.report_live(&live);
+            }
+            TuningEvent::Stage(stage) => {
+                let mut live = self.live.borrow_mut();
+                live.work = None;
+                if let Some(counts) = &stage.counts {
+                    live.units.insert(
+                        (stage.entry.to_owned(), stage.bindings.clone(), stage.statics.clone()),
+                        (counts.measured as u64, counts.programs as u64),
+                    );
                 }
+                self.report_live(&live);
             }
             TuningEvent::Started {
                 entry,
@@ -1049,7 +1106,6 @@ impl TuningObserver for TuningReport {
             // each record published when the optional work stops are in
             // the tuning trace, the latter two with their forecasts.
             TuningEvent::Mandatory { .. }
-            | TuningEvent::Stage(_)
             | TuningEvent::Published { .. } => {}
             TuningEvent::Untuned {
                 programs,
@@ -1059,6 +1115,9 @@ impl TuningObserver for TuningReport {
                  {forming_seconds:.2} s"
             ),
             TuningEvent::Budget(budget) => {
+                let mut live = self.live.borrow_mut();
+                live.work = None;
+                self.report_live(&live);
                 eprintln!(
                     "magnitude-engine: tuning budget {:.2} s: {} pieces of work used {:.2} s, \
                      {:.2} s unused, {:.2} s over; {} offered pieces did not fit",

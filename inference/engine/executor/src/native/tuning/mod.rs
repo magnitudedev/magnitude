@@ -1176,7 +1176,12 @@ pub enum TuningEvent {
     /// Reported when the search walk begins and after each unit it
     /// searches; nothing is reported when every unit is stored.
     Progress { completed: usize, total: usize },
-    /// A unit's optional work starts. How many configurations it can reach
+    /// The selected device work starts, including resumed and composed units.
+    WorkStarted {
+        entry: &'static str,
+        stage: seismic::Stage,
+    },
+    /// A unit's first optional work starts. How many configurations it can reach
     /// is reported with its result ([`SearchProgress`]): counting the
     /// declared domain here would enumerate it.
     Started {
@@ -1253,8 +1258,15 @@ pub enum PinnedChoice {
     NotReplayed,
 }
 
-/// One piece of optional work the allocator started, and what it took.
-/// Times are seconds; `began_seconds` since the tuning time began.
+/// Fresh counters from the current search, excluding stored records.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TuningCounts {
+    pub measured: usize,
+    pub programs: usize,
+}
+
+/// One completed piece of optional work and its current-run counters.
+/// Times are seconds; `began_seconds` is since tuning began.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StageRecord {
     pub entry: &'static str,
@@ -1264,6 +1276,7 @@ pub struct StageRecord {
     /// The unit's share of step time when the piece was started.
     pub share: f64,
     pub stage: seismic::Stage,
+    pub counts: Option<TuningCounts>,
     /// The piece's whole price when it was started: the sum of its
     /// operations' class prices, and how many of its operations belonged
     /// to a class this load had not observed. A piece with an unpriced
@@ -2765,6 +2778,7 @@ impl<'a> SearchedUnit<'a> for ComposedUnit<'a> {
                 statics: self.key.2.clone(),
                 share: self.share,
                 stage: work.stage,
+                counts: None,
                 priced_seconds: work.quote.priced.as_secs_f64(),
                 unpriced: work.quote.unpriced,
                 forecast_seconds: work.quote.forecast().map(|forecast| forecast.as_secs_f64()),
@@ -2973,6 +2987,10 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
         let host_before = seismic::ProcessMemory::footprint_now();
         let peak_before = seismic::ProcessMemory::footprint_peak();
         device.restart_memory_high_water();
+        tuner.context.observer.event(&TuningEvent::WorkStarted {
+            entry: (**self).key().0,
+            stage,
+        });
         let longest = (**self).perform(tuner, before)?;
         let unit = unit_name((**self).key());
         // What the piece added at its most: where the footprint's peak
@@ -3483,6 +3501,10 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
                 statics: self.key.2.clone(),
                 share: self.share,
                 stage: performed.stage,
+                counts: Some(TuningCounts {
+                    measured: self.search.standing().measured,
+                    programs: self.search.standing().programs,
+                }),
                 priced_seconds: work.quote.priced.as_secs_f64(),
                 unpriced: work.quote.unpriced,
                 forecast_seconds: work.quote.forecast().map(|forecast| forecast.as_secs_f64()),

@@ -33,7 +33,7 @@ use utoipa::{PartialSchema, ToSchema};
 use crate::error::{ApiError, ApiErrorBody, ErrorResponse, ServingError};
 use crate::sampling::{SamplingRequest, sampling};
 use crate::source::{
-    GenerationEvent, GenerationStream, LoadProgress, ModelLoadProgress, ModelLoadStage,
+    GenerationEvent, GenerationStream, LoadProgress, ModelLoadDetails, ModelLoadProgress, ModelLoadStage,
 };
 use magnitude_engine::chat::AppliedTemplate;
 use crate::{Serving, include_progress, media, unix_timestamp, with_request_id};
@@ -422,6 +422,9 @@ pub enum ChatCompletionProgress {
     ModelLoading {
         stage: ModelLoadStage,
         fraction: f32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        details: Option<ModelLoadDetails>,
     },
     Queued,
     Preparing,
@@ -439,6 +442,7 @@ impl ChatCompletionProgress {
         Self::ModelLoading {
             stage: load.stage,
             fraction: load.fraction.clamp(0.0, 1.0),
+            details: load.details,
         }
     }
 }

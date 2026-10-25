@@ -1,5 +1,5 @@
 import { Option, Schema } from "effect"
-import { OpenAiModelsResponse } from "@magnitudedev/icn-protocol/schemas"
+import { ModelLoadDetails, OpenAiModelsResponse } from "@magnitudedev/icn-protocol/schemas"
 
 const id = <B extends string>(brand: B) =>
   Schema.NonEmptyString.pipe(Schema.maxLength(128), Schema.brand(brand))
@@ -77,6 +77,10 @@ export const ChatMetrics = Schema.Struct({
 export type ChatMetrics = typeof ChatMetrics.Type
 export const emptyChatMetrics = Schema.decodeUnknownSync(ChatMetrics)({})
 export const ChatPhase = Schema.Literal(
+  "starting",
+  "model_queued",
+  "preparing_model",
+  "generating",
   "queued",
   "optimizing",
   "loading",
@@ -94,6 +98,7 @@ export const ChatActivity = Schema.Struct({
   completed: optional(count),
   total: optional(count),
   cached: optional(count),
+  loadDetails: optional(ModelLoadDetails),
 })
 export type ChatActivity = typeof ChatActivity.Type
 export const ChatGenerationStatus = Schema.Literal(

@@ -8,6 +8,8 @@
 //! the host's resolution before the instance is Ready, and the Ready instance records the device
 //! the worker opened.
 
+use magnitude_serving::source::{ModelLoadDetails, KernelTuningWork, KernelTuningOperation};
+use magnitude_engine::worker::protocol::TuningOperation;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -530,26 +532,45 @@ const REPORT_STEP: f32 = 0.005;
 struct LoadProgression {
     tuned: bool,
     reported: Option<(ModelLoadStage, f32)>,
+    details: Option<ModelLoadDetails>,
 }
 
 impl LoadProgression {
     /// The stage and fraction `progress` advances the load to, or `None` when it is too little
     /// to report.
-    fn advance(&mut self, progress: LoadProgress) -> Option<(ModelLoadStage, f32)> {
+    fn advance(&mut self, progress: LoadProgress) -> Option<(ModelLoadStage, f32, Option<ModelLoadDetails>)> {
         let previous = self.reported.map_or(0.0, |(_, fraction)| fraction);
+        let mut details = None;
         let (stage, fraction) = match progress {
             // The second Load worker prepares again after the Prepare worker tuned: the load
             // does not return to `preparing`.
             LoadProgress::Preparing if self.tuned => return None,
             LoadProgress::Preparing => (ModelLoadStage::Preparing, 0.0),
-            LoadProgress::Tuning { completed, total } => {
+            LoadProgress::Tuning { completed, total, work, measured_configurations, formed_programs } => {
                 self.tuned = true;
+                details = Some(ModelLoadDetails::Tuning {
+                    elapsed_ms: completed,
+                    budget_ms: total,
+                    work: work.map(|work| KernelTuningWork {
+                        entry: work.entry,
+                        operation: match work.operation {
+                            TuningOperation::Discovery => KernelTuningOperation::Discovery,
+                            TuningOperation::Form => KernelTuningOperation::Form,
+                            TuningOperation::Measure => KernelTuningOperation::Measure,
+                            TuningOperation::Promote => KernelTuningOperation::Promote,
+                            TuningOperation::Confirm => KernelTuningOperation::Confirm,
+                        },
+                    }),
+                    measured_configurations,
+                    formed_programs,
+                });
                 (ModelLoadStage::Optimizing, TUNING_SHARE * ratio(completed, total))
             }
             LoadProgress::ImportingWeights {
                 completed_bytes,
                 total_bytes,
             } => {
+                details = Some(ModelLoadDetails::Weights { completed_bytes, total_bytes });
                 let start = if self.tuned { TUNING_SHARE } else { 0.0 };
                 (
                     ModelLoadStage::LoadingWeights,
@@ -559,14 +580,22 @@ impl LoadProgression {
             LoadProgress::Finalizing => (ModelLoadStage::Finalizing, previous),
         };
         let fraction = fraction.max(previous);
-        let reported = self.reported.is_some_and(|(reported, _)| reported == stage)
+        // Do not throttle away a selected operation or a fresh count snapshot.
+        let changed_work = match (&self.details, &details) {
+            (Some(ModelLoadDetails::Tuning { work: a, measured_configurations: am, formed_programs: ap, .. }),
+             Some(ModelLoadDetails::Tuning { work: b, measured_configurations: bm, formed_programs: bp, .. })) =>
+                a != b || am != bm || ap != bp,
+            _ => false,
+        };
+        let reported = !changed_work && self.reported.is_some_and(|(reported, _)| reported == stage)
             && fraction < 1.0
             && fraction - previous < REPORT_STEP;
         if reported {
             return None;
         }
         self.reported = Some((stage, fraction));
-        self.reported
+        self.details = details.clone();
+        Some((stage, fraction, details))
     }
 }
 
@@ -591,6 +620,7 @@ impl EngineResidency {
                 instance_id: instance_id.clone(),
                 stage,
                 fraction: 0.0,
+                details: None,
                 planned_allocation: plan.cloned(),
             });
     }
@@ -668,11 +698,12 @@ impl EngineResidency {
             let progression = RefCell::new(LoadProgression::default());
             let notifier = driver.client.notifier();
             let report = |progress: LoadProgress| {
-                if let Some((stage, fraction)) = progression.borrow_mut().advance(progress) {
+                if let Some((stage, fraction, details)) = progression.borrow_mut().advance(progress) {
                     notifier.send(ResidencyNotification::LoadProgress {
                         instance_id: load_instance.clone(),
                         stage,
                         fraction,
+                        details,
                         planned_allocation: Some(load_plan.clone()),
                     });
                 }
@@ -1032,10 +1063,16 @@ mod tests {
             LoadProgress::Tuning {
                 completed: 0,
                 total: 100,
+            work: None,
+            measured_configurations: 0,
+            formed_programs: 0,
             },
             LoadProgress::Tuning {
                 completed: 50,
                 total: 100,
+            work: None,
+            measured_configurations: 0,
+            formed_programs: 0,
             },
             weights(0, 1000),
             weights(500, 1000),
@@ -1044,7 +1081,10 @@ mod tests {
         ];
         let reported = steps
             .into_iter()
-            .map(|progress| progression.advance(progress).unwrap())
+            .map(|progress| {
+                let (stage, fraction, _) = progression.advance(progress).unwrap();
+                (stage, fraction)
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             reported,
@@ -1072,11 +1112,14 @@ mod tests {
         progression.advance(LoadProgress::Tuning {
             completed: 100,
             total: 100,
+            work: None,
+            measured_configurations: 0,
+            formed_programs: 0,
         });
         // The Load worker.
         assert_eq!(progression.advance(LoadProgress::Preparing), None);
         assert_eq!(
-            progression.advance(weights(500, 1000)),
+            progression.advance(weights(500, 1000)).map(|(stage, fraction, _)| (stage, fraction)),
             Some((ModelLoadStage::LoadingWeights, 0.75))
         );
         // No tuning was reported: the load fills with weights.
@@ -1084,7 +1127,7 @@ mod tests {
         progression.advance(LoadProgress::Preparing);
         assert_eq!(progression.advance(LoadProgress::Preparing), None);
         assert_eq!(
-            progression.advance(weights(500, 1000)),
+            progression.advance(weights(500, 1000)).map(|(stage, fraction, _)| (stage, fraction)),
             Some((ModelLoadStage::LoadingWeights, 0.5))
         );
     }
@@ -1094,7 +1137,7 @@ mod tests {
         let mut progression = LoadProgression::default();
         progression.advance(LoadProgress::Preparing);
         assert_eq!(
-            progression.advance(weights(250, 1000)),
+            progression.advance(weights(250, 1000)).map(|(stage, fraction, _)| (stage, fraction)),
             Some((ModelLoadStage::LoadingWeights, 0.25))
         );
     }
@@ -1106,7 +1149,7 @@ mod tests {
         // Less than a report step within the same stage is not reported.
         assert_eq!(progression.advance(weights(100, 100_000)), None);
         assert_eq!(
-            progression.advance(weights(1000, 100_000)),
+            progression.advance(weights(1000, 100_000)).map(|(stage, fraction, _)| (stage, fraction)),
             Some((ModelLoadStage::LoadingWeights, 0.01))
         );
         // A unit found unexpectedly to search raises the tuning total; the fraction holds.
@@ -1114,11 +1157,17 @@ mod tests {
         progression.advance(LoadProgress::Tuning {
             completed: 50,
             total: 100,
+            work: None,
+            measured_configurations: 0,
+            formed_programs: 0,
         });
         assert_eq!(
             progression.advance(LoadProgress::Tuning {
                 completed: 60,
                 total: 200,
+            work: None,
+            measured_configurations: 0,
+            formed_programs: 0,
             }),
             None
         );

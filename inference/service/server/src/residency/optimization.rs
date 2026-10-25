@@ -256,7 +256,7 @@ impl OptimizationProgression {
     fn advance(&mut self, progress: LoadProgress) -> Option<CatalogOptimizationProgress> {
         let (stage, completed, total) = match progress {
             LoadProgress::Preparing => (CatalogOptimizationStage::Preparing, 0, 0),
-            LoadProgress::Tuning { completed, total } => {
+            LoadProgress::Tuning { completed, total, .. } => {
                 (CatalogOptimizationStage::Tuning, completed.min(total), total)
             }
             LoadProgress::ImportingWeights { .. } | LoadProgress::Finalizing => return None,
@@ -359,6 +359,9 @@ mod tests {
                 progression.advance(LoadProgress::Tuning {
                     completed,
                     total: 10_000,
+                    work: None,
+                    measured_configurations: 0,
+                    formed_programs: 0,
                 })
             })
             .collect::<Vec<_>>();

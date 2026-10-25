@@ -31,11 +31,48 @@ pub enum ModelLoadStage {
     Finalizing,
 }
 
+/// Selected optional tuning work, not a fixed sequence of global phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelTuningOperation {
+    Discovery,
+    Form,
+    Measure,
+    Promote,
+    Confirm,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct KernelTuningWork {
+    pub entry: String,
+    pub operation: KernelTuningOperation,
+}
+
+/// Exact stage observations; budget time is not configuration completion.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModelLoadDetails {
+    Tuning {
+        elapsed_ms: u64,
+        budget_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        work: Option<KernelTuningWork>,
+        measured_configurations: u64,
+        formed_programs: u64,
+    },
+    Weights {
+        completed_bytes: u64,
+        total_bytes: u64,
+    },
+}
+
 /// A model load's stage and completed fraction in `[0, 1]`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelLoadProgress {
     pub stage: ModelLoadStage,
     pub fraction: f32,
+    pub details: Option<ModelLoadDetails>,
 }
 
 /// Observes model loading.

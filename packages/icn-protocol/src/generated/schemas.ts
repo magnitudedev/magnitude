@@ -633,6 +633,10 @@ export type ChatCompletionMessageEncoded = S.Schema.Encoded<typeof ChatCompletio
 export const ChatCompletionProgress = S.Union(
   S.extend(
     S.Struct({
+      details: S.optionalWith(
+        S.suspend((): S.Schema<ModelLoadDetails, ModelLoadDetailsEncoded> => ModelLoadDetails),
+        { exact: true, as: "Option" },
+      ),
       fraction: S.Number,
       phase: S.Literal("model_loading"),
       stage: S.suspend((): S.Schema<ModelLoadStage, ModelLoadStageEncoded> => ModelLoadStage),
@@ -1919,6 +1923,26 @@ export const KernelStatic = S.Struct({
 export type KernelStatic = S.Schema.Type<typeof KernelStatic>
 export type KernelStaticEncoded = S.Schema.Encoded<typeof KernelStatic>
 
+export const KernelTuningOperation = S.Union(
+  S.Literal("discovery"),
+  S.Literal("form"),
+  S.Literal("measure"),
+  S.Literal("promote"),
+  S.Literal("confirm"),
+)
+export type KernelTuningOperation = S.Schema.Type<typeof KernelTuningOperation>
+export type KernelTuningOperationEncoded = S.Schema.Encoded<typeof KernelTuningOperation>
+
+export const KernelTuningWork = S.extend(
+  S.Struct({
+    entry: S.String,
+    operation: S.suspend((): S.Schema<KernelTuningOperation, KernelTuningOperationEncoded> => KernelTuningOperation),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type KernelTuningWork = S.Schema.Type<typeof KernelTuningWork>
+export type KernelTuningWorkEncoded = S.Schema.Encoded<typeof KernelTuningWork>
+
 export const KnownUnsupportedReason = S.Union(
   S.extend(
     S.TaggedStruct("Architecture", {
@@ -2583,6 +2607,33 @@ export const ModelInstancesSnapshot = S.Struct({
 })
 export type ModelInstancesSnapshot = S.Schema.Type<typeof ModelInstancesSnapshot>
 export type ModelInstancesSnapshotEncoded = S.Schema.Encoded<typeof ModelInstancesSnapshot>
+
+export const ModelLoadDetails = S.Union(
+  S.extend(
+    S.Struct({
+      budget_ms: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      elapsed_ms: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      formed_programs: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      kind: S.Literal("tuning"),
+      measured_configurations: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      work: S.optionalWith(
+        S.suspend((): S.Schema<KernelTuningWork, KernelTuningWorkEncoded> => KernelTuningWork),
+        { exact: true, as: "Option" },
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      completed_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      kind: S.Literal("weights"),
+      total_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelLoadDetails = S.Schema.Type<typeof ModelLoadDetails>
+export type ModelLoadDetailsEncoded = S.Schema.Encoded<typeof ModelLoadDetails>
 
 export const ModelLoadDevice = S.Struct({
   backend: S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend),

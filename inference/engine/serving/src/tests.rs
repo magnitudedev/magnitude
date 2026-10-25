@@ -234,6 +234,7 @@ impl ServedModels for Scripted {
                 progress(ModelLoadProgress {
                     stage: ModelLoadStage::LoadingWeights,
                     fraction: 0.5,
+                    details: None,
                 });
             }
             if self.pending {

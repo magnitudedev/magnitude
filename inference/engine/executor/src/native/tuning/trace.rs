@@ -213,6 +213,8 @@ impl TuningTrace {
                 "completed_ms": completed,
                 "total_ms": total,
             }),
+            // Ephemeral UI activity; completed pieces remain the trace's evidence.
+            TuningEvent::WorkStarted { .. } => return,
             TuningEvent::Started {
                 entry,
                 bindings,
