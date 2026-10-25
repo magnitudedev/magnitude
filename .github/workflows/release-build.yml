@@ -239,7 +239,7 @@ jobs:
           New-Item -ItemType Directory -Force $fixture | Out-Null
           $cer = Join-Path $fixture 'acceptance-publisher.cer'
           Export-Certificate -Cert $cert -FilePath $cer | Out-Null
-          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\Root | Out-Null
+          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
           Import-Certificate -FilePath $cer -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null
           $nodeVersion = (& node.exe -p process.versions.node).Trim()
           $library = Join-Path $fixture 'node.lib'

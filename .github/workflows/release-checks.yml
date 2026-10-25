@@ -3,6 +3,10 @@ name: Release checks
 on:
   workflow_dispatch:
     inputs:
+      windows_fixture_only:
+        description: Build only the timestamped Windows installer fixture, reusing the existing native engine for tests
+        type: boolean
+        default: false
       macos_cpu_artifact_run_id:
         description: Test Intel CPU inference using this existing release run (no builds or publication)
         type: string
@@ -51,11 +55,11 @@ jobs:
       model: ${{ inputs.macos_cpu_model }}
 
   integrations:
-    if: ${{ !inputs.macos_cpu_artifact_run_id }}
+    if: ${{ !inputs.macos_cpu_artifact_run_id && !inputs.windows_fixture_only }}
     uses: ./.github/workflows/integrations.yml
 
   static:
-    if: ${{ !inputs.macos_cpu_artifact_run_id }}
+    if: ${{ !inputs.macos_cpu_artifact_run_id && !inputs.windows_fixture_only }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -86,7 +90,7 @@ jobs:
       - run: bun run packages/release/scripts/matrix.ts
 
   release-build:
-    if: ${{ !inputs.macos_cpu_artifact_run_id }}
+    if: ${{ !inputs.macos_cpu_artifact_run_id && !inputs.windows_fixture_only }}
     permissions:
       contents: read
       actions: read
@@ -99,3 +103,46 @@ jobs:
       windows_distribution: false
       apple_distribution: true
     secrets: inherit
+
+  windows-script-fixture:
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_fixture_only
+    runs-on: blacksmith-8vcpu-windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - run: bun install --frozen-lockfile
+      - name: Prepare timestamped disposable publisher fixture
+        shell: pwsh
+        run: |
+          . ./packages/release/scripts/build/windows-engine-toolchain.ps1
+          choco install nsis --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS installation failed.' }
+          $fixture = Join-Path $env:RUNNER_TEMP 'installer-audit'
+          New-Item -ItemType Directory -Force $fixture | Out-Null
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=Magnitude Update Acceptance, O=Magnitude Update Acceptance' -CertStoreLocation Cert:\CurrentUser\My -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -NotAfter (Get-Date).AddDays(2)
+          $cer = Join-Path $fixture 'acceptance-publisher.cer'
+          Export-Certificate -Cert $cert -FilePath $cer | Out-Null
+          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+          $nodeVersion = (& node.exe -p process.versions.node).Trim()
+          $library = Join-Path $fixture 'node.lib'
+          Invoke-WebRequest "https://nodejs.org/download/release/v$nodeVersion/win-x64/node.lib" -OutFile $library
+          $env:MAGNITUDE_NODE_LIBRARY = $library
+          $env:MAGNITUDE_SCRIPT_ACCEPTANCE_OUTPUT = $fixture
+          $env:MAGNITUDE_ACCEPTANCE_WINDOWS_CERTIFICATE = $cert.Thumbprint
+          $env:MAGNITUDE_ACCEPTANCE_TIMESTAMP_SERVER = 'http://timestamp.digicert.com'
+          $env:MAGNITUDE_ACCEPTANCE_NSIS = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          bun packages/release/scripts/acceptance/prepare-windows-script-fixture.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Windows script fixture build failed.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-fixture-windows-x64-msvc
+          path: |
+            ${{ runner.temp }}/installer-audit/hosting/
+            ${{ runner.temp }}/installer-audit/acceptance-publisher.cer
+          if-no-files-found: error
