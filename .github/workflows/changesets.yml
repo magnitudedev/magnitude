@@ -28,7 +28,7 @@ jobs:
           node-version: 24
       - run: npm install --global npm@11.6.2
       - id: derived
-        name: Detect RPC and bundled plugin changes before Changesets discovery
+        name: Detect RPC changes before Changesets discovery
         run: bun packages/release/scripts/prepare-release.ts --detect
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
