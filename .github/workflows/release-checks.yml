@@ -203,4 +203,5 @@ jobs:
           path: |
             /Users/runner/installer-audit-next/*.log
             /Users/runner/installer-audit-next/*.json
+            inference/evaluation/results/
           if-no-files-found: warn
