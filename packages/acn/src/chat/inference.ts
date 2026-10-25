@@ -1,16 +1,10 @@
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import { IcnClient } from "@magnitudedev/icn"
 import * as Native from "@magnitudedev/icn-protocol/schemas"
-import {
-  ChatFailed,
-  LocalInferenceHardwareSchema as HardwareSchema,
-} from "@magnitudedev/acn-protocol"
-import { LocalInferenceHardware } from "../local-inference-hardware"
-import { ACN_VERSION } from "../version"
+import { ChatFailed } from "@magnitudedev/acn-protocol"
 
 export interface ChatInference {
   readonly models: Effect.Effect<Native.OpenAiModelsResponse, ChatFailed>
-  readonly setup: Effect.Effect<string>
   readonly generate: (
     request: Native.ChatCompletionRequest
   ) => Stream.Stream<Native.ChatCompletionChunk, ChatFailed>
@@ -47,24 +41,10 @@ export const ChatInferenceLive = Layer.effect(
   ChatInference,
   Effect.gen(function* () {
     const client = yield* IcnClient
-    const hardware = yield* LocalInferenceHardware
     return ChatInference.of({
       models: client.inference
         .listServableModels({})
         .pipe(Effect.mapError(chatInferenceError)),
-      setup: hardware.state.pipe(
-        Effect.flatMap((state) =>
-          Schema.encode(
-            Schema.parseJson(
-              Schema.Struct({
-                magnitudeVersion: Schema.String,
-                inferenceHost: HardwareSchema,
-              })
-            )
-          )({ magnitudeVersion: ACN_VERSION, inferenceHost: state })
-        ),
-        Effect.orElseSucceed(() => "Setup information unavailable.")
-      ),
       generate: (request) =>
         Stream.unwrap(
           client.chat

@@ -33,7 +33,6 @@ import { AcnChanges } from "../changes"
 import { ServingUsage, ServingUsageRecord } from "../serving-usage"
 import { InferenceActivity } from "../inference-activity"
 import { ChatInference } from "./inference"
-import magnitudeInfo from "./magnitude-info.md" with { type: "text" }
 
 export interface ChatService {
   readonly models: ChatInference["models"]
@@ -421,7 +420,6 @@ export const ChatServiceLive = Layer.scoped(
               return yield* invalid(
                 "This model does not support that reasoning level."
               )
-            const setup = (yield* inference.setup).slice(0, 32768)
             const settings = input.settings
             const optional = <A>(value: Option.Option<A>) =>
               Option.getOrUndefined(value)
@@ -438,7 +436,7 @@ export const ChatServiceLive = Layer.scoped(
               messages: [
                 {
                   role: "system",
-                  content: `You are a helpful assistant. Answer the user directly. You have no tools or independent access to their machine.\n\n${settings.systemPrompt}\n\n${magnitudeInfo}\n\n## Current setup\n${setup}\n\nSelected model: ${model.name} (${modelId}). Context: ${model.context_length} tokens. No tools are available.`,
+                  content: settings.systemPrompt,
                 },
                 ...messages
                   .filter((m) => m.role === "user" || m.content.length > 0)

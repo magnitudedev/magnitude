@@ -57,7 +57,7 @@ export const ChatSettings = Schema.Struct({
 })
 export type ChatSettings = typeof ChatSettings.Type
 export const defaultChatSettings = Schema.decodeUnknownSync(ChatSettings)({
-  systemPrompt: "You are a helpful assistant.",
+  systemPrompt: "You are a helpful assistant chatting inside Magnitude, an app that runs AI models on the user's hardware.",
   stop: [],
 })
 export const ChatMetrics = Schema.Struct({

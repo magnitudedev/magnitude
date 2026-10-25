@@ -144,7 +144,6 @@ function fixture(
     }),
     Layer.succeed(ChatInference, {
       models: Effect.succeed(models),
-      setup: Effect.succeed("Apple M4 Max · 64 GB unified memory"),
       generate: (r) => {
         requests.push(r)
         return generate(r)
@@ -218,10 +217,12 @@ describe("durable Chat", () => {
       f.requests[0]!
     )
     expect(request.tools).toBeUndefined()
-    expect(request.messages[0]?.content).toContain(
-      "Optimization takes up to a minute."
-    )
-    expect(request.messages[0]?.content).toContain("Apple M4 Max")
+    const systemPrompt = request.messages[0]?.content as string
+    expect(systemPrompt).toBe(defaultChatSettings.systemPrompt)
+    expect(systemPrompt).not.toContain("Current setup")
+    expect(systemPrompt).not.toContain("inferenceHost")
+    expect(systemPrompt).not.toContain("App layout")
+    expect(systemPrompt).not.toContain("Selected model:")
     const db = new Database(join(f.path, "chats.sqlite"), { readonly: true })
     expect(
       JSON.stringify(db.query("SELECT data FROM generations").all())
@@ -313,6 +314,7 @@ describe("durable Chat", () => {
   })
   it("retries the last response with current settings and keeps previous attempts", async () => {
     const f = fixture()
+    const customPrompt = " \nAnswer in French.\n "
     await f.run(
       Effect.gen(function* () {
         const s = yield* ChatService
@@ -326,6 +328,7 @@ describe("durable Chat", () => {
           retryMessageId: Option.some(first.messageId),
           settings: {
             ...settings,
+            systemPrompt: customPrompt,
             temperature: Option.some(0.2),
             reasoningEffort: Option.some("high"),
           },
@@ -348,6 +351,10 @@ describe("durable Chat", () => {
     )
     expect(f.requests[1]?.messages).toHaveLength(2)
     expect(f.requests[1]?.temperature).toEqual(Option.some(0.2))
+    const retryRequest = Schema.encodeSync(Native.ChatCompletionRequest)(
+      f.requests[1]!
+    )
+    expect(retryRequest.messages[0]?.content).toBe(customPrompt)
     const db = new Database(join(f.path, "chats.sqlite"), { readonly: true })
     expect(db.query("SELECT COUNT(*) n FROM generations").get()).toEqual({
       n: 3,
