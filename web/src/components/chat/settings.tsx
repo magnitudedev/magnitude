@@ -46,6 +46,17 @@ export function ChatSettingsPanel({
 }) {
   const [advanced, setAdvanced] = useState(false)
   const [stopText, setStopText] = useState(() => formatStopSequences(s.stop))
+  // Unset temperature uses the inference service's sampling default.
+  const temperature = value(s.temperature) ?? 1
+  const defaults = {
+    maxOutputTokens: context,
+    topK: 20,
+    minP: 0,
+    repetitionPenalty: 1,
+    presencePenalty: 0,
+    frequencyPenalty: 0,
+    seed: undefined,
+  }
   const numeric = (
     label: string,
     key:
@@ -67,8 +78,9 @@ export function ChatSettingsPanel({
         min={min}
         max={max}
         step={step}
-        placeholder="Model default"
-        value={value(s[key]) ?? ""}
+        placeholder={key === "seed" ? "Random" : "—"}
+        disabled={key === "maxOutputTokens" && context === undefined && Option.isNone(s.maxOutputTokens)}
+        value={value(s[key]) ?? defaults[key] ?? ""}
         onChange={(e) =>
           patch({
             [key]:
@@ -82,9 +94,6 @@ export function ChatSettingsPanel({
   )
   return (
     <>
-      <p className="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
-        Applies to your next message.
-      </p>
       <Setting title="System prompt">
         <textarea
           aria-label="System prompt"
@@ -97,7 +106,7 @@ export function ChatSettingsPanel({
       </Setting>
       <Setting
         title="Temperature"
-        value={value(s.temperature) ?? "Model default"}
+        value={temperature}
       >
         <input
           aria-label="Temperature"
@@ -105,7 +114,7 @@ export function ChatSettingsPanel({
           min="0"
           max="2"
           step=".1"
-          value={value(s.temperature) ?? 0.7}
+          value={temperature}
           onChange={(e) =>
             patch({ temperature: Option.some(Number(e.target.value)) })
           }
@@ -128,7 +137,7 @@ export function ChatSettingsPanel({
         </button>
         {advanced && (
           <>
-            <Setting title="Top P" value={value(s.topP) ?? "Model default"}>
+            <Setting title="Top P" value={value(s.topP) ?? 0.95}>
               <input
                 aria-label="Top P"
                 type="range"

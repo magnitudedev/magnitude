@@ -44,9 +44,6 @@ export function ChatHistoryPanel({
     }
   return (
     <>
-      <p className="mb-5 mt-1 text-xs text-slate-500">
-        Saved on the inference service
-      </p>
       {Result.isInitial(history) && (
         <p className="text-xs text-slate-500">Loading chats…</p>
       )}

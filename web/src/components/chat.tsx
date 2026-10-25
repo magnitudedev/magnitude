@@ -135,6 +135,10 @@ function ChatView({
     ...settings,
     modelId: modelId ? Option.some(ChatModelId.make(modelId)) : none(),
     reasoningEffort: chatReasoningEffort(model, settings.reasoningEffort),
+    // With no explicit output limit, generation may use the remaining context.
+    maxOutputTokens: Option.orElse(settings.maxOutputTokens, () =>
+      model ? Option.some(contextFor(model)) : none()
+    ),
   }
   const settingsValid = Schema.is(Schema.typeSchema(ChatSettingsSchema))(
     effectiveSettings
