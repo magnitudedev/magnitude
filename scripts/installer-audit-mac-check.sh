@@ -8,16 +8,17 @@ printf '%s\n' 'connect-to = "github.com:443:127.0.0.1:18443"' 'noproxy = "*"' > 
 # This disposable VM's app was installed by this audit; start the candidate from a clean destination.
 test ! -e /Library/LaunchDaemons/dev.magnitude.server.plist
 sudo rm -rf /Applications/Magnitude.app
-python3 - "$root" > "$root/https.log" 2>&1 <<'PY' &
+python3 -u - "$root" > "$root/https.log" 2>&1 <<'PY' &
+print("FIXTURE_START",flush=True)
 import functools,http.server,pathlib,ssl,sys
 r=pathlib.Path(sys.argv[1]);s=http.server.ThreadingHTTPServer(('127.0.0.1',18443),functools.partial(http.server.SimpleHTTPRequestHandler,directory=str(r/'hosting/mac-zip')))
 c=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);c.load_cert_chain(r/'fixture-tls.crt',r/'fixture-tls.key');s.socket=c.wrap_socket(s.socket,server_side=True)
-(r/'listening').touch();s.serve_forever()
+(r/'listening').touch();print('FIXTURE_READY',flush=True);s.serve_forever()
 PY
 server=$!
 trap 'kill -TERM "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true' EXIT
-for n in $(seq 1 100); do [ ! -f "$root/listening" ] || break; sleep .1; done
-test -f "$root/listening"
+for n in $(seq 1 600); do [ ! -f "$root/listening" ] || break; sleep .1; done
+test -f "$root/listening" || { cat "$root/https.log"; exit 1; }
 for pass in fresh repeat; do
  echo INSTALL_PASS="$pass"
  curl -fsSL https://localhost:18443/install.sh | sh > "$root/$pass-install.log" 2>&1
