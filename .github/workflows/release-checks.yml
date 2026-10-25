@@ -193,7 +193,8 @@ jobs:
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 -config "$HOME/installer-audit-next/tls.conf" -keyout "$HOME/installer-audit-next/fixture-tls.key" -out "$HOME/installer-audit-next/fixture-tls.crt"
       - name: Run the unchanged signed installer and real CPU API acceptance
         run: |
-          uv run --project inference/evaluation mrig script scripts/installer-audit-intel.sh --host local --backend cpu --purpose 'Qualify native Intel macOS15 curl installer, cold engine acquisition, current CLI, final response and streaming from the exact built archives' --estimate 8m
+          uv run --project inference/evaluation --package magnitude-rig mrig setup local
+          uv run --project inference/evaluation --package magnitude-rig mrig script scripts/installer-audit-intel.sh --host local --backend cpu --purpose 'Qualify native Intel macOS15 curl installer, cold engine acquisition, current CLI, final response and streaming from the exact built archives' --estimate 8m
           grep -q 'RESULT=next-complete-answer-and-streaming-passed' "$HOME/installer-audit-next/acceptance-api.log"
       - uses: actions/upload-artifact@v4
         if: always()
