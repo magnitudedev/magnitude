@@ -41,6 +41,8 @@ export interface ServerSetupHost {
    * is the one answering), or anything else, such as another account's Magnitude.
    */
   readonly servicePort: Effect.Effect<ServicePort>
+  /** The registered owner's runtime has completed startup, rather than merely bound its port. */
+  readonly serviceReady: Effect.Effect<boolean>
   /** How many times the service manager has started the service, where it says. */
   readonly serviceRuns: Effect.Effect<Option.Option<number>>
   /** The service log's recent lines, since setup started when the log can say. */
@@ -78,7 +80,7 @@ export const portTaken = `Port ${SERVER_PORT} is already in use, by Magnitude ru
   + "so the server can't use it. Stop that, then run `magnitude server setup` again."
 
 /** The service manager's own lines about the unit, which say that it stopped but never why. */
-const SERVICE_MANAGER_LINE = /^(magnitude\.service: |(Started|Starting|Stopped|Stopping) magnitude\.service\b)/
+const SERVICE_MANAGER_LINE = /^(magnitude\.service: |(?:Started|Starting|Stopped|Stopping|Failed to start) (?:magnitude\.service\b|Magnitude server\.$))/
 /** A logger entry, or its continuation: what the service did, rather than its final word. */
 const LOG_ENTRY = /^(\[\d[\d:.]*\] [A-Z]+ \(#\d+\):|timestamp=|\s|")/
 const ERROR_ENTRY = /^\[\d[\d:.]*\] (?:ERROR|FATAL) \(#\d+\):\s*(\S.*)$/
@@ -123,7 +125,7 @@ const awaitService = (host: ServerSetupHost) => Effect.gen(function* () {
   const initialRuns = yield* host.serviceRuns
   for (let foreign = 0; ; yield* Effect.sleep(Duration.seconds(1))) {
     const port = yield* host.servicePort
-    if (port === "Service") return
+    if (port === "Service" && (yield* host.serviceReady)) return
     foreign = port === "Other" ? foreign + 1 : 0
     if (foreign >= FOREIGN_PORT_GRACE) return yield* startFailed(host, portTaken)
     const runs = yield* host.serviceRuns
@@ -145,6 +147,14 @@ export const withinServerStart = <A>(host: ServerSetupHost, wait: Effect.Effect<
     onNone: () => startFailed(host, "The Magnitude server did not become ready within 2 minutes."),
     onSome: Effect.succeed,
   })))
+
+/** Installer restart verification: observes the registered service without changing its settings. */
+export const serverWaitReady = Effect.gen(function* () {
+  const host = yield* ServerSetupHost
+  if (!(yield* host.isSetUp)) return yield* failed("Magnitude is not set up as a server on this machine.")
+  yield* host.write("Waiting for the Magnitude server to become ready…\n")
+  yield* withinServerStart(host, Effect.void)
+})
 
 export const renderServerReady = (platform: NodeJS.Platform, access: ServerAccess) => [
   "Magnitude is running as a server on this machine.",

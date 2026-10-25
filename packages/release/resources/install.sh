@@ -104,7 +104,9 @@ case "$(uname -s)" in
     /usr/bin/plutil -insert offer -json "$(cat "$scratch/offer.json")" "$scratch/request.plist"
     /usr/bin/plutil -convert json -o "$scratch/request.json" "$scratch/request.plist"
     "$app/Contents/Resources/magnitude" _install-mac-application "$(cat "$scratch/request.json")"
-    printf '%s\n' 'Magnitude was installed. Open it from Applications, or run `magnitude server setup` to run it as a server.'
+    printf '%s\n' 'Magnitude was installed. Open it from Applications.' \
+      'Open a new terminal to use the magnitude command.' \
+      'To run it as a server: magnitude server setup'
     ;;
   Linux)
     # Every package requires this glibc; refuse before asking anything rather than fail in the package manager.
@@ -238,7 +240,9 @@ PY
         # Only a server this installer stopped is started; one an administrator stopped stays stopped.
         if [ -n "$restart" ]; then
           $privilege systemctl start magnitude.service
-          printf '%s\n' 'The server restarted. Run `magnitude status` to check on it.'
+          /usr/lib/magnitude-desktop/resources/magnitude _server-wait-ready \
+            || fail 'The package was installed, but the server did not become ready. Check: sudo journalctl -u magnitude -n 100 --no-pager'
+          printf '%s\n' 'The server restarted and is ready. Run `magnitude status` to check on it.'
         else printf '%s\n' 'The server was not running and was left stopped. Start it with: sudo systemctl start magnitude'
         fi ;;
       yes)

@@ -3,7 +3,7 @@ import { Effect, Option } from "effect"
 import { ServerInstallationFailed, installLinuxServer, installMacServer, openServerFirewall, parseServerInstallation, removeLinuxServer, restoreLinuxServerGrant,
   removeMacServer, requireInstalledRoot } from "@magnitudedev/daemon-management/desktop-native"
 import { ServerSetupHostLive } from "../server/server-setup-live"
-import { serverRemove, serverSetup } from "../server/server-setup"
+import { serverRemove, serverSetup, serverWaitReady } from "../server/server-setup"
 
 const report = <E extends { readonly message: string }>(effect: Effect.Effect<void, E>) => Effect.runPromise(effect.pipe(
   Effect.catchAll(error => Effect.sync(() => { process.stderr.write(`${error.message}\n`); process.exitCode = 1 }))))
@@ -11,6 +11,7 @@ const report = <E extends { readonly message: string }>(effect: Effect.Effect<vo
 // A request to a service that never answered may still be pending after setup gave up on it.
 export const runServerSetup = () => report(serverSetup.pipe(Effect.provide(ServerSetupHostLive))).then(() => process.exit())
 export const runServerRemove = () => report(serverRemove.pipe(Effect.provide(ServerSetupHostLive)))
+export const runServerWaitReady = () => report(serverWaitReady.pipe(Effect.provide(ServerSetupHostLive))).then(() => process.exit())
 
 /** The hidden root command. It accepts no input beyond the user name and runs only from the installed CLI as root. */
 export const runServerRootStep = (argv: readonly string[]) => report(Effect.gen(function* () {

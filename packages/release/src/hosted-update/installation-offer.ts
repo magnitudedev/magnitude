@@ -11,7 +11,9 @@ export const InstallationOffer = Schema.Struct({
   download: Schema.String.pipe(Schema.maxLength(2048), Schema.filter(isGithubReleaseAssetUrl)),
 })
 export type InstallationOffer = typeof InstallationOffer.Type
-export class InvalidInstallationOffer extends Schema.TaggedError<InvalidInstallationOffer>()("InvalidInstallationOffer", {}) {}
+export class InvalidInstallationOffer extends Schema.TaggedError<InvalidInstallationOffer>()("InvalidInstallationOffer", {}) {
+  override get message() { return "Application release verification failed. Download the installer again." }
+}
 
 /** Installation has no prior version; platform and channel are explicit caller choices. */
 export const verifyInstallationOffer = (input: unknown, target: ReleaseTarget,

@@ -66,7 +66,7 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
     stub("dpkg-query", '[ -n "${TEST_INSTALLED:-}" ] || exit 1\nprintf "%s" "$(cat "$TEST_INSTALLED")"\n')
     stub("env", 'while [ "$#" -gt 0 ]; do case "$1" in *=*) shift;; *) break;; esac; done\nexec "$@"\n')
     stub("apt-get", 'printf "%s\\n" "$1" >> "$TEST_LOG"\n[ "$1" != install ] || [ -z "${TEST_INSTALL_FAILS:-}" ] || exit 100\n[ "$1" != install ] || [ -z "${TEST_INSTALLED:-}" ] || printf "0.1.6" > "$TEST_INSTALLED"\n')
-    stub("magnitude", 'printf "magnitude %s\\n" "$*" >> "$TEST_LOG"\n')
+    stub("magnitude", 'printf "magnitude %s\\n" "$*" >> "$TEST_LOG"\nif [ "$1" = _server-wait-ready ] && [ -n "${TEST_READY_FAILS:-}" ]; then echo "The inference engine could not start." >&2; exit 1; fi\n')
     // The installer behaves as an ordinary account, whatever account runs the tests.
     stub("id", 'case "$1" in -u) echo 1000;; *) exec /usr/bin/id "$@";; esac\n')
     const keys = generateKeyPairSync("ed25519")
@@ -76,8 +76,9 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
       { os: "linux", arch: arch ?? "x64", package: "deb" }, keys.privateKey))
     writeFileSync(join(root, "offer.json"), JSON.stringify({ release, download: "https://github.com/magnitudedev/magnitude/releases/download/test/magnitude.deb" }))
     script = join(root, "install.sh")
-    writeFileSync(script, await Effect.runPromise(renderUnixInstallationScript({ origin: "https://magnitude.dev", appleTeam: "ABCDEFGHIJ",
-      publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString() }).pipe(Effect.provide(NodeContext.layer))))
+    writeFileSync(script, (await Effect.runPromise(renderUnixInstallationScript({ origin: "https://magnitude.dev", appleTeam: "ABCDEFGHIJ",
+      publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString() }).pipe(Effect.provide(NodeContext.layer)))).replace(
+        "/usr/lib/magnitude-desktop/resources/magnitude _server-wait-ready", `${bin}/magnitude _server-wait-ready`))
     environment = { PATH: bin, HOME: root, TEST_LOG: log, TEST_OFFER: join(root, "offer.json"), TEST_PACKAGE: join(root, "package.deb") }
   })
   afterEach(() => rmSync(root, { recursive: true, force: true }))
@@ -164,7 +165,8 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
       expect(service()).toEqual(["update", "systemctl is-active --quiet magnitude.service", "sudo systemctl stop magnitude.service",
         "systemctl stop magnitude.service", "install", "sudo systemctl start magnitude.service", "systemctl start magnitude.service"])
       expect(result.stdout).toContain("Magnitude was upgraded from 0.1.5 to 0.1.6.")
-      expect(result.stdout).toContain("The server restarted.")
+      expect(events()).toContain("magnitude _server-wait-ready")
+      expect(result.stdout).toContain("The server restarted and is ready.")
     })
     it("says so when the installed version is already current", () => {
       writeFileSync(join(root, "installed"), "0.1.6")
@@ -178,6 +180,15 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
       expect(result.status, result.stderr).toBe(0)
       expect(service()).toEqual(["update", "systemctl is-active --quiet magnitude.service", "install"])
       expect(result.stdout).toContain("left stopped")
+      expect(events()).not.toContain("magnitude _server-wait-ready")
+    })
+    it("reports a failed restart instead of success when the installed runtime does not become ready", () => {
+      const result = unattended({ TEST_READY_FAILS: "1" })
+      expect(result.status).toBe(1)
+      expect(result.stderr).toContain("The inference engine could not start.")
+      expect(result.stderr).toContain("The package was installed, but the server did not become ready.")
+      expect(result.stdout).not.toContain("The server restarted")
+      expect(events()).toContain("magnitude _server-wait-ready")
     })
     it("starts the server again when the package does not install", () => {
       const result = unattended({ TEST_INSTALL_FAILS: "1" })

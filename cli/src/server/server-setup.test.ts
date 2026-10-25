@@ -1,6 +1,6 @@
 import { Duration, Effect, Either, Fiber, Option, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
-import { explainServiceLog, portTaken, SERVER_START_TIMEOUT, type ServerSetupFailed, ServerSetupHost, serverRemove, serverSetup, WINDOWS_SERVER_MESSAGE } from "./server-setup"
+import { explainServiceLog, portTaken, SERVER_START_TIMEOUT, type ServerSetupFailed, ServerSetupHost, serverRemove, serverSetup, serverWaitReady, WINDOWS_SERVER_MESSAGE } from "./server-setup"
 
 const harness = (overrides: Partial<ServerSetupHost> = {}) => {
   const events: string[] = []
@@ -14,6 +14,7 @@ const harness = (overrides: Partial<ServerSetupHost> = {}) => {
     hasTerminal: Effect.succeed(true),
     sudoWithoutPrompt: Effect.succeed(false),
     servicePort: Effect.succeed("Service"),
+    serviceReady: Effect.succeed(true),
     serviceRuns: Effect.succeed(Option.some(0)),
     serviceLog: Effect.succeed([]),
     confirm: () => Effect.sync(() => { events.push("confirm"); return true }),
@@ -144,6 +145,49 @@ describe("magnitude server setup", () => {
   })
 })
 
+describe("installer server readiness", () => {
+  it("waits beyond a bound port until the registered runtime is ready, without changing settings", async () => {
+    let checks = 0
+    const h = harness({ serviceReady: Effect.sync(() => ++checks >= 3) })
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const fiber = yield* Effect.fork(serverWaitReady.pipe(Effect.provideService(ServerSetupHost, h.host), Effect.either))
+      yield* TestClock.adjust(Duration.seconds(3))
+      return yield* Fiber.join(fiber)
+    }).pipe(Effect.provide(TestContext.TestContext)))
+    expect(Either.isRight(result)).toBe(true)
+    expect(checks).toBe(3)
+    expect(h.events).toEqual([])
+  })
+
+  it("fails with the service's error when it crash-loops instead of declaring the restart successful", async () => {
+    let runs = 0
+    const h = harness({ serviceReady: Effect.succeed(false), serviceRuns: Effect.sync(() => Option.some(runs++)),
+      serviceLog: Effect.succeed(["The inference engine could not start."]) })
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const fiber = yield* Effect.fork(serverWaitReady.pipe(Effect.provideService(ServerSetupHost, h.host), Effect.either))
+      yield* TestClock.adjust(Duration.seconds(10))
+      return yield* Fiber.join(fiber)
+    }).pipe(Effect.provide(TestContext.TestContext)))
+    expect(Either.isLeft(result) && result.left.message).toContain("The Magnitude server keeps stopping as it starts.")
+    expect(Either.isLeft(result) && result.left.message).toContain("The inference engine could not start.")
+    expect(h.events).toEqual([])
+  })
+
+  it("bounds a runtime that stays starting and refuses an unconfigured service", async () => {
+    const h = harness({ serviceReady: Effect.succeed(false) })
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const fiber = yield* Effect.fork(serverWaitReady.pipe(Effect.provideService(ServerSetupHost, h.host), Effect.either))
+      yield* TestClock.adjust(SERVER_START_TIMEOUT)
+      return yield* Fiber.join(fiber)
+    }).pipe(Effect.provide(TestContext.TestContext)))
+    expect(Either.isLeft(result) && result.left.message).toContain("did not become ready within 2 minutes")
+    const absent = harness({ isSetUp: Effect.succeed(false) })
+    const refused = await absent.run(serverWaitReady)
+    expect(Either.isLeft(refused) && refused.left.message).toContain("not set up as a server")
+    expect(absent.output()).toBe("")
+  })
+})
+
 describe("explainServiceLog", () => {
   const engine = "Magnitude couldn't download its inference engine (HTTP 404 from github.com). This release isn't available for download. Update Magnitude, or try again later."
   it("quotes the service's final word rather than the service manager's lines", () => {
@@ -156,6 +200,9 @@ describe("explainServiceLog", () => {
       "magnitude.service: Scheduled restart job, restart counter is at 3.",
       "Stopped magnitude.service - Magnitude server.",
       "Started magnitude.service - Magnitude server.",
+      "Stopped Magnitude server.",
+      "Started Magnitude server.",
+      "Failed to start Magnitude server.",
       "[15:02:49.240] INFO (#12): Network access resolved", "  bind: 127.0.0.1",
     ])).toEqual([engine])
   })
