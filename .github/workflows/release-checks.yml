@@ -89,6 +89,7 @@ jobs:
     if: ${{ !inputs.macos_cpu_artifact_run_id }}
     permissions:
       contents: read
+      actions: read
       id-token: write
     needs: [static, integrations]
     uses: ./.github/workflows/release-build.yml
