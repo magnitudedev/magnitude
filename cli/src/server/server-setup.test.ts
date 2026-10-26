@@ -21,6 +21,7 @@ const harness = (overrides: Partial<ServerSetupHost> = {}) => {
     runRootStep: args => Effect.sync(() => { events.push(`root ${args.join(" ")}`) }),
     enableNetworkAccess: Effect.sync(() => { events.push("network"); return { addresses: ["192.168.1.5"], port: 10100, key: "mag-key" } }),
     write: text => Effect.sync(() => { output.push(text) }),
+    status: text => Effect.sync(() => { output.push(text) }),
     ...overrides,
   }
   const run = (program: Effect.Effect<void, ServerSetupFailed, ServerSetupHost>) => Effect.runPromise(program.pipe(Effect.provideService(ServerSetupHost, host), Effect.either))

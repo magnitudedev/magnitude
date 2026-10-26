@@ -50,6 +50,8 @@ export interface ServerSetupHost {
   /** Turns network access on with a key once the service answers, and restarts it if that is needed. */
   readonly enableNetworkAccess: Effect.Effect<ServerAccess, ServerSetupFailed>
   readonly write: (text: string) => Effect.Effect<void>
+  /** Progress for a person watching a terminal; a caller capturing the output, like the installer, shows its own. */
+  readonly status: (text: string) => Effect.Effect<void>
 }
 export type ServicePort = "Free" | "Service" | "Other"
 export const ServerSetupHost = Context.GenericTag<ServerSetupHost>("@magnitudedev/cli/ServerSetupHost")
@@ -152,7 +154,7 @@ export const withinServerStart = <A>(host: ServerSetupHost, wait: Effect.Effect<
 export const serverWaitReady = Effect.gen(function* () {
   const host = yield* ServerSetupHost
   if (!(yield* host.isSetUp)) return yield* failed("Magnitude is not set up as a server on this machine.")
-  yield* host.write("Waiting for the Magnitude server to become ready…\n")
+  yield* host.status("Waiting for the Magnitude server to become ready…\n")
   yield* withinServerStart(host, Effect.void)
 })
 
@@ -202,7 +204,7 @@ export const serverSetup = Effect.gen(function* () {
   if (!host.isRoot && !(yield* host.sudoWithoutPrompt) && !(yield* host.hasTerminal)) return yield* failed("Server setup needs an administrator account (one that can use sudo) and its password; run it in a terminal.")
   // Through sudo the root step names the person who ran it, whom the macOS server serves as; a root login names no one.
   yield* host.runRootStep(host.isRoot ? ["_server-install"] : ["_server-install", host.user])
-  yield* host.write("Waiting for the Magnitude server to start…\n")
+  yield* host.status("Waiting for the Magnitude server to start…\n")
   const access = yield* withinServerStart(host, host.enableNetworkAccess)
   yield* host.write(renderServerReady(host.platform, access))
 })

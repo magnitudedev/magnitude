@@ -1,7 +1,7 @@
 import { BunContext } from "@effect/platform-bun"
 import { Effect, Option } from "effect"
-import { ServerInstallationFailed, installLinuxServer, installMacServer, openServerFirewall, parseServerInstallation, removeLinuxServer, restoreLinuxServerGrant,
-  removeMacServer, requireInstalledRoot } from "@magnitudedev/daemon-management/desktop-native"
+import { ServerInstallationFailed, closeServerFirewall, installLinuxServer, installMacServer, openServerFirewall, parseServerInstallation, recordOpenedServerFirewall,
+  removeLinuxServer, restoreLinuxServerGrant, removeMacServer, requireInstalledRoot } from "@magnitudedev/daemon-management/desktop-native"
 import { ServerSetupHostLive } from "../server/server-setup-live"
 import { serverRemove, serverSetup, serverWaitReady } from "../server/server-setup"
 
@@ -28,8 +28,13 @@ export const runServerRootStep = (argv: readonly string[]) => report(Effect.gen(
     if (Option.isNone(request.user)) return yield* new ServerInstallationFailed({ message: "Run `magnitude server setup` as yourself, without sudo." })
     return yield* installMacServer(request.user.value, cli)
   }
-  if (request._tag === "Remove") return yield* removeLinuxServer
+  const print = (message: Option.Option<string>) => Effect.sync(() => { if (Option.isSome(message)) process.stdout.write(`${message.value}\n`) })
+  if (request._tag === "Remove") {
+    yield* print(yield* closeServerFirewall)
+    return yield* removeLinuxServer
+  }
   yield* installLinuxServer
   const firewall = yield* openServerFirewall
-  if (Option.isSome(firewall)) yield* Effect.sync(() => { process.stdout.write(`${firewall.value}\n`) })
+  if (firewall.opened) yield* recordOpenedServerFirewall
+  yield* print(firewall.message)
 }).pipe(Effect.provide(BunContext.layer)))

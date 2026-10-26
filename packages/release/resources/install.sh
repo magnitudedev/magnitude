@@ -20,6 +20,7 @@ keepalive=''
 stopped_server=''
 privilege=''
 progress_pid=''
+download_pid=''
 progress_terminal=no
 if [ -t 2 ] && [ "${TERM:-}" != dumb ]; then progress_terminal=yes; fi
 # A server stopped for its upgrade is started again however the installer ends.
@@ -32,8 +33,8 @@ restore_server() {
     printf '%s\n' 'The Magnitude server could not be started again. Start it with: sudo systemctl start magnitude' >&2
   fi
 }
-# Server setup marks the server configured before it turns on network access and prints the key,
-# so a later run of this installer only restarts it; an interrupted setup must be finished by hand.
+# Server setup marks the server configured before it prints the network access key, so a later run of
+# this installer only restarts it; after an interrupted setup, running setup again shows the key.
 setting_up=''
 unfinished_setup() {
   [ -n "$setting_up" ] || return 0
@@ -41,7 +42,7 @@ unfinished_setup() {
   printf '%s\n' 'Server setup was interrupted. To finish it, run: magnitude server setup' >&2
 }
 # A hung-up terminal fails every write; set -e must not stop the cleanup at its first message.
-cleanup() { set +e; stop_progress; restore_server; [ -z "$keepalive" ] || kill "$keepalive" 2>/dev/null || true; rm -rf "$scratch"; }
+cleanup() { set +e; [ -z "$download_pid" ] || kill "$download_pid" 2>/dev/null; stop_progress; restore_server; [ -z "$keepalive" ] || kill "$keepalive" 2>/dev/null || true; rm -rf "$scratch"; }
 trap cleanup EXIT
 # Ends the line ^C left, so the shell prompt starts on its own line.
 trap 'printf "\n" >&2; unfinished_setup; exit 130' INT
@@ -133,22 +134,26 @@ run_step() {
     stop_progress
     cat "$scratch/step-output.log"
     cat "$scratch/step-error.log" >&2
-    printf 'Failed while %s.\n' "$step_pending" >&2
+    printf '%s failed.\n' "$step_pending" >&2
     return "$step_status"
   fi
 }
 download() {
   if [ "$#" -ge 4 ]; then start_progress "$4" "$2" "$3"; fi
   # Slow connections may take as long as they need; only a connection that stops delivering data fails.
-  if curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-    --connect-timeout 15 --speed-limit 1 --speed-time 60 --max-filesize "$3" --output "$2" "$1" 2>"$scratch/download-error.log"; then
+  # curl runs in the background so a signal interrupts the wait, and cleanup stops curl, at once.
+  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+    --connect-timeout 15 --speed-limit 1 --speed-time 60 --max-filesize "$3" --output "$2" "$1" 2>"$scratch/download-error.log" &
+  download_pid=$!
+  if wait "$download_pid"; then
+    download_pid=''
     if [ "$#" -ge 4 ]; then
       progress_duration=$(( $(date +%s) - progress_started ))
       progress_size=$(awk -v bytes="$(wc -c < "$2" | tr -d ' ')" 'BEGIN { printf "%.1f MB", bytes / 1000000 }')
       finish_progress "$5 · $progress_size · ${progress_duration}s"
     fi
     return 0
-  else download_status=$?; fi
+  else download_status=$? download_pid=''; fi
   stop_progress
   cat "$scratch/download-error.log" >&2
   case "$download_status" in
@@ -280,7 +285,8 @@ case "$(uname -s)" in
 
     # 1. Ask first, so the person can walk away after answering and authorizing.
     if [ -f "$server_marker" ]; then answer=configured
-    elif ! has_terminal; then answer=no
+    # Server mode runs under systemd; without it (containers, WSL without systemd) there is nothing to offer.
+    elif [ ! -d /run/systemd/system ] || ! has_terminal; then answer=no
     else
       printf '%s\n%s ' 'Run Magnitude as a server? It starts on boot, runs without the desktop app,' \
         'and you can use it from a browser on another computer. [y/N]' >/dev/tty
