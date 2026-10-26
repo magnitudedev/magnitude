@@ -2,7 +2,7 @@ import { NodeContext } from "@effect/platform-node"
 import { Effect } from "effect"
 import { spawnSync } from "node:child_process"
 import { generateKeyPairSync } from "node:crypto"
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -17,6 +17,38 @@ const shell = (body: string, env: Record<string, string> = {}) => spawnSync("/bi
 })
 
 describe.skipIf(process.platform === "win32")("Unix installer progress", () => {
+  it("opens the installed Mac app only in a graphical session, with a nonfatal launch fallback", () => {
+    const root = mkdtempSync(join(tmpdir(), "magnitude-open-"))
+    try {
+      const bin = join(root, "bin"), resources = join(root, "Magnitude.app/Contents/Resources")
+      mkdirSync(bin); mkdirSync(resources, { recursive: true })
+      writeFileSync(join(bin, "id"), '#!/bin/sh\necho 1000\n', { mode: 0o700 })
+      writeFileSync(join(bin, "launchctl"), '#!/bin/sh\nexit "${TEST_NO_GUI:-0}"\n', { mode: 0o700 })
+      writeFileSync(join(resources, "magnitude"), '#!/bin/sh\nprintf "%s\n" "$*" > "$TEST_LAUNCH"\nexit "${TEST_LAUNCH_FAILS:-0}"\n', { mode: 0o700 })
+      symlinkSync(join(resources, "magnitude"), join(bin, "magnitude"))
+      const open = template.slice(template.indexOf("open_desktop() {"), template.indexOf('\ncase "$(uname -s)" in')).replace("/bin/launchctl", "launchctl")
+      const body = `scratch=$TEST_SCRATCH\ndestination=$TEST_DESTINATION\n${open}\nopen_desktop macos`
+      const environment = { PATH: `${bin}:${process.env.PATH}`, TEST_SCRATCH: root, TEST_DESTINATION: join(root, "Magnitude.app"), TEST_LAUNCH: join(root, "launched"), SSH_CONNECTION: "", SSH_CLIENT: "", SSH_TTY: "" }
+      const skipped = shell(body, { ...environment, TEST_NO_GUI: "1" })
+      expect(skipped.status, skipped.stderr).toBe(0)
+      expect(skipped.stderr).not.toContain("Opening Magnitude")
+      const opened = shell(body, environment)
+      expect(opened.status, opened.stderr).toBe(0)
+      expect(readFileSync(join(root, "launched"), "utf8").trim()).toBe("app open")
+      expect(opened.stderr).toContain("Opened Magnitude")
+      const failed = shell(body, { ...environment, TEST_LAUNCH_FAILS: "1" })
+      expect(failed.status, failed.stderr).toBe(0)
+      expect(failed.stderr).toContain("Open Magnitude from Applications.")
+      const linux = body.replace("open_desktop macos", "open_desktop linux")
+      const desktop = shell(linux, { ...environment, DISPLAY: ":0" })
+      expect(desktop.status, desktop.stderr).toBe(0)
+      expect(desktop.stderr).toContain("Opened Magnitude")
+      rmSync(join(root, "launched"))
+      expect(shell(linux, { ...environment, DISPLAY: "", WAYLAND_DISPLAY: "" }).status).toBe(0)
+      expect(shell(linux, { ...environment, DISPLAY: ":0", SSH_CONNECTION: "fixture" }).status).toBe(0)
+      expect(existsSync(join(root, "launched"))).toBe(false)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
   it("shows actual byte progress, average speed and remaining time on both Unix platforms", () => {
     const result = shell(`render_progress 'Downloading app' 12 120000000 200000000 download`)
     expect(result.status, result.stderr).toBe(0)
@@ -71,6 +103,8 @@ describe.skipIf(process.platform === "win32")("Unix installer progress", () => {
       expect(result.status, result.stderr).toBe(0)
       expect(result.stdout).toBe("")
       expect(result.stderr).toContain("50%  1.0/2.0 MB")
+      expect(result.stderr).toContain("\r  [")
+      expect(result.stderr).not.toContain("\r\u001b[K  [")
       expect(result.stderr).toContain("MB/s")
       expect(result.stderr).toContain("s left")
       expect(result.stderr).toContain("✓ Downloaded app · 2.0 MB")

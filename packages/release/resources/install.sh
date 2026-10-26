@@ -47,7 +47,7 @@ stop_progress() {
   [ "$progress_terminal" != yes ] || printf '\r\033[K' >&2
 }
 render_progress() {
-  awk -v label="$1" -v elapsed="$2" -v received="$3" -v total="$4" -v downloading="$5" -v width="${COLUMNS:-80}" '
+  awk -v label="$1" -v elapsed="$2" -v received="$3" -v total="$4" -v downloading="$5" -v width="${6:-${COLUMNS:-80}}" '
     BEGIN {
       if (!downloading) {
         split("| / - \\" , frames, " ")
@@ -85,11 +85,23 @@ start_progress() {
       progress_last_log=$progress_elapsed
       progress_received=0
       if [ -n "$progress_file" ] && [ -f "$progress_file" ]; then progress_received=$(wc -c < "$progress_file" | tr -d ' '); fi
-      if [ "$progress_terminal" = yes ]; then printf '\r\033[K' >&2
-      else printf '%s · ' "$progress_label" >&2; fi
-      if [ "$progress_terminal" != yes ] && [ -z "$progress_file" ]; then printf '%ss elapsed' "$progress_elapsed" >&2
-      else render_progress "$progress_label" "$progress_elapsed" "$progress_received" "$progress_bytes" "$progress_file" >&2; fi
-      [ "$progress_terminal" = yes ] || printf '\n' >&2
+      if [ "$progress_terminal" = yes ]; then
+        progress_width=${COLUMNS:-80}
+        progress_dimensions=$(stty size <&2 2>/dev/null) || progress_dimensions=''
+        case "${progress_dimensions##* }" in ''|*[!0-9]*|0|1) ;; *) progress_width=${progress_dimensions##* } ;; esac
+        # Build the frame before touching the terminal. Erase only its leftover tail, in the same
+        # write as the replacement text; clearing first leaves a visibly blank line between frames.
+        progress_frame=$(render_progress "$progress_label" "$progress_elapsed" "$progress_received" "$progress_bytes" "$progress_file" "$progress_width")
+        if [ "${#progress_frame}" -ge "$progress_width" ]; then
+          progress_frame=$(printf '%s' "$progress_frame" | cut -c "1-$((progress_width - 1))")
+        fi
+        printf '\r%s\033[K' "$progress_frame" >&2
+      elif [ -z "$progress_file" ]; then
+        printf '%s · %ss elapsed\n' "$progress_label" "$progress_elapsed" >&2
+      else
+        progress_frame=$(render_progress "$progress_label" "$progress_elapsed" "$progress_received" "$progress_bytes" "$progress_file")
+        printf '%s · %s\n' "$progress_label" "$progress_frame" >&2
+      fi
     done
   ) </dev/null >/dev/null &
   progress_pid=$!
@@ -159,11 +171,27 @@ installed_summary() {
   else printf '%s\n' "Magnitude $after was installed."
   fi
 }
-# Only a machine with a desktop session installed has an applications menu to open Magnitude from.
-desktop_hint() {
-  for sessions in /usr/share/xsessions /usr/share/wayland-sessions; do
-    if [ -n "$(ls -A "$sessions" 2>/dev/null)" ]; then printf '%s\n' 'Open it from your applications menu.'; return 0; fi
-  done
+# Open only in the installing user's graphical session, never through SSH or as root.
+open_desktop() {
+  [ -z "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ] || return 0
+  [ "$(id -u)" -ne 0 ] || return 0
+  case "$1" in
+    macos)
+      /bin/launchctl print "gui/$(id -u)" >/dev/null 2>&1 || return 0
+      desktop_command="$destination/Contents/Resources/magnitude"
+      desktop_fallback='Open Magnitude from Applications.' ;;
+    linux)
+      [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 0
+      desktop_command=magnitude
+      desktop_fallback='Open Magnitude from your applications menu.' ;;
+  esac
+  start_progress 'Opening Magnitude'
+  if "$desktop_command" app open >"$scratch/open-app.log" 2>&1; then
+    finish_progress 'Opened Magnitude'
+  else
+    stop_progress
+    printf '%s\n' "Magnitude is installed, but could not open automatically. $desktop_fallback" >&2
+  fi
 }
 
 case "$(uname -s)" in
@@ -205,9 +233,9 @@ case "$(uname -s)" in
     /usr/bin/plutil -convert json -o "$scratch/request.json" "$scratch/request.plist"
     run_step 'Installing app and registering CLI' 'Installed app and registered CLI' \
       "$app/Contents/Resources/magnitude" _install-mac-application "$(cat "$scratch/request.json")"
-    printf '%s\n' 'Magnitude was installed. Open it from Applications.' \
-      'Open a new terminal to use the magnitude command.' \
-      'To run it as a server: magnitude server setup'
+    printf '%s\n' 'Magnitude was installed.'
+    open_desktop macos
+    printf '%s\n' 'Open a new terminal to use the magnitude command.'
     ;;
   Linux)
     printf '\nInstalling Magnitude\nLinux · %s\n\n' "$arch" >&2
@@ -360,14 +388,9 @@ PY
         else
           run_step 'Setting up the persistent server service' 'Server is ready' magnitude server setup </dev/null
         fi ;;
-      timeout)
-        installed_summary
-        desktop_hint
-        printf '%s\n' 'No answer, so it was not set up as a server. To run it as one later: magnitude server setup' ;;
       *)
         installed_summary
-        desktop_hint
-        printf '%s\n' 'Not set up as a server. To run it as one later: magnitude server setup' ;;
+        open_desktop linux ;;
     esac
     ;;
   *) fail 'This operating system is not supported.' ;;

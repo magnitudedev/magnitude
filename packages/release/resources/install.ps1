@@ -36,6 +36,8 @@ function Update-InstallerProgress([long]$ReceivedBytes = -1, [long]$ExpectedByte
   $interval = if ($state.Interactive) { 0.2 } else { 10.0 }
   if ($elapsed - $state.LastUpdate -lt $interval) { return }
   $state.LastUpdate = $elapsed
+  $width = 80
+  if ($state.Interactive) { try { $width = [Math]::Max(2, [Console]::WindowWidth) } catch {} }
   if ($ReceivedBytes -lt 0) {
     $frame = @('|', '/', '-', '\')[[int][Math]::Floor($elapsed * 4) % 4]
     $text = "  $frame $($state.Label) $([char]0xb7) $([int][Math]::Floor($elapsed))s"
@@ -46,8 +48,6 @@ function Update-InstallerProgress([long]$ReceivedBytes = -1, [long]$ExpectedByte
       $filled = [int][Math]::Floor($percent * 12.0 / 100)
       $bar = ('=' * $filled) + ('-' * (12 - $filled))
       $total = ($ExpectedBytes / 1000000.0).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture)
-      $width = 80
-      if ($state.Interactive) { try { $width = [Console]::WindowWidth } catch {} }
       if ($width -ge 75) { $text = "  [$bar] $percent%  $received/$total MB" }
       else { $text = "  $percent%  $received/$total MB" }
     } else { $text = "  $received MB" }
@@ -62,7 +62,9 @@ function Update-InstallerProgress([long]$ReceivedBytes = -1, [long]$ExpectedByte
     } else { $text += '  estimating time remaining' }
   }
   if ($state.Interactive) {
-    [Console]::Error.Write("`r" + $text.PadRight($state.LineWidth))
+    if ($text.Length -ge $width) { $text = $text.Substring(0, $width - 1) }
+    # Overwrite and pad in one write, without a blank frame or terminal line wrapping.
+    [Console]::Error.Write("`r" + $text.PadRight([Math]::Min($state.LineWidth, $width - 1)))
     $state.LineWidth = $text.Length
   } elseif ($ReceivedBytes -lt 0) {
     [Console]::Error.WriteLine("$($state.Label) $([char]0xb7) $([int][Math]::Floor($elapsed))s elapsed")
@@ -79,7 +81,7 @@ function Wait-InstallerTask($Task, [long]$ReceivedBytes = -1, [long]$ExpectedByt
   }
   return $Task.GetAwaiter().GetResult()
 }
-function Invoke-InstallerProcess([string]$File, [string[]]$Arguments, [string]$Label, [string]$Completed) {
+function Invoke-InstallerProcess([string]$File, [string[]]$Arguments, [string]$Label, [string]$Completed, [switch]$Quiet) {
   Start-InstallerProgress $Label
   $process = [Diagnostics.Process]::new()
   try {
@@ -102,7 +104,7 @@ function Invoke-InstallerProcess([string]$File, [string[]]$Arguments, [string]$L
       throw "$Label failed with exit code $($process.ExitCode). $($errorOutput.Trim())"
     }
     Complete-InstallerProgress $Completed
-    if ($output) { [Console]::Out.Write($output) }
+    if ($output -and -not $Quiet) { [Console]::Out.Write($output) }
     if ($errorOutput) { [Console]::Error.Write($errorOutput) }
   } finally {
     Stop-InstallerProgress
@@ -160,6 +162,16 @@ function Assert-Publisher([string]$Path) {
     throw 'The downloaded executable does not match the Magnitude publisher.'
   }
 }
+function Open-InstalledDesktop([string]$Command) {
+  # Services, SSH and remote automation do not have a desktop to show the window on.
+  if (-not [Environment]::UserInteractive -or (Get-Process -Id $PID).SessionId -eq 0 -or
+      $env:SSH_CONNECTION -or $env:SSH_CLIENT -or $env:SSH_TTY) { return }
+  try {
+    Invoke-InstallerProcess $Command @('app', 'open') 'Opening Magnitude' 'Opened Magnitude' -Quiet
+  } catch {
+    [Console]::Error.WriteLine('Magnitude is installed, but could not open automatically. Open it from the Start menu.')
+  }
+}
 try {
   $offerPath = Join-Path $scratch 'offer.json'
   # The landing server counts each request and answers with the publisher-signed offer.
@@ -191,7 +203,8 @@ try {
   if (-not (($env:PATH -split ';') | Where-Object { $_.TrimEnd('\') -ieq $commandDirectory.TrimEnd('\') })) {
     $env:PATH = $commandDirectory + ';' + $env:PATH
   }
-  Write-Output 'Magnitude was installed. Open it from the Start menu.'
+  Write-Output 'Magnitude was installed.'
+  Open-InstalledDesktop (Join-Path $commandDirectory 'magnitude.exe')
 } finally {
   Stop-InstallerProgress
   $client.Dispose()

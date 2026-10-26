@@ -92,21 +92,33 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
     spawnSync(setsid, ["-w", "/bin/sh", "-s", "--", ...args], { input: readFileSync(script), encoding: "utf8", timeout: 30000, env: { ...environment, ...extra } })
 
   it("asks first, gets sudo before any download, then runs server setup after Yes", () => {
-    const result = answer("y")
+    const result = answer("y", { DISPLAY: ":0" })
     expect(result.status, result.output).toBe(0)
     expect(result.output).toContain(question)
     const seen = events()
     expect(seen[0]).toBe("sudo -n true")
     expect(seen.findIndex(line => line.startsWith("download"))).toBeGreaterThan(0)
     expect(seen.at(-1)).toBe("magnitude server setup")
+    expect(seen).not.toContain("magnitude app open")
     expect(result.output).not.toContain("Not set up as a server")
   })
   it.each([["n", "No"], ["", "Enter"], ["<eof>", "Ctrl-D"]])("skips server setup for %j (%s)", value => {
     const result = answer(value)
     expect(result.status, result.output).toBe(0)
-    expect(result.output).toContain("Not set up as a server. To run it as one later: magnitude server setup")
+    expect(result.output).not.toContain("To run it as one later")
     expect(events()).not.toContain("magnitude server setup")
     expect(events()).toContain("install")
+  })
+  it.each([{ DISPLAY: ":0" }, { WAYLAND_DISPLAY: "wayland-0" }])("opens the desktop after declining server setup in %j", display => {
+    const result = answer("n", display)
+    expect(result.status, result.output).toBe(0)
+    expect(events().at(-1)).toBe("magnitude app open")
+    expect(result.output).toContain("Opened Magnitude")
+  })
+  it("does not open the desktop over SSH, even with X forwarding", () => {
+    const result = answer("n", { DISPLAY: "localhost:10.0", SSH_CONNECTION: "fixture" })
+    expect(result.status, result.output).toBe(0)
+    expect(events()).not.toContain("magnitude app open")
   })
   it("names the version it installed or upgraded from, without the package revision", () => {
     const installed = join(root, "installed")
@@ -122,14 +134,15 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
     const result = answer("<none>")
     expect(result.status, result.output).toBe(0)
     expect(result.output).toContain(question)
-    expect(result.output).toContain("No answer, so it was not set up as a server. To run it as one later: magnitude server setup")
+    expect(result.output).not.toContain("To run it as one later")
     expect(events()).not.toContain("magnitude server setup")
   })
-  it("does not ask without a terminal, uses non-interactive sudo, and says the server was not set up", () => {
+  it("does not ask without a terminal, uses non-interactive sudo, and leaves a headless desktop closed", () => {
     const result = unattended()
     expect(result.status, result.stderr).toBe(0)
     expect(`${result.stdout}${result.stderr}`).not.toContain("[y/N]")
-    expect(result.stdout).toContain("Not set up as a server. To run it as one later: magnitude server setup")
+    expect(result.stdout).toContain("Magnitude was installed.")
+    expect(events()).not.toContain("magnitude app open")
     expect(events()[0]).toBe("sudo -n true")
   })
   it("never validates with sudo -v, which asks NOPASSWD accounts for a password under verifypw=all", () => {
@@ -155,6 +168,7 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
     // The marker lives under /etc; point this copy of the script at one the test owns.
     beforeEach(() => {
       writeFileSync(join(root, "server"), "")
+      environment.DISPLAY = ":0"
       writeFileSync(join(root, "installed"), "0.1.5")
       environment.TEST_INSTALLED = join(root, "installed")
     })
@@ -165,6 +179,7 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
         "systemctl stop magnitude.service", "install", "sudo systemctl start magnitude.service", "systemctl start magnitude.service"])
       expect(result.stdout).toContain("Magnitude was upgraded from 0.1.5 to 0.1.6.")
       expect(events()).toContain("magnitude _server-wait-ready")
+      expect(events()).not.toContain("magnitude app open")
       expect(result.stdout).toContain("The server restarted and is ready.")
     })
     it("says so when the installed version is already current", () => {

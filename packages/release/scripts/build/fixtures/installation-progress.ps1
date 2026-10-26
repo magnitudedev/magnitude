@@ -8,6 +8,36 @@ $source = [IO.File]::ReadAllText($Installer)
 $start = $source.IndexOf('# Keep status off the success stream.')
 $end = $source.IndexOf('function Assert-Publisher', $start)
 Invoke-Expression $source.Substring($start, $end - $start)
+$openStart = $source.IndexOf('function Open-InstalledDesktop(')
+$openEnd = $source.IndexOf("`ntry {", $openStart)
+Invoke-Expression $source.Substring($openStart, $openEnd - $openStart)
+# Launch selection is checked with fake process/CLI calls; no desktop is actually started.
+& {
+  $script:LaunchCalls = 0
+  $script:TestDesktopSession = 0
+  function Get-Process { param($Id) [pscustomobject]@{ SessionId = $script:TestDesktopSession } }
+  function Invoke-InstallerProcess {
+    param($File, $Arguments, $Label, $Completed, [switch]$Quiet)
+    if ($File -ne 'fixture-cli' -or ($Arguments -join ' ') -ne 'app open') { throw 'Unexpected desktop launch.' }
+    $script:LaunchCalls++
+    if ($script:LaunchCalls -eq 2) { throw 'Fixture launch failure' }
+  }
+  $savedSsh = $env:SSH_CONNECTION
+  try {
+    Open-InstalledDesktop 'fixture-cli'
+    if ($script:LaunchCalls -ne 0) { throw 'Opened a desktop from a service session.' }
+    $script:TestDesktopSession = 1
+    $env:SSH_CONNECTION = 'fixture'
+    Open-InstalledDesktop 'fixture-cli'
+    if ($script:LaunchCalls -ne 0) { throw 'Opened a desktop over SSH.' }
+    $env:SSH_CONNECTION = $null
+    if ([Environment]::UserInteractive -and -not $env:SSH_CLIENT -and -not $env:SSH_TTY) {
+      Open-InstalledDesktop 'fixture-cli'
+      Open-InstalledDesktop 'fixture-cli'
+      if ($script:LaunchCalls -ne 2) { throw 'Desktop launch was not attempted.' }
+    }
+  } finally { $env:SSH_CONNECTION = $savedSsh }
+}
 Start-InstallerProgress 'Downloading app'
 $script:InstallerProgress.Interactive = $false
 $script:InstallerProgress.Clock = [pscustomobject]@{ Elapsed = [TimeSpan]::FromSeconds(12) }
