@@ -7,7 +7,8 @@ if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem) { t
 if (-not $origin.StartsWith('https://') -or $publisher.StartsWith('@MAGNITUDE_')) { throw 'The installer has no publisher configuration.' }
 Add-Type -AssemblyName System.Net.Http
 $client = [Net.Http.HttpClient]::new()
-$client.Timeout = [TimeSpan]::FromMinutes(10)
+# Downloads end only when they stall; see Get-InstallerFile.
+$client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('magnitude-install-' + [Guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($scratch) | Out-Null
 # Keep status off the success stream. Animated output is only used by an interactive console.
@@ -74,10 +75,12 @@ function Complete-InstallerProgress([string]$Message) {
   Stop-InstallerProgress
   [Console]::Error.WriteLine("$([char]0x2713) $Message")
 }
-function Wait-InstallerTask($Task, [long]$ReceivedBytes = -1, [long]$ExpectedBytes = 0) {
-  while (-not $Task.IsCompleted) {
+function Wait-InstallerTask($Task, [long]$ReceivedBytes = -1, [long]$ExpectedBytes = 0, [Threading.CancellationToken]$Cancel, [IDisposable]$Abort) {
+  # Wake as soon as the task completes; the timeout only paces progress redraws.
+  while (-not ([IAsyncResult]$Task).AsyncWaitHandle.WaitOne(100)) {
     Update-InstallerProgress $ReceivedBytes $ExpectedBytes
-    Start-Sleep -Milliseconds 100
+    # .NET Framework network reads ignore cancellation; closing the stream ends a stalled read.
+    if ($null -ne $Abort -and $Cancel.IsCancellationRequested) { $Abort.Dispose() }
   }
   return $Task.GetAwaiter().GetResult()
 }
@@ -86,9 +89,11 @@ function Invoke-InstallerProcess([string]$File, [string[]]$Arguments, [string]$L
   $process = [Diagnostics.Process]::new()
   try {
     $process.StartInfo.FileName = $File
-    # Windows PowerShell 5.1 has no ProcessStartInfo.ArgumentList. Quote each argument for Windows.
+    # Windows PowerShell 5.1 has no ProcessStartInfo.ArgumentList. Quote only arguments that need it:
+    # NSIS reads switches such as /S only when they are unquoted.
     $process.StartInfo.Arguments = ($Arguments | ForEach-Object {
-      '"' + [regex]::Replace([regex]::Replace($_, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
+      if ($_ -match '^[^\s"]+$') { $_ }
+      else { '"' + [regex]::Replace([regex]::Replace($_, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"' }
     }) -join ' '
     $process.StartInfo.UseShellExecute = $false
     $process.StartInfo.CreateNoWindow = $true
@@ -111,10 +116,14 @@ function Invoke-InstallerProcess([string]$File, [string[]]$Arguments, [string]$L
     $process.Dispose()
   }
 }
+# A download that receives no data for this long is cancelled.
+$StallMilliseconds = 60000
 function Get-InstallerFile([string]$Url, [string]$Path, [long]$Limit, [string]$Label, [string]$Completed, [long]$ExpectedBytes = 0) {
   if (-not $Url.StartsWith('https://')) { throw 'Downloads require HTTPS.' }
   Start-InstallerProgress $Label
-  $cancellation = [Threading.CancellationTokenSource]::new(600000)
+  # Slow connections may take as long as they need; only a connection that stops delivering data fails.
+  $cancellation = [Threading.CancellationTokenSource]::new()
+  $cancellation.CancelAfter($StallMilliseconds)
   $response = $null
   try {
     $response = Wait-InstallerTask ($client.GetAsync($Url, [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cancellation.Token)) 0 $ExpectedBytes
@@ -128,7 +137,10 @@ function Get-InstallerFile([string]$Url, [string]$Path, [long]$Limit, [string]$L
       $outputStream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
       $buffer = New-Object byte[] 65536
       [long]$total = 0
-      while (($count = Wait-InstallerTask ($inputStream.ReadAsync($buffer, 0, $buffer.Length, $cancellation.Token)) $total $ExpectedBytes) -gt 0) {
+      while ($true) {
+        $cancellation.CancelAfter($StallMilliseconds)
+        $count = Wait-InstallerTask ($inputStream.ReadAsync($buffer, 0, $buffer.Length, $cancellation.Token)) $total $ExpectedBytes $cancellation.Token $response
+        if ($count -le 0) { break }
         $total += $count
         if ($total -gt $Limit) { throw 'Download exceeds the installation limit.' }
         $outputStream.Write($buffer, 0, $count)
@@ -138,6 +150,11 @@ function Get-InstallerFile([string]$Url, [string]$Path, [long]$Limit, [string]$L
       $duration = [int][Math]::Floor($script:InstallerProgress.Clock.Elapsed.TotalSeconds)
       Complete-InstallerProgress "$Completed $([char]0xb7) $size MB $([char]0xb7) $($duration)s"
     } finally { if ($null -ne $outputStream) { $outputStream.Dispose() }; $inputStream.Dispose() }
+  } catch {
+    if ($cancellation.IsCancellationRequested) {
+      throw "$Label stopped: no data arrived for $($StallMilliseconds / 1000) seconds. Check your network connection and run the installer again."
+    }
+    throw
   } finally {
     Stop-InstallerProgress
     if ($null -ne $response) { $response.Dispose() }
@@ -173,6 +190,11 @@ function Open-InstalledDesktop([string]$Command) {
   }
 }
 try {
+  # Setup refuses to replace a running app, and its own message is hidden by /S. Say so before downloading.
+  $installed = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\Magnitude\'
+  if (Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($installed, [StringComparison]::OrdinalIgnoreCase) }) {
+    throw 'Magnitude is running. Quit it using Quit from its tray menu, then run the installer again.'
+  }
   $offerPath = Join-Path $scratch 'offer.json'
   # The landing server counts each request and answers with the publisher-signed offer.
   [Console]::Error.WriteLine("`nInstalling Magnitude`nWindows $([char]0xb7) x64`n")

@@ -32,11 +32,19 @@ restore_server() {
     printf '%s\n' 'The Magnitude server could not be started again. Start it with: sudo systemctl start magnitude' >&2
   fi
 }
+# Server setup marks the server configured before it turns on network access and prints the key,
+# so a later run of this installer only restarts it; an interrupted setup must be finished by hand.
+setting_up=''
+unfinished_setup() {
+  [ -n "$setting_up" ] || return 0
+  stop_progress
+  printf '%s\n' 'Server setup was interrupted. To finish it, run: magnitude server setup' >&2
+}
 cleanup() { stop_progress; restore_server; [ -z "$keepalive" ] || kill "$keepalive" 2>/dev/null || true; rm -rf "$scratch"; }
 trap cleanup EXIT
 # Ends the line ^C left, so the shell prompt starts on its own line.
-trap 'printf "\n" >&2; exit 130' INT
-trap 'exit 143' TERM HUP
+trap 'printf "\n" >&2; unfinished_setup; exit 130' INT
+trap 'unfinished_setup; exit 143' TERM HUP
 scratch=$(cd "$scratch" && pwd -P)
 # Status goes to stderr so stdout stays usable by scripts. Only a terminal is redrawn.
 stop_progress() {
@@ -129,8 +137,9 @@ run_step() {
 }
 download() {
   if [ "$#" -ge 4 ]; then start_progress "$4" "$2" "$3"; fi
+  # Slow connections may take as long as they need; only a connection that stops delivering data fails.
   if curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-    --connect-timeout 15 --max-time 600 --max-filesize "$3" --output "$2" "$1" 2>"$scratch/download-error.log"; then
+    --connect-timeout 15 --speed-limit 1 --speed-time 60 --max-filesize "$3" --output "$2" "$1" 2>"$scratch/download-error.log"; then
     if [ "$#" -ge 4 ]; then
       progress_duration=$(( $(date +%s) - progress_started ))
       progress_size=$(awk -v bytes="$(wc -c < "$2" | tr -d ' ')" 'BEGIN { printf "%.1f MB", bytes / 1000000 }')
@@ -144,6 +153,7 @@ download() {
     22) fail 'The download server answered with an error. Try again later; if it keeps failing, this release may have been withdrawn.' ;;
     23) fail "Could not save the download in $scratch. Check that there is free disk space." ;;
     63) fail 'The download is larger than the release says.' ;;
+    28) fail 'The download timed out: the connection could not be made or stopped delivering data. Check the network connection and run the installer again.' ;;
     *) fail 'The download failed. Check the network connection and try again.' ;;
   esac
 }
@@ -386,7 +396,9 @@ PY
         if [ -z "$privilege" ] && [ -n "${SUDO_USER:-}" ]; then
           printf '%s\n' "To set up the server, run as $SUDO_USER: magnitude server setup"
         else
+          setting_up=1
           run_step 'Setting up the persistent server service' 'Server is ready' magnitude server setup </dev/null
+          setting_up=''
         fi ;;
       *)
         installed_summary
