@@ -40,7 +40,8 @@ unfinished_setup() {
   stop_progress
   printf '%s\n' 'Server setup was interrupted. To finish it, run: magnitude server setup' >&2
 }
-cleanup() { stop_progress; restore_server; [ -z "$keepalive" ] || kill "$keepalive" 2>/dev/null || true; rm -rf "$scratch"; }
+# A hung-up terminal fails every write; set -e must not stop the cleanup at its first message.
+cleanup() { set +e; stop_progress; restore_server; [ -z "$keepalive" ] || kill "$keepalive" 2>/dev/null || true; rm -rf "$scratch"; }
 trap cleanup EXIT
 # Ends the line ^C left, so the shell prompt starts on its own line.
 trap 'printf "\n" >&2; unfinished_setup; exit 130' INT
@@ -87,7 +88,8 @@ start_progress() {
   else printf '%s...\n' "$progress_label" >&2; fi
   (
     progress_last_log=0
-    while sleep 1 </dev/null >/dev/null 2>&1; do
+    # $$ stays the installer in this subshell: the loop ends with it even when it is killed without its exit trap.
+    while sleep 1 </dev/null >/dev/null 2>&1 && kill -0 $$ 2>/dev/null; do
       progress_elapsed=$(( $(date +%s) - progress_started ))
       if [ "$progress_terminal" != yes ] && [ "$((progress_elapsed - progress_last_log))" -lt 10 ]; then continue; fi
       progress_last_log=$progress_elapsed
@@ -209,6 +211,9 @@ case "$(uname -s)" in
     printf '\nInstalling Magnitude\nmacOS · %s\n\n' "$arch" >&2
     # The server's LaunchDaemon holds the app and installs its own updates when idle.
     [ ! -e "$mac_server" ] || fail 'Magnitude runs as a server on this Mac and installs its own updates when idle. To reinstall it now, run `magnitude server remove`, then this installer, then `magnitude server setup`.'
+    # The app declares macOS 15 as its minimum; earlier systems refuse to open it.
+    macos_version=$(/usr/bin/sw_vers -productVersion)
+    case "$macos_version" in [0-9].*|1[0-4].*) fail "Magnitude needs macOS 15 or later, and this Mac has macOS $macos_version." ;; esac
     case "$apple_team" in *[!A-Z0-9]*|'') fail 'The installation script has no Apple publisher identity.' ;; esac
     [ "${#apple_team}" -eq 10 ] || fail 'Invalid Apple publisher identity.'
     offer darwin mac-zip
@@ -302,7 +307,7 @@ case "$(uname -s)" in
       fi
       privilege=sudo
       # Detached from the terminal so the installer's session ends when it does.
-      ( while sleep 50; do sudo -n true 2>/dev/null || exit 0; done ) </dev/null >/dev/null 2>&1 &
+      ( while sleep 50 && kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null || exit 0; done ) </dev/null >/dev/null 2>&1 &
       keepalive=$!
     fi
 
