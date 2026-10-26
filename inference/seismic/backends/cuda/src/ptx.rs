@@ -2083,7 +2083,9 @@ impl<'a> Emitter<'a> {
             CodeInterpretation::Offset(offset) => {
                 self.line(format!("add.s32 {out}, {raw}, {};", -*offset))
             }
-            CodeInterpretation::Table(table) => {
+            CodeInterpretation::Odd => self.line(format!("mad.lo.u32 {out}, {raw}, 2, 1;")),
+            CodeInterpretation::Table(codebook) => {
+                let table = codebook.values;
                 self.line(format!("mov.s32 {out}, {};", table[0]));
                 for (index, value) in table.iter().copied().enumerate().skip(1) {
                     let p = self.pred();
@@ -2121,21 +2123,21 @@ impl<'a> Emitter<'a> {
         let shift = self.t32();
         self.line(format!(
             "shr.b32 {shift}, {lane}, {};",
-            grid.lanes.trailing_zeros()
+            grid.lanes().trailing_zeros()
         ));
-        self.line(format!("mul.lo.u32 {shift}, {shift}, {};", grid.index_bits));
+        self.line(format!("mul.lo.u32 {shift}, {shift}, {};", grid.index_bits()));
         let index = self.t32();
         self.line(format!("shr.b32 {index}, {raw}, {shift};"));
         self.line(format!(
             "and.b32 {index}, {index}, {};",
-            (1u32 << grid.index_bits) - 1
+            (1u32 << grid.index_bits()) - 1
         ));
         let sub = self.t32();
-        self.line(format!("and.b32 {sub}, {lane}, {};", grid.lanes - 1));
+        self.line(format!("and.b32 {sub}, {lane}, {};", grid.lanes() - 1));
         let slot = self.t32();
         self.line(format!(
             "mad.lo.u32 {slot}, {index}, {}, {sub};",
-            grid.lanes
+            grid.lanes()
         ));
         let base = self.t64();
         self.line(format!("mov.u64 {base}, seismic_lookup{ordinal};"));
@@ -2146,7 +2148,7 @@ impl<'a> Emitter<'a> {
         let signs = self.t32();
         self.line(format!(
             "shr.b32 {signs}, {raw}, {};",
-            grid.indices() * grid.index_bits
+            grid.indices() * grid.index_bits()
         ));
         self.line(format!(
             "and.b32 {signs}, {signs}, {};",

@@ -1,8 +1,10 @@
-//! The ggml tensor types a GGUF file stores, and their block geometry: the one
-//! table the GGUF reader and the kernel registry's external representations
-//! both read.
+//! The ggml tensor types a GGUF file stores, their block geometry, and ggml's
+//! lookup tables (`tables`): the one statement of them the GGUF reader, the
+//! kernel registry and every backend's native library read.
 
 use serde::{Deserialize, Serialize};
+
+pub mod tables;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u32)]

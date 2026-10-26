@@ -190,17 +190,7 @@ pub(crate) fn scalar_word_count(schema: &CallSchema) -> usize {
         .sum()
 }
 
-pub(crate) fn native_macro(name: &str) -> String {
-    name.chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
+pub(crate) use seismic_lang::native_name::native_macro;
 
 /// The geometry of one tensor argument fixed by the specialization's static
 /// dimensions (S10): each axis extent the static dimensions determine, and
@@ -342,11 +332,13 @@ fn render_source_with(
         #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
         Dialect::Vulkan(features) => vulkan::header(features),
     };
+    render_axis_constants(&mut prefix, dialect);
     for (name, representation) in bindings.iter() {
         render_representation(
             &mut prefix,
             &format!("SEISMIC_ELEMENT_{}", native_macro(name)),
             representation,
+            dialect,
         );
     }
     if let Some(kernel) = forming {
@@ -588,7 +580,7 @@ struct TensorAbi<'a> {
 
 impl TensorAbi<'_> {
     fn render(&self, out: &mut String, prefix: &str) {
-        render_representation(out, prefix, self.representation);
+        render_representation(out, prefix, self.representation, self.dialect);
         let constant = |value| literal(self.dialect, value);
         for axis in 0..self.rank {
             match self.fixed.extents[axis] {
@@ -621,7 +613,13 @@ impl TensorAbi<'_> {
                 .expect("checked row-layout tensors have a packing axis");
             match self.fixed.extents[last] {
                 Some(extent) => render_static_rows(out, prefix, rows, extent, self.dialect),
-                None => render_symbolic_rows(out, prefix, rows, &format!("{prefix}_EXTENT_{last}")),
+                None => render_symbolic_rows(
+                    out,
+                    prefix,
+                    rows,
+                    &format!("{prefix}_EXTENT_{last}"),
+                    self.dialect,
+                ),
             }
         }
     }
@@ -650,6 +648,26 @@ fn render_static_rows(
             name = native_macro(plane.name),
         ));
     }
+    render_row_roles(out, prefix, rows, dialect);
+}
+
+/// The row planes a native library addresses by role
+/// (`RowPlaneInfo::role`), every role defined, 0 where the layout has none:
+/// `_ROW_<ROLE>` (row offset) and `_ROW_<ROLE>_BYTES` (bytes per row).
+fn render_row_roles(out: &mut String, prefix: &str, rows: &registry::PackedRowLayout, dialect: Dialect) {
+    for role in registry::RowPlaneRole::ALL {
+        let role_name = native_macro(role.name());
+        match rows.planes.iter().find(|plane| plane.role() == role) {
+            Some(plane) => out.push_str(&format!(
+                "#define {prefix}_ROW_{role_name} {prefix}_PLANE_{name}_ROW_OFFSET\n#define {prefix}_ROW_{role_name}_BYTES {prefix}_PLANE_{name}_BYTES_PER_ROW\n",
+                name = native_macro(plane.name)
+            )),
+            None => out.push_str(&format!(
+                "#define {prefix}_ROW_{role_name} {zero}\n#define {prefix}_ROW_{role_name}_BYTES {zero}\n",
+                zero = literal(dialect, 0)
+            )),
+        }
+    }
 }
 
 /// Row geometry of a row-layout tensor as expressions of its packing-axis
@@ -659,6 +677,7 @@ fn render_symbolic_rows(
     prefix: &str,
     rows: &registry::PackedRowLayout,
     extent: &str,
+    dialect: Dialect,
 ) {
     let align = registry::ROW_ALIGNMENT;
     let group = rows.group();
@@ -682,25 +701,36 @@ fn render_symbolic_rows(
         "#define {prefix}_ROW_STRIDE_BYTES (({end} + {}) / {align} * {align})\n",
         align - 1
     ));
+    render_row_roles(out, prefix, rows, dialect);
 }
 
-fn render_representation(out: &mut String, prefix: &str, representation: RepresentationId) {
+fn render_representation(
+    out: &mut String,
+    prefix: &str,
+    representation: RepresentationId,
+    dialect: Dialect,
+) {
     let info = registry::representation_info(representation);
-    // The representation as a flag; as a name a library can paste onto its
-    // own table's names; and as `SEISMIC_REPRESENTATION_<NAME>` through the
-    // tensor's prefix (`<prefix>()`), which reaches it by expansion alone, so
-    // a library can evaluate it in `#if` (glslang pastes no tokens there).
-    // `<prefix>()` names the representation whose rows a library addresses:
-    // a packed tensor in its packet layout has no rows (no `_ROW_STRIDE_BYTES`),
-    // so it names `SEISMIC_REPRESENTATION_<NAME>_PACKET` instead.
+    // The representation as a flag and as a name a library can paste onto
+    // its own names.
     let name = native_macro(info.representation);
-    let rows = match info.kind {
-        registry::RepresentationKind::Packed(_) => format!("{name}_PACKET"),
-        _ => name.clone(),
-    };
     out.push_str(&format!(
-        "#define {prefix}_REPRESENTATION_{name} 1\n#define {prefix}_REPRESENTATION {name}\n#define {prefix}() SEISMIC_REPRESENTATION_{rows}\n"
+        "#define {prefix}_REPRESENTATION_{name} 1\n#define {prefix}_REPRESENTATION {name}\n"
     ));
+    if let registry::RepresentationKind::PackedRows(_) = info.kind {
+        let coded = Coded::of(representation);
+        for (axis, value) in CODING_AXES {
+            out.push_str(&format!("#define {prefix}_{axis} {}\n", value(&coded)));
+        }
+    }
+    // GLSL's preprocessor pastes no tokens in `#if`: Vulkan libraries read a
+    // tensor's axes through its prefix.
+    #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+    if matches!(dialect, Dialect::Vulkan(_)) {
+        render_axes_tuple(out, prefix, info);
+    }
+    #[cfg(not(any(not(target_os = "macos"), test, feature = "coverage")))]
+    let _ = dialect;
     out.push_str(&format!(
         "#define {prefix}_DECODED_{} 1\n",
         native_macro(info.decoded.name())
@@ -721,13 +751,12 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
         }
         registry::RepresentationKind::PackedRows(rows) => {
             out.push_str(&format!(
-                "#define {prefix}_KIND_PACKED 1\n#define {prefix}_LAYOUT_{} 1\n#define {prefix}_LOGICAL_GROUP {}\n#define {prefix}_GROUP_MULTIPLE {}\n#define {prefix}_ROW_ALIGNMENT {}\n#define {prefix}_TILE_ROWS {}\n#define {prefix}_CODE_BITS {}\n",
+                "#define {prefix}_KIND_PACKED 1\n#define {prefix}_LAYOUT_{} 1\n#define {prefix}_LOGICAL_GROUP {}\n#define {prefix}_GROUP_MULTIPLE {}\n#define {prefix}_ROW_ALIGNMENT {}\n#define {prefix}_TILE_ROWS {}\n",
                 native_macro(info.layout.as_str()),
                 rows.group(),
                 rows.group_multiple,
                 registry::ROW_ALIGNMENT,
                 rows.tile_rows(),
-                rows.packet.planes[0].entry_bits,
             ));
             if info.layout == registry::Layout::Mma16 {
                 out.push_str(&format!(
@@ -743,9 +772,9 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
                     plane.bytes_per_group
                 ));
                 match plane.content {
-                    registry::RowPlaneContent::Codes { shift, bits } => out.push_str(&format!(
-                        "#define {plane_prefix}_CODE_SHIFT {shift}\n#define {plane_prefix}_CODE_BITS {bits}\n"
-                    )),
+                    registry::RowPlaneContent::Codes { bits, .. } => {
+                        out.push_str(&format!("#define {plane_prefix}_CODE_BITS {bits}\n"))
+                    }
                     registry::RowPlaneContent::Grids { bits, .. }
                     | registry::RowPlaneContent::Records { bits, .. } => {
                         out.push_str(&format!("#define {plane_prefix}_CODE_BITS {bits}\n"));
@@ -793,7 +822,6 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
                     plane.entry_bits,
                     native_macro(plane.storage_dtype.name())
                 ));
-                render_plane_encoding(out, &plane_prefix, &plane.encoding);
             }
         }
         registry::RepresentationKind::External(layout) => {
@@ -806,72 +834,305 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
     }
 }
 
-fn render_plane_encoding(out: &mut String, prefix: &str, encoding: &registry::PlaneEncoding) {
-    match encoding {
-        registry::PlaneEncoding::Dense(dtype) => {
-            out.push_str(&format!(
-                "#define {prefix}_ENCODING_DENSE 1\n#define {prefix}_ENCODING_DTYPE_{} 1\n",
-                native_macro(dtype.name())
-            ));
+/// One axis of the native decode ABI: its values are the constants
+/// `SEISMIC_<AXIS>_<NAME>`, numbered from 1 in `ALL` order (an axis a form
+/// lacks is 0). `render_axis_constants` defines them.
+trait Axis: Copy + PartialEq + 'static {
+    const AXIS: &'static str;
+    const ALL: &'static [Self];
+    fn name(self) -> &'static str;
+
+    fn constant(self) -> String {
+        format!("SEISMIC_{}_{}", Self::AXIS, self.name())
+    }
+}
+
+fn render_axis_values<A: Axis>(out: &mut String) {
+    for (index, value) in A::ALL.iter().enumerate() {
+        out.push_str(&format!("#define {} {}\n", value.constant(), index + 1));
+    }
+}
+
+impl Axis for registry::RepresentationForm {
+    const AXIS: &'static str = "FORM";
+    const ALL: &'static [Self] = &registry::RepresentationForm::ALL;
+    fn name(self) -> &'static str {
+        registry::RepresentationForm::name(self)
+    }
+}
+
+impl Axis for registry::CodeKind {
+    const AXIS: &'static str = "CODES";
+    const ALL: &'static [Self] = &registry::CodeKind::ALL;
+    fn name(self) -> &'static str {
+        registry::CodeKind::name(self)
+    }
+}
+
+/// A code interpretation's axis values: the interpretation, its offset, its
+/// codebook (`SEISMIC_CODEBOOK_<NAME>`), and its grid (`SEISMIC_GRID_<NAME>`)
+/// with the grid's index bits and values a point; 0 where it has none (and
+/// every value 0 for no interpretation).
+struct Interpretation {
+    codes: Option<registry::CodeKind>,
+    offset: i32,
+    table: String,
+    grid: String,
+    index_bits: u32,
+    lanes: u32,
+}
+
+impl Interpretation {
+    fn none() -> Self {
+        Self {
+            codes: None,
+            offset: 0,
+            table: "0".to_owned(),
+            grid: "0".to_owned(),
+            index_bits: 0,
+            lanes: 0,
         }
-        registry::PlaneEncoding::Packed {
-            bits,
-            interpretation,
-        } => {
-            out.push_str(&format!(
-                "#define {prefix}_ENCODING_PACKED 1\n#define {prefix}_ENCODING_BITS {bits}\n"
-            ));
-            render_code_interpretation(out, prefix, interpretation);
+    }
+
+    fn of(code: &registry::CodeInterpretation) -> Self {
+        let id = |kind: &str, name: &str| format!("SEISMIC_{kind}_{}", native_macro(name));
+        let kind = Self {
+            codes: Some(code.kind()),
+            ..Self::none()
+        };
+        match code {
+            registry::CodeInterpretation::Unsigned
+            | registry::CodeInterpretation::TwosComplement
+            | registry::CodeInterpretation::Odd => kind,
+            registry::CodeInterpretation::Offset(offset) => Self {
+                offset: *offset,
+                ..kind
+            },
+            registry::CodeInterpretation::Table(codebook) => Self {
+                table: id("CODEBOOK", codebook.name),
+                ..kind
+            },
+            registry::CodeInterpretation::Grid(grid) => Self {
+                grid: id("GRID", grid.grid.name),
+                index_bits: grid.index_bits(),
+                lanes: grid.lanes(),
+                ..kind
+            },
         }
-        registry::PlaneEncoding::FloatCode { format } => {
-            let name = match format {
-                registry::FloatCodeFormat::E2M1 => "E2M1",
-                registry::FloatCodeFormat::E4M3 => "E4M3",
-                registry::FloatCodeFormat::UE4M3 => "UE4M3",
-                registry::FloatCodeFormat::E8M0 => "E8M0",
-            };
-            out.push_str(&format!(
-                "#define {prefix}_ENCODING_FLOAT_CODE 1\n#define {prefix}_ENCODING_FLOAT_CODE_{name} 1\n#define {prefix}_ENCODING_BITS {}\n",
-                format.bits()
-            ));
+    }
+
+    fn codes(&self) -> String {
+        self.codes.map_or_else(|| "0".to_owned(), Axis::constant)
+    }
+}
+
+impl Axis for registry::CoefficientKind {
+    const AXIS: &'static str = "COEFF";
+    const ALL: &'static [Self] = &registry::CoefficientKind::ALL;
+    fn name(self) -> &'static str {
+        registry::CoefficientKind::name(self)
+    }
+}
+
+impl Axis for registry::ScaleEncoding {
+    const AXIS: &'static str = "SCALE";
+    const ALL: &'static [Self] = &registry::ScaleEncoding::ALL;
+    fn name(self) -> &'static str {
+        registry::ScaleEncoding::name(self)
+    }
+}
+
+/// A row-layout packed element's decode axes (`registry::decode_axes`) as
+/// the ABI's flat values, 0 where its coefficients have none: a direct
+/// coefficient's scale is `scale`; a hierarchical one's factor is `scale`,
+/// its local codes are `local_bits`-bit `local`, its minimum's sign is
+/// `bias_sign` (1 without one), and carried local codes sit at entry bit
+/// `carried_bit`, which is past the entry's indices and signs (0: none
+/// carried).
+struct Coded {
+    low: u32,
+    high: u32,
+    code: Interpretation,
+    code_exponent: i32,
+    coeff: registry::CoefficientKind,
+    scale: registry::ScaleEncoding,
+    bias: bool,
+    bias_sign: i32,
+    group: u32,
+    factor_group: u32,
+    exponent: i32,
+    local_bits: u32,
+    local: Interpretation,
+    carried_bit: u32,
+}
+
+impl Coded {
+    fn of(id: RepresentationId) -> Self {
+        let axes = registry::decode_axes(id).expect("packed storage has decode axes");
+        let flat = |coeff, scale, bias, group| Self {
+            low: axes.low,
+            high: axes.high,
+            code: Interpretation::of(&axes.code),
+            code_exponent: axes.code_exponent,
+            coeff,
+            scale,
+            bias,
+            bias_sign: 1,
+            group,
+            factor_group: 0,
+            exponent: 0,
+            local_bits: 0,
+            local: Interpretation::none(),
+            carried_bit: 0,
+        };
+        match &axes.coefficients {
+            registry::CoefficientAxes::Direct { scale, bias, group } => {
+                flat(axes.coefficients.kind(), *scale, *bias, *group)
+            }
+            registry::CoefficientAxes::Hierarchical {
+                factor,
+                factor_group,
+                exponent,
+                group,
+                locals,
+            } => {
+                let hierarchical = Self {
+                    factor_group: *factor_group,
+                    exponent: *exponent,
+                    ..flat(axes.coefficients.kind(), *factor, false, *group)
+                };
+                match locals {
+                    registry::LocalCodes::Plane {
+                        bits,
+                        interpretation,
+                        minimum,
+                    } => Self {
+                        bias: minimum.is_some(),
+                        bias_sign: minimum.map_or(1, registry::MinimumSign::value),
+                        local_bits: *bits,
+                        local: Interpretation::of(interpretation),
+                        ..hierarchical
+                    },
+                    registry::LocalCodes::Carried {
+                        bit,
+                        bits,
+                        interpretation,
+                    } => Self {
+                        local_bits: *bits,
+                        local: Interpretation::of(interpretation),
+                        carried_bit: *bit,
+                        ..hierarchical
+                    },
+                }
+            }
         }
     }
 }
 
-fn render_code_interpretation(
-    out: &mut String,
-    prefix: &str,
-    interpretation: &registry::CodeInterpretation,
-) {
-    match interpretation {
-        registry::CodeInterpretation::Unsigned => {
-            out.push_str(&format!("#define {prefix}_CODE_UNSIGNED 1\n"));
+/// The decode axes of a packed row-layout element, each defined as
+/// `<prefix>_<AXIS>` (`render_representation`), in the order of the axes
+/// tuple (`render_axes_tuple`).
+const CODING_AXES: [(&str, fn(&Coded) -> String); 20] = [
+    ("CODE_LOW_BITS", |c| c.low.to_string()),
+    ("CODE_HIGH_BITS", |c| c.high.to_string()),
+    ("CODES", |c| c.code.codes()),
+    ("CODES_OFFSET", |c| c.code.offset.to_string()),
+    ("CODES_TABLE", |c| c.code.table.clone()),
+    ("CODES_GRID", |c| c.code.grid.clone()),
+    ("CODES_GRID_INDEX_BITS", |c| c.code.index_bits.to_string()),
+    ("CODES_GRID_LANES", |c| c.code.lanes.to_string()),
+    ("CODES_EXPONENT", |c| c.code_exponent.to_string()),
+    ("COEFF", |c| c.coeff.constant()),
+    ("COEFF_SCALE", |c| c.scale.constant()),
+    ("COEFF_BIAS", |c| u32::from(c.bias).to_string()),
+    ("COEFF_BIAS_SIGN", |c| c.bias_sign.to_string()),
+    ("COEFF_GROUP", |c| c.group.to_string()),
+    ("COEFF_FACTOR_GROUP", |c| c.factor_group.to_string()),
+    ("COEFF_EXPONENT", |c| c.exponent.to_string()),
+    ("COEFF_LOCAL_BITS", |c| c.local_bits.to_string()),
+    ("COEFF_LOCAL", |c| c.local.codes()),
+    ("COEFF_LOCAL_OFFSET", |c| c.local.offset.to_string()),
+    ("COEFF_CARRIED", |c| c.carried_bit.to_string()),
+];
+
+/// The tensor's prefix as a function-like macro over its axes, emitted for
+/// Vulkan sources (`render_representation`): `<prefix>(F)` =
+/// `F(<TUPLE_AXES>, <CODING_AXES>)`, its representation's identity
+/// (registry position + 1), its form (`SEISMIC_FORM_*`), a dense form's
+/// dtype (`SEISMIC_DTYPE_*`), its storage group (`_LOGICAL_GROUP`) and a row
+/// form's decode axes, 0 where it has none. A selector `SEISMIC_AXIS_<AXIS>`
+/// takes one of them, and `SEISMIC_AXES_NONE(F)` is the tuple of no tensor
+/// (`render_axis_constants`). Through the prefix a library reaches every
+/// value by expansion alone, so it can evaluate them in `#if`, where glslang
+/// pastes no tokens.
+#[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+fn render_axes_tuple(out: &mut String, prefix: &str, info: &registry::RepresentationInfo) {
+    let id = info.id.index() + 1;
+    let form = info.kind.form();
+    let dtype = match &info.kind {
+        registry::RepresentationKind::Dense(dtype) => {
+            format!("SEISMIC_DTYPE_{}", native_macro(dtype.name()))
         }
-        registry::CodeInterpretation::TwosComplement => {
-            out.push_str(&format!("#define {prefix}_CODE_TWOS_COMPLEMENT 1\n"));
-        }
-        registry::CodeInterpretation::Offset(offset) => {
+        registry::RepresentationKind::PackedRows(_)
+        | registry::RepresentationKind::Packed(_)
+        | registry::RepresentationKind::External(_) => "0".to_owned(),
+    };
+    let axes: Vec<String> = CODING_AXES
+        .iter()
+        .map(|(axis, _)| match form {
+            registry::RepresentationForm::Rows => format!("{prefix}_{axis}"),
+            registry::RepresentationForm::Dense
+            | registry::RepresentationForm::Packet
+            | registry::RepresentationForm::External => "0".to_owned(),
+        })
+        .collect();
+    out.push_str(&format!(
+        "#define {prefix}(F) F({id}, {}, {dtype}, {prefix}_LOGICAL_GROUP, {})\n",
+        form.constant(),
+        axes.join(", ")
+    ));
+}
+
+/// The leading axes of a tensor's axes tuple (`render_axes_tuple`), before
+/// its decode axes.
+#[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+const TUPLE_AXES: [&str; 4] = ["ID", "FORM", "DTYPE", "LOGICAL_GROUP"];
+
+/// The axis values every native source defines (storage forms, dtypes, code
+/// interpretations, coefficient structures and scale encodings), which a
+/// tensor's axes take; on Vulkan also the axes tuple's selectors
+/// (`render_axes_tuple`). Codebook and grid ids are their tables header's
+/// (seismic/lang/build.rs).
+fn render_axis_constants(out: &mut String, dialect: Dialect) {
+    render_axis_values::<registry::CodeKind>(out);
+    render_axis_values::<registry::CoefficientKind>(out);
+    render_axis_values::<registry::ScaleEncoding>(out);
+    // The axes tuple's form and dtype values (`render_axes_tuple`).
+    #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+    if matches!(dialect, Dialect::Vulkan(_)) {
+        render_axis_values::<registry::RepresentationForm>(out);
+        for (index, dtype) in seismic_lang::types::DType::ALL.into_iter().enumerate() {
             out.push_str(&format!(
-                "#define {prefix}_CODE_OFFSET 1\n#define {prefix}_CODE_OFFSET_VALUE {offset}\n"
+                "#define SEISMIC_DTYPE_{} {}\n",
+                native_macro(dtype.name()),
+                index + 1
             ));
         }
-        registry::CodeInterpretation::Table(values) => {
-            out.push_str(&format!(
-                "#define {prefix}_CODE_TABLE 1\n#define {prefix}_CODE_TABLE_COUNT {}\n",
-                values.len()
-            ));
-            for (ordinal, value) in values.iter().enumerate() {
-                out.push_str(&format!("#define {prefix}_CODE_TABLE_{ordinal} {value}\n"));
-            }
+        let names: Vec<&str> = TUPLE_AXES
+            .into_iter()
+            .chain(CODING_AXES.iter().map(|(axis, _)| *axis))
+            .collect();
+        let parameters = names.join(", ");
+        for name in &names {
+            out.push_str(&format!("#define SEISMIC_AXIS_{name}({parameters}) {name}\n"));
         }
-        // The grid's points live in the native packet libraries.
-        registry::CodeInterpretation::Grid(grid) => {
-            out.push_str(&format!(
-                "#define {prefix}_CODE_GRID 1\n#define {prefix}_CODE_GRID_LANES {}\n#define {prefix}_CODE_GRID_INDEX_BITS {}\n",
-                grid.lanes, grid.index_bits
-            ));
-        }
+        out.push_str(&format!(
+            "#define SEISMIC_AXES_NONE(F) F({})\n",
+            vec!["0"; names.len()].join(", ")
+        ));
     }
+    #[cfg(not(any(not(target_os = "macos"), test, feature = "coverage")))]
+    let _ = dialect;
 }
 
 #[cfg(test)]
@@ -1008,7 +1269,6 @@ mod tests {
             "#define SEISMIC_ELEMENT_E_LAYOUT_ROWS16 1\n",
             "#define SEISMIC_ELEMENT_E_TILE_ROWS 1\n",
             "#define SEISMIC_ELEMENT_E_PLANE_CODES_HI_BYTES_PER_GROUP 32\n",
-            "#define SEISMIC_ELEMENT_E_PLANE_CODES_HI_CODE_SHIFT 4\n",
             "#define SEISMIC_X_LAYOUT_ROWS16 1\n",
             "#define SEISMIC_X_ROW_STRIDE_BYTES ((ulong)192)\n",
             "#define SEISMIC_X_PLANE_CODES_LO_ROW_OFFSET ((ulong)0)\n",
@@ -1180,8 +1440,64 @@ mod tests {
         assert!(source.contains("#define SEISMIC_RESULT_0_REPRESENTATION_F32 1\n"));
     }
 
+    /// A row element's decode axes, one form of each coefficient kind: q4k
+    /// (hierarchical, a minimum), q8g32s (direct, no local codes) and iq2xxs
+    /// (a grid carrying its local codes).
     #[test]
-    fn prefix_describes_packed_planes_and_encoding() {
+    fn prefix_names_the_decode_axes_of_row_storage() {
+        for (representation, axes) in [
+            (
+                "q4k@rows16",
+                &[
+                    ("CODE_LOW_BITS", "4"),
+                    ("CODE_HIGH_BITS", "0"),
+                    ("CODES", "SEISMIC_CODES_UNSIGNED"),
+                    ("COEFF", "SEISMIC_COEFF_HIER"),
+                    ("COEFF_SCALE", "SEISMIC_SCALE_F16"),
+                    ("COEFF_BIAS", "1"),
+                    ("COEFF_BIAS_SIGN", "-1"),
+                    ("COEFF_GROUP", "32"),
+                    ("COEFF_FACTOR_GROUP", "256"),
+                    ("COEFF_LOCAL_BITS", "6"),
+                    ("COEFF_LOCAL", "SEISMIC_CODES_UNSIGNED"),
+                ][..],
+            ),
+            (
+                "q8g32s@rows16",
+                &[
+                    ("CODE_LOW_BITS", "8"),
+                    ("CODES", "SEISMIC_CODES_TWOS"),
+                    ("COEFF", "SEISMIC_COEFF_DIRECT"),
+                    ("COEFF_BIAS", "0"),
+                    ("COEFF_GROUP", "32"),
+                    ("COEFF_LOCAL", "0"),
+                ][..],
+            ),
+            (
+                "iq2xxs@rows16",
+                &[
+                    ("CODE_LOW_BITS", "16"),
+                    ("CODES", "SEISMIC_CODES_GRID"),
+                    ("CODES_GRID", "SEISMIC_GRID_IQ2XXS"),
+                    ("CODES_GRID_INDEX_BITS", "8"),
+                    ("CODES_GRID_LANES", "8"),
+                    ("COEFF", "SEISMIC_COEFF_HIER"),
+                    ("COEFF_LOCAL_BITS", "4"),
+                    ("COEFF_LOCAL", "SEISMIC_CODES_ODD"),
+                    ("COEFF_CARRIED", "15"),
+                ][..],
+            ),
+        ] {
+            let source = render(CUDA, representation);
+            for (axis, value) in axes {
+                let line = format!("#define SEISMIC_ELEMENT_E_{axis} {value}\n");
+                assert!(source.contains(&line), "{representation}: missing {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_describes_packed_planes() {
         let source = render(METAL, "q8g32");
         assert!(source.contains("#define SEISMIC_ELEMENT_E_REPRESENTATION_Q8G32 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_KIND_PACKED 1\n"));
@@ -1190,12 +1506,9 @@ mod tests {
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_COUNT 2\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_0_NAME_WORDS 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_0_BYTES_PER_GROUP 32\n"));
-        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_0_ENCODING_PACKED 1\n"));
-        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_0_CODE_UNSIGNED 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_1_NAME_SCALE 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_1_OFFSET 32\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_1_STORAGE_F32 1\n"));
-        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_1_ENCODING_DENSE 1\n"));
     }
 
     #[test]

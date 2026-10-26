@@ -49,12 +49,11 @@ kernel void embedding_rows(
         typename packets::W0::packet packet = rows.packet(token, p);
         for (uint step = 0; step < 4; ++step) {
             float4 even, odd;
-            packets::W0::codes(packet, step, even, odd);
+            packets::W0::exact_values(packet, step, even, odd);
             for (uint i = 0; i < 8; ++i) {
                 uint column = 32u * p + 8u * step + i;
                 if (column < width) {
-                    float code = (i & 1u) ? odd[i >> 1] : even[i >> 1];
-                    float decoded = packets::W0::value(packet, step, code) * scale;
+                    float decoded = ((i & 1u) ? odd[i >> 1] : even[i >> 1]) * scale;
                     float value = activation::round(SEISMIC_PARAM_NORMALIZE != 0 ? decoded * inverse : decoded);
                     out[ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(column) * SEISMIC_RESULT_0_STRIDE_1] =
                         activation::store(value);

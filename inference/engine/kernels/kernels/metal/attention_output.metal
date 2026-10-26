@@ -122,7 +122,7 @@ kernel void attention_output_batch(ATTENTION_OUTPUT_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     ATTENTION_OUTPUT_OPERANDS;
-    if constexpr (projection::matrix_codes<packets::W0>::available && SEISMIC_DIM_Q * SEISMIC_DIM_W % 256 == 0) {
+    if constexpr (projection::matrix_form<packets::W0>::available && SEISMIC_DIM_Q * SEISMIC_DIM_W % 256 == 0) {
         projection::gemv_matrix<packets::W0, BATCH_PARTS>(in, out, w,
             uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_D), k, tile, shared, simdgroups, sg, lane);
         return;

@@ -12,3 +12,6 @@ num-traits = "=0.2.19"
 postcard.workspace = true
 serde.workspace = true
 sha2 = "=0.11.0"
+
+[build-dependencies]
+magnitude-ggml.workspace = true

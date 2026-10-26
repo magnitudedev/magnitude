@@ -12,9 +12,9 @@ use crate::types::DType;
 use magnitude_ggml::Encoding;
 
 pub use crate::repr::{
-    CodeInterpretation, DecodeComponent, DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFormat,
-    GRID_SIGN_BITS, GRID_VALUES, GridCodes, OperandRecipe, PlaneEncoding, PlaneField, PlaneSchema,
-    QuantizedComponent,
+    CodeInterpretation, CodeKind, CoefficientAxes, CoefficientKind, DecodeAxes, DecodeComponent,
+    DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFormat, GRID_SIGN_BITS, GRID_VALUES, GridCodes,
+    LocalCodes, MinimumSign, OperandRecipe, PlaneEncoding, PlaneField, PlaneSchema, QuantizedComponent, ScaleEncoding,
 };
 
 /// Backends are a closed set.
@@ -365,6 +365,39 @@ pub enum RepresentationKind {
     /// never element-readable or writable; a registered exact conversion is
     /// the sole transition into resident storage.
     External(ExternalPacketLayout),
+}
+
+impl RepresentationKind {
+    pub const fn form(&self) -> RepresentationForm {
+        match self {
+            Self::Dense(_) => RepresentationForm::Dense,
+            Self::PackedRows(_) => RepresentationForm::Rows,
+            Self::Packed(_) => RepresentationForm::Packet,
+            Self::External(_) => RepresentationForm::External,
+        }
+    }
+}
+
+/// A representation's storage form: its kind without its layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RepresentationForm {
+    Dense,
+    Rows,
+    Packet,
+    External,
+}
+
+impl RepresentationForm {
+    pub const ALL: [Self; 4] = [Self::Dense, Self::Rows, Self::Packet, Self::External];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Dense => "DENSE",
+            Self::Rows => "ROWS",
+            Self::Packet => "PACKET",
+            Self::External => "EXTERNAL",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -775,8 +808,8 @@ pub enum RowPlaneContent {
     /// `carried_bit` of the group's entry `j`.
     Grids { bits: u32, carried: Option<u32> },
     /// The bytes of the listed packet planes of one packet, concatenated in
-    /// list order, per storage group.
-    Groups { planes: Vec<u32> },
+    /// list order, per storage group: the local or the super coefficients.
+    Groups { level: CoefficientLevel, planes: Vec<u32> },
     /// `mma16` of a carried grid representation: the tile's whole storage
     /// groups as records of its 16 rows (`record_byte`), every group's
     /// carried entries in GEMV lane order, then every group's `factors`
@@ -786,6 +819,61 @@ pub enum RowPlaneContent {
         carried: u32,
         factors: Vec<u32>,
     },
+}
+
+/// The coefficients a `Groups` row plane holds: the local coefficient codes
+/// (`scales`) or the super coefficients (`supers`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoefficientLevel {
+    Local,
+    Super,
+}
+
+impl CoefficientLevel {
+    /// The name of the row plane holding this level.
+    pub const fn plane(self) -> &'static str {
+        match self {
+            Self::Local => "scales",
+            Self::Super => "supers",
+        }
+    }
+}
+
+/// What a row plane is to a decoder: the codes (low code plane, grid entries
+/// or records), their high plane, the local coefficient codes, or the super
+/// coefficients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowPlaneRole {
+    Codes,
+    High,
+    Scales,
+    Supers,
+}
+
+impl RowPlaneRole {
+    pub const ALL: [Self; 4] = [Self::Codes, Self::High, Self::Scales, Self::Supers];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Codes => "codes",
+            Self::High => "high",
+            Self::Scales => CoefficientLevel::Local.plane(),
+            Self::Supers => CoefficientLevel::Super.plane(),
+        }
+    }
+}
+
+impl RowPlaneInfo {
+    pub fn role(&self) -> RowPlaneRole {
+        match self.content {
+            RowPlaneContent::Codes { shift: 0, .. }
+            | RowPlaneContent::Grids { .. }
+            | RowPlaneContent::Records { .. } => RowPlaneRole::Codes,
+            RowPlaneContent::Codes { .. } => RowPlaneRole::High,
+            RowPlaneContent::Groups { level: CoefficientLevel::Local, .. } => RowPlaneRole::Scales,
+            RowPlaneContent::Groups { level: CoefficientLevel::Super, .. } => RowPlaneRole::Supers,
+        }
+    }
 }
 
 impl PackedRowLayout {
@@ -1101,7 +1189,7 @@ impl PackedRowLayout {
             .iter()
             .enumerate()
             .find_map(|(index, candidate)| match &candidate.content {
-                RowPlaneContent::Groups { planes } => {
+                RowPlaneContent::Groups { planes, .. } => {
                     let position = planes.iter().position(|member| *member as usize == plane)?;
                     let prefix = planes[..position]
                         .iter()
@@ -1581,6 +1669,26 @@ pub fn decode_recipe(id: RepresentationId, output: DType) -> Option<DecodeRecipe
         .clone()
 }
 
+/// The row planes of a `bits`-bit code: a low plane of the largest power
+/// of two that fits (1, 2, 4 or 8 bits) and a high plane of the rest, at
+/// most 2 bits (3 = 2 + 1, 5 = 4 + 1, 6 = 4 + 2); `None` for a width no
+/// split holds.
+pub(crate) fn code_planes(bits: u32) -> Option<(u32, u32)> {
+    let low = 1u32 << bits.checked_ilog2()?;
+    let high = bits - low;
+    (low <= 8 && high <= 2).then_some((low, high))
+}
+
+/// How a decoder reads row-layout storage `id` (its code planes are split
+/// by `code_planes` and grid entries may carry its coefficient codes, which
+/// the packet layout's planes do not); `None` for any other storage.
+pub fn decode_axes(id: RepresentationId) -> Option<DecodeAxes> {
+    match representation_info(id).kind {
+        RepresentationKind::PackedRows(_) => internals::packed(id).map(|representation| representation.decode_axes()),
+        RepresentationKind::Packed(_) | RepresentationKind::Dense(_) | RepresentationKind::External(_) => None,
+    }
+}
+
 /// Canonical round-to-nearest-even bfloat16 value used by the representation
 /// registry and native ABI implementations.
 pub fn bf16_round(value: f32) -> f32 {
@@ -2037,11 +2145,12 @@ pub(crate) mod internals {
     }
 
     /// The row layout of one packed representation. Planes, in order:
-    /// 1. code planes from the packet `words` plane: 4-bit codes -> `codes_lo`;
-    ///    5- and 6-bit codes -> `codes_lo` (low 4 bits) and `codes_hi` (the
-    ///    remaining 1 or 2 bits); 8-bit codes -> `codes`; vector-code
-    ///    entries -> `grids`, whole, carrying the `coefficients` plane when
-    ///    the representation's coefficients are carried;
+    /// 1. code planes from the packet `words` plane (`code_planes`): a low
+    ///    plane of the largest power of two of bits that fits (`codes_lo`, or
+    ///    `codes` when it holds the whole 8-bit code) and a high plane of the
+    ///    rest, at most 2 bits (`codes_hi`); vector-code entries -> `grids`,
+    ///    whole, carrying the `coefficients` plane when the representation's
+    ///    coefficients are carried;
     /// 2. `scales`: the hierarchical local coefficients exactly as the packet
     ///    `coefficients` plane packs them (never widened), unless carried;
     /// 3. `supers`: every remaining coefficient plane of one packet
@@ -2141,33 +2250,45 @@ pub(crate) mod internals {
                     carried,
                 },
             }],
-            (_, 4) => vec![code_plane("codes_lo", 0, 4)],
-            (_, 5 | 6) => vec![
-                code_plane("codes_lo", 0, 4),
-                code_plane("codes_hi", 4, words.entry_bits - 4),
-            ],
-            (_, 8) => vec![code_plane("codes", 0, 8)],
-            (_, bits) => panic!("`{}` has no row layout for {bits}-bit codes", repr.name),
+            // A low plane of whole bytes is `codes`.
+            (_, bits) => {
+                let (low, high) = code_planes(bits)
+                    .unwrap_or_else(|| panic!("`{}` has no row layout for {bits}-bit codes", repr.name));
+                match (low, high) {
+                    (8, 0) => vec![code_plane("codes", 0, 8)],
+                    (_, 0) => vec![code_plane("codes_lo", 0, low)],
+                    _ => vec![
+                        code_plane("codes_lo", 0, low),
+                        code_plane("codes_hi", low, high),
+                    ],
+                }
+            }
         };
         if !scales.is_empty() && carried.is_none() {
             planes.push(RowPlaneInfo {
-                name: "scales",
+                name: CoefficientLevel::Local.plane(),
                 bytes_per_group: group_bytes(&scales),
-                content: RowPlaneContent::Groups { planes: scales },
+                content: RowPlaneContent::Groups {
+                    level: CoefficientLevel::Local,
+                    planes: scales,
+                },
             });
         }
         if !matches!(planes[0].content, RowPlaneContent::Records { .. }) {
             planes.push(RowPlaneInfo {
-                name: "supers",
+                name: CoefficientLevel::Super.plane(),
                 bytes_per_group: group_bytes(&supers),
-                content: RowPlaneContent::Groups { planes: supers },
+                content: RowPlaneContent::Groups {
+                    level: CoefficientLevel::Super,
+                    planes: supers,
+                },
             });
         }
         // The row planes together cover every packet plane once.
         let mut covered: Vec<u32> = planes
             .iter()
             .flat_map(|plane| match &plane.content {
-                RowPlaneContent::Groups { planes } => planes.clone(),
+                RowPlaneContent::Groups { planes, .. } => planes.clone(),
                 RowPlaneContent::Codes { .. } | RowPlaneContent::Grids { carried: None, .. } => {
                     Vec::new()
                 }
@@ -3135,6 +3256,29 @@ pub(crate) mod internals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Code planes split a width into a power-of-two low plane and a high
+    /// plane of at most 2 bits; 7 and 11 bits have no split.
+    #[test]
+    fn code_planes_split_every_width() {
+        let planes: Vec<_> = (1..=11).map(super::code_planes).collect();
+        assert_eq!(
+            planes,
+            [
+                Some((1, 0)),
+                Some((2, 0)),
+                Some((2, 1)),
+                Some((4, 0)),
+                Some((4, 1)),
+                Some((4, 2)),
+                None,
+                Some((8, 0)),
+                Some((8, 1)),
+                Some((8, 2)),
+                None,
+            ]
+        );
+    }
 
     #[test]
     fn tables_intern_every_row_once() {

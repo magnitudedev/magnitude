@@ -80,12 +80,11 @@ void draft_rows() {
         const packets_packet packet = packets_load(PACKETS_W0, table_row, table_geometry, p, width);
         [[unroll]] for (uint step = 0u; step < 4u; ++step) {
             vec4 even, odd;
-            packets_codes(PACKETS_W0, packet, step, even, odd);
+            packets_exact_values(PACKETS_W0, packet, step, even, odd);
             [[unroll]] for (uint i = 0u; i < 8u; ++i) {
                 const uint column = 32u * p + 8u * step + i;
                 if (column < width) {
-                    const float code = (i & 1u) != 0u ? odd[i >> 1] : even[i >> 1];
-                    const float value = element_round(DRAFT_ACT, packets_value(PACKETS_W0, packet, step, code));
+                    const float value = element_round(DRAFT_ACT, (i & 1u) != 0u ? odd[i >> 1] : even[i >> 1]);
                     seismic_shared_u16[column] = uint16_t(element_store(DRAFT_ACT, value));
                     embedding_squares = seismic_fma_rn(value, value, embedding_squares);
                 }
@@ -132,12 +131,11 @@ void draft_rows() {
             const packets_packet packet = packets_load(PACKETS_W1, weight_row, combine_geometry, p, inputs);
             [[unroll]] for (uint step = 0u; step < 4u; ++step) {
                 vec4 even, odd;
-                packets_codes(PACKETS_W1, packet, step, even, odd);
+                packets_values(PACKETS_W1, packet, step, even, odd);
                 [[unroll]] for (uint i = 0u; i < 8u; ++i) {
                     const uint column = 32u * p + 8u * step + i;
                     if (column < inputs) {
-                        const float code = (i & 1u) != 0u ? odd[i >> 1] : even[i >> 1];
-                        sum = seismic_fma_rn(packets_value(PACKETS_W1, packet, step, code),
+                        sum = seismic_fma_rn((i & 1u) != 0u ? odd[i >> 1] : even[i >> 1],
                             element_load(DRAFT_ACT, uint(seismic_shared_u16[column])), sum);
                     }
                 }

@@ -4271,6 +4271,7 @@ dependencies = [
 name = "seismic-native-cpu"
 version = "0.1.0"
 dependencies = [
+ "magnitude-ggml",
  "seismic-lang",
 ]
 

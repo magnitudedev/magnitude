@@ -161,11 +161,10 @@ void routed_route_gemv() {
                 router + uint64_t(expert) * router_layout.stride, router_layout, p, hidden);
             [[unroll]] for (uint step = 0u; step < 4u; ++step) {
                 vec4 even, odd;
-                packets_codes(PACKETS_W0, packet, step, even, odd);
+                packets_values(PACKETS_W0, packet, step, even, odd);
                 [[unroll]] for (uint i = 0u; i < 8u; ++i) {
                     const uint source = 32u * p + 8u * step + i;
-                    const float code = (i & 1u) != 0u ? odd[i >> 1] : even[i >> 1];
-                    const float weight = packets_value(PACKETS_W0, packet, step, code);
+                    const float weight = (i & 1u) != 0u ? odd[i >> 1] : even[i >> 1];
                     const float scale = route_norm(source);
                     [[unroll]] for (uint row = 0u; row < 8u; ++row)
                         if (row < rows)
@@ -251,11 +250,10 @@ void routed_route_gemm() {
                 const packets_packet packet = packets_load(PACKETS_W0, row, router_layout, k0 / 32u, hidden);
                 [[unroll]] for (uint step = 0u; step < 4u; ++step) {
                     vec4 even, odd;
-                    packets_codes(PACKETS_W0, packet, step, even, odd);
+                    packets_values(PACKETS_W0, packet, step, even, odd);
                     [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                        const float code = (i & 1u) != 0u ? odd[i >> 1] : even[i >> 1];
                         seismic_shared_f32[columns_tile + (8u * step + i) * ROUTE_PITCH + thread] =
-                            packets_value(PACKETS_W0, packet, step, code);
+                            (i & 1u) != 0u ? odd[i >> 1] : even[i >> 1];
                     }
                 }
             } else {

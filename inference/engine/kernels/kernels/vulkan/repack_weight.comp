@@ -191,7 +191,7 @@ uint repack_source_code(uint64_t gp, uint p) {
     // Value p's grid index is byte p / 4 of the indices (bit p / 4 % 8 of
     // its block's high byte) and its sign byte p / 8, each written over `p`
     // itself: NVIDIA's compiler traps on a value's split bit fields added
-    // back together (`packets_kquant_coefficients`).
+    // back together (`packets_coefficients`).
     const uint slot = p % 8u;
     const uint point = repack_byte(gp, 2u + p / 4u)
         | (((repack_byte(gp, 66u + p / 32u) >> (p / 4u % 8u)) & 1u) << 8);

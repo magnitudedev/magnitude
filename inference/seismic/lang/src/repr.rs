@@ -4,6 +4,7 @@
 //! `RepresentationInfo`, the reference decoder, and the decode recipe.
 
 use crate::types::DType;
+use magnitude_ggml::tables;
 
 /// One readable physical plane of a packed representation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -70,10 +71,10 @@ pub(crate) enum Coefficients {
         factor_exponent: i32,
         bits: u32,
         interpretation: CodeInterpretation,
-        bias: bool,
-        bias_sign: i32,
+        /// The minimum term after each scale code, and how it enters a value.
+        minimum: Option<MinimumSign>,
         /// Row layouts carry the coefficient codes in the grid entries
-        /// (`GridCodes::carried_bits`) instead of a `scales` plane.
+        /// (`GridCodes::carried_bit`) instead of a `scales` plane.
         carried: bool,
     },
     /// One floating scale code shared by the representation group.
@@ -112,6 +113,16 @@ pub enum FloatCodeFormat {
 }
 
 impl FloatCodeFormat {
+    /// A value code's ggml codebook and the exponent its values are scaled
+    /// by: E2M1 is ggml's `kvalues_mxfp4` (E2M1 doubled, −0 as +0) times
+    /// `2^-1`. Scale codes have none.
+    pub const fn codebook(self) -> Option<(&'static tables::Codebook, i32)> {
+        match self {
+            Self::E2M1 => Some((&tables::MXFP4, -1)),
+            Self::E4M3 | Self::UE4M3 | Self::E8M0 => None,
+        }
+    }
+
     pub const fn bits(self) -> u32 {
         match self {
             Self::E2M1 => 4,
@@ -222,10 +233,59 @@ pub enum CodeInterpretation {
     Unsigned,
     TwosComplement,
     Offset(i32),
-    Table(&'static [i32]),
+    /// The odd code `2c + 1` (ggml's IQ sub-block scales `0.5 + c`, doubled).
+    Odd,
+    /// Code `c` names `values[c]` of a ggml codebook.
+    Table(&'static tables::Codebook),
     /// One entry codes eight values through a grid (`GridCodes`); the code
     /// of a value depends on its lane within the eight.
     Grid(&'static GridCodes),
+}
+
+/// A code interpretation without its parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CodeKind {
+    Unsigned,
+    TwosComplement,
+    Offset,
+    Odd,
+    Table,
+    Grid,
+}
+
+impl CodeKind {
+    pub const ALL: [Self; 6] = [
+        Self::Unsigned,
+        Self::TwosComplement,
+        Self::Offset,
+        Self::Odd,
+        Self::Table,
+        Self::Grid,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unsigned => "UNSIGNED",
+            Self::TwosComplement => "TWOS",
+            Self::Offset => "OFFSET",
+            Self::Odd => "ODD",
+            Self::Table => "TABLE",
+            Self::Grid => "GRID",
+        }
+    }
+}
+
+impl CodeInterpretation {
+    pub const fn kind(&self) -> CodeKind {
+        match self {
+            Self::Unsigned => CodeKind::Unsigned,
+            Self::TwosComplement => CodeKind::TwosComplement,
+            Self::Offset(_) => CodeKind::Offset,
+            Self::Odd => CodeKind::Odd,
+            Self::Table(_) => CodeKind::Table,
+            Self::Grid(_) => CodeKind::Grid,
+        }
+    }
 }
 
 /// Vector codes (the GGUF IQ grids): one entry codes `GRID_VALUES`
@@ -239,12 +299,9 @@ pub enum CodeInterpretation {
 /// zero.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct GridCodes {
-    /// Values one grid point codes.
-    pub lanes: u32,
-    pub index_bits: u32,
     pub entry_bits: u32,
-    /// Byte `j` of point `i` is the magnitude of its lane `j`.
-    pub points: &'static [u64],
+    /// The ggml grid: byte `j` of point `i` is the magnitude of its lane `j`.
+    pub grid: &'static tables::Grid,
 }
 
 /// Values one grid entry codes.
@@ -253,16 +310,33 @@ pub const GRID_VALUES: u32 = 8;
 pub const GRID_SIGN_BITS: u32 = 7;
 
 impl GridCodes {
+    /// The grid's points.
+    pub const fn points(&self) -> tables::GridPoints {
+        self.grid.points
+    }
+
+    /// Bits of one grid index: the grid's points are a power of two.
+    pub const fn index_bits(&self) -> u32 {
+        let points = self.points().len();
+        assert!(points.is_power_of_two(), "a grid of a power of two points");
+        points.trailing_zeros()
+    }
+
+    /// Values one grid point codes.
+    pub const fn lanes(&self) -> u32 {
+        self.points().lanes()
+    }
+
     /// Grid indices one entry holds.
     pub const fn indices(&self) -> u32 {
-        GRID_VALUES / self.lanes
+        GRID_VALUES / self.lanes()
     }
 
     /// Bits of one entry.
     pub const fn entry_bits(&self) -> u32 {
         assert!(
             self.entry_bits % 8 == 0
-                && self.entry_bits >= self.indices() * self.index_bits + GRID_SIGN_BITS,
+                && self.entry_bits >= self.indices() * self.index_bits() + GRID_SIGN_BITS,
             "a grid entry is whole bytes holding its indices and signs"
         );
         self.entry_bits
@@ -273,15 +347,15 @@ impl GridCodes {
     /// places, in its row layouts, bit `j` of a group's coefficient code at
     /// this bit of the group's entry `j`; the packet form keeps it zero.
     pub const fn carried_bit(&self) -> u32 {
-        self.indices() * self.index_bits + GRID_SIGN_BITS
+        self.indices() * self.index_bits() + GRID_SIGN_BITS
     }
 
     /// The code of the value at `lane` (< `GRID_VALUES`) of `entry`.
     pub fn code(&self, entry: u32, lane: u32) -> i32 {
-        let index_mask = (1u32 << self.index_bits) - 1;
-        let index = (entry >> (self.index_bits * (lane / self.lanes))) & index_mask;
-        let magnitude = (self.points[index as usize] >> (8 * (lane % self.lanes))) as u8;
-        let signs = (entry >> (self.index_bits * self.indices())) & ((1 << GRID_SIGN_BITS) - 1);
+        let index_mask = (1u32 << self.index_bits()) - 1;
+        let index = (entry >> (self.index_bits() * (lane / self.lanes()))) & index_mask;
+        let magnitude = self.points().byte(index as usize, lane % self.lanes());
+        let signs = (entry >> (self.index_bits() * self.indices())) & ((1 << GRID_SIGN_BITS) - 1);
         let signs = signs | ((signs.count_ones() & 1) << GRID_SIGN_BITS);
         if (signs >> lane) & 1 == 0 {
             i32::from(magnitude)
@@ -304,10 +378,10 @@ impl GridCodes {
         tables
             .entry(self as *const Self as usize)
             .or_insert_with(|| {
-                self.points
-                    .iter()
+                (0..self.points().len())
                     .flat_map(|point| {
-                        (0..self.lanes).map(move |lane| i32::from((point >> (8 * lane)) as u8))
+                        (0..self.lanes())
+                            .map(move |lane| i32::from(self.points().byte(point, lane)))
                     })
                     .collect::<Vec<_>>()
                     .leak()
@@ -316,10 +390,8 @@ impl GridCodes {
 
     /// Every code the grid gives, ascending.
     pub fn codes(&self) -> Vec<i32> {
-        let mut codes = self
-            .points
-            .iter()
-            .flat_map(|point| (0..self.lanes).map(move |lane| (point >> (8 * lane)) as u8))
+        let mut codes = (0..self.points().len())
+            .flat_map(|point| (0..self.lanes()).map(move |lane| self.points().byte(point, lane)))
             .flat_map(|magnitude| [i32::from(magnitude), -i32::from(magnitude)])
             .collect::<Vec<_>>();
         codes.sort_unstable();
@@ -922,8 +994,7 @@ pub(crate) const REPRS: &[Repr] = &[
             factor_exponent: 0,
             bits: 6,
             interpretation: CodeInterpretation::Unsigned,
-            bias: true,
-            bias_sign: -1,
+            minimum: Some(MinimumSign::Subtract),
             carried: false,
         },
     },
@@ -940,8 +1011,7 @@ pub(crate) const REPRS: &[Repr] = &[
             factor_exponent: 0,
             bits: 6,
             interpretation: CodeInterpretation::Unsigned,
-            bias: true,
-            bias_sign: -1,
+            minimum: Some(MinimumSign::Subtract),
             carried: false,
         },
     },
@@ -958,8 +1028,7 @@ pub(crate) const REPRS: &[Repr] = &[
             factor_exponent: 0,
             bits: 8,
             interpretation: CodeInterpretation::TwosComplement,
-            bias: false,
-            bias_sign: 1,
+            minimum: None,
             carried: false,
         },
     },
@@ -986,9 +1055,7 @@ pub(crate) const REPRS: &[Repr] = &[
             bias: false,
             packet_group: 256,
         },
-        code: CodeInterpretation::Table(&[
-            -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-        ]),
+        code: CodeInterpretation::Table(&tables::IQ4NL),
         float_code: None,
     },
     Repr {
@@ -1047,9 +1114,7 @@ pub(crate) const REPRS: &[Repr] = &[
             bias: false,
             packet_group: 32,
         },
-        code: CodeInterpretation::Table(&[
-            -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-        ]),
+        code: CodeInterpretation::Table(&tables::IQ4NL),
         float_code: None,
     },
     // GGUF MXFP4 (OCP MX): E2M1 codes, one E8M0 power-of-two scale per 32.
@@ -1122,9 +1187,8 @@ pub(crate) const REPRS: &[Repr] = &[
             factor_dtype: DType::F32,
             factor_exponent: 0,
             bits: 4,
-            interpretation: CodeInterpretation::Table(&ODD_SCALES),
-            bias: false,
-            bias_sign: 1,
+            interpretation: CodeInterpretation::Odd,
+            minimum: None,
             carried: false,
         },
     },
@@ -1143,9 +1207,8 @@ pub(crate) const REPRS: &[Repr] = &[
             factor_dtype: DType::F32,
             factor_exponent: 0,
             bits: 4,
-            interpretation: CodeInterpretation::Table(&ODD_SCALES),
-            bias: false,
-            bias_sign: 1,
+            interpretation: CodeInterpretation::Odd,
+            minimum: None,
             carried: false,
         },
     },
@@ -1166,37 +1229,27 @@ pub(crate) const REPRS: &[Repr] = &[
             factor_dtype: DType::F16,
             factor_exponent: -3,
             bits: 4,
-            interpretation: CodeInterpretation::Table(&ODD_SCALES),
-            bias: false,
-            bias_sign: 1,
+            interpretation: CodeInterpretation::Odd,
+            minimum: None,
             carried: true,
         },
     },
 ];
 
 pub(crate) static IQ2XS_CODES: GridCodes = GridCodes {
-    lanes: 8,
-    index_bits: 9,
     entry_bits: 16,
-    points: &crate::grids::IQ2XS_GRID,
+    grid: &tables::IQ2XS,
 };
 
 pub(crate) static IQ3XXS_CODES: GridCodes = GridCodes {
-    lanes: 4,
-    index_bits: 8,
     entry_bits: 24,
-    points: &crate::grids::IQ3XXS_GRID,
+    grid: &tables::IQ3XXS,
 };
 
 pub(crate) static IQ2XXS_CODES: GridCodes = GridCodes {
-    lanes: 8,
-    index_bits: 8,
     entry_bits: 16,
-    points: &crate::grids::IQ2XXS_GRID,
+    grid: &tables::IQ2XXS,
 };
-
-/// The odd scale codes `2 s + 1` of a 4-bit IQ sub-block scale `s`.
-const ODD_SCALES: [i32; 16] = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31];
 
 pub(crate) fn lookup(name: &str) -> Option<&'static Repr> {
     REPRS.iter().find(|r| r.name == name)
@@ -1221,7 +1274,8 @@ impl CodeInterpretation {
 impl Repr {
     pub(crate) fn has_bias(&self) -> bool {
         match self.coefficients {
-            Coefficients::Direct { bias, .. } | Coefficients::Hierarchical { bias, .. } => bias,
+            Coefficients::Direct { bias, .. } => bias,
+            Coefficients::Hierarchical { minimum, .. } => minimum.is_some(),
             Coefficients::BlockFloat { .. } => false,
         }
     }
@@ -1265,7 +1319,208 @@ impl OperandRecipe {
     }
 }
 
+/// How a decoder reads a packed representation's values, the axes native
+/// libraries compose their decoders from: code planes of `low` and `high`
+/// bits (a grid code's entry is its one low plane), read through `code`,
+/// their values scaled by `2^code_exponent` (a floating value code is its
+/// codebook, `FloatCodeFormat::codebook`), and the `coefficients` that scale
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodeAxes {
+    pub low: u32,
+    pub high: u32,
+    pub code: CodeInterpretation,
+    pub code_exponent: i32,
+    pub coefficients: CoefficientAxes,
+}
+
+/// A decoder's coefficients: a stored scale (and bias) per `group` values,
+/// or per `group` local codes (`LocalCodes`) under a factor (and minimum
+/// factor) per `factor_group` scaled by `2^exponent`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoefficientAxes {
+    Direct {
+        scale: ScaleEncoding,
+        bias: bool,
+        group: u32,
+    },
+    Hierarchical {
+        factor: ScaleEncoding,
+        factor_group: u32,
+        exponent: i32,
+        group: u32,
+        locals: LocalCodes,
+    },
+}
+
+/// A hierarchical decoder's local codes per group: a `bits`-bit scale code
+/// read through `interpretation`, either in a scales plane (then with a
+/// minimum code, its term added or subtracted by `minimum`) or carried by the
+/// group's grid entries, bit `j` of the code at bit `bit` of entry `j`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalCodes {
+    Plane {
+        bits: u32,
+        interpretation: CodeInterpretation,
+        minimum: Option<MinimumSign>,
+    },
+    Carried {
+        bit: u32,
+        bits: u32,
+        interpretation: CodeInterpretation,
+    },
+}
+
+/// How a hierarchical decoder's minimum term enters a value: added (`+1`) or
+/// subtracted (`-1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MinimumSign {
+    Add,
+    Subtract,
+}
+
+impl MinimumSign {
+    pub const fn value(self) -> i32 {
+        match self {
+            Self::Add => 1,
+            Self::Subtract => -1,
+        }
+    }
+}
+
+/// A decoder's coefficients without their parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CoefficientKind {
+    Direct,
+    Hierarchical,
+}
+
+impl CoefficientKind {
+    pub const ALL: [Self; 2] = [Self::Direct, Self::Hierarchical];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Direct => "DIRECT",
+            Self::Hierarchical => "HIER",
+        }
+    }
+}
+
+impl CoefficientAxes {
+    pub const fn kind(&self) -> CoefficientKind {
+        match self {
+            Self::Direct { .. } => CoefficientKind::Direct,
+            Self::Hierarchical { .. } => CoefficientKind::Hierarchical,
+        }
+    }
+}
+
+/// The encoding of a stored scale, bias or factor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ScaleEncoding {
+    F16,
+    BF16,
+    F32,
+    E8M0,
+    UE4M3,
+}
+
+impl ScaleEncoding {
+    pub const ALL: [Self; 5] = [Self::F16, Self::BF16, Self::F32, Self::E8M0, Self::UE4M3];
+
+    fn of_dtype(dtype: DType) -> Self {
+        match dtype {
+            DType::F16 => Self::F16,
+            DType::BF16 => Self::BF16,
+            DType::F32 => Self::F32,
+            other => panic!("a stored scale is floating, not {other:?}"),
+        }
+    }
+
+    fn of_code(format: FloatCodeFormat) -> Self {
+        match format {
+            FloatCodeFormat::E8M0 => Self::E8M0,
+            FloatCodeFormat::UE4M3 => Self::UE4M3,
+            other => panic!("{other:?} is not a scale code"),
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::F16 => "F16",
+            Self::BF16 => "BF16",
+            Self::F32 => "F32",
+            Self::E8M0 => "E8M0",
+            Self::UE4M3 => "UE4M3",
+        }
+    }
+}
+
 impl Repr {
+    pub(crate) fn decode_axes(&self) -> DecodeAxes {
+        let (code, code_exponent) = match self.float_code {
+            Some(format) => {
+                let (codebook, exponent) = format
+                    .codebook()
+                    .expect("a value floating code has a codebook");
+                (CodeInterpretation::Table(codebook), exponent)
+            }
+            None => (self.code.clone(), 0),
+        };
+        let (low, high) = match code {
+            CodeInterpretation::Grid(_) => (self.bits, 0),
+            _ => crate::registry::code_planes(self.bits).expect("a packed code width"),
+        };
+        let coefficients = match &self.coefficients {
+            Coefficients::Direct { dtype, bias, .. } => CoefficientAxes::Direct {
+                scale: ScaleEncoding::of_dtype(*dtype),
+                bias: *bias,
+                group: self.group,
+            },
+            Coefficients::BlockFloat { format, .. } => CoefficientAxes::Direct {
+                scale: ScaleEncoding::of_code(*format),
+                bias: false,
+                group: self.group,
+            },
+            Coefficients::Hierarchical {
+                factor_group,
+                factor_dtype,
+                factor_exponent,
+                bits,
+                interpretation,
+                minimum,
+                carried,
+            } => CoefficientAxes::Hierarchical {
+                factor: ScaleEncoding::of_dtype(*factor_dtype),
+                factor_group: *factor_group,
+                exponent: *factor_exponent,
+                group: self.group,
+                locals: match (carried, &code) {
+                    (false, _) => LocalCodes::Plane {
+                        bits: *bits,
+                        interpretation: interpretation.clone(),
+                        minimum: *minimum,
+                    },
+                    (true, CodeInterpretation::Grid(grid)) if minimum.is_none() => LocalCodes::Carried {
+                        bit: grid.carried_bit(),
+                        bits: *bits,
+                        interpretation: interpretation.clone(),
+                    },
+                    (true, _) => {
+                        panic!("only grid entries carry coefficient codes, with no minimum")
+                    }
+                },
+            },
+        };
+        DecodeAxes {
+            low,
+            high,
+            code,
+            code_exponent,
+            coefficients,
+        }
+    }
+
     /// The operand recipes of this representation's elements: every
     /// representation multiplies the rounded activation, and NVFP4 (E2M1
     /// codes in 16-value groups under UE4M3 scales) also has its W4A4
@@ -1340,7 +1595,7 @@ impl Repr {
                 factor_dtype,
                 bits,
                 interpretation,
-                bias,
+                minimum,
                 ..
             } => {
                 result.push((
@@ -1348,7 +1603,7 @@ impl Repr {
                     Plane {
                         name: "coefficients",
                         group: self.group,
-                        fields: if *bias { 2 } else { 1 },
+                        fields: if minimum.is_some() { 2 } else { 1 },
                         encoding: PlaneEncoding::Packed {
                             bits: *bits,
                             interpretation: interpretation.clone(),
@@ -1364,7 +1619,7 @@ impl Repr {
                         encoding: PlaneEncoding::Dense(*factor_dtype),
                     },
                 ));
-                if *bias {
+                if minimum.is_some() {
                     result.push((
                         PlaneField::BiasFactor,
                         Plane {
@@ -1457,8 +1712,7 @@ impl Repr {
                     factor_exponent,
                     bits,
                     interpretation,
-                    bias,
-                    bias_sign,
+                    minimum,
                     ..
                 } => {
                     let (scale, scale_factor, code) = recipe.hierarchical_coefficient(
@@ -1470,7 +1724,7 @@ impl Repr {
                     );
                     scale_code = Some(code);
                     let mut bias_factor = None;
-                    let bias = if *bias {
+                    let bias = if let Some(sign) = minimum {
                         let (product, factor, code) = recipe.hierarchical_coefficient(
                             PlaneField::BiasFactor,
                             *factor_exponent,
@@ -1480,10 +1734,9 @@ impl Repr {
                         );
                         bias_factor = Some(factor);
                         bias_code = Some(code);
-                        Some(if *bias_sign < 0 {
-                            recipe.negate(product)
-                        } else {
-                            product
+                        Some(match sign {
+                            MinimumSign::Subtract => recipe.negate(product),
+                            MinimumSign::Add => product,
                         })
                     } else {
                         None
@@ -1592,7 +1845,7 @@ impl Repr {
                 })?,
             }),
             Coefficients::Hierarchical {
-                bias_sign,
+                minimum,
                 factor_exponent,
                 ..
             } => Some(Coefficient::Product {
@@ -1604,7 +1857,7 @@ impl Repr {
                 exponent: factor_exponent,
                 coefficients: find(PlaneField::Coefficients)?,
                 field: u32::from(bias),
-                sign: if bias { bias_sign } else { 1 },
+                sign: if bias { minimum.map_or(1, MinimumSign::value) } else { 1 },
             }),
             Coefficients::BlockFloat { .. } => Some(Coefficient::Direct {
                 plane: find(PlaneField::BlockScale)?,
@@ -1899,7 +2152,7 @@ mod tests {
     }
 
     #[test]
-    fn hierarchical_recipes_apply_the_bias_sign_and_direct_recipes_do_not_negate() {
+    fn hierarchical_recipes_apply_the_minimum_sign_and_direct_recipes_do_not_negate() {
         for repr in REPRS {
             let recipe = repr.decode_recipe_to(DType::F32);
             let negations = recipe
@@ -1909,8 +2162,7 @@ mod tests {
                 .count();
             let expected = match repr.coefficients {
                 Coefficients::Hierarchical {
-                    bias: true,
-                    bias_sign: -1,
+                    minimum: Some(MinimumSign::Subtract),
                     ..
                 } => 1,
                 Coefficients::Hierarchical { .. }

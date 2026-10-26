@@ -79,7 +79,7 @@ inline void project_channels(thread const In &in, thread const projection::Weigh
             PROJECTION_UNROLL
             for (uint r = 0; r < ROWS; ++r) {
                 float4 we, wo;
-                projection::gemv_weights<W>(packets[r][i], step, we, wo);
+                W::values(packets[r][i], step, we, wo);
                 acc[r] = projection::gemv_step_dot(acc[r], we, wo, xe, xo);
             }
         }

@@ -20,10 +20,10 @@ pub mod registry;
 
 mod check;
 mod external_tables;
-pub mod grids;
 pub mod initialization;
 pub mod intrinsics;
 pub mod lattice;
+pub mod native_name;
 pub mod precision;
 pub mod reference_math;
 pub(crate) mod repr;

@@ -150,7 +150,7 @@ struct Weights {
     uint codes_at(uint n, uint bytes, uint unit) const {
         return uint(geometry(n).at(row(n), layout.codes, bytes, unit) - base);
     }
-    // The same in the plane of high code bits (q5k, q6k).
+    // The same in the plane of high code bits.
     uint high_at(uint n, uint bytes, uint unit) const {
         return uint(geometry(n).at(row(n), layout.high, bytes, unit) - base);
     }
@@ -924,16 +924,6 @@ struct gemv_packets {
     }
 };
 
-// Step `step` of a packet as eight dequantized F32 weights (even, odd).
-template <typename W>
-inline void gemv_weights(thread const typename W::packet &k, uint step, thread float4 &even, thread float4 &odd) {
-    W::codes(k, step, even, odd);
-    float scale = W::scale(k, step);
-    float bias = W::bias(k, W::groups == 1 ? 0u : step / 2u);
-    even = metal::fma(float4(scale), even, float4(bias));
-    odd = metal::fma(float4(scale), odd, float4(bias));
-}
-
 // acc += the eight products of one step, in column order.
 inline float gemv_step_dot(float acc, float4 we, float4 wo, float4 xe, float4 xo) {
     PROJECTION_UNROLL
@@ -954,9 +944,9 @@ inline void gemv_accumulate(thread float (&acc)[R][MAXM], thread float (&acc2)[R
         float4 ae[R], ao[R], be[R], bo[R];
         PROJECTION_UNROLL
         for (uint r = 0; r < R; ++r) {
-            gemv_weights<W>(packets.a[r], step, ae[r], ao[r]);
+            W::values(packets.a[r], step, ae[r], ao[r]);
             if (PAIRED)
-                gemv_weights<U>(packets.b[r], step, be[r], bo[r]);
+                U::values(packets.b[r], step, be[r], bo[r]);
         }
         threadgroup const uint4 *x = words + (local * 4u + step) * MAXM;
         PROJECTION_UNROLL
@@ -1489,9 +1479,9 @@ inline void gemv_tile_row(thread const In &in, thread const Out &out, thread con
                     PROJECTION_UNROLL
                     for (uint step = 0; step < 4; ++step) {
                         float4 ae, ao, be, bo;
-                        gemv_weights<W>(a[j].current, step, ae, ao);
+                        W::values(a[j].current, step, ae, ao);
                         if (PAIRED)
-                            gemv_weights<U>(b[j].current, step, be, bo);
+                            U::values(b[j].current, step, be, bo);
                         PROJECTION_UNROLL
                         for (uint m = 0; m < MAXM; ++m) {
                             float4 xe, xo;
@@ -1746,14 +1736,10 @@ inline void gemm_store_b(thread const gemm_b_registers<W, COUNT> &regs, uint cou
         uint within = half_index & 1u;   // half of its packet
         threadgroup half4 *out = reinterpret_cast<threadgroup half4 *>(b + tile_row * gemm_lda + 16u * half_index);
         if (regs.valid[j]) {
-            float scale = W::scale(regs.packet[j], 2u * within);
-            float bias = W::bias(regs.packet[j], W::groups == 1 ? 0u : within);
             PROJECTION_UNROLL
             for (uint s = 0; s < 2; ++s) {
                 float4 even, odd;
-                W::codes(regs.packet[j], 2u * within + s, even, odd);
-                even = metal::fma(float4(scale), even, float4(bias));
-                odd = metal::fma(float4(scale), odd, float4(bias));
+                W::values(regs.packet[j], 2u * within + s, even, odd);
                 out[2 * s] = half4(half(even.x), half(odd.x), half(even.y), half(odd.y));
                 out[2 * s + 1] = half4(half(even.z), half(odd.z), half(even.w), half(odd.w));
             }
@@ -2236,15 +2222,11 @@ inline void gemm_tall_stage_item(thread const Weights<X> &x, uint n, uint group,
         if ((fresh && i == 0) || p % packets::Block<X>::packets == 0)
             run = x.run(n, p);
         typename X::packet packet = x.packet(n, p, run);
-        float scale = X::scale(packet, 2u * within);
-        float bias = X::bias(packet, X::groups == 1 ? 0u : within);
         threadgroup half4 *to = reinterpret_cast<threadgroup half4 *>(row + 32u * i + 16u * within);
         PROJECTION_UNROLL
         for (uint s = 0; s < 2; ++s) {
             float4 even, odd;
-            X::codes(packet, 2u * within + s, even, odd);
-            even = metal::fma(float4(scale), even, float4(bias));
-            odd = metal::fma(float4(scale), odd, float4(bias));
+            X::values(packet, 2u * within + s, even, odd);
             to[2 * s] = half4(half(even.x), half(odd.x), half(even.y), half(odd.y));
             to[2 * s + 1] = half4(half(even.z), half(odd.z), half(even.w), half(odd.w));
         }
@@ -2406,11 +2388,7 @@ inline void gemm_tall_decode(thread const Weights<X> &x, uint n, uint p, uint bl
     if (fresh || p % packets::Block<X>::packets == 0)
         run = x.run(n, p);
     typename X::packet packet = x.packet(n, p, run);
-    X::codes(packet, block, even, odd);
-    float scale = X::scale(packet, 2u * (block / 2u));
-    float bias = X::bias(packet, X::groups == 1 ? 0u : block / 2u);
-    even = metal::fma(float4(scale), even, float4(bias));
-    odd = metal::fma(float4(scale), odd, float4(bias));
+    X::values(packet, block, even, odd);
 }
 
 // A staging thread's items of stage `group`: item i is the tile's weight row
@@ -2616,9 +2594,7 @@ inline void gemv_batch_packet(thread simdgroup_float8x8 (&acc)[NB], thread const
     thread const simdgroup_float8x8 (&x)[4][NB], uint pair_index) {
     for (uint step = 0; step < 4; ++step) {
         simdgroup_float8x8 weights;
-        float2 codes = W::pair(a, step, pair_index);
-        reinterpret_cast<thread float2 &>(weights.thread_elements()) =
-            float2(W::value(a, step, codes.x), W::value(a, step, codes.y));
+        reinterpret_cast<thread float2 &>(weights.thread_elements()) = W::pair_values(a, step, pair_index);
         for (uint b = 0; b < NB; ++b)
             simdgroup_multiply_accumulate(acc[b], weights, x[step][b], acc[b]);
     }
@@ -2838,13 +2814,13 @@ inline void gemv_batch_paired_runtime(thread const In &in, thread const Out &out
 // block are four consecutive values of each of its two rows.
 //
 // The weights stay in the unit as integers: a lane's left element of a step
-// is its code times its row's 6-bit scale of the block, an integer below
-// 2048 entered as the F16 with those bits (the value 2^-24 times it,
+// is its code times its row's local scale code of the block, an integer
+// below 2048 entered as the F16 with those bits (the value 2^-24 times it,
 // exactly), so one accumulator runs over the 32 steps of a 256-column block
-// and folds once with the block's d. The min term of the eight 32-column
-// blocks is one more product, of the rows' 6-bit mins (row y, blocks x,
-// x + 1) with the activation rows' sums over each block (block y, columns the
-// activation rows), folded with dmin.
+// and folds once with the block's scale factor. The min term of the eight
+// 32-column blocks is one more product, of the rows' minimum codes (row y,
+// blocks x, x + 1) with the activation rows' sums over each block (block y,
+// columns the activation rows), folded with the signed minimum factor.
 //
 // PARTS simdgroups share a fragment's eight weight rows, a contiguous range
 // of 256-column blocks each (a simdgroup alone leaves the device short of
@@ -2854,44 +2830,52 @@ inline void gemv_batch_paired_runtime(thread const In &in, thread const Out &out
 // `shared` holds PARTS-independent 16 bytes per thread and activation
 // fragment.
 
-// Weights with a matrix GEMV: the k-quants whose low code bits are one plane
-// of nibbles and whose code times a 6-bit scale stays below 2048. `at` is a
-// lane's place in its row's planes (32-bit offsets from the tensor), `load`
-// its words of block g, `pair` its two codes of step s in the halves of one
-// word.
-template <typename W>
-struct matrix_codes {
+// Weights with a matrix GEMV whose products fold a block's local scale codes
+// into the left operand: unsigned codes of a plane of low nibbles (and a
+// plane of high bits) under hierarchical coefficients with a minimum, an
+// unsigned local scale code per 32 columns and factors per 256, where a code
+// times a scale code stays below 2048 (an exact F16 integer of the
+// operand's 2^-24). `at` is a lane's place in its row's planes (32-bit
+// offsets from the tensor), `load` its words of block g, `pair` its two codes
+// of step s in the halves of one word.
+template <typename P>
+struct matrix_planes {
     static constant constexpr bool available = false;
+    static constant constexpr uint largest = 0;
 };
 template <>
-struct matrix_codes<packets::Q4K> {
+struct matrix_planes<packets::Planes<4, 0>> {
     static constant constexpr bool available = true;
+    static constant constexpr uint largest = packets::CodeRange<packets::Planes<4, 0>>::largest;
     typedef uint place;
     typedef uint words;
-    static place at(thread const Weights<packets::Q4K> &w,
-        thread const typename Weights<packets::Q4K>::located &row, uint x) {
+    template <typename W>
+    static place at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, uint x) {
         return uint(row.geometry.at(row.row, w.layout.codes, 16ul, 0ul) - w.base) + (x / 2u) * 4u;
     }
     // An indexed load from the lane's place: the load takes a base and a
     // 32-bit index, where the address of each word would be a 64-bit sum.
-    static words load(thread const Weights<packets::Q4K> &w, place at, uint g) {
+    template <typename W>
+    static words load(thread const Weights<W> &w, place at, uint g) {
         return reinterpret_cast<device const uint *>(w.base + at)[g * 4u * w.layout.tile];
     }
     static uint pair(words codes, uint s) { return (codes >> (4u * s)) & 0x000f000fu; }
 };
-// q5k: the lane's byte of the block's high bits beside its word of nibbles,
-// a nibble of the byte under each half of the word.
+// With a plane of high bits: the lane's byte of the block's high bits beside
+// its word of nibbles, a nibble of the byte under each half of the word.
 template <>
-struct matrix_codes<packets::Q5K> {
+struct matrix_planes<packets::Planes<4, 1>> {
     static constant constexpr bool available = true;
+    static constant constexpr uint largest = packets::CodeRange<packets::Planes<4, 1>>::largest;
     typedef uint2 place;
     typedef uint2 words;
-    static place at(thread const Weights<packets::Q5K> &w,
-        thread const typename Weights<packets::Q5K>::located &row, uint x) {
+    template <typename W>
+    static place at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, uint x) {
         return uint2(uint(row.geometry.at(row.row, w.layout.codes, 16ul, 0ul) - w.base) + (x / 2u) * 4u,
             uint(row.geometry.at(row.row, w.layout.high, 4ul, 0ul) - w.base) + x / 2u);
     }
-    static words load(thread const Weights<packets::Q5K> &w, place at, uint g) {
+    template <typename W>
+    static words load(thread const Weights<W> &w, place at, uint g) {
         const uint high = w.base[at.y + g * 4u * w.layout.tile];
         return uint2(reinterpret_cast<device const uint *>(w.base + at.x)[g * 4u * w.layout.tile],
             (high | (high << 12)) & 0x000f000fu);
@@ -2901,24 +2885,59 @@ struct matrix_codes<packets::Q5K> {
     }
 };
 
-// q6k has a body of its own (`gemv_matrix_q6k_body`).
-template <>
-struct matrix_codes<packets::Q6K> {
-    static constant constexpr bool available = true;
+template <typename W>
+struct matrix_codes {
+    static constant constexpr bool available = false;
+};
+template <typename P, typename FS, int EXPONENT, uint LOCAL_BITS, int BIAS_SIGN>
+struct matrix_codes<packets::Packet<P, packets::Unsigned,
+    packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, packets::LocalUnsigned<LOCAL_BITS>, 32u, true, BIAS_SIGN, 0u>>> {
+    typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, packets::LocalUnsigned<LOCAL_BITS>, 32u, true, BIAS_SIGN, 0u> K;
+    typedef matrix_planes<P> planes;
+    static constant constexpr bool available =
+        planes::available && planes::largest * packets::LocalUnsigned<LOCAL_BITS>::largest < 2048u;
+    typedef typename planes::place place;
+    typedef typename planes::words words;
+    template <typename W>
+    static place at(thread const Weights<W> &w, thread const typename Weights<W>::located &row, uint x) {
+        return planes::at(w, row, x);
+    }
+    template <typename W>
+    static words load(thread const Weights<W> &w, place at, uint g) { return planes::load(w, at, g); }
+    static uint pair(words codes, uint s) { return planes::pair(codes, s); }
 };
 
-template <>
-struct matrix_codes<packets::Q4G32S> {
+// The weights the matrix GEMV over a block's 16-column runs serves: codes of
+// a plane of low nibbles and a plane of two high bits, of value zero at
+// ZERO_CODE, under hierarchical coefficients without a minimum, a local
+// scale code per 16 columns and factors per 256 (`gemv_matrix_runs_body`).
+template <typename W>
+struct matrix_runs {
+    static constant constexpr bool available = false;
+};
+template <int ZERO_CODE, typename FS, int EXPONENT, uint LOCAL_BITS, typename L, int BIAS_SIGN>
+struct matrix_runs<packets::Packet<packets::Planes<4, 2>, packets::Offset<ZERO_CODE>,
+    packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, 16u, false, BIAS_SIGN, 0u>>> {
+    typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, L, 16u, false, BIAS_SIGN, 0u> K;
+    typedef L local;
     static constant constexpr bool available = true;
+    static constant constexpr int zero_code = ZERO_CODE;
 };
 
-// Bits 12 b .. 12 b + 11 of a k-quant block's 96 bits of (scale6, min6)
-// pairs.
-inline uint matrix_field(uint3 fields, uint b) {
-    const uint bit = 12u * b, word = bit >> 5, shift = bit & 31u;
-    const ulong two = ulong(fields[word]) | (word < 2u ? ulong(fields[word + 1u]) << 32 : 0ul);
-    return uint(two >> shift) & 0xfffu;
-}
+// The weights the symmetric matrix GEMV serves: codes of a plane of low
+// nibbles of value zero at ZERO_CODE under a direct scale per 32 columns
+// (`gemv_matrix_symmetric_body`).
+template <typename W>
+struct matrix_symmetric {
+    static constant constexpr bool available = false;
+};
+template <int ZERO_CODE, typename S, uint STORAGE>
+struct matrix_symmetric<packets::Packet<packets::Planes<4, 0>, packets::Offset<ZERO_CODE>,
+    packets::Direct<S, 32u, false, STORAGE, 0>>> {
+    typedef packets::Direct<S, 32u, false, STORAGE, 0> K;
+    static constant constexpr bool available = true;
+    static constant constexpr int zero_code = ZERO_CODE;
+};
 
 // Whether an operand's rows are read with whole-word loads. The matrix GEMV
 // bodies take the answer as a template argument (UNIT): the test is made
@@ -3049,22 +3068,25 @@ constexpr uint matrix_run() {
     return 8u / NB;
 }
 
-// The matrix GEMV over Q6_K weights: a lane's two matrix columns of a step
-// lie in one 16-column run of its row, so its left elements are
-// (code - 32) times the run's int8 scale as F32 integers; the accumulator
-// runs over a 256-column block and folds once with the block's d. No min
-// term and nothing staged. UNIT is `matrix_unit` of the operand.
-template <uint NB, uint PARTS, bool UNIT, typename In, typename Out>
-inline void gemv_matrix_q6k_body(thread const In &in, thread const Out &out,
-    thread const Weights<packets::Q6K> &w, uint m_rows, uint rows, uint k, uint group, threadgroup uchar *shared,
+// The matrix GEMV over 16-column runs (`matrix_runs`): a lane's two matrix
+// columns of a step lie in one run of its row, so its left elements are
+// (code - zero_code) times the run's local scale code as F32 integers; the
+// accumulator runs over a 256-column block and folds once with the block's
+// factor. No min term and nothing staged. UNIT is `matrix_unit` of the
+// operand.
+template <typename W, uint NB, uint PARTS, bool UNIT, typename In, typename Out>
+inline void gemv_matrix_runs_body(thread const In &in, thread const Out &out,
+    thread const Weights<W> &w, uint m_rows, uint rows, uint k, uint group, threadgroup uchar *shared,
     uint simdgroups, uint sg, uint lane) {
+    typedef typename matrix_runs<W>::K K;
+    typedef typename matrix_runs<W>::local L;
     typedef typename In::activation A;
     constexpr uint RUN = matrix_run<NB>();
     threadgroup float2 *parts = reinterpret_cast<threadgroup float2 *>(shared);
     const ushort2 at = fragment_coordinate(lane);
     const uint index = group * simdgroups + sg, piece = index / PARTS, part = index % PARTS;
     const uint n = piece * 8u + at.y;
-    const typename Weights<packets::Q6K>::located row = w.locate(min(n, rows - 1u));
+    const typename Weights<W>::located row = w.locate(min(n, rows - 1u));
     const uint codes = uint(row.geometry.at(row.row, w.layout.codes, 16ul, 0ul) - w.base) + (at.x / 2u) * 4u;
     const uint high = uint(row.geometry.at(row.row, w.layout.high, 8ul, 0ul) - w.base) + (at.x / 2u) * 2u;
     const uint code_step = 16u * w.layout.tile, high_step = 8u * w.layout.tile;
@@ -3081,18 +3103,17 @@ inline void gemv_matrix_q6k_body(thread const In &in, thread const Out &out,
                 + ulong(in.rows.at(min(8u * f + at.x + j, m_rows - 1u))) * in.stride0;
     }
     for (uint block = part * blocks / PARTS; block < (part + 1u) * blocks / PARTS; ++block) {
-        // The row's 16 run scales of the block: the lane's run of packet b
-        // is byte 2 b + x / 4.
-        const uint4 scales = uint4(*reinterpret_cast<device const packed_uint4 *>(
-            row.geometry.scale_at(row.row, 16ul * block)));
-        const float d = float(*reinterpret_cast<device const half *>(row.geometry.super_at(row.row, 2ul * block)));
+        // The row's local scale codes of the block (the lane's run of packet
+        // b is its group x / 4) and its factor.
+        const typename K::fields::words scales = K::group_fields(row.row, row.geometry, block);
+        const float d = K::factors(row.row, row.geometry, block).scale(0);
         _Pragma("clang loop unroll(disable)")
         for (uint run = 0; run < 8; run += RUN) {
             PROJECTION_UNROLL
             for (uint i = 0; i < RUN; ++i) {
                 const uint b = run + i;
                 const uint g = block * 8u + b;
-                const int scale = int(char((scales[b / 2u] >> (16u * (b % 2u) + 8u * (at.x / 4u))) & 0xffu));
+                const float scale = L::value(K::scale_code(K::field_of(scales, b), at.x / 4u));
                 const uint word = *reinterpret_cast<device const uint *>(w.base + codes + g * code_step);
                 const uint field = uint(*reinterpret_cast<device const ushort *>(w.base + high + g * high_step));
                 const uint spread = (field | (field << 8)) & 0x00ff00ffu;
@@ -3110,7 +3131,7 @@ inline void gemv_matrix_q6k_body(thread const In &in, thread const Out &out,
                         | (((spread >> (2u * s)) & 0x00030003u) << 4);
                     simdgroup_float8x8 left;
                     reinterpret_cast<thread float2 &>(left.thread_elements()) =
-                        float2((int2(int(pair & 0xffffu), int(pair >> 16)) - 32) * scale);
+                        float2(int2(int(pair & 0xffffu), int(pair >> 16)) - matrix_runs<W>::zero_code) * scale;
                     PROJECTION_UNROLL
                     for (uint f = 0; f < NB; ++f) {
                         simdgroup_float8x8 right;
@@ -3139,12 +3160,13 @@ inline void gemv_matrix_q6k_body(thread const In &in, thread const Out &out,
     }
 }
 
-// Symmetric 32-column Q4: decode each code once into an exact integer
-// matrix operand, share it across the activation rows, then fold the F16
-// block scale into the F32 sums. No rounded weight operand or token packing.
-template <bool PAIRED, uint NB, uint PARTS, bool UNIT, typename In, typename Out>
-inline void gemv_matrix_q4_body(thread const In &in, thread const Out &out,
-    thread const Weights<packets::Q4G32S> &w, thread const Weights<packets::Q4G32S> &u,
+// The symmetric 32-column matrix GEMV (`matrix_symmetric`): decode each code
+// once into an exact integer matrix operand, share it across the activation
+// rows, then fold the block scale into the F32 sums. No rounded weight
+// operand or token packing.
+template <bool PAIRED, uint NB, uint PARTS, bool UNIT, typename W, typename U, typename In, typename Out>
+inline void gemv_matrix_symmetric_body(thread const In &in, thread const Out &out,
+    thread const Weights<W> &w, thread const Weights<U> &u,
     uint m_rows, uint rows, uint k, uint group, threadgroup uchar *shared,
     uint simdgroups, uint sg, uint lane) {
     typedef typename In::activation A;
@@ -3156,6 +3178,8 @@ inline void gemv_matrix_q4_body(thread const In &in, thread const Out &out,
     const uint codes = uint(row.geometry.at(row.row, w.layout.codes, 16ul, 0ul) - w.base) + (at.x / 2u) * 4u;
     const auto up_row = u.locate(min(n, rows - 1u));
     const uint up_codes = uint(up_row.geometry.at(up_row.row, u.layout.codes, 16ul, 0ul) - u.base) + (at.x / 2u) * 4u;
+    device const uchar *supers = row.geometry.super_at(row.row, 0ul);
+    device const uchar *up_supers = up_row.geometry.super_at(up_row.row, 0ul);
     const uint blocks = k / 32u;
     device const typename A::storage *stored_rows[NB][2];
     float2 y[NB], y_up[NB];
@@ -3168,12 +3192,12 @@ inline void gemv_matrix_q4_body(thread const In &in, thread const Out &out,
     }
     for (uint g = part * blocks / PARTS; g < (part + 1u) * blocks / PARTS; ++g) {
         const uint word = *reinterpret_cast<device const uint *>(w.base + codes + g * 16u * w.layout.tile);
-        const float d = float(*reinterpret_cast<device const half *>(row.geometry.super_at(row.row, 2ul * g)));
+        const float d = matrix_symmetric<W>::K::at(supers, g).scale(0);
         uint up_word;
         float up_d;
         if constexpr (PAIRED) {
             up_word = *reinterpret_cast<device const uint *>(u.base + up_codes + g * 16u * u.layout.tile);
-            up_d = float(*reinterpret_cast<device const half *>(up_row.geometry.super_at(up_row.row, 2ul * g)));
+            up_d = matrix_symmetric<U>::K::at(up_supers, g).scale(0);
         }
         uint2 stored[NB][2];
         simdgroup_float8x8 acc[NB], acc_up[NB];
@@ -3186,11 +3210,11 @@ inline void gemv_matrix_q4_body(thread const In &in, thread const Out &out,
             const uint pair = (word >> (4u * s)) & 0x000f000fu;
             simdgroup_half8x8 left, up_left;
             reinterpret_cast<thread half2 &>(left.thread_elements()) =
-                half2(int2(int(pair & 0xffffu), int(pair >> 16)) - 8);
+                half2(int2(int(pair & 0xffffu), int(pair >> 16)) - matrix_symmetric<W>::zero_code);
             if constexpr (PAIRED) {
                 const uint up_pair = (up_word >> (4u * s)) & 0x000f000fu;
                 reinterpret_cast<thread half2 &>(up_left.thread_elements()) =
-                    half2(int2(int(up_pair & 0xffffu), int(up_pair >> 16)) - 8);
+                    half2(int2(int(up_pair & 0xffffu), int(up_pair >> 16)) - matrix_symmetric<U>::zero_code);
             }
             PROJECTION_UNROLL for (uint f = 0; f < NB; ++f) {
                 simdgroup_float8x8 right;
@@ -3235,6 +3259,8 @@ inline void gemv_matrix_products(thread const In &in, thread const Out &out, thr
     uint rows, uint k, uint group, threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
     typedef matrix_codes<W> coded;
     typedef matrix_codes<U> coded_up;
+    typedef typename coded::K K;
+    typedef typename coded_up::K K_up;
     typedef typename In::activation A;
     constexpr uint RUN = matrix_run<NB>();
     threadgroup float2 *parts = reinterpret_cast<threadgroup float2 *>(shared);
@@ -3289,17 +3315,13 @@ inline void gemv_matrix_products(thread const In &in, thread const Out &out, thr
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     for (uint block = part * blocks / PARTS; block < (part + 1u) * blocks / PARTS; ++block) {
-        const uint3 fields = uint3(*reinterpret_cast<device const packed_uint3 *>(
-            row.geometry.scale_at(row.row, 12ul * block)));
-        const float2 factors = float2(*reinterpret_cast<device const half2 *>(
-            row.geometry.super_at(row.row, 4ul * block)));
-        uint3 up_fields;
-        float2 up_factors;
+        const typename K::fields::words fields = K::group_fields(row.row, row.geometry, block);
+        const typename K::group_factors factors = K::factors(row.row, row.geometry, block);
+        typename K_up::fields::words up_fields;
+        typename K_up::group_factors up_factors;
         if constexpr (PAIRED) {
-            up_fields = uint3(*reinterpret_cast<device const packed_uint3 *>(
-                up_row.geometry.scale_at(up_row.row, 12ul * block)));
-            up_factors = float2(*reinterpret_cast<device const half2 *>(
-                up_row.geometry.super_at(up_row.row, 4ul * block)));
+            up_fields = K_up::group_fields(up_row.row, up_row.geometry, block);
+            up_factors = K_up::factors(up_row.row, up_row.geometry, block);
         }
         _Pragma("clang loop unroll(disable)")
         for (uint run = 0; run < 8; run += RUN) {
@@ -3307,12 +3329,12 @@ inline void gemv_matrix_products(thread const In &in, thread const Out &out, thr
             for (uint i = 0; i < RUN; ++i) {
                 const uint b = run + i;
                 const uint g = block * 8u + b;
-                const uint scale = matrix_field(fields, b) & 63u;
+                const uint scale = K::scale_code(K::field_of(fields, b), 0u);
                 const typename coded::words words = coded::load(w, codes, g);
                 uint up_scale;
                 typename coded_up::words up_words;
                 if constexpr (PAIRED) {
-                    up_scale = matrix_field(up_fields, b) & 63u;
+                    up_scale = K_up::scale_code(K_up::field_of(up_fields, b), 0u);
                     up_words = coded_up::load(u, up_codes, g);
                 }
                 // The lane's four values of each of its activation rows, as
@@ -3356,11 +3378,12 @@ inline void gemv_matrix_products(thread const In &in, thread const Out &out, thr
         }
         simdgroup_half8x8 left;
         reinterpret_cast<thread half2 &>(left.thread_elements()) = as_type<half2>(
-            ((matrix_field(fields, at.x) >> 6) & 63u) | (((matrix_field(fields, at.x + 1u) >> 6) & 63u) << 16));
+            K::min_code(K::field_of(fields, at.x), 0u) | (K::min_code(K::field_of(fields, at.x + 1u), 0u) << 16));
         simdgroup_half8x8 up_left;
         if constexpr (PAIRED)
             reinterpret_cast<thread half2 &>(up_left.thread_elements()) = as_type<half2>(
-                ((matrix_field(up_fields, at.x) >> 6) & 63u) | (((matrix_field(up_fields, at.x + 1u) >> 6) & 63u) << 16));
+                K_up::min_code(K_up::field_of(up_fields, at.x), 0u)
+                | (K_up::min_code(K_up::field_of(up_fields, at.x + 1u), 0u) << 16));
         PROJECTION_UNROLL
         for (uint f = 0; f < NB; ++f) {
             // The lane's two activation rows' sums over block 8 block + y.
@@ -3374,13 +3397,13 @@ inline void gemv_matrix_products(thread const In &in, thread const Out &out, thr
             reinterpret_cast<thread float2 &>(right.thread_elements()) = sums;
             simdgroup_multiply(mins[f], left, right);
             // The accumulators carry the 2^-24 of the F16 integers.
-            y[f] = metal::fma(float2(factors.x * 0x1p24f), reinterpret_cast<thread float2 &>(acc[f].thread_elements()),
-                metal::fma(float2(-factors.y * 0x1p24f), reinterpret_cast<thread float2 &>(mins[f].thread_elements()),
+            y[f] = metal::fma(float2(factors.scale(0) * 0x1p24f), reinterpret_cast<thread float2 &>(acc[f].thread_elements()),
+                metal::fma(float2(factors.bias(0) * 0x1p24f), reinterpret_cast<thread float2 &>(mins[f].thread_elements()),
                     y[f]));
             if constexpr (PAIRED) {
                 simdgroup_multiply(mins_up[f], up_left, right);
-                y_up[f] = metal::fma(float2(up_factors.x * 0x1p24f), reinterpret_cast<thread float2 &>(acc_up[f].thread_elements()),
-                    metal::fma(float2(-up_factors.y * 0x1p24f), reinterpret_cast<thread float2 &>(mins_up[f].thread_elements()), y_up[f]));
+                y_up[f] = metal::fma(float2(up_factors.scale(0) * 0x1p24f), reinterpret_cast<thread float2 &>(acc_up[f].thread_elements()),
+                    metal::fma(float2(up_factors.bias(0) * 0x1p24f), reinterpret_cast<thread float2 &>(mins_up[f].thread_elements()), y_up[f]));
             }
         }
     }
@@ -3424,10 +3447,23 @@ inline void gemv_matrix_body(thread const In &in, thread const Out &out, thread 
         m_rows, rows, k, group, shared, simdgroups, sg, lane);
 }
 
-// The body a weight format's matrix GEMV runs, chosen once per call by the
-// operand's strides and by whether the block sums are staged.
-template <typename W>
+// The matrix GEMV of weights W (`available`), chosen by its components: the
+// products folding a block's scale codes (`matrix_codes`), the runs of 16
+// columns (`matrix_runs`) or the symmetric 32 columns (`matrix_symmetric`).
+// `run` takes the body for the operand's strides and for whether the block
+// sums are staged, once per call. The forms' weights are disjoint: at most
+// one serves W.
+template <typename W, bool CODES = matrix_codes<W>::available, bool RUNS = matrix_runs<W>::available,
+    bool SYMMETRIC = matrix_symmetric<W>::available>
 struct matrix_form {
+    static_assert(!CODES && !RUNS && !SYMMETRIC, "at most one matrix GEMV form serves a weight");
+    static constant constexpr bool available = false;
+    static constant constexpr bool symmetric32 = false;
+    static constant constexpr bool stages_block_sums = false;
+};
+template <typename W>
+struct matrix_form<W, true, false, false> {
+    static constant constexpr bool available = true;
     static constant constexpr bool symmetric32 = false;
     static constant constexpr bool stages_block_sums = true;
     template <uint NB, uint PARTS, bool PREPARED = false, typename In, typename Out>
@@ -3450,33 +3486,34 @@ struct matrix_form {
         }
     }
 };
-template <>
-struct matrix_form<packets::Q6K> {
+template <typename W>
+struct matrix_form<W, false, true, false> {
+    static constant constexpr bool available = true;
     static constant constexpr bool symmetric32 = false;
     static constant constexpr bool stages_block_sums = false;
     template <uint NB, uint PARTS, bool PREPARED = false, typename In, typename Out>
-    static void run(thread const In &in, thread const Out &out, thread const Weights<packets::Q6K> &w, uint m_rows,
+    static void run(thread const In &in, thread const Out &out, thread const Weights<W> &w, uint m_rows,
         uint rows, uint k, uint group, threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
         if (matrix_unit(in))
-            gemv_matrix_q6k_body<NB, PARTS, true>(in, out, w, m_rows, rows, k, group, shared, simdgroups, sg, lane);
+            gemv_matrix_runs_body<W, NB, PARTS, true>(in, out, w, m_rows, rows, k, group, shared, simdgroups, sg, lane);
         else
-            gemv_matrix_q6k_body<NB, PARTS, false>(in, out, w, m_rows, rows, k, group, shared, simdgroups, sg,
+            gemv_matrix_runs_body<W, NB, PARTS, false>(in, out, w, m_rows, rows, k, group, shared, simdgroups, sg,
                 lane);
     }
 };
-
-template <>
-struct matrix_form<packets::Q4G32S> {
+template <typename W>
+struct matrix_form<W, false, false, true> {
+    static constant constexpr bool available = true;
     static constant constexpr bool stages_block_sums = false;
     static constant constexpr bool symmetric32 = true;
     template <uint NB, uint PARTS, bool PREPARED = false, typename In, typename Out>
-    static void run(thread const In &in, thread const Out &out, thread const Weights<packets::Q4G32S> &w,
+    static void run(thread const In &in, thread const Out &out, thread const Weights<W> &w,
         uint m_rows, uint rows, uint k, uint group, threadgroup uchar *shared,
         uint simdgroups, uint sg, uint lane) {
         if (matrix_unit(in))
-            gemv_matrix_q4_body<false, NB, PARTS, true>(in, out, w, w, m_rows, rows, k, group, shared, simdgroups, sg, lane);
+            gemv_matrix_symmetric_body<false, NB, PARTS, true>(in, out, w, w, m_rows, rows, k, group, shared, simdgroups, sg, lane);
         else
-            gemv_matrix_q4_body<false, NB, PARTS, false>(in, out, w, w, m_rows, rows, k, group, shared, simdgroups, sg, lane);
+            gemv_matrix_symmetric_body<false, NB, PARTS, false>(in, out, w, w, m_rows, rows, k, group, shared, simdgroups, sg, lane);
     }
 };
 
@@ -3567,10 +3604,11 @@ struct matrix_pair_up {
     }
 };
 
-// The split exchange occupies the prefix of shared memory. Q4K/Q5K block
-// sums live after it and survive both products, so the up product may reuse
-// exactly the sums staged by the gate. Each product keeps its own original
-// accumulation and split reduction order; Q6K does not stage block sums.
+// The split exchange occupies the prefix of shared memory. The block sums of
+// products folding scale codes (`matrix_codes`) live after it and survive
+// both products, so the up product may reuse exactly the sums staged by the
+// gate. Each product keeps its own original accumulation and split reduction
+// order; the runs' GEMV does not stage block sums.
 template <typename G, typename U, uint PARTS, uint NB, typename In, typename Out>
 inline void gemv_matrix_paired_body(thread const In &in, thread const Out &out,
     thread const Weights<G> &gate, thread const Weights<U> &up, uint m_rows,
@@ -3578,12 +3616,12 @@ inline void gemv_matrix_paired_body(thread const In &in, thread const Out &out,
     uint sg, uint lane) {
     if constexpr (matrix_form<G>::symmetric32 && matrix_form<U>::symmetric32) {
         if (matrix_unit(in))
-            gemv_matrix_q4_body<true, NB, PARTS, true>(in, out, gate, up, m_rows, rows, k, group, shared, simdgroups, sg, lane);
+            gemv_matrix_symmetric_body<true, NB, PARTS, true>(in, out, gate, up, m_rows, rows, k, group, shared, simdgroups, sg, lane);
         else
-            gemv_matrix_q4_body<true, NB, PARTS, false>(in, out, gate, up, m_rows, rows, k, group, shared, simdgroups, sg, lane);
+            gemv_matrix_symmetric_body<true, NB, PARTS, false>(in, out, gate, up, m_rows, rows, k, group, shared, simdgroups, sg, lane);
         return;
     }
-    // Q4K/Q5K products share each loaded and decoded activation fragment.
+    // The two products share each loaded and decoded activation fragment.
     // Each accumulator keeps the single-product instruction order.
     if constexpr (matrix_form<G>::stages_block_sums && matrix_form<U>::stages_block_sums) {
         const bool staged = gemv_matrix_shared_bytes(k, NB, simdgroups) <= gemv_matrix_staged_bytes;
@@ -3674,8 +3712,9 @@ struct int8_lane {
 //                 (256 columns, r), the rows' factors, then 16 bytes per
 //                 (4 blocks, r), a block's four bytes the rows' integer
 //                 scales. Otherwise 4 F32 per (32-row weight tile, block, r)
-//   biases        16 F16 per (16-row weight tile, 32 blocks, lane):
-//                 -(dmin * min6), the min-term product's left fragment
+//   biases        16 F16 per (16-row weight tile, 32 blocks, lane): the
+//                 block's bias, signed minimum factor * minimum code, the
+//                 min-term product's left fragment
 //                 (`int8_bias_at`)
 struct int8_scratch {
     device uchar *quantized;
@@ -3686,10 +3725,14 @@ struct int8_scratch {
 };
 
 // Weights whose stored codes enter the int8 product (on tensor operations):
-// how a lane reads its codes of one row and block, whether the format has a
+// how a lane reads its codes of one row and block, whether the weights have a
 // min term, and a row's block scales and biases of the eight blocks of one
 // 256-column block: block i's scale is `factor * scale[i]`. `factored`: the
-// scales are integers below 256 and the factor is the 256 columns'.
+// scales are integers below 256 and the factor is the 256 columns'. The
+// product takes the stored codes themselves, so its codes are unsigned 4-bit
+// codes under hierarchical coefficients (the local codes integers under the
+// factor) or two's complement 8-bit codes under direct ones, a scale per
+// block; none otherwise.
 template <typename W>
 struct int8_codes {
     static constant constexpr bool available = false;
@@ -3700,12 +3743,15 @@ struct int8_codes {
         thread float (&)[8]) {}
 };
 #if SEISMIC_HAS_TENSOR_OPS
-// q4k: two bytes hold four codes, a nibble each; value = d * scale6 * code
-// - dmin * min6.
-template <>
-struct int8_codes<packets::Q4K> {
-    static constant constexpr bool available = true;
-    static constant constexpr bool biased = true;
+// Unsigned 4-bit codes: two bytes hold four codes, a nibble each; value =
+// factor * scale code * code + bias factor * minimum code.
+template <typename FS, int EXPONENT, uint LOCAL_BITS, bool MIN, int BIAS_SIGN>
+struct int8_codes<packets::Packet<packets::Planes<4, 0>, packets::Unsigned,
+    packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, packets::LocalUnsigned<LOCAL_BITS>, 32u, MIN, BIAS_SIGN, 0u>>> {
+    typedef packets::Hier<FS, 256u, EXPONENT, 0, LOCAL_BITS, packets::LocalUnsigned<LOCAL_BITS>, 32u, MIN, BIAS_SIGN, 0u> K;
+    // A factor of at most 16 bits times a byte code is exact in F32.
+    static constant constexpr bool available = LOCAL_BITS <= 8 && FS::bytes <= 2;
+    static constant constexpr bool biased = MIN;
     static constant constexpr uint block_bytes = 16;
     // A lane's eight codes of one row and block are one 4-byte word: byte x
     // holds columns 2x (low nibble) and 2x + 1 of the lane's eight. The
@@ -3721,26 +3767,29 @@ struct int8_codes<packets::Q4K> {
         first = as_type<char4>(word & 0x0f0f0f0fu);
         second = as_type<char4>((word >> 4) & 0x0f0f0f0fu);
     }
-    // A block's scale is d * scale6, exact in F32: the factor is d and the
-    // scales are the 6-bit integers, a byte each in the scratch.
+    // A block's scale is factor * scale code, exact in F32 (a 16-bit
+    // factor's significand times a code of at most 8 bits): the factor is
+    // the 256 columns' and the scales are the integer codes, a byte each in
+    // the scratch.
     static constant constexpr bool factored = true;
     static void coefficients(device const uchar *row, Rows16 layout, uint block, thread float &factor,
         thread float (&scale)[8], thread float (&bias)[8]) {
-        packets::KBlock run = packets::KBlock::load(row, layout, block * 8u);
-        factor = run.factors.x;
-        // A block's (scale6, min6); its bias -(dmin * min6) is exact in F32.
+        typename K::run run = K::start(row, layout, block * K::packets);
+        factor = run.factor.scale(0);
+        // A block's bias, bias factor * minimum code, is exact in F32.
         PROJECTION_UNROLL
         for (uint i = 0; i < 8; ++i) {
-            const uint pair = run.fields.x;
-            packets::KBlock::advance(run);
-            scale[i] = float(pair & 63u);
-            bias[i] = run.factors.y * float((pair >> 6) & 63u);
+            const uint field = K::next(run);
+            scale[i] = float(K::scale_code(field, 0u));
+            bias[i] = MIN ? run.factor.bias(0) * float(K::min_code(field, 0u)) : 0.0f;
         }
     }
 };
-// q8: int8 codes, one F16 scale per block.
-template <>
-struct int8_codes<packets::Q8> {
+// Two's complement 8-bit codes, a scale per block.
+template <typename S, uint STORAGE>
+struct int8_codes<packets::Packet<packets::Planes<8, 0>, packets::Twos,
+    packets::Direct<S, 32u, false, STORAGE, 0>>> {
+    typedef packets::Direct<S, 32u, false, STORAGE, 0> K;
     static constant constexpr bool available = true;
     static constant constexpr bool biased = false;
     static constant constexpr uint block_bytes = 32;
@@ -3757,11 +3806,11 @@ struct int8_codes<packets::Q8> {
     static constant constexpr bool factored = false;
     static void coefficients(device const uchar *row, Rows16 layout, uint block, thread float &factor,
         thread float (&scale)[8], thread float (&bias)[8]) {
+        device const uchar *supers = layout.super_at(row, 0ul);
         factor = 1.0f;
         PROJECTION_UNROLL
         for (uint i = 0; i < 8; ++i) {
-            scale[i] = float(*reinterpret_cast<device const half *>(
-                layout.super_at(row, 2ul * (block * 8u + i))));
+            scale[i] = K::at(supers, block * 8u + i).scale(0);
             bias[i] = 0.0f;
         }
     }

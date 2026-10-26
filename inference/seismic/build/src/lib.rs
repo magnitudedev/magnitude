@@ -257,7 +257,7 @@ pub struct NativeCoverage {
 mod internals {
     use super::*;
     use seismic_lang::checked::{ElementSummary, ElementTarget, NativeElementCoverage};
-    use seismic_lang::registry::{self, CodeInterpretation, PlaneEncoding, RepresentationInfo};
+    use seismic_lang::registry::{self, RepresentationInfo};
     use std::collections::HashSet;
     use std::fs;
 
@@ -996,7 +996,6 @@ mod internals {
                         "GROUP_MULTIPLE",
                         "ROW_ALIGNMENT",
                         "TILE_ROWS",
-                        "CODE_BITS",
                         "MMA_KBLOCK",
                         "MMA_LANES",
                     ] {
@@ -1009,7 +1008,6 @@ mod internals {
                             "ROW_OFFSET",
                             "BYTES_PER_ROW",
                             "BYTES_PER_GROUP",
-                            "CODE_SHIFT",
                             "CODE_BITS",
                             "CARRIED_BIT",
                             "ENTRY_BYTES",
@@ -1039,65 +1037,8 @@ mod internals {
                             "{plane_prefix}_STORAGE_{}",
                             native_macro(plane.storage_dtype.name())
                         ));
-                        match &plane.encoding {
-                            PlaneEncoding::Dense(dtype) => {
-                                symbols.insert(format!("{plane_prefix}_ENCODING_DENSE"));
-                                symbols.insert(format!(
-                                    "{plane_prefix}_ENCODING_DTYPE_{}",
-                                    native_macro(dtype.name())
-                                ));
-                            }
-                            PlaneEncoding::Packed { interpretation, .. } => {
-                                symbols.insert(format!("{plane_prefix}_ENCODING_PACKED"));
-                                symbols.insert(format!("{plane_prefix}_ENCODING_BITS"));
-                                add_code_symbols(symbols, &plane_prefix, interpretation);
-                            }
-                            PlaneEncoding::FloatCode { format } => {
-                                symbols.insert(format!("{plane_prefix}_ENCODING_FLOAT_CODE"));
-                                let format = match format {
-                                    registry::FloatCodeFormat::E2M1 => "E2M1",
-                                    registry::FloatCodeFormat::E4M3 => "E4M3",
-                                    registry::FloatCodeFormat::UE4M3 => "UE4M3",
-                                    registry::FloatCodeFormat::E8M0 => "E8M0",
-                                };
-                                symbols
-                                    .insert(format!("{plane_prefix}_ENCODING_FLOAT_CODE_{format}"));
-                                symbols.insert(format!("{plane_prefix}_ENCODING_BITS"));
-                            }
-                        }
                     }
                 }
-            }
-        }
-    }
-
-    fn add_code_symbols(
-        symbols: &mut HashSet<String>,
-        prefix: &str,
-        interpretation: &CodeInterpretation,
-    ) {
-        match interpretation {
-            CodeInterpretation::Unsigned => {
-                symbols.insert(format!("{prefix}_CODE_UNSIGNED"));
-            }
-            CodeInterpretation::TwosComplement => {
-                symbols.insert(format!("{prefix}_CODE_TWOS_COMPLEMENT"));
-            }
-            CodeInterpretation::Offset(_) => {
-                symbols.insert(format!("{prefix}_CODE_OFFSET"));
-                symbols.insert(format!("{prefix}_CODE_OFFSET_VALUE"));
-            }
-            CodeInterpretation::Table(values) => {
-                symbols.insert(format!("{prefix}_CODE_TABLE"));
-                symbols.insert(format!("{prefix}_CODE_TABLE_COUNT"));
-                for ordinal in 0..values.len() {
-                    symbols.insert(format!("{prefix}_CODE_TABLE_{ordinal}"));
-                }
-            }
-            CodeInterpretation::Grid(_) => {
-                symbols.insert(format!("{prefix}_CODE_GRID"));
-                symbols.insert(format!("{prefix}_CODE_GRID_LANES"));
-                symbols.insert(format!("{prefix}_CODE_GRID_INDEX_BITS"));
             }
         }
     }
@@ -1161,17 +1102,7 @@ mod internals {
         identifiers
     }
 
-    fn native_macro(name: &str) -> String {
-        name.chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() {
-                    character.to_ascii_uppercase()
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    }
+    use seismic_lang::native_name::native_macro;
 
     fn render(
         module: &seismic_lang::checked::CheckedModule,

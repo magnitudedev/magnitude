@@ -1,4 +1,5 @@
-//! Exact conversions of external GGUF weights into resident `rows16` storage:
+//! Exact conversions of external GGUF weights into resident `rows16` and
+//! `rows8` storage:
 //! the registry's registered `repack`. Codes and coefficients move bit for
 //! bit, except that `iq4g32` scales are formed (each an exact product or
 //! widening) and q3_K and iq3_s codes and scales are re-expressed as q6k's
@@ -9,18 +10,15 @@
 //! tensors; [`rows`] resolves the conversion from their representations.
 
 use crate::element::f16_to_f32;
-use crate::weights::{
-    Format, Iq2Xs, Iq2Xxs, Iq3Xxs, Iq4, Iq4S, Mxfp4, Nvfp4, Q4G32, Q4K, Q5G32, Q5K, Q6K, Q8,
-    RowGeometry,
-};
+use crate::weights::RowGeometry;
+use seismic_lang::registry::{self, Layout, RepresentationInfo, RowPlaneRole};
 use std::marker::PhantomData;
 
-/// One registered conversion of an external packet format into a `rows16`
+/// One registered conversion of an external packet format into a resident
 /// format whose storage group is one source packet.
 trait Conversion {
     /// The registry name of the external source.
     const SOURCE: &'static str;
-    type Target: Format;
     const PACKET_BYTES: usize;
     /// Values of one packet.
     const GROUP: usize;
@@ -76,7 +74,6 @@ struct GgufQ3K;
 
 impl Conversion for GgufQ3K {
     const SOURCE: &'static str = "gguf_q3_k";
-    type Target = Q6K;
     const PACKET_BYTES: usize = 110;
     const GROUP: usize = 256;
     const BITS: u32 = 6;
@@ -106,7 +103,6 @@ struct GgufQ4K;
 
 impl Conversion for GgufQ4K {
     const SOURCE: &'static str = "gguf_q4_k";
-    type Target = Q4K;
     const PACKET_BYTES: usize = 144;
     const GROUP: usize = 256;
     const BITS: u32 = 4;
@@ -128,7 +124,6 @@ struct GgufQ5K;
 
 impl Conversion for GgufQ5K {
     const SOURCE: &'static str = "gguf_q5_k";
-    type Target = Q5K;
     const PACKET_BYTES: usize = 176;
     const GROUP: usize = 256;
     const BITS: u32 = 5;
@@ -152,7 +147,6 @@ struct GgufQ6K;
 
 impl Conversion for GgufQ6K {
     const SOURCE: &'static str = "gguf_q6_k";
-    type Target = Q6K;
     const PACKET_BYTES: usize = 210;
     const GROUP: usize = 256;
     const BITS: u32 = 6;
@@ -176,7 +170,6 @@ struct GgufQ8;
 
 impl Conversion for GgufQ8 {
     const SOURCE: &'static str = "gguf_q8_0";
-    type Target = Q8;
     const PACKET_BYTES: usize = 34;
     const GROUP: usize = 32;
     const BITS: u32 = 8;
@@ -195,7 +188,6 @@ struct GgufIq4Xs;
 
 impl Conversion for GgufIq4Xs {
     const SOURCE: &'static str = "gguf_iq4_xs";
-    type Target = Iq4;
     const PACKET_BYTES: usize = 136;
     const GROUP: usize = 256;
     const BITS: u32 = 4;
@@ -225,7 +217,6 @@ struct GgufIq3S;
 
 impl Conversion for GgufIq3S {
     const SOURCE: &'static str = "gguf_iq3_s";
-    type Target = Q6K;
     const PACKET_BYTES: usize = 110;
     const GROUP: usize = 256;
     const BITS: u32 = 6;
@@ -236,7 +227,9 @@ impl Conversion for GgufIq3S {
         let (block, group, slot) = (p / 32, p % 32 / 8, p % 8);
         let point = usize::from(packet[2 + 8 * block + 2 * group + slot / 4])
             | usize::from((packet[66 + block] >> (2 * group + slot / 4)) & 1) << 8;
-        let magnitude = (IQ3S_GRID[point] >> (8 * (slot % 4))) as u8;
+        let magnitude = magnitude_ggml::tables::IQ3S
+            .points
+            .byte(point, (slot % 4) as u32);
         if (packet[74 + 4 * block + group] >> slot) & 1 != 0 {
             32 - magnitude
         } else {
@@ -259,7 +252,6 @@ struct GgufIq2Xs;
 
 impl Conversion for GgufIq2Xs {
     const SOURCE: &'static str = "gguf_iq2_xs";
-    type Target = Iq2Xs;
     const PACKET_BYTES: usize = 74;
     const GROUP: usize = 256;
     const BITS: u32 = 0;
@@ -287,7 +279,6 @@ struct GgufIq3Xxs;
 
 impl Conversion for GgufIq3Xxs {
     const SOURCE: &'static str = "gguf_iq3_xxs";
-    type Target = Iq3Xxs;
     const PACKET_BYTES: usize = 98;
     const GROUP: usize = 256;
     const BITS: u32 = 0;
@@ -326,7 +317,6 @@ struct GgufIq2Xxs;
 
 impl Conversion for GgufIq2Xxs {
     const SOURCE: &'static str = "gguf_iq2_xxs";
-    type Target = Iq2Xxs;
     const PACKET_BYTES: usize = 66;
     const GROUP: usize = 256;
     const BITS: u32 = 0;
@@ -337,9 +327,11 @@ impl Conversion for GgufIq2Xxs {
     fn grids(packet: &[u8], out: &mut [u8]) {
         for (entry, out) in out.chunks_exact_mut(2).enumerate() {
             let (block, group) = (entry / 4, entry % 4);
-            let word = u32::from_le_bytes(packet[6 + 8 * block..10 + 8 * block].try_into().unwrap());
+            let word =
+                u32::from_le_bytes(packet[6 + 8 * block..10 + 8 * block].try_into().unwrap());
             out[0] = packet[2 + 8 * block + group];
-            out[1] = ((word >> (7 * group)) & 127) as u8 | (((word >> (28 + group)) & 1) << 7) as u8;
+            out[1] =
+                ((word >> (7 * group)) & 127) as u8 | (((word >> (28 + group)) & 1) << 7) as u8;
         }
     }
     fn supers(packet: &[u8], out: &mut [u8]) {
@@ -347,80 +339,11 @@ impl Conversion for GgufIq2Xxs {
     }
 }
 
-/// ggml's `iq3s_grid`: byte `j` of point `i` is magnitude `j` (odd, 1..=15).
-static IQ3S_GRID: [u32; 512] = [
-    0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
-    0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
-    0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
-    0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
-    0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
-    0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
-    0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
-    0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
-    0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
-    0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
-    0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
-    0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
-    0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
-    0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
-    0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
-    0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
-    0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
-    0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
-    0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
-    0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
-    0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
-    0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
-    0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
-    0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
-    0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
-    0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
-    0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
-    0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
-    0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
-    0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
-    0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
-    0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
-    0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
-    0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
-    0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
-    0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
-    0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
-    0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
-    0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
-    0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
-    0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
-    0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
-    0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
-    0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
-    0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
-    0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
-    0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
-    0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
-    0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
-    0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
-    0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
-    0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
-    0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
-    0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
-    0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
-    0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
-    0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
-    0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
-    0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
-    0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
-    0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
-    0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
-    0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
-    0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
-];
-
 /// Eight consecutive GGUF iq4_nl blocks (one iq4g32 storage group).
 struct GgufIq4Nl;
 
 impl Conversion for GgufIq4Nl {
     const SOURCE: &'static str = "gguf_iq4_nl";
-    type Target = Iq4;
     const PACKET_BYTES: usize = 144;
     const GROUP: usize = 256;
     const BITS: u32 = 4;
@@ -451,7 +374,6 @@ struct GgufIq4NlBlock;
 
 impl Conversion for GgufIq4NlBlock {
     const SOURCE: &'static str = "gguf_iq4_nl_block";
-    type Target = Iq4S;
     const PACKET_BYTES: usize = 18;
     const GROUP: usize = 32;
     const BITS: u32 = 4;
@@ -471,7 +393,6 @@ struct GgufQ4_0;
 
 impl Conversion for GgufQ4_0 {
     const SOURCE: &'static str = "gguf_q4_0";
-    type Target = Q4G32;
     const PACKET_BYTES: usize = 18;
     const GROUP: usize = 32;
     const BITS: u32 = 4;
@@ -492,7 +413,6 @@ struct GgufQ5<const MINIMUM: bool>;
 
 impl<const MINIMUM: bool> Conversion for GgufQ5<MINIMUM> {
     const SOURCE: &'static str = if MINIMUM { "gguf_q5_1" } else { "gguf_q5_0" };
-    type Target = Q5G32<MINIMUM>;
     const PACKET_BYTES: usize = if MINIMUM { 24 } else { 22 };
     const GROUP: usize = 32;
     const BITS: u32 = 5;
@@ -511,7 +431,11 @@ impl<const MINIMUM: bool> Conversion for GgufQ5<MINIMUM> {
 /// The resident E2M1 code of a GGUF MXFP4 / NVFP4 code: code 8 (E2M1 -0),
 /// which ggml decodes as +0, becomes code 0.
 fn e2m1_positive_zero(code: u8) -> u8 {
-    if code == 8 { 0 } else { code }
+    if code == 8 {
+        0
+    } else {
+        code
+    }
 }
 
 /// GGUF mxfp4 (`e | qs[16]`) into mxfp4g32.
@@ -519,7 +443,6 @@ struct GgufMxfp4;
 
 impl Conversion for GgufMxfp4 {
     const SOURCE: &'static str = "gguf_mxfp4";
-    type Target = Mxfp4;
     const PACKET_BYTES: usize = 17;
     const GROUP: usize = 32;
     const BITS: u32 = 4;
@@ -541,7 +464,6 @@ struct GgufNvfp4;
 
 impl Conversion for GgufNvfp4 {
     const SOURCE: &'static str = "gguf_nvfp4";
-    type Target = Nvfp4;
     const PACKET_BYTES: usize = 36;
     const GROUP: usize = 64;
     const BITS: u32 = 4;
@@ -557,14 +479,22 @@ impl Conversion for GgufNvfp4 {
     }
 }
 
-/// Converts the source row at `source` (whole packets of `k` values) into the
-/// target row at `row`, zeroing every stored byte no plane occupies.
+/// Converts the source row at `source` (whole packets of `k` values) into one
+/// row of `geometry`'s planes at `row`, each storage group contiguous (a
+/// `rows16` row; `rows` interleaves it into a `rows8` tile), zeroing every
+/// stored byte no plane occupies.
 ///
 /// # Safety
 /// `source` addresses `ceil(k / GROUP)` packets and `row` one target row of
 /// `k` values.
-unsafe fn convert_row<C: Conversion>(source: *const u8, row: *mut u8, k: usize) {
-    let geometry: RowGeometry = C::Target::geometry(k, 0);
+unsafe fn convert_row<C: Conversion>(
+    source: *const u8,
+    row: *mut u8,
+    k: usize,
+    geometry: &RowGeometry,
+) {
+    let [codes_plane, high_plane, scales_plane, supers_plane] =
+        RowPlaneRole::ALL.map(|role| geometry.offsets[role as usize]);
     let groups = k.div_ceil(C::GROUP);
     let source = unsafe { std::slice::from_raw_parts(source, groups * C::PACKET_BYTES) };
     let out = unsafe { std::slice::from_raw_parts_mut(row, geometry.stride) };
@@ -574,15 +504,15 @@ unsafe fn convert_row<C: Conversion>(source: *const u8, row: *mut u8, k: usize) 
         if C::GRID_BYTES > 0 {
             C::grids(
                 packet,
-                &mut out[geometry.codes + g * C::GRID_BYTES..][..C::GRID_BYTES],
+                &mut out[codes_plane + g * C::GRID_BYTES..][..C::GRID_BYTES],
             );
             C::scales(
                 packet,
-                &mut out[geometry.scales + g * C::SCALE_BYTES..][..C::SCALE_BYTES],
+                &mut out[scales_plane + g * C::SCALE_BYTES..][..C::SCALE_BYTES],
             );
             C::supers(
                 packet,
-                &mut out[geometry.supers + g * C::SUPER_BYTES..][..C::SUPER_BYTES],
+                &mut out[supers_plane + g * C::SUPER_BYTES..][..C::SUPER_BYTES],
             );
             continue;
         }
@@ -591,22 +521,22 @@ unsafe fn convert_row<C: Conversion>(source: *const u8, row: *mut u8, k: usize) 
             *code = C::code(packet, p);
         }
         if C::BITS == 8 {
-            out[geometry.codes + g * C::GROUP..][..C::GROUP].copy_from_slice(codes);
+            out[codes_plane + g * C::GROUP..][..C::GROUP].copy_from_slice(codes);
         } else {
-            let low = &mut out[geometry.codes + g * C::GROUP / 2..][..C::GROUP / 2];
+            let low = &mut out[codes_plane + g * C::GROUP / 2..][..C::GROUP / 2];
             for (i, byte) in low.iter_mut().enumerate() {
                 *byte = (codes[2 * i] & 15) | ((codes[2 * i + 1] & 15) << 4);
             }
         }
         match C::BITS {
             5 => {
-                let high = &mut out[geometry.high + g * C::GROUP / 8..][..C::GROUP / 8];
+                let high = &mut out[high_plane + g * C::GROUP / 8..][..C::GROUP / 8];
                 for (i, code) in codes.iter().enumerate() {
                     high[i / 8] |= ((code >> 4) & 1) << (i % 8);
                 }
             }
             6 => {
-                let high = &mut out[geometry.high + g * C::GROUP / 4..][..C::GROUP / 4];
+                let high = &mut out[high_plane + g * C::GROUP / 4..][..C::GROUP / 4];
                 for (i, code) in codes.iter().enumerate() {
                     high[i / 4] |= ((code >> 4) & 3) << (2 * (i % 4));
                 }
@@ -616,12 +546,12 @@ unsafe fn convert_row<C: Conversion>(source: *const u8, row: *mut u8, k: usize) 
         if C::SCALE_BYTES > 0 {
             C::scales(
                 packet,
-                &mut out[geometry.scales + g * C::SCALE_BYTES..][..C::SCALE_BYTES],
+                &mut out[scales_plane + g * C::SCALE_BYTES..][..C::SCALE_BYTES],
             );
         }
         C::supers(
             packet,
-            &mut out[geometry.supers + g * C::SUPER_BYTES..][..C::SUPER_BYTES],
+            &mut out[supers_plane + g * C::SUPER_BYTES..][..C::SUPER_BYTES],
         );
     }
 }
@@ -634,69 +564,57 @@ pub struct RowConversion {
     /// Bytes and values of one source packet.
     pub packet_bytes: usize,
     pub group: usize,
-    geometry: fn(usize, usize) -> RowGeometry,
-    /// Eight-row block interleaving rather than contiguous rows.
-    rows8: bool,
-    /// Bytes per storage group of each plane, in storage order.
-    planes: &'static [usize],
-    convert: unsafe fn(*const u8, *mut u8, usize),
+    convert: unsafe fn(*const u8, *mut u8, usize, &RowGeometry),
 }
 
-const fn conversion<C: Conversion>(
-    target: &'static str,
-    rows8: bool,
-    planes: &'static [usize],
-) -> RowConversion {
+const fn conversion<C: Conversion>(target: &'static str) -> RowConversion {
     RowConversion {
         source: C::SOURCE,
         target,
         packet_bytes: C::PACKET_BYTES,
         group: C::GROUP,
-        geometry: C::Target::geometry,
-        rows8,
-        planes,
         convert: convert_row::<C>,
     }
 }
 
 static CONVERSIONS: [RowConversion; 34] = [
-    conversion::<GgufIq4NlBlock>("iq4g32s@rows16", false, &[16, 2]),
-    conversion::<GgufIq4NlBlock>("iq4g32s@rows8", true, &[16, 2]),
-    conversion::<GgufIq2Xs>("iq2xs@rows16", false, &[64, 8, 4]),
-    conversion::<GgufIq3Xxs>("iq3xxs@rows16", false, &[96, 4, 4]),
-    conversion::<GgufIq2Xxs>("iq2xxs@rows16", false, &[64, 2]),
-    conversion::<GgufIq2Xs>("iq2xs@rows8", true, &[64, 8, 4]),
-    conversion::<GgufIq3Xxs>("iq3xxs@rows8", true, &[96, 4, 4]),
-    conversion::<GgufIq2Xxs>("iq2xxs@rows8", true, &[64, 2]),
-    conversion::<GgufQ4_0>("q4g32s@rows16", false, &[16, 2]),
-    conversion::<GgufQ5<false>>("q5g32s@rows16", false, &[16, 4, 2]),
-    conversion::<GgufQ5<true>>("q5g32@rows16", false, &[16, 4, 4]),
-    conversion::<GgufMxfp4>("mxfp4g32@rows16", false, &[16, 1]),
-    conversion::<GgufNvfp4>("nvfp4g16@rows16", false, &[32, 4]),
-    conversion::<GgufQ4_0>("q4g32s@rows8", true, &[16, 2]),
-    conversion::<GgufQ5<false>>("q5g32s@rows8", true, &[16, 4, 2]),
-    conversion::<GgufQ5<true>>("q5g32@rows8", true, &[16, 4, 4]),
-    conversion::<GgufMxfp4>("mxfp4g32@rows8", true, &[16, 1]),
-    conversion::<GgufNvfp4>("nvfp4g16@rows8", true, &[32, 4]),
-    conversion::<GgufQ3K>("q6k@rows16", false, &[128, 64, 16, 2]),
-    conversion::<GgufIq3S>("q6k@rows16", false, &[128, 64, 16, 2]),
-    conversion::<GgufQ4K>("q4k@rows16", false, &[128, 12, 4]),
-    conversion::<GgufQ5K>("q5k@rows16", false, &[128, 32, 12, 4]),
-    conversion::<GgufQ6K>("q6k@rows16", false, &[128, 64, 16, 2]),
-    conversion::<GgufQ8>("q8g32s@rows16", false, &[32, 2]),
-    conversion::<GgufIq4Nl>("iq4g32@rows16", false, &[128, 32]),
-    conversion::<GgufIq4Xs>("iq4g32@rows16", false, &[128, 32]),
-    conversion::<GgufQ3K>("q6k@rows8", true, &[128, 64, 16, 2]),
-    conversion::<GgufIq3S>("q6k@rows8", true, &[128, 64, 16, 2]),
-    conversion::<GgufQ4K>("q4k@rows8", true, &[128, 12, 4]),
-    conversion::<GgufQ5K>("q5k@rows8", true, &[128, 32, 12, 4]),
-    conversion::<GgufQ6K>("q6k@rows8", true, &[128, 64, 16, 2]),
-    conversion::<GgufQ8>("q8g32s@rows8", true, &[32, 2]),
-    conversion::<GgufIq4Nl>("iq4g32@rows8", true, &[128, 32]),
-    conversion::<GgufIq4Xs>("iq4g32@rows8", true, &[128, 32]),
+    conversion::<GgufIq4NlBlock>("iq4g32s@rows16"),
+    conversion::<GgufIq4NlBlock>("iq4g32s@rows8"),
+    conversion::<GgufIq2Xs>("iq2xs@rows16"),
+    conversion::<GgufIq3Xxs>("iq3xxs@rows16"),
+    conversion::<GgufIq2Xxs>("iq2xxs@rows16"),
+    conversion::<GgufIq2Xs>("iq2xs@rows8"),
+    conversion::<GgufIq3Xxs>("iq3xxs@rows8"),
+    conversion::<GgufIq2Xxs>("iq2xxs@rows8"),
+    conversion::<GgufQ4_0>("q4g32s@rows16"),
+    conversion::<GgufQ5<false>>("q5g32s@rows16"),
+    conversion::<GgufQ5<true>>("q5g32@rows16"),
+    conversion::<GgufMxfp4>("mxfp4g32@rows16"),
+    conversion::<GgufNvfp4>("nvfp4g16@rows16"),
+    conversion::<GgufQ4_0>("q4g32s@rows8"),
+    conversion::<GgufQ5<false>>("q5g32s@rows8"),
+    conversion::<GgufQ5<true>>("q5g32@rows8"),
+    conversion::<GgufMxfp4>("mxfp4g32@rows8"),
+    conversion::<GgufNvfp4>("nvfp4g16@rows8"),
+    conversion::<GgufQ3K>("q6k@rows16"),
+    conversion::<GgufIq3S>("q6k@rows16"),
+    conversion::<GgufQ4K>("q4k@rows16"),
+    conversion::<GgufQ5K>("q5k@rows16"),
+    conversion::<GgufQ6K>("q6k@rows16"),
+    conversion::<GgufQ8>("q8g32s@rows16"),
+    conversion::<GgufIq4Nl>("iq4g32@rows16"),
+    conversion::<GgufIq4Xs>("iq4g32@rows16"),
+    conversion::<GgufQ3K>("q6k@rows8"),
+    conversion::<GgufIq3S>("q6k@rows8"),
+    conversion::<GgufQ4K>("q4k@rows8"),
+    conversion::<GgufQ5K>("q5k@rows8"),
+    conversion::<GgufQ6K>("q6k@rows8"),
+    conversion::<GgufQ8>("q8g32s@rows8"),
+    conversion::<GgufIq4Nl>("iq4g32@rows8"),
+    conversion::<GgufIq4Xs>("iq4g32@rows8"),
 ];
 
-/// Every registered conversion into a `rows16` representation.
+/// Every registered conversion into a resident row layout.
 pub fn conversions() -> &'static [RowConversion] {
     &CONVERSIONS
 }
@@ -794,14 +712,14 @@ fn external_packet(representation: &str) -> (usize, usize) {
         .unwrap_or_else(|| panic!("`{representation}` is not a registered external source"))
 }
 
-/// A bound result tensor of a packed `rows16` representation, written only
-/// by a conversion.
+/// A bound result tensor of a packed `rows16` or `rows8` element, written
+/// only by a conversion.
 #[derive(Clone, Copy, Debug)]
 pub struct Packed<'a> {
     base: *mut u8,
     rows: usize,
     k: usize,
-    representation: &'static str,
+    element: &'static RepresentationInfo,
     matrix_rows: usize,
     life: PhantomData<&'a u8>,
 }
@@ -822,7 +740,11 @@ impl<'a> Packed<'a> {
         strides: &[u64],
         representation: &'static str,
     ) -> Self {
-        let rows = if representation.ends_with("@rows8") {
+        let element = registry::representation_info(
+            registry::representation(representation)
+                .unwrap_or_else(|| panic!("`{representation}` is no registered element")),
+        );
+        let rows = if element.layout == Layout::Rows8 {
             let rank = extents.len();
             assert!(rank >= 2, "Rows8 requires a row axis");
             assert_eq!(strides[rank - 1], 1);
@@ -843,7 +765,7 @@ impl<'a> Packed<'a> {
             base,
             rows,
             k: extents[extents.len() - 1] as usize,
-            representation,
+            element,
             matrix_rows: extents[extents.len() - 2] as usize,
             life: PhantomData,
         }
@@ -851,10 +773,6 @@ impl<'a> Packed<'a> {
 
     pub fn rows(&self) -> usize {
         self.rows
-    }
-
-    pub fn representation(&self) -> &'static str {
-        self.representation
     }
 }
 
@@ -864,10 +782,10 @@ impl<'a> Packed<'a> {
 /// No other work item writes these rows of `destination` in the launch.
 pub unsafe fn rows(source: &External<'_>, destination: &Packed<'_>, rows: std::ops::Range<usize>) {
     let conversion =
-        resolve(source.representation, destination.representation).unwrap_or_else(|| {
+        resolve(source.representation, destination.element.name).unwrap_or_else(|| {
             panic!(
                 "no CPU conversion of `{}` into `{}`",
-                source.representation, destination.representation
+                source.representation, destination.element.name
             )
         });
     assert_eq!(source.k, destination.k, "a conversion keeps the row length");
@@ -876,9 +794,10 @@ pub unsafe fn rows(source: &External<'_>, destination: &Packed<'_>, rows: std::o
         "rows {rows:?} outside the operands"
     );
     let source_row = source.k.div_ceil(conversion.group) * conversion.packet_bytes;
-    let target_row = (conversion.geometry)(destination.k, 0).stride;
+    let geometry = RowGeometry::of(destination.element, destination.k, 0);
+    let target_row = geometry.stride;
     assert_eq!(source.matrix_rows, destination.matrix_rows);
-    if conversion.rows8 {
+    if geometry.rows8 {
         let n = source.matrix_rows;
         assert!(
             rows.start / n == (rows.end - 1) / n,
@@ -890,13 +809,6 @@ pub unsafe fn rows(source: &External<'_>, destination: &Packed<'_>, rows: std::o
             "a Rows8 work item ends on a tile"
         );
         let groups = source.k.div_ceil(conversion.group);
-        let geometry = (conversion.geometry)(destination.k, 0);
-        let mut offsets = [0usize; 4];
-        let mut end = 0usize;
-        for (plane, bytes) in conversion.planes.iter().enumerate() {
-            offsets[plane] = end.div_ceil(16) * 16;
-            end = offsets[plane] + groups * bytes;
-        }
         for first in (rows.start..rows.end).step_by(8) {
             let matrix = first / n;
             let in_matrix = first % n;
@@ -916,12 +828,16 @@ pub unsafe fn rows(source: &External<'_>, destination: &Packed<'_>, rows: std::o
                         source.base.add((first + r) * source_row),
                         packed.as_mut_ptr(),
                         source.k,
+                        &geometry,
                     )
                 };
-                for (plane, bytes) in conversion.planes.iter().enumerate() {
+                for (offset, bytes) in geometry.offsets.iter().zip(geometry.groups) {
+                    if bytes == 0 {
+                        continue;
+                    }
                     for group in 0..groups {
-                        let from = offsets[plane] + group * bytes;
-                        let to = offsets[plane] * 8 + group * bytes * 8 + r * bytes;
+                        let from = offset + group * bytes;
+                        let to = offset * 8 + group * bytes * 8 + r * bytes;
                         output[to..to + bytes].copy_from_slice(&packed[from..from + bytes]);
                     }
                 }
@@ -936,6 +852,7 @@ pub unsafe fn rows(source: &External<'_>, destination: &Packed<'_>, rows: std::o
                     source.base.add(row * source_row),
                     destination.base.add(row * target_row),
                     source.k,
+                    &geometry,
                 )
             };
         }
@@ -975,14 +892,19 @@ mod tests {
                 let id = registered.id;
                 let expected =
                     seismic_lang::interp::repack(id, &[rows, k], &source).expect("registry repack");
-                let stride = (conversion.geometry)(k, 0).stride;
-                let stored_rows = if conversion.rows8 {
+                let geometry = RowGeometry::of(
+                    registry::representation_info(representation(conversion.target).unwrap()),
+                    k,
+                    0,
+                );
+                let stride = geometry.stride;
+                let stored_rows = if geometry.rows8 {
                     rows.div_ceil(8) * 8
                 } else {
                     rows
                 };
                 let mut out = vec![0xa5u8; stored_rows * stride];
-                if conversion.rows8 {
+                if geometry.rows8 {
                     let from = unsafe {
                         External::from_tensor(
                             source.as_ptr(),
@@ -1007,6 +929,7 @@ mod tests {
                                 source.as_ptr().add(row * packets * conversion.packet_bytes),
                                 out.as_mut_ptr().add(row * stride),
                                 k,
+                                &geometry,
                             )
                         };
                     }

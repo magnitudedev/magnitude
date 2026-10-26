@@ -7,8 +7,8 @@
 //! - [`element`]: the dense element types and their conversions;
 //! - [`tensor`]: typed views of the tensors a kernel receives;
 //! - [`reduce`], [`math`]: defined-order reductions and scalar functions;
-//! - [`weights`]: weight representations, their row geometry and the bodies
-//!   of their components;
+//! - [`weights`]: weight elements, their row geometry and the bodies of
+//!   their components;
 //! - [`components`]: the compiled component instances and their resolution;
 //! - [`repack`]: exact conversions of external weights into resident rows.
 //!
@@ -18,7 +18,6 @@
 
 pub mod components;
 pub mod element;
-mod grids;
 pub mod isa;
 pub mod math;
 pub mod quant;
@@ -35,21 +34,54 @@ pub use repack::{External, Packed};
 pub use tensor::{Scalars, Scratch, Tensor};
 pub use weights::RowGeometry;
 
+use seismic_lang::ids::RepresentationId;
+use seismic_lang::registry;
+
 #[cfg(target_arch = "aarch64")]
 pub use isa::Neon;
 #[cfg(target_arch = "x86_64")]
-pub use isa::{X86V2, X86V3, X86V4, X86V4Vnni};
+pub use isa::{X86V4Vnni, X86V2, X86V3, X86V4};
 
 /// The version of this library, part of every CPU implementation digest.
-pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-4");
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-5");
 
-/// A weight buffer's representation as a call reads it: its resolved
-/// components, and whether products over it take their activation rows as
-/// NVFP4 operands (the registry's operand recipe, `operands(W)`).
+/// A weight buffer's element as a call reads it: its storage element, that
+/// element's resolved components, and whether products over it take their
+/// activation rows as NVFP4 operands (the registry's operand recipe,
+/// `operands(W)`).
 #[derive(Clone, Copy, Debug)]
 pub struct WeightOperand {
-    pub kernels: &'static WeightKernels,
-    pub nvfp4_operands: bool,
+    kernels: &'static WeightKernels,
+    storage: &'static registry::RepresentationInfo,
+    nvfp4_operands: bool,
+}
+
+impl WeightOperand {
+    /// The weight operand of element `element` on `tier`, or `None` when
+    /// `element` is no weight element.
+    pub fn of(tier: Tier, element: RepresentationId) -> Option<Self> {
+        let storage = registry::representation_info(registry::storage_of(element));
+        Some(Self {
+            kernels: components::resolve(tier, storage.id)?,
+            storage,
+            nvfp4_operands: registry::representation_info(element).operands
+                == registry::OperandRecipe::Nvfp4Rows,
+        })
+    }
+
+    /// Bytes of one value of dense rows; `None` for packed rows.
+    pub fn dense_bytes(&self) -> Option<usize> {
+        match self.storage.kind {
+            registry::RepresentationKind::Dense(dtype) => Some(dtype.bytes() as usize),
+            _ => None,
+        }
+    }
+
+    /// Whether the operand multiplies NVFP4 operand rows (the weight's W4A4
+    /// recipe), which never take quantized activations.
+    pub fn nvfp4_operands(&self) -> bool {
+        self.nvfp4_operands
+    }
 }
 
 /// A bound weight operand: a tensor of a weight representation whose rows
@@ -86,9 +118,7 @@ impl<'a> Weights<'a> {
             base,
             rows,
             k,
-            geometry: operand
-                .kernels
-                .geometry(k, dense_stride)
+            geometry: RowGeometry::of(operand.storage, k, dense_stride)
                 .with_base(base, rows.max(1)),
             kernels: operand.kernels,
             nvfp4_operands: operand.nvfp4_operands,
@@ -108,14 +138,11 @@ impl<'a> Weights<'a> {
         strides: &[u64],
         operand: WeightOperand,
     ) -> Self {
-        let kernels = operand.kernels;
         let rank = extents.len();
         assert!(rank >= 1, "a weight operand has a value axis");
         let k = extents[rank - 1] as usize;
         let rows = extents[..rank - 1].iter().product::<u64>() as usize;
-        let dense_stride = if kernels.dense_bytes == 0 {
-            0
-        } else {
+        let dense_stride = if let Some(dense_bytes) = operand.dense_bytes() {
             assert_eq!(
                 strides[rank - 1],
                 1,
@@ -129,10 +156,12 @@ impl<'a> Weights<'a> {
                 );
             }
             if rank >= 2 {
-                strides[rank - 2] as usize * kernels.dense_bytes
+                strides[rank - 2] as usize * dense_bytes
             } else {
-                k * kernels.dense_bytes
+                k * dense_bytes
             }
+        } else {
+            0
         };
         let mut view = unsafe { Self::from_raw(base, rows.max(1), k, dense_stride, operand) };
         view.geometry.matrix_rows = if rank >= 2 {
@@ -156,10 +185,6 @@ impl<'a> Weights<'a> {
     /// NVFP4 operands (`WeightOperand`).
     pub fn nvfp4_operands(&self) -> bool {
         self.nvfp4_operands
-    }
-
-    pub fn representation(&self) -> &'static str {
-        self.kernels.representation
     }
 
     /// The `k` values of row `row`.
