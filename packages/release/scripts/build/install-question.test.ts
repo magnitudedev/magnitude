@@ -11,7 +11,7 @@ import { renderUnixInstallationScript } from "./installation-scripts"
 
 const which = (tool: string) => spawnSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim()
 const python = which("python3"), setsid = which("setsid")
-const tools = ["cat", "chmod", "cp", "cut", "getconf", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
+const tools = ["awk", "date", "cat", "chmod", "cp", "cut", "getconf", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
 // Drives the installer in a new session whose controlling terminal is a pty, with the script on
 // stdin as `curl | sh` does, and answers the question once it appears.
 const driver = `
@@ -77,7 +77,7 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
     writeFileSync(join(root, "offer.json"), JSON.stringify({ release, download: "https://github.com/magnitudedev/magnitude/releases/download/test/magnitude.deb" }))
     script = join(root, "install.sh")
     writeFileSync(script, (await Effect.runPromise(renderUnixInstallationScript({ origin: "https://magnitude.dev", appleTeam: "ABCDEFGHIJ",
-      publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString() }).pipe(Effect.provide(NodeContext.layer)))).replace(
+      publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString() }).pipe(Effect.provide(NodeContext.layer)))).replace("server_marker=/etc/magnitude/server", `server_marker=${join(root, "server")}`).replace(
         "/usr/lib/magnitude-desktop/resources/magnitude _server-wait-ready", `${bin}/magnitude _server-wait-ready`))
     environment = { PATH: bin, HOME: root, TEST_LOG: log, TEST_OFFER: join(root, "offer.json"), TEST_PACKAGE: join(root, "package.deb") }
   })
@@ -157,7 +157,6 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
       writeFileSync(join(root, "server"), "")
       writeFileSync(join(root, "installed"), "0.1.5")
       environment.TEST_INSTALLED = join(root, "installed")
-      writeFileSync(script, readFileSync(script, "utf8").replace("server_marker=/etc/magnitude/server", `server_marker=${join(root, "server")}`))
     })
     it("upgrades around a stopped service without asking", () => {
       const result = unattended()

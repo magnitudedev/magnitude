@@ -18,7 +18,7 @@ describe("installation script generation", () => {
     try {
       const script = await Effect.runPromise(render())
       const start = script.indexOf("    /usr/bin/plutil -create ")
-      const end = script.indexOf('    "$app/Contents/Resources/magnitude"', start)
+      const end = script.indexOf("    run_step 'Installing app", start)
       expect(start).toBeGreaterThan(0)
       expect(end).toBeGreaterThan(start)
       const offer = { release: { version: "1.2.3", bytes: 123, sha256: "abc", signature: "proof" }, download: "https://github.com/magnitudedev/magnitude/releases/download/v1.2.3/app.zip" }
