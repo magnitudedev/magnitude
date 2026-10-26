@@ -36,13 +36,7 @@ Windows PowerShell:
 irm https://magnitude.dev/install.ps1 | iex
 ```
 
-Or [download manually](https://magnitude.dev/download#manual-downloads).
-
-1. Open Magnitude.
-2. Choose a recommended model in **Discover** and download it.
-3. Connect your agent in **Connections** and start using it.
-
-The desktop app includes the `magnitude` CLI. No separate installation is needed.
+Includes both the desktop app and CLI. You can also [download manually](https://magnitude.dev/download#manual-downloads)
 
 ### Run it on a server
 
