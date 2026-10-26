@@ -1,7 +1,36 @@
 # Magnitude CLI
 
 Running `magnitude` without a subcommand prints help and exits.
-Use Desktop or `magnitude serve` to run inference. The following commands manage models and agent connections:
+Use Desktop or `magnitude serve` to run inference.
+
+## Installation
+
+Magnitude includes the desktop app and CLI in one installation. No separate npm package is needed.
+
+macOS / Linux:
+
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://magnitude.dev/install.ps1 | iex
+```
+
+On macOS, open a new terminal or SSH session after installation to use `magnitude`. The Windows script
+updates PATH in its current PowerShell session. Manual installers are at https://magnitude.dev/download.
+
+The Linux installer asks whether to set up a persistent server service. Choose Yes only for a machine
+intended to serve persistently; without an interactive terminal it skips setup. Installation itself does
+not require opening Desktop. Use `magnitude serve` for a foreground headless session. On a dedicated
+Linux or macOS server, use `magnitude server setup` if the installer has not already set it up;
+see `magnitude docs remote-access`.
+
+## Commands
+
+The following commands manage models and agent connections:
 
 ```text
 magnitude update [check|status|download|install|discard]

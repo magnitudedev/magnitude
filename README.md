@@ -20,15 +20,25 @@
 
 Magnitude is an open source inference engine that tunes its kernels on your hardware to find the fastest way to run each model. It's over 2x faster than Ollama and works on Apple Silicon, NVIDIA, AMD, or just a CPU. One click connects it to the agent you already use (Pi, OpenCode, Hermes, Codex, and more).
 
-**[Download Magnitude for macOS, Windows, or Linux](https://magnitude.dev/download)**
-
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
-
-https://github.com/user-attachments/assets/983328c8-93e8-4360-bfef-11e93ff76035
 
 ## Get started
 
-1. [Download Magnitude](https://magnitude.dev/download), install it, and open the app.
+macOS / Linux:
+
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://magnitude.dev/install.ps1 | iex
+```
+
+Or [download manually](https://magnitude.dev/download#manual-downloads).
+
+1. Open Magnitude.
 2. Choose a recommended model in **Discover** and download it.
 3. Connect your agent in **Connections** and start using it.
 
