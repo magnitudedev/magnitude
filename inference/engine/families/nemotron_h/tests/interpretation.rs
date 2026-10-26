@@ -1,12 +1,12 @@
 //! Interpretation of every catalog Nemotron-H header, plus negative cases.
 //!
-//! The headers are the locked catalog components' (`headers::catalog`).
+//! The headers are the locked catalog components' (`headers::target`).
 
 use magnitude_artifacts::{
     gguf::{Array, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
     ArtifactIdentity, InputLayout, PackageIdentity, TokenId, UnsupportedReason,
 };
-use magnitude_family_common::{headers::catalog, TextInput};
+use magnitude_family_common::{headers, TextInput};
 use magnitude_family_contracts::{
     ActivationFunction, AttentionGate, ExitNorm, ExpertSelection, FeedForwardUp, HeadNorm,
     ImportTransform, InputNorm, InputPreparationError, KeyValue, ModelDefinition,
@@ -27,25 +27,25 @@ fn inspect(directory: &Directory) -> Result<ModelDefinition, Error> {
 }
 
 const LIGHTNING: [&str; 3] = [
-    "nemotron-3.5-lightning-30b-a3b__target-gguf:nvfp4-qat",
-    "nemotron-3.5-lightning-30b-a3b__target-gguf:q4",
-    "nemotron-3.5-lightning-30b-a3b__target-gguf:q8",
+    "nemotron-3.5-lightning-30b-a3b:gguf:nvfp4-qat",
+    "nemotron-3.5-lightning-30b-a3b:gguf:q4",
+    "nemotron-3.5-lightning-30b-a3b:gguf:q8",
 ];
 const SUPER: [&str; 2] = [
-    "nemotron-3-super-120b-a12b__target-gguf:mxfp4",
-    "nemotron-3-super-120b-a12b__target-gguf:q4",
+    "nemotron-3-super-120b-a12b:gguf:mxfp4",
+    "nemotron-3-super-120b-a12b:gguf:q4",
 ];
-const ULTRA: &str = "nemotron-3-ultra-550b-a55b__target-gguf:mxfp4";
+const ULTRA: &str = "nemotron-3-ultra-550b-a55b:gguf:mxfp4";
 
 /// NVIDIA's 24GB Bolt release (IQ2_XXS experts, NVFP4 state space).
 fn bolt() -> Directory {
-    catalog("nemotron-3.5-bolt-74b-a9b__target-gguf:iq2-qat")
+    headers::target("nemotron-3.5-bolt-74b-a9b:gguf:iq2-qat")
 }
 
 /// Unsloth's Super VL UD-Q4_K_XL, all three shards' tensors, which states
 /// only `layer_norm_epsilon`.
 fn super_vl() -> Directory {
-    catalog("nemotron-3.5-super-vl-120b-a12b__target-gguf:q4")
+    headers::target("nemotron-3.5-super-vl-120b-a12b:gguf:q4")
 }
 
 /// The layer pattern, one character per sublayer (`M` state space, `*`
@@ -218,7 +218,7 @@ fn lightning() -> Expected {
 #[test]
 fn every_lightning_variant_binds_with_its_prediction_block_skipped() {
     for file in LIGHTNING {
-        let definition = inspect(&catalog(file)).unwrap_or_else(|error| panic!("{file}: {error}"));
+        let definition = inspect(&headers::target(file)).unwrap_or_else(|error| panic!("{file}: {error}"));
         check(&definition, &lightning());
         // One block per mixer (23 state space, 6 attention); 6 lone state
         // space blocks.
@@ -234,7 +234,7 @@ fn every_lightning_variant_binds_with_its_prediction_block_skipped() {
 #[test]
 fn super_and_ultra_bind_latent_experts() {
     for file in SUPER {
-        let definition = inspect(&catalog(file)).unwrap_or_else(|error| panic!("{file}: {error}"));
+        let definition = inspect(&headers::target(file)).unwrap_or_else(|error| panic!("{file}: {error}"));
         check(
             &definition,
             &Expected {
@@ -252,7 +252,7 @@ fn super_and_ultra_bind_latent_experts() {
             },
         );
     }
-    let definition = inspect(&catalog(ULTRA)).unwrap();
+    let definition = inspect(&headers::target(ULTRA)).unwrap();
     check(
         &definition,
         &Expected {
@@ -398,7 +398,7 @@ fn rejects_softmax_gating_and_oversized_layer_selections() {
 
 #[test]
 fn nvfp4_second_level_scales_bind_to_their_weights() {
-    let definition = inspect(&catalog(LIGHTNING[0])).unwrap();
+    let definition = inspect(&headers::target(LIGHTNING[0])).unwrap();
     // Every second-level scale scales the weight it belongs to (the
     // executor applies it on that projection's accumulator).
     assert_eq!(
@@ -442,11 +442,11 @@ fn nvfp4_second_level_scales_bind_to_their_weights() {
 #[test]
 fn recognizes_only_the_nemotron_h_architecture() {
     for file in LIGHTNING.iter().chain(&SUPER).chain([&ULTRA]) {
-        assert!(recognize(&catalog(file)).is_ok(), "{file}");
+        assert!(recognize(&headers::target(file)).is_ok(), "{file}");
     }
-    let draft = catalog("nemotron-3.5-lightning-30b-a3b__draft");
+    let draft = headers::draft("nemotron-3.5-lightning-30b-a3b:gguf:q4");
     assert!(matches!(recognize(&draft), Err(Error::Architecture(_))));
-    let qwen = catalog("qwen3.5-4b__target-gguf:q4");
+    let qwen = headers::target("qwen3.5-4b:gguf:q4");
     assert!(matches!(recognize(&qwen), Err(Error::Architecture(_))));
 }
 
@@ -471,7 +471,7 @@ fn edit_counts(directory: &mut Directory, key: &str, edit: impl FnOnce(&mut Vec<
 }
 
 fn lightning_q8() -> Directory {
-    catalog(LIGHTNING[2])
+    headers::target(LIGHTNING[2])
 }
 
 #[test]
@@ -528,7 +528,7 @@ fn rejects_unknown_metadata_and_unbound_tensors() {
 
 #[test]
 fn rejects_a_misshapen_second_level_scale() {
-    let mut directory = catalog(LIGHTNING[0]);
+    let mut directory = headers::target(LIGHTNING[0]);
     let scale = directory
         .tensors
         .iter_mut()

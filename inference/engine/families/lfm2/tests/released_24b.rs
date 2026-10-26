@@ -8,7 +8,7 @@ use magnitude_family_lfm2::inspect_components;
 #[test]
 fn released_quantizations_bind_the_complete_24b_decoder() {
     for variant in ["q4", "q5", "q6", "q8"] {
-        let directory = headers::catalog(&format!("lfm2.5-24b-a2b__target-gguf:{variant}"));
+        let directory = headers::target(&format!("lfm2.5-24b-a2b:gguf:{variant}"));
         let definition = inspect_components(
             &directory,
             None,

@@ -2,7 +2,7 @@ use magnitude_artifacts::{
     media::{DType, PreparedMedia, PreparedTensor},
     ArtifactIdentity, ImageProcessor, InputLayout, PackageIdentity, TokenId,
 };
-use magnitude_family_common::headers::catalog;
+use magnitude_family_common::headers;
 use magnitude_family_contracts::{
     FamilyError, MarkerTokens, ModelDefinition, PositionSampling, TokenPlan, VisionResize,
 };
@@ -15,8 +15,8 @@ fn definition(large: bool) -> ModelDefinition {
         "minicpm-v-4.7-1b"
     };
     inspect_components(
-        &catalog(&format!("{model}__target-gguf:q4")),
-        Some(&catalog(&format!("{model}__projector"))),
+        &headers::target(&format!("{model}:gguf:q4")),
+        Some(&headers::projector(&format!("{model}:gguf:q4"))),
         PackageIdentity {
             target: ArtifactIdentity([0; 32]),
             projector: Some(ArtifactIdentity([1; 32])),
@@ -58,7 +58,7 @@ fn both_released_projectors_bind_the_exact_tower_and_merger() {
 #[test]
 fn unsupported_compression_and_unknown_weights_are_refused() {
     use magnitude_artifacts::gguf::{Scalar, Value};
-    let mut p = catalog("minicpm-v-4.7-1b__projector");
+    let mut p = headers::projector("minicpm-v-4.7-1b:gguf:q4");
     let original = p.clone();
     p.metadata
         .iter_mut()

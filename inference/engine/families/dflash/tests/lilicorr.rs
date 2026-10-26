@@ -1,5 +1,5 @@
 //! LiLiCorr drafts (NVIDIA Nemotron 3.5 Bolt and Super-VL) at the catalog's
-//! exact headers (`headers::catalog`), and their DSpark drafts at pinned
+//! exact headers (`headers::draft`), and their DSpark drafts at pinned
 //! artifacts' (`headers::artifact`): a convolved backbone without a
 //! candidate selector, per-head attention sinks (Bolt), and the candidate
 //! corrector. Each reads against its own target's header.
@@ -17,8 +17,8 @@ use magnitude_family_contracts::{
 use magnitude_family_dflash::{inspect, recognize, Error};
 use magnitude_family_nemotron_h::NemotronHFamily;
 
-const BOLT_TARGET: &str = "nemotron-3.5-bolt-74b-a9b__target-gguf:iq2-qat";
-const SUPER_TARGET: &str = "nemotron-3.5-super-vl-120b-a12b__target-gguf:q4";
+const BOLT: &str = "nemotron-3.5-bolt-74b-a9b:gguf:iq2-qat";
+const SUPER: &str = "nemotron-3.5-super-vl-120b-a12b:gguf:q4";
 
 fn identity() -> PackageIdentity {
     PackageIdentity {
@@ -27,25 +27,25 @@ fn identity() -> PackageIdentity {
     }
 }
 
-fn target(header: &str) -> ModelDefinition {
+fn target(model: &str) -> ModelDefinition {
     NemotronHFamily
-        .inspect(&headers::catalog(header), None, identity())
+        .inspect(&headers::target(model), None, identity())
         .unwrap_or_else(|error| panic!("target: {error}"))
 }
 
-fn read(draft: &Directory, target_header: &str) -> Result<DraftDefinition, Error> {
-    let definition = target(target_header);
+fn read(draft: &Directory, model: &str) -> Result<DraftDefinition, Error> {
+    let definition = target(model);
     inspect(draft, &definition, &|layer| {
         NemotronHFamily.layer_entry(&definition, layer)
     })
 }
 
 fn bolt() -> Directory {
-    headers::catalog("nemotron-3.5-bolt-74b-a9b__draft")
+    headers::draft(BOLT)
 }
 
 fn super_vl() -> Directory {
-    headers::catalog("nemotron-3.5-super-vl-120b-a12b__draft")
+    headers::draft(SUPER)
 }
 
 fn corrector(draft: &DraftDefinition) -> &CandidateCorrector {
@@ -71,11 +71,11 @@ fn attention(draft: &DraftDefinition, layer: usize) -> &magnitude_family_contrac
 
 #[test]
 fn both_drafts_bind_and_validate_against_their_targets() {
-    for (draft, target_header) in [(bolt(), BOLT_TARGET), (super_vl(), SUPER_TARGET)] {
+    for (draft, model) in [(bolt(), BOLT), (super_vl(), SUPER)] {
         recognize(&draft).unwrap();
-        let definition = read(&draft, target_header).unwrap();
+        let definition = read(&draft, model).unwrap();
         assert_eq!(definition.method.variant(), DraftVariant::LiLiCorr);
-        let mut model = target(target_header);
+        let mut model = target(model);
         model.draft = Some(definition);
         model.validate().unwrap();
     }
@@ -83,7 +83,7 @@ fn both_drafts_bind_and_validate_against_their_targets() {
 
 #[test]
 fn bolt_reads_a_selectorless_convolved_backbone_with_sinks() {
-    let draft = read(&bolt(), BOLT_TARGET).unwrap();
+    let draft = read(&bolt(), BOLT).unwrap();
     assert_eq!(draft.layout, BlockLayout::MaskSlots);
     assert_eq!((draft.block_size, draft.max_proposals()), (8, 7));
     // The corrector scores every mask slot: a block is always whole.
@@ -122,7 +122,7 @@ fn bolt_reads_a_selectorless_convolved_backbone_with_sinks() {
 
 #[test]
 fn bolt_reads_its_corrector() {
-    let draft = read(&bolt(), BOLT_TARGET).unwrap();
+    let draft = read(&bolt(), BOLT).unwrap();
     let corrector = corrector(&draft);
     assert_eq!(
         (
@@ -170,7 +170,7 @@ fn bolt_reads_its_corrector() {
 
 #[test]
 fn super_vl_reads_windowed_layers_without_sinks_and_its_own_projection() {
-    let draft = read(&super_vl(), SUPER_TARGET).unwrap();
+    let draft = read(&super_vl(), SUPER).unwrap();
     assert_eq!(corrector(&draft).layers.len(), 2);
     assert_eq!(draft.taps.len(), 5);
     assert_eq!(draft.block_attention, [BlockAttention::Bidirectional; 5]);
@@ -189,18 +189,18 @@ fn super_vl_reads_windowed_layers_without_sinks_and_its_own_projection() {
     }
 }
 
-const BOLT_DSPARK: &str = "nemotron-3.5-bolt-74b-a9b__draft-dspark";
-const SUPER_DSPARK: &str = "nemotron-3.5-super-vl-120b-a12b__draft-dspark";
+const BOLT_DSPARK: &str = "nemotron-3.5-bolt-74b-a9b-dspark";
+const SUPER_DSPARK: &str = "nemotron-3.5-super-vl-120b-a12b-dspark";
 
 /// The published DSpark drafts: Bolt's bidirectional with the anchor's own
 /// mask token, Super-VL's causal over a 2048-token window, both sampling
 /// from the anchor with a confidence head.
 #[test]
 fn both_dspark_drafts_bind_against_their_targets() {
-    for (draft, target_header, layers, attention_kind, mask, window) in [
+    for (draft, model, layers, attention_kind, mask, window) in [
         (
             BOLT_DSPARK,
-            BOLT_TARGET,
+            BOLT,
             6,
             BlockAttention::Bidirectional,
             18,
@@ -208,7 +208,7 @@ fn both_dspark_drafts_bind_against_their_targets() {
         ),
         (
             SUPER_DSPARK,
-            SUPER_TARGET,
+            SUPER,
             5,
             BlockAttention::Causal,
             999,
@@ -217,7 +217,7 @@ fn both_dspark_drafts_bind_against_their_targets() {
     ] {
         let draft = headers::artifact(draft);
         recognize(&draft).unwrap();
-        let definition = read(&draft, target_header).unwrap();
+        let definition = read(&draft, model).unwrap();
         assert_eq!(definition.method.variant(), DraftVariant::DSpark);
         assert_eq!(definition.layout, BlockLayout::AnchorFirst);
         assert_eq!(definition.mask_token, TokenId(mask));
@@ -230,7 +230,7 @@ fn both_dspark_drafts_bind_against_their_targets() {
                 assert_eq!(*domain, HistoryDomain::Window { tokens });
             }
         }
-        let mut model = target(target_header);
+        let mut model = target(model);
         model.draft = Some(definition);
         model.validate().unwrap();
     }
@@ -268,7 +268,7 @@ fn a_missing_corrector_weight_is_refused() {
     let mut draft = bolt();
     headers::remove_tensor(&mut draft, "lilicorr.in_head.bias");
     assert_eq!(
-        read(&draft, BOLT_TARGET),
+        read(&draft, BOLT),
         Err(Error::MissingWeight("lilicorr.in_head.bias".into()))
     );
 }
@@ -280,7 +280,7 @@ fn a_corrector_layer_beyond_the_declared_count_is_unbound() {
         .tensors
         .push(tensor("blk.8.attn_norm.weight", &[1024]));
     assert_eq!(
-        read(&draft, BOLT_TARGET),
+        read(&draft, BOLT),
         Err(Error::Unadmitted {
             metadata: Vec::new(),
             tensors: vec!["blk.8.attn_norm.weight".into()],
@@ -296,7 +296,7 @@ fn selector_metadata_without_its_roles_is_refused() {
         "dflash.selector_top_k",
         Value::Scalar(Scalar::Unsigned(8)),
     );
-    assert!(matches!(read(&draft, BOLT_TARGET), Err(Error::Geometry(_))));
+    assert!(matches!(read(&draft, BOLT), Err(Error::Geometry(_))));
 }
 
 #[test]
@@ -307,7 +307,7 @@ fn a_corrector_proposes_from_its_mask_slots() {
         "dflash.sample_from_anchor",
         Value::Scalar(Scalar::Bool(true)),
     );
-    assert!(matches!(read(&draft, BOLT_TARGET), Err(Error::Geometry(_))));
+    assert!(matches!(read(&draft, BOLT), Err(Error::Geometry(_))));
 }
 
 #[test]
@@ -315,7 +315,7 @@ fn sinks_take_one_logit_per_query_head() {
     let mut draft = bolt();
     headers::reshape_tensor(&mut draft, "blk.2.attn_sinks.weight", &[16]);
     assert!(matches!(
-        read(&draft, BOLT_TARGET),
+        read(&draft, BOLT),
         Err(Error::WeightShape { name, .. }) if name == "blk.2.attn_sinks.weight"
     ));
 }
@@ -326,5 +326,5 @@ fn a_convolved_backbone_declares_its_kernel_and_group() {
     draft
         .metadata
         .retain(|entry| entry.name != "dflash.conv_group_size");
-    assert!(matches!(read(&draft, BOLT_TARGET), Err(Error::Geometry(_))));
+    assert!(matches!(read(&draft, BOLT), Err(Error::Geometry(_))));
 }

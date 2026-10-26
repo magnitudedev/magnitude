@@ -25,17 +25,15 @@ struct Variant {
 fn catalog() -> Vec<Variant> {
     headers::index()
         .iter()
-        .filter_map(|component| match &component.role {
-            ComponentRole::Target { variant }
-                if matches!(component.model.as_str(), "lfm2.5-2.6b" | "lfm2.5-8b-a1b") =>
-            {
-                Some(Variant {
-                    model: component.model.clone(),
-                    variant: variant.clone(),
-                    directory: headers::component(component),
-                })
-            }
-            _ => None,
+        .filter_map(|component| {
+            let (model, variant) = component.model.split_once(':')?;
+            (component.role == ComponentRole::Target
+                && matches!(model, "lfm2.5-2.6b" | "lfm2.5-8b-a1b"))
+            .then(|| Variant {
+                model: model.to_owned(),
+                variant: variant.to_owned(),
+                directory: headers::component(component),
+            })
         })
         .collect()
 }

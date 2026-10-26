@@ -28,12 +28,13 @@ pub struct HeaderIndex {
     pub artifacts: Vec<ArtifactHeader>,
 }
 
-/// One catalog component: the file a load opens (the first shard of a split
-/// GGUF, whose other shards are exported beside it) at its locked source.
+/// One component of a catalog model's variant: the file a load opens (the
+/// first shard of a split GGUF, whose other shards are exported beside it) at
+/// its locked source.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CatalogComponent {
-    /// Catalog model ID.
+    /// Catalog model ID, `<model>:<variant>` (`qwen3.5-4b:gguf:q4`).
     pub model: String,
     pub role: ComponentRole,
     pub repository: String,
@@ -41,17 +42,23 @@ pub struct CatalogComponent {
     pub path: PathBuf,
 }
 
-/// A component's role in its catalog model. A model's draft and projector
-/// serve every variant, so each is one component.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// A component's role in its catalog model's variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ComponentRole {
-    /// The target of one catalog variant (`gguf:q4`).
-    Target {
-        variant: String,
-    },
+    Target,
     Draft,
     Projector,
+}
+
+impl std::fmt::Display for ComponentRole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Target => "target",
+            Self::Draft => "draft",
+            Self::Projector => "projector",
+        })
+    }
 }
 
 impl CatalogComponent {
@@ -87,31 +94,31 @@ impl ArtifactHeader {
 pub fn artifacts() -> Vec<ArtifactHeader> {
     [
         (
-            "qwen3.8-27b__draft-dspark",
+            "qwen3.8-27b-dspark",
             "magnitudedev/Qwen3.8-27B-DSpark-GGUF",
             "8741336fde55cf8fb01e0dd004a75b688aa0ed71",
             "Qwen3.8-27B-DSpark-Q8_0.gguf",
         ),
         (
-            "nemotron-3.5-bolt-74b-a9b__draft-dspark",
+            "nemotron-3.5-bolt-74b-a9b-dspark",
             "magnitudedev/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-DSpark-GGUF",
             "ca4ba8b87c9db0250c831e0f661c70ba5885d303",
             "dspark-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-NVFP4.gguf",
         ),
         (
-            "nemotron-3.5-super-vl-120b-a12b__draft-dspark",
+            "nemotron-3.5-super-vl-120b-a12b-dspark",
             "magnitudedev/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-DSpark-GGUF",
             "1e4dc982ea54dc02c678d9e4943ed77152778d26",
             "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-DSpark-Q8_0.gguf",
         ),
         (
-            "qwen3.6-27b__target-gguf:q4",
+            "qwen3.6-27b-q4",
             "unsloth/Qwen3.6-27B-MTP-GGUF",
             "5cb35eb3dcbf52dbce5f87dbc64df6aaffadcace",
             "Qwen3.6-27B-UD-Q4_K_XL.gguf",
         ),
         (
-            "gemma-4-e2b-it-bartowski__target-gguf:q4_k_m",
+            "gemma-4-e2b-it-bartowski-q4_k_m",
             "bartowski/google_gemma-4-E2B-it-GGUF",
             "81012ba3538e061d5ee003f11f25335b17f82e2d",
             "google_gemma-4-E2B-it-Q4_K_M.gguf",

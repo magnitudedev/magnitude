@@ -90,24 +90,57 @@ fn open(file: &Path) -> Directory {
         .clone()
 }
 
-/// A catalog component's name in tests: `<model>__target-<variant>`
-/// (`qwen3.5-4b__target-gguf:q4`), `<model>__draft` or `<model>__projector`.
-pub fn key(component: &CatalogComponent) -> String {
-    match &component.role {
-        ComponentRole::Target { variant } => format!("{}__target-{variant}", component.model),
-        ComponentRole::Draft => format!("{}__draft", component.model),
-        ComponentRole::Projector => format!("{}__projector", component.model),
-    }
-}
-
-/// The directory of the catalog component [`key`] names.
-pub fn catalog(name: &str) -> Directory {
+/// The directory of catalog model `model`'s (`qwen3.5-4b:gguf:q4`) component
+/// in `role`.
+pub fn catalog(model: &str, role: ComponentRole) -> Directory {
     component(
         index()
             .iter()
-            .find(|component| key(component) == name)
-            .unwrap_or_else(|| panic!("the catalog has no component {name}")),
+            .find(|component| component.model == model && component.role == role)
+            .unwrap_or_else(|| panic!("the catalog has no {model} {role}")),
     )
+}
+
+/// The directory of catalog model `model`'s target.
+pub fn target(model: &str) -> Directory {
+    catalog(model, ComponentRole::Target)
+}
+
+/// The directory of catalog model `model`'s separately packaged draft.
+pub fn draft(model: &str) -> Directory {
+    catalog(model, ComponentRole::Draft)
+}
+
+/// The directory of catalog model `model`'s projector.
+pub fn projector(model: &str) -> Directory {
+    catalog(model, ComponentRole::Projector)
+}
+
+/// A header a test names: a catalog component, or a pinned artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Header {
+    /// Catalog model `.0`'s (`qwen3.5-4b:gguf:q4`) component in role `.1`.
+    Catalog(&'static str, ComponentRole),
+    /// The pinned artifact named `.0` ([`catalog_headers::artifacts`]).
+    Artifact(&'static str),
+}
+
+impl Header {
+    pub fn directory(self) -> Directory {
+        match self {
+            Self::Catalog(model, role) => catalog(model, role),
+            Self::Artifact(name) => artifact(name),
+        }
+    }
+}
+
+impl std::fmt::Display for Header {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Catalog(model, role) => write!(formatter, "{model} {role}"),
+            Self::Artifact(name) => formatter.write_str(name),
+        }
+    }
 }
 
 /// Sets metadata `name` to `value`, replacing any recorded value.

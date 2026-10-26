@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use magnitude_artifacts::catalog_headers::{self, ComponentRole, HeaderIndex};
+use magnitude_artifacts::catalog_headers::{self, HeaderIndex};
 use magnitude_artifacts::gguf::{Directory, inspect_header, split_paths};
 use magnitude_service_models::{catalog_lock_digest, catalog_source_digest};
 use serde_json::json;
@@ -56,14 +56,6 @@ fn facts(path: &Path) -> anyhow::Result<(Directory, Facts)> {
     Ok((directory, Facts { version, types }))
 }
 
-fn role_name(role: &ComponentRole) -> (&str, &str) {
-    match role {
-        ComponentRole::Target { variant } => ("target", variant),
-        ComponentRole::Draft => ("draft", "all"),
-        ComponentRole::Projector => ("projector", "all"),
-    }
-}
-
 /// Writes the audit of the header export `exported` to `output`, and fails when a file declares
 /// a tensor type the parser doesn't know.
 pub fn run(exported: &Path, output: &Path) -> anyhow::Result<()> {
@@ -74,13 +66,7 @@ pub fn run(exported: &Path, output: &Path) -> anyhow::Result<()> {
     let mut uses = BTreeMap::<File, (PathBuf, Vec<String>)>::new();
     let mut resolutions = Vec::new();
     for component in &index.components {
-        let (role, variant) = role_name(&component.role);
-        let use_name = match &component.role {
-            ComponentRole::Target { variant } => format!("{}/{variant}:target", component.model),
-            ComponentRole::Draft | ComponentRole::Projector => {
-                format!("{}:{role}", component.model)
-            }
-        };
+        let use_name = format!("{} {}", component.model, component.role);
         let first = component.file(exported);
         let (directory, _) = facts(&first)?;
         let shards = split_paths(&first, &directory)?.unwrap_or_else(|| vec![first.clone()]);
@@ -97,8 +83,7 @@ pub fn run(exported: &Path, output: &Path) -> anyhow::Result<()> {
         }
         resolutions.push(json!({
             "modelId": component.model,
-            "variantId": variant,
-            "role": role,
+            "role": component.role.to_string(),
             "repository": component.repository,
             "revision": component.revision,
             "primary": component.path,
@@ -148,7 +133,7 @@ pub fn run(exported: &Path, output: &Path) -> anyhow::Result<()> {
         "d11MissingTensorTypes": missing,
     });
     let report = json!({
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "scope": scope,
         "method": "the release catalog's resolution of the locked revisions and the GGUF headers it exports",
         "engineEncodingBaseline": baseline,

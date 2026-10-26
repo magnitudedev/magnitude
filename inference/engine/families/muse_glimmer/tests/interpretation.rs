@@ -13,10 +13,10 @@ use magnitude_family_muse_glimmer::{inspect_components, recognize, MuseGlimmerFa
 
 /// Every catalog variant of the target.
 const VARIANTS: [&str; 4] = [
-    "muse-glimmer-30b__target-gguf:q4",
-    "muse-glimmer-30b__target-gguf:q5",
-    "muse-glimmer-30b__target-gguf:q6",
-    "muse-glimmer-30b__target-gguf:q8",
+    "muse-glimmer-30b:gguf:q4",
+    "muse-glimmer-30b:gguf:q5",
+    "muse-glimmer-30b:gguf:q6",
+    "muse-glimmer-30b:gguf:q8",
 ];
 
 fn identity() -> PackageIdentity {
@@ -44,7 +44,7 @@ fn transforms(weight: &WeightDescriptor) -> &[ImportTransform] {
 fn every_catalog_variant_binds_to_the_released_geometry() {
     let epsilon = f64::from(1e-5f32);
     for variant in VARIANTS {
-        let directory = headers::catalog(variant);
+        let directory = headers::target(variant);
         assert!(recognize(&directory), "{variant}");
         let model = inspect(&directory).unwrap_or_else(|error| panic!("{variant}: {error}"));
         assert_eq!(model.family.0, "muse-glimmer");
@@ -141,7 +141,7 @@ fn every_catalog_variant_binds_to_the_released_geometry() {
 
 #[test]
 fn a_per_layer_window_pattern_and_partial_rotary_are_read_from_the_header() {
-    let mut directory = headers::catalog(VARIANTS[0]);
+    let mut directory = headers::target(VARIANTS[0]);
     let flags = (0..52).map(|layer| layer % 2 == 0).collect::<Vec<_>>().into();
     headers::set(
         &mut directory,
@@ -177,7 +177,7 @@ fn a_per_layer_window_pattern_and_partial_rotary_are_read_from_the_header() {
 
 #[test]
 fn rejects_missing_misshapen_unbound_and_unknown_roles() {
-    let base = headers::catalog(VARIANTS[0]);
+    let base = headers::target(VARIANTS[0]);
     let rejected = |edit: &dyn Fn(&mut Directory), reason: &str| {
         let mut directory = base.clone();
         edit(&mut directory);
@@ -242,18 +242,18 @@ fn rejects_missing_misshapen_unbound_and_unknown_roles() {
 #[test]
 fn recognizes_only_the_target() {
     for other in [
-        "muse-glimmer-30b__draft",
-        "muse-glimmer-30b__projector",
-        "laguna-s-2.1__target-gguf:q4",
+        headers::draft(VARIANTS[0]),
+        headers::projector(VARIANTS[0]),
+        headers::target("laguna-s-2.1:gguf:q4"),
     ] {
-        assert!(!recognize(&headers::catalog(other)), "{other}");
+        assert!(!recognize(&other));
     }
 }
 
 #[test]
 fn the_projector_windows_sparse_layers_and_shuffles_channel_outer() {
-    let directory = headers::catalog(VARIANTS[0]);
-    let projector = headers::catalog("muse-glimmer-30b__projector");
+    let directory = headers::target(VARIANTS[0]);
+    let projector = headers::projector(VARIANTS[0]);
     let model = inspect_components(&directory, Some(&projector), identity()).unwrap();
     let vision = model.vision.unwrap();
     assert_eq!((vision.hidden, vision.output_hidden), (1536, 6656));
@@ -304,7 +304,7 @@ fn the_projector_windows_sparse_layers_and_shuffles_channel_outer() {
 fn text_input_takes_absolute_positions_and_refuses_media() {
     let family = MuseGlimmerFamily;
     let model = family
-        .inspect(&headers::catalog(VARIANTS[0]), None, identity())
+        .inspect(&headers::target(VARIANTS[0]), None, identity())
         .unwrap();
     struct NoMarkers;
     impl magnitude_family_contracts::MarkerTokens for NoMarkers {

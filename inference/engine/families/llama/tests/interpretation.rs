@@ -12,7 +12,7 @@ use magnitude_artifacts::UnsupportedReason;
 use magnitude_family_contracts::FamilyError;
 use magnitude_family_llama::{admit, inspect_components, Error, Feature, LlamaFamily};
 
-const VARIANTS: [&str; 2] = ["minicpm5-2b__target-gguf:q4", "minicpm5-2b__target-gguf:q8"];
+const VARIANTS: [&str; 2] = ["minicpm5-2b:gguf:q4", "minicpm5-2b:gguf:q8"];
 
 fn identity() -> PackageIdentity {
     PackageIdentity {
@@ -26,13 +26,13 @@ fn inspect(directory: &Directory) -> Result<ModelDefinition, Error> {
 }
 
 fn minicpm5() -> Directory {
-    headers::catalog(VARIANTS[0])
+    headers::target(VARIANTS[0])
 }
 
 #[test]
 fn every_minicpm5_variant_binds_the_admitted_feature_set() {
     let definitions = VARIANTS.map(|file| {
-        inspect(&headers::catalog(file)).unwrap_or_else(|error| panic!("{file}: {error}"))
+        inspect(&headers::target(file)).unwrap_or_else(|error| panic!("{file}: {error}"))
     });
     // Variants differ only in encodings, which the definition does not carry.
     assert_eq!(definitions[0], definitions[1]);
@@ -124,12 +124,13 @@ fn claims_no_other_catalog_component() {
     for component in headers::index() {
         // MiniCPM5's targets, the 1B and the 2B.
         let expected = component.model.starts_with("minicpm5-")
-            && matches!(component.role, ComponentRole::Target { .. });
+            && component.role == ComponentRole::Target;
         assert_eq!(
             LlamaFamily.recognizes(&headers::component(component)),
             expected,
-            "{}",
-            headers::key(component)
+            "{} {}",
+            component.model,
+            component.role
         );
     }
 }

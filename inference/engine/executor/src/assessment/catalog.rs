@@ -16,7 +16,7 @@ use magnitude_artifacts::catalog_headers::{CatalogComponent, ComponentRole};
 use magnitude_artifacts::{
     ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
 };
-use magnitude_family_common::headers;
+use magnitude_family_common::headers::{self, Header};
 use magnitude_family_contracts::ModelFamily;
 use magnitude_family_gemma4::Gemma4Family;
 use magnitude_family_lfm2::Lfm2Family;
@@ -40,11 +40,12 @@ const FAMILIES: [&dyn ModelFamily; 7] = [
     &Qwen4ExpFamily,
 ];
 
-/// Catalog targets whose load must derive whatever their catalog support
-/// level (`headers::key`).
-const REQUIRED: [&str; 1] = ["qwen3.8-flash-next__target-gguf:q4"];
+/// Catalog models whose target's load must derive whatever their catalog
+/// support level.
+const REQUIRED: [&str; 1] = ["qwen3.8-flash-next:gguf:q4"];
 
-/// Each catalog model's support level (`catalog/models.json`).
+/// Each catalog model's support level (`catalog/models.json`), by catalog
+/// model ID.
 fn support_levels() -> BTreeMap<String, String> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../catalog/models.json");
     let catalog: serde_json::Value = serde_json::from_slice(
@@ -55,11 +56,20 @@ fn support_levels() -> BTreeMap<String, String> {
         .as_array()
         .unwrap()
         .iter()
-        .map(|model| {
-            (
-                model["id"].as_str().unwrap().to_owned(),
-                model["support"]["level"].as_str().unwrap().to_owned(),
-            )
+        .flat_map(|model| {
+            let id = model["id"].as_str().unwrap();
+            let level = model["support"]["level"].as_str().unwrap();
+            model["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|source| source["variants"].as_array().unwrap())
+                .map(move |variant| {
+                    (
+                        format!("{id}:{}", variant["variantId"].as_str().unwrap()),
+                        level.to_owned(),
+                    )
+                })
         })
         .collect()
 }
@@ -88,20 +98,20 @@ fn every_admitted_catalog_target_derives_complete_terms() {
     let levels = support_levels();
     let mut required_seen = Vec::new();
     for component in headers::index() {
-        let ComponentRole::Target { .. } = component.role else {
+        if component.role != ComponentRole::Target {
             continue;
-        };
-        let name = headers::key(component);
+        }
+        let name = component.model.as_str();
         let target = headers::component(component);
         // A target that must serve: its catalog model is neither disabled
         // nor deprecated, or it is named in `REQUIRED`.
-        let required = REQUIRED.contains(&name.as_str());
+        let required = REQUIRED.contains(&name);
         if required {
-            required_seen.push(name.clone());
+            required_seen.push(name);
         }
         let served = required
             || !matches!(
-                levels.get(&component.model).map(String::as_str),
+                levels.get(name).map(String::as_str),
                 Some("disabled" | "deprecated")
             );
         let Some(family) = FAMILIES.iter().find(|family| family.recognizes(&target)) else {
@@ -276,7 +286,7 @@ fn every_admitted_catalog_target_derives_complete_terms() {
     // every backend.
     for name in REQUIRED {
         assert!(
-            required_seen.iter().any(|seen| seen == name),
+            required_seen.contains(&name),
             "required target {name} has no catalog header"
         );
         for backend in BackendName::ALL {
@@ -290,66 +300,48 @@ fn every_admitted_catalog_target_derives_complete_terms() {
     }
 }
 
-/// A separate draft's header: a catalog component (`headers::key`) or a
-/// pinned artifact the catalog does not ship (`headers::artifact`).
-#[derive(Clone, Copy)]
-enum DraftHeader {
-    Catalog(&'static str),
-    Artifact(&'static str),
+/// The catalog's separate draft of catalog model `model`.
+const fn catalog_draft(model: &'static str) -> Header {
+    Header::Catalog(model, ComponentRole::Draft)
 }
 
-impl DraftHeader {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Catalog(name) | Self::Artifact(name) => name,
-        }
-    }
-
-    fn directory(self) -> magnitude_artifacts::gguf::Directory {
-        match self {
-            Self::Catalog(name) => headers::catalog(name),
-            Self::Artifact(name) => headers::artifact(name),
-        }
-    }
-}
-
-/// Separate drafts of the qualification artifacts (target header, draft
-/// header) and their target families. Each plans its draft program and
+/// Separate drafts of the qualification artifacts (target's catalog model,
+/// draft header) and their target families. Each plans its draft program and
 /// charges its weights, state and every draft graph class from headers
 /// alone, on every backend: the draft graphs are sealed exactly, in
 /// metadata, for the planned method's proposals.
-const SEPARATE_DRAFTS: [(&str, DraftHeader, &dyn ModelFamily); 6] = [
+const SEPARATE_DRAFTS: [(&str, Header, &dyn ModelFamily); 6] = [
     (
-        "qwen3.6-35b-a3b__target-gguf:q4",
-        DraftHeader::Catalog("qwen3.6-35b-a3b__draft"),
+        "qwen3.6-35b-a3b:gguf:q4",
+        catalog_draft("qwen3.6-35b-a3b:gguf:q4"),
         &Qwen35Family,
     ),
     (
-        "lfm2.5-2.6b__target-gguf:q4",
-        DraftHeader::Catalog("lfm2.5-2.6b__draft"),
+        "lfm2.5-2.6b:gguf:q4",
+        catalog_draft("lfm2.5-2.6b:gguf:q4"),
         &Lfm2Family,
     ),
     (
-        "qwen3.8-27b__target-gguf:q4",
-        DraftHeader::Artifact("qwen3.8-27b__draft-dspark"),
+        "qwen3.8-27b:gguf:q4",
+        Header::Artifact("qwen3.8-27b-dspark"),
         &Qwen35Family,
     ),
     // The catalog's DFlash2 draft.
     (
-        "qwen3.8-27b__target-gguf:q4",
-        DraftHeader::Catalog("qwen3.8-27b__draft"),
+        "qwen3.8-27b:gguf:q4",
+        catalog_draft("qwen3.8-27b:gguf:q4"),
         &Qwen35Family,
     ),
     // An NVFP4 draft (scaled fusion and feed-forward) beside a Q4_K_M
     // target, and beside the NVFP4 target (a scaled vocabulary projection).
     (
-        "nemotron-3.5-lightning-30b-a3b__target-gguf:q4",
-        DraftHeader::Catalog("nemotron-3.5-lightning-30b-a3b__draft"),
+        "nemotron-3.5-lightning-30b-a3b:gguf:q4",
+        catalog_draft("nemotron-3.5-lightning-30b-a3b:gguf:q4"),
         &NemotronHFamily,
     ),
     (
-        "nemotron-3.5-lightning-30b-a3b__target-gguf:nvfp4-qat",
-        DraftHeader::Catalog("nemotron-3.5-lightning-30b-a3b__draft"),
+        "nemotron-3.5-lightning-30b-a3b:gguf:nvfp4-qat",
+        catalog_draft("nemotron-3.5-lightning-30b-a3b:gguf:nvfp4-qat"),
         &NemotronHFamily,
     ),
 ];
@@ -358,15 +350,21 @@ const SEPARATE_DRAFTS: [(&str, DraftHeader, &dyn ModelFamily); 6] = [
 /// explicit attention semantics for each named draft. These do not establish
 /// admission of the captured artifacts; binary-header admission is qualified
 /// separately by the DFlash family's publication test.
-fn synthetic_separate_draft_directory(draft: DraftHeader) -> magnitude_artifacts::gguf::Directory {
+fn synthetic_separate_draft_directory(draft: Header) -> magnitude_artifacts::gguf::Directory {
     use magnitude_artifacts::gguf::{Metadata, Value};
-    let causal: &[bool] = match draft.name() {
-        "qwen3.6-35b-a3b__draft" => &[true, true, true, true, true, false],
-        "lfm2.5-2.6b__draft" => &[false; 5],
-        "qwen3.8-27b__draft-dspark" => &[false; 5],
-        "qwen3.8-27b__draft" => &[false; 5],
-        "nemotron-3.5-lightning-30b-a3b__draft" => &[false; 6],
-        name => panic!("no synthetic attention semantics for {name}"),
+    let causal: &[bool] = match draft {
+        Header::Catalog("qwen3.6-35b-a3b:gguf:q4", ComponentRole::Draft) => {
+            &[true, true, true, true, true, false]
+        }
+        Header::Catalog("lfm2.5-2.6b:gguf:q4", ComponentRole::Draft) => &[false; 5],
+        Header::Artifact("qwen3.8-27b-dspark") => &[false; 5],
+        Header::Catalog("qwen3.8-27b:gguf:q4", ComponentRole::Draft) => &[false; 5],
+        Header::Catalog(
+            "nemotron-3.5-lightning-30b-a3b:gguf:q4"
+            | "nemotron-3.5-lightning-30b-a3b:gguf:nvfp4-qat",
+            ComponentRole::Draft,
+        ) => &[false; 6],
+        draft => panic!("no synthetic attention semantics for {draft}"),
     };
     let mut directory = draft.directory();
     directory
@@ -383,8 +381,8 @@ fn synthetic_separate_draft_directory(draft: DraftHeader) -> magnitude_artifacts
 fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
     for (target, draft, family) in SEPARATE_DRAFTS {
         plan_and_charge_separate_draft(
-            (target, &headers::catalog(target)),
-            (draft.name(), &synthetic_separate_draft_directory(draft)),
+            (target, &headers::target(target)),
+            (&draft.to_string(), &synthetic_separate_draft_directory(draft)),
             family,
         );
     }
@@ -395,22 +393,22 @@ fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
 /// Super-VL with its own NVFP4 projection) and DSpark (Bolt with an NVFP4
 /// Markov projection). Every graph class of their backbones, corrector and
 /// Markov head plans and charges on every backend.
-const NEMOTRON_DRAFTS: [(&str, DraftHeader); 4] = [
+const NEMOTRON_DRAFTS: [(&str, Header); 4] = [
     (
-        "nemotron-3.5-bolt-74b-a9b__target-gguf:iq2-qat",
-        DraftHeader::Catalog("nemotron-3.5-bolt-74b-a9b__draft"),
+        "nemotron-3.5-bolt-74b-a9b:gguf:iq2-qat",
+        catalog_draft("nemotron-3.5-bolt-74b-a9b:gguf:iq2-qat"),
     ),
     (
-        "nemotron-3.5-bolt-74b-a9b__target-gguf:iq2-qat",
-        DraftHeader::Artifact("nemotron-3.5-bolt-74b-a9b__draft-dspark"),
+        "nemotron-3.5-bolt-74b-a9b:gguf:iq2-qat",
+        Header::Artifact("nemotron-3.5-bolt-74b-a9b-dspark"),
     ),
     (
-        "nemotron-3.5-super-vl-120b-a12b__target-gguf:q4",
-        DraftHeader::Catalog("nemotron-3.5-super-vl-120b-a12b__draft"),
+        "nemotron-3.5-super-vl-120b-a12b:gguf:q4",
+        catalog_draft("nemotron-3.5-super-vl-120b-a12b:gguf:q4"),
     ),
     (
-        "nemotron-3.5-super-vl-120b-a12b__target-gguf:q4",
-        DraftHeader::Artifact("nemotron-3.5-super-vl-120b-a12b__draft-dspark"),
+        "nemotron-3.5-super-vl-120b-a12b:gguf:q4",
+        Header::Artifact("nemotron-3.5-super-vl-120b-a12b-dspark"),
     ),
 ];
 
@@ -418,8 +416,8 @@ const NEMOTRON_DRAFTS: [(&str, DraftHeader); 4] = [
 fn nemotron_drafts_plan_and_charge_every_graph_class() {
     for (target, draft) in NEMOTRON_DRAFTS {
         plan_and_charge_separate_draft(
-            (target, &headers::catalog(target)),
-            (draft.name(), &draft.directory()),
+            (target, &headers::target(target)),
+            (&draft.to_string(), &draft.directory()),
             &NemotronHFamily,
         );
     }
@@ -649,12 +647,12 @@ fn every_catalog_variant_lists_kernels_over_every_finalized_readout() {
             projector: projector.as_ref().map(|_| ArtifactIdentity([8; 32])),
         };
         for target_component in components {
-            let ComponentRole::Target { .. } = target_component.role else {
+            if target_component.role != ComponentRole::Target {
                 continue;
-            };
+            }
             let target_file = &target_component.path;
             let target = headers::component(target_component);
-            let context = headers::key(target_component);
+            let context = &target_component.model;
             let Some(family) = FAMILIES.iter().find(|family| family.recognizes(&target)) else {
                 outside.push(format!("{context}: no family recognizes the target"));
                 continue;
