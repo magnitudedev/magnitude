@@ -1,11 +1,11 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { Option, Schema } from "effect"
-import { ChatModels } from "@magnitudedev/sdk"
+import { InferenceModelsResponseSchema, ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { describe, expect, it } from "vitest"
 import { ChatThinkingSelect } from "./thinking"
 
 const model = (reasoning: unknown) =>
-  Schema.decodeUnknownSync(ChatModels)({
+  Schema.decodeUnknownSync(InferenceModelsResponseSchema)({
     object: "list",
     data: [
       {
@@ -36,7 +36,7 @@ const render = (m: ReturnType<typeof model> | undefined, effort?: string) =>
   renderToStaticMarkup(
     <ChatThinkingSelect
       model={m}
-      selected={Option.fromNullable(effort)}
+      selected={Option.map(Option.fromNullable(effort), ReasoningEffortSchema.make)}
       onChange={() => {}}
     />
   )

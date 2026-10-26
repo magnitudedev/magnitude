@@ -1,37 +1,28 @@
 import { rpcGroup } from "../rpc-tree"
 import { Projects } from "./projects"
-import { Agent } from "./agent"
 import { Connection } from "./connection"
-import { Display } from "./display"
-import { Shell } from "./shell"
 import { ProjectFiles } from "./project-files"
 import { Skills } from "./skills"
 import { Models } from "./models"
 import { Git } from "./git"
 import { Files } from "./files"
 import { Changes } from "./changes"
-import { Sessions } from "./sessions"
 import { Configuration } from "./configuration"
 import { Connections } from "./connections"
 import { Application } from "./application"
 import { HuggingFace } from "./hugging-face"
-
 import { Chat } from "./chat"
 
 export const MagnitudeRpcs = {
   chat: Chat,
   projects: Projects,
-  agent: Agent,
   connection: Connection,
-  display: Display,
-  shell: Shell,
   projectFiles: ProjectFiles,
   skills: Skills,
   models: Models,
   git: Git,
   files: Files,
   changes: Changes,
-  sessions: Sessions,
   configuration: Configuration,
   connections: Connections,
   application: Application,

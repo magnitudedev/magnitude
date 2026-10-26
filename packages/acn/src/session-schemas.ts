@@ -1,23 +1,5 @@
 import { Schema } from "effect"
-import { RawMessageUploads, RawMentionOccurrence } from "./attachments"
-import { DirectoryPathSchema } from "./paths"
-export {
-  RawClipboardImageAttachment,
-  DisplayAttachment,
-  RawFileImageAttachment,
-  RawImageAttachment,
-  RawMessageUpload,
-  RawMessageUploads,
-  RawTextFileUpload,
-  ImageAttachment,
-  ImageMediaType,
-  MentionAttachment,
-  MentionDirectoryAttachment,
-  MentionFileAttachment,
-  MentionFileRangeAttachment,
-  MessageAttachment,
-  RawMentionOccurrence,
-} from "./attachments"
+import { DirectoryPathSchema, RawMentionOccurrence, RawMessageUploads } from "@magnitudedev/acn-protocol"
 
 export const CreateSessionInitialMessage = Schema.TaggedStruct("message", {
   messageId: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
@@ -150,3 +132,9 @@ export const ActiveSessionStatuses = Schema.Struct({
   sessions: Schema.Array(ActiveSessionStatus)
 })
 export type ActiveSessionStatuses = Schema.Schema.Type<typeof ActiveSessionStatuses>
+
+export const InterruptTarget = Schema.Union(
+  Schema.TaggedStruct("all", {}),
+  Schema.TaggedStruct("fork", { forkId: Schema.NullOr(Schema.String) }),
+)
+export type InterruptTarget = Schema.Schema.Type<typeof InterruptTarget>

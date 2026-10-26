@@ -32,7 +32,7 @@ import {
   Stream,
 } from "effect"
 import {
-  ChatStorageLive,
+  ChatStoreLive,
   StorageLive,
   GlobalStorage,
   MagnitudeStorage,
@@ -356,12 +356,12 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     withSharedClient
   )
   const withUsage = Layer.provideMerge(Layer.merge(ServingUsageLive, InferenceActivityLive), withCatalog)
-  const withChatDependencies = Layer.provideMerge(Layer.merge(
-    ChatInferenceLive,
-    ChatStorageLive.pipe(Layer.provide(BunSqliteDriverLayer)),
-  ), withUsage)
-  const withChat = Layer.provideMerge(ChatServiceLive, withChatDependencies)
-  const withModelCatalog = Layer.provideMerge(ModelCatalogLive, withChat)
+  const withInference = Layer.provideMerge(ChatInferenceLive, withUsage)
+  const withChats = Layer.provideMerge(
+    ChatServiceLive.pipe(Layer.provide(ChatStoreLive.pipe(Layer.provide(BunSqliteDriverLayer)))),
+    withInference,
+  )
+  const withModelCatalog = Layer.provideMerge(ModelCatalogLive, withChats)
   const withCredentials = Layer.provideMerge(
     ProviderCredentialsLive,
     withModelCatalog

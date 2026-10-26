@@ -1,15 +1,15 @@
 import { FetchHttpClient } from "@effect/platform"
 import { Context, Effect, Layer, Option } from "effect"
-import { SessionOperationFailed, type ProviderAuth, type SessionError } from "@magnitudedev/acn-protocol"
+import { OperationFailed, type ProviderAuth } from "@magnitudedev/acn-protocol"
 import { ProviderIdSchema, type ProviderId } from "@magnitudedev/providers/client"
 import { MagnitudeStorage } from "@magnitudedev/storage"
 import { ProviderModelCatalog } from "./provider-model-catalog"
 import { ProviderClientRegistry } from "./shared-client"
 
 export interface ProviderCredentialsApi {
-  readonly update: (providerId: ProviderId, auth: ProviderAuth) => Effect.Effect<void, SessionError>
-  readonly get: (providerId: ProviderId) => Effect.Effect<Option.Option<ProviderAuth>, SessionError>
-  readonly list: Effect.Effect<ReadonlyMap<ProviderId, ProviderAuth>, SessionError>
+  readonly update: (providerId: ProviderId, auth: ProviderAuth) => Effect.Effect<void, OperationFailed>
+  readonly get: (providerId: ProviderId) => Effect.Effect<Option.Option<ProviderAuth>, OperationFailed>
+  readonly list: Effect.Effect<ReadonlyMap<ProviderId, ProviderAuth>, OperationFailed>
 }
 
 export class ProviderCredentials extends Context.Tag("ProviderCredentials")<
@@ -25,7 +25,7 @@ export const ProviderCredentialsLive: Layer.Layer<
   const storage = yield* MagnitudeStorage
   const clients = yield* ProviderClientRegistry
   const catalog = yield* ProviderModelCatalog
-  const failure = (operation: string) => (cause: unknown): SessionError => new SessionOperationFailed({
+  const failure = (operation: string) => (cause: unknown): OperationFailed => new OperationFailed({
     operation,
     reason: cause instanceof Error ? cause.message : String(cause),
   })

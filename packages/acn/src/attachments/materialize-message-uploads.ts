@@ -9,15 +9,15 @@ import {
   MAX_IMAGE_FILE_UPLOAD_BYTES,
   MAX_MESSAGE_UPLOAD_BYTES,
   MAX_MESSAGE_UPLOAD_COUNT,
-  SessionOperationFailed,
+  OperationFailed,
   canonicalExtensionForImageMediaType,
   filenameWithImageExtension,
   type RawImageAttachment,
   type RawMessageUpload,
   type RawMentionOccurrence,
-  type SessionError,
 } from "@magnitudedev/acn-protocol"
 import { uploadAttachment } from "../attachment-upload"
+import type { SessionError } from "../session-errors"
 
 export interface MaterializedMessageUploads {
   readonly images: readonly ContextImagePart[]
@@ -38,7 +38,7 @@ function validateTextUpload(upload: Extract<RawMessageUpload, { type: "raw_text_
   return Effect.gen(function* () {
     const bytes = canonicalBase64Bytes(upload.data)
     if (!bytes) {
-      return yield* new SessionOperationFailed({
+      return yield* new OperationFailed({
         operation: "MaterializeMessageUpload",
         reason: upload.data.length === 0
           ? `${upload.filename} is empty`
@@ -46,13 +46,13 @@ function validateTextUpload(upload: Extract<RawMessageUpload, { type: "raw_text_
       })
     }
     if (bytes.byteLength > MAX_TEXT_FILE_UPLOAD_BYTES) {
-      return yield* new SessionOperationFailed({
+      return yield* new OperationFailed({
         operation: "MaterializeMessageUpload",
         reason: `${upload.filename} exceeds the 500 KiB text attachment limit`,
       })
     }
     if (bytes.includes(0) || !isUtf8(bytes)) {
-      return yield* new SessionOperationFailed({
+      return yield* new OperationFailed({
         operation: "MaterializeMessageUpload",
         reason: `${upload.filename} is not a UTF-8 text file`,
       })
@@ -65,13 +65,13 @@ function validateImageUpload(upload: RawImageAttachment): Effect.Effect<number, 
   return Effect.gen(function* () {
     const bytes = canonicalBase64Bytes(upload.data)
     if (!bytes) {
-      return yield* new SessionOperationFailed({
+      return yield* new OperationFailed({
         operation: "MaterializeMessageUpload",
         reason: "Image attachment is not valid base64 data",
       })
     }
     if (bytes.byteLength > MAX_IMAGE_FILE_UPLOAD_BYTES) {
-      return yield* new SessionOperationFailed({
+      return yield* new OperationFailed({
         operation: "MaterializeMessageUpload",
         reason: "Image attachment exceeds the 10 MiB limit",
       })
@@ -95,7 +95,7 @@ export function materializeMessageUploads(input: {
     const path = yield* Path.Path
 
     if (input.uploads.length > MAX_MESSAGE_UPLOAD_COUNT) {
-      return yield* new SessionOperationFailed({
+      return yield* new OperationFailed({
         operation: "MaterializeMessageUpload",
         reason: `A message can include at most ${MAX_MESSAGE_UPLOAD_COUNT} attachments`,
       })
@@ -107,7 +107,7 @@ export function materializeMessageUploads(input: {
         ? yield* validateTextUpload(upload)
         : yield* validateImageUpload(upload)
       if (aggregateBytes > MAX_MESSAGE_UPLOAD_BYTES) {
-        return yield* new SessionOperationFailed({
+        return yield* new OperationFailed({
           operation: "MaterializeMessageUpload",
           reason: "Attachments exceed the 25 MiB total message limit",
         })
@@ -142,7 +142,7 @@ export function materializeMessageUploads(input: {
           absolutePath,
           logicalPath: uploaded.path,
           name: uploaded.filename,
-        }).pipe(Effect.mapError(error => new SessionOperationFailed({
+        }).pipe(Effect.mapError(error => new OperationFailed({
           operation: "MaterializeMessageUpload",
           reason: error.message,
         })))

@@ -1,10 +1,14 @@
+import { DirectoryPathSchema } from "@magnitudedev/acn-protocol"
+import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
+import { Context, Effect, Either, Layer, Option, Schema, Stream } from "effect"
 import {
-  DirectoryPathSchema,
   InvalidDirectoryPageCursor,
   InvalidSessionPageCursor,
   SessionInspectionUnavailable,
   SessionMetadataUnreadable,
   SessionNotFound,
+} from "./session-errors"
+import {
   SessionPageCursorSchema,
   type DirectoryPageCursor,
   DirectoryPageCursorSchema,
@@ -16,9 +20,7 @@ import {
   type SessionPageCursor,
   type SessionPageRequest,
   type SessionPinFilter,
-} from "@magnitudedev/acn-protocol"
-import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
-import { Context, Effect, Either, Layer, Option, Schema, Stream } from "effect"
+} from "./session-schemas"
 
 export interface SessionInspector {
   readonly get: (

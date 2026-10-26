@@ -1,9 +1,10 @@
-import { type SessionError, SessionOperationFailed } from "@magnitudedev/acn-protocol"
+import { OperationFailed } from "@magnitudedev/acn-protocol"
 import { Effect, Option } from "effect"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
 import type { PlatformError } from "@effect/platform/Error"
 import { createId } from "@magnitudedev/generate-id"
+import type { SessionError } from "./session-errors"
 
 // ---------------------------------------------------------------------------
 // Attachment upload — writes base64-decoded content to $M/attachments/
@@ -86,6 +87,6 @@ export const uploadAttachment = (
     return { path: attachmentLogicalPath(fallback), filename: fallback }
   }).pipe(
     Effect.mapError(() =>
-      new SessionOperationFailed({ operation: "UploadAttachment", reason: "Failed to write attachment file" })
+      new OperationFailed({ operation: "UploadAttachment", reason: "Failed to write attachment file" })
     ),
   )

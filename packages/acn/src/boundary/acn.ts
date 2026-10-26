@@ -1,30 +1,20 @@
 import { ChatService } from "../chat/service";
+import { ChatInference } from "../chat/inference";
 import { ServingUsage } from "../serving-usage";
 import {
   AcnRpcGroup, Configuration,
   Models,
-  SessionOperationFailed,
-  type DisplayViewShape,
-  type SessionError,
 } from "@magnitudedev/acn-protocol";
 import { Cause, Chunk, Effect, Option, Stream } from "effect";
-import { SessionCommands } from "../session-commands";
-import { SessionLifecycle } from "../session-lifecycle";
 import { ProviderCredentials } from "../provider-credentials";
 import { ProviderModelCatalog } from "../provider-model-catalog";
 import { ModelSlotController } from "../model-slot-controller";
 import { MagnitudeCloudUsage } from "../magnitude-cloud-usage";
-import { ActiveSessionStatusesService } from "../active-session-statuses";
 import { InferenceActivity } from "../inference-activity";
-import { DisplayViewStreams, displayViewId } from "../display-view-streams";
 import { ACN_VERSION } from "../version";
 import { makeHealthResponse } from "../identity";
 import { AcnServiceLifecycle } from "../service-lifecycle";
-import { AcnDisplayViewIntrospector } from "../introspection";
-import { uploadAttachment } from "../attachment-upload";
-import { getSkill, listSkills, runBash } from "../skill-shell-ops";
-import { UserBashCommandId, type AppEvent } from "@magnitudedev/agent";
-import { createId } from "@magnitudedev/generate-id";
+import { getSkill, listSkills } from "../skill-ops";
 import { AcnChanges } from "../changes";
 import { ModelCatalog } from "../model-catalog";
 import { ModelCommands } from "../model-commands";
@@ -37,26 +27,16 @@ import { ProjectFileManager } from "../project-file-manager";
 import { ProjectInspector } from "../project-inspector";
 import { ProjectManager } from "../project-manager";
 import { ProjectStore } from "../project-store";
-import { SessionInspector } from "../session-inspector";
 import { ServerSettings } from "../server-settings";
 import { AcnHarnessConnections } from "../harness-connections";
 import { AcnOwner, requestOwner, watchApplicationOwner } from "../application-owner";
 import { HuggingFaceAccount } from "../hugging-face-account";
 
-const MAX_BASH_OUTPUT_LENGTH = 50_000;
-
-const normalizeBashOutput = (output: string): string =>
-  output.length > MAX_BASH_OUTPUT_LENGTH
-    ? `${output.slice(0, MAX_BASH_OUTPUT_LENGTH)}\n[truncated]`
-    : output;
-
 /** Exhaustive server implementation of the composed ACN boundary. */
 export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const lifecycle = yield* AcnServiceLifecycle;
-    const chat = yield* ChatService;
-    const sessionCommands = yield* SessionCommands;
-    const sessionLifecycle = yield* SessionLifecycle;
-    const sessionInspector = yield* SessionInspector;
+    const chats = yield* ChatService;
+    const inference = yield* ChatInference;
     const projectStore = yield* ProjectStore;
     const projectManager = yield* ProjectManager;
     const projectInspector = yield* ProjectInspector;
@@ -69,9 +49,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const modelSlots = yield* ModelSlotController;
     const cloudUsage = yield* MagnitudeCloudUsage;
     const servingUsage = yield* ServingUsage;
-    const activeSessionStatuses = yield* ActiveSessionStatusesService;
     const inferenceActivity = yield* InferenceActivity;
-    const displayStreams = yield* DisplayViewStreams;
     const changes = yield* AcnChanges;
     const modelCatalog = yield* ModelCatalog;
     const modelCommands = yield* ModelCommands;
@@ -82,9 +60,6 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const owner = yield* AcnOwner;
     const huggingFace = yield* HuggingFaceAccount;
     const ownerRequest = (name: string, request: Parameters<typeof requestOwner>[0]) => observeRpcDefects(name, requestOwner(request).pipe(Effect.provideService(AcnOwner, owner)));
-    const displayViewIntrospector = yield* Effect.serviceOption(
-      AcnDisplayViewIntrospector
-    );
     // Observe programming defects without changing the Cause. Expected domain
     // failures stay typed, defects stay defects, and interruption is preserved.
     const observeRpcDefects = <A, E, R>(
@@ -115,113 +90,20 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
         )
       );
 
-    const withSessionContext = <A, E, R>(
-      sessionId: string,
-      run: (context: {
-        cwd: string;
-        projectRoot: string;
-        scratchpadPath: string;
-      }) => Effect.Effect<A, E, R>
-    ) =>
-      sessionLifecycle
-        .getSessionExecutionContext(sessionId)
-        .pipe(Effect.flatMap((context) => run(context)));
-
-    const observeDisplayViewStream = <A, E, R>(
-      sessionId: string,
-      shape: DisplayViewShape,
-      stream: Stream.Stream<A, E, R>
-    ): Stream.Stream<A, E, R> =>
-      Option.match(displayViewIntrospector, {
-        onNone: () => stream,
-        onSome: (introspector) => {
-          const viewId = displayViewId(shape);
-          return Stream.fromEffect(introspector.openStream(sessionId, viewId, shape)).pipe(
-            Stream.flatMap(() => stream),
-            Stream.ensuring(introspector.closeStream(sessionId, viewId))
-          );
-        },
-      });
-
     return {
-      ListChatModels: () => chat.models,
-      ListChatConversations: ({ offset, limit }) => chat.list(offset, limit),
-      GetChatConversation: ({ conversationId }) => chat.get(conversationId),
-      CreateChatConversation: ({ conversationId, settings }) => chat.create(conversationId, settings),
-      UpdateChatConversation: ({ conversationId, title, settings }) => chat.update(conversationId, title, settings),
-      DeleteChatConversation: ({ conversationId }) => chat.remove(conversationId),
-      StartChatGeneration: input => chat.start(input),
-      StopChatGeneration: ({ conversationId, generationId }) => chat.stop(conversationId, generationId),
-      WatchChatConversation: ({ conversationId }) => chat.watch(conversationId),
+      // Chats
+      ListChats: ({ offset, limit }) => observeRpcDefects("ListChats", chats.list(offset, limit)),
+      StartChat: (payload) => observeRpcDefects("StartChat", chats.start(payload)),
+      SendChatMessage: (payload) => observeRpcDefects("SendChatMessage", chats.send(payload)),
+      RetryChatResponse: (payload) => observeRpcDefects("RetryChatResponse", chats.retry(payload)),
+      RenameChat: (payload) => observeRpcDefects("RenameChat", chats.rename(payload)),
+      StopChatResponse: (payload) => observeRpcDefects("StopChatResponse", chats.stop(payload)),
+      RemoveChat: ({ chatId }) => observeRpcDefects("RemoveChat", chats.remove(chatId)),
+      WatchChat: ({ chatId }) => observeRpcStreamDefects("WatchChat", chats.watch(chatId)),
       // Connection
       Health: () => lifecycle.state.pipe(
         Effect.map((state) => makeHealthResponse(ACN_VERSION, state)),
       ),
-      // Session lifecycle
-      PreloadSession: ({ cwd, options, draftOwnerId }) =>
-        observeRpcDefects(
-          "PreloadSession",
-          sessionLifecycle.preloadSession(
-            cwd,
-            Option.getOrUndefined(options),
-            Option.getOrNull(draftOwnerId)
-          )
-        ),
-
-      ReleaseSessionPreload: ({ cwd, sessionId, options, draftOwnerId }) =>
-        observeRpcDefects(
-          "ReleaseSessionPreload",
-          sessionLifecycle
-            .releaseSessionPreload(
-              cwd,
-              sessionId,
-              Option.getOrUndefined(options),
-              Option.getOrNull(draftOwnerId)
-            )
-            .pipe(Effect.as({}))
-        ),
-
-      CreateSession: ({ cwd, sessionId, initial, options, draftOwnerId }) =>
-        observeRpcDefects(
-          "CreateSession",
-          sessionLifecycle.createSession(
-            cwd,
-            Option.getOrUndefined(sessionId),
-            Option.getOrUndefined(initial),
-            Option.getOrUndefined(options),
-            Option.getOrNull(draftOwnerId)
-          )
-        ),
-
-      ListSessions: (payload) =>
-        observeRpcDefects("ListSessions", sessionInspector.page(payload)),
-
-      ListRecentSessionDirectories: (payload) =>
-        observeRpcDefects(
-          "ListRecentSessionDirectories",
-          sessionInspector.recentDirectories(payload)
-        ),
-
-      StreamActiveSessionStatuses: () => activeSessionStatuses.stream,
-
-      GetSession: ({ sessionId }: { sessionId: string }) =>
-        observeRpcDefects("GetSession", sessionInspector.get(sessionId)),
-
-      DeleteArchivedSession: ({ sessionId }: { sessionId: string }) =>
-        observeRpcDefects(
-          "DeleteArchivedSession",
-          sessionLifecycle.deleteArchivedSession(sessionId).pipe(Effect.as({}))
-        ),
-
-      ArchiveSession: ({ sessionId }) =>
-        observeRpcDefects("ArchiveSession", sessionLifecycle.archiveSession(sessionId)),
-
-      RestoreSession: ({ sessionId }) =>
-        observeRpcDefects("RestoreSession", sessionLifecycle.restoreSession(sessionId)),
-
-      SetSessionPinned: ({ sessionId, pinned }) =>
-        observeRpcDefects("SetSessionPinned", sessionLifecycle.setSessionPinned(sessionId, pinned)),
-
       ListProjects: (payload) =>
         observeRpcDefects("ListProjects", projectStore.page(payload)),
 
@@ -264,47 +146,6 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       MoveProjectEntry: (payload) =>
         observeRpcDefects("MoveProjectEntry", projectFiles.moveEntry(payload)),
 
-      // Agent control
-      SendMessage: (payload) =>
-        observeRpcDefects(
-          "SendMessage",
-          sessionCommands
-            .sendUserMessage({
-              sessionId: payload.sessionId,
-              messageId: Option.getOrUndefined(payload.messageId),
-              content: payload.content,
-              taskMode: payload.taskMode,
-              uploads: payload.uploads,
-              mentions: payload.mentions,
-            })
-            .pipe(Effect.as({}))
-        ),
-
-      StartGoal: (payload) =>
-        observeRpcDefects(
-          "StartGoal",
-          sessionCommands
-            .startGoal({
-              sessionId: payload.sessionId,
-              objective: payload.objective,
-            })
-            .pipe(Effect.as({}))
-        ),
-
-      Interrupt: ({ sessionId, target }) =>
-        observeRpcDefects(
-          "Interrupt",
-          sessionCommands.interrupt(sessionId, target).pipe(Effect.as({}))
-        ),
-
-      UploadAttachment: ({ sessionId, filename, data }) =>
-        observeRpcDefects(
-          "UploadAttachment",
-          withSessionContext(sessionId, (context) =>
-            uploadAttachment(context.scratchpadPath, filename, data)
-          )
-        ),
-
       // Config
       UpdateProviderAuth: ({ providerId, auth }) =>
         observeRpcDefects(
@@ -337,6 +178,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
         observeRpcDefects("GetModelCatalog", modelCatalog.state),
 
       GetServingUsage: request => servingUsage.read(request),
+      ListServableModels: () => observeRpcDefects("ListServableModels", inference.models),
 
       GetModelStorage: () => observeRpcDefects("GetModelStorage", serverSettings.modelStorage),
       SetModelStorage: ({ path }) => observeRpcDefects("SetModelStorage", serverSettings.setModelStorage(path).pipe(Effect.as({}))),
@@ -359,10 +201,9 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       DisconnectHarness: ({ harness }) => observeRpcDefects("DisconnectHarness", harnessConnections.disconnect(harness).pipe(Effect.as({}))),
       DescribeHarnessSetup: request => observeRpcDefects("DescribeHarnessSetup", harnessConnections.describe(request)),
 
-      GetServiceActivity: () => observeRpcDefects("GetServiceActivity", Effect.all({
-        workingSessions: activeSessionStatuses.snapshot.pipe(Effect.map(snapshot => snapshot.sessions.filter(session => session.workStatus === "working").length)),
-        inferenceRequests: inferenceActivity.count,
-      })),
+      GetServiceActivity: () => observeRpcDefects("GetServiceActivity", inferenceActivity.count.pipe(
+        Effect.map((inferenceRequests) => ({ inferenceRequests })),
+      )),
       WatchApplicationOwner: () => observeRpcStreamDefects("WatchApplicationOwner", watchApplicationOwner.pipe(Stream.provideService(AcnOwner, owner))),
       CheckApplicationUpdate: () => ownerRequest("CheckApplicationUpdate", { _tag: "CheckUpdate" }),
       DownloadApplicationUpdate: () => ownerRequest("DownloadApplicationUpdate", { _tag: "DownloadUpdate" }),
@@ -541,32 +382,8 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
           )
         ),
 
-      SearchDirectories: ({ query, limit, includeRecent }) =>
-        observeRpcDefects(
-          "SearchDirectories",
-          Effect.gen(function* () {
-            const recents = includeRecent
-              ? (yield* sessionInspector.recentDirectories({
-                  cursor: Option.none(),
-                  limit: 20,
-                }).pipe(
-                  Effect.map((page) => page.items.map((item) => ({
-                    path: item.cwd,
-                    lastActivity: item.lastActiveAt,
-                  }))),
-                  // Recents are advisory: directory suggestions degrade to
-                  // plain path completion when session inspection fails.
-                  Effect.orElseSucceed(() => []),
-                ))
-              : [];
-            return yield* fileMentionSearcher.searchDirectories({
-              query,
-              limit,
-              includeRecent,
-              recentDirectories: recents,
-            });
-          })
-        ),
+      SearchDirectories: ({ query, limit }) =>
+        observeRpcDefects("SearchDirectories", fileMentionSearcher.searchDirectories({ query, limit })),
 
       GetGitRecentFiles: ({ cwd, limit }) =>
         observeRpcDefects(
@@ -581,44 +398,8 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       GetSkill: ({ cwd, name }) =>
         observeRpcDefects("GetSkill", getSkill(cwd, name)),
 
-      RunBash: ({ sessionId, command, stdin }) =>
-        observeRpcDefects(
-          "RunBash",
-          sessionCommands.getRuntimeExecutionContext(sessionId).pipe(
-            Effect.flatMap((context) =>
-              runBash(context, command, stdin).pipe(
-                Effect.flatMap((result) => {
-                  const stdout = normalizeBashOutput(result.stdout)
-                  const stderr = normalizeBashOutput(result.stderr)
-                  const event: Extract<AppEvent, { type: "user_bash_command" }> = {
-                    type: "user_bash_command",
-                    commandId: UserBashCommandId(createId()),
-                    forkId: null,
-                    timestamp: Date.now(),
-                    command,
-                    cwd: context.cwd,
-                    exitCode: result.exitCode,
-                    stdout,
-                    stderr,
-                  }
-                  return sessionCommands.sendUserEvent(sessionId, event).pipe(
-                    Effect.as({ ...result, stdout, stderr }),
-                  )
-                })
-              )
-            )
-          )
-        ),
-
       // Streams
       StreamChanges: () => observeRpcStreamDefects("StreamChanges", changes.stream),
-
-      StreamDisplayView: ({ sessionId, shape }) =>
-        observeRpcStreamDefects(
-          "StreamDisplayView",
-          observeDisplayViewStream(sessionId, shape, displayStreams.stream(sessionId, shape))
-        ),
-
     };
   })
 );

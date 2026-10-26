@@ -1,6 +1,6 @@
 import { Configuration as Rpcs } from "@magnitudedev/sdk";
 import { Effect } from "effect";
-import { Group, Mutation, QueryClient } from "@magnitudedev/effect-query";
+import { Group, QueryClient } from "@magnitudedev/effect-query";
 import { mutation, query } from "./bind";
 
 const GetProviderAuth = query(
@@ -28,12 +28,6 @@ const GetCloudUsage = query(
   Rpcs.getCloudUsage,
   (client) => client.configuration.getCloudUsage
 );
-
-/**
- * Primary-model selection and work admission share one serialization boundary:
- * a turn must never observe the selection before its mutation has synchronized.
- */
-export const turnAdmissionScope = Mutation.MutationScope("turn-admission");
 
 const GetModelStorage = query(Rpcs.getModelStorage, (client) => client.configuration.getModelStorage);
 const SetModelStorage = mutation(Rpcs.setModelStorage, (client) => client.configuration.setModelStorage, {

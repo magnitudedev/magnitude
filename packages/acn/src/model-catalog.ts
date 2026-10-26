@@ -1,6 +1,5 @@
 import { Context, Effect, Layer, Option, Stream } from "effect"
 import {
-  Chat,
   Models,
   type LocalModelsState,
   type ModelCatalogEntry,
@@ -91,7 +90,7 @@ export const ModelCatalogLive: Layer.Layer<
   )
   // A rescan follows a location becoming readable or disappearing, so its state is read again.
   yield* local.changes.pipe(
-    Stream.runForEach(() => Effect.all([changes.publish({ operation: Models.listModelLocations._tag }), changes.publish({ operation: Chat.listModels._tag })])),
+    Stream.runForEach(() => Effect.all([changes.publish({ operation: Models.listModelLocations._tag }), changes.publish({ operation: Models.listServableModels._tag })])),
     Effect.forkScoped,
   )
   return ModelCatalog.of({

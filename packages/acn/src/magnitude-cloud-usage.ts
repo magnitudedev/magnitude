@@ -1,6 +1,6 @@
 import { FetchHttpClient } from "@effect/platform"
 import { Context, Effect, Layer, Option } from "effect"
-import { SessionOperationFailed, type SessionError } from "@magnitudedev/acn-protocol"
+import { OperationFailed } from "@magnitudedev/acn-protocol"
 import {
   ProviderClient,
   ProviderIdSchema,
@@ -13,7 +13,7 @@ import { MagnitudeStorage } from "@magnitudedev/storage"
 const MAGNITUDE_PROVIDER_ID = ProviderIdSchema.make("magnitude")
 
 export interface MagnitudeCloudUsageApi {
-  readonly get: (query?: UsageQuery) => Effect.Effect<CloudUsageResponse, SessionError>
+  readonly get: (query?: UsageQuery) => Effect.Effect<CloudUsageResponse, OperationFailed>
 }
 
 export class MagnitudeCloudUsage extends Context.Tag("MagnitudeCloudUsage")<
@@ -21,8 +21,8 @@ export class MagnitudeCloudUsage extends Context.Tag("MagnitudeCloudUsage")<
   MagnitudeCloudUsageApi
 >() {}
 
-const failure = (operation: string) => (cause: unknown): SessionError =>
-  new SessionOperationFailed({ operation, reason: cause instanceof Error ? cause.message : String(cause) })
+const failure = (operation: string) => (cause: unknown): OperationFailed =>
+  new OperationFailed({ operation, reason: cause instanceof Error ? cause.message : String(cause) })
 
 export const MagnitudeCloudUsageLive: Layer.Layer<
   MagnitudeCloudUsage,
@@ -31,7 +31,7 @@ export const MagnitudeCloudUsageLive: Layer.Layer<
 > = Layer.effect(MagnitudeCloudUsage, Effect.gen(function* () {
   const client = yield* ProviderClient
   const storage = yield* MagnitudeStorage
-  const authenticatedClient: Effect.Effect<ProviderClientShape, SessionError> = Effect.gen(function* () {
+  const authenticatedClient: Effect.Effect<ProviderClientShape, OperationFailed> = Effect.gen(function* () {
     const environment = process.env.MAGNITUDE_API_KEY?.trim()
     if (environment) return client
     const stored = yield* storage.auth.get(MAGNITUDE_PROVIDER_ID).pipe(
@@ -39,11 +39,11 @@ export const MagnitudeCloudUsageLive: Layer.Layer<
       Effect.orElseSucceed(Option.none),
     )
     if (Option.exists(stored, (auth) => auth.type === "api" && auth.key.trim().length > 0)) return client
-    return yield* new SessionOperationFailed({ operation: "get cloud usage", reason: "No Magnitude API key found" })
+    return yield* new OperationFailed({ operation: "get cloud usage", reason: "No Magnitude API key found" })
   })
   return MagnitudeCloudUsage.of({
     // Cloud is disabled.
-    get: (_query) => Effect.fail(new SessionOperationFailed({
+    get: (_query) => Effect.fail(new OperationFailed({
       operation: "get cloud usage",
       reason: "Magnitude Cloud is disabled",
     })),

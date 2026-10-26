@@ -4,11 +4,26 @@ export type SqliteBinding = string | number | bigint | boolean | null | Uint8Arr
 
 export class SqliteDriverBusy extends Data.TaggedError("SqliteDriverBusy")<{}> {}
 
+/** The file is not a SQLite database. */
+export class SqliteDriverNotADatabase extends Data.TaggedError("SqliteDriverNotADatabase")<{}> {}
+
 export class SqliteDriverFailure extends Data.TaggedError("SqliteDriverFailure")<{
   readonly message: string
 }> {}
 
-export type SqliteDriverError = SqliteDriverBusy | SqliteDriverFailure
+export type SqliteDriverError = SqliteDriverBusy | SqliteDriverNotADatabase | SqliteDriverFailure
+
+/** A failed SQLite call's error, by its primary result code: the low byte of its extended code. */
+export const sqliteError = (code: number, message: string): SqliteDriverError => {
+  switch (code & 0xff) {
+    case 5: // SQLITE_BUSY
+      return new SqliteDriverBusy()
+    case 26: // SQLITE_NOTADB
+      return new SqliteDriverNotADatabase()
+    default:
+      return new SqliteDriverFailure({ message })
+  }
+}
 
 export interface SqliteConnection {
   readonly execute: (

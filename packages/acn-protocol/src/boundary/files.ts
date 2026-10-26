@@ -1,5 +1,5 @@
 import { Rpc } from "@effect/rpc"
-import { replaySafe, atMostOnce } from "../transport/recovery"
+import { replaySafe } from "../transport/recovery"
 import { Schema } from "effect"
 import {
   ReadFilePayload,
@@ -22,7 +22,6 @@ import {
   InvalidDirectoryPath,
   PathNotDirectory,
   PathNotFile,
-  SessionError,
 } from "../errors"
 
 /** Failures of a traversal rooted at the requested cwd. */
@@ -33,20 +32,6 @@ const TraversalError = Schema.Union(
   PathNotDirectory,
   FileSystemUnavailable,
 )
-
-const UploadAttachment = Rpc.make("UploadAttachment", {
-  payload: Schema.Struct({
-    sessionId: Schema.String,
-    filename: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-    data: Schema.String,
-    mediaType: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-  }),
-  success: Schema.Struct({
-    path: Schema.String,
-    filename: Schema.String,
-  }),
-  error: SessionError,
-}).pipe(atMostOnce)
 
 const ListFiles = Rpc.make("ListFiles", {
   payload: Schema.Struct({
@@ -102,7 +87,6 @@ const SearchDirectories = Rpc.make("SearchDirectories", {
 }).pipe(replaySafe)
 
 export const Files = {
-  uploadAttachment: UploadAttachment,
   listFiles: ListFiles,
   readFile: ReadFile,
   checkFileExists: CheckFileExists,

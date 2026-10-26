@@ -50,10 +50,8 @@ export type ApplicationOwnerKind = typeof ApplicationOwnerKind.Type
 export const OwnerCapability = Schema.Literal("Updates", "LaunchAtLogin", "RestartService", "Quit")
 export type OwnerCapability = typeof OwnerCapability.Type
 
-/** Work in progress on the service. The owner installs an update only when both counts are zero. */
+/** Work in progress on the service. The owner installs an update only when the count is zero. */
 export const ServiceActivity = Schema.Struct({
-  /** Sessions whose agents are working on a turn. */
-  workingSessions: Schema.NonNegativeInt,
   /** Inference requests from harnesses and other devices whose responses are still streaming. */
   inferenceRequests: Schema.NonNegativeInt,
 })

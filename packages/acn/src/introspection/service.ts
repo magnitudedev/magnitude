@@ -1,5 +1,5 @@
 import { Context, Effect, Layer, Option, Stream } from "effect"
-import { SessionNotFound, SessionOperationFailed, type SessionError } from "@magnitudedev/acn-protocol"
+import { OperationFailed } from "@magnitudedev/acn-protocol"
 import type { AgentIntrospection } from "@magnitudedev/agent"
 import { AgentRuntime } from "../agent-runtime"
 import { formatUnknownCause } from "../session-errors"
@@ -9,6 +9,7 @@ import type {
   AcnIntrospectionSession,
   AcnSessionIntrospection,
 } from "./types"
+import { SessionNotFound, type SessionError } from "../session-errors"
 
 export interface AcnIntrospectorApi {
   readonly currentOverview: Effect.Effect<AcnIntrospectionOverview>
@@ -28,7 +29,7 @@ export class AcnIntrospector extends Context.Tag("AcnIntrospector")<
 >() {}
 
 const introspectionFailure = (sessionId: string, cause: unknown) =>
-  new SessionOperationFailed({
+  new OperationFailed({
     operation: "AcnIntrospector.currentSession",
     reason: `${sessionId}: ${formatUnknownCause(cause)}`,
   })

@@ -1,13 +1,11 @@
 import { describe, expect, it } from "vitest"
 import { Effect, Layer, Option, PubSub, Ref, Stream } from "effect"
-import {
-  DirectoryPathSchema,
-  SessionNotFound,
-  type SessionMetadata,
-} from "@magnitudedev/acn-protocol"
+import { DirectoryPathSchema } from "@magnitudedev/acn-protocol"
 import { AgentRuntime, type AgentRuntimeApi, type SessionRuntimeSnapshot } from "./agent-runtime"
 import { ActiveSessionStatusesLive, ActiveSessionStatusesService } from "./active-session-statuses"
 import { SessionInspector } from "./session-inspector"
+import { SessionNotFound } from "./session-errors"
+import type { SessionMetadata } from "./session-schemas"
 
 const resident = (
   sessionId: string,

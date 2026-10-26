@@ -7,14 +7,15 @@
   "types": "src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bunx --bun vitest run src/types/session.test.ts src/types/custom-endpoints.test.ts src/types/custom-models.test.ts src/types/model-state.test.ts src/io/structured-file.test.ts src/io/storage.test.ts src/io/boundary-architecture.test.ts src/state/document.test.ts src/state/default-initialization.test.ts src/config/storage.test.ts src/config/model-storage.test.ts src/config/network-access.test.ts src/sessions/storage.test.ts"
+    "test": "bunx --bun vitest run src/types/session.test.ts src/types/custom-endpoints.test.ts src/types/custom-models.test.ts src/types/model-state.test.ts src/io/structured-file.test.ts src/io/storage.test.ts src/io/boundary-architecture.test.ts src/state/document.test.ts src/state/default-initialization.test.ts src/config/storage.test.ts src/config/model-storage.test.ts src/config/network-access.test.ts src/sessions/storage.test.ts src/chat/store.test.ts src/chat/adversarial.test.ts src/sqlite/database.test.ts src/sqlite/bun.test.ts"
   },
   "dependencies": {
     "@effect/platform": "^0.96.0",
     "@effect/platform-bun": "^0.90.0",
-    "@magnitudedev/scratchpad": "workspace:*",
-    "@magnitudedev/ai": "workspace:*",
     "@magnitudedev/acn-protocol": "workspace:*",
+    "@magnitudedev/ai": "workspace:*",
+    "@magnitudedev/event-engine": "workspace:*",
+    "@magnitudedev/scratchpad": "workspace:*",
     "effect": "^3.21.2"
   },
   "devDependencies": {

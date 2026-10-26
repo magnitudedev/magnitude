@@ -1,13 +1,7 @@
 import { Context, Effect, Either, Exit, Layer, Option, Ref } from "effect"
 import {
-  InvalidSessionPath,
-  SessionAlreadyExists,
-  SessionNotFound,
-  SessionOperationFailed,
+  OperationFailed,
   type DirectoryPath,
-  type SessionError,
-  type SessionMetadata as ProtocolSessionMetadata,
-  type SessionOptions,
 } from "@magnitudedev/acn-protocol"
 import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
 import { AgentRuntime, type RuntimeStartRequest } from "./agent-runtime"
@@ -15,6 +9,16 @@ import { FileSystemManager } from "./file-system-manager"
 import { sessionErrorMessage } from "./session-errors"
 import { decodeSessionMetadata } from "./session-inspector"
 import { SessionRuntimeOptionsStore, type SessionRuntimeOptions } from "./session-runtime-options"
+import {
+  InvalidSessionPath,
+  SessionAlreadyExists,
+  SessionNotFound,
+  type SessionError,
+} from "./session-errors"
+import type {
+  SessionMetadata as ProtocolSessionMetadata,
+  SessionOptions,
+} from "./session-schemas"
 
 const READY_DRAFT_TTL_MS = 10 * 60 * 1000
 const SWEEP_INTERVAL = "60 seconds"
@@ -73,7 +77,7 @@ const makeDraftKey = (input: {
 }): string => JSON.stringify(input)
 
 const staleDraftError = (sessionId: string, reason: string) =>
-  new SessionOperationFailed({
+  new OperationFailed({
     operation: `draft session ${sessionId}`,
     reason,
   })
@@ -93,9 +97,9 @@ export const SessionDraftsLive: Layer.Layer<
 
     const readMeta = (
       sessionId: string,
-    ): Effect.Effect<StoredSessionMeta | null, SessionOperationFailed> =>
+    ): Effect.Effect<StoredSessionMeta | null, OperationFailed> =>
       storage.sessions.readMeta(sessionId).pipe(
-        Effect.mapError((error) => new SessionOperationFailed({
+        Effect.mapError((error) => new OperationFailed({
           operation: `read session metadata ${sessionId}`,
           reason: error._tag,
         })),
@@ -138,7 +142,7 @@ export const SessionDraftsLive: Layer.Layer<
       const meta = yield* readMeta(entry.sessionId)
       if (meta && meta.messageCount > 0) return false
       const removeDurableState = storage.sessions.deleteSession(entry.sessionId).pipe(
-        Effect.mapError((error) => new SessionOperationFailed({
+        Effect.mapError((error) => new OperationFailed({
           operation: `delete draft session ${entry.sessionId}`,
           reason: error._tag,
         })),
@@ -318,7 +322,7 @@ export const SessionDraftsLive: Layer.Layer<
         visibility: "visible",
         updated: new Date().toISOString(),
       })).pipe(
-        Effect.mapError((error) => new SessionOperationFailed({
+        Effect.mapError((error) => new OperationFailed({
           operation: `promote draft ${claim.sessionId}`,
           reason: error._tag,
         })),

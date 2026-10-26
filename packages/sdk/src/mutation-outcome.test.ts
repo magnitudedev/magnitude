@@ -8,7 +8,7 @@ describe("isRpcOutcomeUnknown", () => {
     expect(isRpcOutcomeUnknown(new RpcClientError.RpcClientError({
       reason: "Unknown",
       message: "RpcOutcomeUnknown",
-      cause: new RpcOutcomeUnknown({ tag: "SendMessage" }),
+      cause: new RpcOutcomeUnknown({ tag: "ConnectHarness" }),
     }))).toBe(true)
   })
 

@@ -2,15 +2,15 @@ import { createHash } from "node:crypto"
 import { Context, Deferred, Effect, Fiber, Layer, Option, PubSub, Ref, Stream } from "effect"
 import * as Key from "@magnitudedev/utils/canonical-key"
 import {
-  SessionOperationFailed,
+  OperationFailed,
   type DisplayViewShape,
   type DisplayViewStateEvent,
-  type SessionError,
   type StreamEvent,
 } from "@magnitudedev/acn-protocol"
 import { AgentRuntime } from "./agent-runtime"
 import { formatUnknownCause } from "./session-errors"
 import type { RuntimeEntry } from "./session-types"
+import type { SessionError } from "./session-errors"
 
 export interface DisplayViewStreamsApi {
   /**
@@ -58,7 +58,7 @@ interface Registration {
 const operationFailed =
   (sessionId: string, viewId: string, operation: string) =>
   (cause: unknown): SessionError =>
-    new SessionOperationFailed({
+    new OperationFailed({
       operation: `DisplayView.${operation}`,
       reason: `${sessionId}/${viewId}: ${formatUnknownCause(cause)}`,
     })

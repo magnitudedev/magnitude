@@ -18,6 +18,7 @@
     "@effect/rpc": "0.75.1",
     "@magnitudedev/acn-protocol": "workspace:*",
     "@magnitudedev/agent": "workspace:*",
+    "@magnitudedev/event-engine": "workspace:*",
     "@magnitudedev/generate-id": "workspace:*",
     "@magnitudedev/harness-connections": "workspace:*",
     "@magnitudedev/icn": "workspace:*",

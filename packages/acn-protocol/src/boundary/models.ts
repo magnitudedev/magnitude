@@ -3,6 +3,7 @@ import { Rpc } from "@effect/rpc"
 import { replaySafe, atMostOnce } from "../transport/recovery"
 import { Option, Schema } from "effect"
 import { ProviderIdSchema } from "@magnitudedev/ai/provider/model"
+import { OpenAiModelsResponse } from "@magnitudedev/icn-protocol/schemas"
 import {
   CustomModelMutationError,
   LocalInferenceError,
@@ -12,6 +13,7 @@ import {
   ModelPreferenceMutationFailed,
   ModelSlotUpdateError,
   ModelVersionNotRunnable,
+  ServableModelsUnavailable,
 } from "../errors"
 import {
   AutomaticModelLocationKindSchema,
@@ -38,6 +40,13 @@ import {
 } from "../schemas/model-state"
 
 const GetServingUsage = Rpc.make("GetServingUsage", { payload: ServingUsageRequest, success: ServingUsageSnapshot }).pipe(replaySafe)
+
+/** The models the inference service serves now, with what each accepts and produces. */
+const ListServableModels = Rpc.make("ListServableModels", {
+  payload: Schema.Struct({}),
+  success: OpenAiModelsResponse,
+  error: ServableModelsUnavailable,
+}).pipe(replaySafe)
 
 const GetCatalog = Rpc.make("GetModelCatalog", {
   payload: Schema.Struct({}),
@@ -263,6 +272,7 @@ const SetModelLocationEnabled = Rpc.make("SetModelLocationEnabled", {
 
 export const Models = {
   getServingUsage: GetServingUsage,
+  listServableModels: ListServableModels,
   getCatalog: GetCatalog,
   getSlots: GetSlots,
   getLocalEnvironment: GetLocalEnvironment,

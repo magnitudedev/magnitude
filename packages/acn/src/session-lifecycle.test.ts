@@ -3,7 +3,7 @@ import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { describe, expect, it } from "vitest"
 import { Effect, Layer, Option, Ref, Stream } from "effect"
-import { DirectoryPathSchema, SessionNotFound } from "@magnitudedev/acn-protocol"
+import { DirectoryPathSchema } from "@magnitudedev/acn-protocol"
 import { AgentRuntime, type AgentRuntimeApi } from "./agent-runtime"
 import { SessionCommands, type SessionCommandsApi } from "./session-commands"
 import { SessionDrafts, type SessionDraftsApi } from "./session-drafts"
@@ -11,6 +11,7 @@ import { SessionInspector } from "./session-inspector"
 import { SessionLifecycle, SessionLifecycleLive } from "./session-lifecycle"
 import { makeTestStorageLayer } from "./session-test-support"
 import type { SendUserMessageInput } from "./session-types"
+import { SessionNotFound } from "./session-errors"
 
 const metadata = {
   sessionId: "session-1",

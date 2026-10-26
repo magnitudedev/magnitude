@@ -1,657 +1,377 @@
+import { Cause, Context, Data, DateTime, Effect, type Either, Equal, Layer, Option, Ref, Stream, SubscriptionRef } from "effect"
+import type { Closure, EngineClosed, Emit, EventSettlementError, ProjectionReader } from "@magnitudedev/event-engine"
 import {
-  Cause,
-  Context,
-  Deferred,
-  Effect,
-  Fiber,
-  Layer,
-  Option,
-  Queue,
-  Schema,
-  Scope,
-  Stream,
-} from "effect"
-import {
-  applyChatGeneration,
   Chat,
-  ChatActivity,
-  ChatCommandId,
-  ChatConversation,
-  ChatConversationId,
-  ChatFailed,
-  ChatGeneration,
-  ChatGenerationId,
-  ChatMessageId,
-  ChatSettings,
-  ChatUpdate,
-  emptyChatMetrics,
-  ServingModelId,
+  type ChatBusy,
+  type ChatMessage,
+  type ChatMessagePayload,
+  ChatNotFound,
+  type ChatPage,
+  type ChatRenamePayload,
+  type ChatRetryPayload,
+  type ChatStopPayload,
+  ChatStorageFailed,
+  type ChatSummary,
+  type ChatUpdate,
+  InvalidChatRequest,
+  latestResponse,
+  type LiveResponse,
+  type ServableModelsUnavailable,
+  type SessionEvent,
+  type SessionId,
 } from "@magnitudedev/acn-protocol"
-import { ChatStorage, type StoredChatGeneration } from "@magnitudedev/storage"
-import * as Native from "@magnitudedev/icn-protocol/schemas"
+import { ChatStore, type ChatSessionRecord, type ChatStoreError, committedRecord, isChatStoreError, renamedRecord } from "@magnitudedev/storage"
 import { AcnChanges } from "../changes"
-import { ServingUsage, ServingUsageRecord } from "../serving-usage"
-import { InferenceActivity } from "../inference-activity"
+import * as Commands from "./commands"
+import { ChatEngine, settled, storageFailed } from "./engine"
+import { lastObserved, Live, runningResponse, Seen, Transcript } from "./folds"
+import { Generation } from "./generation"
 import { ChatInference } from "./inference"
+import { makeInstances } from "./instances"
 
 export interface ChatService {
-  readonly models: ChatInference["models"]
-  readonly list: ChatStorage["list"]
-  readonly get: ChatStorage["get"]
-  readonly create: ChatStorage["create"]
-  readonly update: ChatStorage["update"]
-  readonly remove: ChatStorage["remove"]
-  readonly start: (input: {
-    readonly conversationId: ChatConversationId
-    readonly commandId: ChatCommandId
-    readonly content: Option.Option<string>
-    readonly retryMessageId: Option.Option<ChatMessageId>
-    readonly settings: ChatSettings
-  }) => Effect.Effect<ChatGenerationId, ChatFailed>
-  readonly stop: (
-    conversationId: ChatConversationId,
-    generationId: ChatGenerationId
-  ) => Effect.Effect<void, ChatFailed>
-  readonly watch: (
-    id: ChatConversationId
-  ) => Stream.Stream<ChatUpdate, ChatFailed>
+  readonly list: (offset: number, limit: number) => Effect.Effect<ChatPage, ChatStorageFailed>
+  readonly start: (
+    input: ChatMessagePayload
+  ) => Effect.Effect<void, InvalidChatRequest | ServableModelsUnavailable | ChatStorageFailed>
+  readonly send: (
+    input: ChatMessagePayload
+  ) => Effect.Effect<void, ChatNotFound | ChatBusy | InvalidChatRequest | ServableModelsUnavailable | ChatStorageFailed>
+  readonly retry: (
+    input: ChatRetryPayload
+  ) => Effect.Effect<void, ChatNotFound | ChatBusy | InvalidChatRequest | ServableModelsUnavailable | ChatStorageFailed>
+  readonly rename: (input: ChatRenamePayload) => Effect.Effect<void, ChatNotFound | InvalidChatRequest | ChatStorageFailed>
+  readonly stop: (input: ChatStopPayload) => Effect.Effect<void, ChatNotFound | InvalidChatRequest | ChatStorageFailed>
+  readonly remove: (chatId: SessionId) => Effect.Effect<void, ChatStorageFailed>
+  readonly watch: (chatId: SessionId) => Stream.Stream<ChatUpdate, ChatNotFound | ChatStorageFailed>
 }
-export const ChatService = Context.GenericTag<ChatService>(
-  "@magnitudedev/acn/ChatService"
-)
-interface Running {
-  value: StoredChatGeneration
-  fiber: Option.Option<Fiber.RuntimeFiber<void, never>>
-  dirty: boolean
-  lastSave: number
-  reasoningStarted: Option.Option<number>
-  completion: Option.Option<"completed" | "length">
-  stopRequested: boolean
-}
-interface Subscriber {
-  readonly queue: Queue.Queue<void>
-  pending: Option.Option<ChatUpdate>
-}
-/** Keep a pending structural snapshot while folding later output into it. */
-const offer = (subscriber: Subscriber, update: ChatUpdate) => Effect.sync(() => {
-  const pending = Option.getOrUndefined(subscriber.pending)
-  subscriber.pending = Option.some(update._tag === "Generation" && pending?._tag === "Snapshot"
-    ? { _tag: "Snapshot", conversation: applyChatGeneration(pending.conversation, update.generation) }
-    : update._tag === "Generation" && pending?._tag === "Deleted" ? pending : update)
-}).pipe(Effect.zipRight(Queue.offer(subscriber.queue, undefined)), Effect.asVoid)
+export const ChatService = Context.GenericTag<ChatService>("@magnitudedev/acn/ChatService")
 
-const invalid = (message: string) =>
-  new ChatFailed({ code: "InvalidRequest", message })
-const someFinite = (n: number) =>
-  Number.isFinite(n) && n >= 0 ? Option.some(n) : Option.none<number>()
+export const ChatEngineDefinition = ChatEngine.make({
+  name: "chat",
+  projections: [Seen, Transcript, Live],
+  workers: [Generation],
+})
+
+/** A chat as it is listed and watched: its session's record, and whether its transcript has a response running. */
+const summaryOf = (record: ChatSessionRecord, transcript: ReadonlyArray<ChatMessage>): ChatSummary =>
+  Data.struct({ ...record, time: Data.struct(record.time), running: Option.isSome(runningResponse(transcript)) })
+
+/**
+ * A response found running when its session opens belonged to a runtime that is gone: a session has
+ * one instance at a time, which closes once idle, or when it fails, leaving the response it ran to
+ * the session's next open. It ended when it was last observed. Returns whether it ended one.
+ */
+const recover = ({ read, emit }: { readonly read: ProjectionReader; readonly emit: Emit<SessionEvent, ChatStoreError> }) =>
+  Effect.flatMap(read.get(Transcript), (transcript) =>
+    Option.match(Option.filter(latestResponse(transcript), (response) => Option.isNone(response.end)), {
+      onNone: () => Effect.succeed(false),
+      onSome: (response) => Effect.as(emit({
+        _tag: "response_ended",
+        time: lastObserved(response),
+        responseId: response.id,
+        outcome: { _tag: "stopped", by: "shutdown" },
+        usage: Option.none(),
+        timings: Option.none(),
+      }), true),
+    }))
+
+/** Whether two transcripts differ only in output: the same messages, and the same responses ended. */
+const listedAlike = (left: ReadonlyArray<ChatMessage>, right: ReadonlyArray<ChatMessage>) =>
+  left.length === right.length && left.every((message, index) => {
+    const other = right[index]!
+    return message.id === other.id && (message._tag === "user" || (other._tag === "assistant" && Option.isSome(message.end) === Option.isSome(other.end)))
+  })
+
+/**
+ * A chat's commands, as transactions, and what is followed of it: its settled transcript and live
+ * state, and with them its record, read in the same step, so a commit is in both or in neither.
+ */
+const ChatFacade = ChatEngine.Facade.define({
+  name: "Chat",
+  mutations: ({ transact }) => {
+    const command = <J>(body: Commands.Command<J>) => transact(({ read }) => body(read))
+    return {
+      start: (input: ChatMessagePayload) => command(Commands.start(input)),
+      send: (input: ChatMessagePayload) => command(Commands.send(input)),
+      retry: (input: ChatRetryPayload) => command(Commands.retry(input)),
+      stop: (input: ChatStopPayload) => command(Commands.stop(input)),
+    }
+  },
+  queries: ({ read }) => ({
+    states: () => settled(Commands.states(read)),
+    transcript: () => settled(read.get(Transcript)),
+    view: () => settled(Effect.map(Effect.all({ messages: read.get(Transcript), live: read.get(Live) }), Data.struct)),
+    watched: (record: Effect.Effect<Option.Option<ChatSessionRecord>>) => settled(Effect.map(
+      Effect.all({ record, messages: read.get(Transcript), live: read.get(Live) }),
+      ({ record, messages, live }): View => Data.struct({ chat: Option.map(record, (found) => summaryOf(found, messages)), messages, live })
+    )),
+  }),
+})
+
+interface View {
+  readonly chat: Option.Option<ChatSummary>
+  readonly messages: ReadonlyArray<ChatMessage>
+  readonly live: Option.Option<LiveResponse>
+}
+
+/**
+ * The one update that takes a watcher from one view to the next: every part that changed, by
+ * identity. A view is read in one step, so its parts are those of one settled state.
+ */
+const changeBetween = (previous: View, current: View): ChatUpdate => ({
+  _tag: "changed",
+  chat: Equal.equals(previous.chat, current.chat) ? Option.none() : current.chat,
+  messages: current.messages.flatMap((message, index) => previous.messages[index] === message ? [] : [{ index, message }]),
+  live: Equal.equals(previous.live, current.live) ? Option.none() : Option.some(current.live),
+})
+
+/** A failed instance's failure, as clients are told it: the store's, or a defect. */
+const failedWith = (closure: Extract<Closure<ChatStoreError>, { _tag: "Failed" }>): Effect.Effect<never, ChatStorageFailed> =>
+  Option.match(Cause.failureOption(closure.cause), {
+    onSome: (error) => isChatStoreError(error) ? Effect.fail(storageFailed(error)) : Effect.die(error),
+    onNone: () => Effect.failCause(closure.cause as Cause.Cause<never>),
+  })
+
+/**
+ * An open session: its engine, its commands and queries, and its record. The record changes only by
+ * the session's own commits, all made by this instance, and by renames, so the instance loads it
+ * once and applies each of those to it as the store does.
+ */
+interface ChatInstance {
+  readonly record: SubscriptionRef.SubscriptionRef<Option.Option<ChatSessionRecord>>
+  readonly closed: Effect.Effect<Closure<ChatStoreError>>
+  /** Once the instance has closed as removed: the removal's delete, as clients are told it. */
+  readonly removed: Effect.Effect<void, ChatStorageFailed>
+  readonly facade: ReturnType<typeof ChatFacade.make>
+  readonly awaitIdle: Effect.Effect<void>
+  readonly close: (reason: "closed" | "removed") => Effect.Effect<void>
+  readonly failed: Effect.Effect<boolean>
+}
 
 export const ChatServiceLive = Layer.scoped(
   ChatService,
   Effect.gen(function* () {
-    const storage = yield* ChatStorage
-    const inference = yield* ChatInference
+    const store = yield* ChatStore
     const changes = yield* AcnChanges
-    const usage = yield* ServingUsage
-    const activity = yield* InferenceActivity
-    const scope = yield* Scope.Scope
-    const lock = yield* Effect.makeSemaphore(1)
-    const deleting = new Set<ChatConversationId>()
-    const running = new Map<ChatConversationId, Running>()
-    const viewers = new Map<ChatConversationId, Set<Subscriber>>()
-    const historyChanged = changes.publish({
-      operation: Chat.listConversations._tag,
-    })
-    const get = (id: ChatConversationId) =>
-      storage.get(id).pipe(
-        Effect.map((conversation) => {
-          const live = running.get(id)?.value
-          return !live
-            ? conversation
-            : {
-                ...conversation,
-                updatedAt: live.updatedAt,
-                messages: conversation.messages.map((m) =>
-                  m.id === live.messageId
-                    ? {
-                        ...m,
-                        content: live.content,
-                        generation: Option.some(live),
-                      }
-                    : m
-                ),
-              }
-        })
-      )
-    const publish = (id: ChatConversationId) =>
-      get(id).pipe(
-        Effect.flatMap((conversation) =>
-          Effect.forEach(
-            viewers.get(id) ?? [],
-            (q) => offer(q, { _tag: "Snapshot", conversation }),
-            { discard: true }
-          )
-        ),
-        Effect.asVoid
-      )
-    const publishGeneration = (id: ChatConversationId, generation: ChatGeneration) => Effect.forEach(
-      viewers.get(id) ?? [], subscriber => offer(subscriber, { _tag: "Generation", generation }), { discard: true },
-    )
-    const snapshotMutation = <A>(
-      id: ChatConversationId,
-      operation: Effect.Effect<A, ChatFailed>
-    ) =>
-      lock.withPermits(1)(
-        operation.pipe(
-          Effect.tap(() => publish(id)),
-          Effect.tap(() => historyChanged)
-        )
-      )
-    const setPhase = (
-      entry: Running,
-      phase: (typeof ChatActivity.Type)["phase"],
-      details: Partial<ChatActivity> = {}
-    ) => {
-      const previous = Option.getOrUndefined(entry.value.activity)
-      entry.value = {
-        ...entry.value,
-        activity: Option.some({
-          phase,
-          since: previous?.phase === phase ? previous.since : Date.now(),
-          fraction: Option.none(),
-          completed: Option.none(),
-          total: Option.none(),
-          cached: Option.none(),
-          loadDetails: Option.none(),
-          ...details,
-        }),
-      }
-    }
-    const consume = (entry: Running, chunk: Native.ChatCompletionChunk) =>
-      Effect.gen(function* () {
-        const now = Date.now()
-        if (Option.isSome(chunk.progress)) {
-          const p = chunk.progress.value
-          if (p.phase === "model_loading")
-            setPhase(
-              entry,
-              p.stage === "optimizing"
-                ? "optimizing"
-                : p.stage === "finalizing"
-                ? "finalizing"
-                : p.stage === "queued"
-                ? "model_queued"
-                : p.stage === "preparing"
-                ? "preparing_model"
-                : "loading",
-              {
-                fraction: someFinite(Math.min(1, Math.max(0, p.fraction))),
-                loadDetails: p.details,
-              }
-            )
-          else if (p.phase === "prefill")
-            setPhase(entry, "prefill", {
-              fraction:
-                p.total_tokens > 0
-                  ? Option.some(
-                      Math.min(1, p.completed_tokens / p.total_tokens)
-                    )
-                  : Option.none(),
-              completed: Option.some(p.completed_tokens),
-              total: Option.some(p.total_tokens),
-              cached: Option.some(p.cached_tokens),
-            })
-          else setPhase(entry, p.phase)
-        }
-        if (Option.isSome(chunk.timings)) {
-          const t = chunk.timings.value
-          entry.value = {
-            ...entry.value,
-            metrics: {
-              ...entry.value.metrics,
-              inputTokens: Option.some(t.prompt_n),
-              cachedTokens: Option.some(t.cache_n),
-              outputTokens: Option.some(t.predicted_n),
-              decodeMs: someFinite(t.predicted_ms),
-              tokensPerSecond: someFinite(t.predicted_per_second),
-              promptMs: someFinite(t.prompt_ms),
-              promptTokensPerSecond: someFinite(t.prompt_per_second),
-              engineTtftMs: someFinite(t.time_to_first_token_ms),
-            },
-          }
-        }
-        if (Option.isSome(chunk.usage)) {
-          const u = chunk.usage.value
-          entry.value = {
-            ...entry.value,
-            metrics: {
-              ...entry.value.metrics,
-              inputTokens: Option.some(u.prompt_tokens),
-              outputTokens: Option.some(u.completion_tokens),
-              cachedTokens: Option.some(u.prompt_tokens_details.cached_tokens),
-            },
-          }
-        }
-        const choice = chunk.choices.find((c) => c.index === 0)
-        if (choice) {
-          const content = Option.getOrNull(choice.delta.content) ?? ""
-          const reasoning = Option.getOrElse(
-            choice.delta.reasoning_content,
-            () => ""
-          )
-          if (content || reasoning) {
-            let metrics = entry.value.metrics
-            if (Option.isNone(metrics.ttftMs))
-              metrics = {
-                ...metrics,
-                ttftMs: Option.some(now - entry.value.createdAt),
-              }
-            if (reasoning && Option.isNone(entry.reasoningStarted))
-              entry.reasoningStarted = Option.some(now)
-            if (content && Option.isNone(metrics.firstAnswerMs))
-              metrics = {
-                ...metrics,
-                firstAnswerMs: Option.some(now - entry.value.createdAt),
-                reasoningMs: Option.map(
-                  entry.reasoningStarted,
-                  (start) => now - start
-                ),
-              }
-            entry.value = {
-              ...entry.value,
-              content: entry.value.content + content,
-              reasoning: entry.value.reasoning + reasoning,
-              metrics,
-            }
-            setPhase(entry, content ? "responding" : "thinking")
-          }
-          if (Option.isSome(choice.finish_reason)) {
-            const reason = choice.finish_reason.value
-            if (reason !== "stop" && reason !== "length")
-              return yield* new ChatFailed({
-                code: "Inference",
-                message: `The model ended with ${reason}. This chat has no tools.`,
-              })
-            entry.completion = Option.some(
-              reason === "length" ? "length" : "completed"
-            )
-          }
-        }
-        entry.value = { ...entry.value, updatedAt: now }
-        entry.dirty = true
-        if (now - entry.lastSave >= 1000) {
-          yield* storage.save(entry.value)
-          entry.lastSave = now
-        }
-      })
-    const finish = (
-      id: ChatConversationId,
-      entry: Running,
-      cause: Option.Option<Cause.Cause<ChatFailed>>
-    ) =>
-      lock.withPermits(1)(
-        Effect.gen(function* () {
-          const now = Date.now()
-          const status = Option.isSome(cause)
-            ? Cause.isInterruptedOnly(cause.value)
-              ? entry.stopRequested
-                ? "stopped"
-                : "interrupted"
-              : "failed"
-            : Option.getOrElse(entry.completion, () => "interrupted" as const)
-          const error =
-            Option.isSome(cause) && !Cause.isInterruptedOnly(cause.value)
-              ? Option.some(
-                  Option.getOrElse(
-                    Cause.failureOption(cause.value),
-                    () =>
-                      new ChatFailed({
-                        code: "Inference",
-                        message:
-                          "The response was interrupted by an unexpected service error.",
-                      })
-                  ).message
-                )
-              : status === "interrupted"
-              ? Option.some(
-                  "The response ended before completion. Retry to continue."
-                )
-              : Option.none<string>()
-          entry.value = {
-            ...entry.value,
-            status,
-            error,
-            updatedAt: now,
-            activity: Option.none(),
-            metrics: {
-              ...entry.value.metrics,
-              totalMs: Option.some(now - entry.value.createdAt),
-              reasoningMs: Option.orElse(entry.value.metrics.reasoningMs, () =>
-                Option.map(entry.reasoningStarted, (start) => now - start)
-              ),
-            },
-          }
-          const saved = yield* Effect.either(storage.save(entry.value))
-          if (saved._tag === "Left") {
-            entry.value = {
-              ...entry.value,
-              error: Option.some(
-                "The response ended, but chat history could not be saved. Check access to the Magnitude data folder before retrying."
-              ),
-            }
-            yield* Effect.logError(saved.left.message)
-          }
-          yield* publishGeneration(id, entry.value)
-          // Retain an unsaved terminal response for this process and retry its write on the next send.
-          if (saved._tag === "Right") running.delete(id)
-          yield* historyChanged
-          const m = entry.value.metrics
-          yield* usage.record({
-            id: ServingUsageRecord.fields.id.make(`chat:${entry.value.id}`),
-            model: ServingModelId.make(entry.value.modelId),
-            completedAt: now,
-            input: Option.getOrNull(m.inputTokens),
-            cached: Option.getOrNull(m.cachedTokens),
-            output: Option.getOrNull(m.outputTokens),
-            generationMs: Option.getOrNull(
-              Option.filter(m.decodeMs, (n) => n > 0)
-            ),
-            firstTokenMs: Option.getOrNull(m.ttftMs),
-            complete: status === "completed" || status === "length",
-          })
-        })
-      )
-    const start: ChatService["start"] = (input) =>
-      lock.withPermits(1)(
-        Effect.uninterruptible(
-          Effect.gen(function* () {
-            const previous = yield* storage.findCommand(
-              input.commandId,
-              input.conversationId
-            )
-            if (Option.isSome(previous)) return previous.value.id
-            if (
-              running.get(input.conversationId)?.value.status === "running" ||
-              deleting.has(input.conversationId)
-            )
-              return yield* new ChatFailed({
-                code: "Busy",
-                message: "A response is already running in this conversation.",
-              })
-            if (
-              Option.isSome(input.content) ===
-              Option.isSome(input.retryMessageId)
-            )
-              return yield* invalid(
-                "Send a message or retry the last response."
-              )
-            if (Option.isSome(input.content) && !input.content.value.trim())
-              return yield* invalid("Enter a message first.")
-            const unsaved = running.get(input.conversationId)
-            if (unsaved) {
-              yield* storage.save(unsaved.value)
-              running.delete(input.conversationId)
-            }
-            const conversation = yield* storage.get(input.conversationId)
-            const models = yield* inference.models
-            const modelId = yield* Option.match(input.settings.modelId, {
-              onNone: () => Effect.fail(invalid("Choose a model first.")),
-              onSome: Effect.succeed,
-            })
-            const model = models.data.find((m) => m.id === modelId)
-            if (
-              !model ||
-              !model.architecture.input_modalities.includes("text") ||
-              !model.architecture.output_modalities.includes("text")
-            )
-              return yield* invalid(
-                "This model is unavailable for text chat. Choose an installed text model."
-              )
-            const reasoning = Option.getOrNull(model.reasoning)
-            if (
-              Option.isSome(input.settings.reasoningEffort) &&
-              (!reasoning?.supported_efforts.includes(
-                input.settings.reasoningEffort.value
-              ) ||
-                (reasoning.mandatory &&
-                  ["none", "off"].includes(
-                    input.settings.reasoningEffort.value
-                  )))
-            )
-              return yield* invalid(
-                "This model does not support that reasoning level."
-              )
-            const settings = input.settings
-            const optional = <A>(value: Option.Option<A>) =>
-              Option.getOrUndefined(value)
-            const messages = Option.isSome(input.retryMessageId)
-              ? conversation.messages.slice(0, -1)
-              : conversation.messages
-            const request = yield* Schema.decodeUnknown(
-              Native.ChatCompletionRequest
-            )({
-              model: modelId,
-              stream: true,
-              stream_options: { include_usage: true },
-              timings_per_token: true,
-              messages: [
-                {
-                  role: "system",
-                  content: settings.systemPrompt,
-                },
-                ...messages
-                  .filter((m) => m.role === "user" || m.content.length > 0)
-                  .map((m) => ({ role: m.role, content: m.content })),
-                ...(Option.isSome(input.content)
-                  ? [{ role: "user", content: input.content.value }]
-                  : []),
-              ],
-              ...Object.fromEntries(
-                Object.entries({
-                  temperature: optional(settings.temperature),
-                  max_tokens: optional(settings.maxOutputTokens),
-                  reasoning_effort: optional(settings.reasoningEffort),
-                  top_p: optional(settings.topP),
-                  top_k: optional(settings.topK),
-                  min_p: optional(settings.minP),
-                  repetition_penalty: optional(settings.repetitionPenalty),
-                  presence_penalty: optional(settings.presencePenalty),
-                  frequency_penalty: optional(settings.frequencyPenalty),
-                  seed: optional(settings.seed),
-                  stop: settings.stop.length ? settings.stop : undefined,
-                }).filter(([, v]) => v !== undefined)
-              ),
-            }).pipe(
-              Effect.mapError(() =>
-                invalid("These settings could not be used for this model.")
-              )
-            )
-            const now = Date.now()
-            const generation: StoredChatGeneration = {
-              id: ChatGenerationId.make(crypto.randomUUID()),
-              commandId: input.commandId,
-              messageId: Option.getOrElse(input.retryMessageId, () =>
-                ChatMessageId.make(crypto.randomUUID())
-              ),
-              modelId,
-              settings,
-              status: "running",
-              createdAt: now,
-              updatedAt: now,
-              content: "",
-              reasoning: "",
-              activity: Option.some({
-                phase: "starting",
-                since: now,
-                fraction: Option.none(),
-                completed: Option.none(),
-                total: Option.none(),
-                cached: Option.none(),
-                loadDetails: Option.none(),
-              }),
-              metrics: emptyChatMetrics,
-              error: Option.none(),
-              requestJson: yield* Schema.encode(
-                Schema.parseJson(
-                  Schema.Struct({
-                    infoVersion: Schema.Literal(1),
-                    request: Native.ChatCompletionRequest,
-                  })
-                )
-              )({ infoVersion: 1, request }).pipe(Effect.orDie),
-            }
-            yield* storage.admit(
-              input.conversationId,
-              generation,
-              Option.map(input.content, (content) => ({
-                id: ChatMessageId.make(crypto.randomUUID()),
-                content,
-              })),
-              input.retryMessageId
-            )
-            const entry: Running = {
-              value: generation,
-              fiber: Option.none(),
-              dirty: false,
-              lastSave: now,
-              reasoningStarted: Option.none(),
-              completion: Option.none(),
-              stopRequested: false,
-            }
-            running.set(input.conversationId, entry)
-            yield* publish(input.conversationId).pipe(Effect.catchAll(error => Effect.logError(error.message)))
-            yield* historyChanged
-            const releaseActivity = yield* activity.begin
-            const ready = yield* Deferred.make<void>()
-            const work = Effect.uninterruptibleMask((restore) =>
-              Deferred.succeed(ready, undefined).pipe(
-                Effect.zipRight(
-                  restore(Effect.scoped(Effect.gen(function* () {
-                    yield* Effect.forkScoped(Effect.forever(Effect.sleep("80 millis").pipe(
-                      Effect.zipRight(lock.withPermits(1)(Effect.suspend(() => {
-                        if (!entry.dirty) return Effect.void
-                        entry.dirty = false
-                        return publishGeneration(input.conversationId, entry.value)
-                      }))),
-                    )))
-                    yield* inference.generate(request).pipe(Stream.runForEach(chunk => consume(entry, chunk)))
-                  }))                  ).pipe(
-                    Effect.exit,
-                    Effect.flatMap((exit) =>
-                      finish(
-                        input.conversationId,
-                        entry,
-                        exit._tag === "Failure"
-                          ? Option.some(exit.cause)
-                          : Option.none()
-                      )
-                    )
-                  )
-                )
-              )
-            )
-            entry.fiber = Option.some(
-              yield* Effect.forkIn(
-                work.pipe(
-                  Effect.interruptible,
-                  Effect.ensuring(Effect.sync(releaseActivity))
-                ),
-                scope
-              )
-            )
-            yield* Deferred.await(ready)
-            return generation.id
-          })
-        )
-      )
-    return ChatService.of({
-      models: inference.models,
-      list: (offset, limit) =>
-        storage.list(offset, limit).pipe(
-          Effect.map((history) => ({
-            ...history,
-            conversations: history.conversations.map((c) => {
-              const entry = running.get(c.id)
-              return entry
-                ? { ...c, active: entry.value.status === "running" }
-                : c
-            }),
-          }))
-        ),
-      get,
-      create: (id, settings) =>
-        snapshotMutation(id, storage.create(id, settings)),
-      update: (id, title, settings) =>
-        snapshotMutation(id, storage.update(id, title, settings)),
-      remove: (id) =>
-        Effect.uninterruptible(
-          Effect.gen(function* () {
-            const active = yield* lock.withPermits(1)(
-              Effect.sync(() => {
-                deleting.add(id)
-                return running.get(id)
-              })
-            )
-            if (active && Option.isSome(active.fiber))
-              yield* Fiber.interrupt(active.fiber.value)
-            yield* lock.withPermits(1)(
-              storage.remove(id).pipe(
-                Effect.tap(() =>
-                  Effect.sync(() => {
-                    running.delete(id)
-                  })
-                ),
-                Effect.tap(() =>
-                  Effect.forEach(
-                    viewers.get(id) ?? [],
-                    (q) =>
-                      offer(q, { _tag: "Deleted", conversationId: id }),
-                    { discard: true }
-                  )
-                ),
-                Effect.tap(() => historyChanged)
-              )
-            )
-          }).pipe(
-            Effect.ensuring(
-              Effect.sync(() => {
-                deleting.delete(id)
-              })
-            )
-          )
-        ),
-      start,
-      stop: (id, generationId) =>
-        Effect.gen(function* () {
-          const active = running.get(id)
-          if (
-            active?.value.id === generationId &&
-            Option.isSome(active.fiber)
-          ) {
-            active.stopRequested = true
-            yield* Fiber.interrupt(active.fiber.value)
-          }
-        }),
-      watch: id => Stream.unwrapScoped(Effect.gen(function* () {
-        const queue = yield* Effect.acquireRelease(Queue.sliding<void>(1), Queue.shutdown)
-        const subscriber: Subscriber = { queue, pending: Option.none() }
-        const initial = yield* lock.withPermits(1)(Effect.gen(function* () {
-          const conversation = yield* get(id)
-          const set = viewers.get(id) ?? new Set<Subscriber>()
-          set.add(subscriber); viewers.set(id, set)
-          return { _tag: "Snapshot" as const, conversation }
+    const inference = yield* ChatInference
+    const listChanged = changes.publish({ operation: Chat.list._tag })
+
+    const instances = yield* makeInstances({
+      open: (chatId: SessionId, removed: Effect.Effect<void, ChatStoreError>) => Effect.gen(function* () {
+        const record = yield* SubscriptionRef.make(yield* store.record(chatId))
+        const log = store.session(chatId)
+        // Recovery runs before anything can close the instance it opens, and the chat list is told
+        // of the response it ends. Each commit, once stored, applies to the record held here; it runs
+        // under the engine's lock, so a view sees a commit in the record and the transcript together.
+        const runtime = yield* settled(ChatEngineDefinition.open({
+          store: {
+            read: log.read,
+            commit: (events) => Effect.zipRight(log.commit(events), SubscriptionRef.update(record, (current) => committedRecord(chatId, current, events))),
+          },
+          recover: (context) => Effect.tap(recover(context), (ended) => ended ? listChanged : Effect.void),
         }))
-        yield* Effect.addFinalizer(() => Effect.sync(() => {
-          viewers.get(id)?.delete(subscriber)
-          if (viewers.get(id)?.size === 0) viewers.delete(id)
-        }))
-        return Stream.concat(Stream.succeed(initial), Stream.fromQueue(queue).pipe(
-          Stream.mapEffect(() => Effect.sync(() => {
-            const pending = subscriber.pending
-            subscriber.pending = Option.none()
-            return pending
-          })),
-          Stream.filterMap(update => update),
+        const facade = ChatFacade.make({ runtime })
+        // The chat list follows every change to the transcript other than output, which changes
+        // the record's caches or whether a response runs, from the transcript the session opened
+        // with, read here, before any command can change it.
+        const opened = yield* facade.queries.transcript.get()
+        yield* Effect.forkScoped(facade.queries.transcript.changes().pipe(
+          Stream.dropWhile((transcript) => listedAlike(transcript, opened)),
+          Stream.changesWith(listedAlike),
+          Stream.runForEach(() => listChanged)
         ))
+        return {
+          record,
+          closed: runtime.closed,
+          removed: Effect.mapError(removed, storageFailed),
+          facade,
+          awaitIdle: runtime.awaitIdle,
+          close: runtime.close,
+          failed: Effect.map(runtime.closed, (closure) => closure._tag === "Failed"),
+        } satisfies ChatInstance
+      }),
+      remove: (chatId: SessionId) => store.delete(chatId),
+      // A failed instance may have left a response running, which its session's next open ends; it
+      // no longer runs, so the chat list, told of it, lists it as not running.
+      failed: () => listChanged,
+      idleTimeToLive: "30 seconds",
+    })
+
+    /** Runs with the chat's instance. */
+    const withChat = <A, E>(chatId: SessionId, use: (instance: ChatInstance) => Effect.Effect<A, E>) =>
+      Effect.scoped(Effect.flatMap(Effect.mapError(instances.get(chatId), storageFailed), use))
+
+    /**
+     * Commits what a command decided, or tells why it could not. A command racing the chat's removal
+     * finds it gone once the removal's delete has succeeded, and fails for the store's reason if the
+     * delete failed; one racing a store failure fails for the store's reason.
+     */
+    const decide = <J>(
+      instance: ChatInstance,
+      command: Effect.Effect<Either.Either<void, J>, EventSettlementError | ChatStoreError | EngineClosed>,
+      gone: () => J
+    ) =>
+      settled(command).pipe(
+        Effect.catchAll((error): Effect.Effect<never, J | ChatStorageFailed> => error._tag === "EngineClosed"
+          ? Effect.flatMap(instance.closed, (closure): Effect.Effect<never, J | ChatStorageFailed> => {
+              switch (closure._tag) {
+                case "Failed":
+                  return failedWith(closure)
+                case "Removed":
+                  return Effect.zipRight(instance.removed, Effect.fail(gone()))
+                case "Closed":
+                  return Effect.interrupt
+              }
+            })
+          : Effect.fail(storageFailed(error))),
+        Effect.flatten
+      )
+
+    const notFound = (chatId: SessionId) => () => new ChatNotFound({ chatId })
+
+    /** The model must be served for text, with the reasoning effort it supports. */
+    const validate = ({ model, reasoningEffort }: ChatMessagePayload | ChatRetryPayload) => Effect.gen(function* () {
+      const served = yield* inference.models
+      const found = served.data.find((candidate) => candidate.id === model)
+      if (
+        found === undefined ||
+        !found.architecture.input_modalities.includes("text") ||
+        !found.architecture.output_modalities.includes("text")
+      ) {
+        return yield* new InvalidChatRequest({ reason: "model_unavailable" })
+      }
+      if (Option.isSome(reasoningEffort)) {
+        const reasoning = Option.getOrNull(found.reasoning)
+        if (
+          reasoning === null ||
+          !reasoning.supported_efforts.includes(reasoningEffort.value) ||
+          (reasoning.mandatory && ["none", "off"].includes(reasoningEffort.value))
+        ) {
+          return yield* new InvalidChatRequest({ reason: "reasoning_unsupported" })
+        }
+      }
+    })
+
+    /**
+     * Validates a command's model, unless its chat does not exist, which is told first, or the
+     * command already took effect, then decides it.
+     */
+    const unlessReplayed = <J>(
+      input: ChatMessagePayload | ChatRetryPayload,
+      replayed: (states: Commands.States) => boolean,
+      command: (mutations: ChatInstance["facade"]["mutations"]) => Effect.Effect<
+        Either.Either<void, J>,
+        EventSettlementError | ChatStoreError | EngineClosed
+      >
+    ) => withChat(input.chatId, (instance) => Effect.gen(function* () {
+      const states = yield* instance.facade.queries.states.get()
+      if (!states.exists) return yield* new ChatNotFound({ chatId: input.chatId })
+      if (!replayed(states)) yield* validate(input)
+      yield* decide<J | ChatNotFound>(instance, command(instance.facade.mutations), notFound(input.chatId))
+    }))
+
+    /**
+     * A record as listed: a response runs only in its session's open instance, so a session with
+     * none has no response running. The list is told whenever that changes: of every change to an
+     * open chat, of recovery's end, of an instance that failed once it is forgotten, of a rename, and
+     * of a removal once it ends, whether or not its delete succeeded.
+     */
+    const listed = (record: ChatSessionRecord): Effect.Effect<ChatSummary> =>
+      Effect.flatMap(instances.current(record.id), Option.match({
+        onNone: () => Effect.succeed(summaryOf(record, [])),
+        onSome: (instance) => Effect.map(instance.facade.queries.transcript.get(), (transcript) => summaryOf(record, transcript)),
+      }))
+
+    return ChatService.of({
+      list: (offset, limit) =>
+        // One more row than asked for says whether there are more.
+        Effect.mapError(store.page({ offset, limit: limit + 1 }), storageFailed).pipe(
+          Effect.flatMap((records) => Effect.map(
+            Effect.forEach(records.slice(0, limit), listed),
+            (chats): ChatPage => ({ chats, hasMore: records.length > limit })
+          ))
+        ),
+      // Only a start creates a chat. Its IDs are the client's, so a chat that exists is either this
+      // start's, replayed, or another's. A removed chat is gone, so a replay after it recreates it.
+      start: (input) => withChat(input.chatId, (instance) => Effect.gen(function* () {
+        if (!Commands.startReplayed(input)(yield* instance.facade.queries.states.get())) yield* validate(input)
+        yield* decide(instance, instance.facade.mutations.start(input), () => new InvalidChatRequest({ reason: "ids_in_use" }))
+      })),
+      send: (input) => unlessReplayed(input, Commands.sendReplayed(input), (mutations) => mutations.send(input)),
+      retry: (input) => unlessReplayed(input, Commands.retryReplayed(input), (mutations) => mutations.retry(input)),
+      /**
+       * Renames from the title the client saw, in the record. A chat that already has the title is
+       * renamed already, as by a replay; one whose title is neither has been renamed meanwhile,
+       * which the client is told. A rename applies to the record of the chat's instance if one is
+       * open or opening: an instance that opens after the store's rename loads the renamed record,
+       * and applying it again changes nothing.
+       */
+      rename: ({ chatId, from, title }) => Effect.flatMap(DateTime.now, (time) => Effect.mapError(store.rename(chatId, { from, title, time }), storageFailed).pipe(
+        Effect.flatMap((outcome): Effect.Effect<void, ChatNotFound | InvalidChatRequest> => {
+          switch (outcome) {
+            case "renamed":
+              return instances.current(chatId).pipe(
+                Effect.flatMap(Option.match({
+                  onNone: () => Effect.void,
+                  onSome: (instance) => SubscriptionRef.update(instance.record, Option.map((record) => renamedRecord(record, { title, time }))),
+                })),
+                Effect.zipRight(listChanged)
+              )
+            case "unchanged":
+              return Effect.void
+            case "title_changed":
+              return Effect.fail(new InvalidChatRequest({ reason: "title_changed" }))
+            case "missing":
+              return Effect.fail(new ChatNotFound({ chatId }))
+          }
+        })
+      )),
+      stop: (input) => withChat(input.chatId, (instance) =>
+        decide(instance, instance.facade.mutations.stop(input), notFound(input.chatId))),
+      remove: (chatId) => instances.remove(chatId).pipe(Effect.mapError(storageFailed), Effect.ensuring(listChanged)),
+      watch: (chatId) => Stream.unwrapScoped(Effect.gen(function* () {
+        const { closed, removed, facade, record } = yield* Effect.mapError(instances.get(chatId), storageFailed)
+        // Each change to the transcript or live state, and each change to the record the instance
+        // holds (a rename: a watch holds its chat's instance, so every rename of it lands there), is
+        // read again in one step, so the views a watcher is given follow one another. The changes end
+        // once the instance has closed and its final state is read, and so do they.
+        const triggers = Stream.merge(
+          Stream.map(facade.queries.view.changes(), () => undefined),
+          Stream.map(record.changes, () => undefined),
+          { haltStrategy: "left" }
+        )
+        const views = triggers.pipe(
+          Stream.mapEffect(() => facade.queries.watched.get(Ref.get(record))),
+          Stream.changesWith((previous: View, current: View) => Equal.equals(previous, current)),
+          Stream.mapAccumEffect(Option.none<View>(), (previous, current) => Option.match(previous, {
+            // The chat exists while it has a record.
+            onNone: () => Option.match(current.chat, {
+              onNone: () => Effect.fail(new ChatNotFound({ chatId })),
+              onSome: (chat) => Effect.succeed([
+                Option.some<View>(current),
+                [{ _tag: "snapshot", chat, messages: current.messages, live: current.live } as ChatUpdate],
+              ] as const),
+            }),
+            onSome: (last) => Effect.succeed([Option.some<View>(current), [changeBetween(last, current)]] as const),
+          })),
+          Stream.flattenIterables
+        )
+        // The view ends when the instance closes, for the reason it closed. A subscription never
+        // completes on its own: only the service's terminal control at shutdown ends it, so a removed
+        // chat's watch says so once the removal's delete has succeeded, and stays open; a delete that
+        // failed fails the watch for the store's reason. A closing service ends the rest itself.
+        const ending = Stream.unwrap(Effect.map(closed, (closure): Stream.Stream<ChatUpdate, ChatStorageFailed> => {
+          switch (closure._tag) {
+            case "Removed":
+              return Stream.concat(Stream.as(Stream.fromEffect(removed), { _tag: "removed" } as ChatUpdate), Stream.never)
+            case "Failed":
+              return Stream.fromEffect(failedWith(closure))
+            case "Closed":
+              return Stream.never
+          }
+        }))
+        return Stream.concat(views, ending)
       })),
     })
   })

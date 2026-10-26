@@ -6,15 +6,15 @@ import type * as Rpc from "@effect/rpc/Rpc"
 import { AcnRpcRecoveryPolicyTag } from "../transport/recovery"
 import { AcnRpcGroup, MagnitudeRpcs } from "./acn"
 import { Connection } from "./connection"
-import { Sessions } from "./sessions"
+import { Projects } from "./projects"
 
 describe("ACN boundary lifecycle policy", () => {
   const healthTag: Extract<TreeRpcs<typeof MagnitudeRpcs>["_tag"], "Health"> = "Health"
   void healthTag
   type HealthRpc = Extract<TreeRpcs<typeof Connection>, { readonly _tag: "Health" }>
-  type SessionQueryRpc = Extract<TreeRpcs<typeof Sessions>, { readonly _tag: "ListSessions" }>
+  type ProjectQueryRpc = Extract<TreeRpcs<typeof Projects>, { readonly _tag: "ListProjects" }>
   expectTypeOf<Rpc.Middleware<HealthRpc>>().toEqualTypeOf<never>()
-  expectTypeOf<Rpc.Middleware<SessionQueryRpc>>().toEqualTypeOf<never>()
+  expectTypeOf<Rpc.Middleware<ProjectQueryRpc>>().toEqualTypeOf<never>()
   it("derives finite recovery policy without lifecycle middleware", () => {
     for (const operation of AcnRpcGroup.requests.values()) {
       const recovery = Context.getOption(operation.annotations, AcnRpcRecoveryPolicyTag)
@@ -33,12 +33,10 @@ describe("ACN boundary lifecycle policy", () => {
       .map((operation) => operation._tag)
       .sort()
     expect(streams).toEqual([
-      "StreamActiveSessionStatuses",
       "StreamChanges",
-      "StreamDisplayView",
       "StreamModelCandidateInspection",
       "WatchApplicationOwner",
-      "WatchChatConversation",
+      "WatchChat",
       "WatchFile",
       "WatchHarnessConnections",
       "WatchProjectFiles",

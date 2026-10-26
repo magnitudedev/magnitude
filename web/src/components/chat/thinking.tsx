@@ -1,8 +1,8 @@
 import { Option } from "effect"
-import type { ChatModels } from "@magnitudedev/sdk"
+import type { InferenceModel, ReasoningEffort, ResponseReasoningEffort } from "@magnitudedev/sdk"
 import {
-  chatReasoningEffort,
-  chatReasoningLevels,
+  reasoningEffortFor,
+  reasoningLevels,
 } from "@magnitudedev/client-common"
 import { ChartBarIcon } from "@phosphor-icons/react"
 import {
@@ -19,12 +19,12 @@ export function ChatThinkingSelect({
   selected,
   onChange,
 }: {
-  model: (typeof ChatModels.Type.data)[number] | undefined
-  selected: Option.Option<string>
-  onChange: (effort: string) => void
+  model: InferenceModel | undefined
+  selected: Option.Option<ResponseReasoningEffort>
+  onChange: (effort: ReasoningEffort) => void
 }) {
-  const levels = chatReasoningLevels(model)
-  const effort = Option.getOrUndefined(chatReasoningEffort(model, selected))
+  const levels = reasoningLevels(model)
+  const effort = Option.getOrUndefined(reasoningEffortFor(model, selected))
   const label = levels.find((level) => level.value === effort)?.label ?? "Off"
   const disabled = levels.length < 2
   const explanation = !model
@@ -51,7 +51,8 @@ export function ChatThinkingSelect({
               value={effort ?? ""}
               disabled={disabled}
               onValueChange={(next) => {
-                if (next) onChange(next)
+                const level = levels.find((l) => l.value === next)
+                if (level) onChange(level.value)
               }}
             >
               <SelectTrigger

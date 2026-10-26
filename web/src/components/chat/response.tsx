@@ -1,6 +1,10 @@
 import { memo, useMemo, useState } from "react"
 import { Option } from "effect"
-import type { ChatGeneration } from "@magnitudedev/sdk"
+import {
+  type ChatAssistantMessage,
+  responseMetrics,
+  responseStatusText,
+} from "@magnitudedev/sdk"
 import {
   ArrowCounterClockwiseIcon,
   CaretDownIcon,
@@ -12,18 +16,26 @@ import Markdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { IconButton, number, seconds } from "./shared"
 import { ChatCodeBlock } from "./code-block"
+/** A response's parts of one kind, joined in order. */
+const partsText = (response: ChatAssistantMessage, part: "text" | "reasoning") =>
+  response.content.flatMap((p) => (p._tag === part ? [p.text] : [])).join("")
+
 export function ChatResponse({
-  generation: g,
+  response: g,
   retry,
   notify,
 }: {
-  generation: ChatGeneration
+  response: ChatAssistantMessage
   retry?: () => void
   notify: (text: string) => void
 }) {
   const [details, setDetails] = useState(false)
   const [copied, setCopied] = useState(false)
-  const m = g.metrics
+  const m = responseMetrics(g)
+  const content = partsText(g, "text")
+  const reasoning = partsText(g, "reasoning")
+  const running = Option.isNone(g.end)
+  const { label, problem: failure } = responseStatusText(g)
   const metrics = [
     Option.map(m.tokensPerSecond, (n) => `${number(n)} tok/s`),
     Option.map(m.ttftMs, (n) => `TTFT ${seconds(n)}`),
@@ -34,37 +46,37 @@ export function ChatResponse({
     ["Cached", Option.map(m.cachedTokens, (n) => `${number(n)} tokens`)],
     [
       "Prefill",
-      Option.map(m.promptTokensPerSecond, (n) => `${number(n)} tok/s`),
+      Option.map(m.prefillTokensPerSecond, (n) => `${number(n)} tok/s`),
     ],
     ["First answer", Option.map(m.firstAnswerMs, seconds)],
     ["Total", Option.map(m.totalMs, seconds)],
   ]
   return (
     <article aria-label="Assistant response">
-      {g.reasoning && (
+      {reasoning && (
         <details className="mb-3">
           <summary className="cursor-pointer py-1 text-xs text-slate-500 dark:text-slate-400">
-            {g.status === "running" && !g.content
+            {running && !content
               ? "Thinking"
-              : Option.match(m.reasoningMs, {
+              : Option.match(m.thoughtForMs, {
                   onNone: () => "Thought process",
                   onSome: (ms) => `Thought for ${seconds(ms)}`,
                 })}
           </summary>
           <div className="mt-2 whitespace-pre-wrap break-words border-l-2 border-slate-200 pl-3 text-[13px] leading-6 text-slate-500 dark:border-slate-700 dark:text-slate-400">
-            {g.reasoning}
+            {reasoning}
           </div>
         </details>
       )}
-      {g.content && <ChatMarkdown content={g.content} notify={notify} />}
-      {g.status !== "running" && (
+      {content && <ChatMarkdown content={content} notify={notify} />}
+      {!running && (
         <>
-          {Option.isSome(g.error) && (
+          {Option.isSome(failure) && (
             <p
               role="alert"
               className="mt-3 text-xs leading-5 text-red-600 dark:text-red-400"
             >
-              {g.error.value}
+              {failure.value}
             </p>
           )}
           <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
@@ -77,15 +89,7 @@ export function ChatResponse({
             >
               {[
                 ...metrics,
-                ...(g.status === "stopped"
-                  ? ["Stopped"]
-                  : g.status === "length"
-                  ? ["Output limit reached"]
-                  : g.status === "failed"
-                  ? ["Failed"]
-                  : g.status === "interrupted"
-                  ? ["Interrupted"]
-                  : []),
+                ...Option.toArray(label),
               ].map((metric, i) => (
                 <span key={metric} className="inline-flex items-center gap-2">
                   {i > 0 && (
@@ -101,9 +105,9 @@ export function ChatResponse({
             <div className="flex items-center">
               <IconButton
                 label={copied ? "Copied" : "Copy response"}
-                disabled={!g.content}
+                disabled={!content}
                 onClick={() => {
-                  void navigator.clipboard.writeText(g.content).then(
+                  void navigator.clipboard.writeText(content).then(
                     () => setCopied(true),
                     () => notify("Copy is unavailable in this browser.")
                   )

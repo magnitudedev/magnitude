@@ -12,8 +12,8 @@
   "cliVersion": "0.2.10",
   "revision": 60,
   "rpc": {
-    "version": 10,
-    "fingerprint": "b78f5ad13b05a44be73f3c18c1326f2f7a1855a6e18319c8208842843e25fa95"
+    "version": 11,
+    "fingerprint": "2c90b62a2557e60d08107e8d86ca0f7c889f4e82fcde3a71e430c773cf5653c5"
   },
   "semanticBreaks": [],
   "plugins": []

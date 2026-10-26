@@ -5,51 +5,11 @@ import { ProjectFileTextSnapshotSchema } from "./schemas/project-files"
 import { SlotIdSchema, UnsupportedReasonSchema } from "./schemas/model-state"
 import { HuggingFaceAccessSchema } from "./schemas/hugging-face"
 
-export class SessionNotFound extends Schema.TaggedError<SessionNotFound>()(
-  "SessionNotFound",
-  { sessionId: Schema.String }
-) {}
-
-export class SessionAlreadyExists extends Schema.TaggedError<SessionAlreadyExists>()(
-  "SessionAlreadyExists",
-  { sessionId: Schema.String }
-) {}
-
-export class SessionStartFailed extends Schema.TaggedError<SessionStartFailed>()(
-  "SessionStartFailed",
-  { sessionId: Schema.String, reason: Schema.String }
-) {}
-
-export class SessionOperationFailed extends Schema.TaggedError<SessionOperationFailed>()(
-  "SessionOperationFailed",
+/** An operation whose handler failed: `operation` names it and `reason` says why. */
+export class OperationFailed extends Schema.TaggedError<OperationFailed>()(
+  "OperationFailed",
   { operation: Schema.String, reason: Schema.String }
 ) {}
-
-export class SessionNotArchived extends Schema.TaggedError<SessionNotArchived>()(
-  "SessionNotArchived",
-  { sessionId: Schema.String }
-) {}
-
-export class DisplayViewNotOpen extends Schema.TaggedError<DisplayViewNotOpen>()(
-  "DisplayViewNotOpen",
-  { sessionId: Schema.String, viewId: Schema.String }
-) {}
-
-export class InvalidSessionPath extends Schema.TaggedError<InvalidSessionPath>()(
-  "InvalidSessionPath",
-  { path: Schema.String }
-) {}
-
-export const SessionError = Schema.Union(
-  SessionNotFound,
-  SessionAlreadyExists,
-  SessionStartFailed,
-  SessionOperationFailed,
-  SessionNotArchived,
-  DisplayViewNotOpen,
-  InvalidSessionPath
-)
-export type SessionError = Schema.Schema.Type<typeof SessionError>
 
 export class ProjectNotFound extends Schema.TaggedError<ProjectNotFound>()(
   "ProjectNotFound",
@@ -63,31 +23,6 @@ export class ProjectStoreUnavailable extends Schema.TaggedError<ProjectStoreUnav
 
 export class InvalidProjectPageCursor extends Schema.TaggedError<InvalidProjectPageCursor>()(
   "InvalidProjectPageCursor",
-  {},
-) {}
-
-export class InvalidSessionPageCursor extends Schema.TaggedError<InvalidSessionPageCursor>()(
-  "InvalidSessionPageCursor",
-  {},
-) {}
-
-export class InvalidDirectoryPageCursor extends Schema.TaggedError<InvalidDirectoryPageCursor>()(
-  "InvalidDirectoryPageCursor",
-  {},
-) {}
-
-export class SessionMetadataWriteFailed extends Schema.TaggedError<SessionMetadataWriteFailed>()(
-  "SessionMetadataWriteFailed",
-  { sessionId: Schema.String },
-) {}
-
-export class SessionMetadataUnreadable extends Schema.TaggedError<SessionMetadataUnreadable>()(
-  "SessionMetadataUnreadable",
-  { sessionId: Schema.String },
-) {}
-
-export class SessionInspectionUnavailable extends Schema.TaggedError<SessionInspectionUnavailable>()(
-  "SessionInspectionUnavailable",
   {},
 ) {}
 
@@ -266,6 +201,12 @@ export const LocalInferenceError = Schema.Union(
   ModelSlotMutationFailed,
 )
 export type LocalInferenceError = Schema.Schema.Type<typeof LocalInferenceError>
+
+/** The inference service could not say which models it serves. */
+export class ServableModelsUnavailable extends Schema.TaggedError<ServableModelsUnavailable>()(
+  "ServableModelsUnavailable",
+  { message: Schema.String },
+) {}
 
 /** A Hugging Face link, repository, version, drafter reference, or local path that names nothing usable. */
 export class InvalidModelReference extends Schema.TaggedError<InvalidModelReference>()(

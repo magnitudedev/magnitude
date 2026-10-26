@@ -16,4 +16,4 @@ export * from './sessions'
 export * from './logs'
 export * from './traces'
 
-export * from "./chat/storage"
+export * from "./chat"
