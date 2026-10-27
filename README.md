@@ -24,6 +24,8 @@ Magnitude is an open source inference engine that tunes its kernels on your hard
 
 ## Get started
 
+Magnitude comes with a desktop app and a CLI. Install from your terminal:
+
 macOS / Linux:
 
 ```sh
@@ -36,7 +38,12 @@ Windows PowerShell:
 irm https://magnitude.dev/install.ps1 | iex
 ```
 
-Includes both the desktop app and CLI. You can also [download manually](https://magnitude.dev/download#manual-downloads)
+Or download the installer:
+
+- **macOS:** [Apple silicon](https://magnitude.dev/api/installer?os=darwin&arch=arm64&package=dmg) · [Intel](https://magnitude.dev/api/installer?os=darwin&arch=x64&package=dmg)
+- **Windows:** [x64](https://magnitude.dev/api/installer?os=windows&arch=x64&package=windows-exe)
+- **Linux x64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=x64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=x64&package=rpm) · [.pkg.tar.zst](https://magnitude.dev/api/installer?os=linux&arch=x64&package=pacman)
+- **Linux ARM64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=rpm)
 
 ### Run it on a server
 
