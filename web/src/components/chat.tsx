@@ -1,5 +1,5 @@
 import { submitsChatMessage } from "./chat/keyboard"
-import { useContext, useRef, useState } from "react"
+import { useCallback, useContext, useRef, useState } from "react"
 import {
   Atom,
   RegistryContext,
@@ -184,6 +184,26 @@ function ChatView({
   const input = useRef<HTMLTextAreaElement>(null)
   const scroller = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
+  const lastScrollTop = useRef(0)
+  // Following the bottom ends the moment the reader scrolls up and resumes once they return to it;
+  // while following, any growth of the transcript (streamed text, an opened thinking panel) is
+  // pinned to the bottom before it paints.
+  const followScroll = useCallback(() => {
+    const node = scroller.current
+    if (!node) return
+    const distance = node.scrollHeight - node.clientHeight - node.scrollTop
+    if (node.scrollTop < lastScrollTop.current && distance > 1) follow.current = false
+    else if (distance < 32) follow.current = true
+    lastScrollTop.current = node.scrollTop
+  }, [])
+  const pinTranscript = useCallback((content: HTMLDivElement) => {
+    const observer = new ResizeObserver(() => {
+      const node = scroller.current
+      if (node && follow.current) node.scrollTop = node.scrollHeight
+    })
+    observer.observe(content)
+    return () => observer.disconnect()
+  }, [])
   const [notice, setNotice] = useState<string | null>(null)
   const last = messages.at(-1)
   const composerText = chatComposerText(
@@ -339,12 +359,7 @@ function ChatView({
         <div className="flex min-w-0 flex-1 flex-col">
           <div
             ref={scroller}
-            onScroll={() => {
-              const node = scroller.current
-              if (node)
-                follow.current =
-                  node.scrollHeight - node.clientHeight - node.scrollTop < 80
-            }}
+            onScroll={followScroll}
             className="chat-scroll min-h-0 flex-1 overflow-y-auto"
           >
             {id && Result.isInitial(watched) ? (
@@ -369,10 +384,7 @@ function ChatView({
               </div>
             ) : (
               <div
-                ref={(node) => {
-                  if (node && follow.current && scroller.current)
-                    scroller.current.scrollTop = scroller.current.scrollHeight
-                }}
+                ref={pinTranscript}
                 className="mx-auto max-w-[760px] space-y-8 pb-8 pt-7 pr-1"
               >
                 {messages.map((message, index) =>
