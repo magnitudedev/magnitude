@@ -92,6 +92,13 @@ inline void split_high2(uint field, thread uint &even, thread uint &odd) {
     odd = (t & 0x0c0c0c0cu) << 2;
 }
 
+// The same for a 16-bit field of 2-bit codes, in bits 0..1.
+inline void split_crumbs(uint field, thread uint &even, thread uint &odd) {
+    split_high2(field, even, odd);
+    even >>= 4;
+    odd >>= 4;
+}
+
 // The same for an 8-bit field of 1-bit high codes, moved to bit 4.
 inline void split_high1(uint field, thread uint &even, thread uint &odd) {
     uint t = (field | (field << 12)) & 0x000f000fu;
@@ -153,6 +160,32 @@ struct CodeRange<Planes<LOW, HIGH>> {
     static constant constexpr uint largest = (1u << (LOW + HIGH)) - 1u;
 };
 
+
+template <>
+struct Planes<2, 0> {
+    struct words {
+        uint2 low;
+    };
+    static words load(device const uchar *row, Rows16 layout, uint p) {
+        words w;
+        w.low = *reinterpret_cast<device const uint2 *>(layout.at(row, layout.codes, 8ul, p));
+        return w;
+    }
+    // Step `step`'s eight codes: bits 16 (step % 2).. of word step / 2.
+    static uint field(thread const words &w, uint step) { return (w.low[step >> 1] >> (16u * (step & 1u))) & 0xffffu; }
+    template <uint MASK>
+    static void floats(thread const words &w, uint step, half offset, thread float4 &even, thread float4 &odd) {
+        uint e, o;
+        split_crumbs(field(w, step), e, o);
+        even = byte_floats(e ^ MASK, offset);
+        odd = byte_floats(o ^ MASK, offset);
+    }
+    template <uint MASK>
+    static uint pair(thread const words &w, uint step, uint j) {
+        uint b = (field(w, step) >> (4u * j)) & 0xfu;
+        return ((b & 3u) | ((b >> 2) << 16)) ^ (MASK & 0x00ff00ffu);
+    }
+};
 
 template <>
 struct Planes<4, 0> {

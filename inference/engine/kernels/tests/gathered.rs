@@ -212,12 +212,18 @@ fn stored_rows_decode_the_rows_their_directory_names() {
         ("gguf_q5_0", "q5g32s@rows16", None),
         ("gguf_q5_1", "q5g32@rows16", None),
     ] {
-        stored_rows_match(source, resident, as_stored);
+        stored_rows_match(source, resident, as_stored, 160);
     }
 }
 
-fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>) {
-    let (rows, slots, width, buckets) = (300usize, 24usize, 160usize, 64usize);
+/// Rows of a 256-value block encoding (Q2_K), 256 wide.
+#[test]
+fn stored_rows_decode_k_quant_rows() {
+    stored_rows_match("gguf_q2_k", "q2k@rows16", None, 256);
+}
+
+fn stored_rows_match(source: &str, resident: &str, as_stored: Option<bool>, width: usize) {
+    let (rows, slots, buckets) = (300usize, 24usize, 64usize);
     let mut random = Random(41);
     let (source_element, resident_element) =
         (Element::named(source).unwrap(), Element::named(resident).unwrap());

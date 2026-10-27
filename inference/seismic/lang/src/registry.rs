@@ -107,7 +107,7 @@ pub enum SourceDialect {
 /// Revision of the whole registry. Any semantic change to a primitive,
 /// capability, intrinsic, or representation changes this string, and with it
 /// every cache identity.
-pub const REGISTRY_REVISION: &str = "seismic-registry-v16";
+pub const REGISTRY_REVISION: &str = "seismic-registry-v17";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityInfo {
@@ -1594,7 +1594,7 @@ const fn gguf_source_spec(
     }
 }
 
-const GGUF_SOURCES: [GgufSource; 17] = [
+const GGUF_SOURCES: [GgufSource; 18] = [
     gguf_source_spec(Encoding::Q3K, 1, "gguf_q3_k", "q6k"),
     gguf_source_spec(Encoding::Iq3S, 1, "gguf_iq3_s", "q6k"),
     gguf_source_spec(Encoding::Q4K, 1, "gguf_q4_k", "q4k"),
@@ -1612,6 +1612,7 @@ const GGUF_SOURCES: [GgufSource; 17] = [
     gguf_source_spec(Encoding::Iq2Xs, 1, "gguf_iq2_xs", "iq2xs"),
     gguf_source_spec(Encoding::Iq3Xxs, 1, "gguf_iq3_xxs", "iq3xxs"),
     gguf_source_spec(Encoding::Iq2Xxs, 1, "gguf_iq2_xxs", "iq2xxs"),
+    gguf_source_spec(Encoding::Q2K, 1, "gguf_q2_k", "q2k"),
 ];
 
 /// The external storage rows of `width` stored values of `encoding` are
@@ -2595,6 +2596,36 @@ pub(crate) mod internals {
                 push(plane(
                     "bias_factor",
                     PlaneRepackRecipe::BitRoutes(direct_bits(2, 2)),
+                ));
+            }
+            "gguf_q2_k" => {
+                // block_q2_K: scales[16] (a 4-bit scale, then a 4-bit
+                // minimum, per 16 values) | qs[64] | d (f16) | dmin (f16).
+                // Value `p`'s code is at bit 2 ((p % 128) / 32) of
+                // `qs[32 (p / 128) + p % 32]`.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::BitRoutes(
+                        (0..512)
+                            .map(|bit| {
+                                let position = bit / 2;
+                                let source_byte = 16 + (position / 128) * 32 + position % 32;
+                                source_byte * 8 + (position % 128 / 32) * 2 + bit % 2
+                            })
+                            .collect(),
+                    ),
+                ));
+                push(plane(
+                    "coefficients",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 16)),
+                ));
+                push(plane(
+                    "scale_factor",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(80, 2)),
+                ));
+                push(plane(
+                    "bias_factor",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(82, 2)),
                 ));
             }
             "gguf_q6_k" => {

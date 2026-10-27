@@ -256,12 +256,13 @@ impl WeightPlan {
 /// The columns of one run of a resident weight's packing bound, the columns
 /// that share a scale: a weight whose resident codes are integers (the
 /// registry's), in the layout the token-packing projection forms read
-/// (Metal's `rows32`); `None` for any other.
+/// (Metal's `rows32`), and that those forms serve
+/// (`IntegerCodes::packing_run`); `None` for any other.
 pub fn packing_run(resident: Element) -> Option<u64> {
     (resident.layout() == Layout::Rows32)
         .then(|| resident.integer_codes())
         .flatten()
-        .map(|codes| codes.group)
+        .and_then(|codes| codes.packing_run())
 }
 
 /// The extent of a weight's packing bound (the `packing_bound` entry), the

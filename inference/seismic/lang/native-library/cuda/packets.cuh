@@ -253,19 +253,45 @@ __device__ __forceinline__ float f16_at(const u8 *address) {
 // 256-code superblocks, so a superblock's four k-blocks always exist and its
 // high plane is fetched warp-coalesced. `W` is the decoder value (its base,
 // stride and planes).
-template <int LOW, int HIGH, bool WHOLE> struct Planes;
-
-// 4-bit codes, with a 1-bit high plane or none.
-template <int HIGH, bool WHOLE> struct Planes<4, HIGH, WHOLE> {
+// LOW-bit codes of a 2- or 4-bit low plane, with a 1-bit high plane or none.
+// A lane chunk of a k-block is 4 LOW bytes of the low plane (and 4 bytes of
+// a 1-bit high plane); a step's word holds its eight slots, LOW bits each
+// (`step_word`). A 2-bit plane's `step_word` spreads its step to the 4-bit
+// slot form, each slot's code in the low bits of its nibble, so every read
+// below is the nibble form's.
+template <u32 LOW> struct LowPlane;
+template <> struct LowPlane<4> {
+    typedef uint4 Words;
+    __device__ static __forceinline__ Words load(const u8 *at) { return seismic_ld_nc_na_v4(at); }
+    __device__ static __forceinline__ u32 step_word(const Words &low, int step) { return word_of(low, step); }
+};
+template <> struct LowPlane<2> {
+    typedef uint2 Words;
+    __device__ static __forceinline__ Words load(const u8 *at) { return seismic_ld_nc_na_v2(at); }
+    // Step s's 16 bits, slot j's code moved from bit 2j to bit 4j.
+    __device__ static __forceinline__ u32 step_word(const Words &low, int step) {
+        u32 x = ((step < 2 ? low.x : low.y) >> (16 * (step % 2))) & 0xFFFFu;
+        x = (x | (x << 8)) & 0x00FF00FFu;
+        x = (x | (x << 4)) & 0x0F0F0F0Fu;
+        return (x | (x << 2)) & 0x33333333u;
+    }
+};
+template <int LOW, int HIGH, bool WHOLE> struct Planes {
+    static_assert(LOW == 2 || LOW == 4, "a sub-byte low plane of 2 or 4 bits");
     static_assert(HIGH <= 1, "a 2-bit high plane needs rows of whole superblocks (Planes<4, 2, true>)");
-    static constexpr int BITS = 4 + HIGH;
+    static_assert(LOW == 4 || HIGH == 0, "a high plane joins a nibble low plane");
+    static constexpr int BITS = LOW + HIGH;
+    typedef LowPlane<(u32)LOW> L;
+    // Low-plane bytes of a lane chunk and of a tile's k-block, and the 16 B
+    // staging chunks of the latter (enumerators: no storage a program keeps).
+    enum : u32 { LANE_BYTES = 4 * LOW, KBLOCK_BYTES = 32 * LANE_BYTES, LOW_CHUNKS = KBLOCK_BYTES / 16 };
     struct Raw {
-        uint4 low;
+        typename L::Words low;
         u32 high;
     };
     template <class W> __device__ static __forceinline__ Raw fetch(const W &w, u64 tile, u64 kblock, u32 lane) {
         Raw raw;
-        raw.low = seismic_ld_nc_na_v4(w.low.chunk(w.base, w.stride, tile, kblock * 512 + lane * 16));
+        raw.low = L::load(w.low.chunk(w.base, w.stride, tile, kblock * KBLOCK_BYTES + lane * LANE_BYTES));
         if constexpr (HIGH == 1)
             raw.high = seismic_ld_nc_u32(w.high.chunk(w.base, w.stride, tile, kblock * 128 + lane * 4));
         else
@@ -289,8 +315,8 @@ template <int HIGH, bool WHOLE> struct Planes<4, HIGH, WHOLE> {
         for (int q = 0; q < 4; ++q)
             if (WHOLE || 4 * superblock + q < kblocks) {
                 if constexpr (WHOLE) {
-                    super.raw[q].low = seismic_ld_nc_na_v4(
-                        w.low.chunk(w.base, w.stride, tile, (4 * superblock + q) * 512 + lane * 16));
+                    super.raw[q].low = L::load(
+                        w.low.chunk(w.base, w.stride, tile, (4 * superblock + q) * KBLOCK_BYTES + lane * LANE_BYTES));
                     super.raw[q].high = 0;
                 } else {
                     super.raw[q] = fetch(w, tile, 4 * superblock + q, lane);
@@ -316,11 +342,14 @@ template <int HIGH, bool WHOLE> struct Planes<4, HIGH, WHOLE> {
     }
     // The step's eight 4-bit low codes, one nibble a slot (a codebook's
     // indices).
-    __device__ static __forceinline__ u32 nibbles(const Raw &raw, int step) { return word_of(raw.low, step); }
+    __device__ static __forceinline__ u32 nibbles(const Raw &raw, int step) {
+        static_assert(LOW == 4, "codebook indices are nibbles");
+        return L::step_word(raw.low, step);
+    }
     // Register i's two codes of step `step` (slots 2i, 2i + 1, in bits 0..
     // and 16..).
     __device__ static __forceinline__ u32 pair(const Raw &raw, int step, int i) {
-        u32 pair = (word_of(raw.low, step) >> (4 * i)) & 0x000F000Fu;
+        u32 pair = (L::step_word(raw.low, step) >> (4 * i)) & 0x000F000Fu;
         if constexpr (HIGH == 1) {
             const u32 bits = raw.high >> (8 * step + i);
             pair |= ((bits << 4) & 0x10u) | ((bits << 16) & 0x100000u);
@@ -329,7 +358,7 @@ template <int HIGH, bool WHOLE> struct Planes<4, HIGH, WHOLE> {
     }
     // Unsigned s8 bytes of rows g and g+8 of step `step` (virtual order).
     __device__ static __forceinline__ S8Pair s8(const Raw &raw, int step) {
-        S8Pair pair = s8_nibbles(word_of(raw.low, step));
+        S8Pair pair = s8_nibbles(L::step_word(raw.low, step));
         if constexpr (HIGH == 1) {
             const u32 bits = raw.high >> (8 * step);
             pair.row_g |= ((bits & 1u) << 4) | (((bits >> 4) & 1u) << 12) | (((bits >> 2) & 1u) << 20) |
@@ -341,24 +370,24 @@ template <int HIGH, bool WHOLE> struct Planes<4, HIGH, WHOLE> {
     }
     // Unsigned code of fragment slot `slot` in step `step`.
     __device__ static __forceinline__ u32 code(const Raw &raw, int step, u32 slot) {
-        u32 value = (word_of(raw.low, step) >> (4 * slot)) & 15u;
+        u32 value = (L::step_word(raw.low, step) >> (4 * slot)) & 15u;
         if constexpr (HIGH == 1)
             value |= ((raw.high >> (8 * step + slot)) & 1u) << 4;
         return value;
     }
     // GEMM staging: the 16 B chunks of one tile's k-block, low plane first.
-    static constexpr int CHUNKS = 32 + (HIGH == 1 ? 8 : 0);
+    static constexpr int CHUNKS = LOW_CHUNKS + (HIGH == 1 ? 8 : 0);
     template <class W> __device__ static __forceinline__ const u8 *chunk_source(const W &w, u64 tile, u64 kblock, u32 chunk) {
         if constexpr (HIGH != 0)
-            if (chunk >= 32)
-                return w.high.chunk(w.base, w.stride, tile, kblock * 128 + (chunk - 32) * 16);
-        return w.low.chunk(w.base, w.stride, tile, kblock * 512 + chunk * 16);
+            if (chunk >= LOW_CHUNKS)
+                return w.high.chunk(w.base, w.stride, tile, kblock * 128 + (chunk - LOW_CHUNKS) * 16);
+        return w.low.chunk(w.base, w.stride, tile, kblock * KBLOCK_BYTES + chunk * 16);
     }
     __device__ static __forceinline__ Raw from_shared(const u8 *staged, u32 lane) {
         Raw raw;
-        raw.low = *reinterpret_cast<const uint4 *>(staged + lane * 16);
+        raw.low = *reinterpret_cast<const typename L::Words *>(staged + lane * LANE_BYTES);
         if constexpr (HIGH == 1)
-            raw.high = *reinterpret_cast<const u32 *>(staged + 512 + lane * 4);
+            raw.high = *reinterpret_cast<const u32 *>(staged + KBLOCK_BYTES + lane * 4);
         else
             raw.high = 0;
         return raw;

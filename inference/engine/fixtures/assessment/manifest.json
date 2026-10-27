@@ -203,7 +203,7 @@
     },
     {
       "name": "qwen35-iq2m",
-      "description": "Qwen3.5 4B UD-IQ2_M: IQ2_S and Q2_K tensors have no import.",
+      "description": "Qwen3.5 4B UD-IQ2_M: IQ2_S tensors have no import.",
       "target": [
         {
           "header": "headers/Qwen3.5-4B-UD-IQ2_M.gguf.gz",
@@ -221,10 +221,6 @@
                   {
                     "ggml_type": "IQ2_S",
                     "tensor_count": 89
-                  },
-                  {
-                    "ggml_type": "Q2_K",
-                    "tensor_count": 5
                   }
                 ]
               }
@@ -470,7 +466,7 @@
     },
     {
       "name": "hauhaucs-gemma4-q2kp",
-      "description": "HauhauCS Gemma 4 E2B Uncensored Aggressive Q2_K_P: Q2_K tensors have no import.",
+      "description": "HauhauCS Gemma 4 E2B Uncensored Aggressive Q2_K_P: Q2_K, Q3_K, Q4_K and Q6_K tensors.",
       "target": [
         {
           "header": "headers/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive-Q2_K_P.gguf.gz",
@@ -480,20 +476,8 @@
         }
       ],
       "expected": {
-        "target": {
-          "unsupported": [
-            {
-              "WeightTypes": {
-                "types": [
-                  {
-                    "ggml_type": "Q2_K",
-                    "tensor_count": 147
-                  }
-                ]
-              }
-            }
-          ]
-        }
+        "target": "supported",
+        "drafter": "none"
       }
     },
     {

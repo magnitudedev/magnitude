@@ -328,6 +328,8 @@ struct packing_layout<packets::Planes<4, 0>, packets::Table<ID>, 1> {
 // + 128 |min term| bounds what it multiplies (`reach`). `available` where
 // the codes are integers, a block of two runs has no min term and the run
 // of a 256-column block's factors is one factor group's or eight packets'.
+// The registry states the same rule as `IntegerCodes::packing_run`
+// (`seismic/api`), by which the planner plans a packing bound.
 template <typename K, uint CENTRE, uint OFFSET>
 struct packing_factors {
     static constant constexpr bool available = false, biased = false;

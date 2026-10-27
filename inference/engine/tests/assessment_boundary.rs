@@ -356,8 +356,8 @@ fn an_unknown_architecture_is_named() {
 #[test]
 fn every_unsupported_weight_type_is_counted() {
     let mut gguf = llama();
-    gguf.encode("blk.0.ffn_up.weight", Encoding::Q2K);
-    gguf.encode("blk.1.ffn_up.weight", Encoding::Q2K);
+    gguf.encode("blk.0.ffn_up.weight", Encoding::Q8K);
+    gguf.encode("blk.1.ffn_up.weight", Encoding::Q8K);
     gguf.encode("blk.1.ffn_gate.weight", Encoding::Iq1M);
     assert_eq!(
         refusal(&gguf, "weights").reasons,
@@ -368,7 +368,7 @@ fn every_unsupported_weight_type_is_counted() {
                     tensor_count: 1
                 },
                 WeightTypeCount {
-                    ggml_type: "Q2_K".into(),
+                    ggml_type: "Q8_K".into(),
                     tensor_count: 2
                 },
             ]
@@ -485,7 +485,7 @@ fn an_unreadable_chat_template_is_named() {
 #[test]
 fn independent_checks_report_every_reason_together() {
     let mut gguf = llama();
-    gguf.encode("blk.0.ffn_down.weight", Encoding::Q2K);
+    gguf.encode("blk.0.ffn_down.weight", Encoding::Q8K);
     gguf.tensor("rope_freqs.weight", &[WIDTH / 2], Encoding::F32);
     gguf.set("tokenizer.ggml.pre", Meta::Str("deepseek-v3".into()));
     gguf.remove("tokenizer.chat_template");
@@ -496,7 +496,7 @@ fn independent_checks_report_every_reason_together() {
         [
             UnsupportedReason::WeightTypes {
                 types: vec![WeightTypeCount {
-                    ggml_type: "Q2_K".into(),
+                    ggml_type: "Q8_K".into(),
                     tensor_count: 1
                 }]
             },
@@ -510,7 +510,7 @@ fn independent_checks_report_every_reason_together() {
             UnsupportedReason::ChatTemplate,
         ]
     );
-    assert!(refusal.detail.contains("Q2_K"), "{}", refusal.detail);
+    assert!(refusal.detail.contains("Q8_K"), "{}", refusal.detail);
 }
 
 /// A header's own refusal is admission's without the weight types: with the
@@ -525,7 +525,7 @@ fn a_header_refuses_what_admission_does_without_its_weight_types() {
         header_refusal(&directory(gguf), extent).map(|refusal| refusal.reasons)
     };
     let mut quantized = llama();
-    quantized.encode("blk.0.ffn_down.weight", Encoding::Q2K);
+    quantized.encode("blk.0.ffn_down.weight", Encoding::Q8K);
     assert_eq!(reasons(&quantized, HeaderExtent::Whole), None);
     let mut refused = quantized;
     refused.tensor("blk.0.attn_q.bias", &[HEADS * WIDTH], Encoding::F32);
@@ -712,14 +712,14 @@ fn prepared(package: &ModelPackagePaths) -> PreparedModelAssessment {
 fn an_unsupported_target_reports_its_fingerprint() {
     let scratch = Scratch::new("unsupported-fingerprint");
     let mut gguf = llama();
-    gguf.encode("blk.0.ffn_up.weight", Encoding::Q2K);
+    gguf.encode("blk.0.ffn_up.weight", Encoding::Q8K);
     let target = gguf.write(&scratch.file("target.gguf"));
     let PreparedModelAssessment::Unsupported {
         unsupported,
         fingerprint,
     } = prepared(&package(target.clone()))
     else {
-        panic!("Q2_K is not imported");
+        panic!("Q8_K is not imported");
     };
     assert!(matches!(
         unsupported.reasons.as_slice(),

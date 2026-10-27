@@ -1333,6 +1333,26 @@ pub(crate) const REPRS: &[Repr] = &[
             carried: true,
         },
     },
+    // GGUF Q2_K: unsigned 2-bit codes, a 4-bit scale and a 4-bit minimum
+    // per 16 under one f16 factor `d` and one f16 minimum factor `dmin` per
+    // 256: ggml's `d s q - dmin m` exactly.
+    Repr {
+        name: "q2k",
+        packing_axis: PackingAxisRule::Last,
+        group: 16,
+        bits: 2,
+        code: CodeInterpretation::Unsigned,
+        float_code: None,
+        coefficients: Coefficients::Hierarchical {
+            factor_group: 256,
+            factor_dtype: DType::F16,
+            factor_exponent: 0,
+            bits: 4,
+            interpretation: CodeInterpretation::Unsigned,
+            minimum: Some(MinimumSign::Subtract),
+            carried: false,
+        },
+    },
 ];
 
 pub(crate) static IQ2XS_CODES: GridCodes = GridCodes {
@@ -2279,7 +2299,7 @@ mod tests {
 
     #[test]
     fn compact_planes_match_payload() {
-        for (name, expected) in [("q4k", 144), ("q5k", 176), ("q6k", 210)] {
+        for (name, expected) in [("q2k", 84), ("q4k", 144), ("q5k", 176), ("q6k", 210)] {
             let r = lookup(name).unwrap();
             assert_eq!(
                 r.planes()

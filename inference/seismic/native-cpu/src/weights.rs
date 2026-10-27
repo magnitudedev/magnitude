@@ -559,17 +559,20 @@ pub trait Codes: Copy + Send + Sync + 'static {
 
 /// Codes in a `LOW`-bit low plane and a `HIGH`-bit high plane
 /// (`registry::code_planes`), read through interpretation `I`: code `i` of
-/// a packet is nibble `i & 1` of byte `i / 2` of a 4-bit low plane (byte
-/// `i` of an 8-bit one) joined with bits `HIGH i ..` of the high plane
-/// shifted to bit `LOW`.
+/// a packet is bits `LOW i ..` of the low plane (the low nibble of byte
+/// `i / 2` first for 4-bit codes; byte `i` of an 8-bit plane) joined with
+/// bits `HIGH i ..` of the high plane shifted to bit `LOW`.
 #[derive(Clone, Copy, Debug)]
 pub struct Planes<const LOW: u32, const HIGH: u32, I>(PhantomData<I>);
 
-impl<const HIGH: u32, I> Planes<4, HIGH, I> {
-    /// The packet's 16 low-plane bytes.
+impl<const LOW: u32, const HIGH: u32, I> Planes<LOW, HIGH, I> {
+    /// The packet's `4 LOW` low-plane bytes.
     #[inline(always)]
     unsafe fn low_bytes(at: At) -> *const u8 {
-        unsafe { at.plane(RowPlaneRole::Codes).add(16 * at.packet) }
+        unsafe {
+            at.plane(RowPlaneRole::Codes)
+                .add(4 * LOW as usize * at.packet)
+        }
     }
 
     /// The packet's `4 HIGH` high-plane bytes.
@@ -584,12 +587,21 @@ impl<const HIGH: u32, I> Planes<4, HIGH, I> {
     /// The packet's raw codes.
     #[inline(always)]
     unsafe fn raw(at: At) -> [u8; PACKET] {
-        const { assert!(HIGH <= 2, "a high plane of at most 2 bits") };
-        let bytes: [u8; 16] = unsafe { read(Self::low_bytes(at)) };
+        const {
+            assert!(
+                matches!(LOW, 2 | 4) && HIGH <= 2,
+                "a 2- or 4-bit low plane and a high plane of at most 2 bits"
+            )
+        };
+        let per_byte = (8 / LOW) as usize;
+        let mask = (1u8 << LOW) - 1;
         let mut codes = [0u8; PACKET];
-        for (i, byte) in bytes.iter().enumerate() {
-            codes[2 * i] = byte & 15;
-            codes[2 * i + 1] = byte >> 4;
+        let low = unsafe { Self::low_bytes(at) };
+        for i in 0..PACKET / per_byte {
+            let byte = unsafe { *low.add(i) };
+            for j in 0..per_byte {
+                codes[per_byte * i + j] = (byte >> (LOW as usize * j)) & mask;
+            }
         }
         if HIGH > 0 {
             let high: u64 = match HIGH {
@@ -598,7 +610,7 @@ impl<const HIGH: u32, I> Planes<4, HIGH, I> {
             };
             let mask = (1u64 << HIGH) - 1;
             for (i, code) in codes.iter_mut().enumerate() {
-                *code |= (((high >> (HIGH as usize * i)) & mask) as u8) << 4;
+                *code |= (((high >> (HIGH as usize * i)) & mask) as u8) << LOW;
             }
         }
         codes
@@ -607,10 +619,11 @@ impl<const HIGH: u32, I> Planes<4, HIGH, I> {
     #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
     #[inline(always)]
     unsafe fn raw_neon(at: At) -> [std::arch::aarch64::int8x16_t; 2] {
+        const { assert!(HIGH == 0 || LOW == 4, "high planes join a nibble low plane") };
         let low = unsafe { Self::low_bytes(at) };
         match HIGH {
-            0 => unsafe { packed_neon::nibbles(low, 0) },
-            1 => unsafe { packed_neon::nibbles(low, read(Self::high_bytes(at))) },
+            0 => unsafe { packed_neon::codes::<LOW>(low, 0) },
+            1 => unsafe { packed_neon::codes::<LOW>(low, read(Self::high_bytes(at))) },
             _ => unsafe { packed_neon::nibbles2(low, Self::high_bytes(at)) },
         }
     }
@@ -618,18 +631,19 @@ impl<const HIGH: u32, I> Planes<4, HIGH, I> {
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn raw_x86(at: At) -> std::arch::x86_64::__m256i {
+        const { assert!(HIGH == 0 || LOW == 4, "high planes join a nibble low plane") };
         let low = unsafe { Self::low_bytes(at) };
         match HIGH {
-            0 => unsafe { packed_x86::nibbles(low) },
+            0 => unsafe { packed_x86::codes::<LOW>(low) },
             1 => unsafe { packed_x86::nibbles1(low, read(Self::high_bytes(at))) },
             _ => unsafe { packed_x86::nibbles2(low, Self::high_bytes(at)) },
         }
     }
 }
 
-impl<const HIGH: u32> Codes for Planes<4, HIGH, Unsigned> {
+impl<const LOW: u32, const HIGH: u32> Codes for Planes<LOW, HIGH, Unsigned> {
     const LEAST: i32 = 0;
-    const GREATEST: i32 = (16 << HIGH) - 1;
+    const GREATEST: i32 = (1 << (LOW + HIGH)) - 1;
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
@@ -660,12 +674,12 @@ impl<const HIGH: u32> Codes for Planes<4, HIGH, Unsigned> {
     }
 }
 
-impl<const HIGH: u32, const C: i32> Codes for Planes<4, HIGH, Offset<C>> {
+impl<const LOW: u32, const HIGH: u32, const C: i32> Codes for Planes<LOW, HIGH, Offset<C>> {
     const LEAST: i32 = {
         assert!(C >= 0 && C <= 128, "values fit a signed byte");
         -C
     };
-    const GREATEST: i32 = (16 << HIGH) - 1 - C;
+    const GREATEST: i32 = (1 << (LOW + HIGH)) - 1 - C;
 
     #[inline(always)]
     unsafe fn values(at: At) -> [i8; PACKET] {
@@ -2265,25 +2279,42 @@ mod packed_neon {
         }
     }
 
-    /// A packet's codes in element order: codes 2i and 2i + 1 are the low
-    /// and high nibble of byte i, each joined with its bit of `high` (a
-    /// 1-bit high plane's packet word). Codes are at most 31, so they are
-    /// also signed bytes.
+    /// A packet's codes of a `LOW`-bit low plane (`4 LOW` bytes) in element
+    /// order: code `(8 / LOW) i + j` is bits `LOW j ..` of byte `i`, joined
+    /// (4-bit codes) with its bit of `high`, a 1-bit high plane's packet word
+    /// (0 for none). Codes are at most 31, so they are also signed bytes.
     ///
     /// # Safety
-    /// `bytes` addresses the packet's 16 code bytes.
+    /// `bytes` addresses the packet's `4 LOW` code bytes.
     #[inline(always)]
-    pub(super) unsafe fn nibbles(bytes: *const u8, high: u32) -> [int8x16_t; 2] {
+    pub(super) unsafe fn codes<const LOW: u32>(bytes: *const u8, high: u32) -> [int8x16_t; 2] {
+        const { assert!(LOW == 2 || LOW == 4, "a 2- or 4-bit low plane") };
         unsafe {
-            let packed = vld1q_u8(bytes);
-            let low = vandq_u8(packed, vdupq_n_u8(15));
-            let upper = vshrq_n_u8(packed, 4);
-            let mut first = vzip1q_u8(low, upper);
-            let mut second = vzip2q_u8(low, upper);
-            if high != 0 {
-                first = vorrq_u8(first, high_bits(high as u16));
-                second = vorrq_u8(second, high_bits((high >> 16) as u16));
-            }
+            let (first, second) = if LOW == 4 {
+                let packed = vld1q_u8(bytes);
+                let low = vandq_u8(packed, vdupq_n_u8(15));
+                let upper = vshrq_n_u8(packed, 4);
+                let mut first = vzip1q_u8(low, upper);
+                let mut second = vzip2q_u8(low, upper);
+                if high != 0 {
+                    first = vorrq_u8(first, high_bits(high as u16));
+                    second = vorrq_u8(second, high_bits((high >> 16) as u16));
+                }
+                (first, second)
+            } else {
+                // Codes 4i..4i + 4 of byte i: its crumbs at bits 0, 2, 4, 6.
+                let packed = vld1_u8(bytes);
+                let three = vdup_n_u8(3);
+                let crumbs = [
+                    vand_u8(packed, three),
+                    vand_u8(vshr_n_u8(packed, 2), three),
+                    vand_u8(vshr_n_u8(packed, 4), three),
+                    vshr_n_u8(packed, 6),
+                ];
+                let even = vcombine_u8(vzip1_u8(crumbs[0], crumbs[2]), vzip2_u8(crumbs[0], crumbs[2]));
+                let odd = vcombine_u8(vzip1_u8(crumbs[1], crumbs[3]), vzip2_u8(crumbs[1], crumbs[3]));
+                (vzip1q_u8(even, odd), vzip2q_u8(even, odd))
+            };
             [vreinterpretq_s8_u8(first), vreinterpretq_s8_u8(second)]
         }
     }
@@ -2455,16 +2486,33 @@ mod packed_x86 {
         }
     }
 
-    /// 16 packed bytes as 32 nibble codes in element order: codes 2i and
-    /// 2i + 1 are the low and high nibble of byte i.
+    /// A packet's `4 LOW` bytes of `LOW`-bit codes as 32 codes in element
+    /// order: code `(8 / LOW) i + j` is bits `LOW j ..` of byte `i`.
     #[inline(always)]
-    pub(super) unsafe fn nibbles(bytes: *const u8) -> __m256i {
+    pub(super) unsafe fn codes<const LOW: u32>(bytes: *const u8) -> __m256i {
+        const { assert!(LOW == 2 || LOW == 4, "a 2- or 4-bit low plane") };
         unsafe {
-            let packed = _mm_loadu_si128(bytes.cast());
-            let mask = _mm_set1_epi8(15);
-            let low = _mm_and_si128(packed, mask);
-            let high = _mm_and_si128(_mm_srli_epi16::<4>(packed), mask);
-            _mm256_set_m128i(_mm_unpackhi_epi8(low, high), _mm_unpacklo_epi8(low, high))
+            if LOW == 4 {
+                let packed = _mm_loadu_si128(bytes.cast());
+                let mask = _mm_set1_epi8(15);
+                let low = _mm_and_si128(packed, mask);
+                let high = _mm_and_si128(_mm_srli_epi16::<4>(packed), mask);
+                _mm256_set_m128i(_mm_unpackhi_epi8(low, high), _mm_unpacklo_epi8(low, high))
+            } else {
+                // Codes 4i..4i + 4 of byte i: its crumbs at bits 0, 2, 4, 6.
+                let packed = _mm_loadl_epi64(bytes.cast());
+                let three = _mm_set1_epi8(3);
+                let crumb0 = _mm_and_si128(packed, three);
+                let crumb1 = _mm_and_si128(_mm_srli_epi16::<2>(packed), three);
+                let crumb2 = _mm_and_si128(_mm_srli_epi16::<4>(packed), three);
+                let crumb3 = _mm_and_si128(_mm_srli_epi16::<6>(packed), three);
+                let pairs01 = _mm_unpacklo_epi8(crumb0, crumb1);
+                let pairs23 = _mm_unpacklo_epi8(crumb2, crumb3);
+                _mm256_set_m128i(
+                    _mm_unpackhi_epi16(pairs01, pairs23),
+                    _mm_unpacklo_epi16(pairs01, pairs23),
+                )
+            }
         }
     }
 
@@ -2489,7 +2537,7 @@ mod packed_x86 {
     /// high plane's packet word).
     #[inline(always)]
     pub(super) unsafe fn nibbles1(bytes: *const u8, high: u32) -> __m256i {
-        unsafe { _mm256_or_si256(nibbles(bytes), high_bits(high)) }
+        unsafe { _mm256_or_si256(codes::<4>(bytes), high_bits(high)) }
     }
 
     /// A packet's codes under a 2-bit high plane: codes 2i and 2i + 1 join

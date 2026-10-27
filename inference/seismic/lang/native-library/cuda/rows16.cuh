@@ -6,8 +6,8 @@
 //
 // In `rows16` every row holds its planes one after another at fixed offsets
 // (the emitted `_ROW_*` roles). Element i's code is bits of the code planes
-// (`registry::code_planes`: nibble i & 1 of byte i / 2 of a 4-bit low plane,
-// byte i of an 8-bit one, bit i or bits 2i, 2i + 1 of a 1- or 2-bit high
+// (`registry::code_planes`: crumb i % 4 of byte i / 4 of a 2-bit low plane,
+// nibble i & 1 of byte i / 2 of a 4-bit one, byte i of an 8-bit one, bit i or bits 2i, 2i + 1 of a 1- or 2-bit high
 // plane) or of the vector-code entry holding it (one per eight elements);
 // its coefficients keep the registry's per-row placement, as in `mma16`,
 // and are `<seismic/packets.cuh>`'s components.
@@ -46,13 +46,17 @@ struct Planes {
 // halved): the NVIDIA aarch64 compiler traps folding a value's own split
 // bit fields added back together.
 
-// Element i's unsigned code of a LOW-bit low plane and HIGH-bit high plane.
+// Element i's unsigned code of a LOW-bit low plane and HIGH-bit high plane:
+// a sub-byte low plane holds 8 / LOW codes a byte, element i's at bit
+// LOW (i % (8 / LOW)) of byte i / (8 / LOW).
 template <u32 LOW, u32 HIGH> __device__ __forceinline__ u32 code(const Planes &w, const u8 *row, u64 i) {
-    static_assert(LOW == 4 || LOW == 8, "a low plane of 4 or 8 bits");
-    static_assert(LOW == 4 || HIGH == 0, "8-bit codes have no high plane");
+    static_assert(LOW == 2 || LOW == 4 || LOW == 8, "a low plane of 2, 4 or 8 bits");
+    static_assert(LOW == 4 || HIGH == 0, "a high plane joins a nibble low plane");
     if constexpr (LOW == 8)
         return u8_at(row + w.codes + i);
-    u32 code = (u8_at(row + w.codes + (i >> 1)) >> (4 * (u32)(i & 1u))) & 15u;
+    // log2 of the codes a byte holds.
+    constexpr u32 PER = LOW == 4 ? 1 : 2;
+    u32 code = (u8_at(row + w.codes + (i >> PER)) >> (LOW * (u32)(i & ((1u << PER) - 1u)))) & ((1u << LOW) - 1u);
     if constexpr (HIGH == 1)
         code |= ((u8_at(row + w.high + (i >> 3)) >> (u32)(i & 7u)) & 1u) << 4;
     else if constexpr (HIGH == 2)

@@ -367,6 +367,11 @@ representation!(Q5KMma16, "q5k", Mma16, F32, 4);
 representation!(Q6KMma16, "q6k", Mma16, F32, 4);
 representation!(Q8G32SMma16, "q8g32s", Mma16, F32, 2);
 representation!(IQ4G32Mma16, "iq4g32", Mma16, F32, 2);
+representation!(Q2K, "q2k", F32, 4);
+representation!(Q2KRows16, "q2k", Rows16, F32, 3);
+representation!(Q2KRows8, "q2k", Rows8, F32, 3);
+representation!(Q2KRows32, "q2k", Rows32, F32, 3);
+representation!(Q2KMma16, "q2k", Mma16, F32, 3);
 // Vector codes: row layouts keep whole entries in `grids`.
 representation!(IQ2XS, "iq2xs", F32, 3);
 representation!(IQ3XXS, "iq3xxs", F32, 3);
@@ -447,6 +452,10 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("q6k", registry::Layout::Mma16) => return visitor.visit::<Q6KMma16>(),
         ("q8g32s", registry::Layout::Mma16) => return visitor.visit::<Q8G32SMma16>(),
         ("iq4g32", registry::Layout::Mma16) => return visitor.visit::<IQ4G32Mma16>(),
+        ("q2k", registry::Layout::Rows16) => return visitor.visit::<Q2KRows16>(),
+        ("q2k", registry::Layout::Rows8) => return visitor.visit::<Q2KRows8>(),
+        ("q2k", registry::Layout::Rows32) => return visitor.visit::<Q2KRows32>(),
+        ("q2k", registry::Layout::Mma16) => return visitor.visit::<Q2KMma16>(),
         ("q4g32s", registry::Layout::Rows16) => return visitor.visit::<Q4G32SRows16>(),
         ("iq4g32s", registry::Layout::Rows16) => return visitor.visit::<IQ4G32SRows16>(),
         ("q5g32s", registry::Layout::Rows16) => return visitor.visit::<Q5G32SRows16>(),
@@ -496,6 +505,7 @@ pub fn with_representation<V: RepresentationVisitor>(
         "q4k" => visitor.visit::<Q4K>(),
         "q5k" => visitor.visit::<Q5K>(),
         "q6k" => visitor.visit::<Q6K>(),
+        "q2k" => visitor.visit::<Q2K>(),
         "q8g32s" => visitor.visit::<Q8G32S>(),
         "iq4g32" => visitor.visit::<IQ4G32>(),
         "q8g32" => visitor.visit::<Q8G32>(),

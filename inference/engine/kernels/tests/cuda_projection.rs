@@ -179,6 +179,12 @@ fn cuda_dense_expand_coded_matches_host_model() {
     );
 }
 
+/// Q2_K gate/up weights, resident as q2k (biased groups of 16).
+#[test]
+fn cuda_dense_expand_k_quant_matches_host_model() {
+    dense_expand_cases(&[Format::Q2K], 19);
+}
+
 fn dense_expand_cases(formats: &[Format], seed: u64) {
     let Some(device) = cuda() else { return };
     let mut rng = Rng(seed);
