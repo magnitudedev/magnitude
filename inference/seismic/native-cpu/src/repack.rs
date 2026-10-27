@@ -10,6 +10,7 @@
 mod program;
 
 use program::{PacketForms, RepackExecutor, RepackProgram, BLOCK, EXECUTION_BYTES};
+pub use program::{ScaledCodeRows, ScaledCodesPlacement};
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry::{
     self, ConversionLayout, Layout, PackedRowLayout, RepresentationConversion, RepresentationInfo,
@@ -163,6 +164,7 @@ impl RowConversion {
                 Some((index, (at - planes[index].0 * 8) as u32))
             },
         )
+        .expect("a tile of an execution's chunk of a row fits a program")
     }
 
     /// Tiles an execution of whole rows of `packets` packets converts at
@@ -209,6 +211,7 @@ impl RowConversion {
                 Some((0, (row / self.tile) as u32 * tile_bits + at as u32))
             },
         )
+        .expect("an execution's whole rows fit a program")
     }
 }
 

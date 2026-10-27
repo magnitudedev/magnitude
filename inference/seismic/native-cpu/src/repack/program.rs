@@ -34,10 +34,11 @@
 //! place ([`RepackExecutor::run_into`]), or stages both in its own buffers
 //! ([`RepackExecutor::run`]).
 
-use seismic_lang::registry::RepresentationConversion;
+use seismic_lang::registry::{self, RepresentationConversion};
 use seismic_lang::repack::{
     negate_if, slot, PacketBit, PacketValues, RepackOp, RepackShape, STACK,
 };
+use std::num::NonZeroU32;
 
 /// Bytes of a vector step: an output block, a term's input window, a
 /// span's least length.
@@ -194,6 +195,20 @@ struct ValueGroup {
     offsets: u32,
     values: u32,
     bytes: u32,
+}
+
+/// Where a program's slots lie ([`RepackProgram::layout`]): the recipe's
+/// computed values, its value groups (one per shape), each with the
+/// computed values of its shape, which every packet holds one of each of
+/// (the group's members, packet by packet), the bytes of its field slots
+/// (whole blocks) and value slots, and the input bit the value slots start
+/// at, past every row's source packets.
+struct SlotLayout<'a> {
+    values: PacketValues<'a>,
+    groups: Vec<(ValueGroup, Vec<usize>)>,
+    field_bytes: u32,
+    value_bytes: u32,
+    values_at: u32,
 }
 
 /// Values evaluated together, a lane each.
@@ -1064,20 +1079,28 @@ impl RepackProgram {
     /// `bit` of plane `plane` of the packet form of packet `p` of row `r`
     /// goes to bit `b` of output segment `s` for
     /// `destination(r, p, plane, bit) = Some((s, b))`, or nowhere for
-    /// `None`. Output bits nothing maps to are zero.
+    /// `None`. Output bits nothing maps to are zero. `None` where the
+    /// program does not fit ([`fits`](Self::fits)).
     pub fn compile(
         conversion: &RepresentationConversion,
         rows: u32,
         packets: u32,
         outputs: &[u32],
         destination: impl Fn(u32, u32, usize, u32) -> Option<(usize, u32)>,
-    ) -> Self {
+    ) -> Option<Self> {
         assert!(
             outputs
                 .iter()
                 .all(|bytes| (*bytes as usize).is_multiple_of(BLOCK)),
             "a repack output's segments are whole blocks"
         );
+        let SlotLayout {
+            values,
+            groups,
+            field_bytes,
+            value_bytes,
+            values_at,
+        } = Self::layout(conversion, rows, packets, outputs)?;
         let output_starts = outputs
             .iter()
             .scan(0, |start, bytes| {
@@ -1085,72 +1108,41 @@ impl RepackProgram {
                 Some(*start - bytes)
             })
             .collect::<Vec<_>>();
-        let (recipe, source) = (&conversion.recipe, conversion.source_layout);
+        let source = conversion.source_layout;
         let packet = conversion.destination_layout.packet();
         let (row_packets, packets) = (packets, rows * packets);
         let packet_bits = source.packet_size * 8;
-        let values = PacketValues::of(recipe, packet);
         let (shapes, computed) = (values.shapes(), values.computed());
-        // One group per shape, over every packet, its values' slots as
-        // wide as the widest needs; the input bit of computed value `v` of
-        // packet `p` is `slots[p * computed values + v]`, past the source
-        // packets.
-        let mut groups: Vec<ValueGroup> = Vec::new();
-        let mut offsets = Vec::new();
-        let mut members = Vec::new();
-        let (mut field_bytes, mut value_bytes) = (0u32, 0u32);
-        for (index, shape) in shapes.iter().enumerate() {
-            let shape_members = (0..packets)
-                .flat_map(|p| (0..computed.len()).map(move |v| (p, v)))
-                .filter(|(_, v)| computed[*v].shape == index)
-                .collect::<Vec<_>>();
-            let count = shape_members.len() as u32;
-            let bytes = slot(
-                shape_members
-                    .iter()
-                    .map(|(_, v)| computed[*v].width)
-                    .max()
-                    .expect("a shape has values"),
-            );
-            groups.push(ValueGroup {
-                shape: index as u32,
-                count,
-                fields: field_bytes,
-                offsets: offsets.len() as u32,
-                values: value_bytes,
-                bytes,
-            });
-            for offset in 0..shape.offsets as usize {
-                offsets.extend(
-                    shape_members
-                        .iter()
-                        .map(|(_, v)| computed[*v].offsets[offset]),
-                );
-            }
-            field_bytes += count * shape.fields;
-            value_bytes += count * bytes;
-            members.push(shape_members);
+        // A group's members: packet by packet, its shape's computed values;
+        // the input bit of computed value `v` of packet `p` is
+        // `slots[p * computed values + v]`.
+        fn members(packets: u32, of_shape: &[usize]) -> impl Iterator<Item = (u32, usize)> + '_ {
+            (0..packets).flat_map(move |p| of_shape.iter().map(move |v| (p, *v)))
         }
-        // The field slots end at a block: their move writes whole blocks.
-        let field_bytes = field_bytes.next_multiple_of(BLOCK as u32);
-        let values_at = source.packet_size * packets * 8;
+        let mut offsets = Vec::new();
+        for (group, of_shape) in &groups {
+            for offset in 0..shapes[group.shape as usize].offsets as usize {
+                offsets
+                    .extend(members(packets, of_shape).map(|(_, v)| computed[v].offsets[offset]));
+            }
+        }
         let mut slots = vec![0u32; computed.len() * packets as usize];
         let mut field_inputs: Vec<Option<u32>> = vec![None; field_bytes as usize * 8];
-        for (group, members) in groups.iter().zip(&members) {
-            for (lane, (p, v)) in members.iter().enumerate() {
+        for (group, of_shape) in &groups {
+            for (lane, (p, v)) in members(packets, of_shape).enumerate() {
                 let lane = lane as u32;
-                slots[*p as usize * computed.len() + v] =
+                slots[p as usize * computed.len() + v] =
                     values_at + (group.values + lane * group.bytes) * 8;
                 // Each field's slot column, as its shape's `Field` op places
                 // it.
-                let shape = shapes[computed[*v].shape];
+                let shape = shapes[computed[v].shape];
                 let columns = values.ops()[shape.ops as usize..][..shape.length as usize]
                     .iter()
                     .filter_map(|op| match op {
                         RepackOp::Field { prefix, width } => Some((*prefix, slot(*width))),
                         _ => None,
                     });
-                for ((prefix, bytes), field) in columns.zip(&computed[*v].fields) {
+                for ((prefix, bytes), field) in columns.zip(&computed[v].fields) {
                     let at = (group.fields + prefix * group.count + lane * bytes) * 8;
                     for (offset, bit) in field {
                         field_inputs[(at + offset) as usize] = Some(p * packet_bits + bit);
@@ -1196,7 +1188,7 @@ impl RepackProgram {
             .chain([packets * source.packet_size])
             .collect::<Vec<_>>();
         let output = ByteMoves::of(&inputs, &input_starts, &output_starts);
-        Self {
+        Some(Self {
             packet_bytes: source.packet_size,
             rows,
             packets: row_packets,
@@ -1204,13 +1196,87 @@ impl RepackProgram {
             output_bytes: outputs.iter().sum(),
             shapes: values.shapes().to_vec(),
             ops: values.ops().to_vec(),
-            groups,
+            groups: groups.into_iter().map(|(group, _)| group).collect(),
             offsets,
             field_bytes,
             value_bytes,
             fields: ByteMoves::of(&field_inputs, &input_starts, &[0]),
             output,
+        })
+    }
+
+    /// Whether the program of `conversion`'s recipe over `packets` source
+    /// packets of each of `rows` rows into output segments of `outputs`
+    /// bytes ([`compile`](Self::compile)) fits: every position it computes,
+    /// an input bit (a source packet's, or a value slot's past them), a
+    /// field slot's bit or an output bit, within `u32`.
+    pub fn fits(
+        conversion: &RepresentationConversion,
+        rows: u32,
+        packets: u32,
+        outputs: &[u32],
+    ) -> bool {
+        Self::layout(conversion, rows, packets, outputs).is_some()
+    }
+
+    /// The slots of the program [`compile`](Self::compile) makes, where it
+    /// fits ([`fits`](Self::fits)): one value group per shape, over every
+    /// packet, its values' slots as wide as the widest needs.
+    fn layout<'a>(
+        conversion: &'a RepresentationConversion,
+        rows: u32,
+        packets: u32,
+        outputs: &[u32],
+    ) -> Option<SlotLayout<'a>> {
+        outputs
+            .iter()
+            .try_fold(0u32, |bytes, segment| bytes.checked_add(*segment))?
+            .checked_mul(8)?;
+        let source = conversion.source_layout;
+        let packets = rows.checked_mul(packets)?;
+        let values_at = packets.checked_mul(source.packet_size)?.checked_mul(8)?;
+        let values = PacketValues::of(&conversion.recipe, conversion.destination_layout.packet());
+        let computed = values.computed();
+        let mut groups = Vec::new();
+        let (mut fields, mut offsets, mut value_bytes) = (0u32, 0u32, 0u32);
+        for (index, shape) in values.shapes().iter().enumerate() {
+            let of_shape = (0..computed.len())
+                .filter(|v| computed[*v].shape == index)
+                .collect::<Vec<_>>();
+            let count = packets.checked_mul(of_shape.len() as u32)?;
+            let bytes = slot(
+                of_shape
+                    .iter()
+                    .map(|v| computed[*v].width)
+                    .max()
+                    .expect("a shape has values"),
+            );
+            groups.push((
+                ValueGroup {
+                    shape: index as u32,
+                    count,
+                    fields,
+                    offsets,
+                    values: value_bytes,
+                    bytes,
+                },
+                of_shape,
+            ));
+            fields = fields.checked_add(count.checked_mul(shape.fields)?)?;
+            offsets = offsets.checked_add(count.checked_mul(shape.offsets)?)?;
+            value_bytes = value_bytes.checked_add(count.checked_mul(bytes)?)?;
         }
+        // The field slots end at a block: their move writes whole blocks.
+        let field_bytes = fields.checked_next_multiple_of(BLOCK as u32)?;
+        field_bytes.checked_mul(8)?;
+        values_at.checked_add(value_bytes.checked_mul(8)?)?;
+        Some(SlotLayout {
+            values,
+            groups,
+            field_bytes,
+            value_bytes,
+            values_at,
+        })
     }
 
     /// Bytes of one source packet.
@@ -1307,10 +1373,207 @@ impl RepackProgram {
     }
 }
 
+/// A program of one source row of consecutive packets into one output
+/// segment: it executes over a stream of source units, one execution after
+/// another ([`execute`](Self::execute)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StreamProgram(RepackProgram);
+
+/// What an execution's output of its units becomes: written whole, or each
+/// unit's mapped by `map(output, mapped)` into `per_unit` bytes while it is
+/// hot.
+#[derive(Clone, Copy)]
+enum Delivery<'a> {
+    Whole,
+    Mapped {
+        per_unit: usize,
+        map: &'a (dyn Fn(&[u8], &mut [u8]) + Sync),
+    },
+}
+
+impl StreamProgram {
+    /// The program of `conversion`'s recipe over `packets` consecutive
+    /// source packets into an output of `output` bytes, whole blocks: bit
+    /// `bit` of plane `plane` of the packet form of packet `p` goes to bit
+    /// `destination(p, plane, bit)` of the output, or nowhere for `None`;
+    /// `None` where it does not fit ([`fits`](Self::fits)).
+    fn compile(
+        conversion: &RepresentationConversion,
+        packets: u32,
+        output: u32,
+        destination: impl Fn(u32, usize, u32) -> Option<u32>,
+    ) -> Option<Self> {
+        RepackProgram::compile(conversion, 1, packets, &[output], |_, p, plane, bit| {
+            destination(p, plane, bit).map(|at| (0, at))
+        })
+        .map(Self)
+    }
+
+    /// Whether the program of [`compile`](Self::compile) fits
+    /// ([`RepackProgram::fits`]).
+    fn fits(conversion: &RepresentationConversion, packets: u32, output: u32) -> bool {
+        RepackProgram::fits(conversion, 1, packets, &[output])
+    }
+
+    /// The output of this program over `source`, whole units of `unit`
+    /// bytes (an execution reads a whole number of them, and writes an
+    /// equal part of its output for each), one execution after another,
+    /// across threads when there are many; each unit's part XORed with
+    /// `flip` (as long as it), if any, while it is hot.
+    fn execute(&self, source: &[u8], unit: usize, flip: Option<&[u8]>) -> Vec<u8> {
+        self.executions(source, unit, flip, Delivery::Whole)
+    }
+
+    /// As [`execute`](Self::execute), each unit's output mapped by
+    /// `map(output, mapped)` into `per_unit` bytes while it is hot, instead
+    /// of written whole.
+    fn execute_mapped(
+        &self,
+        source: &[u8],
+        unit: usize,
+        flip: Option<&[u8]>,
+        per_unit: usize,
+        map: impl Fn(&[u8], &mut [u8]) + Sync,
+    ) -> Vec<u8> {
+        self.executions(
+            source,
+            unit,
+            flip,
+            Delivery::Mapped {
+                per_unit,
+                map: &map,
+            },
+        )
+    }
+
+    fn executions(
+        &self,
+        source: &[u8],
+        unit: usize,
+        flip: Option<&[u8]>,
+        delivery: Delivery<'_>,
+    ) -> Vec<u8> {
+        let program = &self.0;
+        let execution = program.row_bytes();
+        assert_eq!(source.len() % unit, 0, "a repack source is whole units");
+        let units = execution / unit;
+        let produced = program.output_bytes() / units;
+        assert!(
+            flip.is_none_or(|flip| flip.len() == produced),
+            "a flip is a unit's output"
+        );
+        let per_unit = match delivery {
+            Delivery::Whole => produced,
+            Delivery::Mapped { per_unit, .. } => per_unit,
+        };
+        let mut output = vec![0u8; source.len() / unit * per_unit];
+        let executions = source.len().div_ceil(execution);
+        /// Source bytes each thread converts at least. Measured (whole
+        /// tensors of 64 KiB to 16 MiB of `q8_0`, `q4_k`, `iq4_xs` and
+        /// `q3_k` packets into their packet forms, M4 Max): a quarter or
+        /// half of it speeds tensors of 1 MiB (`q3_k` 730 to 270 µs at a
+        /// quarter) but slows the fastest of 4 MiB (`q8_0` 215 to 300 µs at
+        /// a quarter, 245 µs at half); four times it slows every tensor of
+        /// 4 MiB or more (`q3_k` 1.0 to 3.0 ms at 4 MiB). A scaled-codes
+        /// placement of a progressive head runs every core at any of these:
+        /// a `q8_0` head of 32768 × 4096 (136 MiB), all its planes with the
+        /// radii mapped, takes 19.0 ms at it, 19.3 ms at half and 19.2 ms
+        /// at four times (best of 5, alternating, M4 Max).
+        const BYTES_PER_THREAD: usize = 1 << 20;
+        let threads = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(source.len().div_ceil(BYTES_PER_THREAD))
+            .max(1);
+        let chunk = executions.div_ceil(threads).max(1);
+        // Executions `first..` writing `output` from its first: reading the
+        // source in place when it holds every byte an execution may read,
+        // else staged.
+        let run = |first: usize, output: &mut [u8]| {
+            let mut executor = program.executor();
+            // A mapped unit's flipped output, once a mapped unit is flipped.
+            let mut flipped: Option<Vec<u8>> = None;
+            for (index, out) in output.chunks_mut(units * per_unit).enumerate() {
+                let start = (first + index) * execution;
+                let in_place = start + execution + BLOCK <= source.len();
+                if !in_place {
+                    // Past the units, the staging holds what an earlier
+                    // execution left: units convert apart, and the output
+                    // past them is not kept.
+                    let units = &source[start..(start + execution).min(source.len())];
+                    executor.source()[..units.len()].copy_from_slice(units);
+                }
+                let sources = [source.as_ptr().wrapping_add(start)];
+                match delivery {
+                    Delivery::Whole if in_place => {
+                        // SAFETY: the execution's source and a block past it
+                        // lie in `source`, and its output in `out`.
+                        unsafe { executor.run_into(&sources, &[out.as_mut_ptr()]) };
+                        if let Some(flip) = flip {
+                            for out in out.chunks_exact_mut(produced) {
+                                for (byte, flip) in out.iter_mut().zip(flip) {
+                                    *byte ^= flip;
+                                }
+                            }
+                        }
+                    }
+                    Delivery::Whole => {
+                        let placed = &executor.run()[..out.len()];
+                        match flip {
+                            Some(flip) => flip_units(out, placed, flip),
+                            None => out.copy_from_slice(placed),
+                        }
+                    }
+                    Delivery::Mapped { per_unit, map } => {
+                        let placed = if in_place {
+                            // SAFETY: as above.
+                            unsafe { executor.run_from(&sources) }
+                        } else {
+                            executor.run()
+                        };
+                        // The execution's units present: as many as `out`
+                        // holds.
+                        let units = placed.chunks_exact(produced);
+                        for (placed, mapped) in units.zip(out.chunks_exact_mut(per_unit)) {
+                            match flip {
+                                Some(flip) => {
+                                    let flipped =
+                                        flipped.get_or_insert_with(|| vec![0; flip.len()]);
+                                    flip_units(flipped, placed, flip);
+                                    map(flipped, mapped);
+                                }
+                                None => map(placed, mapped),
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        std::thread::scope(|scope| {
+            for (index, output) in output.chunks_mut(chunk * units * per_unit).enumerate() {
+                scope.spawn(move || run(index * chunk, output));
+            }
+        });
+        output
+    }
+}
+
+/// `to`, whole units of `flip.len()` bytes: those of `from`, each XORed
+/// with `flip`.
+fn flip_units(to: &mut [u8], from: &[u8], flip: &[u8]) {
+    for (to, from) in to
+        .chunks_exact_mut(flip.len())
+        .zip(from.chunks_exact(flip.len()))
+    {
+        for ((to, from), flip) in to.iter_mut().zip(from).zip(flip) {
+            *to = from ^ flip;
+        }
+    }
+}
+
 /// A recipe's program writing the packet forms (alignment padding zero) of
 /// consecutive source packets, one after another.
 pub struct PacketForms {
-    program: RepackProgram,
+    program: StreamProgram,
 }
 
 impl PacketForms {
@@ -1326,71 +1589,204 @@ impl PacketForms {
             .find(|packets| ((packets * form) as usize).is_multiple_of(BLOCK))
             .expect("some multiple of an execution is whole blocks");
         Self {
-            program: RepackProgram::compile(
+            program: StreamProgram::compile(
                 conversion,
-                1,
                 packets,
-                &[packets * form],
-                |_, p, plane, bit| Some((0, (p * form + packet.planes[plane].offset) * 8 + bit)),
-            ),
+                packets * form,
+                |p, plane, bit| Some((p * form + packet.planes[plane].offset) * 8 + bit),
+            )
+            .expect("an execution's packets fit a program"),
         }
     }
 
     /// The packet forms of the source packets `source`, across threads when
     /// there are many.
     pub fn execute(&self, source: &[u8]) -> Vec<u8> {
-        let program = &self.program;
-        let (packet_bytes, execution) = (program.packet_bytes(), program.row_bytes());
-        assert_eq!(
-            source.len() % packet_bytes,
-            0,
-            "a repack source is whole packets"
+        self.program
+            .execute(source, self.program.0.packet_bytes(), None)
+    }
+}
+
+/// Rows of `columns` values through a conversion whose destination's values
+/// are integer codes times one stored scale (`DecodeRecipe::scaled_codes`),
+/// each row whole source packets: what a [`ScaledCodesPlacement`] places.
+/// Only [`ScaledCodeRows::admit`] makes one.
+#[derive(Debug)]
+pub struct ScaledCodeRows {
+    conversion: &'static RepresentationConversion,
+    recipe: registry::DecodeRecipe,
+    reads: registry::ScaledCodes,
+    columns: NonZeroU32,
+}
+
+impl ScaledCodeRows {
+    /// Rows of `columns` values through `conversion`; `None` when the
+    /// destination's values are not scaled codes, or the rows not whole
+    /// source packets.
+    pub fn admit(
+        conversion: &'static RepresentationConversion,
+        columns: NonZeroU32,
+    ) -> Option<Self> {
+        let destination = registry::representation_info(conversion.destination);
+        let recipe = registry::decode_recipe(conversion.destination, destination.decoded)?;
+        let reads = recipe.scaled_codes()?;
+        columns
+            .get()
+            .is_multiple_of(conversion.source_layout.logical_group)
+            .then_some(Self {
+                conversion,
+                recipe,
+                reads,
+                columns,
+            })
+    }
+
+    /// Values of each row.
+    pub fn columns(&self) -> NonZeroU32 {
+        self.columns
+    }
+
+    /// The dtype a group's scale is stored in.
+    pub fn scale_dtype(&self) -> seismic_lang::types::DType {
+        self.reads.scale_dtype
+    }
+
+    /// The rows a placement into rows of `row_bytes` bytes places at once:
+    /// at least `EXECUTION_BYTES` source bytes, and whole blocks of output.
+    /// `None` where their program does not fit ([`StreamProgram::fits`]):
+    /// every position the placement computes is a position of its program
+    /// (a placed bit of a row is within the program's output).
+    fn rows(&self, row_bytes: u32) -> Option<u32> {
+        let (source, columns) = (self.conversion.source_layout, self.columns.get());
+        let packets = columns / source.logical_group;
+        let row = packets.checked_mul(source.packet_size)?;
+        let least = EXECUTION_BYTES.div_ceil(row as usize) as u32;
+        let rows = (least..least + BLOCK as u32).find(|rows| {
+            rows.checked_mul(row_bytes)
+                .is_some_and(|bytes| (bytes as usize).is_multiple_of(BLOCK))
+        })?;
+        StreamProgram::fits(
+            self.conversion,
+            rows.checked_mul(packets)?,
+            rows.checked_mul(row_bytes)?,
+        )
+        .then_some(rows)
+    }
+
+    /// Whether these rows place into rows of `row_bytes` bytes
+    /// ([`placement`](Self::placement)).
+    pub fn places(&self, row_bytes: u32) -> bool {
+        self.rows(row_bytes).is_some()
+    }
+
+    /// The placement of these rows into rows of `row_bytes` bytes, which
+    /// they place into ([`places`](Self::places)): bit `bit` of the offset
+    /// `u = c − least` of the code of column `c` at bit `code(c, bit)` of its
+    /// row, and bit `bit` of the stored scale of the row's group `g` at bit
+    /// `scale(g, bit)`, nowhere for `None`; every other bit zero.
+    pub fn placement(
+        &self,
+        row_bytes: u32,
+        code: impl Fn(u32, u32) -> Option<u32>,
+        scale: impl Fn(u32, u32) -> Option<u32>,
+    ) -> ScaledCodesPlacement {
+        let Self {
+            conversion,
+            recipe: codes,
+            reads,
+            columns,
+        } = self;
+        let (columns, reads) = (columns.get(), *reads);
+        let (source, packet) = (
+            conversion.source_layout,
+            conversion.destination_layout.packet(),
         );
-        let produced = program.output_bytes();
-        let form = produced / program.packets();
-        let mut output = vec![0u8; source.len() / packet_bytes * form];
-        let executions = source.len().div_ceil(execution);
-        /// Source bytes each thread converts at least. Measured (whole
-        /// tensors of 64 KiB to 16 MiB of `q8_0`, `q4_k`, `iq4_xs` and
-        /// `q3_k` packets into their packet forms, M4 Max): a quarter or
-        /// half of it speeds tensors of 1 MiB (`q3_k` 730 to 270 µs at a
-        /// quarter) but slows the fastest of 4 MiB (`q8_0` 215 to 300 µs at
-        /// a quarter, 245 µs at half); four times it slows every tensor of
-        /// 4 MiB or more (`q3_k` 1.0 to 3.0 ms at 4 MiB).
-        const BYTES_PER_THREAD: usize = 1 << 20;
-        let threads = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(source.len().div_ceil(BYTES_PER_THREAD))
-            .max(1);
-        let chunk = executions.div_ceil(threads).max(1);
-        // Executions `first..` writing `output` from its first: in place when
-        // the source holds every byte an execution may read, else staged.
-        let run = |first: usize, output: &mut [u8]| {
-            let mut executor = program.executor();
-            for (index, out) in output.chunks_mut(produced).enumerate() {
-                let start = (first + index) * execution;
-                if start + execution + BLOCK <= source.len() {
-                    // SAFETY: the execution's source and a block past it lie
-                    // in `source`, and its output in `out`.
-                    unsafe {
-                        executor.run_into(&[source.as_ptr().add(start)], &[out.as_mut_ptr()])
-                    };
+        let packets = columns / source.logical_group;
+        let row = (packets * source.packet_size) as usize;
+        let rows = self
+            .rows(row_bytes)
+            .expect("the rows place into rows of `row_bytes` bytes");
+        // Where a row's placed bits enter: each within the row (whose bits
+        // fit `u32`, as the rows' output does), so none lands in the next.
+        let within = |at: u32| {
+            assert!(
+                at < row_bytes * 8,
+                "a placed bit ({at}) lies within its row of {row_bytes} bytes"
+            );
+            at
+        };
+        let code = |column, bit| code(column, bit).map(within);
+        let scale = |group, bit| scale(group, bit).map(within);
+        let program = StreamProgram::compile(
+            conversion,
+            rows * packets,
+            rows * row_bytes,
+            |p, plane, bit| {
+                let schema = &codes.planes()[plane];
+                let entry = bit / schema.entry_bits;
+                let local = entry / schema.fields * schema.group;
+                let read = registry::PlaneRead {
+                    plane: plane as u32,
+                    field: entry % schema.fields,
+                };
+                let (row, bit) = (p / packets, bit % schema.entry_bits);
+                let column = p % packets * packet.group + local;
+                let at = if local >= packet.group {
+                    None
+                } else if read == reads.code && bit < reads.bits {
+                    code(column, bit)
+                } else if read == reads.scale {
+                    scale(column / schema.group, bit)
                 } else {
-                    // Past the packets, the staging holds what an earlier
-                    // execution left: packets convert apart, and the forms
-                    // past them are not kept.
-                    let packets = &source[start..(start + execution).min(source.len())];
-                    executor.source()[..packets.len()].copy_from_slice(packets);
-                    out.copy_from_slice(&executor.run()[..out.len()]);
+                    None
+                }?;
+                Some(row * row_bytes * 8 + at)
+            },
+        )
+        .expect("the rows place into rows of `row_bytes` bytes");
+        let mut flip = vec![0u8; row_bytes as usize];
+        for column in 0..columns {
+            for bit in (0..reads.bits).filter(|bit| reads.flip >> bit & 1 == 1) {
+                if let Some(at) = code(column, bit) {
+                    flip[at as usize / 8] |= 1 << (at % 8);
                 }
             }
-        };
-        std::thread::scope(|scope| {
-            for (index, output) in output.chunks_mut(chunk * produced).enumerate() {
-                scope.spawn(move || run(index * chunk, output));
-            }
-        });
-        output
+        }
+        let flip = Some(flip).filter(|flip| flip.iter().any(|byte| *byte != 0));
+        ScaledCodesPlacement { program, row, flip }
+    }
+}
+
+/// A conversion's program placing, rather than its packet forms, the
+/// offset codes and stored scales of rows ([`ScaledCodeRows::placement`]).
+#[derive(Debug)]
+pub struct ScaledCodesPlacement {
+    program: StreamProgram,
+    /// Source bytes of a row.
+    row: usize,
+    /// What a row's placed bits are XORed with: the placed `flip` of every
+    /// code, which turns its raw bits into its offset; `None` when that
+    /// changes no placed bit (the raw bits are the offset, or no code bit is
+    /// placed).
+    flip: Option<Vec<u8>>,
+}
+
+impl ScaledCodesPlacement {
+    /// The placed rows of `source`, whole source rows, each mapped by
+    /// `map(placed row, mapped row)` into `per_row` bytes while it is hot.
+    pub fn execute_mapped(
+        &self,
+        source: &[u8],
+        per_row: usize,
+        map: impl Fn(&[u8], &mut [u8]) + Sync,
+    ) -> Vec<u8> {
+        self.program
+            .execute_mapped(source, self.row, self.flip.as_deref(), per_row, map)
+    }
+
+    /// The placed rows of `source`, whole source rows.
+    pub fn execute(&self, source: &[u8]) -> Vec<u8> {
+        self.program.execute(source, self.row, self.flip.as_deref())
     }
 }
 
@@ -1445,18 +1841,30 @@ impl RepackExecutor<'_> {
     /// The program's output of the staged source rows, its segments one
     /// after another: every byte no move writes is zero.
     pub fn run(&mut self) -> &[u8] {
-        let (mut sources, mut outputs) = (
-            std::mem::take(&mut self.staged_sources),
-            std::mem::take(&mut self.staged_outputs),
-        );
-        // The bases derive from the buffers' own pointers (`Vec::as_ptr`,
-        // `Vec::as_mut_ptr`, which make no reference to their elements), for
-        // this run alone: no reference to `staging` or `output` is made
-        // while the run reads and writes through them.
-        let (staging, output) = (self.staging.as_ptr(), self.output.as_mut_ptr());
-        let row_bytes = self.program.row_bytes();
+        let mut sources = std::mem::take(&mut self.staged_sources);
+        // The bases derive from the buffer's own pointer (`Vec::as_ptr`,
+        // which makes no reference to its elements), for this run alone: no
+        // reference to `staging` is made while the run reads through them.
+        let (staging, row_bytes) = (self.staging.as_ptr(), self.program.row_bytes());
         sources.clear();
         sources.extend((0..self.program.rows()).map(|row| staging.wrapping_add(row * row_bytes)));
+        // SAFETY: `staging` holds the rows and a block past each, and is
+        // otherwise unreferenced during the run (above).
+        unsafe { self.run_from(&sources) };
+        self.staged_sources = sources;
+        &self.output
+    }
+
+    /// The program's output of the source rows at `sources`, its segments
+    /// one after another.
+    ///
+    /// # Safety
+    /// As [`run_into`](Self::run_into)'s for the sources.
+    unsafe fn run_from(&mut self, sources: &[*const u8]) -> &[u8] {
+        let mut outputs = std::mem::take(&mut self.staged_outputs);
+        // The bases derive from the buffer's own pointer (`Vec::as_mut_ptr`),
+        // for this run alone, as `run`'s sources do.
+        let output = self.output.as_mut_ptr();
         outputs.clear();
         outputs.extend(
             self.program
@@ -1464,11 +1872,11 @@ impl RepackExecutor<'_> {
                 .iter()
                 .map(|start| output.wrapping_add(*start as usize)),
         );
-        // SAFETY: `staging` holds the rows and a block past each, and
-        // `output` the segments, each apart from the others; neither is
-        // otherwise referenced during the run (above).
-        unsafe { self.run_into(&sources, &outputs) };
-        (self.staged_sources, self.staged_outputs) = (sources, outputs);
+        // SAFETY: `output` holds the segments, each apart from the others,
+        // and is otherwise unreferenced during the run; as this function's
+        // for the sources.
+        unsafe { self.run_into(sources, &outputs) };
+        self.staged_outputs = outputs;
         &self.output
     }
 
@@ -1821,6 +2229,7 @@ unsafe fn evaluate_ssse3(executor: &mut RepackExecutor<'_>, outputs: &[*mut u8])
 mod tests {
     use magnitude_ggml::Encoding;
     use seismic_lang::registry::{self, RepresentationConversion};
+    use std::num::NonZeroU32;
 
     /// The executable form of `conversion` repacks `source` (a tensor of
     /// `extents`) exactly as the reference interpreter does.
@@ -1859,7 +2268,7 @@ mod tests {
             let layout = conversion.source_layout;
             let group = u64::from(layout.logical_group);
             let execution =
-                super::PacketForms::compile(conversion).program.packets() as u64 * group;
+                super::PacketForms::compile(conversion).program.0.packets() as u64 * group;
             for extents in [
                 [3, group],
                 [5, 2 * group + group.div_ceil(3)],
@@ -1873,6 +2282,131 @@ mod tests {
                 conversion.admit_source(&mut source);
                 assert_matches_the_interpreter(conversion, &extents, &source, "random");
             }
+        }
+    }
+
+    /// A placement is refused where its program's positions would leave
+    /// `u32`, though its output fits: Q8_0 rows of 2^26 + 32 columns placed
+    /// as their scales alone (two bytes a group) take 8 rows at once (whole
+    /// blocks of output), whose value slots would start at bit
+    /// 8 (2^21 + 1) · 34 · 8, past 2^32; rows of 2^20 columns place.
+    #[test]
+    fn placements_whose_programs_leave_u32_are_refused() {
+        let conversion = registry::representation_conversions()
+            .iter()
+            .find(|conversion| {
+                registry::representation_info(conversion.source).name == "gguf_q8_0"
+                    && super::ScaledCodeRows::admit(conversion, NonZeroU32::new(32).unwrap())
+                        .is_some()
+            })
+            .expect("a Q8_0 conversion into scaled codes is registered");
+        let scales = |columns: u32| {
+            let rows = super::ScaledCodeRows::admit(conversion, NonZeroU32::new(columns).unwrap())
+                .unwrap();
+            rows.places(columns / 32 * 2)
+        };
+        assert!(!scales((1 << 26) + 32));
+        assert!(scales(1 << 20));
+    }
+
+    /// Every conversion into scaled codes places, row by row, the offsets
+    /// of the reference decode's codes from the least and the bits of its
+    /// stored scales, here a byte per code and then the scales, over
+    /// executions of several rows with a partial last one, and of one row
+    /// of more source bytes than an execution reads at least.
+    #[test]
+    fn scaled_codes_place_the_decoded_codes_and_scales() {
+        use registry::QuantizedComponent;
+        let mut placed = Vec::new();
+        for conversion in registry::representation_conversions() {
+            let destination = registry::representation_info(conversion.destination);
+            let Some(recipe) = registry::decode_recipe(destination.id, destination.decoded) else {
+                continue;
+            };
+            let Some(reads) = recipe.scaled_codes() else {
+                continue;
+            };
+            let scale_plane = &recipe.planes()[reads.scale.plane as usize];
+            let (scale_bits, scale_group) = (scale_plane.entry_bits, scale_plane.group);
+            let layout = conversion.source_layout;
+            for columns in [1024, 6144] {
+                let groups = columns / scale_group;
+                let row_bytes = columns + groups * scale_bits / 8;
+                let placement =
+                    super::ScaledCodeRows::admit(conversion, NonZeroU32::new(columns).unwrap())
+                        .unwrap()
+                        .placement(
+                            row_bytes,
+                            |column, bit| Some(column * 8 + bit),
+                            |group, bit| Some(columns * 8 + group * scale_bits + bit),
+                        );
+                let rows = 5u64;
+                let extents = [rows, u64::from(columns)];
+                let packets = rows * u64::from(columns / layout.logical_group);
+                let mut source = registry::pseudo_random_bytes(
+                    conversion.id.index() as u64,
+                    (packets * u64::from(layout.packet_size)) as usize,
+                );
+                conversion.admit_source(&mut source);
+                let actual = placement.execute(&source);
+                let mapped =
+                    placement.execute_mapped(&source, row_bytes as usize, |placed, mapped| {
+                        mapped.copy_from_slice(placed)
+                    });
+                assert!(
+                    mapped == actual,
+                    "{} maps its placed rows",
+                    destination.name
+                );
+                let resident = seismic_lang::interp::TensorData::encoded(
+                    destination.id,
+                    vec![rows as usize, columns as usize],
+                    super::super::convert(conversion, &extents, &source).unwrap(),
+                )
+                .unwrap();
+                let codes = resident.components(QuantizedComponent::Code).unwrap();
+                let scales = resident.components(QuantizedComponent::Scale).unwrap();
+                let Some(registry::DecodeComponent::Constant(least)) =
+                    recipe.component(QuantizedComponent::CodeMin)
+                else {
+                    unreachable!("integer codes have a least")
+                };
+                let least = least.to_f64();
+                let scale_bytes = (scale_bits / 8) as usize;
+                for (row, placed) in actual.chunks_exact(row_bytes as usize).enumerate() {
+                    let first = row * columns as usize;
+                    for column in 0..columns as usize {
+                        assert_eq!(
+                            f64::from(placed[column]),
+                            codes[first + column] - least,
+                            "{} row {row} column {column}",
+                            destination.name
+                        );
+                    }
+                    for (group, stored) in placed[columns as usize..]
+                        .chunks_exact(scale_bytes)
+                        .enumerate()
+                    {
+                        let mut bits = [0u8; 8];
+                        bits[..scale_bytes].copy_from_slice(stored);
+                        let stored = seismic_lang::reference_math::ReferenceScalar::from_bits(
+                            reads.scale_dtype,
+                            u64::from_le_bytes(bits),
+                        )
+                        .to_f64();
+                        let expected = scales[first + group * scale_group as usize];
+                        assert!(
+                            stored == expected || stored.is_nan() && expected.is_nan(),
+                            "{} row {row} scale {group}: {stored} against {expected}",
+                            destination.name
+                        );
+                    }
+                }
+            }
+            placed.push(destination.name);
+        }
+        for name in ["q4g32s", "q8g32s"] {
+            assert!(placed.contains(&name), "{name} places as scaled codes");
         }
     }
 

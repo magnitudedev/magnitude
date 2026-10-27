@@ -15,8 +15,8 @@ use magnitude_ggml::Encoding;
 pub use crate::repr::{
     CodeInterpretation, CodeKind, CoefficientAxes, CoefficientKind, DecodeAxes, DecodeComponent,
     DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFormat, GridCodes, LocalCodes, LookupTable,
-    MinimumSign, OperandRecipe, PlaneEncoding, PlaneField, PlaneSchema, QuantizedComponent,
-    ScaleEncoding, GRID_SIGN_BITS, GRID_VALUES,
+    MinimumSign, OperandRecipe, PlaneEncoding, PlaneField, PlaneRead, PlaneSchema,
+    QuantizedComponent, ScaleEncoding, ScaledCodes, GRID_SIGN_BITS, GRID_VALUES,
 };
 
 /// Backends are a closed set.

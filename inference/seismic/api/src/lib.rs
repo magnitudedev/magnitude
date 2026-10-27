@@ -24,6 +24,7 @@ pub use seismic_lang::checked::{
     NativeParameter, NativeScratch, NativeSpecialization, NativeSpecializationError,
 };
 pub use seismic_lang::precision::{Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
+pub use seismic_native_cpu::repack::ScaledCodeRows;
 /// Numerical comparison helpers used by validation frontends.
 pub mod testing {
     pub use seismic_compiler::numerics::{compare_element, ElementComparison};
@@ -167,6 +168,7 @@ pub mod native_cpu {
 
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
+pub use seismic_lang::reference_math::conversion::exact_f64;
 pub use seismic_lang::registry::{f16_bits, f16_to_f32, BackendName, Layout, OperandRecipe};
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
@@ -604,6 +606,20 @@ impl Element {
         }
         .ok()?;
         data.values().ok()
+    }
+    /// Rows of `columns` values stored as `source`, through the registered
+    /// conversion of `source` into this storage, whose values are integer
+    /// codes times one stored scale (`ScaledCodeRows::admit`), placed by
+    /// [`ScaledCodeRows::placement`]. `None` when no conversion is
+    /// registered, this storage's values are not such codes, or the rows
+    /// are not whole packets of `source`.
+    pub fn scaled_code_rows(
+        self,
+        source: Element,
+        columns: std::num::NonZeroU32,
+    ) -> Option<ScaledCodeRows> {
+        let conversion = seismic_lang::registry::representation_conversion(source.0, self.0)?;
+        ScaledCodeRows::admit(conversion, columns)
     }
     fn id(&self) -> RepresentationId {
         self.0

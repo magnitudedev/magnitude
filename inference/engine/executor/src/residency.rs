@@ -173,14 +173,6 @@ impl Stored {
         }
     }
 
-    /// The artifact encoding of a packed tensor.
-    pub(crate) fn packed_encoding(&self) -> Option<Encoding> {
-        match self {
-            Self::Dense(_) => None,
-            Self::GgmlBlocks { encoding, .. } => Some(*encoding),
-        }
-    }
-
     pub fn source_element(&self) -> Option<Element> {
         match self {
             Self::Dense(tensor) => Some(Element::dense(tensor.dtype)),
@@ -707,8 +699,8 @@ impl ResidencyStore {
     }
 
     /// Imports a plane of a progressive weight (`ImportTransform::Progressive`):
-    /// the host places it from the stored Q8_0 rows, and the device holds the
-    /// placed bytes as they are.
+    /// the host places it from the codes of the stored rows, and the device
+    /// holds the placed bytes as they are.
     pub(crate) fn import_progressive(
         &mut self,
         artifact: &GgufArtifact,
@@ -746,15 +738,8 @@ impl ResidencyStore {
         let stored = source.stored();
         let bytes = crate::programs::native_import::stored_source_bytes(stored)
             .map_err(|error| invalid(error.to_string()))?;
-        let bytes = crate::import_transforms::upload_bytes(
-            descriptor,
-            stored.shape(),
-            planned.source,
-            stored.packed_encoding(),
-            planned.upload,
-            bytes,
-        )
-        .map_err(invalid)?;
+        let bytes = crate::import_transforms::upload_bytes(&planned, stored.shape(), bytes)
+            .map_err(invalid)?;
         let tensor = Tensor::from_host(&self.device, planned.resident, &planned.shape, &bytes)
             .map_err(|error| WeightImportError::Device(error.to_string()))?;
         let weight = ResidentWeight {

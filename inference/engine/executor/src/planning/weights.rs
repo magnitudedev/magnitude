@@ -172,10 +172,7 @@ impl WeightPlan {
 
     /// The source code depth retained by a progressive placement.
     pub(crate) fn progressive_depth(&self) -> Option<ProgressiveCodeDepth> {
-        match self.descriptor.transforms[..] {
-            [ImportTransform::Progressive { depth, .. }] => Some(depth),
-            _ => None,
-        }
+        self.descriptor.progressive().map(|(_, depth)| depth)
     }
 
     /// The shape of the stored tensor this weight is made of: `shape`, with
@@ -1280,31 +1277,37 @@ impl ModelLoadPlan {
             for weight in weights {
                 // The views' full pass serves every row the bounded levels
                 // do not. It is measured against the packed projection's
-                // only for Q8_0 projections without a soft cap, so only
-                // those are offered.
-                let width = weight.shape.last().copied().unwrap_or(1);
-                let depth = (Some(weight.source) == source_element(Encoding::Q8_0, width))
-                    .then_some(ProgressiveCodeDepth::Eight);
+                // only for 8-bit codes (Q8_0 projections) without a soft
+                // cap, so only those are offered.
+                let depth = ProgressiveCodeDepth::Eight;
                 let admitted = weight.role.kind == WeightKind::Output
                     && weight.role.scope == WeightScope::Target
                     && definition.decoder.exit.softcap.is_none_or(|cap| cap == 0.0)
                     && !indexed.contains(&weight.role.scope)
                     && weight.scale.is_none()
                     && weight.descriptor.transforms.is_empty()
-                    && weight.upload == weight.source
-                    && weight.shape.len() == 2
-                    && weight.shape[1].is_multiple_of(32);
-                let Some(depth) = depth.filter(|_| admitted) else {
+                    && weight.upload == weight.source;
+                let placed = crate::import_transforms::progressive_matrix(
+                    depth,
+                    &weight.shape,
+                    weight.source,
+                )
+                .is_some();
+                if !(admitted && placed) {
                     continue;
-                };
+                }
                 for plane in ProgressivePlane::ALL {
-                    let descriptor = WeightDescriptor {
+                    let mut descriptor = WeightDescriptor {
                         transforms: vec![ImportTransform::Progressive { plane, depth }],
                         ..weight.descriptor.clone()
                     };
-                    let shape = descriptor
-                        .transformed_shape(&weight.shape)
-                        .map_err(|error| error.to_string())?;
+                    // The weight has no transforms: its shape is as stored.
+                    let shape = crate::import_transforms::admit_transforms(
+                        &descriptor,
+                        &weight.shape,
+                        weight.source,
+                    )?;
+                    descriptor.shape = shape.clone();
                     let element = crate::progressive::element(plane);
                     views.push(WeightPlan {
                         role: WeightRole {
@@ -1317,10 +1320,7 @@ impl ModelLoadPlan {
                         resident: element,
                         source_bytes: representation_bytes(element, &shape)?,
                         resident_bytes: representation_bytes(element, &shape)?,
-                        descriptor: WeightDescriptor {
-                            shape: shape.clone(),
-                            ..descriptor
-                        },
+                        descriptor,
                         shape,
                         scale: None,
                         bound: 0,
@@ -1903,32 +1903,27 @@ fn push_weight(
                 descriptor.name
             )
         })?;
+    let width = stored.shape.last().copied().unwrap_or(1);
+    let source = source_element(stored.encoding, width)
+        .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
     // The logical shape the importer's exact transforms make of the stored
     // tensor (the stored shape when there are none).
-    let logical = crate::import_transforms::admit(descriptor, &stored.shape, stored.encoding)?;
+    let logical = crate::import_transforms::admit(descriptor, &stored.shape, source)?;
     let role = WeightRole { scope, kind };
     // Projector weights keep their stored dense element: the vision kernels
     // read f32, f16 and bf16 matrices and vectors directly, and converting
     // f16 matrices or f32 biases to the activation dtype only loses bits.
-    let width = stored.shape.last().copied().unwrap_or(1);
-    let stored_dense = source_element(stored.encoding, width).and_then(Element::dtype);
+    let stored_dense = source.dtype();
     let dense_resident = match (role.kind, stored_dense) {
         (WeightKind::Vision(_), Some(dtype)) => dtype,
         _ => resident_dtype(role, form.activation),
     };
-    if operators::is_fixed_dense_role(kind)
-        && !matches!(
-            stored.encoding,
-            Encoding::F32 | Encoding::F16 | Encoding::BF16
-        )
-    {
+    if operators::is_fixed_dense_role(kind) && stored_dense.is_none() {
         return Err(format!(
             "fixed-f32 weight {scope:?}/{kind:?} cannot use packed source encoding {:?}",
             stored.encoding
         ));
     }
-    let source = source_element(stored.encoding, width)
-        .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
     // Packed projector weights become dense in the activation dtype: the GPU
     // vision kernels read dense weights only. The host dequantizes them
     // exactly to F32 and the device rounds once to the activation dtype.
@@ -2194,13 +2189,8 @@ pub fn source_element(encoding: Encoding, width: u64) -> Option<Element> {
     }
 }
 
-/// The one map from an artifact encoding to resident storage: dense
-/// encodings become `dense`; packed encodings become what the registry's
-/// conversion of their source (`source_element`) writes in `layout` (from
-/// the device backend) for the activations the weight's producer
-/// calibrated it for (`ScaledActivations`). NVFP4's per-tensor F32 `.scale`
-/// is a separate tensor; its W4A4 storage alone takes NVFP4 operands.
-/// `width` is the stored rows' width, as `source_element` takes it.
+/// The resident storage of an artifact encoding: that of its source
+/// (`source_element`, of rows of `width` values) by [`resident_storage`].
 pub fn resident_element(
     encoding: Encoding,
     activations: ScaledActivations,
@@ -2208,7 +2198,34 @@ pub fn resident_element(
     dense: DType,
     layout: Layout,
 ) -> Option<Element> {
-    let source = source_element(encoding, width)?;
+    resident_storage(source_element(encoding, width)?, activations, dense, layout)
+}
+
+/// The packet storage holding the values alone of a matrix stored as
+/// `source` (the activations a product takes do not change them): its
+/// resident storage for rounded activations, decoding to F32, in the packet
+/// layout, where a row's packets are consecutive bytes.
+pub(crate) fn value_packets(source: Element) -> Option<Element> {
+    resident_storage(
+        source,
+        ScaledActivations::Rounded,
+        DType::F32,
+        Layout::Packet,
+    )
+}
+
+/// The one map from a stored source element to resident storage: dense
+/// sources become `dense`; packed sources become what the registry's
+/// conversion of the source writes in `layout` (from the device backend)
+/// for the activations the weight's producer calibrated it for
+/// (`ScaledActivations`). NVFP4's per-tensor F32 `.scale` is a separate
+/// tensor; its W4A4 storage alone takes NVFP4 operands.
+fn resident_storage(
+    source: Element,
+    activations: ScaledActivations,
+    dense: DType,
+    layout: Layout,
+) -> Option<Element> {
     if source.dtype().is_some() {
         return (activations == ScaledActivations::Rounded).then_some(Element::dense(dense));
     }

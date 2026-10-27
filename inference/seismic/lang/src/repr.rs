@@ -494,6 +494,27 @@ pub struct DecodeTemp {
     dtype: DType,
 }
 
+/// The entry a decode reads: field `field` of plane `plane`
+/// (`DecodeStep::ReadPlaneField`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneRead {
+    pub plane: u32,
+    pub field: u32,
+}
+
+/// The reads of a decode whose value is its integer code times one stored
+/// scale (`DecodeRecipe::scaled_codes`): the code is the low `bits` bits of
+/// entry `code`, and its offset from the least code is those bits XOR
+/// `flip`; the scale is entry `scale` as stored, of dtype `scale_dtype`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScaledCodes {
+    pub code: PlaneRead,
+    pub bits: u32,
+    pub flip: u32,
+    pub scale: PlaneRead,
+    pub scale_dtype: DType,
+}
+
 /// One typed step of a decode recipe. Arithmetic steps operate on `f32`
 /// temporaries and round once at `f32`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -778,6 +799,65 @@ impl DecodeRecipe {
                 ))
             }
         }
+    }
+
+    /// Where a value that is exactly its integer code times one stored
+    /// scale (no bias, factor or code exponent) reads them, when the code's
+    /// offset from the least code is its raw bits XOR a constant; `None`
+    /// for any other decode.
+    pub fn scaled_codes(&self) -> Option<ScaledCodes> {
+        let defining = |temp| self.steps.iter().find(|step| step.defines() == temp);
+        let read = |temp| match defining(temp)? {
+            DecodeStep::ReadPlaneField { plane, field, .. } => Some(PlaneRead {
+                plane: *plane,
+                field: *field,
+            }),
+            _ => None,
+        };
+        let code = self.integer_code?;
+        let DecodeStep::InterpretCode {
+            raw,
+            bits,
+            interpretation,
+            ..
+        } = defining(code)?
+        else {
+            return None;
+        };
+        let DecodeStep::ConvertToF32 { from: stored, .. } = defining(self.scale)? else {
+            return None;
+        };
+        let plain = matches!(
+            defining(self.code_value)?, DecodeStep::ConvertToF32 { from, .. } if *from == code
+        );
+        let product = matches!(
+            defining(self.output)?,
+            DecodeStep::Multiply { left, right, .. }
+                if [*left, *right] == [self.scale, self.code_value]
+                    || [*left, *right] == [self.code_value, self.scale]
+        );
+        if !(plain && product) {
+            return None;
+        }
+        let codes = (0..1u32 << bits)
+            .map(|raw| interpretation.decode(raw, *bits))
+            .collect::<Vec<_>>();
+        let least = *codes.iter().min().expect("a code has values");
+        let flip = (codes[0] - least) as u32;
+        if !codes
+            .iter()
+            .enumerate()
+            .all(|(raw, code)| (code - least) as u32 == raw as u32 ^ flip)
+        {
+            return None;
+        }
+        Some(ScaledCodes {
+            code: read(*raw)?,
+            bits: *bits,
+            flip,
+            scale: read(*stored)?,
+            scale_dtype: self.dtype(*stored),
+        })
     }
 
     pub fn planes(&self) -> &[PlaneSchema] {

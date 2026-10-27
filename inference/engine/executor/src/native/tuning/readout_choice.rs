@@ -31,7 +31,7 @@ use super::{ComposedCensus, ComposedContender, PointShape, TuningInputs, TuningK
 use crate::native::specialization::entry_statics;
 use crate::native::{CatalogFailure, ProgressiveReadoutKernels, ProjectionKernels};
 use crate::{KernelCache, TuningCacheKey};
-use magnitude_family_contracts::{ProgressivePlane, WeightKind, WeightScope};
+use magnitude_family_contracts::{ProgressiveCodeDepth, ProgressivePlane, WeightKind, WeightScope};
 use magnitude_kernels::{
     readout_exact_rows, readout_features_rows, readout_head_rows, readout_planes_rows,
     readout_project_rows, readout_refine_rows, readout_top_rows,
@@ -58,7 +58,8 @@ pub(crate) struct ReadoutRecipe {
     /// norm's extent (0 for the hyper-connection exit site's partials).
     pub parts: u64,
     pub norm_extent: u64,
-    pub low_planes: u64,
+    /// The progressive head's code depth (`ImportTransform::Progressive`).
+    pub depth: ProgressiveCodeDepth,
     pub scale_extent: u64,
 }
 
@@ -160,7 +161,7 @@ impl ReadoutRecipe {
             ("D", self.hidden),
             ("PT", self.parts),
             ("NM", self.norm_extent),
-            ("P", self.low_planes),
+            ("P", u64::from(self.depth.rest_planes())),
             ("WS", self.scale_extent),
             // The prepared projection publishes every vocabulary column of
             // implicit token rows.
@@ -466,8 +467,6 @@ impl RecipeCase {
             Ok(plane.slice_leading(token, token + 1)?.read_to_host()?)
         };
         let columns = usize::try_from(recipe.hidden).map_err(|_| "hidden width exceeds usize")?;
-        let bits = u8::try_from(2 * (recipe.low_planes + 1))
-            .map_err(|_| "progressive code depth exceeds u8")?;
         // The row is the first of its partial rows; the others are zero.
         let partials = (recipe.parts - 1) * recipe.hidden;
         let mut values = Vec::new();
@@ -480,7 +479,7 @@ impl RecipeCase {
                 &stored(rest, token)?,
                 &stored(scales, token)?,
                 columns,
-                bits,
+                recipe.depth,
             ));
             values.extend(std::iter::repeat_n(0.0, partials as usize));
         }
@@ -1051,7 +1050,7 @@ mod tests {
                         hidden: 2048,
                         parts,
                         norm_extent,
-                        low_planes: 3,
+                        depth: ProgressiveCodeDepth::Eight,
                         scale_extent: 0,
                     };
                     let form =

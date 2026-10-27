@@ -34,14 +34,7 @@ impl TuningWeightSource for Package {
             Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
         let bytes = crate::programs::native_import::stored_source_bytes(&stored)
             .map_err(|error| error.to_string())?;
-        crate::import_transforms::upload_bytes(
-            &weight.descriptor,
-            stored.shape(),
-            weight.source,
-            stored.packed_encoding(),
-            weight.upload,
-            bytes,
-        )
+        crate::import_transforms::upload_bytes(weight, stored.shape(), bytes)
     }
 
     /// The source as the load's own importer takes it
