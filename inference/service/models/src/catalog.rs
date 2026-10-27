@@ -114,15 +114,48 @@ struct CatalogModel {
     description: String,
     release_date: ModelReleaseDate,
     parameterization: ModelParameterization,
+    sources: Vec<CatalogModelSource>,
+    #[serde(default)]
+    speculative_decoding: Option<CatalogSpeculativeDecoding>,
+    artificial_analysis: ArtificialAnalysisScore,
+    support: CatalogSupport,
+}
+
+impl CatalogModel {
+    /// Every variant, with the source that publishes it.
+    fn variants(&self) -> impl Iterator<Item = (&CatalogModelSource, &CatalogVariant)> {
+        self.sources
+            .iter()
+            .flat_map(|source| source.variants.iter().map(move |variant| (source, variant)))
+    }
+
+    /// Every repository a variant of the model resolves from: its sources' and a separately
+    /// packaged draft's.
+    fn repositories(&self) -> impl Iterator<Item = &str> {
+        self.sources
+            .iter()
+            .map(|source| source.repository.as_str())
+            .chain(self.draft_repository())
+    }
+
+    fn draft_repository(&self) -> Option<&str> {
+        self.speculative_decoding
+            .as_ref()
+            .and_then(|speculative| speculative.draft.file())
+            .map(|(repository, _)| repository)
+    }
+}
+
+/// One repository's publication of a model: the variants it hosts, the projector they share and
+/// the license it grants.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogModelSource {
     repository: String,
     variants: Vec<CatalogVariant>,
     #[serde(default)]
     projector: Option<CatalogProjectorSource>,
-    #[serde(default)]
-    speculative_decoding: Option<CatalogSpeculativeDecoding>,
     license: String,
-    artificial_analysis: ArtificialAnalysisScore,
-    support: CatalogSupport,
 }
 
 #[derive(Clone, Deserialize)]
@@ -154,11 +187,7 @@ struct CatalogSpeculativeDecoding {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum CatalogSpeculativeDraftSource {
     Embedded,
-    File {
-        #[serde(default)]
-        repository: Option<String>,
-        path: PathBuf,
-    },
+    File { repository: String, path: PathBuf },
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -188,13 +217,10 @@ impl From<CatalogSpeculativeMethod> for SpeculativeMethod {
 }
 
 impl CatalogSpeculativeDraftSource {
-    fn file<'a>(&'a self, target_repository: &'a str) -> Option<(&'a str, &'a Path)> {
+    fn file(&self) -> Option<(&str, &Path)> {
         match self {
             Self::Embedded => None,
-            Self::File { repository, path } => Some((
-                repository.as_deref().unwrap_or(target_repository),
-                path.as_path(),
-            )),
+            Self::File { repository, path } => Some((repository, path)),
         }
     }
 }
@@ -256,15 +282,8 @@ impl ReleasePlannerInput {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelCatalogLockEntry {
-    pub target: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub speculative_draft: Option<String>,
-}
-
-pub type ModelCatalogLock = BTreeMap<String, ModelCatalogLockEntry>;
+/// The immutable commit of every repository the catalog resolves from, by repository.
+pub type ModelCatalogLock = BTreeMap<String, String>;
 
 /// One package component's assessment material: its exact GGUF header (every byte through the
 /// aligned tensor-data offset), which is what the engine's header-only planning and chat
@@ -307,31 +326,45 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
     let mut ids = BTreeSet::new();
     let mut presentations = BTreeSet::new();
     for model in &source.models {
+        let variant_count = model.variants().count();
         let variant_ids = model
-            .variants
-            .iter()
-            .map(|variant| variant.variant_id.as_str())
-            .collect::<BTreeSet<_>>();
-        let formats = model
-            .variants
-            .iter()
-            .map(|variant| variant.format.as_str())
+            .variants()
+            .map(|(_, variant)| variant.variant_id.as_str())
             .collect::<BTreeSet<_>>();
         let variant_labels = model
-            .variants
+            .variants()
+            .map(|(_, variant)| variant.variant_label.as_str())
+            .collect::<BTreeSet<_>>();
+        let repositories = model
+            .sources
             .iter()
-            .map(|variant| variant.variant_label.as_str())
+            .map(|source| source.repository.as_str())
             .collect::<BTreeSet<_>>();
         if !valid_identity_component(&model.id)
             || model.display_name.is_empty()
             || model.description.is_empty()
             || !valid_parameterization(&model.parameterization)
-            || model.repository.is_empty()
-            || model.variants.is_empty()
-            || variant_ids.len() != model.variants.len()
-            || formats.len() != model.variants.len()
-            || variant_labels.len() != model.variants.len()
-            || model.variants.iter().any(|variant| {
+            || model.sources.is_empty()
+            || repositories.len() != model.sources.len()
+            || model.sources.iter().any(|source| {
+                // A format selects its variant's primary GGUF among its repository's files.
+                let formats = source
+                    .variants
+                    .iter()
+                    .map(|variant| variant.format.as_str())
+                    .collect::<BTreeSet<_>>();
+                source.repository.is_empty()
+                    || source.variants.is_empty()
+                    || formats.len() != source.variants.len()
+                    || source
+                        .projector
+                        .as_ref()
+                        .is_some_and(|projector| projector.path.as_os_str().is_empty())
+                    || source.license.is_empty()
+            })
+            || variant_ids.len() != variant_count
+            || variant_labels.len() != variant_count
+            || model.variants().any(|(_, variant)| {
                 !valid_variant_id(&variant.variant_id)
                     || variant.format.is_empty()
                     || variant.format.trim() != variant.format.as_str()
@@ -345,10 +378,6 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                     || variant.variant_label.contains(')')
                     || variant.fidelity_rank == 0
             })
-            || model
-                .projector
-                .as_ref()
-                .is_some_and(|projector| projector.path.as_os_str().is_empty())
             || model
                 .speculative_decoding
                 .as_ref()
@@ -365,18 +394,16 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                     ) || match &speculative.draft {
                         CatalogSpeculativeDraftSource::Embedded => false,
                         CatalogSpeculativeDraftSource::File { repository, path } => {
-                            repository.as_ref().is_some_and(String::is_empty)
-                                || path.as_os_str().is_empty()
+                            repository.is_empty() || path.as_os_str().is_empty()
                         }
                     }
                 })
-            || model.license.is_empty()
             || !valid_artificial_analysis(
                 &model.artificial_analysis,
                 &source.artificial_analysis_frontier,
             )
             || !ids.insert(model.id.as_str())
-            || model.variants.iter().any(|variant| {
+            || model.variants().any(|(_, variant)| {
                 !presentations.insert((model.display_name.as_str(), variant.variant_label.as_str()))
             })
         {
@@ -425,9 +452,8 @@ fn valid_catalog_support(model: &CatalogModel, source: &CatalogSource) -> bool {
                             candidate.id == base_id.as_str()
                                 && candidate.support.is_available()
                                 && candidate
-                                    .variants
-                                    .iter()
-                                    .any(|variant| variant.variant_id == variant_id.as_str())
+                                    .variants()
+                                    .any(|(_, variant)| variant.variant_id == variant_id.as_str())
                         })
                 }
         }
@@ -503,9 +529,10 @@ pub(crate) fn is_projector_path(path: &Path) -> bool {
 
 fn resolve_projector_path(
     declaration: &CatalogModel,
+    source: &CatalogModelSource,
     snapshot: &HuggingFaceRepositorySnapshot,
 ) -> Result<Option<PathBuf>, InventoryError> {
-    let projector = if let Some(projector) = &declaration.projector {
+    let projector = if let Some(projector) = &source.projector {
         if !is_projector_path(&projector.path)
             || !snapshot
                 .gguf_files
@@ -596,20 +623,21 @@ pub fn model_catalog_lock() -> Result<ModelCatalogLock, InventoryError> {
 }
 
 /// Which catalog entries a lock update resolves to their repositories' current commits. Every
-/// other entry keeps its locked revisions.
+/// other repository keeps its locked revision.
 pub enum CatalogLockAdvance {
     All,
     Models(BTreeSet<String>),
 }
 
-/// Advance the selected catalog entries to their repositories' current commits. A deprecated
-/// model is never advanced: its locked revisions are what keep existing installs identifiable.
+/// Advance the selected catalog entries' repositories to their current commits. A repository a
+/// deprecated model resolves from is never advanced: its locked revision is what keeps existing
+/// installs identifiable.
 pub async fn advance_model_catalog_lock(
     models: Arc<ManagedModelStore>,
     advance: CatalogLockAdvance,
 ) -> Result<ModelCatalogLock, InventoryError> {
     let source = catalog_source()?;
-    // The compiled lock need not cover models declared since it was written, so only its
+    // The compiled lock need not cover repositories declared since it was written, so only its
     // syntax is checked here; the advanced lock is validated in full below.
     let current: ModelCatalogLock = serde_json::from_str(CATALOG_LOCK).map_err(|error| {
         InventoryError::Integrity(format!("invalid model catalog lock: {error}"))
@@ -627,74 +655,56 @@ pub async fn advance_model_catalog_lock(
             "{id} is not an advanceable catalog model; deprecated models keep their locked revisions"
         )));
     }
-    let resolved = stream::iter(source.models.clone())
-        .map(|declaration| {
+    let kept = source
+        .models
+        .iter()
+        .filter(|model| model.support.is_deprecated())
+        .flat_map(CatalogModel::repositories)
+        .collect::<BTreeSet<_>>();
+    let advanced = source
+        .models
+        .iter()
+        .filter(|model| match &advance {
+            CatalogLockAdvance::All => true,
+            CatalogLockAdvance::Models(ids) => ids.contains(&model.id),
+        })
+        .flat_map(CatalogModel::repositories)
+        .filter(|repository| !kept.contains(repository))
+        .collect::<BTreeSet<_>>();
+    let repositories = source
+        .models
+        .iter()
+        .flat_map(CatalogModel::repositories)
+        .collect::<BTreeSet<_>>();
+    let resolved = stream::iter(repositories)
+        .map(|repository| {
             let models = Arc::clone(&models);
-            let advanced = !declaration.support.is_deprecated()
-                && match &advance {
-                    CatalogLockAdvance::All => true,
-                    CatalogLockAdvance::Models(ids) => ids.contains(&declaration.id),
-                };
-            let locked = current.get(&declaration.id).cloned();
+            let advanced = advanced.contains(repository);
+            let locked = current.get(repository).cloned();
             async move {
-                let entry_id = declaration.id;
                 if !advanced {
-                    return locked.map(|entry| (entry_id.clone(), entry)).ok_or_else(|| {
-                        InventoryError::Integrity(format!(
-                            "catalog entry {entry_id} has no locked revision to keep"
-                        ))
-                    });
+                    return locked
+                        .map(|commit| (repository.to_owned(), commit))
+                        .ok_or_else(|| {
+                            InventoryError::Integrity(format!(
+                                "catalog repository {repository} has no locked revision to keep"
+                            ))
+                        });
                 }
-                let target_repository = declaration.repository;
-                let target = refresh_hugging_face_repository(
+                let snapshot = refresh_hugging_face_repository(
                     &models,
                     HuggingFaceRepositoryRequest {
-                        repository: target_repository.clone(),
+                        repository: repository.to_owned(),
                         revision: "main".to_owned(),
                     },
                 )
                 .await
                 .map_err(|error| {
                     InventoryError::Upstream(format!(
-                        "failed to resolve catalog entry {entry_id}: {error}"
+                        "failed to resolve catalog repository {repository}: {error}"
                     ))
                 })?;
-                let speculative_draft = match declaration
-                    .speculative_decoding
-                    .and_then(|speculative| match speculative.draft {
-                        CatalogSpeculativeDraftSource::Embedded => None,
-                        CatalogSpeculativeDraftSource::File { repository, .. } => {
-                            Some(repository.unwrap_or_else(|| target_repository.clone()))
-                        }
-                    }) {
-                    Some(repository) if repository == target_repository => {
-                        Some(target.commit.clone())
-                    }
-                    Some(repository) => Some(
-                        refresh_hugging_face_repository(
-                            &models,
-                            HuggingFaceRepositoryRequest {
-                                repository,
-                                revision: "main".to_owned(),
-                            },
-                        )
-                        .await
-                        .map_err(|error| {
-                            InventoryError::Upstream(format!(
-                                "failed to resolve catalog entry {entry_id} speculative draft: {error}"
-                            ))
-                        })?
-                        .commit,
-                    ),
-                    None => None,
-                };
-                Ok::<_, InventoryError>((
-                    entry_id,
-                    ModelCatalogLockEntry {
-                        target: target.commit,
-                        speculative_draft,
-                    },
-                ))
+                Ok::<_, InventoryError>((repository.to_owned(), snapshot.commit))
             }
         })
         .buffer_unordered(12)
@@ -723,35 +733,16 @@ fn validate_model_catalog_lock(
     let expected = source
         .models
         .iter()
-        .map(|model| model.id.clone())
+        .flat_map(CatalogModel::repositories)
         .collect::<BTreeSet<_>>();
-    if lock.keys().cloned().collect::<BTreeSet<_>>() != expected {
+    if !lock.keys().map(String::as_str).eq(expected) {
         return Err(InventoryError::Integrity(
-            "model catalog lock does not exactly cover models.json".to_owned(),
+            "model catalog lock does not exactly cover the repositories of models.json".to_owned(),
         ));
     }
-    if source.models.iter().any(|model| {
-        let Some(entry) = lock.get(&model.id) else {
-            return true;
-        };
-        !valid_commit(&entry.target)
-            || entry.speculative_draft.is_some()
-                != model
-                    .speculative_decoding
-                    .as_ref()
-                    .is_some_and(|speculative| {
-                        matches!(
-                            speculative.draft,
-                            CatalogSpeculativeDraftSource::File { .. }
-                        )
-                    })
-            || entry
-                .speculative_draft
-                .as_ref()
-                .is_some_and(|commit| !valid_commit(commit))
-    }) {
+    if lock.values().any(|commit| !valid_commit(commit)) {
         return Err(InventoryError::Integrity(
-            "model catalog lock contains invalid or mismatched package revisions".to_owned(),
+            "model catalog lock contains invalid package revisions".to_owned(),
         ));
     }
     Ok(())
@@ -1079,17 +1070,14 @@ impl ReleaseCatalog {
 
     /// Write every catalog component's exact header, extended sparsely to its file's size, under
     /// `root` at `<repository>/<revision>/<path>`, and return them
-    /// (`magnitude_artifacts::catalog_headers`): each variant's target, and each model's draft
-    /// and projector.
+    /// (`magnitude_artifacts::catalog_headers`): each variant's target, draft and projector.
     pub fn export_headers(&self, root: &Path) -> Result<Vec<CatalogComponent>, InventoryError> {
-        let mut components = BTreeMap::new();
+        let mut components = Vec::new();
         let mut written = BTreeSet::new();
         for input in self.planner_inputs.values() {
-            let model = input.model_id.as_str();
+            let model = ModelId::catalog(&input.model_id, &input.variant_id);
             let target = (
-                HeaderRole::Target {
-                    variant: input.variant_id.as_str().to_owned(),
-                },
+                HeaderRole::Target,
                 &input.target,
                 input.target.primary_gguf.clone(),
                 &[ComponentRole::Weights, ComponentRole::Shard] as &[ComponentRole],
@@ -1134,8 +1122,8 @@ impl ReleaseCatalog {
                     ));
                 };
                 let component = CatalogComponent {
-                    model: model.to_owned(),
-                    role: role.clone(),
+                    model: model.as_str().to_owned(),
+                    role,
                     repository: repository.clone(),
                     revision: revision.clone(),
                     path,
@@ -1157,18 +1145,11 @@ impl ReleaseCatalog {
                         write_component_header(file, &header, &path)?;
                     }
                 }
-                if let Some(previous) =
-                    components.insert((model.to_owned(), role), component.clone())
-                    && previous != component
-                {
-                    return Err(InventoryError::Integrity(format!(
-                        "catalog model {model} has two {:?} components",
-                        component.role
-                    )));
-                }
+                components.push(component);
             }
         }
-        Ok(components.into_values().collect())
+        components.sort_by(|left, right| (&left.model, left.role).cmp(&(&right.model, right.role)));
+        Ok(components)
     }
 
     pub fn resolve_bundle(
@@ -1414,9 +1395,8 @@ fn validate_resolved_catalog(
         .iter()
         .flat_map(|model| {
             model
-                .variants
-                .iter()
-                .map(|variant| (model.id.as_str(), variant.variant_id.as_str()))
+                .variants()
+                .map(|(_, variant)| (model.id.as_str(), variant.variant_id.as_str()))
         })
         .collect::<BTreeSet<_>>();
     if actual.len() != catalog.models.len()
@@ -1439,9 +1419,26 @@ fn validate_resolved_catalog(
                     model.model_id, model.variant_id
                 ))
             })?;
-        let expected_lock = lock.get(model.model_id.as_str()).ok_or_else(|| {
-            InventoryError::Integrity(format!("model catalog lock is missing {}", model.model_id))
-        })?;
+        let declared_source = declaration
+            .sources
+            .iter()
+            .find(|source| {
+                source
+                    .variants
+                    .iter()
+                    .any(|variant| variant.variant_id == model.variant_id.as_str())
+            })
+            .ok_or_else(|| {
+                InventoryError::Integrity(format!(
+                    "release catalog model {} variant {} has no source declaration",
+                    model.model_id, model.variant_id
+                ))
+            })?;
+        let locked = |repository: &str| {
+            lock.get(repository).ok_or_else(|| {
+                InventoryError::Integrity(format!("model catalog lock is missing {repository}"))
+            })
+        };
         let (target, draft_source, method) = match &model.configuration.bundle {
             ServableModelBundle::Standalone { package } => (package, None, None),
             ServableModelBundle::SpeculativeDecoding {
@@ -1459,37 +1456,26 @@ fn validate_resolved_catalog(
                 }),
                 Some(SpeculativeDraftSource::Embedded),
                 Some(method),
-            ) => expected_lock.speculative_draft.is_none() && method == &(*expected_method).into(),
+            ) => method == &(*expected_method).into(),
             (
                 Some(CatalogSpeculativeDecoding {
                     method: expected_method,
-                    draft: CatalogSpeculativeDraftSource::File { .. },
+                    draft:
+                        CatalogSpeculativeDraftSource::File {
+                            repository: expected_repository,
+                            path: expected_path,
+                        },
                 }),
                 Some(SpeculativeDraftSource::Separate { draft }),
                 Some(method),
             ) => {
-                let Some(expected_draft_commit) = expected_lock.speculative_draft.as_deref() else {
-                    return Err(InventoryError::Integrity(format!(
-                        "model catalog lock is missing {} speculative draft",
-                        model.model_id
-                    )));
-                };
-                let Some((expected_repository, expected_path)) = declaration
-                    .speculative_decoding
-                    .as_ref()
-                    .and_then(|speculative| speculative.draft.file(&declaration.repository))
-                else {
-                    return Err(InventoryError::Integrity(
-                        "file draft declaration lost its source".to_owned(),
-                    ));
-                };
                 method == &(*expected_method).into()
                     && package_source_matches(
                         &draft.source,
                         expected_repository,
-                        expected_draft_commit,
+                        locked(expected_repository)?,
                     )
-                    && draft.files.iter().any(|file| file.path == expected_path)
+                    && draft.files.iter().any(|file| file.path == *expected_path)
             }
             _ => false,
         };
@@ -1500,7 +1486,7 @@ fn validate_resolved_catalog(
             .collect::<Vec<_>>();
         // As `resolve_projector_path` selects: the declared projector, or
         // without a declaration the repository's sole mmproj, if any.
-        let projector_matches = match &declaration.projector {
+        let projector_matches = match &declared_source.projector {
             Some(projector) => {
                 projector_files.len() == 1 && projector_files[0].path == projector.path
             }
@@ -1510,8 +1496,8 @@ fn validate_resolved_catalog(
             != Some(model.configuration.profile.context_length)
             || !package_source_matches(
                 &target.source,
-                &declaration.repository,
-                &expected_lock.target,
+                &declared_source.repository,
+                locked(&declared_source.repository)?,
             )
             || !projector_matches
             || !speculative_matches
@@ -1542,6 +1528,7 @@ fn package_source_matches(
 fn recommendable_model(
     declaration: &CatalogModel,
     frontier: &ArtificialAnalysisFrontier,
+    source: &CatalogModelSource,
     variant: &CatalogVariant,
     target: ModelPackage,
     draft: Option<ModelPackage>,
@@ -1613,7 +1600,7 @@ fn recommendable_model(
         variant_label: variant.variant_label.clone(),
         description: declaration.description.clone(),
         release_date: declaration.release_date.clone(),
-        license: declaration.license.clone(),
+        license: source.license.clone(),
         parameterization: declaration.parameterization.clone(),
         intelligence: frontier.intelligence(&declaration.artificial_analysis),
         support: declaration.support.clone(),
@@ -1637,7 +1624,7 @@ fn catalog_from_planner_inputs(
     }
     let mut models = Vec::new();
     for declaration in &source.models {
-        for variant in &declaration.variants {
+        for (declared_source, variant) in declaration.variants() {
             let identity = (
                 CatalogBaseId::new(declaration.id.clone())
                     .map_err(|error| InventoryError::Integrity(error.to_string()))?,
@@ -1653,6 +1640,7 @@ fn catalog_from_planner_inputs(
             let model = recommendable_model(
                 declaration,
                 &source.artificial_analysis_frontier,
+                declared_source,
                 variant,
                 input.target.package.clone(),
                 input.draft.as_ref().map(|draft| draft.package.clone()),
@@ -1692,6 +1680,7 @@ impl ResolvingRecommendableCatalog {
         &self,
         declaration: &CatalogModel,
         frontier: &ArtificialAnalysisFrontier,
+        source: &CatalogModelSource,
         variant: &CatalogVariant,
         snapshots: &BTreeMap<String, HuggingFaceRepositorySnapshot>,
     ) -> Result<
@@ -1702,17 +1691,17 @@ impl ResolvingRecommendableCatalog {
         ),
         InventoryError,
     > {
-        let snapshot = snapshots.get(&declaration.repository).ok_or_else(|| {
+        let snapshot = snapshots.get(&source.repository).ok_or_else(|| {
             InventoryError::Integrity(format!(
                 "target repository {} was not resolved",
-                declaration.repository
+                source.repository
             ))
         })?;
         let primary = match &variant.path {
             Some(path) => declared_primary_gguf(snapshot, path)?,
             None => select_primary_gguf(snapshot, &variant.format)?,
         };
-        let projector = resolve_projector_path(declaration, snapshot)?;
+        let projector = resolve_projector_path(declaration, source, snapshot)?;
         let additional_components = projector
             .map(|path| ModelPreviewComponentSource {
                 path,
@@ -1752,7 +1741,7 @@ impl ResolvingRecommendableCatalog {
         let draft = match declaration
             .speculative_decoding
             .as_ref()
-            .and_then(|speculative| speculative.draft.file(&declaration.repository))
+            .and_then(|speculative| speculative.draft.file())
         {
             Some((draft_repository, draft_path)) => {
                 let snapshot = snapshots.get(draft_repository).ok_or_else(|| {
@@ -1793,6 +1782,7 @@ impl ResolvingRecommendableCatalog {
         let model = recommendable_model(
             declaration,
             frontier,
+            source,
             variant,
             target.package.clone(),
             draft.as_ref().map(|draft| draft.package.clone()),
@@ -1970,61 +1960,11 @@ fn is_later_shard(name: &str) -> bool {
         })
 }
 
-fn insert_locked_repository(
-    repositories: &mut BTreeMap<String, String>,
-    repository: &str,
-    revision: &str,
-) -> Result<(), InventoryError> {
-    if let Some(existing) = repositories.insert(repository.to_owned(), revision.to_owned())
-        && existing != revision
-    {
-        return Err(InventoryError::Integrity(format!(
-            "catalog repository {repository} is locked to conflicting revisions"
-        )));
-    }
-    Ok(())
-}
-
-/// Insert the locked revisions of a declaration's target repository and, when its speculative
-/// draft is a separate file, its draft repository.
-fn insert_declaration_repositories(
-    repositories: &mut BTreeMap<String, String>,
-    declaration: &CatalogModel,
-    lock: &ModelCatalogLock,
-) -> Result<(), InventoryError> {
-    let entry = lock.get(&declaration.id).ok_or_else(|| {
-        InventoryError::Integrity(format!(
-            "model catalog lock is missing {}",
-            declaration.id
-        ))
-    })?;
-    insert_locked_repository(repositories, &declaration.repository, &entry.target)?;
-    if let Some(speculative) = &declaration.speculative_decoding {
-        if let Some((repository, _)) = speculative.draft.file(&declaration.repository) {
-            insert_locked_repository(
-                repositories,
-                repository,
-                entry.speculative_draft.as_deref().ok_or_else(|| {
-                    InventoryError::Integrity(format!(
-                        "model catalog lock is missing {} speculative draft",
-                        declaration.id
-                    ))
-                })?,
-            )?;
-        } else if entry.speculative_draft.is_some() {
-            return Err(InventoryError::Integrity(format!(
-                "model catalog lock unexpectedly includes {} embedded speculative draft",
-                declaration.id
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// One catalog variant addressed by its catalog `ModelId`, with the locked repository revisions
 /// its target and separately packaged draft resolve from.
 struct LockedCatalogVariant {
     declaration: CatalogModel,
+    source: CatalogModelSource,
     variant: CatalogVariant,
     repositories: BTreeMap<String, String>,
 }
@@ -2048,17 +1988,27 @@ fn locked_catalog_variant(
         .iter()
         .find(|model| model.id == base_id.as_str())
         .ok_or_else(|| InventoryError::NotFound(format!("catalog model {base_id}")))?;
-    let variant = declaration
-        .variants
-        .iter()
-        .find(|variant| variant.variant_id == variant_id.as_str())
+    let (source, variant) = declaration
+        .variants()
+        .find(|(_, variant)| variant.variant_id == variant_id.as_str())
         .ok_or_else(|| {
             InventoryError::NotFound(format!("catalog model {base_id} variant {variant_id}"))
         })?;
-    let mut repositories = BTreeMap::new();
-    insert_declaration_repositories(&mut repositories, declaration, lock)?;
+    let repositories = std::iter::once(source.repository.as_str())
+        .chain(declaration.draft_repository())
+        .map(|repository| {
+            lock.get(repository)
+                .map(|commit| (repository.to_owned(), commit.clone()))
+                .ok_or_else(|| {
+                    InventoryError::Integrity(format!(
+                        "model catalog lock is missing {repository}"
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()?;
     Ok(LockedCatalogVariant {
         declaration: declaration.clone(),
+        source: source.clone(),
         variant: variant.clone(),
         repositories,
     })
@@ -2090,6 +2040,7 @@ impl ResolvingRecommendableCatalog {
             .resolve_model(
                 &selected.declaration,
                 &source.artificial_analysis_frontier,
+                &selected.source,
                 &selected.variant,
                 &snapshots,
             )
@@ -2137,11 +2088,8 @@ impl ResolvingRecommendableCatalog {
     where
         F: Fn(&str, usize, usize) + Send + Sync + 'static,
     {
-        let mut repositories = BTreeMap::new();
-        for declaration in &source.models {
-            insert_declaration_repositories(&mut repositories, declaration, &lock)?;
-        }
-        let repositories = repositories.into_iter().collect::<Vec<_>>();
+        // The lock covers exactly the catalog's repositories (`validate_model_catalog_lock`).
+        let repositories = lock.into_iter().collect::<Vec<_>>();
         let repository_total = repositories.len();
         let mut repository_completed = 0;
         let snapshots = stream::iter(repositories)
@@ -2187,17 +2135,10 @@ impl ResolvingRecommendableCatalog {
         let resolved =
             stream::iter(source.models.iter().cloned().enumerate())
                 .map(|(declaration_index, declaration)| async move {
-                    let mut variants = Vec::with_capacity(declaration.variants.len());
-                    for (variant_index, variant) in declaration.variants.iter().enumerate() {
-                        let missing_repository = std::iter::once(declaration.repository.as_str())
-                            .chain(declaration.speculative_decoding.iter().filter_map(
-                                |speculative| {
-                                    speculative
-                                        .draft
-                                        .file(&declaration.repository)
-                                        .map(|(repository, _)| repository)
-                                },
-                            ))
+                    let mut variants = Vec::new();
+                    for (variant_index, (source, variant)) in declaration.variants().enumerate() {
+                        let missing_repository = std::iter::once(source.repository.as_str())
+                            .chain(declaration.draft_repository())
                             .find(|repository| !resolved_snapshots.contains_key(*repository));
                         let result =
                             match missing_repository {
@@ -2205,6 +2146,7 @@ impl ResolvingRecommendableCatalog {
                                     self.resolve_model(
                                         &declaration,
                                         frontier,
+                                        source,
                                         variant,
                                         resolved_snapshots,
                                     )
@@ -2341,11 +2283,13 @@ mod tests {
     fn projector_resolution_is_automatic_only_when_unambiguous() {
         let source = catalog_source().expect("catalog source should be valid");
         let mut declaration = source.models[0].clone();
-        declaration.projector = None;
         declaration.speculative_decoding = None;
+        let mut model_source = declaration.sources[0].clone();
+        model_source.projector = None;
         assert_eq!(
             resolve_projector_path(
                 &declaration,
+                &model_source,
                 &repository_snapshot(&["model.gguf", "mmproj-model-F16.gguf"]),
             )
             .unwrap(),
@@ -2353,6 +2297,7 @@ mod tests {
         );
         let error = resolve_projector_path(
             &declaration,
+            &model_source,
             &repository_snapshot(&[
                 "model.gguf",
                 "mmproj-model-BF16.gguf",
@@ -2367,25 +2312,26 @@ mod tests {
     fn projector_resolution_rejects_invalid_paths_and_embedded_mtp() {
         let source = catalog_source().expect("catalog source should be valid");
         let mut declaration = source.models[0].clone();
+        let mut model_source = declaration.sources[0].clone();
         let snapshot = repository_snapshot(&["model.gguf", "mmproj-BF16.gguf"]);
-        declaration.projector = Some(CatalogProjectorSource {
+        model_source.projector = Some(CatalogProjectorSource {
             path: PathBuf::from("mmproj-missing.gguf"),
         });
-        let error = resolve_projector_path(&declaration, &snapshot).unwrap_err();
+        let error = resolve_projector_path(&declaration, &model_source, &snapshot).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("is not a repository mmproj GGUF")
         );
 
-        declaration.projector = Some(CatalogProjectorSource {
+        model_source.projector = Some(CatalogProjectorSource {
             path: PathBuf::from("mmproj-BF16.gguf"),
         });
         declaration.speculative_decoding = Some(CatalogSpeculativeDecoding {
             method: CatalogSpeculativeMethod::Mtp,
             draft: CatalogSpeculativeDraftSource::Embedded,
         });
-        let error = resolve_projector_path(&declaration, &snapshot).unwrap_err();
+        let error = resolve_projector_path(&declaration, &model_source, &snapshot).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -2396,12 +2342,12 @@ mod tests {
         declaration.speculative_decoding = Some(CatalogSpeculativeDecoding {
             method: CatalogSpeculativeMethod::Mtp,
             draft: CatalogSpeculativeDraftSource::File {
-                repository: None,
+                repository: "publisher/model-MTP".to_owned(),
                 path: PathBuf::from("mtp-gemma-4-12B-it.gguf"),
             },
         });
         assert_eq!(
-            resolve_projector_path(&declaration, &snapshot).unwrap(),
+            resolve_projector_path(&declaration, &model_source, &snapshot).unwrap(),
             Some(PathBuf::from("mmproj-BF16.gguf"))
         );
     }
@@ -2455,7 +2401,8 @@ mod tests {
                 .models
                 .iter()
                 .filter(|model| model.support.is_deprecated())
-                .all(|model| lock.contains_key(&model.id))
+                .flat_map(CatalogModel::repositories)
+                .all(|repository| lock.contains_key(repository))
         );
     }
 
@@ -2596,51 +2543,69 @@ mod tests {
     fn catalog_variant_selection_locks_target_and_separate_draft_repositories() {
         let selected = select("qwen3.5-4b:gguf:q4").unwrap();
         let lock = model_catalog_lock().unwrap();
-        let entry = &lock["qwen3.5-4b"];
         assert_eq!(selected.declaration.id, "qwen3.5-4b");
         assert_eq!(selected.variant.variant_id, "gguf:q4");
         assert_eq!(selected.variant.format, "UD-Q4_K_XL");
-        let (draft_repository, draft_path) = selected
-            .declaration
-            .speculative_decoding
-            .as_ref()
-            .and_then(|speculative| speculative.draft.file(&selected.declaration.repository))
-            .expect("qwen3.5-4b declares a separate drafter");
-        assert_eq!(draft_path, Path::new("Qwen3.5-4B-DFlash-Q8_0.gguf"));
+        let draft = "magnitudedev/Qwen3.5-4B-DFlash-GGUF";
+        assert_eq!(selected.declaration.draft_repository(), Some(draft));
         assert_eq!(
             selected.repositories,
             BTreeMap::from([
-                (selected.declaration.repository.clone(), entry.target.clone()),
                 (
-                    draft_repository.to_owned(),
-                    entry.speculative_draft.clone().unwrap()
+                    "unsloth/Qwen3.5-4B-MTP-GGUF".to_owned(),
+                    lock["unsloth/Qwen3.5-4B-MTP-GGUF"].clone()
                 ),
+                (draft.to_owned(), lock[draft].clone()),
             ])
         );
+    }
+
+    #[test]
+    fn catalog_variant_selection_locks_its_own_sources_repository() {
+        let lock = model_catalog_lock().unwrap();
+        let shared_draft = "unsloth/Qwen3.8-Flash-Next-GGUF";
+        for (id, repository, license) in [
+            ("qwen3.8-flash-next:gguf:q4", shared_draft, "qwen-community-1.0"),
+            (
+                "qwen3.8-flash-next:gguf:nvfp4",
+                "magnitudedev/Qwen3.8-Flash-Next-NVFP4-GGUF",
+                "nvidia-open-model-license",
+            ),
+        ] {
+            let selected = select(id).unwrap();
+            assert_eq!(selected.source.repository, repository, "{id}");
+            assert_eq!(selected.source.license, license, "{id}");
+            assert_eq!(
+                selected.repositories,
+                [repository, shared_draft]
+                    .into_iter()
+                    .map(|repository| (repository.to_owned(), lock[repository].clone()))
+                    .collect::<BTreeMap<_, _>>(),
+                "{id}"
+            );
+        }
     }
 
     #[test]
     fn catalog_variant_selection_needs_no_draft_repository_for_embedded_or_absent_drafts() {
         let source = catalog_source().unwrap();
         let lock = model_catalog_lock().unwrap();
-        for declaration in source.models.iter().filter(|declaration| {
-            declaration
-                .speculative_decoding
-                .as_ref()
-                .is_none_or(|speculative| {
-                    matches!(speculative.draft, CatalogSpeculativeDraftSource::Embedded)
-                })
-        }) {
-            let id = format!("{}:{}", declaration.id, declaration.variants[0].variant_id);
-            let selected = select(&id).unwrap();
-            assert_eq!(
-                selected.repositories,
-                BTreeMap::from([(
-                    declaration.repository.clone(),
-                    lock[&declaration.id].target.clone()
-                )]),
-                "{id}"
-            );
+        for declaration in source
+            .models
+            .iter()
+            .filter(|declaration| declaration.draft_repository().is_none())
+        {
+            for (model_source, variant) in declaration.variants() {
+                let id = format!("{}:{}", declaration.id, variant.variant_id);
+                assert_eq!(
+                    select(&id).unwrap().repositories,
+                    BTreeMap::from([(
+                        model_source.repository.clone(),
+                        lock[&model_source.repository].clone()
+                    )]),
+                    "{id}"
+                );
+            }
         }
     }
 

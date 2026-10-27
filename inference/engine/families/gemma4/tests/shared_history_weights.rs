@@ -5,7 +5,7 @@
 //! file interprets to the same definition as one without them.
 
 use magnitude_artifacts::{gguf::Directory, ArtifactIdentity, PackageIdentity, UnsupportedReason};
-use magnitude_family_common::headers::{add_tensor, artifact, catalog as header};
+use magnitude_family_common::headers::{self, add_tensor, artifact};
 use magnitude_family_contracts::{KeyValue, ModelDefinition, Operator};
 use magnitude_family_gemma4::{inspect_components, Error};
 
@@ -21,7 +21,7 @@ fn inspect(directory: &Directory) -> Result<ModelDefinition, Error> {
 }
 
 fn catalog(model: &str) -> Directory {
-    header(&format!("gemma-4-{model}-it-qat__target-gguf:q4"))
+    headers::target(&format!("gemma-4-{model}-it-qat:gguf:q4"))
 }
 
 /// `(layer, key/value rows, head width)` of every sharing layer.
@@ -110,7 +110,7 @@ fn an_owning_layer_still_requires_its_key_projection() {
 /// otherwise the same tensor names and Gemma 4 metadata.
 #[test]
 fn the_released_bartowski_e2b_header_interprets_like_the_catalog_file() {
-    let bartowski = artifact("gemma-4-e2b-it-bartowski__target-gguf:q4_k_m");
+    let bartowski = artifact("gemma-4-e2b-it-bartowski-q4_k_m");
     let catalog = catalog("e2b");
     let extra = bartowski
         .tensors

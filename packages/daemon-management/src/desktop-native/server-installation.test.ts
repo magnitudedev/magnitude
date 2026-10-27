@@ -137,6 +137,7 @@ describe("Linux root step", () => {
     vi.spyOn(console, "log").mockImplementation((...values: unknown[]) => { printed.push(values.join(" ")) })
     const accounts = { ...(options.accounts ?? (options.setUp ? ours : { passwd: "", group: "" })) }
     let enabled = options.setUp ?? false
+    const contents = new Map<string, string>()
     const files = new Map<string, Entry>([
       ["/run/systemd/system", { type: "Directory", uid: 0 }],
       ["/etc/login.defs", { type: "File", uid: 0 }],
@@ -155,8 +156,9 @@ describe("Linux root step", () => {
       makeDirectory: path => Effect.sync(() => { files.set(path, { type: "Directory", uid: 0 }); written.push(`mkdir ${path}`) }),
       chmod: (path, mode) => Effect.sync(() => { written.push(`chmod ${mode.toString(8)} ${tmp(path)}`) }),
       chown: (path, uid, gid) => Effect.sync(() => { written.push(`chown ${uid}:${gid} ${tmp(path)}`) }),
-      writeFileString: (path, _, writeOptions) => Effect.sync(() => {
+      writeFileString: (path, data, writeOptions) => Effect.sync(() => {
         files.set(path, { type: "File", uid: 0 })
+        contents.set(path, data)
         written.push(`write ${(writeOptions?.mode ?? 0).toString(8)} ${tmp(path)}`)
       }),
       rename: (from, to) => Effect.sync(() => { files.delete(from); files.set(to, { type: "File", uid: 0 }); written.push(`rename ${to}`) }),
@@ -172,6 +174,7 @@ describe("Linux root step", () => {
       if (lookup) return accounts[lookup[1] as "group" | "passwd"] === "" ? [2, "", ""] : [0, `${accounts[lookup[1] as "group" | "passwd"]}\n`, ""]
       if (line === "/usr/bin/id -u -- ada") return [0, "1000\n", ""]
       if (line === "/usr/bin/id -u -- magnitude") return [0, "990\n", ""]
+      if (line === "/usr/bin/id -g -- magnitude") return [0, "980\n", ""]
       if (line.startsWith("/usr/sbin/groupadd")) accounts.group = "magnitude:x:990:"
       if (line.startsWith("/usr/sbin/useradd")) accounts.passwd = ours.passwd
       if (line === "/usr/sbin/userdel magnitude") {
@@ -185,8 +188,8 @@ describe("Linux root step", () => {
       return [0, "", ""]
     }
     const executor = fakeExecutor(commands, respond)
-    const changes = () => commands.filter(line => !/getent|id -u|is-enabled|systemctl cat/.test(line))
-    return { commands, changes, written, printed, files, accounts, enabled: () => enabled,
+    const changes = () => commands.filter(line => !/getent|id -[ug]|is-enabled|systemctl cat/.test(line))
+    return { commands, changes, written, printed, files, contents, accounts, enabled: () => enabled,
       run: <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem | CommandExecutor.CommandExecutor>) => Effect.runPromise(Effect.either(
         effect.pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(CommandExecutor.CommandExecutor, executor)))) }
   }
@@ -202,8 +205,10 @@ describe("Linux root step", () => {
       "/usr/bin/systemctl daemon-reload", "/usr/bin/systemctl enable --now magnitude.service",
     ])
     expect(m.commands.some(line => line.includes("usermod"))).toBe(false)
+    expect(JSON.parse(m.contents.get("/var/lib/magnitude/config.json")!)).toEqual({ network: { enabled: true, requireApiKey: true } })
     expect(m.written).toEqual([
       "mkdir /var/lib/magnitude", "chmod 711 /var/lib/magnitude",
+      "write 600 /var/lib/magnitude/config.json", "chown 990:980 /var/lib/magnitude/config.json",
       "write 440 /etc/sudoers.d/<tmp>", "chown 0:0 /etc/sudoers.d/<tmp>", "chmod 440 /etc/sudoers.d/<tmp>", "rename /etc/sudoers.d/magnitude",
       "mkdir /etc/magnitude", "chmod 755 /etc/magnitude", "write 644 /etc/magnitude/<tmp>", "chmod 644 /etc/magnitude/<tmp>", "rename /etc/magnitude/server",
     ])

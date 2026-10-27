@@ -23,8 +23,8 @@ Fully quit Desktop before starting `magnitude serve`. Closing its window can lea
 
 Open a **new terminal** and run `magnitude --help`.
 
-- **macOS:** open Desktop once to register the CLI in your shell. Without a graphical session, run `/Applications/Magnitude.app/Contents/Resources/magnitude` directly.
-- **Windows:** the installer updates your user PATH; existing terminals may retain the old PATH. Rerun the installer if command registration failed.
+- **macOS:** the terminal installer registers the CLI automatically; after installing from the DMG, open Desktop once to register it. If installation reported a PATH warning, add `~/.magnitude/bin` to your shell's PATH. Without a graphical session, you can also run `/Applications/Magnitude.app/Contents/Resources/magnitude` directly. See [macOS installation](/installation/macos).
+- **Windows:** the installer updates your user PATH; existing terminals may retain the old PATH. The PowerShell install script also updates PATH in the session that ran it. Rerun the installer if command registration failed.
 - **Linux:** install the desktop package through your package manager; it owns `/usr/bin/magnitude`.
 
 If an old CLI still runs, inspect which executable your terminal finds:

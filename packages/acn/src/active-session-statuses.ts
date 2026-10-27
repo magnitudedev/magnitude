@@ -1,7 +1,7 @@
 import { Context, Effect, Layer, Stream } from "effect"
-import type { ActiveSessionStatus, ActiveSessionStatuses } from "@magnitudedev/acn-protocol"
 import { AgentRuntime } from "./agent-runtime"
 import { SessionInspector } from "./session-inspector"
+import type { ActiveSessionStatus, ActiveSessionStatuses } from "./session-schemas"
 
 export interface ActiveSessionStatusesApi {
   readonly snapshot: Effect.Effect<ActiveSessionStatuses>

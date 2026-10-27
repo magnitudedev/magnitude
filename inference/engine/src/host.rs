@@ -544,7 +544,7 @@ mod tests {
         let family = magnitude_family_qwen35::Qwen35Family;
         let target = family
             .inspect(
-                &headers::catalog("qwen3.6-35b-a3b__target-gguf:q4"),
+                &headers::target("qwen3.6-35b-a3b:gguf:q4"),
                 None,
                 PackageIdentity {
                     target: ArtifactIdentity([7; 32]),
@@ -552,7 +552,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut directory = headers::catalog("qwen3.6-35b-a3b__draft");
+        let mut directory = headers::draft("qwen3.6-35b-a3b:gguf:q4");
         directory
             .metadata
             .retain(|entry| entry.name != "dflash.attention.causal");
@@ -598,14 +598,14 @@ mod tests {
         let qwen = magnitude_family_qwen35::Qwen35Family;
         let target = qwen
             .inspect(
-                &headers::catalog("qwen3.6-35b-a3b__target-gguf:q4"),
+                &headers::target("qwen3.6-35b-a3b:gguf:q4"),
                 None,
                 identity,
             )
             .unwrap();
         // A Gemma assistant reaches the assistant family, which names why it
         // is not a draft of this target; the target is kept whole.
-        let mut assistant = headers::catalog("qwen3.6-35b-a3b__draft");
+        let mut assistant = headers::draft("qwen3.6-35b-a3b:gguf:q4");
         headers::set(
             &mut assistant,
             "general.architecture",
@@ -626,7 +626,7 @@ mod tests {
         let gemma = magnitude_family_gemma4::Gemma4Family;
         let gemma_target = gemma
             .inspect(
-                &headers::catalog("gemma-4-12b-it-qat__target-gguf:q4"),
+                &headers::target("gemma-4-12b-it-qat:gguf:q4"),
                 None,
                 identity,
             )
@@ -718,8 +718,8 @@ mod tests {
         use seismic::BackendName;
         let mut resolved = magnitude_family_qwen35::Qwen35Family
             .inspect(
-                &headers::catalog("qwen3.5-4b__target-gguf:q4"),
-                Some(&headers::catalog("qwen3.5-4b__projector")),
+                &headers::target("qwen3.5-4b:gguf:q4"),
+                Some(&headers::projector("qwen3.5-4b:gguf:q4")),
                 PackageIdentity {
                     target: ArtifactIdentity([7; 32]),
                     projector: Some(ArtifactIdentity([8; 32])),

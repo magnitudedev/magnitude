@@ -2,7 +2,7 @@ import { lstat } from "node:fs/promises"
 import { join } from "node:path"
 import { Effect, Option, Schema } from "effect"
 import { ExactProcessSchema } from "@magnitudedev/utils/process-groups"
-import { SqliteDriver } from "@magnitudedev/storage/sqlite"
+import { SqliteDriver, type SqliteDriverError } from "@magnitudedev/storage/sqlite"
 
 /** Frozen migration input, independent of the removed runtime election contract. */
 export const LegacyOwner = Schema.Struct({
@@ -24,6 +24,18 @@ export class LegacyOwnerInvalid extends Schema.TaggedError<LegacyOwnerInvalid>()
   path: Schema.String, message: Schema.String,
 }) {}
 
+/** Why reading the legacy database failed: it is busy or unreadable, or it is not a database at all. */
+const queryFailed = (path: string) => (error: SqliteDriverError): LegacyOwnerReadFailed | LegacyOwnerInvalid => {
+  switch (error._tag) {
+    case "SqliteDriverBusy":
+      return new LegacyOwnerReadFailed({ path, message: "Legacy database is busy" })
+    case "SqliteDriverNotADatabase":
+      return new LegacyOwnerInvalid({ path, message: "Legacy ownership file is not a SQLite database" })
+    case "SqliteDriverFailure":
+      return new LegacyOwnerReadFailed({ path, message: error.message })
+  }
+}
+
 /** Reads an existing legacy database; never initializes, claims, repairs, or deletes it. */
 export const readLegacyOwner = (dataDirectory: string) => Effect.scoped(Effect.gen(function* () {
   const path = join(dataDirectory, "acn", "coordination.sqlite")
@@ -40,11 +52,9 @@ export const readLegacyOwner = (dataDirectory: string) => Effect.scoped(Effect.g
   const connection = yield* driver.open(path, { create: false, readOnly: true }).pipe(
     Effect.mapError(error => new LegacyOwnerReadFailed({ path, message: error.message })),
   )
-  yield* connection.execute("PRAGMA query_only = ON").pipe(
-    Effect.mapError(error => new LegacyOwnerReadFailed({ path, message: error._tag === "SqliteDriverBusy" ? "Legacy database is busy" : error.message })),
-  )
+  yield* connection.execute("PRAGMA query_only = ON").pipe(Effect.mapError(queryFailed(path)))
   const rows = yield* connection.query("SELECT id, pid, process_start_identity, port FROM owner LIMIT 2").pipe(
-    Effect.mapError(error => new LegacyOwnerReadFailed({ path, message: error._tag === "SqliteDriverBusy" ? "Legacy database is busy" : error.message })),
+    Effect.mapError(queryFailed(path)),
   )
   const owners = yield* Schema.decodeUnknown(Schema.Array(LegacyRow).pipe(Schema.maxItems(1)))(rows).pipe(
     Effect.mapError(() => new LegacyOwnerInvalid({ path, message: "Legacy database contains an invalid owner record" })),

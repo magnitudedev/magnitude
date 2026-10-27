@@ -1,28 +1,20 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { Schema } from "effect"
 import { describe, expect, it } from "vitest"
-import {
-  ChatGeneration,
-  ChatSettings,
-  defaultChatSettings,
-} from "@magnitudedev/sdk"
+import { ChatAssistantMessage } from "@magnitudedev/sdk"
 import { ChatResponse } from "./response"
 import { codeLanguageLabel, highlightCode } from "./code-highlight"
-const render = (content: string, status = "completed") =>
+const render = (content: string, running = false) =>
   renderToStaticMarkup(
     <ChatResponse
-      generation={Schema.decodeUnknownSync(ChatGeneration)({
-        id: "g",
-        commandId: "c",
-        messageId: "m",
-        modelId: "local",
-        settings: Schema.encodeSync(ChatSettings)(defaultChatSettings),
-        status,
-        createdAt: 0,
-        updatedAt: 1,
-        content,
-        reasoning: "",
-        metrics: {},
+      response={Schema.decodeUnknownSync(ChatAssistantMessage)({
+        type: "assistant",
+        id: "response",
+        model: "local",
+        settings: { systemPrompt: "", stop: [] },
+        started: 0,
+        content: [{ type: "text", text: content, time: { started: 0, ended: 1 } }],
+        ...(running ? {} : { end: { time: 1, outcome: { type: "finished", finishReason: "stop" } } }),
       })}
       notify={() => {}}
     />
@@ -78,7 +70,7 @@ describe("Chat Markdown code blocks", () => {
   })
   it("supports empty fences and unfinished fences while streaming", () => {
     expect(render("```python\n\n```")).toContain('aria-label="Copy code"')
-    const html = render("```python\ndef fib(n):\n    return ", "running")
+    const html = render("```python\ndef fib(n):\n    return ", true)
     expect(html).toContain('aria-label="Copy code"')
     expect(html).not.toContain('aria-label="Copy response"')
     expect(text(codeContents(html)[0]!)).toBe("def fib(n):\n    return ")

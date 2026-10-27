@@ -5,18 +5,31 @@ description: "Download a model and use it with your agent."
 
 ## 1. Install Magnitude
 
-[Download Magnitude](https://magnitude.dev/download), install it, and open the app.
+Magnitude comes with a desktop app and a CLI. Install from your terminal:
 
-Need help installing? See the guide for [macOS](/installation/macos), [Windows](/installation/windows), or [Linux](/installation/linux).
+<Tabs>
+<Tab title="macOS / Linux">
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh
+```
+</Tab>
+<Tab title="Windows PowerShell">
+```powershell
+irm https://magnitude.dev/install.ps1 | iex
+```
+</Tab>
+</Tabs>
+
+Or [download the installer](https://magnitude.dev/download#downloads).
+
+Need help installing? See the guide for [**macOS**](https://docs.magnitude.dev/installation/macos), [**Windows**](https://docs.magnitude.dev/installation/windows), or [**Linux**](https://docs.magnitude.dev/installation/linux).
 
 ## 2. Download a model
 
-Open **Discover**, select a recommendation, and click **Download**. Start with **Balanced**, or adjust the slider toward speed or intelligence.
+Open Magnitude and go to **Discover**. Choose a recommended model and click **Download**.
 
 ## 3. Connect your agent
 
-Open **Connections**, find your installed agent, and click **Connect**. Open or restart the agent, select a Magnitude model, and start working.
+Open **Connections**, find your agent, and click **Connect**. Copy the command shown and paste it into your terminal to start your agent.
 
-See your agent’s [integration guide](/integrations/overview) for details. Keep Magnitude running; it loads the model when needed.
-
-Using a dedicated machine for inference? See [Remote server](/remote-server).
+Using a dedicated machine for inference? See [**Remote server**](https://docs.magnitude.dev/remote-server).

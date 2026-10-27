@@ -11,7 +11,7 @@ import { RecommendationPreference } from "./components/model-preference-slider"
 import { ServingUsage } from "./components/serving-usage"
 import { setAppearancePreference, useAppearancePreference } from "./stores/appearance-store"
 import { ActionTooltip, TooltipProvider } from "./components/ui/tooltip"
-import { Button } from "./components/ui/button"
+import { Button, buttonVariants } from "./components/ui/button"
 import { Switch } from "./components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select"
 import { MagnitudeMark } from "./components/magnitude-mark"
@@ -34,9 +34,10 @@ import {
   FolderOpenIcon,
   BuildingsIcon,
   ArrowRightIcon,
+  BookOpenIcon,
 } from "@phosphor-icons/react"
 import { CopyCommand } from "./components/copy-command"
-import { useMemo, useRef, useState, type ReactNode } from "react"
+import { Fragment, useMemo, useRef, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
 import { type ProviderModelId, type CatalogLocalModel, type CustomModelAcquisitionState, type LocalModel, type ModelOptimizationProgress } from "@magnitudedev/sdk"
@@ -763,9 +764,14 @@ function Navigation({ page, navigate, onNavigate }: { page: ApplicationPage; nav
   return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
     {(["discover", "chat", "models", "connections", "usage", "settings"] as const).map(key => {
       const Icon = pageIcons[key]
-      return <Button variant="ghost" key={key} disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={pageNames[key]} aria-current={(page === "catalog" ? "discover" : page) === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${key === "settings" ? "mt-auto" : ""} ${(page === "catalog" ? "discover" : page) === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
-        <Icon className="size-4 shrink-0" />{pageNames[key]}
-      </Button>
+      return <Fragment key={key}>
+        {key === "settings" && <a href="https://docs.magnitude.dev" target="_blank" rel="noreferrer" onClick={onNavigate} className={`${buttonVariants({ variant: "ghost" })} mt-auto h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start hover:bg-slate-100 dark:hover:bg-slate-800`}>
+          <BookOpenIcon className="size-4 shrink-0" />Docs<ArrowUpRightIcon aria-hidden="true" className="ml-auto size-3.5 shrink-0 text-slate-400" />
+        </a>}
+        <Button variant="ghost" disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={pageNames[key]} aria-current={(page === "catalog" ? "discover" : page) === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${(page === "catalog" ? "discover" : page) === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+          <Icon className="size-4 shrink-0" />{pageNames[key]}
+        </Button>
+      </Fragment>
     })}
   </nav>
 }

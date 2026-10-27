@@ -6,11 +6,9 @@ import {
   readStructuredFile,
   writeStructuredFileAtomic,
 } from "@magnitudedev/storage";
-import {
-  SessionOperationFailed,
-  type SessionError,
-  SessionOptions as SessionOptionsSchema,
-} from "@magnitudedev/acn-protocol";
+import { OperationFailed } from "@magnitudedev/acn-protocol";
+import type { SessionError } from "./session-errors";
+import { SessionOptions as SessionOptionsSchema } from "./session-schemas";
 
 export interface SessionRuntimeOptions {
   readonly disableShellSafeguards: boolean;
@@ -62,7 +60,7 @@ export class SessionRuntimeOptionsStore extends Context.Tag(
 const toRuntimeOptionsError =
   (sessionId: string, operation: string) =>
   (cause: unknown): SessionError =>
-    new SessionOperationFailed({
+    new OperationFailed({
       operation: `session runtime options ${operation}`,
       reason: `${sessionId}: ${String(cause)}`,
     });

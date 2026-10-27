@@ -9,23 +9,23 @@ On Linux and macOS, Magnitude runs as a service: it starts at boot, keeps runnin
 
 ## Install on the server
 
-Install the package for [Linux](/installation/linux) or the app for [macOS](/installation/macos) on the server. On a Mac, open the app once so it adds the `magnitude` command.
-
-On a Linux server without a browser, download the package over SSH. For example, on Ubuntu or Debian (use `arch=arm64` on an ARM64 server):
+On the Linux or macOS machine that will run inference:
 
 ```sh
-curl -fL -o magnitude-desktop.deb 'https://magnitude.dev/api/installer?os=linux&arch=x64&package=deb'
-sudo apt update
-sudo apt install ./magnitude-desktop.deb
+curl -fsSL https://magnitude.dev/install.sh | sh
 ```
 
-Then set up the server:
+This installs the desktop app and CLI without requiring a graphical session. On Linux, answer **Yes** when asked whether to run Magnitude as a server; this also runs server setup. On Linux, the installer preserves an existing server setup.
+
+On macOS, open a new terminal or SSH session after installation to use the `magnitude` command. Then run the command below. Also run it on Linux if you skipped the server question, or installed without an interactive terminal:
 
 ```sh
 magnitude server setup
 ```
 
 Run it as yourself, not with `sudo`: it asks for your password once, for the one step that needs it.
+
+To use an installer instead, see [Linux installation](/installation/linux#download-the-installer) or [macOS installation](/installation/macos#download-the-installer).
 
 ## What setup does
 

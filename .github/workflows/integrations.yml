@@ -3,7 +3,6 @@ name: Integration checks
 on:
   pull_request:
     paths:
-      - "integrations/**"
       - "packages/sdk/**"
       - "packages/acn-protocol/**"
       - "packages/version/**"
@@ -15,9 +14,6 @@ on:
       - "packages/roles/**"
       - "cli/src/harness-connections/**"
       - "cli/src/commands/**"
-      - "scripts/*integrations*"
-      - "scripts/dev-pi*"
-      - "scripts/tsconfig.dev-pi.json"
       - ".github/workflows/**"
       - "bun.lock"
       - "package.json"
@@ -49,9 +45,5 @@ jobs:
       - run: bun packages/release/scripts/prepare-release.ts
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - run: bun run --cwd integrations/pi typecheck
-      - run: bun run --cwd integrations/pi test
-      - run: bunx --bun tsc --noEmit -p scripts/tsconfig.dev-pi.json
-      - run: bunx --bun vitest run --config scripts/vitest.config.ts
       - run: bunx --bun vitest run src/harness-connections src/commands
         working-directory: cli

@@ -3,7 +3,6 @@ import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
 import { createId } from "@magnitudedev/generate-id"
 import type { AppEvent } from "@magnitudedev/agent"
-import { SessionStartFailed, type InterruptTarget, type SessionError } from "@magnitudedev/acn-protocol"
 import { AgentRuntime } from "./agent-runtime"
 import {
   hasUserMessageContent,
@@ -13,6 +12,8 @@ import {
 } from "./session-types"
 import { materializeMessageUploads } from "./attachments/materialize-message-uploads"
 import { FileMentionSearcher } from "./file-mention-searcher"
+import { SessionStartFailed, type SessionError } from "./session-errors"
+import type { InterruptTarget } from "./session-schemas"
 
 export interface SessionCommandsApi {
   readonly sendUserMessage: (input: SendUserMessageInput) => Effect.Effect<void, SessionError>

@@ -6,7 +6,7 @@ use magnitude_family_contracts::{
 
 fn target() -> magnitude_family_contracts::ModelDefinition {
     magnitude_family_qwen4exp::inspect_components(
-        &headers::catalog("qwen3.8-flash-next__target-gguf:q4"),
+        &headers::target("qwen3.8-flash-next:gguf:q4"),
         None,
         PackageIdentity {
             target: ArtifactIdentity([7; 32]),
@@ -20,7 +20,7 @@ fn target() -> magnitude_family_contracts::ModelDefinition {
 fn shared_prediction_package_retains_raw_streams_and_owns_causal_history() {
     let mut target = target();
     let head = magnitude_family_qwen4exp::inspect_head(
-        &headers::catalog("qwen3.8-flash-next__draft"),
+        &headers::draft("qwen3.8-flash-next:gguf:q4"),
         &target,
     )
     .unwrap();
@@ -42,7 +42,7 @@ fn shared_prediction_package_retains_raw_streams_and_owns_causal_history() {
 #[test]
 fn prediction_package_rejects_mismatched_target_and_missing_weights() {
     let mut target = target();
-    let mut draft = headers::catalog("qwen3.8-flash-next__draft");
+    let mut draft = headers::draft("qwen3.8-flash-next:gguf:q4");
     target.decoder.residual = ResidualForm::Single;
     assert!(magnitude_family_qwen4exp::inspect_head(&draft, &target).is_err());
     let target = self::target();

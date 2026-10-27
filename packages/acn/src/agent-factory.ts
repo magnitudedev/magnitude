@@ -7,12 +7,13 @@ import {
   type CodingAgentSession,
 } from "@magnitudedev/agent"
 import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
-import type { DirectoryPath, SessionError } from "@magnitudedev/acn-protocol"
+import type { DirectoryPath } from "@magnitudedev/acn-protocol"
 import { AcnChatPersistence } from "./agent-persistence"
 import { toSessionError } from "./session-errors"
 import type { SessionRuntimeOptions } from "./session-runtime-options"
 import { ProviderClientRegistry } from "./shared-client"
 import { ModelSlotController } from "./model-slot-controller"
+import type { SessionError } from "./session-errors"
 
 export interface AgentFactoryApi {
   readonly createSession: (input: {

@@ -224,6 +224,15 @@ export const installLinuxServer = Effect.gen(function* () {
       undo.push(giveDataToRoot)
     }
     yield* fs.chmod(SERVER_DATA_DIRECTORY, SERVER_DATA_DIRECTORY_MODE)
+    // Network access is part of the server setup makes, so it is on from the service's first start, which
+    // makes the access key: a setup interrupted after this step still leaves a server other computers reach.
+    const config = join(SERVER_DATA_DIRECTORY, "config.json")
+    if (!(yield* fs.exists(config))) {
+      const serviceGid = (yield* commandOutput("/usr/bin/id", "-g", "--", SERVER_USER)).trim()
+      yield* fs.writeFileString(config, `${JSON.stringify({ network: { enabled: true, requireApiKey: true } }, null, 2)}\n`, { flag: "wx", mode: 0o600 })
+      undo.push(fs.remove(config).pipe(Effect.ignore))
+      yield* fs.chown(config, Number(serviceUid), Number(serviceGid))
+    }
     if (!hadSudoersRule) undo.push(fs.remove(SERVER_SUDOERS_PATH, { force: true }))
     const updates = yield* writeSudoersRule
     yield* run("reload systemd", systemctl, "daemon-reload")

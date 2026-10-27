@@ -40,6 +40,7 @@ describe("user-owned Mac command PATH", () => {
     yield* fs.writeFileString(file, edited)
     expect((yield* Effect.either(path.remove))._tag).toBe("Left")
     expect(yield* fs.readFileString(file)).toBe(edited)
+    expect(yield* fs.readFileString(join(home, ".bashrc"))).not.toContain("# >>> Magnitude CLI PATH >>>")
   })))
 
   it("removes its original login entry after a higher-priority profile is added", () => fixture((home, fs) => Effect.gen(function* () {
@@ -92,8 +93,11 @@ describe("user-owned Mac command PATH", () => {
     yield* fs.chmod(zshrc, 0o444)
     const registration = yield* makeMacCliRegistration({ home, resourcesDirectory: join(home, "Magnitude.app/Contents/Resources"), environment: {} })
     const warning = yield* macCliRegistrationWarning(registration.install)
-    expect(Option.getOrThrow(warning)).toMatch(/^Warning: Could not update shell PATH: .*\nTo use the magnitude command in a terminal, add ~\/\.magnitude\/bin to your PATH\.$/s)
+    expect(Option.getOrThrow(warning)).toContain(`Warning: Could not update shell PATH in ${zshrc}:`)
+    expect(Option.getOrThrow(warning)).toContain("To use the magnitude command in a terminal, add ~/.magnitude/bin to your PATH.")
     expect(yield* fs.readFileString(zshrc)).toBe("# managed elsewhere\n")
+    expect(yield* fs.readFileString(join(home, ".bash_profile"))).toContain("# >>> Magnitude CLI PATH >>>")
+    expect(yield* fs.readFileString(join(home, ".bashrc"))).toContain("# >>> Magnitude CLI PATH >>>")
     expect(Option.isNone(yield* macCliRegistrationWarning(Effect.void))).toBe(true)
   })))
 })

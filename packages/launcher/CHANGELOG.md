@@ -1,5 +1,96 @@
 # @magnitudedev/cli
 
+## 0.2.12
+
+### Patch Changes
+
+- [`73f7c06`](https://github.com/magnitudedev/magnitude/commit/73f7c068c3f98a243955bceb4791ded6d4b14590) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - App improvements.
+
+  - A Docs link sits above Settings in the sidebar.
+  - Chat follows new output only while you're at the bottom: scrolling up to read stops it, and returning to the bottom resumes it.
+  - While a model is reassessed, its previous fit result stays visible instead of going back to assessing.
+  - Intel GPUs are listed as supported hardware.
+
+- [`73f7c06`](https://github.com/magnitudedev/magnitude/commit/73f7c068c3f98a243955bceb4791ded6d4b14590) Thanks [@anerli](https://github.com/anerli)! - Qwen3.8 Flash Next NVFP4 is now a variant of Qwen3.8 Flash Next instead of a separate model. Its ID is now `qwen3.8-flash-next:gguf:nvfp4` (was `qwen3.8-flash-next-nvfp4:gguf:nvfp4`).
+
+- [`73f7c06`](https://github.com/magnitudedev/magnitude/commit/73f7c068c3f98a243955bceb4791ded6d4b14590) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Install Magnitude with one command on every platform, with clearer progress and fewer failed installs.
+
+  - The README and installation guides now use the install script on macOS, Linux and Windows.
+  - The installer shows each download's speed and time remaining, redraws without blank frames, and opens the desktop app when it's done.
+  - Slow connections no longer fail a download after 10 minutes; a download fails only when no data arrives for 60 seconds, and says so.
+  - On Windows, silent setup works again, and the installer asks you to quit a running Magnitude before downloading instead of failing at the end.
+  - On macOS before 15, the installer says Magnitude needs macOS 15 or later instead of installing an app that won't open.
+  - Ctrl-C, a closed terminal or a killed installer stops the download at once and cleans up after itself.
+  - On Linux without systemd, such as containers or WSL, the installer no longer offers server mode.
+
+- [`73f7c06`](https://github.com/magnitudedev/magnitude/commit/73f7c068c3f98a243955bceb4791ded6d4b14590) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - More reliable Linux server setup and removal.
+
+  - Network access is on from the server's first start, so a `magnitude server setup` that's interrupted still leaves a server other computers can reach; running setup again shows its access key.
+  - `magnitude server remove` closes the firewalld port that setup opened.
+  - If the installer is interrupted while setting up the server, it says how to finish: `magnitude server setup`.
+
+## 0.2.11
+
+### Patch Changes
+
+- [`2e321c6`](https://github.com/magnitudedev/magnitude/commit/2e321c6d221edc0717a751270b480dbe1f08403c) Thanks [@thrgreenwald](https://github.com/thrgreenwald), [@anerli](https://github.com/anerli)! - Run custom models: any GGUF of a model family Magnitude supports, not just catalog models, including other quantizations, finetunes, merges and uncensored versions.
+
+  - Search Hugging Face and add models from the desktop app, the web app or the CLI (`magnitude catalog search`, `inspect` and `pull`). Every version shows its size and whether it fits your computer, can't run (with the reason) or is gated, before you download it.
+  - Sign in to Hugging Face once to download gated models; Magnitude says when a model needs sign-in, its terms accepted, or the author's approval.
+  - Models already on your computer are found and used in place, without copying: the Hugging Face cache, LM Studio, the llama.cpp cache, Ollama, and folders you add. Found models can be hidden without touching their files, and a catalog model already on your computer is used instead of downloaded again.
+  - Each model gets the best drafter known to work with it, when there is one: from its own repository or folder, the matching catalog model, or its built-in MTP heads. You can choose a different drafter or none.
+  - Models that can't run are listed with the reason, such as an architecture without kernels yet or an unsupported weight type.
+
+- [`2e321c6`](https://github.com/magnitudedev/magnitude/commit/2e321c6d221edc0717a751270b480dbe1f08403c) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Discover and the model catalog are now one page.
+
+  - Model cards show one clear status and an estimated download time, and catalog and custom models share the same details view.
+  - Loading and optimizing show live progress.
+  - Service status and model memory moved into Settings.
+
+- [`2e321c6`](https://github.com/magnitudedev/magnitude/commit/2e321c6d221edc0717a751270b480dbe1f08403c) Thanks [@thrgreenwald](https://github.com/thrgreenwald), [@anerli](https://github.com/anerli)! - Faster generation.
+
+  - On x86 CPUs with AVX2 or VNNI, k-quant, Q8 and 4-bit codebook weights run faster.
+  - On NVIDIA GPUs, IQ2_XXS weights read faster, and models that stream a token table decode faster: Nemotron 3.5 Bolt on a GB10 went from 36.0 to 41.9 tok/s with drafting off.
+  - Drafting decides from the time recent steps actually took, so one slow step no longer turns it off, and it resumes once it pays off again.
+  - AMD GPUs on Linux (Vulkan, RADV) prepare a model's programs in a fraction of the time and memory.
+  - Chat templates that scan the whole conversation for every message no longer take seconds to render, and short follow-up turns resume from the cached conversation.
+  - A catalog model's one-time optimization waits until the GPU is free, and loading a model you want takes priority over it.
+
+- [`2e321c6`](https://github.com/magnitudedev/magnitude/commit/2e321c6d221edc0717a751270b480dbe1f08403c) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Fix installation and platform issues.
+
+  - On Windows 10, upgrades no longer fail to replace the installed app.
+  - The desktop app no longer takes over a Magnitude server running as a Windows service, and says why.
+  - Hermes connections on Windows are written where Hermes reads them.
+  - Fix installer readiness checks, macOS onboarding, and verification error messages.
+  - CLI commands piped into a reader that stops early end quietly instead of crashing.
+
+- [`2e321c6`](https://github.com/magnitudedev/magnitude/commit/2e321c6d221edc0717a751270b480dbe1f08403c) Thanks [@thrgreenwald](https://github.com/thrgreenwald), [@anerli](https://github.com/anerli)! - More accurate memory planning and more reliable loading.
+
+  - Fit checks count each backend's own memory costs, so a model shown as fitting loads, and a long conversation's cached prompt no longer grows past what was planned.
+  - Models too large for a small GPU show as not fitting instead of failing to load.
+  - Magnitude serves on the discrete GPU when your computer also has an integrated one, and shows which device it's using.
+  - Requested downloads, drafters and projectors included, resume after a restart, and a cancelled download stays cancelled.
+  - A large image no longer holds a model running on the CPU for minutes.
+
+- [`2e321c6`](https://github.com/magnitudedev/magnitude/commit/2e321c6d221edc0717a751270b480dbe1f08403c) Thanks [@thrgreenwald](https://github.com/thrgreenwald), [@anerli](https://github.com/anerli)! - Fix incorrect output and load failures for several models.
+
+  - Reasoning works with LFM2.5 Instruct and Thinking models, Gemma 4 thinks unless thinking is turned off, and a response that ends inside its reasoning keeps that reasoning instead of failing.
+  - Default sampling is now temperature 1.0, top_p 0.95 and top_k 20 on the OpenAI and Anthropic APIs alike. The OpenAI APIs used 0.8 and 0.95, and the Anthropic API 1.0 and 1.0, with no top_k on either. The Anthropic API now accepts `top_k`.
+  - Finetunes run with their base model's vision projector, and Qwen 3.5 models without built-in prediction heads run.
+  - Fix Vulkan sampling probabilities, Vulkan weight formats failing to compile, and a Metal weight-packing bug.
+
+- [`ac67c47`](https://github.com/magnitudedev/magnitude/commit/ac67c472d049e6899a0ba9782c39ca17d8ff8671) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Add a native Chat tab with local model streaming, performance metrics, reasoning controls, generation settings, and SQLite conversation history.
+
+  Render code blocks with language labels, syntax highlighting, and individual copy actions, and improve Markdown headings and nested spacing.
+
+- [`2e321c6`](https://github.com/magnitudedev/magnitude/commit/2e321c6d221edc0717a751270b480dbe1f08403c) Thanks [@anerli](https://github.com/anerli)! - Add Nemotron 3.5 Bolt 74B-A9B, Nemotron 3.5 Super VL 120B-A12B with vision, and Qwen 3.8 Flash Next NVFP4 to the catalog.
+
+  - Nemotron 3.5 models draft with LiLiCorr, a new drafting method ranked above DFlash2. On a GB10, Bolt decodes at 55.7 tok/s against llama.cpp's 51.6.
+  - NVFP4 models that carry NVIDIA's activation scales, such as Qwen 3.8 Flash Next NVFP4 and Super VL's NVFP4 variant, run on FP4 tensor cores on GPUs that have them. On a GB10, Super VL NVFP4 prefills at 826 tok/s against llama.cpp's 552.
+  - Nemotron 3 Super and Ultra can now run as custom models.
+
+- [`2e321c6`](https://github.com/magnitudedev/magnitude/commit/2e321c6d221edc0717a751270b480dbe1f08403c) Thanks [@anerli](https://github.com/anerli), [@thrgreenwald](https://github.com/thrgreenwald)! - Speed estimates in Discover are now based on measurements of your own hardware instead of a generic memory-bandwidth figure, so they track real performance more closely. The measurement runs once, in the background, and never while a model is in use.
+
 ## 0.2.10
 
 ### Patch Changes

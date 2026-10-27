@@ -1,11 +1,6 @@
 import { Files as Rpcs } from "@magnitudedev/sdk";
 import { Group } from "@magnitudedev/effect-query";
-import { mutation, query, subscription } from "./bind";
-
-const UploadAttachment = mutation(
-  Rpcs.uploadAttachment,
-  (client) => client.files.uploadAttachment
-);
+import { query, subscription } from "./bind";
 
 const ListFiles = query(Rpcs.listFiles, (client) => client.files.listFiles);
 
@@ -40,7 +35,6 @@ const SearchDirectories = query(
 );
 
 export const Files = Group.make({
-  UploadAttachment,
   ListFiles,
   ReadFile,
   CheckFileExists,

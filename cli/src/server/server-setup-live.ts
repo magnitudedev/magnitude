@@ -121,6 +121,7 @@ export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(func
         : `Server setup did not finish.${administrator}`)
     }),
     servicePort,
+    serviceReady: desktopApplication.observe.pipe(Effect.map(snapshot => snapshot.service._tag === "Ready"), Effect.orElseSucceed(() => false)),
     serviceRuns: (platform === "darwin"
       ? output("/bin/launchctl", "print", `system/${MAC_SERVER_LABEL}`).pipe(Effect.map(text => /^\s*runs = (\d+)$/m.exec(text)?.[1]))
       : output("/usr/bin/systemctl", "show", "magnitude.service", "--property=NRestarts", "--value").pipe(Effect.map(text => text.trim()))).pipe(
@@ -133,5 +134,6 @@ export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(func
         Effect.map(text => text.split("\n")))),
     enableNetworkAccess,
     write: text => Effect.sync(() => { process.stdout.write(text) }),
+    status: text => Effect.sync(() => { if (process.stdout.isTTY) process.stdout.write(text) }),
   })
 })).pipe(Layer.provide([BunContext.layer, nodeTerminalCommand]))

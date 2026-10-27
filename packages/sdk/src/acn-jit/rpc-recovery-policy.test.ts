@@ -17,10 +17,7 @@ describe("ACN RPC recovery policy", () => {
     }
   })
 
-  it("keeps side-effecting agent commands at-most-once", () => {
-    expect(recoveryPolicy("SendMessage")).toBe("AtMostOnce")
-    expect(recoveryPolicy("StartGoal")).toBe("AtMostOnce")
-    expect(recoveryPolicy("RunBash")).toBe("AtMostOnce")
-    expect(recoveryPolicy("UploadAttachment")).toBe("AtMostOnce")
+  it("replays a chat's start, which its IDs make idempotent", () => {
+    expect(recoveryPolicy("StartChat")).toBe("ReplaySafe")
   })
 })

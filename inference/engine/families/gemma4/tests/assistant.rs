@@ -1,5 +1,5 @@
 //! Interpretation of Google's Gemma 4 QAT assistant drafters against their
-//! catalog targets (`headers::catalog`). Each
+//! catalog targets (`headers::target`). Each
 //! assistant directory carries the metadata and tensor directory published in
 //! `mtp-gemma-4-<size>-it.gguf` beside its target, without tokenizer keys.
 
@@ -7,7 +7,7 @@ use magnitude_artifacts::{
     ArtifactIdentity, PackageIdentity,
     gguf::{Array, ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
 };
-use magnitude_family_common::headers::{self, catalog as header};
+use magnitude_family_common::headers;
 use magnitude_family_contracts::{
     EmbeddingScale, ExitNorm, HeadChain, HeadComponent, HeadHistory, HeadInput, HistoryDomain,
     KeyValue, ModelDefinition, Operator, OutputForm, ProposalReadoutPolicy, SublayerIndex,
@@ -85,7 +85,7 @@ fn published(model: &str) -> &'static Published {
 
 fn target(model: &str) -> ModelDefinition {
     inspect_components(
-        &header(&format!("gemma-4-{model}-it-qat__target-gguf:q4")),
+        &headers::target(&format!("gemma-4-{model}-it-qat:gguf:q4")),
         None,
         PackageIdentity {
             target: ArtifactIdentity([7; 32]),

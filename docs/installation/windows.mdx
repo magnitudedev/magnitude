@@ -11,9 +11,19 @@ description: "Install Magnitude on Windows."
 
 The current Windows build supports CPU inference and compatible NVIDIA CUDA or Vulkan GPUs on Windows. See [Hardware](/hardware).
 
-## Download and install
+## Install from PowerShell
 
-1. Download the Windows installer from [Download Magnitude](https://magnitude.dev/download).
+```powershell
+irm https://magnitude.dev/install.ps1 | iex
+```
+
+The script verifies the download and runs the Windows installer silently. It includes the desktop app and CLI, and makes `magnitude` available in the current PowerShell session. Open a new terminal to use it in other shells that were already running.
+
+Open Magnitude from the Start menu and follow [Quick start](/get-started). For a headless session, run `magnitude serve` instead.
+
+## Download the installer
+
+1. Download the Windows installer from [Download Magnitude](https://magnitude.dev/download?os=windows#downloads).
 2. Run the `.exe` and complete installation.
 3. Open Magnitude and follow [Quick start](/get-started).
 

@@ -1,11 +1,11 @@
-//! Interpretation of every catalog Gemma 4 header (`headers::catalog`), plus
+//! Interpretation of every catalog Gemma 4 header (`headers::target`), plus
 //! negative cases derived from them.
 
 use magnitude_artifacts::{
     gguf::{Array, Directory, Metadata, Scalar, Value},
     ArtifactIdentity, InputLayout, PackageIdentity, TokenId,
 };
-use magnitude_family_common::headers::catalog as header;
+use magnitude_family_common::headers;
 use magnitude_family_contracts::{
     ActivationFunction, CellReduction, EmbeddingScale, FeedForwardUp, HistoryDomain,
     ImportTransform, InputNorm, KeyValue, MediaRowAttention, ModelDefinition, ModelInputAdapter,
@@ -15,7 +15,7 @@ use magnitude_family_contracts::{
 use magnitude_family_gemma4::{describe_projector, inputs, inspect_components, recognize};
 
 fn target(model: &str) -> Directory {
-    header(&format!("gemma-4-{model}-it-qat__target-gguf:q4"))
+    headers::target(&format!("gemma-4-{model}-it-qat:gguf:q4"))
 }
 
 fn identity() -> PackageIdentity {
@@ -356,7 +356,7 @@ fn encoder_projectors_bind_sandwich_blocks_pooling_and_axial_rotary() {
         ("26b-a4b", 2816, 27, 1152, 16, false, true),
         ("31b", 5376, 27, 1152, 16, false, true),
     ] {
-        let projector = header(&format!("gemma-4-{model}-it-qat__projector"));
+        let projector = headers::projector(&format!("gemma-4-{model}-it-qat:gguf:q4"));
         let vision = describe_projector(&projector, output).unwrap();
         assert_eq!(
             (vision.hidden, vision.output_hidden),
@@ -405,7 +405,7 @@ fn encoder_projectors_bind_sandwich_blocks_pooling_and_axial_rotary() {
     }
     let model = inspect_components(
         &target("e2b"),
-        Some(&header("gemma-4-e2b-it-qat__projector")),
+        Some(&headers::projector("gemma-4-e2b-it-qat:gguf:q4")),
         identity(),
     )
     .unwrap();
@@ -414,7 +414,7 @@ fn encoder_projectors_bind_sandwich_blocks_pooling_and_axial_rotary() {
 
 #[test]
 fn the_unified_projector_is_a_normalized_patch_projection() {
-    let projector = header("gemma-4-12b-it-qat__projector");
+    let projector = headers::projector("gemma-4-12b-it-qat:gguf:q4");
     let vision = describe_projector(&projector, 3840).unwrap();
     assert!(vision.blocks.is_empty());
     assert_eq!(

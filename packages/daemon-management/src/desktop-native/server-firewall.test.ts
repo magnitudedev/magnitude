@@ -24,15 +24,15 @@ const run = (succeeds: (args: string) => boolean | "missing", ufwStatus = "") =>
     }),
   }
   return Effect.runPromise(openServerFirewall.pipe(Effect.provideService(CommandExecutor.CommandExecutor, executor)))
-    .then(message => ({ message, commands }))
+    .then(({ message, opened }) => ({ message, opened, commands }))
 }
 
 describe("server firewall", () => {
   it("does nothing without firewalld or ufw, or when they are not running", async () => {
     const commands = ["/usr/bin/firewall-cmd --state", "/usr/sbin/ufw status"]
-    expect(await run(() => "missing")).toEqual({ message: Option.none(), commands })
-    expect(await run(() => false)).toEqual({ message: Option.none(), commands })
-    expect(await run(() => false, "Status: inactive\n")).toEqual({ message: Option.none(), commands })
+    expect(await run(() => "missing")).toEqual({ message: Option.none(), opened: false, commands })
+    expect(await run(() => false)).toEqual({ message: Option.none(), opened: false, commands })
+    expect(await run(() => false, "Status: inactive\n")).toEqual({ message: Option.none(), opened: false, commands })
   })
   const ufwActive = (...rules: string[]) => ["Status: active", "", "To                         Action      From",
     "--                         ------      ----", "22/tcp                     ALLOW       Anywhere", ...rules, ""].join("\n")
@@ -58,11 +58,13 @@ describe("server firewall", () => {
       "/usr/bin/firewall-cmd --add-port=10100/tcp", "/usr/bin/firewall-cmd --permanent --add-port=10100/tcp",
     ])
     expect(Option.getOrThrow(result.message)).toBe("Opened TCP port 10100 in firewalld's default zone, so other computers can reach the server.")
+    expect(result.opened).toBe(true)
   })
   it("is silent when the port is already open", async () => {
     const result = await run(args => !args.includes("--add-port"))
     expect(result.message).toEqual(Option.none())
     expect(result.commands.some(command => command.includes("--add-port"))).toBe(false)
+    expect(result.opened).toBe(false)
   })
   it("gives the exact command when the port cannot be opened", async () => {
     const result = await run(args => args === "--state")

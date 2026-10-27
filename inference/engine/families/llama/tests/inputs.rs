@@ -19,7 +19,7 @@ impl MarkerTokens for NoMarkers {
 
 fn model() -> ModelDefinition {
     inspect_components(
-        &headers::catalog("minicpm5-2b__target-gguf:q4"),
+        &headers::target("minicpm5-2b:gguf:q4"),
         None,
         PackageIdentity {
             target: ArtifactIdentity([1; 32]),

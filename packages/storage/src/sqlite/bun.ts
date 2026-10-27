@@ -2,19 +2,19 @@ import { Database, SQLiteError, type SQLQueryBindings } from "bun:sqlite"
 import { Effect, Layer } from "effect"
 import {
   SqliteDriver,
-  SqliteDriverBusy,
   type SqliteBinding,
   type SqliteConnection,
   type SqliteDriverError,
   SqliteDriverFailure,
+  sqliteError,
 } from "./driver"
 
 const message = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause)
 
 const failure = (cause: unknown): SqliteDriverError =>
-  cause instanceof SQLiteError && cause.code === "SQLITE_BUSY"
-    ? new SqliteDriverBusy()
+  cause instanceof SQLiteError
+    ? sqliteError(cause.errno, cause.message)
     : new SqliteDriverFailure({ message: message(cause) })
 
 const bindings = (values: readonly SqliteBinding[]): SQLQueryBindings[] =>

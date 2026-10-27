@@ -1,55 +1,26 @@
-import {
-  Chat as Rpcs,
-  applyChatUpdate,
-  type ChatConversation,
-} from "@magnitudedev/sdk"
-import { Option } from "effect"
+import { applyChatUpdate, Chat as Rpcs } from "@magnitudedev/sdk"
 import { Group } from "@magnitudedev/effect-query"
 import { mutation, query, streamQuery } from "./bind"
 
-const ListModels = query(Rpcs.listModels, (client) => client.chat.listModels, {
-  staleTime: "10 seconds",
+const ListChats = query(Rpcs.list, (client) => client.chat.list)
+const WatchChat = streamQuery(Rpcs.watch, (client) => client.chat.watch, {
+  reduce: applyChatUpdate,
+  gcTime: "5 seconds",
 })
-const ListConversations = query(
-  Rpcs.listConversations,
-  (client) => client.chat.listConversations
-)
-const WatchConversation = streamQuery(
-  Rpcs.watchConversation,
-  (client) => client.chat.watchConversation,
-  {
-    reduce: (previous, update): ChatConversation | null =>
-      applyChatUpdate(Option.getOrNull(previous), update),
-    gcTime: "5 seconds",
-  }
-)
-const CreateConversation = mutation(
-  Rpcs.createConversation,
-  (client) => client.chat.createConversation
-)
-const UpdateConversation = mutation(
-  Rpcs.updateConversation,
-  (client) => client.chat.updateConversation
-)
-const DeleteConversation = mutation(
-  Rpcs.deleteConversation,
-  (client) => client.chat.deleteConversation
-)
-const StartGeneration = mutation(
-  Rpcs.startGeneration,
-  (client) => client.chat.startGeneration
-)
-const StopGeneration = mutation(
-  Rpcs.stopGeneration,
-  (client) => client.chat.stopGeneration
-)
+const StartChat = mutation(Rpcs.start, (client) => client.chat.start)
+const SendChatMessage = mutation(Rpcs.send, (client) => client.chat.send)
+const RetryChatResponse = mutation(Rpcs.retry, (client) => client.chat.retry)
+const StopChatResponse = mutation(Rpcs.stop, (client) => client.chat.stop)
+const RenameChat = mutation(Rpcs.rename, (client) => client.chat.rename)
+const RemoveChat = mutation(Rpcs.remove, (client) => client.chat.remove)
+
 export const Chat = Group.make({
-  ListModels,
-  ListConversations,
-  WatchConversation,
-  CreateConversation,
-  UpdateConversation,
-  DeleteConversation,
-  StartGeneration,
-  StopGeneration,
+  ListChats,
+  WatchChat,
+  StartChat,
+  SendChatMessage,
+  RetryChatResponse,
+  StopChatResponse,
+  RenameChat,
+  RemoveChat,
 })

@@ -82,7 +82,7 @@ jobs:
           bun packages/daemon-management/scripts/build-native.ts
       - name: Check full-install script generation
         working-directory: packages/release
-        run: bunx --bun vitest run scripts/build/installation-scripts.test.ts scripts/build/installation-distribution.test.ts
+        run: bunx --bun vitest run scripts/build/installation-scripts.test.ts scripts/build/installation-distribution.test.ts scripts/build/installation-progress.test.ts
       - name: Exercise sealed bundle and nested signature verification
         working-directory: packages/daemon-management
         run: >-
@@ -202,6 +202,9 @@ jobs:
           systemctl --user show-environment > /dev/null
           bunx --bun vitest run src/desktop-native/native.test.ts src/desktop-native/owned-child.test.ts src/desktop-native/login-startup.test.ts
           bunx --bun vitest run src/desktop-native/unix-continuation.test.ts src/desktop-native/guarded-command.test.ts src/desktop-native/linux-update-maintenance.test.ts src/desktop-native/linux-update-package.test.ts src/application-update/linux-foreground-update.test.ts
+      - name: Check Linux installer progress and package admission
+        working-directory: packages/release
+        run: bunx --bun vitest run scripts/build/installation-progress.test.ts scripts/build/linux-installation-script.test.ts scripts/build/install-question.test.ts
       - name: Exercise Linux process identity and exit races
         working-directory: packages/utils
         run: bunx --bun vitest run src/process-groups/exact-process.test.ts src/process-groups/exact-process-linux.test.ts
@@ -264,6 +267,9 @@ jobs:
           "MAGNITUDE_NODE_HEADERS=$(Join-Path $dependencyRoot 'node_modules/node-api-headers/include')" >> $env:GITHUB_ENV
       - name: Install workspace dependencies for native and compiled CLI acceptance
         run: bun install --frozen-lockfile --ignore-scripts
+      - name: Check Windows PowerShell installer progress
+        working-directory: packages/release
+        run: bunx --bun vitest run scripts/build/installation-progress.test.ts
       - name: Generate service and CLI build identity
         run: bun packages/version/scripts/generate-version.ts
       - name: Build the native adapter used by installer acceptance

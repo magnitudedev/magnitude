@@ -1,5 +1,5 @@
 import { FileSystem } from "@effect/platform"
-import { Effect } from "effect"
+import { Effect, Either } from "effect"
 import { dirname, join } from "node:path"
 import { CliLinkFailed } from "./mac-cli-link"
 
@@ -41,22 +41,21 @@ export const makeMacCliPath = (home: string, environment: Readonly<Record<string
       ? [...profiles, ...[".bash_profile", ".bash_login", ".profile"].map(name => ({ path: join(home, name), block: posixBlock }))]
       : profiles
     const unique = [...new Map(selected.map(profile => [profile.path, profile])).values()]
-    const edits = yield* Effect.forEach(unique, ({ path, block }) => Effect.gen(function* () {
+    // Each startup file is independent; an unwritable or edited one must not skip the others.
+    const results = yield* Effect.forEach(unique, ({ path, block }) => Effect.gen(function* () {
       const current = yield* read(path)
       // Edited or incomplete blocks belong to the user; never guess what to delete.
       if (current.includes(begin) && !current.includes(block)) {
         return yield* new CliLinkFailed({ message: `Magnitude's PATH entry in ${path} was edited; it was left unchanged.` })
       }
       const next = remove ? current.replace(block, "") : current.includes(block) ? current : current + block
-      return { path, current, next }
-    }))
-    // Validate every managed block before changing any profile.
-    yield* Effect.forEach(edits, ({ path, current, next }) => Effect.gen(function* () {
       if (next === current) return
       yield* fs.makeDirectory(dirname(path), { recursive: true })
       yield* fs.writeFileString(path, next)
-    }), { discard: true })
-  }).pipe(Effect.mapError(error => error._tag === "CliLinkFailed" ? error
-    : new CliLinkFailed({ message: `Could not update shell PATH: ${error.message}` })))
+    }).pipe(Effect.mapError(error => error._tag === "CliLinkFailed" ? error
+      : new CliLinkFailed({ message: `Could not update shell PATH in ${path}: ${error.message}` })), Effect.either))
+    const failures = results.filter(Either.isLeft)
+    if (failures.length > 0) return yield* new CliLinkFailed({ message: failures.map(result => result.left.message).join("\n") })
+  })
   return { install: change(false), remove: change(true) }
 })

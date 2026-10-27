@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
-import { SessionNotFound, SessionStartFailed } from "@magnitudedev/acn-protocol"
 import { formatUnknownCause, toSessionError } from "./session-errors"
+import { SessionNotFound, SessionStartFailed } from "./session-errors"
 
 describe("session error formatting", () => {
   it("preserves protocol session errors", () => {

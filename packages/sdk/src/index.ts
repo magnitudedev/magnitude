@@ -21,12 +21,6 @@ export type { ModelInstancesSnapshot as InferenceInstancesSnapshot } from "@magn
  * The RPC declaration tree, wire schemas, and operation errors.
  */
 export * from "@magnitudedev/acn-protocol"
-export {
-  DisplayState as DisplayStateSchema,
-  DisplayTimeline as DisplayTimelineSchema,
-  DisplayViewShape as DisplayViewShapeSchema,
-  StreamEvent as StreamEventSchema,
-} from "@magnitudedev/acn-protocol"
 
 export { isRoleId, ROLE_IDS, ROLE_TO_SLOT, DEFAULT_REASONING_EFFORT, SLOT_IDS, SLOT_DISPLAY_NAMES, SLOT_DESCRIPTIONS } from "@magnitudedev/roles/constants"
 export type { RoleId } from "@magnitudedev/roles/constants"

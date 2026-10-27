@@ -5,15 +5,15 @@ import {
 } from "@magnitudedev/utils/patch"
 import {
   DisplayViewSnapshot as DisplayViewSnapshotSchema,
-  SessionOperationFailed,
+  OperationFailed,
   type DisplayViewShape,
   type DisplayViewSnapshot,
   type DisplayViewPatchEvent,
   type DisplayViewRestoreQueuedMessagesEvent,
   type DisplayViewStateEvent,
-  type SessionError,
   type StreamEvent,
 } from "@magnitudedev/acn-protocol"
+import type { SessionError } from "./session-errors"
 
 export interface DisplayViewSource {
   readonly on: {
@@ -91,7 +91,7 @@ export const makeDisplayViewStream = (input: DisplayViewStreamInput): Effect.Eff
             }
 
             const ops = yield* diffDecoded(prev.value, next.snapshot, patchMap).pipe(
-              Effect.mapError((error) => new SessionOperationFailed({
+              Effect.mapError((error) => new OperationFailed({
                 operation: "displayViewDiff",
                 reason: error instanceof Error ? error.message : String(error),
               })),

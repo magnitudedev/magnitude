@@ -12,7 +12,7 @@ import { LINUX_GLIBC_MINIMUM } from "../../src/linux-package"
 
 // The script selects its package manager by availability, so each case sees only its own.
 const setsid = spawnSync("/bin/sh", ["-c", "command -v setsid"], { encoding: "utf8" }).stdout.trim()
-const systemTools = ["cat", "chmod", "cp", "cut", "getconf", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
+const systemTools = ["awk", "date", "cat", "chmod", "cp", "cut", "getconf", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
 const managers = [
   { manager: "apt-get", package: "deb", receipt: /^update\ninstall\n-y\n-o\nDPkg::Lock::Timeout=300\n.*magnitude\.deb\n$/ },
   { manager: "pacman", package: "pacman", receipt: /^-Q\nmagnitude-desktop\n-U\n--noconfirm\n.*magnitude\.pacman\n-Q\nmagnitude-desktop\n$/ },
@@ -49,8 +49,9 @@ describe.skipIf(process.platform !== "linux").each(managers)("Linux installation
         download: `https://github.com/magnitudedev/magnitude/releases/download/test/magnitude.${format}` }))
       const script = await Effect.runPromise(renderUnixInstallationScript({ origin: "https://magnitude.dev", appleTeam: "ABCDEFGHIJ",
         publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString() }).pipe(Effect.provide(NodeContext.layer)))
+      const isolated = script.replace("server_marker=/etc/magnitude/server", `server_marker="${join(root, "server")}"`)
       // setsid: no controlling terminal, as when an agent runs the installer.
-      const result = spawnSync(setsid, ["-w", "/bin/sh", "-s"], { input: script, encoding: "utf8", timeout: 15000,
+      const result = spawnSync(setsid, ["-w", "/bin/sh", "-s"], { input: isolated, encoding: "utf8", timeout: 15000,
         env: { ...process.env, PATH: `${bin}:${tools}`, TEST_OFFER: offerPath, TEST_PACKAGE: packagePath, TEST_APT_RECEIPT: receipt } })
       if (scenario === "valid") {
         expect(result.status, result.stderr).toBe(0)
@@ -93,11 +94,12 @@ describe.skipIf(process.platform !== "linux")("Linux installation shell architec
       mkdirSync(bin)
       const executable = (name: string, contents: string) => writeFileSync(join(bin, name), contents, { mode: 0o700 })
       for (const [name, contents] of Object.entries(stubs)) executable(name, contents)
+      if (tools.includes("id") && !("id" in stubs)) executable("id", '#!/bin/sh\necho 1000\n')
       executable("curl", `#!/bin/sh\n: > ${JSON.stringify(join(root, "downloaded"))}\nexit 1\n`)
       executable("sudo", `#!/bin/sh\n: > ${JSON.stringify(join(root, "sudo"))}\nexit 1\n`)
       for (const tool of ["uname", "mktemp", "rm", ...tools]) {
         const found = spawnSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim()
-        if (found && !(tool in stubs)) symlinkSync(found, join(bin, tool))
+        if (found && !(tool in stubs) && !existsSync(join(bin, tool))) symlinkSync(found, join(bin, tool))
       }
       const script = readFileSync(join(import.meta.dirname, "../../resources/install.sh"), "utf8").replace("@MAGNITUDE_INSTALL_ORIGIN@", "https://magnitude.dev")
       const result = spawnSync(setsid, ["-w", "/bin/sh", "-s"], { input: script, encoding: "utf8", timeout: 15000, env: { PATH: bin } })

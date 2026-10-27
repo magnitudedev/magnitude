@@ -13,14 +13,15 @@ export const titleCase = (text: string) =>
   text === "none" || text === "off"
     ? "Off"
     : text[0]?.toUpperCase() + text.slice(1)
+const unspecified = "This action could not be completed. Please try again."
 export const errorText = (result: Result.Result<unknown, unknown>) =>
   Result.isFailure(result)
     ? Option.match(Cause.failureOption(result.cause), {
-        onNone: () => "This action could not be completed. Please try again.",
+        onNone: () => unspecified,
         onSome: (error) =>
           error && typeof error === "object" && "message" in error
             ? String(error.message)
-            : "This action could not be completed. Please try again.",
+            : unspecified,
       })
     : null
 export function IconButton({

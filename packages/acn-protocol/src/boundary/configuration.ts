@@ -2,9 +2,7 @@ import { Rpc } from "@effect/rpc"
 import { atMostOnce, replaySafe } from "../transport/recovery"
 import { Schema } from "effect"
 import { ProviderIdSchema } from "@magnitudedev/ai/provider/model"
-import {
-  SessionError,
-} from "../errors"
+import { OperationFailed } from "../errors"
 import {
   CloudUsageResponse,
   UsagePeriod,
@@ -27,7 +25,7 @@ const GetProviderAuth = Rpc.make("GetProviderAuth", {
   success: Schema.Struct({
     auth: Schema.optionalWith(ProviderAuthSchema, { as: "Option", exact: true }),
   }),
-  error: SessionError,
+  error: OperationFailed,
 }).pipe(replaySafe)
 
 const ListProviderAuth = Rpc.make("ListProviderAuth", {
@@ -35,7 +33,7 @@ const ListProviderAuth = Rpc.make("ListProviderAuth", {
   success: Schema.Struct({
     auths: Schema.Record({ key: ProviderIdSchema, value: ProviderAuthSchema }),
   }),
-  error: SessionError,
+  error: OperationFailed,
 }).pipe(replaySafe)
 
 const UpdateProviderAuth = Rpc.make("UpdateProviderAuth", {
@@ -44,7 +42,7 @@ const UpdateProviderAuth = Rpc.make("UpdateProviderAuth", {
     auth: ProviderAuthSchema,
   }),
   success: Schema.Struct({}),
-  error: SessionError,
+  error: OperationFailed,
 }).pipe(replaySafe)
 
 const GetCloudUsage = Rpc.make("GetCloudUsage", {
@@ -54,7 +52,7 @@ const GetCloudUsage = Rpc.make("GetCloudUsage", {
     tz: Schema.optional(Schema.String),
   }),
   success: CloudUsageResponse,
-  error: SessionError,
+  error: OperationFailed,
 }).pipe(replaySafe)
 
 const GetModelStorage = Rpc.make("GetModelStorage", {

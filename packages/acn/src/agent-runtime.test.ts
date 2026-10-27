@@ -27,7 +27,7 @@ import type {
 import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
 import {
   DirectoryPathSchema,
-  SessionOperationFailed,
+  OperationFailed,
   type DirectoryPath,
 } from "@magnitudedev/acn-protocol"
 import { AgentFactory, type AgentFactoryApi } from "./agent-factory"
@@ -396,8 +396,8 @@ describe("AgentRuntime", () => {
         const result = yield* Fiber.join(blocked)
         expect(Either.isLeft(result)).toBe(true)
         if (Either.isLeft(result)) {
-          expect(result.left._tag).toBe("SessionOperationFailed")
-          if (result.left._tag === "SessionOperationFailed") {
+          expect(result.left._tag).toBe("OperationFailed")
+          if (result.left._tag === "OperationFailed") {
             expect(result.left.reason).toContain("did not finish shutting down")
           }
         }
@@ -443,7 +443,7 @@ describe("AgentRuntime", () => {
         const blockedResult = yield* Fiber.join(blocked)
         expect(Either.isLeft(blockedResult)).toBe(true)
         if (Either.isLeft(blockedResult)) {
-          expect(blockedResult.left._tag).toBe("SessionOperationFailed")
+          expect(blockedResult.left._tag).toBe("OperationFailed")
         }
       }).pipe(Effect.provide(setup.layer))
     })
@@ -496,7 +496,7 @@ describe("AgentRuntime", () => {
   it("clears a failed startup so a later request can retry", async () => {
     const program = Effect.gen(function* () {
       const calls = yield* Ref.make(0)
-      const failure = new SessionOperationFailed({ operation: "start", reason: "boom" })
+      const failure = new OperationFailed({ operation: "start", reason: "boom" })
       const setup = yield* makeSetup({
         factory: {
           createSession: () =>
@@ -662,7 +662,7 @@ describe("AgentRuntime", () => {
           Effect.scoped(runtime.acquireSession("delete", "too-late")),
         )
         expect(Either.isLeft(rejected)).toBe(true)
-        if (Either.isLeft(rejected)) expect(rejected.left._tag).toBe("SessionOperationFailed")
+        if (Either.isLeft(rejected)) expect(rejected.left._tag).toBe("OperationFailed")
 
         yield* Deferred.succeed(releaseUse, undefined)
         yield* Fiber.join(inFlight)

@@ -1,5 +1,5 @@
 import { submitsChatMessage } from "./chat/keyboard"
-import { useContext, useRef, useState } from "react"
+import { useCallback, useContext, useRef, useState } from "react"
 import {
   Atom,
   RegistryContext,
@@ -7,23 +7,31 @@ import {
   useAtomSet,
   useAtomValue,
 } from "@effect-atom/atom-react"
-import { Option, Schema } from "effect"
+import { Cause, Effect, Option, Schema } from "effect"
 import {
-  ChatCommandId,
-  ChatConversationId,
-  ChatModelId,
-  ChatSettings as ChatSettingsSchema,
-  defaultChatSettings,
-  type ChatConversation,
-  type ChatGeneration,
-  type ChatSettings,
+  type ChatAssistantMessage,
+  chatMessages,
+  generateSessionId,
+  liveResponse,
+  type MessageId,
+  ReasoningEffortSchema,
+  RequestedResponseSettings,
+  ServingModelId,
+  type SessionId,
+  type WatchedChat,
 } from "@magnitudedev/sdk"
 import {
-  chatDraft,
   chatComposerText,
+  chatDraft,
+  chatRequest,
+  chatRequestSettings,
+  chatRetry,
+  chatSend,
   completeChatSubmission,
+  defaultResponseSettings,
+  reasoningEffortFor,
   selectedChat,
-  chatReasoningEffort,
+  type ChatRequestSettings,
   localModelProviderModelId,
   localModelServingProfile,
   localModelResidency,
@@ -74,17 +82,19 @@ function ChatView({
   id,
   select,
 }: {
-  id: ChatConversationId | null
-  select: (id: ChatConversationId | null) => void
+  id: SessionId | null
+  select: (id: SessionId | null) => void
 }) {
   const client = useAgentClient()
   const registry = useContext(RegistryContext)
-  const clearCreate = useAtomSet(client.Chat.CreateConversation)
-  const clearSend = useAtomSet(client.Chat.StartGeneration)
-  const clearStop = useAtomSet(client.Chat.StopGeneration)
+  const clearStart = useAtomSet(client.Chat.StartChat)
+  const clearSend = useAtomSet(client.Chat.SendChatMessage)
+  const clearRetry = useAtomSet(client.Chat.RetryChatResponse)
+  const clearStop = useAtomSet(client.Chat.StopChatResponse)
   const clearError = () => {
-    clearCreate(Atom.Reset)
+    clearStart(Atom.Reset)
     clearSend(Atom.Reset)
+    clearRetry(Atom.Reset)
     clearStop(Atom.Reset)
   }
   const [panel, setPanel] = useState<"settings" | "history" | null>(null)
@@ -92,14 +102,24 @@ function ChatView({
   const draft = useAtomValue(draftAtom)
   const setDraft = useAtomSet(draftAtom)
   const setNewDraft = useAtomSet(chatDraft(null))
-  // A missing conversation uses an inert atom; no request is made for a new draft.
+  // A new draft has no chat yet; an inert atom stands in, so no request is made.
   const watched = useAtomValue(
-    id
-      ? client.Chat.WatchConversation({ conversationId: id })
-      : emptyConversation
+    id ? client.Chat.WatchChat({ chatId: id }) : unwatched
   ).result
-  const conversation = Result.isSuccess(watched) ? watched.value : null
-  const modelResult = useAtomValue(client.Chat.ListModels({})).result
+  const chat =
+    Result.isSuccess(watched) && watched.value._tag === "open"
+      ? watched.value
+      : null
+  // A chat found absent reads as one removed while watched.
+  const removed =
+    (Result.isSuccess(watched) && watched.value._tag === "removed") ||
+    (Result.isFailure(watched) &&
+      Option.exists(
+        Cause.failureOption(watched.cause),
+        (error) => error._tag === "ChatNotFound"
+      ))
+  const messages = chat ? chatMessages(chat) : []
+  const modelResult = useAtomValue(client.Models.ListServableModels({})).result
   const models = Result.isSuccess(modelResult)
     ? modelResult.value.data.filter(
         (m) =>
@@ -107,8 +127,8 @@ function ChatView({
           m.architecture.output_modalities.includes("text")
       )
     : []
-  const settings = {
-    ...(conversation?.settings ?? defaultChatSettings),
+  const settings: ChatRequestSettings = {
+    ...chatRequestSettings(chat?.messages ?? []),
     ...draft.settings,
   }
   const local = useLocalModels()
@@ -127,77 +147,124 @@ function ChatView({
         )
       : m.context_length
   }
-  const modelId = value(settings.modelId) ?? models[0]?.id
+  const modelId = value(settings.model) ?? models[0]?.id
   const model = models.find((m) => m.id === modelId)
   const reasoning = model ? Option.getOrNull(model.reasoning) : null
-  const effort = value(chatReasoningEffort(model, settings.reasoningEffort))
-  const effectiveSettings: ChatSettings = {
+  const effort = reasoningEffortFor(model, settings.reasoningEffort)
+  const effectiveSettings: ChatRequestSettings = {
     ...settings,
-    modelId: modelId ? Option.some(ChatModelId.make(modelId)) : none(),
-    reasoningEffort: chatReasoningEffort(model, settings.reasoningEffort),
+    model: modelId ? Option.some(ServingModelId.make(modelId)) : none(),
+    reasoningEffort: effort,
     // With no explicit output limit, generation may use the remaining context.
     maxOutputTokens: Option.orElse(settings.maxOutputTokens, () =>
       model ? Option.some(contextFor(model)) : none()
     ),
   }
-  const settingsValid = Schema.is(Schema.typeSchema(ChatSettingsSchema))(
+  const request = chatRequest(effectiveSettings)
+  const settingsValid = Schema.is(Schema.typeSchema(RequestedResponseSettings))(
     effectiveSettings
   )
-  const patch = (change: Partial<ChatSettings>) =>
+  const patch = (change: Partial<ChatRequestSettings>) =>
     setDraft({ ...draft, settings: { ...draft.settings, ...change } })
-  const create = useAtomSet(client.Chat.CreateConversation, { mode: "promise" })
-  const send = useAtomSet(client.Chat.StartGeneration, { mode: "promise" })
-  const stop = useAtomSet(client.Chat.StopGeneration)
-  const createState = useAtomValue(client.Chat.CreateConversation)
-  const sendState = useAtomValue(client.Chat.StartGeneration)
-  const stopState = useAtomValue(client.Chat.StopGeneration)
-  const pending = createState.waiting || sendState.waiting
-  const active = conversation?.messages
-    .flatMap((m) => Option.toArray(m.generation))
-    .find((g) => g.status === "running")
+  const start = useAtomSet(client.Chat.StartChat, { mode: "promise" })
+  const send = useAtomSet(client.Chat.SendChatMessage, { mode: "promise" })
+  const retry = useAtomSet(client.Chat.RetryChatResponse, {
+    mode: "promise",
+  })
+  const stop = useAtomSet(client.Chat.StopChatResponse)
+  const startState = useAtomValue(client.Chat.StartChat)
+  const sendState = useAtomValue(client.Chat.SendChatMessage)
+  const retryState = useAtomValue(client.Chat.RetryChatResponse)
+  const stopState = useAtomValue(client.Chat.StopChatResponse)
+  const pending = startState.waiting || sendState.waiting || retryState.waiting
+  const active = messages.find(
+    (m): m is ChatAssistantMessage =>
+      m._tag === "assistant" && Option.isNone(m.end)
+  )
   const input = useRef<HTMLTextAreaElement>(null)
   const scroller = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
+  const lastScrollTop = useRef(0)
+  // Following the bottom ends the moment the reader scrolls up and resumes once they return to it;
+  // while following, any growth of the transcript (streamed text, an opened thinking panel) is
+  // pinned to the bottom before it paints.
+  const followScroll = useCallback(() => {
+    const node = scroller.current
+    if (!node) return
+    const distance = node.scrollHeight - node.clientHeight - node.scrollTop
+    if (node.scrollTop < lastScrollTop.current && distance > 1) follow.current = false
+    else if (distance < 32) follow.current = true
+    lastScrollTop.current = node.scrollTop
+  }, [])
+  const pinTranscript = useCallback((content: HTMLDivElement) => {
+    const observer = new ResizeObserver(() => {
+      const node = scroller.current
+      if (node && follow.current) node.scrollTop = node.scrollHeight
+    })
+    observer.observe(content)
+    return () => observer.disconnect()
+  }, [])
   const [notice, setNotice] = useState<string | null>(null)
+  const last = messages.at(-1)
   const composerText = chatComposerText(
     draft,
-    conversation?.messages.at(-1)?.generation.pipe(Option.getOrUndefined)
+    last?._tag === "assistant" ? last : undefined
   )
-  const submit = async (retryMessageId?: ChatGeneration["messageId"]) => {
-    if (
-      active ||
-      pending ||
-      !settingsValid ||
-      !modelId ||
-      (!retryMessageId && !composerText.trim())
+  // The one rule for what may be submitted, which the send button and Enter share: a chosen,
+  // served model, valid settings, nothing running or being sent, a chat that still exists, and for
+  // a new message, its text.
+  const submittable = (replaces?: MessageId) =>
+    Option.filter(
+      request,
+      () =>
+        !active &&
+        !pending &&
+        settingsValid &&
+        model !== undefined &&
+        !(id && !chat) &&
+        (replaces !== undefined || composerText.trim() !== "")
     )
-      return
-    const text = retryMessageId
-      ? conversation?.messages.at(-2)?.content ?? ""
+  const canSend = Option.isSome(submittable())
+  const submit = async (replaces?: MessageId) => {
+    const ready = submittable(replaces)
+    if (Option.isNone(ready)) return
+    const asked = messages.at(-2)
+    const text = replaces
+      ? asked?._tag === "user"
+        ? asked.text
+        : ""
       : composerText
     follow.current = true
     try {
-      const conversationId = id ?? ChatConversationId.make(crypto.randomUUID())
-      if (!id) await create({ conversationId, settings: effectiveSettings })
-      const generationId = await send({
-        conversationId,
-        commandId: ChatCommandId.make(crypto.randomUUID()),
-        content: retryMessageId ? none() : Option.some(text),
-        retryMessageId: Option.fromNullable(retryMessageId),
-        settings: effectiveSettings,
-      })
+      // A new chat starts with its first message; an existing one is sent the next.
+      let submitted: { readonly chatId: SessionId; readonly responseId: MessageId; readonly text: string }
+      if (!id) {
+        const payload = Effect.runSync(
+          chatSend(Effect.runSync(generateSessionId), text, ready.value)
+        )
+        await start(payload)
+        submitted = payload
+      } else if (replaces) {
+        const payload = Effect.runSync(chatRetry(id, replaces, ready.value))
+        await retry(payload)
+        submitted = { chatId: id, responseId: payload.responseId, text }
+      } else {
+        const payload = Effect.runSync(chatSend(id, text, ready.value))
+        await send(payload)
+        submitted = { chatId: id, responseId: payload.responseId, text }
+      }
       const latest = registry.get(draftAtom)
       const next = completeChatSubmission(
         latest,
-        text,
-        generationId,
-        !!retryMessageId
+        submitted.text,
+        submitted.responseId,
+        !!replaces
       )
       setDraft(next)
       if (!id) {
-        registry.set(chatDraft(conversationId), next)
+        registry.set(chatDraft(submitted.chatId), next)
         setNewDraft({ ...latest, text: "", submitted: null })
-        if (registry.get(selectedChat) === id) select(conversationId)
+        if (registry.get(selectedChat) === id) select(submitted.chatId)
       }
       input.current?.focus()
     } catch {
@@ -206,7 +273,10 @@ function ChatView({
   }
   const error = pending
     ? null
-    : errorText(createState) ?? errorText(sendState) ?? errorText(stopState)
+    : errorText(startState) ??
+      errorText(sendState) ??
+      errorText(retryState) ??
+      errorText(stopState)
   const narrow = useNarrowViewport()
   const PanelTitle = narrow ? DialogTitle : "h2"
   const body = (
@@ -226,10 +296,10 @@ function ChatView({
           context={model ? contextFor(model) : undefined}
           reset={() =>
             patch({
-              ...defaultChatSettings,
-              modelId: effectiveSettings.modelId,
+              ...defaultResponseSettings,
+              model: effectiveSettings.model,
               reasoningEffort: reasoning
-                ? Option.some(reasoning.default_effort)
+                ? Option.some(ReasoningEffortSchema.make(reasoning.default_effort))
                 : none(),
             })
           }
@@ -289,12 +359,7 @@ function ChatView({
         <div className="flex min-w-0 flex-1 flex-col">
           <div
             ref={scroller}
-            onScroll={() => {
-              const node = scroller.current
-              if (node)
-                follow.current =
-                  node.scrollHeight - node.clientHeight - node.scrollTop < 80
-            }}
+            onScroll={followScroll}
             className="chat-scroll min-h-0 flex-1 overflow-y-auto"
           >
             {id && Result.isInitial(watched) ? (
@@ -304,52 +369,54 @@ function ChatView({
               >
                 Loading conversation…
               </div>
+            ) : id && removed ? (
+              <p className="py-10 text-sm text-slate-500">
+                This conversation was deleted.
+              </p>
             ) : Result.isFailure(watched) ? (
               <ErrorNotice
                 title="Couldn’t open this chat"
                 description={errorText(watched) ?? "Please try again."}
               />
-            ) : id && Result.isSuccess(watched) && !conversation ? (
-              <p className="py-10 text-sm text-slate-500">
-                This conversation was deleted.
-              </p>
-            ) : !conversation?.messages.length ? (
+            ) : !messages.length ? (
               <div className="flex h-full min-h-40 items-center justify-center">
                 <MagnitudeMark className="size-12 opacity-20" />
               </div>
             ) : (
               <div
-                ref={(node) => {
-                  if (node && follow.current && scroller.current)
-                    scroller.current.scrollTop = scroller.current.scrollHeight
-                }}
+                ref={pinTranscript}
                 className="mx-auto max-w-[760px] space-y-8 pb-8 pt-7 pr-1"
               >
-                {conversation.messages.map((message, index) =>
-                  message.role === "user" ? (
+                {messages.map((message, index) =>
+                  message._tag === "user" ? (
                     <div key={message.id} className="flex justify-end">
                       <div className="max-w-[88%] whitespace-pre-wrap break-words rounded-2xl bg-slate-150 px-4 py-3 text-sm leading-6 dark:bg-slate-800">
-                        {message.content}
+                        {message.text}
                       </div>
                     </div>
-                  ) : Option.isSome(message.generation) ? (
+                  ) : (
                     <ChatResponse
-                      key={message.generation.value.id}
-                      generation={message.generation.value}
+                      key={message.id}
+                      response={message}
                       retry={
-                        index === conversation.messages.length - 1 && !active
+                        index === messages.length - 1 && !active
                           ? () => void submit(message.id)
                           : undefined
                       }
                       notify={setNotice}
                     />
-                  ) : null
+                  )
                 )}
               </div>
             )}
           </div>
           <div className="mx-auto w-full max-w-[760px] shrink-0 pb-4 pt-3">
-            {active && <ChatRequestStatus generation={active} />}
+            {active && chat && (
+              <ChatRequestStatus
+                response={active}
+                live={liveResponse(chat, active)}
+              />
+            )}
             {(notice || error) && (
               <div
                 role="alert"
@@ -395,6 +462,8 @@ function ChatView({
             >
               <textarea
                 ref={input}
+                // A chat's view mounts whenever a chat is opened or started, so its composer starts focused.
+                autoFocus
                 rows={2}
                 maxLength={1_048_576}
                 aria-label="Message"
@@ -426,11 +495,8 @@ function ChatView({
                       if (next) {
                         const m = models.find((m) => m.id === next)
                         patch({
-                          modelId: Option.some(ChatModelId.make(next)),
-                          reasoningEffort: chatReasoningEffort(
-                            m,
-                            Option.fromNullable(effort)
-                          ),
+                          model: Option.some(ServingModelId.make(next)),
+                          reasoningEffort: reasoningEffortFor(m, effort),
                         })
                       }
                     }}
@@ -507,8 +573,7 @@ function ChatView({
                     aria-label="Stop generation"
                     disabled={stopState.waiting}
                     onClick={() =>
-                      id &&
-                      stop({ conversationId: id, generationId: active.id })
+                      id && stop({ chatId: id, responseId: active.id })
                     }
                   >
                     <SquareIcon weight="fill" />
@@ -518,13 +583,7 @@ function ChatView({
                     type="submit"
                     size="icon"
                     aria-label="Send message"
-                    disabled={
-                      !composerText.trim() ||
-                      !model ||
-                      pending ||
-                      !settingsValid ||
-                      (!!id && !conversation)
-                    }
+                    disabled={!canSend}
                   >
                     {pending ? (
                       <CircleNotchIcon className="motion-safe:animate-spin" />
@@ -564,8 +623,8 @@ function ChatView({
     </section>
   )
 }
-const emptyConversation = Atom.make({
-  result: Result.success<ChatConversation | null>(null),
+const unwatched = Atom.make({
+  result: Result.initial<WatchedChat>(),
   fetchStatus: "idle" as const,
   isStale: false,
   dataUpdatedAt: Option.none<number>(),

@@ -93,21 +93,19 @@ export const SearchMentionsResult = Schema.Struct({
 })
 export type SearchMentionsResult = Schema.Schema.Type<typeof SearchMentionsResult>
 
-export const DirectoryCandidateSource = Schema.Literal("recent", "filesystem", "exact")
+export const DirectoryCandidateSource = Schema.Literal("filesystem", "exact")
 export type DirectoryCandidateSource = Schema.Schema.Type<typeof DirectoryCandidateSource>
 
 export const DirectoryCandidate = Schema.Struct({
   path: Schema.String,
   label: Schema.String,
-  source: DirectoryCandidateSource,
-  lastActivity: Schema.optional(Schema.Number)
+  source: DirectoryCandidateSource
 })
 export type DirectoryCandidate = Schema.Schema.Type<typeof DirectoryCandidate>
 
 export const SearchDirectoriesPayload = Schema.Struct({
   query: Schema.String,
-  limit: Schema.optionalWith(Schema.Number, { default: () => 20 }),
-  includeRecent: Schema.optionalWith(Schema.Boolean, { default: () => true })
+  limit: Schema.optionalWith(Schema.Number, { default: () => 20 })
 })
 export type SearchDirectoriesPayload = Schema.Schema.Type<typeof SearchDirectoriesPayload>
 

@@ -1,7 +1,7 @@
 import { formatStopSequences, parseStopSequences } from "./stop-sequences"
 import { useState, type ReactNode } from "react"
 import { Option } from "effect"
-import type { ChatSettings } from "@magnitudedev/sdk"
+import type { ChatRequestSettings } from "@magnitudedev/client-common"
 import {
   ArrowCounterClockwiseIcon,
   CaretDownIcon,
@@ -39,8 +39,8 @@ export function ChatSettingsPanel({
   context,
   reset,
 }: {
-  settings: ChatSettings
-  patch: (change: Partial<ChatSettings>) => void
+  settings: ChatRequestSettings
+  patch: (change: Partial<ChatRequestSettings>) => void
   context?: number
   reset: () => void
 }) {

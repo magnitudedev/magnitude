@@ -1,9 +1,9 @@
 import { BunContext } from "@effect/platform-bun"
 import { Effect, Option } from "effect"
-import { ServerInstallationFailed, installLinuxServer, installMacServer, openServerFirewall, parseServerInstallation, removeLinuxServer, restoreLinuxServerGrant,
-  removeMacServer, requireInstalledRoot } from "@magnitudedev/daemon-management/desktop-native"
+import { ServerInstallationFailed, closeServerFirewall, installLinuxServer, installMacServer, openServerFirewall, parseServerInstallation, recordOpenedServerFirewall,
+  removeLinuxServer, restoreLinuxServerGrant, removeMacServer, requireInstalledRoot } from "@magnitudedev/daemon-management/desktop-native"
 import { ServerSetupHostLive } from "../server/server-setup-live"
-import { serverRemove, serverSetup } from "../server/server-setup"
+import { serverRemove, serverSetup, serverWaitReady } from "../server/server-setup"
 
 const report = <E extends { readonly message: string }>(effect: Effect.Effect<void, E>) => Effect.runPromise(effect.pipe(
   Effect.catchAll(error => Effect.sync(() => { process.stderr.write(`${error.message}\n`); process.exitCode = 1 }))))
@@ -11,6 +11,7 @@ const report = <E extends { readonly message: string }>(effect: Effect.Effect<vo
 // A request to a service that never answered may still be pending after setup gave up on it.
 export const runServerSetup = () => report(serverSetup.pipe(Effect.provide(ServerSetupHostLive))).then(() => process.exit())
 export const runServerRemove = () => report(serverRemove.pipe(Effect.provide(ServerSetupHostLive)))
+export const runServerWaitReady = () => report(serverWaitReady.pipe(Effect.provide(ServerSetupHostLive))).then(() => process.exit())
 
 /** The hidden root command. It accepts no input beyond the user name and runs only from the installed CLI as root. */
 export const runServerRootStep = (argv: readonly string[]) => report(Effect.gen(function* () {
@@ -27,8 +28,13 @@ export const runServerRootStep = (argv: readonly string[]) => report(Effect.gen(
     if (Option.isNone(request.user)) return yield* new ServerInstallationFailed({ message: "Run `magnitude server setup` as yourself, without sudo." })
     return yield* installMacServer(request.user.value, cli)
   }
-  if (request._tag === "Remove") return yield* removeLinuxServer
+  const print = (message: Option.Option<string>) => Effect.sync(() => { if (Option.isSome(message)) process.stdout.write(`${message.value}\n`) })
+  if (request._tag === "Remove") {
+    yield* print(yield* closeServerFirewall)
+    return yield* removeLinuxServer
+  }
   yield* installLinuxServer
   const firewall = yield* openServerFirewall
-  if (Option.isSome(firewall)) yield* Effect.sync(() => { process.stdout.write(`${firewall.value}\n`) })
+  if (firewall.opened) yield* recordOpenedServerFirewall
+  yield* print(firewall.message)
 }).pipe(Effect.provide(BunContext.layer)))

@@ -5,9 +5,7 @@ import { describe, expect, it } from "vitest"
 import { Effect, Either, Layer, Option, Ref } from "effect"
 import {
   DirectoryPathSchema,
-  SessionPageCursorSchema,
   type DirectoryPath,
-  type SessionPageRequest,
 } from "@magnitudedev/acn-protocol"
 import {
   MagnitudeStorage,
@@ -17,6 +15,7 @@ import {
 } from "@magnitudedev/storage"
 import { SessionInspector, SessionInspectorLive } from "./session-inspector"
 import { makeTestStorageLayer } from "./session-test-support"
+import { SessionPageCursorSchema, type SessionPageRequest } from "./session-schemas"
 
 const meta = (
   sessionId: string,

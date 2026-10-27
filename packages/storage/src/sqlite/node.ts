@@ -1,15 +1,13 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite"
 import { pathToFileURL } from "node:url"
 import { Effect, Layer } from "effect"
-import { SqliteDriver, SqliteDriverBusy, SqliteDriverFailure, type SqliteBinding, type SqliteConnection, type SqliteDriverError } from "./driver"
+import { SqliteDriver, SqliteDriverFailure, type SqliteBinding, type SqliteConnection, type SqliteDriverError, sqliteError } from "./driver"
 
-const failure = (cause: unknown): SqliteDriverError => {
-  // SQLite extended result codes retain the primary code in the low byte.
-  if (cause instanceof Error && "errcode" in cause && typeof cause.errcode === "number" && (cause.errcode & 0xff) === 5) {
-    return new SqliteDriverBusy()
-  }
-  return new SqliteDriverFailure({ message: cause instanceof Error ? cause.message : String(cause) })
-}
+// A SQLite error carries its extended result code as `errcode`.
+const failure = (cause: unknown): SqliteDriverError =>
+  cause instanceof Error && "errcode" in cause && typeof cause.errcode === "number"
+    ? sqliteError(cause.errcode, cause.message)
+    : new SqliteDriverFailure({ message: cause instanceof Error ? cause.message : String(cause) })
 const bindings = (values: readonly SqliteBinding[]): SQLInputValue[] => values.map((value) => typeof value === "boolean" ? Number(value) : value)
 const connection = (database: DatabaseSync): SqliteConnection => ({
   execute: (sql, values = []) => Effect.try({

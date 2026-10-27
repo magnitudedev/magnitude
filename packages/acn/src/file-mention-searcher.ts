@@ -61,11 +61,6 @@ export interface FileMentionSearcher {
   readonly searchDirectories: (request: {
     readonly query: string
     readonly limit: number
-    readonly includeRecent: boolean
-    readonly recentDirectories: ReadonlyArray<{
-      readonly path: string
-      readonly lastActivity?: number | undefined
-    }>
   }) => Effect.Effect<SearchDirectoriesResult>
   readonly readFile: (cwd: DirectoryPath, request: {
     readonly path: string
@@ -531,7 +526,6 @@ export const FileMentionSearcherLive: Layer.Layer<
         request,
       ) {
         const trimmed = request.query.trim()
-        const queryLower = trimmed.toLowerCase()
         const candidates: DirectoryCandidate[] = []
         const seen = new Set<string>()
         const push = (candidate: DirectoryCandidate) => {
@@ -546,20 +540,6 @@ export const FileMentionSearcherLive: Layer.Layer<
           }).pipe(Effect.option)
           if (Option.isSome(exact) && (yield* isDirectory(exact.value))) {
             push({ path: exact.value, label: directoryLabel(exact.value), source: "exact" })
-          }
-        }
-
-        if (request.includeRecent) {
-          for (const recent of request.recentDirectories) {
-            if (!recent.path) continue
-            if (queryLower && !recent.path.toLowerCase().includes(queryLower)) continue
-            push({
-              path: recent.path,
-              label: directoryLabel(recent.path),
-              source: "recent",
-              ...(recent.lastActivity !== undefined ? { lastActivity: recent.lastActivity } : {}),
-            })
-            if (candidates.length >= request.limit && !isPathPrefix(trimmed)) break
           }
         }
 

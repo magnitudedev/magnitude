@@ -18,21 +18,32 @@
   <a href="https://github.com/magnitudedev/magnitude/stargazers"><img src="https://img.shields.io/github/stars/magnitudedev/magnitude" alt="GitHub Repo stars"></a>
 </p>
 
-Magnitude is an open source inference engine that tunes its kernels on your hardware to find the fastest way to run each model. It's over 2x faster than Ollama and works on Apple Silicon, NVIDIA, AMD, or just a CPU. One click connects it to the agent you already use (Pi, OpenCode, Hermes, Codex, and more).
-
-**[Download Magnitude for macOS, Windows, or Linux](https://magnitude.dev/download)**
+Magnitude is an open source inference engine that tunes its kernels on your hardware to find the fastest way to run each model. It's over 2x faster than Ollama and works on Apple Silicon, NVIDIA, AMD, Intel, or just a CPU. One click connects it to the agent you already use (Pi, OpenCode, Hermes, Codex, and more).
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
-https://github.com/user-attachments/assets/983328c8-93e8-4360-bfef-11e93ff76035
-
 ## Get started
 
-1. [Download Magnitude](https://magnitude.dev/download), install it, and open the app.
-2. Choose a recommended model in **Discover** and download it.
-3. Connect your agent in **Connections** and start using it.
+Magnitude comes with a desktop app and a CLI. Install from your terminal:
 
-The desktop app includes the `magnitude` CLI. No separate installation is needed.
+macOS / Linux:
+
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://magnitude.dev/install.ps1 | iex
+```
+
+Or download the installer:
+
+- **macOS:** [Apple silicon](https://magnitude.dev/api/installer?os=darwin&arch=arm64&package=dmg) · [Intel](https://magnitude.dev/api/installer?os=darwin&arch=x64&package=dmg)
+- **Windows:** [x64](https://magnitude.dev/api/installer?os=windows&arch=x64&package=windows-exe)
+- **Linux x64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=x64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=x64&package=rpm) · [.pkg.tar.zst](https://magnitude.dev/api/installer?os=linux&arch=x64&package=pacman)
+- **Linux ARM64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=rpm)
 
 ### Run it on a server
 
@@ -69,7 +80,7 @@ They ship one-size-fits-all kernels, because tuning each model for each chip by 
 
 ### What hardware do I need?
 
-Any Apple Silicon, NVIDIA, or AMD GPU, or nothing but a CPU. There is no fixed minimum. Smaller machines run smaller models, and more memory lets you run larger ones.
+Any Apple Silicon, NVIDIA, AMD, or Intel GPU, or nothing but a CPU. There is no fixed minimum. Smaller machines run smaller models, and more memory lets you run larger ones.
 
 ### What operating systems does it support?
 

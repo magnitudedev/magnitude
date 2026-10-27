@@ -5,18 +5,28 @@ description: "Install Magnitude on an Apple Silicon or Intel Mac."
 
 ## Requirements
 
-- macOS 13 Ventura or later.
+- macOS 15 Sequoia or later.
 - An Apple Silicon or Intel Mac.
 - Free disk space for the app and the models you download.
 
 Apple Silicon uses Metal GPU acceleration. Intel Macs use CPU inference. See [Hardware](/hardware) for memory and performance guidance.
 
-## Download and install
+## Install from the terminal
 
-1. Visit [Download Magnitude](https://magnitude.dev/download).
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh
+```
+
+The installer selects Apple Silicon or Intel automatically, verifies the download, installs Magnitude in `/Applications`, and registers the `magnitude` CLI. Open a new terminal to use the command.
+
+Open Magnitude from Applications and follow [Quick start](/get-started). For a headless session, run `magnitude serve` instead; the installer does not require opening the desktop app.
+
+## Download the installer
+
+1. Visit [Download Magnitude](https://magnitude.dev/download?os=macos#downloads).
 2. Choose the download for your Mac. If you're unsure, open **Apple menu → About This Mac**: a chip named Apple M1, M2, or another M-series chip is Apple Silicon; an Intel processor uses the Intel download.
 3. Open the `.dmg` and drag **Magnitude** into **Applications**.
-4. Open Magnitude from Applications, then follow [Quick start](/get-started).
+4. Open Magnitude from Applications, then follow [Quick start](/get-started). Opening the app registers the CLI; use a new terminal for the `magnitude` command.
 
 To run Magnitude as a service on a Mac that serves other computers, see [Remote server](/remote-server).
 

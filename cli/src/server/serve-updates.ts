@@ -55,9 +55,9 @@ export const prepareServeStartup = (runtime: ApplicationRuntime, profile: Applic
     stateDirectory, dataDirectory: profile.dataDirectory, version: CLI_VERSION, architecture: yield* architectureOf(process.arch), arguments: process.argv.slice(2) })
 }).pipe(Effect.provide([unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer))]))
 
-/** True once the service reports no working sessions and no inference requests in flight. */
+/** True once the service reports no inference requests in flight. */
 const isIdle = (endpoint: string) => withLocalService(endpoint, client => client.application.getServiceActivity({})).pipe(
-  Effect.map(activity => activity.workingSessions === 0 && activity.inferenceRequests === 0), Effect.orElseSucceed(() => false))
+  Effect.map(activity => activity.inferenceRequests === 0), Effect.orElseSucceed(() => false))
 
 /** The one line a server that cannot install by itself prints for each downloaded version. */
 export const makeDownloadedNotice = (notify: (line: string) => Effect.Effect<void>) => Effect.gen(function* () {

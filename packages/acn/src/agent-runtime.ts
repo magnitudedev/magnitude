@@ -15,11 +15,8 @@ import {
 } from "effect"
 import { DEFAULT_CHAT_NAME, type SessionWorkStatus } from "@magnitudedev/agent"
 import {
-  InvalidSessionPath,
-  SessionNotFound,
-  SessionOperationFailed,
+  OperationFailed,
   type DirectoryPath,
-  type SessionError,
 } from "@magnitudedev/acn-protocol"
 import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
 import { AgentFactory } from "./agent-factory"
@@ -35,6 +32,7 @@ import {
   type SessionRuntimeOptions,
 } from "./session-runtime-options"
 import type { RuntimeEntry } from "./session-types"
+import { InvalidSessionPath, SessionNotFound, type SessionError } from "./session-errors"
 
 export interface RuntimeStartRequest {
   readonly sessionId: string
@@ -165,9 +163,9 @@ export const makeAgentRuntimeLive = (
 
       const readStoredMeta = (
         sessionId: string,
-      ): Effect.Effect<StoredSessionMeta | null, SessionOperationFailed> =>
+      ): Effect.Effect<StoredSessionMeta | null, OperationFailed> =>
         storage.sessions.readMeta(sessionId).pipe(
-          Effect.mapError((error) => new SessionOperationFailed({
+          Effect.mapError((error) => new OperationFailed({
             operation: `read session metadata ${sessionId}`,
             reason: error._tag,
           })),
@@ -329,7 +327,7 @@ export const makeAgentRuntimeLive = (
         Effect.uninterruptibleMask((restore) =>
           Effect.gen(function* () {
             const deleting = () =>
-              new SessionOperationFailed({
+              new OperationFailed({
                 operation: `session ${request.sessionId}`,
                 reason: "Session is being deleted",
               })
@@ -351,7 +349,7 @@ export const makeAgentRuntimeLive = (
                   Effect.timeoutFail({
                     duration: options.retirementAdmissionTimeout ?? "10 seconds",
                     onTimeout: () =>
-                      new SessionOperationFailed({
+                      new OperationFailed({
                         operation: `session ${request.sessionId}`,
                         reason:
                           "The previous idle session runtime did not finish shutting down in time",
@@ -373,7 +371,7 @@ export const makeAgentRuntimeLive = (
                   Effect.timeoutFail({
                     duration: options.retirementAdmissionTimeout ?? "10 seconds",
                     onTimeout: () =>
-                      new SessionOperationFailed({
+                      new OperationFailed({
                         operation: `session ${request.sessionId}`,
                         reason:
                           "The newly started session runtime did not become available in time",

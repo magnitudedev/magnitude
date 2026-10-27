@@ -3,10 +3,10 @@ import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import * as HttpRouter from "@effect/platform/HttpRouter"
 import type { HttpServerRequest } from "@effect/platform/HttpServerRequest"
 import { Effect, Layer, Stream } from "effect"
-import { SessionError } from "@magnitudedev/acn-protocol"
 import { sessionErrorMessage } from "../session-errors"
 import { AcnIntrospector } from "./service"
 import type { AcnIntrospectorApi } from "./service"
+import { SessionError } from "../session-errors"
 
 const encoder = new TextEncoder()
 
@@ -20,7 +20,7 @@ const sessionErrorStatus = (error: SessionError): number => {
     case "InvalidSessionPath":
     case "SessionAlreadyExists":
     case "SessionStartFailed":
-    case "SessionOperationFailed":
+    case "OperationFailed":
       return 400
   }
   return 500

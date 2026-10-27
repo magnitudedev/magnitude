@@ -3,9 +3,27 @@ title: "Linux"
 description: "Choose and install the Linux package for your distribution."
 ---
 
-## Choose your package
+## Requirements
 
-Visit [Download Magnitude](https://magnitude.dev/download) and choose:
+Magnitude requires **glibc 2.34 or later**. Ubuntu 22.04, Debian 12 and RHEL 9 (and its rebuilds) meet the glibc requirement. The desktop window needs a graphical session; `magnitude serve` can run without one, including over SSH.
+
+Your package manager installs required desktop libraries. GPU inference also needs a supported driver; see [Hardware](/hardware). Alpine/musl packages are not available.
+
+## Install from the terminal
+
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh
+```
+
+Includes the desktop app and CLI. The script detects your architecture, selects the package for `apt`, `dnf`, or `pacman`, verifies the download, and installs it with its dependencies. It requires `curl`, Python 3, `openssl`, and `timeout`, and asks for administrator authorization when needed.
+
+The installer asks whether to run Magnitude as a server. Choose **Yes** for a persistent service that starts at boot on a dedicated inference machine; otherwise choose **No**. With no terminal, or no answer within 60 seconds, it installs without setting up a server. See [Remote server](/remote-server).
+
+For desktop use, open **Magnitude** from your applications menu and follow [Quick start](/get-started). For a headless session without a persistent service, run `magnitude serve`.
+
+## Download the installer
+
+Visit [Download Magnitude](https://magnitude.dev/download?os=linux#downloads) and choose:
 
 | Distribution family | Package |
 | --- | --- |
@@ -14,14 +32,6 @@ Visit [Download Magnitude](https://magnitude.dev/download) and choose:
 | Arch Linux / Omarchy and other Arch-based distributions | `.pkg.tar.zst` |
 
 Choose **Intel / AMD (x64)** for an x86-64 processor or **ARM64** for an ARM64 processor. The Arch package is available for x64 only. If you need to check, run `uname -m`: `x86_64` means x64; `aarch64` means ARM64.
-
-## Requirements
-
-Magnitude requires **glibc 2.34 or later**. Ubuntu 22.04, Debian 12 and RHEL 9 (and its rebuilds) meet the glibc requirement. The desktop window needs a graphical session; `magnitude serve` can run without one, including over SSH.
-
-Your package manager installs required desktop libraries. GPU inference also needs a supported driver; see [Hardware](/hardware). Alpine/musl packages are not available.
-
-## Install
 
 Open the downloaded package in your distribution's software installer, or install it from the terminal. Replace the filename below with the file you downloaded.
 

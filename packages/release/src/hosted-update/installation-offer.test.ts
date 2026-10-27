@@ -1,4 +1,4 @@
-import { Effect } from "effect"
+import { Effect, Either } from "effect"
 import { generateKeyPairSync } from "node:crypto"
 import { describe, expect, it } from "vitest"
 import { verifyInstallationOffer } from "./installation-offer"
@@ -28,6 +28,12 @@ describe("full installation release admission", () => {
       expect(await Effect.runPromise(verifyInstallationOffer(changed, target, "stable", trusted).pipe(Effect.isFailure))).toBe(true)
     }
     expect(await Effect.runPromise(verifyInstallationOffer(input, target, "stable", new Map()).pipe(Effect.isFailure))).toBe(true)
+  })
+  it("gives the native installer a readable verification error for an invalid signature", async () => {
+    const input = await Effect.runPromise(offer())
+    const result = await Effect.runPromise(verifyInstallationOffer({ ...input,
+      release: { ...input.release, signature: Buffer.alloc(64).toString("base64") } }, target, "stable", trusted).pipe(Effect.either))
+    expect(Either.isLeft(result) && result.left.message).toBe("Application release verification failed. Download the installer again.")
   })
   it("applies the shared channel admission policy", async () => {
     const beta = await Effect.runPromise(offer("0.1.6-beta.1"))

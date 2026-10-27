@@ -1,18 +1,5 @@
 import { Cause, Clock, Context, Effect, Either, Exit, Layer, Option } from "effect"
-import {
-  SessionAlreadyExists,
-  SessionMetadataUnreadable,
-  SessionMetadataWriteFailed,
-  SessionNotArchived,
-  SessionNotFound,
-  SessionOperationFailed,
-  SessionStartFailed,
-  type CreateSessionInitial,
-  type CreateSessionResult,
-  type SessionError,
-  type SessionMetadata as ProtocolSessionMetadata,
-  type SessionOptions,
-} from "@magnitudedev/acn-protocol"
+import { OperationFailed } from "@magnitudedev/acn-protocol"
 import { MagnitudeStorage, type StoredSessionMeta } from "@magnitudedev/storage"
 import { AgentRuntime } from "./agent-runtime"
 import { SessionDrafts } from "./session-drafts"
@@ -20,6 +7,21 @@ import { SessionCommands } from "./session-commands"
 import { sessionErrorMessage } from "./session-errors"
 import { decodeSessionMetadata, SessionInspector } from "./session-inspector"
 import { hasUserMessageContent, type SessionExecutionContext } from "./session-types"
+import {
+  SessionAlreadyExists,
+  SessionMetadataUnreadable,
+  SessionMetadataWriteFailed,
+  SessionNotArchived,
+  SessionNotFound,
+  SessionStartFailed,
+  type SessionError,
+} from "./session-errors"
+import type {
+  CreateSessionInitial,
+  CreateSessionResult,
+  SessionMetadata as ProtocolSessionMetadata,
+  SessionOptions,
+} from "./session-schemas"
 
 export type SessionCommandError =
   | SessionNotFound
@@ -292,7 +294,7 @@ export const SessionLifecycleLive: Layer.Layer<
             if (!meta) return yield* new SessionNotFound({ sessionId })
             if (!meta.archived) return yield* new SessionNotArchived({ sessionId })
             const removeDurableState = storage.sessions.deleteArchivedSession(sessionId).pipe(
-              Effect.mapError((error) => new SessionOperationFailed({
+              Effect.mapError((error) => new OperationFailed({
                 operation: `delete archived session ${sessionId}`,
                 reason: error._tag,
               })),
@@ -324,7 +326,7 @@ export const SessionLifecycleLive: Layer.Layer<
               return { cwd: live.cwd, projectRoot: live.cwd, scratchpadPath: live.scratchpadPath }
             }
             const meta = yield* storage.sessions.readMeta(sessionId).pipe(
-              Effect.mapError((error) => new SessionOperationFailed({
+              Effect.mapError((error) => new OperationFailed({
                 operation: `read session metadata ${sessionId}`,
                 reason: error._tag,
               })),
@@ -340,7 +342,7 @@ export const SessionLifecycleLive: Layer.Layer<
 
         getSessionCwd: Effect.fn("acn.session-lifecycle.get-session-cwd")(function* (sessionId) {
           const meta = yield* storage.sessions.readMeta(sessionId).pipe(
-            Effect.mapError((error) => new SessionOperationFailed({
+            Effect.mapError((error) => new OperationFailed({
               operation: `read session metadata ${sessionId}`,
               reason: error._tag,
             })),

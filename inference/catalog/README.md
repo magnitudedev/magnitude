@@ -1,13 +1,15 @@
 # Release model catalog
 
-`models.json` owns the catalog. `models.lock.json` maps each catalog ID to the immutable Hugging
-Face commit for its target package and, when separately packaged speculative decoding is declared,
-the immutable commit for its draft package.
+`models.json` owns the catalog. A model lists its `sources`: each is one repository's
+publication of it, with the variants it hosts, the projector they share and the license it grants,
+so a model's variants can come from different publishers. A separately packaged speculative draft
+names its own repository. `models.lock.json` maps every repository the catalog resolves from to its
+immutable Hugging Face commit.
 
 Input modality is inspected from the exact target package. Image-capable targets receive a
 projector during generation: a sole repository `mmproj` is selected automatically, while
-repositories with multiple candidates require an exact `projector.path` declaration. The
-projector is locked as a related component of the target package.
+repositories with multiple candidates require an exact `projector.path` declaration on the source.
+The projector is locked as a related component of the target package.
 
 Each variant's primary GGUF is the one file (or first shard) whose path contains its `format`.
 When other repository files also contain that format, such as MTP heads, the variant declares its

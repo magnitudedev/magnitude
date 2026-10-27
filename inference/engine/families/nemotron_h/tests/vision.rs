@@ -1,7 +1,8 @@
 //! Interpretation of the released Nemotron Omni projectors and the image
 //! input they take.
 //!
-//! The headers are the locked catalog components' (`headers::catalog`): the
+//! The headers are the locked catalog components' (`headers::target`,
+//! `headers::projector`): the
 //! Nemotron 3.5 Bolt 74B-A9B and Super-VL 120B-A12B (UD-Q4_K_XL, every
 //! shard) targets and their projectors.
 
@@ -10,7 +11,7 @@ use magnitude_artifacts::{
     media::{DType, PreparedMedia, PreparedTensor},
     ArtifactIdentity, ImageProcessor, InputLayout, PackageIdentity, TokenId,
 };
-use magnitude_family_common::headers::{add_tensor, catalog, remove_tensor, reshape_tensor, set};
+use magnitude_family_common::headers::{self, add_tensor, remove_tensor, reshape_tensor, set};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, FamilyError, ImportTransform, MarkerTokens, ModelDefinition,
     ModelFamily, PositionSampling, RowRange, TokenPlan, VisionActivation, VisionAttentionScale,
@@ -21,10 +22,8 @@ use magnitude_family_nemotron_h::{
     inputs::spatial_controls, inspect_components, projector::describe_projector, NemotronHFamily,
 };
 
-const BOLT_TARGET: &str = "nemotron-3.5-bolt-74b-a9b__target-gguf:iq2-qat";
-const BOLT_PROJECTOR: &str = "nemotron-3.5-bolt-74b-a9b__projector";
-const SUPER_TARGET: &str = "nemotron-3.5-super-vl-120b-a12b__target-gguf:q4";
-const SUPER_PROJECTOR: &str = "nemotron-3.5-super-vl-120b-a12b__projector";
+const BOLT: &str = "nemotron-3.5-bolt-74b-a9b:gguf:iq2-qat";
+const SUPER: &str = "nemotron-3.5-super-vl-120b-a12b:gguf:q4";
 
 fn identity() -> PackageIdentity {
     PackageIdentity {
@@ -35,12 +34,12 @@ fn identity() -> PackageIdentity {
 
 /// The Super-VL target with its released projector.
 fn super_vl(projector: &Directory) -> Result<ModelDefinition, String> {
-    let target = catalog(SUPER_TARGET);
+    let target = headers::target(SUPER);
     inspect_components(&target, Some(projector), identity()).map_err(|error| error.to_string())
 }
 
-fn embedding_length(target: &str) -> u64 {
-    catalog(target)
+fn embedding_length(model: &str) -> u64 {
+    headers::target(model)
         .value("nemotron_h_moe.embedding_length")
         .and_then(Value::unsigned)
         .unwrap()
@@ -188,15 +187,12 @@ fn check(vision: &VisionDescription, fused: bool) {
 
 #[test]
 fn both_released_projectors_bind_the_radio_tower_and_projection() {
-    for (projector, target, fused) in [
-        (BOLT_PROJECTOR, BOLT_TARGET, false),
-        (SUPER_PROJECTOR, SUPER_TARGET, true),
-    ] {
-        let directory = catalog(projector);
+    for (model, fused) in [(BOLT, false), (SUPER, true)] {
+        let directory = headers::projector(model);
         let vision = describe_projector(&directory).unwrap();
         check(&vision, fused);
         // Features have the width of the target each projector ships with.
-        assert_eq!(vision.output_hidden, embedding_length(target));
+        assert_eq!(vision.output_hidden, embedding_length(model));
         // Every stored tensor but the video kernel has a role.
         let named = vision
             .weights()
@@ -210,13 +206,10 @@ fn both_released_projectors_bind_the_radio_tower_and_projection() {
 
 #[test]
 fn both_targets_inspect_with_their_projectors_and_place_images() {
-    for (projector, target, fused) in [
-        (BOLT_PROJECTOR, BOLT_TARGET, false),
-        (SUPER_PROJECTOR, SUPER_TARGET, true),
-    ] {
+    for (model, fused) in [(BOLT, false), (SUPER, true)] {
         let definition = inspect_components(
-            &catalog(target),
-            Some(&catalog(projector)),
+            &headers::target(model),
+            Some(&headers::projector(model)),
             identity(),
         )
         .unwrap();
@@ -231,7 +224,7 @@ fn both_targets_inspect_with_their_projectors_and_place_images() {
 
 #[test]
 fn unknown_misshapen_or_mismatched_projectors_are_refused() {
-    let original = catalog(BOLT_PROJECTOR);
+    let original = headers::projector(BOLT);
     let refused = |edit: &dyn Fn(&mut Directory)| {
         let mut directory = original.clone();
         edit(&mut directory);
@@ -265,7 +258,7 @@ fn unknown_misshapen_or_mismatched_projectors_are_refused() {
     refused(&|d| reshape_tensor(d, "mm.model.mlp.0.weight", &[4096]));
 
     // A projector whose features are narrower than the target's width.
-    let mut narrow = catalog(SUPER_PROJECTOR);
+    let mut narrow = headers::projector(SUPER);
     set(
         &mut narrow,
         "clip.vision.projection_dim",
@@ -285,7 +278,7 @@ fn unknown_misshapen_or_mismatched_projectors_are_refused() {
 /// align_corners=False)[..., :h, :w]` of `t = arange(128²)`).
 #[test]
 fn positions_sample_the_cropped_square_grid() {
-    let definition = super_vl(&catalog(SUPER_PROJECTOR)).unwrap();
+    let definition = super_vl(&headers::projector(SUPER)).unwrap();
     let expected_4_by_6 = [
         1311.5001, 1332.8334, 1354.1669, 1375.5001, 1396.8335, 1418.1667, 4042.1667, 4063.5,
         4084.8335, 4106.1665, 4127.5, 4148.8335, 6772.834, 6794.167, 6815.5005, 6836.8335,
@@ -388,7 +381,7 @@ fn media(definition: &ModelDefinition, grids: &[[i64; 3]]) -> PreparedMedia {
 /// position.
 #[test]
 fn images_expand_between_their_markers_at_absolute_positions() {
-    let definition = super_vl(&catalog(SUPER_PROJECTOR)).unwrap();
+    let definition = super_vl(&headers::projector(SUPER)).unwrap();
     let adapter = NemotronHFamily
         .input_adapter(&definition, &Markers)
         .unwrap();
@@ -444,7 +437,7 @@ fn images_expand_between_their_markers_at_absolute_positions() {
 /// A target without a projector keeps its text-only input.
 #[test]
 fn a_text_only_definition_takes_no_markers_or_images() {
-    let target = catalog(SUPER_TARGET);
+    let target = headers::target(SUPER);
     let definition = inspect_components(
         &target,
         None,
