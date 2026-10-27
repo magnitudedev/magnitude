@@ -135,6 +135,7 @@ struct AssessmentPoolCurrent {
     /// The work of every key an entry references, with its preparation: a new environment
     /// finishes each assessed model again from it.
     works: std::collections::BTreeMap<AssessmentWorkKey, AssessmentWork>,
+    revalidating: std::collections::BTreeSet<ModelAssessmentSubject>,
     /// Sources whose last read failed. A failed read is the model inventory's failure, which the
     /// catalog reports from the same listing; the pool keeps the slice it has and reads again.
     failed_reads: std::collections::BTreeSet<AssessmentDomain>,
@@ -172,6 +173,7 @@ impl AssessmentPoolCurrent {
         self.domains()
             .into_iter()
             .flat_map(assessment_domain_entries)
+            .filter(|entry| !self.revalidating.contains(&entry.subject))
             .filter_map(|entry| {
                 self.entry_keys
                     .get(&entry.subject)
@@ -197,19 +199,27 @@ impl AssessmentPoolCurrent {
             .iter()
             .map(|target| (target.entry.subject.clone(), target.key.clone()))
             .collect::<std::collections::BTreeMap<_, _>>();
+        let previous_results = assessment_domain_entries(self.domain(domain))
+            .iter()
+            .filter(|entry| matches!(entry.state, ModelAssessmentEntryState::Assessed { .. }))
+            .map(|entry| (entry.subject.clone(), entry.state.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut revalidating = std::collections::BTreeSet::new();
         let entries = targets
             .iter()
             .map(|target| {
                 let mut entry = target.entry.clone();
-                if let Some(state) = work_by_entry
-                    .get(&entry.subject)
-                    .and_then(|key| retained.get(key))
+                if let Some(state) = retained.get(&target.key) {
+                    entry.state = state.clone();
+                } else if matches!(entry.state, ModelAssessmentEntryState::Assessing)
+                    && let Some(state) = previous_results.get(&entry.subject)
                 {
                     entry.state = state.clone();
+                    revalidating.insert(entry.subject.clone());
                 }
                 entry
             })
-            .collect();
+            .collect::<Vec<_>>();
         let next = ModelAssessmentDomainSnapshot::Available {
             source_revision,
             entries,
@@ -232,8 +242,10 @@ impl AssessmentPoolCurrent {
         }
         for subject in old_subjects {
             self.entry_keys.remove(&subject);
+            self.revalidating.remove(&subject);
         }
         self.entry_keys.extend(work_by_entry);
+        self.revalidating.extend(revalidating);
         for target in targets {
             if let Some(work) = &target.work {
                 self.works
@@ -260,7 +272,10 @@ impl AssessmentPoolCurrent {
         self.domains()
             .into_iter()
             .flat_map(assessment_domain_entries)
-            .filter(|entry| matches!(entry.state, ModelAssessmentEntryState::Assessed { .. }))
+            .filter(|entry| {
+                matches!(entry.state, ModelAssessmentEntryState::Assessed { .. })
+                    && !self.revalidating.contains(&entry.subject)
+            })
             .filter_map(|entry| self.entry_keys.get(&entry.subject).cloned())
             .collect()
     }
@@ -354,6 +369,7 @@ impl AssessmentPoolCurrent {
             .collect::<Vec<_>>();
         for subject in old_subjects {
             self.entry_keys.remove(&subject);
+            self.revalidating.remove(&subject);
         }
         self.retain_referenced_works();
         *self.domain_mut(domain) = next;
@@ -366,15 +382,21 @@ impl AssessmentPoolCurrent {
             matches!(domain, ModelAssessmentDomainSnapshot::Available { .. })
                 && assessment_domain_entries(domain)
                     .iter()
-                    .all(|entry| !matches!(entry.state, ModelAssessmentEntryState::Assessing))
+                    .all(|entry| !self.awaits_outcome(entry))
         })
+    }
+
+    /// Whether `entry` waits on its work's outcome: it is assessing, or shows its previous
+    /// result while its new work is assessed.
+    fn awaits_outcome(&self, entry: &ModelAssessmentEntry) -> bool {
+        matches!(entry.state, ModelAssessmentEntryState::Assessing)
+            || self.revalidating.contains(&entry.subject)
     }
 
     fn references_assessing(&self, key: &AssessmentWorkKey) -> bool {
         self.domains().into_iter().any(|domain| {
             assessment_domain_entries(domain).iter().any(|entry| {
-                self.entry_keys.get(&entry.subject) == Some(key)
-                    && matches!(entry.state, ModelAssessmentEntryState::Assessing)
+                self.entry_keys.get(&entry.subject) == Some(key) && self.awaits_outcome(entry)
             })
         })
     }
@@ -404,7 +426,8 @@ impl AssessmentPoolCurrent {
             };
             for entry in entries.iter_mut() {
                 if self.entry_keys.get(&entry.subject) == Some(&outcome.key)
-                    && matches!(entry.state, ModelAssessmentEntryState::Assessing)
+                    && (matches!(entry.state, ModelAssessmentEntryState::Assessing)
+                        || self.revalidating.remove(&entry.subject))
                 {
                     let catalog = matches!(domain_kind, AssessmentDomain::Catalog);
                     let dropped = match &outcome.result {
@@ -599,6 +622,7 @@ impl ManagedModelAssessments {
                 },
                 entry_keys: std::collections::BTreeMap::new(),
                 works: std::collections::BTreeMap::new(),
+                revalidating: std::collections::BTreeSet::new(),
                 failed_reads: std::collections::BTreeSet::new(),
             }),
             changes,
@@ -1179,6 +1203,7 @@ mod tests {
             },
             entry_keys: std::collections::BTreeMap::new(),
             works: std::collections::BTreeMap::new(),
+            revalidating: std::collections::BTreeSet::new(),
             failed_reads: std::collections::BTreeSet::new(),
         }
     }
@@ -1283,6 +1308,164 @@ mod tests {
                 .assessed_keys()
                 .iter()
                 .all(|key| key.0.ends_with("-measured"))
+        );
+    }
+
+    /// QA: once measurements arrived, a change to the local models read before the assessed
+    /// models were finished again in the new environment sent every one of them back to
+    /// `Assessing`, so a finished catalog showed its assessment progress again from the start.
+    /// An assessed model keeps its result until its result in the new environment lands.
+    #[test]
+    fn a_source_read_while_measurements_land_keeps_every_assessed_model() {
+        use magnitude_service_contracts::models::{ModelPerformance, PerformanceEvidence};
+        let subject = assessment_subject("refinished", CatalogModelSelection::Desired);
+        let mut current = assessment_pool_current();
+        current.replace_domain(
+            AssessmentDomain::Catalog,
+            1,
+            &[assessment_target(subject.clone(), "pending")],
+        );
+        current.apply_outcome(&AssessmentOutcome {
+            key: AssessmentWorkKey("pending".to_owned()),
+            result: Ok(fits(&subject, ModelPerformance::Pending)),
+        });
+        let catalog = seismic::Devices::discover(&[]).expect("device catalog");
+        let structure = magnitude_engine::assessment::AssessmentStructure::discover(
+            &catalog,
+            magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+            magnitude_executor::platform::MemoryReserves::standard(),
+            environment::serving_policy(),
+            magnitude_engine::options::standard_service_limits(),
+        )
+        .expect("the CPU backend is selectable");
+        let environment = Arc::new(
+            AssessmentEnvironment::new(
+                Arc::new(structure),
+                magnitude_engine::assessment::Measurements::Pending,
+            )
+            .expect("the CPU environment"),
+        );
+        let configuration = test_configuration(subject.model_id().as_str());
+        let profile = configuration.profile.clone();
+        let work = ModelAssessor::work_for(
+            &environment,
+            configuration,
+            profile,
+            Arc::new(tokio::sync::OnceCell::new()),
+        );
+        let measured = work.key.clone();
+        let pending = AssessmentWorkKey("pending".to_owned());
+        let assessed = current.assessed_keys();
+        current.rekey_unassessed(&[(pending.clone(), work)].into_iter().collect(), &assessed);
+        current.replace_domain(
+            AssessmentDomain::Catalog,
+            2,
+            &[assessment_target(subject.clone(), &measured.0)],
+        );
+        assert!(
+            matches!(
+                current.domain(AssessmentDomain::Catalog),
+                ModelAssessmentDomainSnapshot::Available { entries, .. }
+                    if matches!(entries.as_slice(), [ModelAssessmentEntry {
+                        state: ModelAssessmentEntryState::Assessed { .. }, ..
+                    }])
+            ),
+            "the read keeps the assessed result"
+        );
+        assert!(current.references_assessing(&measured));
+        let estimated = ModelPerformance::Estimated {
+            samples: vec![PerformanceEvidence {
+                context_tokens: 8_192,
+                estimated_tokens_per_second: 40.0,
+            }],
+        };
+        current.republish(
+            &environment.id,
+            MeasurementState::Measured,
+            &[(pending, measured.clone())].into_iter().collect(),
+            &[AssessmentOutcome {
+                key: measured.clone(),
+                result: Ok(fits(&subject, estimated.clone())),
+            }],
+        );
+        assert_eq!(current.entry_keys.get(&subject), Some(&measured));
+        assert!(matches!(
+            current.domain(AssessmentDomain::Catalog),
+            ModelAssessmentDomainSnapshot::Available { entries, .. }
+                if matches!(entries.as_slice(), [ModelAssessmentEntry {
+                    state: ModelAssessmentEntryState::Assessed { profiles, .. }, ..
+                }] if matches!(profiles.as_slice(), [ModelAssessment::Fits { performance, .. }]
+                    if *performance == estimated))
+        ));
+    }
+
+    /// QA: once the catalog learned that a model with a drafter fits only without it, its new
+    /// configuration was a new target, and the model showed `Assessing` again (77 of 78) until
+    /// that target was assessed. A model keeps its result while its new target is assessed.
+    #[test]
+    fn a_model_whose_target_changes_keeps_its_result_until_the_new_one_lands() {
+        use magnitude_service_contracts::models::{ModelPerformance, PerformanceEvidence};
+        let subject = assessment_subject("redrafted", CatalogModelSelection::Desired);
+        let mut current = assessment_pool_current();
+        current.replace_domain(
+            AssessmentDomain::Catalog,
+            1,
+            &[assessment_target(subject.clone(), "with-drafter")],
+        );
+        current.apply_outcome(&AssessmentOutcome {
+            key: AssessmentWorkKey("with-drafter".to_owned()),
+            result: Ok(fits(&subject, ModelPerformance::Pending)),
+        });
+        let plain = AssessmentWorkKey("plain".to_owned());
+        assert!(current.replace_domain(
+            AssessmentDomain::Catalog,
+            2,
+            &[assessment_target(subject.clone(), &plain.0)],
+        ));
+        let entry_state = |current: &AssessmentPoolCurrent| match current
+            .domain(AssessmentDomain::Catalog)
+        {
+            ModelAssessmentDomainSnapshot::Available { entries, .. } => entries[0].state.clone(),
+            ModelAssessmentDomainSnapshot::Pending { .. } => {
+                panic!("the catalog slice is available")
+            }
+        };
+        assert!(matches!(
+            entry_state(&current),
+            ModelAssessmentEntryState::Assessed { profiles, .. }
+                if matches!(profiles.as_slice(), [ModelAssessment::Fits { performance: ModelPerformance::Pending, .. }])
+        ));
+        assert!(
+            current.references_assessing(&plain),
+            "the new target is scheduled"
+        );
+        assert!(
+            current.assessed_keys().is_empty(),
+            "no environment finishes the old result again"
+        );
+        let estimated = ModelPerformance::Estimated {
+            samples: vec![PerformanceEvidence {
+                context_tokens: 8_192,
+                estimated_tokens_per_second: 40.0,
+            }],
+        };
+        assert!(
+            current
+                .apply_outcome(&AssessmentOutcome {
+                    key: plain.clone(),
+                    result: Ok(fits(&subject, estimated.clone())),
+                })
+                .changed
+        );
+        assert!(matches!(
+            entry_state(&current),
+            ModelAssessmentEntryState::Assessed { profiles, .. }
+                if matches!(profiles.as_slice(), [ModelAssessment::Fits { performance, .. }] if *performance == estimated)
+        ));
+        assert!(!current.references_assessing(&plain));
+        assert_eq!(
+            current.assessed_keys().into_iter().collect::<Vec<_>>(),
+            vec![plain]
         );
     }
 
