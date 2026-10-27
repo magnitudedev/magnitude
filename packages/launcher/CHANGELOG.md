@@ -1,5 +1,34 @@
 # @magnitudedev/cli
 
+## 0.2.12
+
+### Patch Changes
+
+- [`73f7c06`](https://github.com/magnitudedev/magnitude/commit/73f7c068c3f98a243955bceb4791ded6d4b14590) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - App improvements.
+
+  - A Docs link sits above Settings in the sidebar.
+  - Chat follows new output only while you're at the bottom: scrolling up to read stops it, and returning to the bottom resumes it.
+  - While a model is reassessed, its previous fit result stays visible instead of going back to assessing.
+  - Intel GPUs are listed as supported hardware.
+
+- [`73f7c06`](https://github.com/magnitudedev/magnitude/commit/73f7c068c3f98a243955bceb4791ded6d4b14590) Thanks [@anerli](https://github.com/anerli)! - Qwen3.8 Flash Next NVFP4 is now a variant of Qwen3.8 Flash Next instead of a separate model. Its ID is now `qwen3.8-flash-next:gguf:nvfp4` (was `qwen3.8-flash-next-nvfp4:gguf:nvfp4`).
+
+- [`73f7c06`](https://github.com/magnitudedev/magnitude/commit/73f7c068c3f98a243955bceb4791ded6d4b14590) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Install Magnitude with one command on every platform, with clearer progress and fewer failed installs.
+
+  - The README and installation guides now use the install script on macOS, Linux and Windows.
+  - The installer shows each download's speed and time remaining, redraws without blank frames, and opens the desktop app when it's done.
+  - Slow connections no longer fail a download after 10 minutes; a download fails only when no data arrives for 60 seconds, and says so.
+  - On Windows, silent setup works again, and the installer asks you to quit a running Magnitude before downloading instead of failing at the end.
+  - On macOS before 15, the installer says Magnitude needs macOS 15 or later instead of installing an app that won't open.
+  - Ctrl-C, a closed terminal or a killed installer stops the download at once and cleans up after itself.
+  - On Linux without systemd, such as containers or WSL, the installer no longer offers server mode.
+
+- [`73f7c06`](https://github.com/magnitudedev/magnitude/commit/73f7c068c3f98a243955bceb4791ded6d4b14590) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - More reliable Linux server setup and removal.
+
+  - Network access is on from the server's first start, so a `magnitude server setup` that's interrupted still leaves a server other computers can reach; running setup again shows its access key.
+  - `magnitude server remove` closes the firewalld port that setup opened.
+  - If the installer is interrupted while setting up the server, it says how to finish: `magnitude server setup`.
+
 ## 0.2.11
 
 ### Patch Changes
